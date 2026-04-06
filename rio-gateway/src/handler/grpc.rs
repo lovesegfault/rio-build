@@ -51,19 +51,15 @@ pub(super) async fn grpc_is_valid_path(
 }
 
 /// Max attempts for `Code::Aborted` retry in [`grpc_put_path`]. The
-/// store returns Aborted for two distinct reasons:
-///
-/// 1. Another upload holds the placeholder for this path (I-068) —
-///    clears in one round-trip (.drv NARs are KB).
-/// 2. GC mark holds `GC_MARK_LOCK_ID` exclusive (I-168) — clears when
-///    the `compute_unreachable` CTE finishes (seconds, scales with DB
-///    size); the store-side retry covers most of this, but a long mark
-///    can still surface here.
+/// store returns Aborted when another upload holds the placeholder for
+/// this path (I-068) or on PG serialization/deadlock conflicts — both
+/// clear in one round-trip (.drv NARs are KB). GC no longer blocks
+/// PutPath at all (I-192).
 ///
 /// Exponential backoff (base [`PUT_PATH_ABORTED_BASE_MS`], ×2, full
-/// jitter, ceiling [`PUT_PATH_ABORTED_CEIL_MS`]) keeps case (1) fast
-/// (first retry ≤50 ms) while tolerating multi-second case-(2)
-/// windows. 8 attempts → ≤~6 s budget.
+/// jitter, ceiling [`PUT_PATH_ABORTED_CEIL_MS`]). 8 attempts → ≤~6 s
+/// budget — generous for the remaining (fast-clearing) cases; kept as
+/// a safety margin rather than tightened.
 const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 8;
 const PUT_PATH_ABORTED_BASE_MS: u64 = 50;
 const PUT_PATH_ABORTED_CEIL_MS: u64 = 2000;

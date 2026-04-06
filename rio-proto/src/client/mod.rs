@@ -299,9 +299,9 @@ impl NarCollectError {
                 // The pool drains in <1s — retry is the right answer.
                 //
                 // I-189: Aborted = store's retryable PG conflict
-                // (Serialization, GcMarkBusy, Deadlock — see
-                // `rio-store::metadata`, I-168). The store says "retry"
-                // via Aborted; without it here the builder's
+                // (Serialization, Deadlock — see `rio-store::metadata`).
+                // The store says "retry" via Aborted; without it here
+                // the builder's
                 // no-manifest-hint fallback path EIOs immediately on PG
                 // contention instead of backing off.
                 if matches!(

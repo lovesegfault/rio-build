@@ -131,15 +131,13 @@ pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
 pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Status {
     use metadata::MetadataError as M;
     match &e {
-        // I-145: serialization failure is the EXPECTED outcome when a
-        // PutPath/QueryPathInfo txn collides with GC mark holding the
-        // advisory lock under SERIALIZABLE. Client retries on `aborted`;
-        // logging at ERROR floods the log with thousands of spurious
-        // entries during a normal GC cycle.
-        M::Serialization | M::GcMarkBusy => debug!(
+        // I-145: serialization failure is an EXPECTED outcome under
+        // concurrent write contention. Client retries on `aborted`;
+        // logging at ERROR floods the log with spurious entries.
+        M::Serialization => debug!(
             context,
             error = %e,
-            "metadata layer: serialization conflict (expected during GC mark; client retries)"
+            "metadata layer: serialization conflict (client retries)"
         ),
         _ => error!(context, error = %e, "metadata layer error"),
     }
@@ -148,7 +146,6 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
         M::Conflict(_) => Status::already_exists("conflict: path already exists"),
         M::Connection(_) => Status::unavailable("database connection failed; retry"),
         M::Serialization => Status::aborted("transaction serialization failure; retry"),
-        M::GcMarkBusy => Status::aborted("GC mark in progress; retry"),
         M::Deadlock(_) => Status::aborted("transaction deadlock detected; retry"),
         M::PlaceholderMissing { .. } => {
             Status::aborted("upload placeholder concurrently deleted; retry")
@@ -176,7 +173,6 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
     use metadata::MetadataError as M;
     let reason = match &e {
         M::Serialization => Some("serialization"),
-        M::GcMarkBusy => Some("gc_mark"),
         M::Deadlock(_) => Some("deadlock"),
         M::PlaceholderMissing { .. } => Some("placeholder_missing"),
         M::Connection(_) => Some("connection"),

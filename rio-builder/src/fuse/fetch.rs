@@ -683,10 +683,10 @@ async fn fetch_one_chunk(
 /// raw `Status` (per-chunk closure has no `NarCollectError` yet).
 ///
 /// I-189: includes `Aborted`. The store maps retryable PG conflicts
-/// (Serialization, GcMarkBusy, Deadlock — see `rio-store::metadata`,
-/// I-168) to `tonic::Code::Aborted` with explicit "client should
-/// retry" intent. Without it here, the no-manifest-hint fallback path
-/// EIOs immediately on PG contention instead of backing off.
+/// (Serialization, Deadlock — see `rio-store::metadata`) to
+/// `tonic::Code::Aborted` with explicit "client should retry" intent.
+/// Without it here, the no-manifest-hint fallback path EIOs immediately
+/// on PG contention instead of backing off.
 // r[impl builder.fuse.retry-jitter]
 fn is_transient_status(s: &tonic::Status) -> bool {
     matches!(
@@ -1174,8 +1174,8 @@ mod tests {
     use super::*;
 
     /// I-189 Option D: store returns `Aborted` for retryable PG
-    /// conflicts (Serialization, GcMarkBusy, Deadlock). Builder must
-    /// retry, not EIO.
+    /// conflicts (Serialization, Deadlock). Builder must retry, not
+    /// EIO.
     // r[verify builder.fuse.retry-jitter]
     #[test]
     fn test_aborted_is_transient() {

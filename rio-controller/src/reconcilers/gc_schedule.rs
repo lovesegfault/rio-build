@@ -51,11 +51,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Jitter (0..=60 s) added on top so a multi-controller-replica restart
 /// (operator misconfig — see module doc) doesn't thunder.
 ///
-/// I-168: previously the loop fired at t≈0 (`interval()` immediate
-/// first poll), so EVERY deploy collided GC mark with post-deploy
-/// validation traffic — `nix copy` of ~26 k paths hit
-/// `GC_MARK_LOCK_ID` exclusive and exhausted the gateway retry budget.
-/// 5 minutes clears the deploy-then-stress window while preserving the
+/// GC no longer blocks PutPath (I-192), so this is no longer a
+/// correctness/availability concern — kept because firing GC at t≈0
+/// (`interval()` immediate first poll) on every deploy still wastes
+/// work (post-deploy validation traffic is all within grace, nothing
+/// to collect) and clutters `paths_resurrected` metrics. 5 minutes
+/// clears the deploy-then-stress window while preserving the
 /// "controller restart doesn't delay GC by 24 h" intent.
 pub(crate) const STARTUP_DELAY: Duration = Duration::from_secs(300);
 

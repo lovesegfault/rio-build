@@ -206,12 +206,16 @@ pub async fn sweep(
             .await?
             .flatten();
 
-            // Step 1b: reference re-check. Mark held GC_MARK_LOCK_ID
-            // exclusive, but we RELEASED it before sweep (to avoid
-            // blocking PutPath during the longer sweep phase). A PutPath
-            // that completed BETWEEN mark and now may have written
-            // references=[this_path]. Re-check via GIN index before
+            // Step 1b: reference re-check. Mark's CTE took a
+            // point-in-time MVCC snapshot; a PutPath that committed
+            // AFTER that snapshot (during mark, or between mark and
+            // now) may have written references=[this_path] —
+            // including `'uploading'` placeholders, which carry
+            // references from insert. Re-check via GIN index before
             // deleting. If found: skip, increment resurrected metric.
+            // I-192: this is the LOAD-BEARING mark-vs-PutPath guard
+            // (there is no advisory lock).
+            // r[impl store.gc.sweep-recheck]
             //
             // The subquery resolves hash→path because narinfo."references"
             // is TEXT[] (store_path strings, not hashes). The GIN index
@@ -686,6 +690,76 @@ mod tests {
                 .await
                 .unwrap();
         assert!(p_exists, "P should still exist (resurrected, not swept)");
+    }
+
+    /// I-192: same race as `sweep_resurrected_path_skipped`, but the
+    /// new referrer is an `'uploading'` PLACEHOLDER (not a complete
+    /// path). This is the precise mark-vs-PutPath case the now-removed
+    /// `GC_MARK_LOCK_ID` advisory lock guarded against: mark snapshot
+    /// at T0 → `insert_manifest_uploading(P, refs=[Q])` commits at T1
+    /// → sweep at T2. The re-check scans ALL narinfo (no
+    /// `status='complete'` filter), so the placeholder's `references`
+    /// column is enough to resurrect Q. The grace window protects P
+    /// itself; this proves Q (P's reference, past grace) is also
+    /// protected — without an advisory lock.
+    // r[verify store.gc.sweep-recheck]
+    #[tokio::test]
+    async fn sweep_recheck_sees_uploading_placeholder() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Q: old, no roots — mark would (and did) declare unreachable.
+        let q = test_store_path("placeholder-ref-target");
+        let q_hash = StoreSeed::raw_path(&q)
+            .created_hours_ago(48)
+            .seed(&db.pool)
+            .await;
+
+        // Simulate "mark already returned [Q]" by passing it directly
+        // to sweep. Now P's placeholder commits — exactly the race
+        // window the lock used to (redundantly) close.
+        let p = test_store_path("placeholder-referrer");
+        let p_hash = path_hash(&p);
+        let inserted = crate::metadata::insert_manifest_uploading(
+            &db.pool,
+            &p_hash,
+            &p,
+            std::slice::from_ref(&q),
+        )
+        .await
+        .unwrap();
+        assert!(inserted);
+
+        // Sanity: P is status='uploading', nar_size=0 — a real
+        // placeholder, not a complete path.
+        let (status, nar_size): (String, i64) = sqlx::query_as(
+            "SELECT m.status::text, n.nar_size FROM manifests m \
+             JOIN narinfo n USING (store_path_hash) WHERE m.store_path_hash = $1",
+        )
+        .bind(&p_hash)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "uploading");
+        assert_eq!(nar_size, 0);
+
+        // Sweep with Q in unreachable. Re-check must see P's
+        // placeholder narinfo.references @> [Q] → resurrect.
+        let stats = sweep(&db.pool, None, vec![q_hash.clone()], false, &no_shutdown())
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.paths_deleted, 0,
+            "Q must NOT be deleted — uploading placeholder P references it"
+        );
+        assert_eq!(stats.paths_resurrected, 1);
+
+        let q_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)")
+                .bind(&q_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(q_exists, "Q's narinfo must survive sweep");
     }
 
     /// Sweep must DELETE path_tenants rows for swept paths.

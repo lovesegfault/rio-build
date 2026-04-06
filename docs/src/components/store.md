@@ -138,8 +138,8 @@ Uploaders MUST heartbeat `manifests.updated_at` during long-running chunk upload
 r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
 
-r[store.put.gc-mark-retry]
-The `'uploading'` placeholder insert MUST acquire `GC_MARK_LOCK_ID` shared via a bounded retry of `pg_try_advisory_xact_lock_shared`, releasing the pool connection between attempts. On exhaustion it MUST return `MetadataError::GcMarkBusy` (→ gRPC `aborted("GC mark in progress; retry")`, metric `reason="gc_mark"`). Rationale (I-168): the blocking `pg_advisory_xact_lock_shared` form holds a pool connection for the full mark-CTE duration; with 1024 concurrent waiters × 50-conn pool that's a `PoolTimedOut` cascade. The single-shot `try` form surfaces an `Aborted` to `nix copy` on every controller restart.
+r[store.put.placeholder-refs]
+The `'uploading'` placeholder narinfo MUST carry `references` from the instant it commits (same INSERT, same transaction as the `manifests` row). PutPath does NOT take any GC-related advisory lock. The placeholder's references are what protect its closure from GC: either mark's CTE seed (b) walks them (placeholder committed before mark's snapshot), or sweep's per-path re-check sees them (`r[store.gc.sweep-recheck]`). Rationale: I-192 — the previous `GC_MARK_LOCK_ID` advisory lock was redundant with the re-check, and surfaced `Aborted` to `nix copy` under mark-CTE pressure (I-168).
 
 r[store.atomic.multi-output]
 Multi-output derivation registration MUST be atomic at the DB level: all output rows commit in one transaction, or none do. Blob-store writes are NOT rolled back (orphaned blobs are refcount-zero and GC-eligible on the next sweep). The bound is ≤1 NAR-size per failure.
@@ -248,9 +248,12 @@ When `try_substitute` finds an existing `'uploading'` placeholder for the reques
 ## Two-Phase Garbage Collection
 
 r[store.gc.two-phase]
-- **Phase 1 (Mark):** Identify paths unreachable from GC roots via a recursive CTE over `narinfo."references"`. GC root seeds: explicit pins in the `gc_roots` table, auto-pinned live-build inputs in the `scheduler_live_pins` table, manifests with `status='uploading'` (in-flight PutPath), paths with `created_at > now() - grace_hours` (recent uploads), and `extra_roots` passed from the scheduler's live-build output paths (`ActorCommand::GcRoots`). Mark takes an **exclusive** advisory lock (`GC_MARK_LOCK_ID = 0x724F47430002`); PutPath takes the same lock **shared** around its placeholder-insert → complete-manifest window. This blocks PutPath for ~1s (CTE duration) during mark.
+- **Phase 1 (Mark):** Identify paths unreachable from GC roots via a recursive CTE over `narinfo."references"`. GC root seeds: explicit pins in the `gc_roots` table, auto-pinned live-build inputs in the `scheduler_live_pins` table, manifests with `status='uploading'` (in-flight PutPath), paths with `created_at > now() - grace_hours` (recent uploads), and `extra_roots` passed from the scheduler's live-build output paths (`ActorCommand::GcRoots`). Mark takes NO lock against PutPath (I-192); PutPath runs freely throughout. The CTE's MVCC snapshot is a point-in-time view — placeholders that commit after it are caught by sweep's re-check.
 - **Grace period:** Configurable per-invocation via `GcRequest.grace_period_hours` (default **2h**). Protects paths uploaded shortly before GC that builds haven't referenced yet.
-- **Phase 2 (Sweep):** Re-read chunk refcounts at sweep time (NOT from a mark-phase snapshot). Per unreachable path, in batched transactions: `SELECT chunk_list ... FOR UPDATE OF m` locks the **manifest** row (not chunk rows), then sweep **re-checks references** (GIN-indexed) --- if a PutPath completed between mark and sweep with a reference to this path, the delete is skipped (`rio_store_gc_path_resurrected_total` metric). DELETE narinfo (CASCADE), decrement chunk refcounts, mark `refcount=0` chunks deleted, enqueue S3 keys to `pending_s3_deletes` --- all in the same PG transaction. Sweep does NOT hold the mark advisory lock.
+- **Phase 2 (Sweep):** Re-read chunk refcounts at sweep time (NOT from a mark-phase snapshot). Per unreachable path, in batched transactions: `SELECT chunk_list ... FOR UPDATE OF m` locks the **manifest** row (not chunk rows), then sweep **re-checks references** (`r[store.gc.sweep-recheck]`). DELETE narinfo (CASCADE), decrement chunk refcounts, mark `refcount=0` chunks deleted, enqueue S3 keys to `pending_s3_deletes` --- all in the same PG transaction.
+
+r[store.gc.sweep-recheck]
+Sweep MUST, before deleting each candidate path Q, re-check `EXISTS(SELECT 1 FROM narinfo n WHERE n."references" @> ARRAY[Q] AND n ∉ sweep_unreachable)` with a fresh READ-COMMITTED snapshot. The scan covers ALL narinfo rows including `status='uploading'` placeholders (which carry references from insert per `r[store.put.placeholder-refs]`). On match, sweep MUST skip Q and increment `rio_store_gc_path_resurrected_total`. This re-check is the sole load-bearing mark-vs-PutPath concurrency guard: a PutPath that commits a placeholder referencing Q at any point before the re-check resurrects Q regardless of mark's snapshot timing. A μs-scale TOCTOU between re-check and DELETE remains; the grace period makes it operationally negligible (Q being swept means it's >grace old with zero referrers).
 
 **Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 15 minutes). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
 
@@ -470,7 +473,7 @@ CREATE INDEX idx_pending_s3_deletes_drain
 
 ## GC Files
 
-- `rio-store/src/gc/mod.rs` --- GC lock constants (`GC_LOCK_ID`, `GC_MARK_LOCK_ID`), `GcStats`, `run_gc` orchestration
+- `rio-store/src/gc/mod.rs` --- GC lock constant (`GC_LOCK_ID`), `GcStats`, `run_gc` orchestration
 - `rio-store/src/gc/mark.rs` --- `compute_unreachable` recursive CTE (seeds: gc_roots, scheduler_live_pins, uploading manifests, grace-period, extra_roots)
 - `rio-store/src/gc/sweep.rs` --- Per-path batched delete with `FOR UPDATE OF m` + reference re-check
 - `rio-store/src/gc/drain.rs` --- Background S3 delete drain (30s interval, blake3_hash re-check)
