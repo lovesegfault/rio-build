@@ -105,12 +105,16 @@ pub trait Provider {
     /// no greeting banner. Always `kubectl port-forward` (eks too: the
     /// scheduler/store aren't behind the NLB; kubectl reaches them via
     /// the apiserver proxy, which `aws eks update-kubeconfig` already
-    /// set up).
+    /// set up). Pass `0` for either port to bind an ephemeral local
+    /// port (I-101); the RETURNED port is what to connect to.
     async fn tunnel_grpc(
         &self,
         sched_port: u16,
         store_port: u16,
-    ) -> Result<(super::shared::ProcessGuard, super::shared::ProcessGuard)>;
+    ) -> Result<(
+        (u16, super::shared::ProcessGuard),
+        (u16, super::shared::ProcessGuard),
+    )>;
 
     /// helm uninstall + tofu destroy (eks) | rook teardown (k3s) | kind delete.
     async fn destroy(&self, cfg: &XtaskConfig) -> Result<()>;

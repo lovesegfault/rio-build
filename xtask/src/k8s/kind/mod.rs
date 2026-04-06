@@ -190,7 +190,7 @@ impl Provider for Kind {
         &self,
         sched_port: u16,
         store_port: u16,
-    ) -> Result<(shared::ProcessGuard, shared::ProcessGuard)> {
+    ) -> Result<((u16, shared::ProcessGuard), (u16, shared::ProcessGuard))> {
         super::k3s::smoke::tunnel_grpc(sched_port, store_port).await
     }
 

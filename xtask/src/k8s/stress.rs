@@ -444,12 +444,7 @@ fn reap_dead_sessions() -> Result<()> {
 
 // ─── watch ──────────────────────────────────────────────────────────
 
-/// Local port for the watch-owned scheduler:9091 metrics forward.
-/// Offset from CliTunnel's 19001/19002 to avoid collision with a
-/// concurrent `k8s cli` invocation.
-const WATCH_METRICS_PORT: u16 = 19091;
-const WATCH_SCHED_PORT: u16 = 19101;
-const WATCH_STORE_PORT: u16 = 19102;
+/// Watch poll cadence.
 const WATCH_INTERVAL: Duration = Duration::from_secs(30);
 
 // Watch's one-liner-per-poll prints between sleeps; no progress bars
@@ -470,7 +465,9 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
     // (ProcessGuard drop fires — watch is a long-lived foreground
     // process, not detached like run).
     let client = crate::kube::client().await?;
-    let cli = CliCtx::open(&client, WATCH_SCHED_PORT, WATCH_STORE_PORT).await?;
+    // I-101: ephemeral local ports — no collision with a concurrent
+    // `k8s cli` invocation (previously offset to 19101/19102/19091).
+    let cli = CliCtx::open(&client, 0, 0).await?;
     // I-050: svc/rio-scheduler only exposes port 9001 — `kubectl
     // port-forward svc/rio-scheduler X:9091` exits immediately with
     // "does not have a service port 9091". port_forward() nulls
@@ -480,13 +477,13 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
     // forwards. Second Lease lookup (CliCtx::open did one internally)
     // is one extra `kubectl get` — negligible vs. a 30s poll loop.
     let leader = scheduler_leader_pod().await?;
-    let _metrics_fwd = port_forward(NS, &leader, WATCH_METRICS_PORT, 9091)?;
+    let (metrics_port, _metrics_fwd) = port_forward(NS, &leader, 0, 9091).await?;
     crate::ui::poll(
         "scheduler metrics TCP accept",
         Duration::from_secs(2),
         10,
         || async {
-            let s = tokio::net::TcpStream::connect(("127.0.0.1", WATCH_METRICS_PORT)).await;
+            let s = tokio::net::TcpStream::connect(("127.0.0.1", metrics_port)).await;
             Ok(s.is_ok().then_some(()))
         },
     )
@@ -511,7 +508,7 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
             .run(&["--json", "builds", "--status", "active"])
             .unwrap_or_else(|e| format!("(rio-cli error: {e:#})"));
 
-        let metrics = scrape_metrics(WATCH_METRICS_PORT).await;
+        let metrics = scrape_metrics(metrics_port).await;
 
         let top = std::process::Command::new("kubectl")
             .args(["top", "nodes", "--no-headers"])
