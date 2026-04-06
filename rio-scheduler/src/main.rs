@@ -256,6 +256,26 @@ fn validate_config(cfg: &Config) -> anyhow::Result<()> {
          every derivation poisons immediately)",
         cfg.poison.threshold
     );
+    for class in &cfg.size_classes {
+        // r[impl sched.classify.cpu-bump]
+        // cpu_limit_cores is Option<f64> — None means no CPU check. Some(NaN)
+        // or Some(neg) would silently disable or always-bump respectively
+        // (assignment.rs:128 `c > limit` — NaN→always-false, neg→always-true).
+        // Same bounds-check shape as cutoff_secs / P0415's backoff_*.
+        // Missed by the P0415 wave (bughunt-mc238, P0424).
+        //
+        // TODO(P0304): T189 moves the :386 cutoff_secs ensure from main()
+        // into this loop — when that lands, both checks live here and the
+        // main() loop becomes gauge-emit-only.
+        if let Some(limit) = class.cpu_limit_cores {
+            anyhow::ensure!(
+                limit.is_finite() && limit > 0.0,
+                "size_classes[{}].cpu_limit_cores must be finite and positive when set, got {}",
+                class.name,
+                limit
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1152,6 +1172,69 @@ mod tests {
 
         // Defaults (5.0, 2.0, 300.0) pass all checks.
         validate_config(&test_valid_config()).expect("defaults should be valid");
+    }
+
+    /// Helper: single-element size_classes vec with the given cpu_limit_cores.
+    /// Fills cutoff_secs and mem_limit_bytes with valid placeholders so the
+    /// test exercises ONLY the cpu_limit check.
+    fn size_classes_with_cpu_limit(limit: Option<f64>) -> Vec<rio_scheduler::SizeClassConfig> {
+        vec![rio_scheduler::SizeClassConfig {
+            name: "small".into(),
+            cutoff_secs: 30.0,
+            mem_limit_bytes: 1 << 30,
+            cpu_limit_cores: limit,
+        }]
+    }
+
+    /// `cpu_limit_cores = Some(NaN)` → `c > NaN` at assignment.rs:128 is
+    /// always false → CPU-bump silently disabled, builds never bump even
+    /// when CPU-bound. validate_config catches it at startup (bughunt-mc238,
+    /// P0424 — missed by the P0415 f64-bounds wave).
+    #[test]
+    fn config_rejects_nan_cpu_limit_cores() {
+        let cfg = Config {
+            size_classes: size_classes_with_cpu_limit(Some(f64::NAN)),
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("cpu_limit_cores") && err.contains("finite"),
+            "NaN cpu_limit must be rejected with clear message, got: {err}"
+        );
+    }
+
+    /// `cpu_limit_cores = Some(-1.0)` → `c > -1.0` at assignment.rs:128 is
+    /// always true → every build bumps to next class, misroutes entire
+    /// small-class queue.
+    #[test]
+    fn config_rejects_negative_cpu_limit_cores() {
+        let cfg = Config {
+            size_classes: size_classes_with_cpu_limit(Some(-1.0)),
+            ..test_valid_config()
+        };
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("cpu_limit_cores") && err.contains("positive"),
+            "negative cpu_limit must be rejected, got: {err}"
+        );
+    }
+
+    /// `cpu_limit_cores = None` → no CPU check, valid. The Option is what
+    /// makes this field optional for existing TOML without the key. Only
+    /// Some(bad) is an error.
+    #[test]
+    fn config_accepts_none_cpu_limit_cores() {
+        let cfg = Config {
+            size_classes: size_classes_with_cpu_limit(None),
+            ..test_valid_config()
+        };
+        validate_config(&cfg).expect("None cpu_limit_cores = no check, should be valid");
+        // Boundary: Some(small positive) is fine.
+        let cfg = Config {
+            size_classes: size_classes_with_cpu_limit(Some(0.5)),
+            ..test_valid_config()
+        };
+        validate_config(&cfg).expect("positive cpu_limit should be valid");
     }
 
     // -----------------------------------------------------------------------

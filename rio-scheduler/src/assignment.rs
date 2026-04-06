@@ -63,7 +63,10 @@ pub struct SizeClassConfig {
     /// If a build's ema_peak_cpu_cores exceeds this, bump to the next
     /// class even if duration fits (mirrors mem-bump). `None` = no CPU
     /// check. Optional so existing TOML without `cpu_limit_cores` keeps
-    /// working.
+    /// working. When Some, main.rs validate_config enforces is_finite
+    /// && >0 at startup (same shape as cutoff_secs / P0415 backoff_*
+    /// bounds; bughunt-mc238 found this gap — `c > NaN` at :128 would
+    /// silently disable the bump, `c > neg` would always-bump). P0424.
     #[serde(default)]
     pub cpu_limit_cores: Option<f64>,
 }
