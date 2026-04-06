@@ -21,7 +21,7 @@ use crate::fixtures::test_sched_addrs;
 use crate::reconcilers::builderpool::manifest::{
     Bucket, CPU_CLASS_LABEL, FLOOR_CLASS, MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST,
     SpawnDirective, bucket_labels, build_manifest_job, compute_spawn_plan, group_by_bucket,
-    inventory_by_bucket, parse_bucket_from_labels,
+    inventory_by_bucket, parse_bucket_from_labels, truncate_plan,
 };
 
 use super::*;
@@ -203,6 +203,99 @@ fn mixed_bucketed_and_cold_start() {
 fn empty_manifest_empty_plan() {
     let plan = compute_spawn_plan(&BTreeMap::new(), &BTreeMap::new(), 0, 0);
     assert!(plan.is_empty());
+}
+
+// ─── truncate_plan ───────────────────────────────────────────────
+
+// r[verify ctrl.pool.manifest-fairness]
+/// The P0503 regression: 100-tiny + 3-huge + 20-cold, budget=10.
+/// OLD truncation: 10× tiny, 0× huge, 0× cold. Cold never escapes.
+/// NEW: floor pass gives 1 each (3 directives → 3 budget), then
+/// proportional on 7 remaining (tiny gets most; huge + cold get
+/// their proportion of 2+19 / 120).
+#[test]
+fn truncate_plan_per_bucket_floor_under_sustained_tiny_load() {
+    let plan = vec![
+        SpawnDirective {
+            bucket: Some((4 * GI, 2000)),
+            count: 100,
+        }, // tiny
+        SpawnDirective {
+            bucket: Some((48 * GI, 16000)),
+            count: 3,
+        }, // huge
+        SpawnDirective {
+            bucket: None,
+            count: 20,
+        }, // cold
+    ];
+    let out = truncate_plan(&plan, 10);
+
+    assert_eq!(out.len(), 3, "all three classes spawn at least once");
+    // Floor: every class got ≥1.
+    for d in &out {
+        assert!(
+            d.count >= 1,
+            "bucket {:?} starved (count={})",
+            d.bucket,
+            d.count
+        );
+    }
+    // Budget conserved.
+    assert_eq!(out.iter().map(|d| d.count).sum::<usize>(), 10);
+    // Cold-start specifically (the escape-hatch bug): it's in the output.
+    assert!(
+        out.iter().any(|d| d.bucket.is_none() && d.count >= 1),
+        "cold-start must spawn — otherwise derivations never graduate"
+    );
+}
+
+/// Total demand 5, budget 20 → spawn exactly 5 (don't over-allocate).
+/// The old inline loop got this for free by iterating up to
+/// `directive.count`; two-pass needs an explicit cap.
+#[test]
+fn truncate_plan_budget_exceeds_demand_no_overspawn() {
+    let plan = vec![
+        SpawnDirective {
+            bucket: Some((8 * GI, 4000)),
+            count: 3,
+        },
+        SpawnDirective {
+            bucket: None,
+            count: 2,
+        },
+    ];
+    let out = truncate_plan(&plan, 20);
+    assert_eq!(out.iter().map(|d| d.count).sum::<usize>(), 5);
+    assert_eq!(out[0].count, 3);
+    assert_eq!(out[1].count, 2);
+}
+
+/// 5 buckets, budget 3 → first 3 get their floor, last 2 starve
+/// THIS tick. Next tick, supply has changed (those 3 are now
+/// counted), so floor-pass covers the next slice. N ticks = coverage.
+#[test]
+fn truncate_plan_budget_less_than_buckets_covers_prefix() {
+    let plan: Vec<_> = (1..=5)
+        .map(|i| SpawnDirective {
+            bucket: Some((i as u64 * 4 * GI, 2000)),
+            count: 10,
+        })
+        .collect();
+    let out = truncate_plan(&plan, 3);
+    assert_eq!(out.len(), 3);
+    for d in &out {
+        assert_eq!(d.count, 1);
+    }
+}
+
+#[test]
+fn truncate_plan_zero_budget_noop() {
+    let plan = vec![SpawnDirective {
+        bucket: None,
+        count: 5,
+    }];
+    assert!(truncate_plan(&plan, 0).is_empty());
 }
 
 // ─── group_by_bucket ─────────────────────────────────────────────
