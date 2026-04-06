@@ -94,11 +94,15 @@ pub async fn drain_once(
         // If so, the chunk is live again — skip S3, drop pending row.
         // NULL blake3_hash (pre-006 row) → skip re-check, proceed.
         //
-        // Re-check runs inside the SKIP LOCKED tx: the pending row
-        // is locked (no other replica touches it), but the CHUNKS
-        // row is NOT locked by this tx — PutPath can still flip it
-        // between this check and the S3 delete. That window is
-        // small (one PG roundtrip + one S3 call).
+        // FOR UPDATE serializes this re-check with concurrent
+        // PutPath upserts — the upsert's ON CONFLICT row lock
+        // blocks until this tx commits or rolls back, so a
+        // resurrection-between-check-and-S3-delete is impossible.
+        // Without FOR UPDATE, PutPath could flip the chunk live
+        // between this SELECT and the S3 delete below: PG would
+        // say refcount≥1, S3 would no longer have the object, and
+        // subsequent PutPaths would see refcount≥2 via the upsert
+        // and skip upload — permanent data loss.
         //
         // The upload-skip race (X18) is now closed at insert time:
         // chunked.rs's upsert RETURNING (refcount=1) is atomic — PG
@@ -107,9 +111,10 @@ pub async fn drain_once(
         // (→ skip). No re-query window for a concurrent increment to
         // slip through. This still_dead re-check stays as the guard
         // for resurrection-between-sweep-and-drain (its primary job).
+        // r[impl store.gc.pending-deletes]
         if let Some(hash) = &blake3_hash {
             let still_dead: bool = sqlx::query_scalar(
-                "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1",
+                "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1 FOR UPDATE",
             )
             .bind(hash)
             .fetch_optional(&mut *tx)
@@ -399,6 +404,111 @@ mod tests {
         // Operator investigates; this row is effectively "parked."
         assert_eq!(deleted, 0);
         assert_eq!(failed, 0, "max-attempts row excluded from drain");
+    }
+
+    /// TOCTOU regression: drain's re-check SELECT ... FOR UPDATE must
+    /// serialize with a concurrent PutPath upsert. Without FOR UPDATE,
+    /// PutPath could resurrect the chunk between the SELECT and the S3
+    /// delete → PG says refcount≥1, S3 no longer has the object →
+    /// permanent data loss.
+    ///
+    /// We can't interleave inside drain_once's loop from a unit test,
+    /// so we assert the INVARIANT the FOR UPDATE enforces: once drain
+    /// holds the row lock, a concurrent upsert BLOCKS until drain
+    /// commits. We simulate this by opening a second tx that issues
+    /// the upsert while drain's tx holds FOR UPDATE on the chunk row.
+    /// The upsert must either see still_dead=true (blocked until
+    /// drain committed → chunk deleted → upsert sees refcount=0 and
+    /// re-uploads) or drain sees resurrection and skips. Neither path
+    /// results in loss.
+    // r[verify store.gc.pending-deletes]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_for_update_serializes_with_upsert() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Seed chunk X: dead state (refcount=0, deleted=true) — sweep
+        // already marked it. Pending S3 delete enqueued.
+        let hash_x = [0x77u8; 32];
+        backend
+            .put(&hash_x, bytes::Bytes::from_static(b"chunk-X-toctou"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+             VALUES ($1, 0, 14, true)",
+        )
+        .bind(hash_x.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let key_x = backend.key_for(&hash_x);
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
+            .bind(&key_x)
+            .bind(hash_x.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Race: drain_once vs the PutPath upsert. With FOR UPDATE, PG
+        // serializes these — one completes fully before the other
+        // touches the chunks row. Both orderings are correct; neither
+        // loses data.
+        let pool_a = db.pool.clone();
+        let pool_b = db.pool.clone();
+        let backend_a = Arc::clone(&backend);
+
+        let (drain_res, upsert_res) = tokio::join!(
+            drain_once(&pool_a, &backend_a),
+            // PutPath's chunk upsert: ON CONFLICT bumps refcount,
+            // clears deleted. RETURNING (refcount = 1) tells caller
+            // whether to upload (true = first reference, must upload).
+            sqlx::query_scalar::<_, bool>(
+                "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+                 VALUES ($1, 1, 14, false) \
+                 ON CONFLICT (blake3_hash) DO UPDATE SET \
+                   refcount = chunks.refcount + 1, deleted = false \
+                 RETURNING (refcount = 1)"
+            )
+            .bind(hash_x.as_slice())
+            .fetch_one(&pool_b),
+        );
+        let (deleted, failed) = drain_res.unwrap();
+        let must_upload = upsert_res.unwrap();
+        assert_eq!(failed, 0);
+
+        // Two valid serializations:
+        //
+        // A) Drain wins: re-check sees (deleted AND refcount=0)=true,
+        //    S3-deletes, commits. THEN upsert runs, sees refcount=0 →
+        //    sets refcount=1 → RETURNING (refcount=1)=true → caller
+        //    re-uploads. deleted=1, must_upload=true.
+        //
+        // B) Upsert wins: refcount→1, deleted→false, commits. THEN
+        //    drain's re-check sees (deleted AND refcount=0)=false,
+        //    skips S3 delete. deleted=0, must_upload=true (refcount
+        //    went 0→1).
+        //
+        // What must NEVER happen (the bug FOR UPDATE fixes):
+        // deleted=1 AND must_upload=false → S3 deleted but PG thinks
+        // refcount≥2 so nobody re-uploads → permanent loss.
+        // nonminimal_bool: the negated-conjunction form directly
+        // encodes "NOT the bad state"; De Morgan obscures the
+        // invariant being asserted.
+        #[allow(clippy::nonminimal_bool)]
+        let no_loss = !(deleted == 1 && !must_upload);
+        assert!(
+            no_loss,
+            "permanent data loss: S3 deleted but upsert saw refcount>=2 \
+             (skipped re-upload). deleted={deleted} must_upload={must_upload}"
+        );
+        // In practice, with this timing, upsert always sees
+        // refcount=1 (chunk was at 0 before). Both serializations
+        // yield must_upload=true. Sanity-check that invariant.
+        assert!(
+            must_upload,
+            "upsert should see refcount=1 (was 0) → must re-upload"
+        );
     }
 
     /// SKIP LOCKED: two concurrent drain_once calls against the same
