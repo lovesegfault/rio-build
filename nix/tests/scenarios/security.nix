@@ -840,9 +840,10 @@ in
         #   - scheduler/grpc/tests.rs::test_resolve_tenant_rpc (the RPC)
         #   - server.rs::jwt_issuance_tests (mint + token contents)
         #   - jwt_interceptor.rs tests (verify + hot-swap)
-        # Extending this VM fixture with the Secret mount is future work
-        # (TODO(P0349): fixture extraServiceEnv for RIO_JWT__KEY_PATH +
-        # a pkgs.writeText with a seed). The FALLBACK branch is the
+        # WONTFIX(P0349): extending the standalone fixture with
+        # RIO_JWT__KEY_PATH was descoped — the JWT-issue branch is now
+        # covered by the k3s jwt-mount-present subtest (lifecycle.nix,
+        # P0357) + the rust unit tests above. The FALLBACK branch is the
         # PERMANENT path that must never break — proving it here under
         # a real gateway+scheduler+PG is the load-bearing half.
 

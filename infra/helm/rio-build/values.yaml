@@ -159,12 +159,9 @@ store:
     kind: s3
     bucket: ""
     prefix: chunks/
-    # For MinIO in dev: http://rio-build-minio:9000 (bitnami subchart svc name)
+    # For Rook RGW in dev: http://rook-ceph-rgw-rio-store.rook-ceph:80
     endpoint: ""
-  # Build logs go to the same bucket (different prefix). Empty → logs stay
-  # in PG only.
-  logS3Bucket: ""
-  # For MinIO dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
+  # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
@@ -181,11 +178,18 @@ scheduler:
   enabled: true
   image: rio-scheduler
   replicas: 2
+  serviceAccount:
+    # EKS IRSA: eks.amazonaws.com/role-arn set via --set from tofu output.
+    # Scheduler needs S3 PutObject for build-log flush.
+    annotations: {}
   # All replicas contend for SAME Lease. Presence of this name ENABLES lease
   # mode (LeaseConfig::from_env returns None without RIO_LEASE_NAME →
   # always-leader mode, WRONG with replicas>1).
   leaseName: rio-scheduler-leader
   storeAddr: rio-store:9002
+  # Build logs flush to S3 from the scheduler (log aggregation lives here,
+  # not the store). Empty → logs stay in PG only.
+  logS3Bucket: ""
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     limits: {memory: 2Gi}

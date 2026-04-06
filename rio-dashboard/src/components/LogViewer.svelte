@@ -19,8 +19,10 @@
 
   let {
     buildId,
-    // TODO(P0280): drvPath live once node-click wires it. Currently
-    // dead in practice — BuildDrawer.svelte passes only buildId.
+    // Populated by BuildDrawer when a DrvNode is clicked in the Graph
+    // tab — the drawer's `focusedDrv` state threads through via the
+    // `ondrvclick` callback on Graph.svelte. Undefined means "whole
+    // build" (no derivation filter on the log stream).
     drvPath = undefined,
     // @internal test-only hook: jsdom layout is all-zeros so the
     // scroll-derived viewport range can't be exercised. A test stubs

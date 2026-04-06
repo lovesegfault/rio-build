@@ -1,6 +1,6 @@
 // r[impl dash.envoy.grpc-web-translate+2]
 // r[impl dash.auth.method-gate]
-// Shared gRPC-Web transport for all AdminService/SchedulerService clients.
+// Shared gRPC-Web transport for the AdminService client.
 //
 // The translation and method-gate enforcement are IN Envoy Gateway (Helm
 // CRDs, infra/helm/rio-build/templates/dashboard-gateway*.yaml — tracey

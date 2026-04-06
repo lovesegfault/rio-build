@@ -239,3 +239,45 @@ resource "aws_iam_policy" "rio_store_s3" {
   name   = "${var.cluster_name}-rio-store-s3"
   policy = data.aws_iam_policy_document.rio_store_s3.json
 }
+
+# IRSA for rio-scheduler: S3 PutObject/ListBucket on the chunks bucket
+# (build-log flush writes under logs/ prefix in the same bucket). The
+# scheduler aggregates worker logs and flushes to S3 — it does NOT read
+# or delete, so narrower than the store policy.
+data "aws_iam_policy_document" "rio_scheduler_s3" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+    ]
+    resources = ["${aws_s3_bucket.chunks.arn}/*"]
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.chunks.arn]
+  }
+}
+
+module "rio_scheduler_irsa" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
+  version = "~> 6.0"
+
+  name = "${var.cluster_name}-rio-scheduler"
+
+  oidc_providers = {
+    eks = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["rio-system:rio-scheduler"]
+    }
+  }
+
+  policies = {
+    s3 = aws_iam_policy.rio_scheduler_s3.arn
+  }
+}
+
+resource "aws_iam_policy" "rio_scheduler_s3" {
+  name   = "${var.cluster_name}-rio-scheduler-s3"
+  policy = data.aws_iam_policy_document.rio_scheduler_s3.json
+}

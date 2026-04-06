@@ -486,9 +486,9 @@ rec {
     # This gate directly tests the actual precondition. EXISTS (not
     # Ready) is sufficient: Ready needs CNI which needs flannel which
     # needs the node to exist first.
-    # TODO: timeout=600 predates containerd-tmpfs (same story as the
-    # rio-all gate above). ~180s typical under TCG; reduce to 300 once
-    # tmpfs is verified to have collapsed the builder-disk tail.
+    # TODO(P0304): timeout=600 predates containerd-tmpfs (same story as
+    # the rio-all gate above). ~180s typical under TCG; reduce to 300
+    # once tmpfs is verified to have collapsed the builder-disk tail.
     k3s_server.wait_until_succeeds(
         "k3s kubectl get node k3s-server 2>/dev/null",
         timeout=600,

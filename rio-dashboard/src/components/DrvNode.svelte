@@ -15,15 +15,56 @@
   // Svelte 5's `$props()` just drops them.
   import { Handle, Position, type NodeProps } from '@xyflow/svelte';
   import { hashPrefix, statusClass, type DrvNode } from '../lib/graphLayout';
+  import ClearPoisonButton from './ClearPoisonButton.svelte';
 
   let { id, data }: NodeProps<DrvNode> = $props();
 
   let hash = $derived(hashPrefix(id));
   let cls = $derived(statusClass(data.status));
+
+  // ClearPoison RPC keys on the 32-char store-path hash, not the full
+  // drvPath. Same regex as hashPrefix but captures the whole thing.
+  // Falls back to the full id for non-standard paths (tests, mocks).
+  let drvHash = $derived(
+    /\/nix\/store\/([a-z0-9]{32})-/.exec(id)?.[1] ?? id,
+  );
+
+  // Context-menu state. Right-click opens; any click (inside or out)
+  // closes via the window listener below. stopPropagation on the menu
+  // body keeps a click on ClearPoisonButton from dismissing before the
+  // confirm() dialog pops.
+  let menuOpen = $state(false);
+  let menuPos = $state({ x: 0, y: 0 });
+
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    menuPos = { x: e.clientX, y: e.clientY };
+    menuOpen = true;
+  }
+
+  $effect(() => {
+    if (!menuOpen) return;
+    const close = () => (menuOpen = false);
+    // Defer registration one tick so the contextmenu's own click
+    // bubble doesn't immediately fire `close`.
+    const id = setTimeout(() => window.addEventListener('click', close), 0);
+    return () => {
+      clearTimeout(id);
+      window.removeEventListener('click', close);
+    };
+  });
 </script>
 
 <Handle type="target" position={Position.Top} />
-<div class={`drv ${cls}`} data-testid="drv-node" data-status={data.status} title={id}>
+<div
+  class={`drv ${cls}`}
+  data-testid="drv-node"
+  data-status={data.status}
+  title={id}
+  oncontextmenu={onContextMenu}
+  role="button"
+  tabindex="-1"
+>
   <span class="pname">{data.pname || '(unnamed)'}</span>
   <span class="hash">{hash}</span>
   {#if data.workerId && (data.status === 'running' || data.status === 'assigned')}
@@ -31,6 +72,26 @@
   {/if}
 </div>
 <Handle type="source" position={Position.Bottom} />
+
+{#if menuOpen}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div
+    class="ctx-menu"
+    data-testid="drv-ctx-menu"
+    style:left="{menuPos.x}px"
+    style:top="{menuPos.y}px"
+    onclick={(e) => e.stopPropagation()}
+  >
+    <ClearPoisonButton
+      derivationHash={drvHash}
+      poisoned={data.status === 'poisoned'}
+      onCleared={() => (menuOpen = false)}
+    />
+    {#if data.status !== 'poisoned'}
+      <span class="ctx-empty">no actions</span>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .drv {
@@ -96,5 +157,20 @@
     50% {
       box-shadow: 0 0 0 6px rgba(245, 158, 11, 0);
     }
+  }
+  .ctx-menu {
+    position: fixed;
+    z-index: 20;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    padding: 0.5rem;
+    min-width: 10rem;
+  }
+  .ctx-empty {
+    color: #9ca3af;
+    font-size: 0.8125rem;
+    font-style: italic;
   }
 </style>

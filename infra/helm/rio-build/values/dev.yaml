@@ -1,4 +1,4 @@
-# Local k3s/kind. In-cluster PG + MinIO, no TLS, single replicas.
+# Local k3s/kind. In-cluster PG + Rook RGW, no TLS, single replicas.
 # `helm upgrade --install rio . -f values/dev.yaml`
 
 global:

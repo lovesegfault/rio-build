@@ -14,8 +14,13 @@ output "kubeconfig_command" {
 }
 
 output "store_iam_role_arn" {
-  description = "IAM role ARN for rio-store IRSA (set STORE_IAM_ROLE_ARN to this before kustomize apply)"
+  description = "IAM role ARN for rio-store IRSA (`just eks deploy` passes as helm --set store.serviceAccount.annotations)"
   value       = module.rio_store_irsa.arn
+}
+
+output "scheduler_iam_role_arn" {
+  description = "IAM role ARN for rio-scheduler IRSA (`just eks deploy` passes as --set scheduler.serviceAccount.annotations)"
+  value       = module.rio_scheduler_irsa.arn
 }
 
 output "bootstrap_iam_role_arn" {

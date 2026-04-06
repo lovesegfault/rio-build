@@ -906,6 +906,50 @@
 
                   touch $out
                 '';
+
+            # CRD drift: crdgen output (split per-CRD) must equal the
+            # committed infra/helm/crds/. Catches the "Rust CRD struct
+            # changed but nobody ran split-crds.sh" drift — the committed
+            # YAML is what Argo syncs, so a stale file means the deployed
+            # schema diverges from what the controller expects.
+            #
+            # Mirrors scripts/split-crds.sh (multi-doc → one file per
+            # metadata.name) but writes to $TMPDIR instead of the worktree.
+            # diff -r: recursive, exits non-zero on any difference.
+            crds-drift =
+              let
+                crdsYaml = pkgs.runCommand "rio-crds.yaml" { } ''
+                  ${rio-workspace}/bin/crdgen > $out
+                '';
+                py = pkgs.python3.withPackages (p: [ p.pyyaml ]);
+              in
+              pkgs.runCommand "rio-crds-drift"
+                {
+                  nativeBuildInputs = [
+                    py
+                    pkgs.diffutils
+                  ];
+                }
+                ''
+                  mkdir -p $TMPDIR/split
+                  python3 - ${crdsYaml} $TMPDIR/split <<'PY'
+                  import sys, yaml, pathlib
+                  src, out = sys.argv[1], pathlib.Path(sys.argv[2])
+                  with open(src) as f:
+                      for doc in yaml.safe_load_all(f):
+                          if doc is None:
+                              continue
+                          name = doc["metadata"]["name"]
+                          (out / f"{name}.yaml").write_text(yaml.dump(doc, sort_keys=False))
+                  PY
+                  diff -r $TMPDIR/split ${./infra/helm/crds} > $TMPDIR/diff || {
+                    echo "FAIL: crdgen output drifted from infra/helm/crds/" >&2
+                    echo "Run: nix build .#crds && ./scripts/split-crds.sh result" >&2
+                    cat $TMPDIR/diff >&2
+                    exit 1
+                  }
+                  touch $out
+                '';
           };
 
           # Container images (Linux-only — dockerTools uses Linux VM
@@ -950,8 +994,15 @@
           #   vm-scheduling-{core,disrupt}-standalone — 5 VMs: fanout, size-class, cgroup
           #   vm-security-standalone — 3 VMs: mTLS, HMAC, tenant-resolve
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
+          #   vm-ca-cutoff-standalone — CA-on-CA cutoff propagation
+          #   vm-chaos-standalone — fault injection
           #   vm-lifecycle-{core,recovery,autoscale,wps}-k3s
           #   vm-le-{stability,build}-k3s — 2-node k3s fixture (fragment splits)
+          #   vm-security-nonpriv-k3s — privileged-hardening e2e
+          #   vm-cli-k3s — rio-cli integration
+          #   vm-dashboard-k3s, vm-dashboard-gateway-k3s — gRPC-Web + envoy
+          #   vm-fod-proxy-k3s — fixed-output derivation proxy
+          #   vm-netpol-k3s — NetworkPolicy enforcement
           #
           # mkVmTests: build the attrset for a given (workspace,
           # dockerImages, coverage) triple. vmTests uses the normal
@@ -962,7 +1013,7 @@
           # Request a minimum CPU allocation from the remote builder. Each
           # VM has `virtualisation.cores = 4` in common.nix; without
           # this, the builder's heuristic allocation can under-provision
-          # (vm-phase2a once got 5 CPUs for 4 VMs → 16 vCPUs on 5
+          # (vm-scheduling-core once got 5 CPUs for 4 VMs → 16 vCPUs on 5
           # physical, 2 VMs fell back to TCG, worker1's kernel boot
           # starved at PCI enumeration → Shell disconnected flake).
           #
@@ -1063,7 +1114,7 @@
           };
 
           # Coverage-mode VM tests. Not in `checks` (too slow for flake
-          # check) — exposed as packages.cov-vm-phaseXY for manual runs
+          # check) — exposed as packages.cov-vm-<scenario> for manual runs
           # + consumed by nix/coverage.nix for the merged lcov.
           vmTestsCov = mkVmTests {
             rio-workspace = rio-workspace-cov;
@@ -1376,7 +1427,7 @@
               # entry rebuilds the shared fuzz-build derivation, but
               # spot CPU is cheap and the cache fills after first green.
               fuzz = fuzz.runs;
-              # Normal VM tests. Keys: vm-phase1a etc. Per-test
+              # Normal VM tests. Keys: vm-<scenario>-<fixture>. Per-test
               # red/green signal in the GHA UI.
               vm-test = vmTests;
               # lcov-producing jobs, one per Codecov flag. `unit`
@@ -1810,7 +1861,7 @@
             # needs KVM (run via nix-build-remote). Output:
             #   result/lcov.info   — combined, stripped to workspace paths
             #   result/html/       — genhtml report
-            #   result/per-test/   — vm-phase*.lcov individual breakdowns
+            #   result/per-test/   — vm-<scenario>.lcov individual breakdowns
             coverage-full = coverage.full;
             # Same data as coverage-full, HTML-only output at result/
             # (no lcov.info / per-test subdirs). Mirrors coverage-html's
@@ -1821,12 +1872,12 @@
             # VM-only combined (no unit-test merge). Debugging.
             coverage-vm = coverage.vmLcov;
           }
-          # Per-test lcovs: coverage-vm-phase1a etc. Useful for
+          # Per-test lcovs: coverage-vm-<scenario> etc. Useful for
           # "why is X not covered" — inspect one VM test's
           # contribution in isolation. `or {}`: coverage is
           # optionalAttrs isLinux → empty on Darwin → no attr error.
           // prefixed "coverage-" (coverage.perTestLcov or { })
-          # Coverage-mode VM test runs: cov-vm-phase1a etc. Build
+          # Coverage-mode VM test runs: cov-vm-<scenario> etc. Build
           # one to get the raw profraws at result/coverage/<node>/.
           # Used during smoke debugging.
           // prefixed "cov-" vmTestsCov
@@ -1961,7 +2012,7 @@
           // fuzz.runs
           # Per-phase milestone VM tests (Linux-only, need KVM).
           # Debug interactively:
-          #   nix build .#checks.x86_64-linux.vm-phase2a.driverInteractive
+          #   nix build .#checks.x86_64-linux.vm-protocol-warm-standalone.driverInteractive
           #   ./result/bin/nixos-test-driver
           // vmTests
           # Eval-time assertion: codecov.yml after_n_builds must equal the

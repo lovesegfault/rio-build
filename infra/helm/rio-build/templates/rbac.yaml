@@ -63,6 +63,12 @@ metadata:
   namespace: {{ $ns }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+  {{- with .Values.scheduler.serviceAccount.annotations }}
+  # EKS IRSA: scheduler flushes build logs to S3. Role attached via
+  # projected token, NO static AWS keys.
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- end }}
 
 {{- if .Values.controller.enabled }}

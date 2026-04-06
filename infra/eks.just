@@ -107,6 +107,7 @@ deploy:
     ecr=$(just eks::_tf-out ecr_registry)
     bucket=$(just eks::_tf-out chunk_bucket_name)
     store_arn=$(just eks::_tf-out store_iam_role_arn)
+    scheduler_arn=$(just eks::_tf-out scheduler_iam_role_arn)
     bootstrap_arn=$(just eks::_tf-out bootstrap_iam_role_arn)
     db_arn=$(just eks::_tf-out db_secret_arn)
     db_host=$(just eks::_tf-out db_endpoint)
@@ -162,8 +163,9 @@ deploy:
         --set global.region="$region" \
         --set global.logLevel="${RIO_LOG_LEVEL:-debug}" \
         --set store.chunkBackend.bucket="$bucket" \
-        --set store.logS3Bucket="$bucket" \
+        --set scheduler.logS3Bucket="$bucket" \
         --set store.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$store_arn" \
+        --set scheduler.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$scheduler_arn" \
         --set externalSecrets.enabled=true \
         --set externalSecrets.auroraSecretArn="$db_arn" \
         --set externalSecrets.auroraEndpoint="$db_host" \

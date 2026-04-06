@@ -42,7 +42,7 @@
   // @xyflow/svelte's SvelteFlow.svelte. The query form sidesteps the
   // plugin-ordering conflict entirely.
   import GraphLayoutWorker from '../lib/graphLayout.worker?worker';
-  import DrvNodeComponent from '../components/DrvNode.svelte';
+  import DrvNodeComponent from './DrvNode.svelte';
   import type { Edge } from '@xyflow/svelte';
 
   let {

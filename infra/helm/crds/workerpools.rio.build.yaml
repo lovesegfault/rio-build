@@ -116,6 +116,26 @@ spec:
                   standing set,\" only a concurrent-Job\nceiling. `replicas.max` becomes\
                   \ that ceiling.\n\nSee `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`."
                 type: boolean
+              ephemeralDeadlineSeconds:
+                description: "Ephemeral Job `activeDeadlineSeconds` \u2014 K8s kills\
+                  \ the pod if\nit doesn't complete within this many seconds. Backstop\
+                  \ for\nwrong-pool spawns: `reconcile_ephemeral` spawns from the\n\
+                  CLUSTER-WIDE `queued_derivations` count, not pool-matching\ndepth.\
+                  \ A queue full of `x86_64-linux` work on an\n`aarch64-darwin` ephemeral\
+                  \ pool triggers a Job spawn; the\nworker heartbeats, never matches\
+                  \ dispatch, and would hang\nindefinitely without a deadline. Default\
+                  \ 3600 (1h): long\nenough that a matched dispatch + build completes;\
+                  \ short\nenough that a wrong-pool spawn doesn't leak for the life\
+                  \ of\nthe cluster. Raise for pools running known-long builds (this\n\
+                  bounds BUILD time too \u2014 `backoffLimit: 0` means K8s doesn't\n\
+                  distinguish \"worker idle\" from \"worker busy on 90min build\"\
+                  ).\nCEL-enforced: only settable when `ephemeral: true`.\n\nPer-pool\
+                  \ queue depth (the proper fix) is deferred to phase5's\nClusterStatus\
+                  \ proto extension. See `r[ctrl.pool.ephemeral-\ndeadline]` in controller.md."
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
               features:
                 default: []
                 description: 'requiredSystemFeatures this pool advertises (e.g., "kvm",
@@ -234,7 +254,9 @@ spec:
                 format: int32
                 type: integer
                 x-kubernetes-validations:
-                - rule: self >= 1
+                - message: "maxConcurrentBuilds must be >= 1 \u2014 a worker that\
+                    \ runs 0 builds is a misconfiguration"
+                  rule: self >= 1
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -289,7 +311,8 @@ spec:
                 - min
                 type: object
                 x-kubernetes-validations:
-                - rule: self.min <= self.max
+                - message: replicas.min must be <= replicas.max
+                  rule: self.min <= self.max
               resources:
                 description: "K8s resource requests/limits for the worker container.\n\
                   `None` = unbounded (cluster default). Operators should set\nthis\
@@ -362,7 +385,9 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-validations:
-                - rule: size(self) > 0
+                - message: "systems must be non-empty \u2014 a worker pool with no\
+                    \ target systems accepts no work"
+                  rule: size(self) > 0
               terminationGracePeriodSeconds:
                 description: "Pod terminationGracePeriodSeconds. SIGTERM \u2192 worker\
                   \ drain\n(DrainWorker + wait for in-flight builds to complete).\
@@ -423,6 +448,10 @@ spec:
                 \ + overlayfs upper); see security.md \xA7 Ephemeral Builders"
               rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
                 > 0 && self.maxConcurrentBuilds == 1)'
+            - message: "ephemeralDeadlineSeconds is only valid with ephemeral:true\
+                \ \u2014 the field sets the Job's activeDeadlineSeconds (backstop\
+                \ for wrong-pool spawns); STS pools have no Jobs"
+              rule: '!has(self.ephemeralDeadlineSeconds) || self.ephemeral'
             - message: "hostNetwork:true requires privileged:true \u2014 Kubernetes\
                 \ rejects hostUsers:false with hostNetwork:true at admission; the\
                 \ non-privileged path sets hostUsers:false (see ADR-012)"

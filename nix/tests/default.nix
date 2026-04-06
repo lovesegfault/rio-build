@@ -182,7 +182,6 @@ let
   };
 in
 {
-  # ── New scenario-based tests ────────────────────────────────────────
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
@@ -438,7 +437,7 @@ in
     };
   };
 
-  # ── lifecycle splits (3 tests, k3s-full fixture) ─────────────────────
+  # ── lifecycle splits (4 tests, k3s-full fixture) ─────────────────────
   # Monolith was ~14min (13 subtests serially after ~4min bootstrap).
   # Split critical path ~8min (autoscale: 238s subtests + 4min boot).
   # The `initial` subtest was dropped — it only existed to seed out_pin
