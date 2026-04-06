@@ -1635,6 +1635,21 @@ impl DagActor {
         executor_id: &ExecutorId,
         error_msg: &str,
     ) {
+        // I-199: promote size_class_floor on InfrastructureFailure too.
+        // The dominant infra failure mode is `CgroupOom` (I-196 OOM
+        // watcher) — exactly when promotion is the right answer. Other
+        // infra failures (FUSE EIO, PutPath race) aren't size-related,
+        // but over-promoting them is bounded by `max_infra_retries`
+        // and the cost is one larger pod, not correctness. Without
+        // this, the OOM-watcher path retries on the same class until
+        // the infra cap poisons — defeating the watcher's purpose.
+        let failed_class = self
+            .executors
+            .get(executor_id)
+            .and_then(|e| e.size_class.clone());
+        self.promote_size_class_floor(drv_hash, failed_class.as_deref())
+            .await;
+
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };

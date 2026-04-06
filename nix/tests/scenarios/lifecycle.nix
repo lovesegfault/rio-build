@@ -417,6 +417,76 @@ let
             timeout=timeout,
         )
 
+    # workers_active==0 wait, sized for the heartbeat-timeout FALLBACK
+    # path. The autoscale chain (autoscaler→finalizer→ephemeral-pool→
+    # manifest-pool) has flaked at this exact assertion four times
+    # (8cf70d94/d82a0046/69fc4ae0/e76c95b6, GHA 24046508263). Each
+    # prior fix tightened the producer side; this one bounds the
+    # consumer side from first principles.
+    #
+    # Mechanism (GHA 24046508263: pods-gone 1.24s, workers_active==0
+    # 57.38s, then next workers_active==0 blew 90s; local KVM 0.17s):
+    #
+    #   I-195 made idle-SIGTERM `break 'reconnect` WITHOUT opening a
+    #   second BuildExecution stream (the redundant ExecutorRegister
+    #   that cov_factor was masking). That fix is correct, but it also
+    #   removed the SECOND-CHANCE stream-EOF: pre-I-195, the worker
+    #   opened S2 then immediately broke, so the scheduler saw TWO
+    #   EOFs (S1-drop + S2-drop) — if one was lost under load, the
+    #   other still landed `ExecutorDisconnected`. Post-I-195 there's
+    #   only the S1-drop. Under GHA runner load the single RST_STREAM
+    #   can be lost (CNI veth-teardown vs FIN race, h2 frame congestion);
+    #   the scheduler's `worker-stream-reader` then never breaks, and
+    #   the entry sits in `self.executors` until `tick_check_heartbeats`
+    #   reaps it. With autoscaler scaling 2→1 mid-drain (`replicas==1`
+    #   was already true at 0.12s — pod-1 SIGTERM'd ~20s before
+    #   finalizer SIGTERMs pod-0), the two pods' `last_heartbeat`s are
+    #   staggered, so the gauge can dip to 0 on the first reap (event-
+    #   driven `decrement` at executor.rs:320) and be re-`set` to 1 by
+    #   the next `tick_publish_gauges` if the second entry is still
+    #   `is_registered()`. Finalizer's wait catches the dip; the next
+    #   precondition wait then sits out the second entry's full
+    #   fallback window.
+    #
+    # Budget derivation (rio-common/src/limits.rs constants):
+    #   HEARTBEAT_TIMEOUT_SECS (30) + MAX_MISSED_HEARTBEATS×tick (30)
+    #   = ~60s last_heartbeat→reap (tick_check_heartbeats), plus:
+    #   + tick alignment (≤10s)
+    #   + autoscale-chain stagger: pod-1 terminates ~20-30s before
+    #     pod-0 (autoscaler 2→1 fires during the 46s q==0 r==0 drain),
+    #     so the second reap lands ~20-30s after the first
+    #   + one in-flight heartbeat delayed under load (≤10s)
+    #   ≈ 110s worst-case from pods-gone to stable workers_active==0.
+    #   180s budget = 110s + ~60% GHA tail headroom. Stays under the
+    #   300s pods-gone budget so a real disconnect-detection regression
+    #   (e.g. heartbeat-reap broken) still trips before globalTimeout.
+    #
+    # Diagnostic dump on timeout: the prior three flakes were debugged
+    # from k3s kernel logs alone (no scheduler-side state). This one
+    # captures the live gauge value + scheduler's executor view +
+    # any straggler pods, so a fifth flake names the stuck executor.
+    def wait_workers_zero(ctx):
+        try:
+            sched_metric_wait(
+                "grep -qx 'rio_scheduler_workers_active 0'",
+                timeout=180,
+            )
+        except Exception:
+            k3s_server.execute(
+                f"echo '=== DIAG[{ctx}]: workers_active!=0 after 180s ===' >&2; "
+                "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                "  -o jsonpath='{.spec.holderIdentity}'); "
+                "k3s kubectl get --raw "
+                '  "/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
+                "  2>/dev/null | grep -E "
+                "'^rio_scheduler_(workers_active|worker_disconnects_total) ' >&2; "
+                "k3s kubectl -n ${nsBuilders} get pods -o wide >&2 2>&1 || true; "
+                'k3s kubectl -n ${ns} logs "$leader" --since=4m '
+                "  | grep -iE 'executor|disconnect|heartbeat|worker' "
+                "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
+            )
+            raise
+
     # Negative-apply a deliberately-invalid BuilderPool spec. CRD CEL
     # rules (rio-crds/src/builderpool.rs x_kube validations) are
     # cross-field constraints that fire at kubectl-apply admission.
@@ -2028,15 +2098,14 @@ let
       # emptyDir" property is structural — K8s guarantees it.
       with subtest("ephemeral-pool: no STS, Job spawned, pod reaped, second build = new Job"):
           # Precondition: no STS workers. The finalizer fragment (run
-          # before this) deletes the default pool. 90s: finalizer drain
-          # + scheduler disconnect-detect + metric-update can lag under
-          # KVM-speed test ordering or TCG slowness. I-195 closed the
-          # coverage-mode SIGTERM-reconnect re-register that pushed
-          # this to 80-90s under profraw atexit (GHA 24018216226).
-          sched_metric_wait(
-              "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=90,
-          )
+          # before this) deletes the default pool and waits its own
+          # pods gone. wait_workers_zero (see prelude) bounds the
+          # scheduler's view by the heartbeat-timeout fallback path —
+          # I-195 closed the coverage-mode SIGTERM-reconnect re-
+          # register (GHA 24018216226) but also removed the second-
+          # chance stream-EOF; under GHA load the single EOF can be
+          # lost, falling back to ~60s heartbeat-reap per executor.
+          wait_workers_zero("ephemeral-pool precondition")
 
           # ── CEL: ephemeralDeadlineSeconds without ephemeral rejected ──
           # ctrl.pool.ephemeral-deadline — field tunes Job's
@@ -2353,15 +2422,11 @@ let
           # ALL pool=ephemeral pods gone (not just CR gone — see that
           # fragment's comment re: SIGTERM-reconnect bounce, GHA run
           # 24012511360), and finalizer earlier waited pool=x86-64
-          # pods gone. So this is just h2 stream-close propagation +
-          # one tick_publish_gauges (~10s typical). 90s: shared budget
-          # for the chain's three workers_active==0 waits. I-195 closed
-          # the SIGTERM-reconnect re-register that blew this under
-          # coverage (GHA 24018216226, 90s+ despite pods-gone 1.24s).
-          sched_metric_wait(
-              "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=90,
-          )
+          # pods gone. wait_workers_zero (see prelude) bounds the
+          # scheduler's view by the heartbeat-timeout fallback —
+          # under GHA load the stream-EOF can be lost, falling back
+          # to ~60s heartbeat-reap (GHA 24046508263).
+          wait_workers_zero("manifest-pool precondition")
 
           # Apply manifest BuilderPool. Spec mirrors ephemeral-pool's
           # inline YAML (image:dev, tlsSecretName, privileged) except:
@@ -2795,17 +2860,16 @@ let
           # Scheduler saw the disconnect. workers_active EXACTLY 0 — not
           # just ≤0 (gauge underflow would be a bug).
           #
-          # 90s: with the all-pods-gone wait above, this is just h2
-          # stream-close propagation + one tick_publish_gauges cycle
-          # (~10s typical). The old 30→90s widen (8cf70d94) chased a
-          # symptom — the real tail was pod-1 surviving the pod-0-only
-          # check above, now closed. Kept at 90s as the shared budget
-          # for the three identical workers_active==0 waits in this
-          # fragment chain (ephemeral-pool/manifest-pool preconditions).
-          sched_metric_wait(
-              "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=90,
-          )
+          # With the all-pods-gone wait above, this is h2 stream-close
+          # propagation + one tick_publish_gauges cycle (~10s typical;
+          # 0.17s observed local KVM). The old 30→90s widen (8cf70d94)
+          # chased a symptom — the real tail was pod-1 surviving the
+          # pod-0-only check above, now closed. wait_workers_zero
+          # (see prelude) bounds the heartbeat-timeout FALLBACK path:
+          # GHA 24046508263 hit 57.38s here (pods-gone 1.24s) — the
+          # stream-EOF never reached the scheduler, tick_check_
+          # heartbeats reaped at last_hb+~60s.
+          wait_workers_zero("finalizer assertion")
           print("finalizer PASS: BuilderPool deleted, pod drained, scheduler saw disconnect")
     '';
 
