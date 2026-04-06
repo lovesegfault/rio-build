@@ -715,6 +715,8 @@
                 vm-lifecycle-autoscale-k3s = 8;
                 vm-le-stability-k3s = 8;
                 vm-le-build-k3s = 8;
+                # k3s + one extra airgap image (squid). Does builds.
+                vm-fod-proxy-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (

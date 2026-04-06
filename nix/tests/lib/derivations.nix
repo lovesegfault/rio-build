@@ -38,6 +38,16 @@ rec {
   # Takes `{ tag, sleepSecs }` at nix-build time via `--arg`.
   coldBootstrap = ./derivations/cold-bootstrap.nix;
 
+  # busybox-wget FOD for the fod-proxy scenario. Parameterized at
+  # nix-build time via `--argstr url ... --argstr sha256 ...`. wget
+  # honors http_proxy (the rio-worker is_fod gate → daemon env →
+  # Nix FOD sandbox pass-through → wget → squid chain under test).
+  fodFetch = ./derivations/fod-fetch.nix;
+
+  # Non-FOD sentinel: `busybox env > $out`. fod-proxy asserts
+  # http_proxy is absent — proves executor's is_fod gate.
+  envDump = ./derivations/env-dump.nix;
+
   # Host-side pre-fetch of the busybox for airgapped VM workers. Served
   # via Python http.server on the client VM (see coldBootstrapServer
   # below); cold-bootstrap.nix's url is overridden to http://client:8000/
