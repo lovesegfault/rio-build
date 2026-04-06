@@ -89,29 +89,83 @@ pub async fn scan_once(
 
     let mut reaped = 0u64;
     for (store_path_hash,) in stale {
-        // Single-path transaction (not batched — orphans are rare,
-        // batching isn't worth the complexity).
-        let mut tx = pool.begin().await?;
+        if reap_one(pool, &store_path_hash, Some(threshold_secs), chunk_backend).await? {
+            reaped += 1;
+        }
+    }
 
-        // Re-read chunk_list INSIDE the tx with FOR UPDATE, and re-check
-        // the stale threshold. Two races this guards:
-        //
-        // (1) Outer-SELECT vs inner-DELETE: the outer SELECT is OUTSIDE
-        // any tx. Reading chunk_list INSIDE the tx (with FOR UPDATE
-        // locking the manifest row) guarantees we decrement the
-        // chunk_list that we DELETE.
-        //
-        // (2) Reap-then-reupload: status='uploading' alone doesn't catch
-        // the multi-replica race. store-0 + store-1 both outer-SELECT the
-        // same stale hash; store-0 reaps; worker re-uploads (NEW row, same
-        // hash, status='uploading', updated_at=now()); store-1's FOR UPDATE
-        // would match the NEW row (status is 'uploading' ✓) and reap a
-        // FRESH upload. Re-checking the stale threshold inside the tx
-        // catches this — fresh re-uploads have updated_at=now() → don't match.
-        //
-        // The FOR UPDATE blocks any concurrent re-upload until this
-        // tx commits — same pattern as sweep.rs.
-        let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
+    if reaped > 0 {
+        info!(
+            count = reaped,
+            "orphan scan: reaped stale uploading manifests"
+        );
+    }
+    Ok(reaped)
+}
+
+/// Reap a single 'uploading' placeholder: chunk-aware DELETE.
+///
+/// `threshold_secs`: `Some(t)` re-checks `updated_at < now() - t`
+/// inside the tx (TOCTOU guard against reaping a fresh re-upload).
+/// `None` skips the stale check (callers that KNOW the placeholder
+/// is theirs — e.g. cleanup-on-failure).
+///
+/// Returns `true` if reaped, `false` if no matching placeholder
+/// (already gone, completed, or fresher than threshold).
+///
+/// # Why this exists (I-040)
+///
+/// Substitution's hot-path reclaim and its cleanup-on-failure both
+/// previously called [`crate::metadata::delete_manifest_uploading`]
+/// (the inline variant). That function deletes `manifests` (CASCADE
+/// → `manifest_data`) but does NOT decrement chunk refcounts. For a
+/// CHUNKED placeholder — left by an interrupted `cas::put_chunked` —
+/// this leaks the +1 from `upgrade_manifest_to_chunked`.
+///
+/// The leak alone is just storage waste. The data loss happens on the
+/// NEXT upload: `upgrade_manifest_to_chunked` sees `refcount ≥ 1`,
+/// returns `inserted = (refcount == 1) = false`, and `do_upload`
+/// SKIPS the chunk. If the prior crash was BEFORE that chunk made
+/// it to S3 (process killed mid-`do_upload`), the manifest now
+/// references a chunk that doesn't exist. `GetPath` →
+/// `chunk reassembly failed: chunk … not found in backend`.
+///
+/// This helper carries the same FOR UPDATE + EXISTS-guard +
+/// `decrement_and_enqueue` discipline as [`scan_once`]'s loop body,
+/// so any caller that needs to reap an uploading placeholder gets
+/// chunk-aware semantics for free.
+pub(crate) async fn reap_one(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    threshold_secs: Option<i64>,
+    chunk_backend: Option<&Arc<dyn ChunkBackend>>,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Re-read chunk_list INSIDE the tx with FOR UPDATE. Two races
+    // this guards (preserved from the pre-extraction loop body):
+    //
+    // (1) Outer-SELECT vs inner-DELETE: scan_once's outer SELECT is
+    // OUTSIDE any tx. Reading chunk_list INSIDE the tx (with FOR
+    // UPDATE locking the manifest row) guarantees we decrement the
+    // chunk_list that we DELETE.
+    //
+    // (2) Reap-then-reupload (when threshold_secs is Some): store-0
+    // + store-1 both outer-SELECT the same stale hash; store-0
+    // reaps; worker re-uploads (NEW row, same hash, status=
+    // 'uploading', updated_at=now()); store-1's FOR UPDATE would
+    // match the NEW row (status is 'uploading' ✓) and reap a FRESH
+    // upload. Re-checking the stale threshold inside the tx catches
+    // this — fresh re-uploads have updated_at=now() → don't match.
+    //
+    // The FOR UPDATE blocks any concurrent re-upload until this tx
+    // commits — same pattern as sweep.rs.
+    //
+    // Two query strings (not a runtime-built one) so sqlx can prepare
+    // both at compile time. The EXISTS-guard DELETE below mirrors the
+    // same shape.
+    let chunk_list: Option<Vec<u8>> = match threshold_secs {
+        Some(t) => sqlx::query_scalar(
             r#"
             SELECT md.chunk_list
               FROM manifests m
@@ -122,27 +176,44 @@ pub async fn scan_once(
                FOR UPDATE OF m
             "#,
         )
-        .bind(&store_path_hash)
-        .bind(threshold_secs)
+        .bind(store_path_hash)
+        .bind(t)
         .fetch_optional(&mut *tx)
         .await?
-        .flatten();
-
-        // DELETE narinfo → CASCADE to manifests/manifest_data.
-        //
-        // Status + stale-threshold guards in EXISTS: atomic re-check
-        // at DELETE time. rows_affected()==0 catches: (a) another
-        // replica already reaped (gone), (b) upload completed since
-        // outer SELECT (status='complete' → EXISTS false), (c)
-        // reap-then-reupload: a FRESH 'uploading' row exists (updated_at
-        // recent → stale clause false → EXISTS false).
-        //
-        // The FOR UPDATE above already re-checked stale+status and
-        // locked the row — the EXISTS guard is defense-in-depth for
-        // the case where FOR UPDATE returned 0 rows (chunk_list=None)
-        // but the DELETE would otherwise match a fresh row.
-        let deleted = sqlx::query(
+        .flatten(),
+        None => sqlx::query_scalar(
             r#"
+            SELECT md.chunk_list
+              FROM manifests m
+              LEFT JOIN manifest_data md USING (store_path_hash)
+             WHERE m.store_path_hash = $1
+               AND m.status = 'uploading'
+               FOR UPDATE OF m
+            "#,
+        )
+        .bind(store_path_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten(),
+    };
+
+    // DELETE narinfo → CASCADE to manifests/manifest_data.
+    //
+    // Status (+ stale, when thresholded) guards in EXISTS: atomic
+    // re-check at DELETE time. rows_affected()==0 catches: (a)
+    // another replica already reaped (gone), (b) upload completed
+    // since FOR UPDATE (status='complete' → EXISTS false), (c)
+    // reap-then-reupload: a FRESH 'uploading' row exists
+    // (updated_at recent → stale clause false → EXISTS false).
+    //
+    // The FOR UPDATE above already re-checked status (+ stale) and
+    // locked the row — the EXISTS guard is defense-in-depth for the
+    // case where FOR UPDATE returned 0 rows (chunk_list=None) but
+    // the DELETE would otherwise match a fresh row.
+    let deleted = match threshold_secs {
+        Some(t) => {
+            sqlx::query(
+                r#"
             DELETE FROM narinfo n
              WHERE n.store_path_hash = $1
                AND EXISTS (
@@ -152,38 +223,46 @@ pub async fn scan_once(
                       AND m.updated_at < now() - make_interval(secs => $2)
                )
             "#,
-        )
-        .bind(&store_path_hash)
-        .bind(threshold_secs)
-        .execute(&mut *tx)
-        .await?;
-        if deleted.rows_affected() == 0 {
-            // Gone or completed — either way, not an orphan
-            // anymore. Rollback (no-op, nothing changed) and
-            // continue.
-            tx.rollback().await?;
-            continue;
+            )
+            .bind(store_path_hash)
+            .bind(t)
+            .execute(&mut *tx)
+            .await?
         }
-
-        // Chunk decrement + enqueue (if chunked). Same helper as
-        // sweep::sweep — see gc::decrement_and_enqueue. chunk_list
-        // was read INSIDE the tx above — it's the CURRENT
-        // value for the manifest we just deleted.
-        if let Some(bytes) = chunk_list {
-            super::decrement_and_enqueue(&mut tx, &bytes, chunk_backend).await?;
+        None => {
+            sqlx::query(
+                r#"
+            DELETE FROM narinfo n
+             WHERE n.store_path_hash = $1
+               AND EXISTS (
+                   SELECT 1 FROM manifests m
+                    WHERE m.store_path_hash = $1
+                      AND m.status = 'uploading'
+               )
+            "#,
+            )
+            .bind(store_path_hash)
+            .execute(&mut *tx)
+            .await?
         }
-
-        tx.commit().await?;
-        reaped += 1;
+    };
+    if deleted.rows_affected() == 0 {
+        // Gone or completed — either way, not an orphan anymore.
+        // Rollback (no-op, nothing changed yet).
+        tx.rollback().await?;
+        return Ok(false);
     }
 
-    if reaped > 0 {
-        info!(
-            count = reaped,
-            "orphan scan: reaped stale uploading manifests"
-        );
+    // Chunk decrement + enqueue (if chunked). chunk_list was read
+    // INSIDE the tx above — it's the CURRENT value for the manifest
+    // we just deleted. This is the I-040 fix: the inline
+    // `delete_manifest_uploading` skipped this step.
+    if let Some(bytes) = chunk_list {
+        super::decrement_and_enqueue(&mut tx, &bytes, chunk_backend).await?;
     }
-    Ok(reaped)
+
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Spawn the periodic orphan scanner. Runs `scan_once` every
@@ -212,7 +291,148 @@ pub fn spawn_scanner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{Manifest, ManifestEntry};
     use rio_test_support::TestDb;
+
+    /// Seed an 'uploading' placeholder, upgrade to chunked (refcount
+    /// +1, manifest_data written), backdate. Simulates: prior
+    /// `cas::put_chunked` crashed AFTER `upgrade_manifest_to_chunked`.
+    ///
+    /// Returns the chunk hash so the caller can check refcount.
+    async fn seed_stale_chunked(pool: &PgPool, hash: &[u8], path: &str) -> [u8; 32] {
+        crate::metadata::insert_manifest_uploading(pool, hash, path, &[])
+            .await
+            .unwrap();
+        // One-chunk manifest. The chunk_list bytes must deserialize
+        // (decrement_and_enqueue calls Manifest::deserialize), so
+        // build it via the real serializer.
+        let chunk_hash = [hash[0]; 32]; // distinct per test via the path-hash byte
+        let chunk_list = Manifest {
+            entries: vec![ManifestEntry {
+                hash: chunk_hash,
+                size: 100,
+            }],
+        }
+        .serialize();
+        crate::metadata::upgrade_manifest_to_chunked(
+            pool,
+            hash,
+            &chunk_list,
+            &[chunk_hash.to_vec()],
+            &[100i64],
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - interval '1 hour' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(hash)
+        .execute(pool)
+        .await
+        .unwrap();
+        chunk_hash
+    }
+
+    // r[verify store.substitute.stale-reclaim]
+    /// I-040 unit: `reap_one` on a CHUNKED placeholder MUST decrement.
+    /// This is what the inline `delete_manifest_uploading` skipped.
+    /// Spec at store.md:133: "The chunk list in `manifest_data` is
+    /// used to decrement refcounts" — substitute's reclaim violated
+    /// this (called the inline delete unconditionally).
+    #[tokio::test]
+    async fn reap_one_chunked_decrements_refcount() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let hash = vec![0x40u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("i040-reap-chunked");
+        let chunk_hash = seed_stale_chunked(&db.pool, &hash, &path).await;
+
+        // Verify setup: refcount=1, manifest_data exists.
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(chunk_hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1, "setup: chunk at refcount=1");
+
+        // reap_one (unconditional — None threshold).
+        let reaped = reap_one(&db.pool, &hash, None, None).await.unwrap();
+        assert!(reaped, "chunked placeholder reaped");
+
+        // Refcount decremented to 0. Before I-040 fix, the inline
+        // delete would have left this at 1 (leaked).
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(chunk_hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 0, "I-040: chunked-reap MUST decrement refcount");
+
+        // Placeholder gone (narinfo CASCADE → manifests/manifest_data).
+        let n: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM manifest_data WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(n.0, 0, "manifest_data gone via CASCADE");
+    }
+
+    /// `scan_once`'s loop now delegates to `reap_one` — chunked
+    /// placeholders found by the periodic scanner ALSO decrement.
+    /// (This was already correct pre-extraction; this test pins it.)
+    #[tokio::test]
+    async fn scan_once_chunked_decrements_refcount() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let hash = vec![0x41u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("i040-scan-chunked");
+        let chunk_hash = seed_stale_chunked(&db.pool, &hash, &path).await;
+
+        let reaped = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(reaped, 1);
+
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(chunk_hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 0, "scan_once via reap_one decrements");
+    }
+
+    /// `reap_one(Some(threshold))` skips a fresh placeholder. Same
+    /// guard scan_once relied on; pinned here so a future direct
+    /// caller (substitute) gets the same protection.
+    #[tokio::test]
+    async fn reap_one_thresholded_skips_fresh_chunked() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let hash = vec![0x42u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("i040-fresh-chunked");
+        let chunk_hash = seed_stale_chunked(&db.pool, &hash, &path).await;
+        // Re-freshen: undo the backdate from the seed helper.
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() + interval '10 seconds' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // 5min threshold → fresh placeholder NOT reaped.
+        let reaped = reap_one(&db.pool, &hash, Some(300), None).await.unwrap();
+        assert!(!reaped, "fresh placeholder skipped under threshold");
+
+        // Refcount UNCHANGED (still 1).
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(chunk_hash.as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1, "fresh chunked placeholder's refcount untouched");
+    }
 
     /// Helper: insert an 'uploading' placeholder AND backdate
     /// updated_at so the stale-threshold check deterministically

@@ -503,35 +503,48 @@ impl Substituter {
             // crashed uploader left it. Check age: if stale, reclaim
             // and retry. The orphan scanner would catch this in 15min;
             // we can't wait that long on the hot path.
+            //
+            // I-040: this previously called the inline-only
+            // `delete_manifest_uploading`, which leaks chunk
+            // refcounts when the stale placeholder is CHUNKED (left
+            // by an interrupted `cas::put_chunked`). The leaked +1
+            // makes the next `upgrade_manifest_to_chunked` see
+            // `inserted=false` → skip upload → manifest references
+            // chunks that never made it to S3. `gc::orphan::reap_one`
+            // reads `manifest_data.chunk_list` and decrements.
             // r[impl store.substitute.stale-reclaim]
-            match metadata::manifest_uploading_age(&self.pool, &store_path_hash).await? {
-                Some(age) if age > self.stale_threshold => {
-                    warn!(
-                        store_path = %info.store_path,
-                        ?age,
-                        threshold = ?self.stale_threshold,
-                        "stale 'uploading' placeholder — reclaiming"
-                    );
-                    metadata::delete_manifest_uploading(&self.pool, &store_path_hash).await?;
-                    metrics::counter!("rio_store_substitute_stale_reclaimed_total").increment(1);
-                    // Retry the insert. If THIS also fails, a live
-                    // concurrent uploader really did grab the slot
-                    // between our delete and re-insert — fall through
-                    // to PlaceholderMissing (retriable).
-                    inserted = metadata::insert_manifest_uploading(
-                        &self.pool,
-                        &store_path_hash,
-                        info.store_path.as_str(),
-                        &refs_str,
-                    )
-                    .await?;
-                }
-                // Young placeholder (genuine concurrent uploader) or
-                // gone entirely (another reclaimer beat us between
-                // insert_manifest_uploading and manifest_uploading_age
-                // — TOCTOU, harmless). Either way: don't reclaim.
-                _ => {}
+            let threshold_secs = self.stale_threshold.as_secs() as i64;
+            let reaped = crate::gc::orphan::reap_one(
+                &self.pool,
+                &store_path_hash,
+                Some(threshold_secs),
+                self.chunk_backend.as_ref(),
+            )
+            .await
+            .map_err(metadata::MetadataError::from)?;
+            if reaped {
+                warn!(
+                    store_path = %info.store_path,
+                    threshold = ?self.stale_threshold,
+                    "stale 'uploading' placeholder — reclaimed"
+                );
+                metrics::counter!("rio_store_substitute_stale_reclaimed_total").increment(1);
+                // Retry the insert. If THIS also fails, a live
+                // concurrent uploader really did grab the slot
+                // between our delete and re-insert — fall through
+                // to PlaceholderMissing (retriable).
+                inserted = metadata::insert_manifest_uploading(
+                    &self.pool,
+                    &store_path_hash,
+                    info.store_path.as_str(),
+                    &refs_str,
+                )
+                .await?;
             }
+            // reaped=false: young placeholder (genuine concurrent
+            // uploader) or gone entirely (another reclaimer beat us
+            // — TOCTOU, harmless). Either way: don't re-insert,
+            // fall through to PlaceholderMissing below.
             if !inserted {
                 return Err(SubstituteError::Ingest(
                     metadata::MetadataError::PlaceholderMissing {
@@ -563,8 +576,23 @@ impl Substituter {
 
         // On failure, clean up the placeholder. Best-effort — if
         // cleanup also fails, the orphan-sweeper will reclaim it.
+        //
+        // `cas::put_chunked` already calls its own internal rollback
+        // (delete_manifest_chunked_uploading) before returning Err,
+        // so this is normally a no-op (placeholder already gone).
+        // But if put_chunked's rollback ALSO failed (rare — PG
+        // transient), the placeholder is still chunked and we need
+        // chunk-aware cleanup (I-040 — same leak path as the
+        // stale-reclaim above). threshold=None: this is OUR
+        // placeholder from a few lines up, no stale check needed.
         if let Err(e) = result {
-            if let Err(ce) = metadata::delete_manifest_uploading(&self.pool, &store_path_hash).await
+            if let Err(ce) = crate::gc::orphan::reap_one(
+                &self.pool,
+                &store_path_hash,
+                None,
+                self.chunk_backend.as_ref(),
+            )
+            .await
             {
                 warn!(error = %ce, "cleanup after failed ingest also failed");
             }

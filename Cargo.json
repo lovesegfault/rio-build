@@ -19790,6 +19790,10 @@
           "packageId": "clap"
         },
         {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
           "name": "k8s-openapi",
           "packageId": "k8s-openapi"
         },

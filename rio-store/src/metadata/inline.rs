@@ -171,11 +171,11 @@ pub async fn complete_manifest_inline_in_tx(
 /// placeholder exists (already completed, already cleaned up, or never
 /// inserted).
 ///
-/// Used by `Substituter::ingest` to distinguish a stale placeholder
-/// (crashed uploader — reclaim and retry) from a young one (live
-/// concurrent uploader — return miss and let them finish). The orphan
-/// scanner would eventually reclaim stale placeholders, but with a
-/// 15-minute threshold; the substitution hot path can't wait that long.
+/// Test-only since I-040: `Substituter::ingest`'s reclaim now uses
+/// [`crate::gc::orphan::reap_one`], which does the stale check
+/// in-SQL. This survives as a test helper for asserting "placeholder
+/// still present" after a non-reclaiming flow.
+#[cfg(test)]
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
 pub async fn manifest_uploading_age(
     pool: &PgPool,

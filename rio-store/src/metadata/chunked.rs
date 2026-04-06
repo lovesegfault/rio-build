@@ -800,4 +800,97 @@ mod tests {
         .unwrap();
         assert_eq!(sum, 0, "both rollbacks decremented all 50 chunks to zero");
     }
+
+    /// I-040 chain: documents how the inline `delete_manifest_uploading`
+    /// on a chunked placeholder leads to upload-skip on retry.
+    ///
+    /// The bug WAS: substitute.rs's reclaim called the inline delete
+    /// (which leaks chunk refcounts) → next `upgrade_manifest_to_chunked`
+    /// sees `refcount ≥ 1` → `inserted=false` → `do_upload` skips. If
+    /// the prior crash was before that chunk made it to S3, the manifest
+    /// references a chunk that doesn't exist.
+    ///
+    /// This test traces the chain step-by-step on the inline delete
+    /// (still callable — it's correct for INLINE placeholders) and
+    /// asserts the upload-skip happens. The fix is at the CALL SITE
+    /// (substitute.rs uses `gc::orphan::reap_one`, which decrements);
+    /// this test pins the underlying mechanism so the chain doesn't
+    /// silently re-form via a different caller.
+    #[tokio::test]
+    async fn i040_inline_delete_on_chunked_causes_upload_skip() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk = vec![0x40u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("i040-chain");
+        // path-derived hash (matches what real callers compute) so the
+        // narinfo placeholder's store_path column round-trips.
+        let sph = rio_nix::store_path::StorePath::parse(&path)
+            .unwrap()
+            .sha256_digest()
+            .to_vec();
+
+        // --- Step 1: prior upload's upgrade_manifest_to_chunked ---
+        // Simulates: cas::put_chunked got past upgrade, then crashed.
+        crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
+            .await
+            .unwrap();
+        let chunk_list = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: chunk.as_slice().try_into().unwrap(),
+                size: 100,
+            }],
+        }
+        .serialize();
+        let one_chunk = std::slice::from_ref(&chunk);
+        let ins1 = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
+            .await
+            .unwrap();
+        assert!(ins1.contains(&chunk), "step 1: chunk fresh → would upload");
+        // Crash here: chunk MAY or may not have made it to S3. PG state
+        // is committed (refcount=1).
+
+        // --- Step 2: inline delete (the I-040 bug path) ---
+        // This deletes manifests (CASCADE → manifest_data) but does NOT
+        // touch chunk refcounts. Correct for inline placeholders, WRONG
+        // for chunked — substitute.rs called this unconditionally.
+        crate::metadata::delete_manifest_uploading(&db.pool, &sph)
+            .await
+            .unwrap();
+
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rc, 1,
+            "step 2: refcount LEAKED at 1 (inline delete ≠ decrement)"
+        );
+
+        // --- Step 3: retry's upgrade_manifest_to_chunked ---
+        crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
+            .await
+            .unwrap();
+        let ins2 = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
+            .await
+            .unwrap();
+
+        // THE BUG'S CONSEQUENCE: refcount went 1→2, so (refcount==1) is
+        // false, so chunk is NOT in inserted set → do_upload SKIPS it.
+        // If the chunk never made it to S3 in step 1, the manifest now
+        // references a chunk that doesn't exist → GetPath fails.
+        assert!(
+            !ins2.contains(&chunk),
+            "step 3: leaked refcount → upload SKIPPED. \
+             Fix is at the call site: use gc::orphan::reap_one (decrements) \
+             instead of delete_manifest_uploading (doesn't)."
+        );
+
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 2, "1 leaked + 1 real = 2");
+    }
 }

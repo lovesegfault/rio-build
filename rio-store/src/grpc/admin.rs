@@ -18,7 +18,7 @@ use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::{
     AddUpstreamRequest, GcProgress, GcRequest, ListUpstreamsRequest, ListUpstreamsResponse,
     PinPathRequest, PinPathResponse, RemoveUpstreamRequest, ResignPathsRequest,
-    ResignPathsResponse, UpstreamInfo,
+    ResignPathsResponse, UpstreamInfo, VerifyChunksProgress, VerifyChunksRequest,
 };
 
 use crate::backend::chunk::ChunkBackend;
@@ -270,10 +270,15 @@ const RESIGN_BATCH_DEFAULT: i64 = 100;
 const RESIGN_BATCH_MAX: i64 = 1000;
 
 type TriggerGcStream = ReceiverStream<Result<GcProgress, Status>>;
+type VerifyChunksStream = ReceiverStream<Result<VerifyChunksProgress, Status>>;
+
+const VERIFY_BATCH_DEFAULT: u32 = 1000;
+const VERIFY_BATCH_MAX: u32 = 5000;
 
 #[tonic::async_trait]
 impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     type TriggerGCStream = TriggerGcStream;
+    type VerifyChunksStream = VerifyChunksStream;
 
     /// Two-phase GC: mark (recursive CTE from roots) + sweep
     /// (DELETE CASCADE + chunk decrement + pending_s3_deletes).
@@ -640,6 +645,182 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             refs_changed,
             failed,
         }))
+    }
+
+    /// PG↔backend chunk consistency audit. Streams progress so the
+    /// operator sees activity during a multi-minute scan; missing
+    /// hashes surface per-batch (no need to wait for the full sweep
+    /// to start `aws s3 ls`-ing).
+    ///
+    /// I-040 diagnostic. The I-007 prefix-normalize fix changed the
+    /// S3 key format mid-deployment; chunks written before the fix
+    /// landed at `chunks//chunks/...`, chunks after at `chunks/
+    /// chunks/...`. PG had refcount=1 deleted=false (correct);
+    /// `exists_batch`'s HeadObject 404'd at the new key. This RPC
+    /// surfaces exactly that gap — PG-says-yes, backend-says-no —
+    /// without guessing key formats (it asks `key_for`, the same
+    /// function the read path uses).
+    ///
+    /// Read-only. No `--repair`: a missing chunk could be at a legacy
+    /// key (and `S3ChunkBackend::get`'s fallback already covers that
+    /// on the read path), so deleting the PG row would be the wrong
+    /// move. The operator decides — sync the legacy keys, restore
+    /// from backup, or accept the loss.
+    #[instrument(skip(self, request), fields(rpc = "VerifyChunks"))]
+    async fn verify_chunks(
+        &self,
+        request: Request<VerifyChunksRequest>,
+    ) -> Result<Response<Self::VerifyChunksStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        // Inline-only stores have nothing to verify (no chunk
+        // backend, no chunks table content). FAILED_PRECONDITION not
+        // INTERNAL — config issue, not bug.
+        let Some(backend) = self.chunk_backend.clone() else {
+            return Err(Status::failed_precondition(
+                "VerifyChunks: no chunk backend configured (inline-only store)",
+            ));
+        };
+
+        let batch_size = match req.batch_size {
+            0 => VERIFY_BATCH_DEFAULT,
+            n => n.min(VERIFY_BATCH_MAX),
+        } as i64;
+
+        info!(batch_size, "VerifyChunks: starting");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let pool = self.pool.clone();
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            let mut scanned = 0u64;
+            let mut missing = 0u64;
+            // Keyset cursor: blake3_hash > $cursor ORDER BY blake3_hash.
+            // Starts at the empty bytea (sorts before any 32-byte hash).
+            // OFFSET would re-scan rows linearly per page → O(N²) total
+            // for a 100k-chunk store; keyset is O(N) overall.
+            let mut cursor: Vec<u8> = Vec::new();
+
+            loop {
+                if shutdown.is_cancelled() {
+                    let _ = tx
+                        .send(Err(Status::aborted("VerifyChunks: shutdown")))
+                        .await;
+                    return;
+                }
+
+                // deleted = FALSE only: a deleted=true row is awaiting
+                // S3-delete (drain.rs); the object might or might not
+                // be there yet. Either way it's not a verification
+                // target. refcount=0 IS verified — it could be a
+                // PutChunk-then-crash (grace TTL), and the object
+                // SHOULD exist.
+                let rows: Vec<(Vec<u8>,)> = match sqlx::query_as(
+                    "SELECT blake3_hash FROM chunks \
+                     WHERE deleted = FALSE AND blake3_hash > $1 \
+                     ORDER BY blake3_hash LIMIT $2",
+                )
+                .bind(&cursor)
+                .bind(batch_size)
+                .fetch_all(&pool)
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!(
+                                "VerifyChunks: PG batch query failed: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                if rows.is_empty() {
+                    break;
+                }
+
+                // Advance cursor BEFORE filtering — if every row is
+                // shape-invalid (32-byte invariant says: never), the
+                // loop still progresses. Last row's hash, not the
+                // last accepted.
+                cursor.clone_from(&rows.last().unwrap().0);
+
+                // Shape filter: chunks PK is BYTEA but every writer
+                // inserts exactly 32 bytes. A wrong-length row is a
+                // schema-invariant violation — warn + skip rather
+                // than poisoning the whole scan over one corrupt
+                // row. Same defensive carve-out enqueue_chunk_deletes
+                // uses.
+                let hashes: Vec<[u8; 32]> = rows
+                    .into_iter()
+                    .filter_map(|(h,)| match <[u8; 32]>::try_from(h.as_slice()) {
+                        Ok(a) => Some(a),
+                        Err(_) => {
+                            warn!(
+                                len = h.len(),
+                                "VerifyChunks: chunk hash wrong length, skipping"
+                            );
+                            None
+                        }
+                    })
+                    .collect();
+                scanned += hashes.len() as u64;
+
+                let exists = match backend.exists_batch(&hashes).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // Transient S3 failure surfaces a partial
+                        // result. Stream the error so the operator
+                        // sees the boundary (last scanned was N) and
+                        // can resume. No partial done=true.
+                        let _ = tx
+                            .send(Err(Status::unavailable(format!(
+                                "VerifyChunks: backend exists_batch failed at \
+                                 scanned={scanned}: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let missing_hashes: Vec<Vec<u8>> = hashes
+                    .iter()
+                    .zip(&exists)
+                    .filter(|&(_, &ok)| !ok)
+                    .map(|(h, _)| h.to_vec())
+                    .collect();
+                missing += missing_hashes.len() as u64;
+
+                if tx
+                    .send(Ok(VerifyChunksProgress {
+                        scanned,
+                        missing,
+                        missing_hashes,
+                        done: false,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    // Client hung up — bail; no need to keep
+                    // HeadObject-ing.
+                    return;
+                }
+            }
+
+            info!(scanned, missing, "VerifyChunks: complete");
+            let _ = tx
+                .send(Ok(VerifyChunksProgress {
+                    scanned,
+                    missing,
+                    missing_hashes: vec![],
+                    done: true,
+                }))
+                .await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -1817,5 +1998,88 @@ mod tests {
             .into_inner();
         assert_eq!(added.sig_mode, "keep");
         assert_eq!(added.priority, 50);
+    }
+
+    /// VerifyChunks: PG-yes-backend-no surfaces in `missing_hashes`.
+    /// One chunk in PG and the MemoryChunkBackend (consistent), one in
+    /// PG only (the I-040 case). Batch boundary forced (batch_size=1)
+    /// so the keyset cursor advances and the per-batch progress shape
+    /// is observable.
+    #[tokio::test]
+    async fn verify_chunks_reports_missing() {
+        use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+        use crate::test_helpers::ChunkSeed;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Consistent: refcount=1 in PG, present in backend.
+        let h_ok = ChunkSeed::new(0x10).with_refcount(1).seed(&db.pool).await;
+        backend
+            .put(&h_ok, bytes::Bytes::from_static(b"ok"))
+            .await
+            .unwrap();
+
+        // The I-040 case: refcount=1 in PG, NOT in backend.
+        let h_missing = ChunkSeed::new(0x20).with_refcount(1).seed(&db.pool).await;
+
+        // deleted=true in PG → MUST be skipped (it's awaiting drain;
+        // backend state is undefined). Tag 0x05 sorts before 0x10 so
+        // a buggy WHERE that ignores `deleted` would scan it first.
+        // ChunkSeed synthesizes hash as [tag, 0, 0, ...] — bind the
+        // returned hash, not a literal.
+        let h_deleted = ChunkSeed::new(0x05).with_refcount(0).seed(&db.pool).await;
+        sqlx::query("UPDATE chunks SET deleted = TRUE WHERE blake3_hash = $1")
+            .bind(h_deleted.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), Some(backend));
+        let resp = svc
+            .verify_chunks(Request::new(VerifyChunksRequest { batch_size: 1 }))
+            .await
+            .unwrap();
+        let mut stream = resp.into_inner();
+
+        // Drain the stream. Two PG rows pass the filter (0x10, 0x20)
+        // → with batch_size=1, expect two progress frames + one done
+        // frame. Collect across all frames so the test doesn't depend
+        // on which batch a hash lands in (PG sort is by blake3_hash,
+        // so it's deterministic — but pinning that here would make
+        // the test brittle for no gain).
+        use tokio_stream::StreamExt;
+        let mut all_missing: Vec<Vec<u8>> = Vec::new();
+        let mut final_progress = None;
+        while let Some(p) = stream.next().await {
+            let p = p.expect("progress frame, not Err");
+            all_missing.extend(p.missing_hashes.clone());
+            final_progress = Some(p);
+        }
+        let p = final_progress.expect("at least one progress frame");
+
+        assert!(p.done, "stream ends with done=true");
+        assert_eq!(p.scanned, 2, "deleted=true row excluded");
+        assert_eq!(p.missing, 1);
+        assert_eq!(all_missing, vec![h_missing.to_vec()]);
+        assert!(
+            !all_missing.contains(&h_ok.to_vec()),
+            "backend-consistent chunk not flagged"
+        );
+    }
+
+    /// Inline-only store (no chunk_backend) → FAILED_PRECONDITION.
+    /// Config issue, not bug — operator gets a clear "wire a backend"
+    /// instead of an empty success.
+    #[tokio::test]
+    async fn verify_chunks_no_backend_precondition() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        let err = svc
+            .verify_chunks(Request::new(VerifyChunksRequest { batch_size: 0 }))
+            .await
+            .expect_err("no backend → error");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }

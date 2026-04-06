@@ -28,6 +28,7 @@ tonic = { workspace = true }
 rustls = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # kube::Client + Api<T> for `wps` subcommand (talks to K8s apiserver,

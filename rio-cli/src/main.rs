@@ -31,6 +31,7 @@ mod gc;
 mod logs;
 mod status;
 mod upstream;
+mod verify_chunks;
 mod wps;
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
@@ -259,6 +260,16 @@ enum Cmd {
     /// child BuilderPool replica counts + effective-cutoff status —
     /// the spec→child→replica chain kubectl can't show in one place.
     Wps(wps::WpsArgs),
+    /// PG↔backend chunk consistency audit. HeadObject every non-deleted
+    /// chunk; report PG-says-exists-but-S3-says-no. Missing hashes go
+    /// to stdout (one hex BLAKE3 per line, pipeable); progress to stderr.
+    /// I-040 diagnostic — catches chunks stranded by key-format changes.
+    /// Talks to StoreAdminService directly — `--store-addr` required.
+    VerifyChunks {
+        /// Chunks per backend exists_batch. 0 = server default (1000).
+        #[arg(long, default_value_t = 0)]
+        batch_size: u32,
+    },
     /// Manage per-tenant upstream binary-cache substitution config.
     /// Talks to StoreAdminService directly (not scheduler-proxied) —
     /// `--store-addr` or `RIO_STORE_ADDR` must reach the store.
@@ -309,6 +320,12 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow!("connect to store at {}: {e}", cfg.store_addr))?;
             return upstream::run(as_json, &mut sc, args.cmd).await;
+        }
+        Cmd::VerifyChunks { batch_size } => {
+            let mut sc = rio_proto::client::connect_store_admin(&cfg.store_addr)
+                .await
+                .map_err(|e| anyhow!("connect to store at {}: {e}", cfg.store_addr))?;
+            return verify_chunks::run(&mut sc, batch_size).await;
         }
         other => other,
     };
@@ -708,6 +725,7 @@ async fn main() -> anyhow::Result<()> {
         // doesn't need admin RPC), reconsider the split.
         Cmd::Wps(_) => unreachable!("Wps handled before gRPC connect"),
         Cmd::Upstream(_) => unreachable!("Upstream handled before scheduler connect"),
+        Cmd::VerifyChunks { .. } => unreachable!("VerifyChunks handled before scheduler connect"),
     }
     Ok(())
 }
