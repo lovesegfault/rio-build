@@ -351,6 +351,28 @@ pub const M_028: () = ();
 /// hot-applied case a no-op.
 pub const M_029: () = ();
 
+/// `030_builds_denorm_counts.sql` — denormalize total/completed/cached
+/// drv counts onto `builds` (I-103).
+///
+/// `LIST_BUILDS_SELECT` previously did `builds ⟕ build_derivations ⟕
+/// derivations` with COUNT aggregation + a correlated `NOT EXISTS
+/// (assignments)` for `cached`. The LIMIT applied AFTER the GROUP BY,
+/// so listing 10 builds aggregated EVERY drv of EVERY build. I-102
+/// showed it going 16ms→2.3s with stale stats at only 10 builds × ~5k
+/// drvs; at 1000 builds × 5k it'd be 5M rows/call regardless of stats.
+///
+/// Counts are now columns maintained by `update_build_counts()` (sets
+/// from in-mem ground truth at merge + every completion). The backfill
+/// SELECT replicates the original aggregation once, then it's never
+/// joined again. Recovery re-runs `update_build_counts` for active
+/// builds, so a missed best-effort write self-heals on failover.
+///
+/// Semantic note: `cached_drvs` is now "merge-time hits + dispatch_fod
+/// short-circuits" (the in-mem `cached_count`). The original SQL's
+/// `NOT EXISTS (assignments)` heuristic is equivalent in practice —
+/// both mean "completed without dispatch".
+pub const M_030: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

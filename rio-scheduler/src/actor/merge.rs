@@ -468,11 +468,13 @@ impl DagActor {
             }
         }
 
-        // Update build's cached count
+        // Update build's cached count + persist initial denorm columns.
         if let Some(build) = self.builds.get_mut(&build_id) {
             build.cached_count = cached_count;
-            build.completed_count = cached_count;
         }
+        // I-103: sets completed_count from DAG ground truth + persists
+        // (total, completed, cached) to PG so list_builds is O(LIMIT).
+        self.update_build_counts(build_id).await;
 
         // Send BuildStarted event
         self.emit_build_event(
