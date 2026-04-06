@@ -332,6 +332,12 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
         "rio_scheduler_assignment_latency_seconds",
         ASSIGNMENT_LATENCY_BUCKETS,
     ),
+    (
+        // Same buckets as assignment_latency_seconds — same measurement
+        // (Ready→Assigned), dashboard-facing alias (P0539c).
+        "rio_scheduler_dispatch_wait_seconds",
+        ASSIGNMENT_LATENCY_BUCKETS,
+    ),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
     (
         "rio_builder_upload_references_count",

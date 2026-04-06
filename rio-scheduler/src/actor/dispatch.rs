@@ -733,9 +733,15 @@ impl DagActor {
             }
             // Record assignment latency (Ready -> Assigned time) after transitioning
             if let Some(ready_at) = state.ready_at.take() {
-                let latency = ready_at.elapsed();
-                metrics::histogram!("rio_scheduler_assignment_latency_seconds")
-                    .record(latency.as_secs_f64());
+                let latency = ready_at.elapsed().as_secs_f64();
+                metrics::histogram!("rio_scheduler_assignment_latency_seconds").record(latency);
+                // P0539c: same measurement, dashboard-facing name. Kept
+                // distinct from `assignment_latency_seconds` (legacy
+                // alias) so part-B Grafana JSON can reference a stable
+                // name without coupling to the older one's eventual
+                // deprecation. Both fed from the same `ready_at`
+                // (set on transition→Ready in DerivationState).
+                metrics::histogram!("rio_scheduler_dispatch_wait_seconds").record(latency);
             }
             // Clear retry-backoff deadline: we're dispatching, the
             // backoff has been honored (dispatch_ready wouldn't

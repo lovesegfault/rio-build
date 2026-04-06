@@ -263,6 +263,9 @@ spec:
     - from:
         - podSelector: {}
       ports: [{protocol: TCP, port: 9102}]
+    # Metrics: same any-source allowance as scheduler 9091 above —
+    # Prometheus scrape + apiserver pods/proxy. Read-only observability.
+    - ports: [{protocol: TCP, port: 9092}]
 ---
 # r[impl store.netpol.egress]
 #

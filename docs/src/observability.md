@@ -133,6 +133,9 @@ r[obs.metric.scheduler]
 | `rio_scheduler_ca_hash_compares_total` | Counter | CA cutoff-compare output-hash lookups against the content index on completion (labeled by `outcome`: `match`/`miss`/`skipped_after_miss`/`malformed`/`error`). High match ratio → CA derivations rebuilding identical content. `skipped_after_miss` counts outputs NOT looked up because an earlier output in the same derivation missed (short-circuit); the compare loop breaks early since the AND-fold result is already false. `malformed` = worker sent an empty output path; `error` = PG lookup failed or timed out (alert if rate>0). |
 | `rio_scheduler_ca_cutoff_saves_total` | Counter | Derivations skipped via CA early-cutoff (Queued→Skipped transitions). Each increment is one build that did NOT run because a CA dep's output matched the content index. |
 | `rio_scheduler_ca_cutoff_seconds_saved` | Counter | Sum of `est_duration` of skipped derivations. Lower-bound estimate of wall-clock saved (est_duration is the Estimator's EMA; a never-run derivation has the fallback, not actual). Divide by `saves_total` for avg-seconds-per-save. |
+| `rio_scheduler_actor_mailbox_depth` | Gauge | `ActorCommand` mpsc queue depth, sampled once per dequeued command. The actor is single-threaded — depth growth means commands arrive faster than the loop retires them. Pair with `actor_cmd_seconds` to localize a wedge: high depth + one slow `cmd` label = head-of-line block; high depth + uniformly fast cmds = sustained burst. |
+| `rio_scheduler_dispatch_wait_seconds` | Histogram | Time from a derivation entering Ready to being Assigned. Same measurement as `assignment_latency_seconds` (both fed from `DerivationState.ready_at`); this is the dashboard-facing name. With ephemeral builders, dominated by node-provision (~60–180s on EKS). |
+| `rio_scheduler_broadcast_lagged_total` | Counter | BuildEvent broadcast events skipped by lagging subscribers (sum of `RecvError::Lagged(n)` across all bridge tasks). Non-zero under sustained event burst — large DAG initial dispatch, or many concurrent drvs emitting Log lines, and the gateway can't drain the 1024-slot ring fast enough. The bridge continues post-lag (I-144); the gap is recoverable via S3 logs / WatchBuild reconnect. |
 | `rio_scheduler_ca_cutoff_depth_cap_hits_total` | Counter | CA cutoff cascade walks that hit `MAX_CASCADE_NODES` (1000). Non-zero → cascades truncated; pathological DAG shape or cap too low. |
 
 r[obs.metric.scheduler-leader-gate]
@@ -253,7 +256,7 @@ r[obs.metric.controller]
 | `rio_scheduler_build_duration_seconds`, `rio_builder_build_duration_seconds` | `[1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200]` |
 | `rio_scheduler_critical_path_accuracy` | `[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0]` (ratio: actual/estimated; 1.0 = perfect) |
 | `rio_controller_reconcile_duration_seconds` | `[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` |
-| `rio_scheduler_assignment_latency_seconds` | `[0.1, 0.5, 1, 5, 10, 30, 60, 120, 180, 300, 600]` (ephemeral builders: dominated by node-provision) |
+| `rio_scheduler_assignment_latency_seconds`, `rio_scheduler_dispatch_wait_seconds` | `[0.1, 0.5, 1, 5, 10, 30, 60, 120, 180, 300, 600]` (ephemeral builders: dominated by node-provision) |
 | `rio_scheduler_build_graph_edges` | `[100, 500, 1000, 5000, 10000, 20000]` (count) |
 | `rio_builder_upload_references_count` | `[1, 5, 10, 25, 50, 100, 250, 500]` (count) |
 

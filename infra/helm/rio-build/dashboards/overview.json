@@ -1,0 +1,191 @@
+{
+  "uid": "rio-overview",
+  "title": "rio-build: Overview",
+  "tags": ["rio-build", "overview"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "links": [
+    {"type": "dashboards", "title": "rio-build dashboards", "tags": ["rio-build"], "asDropdown": true, "includeVars": true, "keepTime": true}
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active builds",
+      "description": "rio_scheduler_builds_active — builds with at least one non-terminal derivation.",
+      "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "rio_scheduler_builds_active", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "colorMode": "value", "graphMode": "area"},
+      "links": [{"title": "Detail →", "url": "/d/rio-build-progress", "targetBlank": false}]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Derivations in flight",
+      "description": "queued + running. Throughput numerator; sustained high with low running = dispatch stall.",
+      "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "rio_scheduler_derivations_queued + rio_scheduler_derivations_running", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "colorMode": "value", "graphMode": "area"},
+      "links": [{"title": "Detail →", "url": "/d/rio-dispatch-flow", "targetBlank": false}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Workers active",
+      "description": "rio_scheduler_workers_active — fully-registered workers (stream + heartbeat). Zero with queued > 0 = no capacity.",
+      "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "rio_scheduler_workers_active", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "colorMode": "value", "graphMode": "area"},
+      "links": [{"title": "Detail →", "url": "/d/rio-builder-lifecycle", "targetBlank": false}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Actor mailbox",
+      "description": "rio_scheduler_actor_mailbox_depth — actor mpsc backlog. Yellow ≥64, red ≥256 = head-of-line blocking.",
+      "gridPos": {"x": 12, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "rio_scheduler_actor_mailbox_depth", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 64}, {"color": "red", "value": 256}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
+      "links": [{"title": "Detail →", "url": "/d/rio-scheduler-actor", "targetBlank": false}]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "PG pool util (max)",
+      "description": "max(rio_store_pg_pool_utilization) across store replicas. Yellow ≥0.7, red ≥0.9 = pool-starved, RPCs queue.",
+      "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "max(rio_store_pg_pool_utilization)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.7}, {"color": "red", "value": 0.9}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
+      "links": [{"title": "Detail →", "url": "/d/rio-store", "targetBlank": false}]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Spawn failures",
+      "description": "sum(rate(rio_controller_manifest_spawn_failures_total[5m])). Any red = pods can't be created (quota, image pull, admission).",
+      "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(rate(rio_controller_manifest_spawn_failures_total[5m]))", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.001}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
+      "links": [{"title": "Detail →", "url": "/d/rio-builder-lifecycle", "targetBlank": false}]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Queue / running / workers",
+      "description": "The dispatch-stall test: queued > workers with running < workers = scheduler isn't placing Ready work.",
+      "gridPos": {"x": 0, "y": 4, "w": 14, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rio_scheduler_derivations_queued", "legendFormat": "queued", "refId": "A"},
+        {"expr": "rio_scheduler_derivations_running", "legendFormat": "running", "refId": "B"},
+        {"expr": "rio_scheduler_workers_active", "legendFormat": "workers", "refId": "C"}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "workers"}, "properties": [{"id": "custom.lineStyle", "value": {"dash": [10, 10], "fill": "dash"}}, {"id": "custom.fillOpacity", "value": 0}]}
+        ]
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "links": [{"title": "Detail →", "url": "/d/rio-dispatch-flow", "targetBlank": false}]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Dispatch wait p50/p99",
+      "description": "rio_scheduler_dispatch_wait_seconds — Ready→Assigned latency. p99 > a few seconds under spare capacity = dispatch bug.",
+      "gridPos": {"x": 14, "y": 4, "w": 10, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum by (le) (rate(rio_scheduler_dispatch_wait_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(rio_scheduler_dispatch_wait_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "links": [{"title": "Detail →", "url": "/d/rio-dispatch-flow", "targetBlank": false}]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Pool replicas: desired vs actual",
+      "description": "rio_controller_workerpool_replicas — gap between desired and actual = pods Pending or Terminating.",
+      "gridPos": {"x": 0, "y": 11, "w": 14, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "rio_controller_workerpool_replicas{kind=\"desired\"}", "legendFormat": "{{pool}} desired", "refId": "A"},
+        {"expr": "rio_controller_workerpool_replicas{kind=\"actual\"}", "legendFormat": "{{pool}} actual", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "links": [{"title": "Detail →", "url": "/d/rio-builder-lifecycle", "targetBlank": false}]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Store: PutPath p99 / retries",
+      "description": "PutPath p99 latency (left) + retries/s (right axis). p99 spikes track S3/PG pressure; retries > 1/s = serialization contention.",
+      "gridPos": {"x": 14, "y": 11, "w": 10, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(rio_store_put_path_duration_seconds_bucket[5m])))", "legendFormat": "putpath p99", "refId": "A"},
+        {"expr": "sum(rate(rio_store_putpath_retries_total[5m]))", "legendFormat": "retries/s", "refId": "B"}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "s", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "retries/s"}, "properties": [{"id": "unit", "value": "ops"}, {"id": "custom.axisPlacement", "value": "right"}, {"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+        ]
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "links": [{"title": "Detail →", "url": "/d/rio-store", "targetBlank": false}]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Build outcomes",
+      "description": "rate(rio_scheduler_builds_total[5m]) by outcome. Red (failure) > 0 sustained is the headline alert.",
+      "gridPos": {"x": 0, "y": 18, "w": 24, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum by (outcome) (rate(rio_scheduler_builds_total[5m]))", "legendFormat": "{{outcome}}", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "ops", "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "failure"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "cancelled"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]}
+        ]
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "links": [{"title": "Detail →", "url": "/d/rio-build-progress", "targetBlank": false}]
+    }
+  ]
+}

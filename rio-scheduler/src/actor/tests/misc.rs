@@ -988,3 +988,65 @@ async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> Te
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// P0539c metrics: mailbox_depth, dispatch_wait_seconds
+// ---------------------------------------------------------------------------
+
+// r[verify obs.metric.scheduler]
+/// Mailbox-depth gauge is set on every dequeued command. Send a Tick,
+/// barrier (request-reply, also dequeued), and assert the gauge was
+/// touched. Value is non-deterministic (depends on how many commands
+/// were queued at sample time) — touch-set assertion only.
+#[tokio::test]
+async fn test_mailbox_depth_gauge_set_per_command() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    assert!(
+        recorder.gauge_touched("rio_scheduler_actor_mailbox_depth"),
+        "mailbox_depth gauge not set after dequeuing commands.\n\
+         Gauges touched: {:?}",
+        recorder.gauge_names()
+    );
+    Ok(())
+}
+
+// r[verify obs.metric.scheduler]
+/// dispatch_wait_seconds is recorded on Ready→Assigned. Connect a
+/// worker, merge a single-node DAG (enters Ready immediately — no
+/// deps), wait for the assignment to land, then assert the histogram
+/// was touched. Elapsed value is non-deterministic; touch-set only.
+#[tokio::test]
+async fn test_dispatch_wait_recorded_on_assignment() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    let mut rx = connect_executor(&handle, "dw-worker", "x86_64-linux", 1).await?;
+    merge_single_node(&handle, Uuid::new_v4(), "dw-drv", PriorityClass::Scheduled).await?;
+
+    // MergeDag's reply is sent AFTER dispatch_ready runs inline
+    // (helpers.rs:624), so the assignment is already in flight. Drain
+    // it to confirm assign_to_worker actually ran.
+    let _assignment = recv_assignment(&mut rx).await;
+
+    assert!(
+        recorder.histogram_touched("rio_scheduler_dispatch_wait_seconds"),
+        "dispatch_wait_seconds not recorded on Ready→Assigned"
+    );
+    // Legacy alias still emitted (same ready_at source).
+    assert!(
+        recorder.histogram_touched("rio_scheduler_assignment_latency_seconds"),
+        "assignment_latency_seconds (legacy alias) not recorded"
+    );
+    Ok(())
+}

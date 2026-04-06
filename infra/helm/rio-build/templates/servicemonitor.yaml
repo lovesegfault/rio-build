@@ -1,0 +1,80 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := .Values.namespaces -}}
+{{- /*
+  One ServiceMonitor per long-lived component. The component Services
+  (gateway/scheduler/store) only expose their data-plane port — adding a
+  metrics port there would publish :909x on the gateway NLB. Instead each
+  component gets a dedicated ClusterIP-None metrics Service here, sharing
+  the component's selectorLabels so the same pods back it. Controller has
+  no Service at all (nothing dials it) so it needs one regardless.
+
+  ServiceMonitor.spec.endpoints[].port references the Service port NAME
+  ("metrics"); the operator resolves that to the targetPort (the
+  containerPort named "metrics" each Deployment/StatefulSet declares —
+  9090/9091/9092/9094 respectively).
+*/ -}}
+{{- range $c := list
+      (dict "name" "gateway"    "ns" $.Values.namespace.name "port" 9090)
+      (dict "name" "scheduler"  "ns" $.Values.namespace.name "port" 9091)
+      (dict "name" "controller" "ns" $.Values.namespace.name "port" 9094)
+      (dict "name" "store"      "ns" $ns.store.name          "port" 9092)
+}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-{{ $c.name }}-metrics
+  namespace: {{ $c.ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" $ "name" (printf "rio-%s" $c.name) "component" $c.name) | nindent 4 }}
+spec:
+  # Headless — Prometheus scrapes pod IPs from EndpointSlices, a
+  # ClusterIP would be unused. Also sidesteps rio.ipFamily (metrics
+  # is plain HTTP, no dual-stack concern).
+  clusterIP: None
+  selector:
+    {{- include "rio.selectorLabels" (printf "rio-%s" $c.name) | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ $c.port }}
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rio-{{ $c.name }}
+  namespace: {{ $c.ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" $ "name" (printf "rio-%s" $c.name) "component" $c.name) | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" (printf "rio-%s" $c.name) | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ $.Values.monitoring.scrapeInterval }}
+{{- end }}
+---
+# Builders: ephemeral Jobs (one drv per pod) — no stable Service to hang
+# a ServiceMonitor off. PodMonitor scrapes pods directly by label. The
+# controller stamps rio.build/role + rio.build/pool on every executor pod
+# (reconcilers/common/sts.rs ROLE_LABEL/POOL_LABEL); matching on `pool`
+# existence covers all pools without enumerating them. portName resolves
+# against the pod's containerPort name ("metrics" → 9093, set in sts.rs).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: rio-builder
+  namespace: {{ $ns.builders.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" $ "name" "rio-builder" "component" "builder") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      rio.build/role: builder
+    matchExpressions:
+      - {key: rio.build/pool, operator: Exists}
+  podMetricsEndpoints:
+    - portName: metrics
+      interval: {{ .Values.monitoring.scrapeInterval }}
+{{- end }}

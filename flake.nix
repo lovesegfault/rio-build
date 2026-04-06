@@ -693,6 +693,16 @@
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/kind.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
+                  # monitoring-on: ServiceMonitor/PodMonitor/PrometheusRule
+                  # templates are gated and otherwise never rendered by CI.
+                  helm template rio . --set global.image.tag=test \
+                    --set monitoring.enabled=true > /tmp/monitoring.yaml
+                  for k in ServiceMonitor PodMonitor PrometheusRule; do
+                    grep -qx "kind: $k" /tmp/monitoring.yaml || {
+                      echo "FAIL: monitoring.enabled=true did not render kind: $k" >&2
+                      exit 1
+                    }
+                  done
 
                   # dash-on: all CRD kinds + third-party images present. Rendered
                   # here (before the digest-pin loop below and the Gateway API
@@ -1947,6 +1957,7 @@
                 # someone runs them outside `nix develop`.
                 awscli2
                 ssm-session-manager-plugin # cargo xtask k8s -p eks smoke — SSM tunnel to NLB
+                lsof # cargo xtask k8s rsb — reap stale tunnel listeners on :2222
                 # opentofu (not terraform: BSL license → unfree in nixpkgs)
                 # with providers bundled via withPlugins. No `tofu init`
                 # download step — providers are in the nix store, pinned by

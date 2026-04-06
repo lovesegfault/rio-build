@@ -152,6 +152,10 @@ pub struct CountingRecorder {
     // the key here captures "gauge was touched" regardless of value.
     // Used for absence-checks (leader-gate: standby must NOT set).
     gauges: Mutex<HashSet<String>>,
+    // Histogram touch-set: names only, mirroring `gauges`. For "this
+    // code path recorded into this histogram" assertions where the
+    // value is non-deterministic (elapsed time).
+    histograms: Mutex<HashSet<String>>,
 }
 
 impl CountingRecorder {
@@ -195,6 +199,13 @@ impl CountingRecorder {
     /// All gauge names seen so far (sorted). For assertion-failure
     /// diagnostics: when an absence-check fails, this shows what DID
     /// get touched.
+    /// True if any `histogram!()` invocation has been observed for `name`
+    /// (unlabeled name only). For "this code path recorded into this
+    /// histogram" assertions where the value is non-deterministic.
+    pub fn histogram_touched(&self, name: &str) -> bool {
+        self.histograms.lock().unwrap().contains(name)
+    }
+
     pub fn gauge_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.gauges.lock().unwrap().iter().cloned().collect();
         names.sort();
@@ -222,7 +233,11 @@ impl Recorder for CountingRecorder {
         self.gauges.lock().unwrap().insert(key.name().to_string());
         Gauge::noop()
     }
-    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+    fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
+        self.histograms
+            .lock()
+            .unwrap()
+            .insert(key.name().to_string());
         Histogram::noop()
     }
 }
