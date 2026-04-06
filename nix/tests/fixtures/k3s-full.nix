@@ -586,7 +586,7 @@ rec {
     # worker pod can leave Pending (~30-60s extra under TCG).
     rc, _ = k3s_server.execute(
         "k3s kubectl -n ${ns} wait --for=condition=Ready "
-        "pod/default-workers-0 --timeout=270s"
+        "pod/default-builders-0 --timeout=270s"
     )
     if rc != 0:
         print("=== worker-Ready TIMEOUT: diagnostic dump ===")
@@ -594,7 +594,7 @@ rec {
         # insufficient resource) OR CrashLoopBackOff + last-state
         # exit code + events.
         print(k3s_server.execute(
-            "k3s kubectl -n ${ns} describe pod default-workers-0 2>&1"
+            "k3s kubectl -n ${ns} describe pod default-builders-0 2>&1"
         )[1])
         # Previous container logs: the crash stderr. --previous
         # because current container may be in backoff (no logs yet).
@@ -602,8 +602,8 @@ rec {
         # no previous container).
         print("--- kubectl logs --previous ---")
         print(k3s_server.execute(
-            "k3s kubectl -n ${ns} logs default-workers-0 --previous 2>&1 "
-            "|| k3s kubectl -n ${ns} logs default-workers-0 2>&1"
+            "k3s kubectl -n ${ns} logs default-builders-0 --previous 2>&1 "
+            "|| k3s kubectl -n ${ns} logs default-builders-0 2>&1"
         )[1])
         # Device-plugin state: DS rollout + node allocatable. If
         # allocatable.smarter-devices/fuse is absent/0, the DS
@@ -633,7 +633,7 @@ rec {
         print("--- STS describe + controller logs ---")
         print(k3s_server.execute(
             "set +e; "
-            "k3s kubectl -n ${ns} describe sts default-workers 2>&1; "
+            "k3s kubectl -n ${ns} describe sts default-builders 2>&1; "
             "echo '--- BuilderPool status ---'; "
             "k3s kubectl -n ${ns} get builderpool default -o yaml 2>&1; "
             "echo '--- k3s addon events (manifest apply) ---'; "
@@ -644,7 +644,7 @@ rec {
             "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=30 2>&1; "
             "true"
         )[1])
-        raise Exception("default-workers-0 not Ready after 270s (see dump above)")
+        raise Exception("default-builders-0 not Ready after 270s (see dump above)")
 
     # ── Worker registered at scheduler ───────────────────────────────
     # Scheduler pods have no shell (minimal image). Scrape via the

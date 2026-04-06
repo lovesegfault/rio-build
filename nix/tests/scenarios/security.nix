@@ -1091,7 +1091,7 @@ in
         # must register with kubelet BEFORE the worker pod schedules —
         # otherwise resources.limits[smarter-devices/fuse] is
         # unschedulable ("Insufficient smarter-devices/fuse"). waitReady
-        # already waited for default-workers-0 Ready, which TRANSITIVELY
+        # already waited for default-builders-0 Ready, which TRANSITIVELY
         # proves the DS was up in time; this explicit check makes the
         # ordering visible in CI logs and catches a regression where the
         # worker pod Ready but the DS isn't (e.g., if privileged:true
@@ -1123,13 +1123,13 @@ in
             )
 
         # ── Worker pod security posture: non-privileged admitted ────────
-        # waitReady already proved default-workers-0 condition=Ready.
+        # waitReady already proved default-builders-0 condition=Ready.
         # Fetch the live pod spec and assert hostUsers:false + privileged
         # absent/false. If privileged:true leaked through (helm layering
         # miss, null vs false semantics), the DS check above might still
         # pass (DS runs regardless) but THIS fails — the load-bearing half.
         with subtest("nonpriv-admitted: privileged:false + device-plugin rendered and admitted"):
-            pod_json = kubectl("get pod default-workers-0 -o json")
+            pod_json = kubectl("get pod default-builders-0 -o json")
             pod = json.loads(pod_json)
 
             # hostUsers: vmtest-full-nonpriv.yaml sets hostUsers:true
@@ -1214,7 +1214,7 @@ in
             #    the remount failed (EROFS) or mkdir failed (EACCES
             #    under userns), the worker crashes BEFORE this log
             #    line → CrashLoopBackOff → we never reach this subtest.
-            log = kubectl("logs default-workers-0")
+            log = kubectl("logs default-builders-0")
             assert "moved self into leaf sub-cgroup" in log, (
                 "worker log should show 'moved self into leaf sub-"
                 "cgroup' (delegated_root() success signal). Log tail: "
@@ -1227,7 +1227,7 @@ in
             #    cri-containerd-<id>.scope/leaf. Checking on k3s-agent
             #    (where the pod scheduled — see describe Node field).
             cid = kubectl(
-                "get pod default-workers-0 "
+                "get pod default-builders-0 "
                 "-o jsonpath='{.status.containerStatuses[0].containerID}'"
             ).strip().removeprefix("containerd://")
             assert cid, "no containerID yet — pod not started?"

@@ -31,7 +31,7 @@ pub enum PgServer {
     /// Ephemeral server we bootstrapped ourselves. The child process dies
     /// when the test binary exits (PR_SET_PDEATHSIG on Linux). The tempdir
     /// lives in a static so `TempDir::drop` NEVER runs — cleanup happens
-    /// via [`gc_stale_dirs`] on the next bootstrap.
+    /// via `gc_stale_dirs` on the next bootstrap.
     Ephemeral {
         _tempdir: TempDir,
         _child: Child,

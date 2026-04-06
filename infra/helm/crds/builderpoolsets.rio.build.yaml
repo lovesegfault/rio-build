@@ -14,10 +14,10 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: '.spec.classes[*].name'
+    - jsonPath: .spec.classes[*].name
       name: Classes
       type: string
-    - jsonPath: '.metadata.creationTimestamp'
+    - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
     name: v1alpha1
@@ -26,90 +26,96 @@ spec:
         description: Auto-generated derived type for BuilderPoolSetSpec via `CustomResource`
         properties:
           spec:
-            description: |-
-              BuilderPoolSet spec. Each `classes[]` entry becomes a child
-              BuilderPool owned by this CR (ownerReference → cascade delete).
-
-              `KubeSchema` alongside `CustomResource`: same pattern as
-              BuilderPoolSpec. No CEL on this struct today, but KubeSchema
-              keeps the door open without a re-derive (CustomResource +
-              JsonSchema conflict if you later add `#[x_kube(validation)]`).
+            description: "BuilderPoolSet spec. Each `classes[]` entry becomes a child\n\
+              BuilderPool owned by this CR (ownerReference \u2192 cascade delete).\n\
+              \n`KubeSchema` alongside `CustomResource`: same pattern as\nBuilderPoolSpec.\
+              \ No CEL on this struct today, but KubeSchema\nkeeps the door open without\
+              \ a re-derive (CustomResource +\nJsonSchema conflict if you later add\
+              \ `#[x_kube(validation)]`)."
             properties:
               classes:
-                description: |-
-                  Size classes. Each becomes a child BuilderPool named
-                  `{bps-name}-{class.name}`. Order doesn't matter — the
-                  reconciler keys by `.name`, not position (spec-order
-                  churn shouldn't trigger reconciles).
+                description: "Size classes. Each becomes a child BuilderPool named\n\
+                  `{bps-name}-{class.name}`. Order doesn't matter \u2014 the\nreconciler\
+                  \ keys by `.name`, not position (spec-order\nchurn shouldn't trigger\
+                  \ reconciles)."
                 items:
-                  description: |-
-                    One size class. The scheduler's classify() maps a derivation's
-                    predicted build time to the class whose cutoff is closest-above.
+                  description: 'One size class. The scheduler''s classify() maps a
+                    derivation''s
+
+                    predicted build time to the class whose cutoff is closest-above.'
                   properties:
                     cutoffSecs:
-                      description: |-
-                        Upper bound (seconds) for builds this class handles. A
+                      description: 'Upper bound (seconds) for builds this class handles.
+                        A
+
                         build with predicted duration < cutoff_secs routes here.
+
                         f64 because build-time predictions are fractional (EMA
-                        output). The LAST class's cutoff is effectively infinity
-                        (it catches everything above the previous cutoff).
+
+                        output). The LAST class''s cutoff is effectively infinity
+
+                        (it catches everything above the previous cutoff).'
                       format: double
                       type: number
                     maxReplicas:
-                      description: |-
-                        Replica ceiling. `None` = inherit. Per-class because
-                        "large" workers have big resource requests — capping them
-                        prevents one class from starving the cluster.
+                      description: "Replica ceiling. `None` = inherit. Per-class because\n\
+                        \"large\" workers have big resource requests \u2014 capping\
+                        \ them\nprevents one class from starving the cluster."
                       format: int32
                       nullable: true
                       type: integer
                     minReplicas:
-                      description: |-
-                        Replica floor for this class's child BuilderPool. `None`
+                      description: 'Replica floor for this class''s child BuilderPool.
+                        `None`
+
                         = inherit from `pool_template` or fall through to child
-                        BuilderPool's own default. Per-class because "small" wants
+
+                        BuilderPool''s own default. Per-class because "small" wants
+
                         many warm replicas (low-latency dispatch) while "large"
+
                         tolerates scale-from-zero (builds are hours; +2min spinup
-                        is noise).
+
+                        is noise).'
                       format: int32
                       nullable: true
                       type: integer
                     name:
-                      description: |-
-                        Class name. Becomes the child BuilderPool's name suffix
+                      description: 'Class name. Becomes the child BuilderPool''s name
+                        suffix
+
                         (`{bps}-{name}`) AND the `BuilderPoolSpec.size_class` value
+
                         the scheduler matches against. Convention: "small" / "medium"
-                        / "large"; nothing enforces that.
+
+                        / "large"; nothing enforces that.'
                       type: string
                     resources:
-                      description: |-
-                        K8s resource requests/limits for this class's builder
-                        pods. NON-Option: the entire POINT of size classes is
-                        distinct resource profiles ("small" = 1cpu/2Gi; "large"
-                        = 16cpu/64Gi). An inherited default defeats the purpose.
-                        P0233's child-builder does `Some(class.resources.clone())`
-                        straight into `Option<ResourceRequirements>`.
-
-                        `any_object` passthrough — see builderpool.rs for why.
-                        The helper emits `nullable: true` (it was written for
-                        Option fields); here the field is non-Option so serde
-                        rejects `null` at deserialize regardless. Apiserver
-                        accepts `null` → controller fails deserialize with a
-                        clear error — acceptable (operators see it).
+                      description: "K8s resource requests/limits for this class's\
+                        \ builder\npods. NON-Option: the entire POINT of size classes\
+                        \ is\ndistinct resource profiles (\"small\" = 1cpu/2Gi; \"\
+                        large\"\n= 16cpu/64Gi). An inherited default defeats the purpose.\n\
+                        P0233's child-builder does `Some(class.resources.clone())`\n\
+                        straight into `Option<ResourceRequirements>`.\n\n`any_object`\
+                        \ passthrough \u2014 see builderpool.rs for why.\nThe helper\
+                        \ emits `nullable: true` (it was written for\nOption fields);\
+                        \ here the field is non-Option so serde\nrejects `null` at\
+                        \ deserialize regardless. Apiserver\naccepts `null` \u2192\
+                        \ controller fails deserialize with a\nclear error \u2014\
+                        \ acceptable (operators see it)."
                       nullable: true
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
                     targetQueuePerReplica:
                       default: 5
-                      description: |-
-                        Queued-builds-per-replica target for this class's
-                        autoscaler. `compute_desired` (P0234) scales to
-                        `queued / target`. Default 5 (one replica per 5 queued).
-                        Lower = more aggressive scaling = lower queue latency
-                        = higher pod churn. "small" class probably wants lower
-                        (fast builds → operators notice queue lag); "large"
-                        tolerates higher (hours-long builds don't care about
-                        a few extra minutes queued).
+                      description: "Queued-builds-per-replica target for this class's\n\
+                        autoscaler. `compute_desired` (P0234) scales to\n`queued /\
+                        \ target`. Default 5 (one replica per 5 queued).\nLower =\
+                        \ more aggressive scaling = lower queue latency\n= higher\
+                        \ pod churn. \"small\" class probably wants lower\n(fast builds\
+                        \ \u2192 operators notice queue lag); \"large\"\ntolerates\
+                        \ higher (hours-long builds don't care about\na few extra\
+                        \ minutes queued)."
                       format: uint32
                       minimum: 0.0
                       nullable: true
@@ -121,38 +127,41 @@ spec:
                   type: object
                 type: array
               cutoffLearning:
-                description: |-
-                  Cutoff learning config. `None` = static cutoffs (whatever
-                  `classes[].cutoff_secs` says). `Some(..)` enables the EMA
-                  rebalancer — it watches build-time histograms and shifts
-                  `status.classes[].effective_cutoff_secs` to balance queue
-                  load across classes.
+                description: "Cutoff learning config. `None` = static cutoffs (whatever\n\
+                  `classes[].cutoff_secs` says). `Some(..)` enables the EMA\nrebalancer\
+                  \ \u2014 it watches build-time histograms and shifts\n`status.classes[].effective_cutoff_secs`\
+                  \ to balance queue\nload across classes."
                 nullable: true
                 properties:
                   emaAlpha:
                     default: 0.3
-                    description: |-
-                      EMA smoothing factor. `new = alpha*obs + (1-alpha)*old`.
+                    description: 'EMA smoothing factor. `new = alpha*obs + (1-alpha)*old`.
+
                       0.3 means ~3 observation cycles to converge on a new
+
                       distribution (forgets old data in ~10 cycles). Lower =
+
                       smoother but slower to adapt; higher = responsive but
-                      can oscillate on bursty workloads.
+
+                      can oscillate on bursty workloads.'
                     format: double
                     type: number
                   enabled:
-                    description: |-
-                      Master switch. `false` = `effective_cutoff_secs` stays
+                    description: 'Master switch. `false` = `effective_cutoff_secs`
+                      stays
+
                       pinned to `spec.classes[].cutoff_secs`. Lets operators
+
                       keep the config present (for quick re-enable) without
-                      the rebalancer acting.
+
+                      the rebalancer acting.'
                     type: boolean
                   minSamples:
                     default: 100
-                    description: |-
-                      Minimum observed builds before the rebalancer acts.
-                      Below this, the sample is too small — the EMA would
-                      chase noise. 100 is a rough "one busy hour" default;
-                      cold clusters should raise this.
+                    description: "Minimum observed builds before the rebalancer acts.\n\
+                      Below this, the sample is too small \u2014 the EMA would\nchase\
+                      \ noise. 100 is a rough \"one busy hour\" default;\ncold clusters\
+                      \ should raise this."
                     format: uint64
                     minimum: 0.0
                     type: integer
@@ -160,113 +169,109 @@ spec:
                 - enabled
                 type: object
               poolTemplate:
-                description: |-
-                  Template merged into each child BuilderPool's spec. Per-
+                description: 'Template merged into each child BuilderPool''s spec.
+                  Per-
+
                   class fields (resources, cutoff) override; template fields
-                  (image, node_selector, seccomp) apply uniformly.
+
+                  (image, node_selector, seccomp) apply uniformly.'
                 properties:
                   features:
                     default: []
-                    description: |-
-                      requiredSystemFeatures this pool advertises. Shared
-                      across classes for the same reason as `systems`.
+                    description: 'requiredSystemFeatures this pool advertises. Shared
+
+                      across classes for the same reason as `systems`.'
                     items:
                       type: string
                     type: array
                   hostNetwork:
-                    description: |-
-                      Host network. Shared — if one class needs hostNetwork
-                      (e.g., bare-metal with NAR-heavy store traffic), all do.
+                    description: "Host network. Shared \u2014 if one class needs hostNetwork\n\
+                      (e.g., bare-metal with NAR-heavy store traffic), all do."
                     nullable: true
                     type: boolean
                   hostUsers:
-                    description: |-
-                      Explicit hostUsers override. Shared — cluster runtime cgroup
-                      delegation behavior (containerd OwnerUID under userns) is
-                      the same for all class pods. See `BuilderPoolSpec.host_users`.
+                    description: "Explicit hostUsers override. Shared \u2014 cluster\
+                      \ runtime cgroup\ndelegation behavior (containerd OwnerUID under\
+                      \ userns) is\nthe same for all class pods. See `BuilderPoolSpec.host_users`."
                     nullable: true
                     type: boolean
                   image:
-                    description: |-
-                      Container image. Shared across classes — same builder
-                      binary, different resource allocations. REQUIRED —
-                      `BuilderPoolSpec.image` has no default. The reconciler's
-                      child builder errors with `InvalidSpec` if this is empty.
+                    description: "Container image. Shared across classes \u2014 same\
+                      \ builder\nbinary, different resource allocations. REQUIRED\
+                      \ \u2014\n`BuilderPoolSpec.image` has no default. The reconciler's\n\
+                      child builder errors with `InvalidSpec` if this is empty."
                     type: string
                   nodeSelector:
                     additionalProperties:
                       type: string
-                    description: |-
-                      Node selector. Shared because builder nodes are usually
+                    description: 'Node selector. Shared because builder nodes are
+                      usually
+
                       tainted/labeled uniformly (`rio.build/builder: "true"`),
-                      not per-class.
+
+                      not per-class.'
                     nullable: true
                     type: object
                   privileged:
-                    description: |-
-                      Privileged escape hatch. Shared — cluster runtime
-                      constraints (containerd seccomp blocking mount(2)) are
-                      the same for all class pods on a given node pool.
+                    description: "Privileged escape hatch. Shared \u2014 cluster runtime\n\
+                      constraints (containerd seccomp blocking mount(2)) are\nthe\
+                      \ same for all class pods on a given node pool."
                     nullable: true
                     type: boolean
                   seccompProfile:
-                    description: |-
-                      Seccomp profile (P0223). Applied uniformly — the syscall
-                      filter doesn't vary by builder size. The Localhost profile
-                      (`infra/helm/rio-build/files/seccomp-rio-builder.json`)
-                      denies ptrace/bpf/setns/process_vm_* regardless of how
-                      big the builder is.
+                    description: "Seccomp profile (P0223). Applied uniformly \u2014\
+                      \ the syscall\nfilter doesn't vary by builder size. The Localhost\
+                      \ profile\n(`infra/helm/rio-build/files/seccomp-rio-builder.json`)\n\
+                      denies ptrace/bpf/setns/process_vm_* regardless of how\nbig\
+                      \ the builder is."
                     nullable: true
                     properties:
                       localhostProfile:
-                        description: |-
-                          Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
-                          `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
-                          rio's profile is `rio-builder.json` — install the file at
-                          `/var/lib/kubelet/seccomp/rio-builder.json` on every node
-                          BEFORE applying the BuilderPool, or the pod fails
-                          CreateContainerError.
+                        description: "Path relative to `/var/lib/kubelet/seccomp/`.\
+                          \ REQUIRED when\n`type: Localhost`, FORBIDDEN otherwise\
+                          \ (CEL enforces both).\nrio's profile is `rio-builder.json`\
+                          \ \u2014 install the file at\n`/var/lib/kubelet/seccomp/rio-builder.json`\
+                          \ on every node\nBEFORE applying the BuilderPool, or the\
+                          \ pod fails\nCreateContainerError."
                         nullable: true
                         type: string
                       type:
-                        description: |-
-                          `RuntimeDefault` — the runtime's default filter (~40 syscalls
-                          blocked). `Localhost` — a profile JSON at `/var/lib/kubelet/
-                          seccomp/<localhostProfile>` on the node; rio ships one at
-                          `infra/helm/rio-build/files/seccomp-rio-builder.json` that
-                          additionally denies ptrace/bpf/setns/process_vm_*.
-                          `Unconfined` — no filter (debugging ONLY; never production).
-
-                          `type_` with serde rename: `type` is a Rust keyword. K8s
-                          convention is the field is literally `type` in YAML.
+                        description: "`RuntimeDefault` \u2014 the runtime's default\
+                          \ filter (~40 syscalls\nblocked). `Localhost` \u2014 a profile\
+                          \ JSON at `/var/lib/kubelet/\nseccomp/<localhostProfile>`\
+                          \ on the node; rio ships one at\n`infra/helm/rio-build/files/seccomp-rio-builder.json`\
+                          \ that\nadditionally denies ptrace/bpf/setns/process_vm_*.\n\
+                          `Unconfined` \u2014 no filter (debugging ONLY; never production).\n\
+                          \n`type_` with serde rename: `type` is a Rust keyword. K8s\n\
+                          convention is the field is literally `type` in YAML."
                         type: string
                     required:
                     - type
                     type: object
                     x-kubernetes-validations:
                     - rule: self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']
-                    - rule: 'self.type == ''Localhost'' ? has(self.localhostProfile) : !has(self.localhostProfile)'
+                    - rule: 'self.type == ''Localhost'' ? has(self.localhostProfile)
+                        : !has(self.localhostProfile)'
                   systems:
-                    description: |-
-                      Target systems (e.g., `["x86_64-linux"]`). Shared across
-                      classes — all size classes in one BPS run the same binary
-                      on the same arch; separate arches warrant separate BPSes.
-                      REQUIRED — child BuilderPool CEL rejects empty `systems[]`.
+                    description: "Target systems (e.g., `[\"x86_64-linux\"]`). Shared\
+                      \ across\nclasses \u2014 all size classes in one BPS run the\
+                      \ same binary\non the same arch; separate arches warrant separate\
+                      \ BPSes.\nREQUIRED \u2014 child BuilderPool CEL rejects empty\
+                      \ `systems[]`."
                     items:
                       type: string
                     type: array
                   tlsSecretName:
-                    description: |-
-                      mTLS client cert Secret name. Shared — same cert-manager
-                      Certificate across all builder pods regardless of size.
+                    description: "mTLS client cert Secret name. Shared \u2014 same\
+                      \ cert-manager\nCertificate across all builder pods regardless\
+                      \ of size."
                     nullable: true
                     type: string
                   tolerations:
-                    description: |-
-                      Tolerations. Shared — pairs with node_selector.
-                      Typed `Toleration` (not serde_json::Value) to match
-                      builderpool.rs; `any_object_array` passthrough because
-                      k8s-openapi types don't impl JsonSchema.
+                    description: "Tolerations. Shared \u2014 pairs with node_selector.\n\
+                      Typed `Toleration` (not serde_json::Value) to match\nbuilderpool.rs;\
+                      \ `any_object_array` passthrough because\nk8s-openapi types\
+                      \ don't impl JsonSchema."
                     items:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
@@ -281,63 +286,65 @@ spec:
             - poolTemplate
             type: object
           status:
-            description: |-
-              BuilderPoolSet status. Reconciler writes; `kubectl get bps`
-              reads.
+            description: 'BuilderPoolSet status. Reconciler writes; `kubectl get bps`
+
+              reads.'
             nullable: true
             properties:
               classes:
                 default: []
-                description: |-
-                  Per-class observed state. One entry per `spec.classes[]`,
-                  matched by `.name`. A missing entry = reconciler hasn't
-                  processed that class yet (transient) or the child
-                  BuilderPool create failed (check .conditions on the BPS
-                  — P0233 adds those).
+                description: "Per-class observed state. One entry per `spec.classes[]`,\n\
+                  matched by `.name`. A missing entry = reconciler hasn't\nprocessed\
+                  \ that class yet (transient) or the child\nBuilderPool create failed\
+                  \ (check .conditions on the BPS\n\u2014 P0233 adds those)."
                 items:
-                  description: |-
-                    One class's observed state. Mirrors the child BuilderPool's
-                    status plus BPS-level derived fields (effective cutoff).
+                  description: 'One class''s observed state. Mirrors the child BuilderPool''s
+
+                    status plus BPS-level derived fields (effective cutoff).'
                   properties:
                     childPool:
-                      description: |-
-                        Name of the owned child BuilderPool (`{bps}-{name}`).
+                      description: 'Name of the owned child BuilderPool (`{bps}-{name}`).
+
                         Stored explicitly (not just derivable) so `kubectl get
+
                         bps -o yaml` shows the link without operators having to
-                        know the naming convention.
+
+                        know the naming convention.'
                       type: string
                     effectiveCutoffSecs:
-                      description: |-
-                        The cutoff the scheduler ACTUALLY uses right now. Equals
+                      description: 'The cutoff the scheduler ACTUALLY uses right now.
+                        Equals
+
                         `spec.classes[].cutoff_secs` when learning is off; drifts
+
                         toward observed build-time percentiles when on. This (not
-                        the spec value) is what the scheduler's classify() reads.
+
+                        the spec value) is what the scheduler''s classify() reads.'
                       format: double
                       type: number
                     name:
                       description: Matches `spec.classes[].name`.
                       type: string
                     queued:
-                      description: |-
-                        Builds currently queued for this class. From scheduler
-                        `ClusterStatus.queued_derivations` filtered by size_class.
-                        The autoscaler input — `queued / target_queue_per_replica`
-                        is the desired-replica formula.
+                      description: "Builds currently queued for this class. From scheduler\n\
+                        `ClusterStatus.queued_derivations` filtered by size_class.\n\
+                        The autoscaler input \u2014 `queued / target_queue_per_replica`\n\
+                        is the desired-replica formula."
                       format: uint64
                       minimum: 0.0
                       type: integer
                     readyReplicas:
-                      description: |-
-                        Child BuilderPool's `.status.readyReplicas`. Passed
-                        readinessProbe = heartbeating to scheduler. THIS is
-                        the operator signal — Ready/Desired gap diagnoses
-                        stuck rollouts (matches builderpool.rs printcolumns).
+                      description: "Child BuilderPool's `.status.readyReplicas`. Passed\n\
+                        readinessProbe = heartbeating to scheduler. THIS is\nthe operator\
+                        \ signal \u2014 Ready/Desired gap diagnoses\nstuck rollouts\
+                        \ (matches builderpool.rs printcolumns)."
                       format: int32
                       type: integer
                     replicas:
-                      description: |-
-                        Child BuilderPool's `.status.replicas` (observed). May
-                        lag `ready_replicas` during rollout.
+                      description: 'Child BuilderPool''s `.status.replicas` (observed).
+                        May
+
+                        lag `ready_replicas` during rollout.'
                       format: int32
                       type: integer
                   required:

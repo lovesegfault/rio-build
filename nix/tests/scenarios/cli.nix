@@ -83,22 +83,22 @@ pkgs.testers.runNixOSTest {
     # status — ClusterStatus + ListWorkers + ListBuilds
     # ══════════════════════════════════════════════════════════════════
     # The three AdminService RPCs fire in sequence (main.rs:131-170).
-    # print_status formats as "workers: N total, ...". At least one
-    # worker pod (default-workers-0) should be registered by now —
+    # print_status formats as "executors: N total, ...". At least one
+    # builder pod (default-builders-0) should be registered by now —
     # waitReady blocks until it's Ready.
-    with subtest("cli status: ClusterStatus shows workers"):
+    with subtest("cli status: ClusterStatus shows executors"):
         out = cli("status")
         print(f"cli status output:\n{out}")
-        # print_status line 191: "workers: {total} total, {active} active, ..."
-        assert "workers:" in out, (
-            f"status output should contain 'workers:' summary line:\n{out!r}"
+        # print_status line 97: "executors: {total} total, {active} active, ..."
+        assert "executors:" in out, (
+            f"status output should contain 'executors:' summary line:\n{out!r}"
         )
-        # Should report ≥1 total workers (default-workers-0 is up).
-        # Parse the total count from "workers: N total".
+        # Should report ≥1 total executors (default-builders-0 is up).
+        # Parse the total count from "executors: N total".
         import re
-        m = re.search(r'workers:\s+(\d+)\s+total', out)
+        m = re.search(r'executors:\s+(\d+)\s+total', out)
         assert m and int(m.group(1)) >= 1, (
-            f"expected ≥1 worker in status summary:\n{out!r}"
+            f"expected ≥1 executor in status summary:\n{out!r}"
         )
         # ListWorkers detail line (main.rs:143): "  worker <id> [<status>] ..."
         assert "  worker " in out, (
@@ -135,14 +135,14 @@ pkgs.testers.runNixOSTest {
     with subtest("cli workers: detailed view + --json is valid"):
         # Human output: print_worker multi-line format, "worker <id> [<status>]"
         # on line 1. Same ≥1-worker invariant as status — waitReady
-        # guarantees default-workers-0 registered.
+        # guarantees default-builders-0 registered.
         out = cli("workers")
         print(f"cli workers output:\n{out}")
         assert "worker " in out and "[" in out, (
             f"workers should print per-worker blocks:\n{out!r}"
         )
 
-        # --json: jq -e '.workers | length >= 1' exits nonzero if the
+        # --json: jq -e '.executors | length >= 1' exits nonzero if the
         # key is absent, not an array, or empty. Store-path jq pulls
         # it into the VM closure (same trick as netcat above).
         k3s_server.succeed(
@@ -150,7 +150,7 @@ pkgs.testers.runNixOSTest {
             "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             "${rioCli} workers --json "
-            "| ${pkgs.jq}/bin/jq -e '.workers | length >= 1'"
+            "| ${pkgs.jq}/bin/jq -e '.executors | length >= 1'"
         )
 
     # ══════════════════════════════════════════════════════════════════
@@ -211,7 +211,7 @@ pkgs.testers.runNixOSTest {
     # would be InvalidArgument, but a well-formed-but-unknown hash is
     # fine — the spec explicitly says so.)
     with subtest("cli poison-clear: idempotent on unknown hash"):
-        fake_hash = "0" * 64
+        fake_hash = "/nix/store/" + "0" * 32 + "-nothing.drv"
         out = cli(f"poison-clear {fake_hash}")
         print(f"cli poison-clear output:\n{out}")
         assert "not poisoned" in out, (

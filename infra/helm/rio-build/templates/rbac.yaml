@@ -84,12 +84,12 @@ rules:
   # Full lifecycle. `update` for finalizer add/remove (finalizer() patches
   # metadata.finalizers).
   - apiGroups: [rio.build]
-    resources: [workerpools]
+    resources: [builderpools]
     verbs: [get, list, watch, create, update, patch, delete]
   # Status subresource = separate permission. Never GET /status separately
   # (it's in the main GET).
   - apiGroups: [rio.build]
-    resources: [workerpools/status]
+    resources: [builderpools/status]
     verbs: [get, patch]
   # /finalizers subresource: OwnerReferencesPermissionEnforcement
   # admission plugin checks `update` on `<owner>/finalizers` when
@@ -97,9 +97,9 @@ rules:
   # controller_owner_ref sets on StatefulSet/Service/PDB/Job).
   # Without this verb, child creates fail with "cannot set
   # blockOwnerDeletion ... not permitted to update the owner
-  # resource." Mirrors the workerpoolsets/finalizers rule below.
+  # resource." Mirrors the builderpoolsets/finalizers rule below.
   - apiGroups: [rio.build]
-    resources: [workerpools/finalizers]
+    resources: [builderpools/finalizers]
     verbs: [update]
   # BuilderPoolSet: aggregating CRD — one WPS spawns one child BuilderPool
   # per size class. Reconciler watches WPS, SSA-applies child WPs, refreshes
@@ -108,12 +108,12 @@ rules:
   # and status (below). Child BuilderPool lifecycle is covered by the rule
   # above.
   - apiGroups: [rio.build]
-    resources: [workerpoolsets]
+    resources: [builderpoolsets]
     verbs: [get, list, watch, patch, update]
   # Per-class status (effective_cutoff_secs + queued from scheduler's
   # GetSizeClassStatus, joined with observed child WP replicas).
   - apiGroups: [rio.build]
-    resources: [workerpoolsets/status]
+    resources: [builderpoolsets/status]
     verbs: [get, patch, update]
   # /finalizers subresource: OwnerReferencesPermissionEnforcement
   # admission plugin checks `update` on `<owner>/finalizers` when
@@ -123,10 +123,10 @@ rules:
   # update the owner resource" — NOT a finalizer() helper concern
   # (that uses JSON-patch on the main resource).
   - apiGroups: [rio.build]
-    resources: [workerpoolsets/finalizers]
+    resources: [builderpoolsets/finalizers]
     verbs: [update]
   # FetcherPool: ADR-019 FOD-only executor pods. Same lifecycle verbs as
-  # workerpools — the reconciler SSA-applies StatefulSets into the
+  # builderpools — the reconciler SSA-applies StatefulSets into the
   # rio-fetchers namespace (the ClusterRoleBinding below grants this
   # cluster-wide, so no per-namespace RoleBinding needed; the controller
   # SA in rio-system can manage STS in rio-builders AND rio-fetchers via

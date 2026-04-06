@@ -232,6 +232,14 @@ in
         worker = {
           maxBuilds = 1;
         };
+        # P0452 hard-split: FODs only dispatch to fetchers. The cold
+        # DAG includes a busybox FOD + non-FOD consumer — needs both
+        # kinds or hard_filter never matches and the build hangs
+        # until globalTimeout.
+        fetcher = {
+          maxBuilds = 1;
+          extraServiceEnv.RIO_EXECUTOR_KIND = "fetcher";
+        };
       };
       # Python http.server on :8000 serving the pre-fetched busybox.
       # cold-bootstrap.nix's url is overridden to http://client:8000/
@@ -473,7 +481,7 @@ in
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
       # r[verify ctrl.drain.disruption-target]
-      #   LAST: evicts default-workers-0 (STS recreates it ~120s later,
+      #   LAST: evicts default-builders-0 (STS recreates it ~120s later,
       #   but core has no subsequent subtests needing a ready worker).
       #   Proves the watcher (disruption.rs) fires DrainWorker{force=
       #   true} — before P0285, force=true had ZERO prod callers.

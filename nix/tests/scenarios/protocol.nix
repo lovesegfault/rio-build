@@ -126,10 +126,12 @@ let
         parsed = _json.loads(info)
         assert parsed[out]["narSize"] > 0, f"narSize=0 for {out!r}: {info}"
 
-    with subtest("metric accounting (per-submit vs per-dispatch)"):
+    with subtest("metric accounting (per-submit vs per-dispatch + FOD routing)"):
         # scheduler_builds_total is per-SubmitBuild RPC: one submit,
-        # one count — the whole DAG succeeded. worker_builds_total is
-        # per-derivation-dispatched: FOD + consumer = 2.
+        # one count — the whole DAG succeeded. builder_builds_total is
+        # per-derivation-dispatched. P0452 hard-split routes the FOD
+        # to the fetcher and the consumer to the builder — 1 each.
+        # r[verify sched.dispatch.fod-to-fetcher]
         assert_metric_exact(
             ${gatewayHost}, 9091,
             "rio_scheduler_builds_total", 1.0,
@@ -137,7 +139,12 @@ let
         )
         assert_metric_exact(
             worker, 9093,
-            "rio_builder_builds_total", 2.0,
+            "rio_builder_builds_total", 1.0,
+            labels='{outcome="success"}',
+        )
+        assert_metric_exact(
+            fetcher, 9093,
+            "rio_builder_builds_total", 1.0,
             labels='{outcome="success"}',
         )
   '';

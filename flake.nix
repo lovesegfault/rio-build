@@ -470,7 +470,7 @@
             # conformance tests (nix-store --dump, nix-instantiate),
             # openssh for rio-gateway SSH accept tests.
             runtimeTestInputs = with pkgs; [
-              inputs.nix.packages.${system}.nix-cli
+              inputs.nix.packages.${system}.nix
               openssh
               postgresql_18
             ];
@@ -1273,7 +1273,7 @@
                 cmake
                 # Test-time deps (baseline run hits the whole workspace).
                 # Same set as crateChecks' runtimeTestInputs.
-                inputs.nix.packages.${system}.nix-cli
+                inputs.nix.packages.${system}.nix
                 openssh
                 postgresql_18
               ];
