@@ -6,17 +6,19 @@
 //! `executor::execute_build` with ACK + CompletionReport + panic-catcher.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::time::Duration;
 
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    CompletionReport, HeartbeatRequest, PrefetchHint, WorkAssignment, WorkAssignmentAck,
-    WorkerMessage, worker_message,
+    CompletionReport, HeartbeatRequest, PrefetchHint, ProgressUpdate, ResourceUsage,
+    WorkAssignment, WorkAssignmentAck, WorkerMessage, worker_message,
 };
 
 use tracing::{Instrument, instrument};
@@ -274,6 +276,101 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
     }
 }
 
+/// Proactive-ema resource tick interval. 10s matches HEARTBEAT_INTERVAL
+/// — frequent enough that a build trending toward OOM is noticed within
+/// one tick, coarse enough that the WorkerMessage stream isn't flooded
+/// (a 30-min build = 180 messages, dwarfed by log batches).
+const RESOURCE_TICK: Duration = Duration::from_secs(10);
+
+/// Wrap a build future with a 10s resource tick: samples the per-build
+/// cgroup's `memory.peak` and emits `ProgressUpdate{resources}` to the
+/// scheduler. Proactive ema — scheduler updates `ema_peak_memory_bytes`
+/// BEFORE completion so the NEXT submit of that drv is right-sized
+/// immediately, instead of after a full OOM→retry cycle.
+///
+/// `r[sched.preempt.never-running]` stands: this NEVER kills. The
+/// scheduler's response to these samples is to update an ema, not
+/// to cancel. A build trending toward OOM still OOMs — but the
+/// retry gets a bigger worker on the first attempt.
+///
+/// `memory.peak` is kernel-tracked cumulative-max: monotone, exact,
+/// zero-polling-overhead (kernel updates on every alloc). Reading it
+/// mid-build gives "peak so far" — exactly what the ema update wants.
+/// The cgroup may not exist yet (executor creates it after spawning
+/// the daemon); ENOENT → skip the tick, try again next interval.
+///
+/// Generic over the future's output so tests can pass a simple
+/// `sleep(35s)` instead of mocking all of `execute_build`.
+async fn run_with_resource_tick<F, T>(
+    build: F,
+    cgroup_path: &Path,
+    drv_path: &str,
+    tx: &mpsc::Sender<WorkerMessage>,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    // pin! not Box::pin: the future is stack-local, no heap needed.
+    // The select! arm re-borrows &mut on each iteration.
+    let mut build = std::pin::pin!(build);
+
+    // interval_at(now + period) so the first tick is at t=10s, not
+    // t=0. A t=0 tick would sample before the cgroup exists (executor
+    // creates it post-daemon-spawn) — harmless (skip-on-ENOENT) but
+    // noise. Delay-on-missed: under load, don't burst-emit stale
+    // samples; one tick per period is the contract.
+    let start = tokio::time::Instant::now() + RESOURCE_TICK;
+    let mut tick = tokio::time::interval_at(start, RESOURCE_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let peak_file = cgroup_path.join("memory.peak");
+    loop {
+        tokio::select! {
+            // biased: poll the build first. If the build completed in
+            // the same wakeup that the tick fired, we want to break
+            // and send CompletionReport (which carries the FINAL
+            // memory.peak), not emit a redundant mid-build sample.
+            biased;
+            result = &mut build => break result,
+            _ = tick.tick() => {
+                // Inline read_single_u64 — it's crate-private in cgroup.rs
+                // and it's one line. memory.peak format: "12345\n".
+                // ENOENT (cgroup not created yet) / parse-fail → None →
+                // skip. The cgroup appears mid-build; first few ticks
+                // may be skipped on a slow daemon-spawn.
+                let Some(peak) = std::fs::read_to_string(&peak_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                // Only memory_used_bytes populated — that's the ema
+                // input. cpu_fraction would need delta-polling (two
+                // reads + elapsed); not worth it for proactive-ema
+                // (scheduler tracks ema_peak_memory_bytes, not CPU).
+                // Everything else ..Default = 0 = "not sampled."
+                //
+                // try_send: if the stream is backpressured (log batch
+                // flood during a chatty build), drop the sample. Same
+                // policy as ForwardLogBatch — this is advisory. Next
+                // tick re-samples memory.peak (monotone, so no info
+                // lost). send().await would block the select loop →
+                // the BUILD future wouldn't be polled → build stalls.
+                let _ = tx.try_send(WorkerMessage {
+                    msg: Some(worker_message::Msg::Progress(ProgressUpdate {
+                        drv_path: drv_path.to_string(),
+                        resources: Some(ResourceUsage {
+                            memory_used_bytes: peak,
+                            ..Default::default()
+                        }),
+                        build_phase: String::new(),
+                    })),
+                });
+            }
+        }
+    }
+}
+
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
 /// a panic-catcher.
 ///
@@ -321,6 +418,9 @@ pub async fn spawn_build_task(
     let build_id = executor::sanitize_build_id(&drv_path);
     let cgroup_path = ctx.cgroup_parent.join(&build_id);
     let cancelled = Arc::new(AtomicBool::new(false));
+    // Cloned for the resource tick sampler before moving into the
+    // cancel registry. Same deterministic path execute_build creates.
+    let build_cgroup_path = cgroup_path.clone();
     ctx.cancel_registry
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -378,12 +478,20 @@ pub async fn spawn_build_task(
             }
         });
 
-        let result = executor::execute_build(
-            &assignment,
-            &build_env,
-            &mut build_store_client,
+        // Proactive-ema wrap: 10s memory.peak samples flow to the
+        // scheduler while the build runs. execute_build is the polled
+        // future; run_with_resource_tick drives the select! loop.
+        let result = run_with_resource_tick(
+            executor::execute_build(
+                &assignment,
+                &build_env,
+                &mut build_store_client,
+                &build_tx,
+                &build_leaked_mounts,
+            ),
+            &build_cgroup_path,
+            &build_drv_path,
             &build_tx,
-            &build_leaked_mounts,
         )
         .await;
 
@@ -908,6 +1016,134 @@ mod tests {
             snapshot.maybe_contains("/nix/store/persistent-path"),
             "bloom should include paths from previous run's SQLite"
         );
+    }
+}
+
+#[cfg(test)]
+mod resource_tick_tests {
+    use super::*;
+
+    /// Extract memory_used_bytes from Progress messages; filter the rest.
+    fn progress_peaks(rx: &mut mpsc::Receiver<WorkerMessage>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Some(worker_message::Msg::Progress(p)) = m.msg {
+                out.push(p.resources.map(|r| r.memory_used_bytes).unwrap_or(0));
+            }
+        }
+        out
+    }
+
+    /// start_paused = true: tokio's clock is frozen. Time advances
+    /// only when all tasks are idle (auto-advance). A 35s sleep as
+    /// the "build" + a 10s tick → ticks fire at t=10, t=20, t=30;
+    /// the build completes at t=35 before t=40 fires. 3 samples.
+    ///
+    /// Auto-advance drives this without manual `advance()` calls:
+    /// select! polls both arms, both pending → runtime auto-advances
+    /// to the nearest timer (t=10 tick), tick fires, loop, repeat.
+    /// The blocking fs::read_to_string is tmpfs (microseconds), not
+    /// enough to confuse paused-time.
+    #[tokio::test(start_paused = true)]
+    async fn resource_usage_emitted_every_10s() {
+        let cgroup = tempfile::tempdir().unwrap();
+        // memory.peak exists from t=0 in this test (real executor
+        // creates it mid-build — cgroup_missing_skips_tick covers that).
+        std::fs::write(cgroup.path().join("memory.peak"), "4096\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let build = tokio::time::sleep(Duration::from_secs(35));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/test.drv", &tx).await;
+
+        let peaks = progress_peaks(&mut rx);
+        assert_eq!(
+            peaks.len(),
+            3,
+            "35s build / 10s tick → samples at t=10,20,30 (t=40 never fires)"
+        );
+        assert!(
+            peaks.iter().all(|&p| p == 4096),
+            "all samples read the 4096 fixture: {peaks:?}"
+        );
+    }
+
+    /// Build shorter than one tick → zero emissions. Exercises the
+    /// `biased; build-first` ordering: even if the build completes
+    /// at an instant where auto-advance COULD fire the tick, the
+    /// build arm wins and we break.
+    #[tokio::test(start_paused = true)]
+    async fn short_build_emits_nothing() {
+        let cgroup = tempfile::tempdir().unwrap();
+        std::fs::write(cgroup.path().join("memory.peak"), "999\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        // 5s < 10s first tick.
+        let build = tokio::time::sleep(Duration::from_secs(5));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/fast.drv", &tx).await;
+
+        assert!(
+            progress_peaks(&mut rx).is_empty(),
+            "sub-10s build → interval_at(now+10s) never fires"
+        );
+    }
+
+    /// cgroup doesn't exist yet (executor creates it post-daemon-spawn).
+    /// Ticks still fire on schedule; ENOENT → skip, no message. When
+    /// memory.peak appears mid-build, later ticks emit.
+    #[tokio::test(start_paused = true)]
+    async fn cgroup_missing_skips_tick() {
+        let cgroup = tempfile::tempdir().unwrap();
+        // memory.peak NOT written — ENOENT on every tick.
+        let (tx, mut rx) = mpsc::channel(16);
+        let build = tokio::time::sleep(Duration::from_secs(25));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/test.drv", &tx).await;
+
+        assert!(
+            progress_peaks(&mut rx).is_empty(),
+            "ENOENT on memory.peak → skip every tick, never emit"
+        );
+    }
+
+    /// The wrapped future's output is returned unchanged. Proves the
+    /// select! break-arm plumbs through without eating the result.
+    #[tokio::test(start_paused = true)]
+    async fn build_result_passes_through() {
+        let cgroup = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+
+        let build = async {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            42u64
+        };
+
+        let result = run_with_resource_tick(build, cgroup.path(), "/nix/store/x.drv", &tx).await;
+        assert_eq!(result, 42, "select! break arm returns the build's output");
+    }
+
+    /// drv_path is plumbed into the emitted ProgressUpdate — scheduler
+    /// needs this to key the ema update by derivation hash.
+    #[tokio::test(start_paused = true)]
+    async fn drv_path_populated() {
+        let cgroup = tempfile::tempdir().unwrap();
+        std::fs::write(cgroup.path().join("memory.peak"), "1\n").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let build = tokio::time::sleep(Duration::from_secs(12));
+
+        run_with_resource_tick(build, cgroup.path(), "/nix/store/abc-foo.drv", &tx).await;
+
+        let msg = rx.try_recv().expect("one tick at t=10");
+        let Some(worker_message::Msg::Progress(p)) = msg.msg else {
+            panic!("expected Progress, got {msg:?}");
+        };
+        assert_eq!(p.drv_path, "/nix/store/abc-foo.drv");
+        // Precondition self-assert: resources IS Some. If the impl
+        // ever regresses to Default::default() on the whole message,
+        // this catches it before the scheduler-side P0266 test does.
+        assert!(p.resources.is_some(), "resources must be populated");
     }
 }
 
