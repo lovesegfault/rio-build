@@ -51,6 +51,12 @@ in
   extraSchedulerConfig ? { },
   extraStoreConfig ? { },
   extraPackages ? [ ],
+  # Gateway-only env (figment RIO_FOO__BAR=... style). substitute.nix
+  # uses this to set RIO_JWT__KEY_PATH for the gateway's signing seed
+  # without also applying it to store/scheduler (extraServiceEnv goes
+  # to all three, which would conflict — store wants the PUBKEY path,
+  # gateway wants the SEED path, same env var name).
+  extraGatewayEnv ? { },
   # NixOS modules merged into the client VM. protocol-cold uses this
   # for drvs.coldBootstrapServer (Python http.server serving busybox).
   extraClientModules ? [ ],
@@ -148,11 +154,15 @@ let
       otelModule
     ];
     systemd.services = {
-      # Gateway CN override. mkControlNode's extraServiceEnv applies
-      # controlTlsEnv to ALL three services (including gateway). NixOS
-      # module merge of two string values for the same key → conflict.
-      # mapAttrs mkForce makes the gateway cert paths win unambiguously.
-      rio-gateway.environment = lib.mkIf withPki (lib.mapAttrs (_: lib.mkForce) gatewayTlsEnv);
+      # Gateway CN override + gateway-only env. mkControlNode's
+      # extraServiceEnv applies controlTlsEnv to ALL three services
+      # (including gateway). NixOS module merge of two string values
+      # for the same key → conflict. mapAttrs mkForce makes the gateway
+      # cert paths win unambiguously. extraGatewayEnv merges alongside
+      # (no mkForce — it's gateway-only, no conflict with
+      # extraServiceEnv's shared keys).
+      rio-gateway.environment =
+        (lib.optionalAttrs withPki (lib.mapAttrs (_: lib.mkForce) gatewayTlsEnv)) // extraGatewayEnv;
 
       # Serialize migration runs — migration 011's CREATE INDEX
       # CONCURRENTLY deadlocks with sqlx's pg_advisory_lock when store

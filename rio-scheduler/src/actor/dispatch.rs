@@ -896,6 +896,7 @@ impl DagActor {
             &drv_path,
             FETCH_TIMEOUT,
             MAX_DRV_NAR_SIZE,
+            &[],
         )
         .await;
 

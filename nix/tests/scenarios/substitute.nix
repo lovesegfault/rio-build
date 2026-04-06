@@ -4,17 +4,18 @@
 # fetch → sig-verify → CAS ingest → narinfo row. Plus sig_mode handling
 # and cross-tenant visibility.
 #
-# ── WHY grpcurl, not ssh-ng ────────────────────────────────────────────
-# The gateway's wopQueryMissing/wopQueryPathInfo handlers wire the
-# RESPONSE (substitutable_paths → willSubstitute, P0463 commit 41deb033)
-# but do NOT propagate x-rio-tenant-token to store_client. Only
-# handler/build.rs (SubmitBuild) adds the JWT header. Without tenant_id
-# at the store, try_substitute_on_miss short-circuits → no substitution.
-# TODO(P0465): wire JWT propagation into gateway read-opcode handlers.
+# ── Dual approach: grpcurl + ssh-ng ────────────────────────────────────
+# substitute-ssh-ng: the REAL protocol path — ssh-ng → gateway →
+# wopQueryPathInfo → store. P0465 wired JWT propagation through
+# opcodes_read.rs so the session JWT reaches the store's
+# try_substitute_on_miss. Before P0465, only build.rs (SubmitBuild)
+# attached the JWT; read-opcodes saw anonymous → substitution skipped.
 #
-# Until then: hit the store's gRPC directly with a self-signed JWT (the
-# jwt-keys.nix test keypair). Same Substituter codepath as the gateway
-# would exercise, minus the ssh-ng → gateway → gRPC hop.
+# substitute-{cold-fetch,sig-mode-add,cross-tenant-gate}: grpcurl with
+# self-signed JWTs for MULTI-TENANT scenarios (three tenants, three
+# trust configs). ssh-ng would need per-tenant SSH keys + authorized_keys
+# gymnastics; grpcurl is the sharper tool for store-side tenant-gate
+# assertions. Same Substituter codepath, tighter test surface.
 #
 # ── Fake upstream mechanics ────────────────────────────────────────────
 # Generated at VM RUNTIME on the client node using Nix's own tooling:
@@ -146,10 +147,10 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # Tenant + JWT setup
     # ══════════════════════════════════════════════════════════════════
-    # Three tenants for the cross-tenant gate subtest. Direct psql()
-    # (from common.assertions) — rio-cli create-tenant goes through
-    # the scheduler's AdminService which we don't need here (pure
-    # store-side test).
+    # Three tenants for the cross-tenant gate subtest, plus one for the
+    # ssh-ng end-to-end path. Direct psql() (from common.assertions) —
+    # rio-cli create-tenant goes through the scheduler's AdminService
+    # which we don't need here (pure store-side test).
     def mk_tenant(name):
         return psql(
             ${gatewayHost},
@@ -159,7 +160,8 @@ pkgs.testers.runNixOSTest {
     tid_a = mk_tenant("sub-tenant-a")  # trusts test-cache-1, sig_mode=keep
     tid_b = mk_tenant("sub-tenant-b")  # trusts test-cache-1 (cross-tenant)
     tid_c = mk_tenant("sub-tenant-c")  # trusts WRONG key → gated out
-    print(f"substitute: tenants A={tid_a} B={tid_b} C={tid_c}")
+    tid_ssh = mk_tenant("sub-tenant-ssh")  # ssh-ng end-to-end path
+    print(f"substitute: tenants A={tid_a} B={tid_b} C={tid_c} ssh={tid_ssh}")
 
     # Sign per-tenant JWTs. The store's jwt_interceptor verifies
     # against the pubkey at RIO_JWT__KEY_PATH (set via extraServiceEnv
@@ -360,6 +362,99 @@ pkgs.testers.runNixOSTest {
         assert rc == 0, (
             f"after adding test-cache-1 to C's trusted_keys, path "
             f"should be visible:\n{out}"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # substitute-ssh-ng — gateway JWT propagation end-to-end
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("substitute-ssh-ng: gateway propagates JWT through wopQueryPathInfo"):
+        # Fresh path so the ssh-ng request is a cold miss → triggers
+        # try_substitute_on_miss at the store. Reusing sub_path would
+        # hit the warm narinfo row from substitute-cold-fetch above,
+        # bypassing the substituter entirely.
+        client.succeed("echo rio-substitute-fixture-v3-sshng > /tmp/sub/payload3")
+        sub_path3 = client.succeed("nix-store --add /tmp/sub/payload3").strip()
+        client.succeed(f"nix store sign --key-file /tmp/sub/sec {sub_path3}")
+        client.succeed(
+            f"nix copy --no-check-sigs "
+            f"--to 'file:///srv/cache?compression=none' {sub_path3}"
+        )
+
+        # Tenant-ssh trusts the test cache. No sig_mode complications;
+        # this subtest proves JWT PROPAGATION, not sig handling.
+        cli(
+            f"upstream add --tenant {tid_ssh} "
+            "--url http://client:8080 --priority 50 "
+            f"--trusted-key '{test_pubkey}' --sig-mode keep"
+        )
+
+        # SSH key with tenant NAME in the comment. Gateway extracts
+        # the comment → scheduler.resolve_tenant → UUID → mint JWT.
+        # -C 'sub-tenant-ssh' (not the UUID — gateway is PG-free,
+        # scheduler owns name→UUID resolution per r[sched.tenant.resolve]).
+        #
+        # Key MUST be at /root/.ssh/id_ed25519 — mkClientNode's
+        # ssh_config hardcodes that IdentityFile (common.nix:464) and
+        # the ?ssh-key= querystring is unreliable across Nix versions
+        # (common.nix:457). authorized_keys write uses > (overwrite, not
+        # append) because tmpfiles seeds the placeholder without a
+        # trailing newline — >> would glue our key to it.
+        client.succeed(
+            "mkdir -p /root/.ssh && "
+            "ssh-keygen -t ed25519 -N ''' -C 'sub-tenant-ssh' "
+            "-f /root/.ssh/id_ed25519"
+        )
+        sub_pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
+        ${gatewayHost}.succeed(
+            f"echo '{sub_pubkey}' > /var/lib/rio/gateway/authorized_keys"
+        )
+        ${gatewayHost}.succeed("systemctl restart rio-gateway.service")
+        ${gatewayHost}.wait_for_unit("rio-gateway.service")
+        ${gatewayHost}.wait_for_open_port(2222)
+
+        # Precondition: store is cold for this path (no narinfo row).
+        # Without this guard, a prior-test ingest makes the ssh-ng
+        # success VACUOUS — it'd be a warm hit, not a substitute.
+        before = psql(
+            ${gatewayHost},
+            f"SELECT count(*) FROM narinfo WHERE store_path = '{sub_path3}'",
+        )
+        assert before == "0", (
+            f"precondition FAIL: narinfo already has {before} row(s) for "
+            f"{sub_path3} — store not cold. ssh-ng hit below is VACUOUS."
+        )
+
+        # THE ACTUAL TEST: nix path-info via ssh-ng → gateway
+        # wopQueryPathInfo → store QueryPathInfo WITH x-rio-tenant-token
+        # → try_substitute_on_miss → upstream fetch → PathInfo returned.
+        #
+        # Before P0465: gateway didn't attach JWT → store saw anonymous
+        # → substitute short-circuited → NotFound → nix path-info failed.
+        # After P0465: JWT propagated → tenant-scoped substitute fires.
+        #
+        # No ?ssh-key= querystring — ssh_config's IdentityFile handles it.
+        out = client.succeed(
+            f"nix path-info --store 'ssh-ng://${gatewayHost}' {sub_path3} 2>&1"
+        )
+        assert sub_path3 in out, (
+            f"ssh-ng path-info should return the substituted path. "
+            f"If this fails with 'not valid', the gateway's JWT "
+            f"propagation through opcodes_read.rs is broken — store "
+            f"saw anonymous request, try_substitute_on_miss skipped.\n"
+            f"output:\n{out}"
+        )
+        print(f"substitute-ssh-ng PASS: {sub_path3} visible via ssh-ng")
+
+        # Ingest proof: narinfo row now exists (was 0, now 1) —
+        # confirms the ssh-ng request triggered the substitute, not
+        # just a cache-hit or error-masked-as-success.
+        after = psql(
+            ${gatewayHost},
+            f"SELECT count(*) FROM narinfo WHERE store_path = '{sub_path3}'",
+        )
+        assert after == "1", (
+            f"expected narinfo row after ssh-ng substitute, got {after} — "
+            f"did try_substitute_on_miss actually fire?"
         )
 
     client.execute("systemctl stop test-cache 2>/dev/null || true")

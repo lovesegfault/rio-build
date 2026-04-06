@@ -335,6 +335,7 @@ fn fetch_extract_insert(
             &store_path,
             fetch_timeout,
             rio_common::limits::MAX_NAR_SIZE,
+            &[],
         )
         .await
         {

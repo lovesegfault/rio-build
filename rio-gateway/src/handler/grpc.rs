@@ -1,26 +1,51 @@
 //! Store-query helpers using gRPC.
+//!
+//! All helpers take `jwt_token: Option<&str>` and attach it as
+//! `x-rio-tenant-token` via [`with_jwt`]. Without the JWT, store-side
+//! tenant-scoped operations (substitution, narinfo visibility gate)
+//! short-circuit — see `r[gw.jwt.issue]`.
 
 use super::*;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
 use tokio::io::AsyncReadExt;
 
+/// Build the `x-rio-tenant-token` metadata pair for rio-proto helpers.
+///
+/// Returns a borrowed-slice-compatible array so callers can pass
+/// `&jwt_metadata(token)` directly. Empty slice when `jwt_token` is
+/// `None` (dual-mode fallback — store's interceptor treats absent
+/// header as pass-through per `r[gw.jwt.dual-mode]`).
+fn jwt_metadata(jwt_token: Option<&str>) -> Vec<(&'static str, &str)> {
+    match jwt_token {
+        Some(t) => vec![(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, t)],
+        None => vec![],
+    }
+}
+
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
-pub(super) async fn grpc_query_path_info(
+pub(crate) async fn grpc_query_path_info(
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     store_path: &str,
 ) -> anyhow::Result<Option<ValidatedPathInfo>> {
-    rio_proto::client::query_path_info_opt(store_client, store_path, DEFAULT_GRPC_TIMEOUT)
-        .await
-        .map_err(|e| GatewayError::Store(format!("QueryPathInfo failed: {e}")).into())
+    rio_proto::client::query_path_info_opt(
+        store_client,
+        store_path,
+        DEFAULT_GRPC_TIMEOUT,
+        &jwt_metadata(jwt_token),
+    )
+    .await
+    .map_err(|e| GatewayError::Store(format!("QueryPathInfo failed: {e}")).into())
 }
 
 /// Check validity via QueryPathInfo -- returns true if path exists.
 pub(super) async fn grpc_is_valid_path(
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     path: &StorePath,
 ) -> anyhow::Result<bool> {
-    Ok(grpc_query_path_info(store_client, path.as_str())
+    Ok(grpc_query_path_info(store_client, jwt_token, path.as_str())
         .await?
         .is_some())
 }
@@ -28,6 +53,7 @@ pub(super) async fn grpc_is_valid_path(
 /// Upload a path to the store via gRPC PutPath (metadata + NAR chunks).
 pub(super) async fn grpc_put_path(
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     info: ValidatedPathInfo,
     nar_data: Vec<u8>,
 ) -> anyhow::Result<bool> {
@@ -36,7 +62,7 @@ pub(super) async fn grpc_put_path(
     let resp = rio_common::grpc::with_timeout(
         "PutPath",
         GRPC_STREAM_TIMEOUT,
-        store_client.put_path(stream),
+        store_client.put_path(with_jwt(stream, jwt_token)?),
     )
     .await?;
 
@@ -54,6 +80,7 @@ pub(super) async fn grpc_put_path(
 /// Caller is responsible for the `nar_size <= MAX_NAR_SIZE` check.
 pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     store_client: &StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     info: ValidatedPathInfo,
     nar_reader: &mut R,
     nar_size: u64,
@@ -77,16 +104,15 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     .map_err(|_| GatewayError::GrpcStream("PutPath channel closed before metadata".into()))?;
 
     // Drive the gRPC call. Clone: tonic Channel is Arc-backed.
+    // JWT wrapped BEFORE the spawn — jwt_token's lifetime doesn't
+    // extend into the 'static task.
     let mut client = store_client.clone();
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let req = with_jwt(outbound, jwt_token)?;
     let rpc: tokio::task::JoinHandle<anyhow::Result<tonic::Response<types::PutPathResponse>>> =
         tokio::spawn(async move {
-            let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
-            rio_common::grpc::with_timeout(
-                "PutPath",
-                GRPC_STREAM_TIMEOUT,
-                client.put_path(outbound),
-            )
-            .await
+            rio_common::grpc::with_timeout("PutPath", GRPC_STREAM_TIMEOUT, client.put_path(req))
+                .await
         });
 
     // Read exactly nar_size bytes in NAR_CHUNK_SIZE chunks, forward each.
@@ -146,11 +172,25 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 
 /// Fetch NAR data from store via gRPC GetPath.
 /// Returns (PathInfo, NAR bytes) or None if not found.
+///
+/// Delegates to `rio_proto::client::get_path_nar` — DO NOT inline that
+/// helper's await structure here. Under `#[tokio::test(start_paused =
+/// true)]`, the exact suspend-point layout determines whether tokio's
+/// auto-advance fires the GRPC_STREAM_TIMEOUT before in-process gRPC
+/// I/O completes (observed in wire_opcodes::build reconnect tests when
+/// P0465 initially inlined this; reverted to delegation).
 pub(super) async fn grpc_get_path(
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     store_path: &str,
 ) -> anyhow::Result<Option<(ValidatedPathInfo, Vec<u8>)>> {
-    rio_proto::client::get_path_nar(store_client, store_path, GRPC_STREAM_TIMEOUT, MAX_NAR_SIZE)
-        .await
-        .map_err(|e| GatewayError::Store(format!("GetPath for {store_path}: {e}")).into())
+    rio_proto::client::get_path_nar(
+        store_client,
+        store_path,
+        GRPC_STREAM_TIMEOUT,
+        MAX_NAR_SIZE,
+        &jwt_metadata(jwt_token),
+    )
+    .await
+    .map_err(|e| GatewayError::Store(format!("GetPath for {store_path}: {e}")).into())
 }

@@ -39,6 +39,11 @@ pub(crate) const MAX_TRANSITIVE_INPUTS: usize = 10_000;
 /// fetching missing derivations from the store via gRPC as needed.
 ///
 /// Returns `(nodes, edges)` for `SubmitBuildRequest`.
+///
+/// NOTE: all store lookups here are ANONYMOUS (no JWT). This is build
+/// INPUT resolution — `.drv` files and their `input_srcs` may have been
+/// uploaded via a different tenant context. See `resolve_derivation`
+/// in `handler/mod.rs` for the full rationale.
 pub async fn reconstruct_dag(
     root_path: &StorePath,
     root_drv: &Derivation,
@@ -211,7 +216,7 @@ async fn populate_input_srcs_sizes(
     drv_cache: &HashMap<StorePath, Derivation>,
     store_client: &mut StoreServiceClient<Channel>,
 ) {
-    use rio_proto::client::query_path_info_opt;
+    use crate::handler::grpc_query_path_info;
 
     // HashSet not Vec: the dedup IS the point.
     let mut all_srcs: HashSet<String> = HashSet::new();
@@ -228,7 +233,9 @@ async fn populate_input_srcs_sizes(
     // confusing for dashboards; prefer honest "no signal".
     let mut sizes: HashMap<String, u64> = HashMap::with_capacity(all_srcs.len());
     for src in &all_srcs {
-        match query_path_info_opt(store_client, src, rio_common::grpc::DEFAULT_GRPC_TIMEOUT).await {
+        // Input srcs are build INPUTS — anonymous lookup (no JWT).
+        // See resolve_derivation docstring for the rationale.
+        match grpc_query_path_info(store_client, None, src).await {
             Ok(Some(info)) => {
                 sizes.insert(src.clone(), info.nar_size);
             }
@@ -541,6 +548,11 @@ pub async fn filter_and_inline_drv(
     let missing: HashSet<String> = if all_outputs.is_empty() {
         HashSet::new()
     } else {
+        // Anonymous lookup — this gates whether to inline .drv content
+        // (an optimization), not whether the tenant can see outputs.
+        // Tenant-scoped miss here would over-inline (worker still
+        // fetches, no harm) but anonymous keeps the cache-hit
+        // calculation accurate across upload contexts.
         match tokio::time::timeout(
             rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
             store_client.find_missing_paths(types::FindMissingPathsRequest {

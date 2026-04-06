@@ -189,6 +189,7 @@ pub(super) async fn fetch_input_metadata(
                     &mut client,
                     &path,
                     rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    &[],
                 )
                 .await
                 {
@@ -233,6 +234,7 @@ pub(super) async fn fetch_drv_from_store(
         drv_path,
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
         rio_common::limits::MAX_NAR_SIZE,
+        &[],
     )
     .await
     .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}): {e}")))?;
@@ -303,6 +305,7 @@ pub(super) async fn compute_input_closure(
                         &mut client,
                         &path,
                         rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                        &[],
                     )
                     .await
                     {

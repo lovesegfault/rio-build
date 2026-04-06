@@ -67,6 +67,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
@@ -140,7 +141,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
             stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}");
         }
         try_cache_drv(&path, &nar_data, drv_cache);
-        if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
+        if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
             return send_store_error(stderr, e).await;
         }
     } else {
@@ -150,8 +151,15 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
                 "oversize .drv NAR — streaming (not cached; resolve_derivation fetches from store later)"
             );
         }
-        if let Err(e) =
-            grpc_put_path_streaming(store_client, info, &mut framed, nar_size, nar_hash_bytes).await
+        if let Err(e) = grpc_put_path_streaming(
+            store_client,
+            jwt_token,
+            info,
+            &mut framed,
+            nar_size,
+            nar_hash_bytes,
+        )
+        .await
         {
             return send_store_error(stderr, e).await;
         }
@@ -192,6 +200,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
 async fn stream_one_entry<R: AsyncRead + Unpin>(
     framed: &mut R,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(framed).await?;
@@ -255,7 +264,7 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
                 source: e,
             })?;
         try_cache_drv(&path, &nar_data, drv_cache);
-        grpc_put_path(store_client, info, nar_data)
+        grpc_put_path(store_client, jwt_token, info, nar_data)
             .await
             .map_err(|e| GatewayError::Store(format!("entry '{path_str}': {e}")))?;
     } else {
@@ -265,9 +274,16 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
                 "oversize .drv NAR — streaming (not cached; resolve_derivation fetches from store later)"
             );
         }
-        grpc_put_path_streaming(store_client, info, framed, nar_size, nar_hash_bytes)
-            .await
-            .map_err(|e| GatewayError::Store(format!("entry '{path_str}': {e}")))?;
+        grpc_put_path_streaming(
+            store_client,
+            jwt_token,
+            info,
+            framed,
+            nar_size,
+            nar_hash_bytes,
+        )
+        .await
+        .map_err(|e| GatewayError::Store(format!("entry '{path_str}': {e}")))?;
     }
 
     Ok(())
@@ -280,6 +296,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let name = wire::read_string(reader).await?;
@@ -364,7 +381,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     };
     let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca.clone());
 
-    if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
+    if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
         return send_store_error(stderr, e).await;
     }
 
@@ -391,6 +408,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let name = wire::read_string(reader).await?;
@@ -440,7 +458,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     };
     let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca);
 
-    if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
+    if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
         return send_store_error(stderr, e).await;
     }
 
@@ -495,6 +513,7 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let _repair = wire::read_bool(reader).await?;
@@ -529,7 +548,7 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
     debug!(num_paths, "wopAddMultipleToStore: processing entries");
 
     for i in 0..num_paths {
-        if let Err(e) = stream_one_entry(&mut framed, store_client, drv_cache).await {
+        if let Err(e) = stream_one_entry(&mut framed, store_client, jwt_token, drv_cache).await {
             stderr
                 .error(&StderrError::simple(
                     PROGRAM_NAME,

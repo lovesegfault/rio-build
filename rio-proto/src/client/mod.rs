@@ -273,15 +273,27 @@ pub fn chunk_nar_for_put(
 /// path, wrong-length nar_hash, bad reference) is propagated as an error,
 /// not silently passed through. Collapses the common
 /// `match { Ok => Some, NotFound => None, Err => Err }` pattern.
+///
+/// `extra_metadata`: caller-supplied metadata attached after trace-context.
+/// The gateway passes `x-rio-tenant-token` here so store-side tenant-scoped
+/// operations (substitution, narinfo visibility) see the session identity.
 pub async fn query_path_info_opt(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     timeout: Duration,
+    extra_metadata: &[(&'static str, &str)],
 ) -> Result<Option<ValidatedPathInfo>, tonic::Status> {
     let mut req = tonic::Request::new(QueryPathInfoRequest {
         store_path: store_path.to_string(),
     });
     crate::interceptor::inject_current(req.metadata_mut());
+    for (k, v) in extra_metadata {
+        req.metadata_mut().insert(
+            *k,
+            v.parse()
+                .map_err(|e| tonic::Status::internal(format!("metadata {k}: {e}")))?,
+        );
+    }
     match tokio::time::timeout(timeout, client.query_path_info(req)).await {
         Ok(Ok(resp)) => {
             let validated = ValidatedPathInfo::try_from(resp.into_inner()).map_err(|e| {
@@ -302,16 +314,32 @@ pub async fn query_path_info_opt(
 /// Combines the `GetPath → collect_nar_stream → NotFound-branch` pattern.
 /// The whole operation (initial call + stream drain) is bounded by `timeout`.
 /// Returns `None` if the path doesn't exist or the stream contains no PathInfo.
+///
+/// `extra_metadata`: see [`query_path_info_opt`]. DO NOT inline this
+/// function's await structure at callsites — under
+/// `#[tokio::test(start_paused = true)]`, the exact suspend-point
+/// layout determines whether tokio's auto-advance fires the timeout
+/// before in-process gRPC I/O completes. See
+/// `rio-gateway/tests/wire_opcodes/build.rs` reconnect tests comment.
 pub async fn get_path_nar(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     timeout: Duration,
     max_nar_size: u64,
+    extra_metadata: &[(&'static str, &str)],
 ) -> Result<Option<(ValidatedPathInfo, Vec<u8>)>, NarCollectError> {
     let mut req = tonic::Request::new(GetPathRequest {
         store_path: store_path.to_string(),
     });
     crate::interceptor::inject_current(req.metadata_mut());
+    for (k, v) in extra_metadata {
+        req.metadata_mut().insert(
+            *k,
+            v.parse().map_err(|e| {
+                NarCollectError::Stream(tonic::Status::internal(format!("metadata {k}: {e}")))
+            })?,
+        );
+    }
     let fut = async {
         let mut stream = match client.get_path(req).await {
             Ok(resp) => resp.into_inner(),

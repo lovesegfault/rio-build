@@ -898,7 +898,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                match grpc_is_valid_path(store_client, path).await {
+                match grpc_is_valid_path(store_client, jwt_token.as_deref(), path).await {
                     Ok(true) => { /* exists, fine */ }
                     Ok(false) => {
                         stderr_err!(stderr, "path '{path}' is not valid and cannot be built");
@@ -1057,7 +1057,9 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                let result = match grpc_is_valid_path(store_client, path).await {
+                let result = match grpc_is_valid_path(store_client, jwt_token.as_deref(), path)
+                    .await
+                {
                     Ok(true) => BuildResult {
                         status: BuildStatus::AlreadyValid,
                         ..Default::default()

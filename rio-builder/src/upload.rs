@@ -696,6 +696,7 @@ async fn partition_by_presence(
             &mut client,
             &store_path,
             rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            &[],
         )
         .await
         {
