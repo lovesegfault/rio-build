@@ -133,6 +133,10 @@ pub async fn build_heartbeat_request(
         // pass through verbatim — the worker doesn't interpret it,
         // just declares what the operator configured.
         size_class: size_class.to_string(),
+        // TODO(P0210): replace with circuit.is_open() once the FUSE
+        // circuit breaker lands. Explicit `false` (not ..Default::default())
+        // so P0210 has a clean one-line rebase target.
+        store_degraded: false,
     }
 }
 

@@ -365,6 +365,12 @@ message HeartbeatRequest {
   // builds, "large" gets slow ones. Empty-string semantics avoid needing
   // Option in the proto; scheduler side maps "" → None.
   string size_class = 8;
+  // FUSE circuit breaker open — worker cannot fetch from store.
+  // Scheduler treats like `draining`: `has_capacity()` returns false.
+  // Cleared when breaker closes/half-opens. Default false — wire-compatible
+  // (old workers don't send it, scheduler reads false).
+  // Spec: r[worker.heartbeat.store-degraded]
+  bool store_degraded = 9;
 }
 
 message HeartbeatResponse {
