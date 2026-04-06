@@ -170,16 +170,15 @@ workerPool:
 
 postgresql:
   enabled: true
-  # Pin the full image ref to what nix/docker-pulled.nix preloads.
+  # Pin the image ref to what nix/docker-pulled.nix preloads.
   # Bitnami chart defaults differ from what ctr imports as
   # ("docker.io/..." via finalImageName); containerd does exact-string
   # lookup so any mismatch → ImagePullBackOff in the airgapped VM.
-  # When nixhelm bumps the chart, this + the pullImage FOD update
-  # together.
+  # The tag is passed via --set-string in k3s-full.nix (DERIVED from
+  # pulled.bitnami-postgresql.imageTag — bumping the FOD auto-bumps).
   image:
     registry: docker.io
     repository: bitnami/postgresql
-    tag: "18.3.0"
     pullPolicy: IfNotPresent
   auth:
     database: rio

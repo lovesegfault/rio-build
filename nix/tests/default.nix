@@ -361,12 +361,20 @@ in
   #   exists + subtree_control writable → build completes over FUSE).
   vm-security-nonpriv-k3s = security.privileged-hardening-e2e {
     fixture = k3sFull {
-      # Layer vmtest-full-nonpriv.yaml on top of the base vmtest-full.
-      # yaml — flips workerPool.privileged:false + devicePlugin.enabled
-      # + overrides devicePlugin.image to match docker-pulled.nix.
+      # Layer vmtest-full-nonpriv.yaml for workerPool.privileged:false +
+      # devicePlugin.enabled + nodeSelector/tolerations null. The
+      # devicePlugin.image override is passed via extraValues below
+      # (DERIVED from the preload FOD — no drift window).
       extraValuesFiles = [
         ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
       ];
+      # containerd airgap cache is tag-indexed (pullImage's finalImageTag),
+      # not digest-indexed. Chart default is digest-pinned (@sha256:…) →
+      # exact-string miss → ImagePullBackOff. destNameTag is
+      # "${finalImageName}:${finalImageTag}" — the preloaded cache key.
+      extraValues = {
+        "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
+      };
       # smarter-device-manager is NOT in the default airgap set
       # (only bitnami-postgresql + rio-all). Without this, the DS pod
       # goes ImagePullBackOff (airgapped, no pull).

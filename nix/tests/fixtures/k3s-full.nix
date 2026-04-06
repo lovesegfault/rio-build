@@ -91,20 +91,26 @@ let
     # through --set-string (extraSet), not --set (extraSetTyped would
     # try YAML-parsing the trailing `=` padding). Merged with caller's
     # extraValues; caller wins on collision (// is right-biased).
-    extraSet =
-      (pkgs.lib.optionalAttrs jwtEnabled {
-        "jwt.publicKey" = jwtKeys.pubkeyB64;
-        "jwt.signingSeed" = jwtKeys.seedB64;
-      })
-      // (pkgs.lib.optionalAttrs envoyGatewayEnabled {
-        # containerd airgap cache is tag-indexed (docker-pulled.nix:54),
-        # not digest-indexed. values.yaml:410 default has @sha256: suffix
-        # (P0379 digest-pin) → exact-string miss → ImagePullBackOff.
-        # Override to bare-tag to match preloaded finalImageTag. Same
-        # pattern as vmtest-full-nonpriv.yaml:33 devicePlugin.image.
-        "dashboard.envoyImage" = "docker.io/envoyproxy/envoy:distroless-v1.37.1";
-      })
-      // extraValues;
+    extraSet = {
+      # Postgres tag matches the preloaded FOD (imageTag passthru =
+      # finalImageTag). Bumping docker-pulled.nix auto-bumps here.
+      # vmtest-full.yaml keeps registry/repository (stable); the tag
+      # is the drift axis on nixhelm chart bumps.
+      "postgresql.image.tag" = pulled.bitnami-postgresql.imageTag;
+    }
+    // (pkgs.lib.optionalAttrs jwtEnabled {
+      "jwt.publicKey" = jwtKeys.pubkeyB64;
+      "jwt.signingSeed" = jwtKeys.seedB64;
+    })
+    // (pkgs.lib.optionalAttrs envoyGatewayEnabled {
+      # containerd airgap cache is tag-indexed, not digest-indexed.
+      # values.yaml default has @sha256: suffix (P0379 digest-pin) →
+      # exact-string miss → ImagePullBackOff. Override to bare-tag
+      # DERIVED from the preload FOD's finalImageName:finalImageTag
+      # (destNameTag attr) — bumping docker-pulled.nix auto-bumps here.
+      "dashboard.envoyImage" = pulled.envoy-distroless.destNameTag;
+    })
+    // extraValues;
     # coverage is a bool — must use --set (not --set-string) or
     # "false" becomes truthy (non-empty string). jwt.enabled likewise.
     extraSetTyped = {
@@ -158,8 +164,8 @@ let
     pulled.envoy-gateway
     # Data-plane envoy. Pinned via EnvoyProxy.spec.provider.kubernetes.
     # envoyDeployment.container.image in dashboard-gateway-tls.yaml —
-    # matches extraSet bare-tag override above (v1.37.1; values.yaml
-    # default is digest-pinned but airgap containerd needs tag-only).
+    # matches extraSet bare-tag override above (destNameTag — values.
+    # yaml default is digest-pinned but airgap containerd needs tag-only).
     pulled.envoy-distroless
   ]
   # nginx + SPA bundle (rio-dashboard:dev). dashboard.enabled=true
