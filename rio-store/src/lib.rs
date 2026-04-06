@@ -16,6 +16,7 @@ pub mod grpc;
 // Manifest::deserialize. The fuzz crate is a separate workspace root.
 pub mod manifest;
 pub(crate) mod metadata;
+pub mod migrations;
 pub(crate) mod realisations;
 pub mod signing;
 pub(crate) mod validate;

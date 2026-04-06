@@ -98,6 +98,14 @@ Pre-commit hooks run treefmt automatically on commit.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
 - **tracey MCP (optional):** `nix develop -c tracey ai --claude` registers the tracey MCP server + installs the annotation skill. After registration, Claude Code can query `tracey_uncovered` / `tracey_untested` / `tracey_rule` during dev sessions. The daemon caches scan results — `rm -rf .tracey/` to force rescan.
 
+### Migration files are frozen after they ship
+
+`sqlx::migrate!()` checksums `.sql` files by content (SHA-384 over the full file body, including comments). Editing a comment changes the checksum → persistent-DB deploys fail with `VersionMismatch`. Hit twice pre-production before P0353 froze it.
+
+- **Commentary, rationale, history:** goes in `rio-store/src/migrations.rs` (per-migration `M_NNN` doc-consts). NOT in the `.sql`.
+- **New migration:** add the SQL, run `cargo test -p rio-store --test migrations`, copy the hex-SHA from the `unpinned migration NNN` panic into `PINNED` at `rio-store/tests/migrations.rs`, commit both.
+- **Behavior change to a shipped migration:** write a NEW migration. Never edit shipped ones. The checksum-freeze test (`migration_checksums_frozen`) fails CI on any content change.
+
 ## Plan-driven development
 
 Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `onibus dag render` for display. File-collision matrix is live-computed via `onibus collisions top` / `onibus collisions check`.
