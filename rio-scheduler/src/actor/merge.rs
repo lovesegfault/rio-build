@@ -769,6 +769,22 @@ impl DagActor {
 
         tx.commit().await?;
 
+        // I-102: a large merge (e.g. 5800 rows for hello-mixed-32x) leaves
+        // planner stats stale until autovacuum's analyze cycle (~1-10min on
+        // RDS). In that window, list_builds chose a bad plan and went
+        // 16ms → 2.3s. ANALYZE post-commit refreshes stats immediately;
+        // cost is ~100ms on tables this size, paid once per large merge.
+        // Threshold 500 ≈ PG's default autovacuum_analyze_threshold +
+        // 10% of a few-thousand-row table.
+        if node_rows.len() >= 500
+            && let Err(e) = sqlx::query("ANALYZE derivations, build_derivations, derivation_edges")
+                .execute(self.db.pool())
+                .await
+        {
+            warn!(error = %e, rows = node_rows.len(),
+                  "post-merge ANALYZE failed (non-fatal; autovacuum will catch up)");
+        }
+
         // r[impl sched.db.tx-commit-before-mutate]
         // In-mem db_id write ONLY after the tx is durable. If anything
         // above returned Err, the tx rolled back and we never reach
