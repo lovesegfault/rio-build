@@ -108,10 +108,11 @@ describe('createLogStream perf', () => {
   });
 
   it('stays under cap with a single oversized chunk', async () => {
-    // Edge: one giant chunk that itself exceeds the cap. push(...60K)
-    // → length 60K > 50K → splice(0, 10K) → 50K. Truncated flips.
-    // A builder dumping a huge final burst (cat of a large file) hits
-    // this path — the cap still holds.
+    // Edge: one giant chunk that itself exceeds the cap. push 60K →
+    // length 60K > 50K → excess = 60K - (50K - 10K) = 20K →
+    // splice(0, 20K) → 40K. Truncated flips. A builder dumping a huge
+    // final burst (cat of a large file) hits this path — the cap holds
+    // at the MAX_LINES - DROP_LINES target, not just -DROP_LINES.
     getBuildLogs.mockImplementation(async function* () {
       yield chunk(60_000, true);
     });
@@ -121,6 +122,47 @@ describe('createLogStream perf', () => {
 
     expect(s.done).toBe(true);
     expect(s.truncated).toBe(true);
-    expect(s.lines.length).toBe(50_000);
+    expect(s.lines.length).toBe(40_000);
+  });
+
+  // r[verify dash.stream.log-tail]
+  // rev-p392 correctness: single giant chunk is bounded correctly.
+  // Pre-fix a 70K-line chunk left lines at 60K (splice removed fixed
+  // DROP_LINES, didn't re-check). Post-fix it's capped at
+  // MAX_LINES - DROP_LINES = 40K regardless of chunk magnitude.
+  it('caps a single oversized chunk to the target, not just -DROP_LINES', async () => {
+    getBuildLogs.mockImplementation(async function* () {
+      yield chunk(70_000, true);
+    });
+
+    const s = createLogStream('b-giant');
+    await flush(3);
+
+    expect(s.done).toBe(true);
+    expect(s.truncated).toBe(true);
+    // 70K > 50K → excess = 70K - 40K = 30K → splice(0, 30K) → 40K.
+    // Pre-fix this was 70K - 10K = 60K — still over the cap.
+    expect(s.lines.length).toBe(40_000);
+  });
+
+  // rev-p392 correctness: 100K-line chunk doesn't RangeError on spread.
+  // Pre-fix lines.push(...decoded) hit V8's ~65K arg limit — the spread
+  // expands to 100K stack arguments and throws. Post-fix loop-push has
+  // no ceiling. This test proves no exception surfaces as err; the cap
+  // assertion proves the result is bounded.
+  it('handles a 100K-line chunk without RangeError', async () => {
+    getBuildLogs.mockImplementation(async function* () {
+      yield chunk(100_000, true);
+    });
+
+    const s = createLogStream('b-100k');
+    await flush(3);
+
+    // Pre-fix: spread throws, catch sets err = RangeError, done = true.
+    // Post-fix: err stays null, the cap trims to 40K.
+    expect(s.err).toBeNull();
+    expect(s.done).toBe(true);
+    expect(s.truncated).toBe(true);
+    expect(s.lines.length).toBe(40_000);
   });
 });
