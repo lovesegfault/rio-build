@@ -24,6 +24,7 @@ use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios, test_sche
 mod apply_tests;
 mod builders_tests;
 mod disruption_tests;
+mod manifest_tests;
 
 /// Construct a minimal BuilderPool for builder tests. No K8s
 /// interaction — pure struct-to-struct.

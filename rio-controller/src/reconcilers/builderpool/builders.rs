@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{PodSpec, Service, ServicePort, ServiceSpec};
+use k8s_openapi::api::core::v1::{
+    PodSpec, ResourceRequirements, Service, ServicePort, ServiceSpec,
+};
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
@@ -158,16 +160,25 @@ pub(super) fn build_pdb(wp: &BuilderPool, oref: OwnerReference) -> PodDisruption
     }
 }
 
-/// The pod spec. Re-exported for `ephemeral::build_job` — the
-/// ephemeral Job pod is the same executor container with one extra
-/// env var.
+/// The pod spec. Re-exported for `ephemeral::build_job` and
+/// `manifest::build_manifest_job` — the Job pod is the same
+/// executor container with env/resource tweaks.
+///
+/// `resources_override`: `None` reads `wp.spec.resources`
+/// (STS path, ephemeral path — today's behavior). `Some(r)`
+/// replaces it (manifest path — per-bucket `ResourceRequirements`
+/// from `GetCapacityManifest`, ADR-020).
 pub(super) fn build_pod_spec(
     wp: &BuilderPool,
     scheduler: &SchedulerAddrs,
     store_addr: &str,
     cache_gb: u64,
     cache_quantity: Quantity,
+    resources_override: Option<ResourceRequirements>,
 ) -> PodSpec {
-    let params = executor_params(wp, cache_gb, cache_quantity);
+    let mut params = executor_params(wp, cache_gb, cache_quantity);
+    if let Some(r) = resources_override {
+        params.resources = Some(r);
+    }
     sts::build_executor_pod_spec(&params, scheduler, store_addr)
 }

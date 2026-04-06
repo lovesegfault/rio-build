@@ -348,7 +348,7 @@ fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
 /// this reconciler writes every 10s tick; without preservation the
 /// timestamp always reads "~10s ago" regardless of when the
 /// scheduler actually went down/recovered.
-fn scheduler_unreachable_condition(
+pub(super) fn scheduler_unreachable_condition(
     err: Option<&str>,
     prev: Option<&serde_json::Value>,
 ) -> serde_json::Value {
@@ -420,7 +420,7 @@ pub(super) fn build_job(
     let cache_gb = builders::parse_quantity_to_gb(&wp.spec.fuse_cache_size)?;
 
     let mut pod_spec =
-        builders::build_pod_spec(wp, scheduler, store_addr, cache_gb, cache_quantity);
+        builders::build_pod_spec(wp, scheduler, store_addr, cache_gb, cache_quantity, None);
 
     // Append RIO_EPHEMERAL=1 to the worker container's env. The
     // container is always index 0 (build_pod_spec constructs exactly
@@ -534,7 +534,7 @@ pub(super) fn build_job(
 /// returns. We want to log the name in the create-error path
 /// (409, other API errors). Generating our own suffix is the
 /// same collision math with better observability.
-fn random_suffix() -> String {
+pub(super) fn random_suffix() -> String {
     use rand::Rng;
     // 36^6 ≈ 2.18 billion combinations. With ttl=60s and even
     // 1000 Jobs/sec, steady-state population is ~60k live names
