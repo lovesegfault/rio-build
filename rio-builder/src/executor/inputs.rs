@@ -3,24 +3,29 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
-use tokio::task::JoinError;
 use tonic::transport::Channel;
 use tracing::instrument;
 
 use rio_nix::derivation::Derivation;
 use rio_proto::StoreServiceClient;
 
+use crate::fuse::cache::Cache;
+use crate::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
 use crate::synth_db::SynthPathInfo;
 
 use super::{ExecutorError, MAX_PARALLEL_FETCHES};
 
-/// FUSE-warm concurrency. Matches the default `fuse_threads` (4): the
-/// FUSE layer can't service more than that anyway, and excess stat()s
-/// queue kernel-side. See [`warm_inputs_in_fuse`] doc.
+/// FUSE-warm concurrency. Bounds concurrent `GetPath` gRPC fetches fired
+/// at the store during warm. I-165c: no longer tied to `fuse_threads`
+/// (warm doesn't go through the kernel FUSE layer), but kept moderate —
+/// the I-165 thundering-herd that motivated the deadline was 86 builders
+/// warming simultaneously; per-builder fan-out stays small so the
+/// aggregate doesn't re-saturate the store. See [`warm_inputs_in_fuse`].
 const WARM_FUSE_CONCURRENCY: usize = 4;
 
 /// Overall deadline for [`warm_inputs_in_fuse`]. Well above happy-path
@@ -211,110 +216,184 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// entry; the overlay's later lookup of the same name reuses that
 /// FUSE-layer dentry without re-entering FUSE userspace.
 ///
-/// I-110c: each `stat()` below triggers FUSE `lookup()` →
-/// `fetch_extract_insert` → `GetPath` → store-side PG narinfo+manifest
-/// lookup (~1600 PG hits/builder). [`prefetch_manifests`] primes the
-/// FUSE cache's hint map BEFORE this loop so each `GetPath` carries its
-/// manifest and the store skips PG. The S3 chunk fetch stays per-path
-/// (it's content; can't avoid).
+/// I-165c: warming is two-stage. (1) `prefetch_path_blocking` materializes
+/// the path on local disk via the cache's own gRPC+NAR-extract pipeline —
+/// the SAME code FUSE `lookup()` would call, but invoked directly so the
+/// `spawn_blocking` thread is in USERSPACE `block_on(gRPC)`, not kernel
+/// D-state `request_wait_answer`. (2) Once the path is on disk, ONE
+/// `symlink_metadata()` through the FUSE mount populates the kernel's
+/// FUSE-layer dentry — that stat hits ops.rs `lookup()`'s local-disk fast
+/// path (`child_path.symlink_metadata()` on `cache_dir`) and returns in
+/// microseconds, never reaching `ensure_cached`.
+///
+/// Why this matters: I-165's deadline detaches in-flight `spawn_blocking`
+/// futures on expiry. With the OLD stat-through-own-FUSE warm, those
+/// detached threads were in kernel D-state — uncancellable, and if the
+/// build later died by SIGKILL (OOM), `FuseMount::Drop` never ran → no
+/// fusectl abort → D-state threads pinned the process forever (pod showed
+/// `Running` masking the OOMKilled container). With direct prefetch, any
+/// detached thread is in userspace, bounded by `fetch_timeout`, and dies
+/// cleanly on SIGKILL.
+///
+/// I-110c: [`prefetch_manifests`] primes the FUSE cache's hint map BEFORE
+/// this loop so each `GetPath` (now from `prefetch_path_blocking` instead
+/// of FUSE-triggered `ensure_cached`) carries its manifest and the store
+/// skips PG. ~1600 PG hits/builder → ≤2. The S3 chunk fetch stays
+/// per-path (it's content; can't avoid).
 ///
 /// `compute_input_closure` already verified each path exists in the
 /// store via BatchQueryPathInfo (BFS only adds found paths), so the only window for
-/// FUSE ENOENT here is a sub-200ms visibility race — exactly what
+/// ENOENT here is a sub-200ms visibility race — exactly what
 /// `fetch_extract_insert`'s NotFound re-probe covers. Warm failures
 /// don't fail the build (the daemon will surface the real error if a
 /// path is truly gone); they're WARN'd so a sustained nonzero metric
 /// flags a wider problem upstream.
 ///
-/// The stats run on the blocking pool: each one blocks on
-/// `ensure_cached` → `block_on(get_path_nar)`. Concurrency is
-/// `WARM_FUSE_CONCURRENCY` (matches default `fuse_threads`), NOT
-/// `MAX_PARALLEL_FETCHES`: the FUSE layer is the bound either way
-/// (n_threads readers, fetch_sem = n_threads − 1 fetchers). Firing 16
-/// just parks 12 spawn_blocking threads in the kernel's FUSE request
-/// queue with nothing gained — and pre-I-080 (no FUSE_PARALLEL_DIROPS),
-/// they piled up uninterruptibly in `fuse_lock_inode(root)`. Order
-/// doesn't matter — all must complete before daemon spawn.
-///
 /// I-165: bounded by `deadline` ([`WARM_OVERALL_DEADLINE`] in production).
-/// On expiry, in-flight `spawn_blocking` stats are detached (≤
-/// `WARM_FUSE_CONCURRENCY` threads leaked into the blocking pool until
-/// their fuser thread's `fetch_timeout` fires); the build proceeds with
+/// On expiry, in-flight `spawn_blocking` prefetches are detached (≤
+/// `WARM_FUSE_CONCURRENCY` userspace threads leaked into the blocking
+/// pool until their `fetch_timeout` fires); the build proceeds with
 /// whatever subset warmed in time.
+///
+/// `fuse_cache: None` (unit tests without a live FUSE mount) skips stage
+/// (1) and stats the tempdir directly — preserves the existing test shell
+/// without needing a `Cache`+gRPC fixture for closure-walk coverage.
 #[instrument(skip_all, fields(input_count = input_paths.len()))]
 pub(super) async fn warm_inputs_in_fuse(
     fuse_mount_point: &Path,
+    fuse_cache: Option<&Arc<Cache>>,
+    store_client: &StoreServiceClient<Channel>,
+    fetch_timeout: Duration,
     input_paths: &[String],
     deadline: Duration,
 ) {
-    // r[impl builder.input.warm-bounded]
-    warm_inputs_bounded(fuse_mount_point, input_paths, deadline, |fuse_path| {
-        // The whole point is the syscall side-effect (FUSE lookup
-        // → ensure_cached → materialize). The metadata itself is
-        // discarded.
-        tokio::task::spawn_blocking(move || {
-            fuse_path
-                .symlink_metadata()
-                .map(|_| ())
-                .map_err(|e| (fuse_path, e))
-        })
-    })
+    // r[impl builder.input.warm-bounded+2]
+    let cache = fuse_cache.cloned();
+    let client = store_client.clone();
+    warm_inputs_bounded(
+        fuse_mount_point,
+        input_paths,
+        deadline,
+        move |basename, fuse_path| {
+            let cache = cache.clone();
+            let client = client.clone();
+            async move {
+                // Stage 1: materialize via the cache's own fetch path. The
+                // spawn_blocking thread parks in userspace `block_on(gRPC)`
+                // (Cache methods use `Handle::block_on` internally — calling
+                // from async would nested-runtime panic). NOT kernel D-state.
+                if let Some(cache) = cache {
+                    let rt = tokio::runtime::Handle::current();
+                    let bn = basename.clone();
+                    let on_disk = tokio::task::spawn_blocking(move || {
+                        prefetch_path_blocking(&cache, &client, &rt, fetch_timeout, &bn)
+                    })
+                    .await
+                    .map_err(WarmErr::Join)?
+                    .map_err(|errno| {
+                        WarmErr::Io(
+                            basename,
+                            std::io::Error::from_raw_os_error(i32::from(errno)),
+                        )
+                    })?;
+                    // AlreadyInFlight: another fetcher (PrefetchHint handler
+                    // or a concurrent FUSE lookup) owns it. SKIP the dentry
+                    // stat — it would D-state behind that fetcher's
+                    // `block_on(GetPath)`. Safe for I-043: the daemon's own
+                    // overlay→FUSE stat will hit `ensure_cached` → `WaitFor`
+                    // → block until the fetcher finishes → return POSITIVE
+                    // (overlay never sees ENOENT to negative-cache). Count
+                    // as warmed: the path IS being materialized.
+                    if matches!(on_disk, Some(PrefetchSkip::AlreadyInFlight)) {
+                        return Ok(());
+                    }
+                    // Ok(None) = fetched; Some(AlreadyCached) = already on
+                    // disk. Either way: stage 2's stat hits the fast path.
+                }
+                // Stage 2: populate the kernel FUSE-layer dentry. Path is on
+                // local disk (stage 1 just put it there or confirmed it), so
+                // FUSE `lookup()` returns from its `child_path.symlink_
+                // metadata()` fast path in microseconds — no `ensure_cached`,
+                // no gRPC, no D-state risk.
+                tokio::task::spawn_blocking(move || {
+                    fuse_path
+                        .symlink_metadata()
+                        .map(|_| ())
+                        .map_err(|e| WarmErr::Io(fuse_path.display().to_string(), e))
+                })
+                .await
+                .map_err(WarmErr::Join)?
+            }
+        },
+    )
     .await;
+}
+
+/// Per-path warm failure. Carries enough context for the WARN log; the
+/// distinction between Io and Join is just log-shape (both increment the
+/// same `failed` counter).
+enum WarmErr {
+    /// `prefetch_path_blocking` errno or `symlink_metadata` error.
+    Io(String, std::io::Error),
+    /// `spawn_blocking` panicked.
+    Join(tokio::task::JoinError),
 }
 
 /// Core of [`warm_inputs_in_fuse`] with the per-path operation
 /// injected. Split out so the deadline can be unit-tested with a
-/// deterministically-stalling `warm_one` — `symlink_metadata` on a
-/// normal filesystem never blocks (only a stuck FUSE userspace does),
-/// so the timeout path is otherwise untestable without a live mount.
+/// deterministically-stalling `warm_one` — the production path's stall
+/// point is `block_on(GetPath)` inside `prefetch_path_blocking`, which
+/// needs a live store mock to reproduce; the timeout path is otherwise
+/// untestable without that fixture.
 async fn warm_inputs_bounded<F, Fut>(
     fuse_mount_point: &Path,
     input_paths: &[String],
     deadline: Duration,
     warm_one: F,
 ) where
-    F: Fn(PathBuf) -> Fut,
-    Fut: Future<Output = Result<Result<(), (PathBuf, std::io::Error)>, JoinError>>,
+    F: Fn(String, PathBuf) -> Fut,
+    Fut: Future<Output = Result<(), WarmErr>>,
 {
     let warm_start = std::time::Instant::now();
 
-    // Owned PathBufs collected up-front so the spawned futures are
-    // 'static (the spawn_blocking closure moves the PathBuf in; no
-    // borrow on `input_paths` survives the .await).
-    let fuse_paths: Vec<PathBuf> = input_paths
+    // Owned (basename, fuse_path) pairs collected up-front so the spawned
+    // futures are 'static (closures move owned data in; no borrow on
+    // `input_paths` survives the .await).
+    let warm_paths: Vec<(String, PathBuf)> = input_paths
         .iter()
         .filter_map(|p| {
             // Malformed paths (no /nix/store/ prefix) would have failed
             // compute_input_closure's QueryPathInfo with InvalidArgument
             // already; skip silently as defense-in-depth.
-            Some(fuse_mount_point.join(p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?))
+            let basename = p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?;
+            Some((basename.to_owned(), fuse_mount_point.join(basename)))
         })
         .collect();
-    let total = fuse_paths.len();
+    let total = warm_paths.len();
 
     // Atomics not a collected Vec: `tokio::time::timeout` drops the
     // inner future on expiry, so a `.collect::<Vec<_>>()` would lose
     // the partial result. Counters survive the drop.
     let warmed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
-    let warm_all = stream::iter(fuse_paths)
-        .map(|fuse_path| {
-            let fut = warm_one(fuse_path);
+    let warm_all = stream::iter(warm_paths)
+        .map(|(basename, fuse_path)| {
+            let fut = warm_one(basename, fuse_path);
             async {
                 match fut.await {
-                    Ok(Ok(())) => {
+                    Ok(()) => {
                         warmed.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(Err((fuse_path, e))) => {
+                    Err(WarmErr::Io(what, e)) => {
                         tracing::warn!(
-                            path = %fuse_path.display(),
+                            path = %what,
                             error = %e,
-                            "FUSE warm stat failed; daemon's overlay lookup may negative-cache this input"
+                            "FUSE input warm failed; daemon's overlay lookup may negative-cache this input"
                         );
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(join_err) => {
-                        tracing::warn!(error = %join_err, "FUSE warm stat task panicked");
+                    Err(WarmErr::Join(join_err)) => {
+                        tracing::warn!(error = %join_err, "FUSE warm task panicked");
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1391,11 +1470,21 @@ mod tests {
     // warm_inputs_in_fuse
     // -----------------------------------------------------------------------
     //
-    // Tested against a tempdir standing in for the FUSE mount —
-    // warm_inputs_in_fuse only does symlink_metadata(), so any
-    // filesystem works. The real FUSE side-effect (lookup →
-    // ensure_cached → fetch) is covered by fuse/fetch.rs tests; here
-    // we test the closure-walk + parallelism + error-tolerance shell.
+    // Tested against a tempdir standing in for the FUSE mount, with
+    // `fuse_cache: None` — stage 1 (`prefetch_path_blocking`) is
+    // skipped, stage 2's `symlink_metadata()` runs against the tempdir.
+    // The real prefetch path (gRPC → NAR extract → SQLite) is covered
+    // by `fuse/fetch.rs`'s `test_prefetch_*`; here we test the
+    // closure-walk + parallelism + error-tolerance + deadline shell.
+
+    /// `fuse_cache: None` test fixture: lazy `connect_lazy()` client
+    /// pointed at a garbage endpoint. Stage 1 is skipped so the client
+    /// is never dialed.
+    fn dummy_store_client() -> StoreServiceClient<Channel> {
+        StoreServiceClient::new(Channel::from_static("http://127.0.0.1:1").connect_lazy())
+    }
+
+    const WARM_TEST_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Paths that exist in the "FUSE" dir produce no warnings; the
     /// function completes without error. Verifies the basename
@@ -1412,7 +1501,15 @@ mod tests {
             std::fs::write(dir.path().join(basename), b"x").expect("write");
         }
 
-        warm_inputs_in_fuse(dir.path(), &inputs, WARM_OVERALL_DEADLINE).await;
+        warm_inputs_in_fuse(
+            dir.path(),
+            None,
+            &dummy_store_client(),
+            WARM_TEST_FETCH_TIMEOUT,
+            &inputs,
+            WARM_OVERALL_DEADLINE,
+        )
+        .await;
     }
 
     /// Missing paths are WARN'd, not fatal. The function completes;
@@ -1426,7 +1523,15 @@ mod tests {
             "/nix/store/dddddddddddddddddddddddddddddddd-also-missing".to_string(),
         ];
 
-        warm_inputs_in_fuse(dir.path(), &inputs, WARM_OVERALL_DEADLINE).await;
+        warm_inputs_in_fuse(
+            dir.path(),
+            None,
+            &dummy_store_client(),
+            WARM_TEST_FETCH_TIMEOUT,
+            &inputs,
+            WARM_OVERALL_DEADLINE,
+        )
+        .await;
     }
 
     /// Malformed paths (no /nix/store/ prefix) are filtered out
@@ -1446,7 +1551,15 @@ mod tests {
         )
         .expect("write");
 
-        warm_inputs_in_fuse(dir.path(), &inputs, WARM_OVERALL_DEADLINE).await;
+        warm_inputs_in_fuse(
+            dir.path(),
+            None,
+            &dummy_store_client(),
+            WARM_TEST_FETCH_TIMEOUT,
+            &inputs,
+            WARM_OVERALL_DEADLINE,
+        )
+        .await;
     }
 
     /// Mixed present/missing: present ones succeed, missing ones
@@ -1463,29 +1576,43 @@ mod tests {
         )
         .expect("write");
 
-        warm_inputs_in_fuse(dir.path(), &[present, missing], WARM_OVERALL_DEADLINE).await;
+        warm_inputs_in_fuse(
+            dir.path(),
+            None,
+            &dummy_store_client(),
+            WARM_TEST_FETCH_TIMEOUT,
+            &[present, missing],
+            WARM_OVERALL_DEADLINE,
+        )
+        .await;
     }
 
-    /// I-165: a per-path warm op that blocks indefinitely (simulating
-    /// `stat()` parked in the kernel FUSE request queue behind a
-    /// saturated `block_on(GetPath)`) MUST NOT hang the warm phase.
-    /// The overall deadline fires; the function returns with the
-    /// stalling tasks detached.
+    /// I-165 / I-165c: a per-path warm op that hangs indefinitely
+    /// (simulating `prefetch_path_blocking` parked in `block_on(
+    /// GetPath)` against a saturated store) MUST NOT hang the warm
+    /// phase. The overall deadline fires; the function returns.
     ///
-    /// `symlink_metadata` on a normal fs never blocks, so this tests
-    /// via [`warm_inputs_bounded`] with an injected `spawn_blocking`
-    /// that sleeps far past the deadline. multi_thread flavor: the
-    /// blocking pool needs real threads, and the timeout timer needs
-    /// a free worker to fire while spawn_blocking is parked.
+    /// The injected `warm_one` is a PURE-ASYNC `pending()` for the
+    /// stall path — when `tokio::time::timeout` drops the stream, the
+    /// pending future is dropped with NO lingering work. This is the
+    /// I-165c structural property: the stall point is now a
+    /// cancellable future, not a kernel D-state thread. (The
+    /// production path's `spawn_blocking(prefetch_path_blocking)` IS
+    /// detached on timeout, but that thread is in userspace
+    /// `block_on(gRPC)` bounded by `fetch_timeout` — dies on SIGKILL,
+    /// never D-states.)
+    ///
+    /// multi_thread flavor: the timeout timer needs a free worker to
+    /// fire while the fast path's spawn_blocking is in the pool.
     ///
     /// TODO(I-165): the end-to-end VM coverage for this (toxiproxy on
     /// the worker→store GetPath link, assert
     /// `rio_builder_input_warm_timeout_total ≥ 1` within
     /// deadline+slop) needs the chaos fixture extended to proxy
     /// worker→store. Tracked as a Tier-2 followup.
-    // r[verify builder.input.warm-bounded]
+    // r[verify builder.input.warm-bounded+2]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_warm_inputs_deadline_bounds_stalled_stat() {
+    async fn test_warm_inputs_deadline_bounds_stalled_fetch() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Two inputs: one resolves instantly, one stalls. Partial-warm
         // accounting should reflect 1 warmed, 1 skipped (not failed —
@@ -1499,20 +1626,28 @@ mod tests {
         .expect("write");
 
         let deadline = Duration::from_millis(300);
-        // Stall well past deadline+slop so the timeout MUST fire, but
-        // short enough that the detached blocking thread doesn't hold
-        // up the test runner for long after the assert returns.
-        const STALL: Duration = Duration::from_secs(5);
 
         let start = std::time::Instant::now();
-        warm_inputs_bounded(dir.path(), &[fast, slow], deadline, |p| {
-            tokio::task::spawn_blocking(move || {
-                if p.as_os_str().as_encoded_bytes().ends_with(b"-stall") {
-                    std::thread::sleep(STALL);
+        warm_inputs_bounded(
+            dir.path(),
+            &[fast, slow],
+            deadline,
+            |basename, p| async move {
+                if basename.ends_with("-stall") {
+                    // Pure-async hang: dropped cleanly when the timeout
+                    // drops the buffer_unordered stream. No spawn_blocking,
+                    // no detached thread.
+                    std::future::pending::<()>().await;
                 }
-                p.symlink_metadata().map(|_| ()).map_err(|e| (p, e))
-            })
-        })
+                tokio::task::spawn_blocking(move || {
+                    p.symlink_metadata()
+                        .map(|_| ())
+                        .map_err(|e| WarmErr::Io(p.display().to_string(), e))
+                })
+                .await
+                .map_err(WarmErr::Join)?
+            },
+        )
         .await;
         let elapsed = start.elapsed();
 
@@ -1520,12 +1655,9 @@ mod tests {
             elapsed >= deadline,
             "should not return before deadline (stall didn't take effect?): {elapsed:?}"
         );
-        assert!(
-            elapsed < STALL,
-            "warm must give up at deadline, not wait for stalled stat: {elapsed:?}"
-        );
         // Generous slop for CI scheduling jitter; the load-bearing
-        // assertion is `< STALL` above.
+        // assertion is that we returned at all (a pure-async pending()
+        // would hang forever without the timeout wiring).
         assert!(
             elapsed < deadline + Duration::from_secs(2),
             "returned well past deadline (timeout not wired?): {elapsed:?}"

@@ -459,8 +459,8 @@ A cancel that arrives before the per-build cgroup exists (`cgroup.kill` → ENOE
 
 ## Input Warming
 
-r[builder.input.warm-bounded]
-The FUSE input-warm phase (`warm_inputs_in_fuse`) MUST be bounded by an overall deadline independent of input count. On deadline expiry the build proceeds with a partial warm and increments `rio_builder_input_warm_timeout_total`; un-warmed inputs are subject to the I-043 overlay negative-dentry race (rare, recoverable via build retry). A 47-minute hang (I-165: store-side S3 saturation under a thundering-herd dispatch wave) is not. Warm is best-effort --- a partially-warmed build that fails on `does not exist in the store` is recoverable; a builder pod stuck in warm is not cancellable until the per-build cgroup exists.
+r[builder.input.warm-bounded+2]
+The FUSE input-warm phase (`warm_inputs_in_fuse`) MUST materialize each input by calling the FUSE cache's fetch path directly (`prefetch_path_blocking`), NOT by `stat()`ing through the builder's own FUSE mount. The phase MUST be bounded by an overall deadline independent of input count; on expiry the build proceeds with a partial warm and increments `rio_builder_input_warm_timeout_total`. Un-warmed inputs are subject to the I-043 overlay negative-dentry race (rare, recoverable via build retry). I-165c: a stat-through-own-FUSE warm parks the `spawn_blocking` thread in kernel D-state (`request_wait_answer`) when the store stalls; the deadline detaches that thread but cannot wake it. If the build later dies by SIGKILL (OOM), `FuseMount::Drop` never runs --- no fusectl abort --- and the D-state threads pin the process forever (pod shows `Running` with the OOMKilled container un-reaped). Calling the cache directly keeps any detached thread in userspace `block_on(gRPC)` (bounded by `fetch_timeout`, dies on SIGKILL). After the cache confirms a path is on local disk, ONE fast `stat()` through the FUSE mount populates the kernel's FUSE-layer dentry for I-043 --- that stat hits the FUSE `lookup()` local-disk fast path and returns in microseconds, never D-states.
 
 ## Shutdown
 

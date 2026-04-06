@@ -312,6 +312,11 @@ pub struct BuildSpawnContext {
     /// `ExecutorEnv` so `prefetch_manifests` can prime the manifest-
     /// hint map before the warm-stat loop.
     pub fuse_cache: Arc<crate::fuse::cache::Cache>,
+    /// Per-fetch gRPC timeout for `prefetch_path_blocking`. I-165c:
+    /// `warm_inputs_in_fuse` now calls the cache's fetch path directly
+    /// (not stat-through-own-FUSE) and needs the same timeout the FUSE
+    /// layer uses. Same value passed to [`handle_prefetch_hint`].
+    pub fuse_fetch_timeout: Duration,
 }
 
 /// Attempt to cancel a build by drv_path. Looks up the cgroup
@@ -566,6 +571,7 @@ pub async fn spawn_build_task(
         cgroup_parent: ctx.cgroup_parent.clone(),
         executor_kind: ctx.executor_kind,
         fuse_cache: Some(Arc::clone(&ctx.fuse_cache)),
+        fuse_fetch_timeout: ctx.fuse_fetch_timeout,
         // Same Arc as the registry entry and `build_cancelled` below.
         // execute_build polls it during the pre-cgroup phase (I-166).
         cancelled: Arc::clone(&build_cancelled),

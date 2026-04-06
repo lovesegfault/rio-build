@@ -859,6 +859,15 @@ in
             # leaf EACCES → CrashLoop. Same escape hatch builderPool
             # uses (via privileged:true which implies hostUsers:true).
             hostUsers: true
+            # I-170/P0556: values.yaml defaults classes=[tiny(1Gi req),
+            # small(4Gi req)]. k3s-agent VM can't fit 1Gi alongside the
+            # builder pod. Override tiny to 128Mi — this test exercises
+            # routing/netpol, not memory sizing.
+            classes:
+              - name: tiny
+                resources:
+                  requests: {cpu: 100m, memory: 128Mi}
+                  limits: {memory: 512Mi}
         '')
       ];
       extraImages = [ pulled.smarter-device-manager ];

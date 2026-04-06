@@ -354,6 +354,10 @@ async fn main() -> anyhow::Result<()> {
         // I-110c: same Arc as prefetch_cache / the FUSE mount —
         // executor primes manifest hints, FUSE threads consume them.
         fuse_cache: Arc::clone(&prefetch_cache),
+        // I-165c: warm_inputs_in_fuse calls prefetch_path_blocking
+        // directly with the same fetch timeout the FUSE layer and
+        // PrefetchHint handler use.
+        fuse_fetch_timeout,
     };
 
     // Process incoming scheduler messages + shutdown signal for graceful drain.
