@@ -1501,7 +1501,7 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.cancel-on-disconnect]
+// r[verify gw.conn.cancel-on-disconnect+2]
 /// P0335: graceful-shutdown signal lets the cancel-on-disconnect
 /// machinery run — task is NOT aborted.
 ///

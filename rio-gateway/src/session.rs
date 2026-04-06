@@ -139,7 +139,27 @@ where
         limiter,
         quota_cache,
     );
+    run_protocol_loop(reader, writer, &mut ctx, shutdown).await
+}
 
+/// Handshake + opcode loop. [`run_protocol`] constructs a fresh
+/// [`SessionContext`] and delegates here; tests that need a pre-seeded
+/// context (e.g. non-empty `active_build_ids` to exercise a cancel path)
+/// build the context themselves and call this directly. Both entry points
+/// run IDENTICAL code from this line on — the split exists purely so the
+/// four exit-path cancel contracts can be regression-tested without
+/// having to drive a full build opcode into the exact state that leaves
+/// a build_id in the map between opcodes.
+pub async fn run_protocol_loop<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    ctx: &mut SessionContext,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin,
+{
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));
     match handshake::server_handshake_split(reader, writer, &version_string).await {
         Ok(result) => {
@@ -183,7 +203,7 @@ where
     }
 
     loop {
-        // r[impl gw.conn.cancel-on-disconnect]
+        // r[impl gw.conn.cancel-on-disconnect+2]
         // Select over shutdown-signal + opcode-read. `biased` polls
         // shutdown first: when BOTH are ready on the same poll (TCP RST
         // → russh fires channel_eof AND channel_close near-simultaneously
@@ -200,7 +220,7 @@ where
             biased;
             () = shutdown.cancelled() => {
                 debug!("channel closed (graceful shutdown signal)");
-                cancel_active_builds(&mut ctx, "channel_close").await;
+                cancel_active_builds(ctx, "channel_close").await;
                 return Ok(());
             }
             r = tokio::time::timeout(OPCODE_IDLE_TIMEOUT, wire::read_u64(reader)) => r,
@@ -220,6 +240,13 @@ where
                         format!("idle timeout: no opcode received in {OPCODE_IDLE_TIMEOUT:?}"),
                     ))
                     .await;
+                // P0444: fourth exit path — same cancel contract as the
+                // other three. Today active_build_ids is empty here in
+                // practice (handlers run outside the idle timer and
+                // remove on completion), but this is the defense-in-depth
+                // for future handler changes that leave entries between
+                // opcodes. Cheap when empty (one .keys() on empty map).
+                cancel_active_builds(ctx, "idle_timeout").await;
                 return Ok(());
             }
             Ok(Err(wire::WireError::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -228,7 +255,7 @@ where
                 // is usually empty here (handlers remove on completion) —
                 // this catches abnormal handler exits that left an entry.
                 debug!("client disconnected (EOF)");
-                cancel_active_builds(&mut ctx, "client_disconnect").await;
+                cancel_active_builds(ctx, "client_disconnect").await;
                 return Ok(());
             }
             Ok(Err(e)) => {
@@ -240,7 +267,7 @@ where
 
         debug!(opcode = opcode, "received opcode");
 
-        if let Err(e) = handler::handle_opcode(opcode, reader, writer, &mut ctx).await {
+        if let Err(e) = handler::handle_opcode(opcode, reader, writer, ctx).await {
             // Mid-opcode disconnect: handler error is typically BrokenPipe
             // on a response write (client dropped during wopBuildDerivation
             // or wopBuildPathsWithResults). The build handler leaves the
@@ -250,7 +277,7 @@ where
             // Without this, the ? propagated straight out and the EOF arm
             // above was never reached — it only catches opcode-READ errors,
             // not handler-execution errors. P0331.
-            cancel_active_builds(&mut ctx, "client_disconnect").await;
+            cancel_active_builds(ctx, "client_disconnect").await;
             return Err(e);
         }
 
