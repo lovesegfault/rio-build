@@ -33,14 +33,15 @@ use rio_proto::AdminService;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse, GcProgress,
-    GcRequest, GetBuildLogsRequest, ListBuildsRequest, ListBuildsResponse, ListTenantsResponse,
-    ListWorkersRequest, ListWorkersResponse, TenantInfo,
+    GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest, ListBuildsRequest,
+    ListBuildsResponse, ListTenantsResponse, ListWorkersRequest, ListWorkersResponse, TenantInfo,
 };
 
 use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
 
 mod builds;
+mod graph;
 mod workers;
 
 /// Chunk size for streaming S3-fetched log lines back to the client.
@@ -761,6 +762,26 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(CreateTenantResponse {
             tenant: Some(tenant_row_to_proto(row)),
         }))
+    }
+
+    /// PG-backed DAG snapshot for dashboard viz. No actor round-trip —
+    /// this reads PG directly (same pattern as ListBuilds/ListTenants).
+    /// Works for completed builds too (actor state is gone, PG persists).
+    ///
+    /// Leader-guarded: standby's PG view is correct (replicas see the
+    /// same DB) but guarding keeps all admin RPCs uniform — operator
+    /// tooling points at the leader VIP, period.
+    #[instrument(skip(self, request), fields(rpc = "GetBuildGraph"))]
+    async fn get_build_graph(
+        &self,
+        request: Request<GetBuildGraphRequest>,
+    ) -> Result<Response<GetBuildGraphResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        let req = request.into_inner();
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let resp = graph::get_build_graph(&db, &req.build_id, None).await?;
+        Ok(Response::new(resp))
     }
 }
 
