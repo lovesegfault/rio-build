@@ -49,10 +49,11 @@
   # via resources.limits instead of hostPath, which makes
   # hostUsers:false work (kernel rejects idmap mounts on device nodes).
   #
-  # Chart default (values.yaml devicePlugin.image) uses v1.20.15 but
-  # only v1.20.12 exists upstream; the nonpriv values file overrides
-  # devicePlugin.image to match this preloaded tag. If upstream adds
-  # v1.20.15 later, bump here + drop the values override.
+  # Chart default (values.yaml devicePlugin.image) is digest-pinned to
+  # the same v1.20.12 digest; the nonpriv values file overrides to the
+  # bare `:v1.20.12` tag because containerd's airgap cache is tag-
+  # indexed (finalImageTag below), not digest-indexed. Keep imageDigest
+  # here and the chart default's @sha256 suffix in lockstep.
   #
   # finalImageName/Tag MUST match `devicePlugin.image` in
   # vmtest-full-nonpriv.yaml exactly — containerd exact-string lookup
