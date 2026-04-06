@@ -138,9 +138,11 @@ pub fn span_from_traceparent(name: &'static str, traceparent: &str) -> tracing::
 /// parent. `#[instrument]` created this span at function entry with its
 /// own trace_id; `set_parent()` called after produces a link, not a
 /// parent-child edge. Jaeger shows two traces connected by the link.
-/// See TODO(phase4b) at `nix/tests/scenarios/observability.nix:269` for
-/// the operator-visible consequence (STDERR_NEXT emits the gateway's
-/// trace_id, which does NOT span scheduler→worker).
+/// Operator-visible consequence: the scheduler exposes its trace_id
+/// via the `x-rio-trace-id` response header so the gateway can emit
+/// THAT in STDERR_NEXT (the scheduler's trace spans scheduler→worker
+/// via data-carry; the gateway's trace has only gateway spans). See
+/// r[obs.trace.scheduler-id-in-metadata].
 ///
 /// No-op if the incoming metadata has no `traceparent` header (the
 /// client isn't tracing, or it's a raw grpcurl call).

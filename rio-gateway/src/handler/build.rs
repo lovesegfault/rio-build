@@ -412,6 +412,19 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         .get(rio_proto::BUILD_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // r[impl obs.trace.scheduler-id-in-metadata]
+    // x-rio-trace-id: the SCHEDULER handler span's trace_id. Prefer this
+    // over our own — the scheduler's #[instrument] span was created
+    // before link_parent() ran, so it has its OWN trace_id (LINKED to
+    // ours, not parented). That trace extends through worker via the
+    // WorkAssignment.traceparent data-carry; ours has only gateway
+    // spans. Read BEFORE into_inner() consumes metadata.
+    let header_trace_id = resp
+        .metadata()
+        .get(rio_proto::TRACE_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let mut event_stream = resp.into_inner();
 
     let build_id = match header_build_id {
@@ -467,10 +480,16 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // grep handle for Tempo when debugging a user's build. With the
     // header path this now fires BEFORE event 0 — operator gets the
     // Tempo handle the moment the build is accepted, not after the
-    // first event arrives. Empty-guard suppresses output when no OTel
-    // tracer is configured (current_trace_id_hex returns "" for
-    // TraceId::INVALID).
-    let trace_id = rio_proto::interceptor::current_trace_id_hex();
+    // first event arrives. PRIORITIZE the scheduler's trace_id
+    // (x-rio-trace-id header, read above) over our own — the scheduler
+    // span is the one that actually spans the full scheduler→worker
+    // chain (data-carry per r[sched.trace.assignment-traceparent]).
+    // Our own trace only has gateway spans. Fallback to our own for
+    // legacy schedulers that don't set the header. Empty-guard
+    // suppresses output when no OTel tracer is configured
+    // (current_trace_id_hex returns "" for TraceId::INVALID and the
+    // header is absent with no OTel on the scheduler side either).
+    let trace_id = header_trace_id.unwrap_or_else(rio_proto::interceptor::current_trace_id_hex);
     if !trace_id.is_empty() {
         let _ = stderr.log(&format!("rio trace_id: {trace_id}\n")).await;
     }

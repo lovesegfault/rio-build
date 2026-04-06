@@ -24,6 +24,24 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 /// scheduler; callers fall back to first-event peek.
 pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
 
+/// gRPC initial-metadata key carrying the scheduler handler span's
+/// trace_id on `SubmitBuild` responses.
+///
+/// Set by the scheduler AFTER `link_parent()` so it reflects the actual
+/// trace the handler is in — which, due to the `#[instrument]` +
+/// `set_parent` ordering, is a NEW trace LINKED to the gateway's, not a
+/// child of it. Jaeger shows two traces connected by an OTel span link.
+///
+/// The gateway emits THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`)
+/// so operators grep the trace that actually spans scheduler→worker (via
+/// the `WorkAssignment.traceparent` data-carry). The gateway's own
+/// trace_id only reaches gateway spans.
+///
+/// Value: 32 lowercase-hex characters (128-bit W3C trace_id). Always
+/// ASCII. Empty/absent → legacy scheduler; gateway falls back to its
+/// own `current_trace_id_hex()`.
+pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
+
 /// Read the max message size from the `RIO_GRPC_MAX_MESSAGE_SIZE` environment
 /// variable, falling back to [`DEFAULT_MAX_MESSAGE_SIZE`] if not set or invalid.
 ///

@@ -247,78 +247,121 @@ pkgs.testers.runNixOSTest {
             f"have {services} ({len(spans)} spans)"
         )
 
-    with subtest("trace-export: scheduler + gateway spans in otelcol"):
-        spans, services = wait_for_spans({"scheduler", "gateway"})
+    with subtest("trace-export: gateway+scheduler+worker spans in otelcol"):
+        spans, services = wait_for_spans({"scheduler", "gateway", "worker"})
         assert "scheduler" in services, (
             f"no scheduler spans; services present: {services}"
         )
         assert "gateway" in services, (
             f"no gateway spans; services present: {services}"
         )
+        assert "worker" in services, (
+            f"no worker spans; services present: {services}"
+        )
         print(f"trace-export: {len(spans)} spans across services {services}")
 
     # ══════════════════════════════════════════════════════════════════
-    # trace-id-propagation: STDERR_NEXT trace_id is real + queryable
+    # trace-id-propagation: STDERR_NEXT trace_id spans scheduler+worker
     # ══════════════════════════════════════════════════════════════════
     #
     # Gateway emits `rio trace_id: <32-hex>` via STDERR_NEXT after
     # SubmitBuild — gives operators a grep handle into the trace
-    # backend. The emitted id must appear in at least one gateway span
-    # in the collector file (proves the id is the gateway's actual
-    # trace, not a fabricated hex string).
+    # backend. The emitted id is the SCHEDULER's trace_id (from the
+    # x-rio-trace-id response-metadata header, not the gateway's own
+    # span — see r[obs.trace.scheduler-id-in-metadata]). That trace
+    # extends through worker via WorkAssignment.traceparent data-carry.
     #
-    # TODO(phase4b): round-4 validation proved that the gateway trace
-    # does NOT include scheduler/worker spans — link_parent() calls
-    # tracing::Span::current().set_parent() but the #[instrument] span
-    # was already created at function entry, so the scheduler handler
-    # span is an orphan with its own trace_id (LINKED to the gateway
-    # trace but not a child). The data-carry fix (round 3) makes
-    # scheduler→worker work, but gateway→scheduler was never actually
-    # parented. The previous ≥3 span-count assertion was satisfied by
-    # gateway alone (it emits many spans per ssh-ng session). Fix:
-    # either (a) create handler spans manually AFTER extracting
-    # traceparent (not #[instrument] + link_parent), or (b) return
-    # scheduler trace_id in SubmitBuildResponse so gateway emits THAT
-    # in STDERR_NEXT. Unit test at actor/tests/dispatch.rs:227
-    # verifies the scheduler→worker data-carry in isolation.
-    #
-    # Assertion stays GATEWAY-ONLY until this is fixed.
+    # link_parent() + #[instrument] produces a LINK, not a parent: the
+    # scheduler handler span keeps its own trace_id. Gateway's trace
+    # contains only gateway spans; the scheduler's is the useful one.
+    # Round-4 validation proved this; option (b) from the phase4b TODO
+    # (return scheduler trace_id in response metadata) is now landed.
 
-    with subtest("trace-id-propagation: STDERR_NEXT id matches a gateway span"):
+    with subtest("trace-id-propagation: STDERR_NEXT id spans scheduler+worker"):
         m = re.search(r"rio trace_id: ([0-9a-f]{32})", output)
         assert m, (
             f"expected 'rio trace_id: <32-hex>' in build output; "
             f"first 500 chars: {output[:500]!r}"
         )
-        emitted_trace_id = m.group(1)
+        emitted_trace_id = m.group(1).lower()
 
         # otelcol file exporter writes traceId as no-dash hex —
         # same format as gateway emits. Case-fold to be safe.
-        # Under KVM the build completes fast enough that the gateway's
-        # SubmitBuild span may not have flushed yet — re-poll the
-        # collector file until the emitted id appears (same pattern
-        # as wait_for_spans).
+        # The emitted id is the SCHEDULER's trace_id (x-rio-trace-id
+        # header). The WorkAssignment.traceparent data-carry extends
+        # this trace through worker. Assert both services appear.
+        # Under KVM the build completes fast enough that spans may not
+        # have flushed yet — re-poll the collector file until both
+        # services appear in the trace (same pattern as wait_for_spans).
         deadline = time.time() + 30
-        gateway_trace_ids = set()
+        services_in_trace = set()
         while time.time() < deadline:
             spans = load_otel_spans(${gatewayHost})
-            gateway_trace_ids = {
-                tid.lower()
+            services_in_trace = {
+                svc
                 for svc, tid, _ in spans
-                if svc == "gateway" and tid
+                if tid and tid.lower() == emitted_trace_id
             }
-            if emitted_trace_id.lower() in gateway_trace_ids:
+            if {"scheduler", "worker"} <= services_in_trace:
                 break
             time.sleep(2)
-        assert emitted_trace_id.lower() in gateway_trace_ids, (
-            f"emitted trace_id {emitted_trace_id} not in gateway spans; "
-            f"gateway has {len(gateway_trace_ids)} distinct trace_ids: "
-            f"{sorted(gateway_trace_ids)[:5]}..."
+        assert "scheduler" in services_in_trace, (
+            f"scheduler not in trace {emitted_trace_id}; "
+            f"services in trace: {services_in_trace}; "
+            f"scheduler trace_ids: "
+            f"{sorted({t.lower() for s,t,_ in spans if s=='scheduler' and t})[:5]}"
+        )
+        assert "worker" in services_in_trace, (
+            f"worker not in trace {emitted_trace_id}; "
+            f"services in trace: {services_in_trace}; "
+            f"worker trace_ids: "
+            f"{sorted({t.lower() for s,t,_ in spans if s=='worker' and t})[:5]}"
         )
         print(
-            f"trace_id {emitted_trace_id}: present in gateway spans "
-            f"(scheduler/worker linkage: see TODO(phase4b) above)"
+            f"trace_id {emitted_trace_id}: spans services {services_in_trace}"
         )
+
+        # ── span_from_traceparent: parenting vs link ────────────────────
+        # span_from_traceparent (interceptor.rs:126) is info_span!() THEN
+        # set_parent() — the span is created but NOT yet entered when
+        # set_parent runs. link_parent (same file) calls set_parent on an
+        # ALREADY-ENTERED #[instrument] span and produces a LINK (proven
+        # by the unit test at rio-scheduler/src/grpc/tests.rs which checks
+        # the trace_id differs). This block OBSERVES whether the
+        # not-yet-entered variant produces parenting (same trace_id,
+        # worker's parentSpanId in scheduler's spanId set) or a link.
+        # The doc text at r[sched.trace.assignment-traceparent] gets
+        # tightened based on this observation.
+        sched_spans = [
+            sp for svc, tid, sp in spans
+            if svc == "scheduler" and tid and tid.lower() == emitted_trace_id
+        ]
+        worker_spans = [
+            sp for svc, tid, sp in spans
+            if svc == "worker" and tid and tid.lower() == emitted_trace_id
+        ]
+        assert sched_spans and worker_spans, (
+            f"precondition: both services in trace {emitted_trace_id}; "
+            f"sched={len(sched_spans)} worker={len(worker_spans)}"
+        )
+        sched_span_ids = {sp.get("spanId") for sp in sched_spans if sp.get("spanId")}
+        worker_parents = {
+            sp.get("parentSpanId") for sp in worker_spans if sp.get("parentSpanId")
+        }
+        overlap = worker_parents & sched_span_ids
+        if overlap:
+            print(
+                "CONFIRMED: span_from_traceparent → PARENTING "
+                "(worker parentSpanId in scheduler spanId set; "
+                f"overlap={sorted(overlap)[:3]})"
+            )
+        else:
+            print(
+                "CONFIRMED: span_from_traceparent → LINK only "
+                "(no worker parentSpanId matches any scheduler spanId; "
+                f"worker_parents={sorted(worker_parents)[:3]} "
+                f"sched_span_ids={sorted(sched_span_ids)[:3]})"
+            )
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

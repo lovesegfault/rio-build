@@ -350,7 +350,9 @@ impl SchedulerService for SchedulerGrpc {
         // — NOT a parent. This span keeps its own trace_id; Jaeger shows
         // two traces connected by the link. Everything below (actor calls,
         // DB writes, store RPCs) inherits THIS span's trace_id.
-        // See TODO(phase4b) at nix/tests/scenarios/observability.nix:269.
+        // The gateway reads THIS trace_id from x-rio-trace-id response
+        // metadata (set below) and emits it in STDERR_NEXT — see
+        // r[obs.trace.scheduler-id-in-metadata].
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
@@ -567,6 +569,25 @@ impl SchedulerService for SchedulerGrpc {
                 .parse()
                 .expect("UUID string is always valid ASCII metadata"),
         );
+        // r[impl obs.trace.scheduler-id-in-metadata]
+        // Set x-rio-trace-id alongside x-rio-build-id. The #[instrument]
+        // span was created BEFORE link_parent() ran, so it has its OWN
+        // trace_id (LINKED to the gateway's, not parented). Gateway emits
+        // THIS id in STDERR_NEXT — operators grep the scheduler trace,
+        // which is the one that spans scheduler→worker via the data-carry
+        // at r[sched.trace.assignment-traceparent]. The gateway's own
+        // trace_id only gets them to a trace with gateway spans; this one
+        // gets them to the full chain. Empty-guard: no-OTel unit tests
+        // get TraceId::INVALID → "" → no header.
+        let trace_id = rio_proto::interceptor::current_trace_id_hex();
+        if !trace_id.is_empty() {
+            resp.metadata_mut().insert(
+                rio_proto::TRACE_ID_HEADER,
+                trace_id
+                    .parse()
+                    .expect("32 lowercase-hex chars is always valid ASCII metadata"),
+            );
+        }
         Ok(resp)
     }
 
