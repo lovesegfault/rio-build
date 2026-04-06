@@ -231,6 +231,71 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
     let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
 
+    // ---- Sweep Failed Jobs FIRST ----
+    // This MUST run before spawn: under a namespace ResourceQuota on
+    // count/jobs.batch (GKE Autopilot default, common in hardened
+    // clusters), a crash-loop fills the quota with Failed Jobs. If
+    // spawn-before-sweep, jobs_api.create 403s on quota exhaustion →
+    // return Err → sweep never runs → deadlock (can't clear quota to
+    // make room for the spawn that would succeed next). Sweep-first
+    // clears dead weight; spawn then has room.
+    //
+    // Separate from the idle-reapable pass below: Failed Jobs need no
+    // idle-check (no running pod) and no ListExecutors RPC. This block
+    // is self-contained — runs unconditionally, bounded-per-tick
+    // (select_failed_jobs caps internally at sweep_cap =
+    // max(FAILED_SWEEP_MIN, replicas.max)).
+    //
+    // CrashLoopDetected: operator visibility via `kubectl describe
+    // builderpool`. The message interpolates a coarse tier
+    // (crash_loop_tier), not the exact count — K8s deduplicates
+    // events by (reason, message), so a stable message lets the
+    // apiserver collapse per-tick emits into one event with a
+    // rising .count. Exact count would change every tick → no dedup
+    // → event flood compounding the Job flood.
+    if failed_total >= CRASH_LOOP_WARN_THRESHOLD {
+        use kube::runtime::events::{Event as KubeEvent, EventType};
+        ctx.publish_event(
+            wp,
+            &KubeEvent {
+                type_: EventType::Warning,
+                reason: REASON_CRASH_LOOP.into(),
+                note: Some(format!(
+                    "{} Failed manifest Jobs (backoff_limit=0); check \
+                     pod logs for crash cause. Sweeping up to {} per \
+                     tick. To clear immediately: kubectl delete jobs \
+                     -l {SIZING_LABEL}={SIZING_MANIFEST} \
+                     --field-selector status.successful=0",
+                    crash_loop_tier(failed_total),
+                    sweep_cap,
+                )),
+                action: "Sweep".into(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
+    for job in &failed_jobs {
+        let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        match jobs_api.delete(job_name, &DeleteParams::default()).await {
+            Ok(_) => {
+                info!(
+                    pool = %name, job = %job_name,
+                    "swept Failed manifest Job (backoff_limit=0 crash)"
+                );
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                debug!(pool = %name, job = %job_name, "Failed Job already deleted");
+            }
+            Err(e) => {
+                warn!(
+                    pool = %name, job = %job_name, error = %e,
+                    "failed to sweep Failed Job; will retry next tick"
+                );
+            }
+        }
+    }
+
     // ---- Diff: spawn (scale-up) ----
     let plan = compute_spawn_plan(&demand, &supply, cold_start, cold_start_supply);
     let to_spawn: usize = plan.iter().map(|d| d.count).sum();
@@ -289,7 +354,21 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                     Err(kube::Error::Api(ae)) if ae.code == 409 => {
                         debug!(pool = %name, job = %job_name, "Job name collision; will retry");
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        // warn+continue, not bail. A spawn failure
+                        // (quota, webhook rejection, transient apiserver
+                        // blip) shouldn't skip the rest of this tick's
+                        // work — subsequent spawns in the batch may
+                        // succeed (different bucket → different resource
+                        // limits), and the idle-reapable pass below is
+                        // independent. Matches delete-error handling in
+                        // the sweep loop.
+                        warn!(
+                            pool = %name, job = %job_name,
+                            bucket = ?directive.bucket, error = %e,
+                            "manifest Job spawn failed; continuing tick"
+                        );
+                    }
                 }
             }
         }
@@ -368,64 +447,6 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                 warn!(
                     pool = %name, error = %e, reapable = ?reapable.keys().collect::<Vec<_>>(),
                     "ListExecutors failed; skipping scale-down this tick (can't verify idle)"
-                );
-            }
-        }
-    }
-
-    // ---- Scale-down: sweep Failed Jobs ----
-    // Separate from the reapable pass above: Failed Jobs need no
-    // idle-check (no running pod to interrupt — status.failed > 0
-    // means the pod already terminated). Runs unconditionally; a
-    // crash-loop accumulates Failed Jobs regardless of whether any
-    // bucket is surplus. Bounded to sweep_cap (computed above as
-    // max(FAILED_SWEEP_MIN, replicas.max)).
-    //
-    // CrashLoopDetected: operator visibility via `kubectl describe
-    // builderpool`. The message interpolates a coarse tier
-    // (crash_loop_tier), not the exact count — K8s deduplicates
-    // events by (reason, message), so a stable message lets the
-    // apiserver collapse per-tick emits into one event with a
-    // rising .count. Exact count would change every tick → no dedup
-    // → event flood compounding the Job flood.
-    if failed_total >= CRASH_LOOP_WARN_THRESHOLD {
-        use kube::runtime::events::{Event as KubeEvent, EventType};
-        ctx.publish_event(
-            wp,
-            &KubeEvent {
-                type_: EventType::Warning,
-                reason: REASON_CRASH_LOOP.into(),
-                note: Some(format!(
-                    "{} Failed manifest Jobs (backoff_limit=0); check \
-                     pod logs for crash cause. Sweeping up to {} per \
-                     tick. To clear immediately: kubectl delete jobs \
-                     -l {SIZING_LABEL}={SIZING_MANIFEST} \
-                     --field-selector status.successful=0",
-                    crash_loop_tier(failed_total),
-                    sweep_cap,
-                )),
-                action: "Sweep".into(),
-                secondary: None,
-            },
-        )
-        .await;
-    }
-    for job in &failed_jobs {
-        let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
-        match jobs_api.delete(job_name, &DeleteParams::default()).await {
-            Ok(_) => {
-                info!(
-                    pool = %name, job = %job_name,
-                    "swept Failed manifest Job (backoff_limit=0 crash)"
-                );
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!(pool = %name, job = %job_name, "Failed Job already deleted");
-            }
-            Err(e) => {
-                warn!(
-                    pool = %name, job = %job_name, error = %e,
-                    "failed to sweep Failed Job; will retry next tick"
                 );
             }
         }

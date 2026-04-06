@@ -1383,3 +1383,62 @@ fn crash_loop_tier_stable_within_bucket() {
          message, so K8s can dedup across ticks"
     );
 }
+
+// r[verify ctrl.pool.manifest-failed-sweep+2]
+#[test]
+fn sweep_ordered_before_spawn_in_source() {
+    // STRUCTURAL GUARD: the Failed-Job sweep MUST appear before the
+    // spawn loop in reconcile_manifest's body. A return-on-spawn-error
+    // can't skip a sweep that already ran. This test greps the source
+    // — brittle to refactoring, but that brittleness is the point:
+    // anyone reordering these sections trips this test and has to
+    // consciously decide the ordering is still safe.
+    //
+    // Quota-deadlock scenario this guards: ResourceQuota on
+    // count/jobs.batch exhausted by Failed Jobs → spawn 403 →
+    // pre-reorder: return Err skipped sweep → can't clear quota.
+    // The reconciler could not recover without `kubectl delete`.
+    let src = include_str!("../manifest.rs");
+    let sweep_marker = "---- Sweep Failed Jobs FIRST ----";
+    let spawn_marker = "---- Spawn ----";
+    let sweep_pos = src
+        .find(sweep_marker)
+        .expect("sweep section comment present");
+    let spawn_pos = src
+        .find(spawn_marker)
+        .expect("spawn section comment present");
+    assert!(
+        sweep_pos < spawn_pos,
+        "Failed-Job sweep at byte {sweep_pos} MUST precede spawn at \
+         byte {spawn_pos}. Reordering spawn-before-sweep reintroduces \
+         the quota-exhaustion deadlock (spawn 403 → early return → \
+         sweep skipped → quota never clears).",
+    );
+}
+
+#[test]
+fn spawn_loop_no_early_return_on_error() {
+    // The Err arm at the jobs_api.create match is warn+continue, not
+    // return. grep for the specific `return Err(e.into())` that was
+    // the deadlock line — it should be gone from the spawn loop.
+    // Slices the source between `---- Spawn ----` and the next
+    // `---- Scale-down` header so a `return Err` elsewhere in the
+    // file doesn't false-positive.
+    let src = include_str!("../manifest.rs");
+    let spawn_start = src.find("---- Spawn ----").unwrap();
+    let spawn_end = src[spawn_start..]
+        .find("---- Scale-down")
+        .map(|i| i + spawn_start)
+        .expect("scale-down section follows spawn");
+    let spawn_block = &src[spawn_start..spawn_end];
+    assert!(
+        !spawn_block.contains("return Err(e.into())"),
+        "spawn loop must warn+continue on create error, not bail — \
+         bailing skips the idle-reapable pass + status patch"
+    );
+    // Positive: the warn message is there.
+    assert!(
+        spawn_block.contains("manifest Job spawn failed; continuing tick"),
+        "spawn loop should warn on create error with a grep-able message"
+    );
+}
