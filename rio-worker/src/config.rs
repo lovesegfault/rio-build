@@ -122,6 +122,14 @@ pub(crate) struct Config {
     /// output is true. Env: `RIO_FOD_PROXY_URL`. Unset = FODs
     /// have direct internet.
     pub(crate) fod_proxy_url: Option<String>,
+    /// Bloom filter expected-items capacity. `None` → default 50 000.
+    /// Oversizing is cheap (~1.2 bytes/item at 1% FPR — 500k = ~600 KB
+    /// filter). Long-lived low-ordinal StatefulSet workers churn past
+    /// the default via eviction; the filter never shrinks (evicted
+    /// paths stay as stale positives), only restart clears it. Bump
+    /// this when `rio_worker_bloom_fill_ratio` alerts ≥ 0.5.
+    /// Env: `RIO_BLOOM_EXPECTED_ITEMS`. TOML: `bloom_expected_items`.
+    pub(crate) bloom_expected_items: Option<usize>,
 }
 
 impl Default for Config {
@@ -159,6 +167,7 @@ impl Default for Config {
             max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
             fod_proxy_url: None,
+            bloom_expected_items: None,
         }
     }
 }
@@ -327,6 +336,10 @@ mod tests {
         assert_eq!(d.log_rate_limit, 10_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
         assert_eq!(d.max_leaked_mounts, 3);
+        assert!(
+            d.bloom_expected_items.is_none(),
+            "bloom_expected_items defaults to None → Cache::new uses 50k compile-time fallback"
+        );
     }
 
     #[test]

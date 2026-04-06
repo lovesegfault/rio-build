@@ -196,16 +196,18 @@ pub struct Cache {
     bloom: Arc<RwLock<BloomFilter>>,
 }
 
-/// Expected cache inventory size for bloom filter sizing. A worker with
-/// a 100 GB SSD and typical 10 MB outputs holds ~10k paths. We size for
-/// 50k at 1% FPR — headroom for workers with bigger caches, cheap
-/// enough (~60 KB filter) that over-sizing doesn't matter.
+/// Default expected cache inventory size for bloom filter sizing. A
+/// worker with a 100 GB SSD and typical 10 MB outputs holds ~10k paths.
+/// We size for 50k at 1% FPR — headroom for workers with bigger caches,
+/// cheap enough (~60 KB filter) that over-sizing doesn't matter.
 ///
 /// If the actual inventory blows past this, FPR degrades gracefully
 /// (more false positives, scheduler scoring gets noisier, but nothing
-/// breaks). A future enhancement could resize-on-restart based on
-/// the previous run's SQLite count.
-const BLOOM_EXPECTED_ITEMS: usize = 50_000;
+/// breaks). Operators with larger caches — or long-lived low-ordinal
+/// StatefulSet workers that churn past 50k inserts via eviction —
+/// override via `worker.toml bloom_expected_items`. Oversizing is
+/// cheap: ~1.2 bytes/item at 1% FPR, so 500k items = ~600 KB filter.
+const BLOOM_EXPECTED_ITEMS_DEFAULT: usize = 50_000;
 const BLOOM_TARGET_FPR: f64 = 0.01;
 
 impl Cache {
@@ -213,7 +215,17 @@ impl Cache {
     ///
     /// Creates the cache directory and SQLite index if they don't exist.
     /// Must be called from within a tokio runtime (captures the current `Handle`).
-    pub async fn new(cache_dir: PathBuf, max_size_gb: u64) -> Result<Self, CacheError> {
+    ///
+    /// `bloom_expected_items` — bloom filter capacity. `None` →
+    /// `BLOOM_EXPECTED_ITEMS_DEFAULT` (50 000). Operators with
+    /// long-lived StatefulSet workers override via `worker.toml`;
+    /// the filter never shrinks (evicted paths stay as stale
+    /// positives) so churn eventually saturates the default.
+    pub async fn new(
+        cache_dir: PathBuf,
+        max_size_gb: u64,
+        bloom_expected_items: Option<usize>,
+    ) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
 
         // Clean up stale .tmp-* directories left behind by interrupted NAR
@@ -253,7 +265,8 @@ impl Cache {
         // We don't rebuild periodically — evicted paths stay in the
         // filter as stale positives (see the struct field doc for why
         // that's OK). Only restart clears it.
-        let mut bloom = BloomFilter::new(BLOOM_EXPECTED_ITEMS, BLOOM_TARGET_FPR);
+        let expected = bloom_expected_items.unwrap_or(BLOOM_EXPECTED_ITEMS_DEFAULT);
+        let mut bloom = BloomFilter::new(expected, BLOOM_TARGET_FPR);
         let existing: Vec<(String,)> = sqlx::query_as("SELECT store_path FROM cached_paths")
             .fetch_all(&pool)
             .await?;
@@ -640,7 +653,7 @@ mod tests {
     /// Cache sync methods use `block_on`, so tests create the cache in async
     /// context then exercise the sync methods via `spawn_blocking`.
     async fn make_cache(cache_dir: PathBuf, max_size_gb: u64) -> anyhow::Result<Arc<Cache>> {
-        Ok(Arc::new(Cache::new(cache_dir, max_size_gb).await?))
+        Ok(Arc::new(Cache::new(cache_dir, max_size_gb, None).await?))
     }
 
     #[tokio::test]
@@ -1048,7 +1061,7 @@ mod tests {
         std::fs::create_dir_all(&real_entry)?;
 
         // Cache::new should clean the stale tmp dir but leave the real entry.
-        let _cache = Cache::new(cache_dir, 10).await?;
+        let _cache = Cache::new(cache_dir, 10, None).await?;
         assert!(
             !stale_tmp.exists(),
             "stale tmp dir should be removed on init"

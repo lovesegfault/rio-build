@@ -235,8 +235,14 @@ async fn main() -> anyhow::Result<()> {
     // BEFORE moving into mount_fuse_background: bloom_handle for
     // heartbeat, and the Arc itself for the prefetch handler.
     // Same extract-before-move pattern as bloom_handle always used.
-    let cache =
-        Arc::new(fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?);
+    let cache = Arc::new(
+        fuse::cache::Cache::new(
+            cfg.fuse_cache_dir,
+            cfg.fuse_cache_size_gb,
+            cfg.bloom_expected_items,
+        )
+        .await?,
+    );
     // Extract the bloom handle. The heartbeat loop reads from the
     // same RwLock that cache.insert() writes to — inserts by FUSE
     // ops show up in subsequent heartbeat snapshots.
