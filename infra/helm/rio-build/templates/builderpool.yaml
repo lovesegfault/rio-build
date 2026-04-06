@@ -5,7 +5,7 @@ apiVersion: rio.build/v1alpha1
 kind: BuilderPool
 metadata:
   name: {{ $bp.name }}
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.builders.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: builder
@@ -23,8 +23,6 @@ spec:
   features:
     {{- toYaml $bp.features | nindent 4 }}
   sizeClass: {{ $bp.sizeClass | quote }}
-  # fodProxyUrl removed per ADR-019: builders are airgapped; FODs
-  # route to FetcherPool which has direct egress. Squid is gone.
   image: {{ include "rio.image" (list . $bp.image) }}
   {{- if .Values.tls.enabled }}
   tlsSecretName: rio-builder-tls

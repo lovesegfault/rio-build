@@ -77,17 +77,22 @@ pub async fn wait_crd_established(client: &Client, name: &str, timeout: Duration
     .await
 }
 
-/// Create namespace with PSA label. Idempotent.
+/// Create namespace with PSA + part-of labels. Idempotent.
+///
+/// `app.kubernetes.io/part-of: rio-build` is set unconditionally — the
+/// chart's NetworkPolicy namespaceSelector rules match by it. `pod-
+/// security.kubernetes.io/enforce` is always set (baseline or
+/// privileged) so the label stays SSA-owned by xtask and a later flip
+/// doesn't hit field-manager conflicts.
 pub async fn ensure_namespace(client: &Client, name: &str, privileged: bool) -> Result<()> {
     let api: Api<Namespace> = Api::all(client.clone());
     let mut ns = Namespace::default();
     ns.metadata.name = Some(name.into());
-    if privileged {
-        ns.metadata.labels = Some(BTreeMap::from([(
-            "pod-security.kubernetes.io/enforce".into(),
-            "privileged".into(),
-        )]));
-    }
+    let psa = if privileged { "privileged" } else { "baseline" };
+    ns.metadata.labels = Some(BTreeMap::from([
+        ("app.kubernetes.io/part-of".into(), "rio-build".into()),
+        ("pod-security.kubernetes.io/enforce".into(), psa.into()),
+    ]));
     let ssapply = PatchParams::apply("xtask").force();
     api.patch(name, &ssapply, &Patch::Apply(&ns)).await?;
     Ok(())

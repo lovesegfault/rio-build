@@ -51,7 +51,45 @@ impl LogLevelArgs {
     }
 }
 
+/// Control-plane namespace. Helm release anchors here; scheduler,
+/// gateway, controller, and the SSH/postgres secrets live here. Code
+/// that means "the rio namespace" uses this const — only multi-ns-aware
+/// code iterates NAMESPACES.
 pub const NS: &str = "rio-system";
+
+/// Store namespace. ADR-019: store moved out of rio-system to run at
+/// PSA baseline. Secrets the store reads (rio-postgres) need a copy
+/// here.
+pub const NS_STORE: &str = "rio-store";
+
+/// Builder namespace. ADR-019: builders need CAP_SYS_ADMIN (FUSE),
+/// which PSA baseline rejects. Builders are airgapped (NetworkPolicy).
+pub const NS_BUILDERS: &str = "rio-builders";
+
+/// Fetcher namespace. ADR-019: same FUSE story as builders, but with
+/// open internet egress on 80/443 (FOD fetchurl/git).
+pub const NS_FETCHERS: &str = "rio-fetchers";
+
+/// All four rio namespaces and whether each needs the `privileged` PSA
+/// label. Providers iterate this at deploy time so the namespaces exist
+/// before `helm upgrade` (which renders cross-ns resources into them).
+pub const NAMESPACES: &[(&str, bool)] = &[
+    (NS, false),
+    (NS_STORE, false),
+    (NS_BUILDERS, true),
+    (NS_FETCHERS, true),
+];
+
+/// Ensure all four rio namespaces exist with the right PSA label.
+/// Called at the start of every provider's deploy() so cross-ns chart
+/// resources (store.yaml → rio-store, builderpool.yaml → rio-builders,
+/// etc.) have somewhere to land.
+pub async fn ensure_namespaces(client: &kube::Client) -> anyhow::Result<()> {
+    for &(ns, privileged) in NAMESPACES {
+        kube::ensure_namespace(client, ns, privileged).await?;
+    }
+    Ok(())
+}
 
 #[derive(Args)]
 // Allows `k8s up -p eks` (flag after subcommand) as well as

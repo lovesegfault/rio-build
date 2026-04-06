@@ -16,13 +16,19 @@
 # Sequence: update ConfigMap → SIGHUP verify pods → rotate Secret →
 # restart gateways. Verify side accepts both old+new during overlap
 # (TODO(P0260): multi-key verify; for now, sequence is tight).
+{{- range $ns := list .Values.namespace.name .Values.namespaces.store.name }}
+---
+# ADR-019: scheduler stays in rio-system, store moved to rio-store.
+# ConfigMap duplicated — ConfigMaps are ns-scoped, the store can't
+# mount a ConfigMap from another namespace. Same key, same data.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rio-jwt-pubkey
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-jwt-pubkey" "component" "auth") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" $ "name" "rio-jwt-pubkey" "component" "auth") | nindent 4 }}
 data:
-  ed25519_pubkey: {{ .Values.jwt.publicKey | quote }}
+  ed25519_pubkey: {{ $.Values.jwt.publicKey | quote }}
+{{- end }}
 {{- end }}

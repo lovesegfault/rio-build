@@ -26,7 +26,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rio-seccomp-profile
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.builders.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-seccomp-installer" "component" "worker") | nindent 4 }}
 # Two profiles: rio-builder.json (standard) + rio-fetcher.json (ADR-019
@@ -45,7 +45,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: rio-seccomp-installer
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.builders.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-seccomp-installer" "component" "worker") | nindent 4 }}
 spec:

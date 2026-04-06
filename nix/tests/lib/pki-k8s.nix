@@ -16,6 +16,8 @@
 { pkgs }:
 {
   ns ? "rio-system",
+  nsStore ? "rio-store",
+  nsBuilders ? "rio-builders",
   # Additional component names to generate leaf certs for. The
   # default set matches cert-manager.yaml's `range`; callers that
   # need more (e.g. k3s-full.nix with envoyGatewayEnabled → adds
@@ -25,6 +27,21 @@
   extraComponents ? [ ],
 }:
 let
+  # Per-component target namespace. ADR-019: store moved to rio-store,
+  # builder/fetcher pods live in rio-builders/rio-fetchers. Secrets
+  # are ns-scoped — a store pod in rio-store can't mount a Secret from
+  # rio-system. SANs include BOTH the short Service name (tonic's
+  # :authority from `rio-scheduler:9001`) and the FQDN form (cross-ns
+  # addressing like `rio-store.rio-store:9002`).
+  nsFor =
+    c:
+    if c == "store" then
+      nsStore
+    else if c == "builder" then
+      nsBuilders
+    else
+      ns;
+
   # Components that get per-service certs. Matches the `range` in
   # cert-manager.yaml. Each gets SANs for the short Service name
   # (tonic's :authority derivation) + all FQDN forms + localhost
@@ -38,12 +55,16 @@ let
   ++ extraComponents;
 
   mkSans =
-    svc:
+    c:
+    let
+      svc = "rio-${c}";
+      cns = nsFor c;
+    in
     pkgs.lib.concatMapStringsSep "," (s: "DNS:${s}") [
       svc
-      "${svc}.${ns}"
-      "${svc}.${ns}.svc"
-      "${svc}.${ns}.svc.cluster.local"
+      "${svc}.${cns}"
+      "${svc}.${cns}.svc"
+      "${svc}.${cns}.svc.cluster.local"
       "localhost"
     ];
 
@@ -80,7 +101,7 @@ let
           openssl x509 -req -in /tmp/${c}.csr \
             -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
             -out $out/rio-${c}/tls.crt -days 3650 \
-            -extfile <(printf 'subjectAltName=${mkSans "rio-${c}"}')
+            -extfile <(printf 'subjectAltName=${mkSans c}')
           cp $out/ca.crt $out/rio-${c}/ca.crt
         '') components}
 
@@ -96,7 +117,19 @@ let
         cp $out/ca.crt $out/rio-builder/ca.crt
       '';
 
-  secretNames = map (c: "rio-${c}") components ++ [ "rio-builder" ];
+  # Secret-name → target-namespace pairs. ADR-019: store/builder
+  # Secrets land in their own namespaces so pods can mount them.
+  secretTargets =
+    map (c: {
+      name = "rio-${c}";
+      namespace = nsFor c;
+    }) components
+    ++ [
+      {
+        name = "rio-builder";
+        namespace = nsBuilders;
+      }
+    ];
 in
 {
   inherit pki;
@@ -115,20 +148,20 @@ in
   # As a regular input, Nix guarantees the SAME pki build feeds both
   # this manifest and the VM closure's ${pki} reference.
   secretsManifest = pkgs.runCommand "rio-tls-secrets.yaml" { } ''
-    for name in ${pkgs.lib.concatStringsSep " " secretNames}; do
+    ${pkgs.lib.concatMapStringsSep "\n" (t: ''
       cat >> $out <<EOF
-    ---
-    apiVersion: v1
-    kind: Secret
-    metadata:
-      name: $name-tls
-      namespace: ${ns}
-    type: kubernetes.io/tls
-    data:
-      tls.crt: $(base64 -w0 < ${pki}/$name/tls.crt)
-      tls.key: $(base64 -w0 < ${pki}/$name/tls.key)
-      ca.crt: $(base64 -w0 < ${pki}/$name/ca.crt)
-    EOF
-    done
+      ---
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: ${t.name}-tls
+        namespace: ${t.namespace}
+      type: kubernetes.io/tls
+      data:
+        tls.crt: $(base64 -w0 < ${pki}/${t.name}/tls.crt)
+        tls.key: $(base64 -w0 < ${pki}/${t.name}/tls.key)
+        ca.crt: $(base64 -w0 < ${pki}/${t.name}/ca.crt)
+      EOF
+    '') secretTargets}
   '';
 }

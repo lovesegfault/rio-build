@@ -1059,7 +1059,7 @@ in
   privileged-hardening-e2e =
     { fixture }:
     let
-      inherit (fixture) ns;
+      inherit (fixture) ns nsBuilders;
 
       # One trivial build to prove FUSE works end-to-end. Distinct
       # marker (no DAG-dedup with any other scenario's drvs).
@@ -1097,7 +1097,7 @@ in
         # worker pod Ready but the DS isn't (e.g., if privileged:true
         # accidentally leaked through).
         with subtest("device-plugin: DaemonSet Ready + extended resource advertised"):
-            kubectl("rollout status ds/rio-device-plugin --timeout=90s")
+            kubectl("rollout status ds/rio-device-plugin --timeout=90s", ns="${nsBuilders}")
 
             # Kubelet advertises the extended resource once the plugin
             # registers. Must be non-zero on at least one node (the DS
@@ -1129,7 +1129,7 @@ in
         # miss, null vs false semantics), the DS check above might still
         # pass (DS runs regardless) but THIS fails — the load-bearing half.
         with subtest("nonpriv-admitted: privileged:false + device-plugin rendered and admitted"):
-            pod_json = kubectl("get pod default-builders-0 -o json")
+            pod_json = kubectl("get pod default-builders-0 -o json", ns="${nsBuilders}")
             pod = json.loads(pod_json)
 
             # hostUsers: vmtest-full-nonpriv.yaml sets hostUsers:true
@@ -1214,7 +1214,7 @@ in
             #    the remount failed (EROFS) or mkdir failed (EACCES
             #    under userns), the worker crashes BEFORE this log
             #    line → CrashLoopBackOff → we never reach this subtest.
-            log = kubectl("logs default-builders-0")
+            log = kubectl("logs default-builders-0", ns="${nsBuilders}")
             assert "moved self into leaf sub-cgroup" in log, (
                 "worker log should show 'moved self into leaf sub-"
                 "cgroup' (delegated_root() success signal). Log tail: "
@@ -1228,7 +1228,8 @@ in
             #    (where the pod scheduled — see describe Node field).
             cid = kubectl(
                 "get pod default-builders-0 "
-                "-o jsonpath='{.status.containerStatuses[0].containerID}'"
+                "-o jsonpath='{.status.containerStatuses[0].containerID}'",
+                ns="${nsBuilders}",
             ).strip().removeprefix("containerd://")
             assert cid, "no containerID yet — pod not started?"
             # Pod may schedule on EITHER node (topology spread is

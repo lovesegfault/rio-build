@@ -38,6 +38,7 @@ let
   curl = "${pkgs.curl}/bin/curl";
   nc = "${pkgs.netcat}/bin/nc";
   jq = "${pkgs.jq}/bin/jq";
+  inherit (fixture) nsBuilders;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-netpol";
@@ -65,7 +66,8 @@ pkgs.testers.runNixOSTest {
     # helm-render.nix puts NetworkPolicy (not Namespace/RBAC kind) in
     # 02-workloads.yaml → k3s auto-applies it at boot along with
     # everything else. If this get fails, the helm override didn't take.
-    kubectl("get networkpolicy rio-builder-egress -o name")
+    # ADR-019: builder-egress policy lives in rio-builders namespace.
+    kubectl("get networkpolicy builder-egress -o name", ns="${nsBuilders}")
 
     # kube-router watches NetworkPolicy CRs → iptables rules. Watch
     # latency is usually sub-second but the policy was applied at
@@ -82,7 +84,8 @@ pkgs.testers.runNixOSTest {
     # containers in one pod share one netns (pause container's), so
     # head -1 of any running container works.
     worker_node = kubectl(
-        "get pod default-builders-0 -o jsonpath='{.spec.nodeName}'"
+        "get pod default-builders-0 -o jsonpath='{.spec.nodeName}'",
+        ns="${nsBuilders}",
     ).strip()
     worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
     print(f"netpol: default-builders-0 is on {worker_node}")

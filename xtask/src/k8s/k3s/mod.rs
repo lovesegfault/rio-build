@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::config::XtaskConfig;
 use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
-use crate::k8s::{NS, shared};
+use crate::k8s::{NS, ensure_namespaces, shared};
 use crate::sh::{self, cmd, shell};
 use crate::{helm, kube, ssh, ui};
 
@@ -86,8 +86,8 @@ impl Provider for K3s {
         ui::step("chart deps", || async { shared::chart_deps() }).await?;
         ui::step("apply CRDs", || kube::apply_crds(&client)).await?;
 
-        ui::step("ssh secret", || async {
-            kube::ensure_namespace(&client, NS, true).await?;
+        ui::step("namespaces + ssh secret", || async {
+            ensure_namespaces(&client).await?;
             let authorized = ssh::authorized_keys(cfg)?;
             kube::apply_secret(
                 &client,

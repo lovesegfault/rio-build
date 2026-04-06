@@ -151,7 +151,13 @@
   fixture,
 }:
 let
-  inherit (fixture) ns pki;
+  inherit (fixture)
+    ns
+    nsStore
+    nsBuilders
+    nsFetchers
+    pki
+    ;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
 
@@ -422,7 +428,7 @@ let
         """PinPath/UnpinPath on the store. deploy/ port-forward picks any
         replica (there's only one). Returns stdout+stderr."""
         return k3s_server.succeed(
-            f"k3s kubectl -n ${ns} port-forward deploy/rio-store 19002:9002 "
+            f"k3s kubectl -n ${nsStore} port-forward deploy/rio-store 19002:9002 "
             f">/dev/null 2>&1 & pf=$!; "
             f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
             f"${grpcurl} ${grpcurlTls} -max-time 30 "
@@ -571,15 +577,16 @@ let
           # template; `get pod -l ... -o jsonpath` reads a live pod.
           # Either proves the same thing; the pod spec is what the
           # kubelet actually used to build the container.
-          for dep, vol_name, key_path in [
-              ("rio-scheduler", "jwt-pubkey", "/etc/rio/jwt/ed25519_pubkey"),
-              ("rio-store", "jwt-pubkey", "/etc/rio/jwt/ed25519_pubkey"),
-              ("rio-gateway", "jwt-signing", "/etc/rio/jwt/ed25519_seed"),
+          for dep, dep_ns, vol_name, key_path in [
+              ("rio-scheduler", "${ns}", "jwt-pubkey", "/etc/rio/jwt/ed25519_pubkey"),
+              ("rio-store", "${nsStore}", "jwt-pubkey", "/etc/rio/jwt/ed25519_pubkey"),
+              ("rio-gateway", "${ns}", "jwt-signing", "/etc/rio/jwt/ed25519_seed"),
           ]:
               # env: RIO_JWT__KEY_PATH set to the expected path.
               envs = kubectl(
                   f"get deploy {dep} -o jsonpath="
-                  f"'{{.spec.template.spec.containers[0].env}}'"
+                  f"'{{.spec.template.spec.containers[0].env}}'",
+                  ns=dep_ns,
               )
               assert key_path in envs and "RIO_JWT__KEY_PATH" in envs, (
                   f"{dep} missing RIO_JWT__KEY_PATH={key_path} in env "
@@ -589,7 +596,8 @@ let
               # volumeMounts: named mount at /etc/rio/jwt.
               mounts = kubectl(
                   f"get deploy {dep} -o jsonpath="
-                  f"'{{.spec.template.spec.containers[0].volumeMounts}}'"
+                  f"'{{.spec.template.spec.containers[0].volumeMounts}}'",
+                  ns=dep_ns,
               )
               assert vol_name in mounts and "/etc/rio/jwt" in mounts, (
                   f"{dep} missing {vol_name} volumeMount at "
@@ -603,7 +611,8 @@ let
               # asserts the ref shape.
               vols = kubectl(
                   f"get deploy {dep} -o jsonpath="
-                  f"'{{.spec.template.spec.volumes}}'"
+                  f"'{{.spec.template.spec.volumes}}'",
+                  ns=dep_ns,
               )
               assert vol_name in vols, (
                   f"{dep} missing {vol_name} volume: {vols!r}"
@@ -616,10 +625,16 @@ let
           # wrong length, not a curve point), the process would exit
           # → CrashLoopBackOff → waitReady hangs. This subtest
           # reaching here = all three parsed their key OK.
-          for dep in ["rio-scheduler", "rio-store", "rio-gateway"]:
+          # ADR-019: store moved to rio-store namespace.
+          for dep, dep_ns in [
+              ("rio-scheduler", "${ns}"),
+              ("rio-store", "${nsStore}"),
+              ("rio-gateway", "${ns}"),
+          ]:
               phase = kubectl(
                   f"get pods -l app.kubernetes.io/name={dep} "
-                  f"-o jsonpath='{{.items[0].status.phase}}'"
+                  f"-o jsonpath='{{.items[0].status.phase}}'",
+                  ns=dep_ns,
               ).strip()
               assert phase == "Running", (
                   f"{dep} pod not Running (phase={phase!r}) — "
@@ -786,7 +801,7 @@ let
           # timeout=120: dispatch-lag variance (flannel subnet race
           # observed 2026-03-16 delaying worker pod start).
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${ns} get pod default-builders-0 "
+              "k3s kubectl -n ${nsBuilders} get pod default-builders-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -843,7 +858,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (non-DEBUG, last 2m) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs default-builders-0 --since=2m "
+                  "k3s kubectl -n ${nsBuilders} logs default-builders-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true; "
                   "echo '=== DIAG: scheduler leader logs (cancel dispatch) ===' >&2; "
                   "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
@@ -918,7 +933,7 @@ let
           # `| grep .` fails on empty (find exits 0 on no-match) so
           # wait_until_succeeds retries.
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${ns} get pod default-builders-0 "
+              "k3s kubectl -n ${nsBuilders} get pod default-builders-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -959,7 +974,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (last 2m, non-DEBUG) ===' >&2; "
-                  "k3s kubectl -n ${ns} logs default-builders-0 --since=2m "
+                  "k3s kubectl -n ${nsBuilders} logs default-builders-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
               )
               print(f"build-timeout DIAG: procs_after={procs_after} "
@@ -987,7 +1002,7 @@ let
           # 9091 is the SCHEDULER's — original test copy-pasted the wrong port.
           worker_metrics = k3s_server.succeed(
               "k3s kubectl -n ${ns} get --raw "
-              "/api/v1/namespaces/${ns}/pods/default-builders-0:9093/proxy/metrics"
+              "/api/v1/namespaces/${nsBuilders}/pods/default-builders-0:9093/proxy/metrics"
           )
           timed_out_line = [
               l for l in worker_metrics.splitlines()
@@ -1280,7 +1295,7 @@ let
       # `time.sleep(5)` hope-the-reconcile-ran hack with a deterministic
       # gate (phase3a.nix:725-730).
       with subtest("reconciler-replicas: SSA field-ownership handoff preserves manual scale"):
-          kubectl("scale statefulset default-builders --replicas=2")
+          kubectl("scale statefulset default-builders --replicas=2", ns="${nsBuilders}")
 
           # Reconciler observed the change (via .owns watch), reconciled,
           # patched BuilderPool.status.desiredReplicas. This IS the
@@ -1291,7 +1306,7 @@ let
           # desiredReplicas reflecting a NON-STALE value proves reconcile
           # ran after our scale.
           k3s_server.wait_until_succeeds(
-              "dr=$(k3s kubectl -n ${ns} get builderpool default "
+              "dr=$(k3s kubectl -n ${nsBuilders} get builderpool default "
               "-o jsonpath='{.status.desiredReplicas}'); "
               'test "$dr" = 1 -o "$dr" = 2',
               timeout=20,
@@ -1310,16 +1325,16 @@ let
           # NOT found under rio-controller. Previously checked value==2
           # which raced with the 10s-window autoscaler.
           k3s_server.succeed(
-              "! k3s kubectl -n ${ns} get statefulset default-builders -o yaml | "
+              "! k3s kubectl -n ${nsBuilders} get statefulset default-builders -o yaml | "
               "grep -A50 'manager: rio-controller' | "
               "grep -B50 -m1 '^  - apiVersion\\|^status:' | "
               "grep -q 'f:replicas'"
           )
 
           # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
-          kubectl("scale statefulset default-builders --replicas=1")
+          kubectl("scale statefulset default-builders --replicas=1", ns="${nsBuilders}")
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get builderpool default "
+              "test \"$(k3s kubectl -n ${nsBuilders} get builderpool default "
               "-o jsonpath='{.status.desiredReplicas}')\" = 1",
               timeout=20,
           )
@@ -1369,7 +1384,7 @@ let
           # swallowed as warn-logs by kube-rs). 60s: 3s poll + 3s
           # up-window + jitter + k3s VM latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get statefulset default-builders "
+              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset default-builders "
               "-o jsonpath='{.spec.replicas}')\" = 2",
               timeout=60,
           )
@@ -1379,7 +1394,7 @@ let
           # from the reconciler's — otherwise reconcile would clobber it
           # to None every cycle).
           k3s_server.wait_until_succeeds(
-              "sc=$(k3s kubectl -n ${ns} get builderpool default "
+              "sc=$(k3s kubectl -n ${nsBuilders} get builderpool default "
               "-o jsonpath='{.status.lastScaleTime}'); "
               "test -n \"$sc\"",
               timeout=20,
@@ -1389,7 +1404,8 @@ let
           kubectl(
               "get builderpool default "
               "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "
-              "grep -q ScaledUp"
+              "grep -q ScaledUp",
+              ns="${nsBuilders}",
           )
 
           # scaling_decisions_total{direction="up"} ≥1. Proves scale_one()
@@ -1427,7 +1443,7 @@ let
           # recorder path — both uncovered before this test.
           # 60s: 10s down-window + 3s poll + 3s min-interval + k3s latency.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get statefulset default-builders "
+              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset default-builders "
               "-o jsonpath='{.spec.replicas}')\" = 1",
               timeout=60,
           )
@@ -1448,7 +1464,8 @@ let
           events_down = kubectl(
               "get events "
               "--field-selector involvedObject.name=default,involvedObject.kind=BuilderPool,reason=ScaledDown "
-              "-o name"
+              "-o name",
+              ns="${nsBuilders}",
           ).strip()
           assert events_down, (
               "expected ScaledDown K8s Event on BuilderPool/default, got none"
@@ -1992,7 +2009,7 @@ let
               "kind: BuilderPool\n"
               "metadata:\n"
               "  name: ephemeral-bad-maxbuilds\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  ephemeral: true\n"
               "  replicas: {min: 0, max: 4}\n"
@@ -2021,7 +2038,7 @@ let
               "kind: BuilderPool\n"
               "metadata:\n"
               "  name: sts-with-deadline\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  ephemeral: false\n"
               "  ephemeralDeadlineSeconds: 7200\n"
@@ -2052,7 +2069,7 @@ let
               "kind: BuilderPool\n"
               "metadata:\n"
               "  name: ephemeral\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  ephemeral: true\n"
               "  replicas: {min: 0, max: 4}\n"
@@ -2093,11 +2110,11 @@ let
           import time
           time.sleep(3)  # one reconcile tick (kube-runtime is fast)
           k3s_server.fail(
-              "k3s kubectl -n ${ns} get sts ephemeral-workers 2>/dev/null"
+              "k3s kubectl -n ${nsBuilders} get sts ephemeral-workers 2>/dev/null"
           )
           # Headless Service also skipped.
           k3s_server.fail(
-              "k3s kubectl -n ${ns} get svc ephemeral-workers 2>/dev/null"
+              "k3s kubectl -n ${nsBuilders} get svc ephemeral-workers 2>/dev/null"
           )
 
           # ── Status patched by reconcile_ephemeral ─────────────────────
@@ -2105,7 +2122,7 @@ let
           # ceiling). reconcile_ephemeral runs on first apply even with
           # queued=0 — it patches status then requeues at 10s.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get builderpool ephemeral "
+              "test \"$(k3s kubectl -n ${nsBuilders} get builderpool ephemeral "
               "-o jsonpath='{.status.desiredReplicas}')\" = 4",
               timeout=120,
           )
@@ -2127,12 +2144,12 @@ let
           # margin. The Job label `rio.build/pool=ephemeral` comes
           # from builders::labels() — same label cleanup() lists by.
           k3s_server.wait_until_succeeds(
-              "test -n \"$(k3s kubectl -n ${ns} get jobs "
+              "test -n \"$(k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name)\"",
               timeout=45,
           )
           job1 = k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral "
               "-o jsonpath='{.items[0].metadata.name}'"
           ).strip()
@@ -2143,7 +2160,7 @@ let
           # jsonpath into Job.spec.template (not pod — pod name is
           # Job-generated, less stable for the query).
           eph_env = k3s_server.succeed(
-              f"k3s kubectl -n ${ns} get job {job1} "
+              f"k3s kubectl -n ${nsBuilders} get job {job1} "
               "-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name==\"RIO_EPHEMERAL\")].value}'"
           ).strip()
           assert eph_env == "1", (
@@ -2171,7 +2188,7 @@ let
           # whichever sorts first (possibly a newer Job's pod if the
           # reconciler spawned another). Filter to job1's pod specifically.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get pods "
+              "test \"$(k3s kubectl -n ${nsBuilders} get pods "
               f"-l job-name={job1} "
               "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
               timeout=120,
@@ -2186,7 +2203,7 @@ let
           # this hit 4 (ceiling) under KVM-speed; a regression to the
           # old queued.min(headroom) formula would trip this assertion.
           job_count = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
           assert job_count <= 2, (
@@ -2203,7 +2220,7 @@ let
           # ASSERTION is that a NEW Job appears, not that job1 is gone.
           # Count Jobs before build 2, expect +1 after.
           jobs_before = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
           # Precondition self-assert BEFORE the check it guards:
@@ -2226,7 +2243,7 @@ let
           )
 
           jobs_after = int(k3s_server.succeed(
-              "k3s kubectl -n ${ns} get jobs "
+              "k3s kubectl -n ${nsBuilders} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
           # >= not ==: job1 might have been TTL-reaped during build 2
@@ -2249,11 +2266,11 @@ let
           # spec.ephemeral and returns immediately (no STS scale-to-0,
           # no DrainWorker loop). In-flight Jobs finish naturally;
           # ownerRef GC deletes them.
-          kubectl("delete builderpool ephemeral --wait=false")
+          kubectl("delete builderpool ephemeral --wait=false", ns="${nsBuilders}")
           # CR gone quickly — finalizer removed on first cleanup() call.
           # 30s is generous; should be <5s in practice.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get builderpool ephemeral 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get builderpool ephemeral 2>/dev/null",
               timeout=30,
           )
           print("ephemeral-pool PASS: no STS, Job spawned per build, "
@@ -2325,9 +2342,9 @@ let
           k3s_server.succeed(
               "printf '%s' "
               "'{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\","
-              "\"metadata\":{\"name\":\"default-builders-0\",\"namespace\":\"${ns}\"}}' "
+              "\"metadata\":{\"name\":\"default-builders-0\",\"namespace\":\"${nsBuilders}\"}}' "
               "| k3s kubectl create --raw "
-              "'/api/v1/namespaces/${ns}/pods/default-builders-0/eviction' -f - "
+              "'/api/v1/namespaces/${nsBuilders}/pods/default-builders-0/eviction' -f - "
               "|| true"
           )
 
@@ -2417,7 +2434,7 @@ let
           # --wait=false: don't block kubectl on the finalizer. We assert
           # each stage with its own timeout so a hang points at the exact
           # stage (pod-gone vs CR-gone vs workers_active).
-          kubectl("delete builderpool default --wait=false")
+          kubectl("delete builderpool default --wait=false", ns="${nsBuilders}")
 
           # Pod gone. Proves: STS scaled to 0, SIGTERM drain exited
           # cleanly (no in-flight builds), finalizer removed (K8s could
@@ -2431,13 +2448,13 @@ let
           # before starting its own termination. v24/v25 showed pod-1
           # Terminating 4m44s with the old 7200s grace.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get pod default-builders-0 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get pod default-builders-0 2>/dev/null",
               timeout=300,
           )
 
           # BuilderPool CR gone (finalizer removed → K8s deleted it).
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get builderpool default 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get builderpool default 2>/dev/null",
               timeout=30,
           )
 
@@ -2473,7 +2490,7 @@ let
           # the prelude returns, `default-pdb` should exist. 30s margin
           # for the SSA patch + k3s apiserver admission lag.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get pdb default-pdb "
+              "test \"$(k3s kubectl -n ${nsBuilders} get pdb default-pdb "
               "-o jsonpath='{.spec.maxUnavailable}')\" = 1",
               timeout=30,
           )
@@ -2485,7 +2502,8 @@ let
           # controller_owner_ref(&()) sets controller=true.
           owner_kind = kubectl(
               f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
+              "-o jsonpath='{.metadata.ownerReferences[0].kind}'",
+              ns="${nsBuilders}",
           ).strip()
           assert owner_kind == "BuilderPool", (
               f"expected ownerRef[0].kind=BuilderPool, got {owner_kind!r}. "
@@ -2493,7 +2511,8 @@ let
           )
           owner_name = kubectl(
               f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].name}'"
+              "-o jsonpath='{.metadata.ownerReferences[0].name}'",
+              ns="${nsBuilders}",
           ).strip()
           assert owner_name == "default", (
               f"expected ownerRef[0].name=default (the pool name), "
@@ -2501,7 +2520,8 @@ let
           )
           owner_ctrl = kubectl(
               f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].controller}'"
+              "-o jsonpath='{.metadata.ownerReferences[0].controller}'",
+              ns="${nsBuilders}",
           ).strip()
           assert owner_ctrl == "true", (
               f"expected ownerRef[0].controller=true (K8s GC requires "
@@ -2515,14 +2535,14 @@ let
           # in-flight builds (fresh fixture, no subtest submitted any).
           # terminationGracePeriodSeconds=180 still applies to the pod,
           # but with no builds the worker SIGTERM-exits immediately.
-          kubectl("delete builderpool default --wait=false")
+          kubectl("delete builderpool default --wait=false", ns="${nsBuilders}")
 
           # BuilderPool CR gone first (finalizer removed → K8s deletes).
           # 120s: grace=180s would apply if SIGTERM hung, but idle
           # worker exits in <5s. 120s absorbs the finalizer's
           # DRAIN_WAIT_SLOP (60s) + k3s controller-manager GC sweep lag.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get builderpool default 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get builderpool default 2>/dev/null",
               timeout=120,
           )
 
@@ -2531,7 +2551,7 @@ let
           # manager) runs a continuous sweep; orphan detection is
           # event-driven (owner delete → GC fires). 30s is generous.
           k3s_server.wait_until_succeeds(
-              f"! k3s kubectl -n ${ns} get pdb {pdb} 2>/dev/null",
+              f"! k3s kubectl -n ${nsBuilders} get pdb {pdb} 2>/dev/null",
               timeout=30,
           )
           print(f"pdb-ownerref PASS: {pdb} GC'd after BuilderPool delete")
@@ -2576,7 +2596,7 @@ let
               "kind: BuilderPoolSet\n"
               "metadata:\n"
               "  name: test-wps\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  classes:\n"
               "    - name: small\n"
@@ -2607,42 +2627,36 @@ let
           for cls in ["small", "medium", "large"]:
               child = f"test-wps-{cls}"
               k3s_server.wait_until_succeeds(
-                  f"k3s kubectl -n ${ns} get builderpool {child} 2>/dev/null",
+                  f"k3s kubectl -n ${nsBuilders} get builderpool {child} 2>/dev/null",
                   timeout=30,
               )
-              sc = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.spec.sizeClass}'"
-              ).strip()
+              # Pull once, assert against parsed JSON — cheaper than
+              # 4× kubectl roundtrips per child and keeps the ns kwarg
+              # in one place (ADR-019: builderpools live in rio-builders).
+              import json as _json
+              bp = _json.loads(
+                  kubectl(f"get builderpool {child} -o json", ns="${nsBuilders}")
+              )
+              sc = bp["spec"].get("sizeClass")
               assert sc == cls, (
                   f"expected {child}.spec.sizeClass={cls}, got {sc!r}. "
                   f"builders.rs:114 sets size_class=class.name — if "
                   f"these diverge, scheduler routing breaks."
               )
-              owner = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.metadata.ownerReferences[0].name}'"
-              ).strip()
-              assert owner == "test-wps", (
+              owner = bp["metadata"]["ownerReferences"][0]
+              assert owner["name"] == "test-wps", (
                   f"expected {child} ownerRef[0].name=test-wps, "
-                  f"got {owner!r}"
+                  f"got {owner['name']!r}"
               )
-              owner_kind = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
-              ).strip()
-              assert owner_kind == "BuilderPoolSet", (
+              assert owner["kind"] == "BuilderPoolSet", (
                   f"expected {child} ownerRef[0].kind=BuilderPoolSet, "
-                  f"got {owner_kind!r}"
+                  f"got {owner['kind']!r}"
               )
               # autoscaling.targetValue = class.targetQueuePerReplica
               # (default 5, per-class in builders.rs:98). Proves the
               # per-class autoscaler wiring — each child carries its
               # own target, not a shared WPS-level value.
-              tv = kubectl(
-                  f"get builderpool {child} "
-                  "-o jsonpath='{.spec.autoscaling.targetValue}'"
-              ).strip()
+              tv = str(bp["spec"]["autoscaling"]["targetValue"])
               assert tv == "5", (
                   f"expected {child}.spec.autoscaling.targetValue=5 "
                   f"(default targetQueuePerReplica), got {tv!r}"
@@ -2655,14 +2669,14 @@ let
           # with 404 tolerance. Each child then runs ITS OWN BuilderPool
           # finalizer (DrainWorker + scale STS→0 — trivially fast at
           # replicas=0) before K8s GC deletes STS/Service/PDB.
-          kubectl("delete builderpoolset test-wps --wait=false")
+          kubectl("delete builderpoolset test-wps --wait=false", ns="${nsBuilders}")
 
           # WPS CR gone: finalizer removed → K8s deletes. 60s: cleanup
           # iterates 3 children × (delete RPC + child finalizer). At
           # replicas=0, child finalizers complete in <5s each (no pods
           # to drain). 60s absorbs k3s controller lag.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get builderpoolset test-wps 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get builderpoolset test-wps 2>/dev/null",
               timeout=60,
           )
 
@@ -2671,7 +2685,7 @@ let
           # Checked per-child so a hang names which class stuck.
           for cls in ["small", "medium", "large"]:
               k3s_server.wait_until_succeeds(
-                  f"! k3s kubectl -n ${ns} get builderpool test-wps-{cls} 2>/dev/null",
+                  f"! k3s kubectl -n ${nsBuilders} get builderpool test-wps-{cls} 2>/dev/null",
                   timeout=30,
               )
 
@@ -2697,10 +2711,8 @@ let
       # spec IS the proof: if the reconciler emits the right labels/
       # securityContext/nodeSelector, the ADR-019 wiring is correct.
       #
-      # Applied in the SAME namespace as the builderpool fixture
-      # (rio-fetchers four-namespace layout lands with P0454). This
-      # exercises the reconciler; the namespace is cosmetic for STS
-      # shape.
+      # Applied in rio-fetchers (ADR-019 four-namespace layout, P0454).
+      # The reconciler creates the STS in the same namespace as the CR.
       #
       # Tracey: r[verify ctrl.fetcherpool.reconcile] +
       # r[verify fetcher.sandbox.strict-seccomp] +
@@ -2714,7 +2726,7 @@ let
               "kind: FetcherPool\n"
               "metadata:\n"
               "  name: test-fp\n"
-              "  namespace: ${ns}\n"
+              "  namespace: ${nsFetchers}\n"
               "spec:\n"
               "  replicas: 1\n"
               "  image: rio-all:dev\n"
@@ -2727,26 +2739,31 @@ let
           # the apply + k3s admission lag (same as pdb-ownerref above).
           sts = "test-fp-fetchers"
           k3s_server.wait_until_succeeds(
-              f"k3s kubectl -n ${ns} get statefulset {sts}",
+              f"k3s kubectl -n ${nsFetchers} get statefulset {sts}",
               timeout=30,
           )
 
+          # STS-shape checks: pull once, assert against the JSON. Fetch-
+          # per-field was 6 kubectl roundtrips; one -o json + jsonpath
+          # on the python side is cheaper and keeps the ns kwarg in one
+          # place (ADR-019: STS lives in rio-fetchers).
+          import json as _json
+          sts_json = _json.loads(
+              kubectl(f"get sts {sts} -o json", ns="${nsFetchers}")
+          )
+          tmpl = sts_json["spec"]["template"]
+          ctr = tmpl["spec"]["containers"][0]
+
           # ── Pod template label: rio.build/role=fetcher ────────────────
-          role = kubectl(
-              f"get sts {sts} "
-              "-o jsonpath='{.spec.template.metadata.labels.rio\\.build/role}'"
-          ).strip()
+          role = tmpl["metadata"]["labels"].get("rio.build/role")
           assert role == "fetcher", (
               f"expected rio.build/role=fetcher, got {role!r}. "
               f"NetworkPolicies and scheduler routing key on this."
           )
 
           # ── securityContext: readOnlyRootFilesystem=true ──────────────
-          ro_fs = kubectl(
-              f"get sts {sts} -o jsonpath="
-              "'{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}'"
-          ).strip()
-          assert ro_fs == "true", (
+          ro_fs = ctr.get("securityContext", {}).get("readOnlyRootFilesystem")
+          assert ro_fs is True, (
               f"expected readOnlyRootFilesystem=true, got {ro_fs!r}. "
               f"ADR-019 §Sandbox hardening — rootfs tampering blocked."
           )
@@ -2755,51 +2772,41 @@ let
           # Container-level (not pod-level — pod-level stays
           # RuntimeDefault so wait-seccomp initContainer can run
           # before the profile lands on the node).
-          seccomp = kubectl(
-              f"get sts {sts} -o jsonpath="
-              "'{.spec.template.spec.containers[0].securityContext.seccompProfile.localhostProfile}'"
-          ).strip()
+          seccomp = (
+              ctr.get("securityContext", {})
+              .get("seccompProfile", {})
+              .get("localhostProfile")
+          )
           assert seccomp == "profiles/rio-fetcher.json", (
               f"expected profiles/rio-fetcher.json, got {seccomp!r}. "
               f"ADR-019 §Sandbox hardening — extra denies for ptrace/bpf/…"
           )
 
           # ── nodeSelector + toleration: fetcher node pool ──────────────
-          node_role = kubectl(
-              f"get sts {sts} -o jsonpath="
-              "'{.spec.template.spec.nodeSelector.rio\\.build/node-role}'"
-          ).strip()
+          node_role = tmpl["spec"].get("nodeSelector", {}).get("rio.build/node-role")
           assert node_role == "fetcher", (
               f"expected nodeSelector rio.build/node-role=fetcher, "
               f"got {node_role!r}. ADR-019 §Node isolation."
           )
-          tol_key = kubectl(
-              f"get sts {sts} -o jsonpath="
-              "'{.spec.template.spec.tolerations[0].key}'"
-          ).strip()
-          assert tol_key == "rio.build/fetcher", (
-              f"expected toleration key rio.build/fetcher, got {tol_key!r}"
+          tols = tmpl["spec"].get("tolerations", [])
+          assert any(t.get("key") == "rio.build/fetcher" for t in tols), (
+              f"expected toleration key rio.build/fetcher, got {tols!r}"
           )
 
           # ── RIO_EXECUTOR_KIND=fetcher env ─────────────────────────────
           # rio-builder's kind-gate (ADR-019 §Executor enforcement)
           # refuses FODs when RIO_EXECUTOR_KIND!=fetcher.
-          # Grep-based check avoids jsonpath @.name== quote hell through
-          # nix→python→shell→kubectl layers.
-          env_dump = kubectl(
-              f"get sts {sts} -o jsonpath="
-              "'{.spec.template.spec.containers[0].env}'"
-          )
-          assert "RIO_EXECUTOR_KIND" in env_dump and "fetcher" in env_dump, (
-              f"expected RIO_EXECUTOR_KIND=fetcher in env, got:\n{env_dump!r}"
+          env = {e["name"]: e.get("value") for e in ctr.get("env", [])}
+          assert env.get("RIO_EXECUTOR_KIND") == "fetcher", (
+              f"expected RIO_EXECUTOR_KIND=fetcher in env, got:\n{env!r}"
           )
 
           # ── Cleanup ───────────────────────────────────────────────────
           # --wait=false + short timeout: fetcherpool cleanup is
           # immediate (no long terminationGracePeriod to wait through).
-          kubectl("delete fetcherpool test-fp --wait=false")
+          kubectl("delete fetcherpool test-fp --wait=false", ns="${nsFetchers}")
           k3s_server.wait_until_succeeds(
-              f"! k3s kubectl -n ${ns} get statefulset {sts} 2>/dev/null",
+              f"! k3s kubectl -n ${nsFetchers} get statefulset {sts} 2>/dev/null",
               timeout=60,
           )
           print("fetcherpool-sts PASS: STS shape matches ADR-019")

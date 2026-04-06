@@ -13,7 +13,7 @@ use tracing::info;
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
-use crate::k8s::NS;
+use crate::k8s::{NS, ensure_namespaces};
 use crate::sh::repo_root;
 use crate::{helm, kube, ssh, tofu, ui};
 
@@ -50,14 +50,15 @@ pub async fn run(cfg: &XtaskConfig, log_level: &str) -> Result<()> {
     )
     .await?;
 
-    // Namespace + SSH secret. Namespace is created here (not by the
-    // chart — namespace.create=false below) because: (a) the SSH Secret
-    // must exist before helm runs; (b) Helm refuses to adopt a namespace
-    // it didn't create. PSA label (privileged) is load-bearing: workers
-    // need SYS_ADMIN for FUSE mounts.
-    ui::step("namespace + ssh secret", || async {
+    // Namespaces first. Created here (not by the chart —
+    // namespace.create=false below) because: (a) the SSH Secret must
+    // exist before helm runs; (b) Helm refuses to adopt a namespace it
+    // didn't create. ADR-019 four-namespace split: control plane +
+    // store at baseline, builders + fetchers at privileged (SYS_ADMIN
+    // for FUSE).
+    ui::step("namespaces + ssh secret", || async {
+        ensure_namespaces(&client).await?;
         let authorized = ssh::authorized_keys(cfg)?;
-        kube::ensure_namespace(&client, NS, true).await?;
         kube::apply_secret(
             &client,
             NS,
@@ -110,7 +111,7 @@ pub async fn run(cfg: &XtaskConfig, log_level: &str) -> Result<()> {
             .set("karpenter.enabled", "true")
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)
-            .set("workerPool.enabled", "true")
+            .set("builderPool.enabled", "true")
             .wait(Duration::from_secs(600))
             .run()
     })

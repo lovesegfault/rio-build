@@ -28,12 +28,23 @@ global:
 
 namespace:
   create: true
+  # Control-plane namespace (scheduler, gateway, controller). Most
+  # templates reference this via `.Values.namespace.name` — it's the
+  # "default" ns, the one `helm --namespace` anchors to. Cross-ns
+  # resources (store, builderpool, fetcherpool) set explicit
+  # `metadata.namespace:` from the `namespaces` map below.
   name: rio-system
-  # Workers need SYS_ADMIN (FUSE mount); restricted/baseline PSA reject it.
-  # Builders live in SAME namespace (BuilderPool CRD is namespaced, reconciler
-  # creates STS there). Possible future split: workers → dedicated privileged
-  # ns, control plane → baseline.
-  podSecurityLabel: privileged
+
+# ADR-019 four-namespace split: privileged PSA narrows to the two
+# namespaces whose pods actually need CAP_SYS_ADMIN (FUSE mount).
+# Control plane + store drop to baseline. All four carry
+# `app.kubernetes.io/part-of: rio-build` so NetworkPolicy
+# namespaceSelector rules match without enumerating names.
+namespaces:
+  system:   {name: rio-system,   psa: baseline}
+  store:    {name: rio-store,    psa: baseline}
+  builders: {name: rio-builders, psa: privileged}
+  fetchers: {name: rio-fetchers, psa: privileged}
 
 # TLS on → mounts TLS secrets into each Deployment + sets RIO_TLS__* env +
 # retargets store's readiness probe to the plaintext health port (9102).
@@ -106,6 +117,10 @@ podDisruptionBudget:
 
 networkPolicy:
   enabled: true
+  # S3 VPC endpoint CIDR for builder direct-S3 reads (presigned URLs
+  # from store). AWS-specific; varies by VPC. Unset → no S3 egress rule
+  # rendered (builder fetches chunks via store gRPC only).
+  builderS3Cidr: ""
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-controller
@@ -121,12 +136,19 @@ controller:
   # Addresses passed through to builder pods via the controller's env.
   # Lazy-connected per-reconcile — transient scheduler outage doesn't kill
   # the controller.
-  schedulerAddr: rio-scheduler:9001
-  storeAddr: rio-store:9002
+  # Cross-ns FQDNs per ADR-019 four-namespace split. Scheduler stays
+  # in rio-system; store lives in rio-store. Short names only resolve
+  # within the same namespace — the controller's rio-system pod can
+  # resolve rio-scheduler but NOT rio-store without the .rio-store.svc
+  # suffix. Spelled out here (not templated from .Values.namespaces)
+  # because these are passed through to builder/fetcher pods via env,
+  # and overriding one without the other is a valid dev-test pattern.
+  schedulerAddr: rio-scheduler.rio-system:9001
+  storeAddr: rio-store.rio-store:9002
   # Balanced-channel config also passed through to workers. Workers
   # DNS-resolve the headless Service, health-probe pod IPs, route to leader.
   # Empty → workers fall back to single-channel (VM tests don't set this).
-  schedulerBalanceHost: rio-scheduler-headless
+  schedulerBalanceHost: rio-scheduler-headless.rio-system
   schedulerBalancePort: 9001
   # Extra env injected after base vars. VM tests use this for autoscaler
   # tuning (RIO_AUTOSCALER_POLL_SECS=3 etc); coverage mode injects
@@ -186,7 +208,7 @@ scheduler:
   # mode (LeaseConfig::from_env returns None without RIO_LEASE_NAME →
   # always-leader mode, WRONG with replicas>1).
   leaseName: rio-scheduler-leader
-  storeAddr: rio-store:9002
+  storeAddr: rio-store.rio-store:9002
   # Build logs flush to S3 from the scheduler (log aggregation lives here,
   # not the store). Empty → logs stay in PG only.
   logS3Bucket: ""
@@ -204,8 +226,8 @@ gateway:
   enabled: true
   image: rio-gateway
   replicas: 2
-  schedulerAddr: rio-scheduler:9001
-  storeAddr: rio-store:9002
+  schedulerAddr: rio-scheduler.rio-system:9001
+  storeAddr: rio-store.rio-store:9002
   # Balanced-channel: gateway DNS-resolves headless to pod IPs, probes
   # grpc.health.v1 on each, routes to leader.
   schedulerBalanceHost: rio-scheduler-headless
@@ -312,6 +334,32 @@ karpenter:
           operator: In
           values: [on-demand]
       limits: {cpu: 256}
+      consolidateAfter: 30s
+
+    # r[impl fetcher.node.dedicated]
+    #
+    # Fetcher: dedicated NodePool with rio.build/fetcher taint. Keeps
+    # fetchers off builder nodes and vice versa — an escaped fetcher
+    # lands on a node running only other fetchers. Network-bound (FOD
+    # fetchurl/git), not CPU-bound: cheap burstable t3a. Low weight so
+    # Karpenter doesn't prefer it for unrelated pods that happen to
+    # tolerate the taint.
+    - name: rio-fetcher
+      weight: 5
+      labels:
+        rio.build/node-role: fetcher
+      taints:
+        - key: rio.build/fetcher
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [t3a.medium, t3a.large]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 64}
       consolidateAfter: 30s
 
     # General: untainted, for future gateway/scheduler HPA overflow.

@@ -4,7 +4,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rio-store
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.store.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
@@ -112,7 +112,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: rio-store
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.store.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:

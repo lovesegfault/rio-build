@@ -17,9 +17,6 @@ global:
 namespace:
   create: true
   name: rio-system
-  # Workers need SYS_ADMIN for FUSE. Control plane is fine with
-  # restricted but shares the namespace.
-  podSecurityLabel: privileged
 
 # cert-manager not preloaded (phase4c, needs its own airgap images).
 # TLS Secrets provided out-of-band via lib/pki-k8s.nix → k3s manifest.
@@ -77,9 +74,12 @@ controller:
   # In-cluster Service DNS. hostNetwork=false — unlike vmtest.yaml,
   # everything is in-cluster so CoreDNS works.
   hostNetwork: false
-  schedulerAddr: rio-scheduler:9001
-  storeAddr: rio-store:9002
-  schedulerBalanceHost: rio-scheduler-headless
+  # ADR-019: store moved to rio-store namespace. FQDN required for
+  # cross-ns resolution — short names only work same-ns. Controller
+  # passes these through to builder pods (rio-builders ns) via env.
+  schedulerAddr: rio-scheduler.rio-system:9001
+  storeAddr: rio-store.rio-store:9002
+  schedulerBalanceHost: rio-scheduler-headless.rio-system
   schedulerBalancePort: 9001
 
 store:
@@ -98,7 +98,7 @@ scheduler:
   # Exercises leader election for scenarios/leader-election.nix.
   replicas: 2
   leaseName: rio-scheduler-leader
-  storeAddr: rio-store:9002
+  storeAddr: rio-store.rio-store:9002
 
 gateway:
   enabled: true
@@ -106,9 +106,9 @@ gateway:
   command: ["/bin/rio-gateway"]
   # 1 replica: no LB in VM. podAntiAffinity renders only at replicas>1.
   replicas: 1
-  schedulerAddr: rio-scheduler:9001
-  storeAddr: rio-store:9002
-  schedulerBalanceHost: rio-scheduler-headless
+  schedulerAddr: rio-scheduler.rio-system:9001
+  storeAddr: rio-store.rio-store:9002
+  schedulerBalanceHost: rio-scheduler-headless.rio-system
   schedulerBalancePort: 9001
   service:
     # NodePort so client VM connects to k3s-server:32222. No cloud LB.
