@@ -63,6 +63,14 @@ in
   # yaml] to flip workerPool.privileged:false + devicePlugin.enabled
   # without duplicating the full base values file.
   extraValuesFiles ? [ ],
+  # --set (typed) overrides. bool/int values that MUST NOT be coerced
+  # to string — e.g. bootstrap.enabled=true (a bool the template checks
+  # with {{- if .Values... }}) or scheduler.replicas=2 (an int the
+  # Deployment spec expects). --set-string "true" happens to be truthy
+  # in Go templating (non-empty string) but --set-string "2" becomes
+  # replicas: "2" in the rendered Deployment, which k8s API validation
+  # rejects. prod-parity fixture passes bootstrap.enabled here.
+  extraValuesTyped ? { },
   # Envoy Gateway (dashboard gRPC-Web). Preloads envoyproxy/gateway +
   # envoyproxy/envoy:distroless images, renders the gateway-helm chart
   # as k3s manifests (CRDs+operator+certgen), sets dashboard.enabled=
@@ -134,7 +142,8 @@ let
       # sit in 02-workloads.yaml but don't match any 01-rbac kind, so
       # they land in the workloads split correctly.
       "dashboard.enabled" = true;
-    };
+    }
+    // extraValuesTyped;
     namespace = ns;
   };
 
