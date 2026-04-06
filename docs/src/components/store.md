@@ -78,6 +78,14 @@ Chunk refcounts track how many manifests reference each chunk. The `chunks` tabl
 r[store.chunk.refcount-txn]
 **Refcount increment:** In the same PostgreSQL transaction that writes `manifest_data` (step 2 of PutPath). Uses `INSERT ... ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1` — a single UPSERT over the full chunk list via `UNNEST`. PostgreSQL's conflict resolution serializes INSERT vs UPDATE per-row, so concurrent `PutPath` calls with overlapping chunk lists both increment correctly without explicit locking.
 
+r[store.chunk.put-standalone]
+
+The `PutChunk` RPC MUST accept chunks independent of any NAR manifest. A chunk with no manifest reference is held for the grace-TTL before GC eligibility. (Sibling to `r[store.chunk.refcount-txn]`.)
+
+r[store.chunk.grace-ttl]
+
+Chunks with zero manifest references AND `created_at < now() - grace_seconds` are GC-eligible. The grace period prevents a race where a worker's `PutChunk` arrives before its `PutPath` manifest. (Sibling to `r[store.chunk.refcount-txn]`.)
+
 **Refcount decrement:** In the same PostgreSQL transaction that deletes a manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of unreachable `'complete'` manifests). Uses `UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)` — atomic batch decrement.
 
 Chunks with `refcount = 0` are not immediately deleted from S3; they become eligible for GC sweep, which soft-deletes them and enqueues S3 key deletion via the `pending_s3_deletes` table.
@@ -113,6 +121,10 @@ The HMAC bypass check accepts a client certificate whose CN **or** any SAN `DNSN
 
 r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
+
+r[store.atomic.multi-output]
+
+Multi-output derivation registration MUST be atomic at the DB level: all output rows commit in one transaction, or none do. Blob-store writes are NOT rolled back (orphaned blobs are refcount-zero and GC-eligible on the next sweep). The bound is ≤1 NAR-size per failure.
 
 ## NAR Reassembly
 
@@ -173,6 +185,14 @@ r[store.signing.empty-refs-warn]
 
 When signing a non-CA path with zero references, the store MUST emit a warning. Non-leaf derivations with empty references indicate the worker's reference scanner missed deps.
 
+r[store.tenant.sign-key]
+
+narinfo signing MUST use the tenant's active signing key from `tenant_keys` when present, falling back to the cluster key otherwise. A tenant with its own key produces narinfo that `nix store verify --trusted-public-keys tenant:<pk>` accepts for that tenant's paths only.
+
+r[store.tenant.narinfo-filter]
+
+Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = auth.tenant_id`. Anonymous (unauthenticated) requests return unfiltered results for backward compatibility.
+
 ### Key Rotation
 
 1. Generate a new ed25519 signing key
@@ -212,6 +232,10 @@ WHERE tenant_id = $1`). Phase 4b is accounting-only — the query exists
 and returns bytes, but no quota enforcement is implemented. Phase 5
 adds enforcement (reject PutPath above quota, or trigger tenant-scoped
 GC).
+
+r[store.gc.tenant-quota-enforce]
+
+The gateway MUST reject `SubmitBuild` with `STDERR_ERROR` when `tenant_store_bytes(tenant_id)` exceeds `tenants.gc_max_store_bytes`. Enforcement is eventually-consistent — `tenant_store_bytes` may be cached with ≤30s TTL. The connection stays open; the user can retry after GC. (Sibling to `r[store.gc.tenant-quota]` — distinguishes enforcement from accounting.)
 
 Supports dry-run mode via `GCRequest.dry_run`.
 

@@ -1,82 +1,40 @@
 # rio-dashboard
 
-> **Status: Preliminary design --- Phase 5 deliverable. Technology choices are not finalized.**
-
-A TypeScript SPA providing a web-based view of the rio-build cluster.
+> **Phase 5:** Web dashboard for operational visibility. Svelte 5 SPA,
+> Envoy-sidecar gRPC-Web translation, DAG visualization via @xyflow/svelte.
 
 ## Architecture
 
-- **Frontend**: React SPA compiled to static assets
-- **Deployment**: Separate K8s Deployment serving static assets via nginx or a lightweight container
-- **API**: Consumes `AdminService` and `SchedulerService` via gRPC-Web
-- **gRPC-Web proxy**: Envoy sidecar or `tonic-web` middleware on the scheduler/admin server
-- **Authentication**: OIDC integration or SSH-key-to-tenant mapping shared with the gateway
+See `infra/helm/rio-build/templates/dashboard-*.yaml`.
 
-The dashboard does NOT share a process with any backend component. It is a pure frontend application.
+The dashboard does NOT share a process with any backend component. It is
+a pure frontend application consuming `AdminService` and `SchedulerService`
+via gRPC-Web through an Envoy sidecar.
 
 ## Key Views
 
 | View | Data Source | Description |
 |------|------------|-------------|
 | Build list | `SchedulerService.QueryBuildStatus` | Status, timing, requestor, derivation counts, cache hit rate per build |
-| DAG visualization | `SchedulerService.SubmitBuild` (BuildEvent stream) | Interactive derivation graph with color-coded status (queued/building/completed/cached/failed) |
+| DAG visualization | `SchedulerService.WatchBuild` (BuildEvent stream) | Interactive derivation graph with color-coded status |
 | Worker utilization | `AdminService.ListWorkers` | Current load, builds/hour, local store size, resource usage per worker |
 | Cache analytics | `AdminService.ClusterStatus` | Global cache hit rate, chunk dedup ratio, storage usage, transfer volumes |
-| Build log viewer | `SchedulerService.SubmitBuild` (BuildEvent.BuildLog) | Real-time streamed logs via gRPC-Web server streaming |
+| Build log viewer | `SchedulerService.GetBuildLogs` | Real-time streamed logs via gRPC-Web server streaming |
 
-## Technology Stack
+## Normative requirements
 
-This is a TypeScript project, not a Rust crate. It lives in the workspace root as `rio-dashboard/` with its own `package.json` and build toolchain (Node/Bun).
+r[dash.envoy.grpc-web-translate]
 
-| Concern | Choice |
-|---------|--------|
-| Framework | React |
-| gRPC-Web | `@improbable-eng/grpc-web` or `grpc-web` |
-| Charts | Recharts, D3, or similar |
-| DAG rendering | dagre-d3 or Elk.js |
-| Build toolchain | Vite |
+The dashboard pod's Envoy sidecar translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. CORS preflight and the `grpc-web` filter are Envoy-side.
 
-## Deployment
+r[dash.journey.build-to-logs]
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: rio-dashboard
-spec:
-  replicas: 2
-  template:
-    spec:
-      containers:
-        - name: dashboard
-          image: rio-dashboard:latest
-          ports:
-            - containerPort: 8080
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: rio-dashboard
-spec:
-  type: ClusterIP
-  ports:
-    - port: 80
-      targetPort: 8080
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: rio-dashboard
-spec:
-  rules:
-    - host: rio.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: rio-dashboard
-                port:
-                  number: 80
-```
+The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
+
+r[dash.graph.degrade-threshold]
+
+Graph rendering MUST degrade to a sortable table when the node count exceeds 2000. dagre layout on >2000 nodes freezes the main thread. Above 500 nodes, dagre runs in a Web Worker. The server separately caps responses at 5000 nodes (`GetBuildGraphResponse.truncated`).
+
+r[dash.stream.log-tail]
+
+`GetBuildLogs` server-stream consumption MUST use `TextDecoder('utf-8', {fatal: false})` — build output can contain non-UTF-8 bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx `proxy_buffering off` is required or the stream buffers entirely before reaching the browser.

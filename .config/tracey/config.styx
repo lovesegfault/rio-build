@@ -25,6 +25,7 @@ specs (
       docs/src/components/store.md
       docs/src/components/worker.md
       docs/src/components/controller.md
+      docs/src/components/dashboard.md
       docs/src/components/proto.md
       docs/src/observability.md
       docs/src/security.md

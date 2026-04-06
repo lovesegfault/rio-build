@@ -204,3 +204,75 @@ async fn test_chunked_hash_mismatch_no_leaked_state() -> TestResult {
 
     Ok(())
 }
+
+/// GT13 verify — multi-output atomicity gap. SCOPE-GATING for P0267.
+///
+/// Simulates a 2-output derivation where output-1's PutPath succeeds
+/// and output-2's fails. Proves the architectural gap:
+///
+///   worker upload_all_outputs() → buffer_unordered(4) independent RPCs
+///   → each PutPath is per-path transactional (put_chunked correct)
+///   → NO cross-output transaction exists
+///   → output-1 row stays 'complete' after output-2 fails
+///
+/// This test PASSES by asserting the gap (one row survives). P0267
+/// adds cross-output atomicity and inverts this assertion.
+///
+/// No proto-level batch-put RPC exists (`rg PutPathBatch rio-proto/` = 0).
+///
+/// TODO(P0267): invert assertion once atomic multi-output lands.
+#[tokio::test]
+async fn gt13_multi_output_not_atomic() -> TestResult {
+    let mut s = StoreSession::new().await?;
+
+    // Output 1: valid. Small NAR → inline (no chunking needed for this
+    // demonstration — the gap is at the per-RPC level, not per-chunk).
+    let out1_path = test_store_path("gt13-out1");
+    let (out1_nar, _) = make_nar(b"output one content");
+    let out1_info = make_path_info_for_nar(&out1_path, &out1_nar);
+    let r1 = put_path(&mut s.client, out1_info, out1_nar).await?;
+    assert!(r1, "output-1 PutPath succeeds");
+
+    // Output 2: hash mismatch (declare out1's hash, send garbage).
+    // Models: network corruption, worker crash mid-stream, S3 fault.
+    let out2_path = test_store_path("gt13-out2");
+    let (out2_good_nar, _) = make_nar(b"output two content");
+    let out2_info = make_path_info_for_nar(&out2_path, &out2_good_nar);
+    let (out2_bad_nar, _) = make_nar(b"CORRUPTED");
+    let r2 = put_path(&mut s.client, out2_info, out2_bad_nar).await;
+    assert!(r2.is_err(), "output-2 PutPath fails (hash mismatch)");
+
+    // THE GAP: output-1 is already 'complete' in PG. Nothing rolled it
+    // back when output-2 failed — there's no mechanism that COULD roll
+    // it back (separate RPC, separate transaction, already committed).
+    //
+    // A consumer querying output-1 right now gets a valid response. For
+    // a multi-output derivation this breaks the "all outputs or none"
+    // contract — partial registration is visible.
+    let complete: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifests m JOIN narinfo n \
+         ON m.store_path_hash = n.store_path_hash \
+         WHERE n.store_path = $1 AND m.status = 'complete'",
+    )
+    .bind(&out1_path)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert_eq!(
+        complete, 1,
+        "GT13-OUTCOME: real — output-1 survives output-2 failure. \
+         P0267 scope: full sqlx::Transaction wrap, NOT tracey-annotate-only."
+    );
+
+    // Output-2 correctly rolled back (per-path rollback DOES work).
+    let out2_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifests m JOIN narinfo n \
+         ON m.store_path_hash = n.store_path_hash \
+         WHERE n.store_path = $1",
+    )
+    .bind(&out2_path)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert_eq!(out2_rows, 0, "output-2 per-path rollback works correctly");
+
+    Ok(())
+}

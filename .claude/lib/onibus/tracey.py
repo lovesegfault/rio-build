@@ -2,7 +2,9 @@
 
 Authoritative domain set derived from docs/src/**/*.md standalone r[domain.*]
 paragraphs. test_tracey_domains_matches_spec() catches drift — hardcoding the
-alternation at 8 sites previously missed `common`.
+alternation at 8 sites previously missed `common`. `dash` seeded by P0245
+(pulled forward from P0284 so 6 dashboard plans don't tracey-validate-fail
+on merge).
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ import re
 from pathlib import Path
 
 TRACEY_DOMAINS: frozenset[str] = frozenset({
-    "common", "ctrl", "gw", "obs", "proto", "sched", "sec", "store", "worker"
+    "common", "ctrl", "dash", "gw", "obs", "proto", "sched", "sec", "store", "worker"
 })
 TRACEY_DOMAIN_ALT = "|".join(sorted(TRACEY_DOMAINS))
 # Capture the full marker ID (domain.area.detail), not just the domain —
