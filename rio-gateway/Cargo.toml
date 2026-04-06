@@ -38,6 +38,11 @@ metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+# JWT issuance (P0258): Claims.sub is Uuid; signing key is ed25519.
+# Both via rio-common::jwt but the gateway constructs the SigningKey
+# (K8s Secret load is P0260's job) and generates the jti Uuid.
+uuid = { workspace = true }
+ed25519-dalek = { workspace = true }
 # wopRegisterDrvOutput/wopQueryRealisation parse/emit Realisation JSON
 # on the wire. Was dev-only (golden tests); promoted now that the opcodes
 # are real instead of stubs.

@@ -85,12 +85,18 @@ pub async fn run_protocol<R, W>(
     store_client: &mut StoreServiceClient<Channel>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: String,
+    jwt_token: Option<String>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin,
 {
-    let mut ctx = SessionContext::new(store_client.clone(), scheduler_client.clone(), tenant_name);
+    let mut ctx = SessionContext::new(
+        store_client.clone(),
+        scheduler_client.clone(),
+        tenant_name,
+        jwt_token,
+    );
 
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));
     match handshake::server_handshake_split(reader, writer, &version_string).await {

@@ -140,7 +140,7 @@ impl RioStack {
         let server_task = tokio::spawn(async move {
             let (mut r, mut w) = tokio::io::split(server_stream);
             if let Err(e) =
-                session::run_protocol(&mut r, &mut w, &mut sc, &mut scc, String::new()).await
+                session::run_protocol(&mut r, &mut w, &mut sc, &mut scc, String::new(), None).await
             {
                 let is_eof = e
                     .downcast_ref::<rio_nix::protocol::wire::WireError>()

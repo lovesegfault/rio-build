@@ -4795,6 +4795,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
  "hex",
  "metrics",
  "regex",
@@ -4817,6 +4818,7 @@ dependencies = [
  "tonic-health",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

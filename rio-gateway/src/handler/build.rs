@@ -231,6 +231,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     request: types::SubmitBuildRequest,
     active_build_ids: &mut HashMap<String, u64>,
+    jwt_token: Option<&str>,
 ) -> anyhow::Result<BuildResult> {
     // Trace propagation: gateway is the trace ROOT (no incoming
     // traceparent from the SSH client — Nix doesn't speak W3C trace
@@ -242,6 +243,28 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // work — without it, scheduler spans are orphaned root traces.
     let mut request = tonic::Request::new(request);
     rio_proto::interceptor::inject_current(request.metadata_mut());
+
+    // JWT propagation: x-rio-tenant-token carries the signed claims.
+    // The scheduler's interceptor (P0259) verifies signature+expiry,
+    // attaches Claims to request extensions, and the SubmitBuild
+    // handler reads jti from there — NO proto body field for jti
+    // (zero wire redundancy: jti lives once in the JWT, parsed once
+    // by the interceptor, read once by the handler; see
+    // r[gw.jwt.issue]). When token is None, header is absent →
+    // scheduler falls back to SubmitBuildRequest.tenant_name per
+    // r[gw.jwt.dual-mode].
+    //
+    // try_from on a JWT can't actually fail — jsonwebtoken emits
+    // base64url.base64url.base64url (pure ASCII, no control chars,
+    // well under the 8KB MetadataValue limit). The ? is defensive:
+    // if rio_common::jwt ever changes encoding, we'd rather error
+    // than silently drop auth on the floor.
+    if let Some(token) = jwt_token {
+        request.metadata_mut().insert(
+            "x-rio-tenant-token",
+            tonic::metadata::MetadataValue::try_from(token)?,
+        );
+    }
 
     let resp = match rio_common::grpc::with_timeout(
         "SubmitBuild",
@@ -540,6 +563,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         has_seen_build_paths_with_results,
         active_build_ids,
         tenant_name,
+        jwt_token,
         ..
     } = ctx;
     let drv_path_str = wire::read_string(reader).await?;
@@ -650,14 +674,21 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         tenant_name,
     );
 
-    let build_result =
-        match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "build submission failed");
-                BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
-            }
-        };
+    let build_result = match submit_and_process_build(
+        stderr,
+        scheduler_client,
+        request,
+        active_build_ids,
+        jwt_token.as_deref(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "build submission failed");
+            BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
+        }
+    };
 
     debug!(
         status = ?build_result.status,
@@ -685,6 +716,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         drv_cache,
         active_build_ids,
         tenant_name,
+        jwt_token,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -768,11 +800,18 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     let request =
         translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci", tenant_name);
 
-    let build_result =
-        match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
-            Ok(r) => r,
-            Err(e) => stderr_err!(stderr, "build failed: {e}"),
-        };
+    let build_result = match submit_and_process_build(
+        stderr,
+        scheduler_client,
+        request,
+        active_build_ids,
+        jwt_token.as_deref(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => stderr_err!(stderr, "build failed: {e}"),
+    };
 
     if !build_result.status.is_success() {
         stderr_err!(stderr, "build failed: {}", build_result.error_msg);
@@ -799,6 +838,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         drv_cache,
         active_build_ids,
         tenant_name,
+        jwt_token,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -919,14 +959,20 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 tenant_name,
             );
 
-            submit_and_process_build(stderr, scheduler_client, request, active_build_ids)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
-                    metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
-                        .increment(1);
-                    BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
-                })
+            submit_and_process_build(
+                stderr,
+                scheduler_client,
+                request,
+                active_build_ids,
+                jwt_token.as_deref(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
+                metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
+                    .increment(1);
+                BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
+            })
         };
 
         // Apply the build result to all derivation paths, enriching each with
