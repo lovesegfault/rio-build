@@ -11,7 +11,7 @@
 //!      derivation, up to the ceiling).
 //!   3. Each Job runs one rio-builder pod with `RIO_EPHEMERAL=1` →
 //!      worker's main loop exits after one build → pod terminates →
-//!      `ttlSecondsAfterFinished: 60` reaps the Job.
+//!      `ttlSecondsAfterFinished` ([`JOB_TTL_SECS`]) reaps the Job.
 //!
 //! From the scheduler's perspective, an ephemeral Job pod is
 //! indistinguishable from an STS pod: it heartbeats in, gets a
@@ -43,7 +43,7 @@
 //! `rio-builder-{pool}-{random-suffix}` — random because we don't have an
 //! assignment_id at spawn time (the scheduler picks the derivation
 //! AFTER the worker heartbeats). 6 lowercase-alnum chars: 36^6 ≈
-//! 2 billion combinations; with `ttlSecondsAfterFinished: 60` and
+//! 2 billion combinations; with [`JOB_TTL_SECS`] reaping and
 //! realistic build rates, collision is effectively impossible. K8s
 //! would reject on collision anyway (409 AlreadyExists) and next
 //! tick retries.
