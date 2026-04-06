@@ -215,6 +215,9 @@ Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = 
 4. Existing active paths are re-signed during GC (mark phase signs reachable paths with the new key)
 5. After a grace period (default: 30 days), remove the old key from `trusted-public-keys`
 
+r[store.key.rotation-cluster-history]
+The cluster signing key MAY be rotated. Prior cluster public keys MUST remain in the trusted set for `sig_visibility_gate` verification until the grace period expires — otherwise paths signed under the old key become invisible to cross-tenant reads when `path_tenants` row count hits zero (CASCADE on tenant deletion). Prior keys are loaded from `cluster_key_history` alongside the active `Signer`.
+
 ### Realisation Signing
 
 CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv_hash, output_name, output_path, nar_hash)`. This provides integrity for content-addressed output mappings independently of narinfo signatures.
