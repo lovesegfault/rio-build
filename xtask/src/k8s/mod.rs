@@ -1,6 +1,7 @@
 //! Unified k8s deploy. One command surface, provider flag selects
 //! k3s (local) vs eks (AWS).
 
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -77,9 +78,11 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Canonical order. ami precedes push: deploy reads `.rio-ami-tag`,
-    /// and if up is interrupted after push the operator's reflex is
-    /// `up --deploy`, which then finds both tags present.
+    /// Canonical order for selection/validation. Execution is NOT
+    /// strictly this order: ami runs concurrently with the
+    /// bootstrap→provision→kubeconfig→push chain (see
+    /// [`run_up_phases`]). deploy reads both `.rio-ami-tag` and the
+    /// image tag, so it waits on the join of both branches.
     pub const ALL: [Phase; 7] = [
         Phase::Bootstrap,
         Phase::Provision,
@@ -256,8 +259,8 @@ pub struct K8sArgs {
 
 #[derive(Subcommand)]
 pub enum K8sCmd {
-    /// Bring up the cluster: bootstrap → provision → kubeconfig → ami
-    /// → push → deploy → envoy. Phase flags select a subset.
+    /// Bring up the cluster: ami ∥ (bootstrap → provision → kubeconfig
+    /// → push), then deploy → envoy. Phase flags select a subset.
     Up(UpOpts),
     /// End-to-end build + worker-kill chaos test.
     Smoke,
@@ -451,7 +454,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
     }
 }
 
-/// Dispatch the selected `up` phases in canonical order.
+/// Dispatch the selected `up` phases.
 ///
 /// `explicit` distinguishes `up --ami -p kind` (hard error: the user
 /// asked for an EKS-only phase on the wrong provider) from `up -p kind`
@@ -468,8 +471,8 @@ async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOp
     // are hard errors vs silent skips.
     let explicit = selected.len() != Phase::ALL.len();
     o.validate_phase_opts(&selected)?;
-    // Provider-support validation BEFORE the dispatch loop — same
-    // upfront-fail discipline as validate_phase_opts. Without this,
+    // Provider-support validation BEFORE dispatch — same upfront-fail
+    // discipline as validate_phase_opts. Without this,
     // `-p kind up --bootstrap --provision --ami` would create a real
     // cluster THEN error.
     if explicit && selected.contains(&Phase::Ami) && !matches!(kind, ProviderKind::Eks) {
@@ -480,45 +483,134 @@ async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOp
         .deploy_log_level
         .clone()
         .unwrap_or_else(|| cfg.log_level.clone());
-    let tenant = o.deploy_tenant.as_deref();
-    let nodes = o.provision_nodes.unwrap_or(3);
+    let pp = PhaseParams {
+        yes: o.yes,
+        nodes: o.provision_nodes.unwrap_or(3),
+        log_level: &log_level,
+        tenant: o.deploy_tenant.as_deref(),
+        skip_preflight: o.deploy_skip_preflight,
+    };
 
-    ui::step("k8s up", || async {
-        for &phase in &selected {
-            match phase {
-                Phase::Bootstrap => ui::step("bootstrap", || p.bootstrap(cfg)).await?,
-                Phase::Provision => {
-                    ui::step("provision", || p.provision(cfg, o.yes, nodes)).await?
-                }
-                Phase::Kubeconfig => ui::step("kubeconfig", || p.kubeconfig(cfg)).await?,
-                Phase::Ami => match kind {
-                    ProviderKind::Eks => {
-                        ui::step("ami", || eks::ami::run_phase(o.ami_arch)).await?
-                    }
-                    // explicit + non-EKS already rejected above the loop;
-                    // reaching here means implicit full-sequence on
-                    // kind/k3s — skip.
-                    _ => debug!("ami: provider={kind}, skipping"),
-                },
-                Phase::Push => {
-                    let images = ui::step("build", || p.build(cfg)).await?;
-                    ui::step("push", || p.push(&images, cfg)).await?
-                }
-                Phase::Deploy => {
-                    ui::step("deploy", || {
-                        p.deploy(cfg, &log_level, tenant, o.deploy_skip_preflight)
-                    })
-                    .await?
-                }
-                Phase::Envoy => ui::step("envoy", envoy_install).await?,
+    // ami_branch is built here (not inside run_up_phases) because the
+    // EKS-only gate needs `kind`, which the provider-agnostic core
+    // doesn't see. Tests inject their own ami future directly.
+    let ami_selected = selected.contains(&Phase::Ami);
+    let ami_arch = o.ami_arch;
+    let ami_branch = async move {
+        if !ami_selected {
+            return Ok(());
+        }
+        match kind {
+            ProviderKind::Eks => ui::step("ami", || eks::ami::run_phase(ami_arch)).await,
+            // explicit + non-EKS already rejected above; reaching here
+            // means implicit full-sequence on kind/k3s — skip.
+            _ => {
+                debug!("ami: provider={kind}, skipping");
+                Ok(())
             }
         }
+    };
+
+    ui::step("k8s up", || async {
+        run_up_phases(p, cfg, &selected, pp, ami_branch, envoy_install()).await?;
         if !explicit {
             info!("all phases done — run `cargo xtask k8s -p {kind} smoke` to verify");
         }
         Ok(())
     })
     .await
+}
+
+/// Per-phase knobs threaded through [`run_up_phases`]. Bundled so the
+/// concurrent-dispatch core has a stable test surface independent of
+/// `UpOpts` (which is clap-coupled).
+struct PhaseParams<'a> {
+    yes: bool,
+    nodes: u8,
+    log_level: &'a str,
+    tenant: Option<&'a str>,
+    skip_preflight: bool,
+}
+
+/// Concurrent core of `up`: the AMI build runs in parallel with the
+/// bootstrap → provision → kubeconfig → push chain; deploy and envoy
+/// run sequentially after both complete.
+///
+/// **`join!`, not `try_join!`**: provision is `terraform apply` —
+/// real cloud resources mid-creation. An AMI build failure (nix eval
+/// error, S3 throttle) MUST NOT drop the infra future on the floor;
+/// that would abandon a half-applied tofu plan with state drift the
+/// operator then has to untangle by hand. Both branches always run to
+/// completion; errors are collected and surfaced together afterward.
+///
+/// `push` stays in the infra chain (not a third concurrent branch):
+/// the ECR repo URL is a tofu output, so push can't start until
+/// provision has finished.
+///
+/// `ami_branch` / `envoy_branch` are injected so tests can mock them
+/// without an EKS account or a live cluster. Phase selection still
+/// applies: a phase not in `selected` is a no-op even if its branch
+/// future would do work — callers pass `async { Ok(()) }` for an
+/// unselected ami.
+///
+/// `ui::step` is concurrency-aware (span-scoped depth, see ui.rs
+/// `DepthLayer`); interleaved ✓/✗ lines from the two branches render
+/// with correct indentation. The transient spinner is best-effort
+/// (last-enter-wins) — acceptable, the persistent tree is the record.
+async fn run_up_phases<A, E>(
+    p: &dyn Provider,
+    cfg: &XtaskConfig,
+    selected: &[Phase],
+    pp: PhaseParams<'_>,
+    ami_branch: A,
+    envoy_branch: E,
+) -> Result<()>
+where
+    A: Future<Output = Result<()>>,
+    E: Future<Output = Result<()>>,
+{
+    let sel = |ph| selected.contains(&ph);
+
+    let infra_branch = async {
+        if sel(Phase::Bootstrap) {
+            ui::step("bootstrap", || p.bootstrap(cfg)).await?;
+        }
+        if sel(Phase::Provision) {
+            ui::step("provision", || p.provision(cfg, pp.yes, pp.nodes)).await?;
+        }
+        if sel(Phase::Kubeconfig) {
+            ui::step("kubeconfig", || p.kubeconfig(cfg)).await?;
+        }
+        if sel(Phase::Push) {
+            let images = ui::step("build", || p.build(cfg)).await?;
+            ui::step("push", || p.push(&images, cfg)).await?;
+        }
+        anyhow::Ok(())
+    };
+
+    // Both run to completion regardless of the other erroring — see
+    // doc comment. ui::step already printed per-branch ✗ lines; the
+    // bail here is the combined summary for the outer `k8s up` ✗.
+    let (ami_r, infra_r) = tokio::join!(ami_branch, infra_branch);
+    match (ami_r, infra_r) {
+        (Ok(()), Ok(())) => {}
+        (Err(e), Ok(())) => return Err(e.context("ami branch failed")),
+        (Ok(()), Err(e)) => return Err(e.context("infra branch failed")),
+        (Err(ea), Err(ei)) => {
+            bail!("both concurrent branches failed:\n  ami:   {ea:#}\n  infra: {ei:#}")
+        }
+    }
+
+    if sel(Phase::Deploy) {
+        ui::step("deploy", || {
+            p.deploy(cfg, pp.log_level, pp.tenant, pp.skip_preflight)
+        })
+        .await?;
+    }
+    if sel(Phase::Envoy) {
+        ui::step("envoy", || envoy_branch).await?;
+    }
+    Ok(())
 }
 
 /// Open a tunnel to the gateway, resolve the ssh-ng:// store URL,
@@ -613,10 +705,213 @@ async fn envoy_install() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use async_trait::async_trait;
+    use provider::BuiltImages;
+
     use super::*;
 
     fn opts() -> UpOpts {
         UpOpts::default()
+    }
+
+    // -- mock provider for run_up_phases concurrency tests ------------
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    /// Records call order; per-method delays make `tokio::join!`
+    /// interleaving observable. `provision_done` is the witness for
+    /// the "ami error must not cancel provision" test.
+    struct MockProvider {
+        log: Log,
+        provision_delay: Duration,
+        provision_done: Arc<AtomicBool>,
+    }
+
+    impl MockProvider {
+        fn new(log: Log) -> Self {
+            Self {
+                log,
+                provision_delay: Duration::ZERO,
+                provision_done: Arc::new(AtomicBool::new(false)),
+            }
+        }
+        fn record(&self, what: &'static str) {
+            self.log.lock().unwrap().push(what);
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for MockProvider {
+        fn context_matches(&self, _: &str) -> bool {
+            unimplemented!()
+        }
+        async fn bootstrap(&self, _: &XtaskConfig) -> Result<()> {
+            self.record("bootstrap");
+            Ok(())
+        }
+        async fn provision(&self, _: &XtaskConfig, _: bool, _: u8) -> Result<()> {
+            tokio::time::sleep(self.provision_delay).await;
+            self.record("provision");
+            self.provision_done.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn kubeconfig(&self, _: &XtaskConfig) -> Result<()> {
+            self.record("kubeconfig");
+            Ok(())
+        }
+        async fn build(&self, _: &XtaskConfig) -> Result<BuiltImages> {
+            self.record("build");
+            Ok(BuiltImages {
+                dir: tempfile::TempDir::new()?,
+                tag: "test".into(),
+            })
+        }
+        async fn push(&self, _: &BuiltImages, _: &XtaskConfig) -> Result<()> {
+            self.record("push");
+            Ok(())
+        }
+        async fn deploy(&self, _: &XtaskConfig, _: &str, _: Option<&str>, _: bool) -> Result<()> {
+            self.record("deploy");
+            Ok(())
+        }
+        async fn smoke(&self, _: &XtaskConfig) -> Result<()> {
+            unimplemented!()
+        }
+        async fn tunnel(&self, _: u16) -> Result<shared::ProcessGuard> {
+            unimplemented!()
+        }
+        async fn tunnel_grpc(
+            &self,
+            _: u16,
+            _: u16,
+        ) -> Result<((u16, shared::ProcessGuard), (u16, shared::ProcessGuard))> {
+            unimplemented!()
+        }
+        async fn destroy(&self, _: &XtaskConfig) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn pp() -> PhaseParams<'static> {
+        PhaseParams {
+            yes: true,
+            nodes: 1,
+            log_level: "info",
+            tenant: None,
+            skip_preflight: true,
+        }
+    }
+
+    fn pos(log: &[&str], what: &str) -> usize {
+        log.iter().position(|&x| x == what).unwrap()
+    }
+
+    /// All phases selected: ami runs concurrently with the infra
+    /// chain, and deploy only starts after BOTH have produced a
+    /// result. The ami branch sleeps longer than the whole infra
+    /// chain so "ami after push, deploy after ami" is observable.
+    #[tokio::test]
+    async fn up_phases_concurrent_ordering() {
+        let log: Log = Arc::default();
+        let p = MockProvider::new(log.clone());
+        let cfg = XtaskConfig::default();
+
+        let ami_log = log.clone();
+        let ami = async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            ami_log.lock().unwrap().push("ami");
+            Ok(())
+        };
+        let envoy_log = log.clone();
+        let envoy = async move {
+            envoy_log.lock().unwrap().push("envoy");
+            Ok(())
+        };
+
+        run_up_phases(&p, &cfg, &Phase::ALL, pp(), ami, envoy)
+            .await
+            .unwrap();
+
+        let log = log.lock().unwrap();
+        // infra chain stays internally ordered
+        assert!(pos(&log, "bootstrap") < pos(&log, "provision"));
+        assert!(pos(&log, "provision") < pos(&log, "push"));
+        // ami overlapped infra: it finished AFTER push (30ms sleep vs
+        // synchronous infra chain) — proves the branches actually ran
+        // concurrently, not sequentially
+        assert!(pos(&log, "push") < pos(&log, "ami"), "log: {log:?}");
+        // deploy waited for the join: it's after BOTH ami and push
+        assert!(pos(&log, "ami") < pos(&log, "deploy"), "log: {log:?}");
+        assert!(pos(&log, "push") < pos(&log, "deploy"), "log: {log:?}");
+        // envoy is last
+        assert!(pos(&log, "deploy") < pos(&log, "envoy"));
+    }
+
+    /// The critical safety property: an AMI build failure does NOT
+    /// cancel an in-flight provision. `try_join!` would drop the
+    /// infra future the moment ami errors; `join!` lets provision
+    /// run to completion (sets its flag) and surfaces the error
+    /// afterward.
+    #[tokio::test]
+    async fn up_ami_error_does_not_cancel_provision() {
+        let log: Log = Arc::default();
+        let mut p = MockProvider::new(log.clone());
+        p.provision_delay = Duration::from_millis(50);
+        let provision_done = p.provision_done.clone();
+        let cfg = XtaskConfig::default();
+
+        // ami fails immediately — well before provision's 50ms sleep
+        // completes. With try_join!, provision would be dropped here.
+        let ami = async { Err(anyhow!("ami build failed")) };
+        let envoy = async { Ok(()) };
+
+        let r = run_up_phases(
+            &p,
+            &cfg,
+            &[Phase::Bootstrap, Phase::Provision, Phase::Ami],
+            pp(),
+            ami,
+            envoy,
+        )
+        .await;
+
+        // provision ran to completion despite ami erroring first
+        assert!(
+            provision_done.load(Ordering::SeqCst),
+            "provision was cancelled — join! semantics broken"
+        );
+        assert!(log.lock().unwrap().contains(&"provision"));
+        // overall result is still Err, with the ami context
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("ami branch failed"), "err: {e}");
+    }
+
+    /// Phase selection still gates: `up --push --deploy` runs only
+    /// push+deploy; ami_branch is the caller's responsibility (here a
+    /// no-op) and bootstrap/provision/kubeconfig are skipped.
+    #[tokio::test]
+    async fn up_phases_selection_subset() {
+        let log: Log = Arc::default();
+        let p = MockProvider::new(log.clone());
+        let cfg = XtaskConfig::default();
+
+        run_up_phases(
+            &p,
+            &cfg,
+            &[Phase::Push, Phase::Deploy],
+            pp(),
+            async { Ok(()) },
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(&*log.lock().unwrap(), &["build", "push", "deploy"]);
     }
 
     #[test]
