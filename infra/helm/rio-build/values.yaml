@@ -283,7 +283,8 @@ karpenter:
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # bottlerocket@latest: container-optimized, immutable root fs, smaller
-  # attack surface. Worker pods run privileged (FUSE); Bottlerocket allows.
+  # attack surface. Worker pods need CAP_SYS_ADMIN (FUSE) + hostUsers:false
+  # (containerd ≥ 1.7 idmap mounts) — Bottlerocket ships both.
   amiAlias: bottlerocket@latest
   # Bottlerocket data volume (/dev/xvdb — container images + emptyDir +
   # logs). AMI default is ~20GB; worker pods request 25Gi ephemeral-
@@ -365,6 +366,38 @@ karpenter:
       consolidateAfter: 5m
 
 # ──────────────────────────────────────────────────────────────────────────
+# FUSE Device Plugin
+# ──────────────────────────────────────────────────────────────────────────
+# smarter-device-manager DaemonSet: exposes /dev/fuse as an extended
+# resource (smarter-devices/fuse). Worker pods request it via
+# resources.limits instead of a hostPath volume, which makes
+# hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
+#
+# enabled=true by default because workerPool.privileged=false (below)
+# depends on it. Disable on clusters where privileged:true is the escape
+# hatch (k3s/kind without node-level device-plugin support).
+devicePlugin:
+  enabled: true
+  # Upstream image. Pin to a digest for production; the default tag
+  # follows upstream releases.
+  image: ghcr.io/smarter-project/smarter-device-manager:v1.20.15
+  # Per-node ceiling on how many pods can claim /dev/fuse. Each worker
+  # pod requests 1. Set this >= max worker pods per node (which is
+  # typically 1 given the resource requests below, but bursty
+  # autoscaling + small nodes could pack more).
+  fuseMaxDevices: 100
+  # Same nodeSelector as workerPool: plugin runs on worker nodes only.
+  # Control-plane nodes don't need /dev/fuse.
+  nodeSelector:
+    rio.build/node-role: worker
+  # Tolerate the worker-node taint so the DaemonSet schedules there.
+  tolerations:
+    - key: rio.build/worker
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+# ──────────────────────────────────────────────────────────────────────────
 # Default WorkerPool
 # ──────────────────────────────────────────────────────────────────────────
 # One-size-fits-all baseline for phase 4b — phase 4c WorkerPoolSet
@@ -400,12 +433,16 @@ workerPool:
       cpu: "2"
       memory: "4Gi"
       ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
-  # Device cgroup: /dev/fuse needs a device plugin for caps-only
-  # (smarter-device-manager). ADR-012 defers to phase 5; privileged
-  # bypasses device cgroup entirely. crds/workerpool.rs:145 says
-  # "Production on EKS/GKE with proper runtime config should NOT need
-  # this" — that proper config IS the device plugin.
-  privileged: true
+  # Device cgroup: /dev/fuse is provided by smarter-device-manager
+  # (templates/device-plugin.yaml) via resources.limits. With the
+  # device plugin, granular SYS_ADMIN+SYS_CHROOT caps suffice and
+  # hostUsers:false works (hostPath /dev/fuse breaks idmap mounts).
+  #
+  # privileged:true is an ESCAPE HATCH for k3s/kind without the
+  # device plugin. It disables seccomp entirely (ADR-012:10) and
+  # is unacceptable for multi-tenant (ADR-012:18). Production on
+  # EKS/GKE with the device plugin deployed should NOT need this.
+  privileged: false
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:

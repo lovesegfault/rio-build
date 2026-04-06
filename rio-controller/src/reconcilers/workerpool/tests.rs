@@ -248,24 +248,159 @@ fn seccomp_profile_json_is_valid() {
     }
 }
 
+// r[verify sec.pod.fuse-device-plugin]
 #[test]
-fn statefulset_dev_fuse_volume() {
+fn statefulset_fuse_via_device_plugin_when_unprivileged() {
+    // Default (privileged=None→false): NO hostPath /dev/fuse volume.
+    // Instead, resources.limits has smarter-devices/fuse=1 and the
+    // kubelet+device-plugin inject the device. This is the ADR-012
+    // production path — enables hostUsers:false (hostPath /dev/fuse
+    // is incompatible with idmap mounts).
     let wp = test_wp();
     let sts = test_sts(&wp);
-
     let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    // No dev-fuse volume (device plugin injects, no volume needed).
+    assert!(
+        !pod.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|v| v.name == "dev-fuse"),
+        "non-privileged path uses device plugin, not hostPath"
+    );
+    // No dev-fuse mount either.
+    assert!(
+        !pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.name == "dev-fuse"),
+    );
+
+    // resources.limits has the FUSE device resource. kubelet sees
+    // this → device plugin injects /dev/fuse + adds to device cgroup.
+    let resources = pod.containers[0]
+        .resources
+        .as_ref()
+        .expect("resources set (device plugin request)");
+    let limits = resources.limits.as_ref().expect("limits set");
+    assert_eq!(
+        limits.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+        Some("1"),
+        "one FUSE device per worker pod"
+    );
+    // K8s treats extended-resource limits as requests too, but we
+    // set both for `kubectl get` clarity.
+    let requests = resources.requests.as_ref().expect("requests set");
+    assert_eq!(
+        requests.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+        Some("1"),
+    );
+}
+
+// r[verify sec.pod.fuse-device-plugin]
+#[test]
+fn statefulset_fuse_device_merges_with_operator_resources() {
+    // Operator-supplied resources (cpu/memory/ephemeral) must be
+    // PRESERVED when the builder adds the FUSE device request.
+    // A naive overwrite would drop the operator's limits → unbounded
+    // pod on a shared node (noisy neighbor).
+    use k8s_openapi::api::core::v1::ResourceRequirements;
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+    let mut wp = test_wp();
+    wp.spec.resources = Some(ResourceRequirements {
+        requests: Some(BTreeMap::from([
+            ("cpu".into(), Quantity("2".into())),
+            ("memory".into(), Quantity("4Gi".into())),
+        ])),
+        limits: Some(BTreeMap::from([("memory".into(), Quantity("8Gi".into()))])),
+        ..Default::default()
+    });
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    let resources = pod.containers[0].resources.as_ref().unwrap();
+    let limits = resources.limits.as_ref().unwrap();
+    let requests = resources.requests.as_ref().unwrap();
+
+    // Operator's memory limit preserved.
+    assert_eq!(limits.get("memory").map(|q| q.0.as_str()), Some("8Gi"));
+    // FUSE device merged in alongside.
+    assert_eq!(
+        limits.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+        Some("1")
+    );
+    // Operator's cpu/memory requests preserved.
+    assert_eq!(requests.get("cpu").map(|q| q.0.as_str()), Some("2"));
+    assert_eq!(requests.get("memory").map(|q| q.0.as_str()), Some("4Gi"));
+}
+
+// r[verify sec.pod.host-users-false]
+#[test]
+fn statefulset_host_users_false_when_unprivileged() {
+    // hostUsers:false → K8s user-namespace isolation. Container UIDs
+    // remapped to unprivileged host UIDs; CAP_SYS_ADMIN applies only
+    // within the user namespace. The LOAD-BEARING defense-in-depth
+    // layer (ADR-012 §User Namespace Isolation).
+    let wp = test_wp();
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+    assert_eq!(
+        pod.host_users,
+        Some(false),
+        "non-privileged → user-namespace isolation active"
+    );
+}
+
+// r[verify sec.pod.host-users-false]
+// r[verify sec.pod.fuse-device-plugin]
+#[test]
+fn statefulset_privileged_escape_hatch_uses_hostpath() {
+    // privileged=true → hostPath /dev/fuse fallback. No device
+    // plugin resource, no hostUsers:false (both incompatible with
+    // privileged containers). This is the k3s/kind escape hatch.
+    let mut wp = test_wp();
+    wp.spec.privileged = Some(true);
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    // hostPath /dev/fuse volume present (escape hatch).
     let fuse_vol = pod
         .volumes
+        .as_ref()
         .unwrap()
-        .into_iter()
+        .iter()
         .find(|v| v.name == "dev-fuse")
-        .expect("/dev/fuse volume");
-    let hp = fuse_vol.host_path.expect("hostPath");
+        .expect("/dev/fuse hostPath volume (privileged escape hatch)");
+    let hp = fuse_vol.host_path.as_ref().expect("hostPath");
     assert_eq!(hp.path, "/dev/fuse");
+    assert_eq!(hp.type_, Some("CharDevice".into()));
+
+    // Mount present too.
+    let mount = pod.containers[0]
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|m| m.name == "dev-fuse")
+        .expect("dev-fuse mount");
+    assert_eq!(mount.mount_path, "/dev/fuse");
+
+    // hostUsers NOT set (privileged containers can't be user-namespaced).
     assert_eq!(
-        hp.type_,
-        Some("CharDevice".into()),
-        "CharDevice type makes K8s verify it's a char device (catches no-FUSE nodes)"
+        pod.host_users, None,
+        "privileged escape hatch skips hostUsers:false"
+    );
+
+    // NO device plugin resource (privileged bypasses device cgroup).
+    // If operator set resources, pass through unchanged; here test_wp
+    // has resources=None so the container resources should be None.
+    assert!(
+        pod.containers[0].resources.is_none(),
+        "privileged path doesn't inject FUSE device resource"
     );
 }
 

@@ -1,0 +1,59 @@
+{{- /*
+NOTES.txt: printed after `helm install`/`helm upgrade`.
+
+Post-install prerequisites that the chart cannot apply itself
+(node-level state outside K8s API reach).
+*/ -}}
+rio-build installed to namespace {{ .Values.namespace.name }}.
+
+{{- if .Values.devicePlugin.enabled }}
+
+── FUSE device plugin (smarter-device-manager) ────────────────────────
+The rio-device-plugin DaemonSet exposes /dev/fuse as the
+`smarter-devices/fuse` extended resource. Worker pods request it via
+resources.limits instead of a hostPath volume.
+
+Prerequisites:
+  • /dev/fuse present on every worker node (kernel FUSE module loaded).
+    On most distros: `modprobe fuse` or ensure `fuse` is in modules-load.
+  • Container runtime with idmap-mount support (containerd ≥ 1.7,
+    CRI-O ≥ 1.25) for hostUsers:false to work. EKS/GKE managed
+    nodegroups on AL2023/COS ship compatible runtimes by default.
+
+Verify:
+  kubectl get node -o json | jq '.items[].status.allocatable["smarter-devices/fuse"]'
+  — should show {{ .Values.devicePlugin.fuseMaxDevices }} on worker nodes.
+{{- end }}
+
+{{- if not .Values.workerPool.privileged }}
+
+── Seccomp Localhost profile (optional hardening) ─────────────────────
+Worker pods default to seccompProfile: RuntimeDefault (~40 denied
+syscalls). For stricter hardening, set WorkerPool.spec.seccompProfile
+to Localhost and install the rio-worker profile on every node:
+
+  # Copy to each worker node (DaemonSet hostPath, or node-prep script):
+  sudo mkdir -p /var/lib/kubelet/seccomp
+  sudo cp <chart>/files/seccomp-rio-worker.json \
+          /var/lib/kubelet/seccomp/rio-worker.json
+
+Then set in the WorkerPool CR:
+  spec:
+    seccompProfile:
+      type: Localhost
+      localhostProfile: rio-worker.json
+
+This additionally denies ptrace/bpf/setns/process_vm_* — syscalls a
+sandbox escapee with CAP_SYS_ADMIN would otherwise have under
+RuntimeDefault. See docs/src/security.md r[worker.seccomp.localhost-profile].
+{{- end }}
+
+{{- if .Values.workerPool.privileged }}
+
+── privileged:true escape hatch ───────────────────────────────────────
+WARNING: workerPool.privileged=true is active. This disables seccomp
+entirely and is UNACCEPTABLE for multi-tenant deployments (ADR-012).
+It is intended for k3s/kind clusters lacking the FUSE device plugin
+or idmap-mount support. Production on EKS/GKE should use
+privileged:false (the chart default).
+{{- end }}

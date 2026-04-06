@@ -51,7 +51,30 @@ When `jwt.enabled=true`, scheduler and store pods MUST have the `rio-jwt-pubkey`
 
 - **Auth**: None (sandbox is a purity mechanism, NOT a security boundary)
 - **Threat**: Malicious derivation escaping sandbox and accessing worker resources
-- **Mitigations**: `CAP_SYS_ADMIN` + `seccompProfile: RuntimeDefault` (NOT `privileged: true`), dedicated node pool, NetworkPolicy, `automountServiceAccountToken: false`, IMDSv2 hop limit=1
+- **Mitigations**: `CAP_SYS_ADMIN` + `seccompProfile: RuntimeDefault` (NOT `privileged: true`), `hostUsers: false` (user-namespace isolation), dedicated node pool, NetworkPolicy, `automountServiceAccountToken: false`, IMDSv2 hop limit=1
+
+## Worker Pod Security
+
+r[sec.pod.host-users-false]
+Worker pods MUST set `hostUsers: false` to activate Kubernetes user-namespace
+isolation (K8s 1.33+). Container UIDs are remapped to unprivileged host UIDs;
+`CAP_SYS_ADMIN` applies only within the user namespace. A container escape
+gaining `CAP_SYS_ADMIN` cannot affect the host or other pods. See
+[ADR-012](./decisions/012-privileged-worker-pods.md#kubernetes-user-namespace-isolation).
+The `privileged: true` escape hatch (for k3s/kind clusters lacking the device
+plugin) skips `hostUsers: false` — privileged containers cannot be
+user-namespaced.
+
+r[sec.pod.fuse-device-plugin]
+Worker pods MUST obtain `/dev/fuse` via a device-plugin resource request
+(`resources.limits["smarter-devices/fuse"]`), NOT a hostPath volume. The
+hostPath mechanism is incompatible with `hostUsers: false` — the kernel
+rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding). The
+device plugin adds `/dev/fuse` to the container's device cgroup allowlist
+without a hostPath volume, enabling both `hostUsers: false` and the
+non-privileged security context. `privileged: true` remains an escape hatch
+for k3s/kind clusters lacking the device plugin; it falls back to the
+hostPath mechanism and MUST NOT be the production default.
 
 > **seccomp (Phase 3b):** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` shipped in Phase 4c — see `r[worker.seccomp.localhost-profile]` below.
 

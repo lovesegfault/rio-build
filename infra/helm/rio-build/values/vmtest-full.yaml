@@ -41,6 +41,14 @@ karpenter:
 networkPolicy:
   enabled: false
 
+# smarter-device-manager needs (a) its own airgap image and (b) kubelet
+# to honor hostUsers:false (containerd 1.7+ with idmap-mounts support).
+# k3s's bundled containerd version varies; for deterministic CI, use the
+# privileged:true escape hatch (workerPool.privileged below). Production
+# on EKS/GKE leaves devicePlugin.enabled=true (the chart default).
+devicePlugin:
+  enabled: false
+
 # Tests the pdb.yaml template. Gateway PDB with minAvailable=1 is a
 # no-op at replicas=1 (blocks drain, which we don't do) but renders.
 podDisruptionBudget:
@@ -137,8 +145,12 @@ workerPool:
       cpu: "1"
       memory: "1Gi"
       ephemeral-storage: "6Gi"
-  # Required until the device-plugin path lands (ADR-012). k3s's
-  # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN.
+  # k3s escape hatch. The device-plugin path (ADR-012, see
+  # devicePlugin.enabled above) is not wired for the airgap VM test —
+  # it would need the smarter-device-manager image + containerd with
+  # idmap-mount support for hostUsers:false. k3s's containerd default
+  # seccomp also blocks mount(2) even with CAP_SYS_ADMIN. Production
+  # on EKS/GKE uses privileged:false (the chart default).
   privileged: true
   # Default is 7200 (2h, for LLVM-cold-ccache builds). Test builds
   # are ≤90s sleeps. 180s covers the longest + drain overhead.

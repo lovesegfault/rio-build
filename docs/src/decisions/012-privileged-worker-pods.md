@@ -47,11 +47,12 @@ The Phase 1a spike discovered two constraints:
 - **Negative**: `CAP_SYS_ADMIN` is a broad capability. The seccomp profile is the real security boundary.
 - **Negative**: Not compatible with restrictive PodSecurityStandard `restricted` profile; requires `privileged` or `baseline` with custom exceptions.
 
-## Implementation Note (Phase 3a)
+## Implementation
 
-The controller-generated pod spec (`rio-controller/src/reconcilers/workerpool/builders.rs`) diverges from the recommended configuration above in two ways:
+The controller-generated pod spec (`rio-controller/src/reconcilers/workerpool/builders.rs`) matches the recommended configuration above:
 
-- **`/dev/fuse` via hostPath, not device plugin.** The controller emits a `hostPath` volume of type `CharDevice` for `/dev/fuse`. The FUSE device plugin recommended in the Phase 1a spike finding is not yet wired. On clusters where the containerd device cgroup does not include `/dev/fuse` by default, this requires the `privileged` escape hatch (see below).
-- **`hostUsers: false` not set.** The pod spec does not request user-namespace isolation. Adding it requires the device-plugin migration first (hostPath + idmap mounts on device nodes are incompatible, per the spike finding).
+- **`/dev/fuse` via device plugin.** The `smarter-device-manager` DaemonSet (`infra/helm/rio-build/templates/device-plugin.yaml`) exposes `/dev/fuse` as an extended resource `smarter-devices/fuse`. The worker container requests it via `resources.limits["smarter-devices/fuse"] = 1`; the kubelet+plugin inject the device node and add it to the container's device cgroup allowlist. No hostPath volume — `hostUsers: false` works.
+- **`hostUsers: false` set.** User-namespace isolation active on non-privileged pods. `CAP_SYS_ADMIN` is scoped to the user namespace; a container escape cannot use it on the host.
+- **Helm chart default is `workerPool.privileged: false`.** The device plugin is enabled by default (`devicePlugin.enabled: true`).
 
-Additionally, the `WorkerPool` CRD exposes an optional `privileged: bool` field (`rio-controller/src/crds/workerpool.rs`). When unset or `false`, the container gets the granular `SYS_ADMIN` + `SYS_CHROOT` capabilities (this ADR's recommended default). When `true`, the container runs fully privileged — an escape hatch for k3s/kind clusters whose default seccomp profiles block `mount(2)` even with `SYS_ADMIN`. Production deployments on EKS/GKE with proper runtime configuration should not need this.
+The `WorkerPool` CRD exposes an optional `privileged: bool` field (`rio-crds/src/workerpool.rs`). When unset or `false` (production default), the container gets the granular `SYS_ADMIN` + `SYS_CHROOT` capabilities, `hostUsers: false`, and the FUSE device-plugin resource. When `true`, the container runs fully privileged with the hostPath `/dev/fuse` fallback — an escape hatch for k3s/kind clusters whose default seccomp profiles block `mount(2)` even with `SYS_ADMIN`, or whose containerd lacks idmap-mount support. Production deployments on EKS/GKE with the device plugin deployed should not need this.

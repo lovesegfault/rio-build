@@ -298,10 +298,11 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         // fails to clear RO if a runtime ever sets it via the
         // bind-remount path instead of superblock.
         //
-        // TODO(P0286): this path is unreachable under
-        // privileged=true (containerd mounts rw already). Exercise
-        // it in VM tests once the non-privileged + device-plugin
-        // setup (ADR-012) is wired. ADR-012 is a separate track.
+        // Under privileged=true (k3s/kind escape hatch) this path
+        // is unreachable — containerd mounts rw already. Under the
+        // production default (privileged=false + device plugin +
+        // hostUsers:false, ADR-012), the container's cgroup mount
+        // may be RO and this remount is load-bearing.
         nix::mount::mount(
             None::<&str>,
             CGROUP_ROOT,
