@@ -96,4 +96,87 @@ describe('LogViewer', () => {
     expect(screen.queryByText('no log output')).toBeNull();
     expect(screen.getByText('final line')).toBeInTheDocument();
   });
+
+  it('renders windowed subset, not all lines (virtualized)', () => {
+    // jsdom's layout is all-zeros (scrollTop, clientHeight, scrollHeight
+    // are all 0), so we can't drive the scroll arithmetic. But with
+    // both at 0 the viewport math resolves to {start:0, end:min(n,
+    // 2*OVERSCAN)} = {start:0, end:20} — so a 5000-line stream renders
+    // exactly 20 <pre> nodes. That's the structural assertion: the
+    // {#each} is bounded by viewport math, not by lines.length.
+    //
+    // A regression back to {#each stream.lines as line} would render
+    // 5000 nodes here. We assert <100 (way under 5000) and >0 (not
+    // accidentally empty) to tolerate OVERSCAN tuning without tying
+    // the test to the exact constant.
+    const lines = Array.from({ length: 5000 }, (_, i) => `L${i}`);
+    createLogStream.mockReturnValue({
+      lines,
+      done: true,
+      err: null,
+      truncated: false,
+      destroy: vi.fn(),
+    });
+    const { container } = render(LogViewer, { props: { buildId: 'b-virt' } });
+
+    const pres = container.querySelectorAll('pre.line');
+    expect(pres.length).toBeLessThan(100);
+    expect(pres.length).toBeGreaterThan(0);
+    // With scrollTop=0 the visible slice starts at line 0.
+    expect(pres[0].textContent).toBe('L0');
+  });
+
+  it('honors viewportOverride prop for slice-bounds testing', () => {
+    // The test-only viewportOverride prop lets us assert the slice
+    // boundaries directly — jsdom can't drive scrollTop so the prod
+    // path's arithmetic is opaque here, but the override exercises the
+    // same $derived + {#each lines.slice(start, end)} rendering.
+    const lines = Array.from({ length: 1000 }, (_, i) => `L${i}`);
+    createLogStream.mockReturnValue({
+      lines,
+      done: true,
+      err: null,
+      truncated: false,
+      destroy: vi.fn(),
+    });
+    const { container } = render(LogViewer, {
+      props: {
+        buildId: 'b-override',
+        viewportOverride: { start: 400, end: 430 },
+      },
+    });
+
+    const pres = container.querySelectorAll('pre.line');
+    expect(pres.length).toBe(30);
+    expect(pres[0].textContent).toBe('L400');
+    expect(pres[29].textContent).toBe('L429');
+    // Spacers are present for the off-screen ranges. Their inline
+    // height is computed from (start × LINE_H) and
+    // ((n - end) × LINE_H). We don't assert exact px (LINE_H is an
+    // implementation constant) but we do assert both spacers exist
+    // with nonzero height when the window is mid-stream.
+    const spacers = container.querySelectorAll('.spacer');
+    expect(spacers.length).toBe(2);
+    const [top, bottom] = spacers;
+    expect((top as HTMLElement).style.height).not.toBe('0px');
+    expect((bottom as HTMLElement).style.height).not.toBe('0px');
+  });
+
+  it('renders truncation banner when stream.truncated is set', () => {
+    // logStream flips `truncated` after dropping the oldest 10K lines
+    // at the 50K cap. The banner tells the user the head of the log is
+    // gone — not an error, just a memory cap. Asserting testid rather
+    // than the exact em-dash string so the copy can change freely.
+    createLogStream.mockReturnValue({
+      lines: ['tail line'],
+      done: true,
+      err: null,
+      truncated: true,
+      destroy: vi.fn(),
+    });
+    render(LogViewer, { props: { buildId: 'b-trunc' } });
+
+    expect(screen.getByTestId('log-truncated')).toBeInTheDocument();
+    expect(screen.getByText(/earlier output truncated/)).toBeInTheDocument();
+  });
 });

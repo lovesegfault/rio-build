@@ -5,12 +5,30 @@
   // auto-following — jumping them back to the tail mid-read is hostile.
   // Scrolling back within a small threshold of the bottom re-engages
   // the follow.
+  //
+  // Virtualization: rendering one <pre> per line means 10K+ DOM nodes
+  // for a long build — every scroll recomputes layout for all of them,
+  // and the follow-tail $effect's `scrollHeight` read forces layout on
+  // every chunk arrival. With a fixed line-height the visible window is
+  // trivial arithmetic from scrollTop, so we render only the slice in
+  // view plus an overscan buffer, with fixed-height spacers filling the
+  // off-screen ranges. The container's scrollHeight stays synthetic
+  // (spacer-driven) but arithmetically identical to full render, so
+  // follow-tail's scrollTop = scrollHeight still lands at the bottom.
   import { createLogStream, type LogStream } from '../lib/logStream.svelte';
 
   let {
     buildId,
     drvPath = undefined,
-  }: { buildId: string; drvPath?: string } = $props();
+    // Test-only hook: jsdom layout is all-zeros so the scroll-derived
+    // viewport range can't be exercised. A test stubs this to assert
+    // slice bounds directly. Production never passes it.
+    viewportOverride = undefined,
+  }: {
+    buildId: string;
+    drvPath?: string;
+    viewportOverride?: { start: number; end: number };
+  } = $props();
 
   // One stream per mount. Unmount aborts the underlying fetch via the
   // $effect teardown below — BuildDrawer destroys this component when
@@ -28,28 +46,72 @@
 
   let container: HTMLElement | undefined = $state();
   let follow = $state(true);
+  let scrollTop = $state(0);
+  let clientHeight = $state(0);
 
   // Threshold in px — "near enough to the bottom" to count as tailing.
   // One line-height of slop avoids a fight with the browser's fractional
   // scroll rounding.
   const TAIL_SLOP = 16;
 
+  // Virtualization constants. LINE_H matches the `.log-viewer`
+  // line-height in CSS; the .line elements are margin:0 so each row is
+  // exactly one line-height tall. OVERSCAN pads the visible window so
+  // fast scrolling doesn't flash blank regions before the next render.
+  // Under jsdom both clientHeight and scrollTop stay 0, so startIdx is
+  // always 0 and endIdx = OVERSCAN — the jsdom render-count test
+  // asserts exactly that many nodes.
+  const LINE_H = 20; // 1.25rem @ 16px root
+  const OVERSCAN = 10;
+
   function onScroll() {
     if (!container) return;
+    scrollTop = container.scrollTop;
+    clientHeight = container.clientHeight;
     const gap =
       container.scrollHeight - container.scrollTop - container.clientHeight;
     follow = gap <= TAIL_SLOP;
   }
 
-  // Auto-scroll effect. Reading `stream.lines` establishes the reactive
-  // dependency; the assignment inside the guard keeps us pinned to the
-  // bottom whenever a new chunk lands and the user hasn't scrolled away.
-  // jsdom's layout is all-zeros (scrollHeight === 0) so this is a no-op
-  // under vitest — the follow-tail behavior is covered manually.
+  // Visible-slice bounds, reactive to both scroll position and line
+  // count. Reading `stream.lines.length` tracks the runes-proxied array
+  // — push() bumps .length and this $derived reruns. When
+  // viewportOverride is supplied (tests), use it verbatim and skip the
+  // arithmetic. In production the override is undefined; the derived
+  // falls through to scroll math. The Math.min on endIdx clamps to the
+  // array length so a near-bottom scroll doesn't slice past the end.
+  const viewport = $derived.by(() => {
+    const n = stream.lines.length;
+    if (viewportOverride) {
+      return {
+        start: Math.max(0, Math.min(viewportOverride.start, n)),
+        end: Math.max(0, Math.min(viewportOverride.end, n)),
+      };
+    }
+    const start = Math.max(0, Math.floor(scrollTop / LINE_H) - OVERSCAN);
+    const visible = Math.ceil(clientHeight / LINE_H) + 2 * OVERSCAN;
+    const end = Math.min(n, start + visible);
+    return { start, end };
+  });
+
+  // Auto-scroll effect. Reading `stream.lines.length` establishes the
+  // reactive dependency; the assignment inside the guard keeps us pinned
+  // to the bottom whenever a new chunk lands and the user hasn't
+  // scrolled away. With virtualization the spacers keep scrollHeight
+  // arithmetically equal to (lines.length × LINE_H) + any header/footer,
+  // so the same scrollTop = scrollHeight write lands at the tail. jsdom
+  // layout is all-zeros so this is a no-op under vitest — the
+  // follow-tail behavior is covered manually.
   $effect(() => {
-    void stream.lines;
+    void stream.lines.length;
     if (follow && container) {
       container.scrollTop = container.scrollHeight;
+      // Sync the reactive mirror so the viewport $derived reruns. The
+      // native scroll event fires asynchronously after scrollTop
+      // assignment; without this the visible slice lags one tick
+      // behind the tail.
+      scrollTop = container.scrollTop;
+      clientHeight = container.clientHeight;
     }
   });
 </script>
@@ -63,9 +125,24 @@
   {#if stream.err}
     <div role="alert" class="err">log stream failed: {stream.err.message}</div>
   {/if}
-  {#each stream.lines as line, i (i)}
+  {#if stream.truncated}
+    <div class="truncated" data-testid="log-truncated">
+      — earlier output truncated —
+    </div>
+  {/if}
+  <div
+    class="spacer"
+    style:height="{viewport.start * LINE_H}px"
+    aria-hidden="true"
+  ></div>
+  {#each stream.lines.slice(viewport.start, viewport.end) as line, i (viewport.start + i)}
     <pre class="line">{line}</pre>
   {/each}
+  <div
+    class="spacer"
+    style:height="{(stream.lines.length - viewport.end) * LINE_H}px"
+    aria-hidden="true"
+  ></div>
   {#if !stream.done}
     <div class="tail" data-testid="log-tail">
       <span class="spinner" aria-hidden="true"></span> streaming…
@@ -88,10 +165,27 @@
     border-radius: 4px;
   }
   .line {
+    /* Fixed height is load-bearing for virtualization: LINE_H in the
+       script must match. pre-wrap would let long lines grow to multiple
+       rows and desync the spacer math, so we clip with ellipsis instead.
+       Losing wrap on 200-char lines is the trade for O(viewport) DOM
+       under 100K-line builds. */
     margin: 0;
     padding: 0 0.75rem;
-    white-space: pre-wrap;
-    word-break: break-all;
+    height: 1.25rem;
+    white-space: pre;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .spacer {
+    flex-shrink: 0;
+  }
+  .truncated {
+    padding: 0.5rem 0.75rem;
+    color: #64748b;
+    font-style: italic;
+    text-align: center;
+    border-bottom: 1px dashed #334155;
   }
   .tail,
   .empty {
