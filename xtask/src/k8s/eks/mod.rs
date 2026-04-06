@@ -7,6 +7,7 @@ use crate::config::XtaskConfig;
 use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
 use crate::{sh, tofu, ui};
 
+pub mod ami;
 mod bootstrap;
 mod deploy;
 mod destroy;

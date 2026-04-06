@@ -105,12 +105,6 @@ pub struct ExecutorEnv {
     /// tests that don't mount FUSE — both calls are skipped, FUSE
     /// `lookup` falls back to legacy `JitClass::NotArmed`.
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
-    /// `StoreService`+`ChunkService` over the same balanced channel,
-    /// for `prefetch_path_blocking` (FUSE JIT fetch). `None` in tests
-    /// that don't mount FUSE (same lifecycle as `fuse_cache`).
-    /// dataplane2: the chunk client enables the parallel `GetChunk`
-    /// fan-out transport when `RIO_BUILDER_FETCH_TRANSPORT=getchunk`.
-    pub fuse_clients: Option<crate::fuse::StoreClients>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
     /// (`worker.toml fuse_fetch_timeout_secs`, default 60s). JIT
     /// `lookup` uses `jit_fetch_timeout(this, nar_size)` per path so
@@ -1764,7 +1758,6 @@ mod tests {
             cgroup_parent: dir.path().to_path_buf(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
             fuse_cache: None,
-            fuse_clients: None,
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
         };

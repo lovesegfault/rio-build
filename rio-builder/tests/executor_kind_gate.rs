@@ -35,7 +35,6 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         cgroup_parent: dir.to_path_buf(),
         executor_kind: kind,
         fuse_cache: None,
-        fuse_clients: None,
         fuse_fetch_timeout: std::time::Duration::from_secs(60),
         cancelled: Arc::new(AtomicBool::new(false)),
     }

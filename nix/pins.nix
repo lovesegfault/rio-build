@@ -25,6 +25,34 @@
   # the EKS module's karpenter submodule compat range (~> 21.0).
   karpenter_version = "1.10.0";
 
+  # NixOS node AMI kernel minor (ADR-021). String form ("6_18") so
+  # minimal.nix can do `pkgs."linuxPackages_${node_kernel_minor}"`.
+  # Pinned (not linuxPackages_latest) so a nixpkgs flake-input bump
+  # can't surprise-rebuild the ~40min kernel derivation.
+  node_kernel_minor = "6_18";
+
+  # awslabs/amazon-eks-ami release tag for the packaged `nodeadm`
+  # (nix/nixos-node/nodeadm.nix). Track kubernetes_version's minor —
+  # nodeadm emits a KubeletConfiguration matching the control plane.
+  # Hashes: build once with lib.fakeHash, copy "got:" lines.
+  nodeadm_rev = "v20260318";
+  nodeadm_src_hash = "sha256-lrkifYFc9XXBienp15gZ2gJkeFqcJH21cGl7SWyj+Qw=";
+
+  # kubernetes/cloud-provider-aws → ecr-credential-provider binary.
+  # nodeadm REQUIRES this on disk before it will finish kubelet config
+  # (stat()s the path; no skip flag). Tracks kubernetes_version's minor.
+  ecr_credential_provider_rev = "v1.35.1";
+  ecr_credential_provider_src_hash = "sha256-kCDhkwcxYNDAmYrrk+dnHkVG2Qzcw8USPcaxHKZwxzs=";
+  ecr_credential_provider_vendor_hash = "sha256-eW9vsuhDaudnq34onV5LH1hY9S7Zt2jkzhL5UhbUlHY=";
+
+  # smarter-device-manager (nix/nixos-node/smarter-device-manager/).
+  # Runs as a host systemd unit on the NixOS AMI; the helm chart's
+  # devicePlugin.image (k3s DaemonSet path) tracks the same version
+  # via @sha256 digest. Bump BOTH together.
+  smarter_device_manager_version = "1.20.12";
+  smarter_device_manager_src_hash = "sha256-uACRrhlSzGctl+ZeSIM2QLI4Uwr1uFbh+m5qpg06Ahs=";
+  smarter_device_manager_vendor_hash = "sha256-hkpO1bpri0HQaWrAcZEKonuCCmEKLZKgfOQotwCS64s=";
+
   # security-profiles-operator. NOT a tofu-managed helm release: SPO
   # stopped publishing chart tarballs after v0.7.1 (only the in-repo
   # deploy/helm/ exists). The static deploy/operator.yaml is vendored

@@ -5,11 +5,12 @@
 # instead of a hostPath volume.
 #
 # DaemonSet path is for k3s/kind ONLY (karpenter.enabled=false). On EKS
-# the plugin runs as a Bottlerocket static pod via EC2NodeClass userData
-# (see karpenter.yaml + _helpers.tpl rio.devicePluginPodManifest) —
-# kubelet starts it at node boot, ~1-2s vs the ~5-15s DS schedule+pull+
-# register latency. Same image, same conf.yaml (rio.devicePluginConf
-# helper), same extended-resource semantics; only the delivery differs.
+# the plugin runs as a host systemd unit baked into the NixOS AMI
+# (nix/nixos-node/eks-node.nix) — registers as soon as kubelet's
+# device-plugin socket is up, no registry pull. Same conf.yaml shape
+# (rio.devicePluginConf helper ↔ eks-node.nix devicePluginConf, parity-
+# checked in helm-lint), same extended-resource semantics; only the
+# delivery differs.
 #
 # Why this matters (ADR-012):
 #   - hostPath /dev/fuse + hostUsers:false is INCOMPATIBLE — the kernel
@@ -40,8 +41,8 @@ data:
   # /dev/fuse0 or fuse-ctl). nummaxdevices is the per-node ceiling — each
   # worker pod requests 1. ^kvm$: present only on .metal instance types;
   # smarter-device-manager advertises 0 where /dev/kvm is absent. Body
-  # comes from rio.devicePluginConf so the static-pod path (karpenter.yaml
-  # userData) renders the identical list.
+  # comes from rio.devicePluginConf so helm-lint can parity-check it
+  # against the AMI-baked nix/nixos-node/eks-node.nix devicePluginConf.
   conf.yaml: |
     {{- include "rio.devicePluginConf" . | nindent 4 }}
 ---

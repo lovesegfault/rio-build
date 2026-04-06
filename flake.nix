@@ -693,6 +693,16 @@
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/kind.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
+                  # ADR-021: karpenter.enabled requires amiTag (NixOS AMI is
+                  # the only EC2NodeClass — no Bottlerocket fallback). The
+                  # `required` template func should fail without it.
+                  if helm template rio . --set global.image.tag=test \
+                    --set karpenter.enabled=true \
+                    --set karpenter.clusterName=ci \
+                    --set karpenter.nodeRoleName=ci 2>/dev/null; then
+                    echo "FAIL: karpenter.enabled=true without amiTag should fail render" >&2
+                    exit 1
+                  fi
                   # monitoring-on: ServiceMonitor/PodMonitor/PrometheusRule
                   # templates are gated and otherwise never rendered by CI.
                   helm template rio . --set global.image.tag=test \
@@ -1009,71 +1019,75 @@
                     exit 1
                   }
 
-                  # ── r[sec.pod.fuse-device-plugin] static-pod delivery ───────
-                  # karpenter.enabled=true MUST render the device-plugin as a
-                  # Bottlerocket static pod in EC2NodeClass userData (not a
-                  # DaemonSet). The DaemonSet path is for k3s/kind only —
-                  # asserted via /tmp/default.yaml above (default values have
-                  # karpenter.enabled=false → DaemonSet renders → digest-pin
-                  # loop covers its image).
+                  # ── r[infra.node.nixos-ami] full cutover ────────────────────
+                  # karpenter.enabled=true MUST render the rio-default
+                  # EC2NodeClass with amiFamily: AL2023, the rio.build/ami
+                  # tag selector, and NO userData (sysctls/seccomp/device-
+                  # plugin are baked into the AMI — nix/nixos-node/).
                   helm template rio . \
                     --set karpenter.enabled=true \
                     --set karpenter.clusterName=ci \
                     --set karpenter.nodeRoleName=ci-role \
+                    --set karpenter.amiTag=test \
                     --set global.image.tag=test \
                     --set postgresql.enabled=false \
                     > $TMPDIR/karp-on.yaml
-                  yq 'select(.kind=="EC2NodeClass") | .spec.userData' \
-                    $TMPDIR/karp-on.yaml > $TMPDIR/userdata.toml
-                  grep -x '\[settings.kubernetes.static-pods.rio-device-plugin\]' \
-                    $TMPDIR/userdata.toml >/dev/null || {
-                    echo "FAIL: karpenter.enabled=true userData missing static-pods.rio-device-plugin section" >&2
-                    cat $TMPDIR/userdata.toml >&2
+                  test "$(yq 'select(.kind=="EC2NodeClass" and .metadata.name=="rio-default")
+                              | .spec.amiFamily' $TMPDIR/karp-on.yaml)" = AL2023 || {
+                    echo "FAIL: rio-default EC2NodeClass amiFamily != AL2023" >&2
                     exit 1
                   }
-                  # Decode the manifest and assert it's a well-formed Pod with
-                  # BOTH devicematch entries (fuse + kvm — kvm added dd9a5c41,
-                  # must not drift between DS and static-pod paths) and a
-                  # digest-pinned image (b64-encoded → invisible to the
-                  # third-party-digest loop above, so re-assert here).
-                  sed -n 's/^manifest = "\(.*\)"$/\1/p' $TMPDIR/userdata.toml \
-                    | base64 -d > $TMPDIR/static-pod.yaml
-                  test "$(yq '.kind' $TMPDIR/static-pod.yaml)" = Pod || {
-                    echo "FAIL: static-pod manifest .kind != Pod" >&2
-                    cat $TMPDIR/static-pod.yaml >&2
+                  test "$(yq 'select(.kind=="EC2NodeClass" and .metadata.name=="rio-default")
+                              | .spec.amiSelectorTerms[0].tags."rio.build/ami"' \
+                              $TMPDIR/karp-on.yaml)" = test || {
+                    echo "FAIL: rio-default amiSelectorTerms[0] missing rio.build/ami=test tag" >&2
                     exit 1
                   }
-                  # Main container = third-party smarter-device-manager →
-                  # MUST be digest-pinned. initContainer = first-party
-                  # rio-seccomp-bootstrap (tag-based like all rio images)
-                  # — already pulled at boot by the bootstrap-container.
-                  yq '.spec.containers[0].image' $TMPDIR/static-pod.yaml \
-                    | grep -v '@sha256:' && {
-                    echo "FAIL: static-pod smarter-device-manager image not digest-pinned" >&2
-                    exit 1
-                  } || true
-                  yq '.spec.initContainers[0].image' $TMPDIR/static-pod.yaml \
-                    | grep '^rio-seccomp-bootstrap:' >/dev/null || {
-                    echo "FAIL: static-pod initContainer not rio-seccomp-bootstrap" >&2
+                  test "$(yq 'select(.kind=="EC2NodeClass" and .metadata.name=="rio-default")
+                              | .spec.userData' $TMPDIR/karp-on.yaml)" = null || {
+                    echo "FAIL: rio-default EC2NodeClass renders userData (should be baked into AMI)" >&2
                     exit 1
                   }
-                  for dm in '\^fuse\$' '\^kvm\$'; do
-                    yq '.spec.initContainers[0].args[0]' $TMPDIR/static-pod.yaml \
-                      | grep -- "devicematch: $dm" >/dev/null || {
-                      echo "FAIL: static-pod conf.yaml missing devicematch: $dm" >&2
+                  # No Bottlerocket functionality in the karpenter render —
+                  # the cutover deletes the fallback entirely. Check for
+                  # functional markers (amiAlias key, Bottlerocket TOML
+                  # settings sections, the canary NodeClass), not the bare
+                  # word — comments mention it in past tense.
+                  for pat in 'amiAlias:' '\[settings\.' 'name: rio-nixos$' \
+                             'rio-builder-nixos-canary' 'amiFamily: Bottlerocket'; do
+                    if grep -Eq "$pat" $TMPDIR/karp-on.yaml; then
+                      echo "FAIL: Bottlerocket-era pattern '$pat' present in karpenter render" >&2
+                      grep -En "$pat" $TMPDIR/karp-on.yaml >&2
                       exit 1
-                    }
+                    fi
                   done
-                  # DaemonSet MUST NOT render alongside the static pod — the two
-                  # would race to register the same kubelet socket.
+                  # device-plugin-conf-parity: the chart's rio.devicePluginConf
+                  # (k3s DaemonSet) and the AMI's eks-node.nix devicePluginConf
+                  # MUST list the same devicematch regexes. Compare the regexes
+                  # only (nummaxdevices is a chart value vs a NixOS option,
+                  # both default 100 — drift there is intentional config, not
+                  # a bug). /tmp/default.yaml (rendered above with karpenter.
+                  # enabled=false) carries the DaemonSet ConfigMap.
+                  yq 'select(.kind=="ConfigMap" and .metadata.name=="rio-device-plugin-config")
+                      | .data."conf.yaml"' /tmp/default.yaml \
+                      | yq '.[].devicematch' | sort > $TMPDIR/dp-conf-chart
+                  grep 'devicematch:' ${./nix/nixos-node/eks-node.nix} \
+                      | sed 's/.*devicematch: //' | sort > $TMPDIR/dp-conf-ami
+                  diff $TMPDIR/dp-conf-chart $TMPDIR/dp-conf-ami || {
+                    echo "FAIL: device-plugin conf.yaml drift: chart vs nix/nixos-node/eks-node.nix" >&2
+                    exit 1
+                  }
+                  # DaemonSet MUST NOT render with karpenter.enabled=true — the
+                  # AMI systemd unit and a DS would race to register the same
+                  # kubelet socket.
                   ! yq 'select(.kind=="DaemonSet") | .metadata.name' \
                     $TMPDIR/karp-on.yaml | grep -x rio-device-plugin >/dev/null || {
-                    echo "FAIL: rio-device-plugin DaemonSet rendered with karpenter.enabled=true (should be static-pod only)" >&2
+                    echo "FAIL: rio-device-plugin DaemonSet rendered with karpenter.enabled=true (AMI systemd unit only)" >&2
                     exit 1
                   }
-                  # NodeOverlay (synthetic capacity) MUST still render — the
-                  # static pod shrinks the boot→register window but does not
-                  # eliminate the cold-start bin-packing deadlock.
+                  # NodeOverlay (synthetic capacity) MUST still render —
+                  # Karpenter bin-packs from zero nodes, before any systemd
+                  # unit can register.
                   yq 'select(.kind=="NodeOverlay") | .metadata.name' \
                     $TMPDIR/karp-on.yaml | grep -x rio-builder-fuse >/dev/null || {
                     echo "FAIL: NodeOverlay rio-builder-fuse missing with karpenter.enabled=true" >&2
@@ -1136,6 +1150,24 @@
                     echo "Run: nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json" >&2
                     exit 1
                   }
+                  touch $out
+                '';
+
+            # ADR-021: seccomp profiles dual-sourced under
+            # nix/nixos-node/seccomp/ (canonical, AMI bakes them via
+            # hardening.nix tmpfiles) and infra/helm/rio-build/files/
+            # (helm `.Files.Get` for SPO/k3s — cleanSource can't follow
+            # out-of-tree symlinks). Fail on drift.
+            seccomp-fresh =
+              pkgs.runCommand "rio-seccomp-fresh"
+                {
+                  nativeBuildInputs = [ pkgs.diffutils ];
+                }
+                ''
+                  diff ${./nix/nixos-node/seccomp/rio-builder.json} \
+                       ${./infra/helm/rio-build/files/seccomp-rio-builder.json}
+                  diff ${./nix/nixos-node/seccomp/rio-fetcher.json} \
+                       ${./infra/helm/rio-build/files/seccomp-rio-fetcher.json}
                   touch $out
                 '';
 
@@ -1235,6 +1267,37 @@
               }
             );
           dockerImages = mkDockerImages { inherit rio-workspace; };
+
+          # NixOS EKS node AMI builder (ADR-021). Exposed below as
+          # packages.node-ami-{x86_64,aarch64}. The amazon-image.nix
+          # builder module emits a directory with the disk image +
+          # nix-support/image-info.json (consumed by `xtask ami push`).
+          #
+          # `nodeSystem` is the TARGET arch, independent of the eval
+          # host — same shape as the dockerImages multi-arch build.
+          # specialArgs threads pins.nix through so module files can
+          # read kernel/nodeadm pins without `import ../../pins.nix`
+          # scattershot.
+          nodeAmi =
+            nodeSystem:
+            (nixpkgs.lib.nixosSystem {
+              system = nodeSystem;
+              specialArgs = {
+                pins = import ./nix/pins.nix;
+              };
+              modules = [
+                (nixpkgs + "/nixos/maintainers/scripts/ec2/amazon-image.nix")
+                ./nix/nixos-node
+                {
+                  # raw → coldsnap uploads directly to an EBS snapshot
+                  # via the EBS Direct API (no S3 / VM-Import round-trip,
+                  # ~20min → ~2min for an 8 GB image).
+                  amazonImage.format = "raw";
+                  virtualisation.diskSize = "auto";
+                  ec2.efi = true;
+                }
+              ];
+            }).config.system.build.amazonImage;
 
           # Subcharts from nixhelm (FODs — hash-pinned `helm pull`).
           # Referenced by: helm-lint check (symlinked into charts/ in-sandbox),
@@ -1713,6 +1776,7 @@
                   helm-lint
                   crds-drift
                   tfvars-fresh
+                  seccomp-fresh
                   onibus-pytest
                   ;
                 inherit (config.checks) pre-commit;
@@ -2027,6 +2091,7 @@
                 # pointing at these same packages, so they work even if
                 # someone runs them outside `nix develop`.
                 awscli2
+                coldsnap # cargo xtask k8s -p eks ami push — direct-to-EBS-snapshot upload (ADR-021)
                 ssm-session-manager-plugin # cargo xtask k8s -p eks smoke — SSM tunnel to NLB
                 lsof # cargo xtask k8s rsb — reap stale tunnel listeners on :2222
                 # opentofu (not terraform: BSL license → unfree in nixpkgs)
@@ -2159,7 +2224,6 @@
             docker-fetcher = dockerImages.fetcher;
             docker-controller = dockerImages.controller;
             docker-bootstrap = dockerImages.bootstrap;
-            docker-seccomp-bootstrap = dockerImages.seccomp-bootstrap;
             docker-dashboard = dockerImages.dashboard;
             docker-all = dockerImages.all;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
@@ -2180,6 +2244,24 @@
                   { services.rio.package = rio-workspace; }
                 ];
               }).config.system.build.vm;
+
+            # ──────────────────────────────────────────────────────────
+            # NixOS EKS node AMI (ADR-021). Replaces bottlerocket@latest
+            # for builder/fetcher Karpenter NodePools.
+            #
+            #   nix build .#node-ami-x86_64    # → result/nixos-amazon-image-*.vhd
+            #   cargo xtask k8s -p eks ami push --arch x86_64
+            #
+            # Output dir contains the disk image plus `nix-support/
+            # image-info.json` (label, system, file, boot_mode) which
+            # `xtask ami push` reads for coldsnap upload + register-image.
+            #
+            # Per-arch attrs (NOT keyed off the eval host's `system`): the
+            # build host cross-builds both, like .#packages.<sys>.
+            # dockerImages. xtask asks for both explicitly.
+            # ──────────────────────────────────────────────────────────
+            node-ami-x86_64 = nodeAmi "x86_64-linux";
+            node-ami-aarch64 = nodeAmi "aarch64-linux";
 
             # CRD YAML for kustomize. runCommand invokes the crdgen
             # binary (serde_yaml write-only) and dumps two YAML
