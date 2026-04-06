@@ -23,11 +23,11 @@ use crate::{helm, kube, tofu, ui};
 /// whose EMA peak exceeds it routes to the next class up).
 /// `cpuLimitCores` mirrors `requests.cpu` for the same reason.
 const SIZE_CLASSES_JSON: &str = r#"[
-  {"name":"tiny","cutoffSecs":30,"memLimitBytes":1073741824,"cpuLimitCores":0.5},
-  {"name":"small","cutoffSecs":120,"memLimitBytes":4294967296,"cpuLimitCores":1.0},
-  {"name":"medium","cutoffSecs":600,"memLimitBytes":8589934592,"cpuLimitCores":2.0},
-  {"name":"large","cutoffSecs":1800,"memLimitBytes":17179869184,"cpuLimitCores":4.0},
-  {"name":"xlarge","cutoffSecs":7200,"memLimitBytes":34359738368,"cpuLimitCores":8.0}
+  {"name":"tiny","cutoffSecs":30,"memLimitBytes":4294967296,"cpuLimitCores":2.0},
+  {"name":"small","cutoffSecs":120,"memLimitBytes":17179869184,"cpuLimitCores":8.0},
+  {"name":"medium","cutoffSecs":600,"memLimitBytes":68719476736,"cpuLimitCores":32.0},
+  {"name":"large","cutoffSecs":1800,"memLimitBytes":137438953472,"cpuLimitCores":64.0},
+  {"name":"xlarge","cutoffSecs":7200,"memLimitBytes":274877906944,"cpuLimitCores":128.0}
 ]"#;
 
 /// `builderPoolSets[]` (helm list — replaced wholesale, hence one const).
@@ -51,13 +51,13 @@ const BUILDER_POOL_SETS_JSON: &str = r#"[
   {"name":"x86-64-kvm","systems":["x86_64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
    "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
-     "resources":{"requests":{"cpu":"8","memory":"16Gi","ephemeral-storage":"60Gi"},
-                  "limits":{"memory":"32Gi"}}}]},
+     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"60Gi"},
+                  "limits":{"memory":"256Gi"}}}]},
   {"name":"aarch64-kvm","systems":["aarch64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
    "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
-     "resources":{"requests":{"cpu":"8","memory":"16Gi","ephemeral-storage":"60Gi"},
-                  "limits":{"memory":"32Gi"}}}]}
+     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"60Gi"},
+                  "limits":{"memory":"256Gi"}}}]}
 ]"#;
 
 /// One FetcherPool per arch — `system="builtin"` FODs overflow to

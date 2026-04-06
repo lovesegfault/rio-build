@@ -522,6 +522,101 @@ fn read_single_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Host logical-CPU count. `available_parallelism()` is std (no
+/// `num_cpus` dep) and reads `/proc` directly — NOT cgroup-aware on
+/// Linux, so it returns the node's full core count even under a
+/// `cpu.max` quota. That's exactly what we want as the "no quota"
+/// fallback for [`parse_cpu_max`]; the quota clamp is applied on top.
+fn nproc() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+/// Parse cgroup v2 `cpu.max` into an effective whole-core count.
+///
+/// Format: `"<quota> <period>\n"`. `quota` is either a µs budget per
+/// `period` µs, or the literal `"max"` (unbounded). k8s writes this
+/// from `resources.limits.cpu` — e.g. `cpuLimitCores=0.5` on a default
+/// 100ms period → `"50000 100000"`.
+///
+/// Returns `ceil(quota/period)` clamped to ≥1. Ceiling because a
+/// fractional limit (0.5 cores) still means ONE concurrent job is
+/// the right `-jN` — `make -j0` is meaningless and `-j` ≥2 just
+/// thrashes the throttle. `"max"` → host nproc.
+///
+/// On parse failure (malformed file — shouldn't happen on a v2
+/// mount), falls back to host nproc rather than erroring: `cpu.max`
+/// is advisory for `-jN`, not a hard gate, and the cgroup throttle
+/// still applies regardless of what we pass to make.
+pub(crate) fn parse_cpu_max(content: &str) -> u32 {
+    let mut it = content.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some("max"), _) => nproc(),
+        (Some(q), Some(p)) => match (q.parse::<u64>(), p.parse::<u64>()) {
+            (Ok(quota), Ok(period)) if period > 0 => {
+                // ceil(quota/period), min 1
+                quota.div_ceil(period).max(1) as u32
+            }
+            _ => nproc(),
+        },
+        _ => nproc(),
+    }
+}
+
+// r[impl builder.cores.cgroup-clamp]
+/// Effective core count for `build_cores` (`nix --cores`, → `make -jN`).
+///
+/// Reads `cpu.max` from the delegated-root cgroup (`parent`). In a k8s
+/// pod that's `/sys/fs/cgroup/cpu.max` — the pod's CPU limit. cgroup
+/// CPU quota does NOT reduce visible cores (sched_getaffinity / nproc
+/// see all node cores), so without this clamp `build_cores=0` →
+/// nix-daemon uses nproc → `make -j16` on a 0.5-core pod → 16×cc1 each
+/// at ~100MB → cgroup OOM-loop (cc1 killed, make respawns, never
+/// converges). I-196: python3-minimal stuck 15min on a `tiny` builder.
+///
+/// Returns host nproc if `cpu.max` is unreadable (e.g. running outside
+/// a cgroup-limited container in tests) — same value the daemon would
+/// have picked on its own.
+pub fn effective_cores(parent: &Path) -> u32 {
+    match fs::read_to_string(parent.join("cpu.max")) {
+        Ok(s) => parse_cpu_max(&s),
+        Err(_) => nproc(),
+    }
+}
+
+/// Parse cgroup v2 `memory.events` for the `oom_kill` counter.
+///
+/// Format: one `key value` per line (`low`, `high`, `max`, `oom`,
+/// `oom_kill`, `oom_group_kill`). `oom_kill` is the count of processes
+/// SIGKILLed by the kernel OOM killer because this cgroup (or an
+/// ancestor) hit `memory.max`. Hierarchical — descendants' kills are
+/// included (vs `memory.events.local`).
+pub(crate) fn parse_memory_events_oom_kill(content: &str) -> Option<u64> {
+    content
+        .lines()
+        .find(|l| l.starts_with("oom_kill "))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+}
+
+// r[impl builder.oom.cgroup-watch]
+/// Read the `oom_kill` count from `parent/memory.events`.
+///
+/// `parent` is the delegated root (pod-level cgroup in k8s). The pod's
+/// `memory.max` is set there; the per-build sub-cgroup has no limit of
+/// its own (spec: "measurement and cancellation only"), so OOM kills
+/// fire at — and are recorded at — this level. The hierarchical
+/// `memory.events` (not `.local`) sees kills in descendant cgroups.
+///
+/// `None` on read failure (memory controller not enabled, or running
+/// outside a cgroup in tests). Caller treats `None` as "can't watch"
+/// and skips the OOM guard.
+pub fn read_oom_kill(parent: &Path) -> Option<u64> {
+    let content = fs::read_to_string(parent.join("memory.events")).ok()?;
+    parse_memory_events_oom_kill(&content)
+}
+
 fn cpu_fraction(delta_usec: u64, wall_usec: u64) -> f64 {
     if wall_usec > 0 {
         delta_usec as f64 / wall_usec as f64
@@ -931,5 +1026,51 @@ mod tests {
 
         // Missing file → None
         assert_eq!(read_single_u64(&dir.path().join("nope")), None);
+    }
+
+    // r[verify builder.cores.cgroup-clamp]
+    /// I-196: cpu.max → effective whole-core count for `make -jN`.
+    /// Ceiling division, min 1, "max" → host nproc.
+    #[test]
+    fn parse_cpu_max_quota_to_cores() {
+        // 0.5 cores: 50ms/100ms. -j1 (ceil, never 0).
+        assert_eq!(parse_cpu_max("50000 100000\n"), 1);
+        // 2.5 cores: 250ms/100ms. -j3 (ceil — 2.5 jobs is 3 slots).
+        assert_eq!(parse_cpu_max("250000 100000\n"), 3);
+        // exact integer: 200ms/100ms = 2.
+        assert_eq!(parse_cpu_max("200000 100000\n"), 2);
+        // unbounded: literal "max". Period is still present
+        // (kernel writes "max 100000"); period-less also handled.
+        assert_eq!(parse_cpu_max("max 100000\n"), nproc());
+        assert_eq!(parse_cpu_max("max\n"), nproc());
+        // garbage → nproc fallback (advisory clamp; cgroup throttle
+        // still applies regardless).
+        assert_eq!(parse_cpu_max(""), nproc());
+        assert_eq!(parse_cpu_max("bogus 100000\n"), nproc());
+    }
+
+    #[test]
+    fn effective_cores_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("cpu.max"), "50000 100000\n").unwrap();
+        assert_eq!(effective_cores(dir.path()), 1);
+        // Missing cpu.max → nproc (not an error: dev/test outside k8s).
+        assert_eq!(effective_cores(&dir.path().join("nope")), nproc());
+    }
+
+    // r[verify builder.oom.cgroup-watch]
+    #[test]
+    fn parse_memory_events_oom_kill_line() {
+        let content = "low 0\n\
+                       high 0\n\
+                       max 42\n\
+                       oom 3\n\
+                       oom_kill 7\n\
+                       oom_group_kill 0\n";
+        assert_eq!(parse_memory_events_oom_kill(content), Some(7));
+        // `oom` line must NOT match (prefix of `oom_kill` — the
+        // `starts_with("oom_kill ")` includes the trailing space).
+        assert_eq!(parse_memory_events_oom_kill("oom 3\n"), None);
+        assert_eq!(parse_memory_events_oom_kill(""), None);
     }
 }

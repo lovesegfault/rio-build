@@ -1,8 +1,9 @@
 """Tests for DAG-orchestration scripts.
 
-Run: python3 -m pytest .claude/lib/
+Run: nix develop -c python3 -m pytest .claude/lib/
 (NOT bare `pytest` — see the DEV-SHELL DIVERGENCE note at flake.nix's
-checks.onibus-pytest for why the wrapper form shows spurious failures.)
+checks.onibus-pytest for why the wrapper form shows spurious failures.
+The `nix develop -c` prefix supplies pydantic — bare python3 lacks it.)
 
 rio-build deltas:
   - fixture paths: crates/rix-*/ → rio-*/ (real crate paths)

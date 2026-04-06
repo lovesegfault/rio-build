@@ -1644,8 +1644,8 @@ mod tests {
     }
 
     /// MockStore.get_path_garbage = true → GetPath returns valid PathInfo
-    /// but garbage NAR bytes → nar::parse fails → EIO. Covers the NAR
-    /// parse-error arm in fetch_extract_insert.
+    /// but garbage NAR bytes → `restore_path_streaming` fails → EIO.
+    /// Covers the NAR parse-error arm in fetch_extract_insert.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_nar_parse_error_returns_eio() {
         let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;

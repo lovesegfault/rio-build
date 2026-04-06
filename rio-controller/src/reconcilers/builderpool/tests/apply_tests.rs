@@ -64,17 +64,13 @@ async fn apply_uses_server_side_apply() {
         ),
         // GET before STS PATCH (replicas-ownership check).
         // 404 → first-create → replicas set to min.
-        Scenario {
-            method: http::Method::GET,
-            path_contains: "/statefulsets/rio-builder-test-pool",
-            body_contains: None,
-            status: 404,
-            body_json: serde_json::json!({
-                "kind":"Status","apiVersion":"v1",
-                "status":"Failure","reason":"NotFound","code":404,
-            })
-            .to_string(),
-        },
+        Scenario::k8s_error(
+            http::Method::GET,
+            "/statefulsets/rio-builder-test-pool",
+            404,
+            "NotFound",
+            "",
+        ),
         Scenario::ok(
             http::Method::PATCH,
             "fieldManager=rio-controller",
@@ -122,18 +118,13 @@ async fn cleanup_tolerates_missing_statefulset() {
             serde_json::json!({"apiVersion":"v1","kind":"PodList","items":[]}).to_string(),
         ),
         // STS PATCH → 404. K8s 404 body is a Status object.
-        Scenario {
-            method: http::Method::PATCH,
-            path_contains: "/statefulsets/rio-builder-test-pool",
-            body_contains: None,
-            status: 404,
-            body_json: serde_json::json!({
-                "apiVersion":"v1","kind":"Status","status":"Failure",
-                "reason":"NotFound","code":404,
-                "message":"statefulsets.apps \"rio-builder-test-pool\" not found"
-            })
-            .to_string(),
-        },
+        Scenario::k8s_error(
+            http::Method::PATCH,
+            "/statefulsets/rio-builder-test-pool",
+            404,
+            "NotFound",
+            "statefulsets.apps \"rio-builder-test-pool\" not found",
+        ),
     ]);
 
     let action = cleanup(wp, &ctx).await.expect("cleanup tolerates 404");

@@ -194,6 +194,7 @@ r[obs.metric.builder]
 | `rio_builder_build_duration_seconds` | Histogram | Per-derivation build time |
 | `rio_builder_fuse_jit_lookup_total` | Counter | Top-level FUSE lookup outcomes under JIT fetch (labeled by `outcome`: `reject` = not in input set, fast ENOENT, no store contact; `fetch` = registered input materialized; `eio` = registered input fetch failed → EIO so overlay can't negative-cache). `reject`/`fetch` ratio ≈ closure utilization; `eio` nonzero = store degraded. |
 | `rio_builder_jit_inputs_registered` | Gauge | Size of the JIT FUSE allowlist (`known_inputs.len()`) at daemon spawn. |
+| `rio_builder_cgroup_oom_total` | Counter | Builds killed by the cgroup OOM watcher (`memory.events` `oom_kill` incremented during build → `cgroup.kill` + `InfrastructureFailure` for scheduler size-class promotion, I-196). Nonzero = pool's `resources.limits.memory` is undersized for its workload. |
 | `rio_builder_input_materialization_failures_total` | Counter | Daemon `MiscFailure` reclassified as `InfrastructureFailure` because the missing path is in the build's input closure (I-178 safety net). Sustained nonzero = `JIT_MIN_THROUGHPUT_BPS` is set above actual store→builder throughput. |
 | `rio_builder_fuse_cache_size_bytes` | Gauge | FUSE SSD cache usage |
 | `rio_builder_fuse_cache_hits_total` | Counter | FUSE cache hits |

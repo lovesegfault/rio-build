@@ -2665,9 +2665,22 @@ let
           # SIGTERM force=false self-drain).
           # Read /var/log/pods directly (not kubectl logs): kubectl logs
           # fails with "http2: stream closed" under poll-loop load. Check
-          # both nodes (controller replicas=2, podAntiAffinity). nullglob
-          # + cat: safe if no matching files on a node. Poll both nodes
-          # each iteration — the watcher may fire on either replica.
+          # both nodes — controller replicas=1 (HARD, controller.yaml:15);
+          # the single pod schedules to either node ~50/50. Poll both
+          # each iteration; the node WITHOUT the pod has no matching log
+          # dir.
+          #
+          # P0535: nullglob + `cat` MUST have a /dev/null sentinel arg.
+          # Without it, on the node WITHOUT a controller pod the glob
+          # expands to nothing → `cat` with NO args reads stdin → blocks
+          # on the backdoor-shell pipe forever. The deadline check below
+          # never runs (Machine.execute default timeout=900s). Observed
+          # drv 3i5wnky7 (impl-19): 7-min silent hang → globalTimeout
+          # SIGTERM → "[Errno 9] Bad file descriptor". Bimodal ~50% =
+          # P(controller on k3s-agent) — k3s_server is checked first;
+          # when it's the empty-glob node, the test hangs immediately.
+          # /dev/null first arg makes empty-glob `cat /dev/null` → exit 0
+          # → grep exits 1 → loop continues to the other node.
           import time
           deadline = time.time() + _drain_deadline_s
           found = False
@@ -2675,8 +2688,10 @@ let
               for node in [k3s_server, k3s_agent]:
                   rc, _ = node.execute(
                       "shopt -s nullglob; "
-                      "cat /var/log/pods/${ns}_rio-controller-*/controller/*.log "
-                      "2>/dev/null | grep -q 'DisruptionTarget.*force=true'"
+                      "cat /dev/null "
+                      "/var/log/pods/${ns}_rio-controller-*/controller/*.log "
+                      "2>/dev/null | grep -q 'DisruptionTarget.*force=true'",
+                      timeout=15,
                   )
                   if rc == 0:
                       found = True
@@ -2705,8 +2720,10 @@ let
               for node in [k3s_server, k3s_agent]:
                   rc, _ = node.execute(
                       "shopt -s nullglob; "
-                      "cat /var/log/pods/${ns}_rio-scheduler-*/scheduler/*.log "
-                      "2>/dev/null | grep -q 'force-drain'"
+                      "cat /dev/null "
+                      "/var/log/pods/${ns}_rio-scheduler-*/scheduler/*.log "
+                      "2>/dev/null | grep -q 'force-drain'",
+                      timeout=15,
                   )
                   if rc == 0:
                       found = True

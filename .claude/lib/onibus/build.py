@@ -168,9 +168,13 @@ _VM_FAIL_RE = re.compile(
 #
 # `rio-cov-vm-total`, `rio-ci`, etc. (aggregates) WOULD match here on failure,
 # but _AGGREGATE_DRVS below set-subtracts them at extraction time — they're
-# cascade-fails (NEVER independent evidence), and leaving them in `failing`
-# breaks the len(failing)>1 gate for the REAL fail. No re-introduction of
-# P0517's over-count.
+# cascade-fails (NEVER independent evidence). Two failure modes if left in:
+# (a) len>1 cascade: real-fail + aggregate → failing len=2 → the len>1
+#     gate rejects before by_drv lookup → known-flake can't save (P0517);
+# (b) len==1 aggregate-only: constituent failed via a line shape we don't
+#     extract → only `rio-ci` in failing → "rio-ci not in known-flakes"
+#     verdict (misleading — names the aggregate, not the real fail).
+#     Filtered → failing=[] → "no FAIL lines" verdict (accurate).
 _CHECK_FAIL_RE = re.compile(
     r"^error: Cannot build '/nix/store/[a-z0-9]+-(rio-[\w-]+)\.drv'",
     re.MULTILINE,
@@ -179,10 +183,16 @@ _CHECK_FAIL_RE = re.compile(
 # Aggregate drvs (linkFarm/symlinkJoin targets that cascade-fail when
 # any constituent fails). These are NEVER independent evidence — they
 # fail BECAUSE a dependency failed. P0534: P0530's _CHECK_FAIL_RE
-# matches rio-ci, which puts it in check_fails → len(failing)>1 at
-# :300 rejects → known-flake can't save. Before P0530 nothing extracted
+# matches rio-ci, which puts it in check_fails → len(failing)>1
+# rejects → known-flake can't save. Before P0530 nothing extracted
 # rio-ci; len=1; flake saved. P0532 hit this (iter1 excusable=false).
-_AGGREGATE_DRVS = frozenset({"rio-ci", "rio-cov-vm-total", "rio-coverage-full"})
+#
+# rio-{nextest,doc,clippy,test}-all are the symlinkJoin per-crate
+# aggregates from nix/checks.nix — same cascade-fail semantics as rio-ci.
+_AGGREGATE_DRVS = frozenset({
+    "rio-ci", "rio-cov-vm-total", "rio-coverage-full",
+    "rio-nextest-all", "rio-doc-all", "rio-clippy-all", "rio-test-all",
+})
 
 # nixbuild.net remote-builder infra errors. ^error: anchor is load-bearing
 # (same rationale as _VM_FAIL_RE) — excludes `drv> ...` build-stdout relay
@@ -225,15 +235,6 @@ _INFRA_ERROR_RE = re.compile(
     r"|builder failed with exit code 137)",
     re.MULTILINE,
 )
-
-# 2026-03-20: HARD-STOP — KVM-denied is no longer excusable. The root cause
-# was two-fold: (1) kvmOnly module's dual `-machine accel=` breaks qemu 10.2.1
-# on multi-VM tests (FIXED @ 7bd70aba), (2) 7 of 13 kvm:y builders have
-# /dev/kvm mode 0660 with empty snix-qemu group (nixbld can't access). (2) is
-# an infra issue that must be fixed fleet-side. Until then, CI is EXPECTED to
-# fail when a VM test lands on a 0660 builder — that's correct behavior.
-# Retry-roulette let 180+ merges ship without VM coverage; never again.
-_TCG_MARKERS = ()  # empty — no TCG excusability
 
 # Retry restrictiveness: Never (no retry) > Once > Twice (most permissive).
 # Lower index = more restrictive = wins when multiple entries share a drv_name.
@@ -309,13 +310,11 @@ def excusable(log_path: Path) -> ExcusableVerdict:
     elif len(failing) > 1:
         reason, ok = f"{len(failing)} failures — excusable requires exactly 1", False
     elif not matched:
-        # P0304-T10 supplementary grant: VM-fail + TCG marker = infra-excusable
-        # even if drv isn't in known-flakes. The 1-failure discipline above
-        # already excludes co-occurring real failures (nextest FAIL + VM TCG).
-        if failing[0] in vm_fails and any(m in text for m in _TCG_MARKERS):
-            reason, ok = f"{failing[0]!r} TCG-marker present — builder-side KVM infra, retry", True
-        else:
-            reason, ok = f"{failing[0]!r} not in known-flakes.jsonl (neither test nor drv_name)", False
+        # P0304-T10's TCG supplementary-grant removed — _TCG_MARKERS was
+        # emptied 2026-03-20 (HARD-STOP: KVM-denied retry-roulette let 180+
+        # merges ship without VM coverage), making the branch dead. bughunter
+        # mc=91 confirmed; removed.
+        reason, ok = f"{failing[0]!r} not in known-flakes.jsonl (neither test nor drv_name)", False
     elif matched_row.retry == "Never":
         reason, ok = f"{matched[0]!r} is known-flake but retry=Never — investigate, don't retry", False
     else:

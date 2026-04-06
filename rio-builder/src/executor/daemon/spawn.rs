@@ -72,9 +72,11 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     let conf_dir = overlay_mount.upper_nix_conf();
 
     // Build the command + pre_exec closure, then spawn on the blocking pool.
-    // See "Why async + spawn_blocking" in the function doc for the deadlock chain
-    // this avoids. tokio::process::Command is not Send (the FnMut pre_exec
-    // closure makes it !Send), so we build it INSIDE the spawn_blocking closure.
+    // See "Why async + spawn_blocking" in the function doc — post-I-060
+    // there's no FUSE-deadlock to avoid; spawn_blocking is for !Send +
+    // the parent's sync CLOEXEC-pipe wait. tokio::process::Command is
+    // not Send (the FnMut pre_exec closure makes it !Send), so we build
+    // it INSIDE the spawn_blocking closure.
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("nix-daemon");
         cmd.arg("--stdio")

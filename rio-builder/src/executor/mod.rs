@@ -193,6 +193,15 @@ pub enum ExecutorError {
     Wire(#[from] rio_nix::protocol::wire::WireError),
     #[error("cgroup resource tracking failed: {0}")]
     Cgroup(String),
+    /// Pod-level cgroup `memory.events` `oom_kill` incremented during
+    /// the build. The kernel killed a build process (cc1, ld, …) for
+    /// hitting `memory.max`; make typically respawns it → OOM-loop that
+    /// never converges (I-196). Distinct from `BuildFailed` because the
+    /// derivation isn't broken — this builder is undersized. Maps to
+    /// `InfrastructureFailure` so the scheduler reassigns to a larger
+    /// size class instead of marking the drv permanently failed.
+    #[error("cgroup OOM during build; promoting size class")]
+    CgroupOom,
     #[error(
         "wrong executor kind: derivation is_fod={is_fod} but this executor is {executor_kind:?}"
     )]
@@ -536,7 +545,26 @@ pub async fn execute_build(
         .map(|o| o.max_silent_time)
         .filter(|&v| v > 0)
         .unwrap_or(env.max_silent_time);
-    let build_cores = opts.map(|o| o.build_cores).unwrap_or(0);
+    // r[impl builder.cores.cgroup-clamp]
+    // I-196: NEVER pass build_cores=0 to the daemon. 0 means "use
+    // nproc", and nproc inside a pod sees ALL node cores (cgroup CPU
+    // quota throttles scheduling, doesn't hide CPUs). On a 16-core
+    // node a `tiny` (0.5-core, 1Gi) builder would run `make -j16` →
+    // 16×cc1×~100MB → cgroup OOM-loop. Clamp to the pod's cpu.max
+    // (delegated-root cgroup), and cap any client-requested value at
+    // the same ceiling — a client asking for --cores 64 on a 2-core
+    // pod gets 2.
+    let effective_cores = u64::from(crate::cgroup::effective_cores(&env.cgroup_parent));
+    let build_cores = match opts.map(|o| o.build_cores).filter(|&c| c > 0) {
+        Some(client) => client.min(effective_cores),
+        None => effective_cores,
+    };
+    tracing::debug!(
+        effective_cores,
+        build_cores,
+        client_requested = opts.map(|o| o.build_cores),
+        "build_cores clamped to cgroup cpu.max"
+    );
 
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
     let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;
@@ -657,6 +685,58 @@ pub async fn execute_build(
     let cpu_poll_abort = cpu_poll.abort_handle();
     let _cpu_poll_guard = scopeguard::guard((), move |()| cpu_poll_abort.abort());
 
+    // r[impl builder.oom.cgroup-watch]
+    // OOM watcher (I-196 defense-in-depth). Polls the POD-level
+    // `memory.events` (delegated root — where k8s set memory.max; the
+    // per-build sub-cgroup has no limit of its own) for `oom_kill`
+    // increments. When the kernel OOM-kills a build process, make
+    // typically respawns it → loop that burns the silence timeout.
+    // Detect the first kill, cgroup.kill the build to break the loop,
+    // and flag it so the result becomes CgroupOom (→ Infrastructure-
+    // Failure → scheduler promotes size class) instead of a confusing
+    // Wire(UnexpectedEof) or silence-timeout BuildFailed.
+    //
+    // Baseline captured at spawn: a prior build's OOM (or the FUSE
+    // warm getting killed) shouldn't count. `None` baseline (file
+    // unreadable — memory controller off, or non-k8s test env) → the
+    // task idles harmlessly; the build_cores clamp above is the
+    // primary fix anyway.
+    let oom_detected = Arc::new(AtomicBool::new(false));
+    let oom_watch = {
+        let parent = env.cgroup_parent.clone();
+        let kill_path = build_cgroup.path().to_path_buf();
+        let flag = Arc::clone(&oom_detected);
+        let baseline = crate::cgroup::read_oom_kill(&parent);
+        tokio::spawn(async move {
+            let Some(baseline) = baseline else {
+                return; // can't watch — no memory.events
+            };
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.tick().await; // skip immediate fire
+            loop {
+                interval.tick().await;
+                let Some(n) = crate::cgroup::read_oom_kill(&parent) else {
+                    continue; // transient read fail; keep polling
+                };
+                if n > baseline {
+                    tracing::warn!(
+                        baseline,
+                        current = n,
+                        "cgroup oom_kill incremented during build; killing build cgroup"
+                    );
+                    flag.store(true, Ordering::SeqCst);
+                    // Break the make-respawn loop. run_daemon_build
+                    // sees daemon EOF; the flag check below converts
+                    // that into CgroupOom.
+                    let _ = std::fs::write(kill_path.join("cgroup.kill"), "1");
+                    return;
+                }
+            }
+        })
+    };
+    let oom_watch_abort = oom_watch.abort_handle();
+    let _oom_watch_guard = scopeguard::guard((), move |()| oom_watch_abort.abort());
+
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
     // The cgroup setup above (create/add_process)
     // is NOT inside this helper — its `?` paths rely on the
@@ -685,7 +765,22 @@ pub async fn execute_build(
     // fast stop (guard fires redundantly after, which is a no-op
     // on an already-aborted handle).
     cpu_poll.abort();
+    oom_watch.abort();
     let peak_cpu_cores = f64::from_bits(peak_cpu_atomic.load(Ordering::Acquire));
+
+    // OOM override: if the watcher fired, run_daemon_build returned
+    // some Err (Wire(UnexpectedEof) from the cgroup.kill, or possibly
+    // a daemon-reported MiscFailure if the daemon caught the child
+    // death first). Replace it with CgroupOom so runtime.rs reports
+    // InfrastructureFailure with the size-class hint, NOT a transient-
+    // retry (UnexpectedEof would hit `is_daemon_transient` → 3× local
+    // retry → 3× more OOM-loops) and NOT BuildFailed (drv isn't broken).
+    let build_result = if oom_detected.load(Ordering::SeqCst) {
+        metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+        Err(ExecutorError::CgroupOom)
+    } else {
+        build_result
+    };
 
     // Read cgroup memory.peak. Kernel-tracked lifetime max of the
     // WHOLE TREE — daemon + builder + every child. One read, no
@@ -1709,6 +1804,10 @@ mod tests {
         assert!(!ExecutorError::BuildFailed("exit 1".into()).is_daemon_transient());
         assert!(!ExecutorError::Cgroup("EACCES".into()).is_daemon_transient());
         assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_daemon_transient());
+        // NOT retryable: cgroup OOM. Retrying on the same undersized
+        // pod just OOM-loops again — must escalate to scheduler for
+        // size-class promotion (I-196).
+        assert!(!ExecutorError::CgroupOom.is_daemon_transient());
     }
 
     #[test]

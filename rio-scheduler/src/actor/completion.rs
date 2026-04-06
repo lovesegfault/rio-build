@@ -370,16 +370,17 @@ impl DagActor {
                 (to, "builder")
             };
             let Some(to) = to else { return };
-            // Only bump UP. A drv already at floor=small that
-            // happens to fail on a tiny executor (overflow placed
-            // it there, or floor reset on recovery) shouldn't
-            // demote — but `next_*_class(tiny)` = small, which
-            // equals current floor, so the assignment is a no-op.
-            // A genuine bump (floor=None→small, or tiny→small)
-            // lands here. Dispatch respects floor (both FOD and
-            // non-FOD branches as of I-177), so a floor=large drv
-            // can't be assigned to tiny — the demote case is
-            // unreachable in steady state.
+            // Change-detector, NOT an ordinal compare — fires on any
+            // `to != current floor`, not strictly `to > floor`. The
+            // "only ever bumps UP" property is structural: dispatch
+            // clamps assignments at floor (FOD + non-FOD as of I-177),
+            // so `from` ≥ floor, so `next_*_class(from)` is the class
+            // above floor (or None at top). A floor=large drv can't be
+            // assigned to tiny, so the demote case is unreachable in
+            // steady state. The `!=` form just skips the no-op write +
+            // metric when floor is already at `to` (e.g. floor=small,
+            // overflow-placed on tiny, `next(tiny)=small` — equal, no
+            // log spam).
             if state.size_class_floor.as_deref() != Some(to.as_str()) {
                 info!(
                     drv_hash = %drv_hash, kind, from = %from, to = %to,

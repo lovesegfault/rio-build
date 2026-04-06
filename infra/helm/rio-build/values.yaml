@@ -825,28 +825,9 @@ devicePlugin:
 # Unconfined, privileged:true escape hatch) — the CRs are dead weight then.
 securityProfilesOperator:
   enabled: true
-  # Constrain spod to builder + fetcher nodes — control-plane nodes don't
-  # need the profiles. Same shape as the devicePlugin DS constraints.
-  nodeAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: rio.build/node-role
-              operator: In
-              values: [builder, fetcher]
-  tolerations:
-    - key: rio.build/builder
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
-    - key: rio.build/fetcher
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
-    - key: rio.build/kvm
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
+  # spod DaemonSet scheduling (tolerations/affinity) is NOT chart-
+  # managed — the operator creates the `spod` CR; xtask deploy patches
+  # it via server-side-apply (see seccomp-profiles.yaml trailer).
 
 # ──────────────────────────────────────────────────────────────────────────
 # Default BuilderPool
@@ -897,40 +878,45 @@ builderPoolSetDefaults:
   #   large→c6a.4xlarge, xlarge→c6a.8xlarge.
   # Memory limit at 2× request (same blast-radius cap as
   # builderPoolDefaults.resources). No CPU limit — compressible.
+  # I-196: 2/8/32/64/128 cores. <2 means make -j1 which serializes
+  # configure scripts; the steep ramp lets the EMA classifier route
+  # compile-heavy work straight to a node that finishes it fast
+  # rather than thrashing on a 2-core box. Memory ≈ 2Gi/core (cc1
+  # peaks ~100-200MB; -jN headroom). MUST track scheduler.sizeClasses
+  # in deploy.rs SIZE_CLASSES_JSON.
   classes:
     - name: tiny
       cutoffSecs: 30
       maxReplicas: 200
       resources:
         # I-118: 2Gi storage — hello-class builds need <500MB FUSE
-        # cache + overlay. 10Gi was the dominant scheduling blocker
-        # (4 pods/node instead of ~8 by cpu/mem).
-        requests: {cpu: "500m", memory: "512Mi", ephemeral-storage: "2Gi"}
-        limits: {memory: "1Gi"}
+        # cache + overlay. 10Gi was the dominant scheduling blocker.
+        requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "2Gi"}
+        limits: {memory: "4Gi"}
     - name: small
       cutoffSecs: 120
       maxReplicas: 200
       resources:
-        requests: {cpu: "1", memory: "2Gi", ephemeral-storage: "8Gi"}
-        limits: {memory: "4Gi"}
+        requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "8Gi"}
+        limits: {memory: "16Gi"}
     - name: medium
       cutoffSecs: 600
       maxReplicas: 100
       resources:
-        requests: {cpu: "2", memory: "4Gi", ephemeral-storage: "25Gi"}
-        limits: {memory: "8Gi"}
+        requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "25Gi"}
+        limits: {memory: "64Gi"}
     - name: large
       cutoffSecs: 1800
       maxReplicas: 50
       resources:
-        requests: {cpu: "4", memory: "8Gi", ephemeral-storage: "40Gi"}
-        limits: {memory: "16Gi"}
+        requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "40Gi"}
+        limits: {memory: "128Gi"}
     - name: xlarge
       cutoffSecs: 7200
       maxReplicas: 20
       resources:
-        requests: {cpu: "8", memory: "16Gi", ephemeral-storage: "60Gi"}
-        limits: {memory: "32Gi"}
+        requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "60Gi"}
+        limits: {memory: "256Gi"}
   # poolTemplate fields layer over builderPoolDefaults (deep-merge), so
   # seccomp/tolerations/nodeSelector/privileged/hostUsers stay single-
   # sourced. Override here only what differs from the flat-pool defaults.

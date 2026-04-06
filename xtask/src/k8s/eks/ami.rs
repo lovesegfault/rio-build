@@ -154,6 +154,7 @@ async fn build_and_register_one(
             "AMI {existing} already tagged rio.build/ami={ami_tag} ({k8s_arch}) — skipping upload"
         );
         tag(ec2, &existing, ami_tag, sha, k8s_arch, cluster).await?;
+        untag_prior_latest(ec2, &existing, k8s_arch).await?;
         return Ok(());
     }
 
@@ -210,6 +211,7 @@ async fn build_and_register_one(
         tag(ec2, &ami, ami_tag, sha, k8s_arch, cluster)
     })
     .await?;
+    untag_prior_latest(ec2, &ami, k8s_arch).await?;
 
     info!(
         "registered {ami} (snapshot {snap}) — rio.build/ami={ami_tag} kubernetes.io/arch={k8s_arch}"
@@ -249,10 +251,12 @@ async fn find_existing(
 
 /// I-182 read side: resolve the deploy-time `rio.build/ami` tag value
 /// from EC2, not the per-worktree `.rio-ami-tag` file. `tag()` below
-/// stamps every newly-registered AMI with `rio.build/ami-latest=true`;
-/// query for that and read back the content-addressed `rio.build/ami`
-/// value. If multiple generations carry `ami-latest` (no untag step
-/// yet), the newest by `CreationDate` wins — ISO 8601 strings sort
+/// stamps every newly-registered AMI with `rio.build/ami-latest=true`
+/// and `untag_prior_latest()` strips it from older generations of the
+/// same arch; query for that and read back the content-addressed
+/// `rio.build/ami` value. If multiple generations still carry
+/// `ami-latest` (interrupted untag, or pre-untag-step images), the
+/// newest by `CreationDate` wins — ISO 8601 strings sort
 /// lexically. A worktree that never ran `up --ami` now deploys the
 /// same tag any other worktree would; previously it read a stale
 /// gitignored file or recomputed a drvPath-hash that pointed at
@@ -397,6 +401,48 @@ async fn tag(
     Ok(())
 }
 
+/// I-182 write side: strip `rio.build/ami-latest` from prior
+/// generations of this arch. Runs AFTER `tag()` so a failure here
+/// leaves the new AMI tagged (deploy still resolves it via
+/// `max(CreationDate)`); idempotent (delete-tags on an absent tag is a
+/// no-op). Without this, every generation accumulates `ami-latest=true`
+/// and `resolve_latest_tag` walks an ever-growing describe-images
+/// result. Only the `ami-latest` key is removed — `rio.build/ami`
+/// (content tag) and `rio.build/git-sha` stay for rollback pinning.
+async fn untag_prior_latest(
+    ec2: &aws_sdk_ec2::Client,
+    keep_ami: &str,
+    k8s_arch: &str,
+) -> Result<()> {
+    let resp = ec2
+        .describe_images()
+        .owners("self")
+        .filters(tag_filter("rio.build/ami-latest", "true"))
+        .filters(tag_filter("kubernetes.io/arch", k8s_arch))
+        .send()
+        .await?;
+    let prior: Vec<String> = resp
+        .images()
+        .iter()
+        .filter_map(|i| i.image_id())
+        .filter(|id| *id != keep_ami)
+        .map(str::to_string)
+        .collect();
+    if prior.is_empty() {
+        return Ok(());
+    }
+    info!(
+        "untagging rio.build/ami-latest from {} prior {k8s_arch} AMI(s)",
+        prior.len()
+    );
+    ec2.delete_tags()
+        .set_resources(Some(prior))
+        .tags(Tag::builder().key("rio.build/ami-latest").build())
+        .send()
+        .await?;
+    Ok(())
+}
+
 fn mk_tag(k: &str, v: &str) -> Tag {
     Tag::builder().key(k).value(v).build()
 }
@@ -441,8 +487,9 @@ mod tests {
     #[test]
     fn latest_ami_tag_picks_newest_and_reads_rio_tag() {
         // I-182 read side: two generations both tagged ami-latest=true
-        // (no untag step) — newest CreationDate wins, and the value
-        // returned is the rio.build/ami tag, not the image ID.
+        // (interrupted untag or pre-untag-step images) — newest
+        // CreationDate wins, and the value returned is the
+        // rio.build/ami tag, not the image ID.
         let img = |id: &str, date: &str, ami: &str| {
             Image::builder()
                 .image_id(id)

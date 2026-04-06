@@ -485,8 +485,9 @@ fn fusectl_abort_path_at(mount_point: &Path, connections_root: &Path) -> Option<
 
 /// Mount the FUSE filesystem in a background thread.
 ///
-/// Returns the [`FuseMount`] handle (call `.abort_and_drop()` on
-/// shutdown) plus the circuit breaker handle (cloned out BEFORE
+/// Returns the [`FuseMount`] handle (drop on shutdown — `Drop` writes
+/// the fusectl abort then unmounts) plus the circuit breaker handle
+/// (cloned out BEFORE
 /// `spawn_mount2` consumes the fs — same extract-before-move pattern
 /// as `bloom_handle`). The heartbeat loop polls `is_open()` on the
 /// returned handle; the fuser thread pool writes to the same breaker

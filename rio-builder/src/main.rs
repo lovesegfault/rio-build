@@ -581,9 +581,21 @@ async fn main() -> anyhow::Result<()> {
                             // start. P0537: one build per pod —
                             // try_claim is non-blocking. If busy,
                             // the scheduler dispatched while heartbeat
-                            // shows running_builds nonempty (its bug,
-                            // or a race within one heartbeat tick).
-                            // No ACK sent — same rationale as the
+                            // shows running_builds nonempty.
+                            //
+                            // Known harmless trigger (observed in KVM
+                            // test, ~300ms double-dispatch of SAME
+                            // drv): worker stream reconnects mid-build
+                            // → handle_worker_connected creates a
+                            // fresh executor entry with running=None
+                            // → became_idle inline dispatch re-picks
+                            // the drv before the first post-reconnect
+                            // heartbeat adopts it back. The TOCTOU
+                            // keep-logic (executor.rs handle_heartbeat)
+                            // covers the stale-heartbeat race; phantom
+                            // confirmation needs 2 heartbeats ≥10s, so
+                            // neither explains a 300ms window. No ACK
+                            // sent — same rationale as the
                             // stale-generation reject above.
                             let Some(guard) = slot.try_claim(&assignment.drv_path) else {
                                 tracing::warn!(
