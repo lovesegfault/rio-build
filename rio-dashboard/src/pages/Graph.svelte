@@ -19,6 +19,7 @@
   import { admin } from '../api/admin';
   import {
     DEGRADE_THRESHOLD,
+    TERMINAL,
     WORKER_THRESHOLD,
     layoutGraph,
     sortForTable,
@@ -86,6 +87,32 @@
     return worker;
   }
 
+  // Re-entrancy gate for fetchAndLayout. The 5s setInterval keeps
+  // firing regardless of whether the last poll finished — a slow
+  // network or a heavy dagre pass (1-3s in the worker for 1500+ nodes)
+  // means overlapping calls. Without the gate, both calls race through
+  // layoutInWorker: each installs its own {once:true}-style listener,
+  // the FIRST worker response fires the FIRST listener (promise N
+  // resolves correctly), the SECOND worker response fires the SECOND
+  // listener — promise N+1 resolves with response N+1. That's actually
+  // fine for the worker path in isolation, BUT the two fetches run
+  // concurrently: response N has stale statuses relative to N+1, and if
+  // N's fetch was slow but its layout was fast, N's assignment can land
+  // AFTER N+1's (last-write-wins on `layout =`, `nodes =`). The gate
+  // serializes the whole fetch→layout→assign pipeline — simpler than
+  // seq-number correlation, and we don't want concurrent layouts anyway
+  // (the poll is a single logical stream).
+  let inflight = false;
+
+  // Set once every node hits a terminal status (graphLayout.TERMINAL
+  // mirrors is_terminal() in the scheduler). A finished build's drawer
+  // can sit open indefinitely — no point polling GetBuildGraph every 5s
+  // when nothing can change. The $effect reads this reactively and
+  // tears down the interval; if the {#key buildId} wrapper remounts us
+  // for a different build, $state re-initializes to false and polling
+  // resumes for the new graph.
+  let allTerminal = $state(false);
+
   function layoutInWorker(
     gn: RawNode[],
     ge: RawEdge[],
@@ -131,6 +158,8 @@
   }
 
   async function fetchAndLayout() {
+    if (inflight) return;
+    inflight = true;
     let r;
     try {
       r = await admin.getBuildGraph({ buildId });
@@ -138,43 +167,57 @@
     } catch (e) {
       error = String(e);
       loading = false;
+      inflight = false;
       return;
     }
 
-    // Server-side truncation trumps our own threshold — the subset we
-    // got back is arbitrary (first-5000 by insertion order, not
-    // topological), so laying it out would lie about the graph shape.
-    if (r.truncated || r.nodes.length > DEGRADE_THRESHOLD) {
-      layout = {
-        degraded: true,
-        reason: r.truncated
-          ? `server truncated (${r.totalNodes} total)`
-          : `${r.nodes.length} nodes > ${DEGRADE_THRESHOLD}`,
-        nodes: sortForTable(r.nodes),
-      };
+    try {
+      // Terminal-settle check. `r.nodes.length > 0` guards the trivial
+      // every([])→true — an empty response (build not yet populated, or
+      // ListWatcher race) must NOT stop polling. The server's truncated
+      // subset is fine here: if the first 5000 are all terminal the
+      // tail almost certainly is too (scheduler walks the DAG forward).
+      if (r.nodes.length > 0 && r.nodes.every((n) => TERMINAL.has(n.status))) {
+        allTerminal = true;
+      }
+
+      // Server-side truncation trumps our own threshold — the subset we
+      // got back is arbitrary (first-5000 by insertion order, not
+      // topological), so laying it out would lie about the graph shape.
+      if (r.truncated || r.nodes.length > DEGRADE_THRESHOLD) {
+        layout = {
+          degraded: true,
+          reason: r.truncated
+            ? `server truncated (${r.totalNodes} total)`
+            : `${r.nodes.length} nodes > ${DEGRADE_THRESHOLD}`,
+          nodes: sortForTable(r.nodes),
+        };
+        loading = false;
+        return;
+      }
+
+      const sig = sigOf(r.nodes, r.edges);
+      if (sig === lastSig && layout && !layout.degraded) {
+        patchStatuses(r.nodes);
+        loading = false;
+        return;
+      }
+      lastSig = sig;
+
+      const result =
+        r.nodes.length > WORKER_THRESHOLD
+          ? await layoutInWorker(r.nodes, r.edges)
+          : layoutGraph(r.nodes, r.edges);
+
+      layout = result;
+      if (!result.degraded) {
+        nodes = result.nodes;
+        edges = result.edges;
+      }
       loading = false;
-      return;
+    } finally {
+      inflight = false;
     }
-
-    const sig = sigOf(r.nodes, r.edges);
-    if (sig === lastSig && layout && !layout.degraded) {
-      patchStatuses(r.nodes);
-      loading = false;
-      return;
-    }
-    lastSig = sig;
-
-    const result =
-      r.nodes.length > WORKER_THRESHOLD
-        ? await layoutInWorker(r.nodes, r.edges)
-        : layoutGraph(r.nodes, r.edges);
-
-    layout = result;
-    if (!result.degraded) {
-      nodes = result.nodes;
-      edges = result.edges;
-    }
-    loading = false;
   }
 
   $effect(() => {
@@ -183,9 +226,24 @@
     // wrapper tears this whole component down — but belt-and-braces).
     void buildId;
     fetchAndLayout();
-    const t = setInterval(fetchAndLayout, 5000);
+    // allTerminal is reactive: when fetchAndLayout flips it true the
+    // effect re-runs, the old interval is cleared by the teardown
+    // closure, and this branch declines to start a new one. One last
+    // fetchAndLayout fires (above) — harmless, the inflight gate or
+    // the sig-match short-circuits it.
+    const t = allTerminal ? null : setInterval(fetchAndLayout, 5000);
     return () => {
-      clearInterval(t);
+      if (t !== null) clearInterval(t);
+    };
+  });
+
+  // Worker lifecycle split into its own effect so the allTerminal flip
+  // above doesn't tear down an in-use worker — the worker should
+  // survive until component unmount (or buildId change, which the
+  // {#key} wrapper turns into an unmount anyway). Svelte effects with
+  // no reactive dependencies run once on mount and teardown on unmount.
+  $effect(() => {
+    return () => {
       worker?.terminate();
       worker = null;
     };
