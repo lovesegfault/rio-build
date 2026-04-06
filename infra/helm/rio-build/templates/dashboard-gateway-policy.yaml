@@ -1,3 +1,24 @@
+{{- /*
+Common CORS block — both SecurityPolicies need identical allowMethods/
+allowHeaders/exposeHeaders (gRPC-Web contract doesn't change between
+readonly and mutating). Only allowOrigins differs by targetRef.
+define MUST be at template top-level (outside if/range) — helm parse
+error otherwise.
+*/ -}}
+{{- define "rio.dashboard.corsCommon" -}}
+allowMethods:
+  - POST
+  - OPTIONS
+allowHeaders:
+  - content-type
+  - x-grpc-web
+  - x-user-agent
+  - grpc-timeout
+exposeHeaders:
+  - grpc-status
+  - grpc-message
+  - grpc-status-details-bin
+{{- end -}}
 {{- if .Values.dashboard.enabled }}
 {{- $ns := .Values.namespace.name -}}
 ---
@@ -5,11 +26,12 @@
 # headers exposed or connect-web can't read the trailer status. The
 # spec.cors.allowOrigins pattern is
 #   ^(\*|https?://(\*|(\*.)?(([\w-]+\.?)+)?[\w-]+)(:\d{1,5})?)$
-# — bare "*" is a valid single-token match.
+# — bare "*" is a valid single-token match but defeats the origin
+# check entirely. .Values.dashboard.cors.allowOrigins drives the list.
 #
-# Permissive MVP — tighten allowOrigins to the dashboard's served
-# origin post-MVP (once P0274 lands the nginx Deployment and its
-# Service hostname is known).
+# Scoped to the readonly GRPCRoute (not the Gateway). The mutating
+# route — when rendered at all — gets its own SecurityPolicy below
+# (same origin list by default; operator can narrow further).
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: SecurityPolicy
 metadata:
@@ -20,23 +42,35 @@ metadata:
 spec:
   targetRefs:
     - group: gateway.networking.k8s.io
-      kind: Gateway
-      name: rio-dashboard
+      kind: GRPCRoute
+      name: rio-scheduler-readonly
   cors:
     allowOrigins:
-      - "*"
-    allowMethods:
-      - POST
-      - OPTIONS
-    allowHeaders:
-      - content-type
-      - x-grpc-web
-      - x-user-agent
-      - grpc-timeout
-    exposeHeaders:
-      - grpc-status
-      - grpc-message
-      - grpc-status-details-bin
+      {{- toYaml .Values.dashboard.cors.allowOrigins | nindent 6 }}
+    {{- include "rio.dashboard.corsCommon" . | nindent 4 }}
+{{- if .Values.dashboard.enableMutatingMethods }}
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: rio-dashboard-cors-mutating
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      name: rio-scheduler-mutating
+  cors:
+    # Same origin list as readonly by default. If mutating methods are
+    # enabled, the operator has accepted the risk; narrowing origins
+    # further is their call (override dashboard.cors.allowOrigins or
+    # post-render kustomize).
+    allowOrigins:
+      {{- toYaml .Values.dashboard.cors.allowOrigins | nindent 6 }}
+    {{- include "rio.dashboard.corsCommon" . | nindent 4 }}
+{{- end }}
 ---
 # Streaming timeout: GetBuildLogs / WatchBuild are long-lived server-
 # streams. Envoy's default stream_idle_timeout (5m) would cut a

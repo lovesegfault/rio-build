@@ -83,10 +83,17 @@ pkgs.testers.runNixOSTest {
         # simple top-level condition — status surfaces via
         # ancestorStatus; the curl below is the real proof.
         k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} get grpcroute rio-scheduler "
+            "k3s kubectl -n ${ns} get grpcroute rio-scheduler-readonly "
             "-o jsonpath='{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}' "
             "| grep -qx True",
             timeout=30,
+        )
+        # Mutating route MUST NOT exist — enableMutatingMethods defaults
+        # false. The k3s fixture doesn't set it (fixture sets
+        # dashboard.enabled=true only). Any accidental render =
+        # fail-open on ClearPoison/DrainWorker/CreateTenant/TriggerGC.
+        k3s_server.fail(
+            "k3s kubectl -n ${ns} get grpcroute rio-scheduler-mutating"
         )
 
     # ── envoy Service endpoints ready ───────────────────────────────────
@@ -180,6 +187,59 @@ pkgs.testers.runNixOSTest {
             "--data-binary @- "
             "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
             timeout=30,
+        )
+
+    # ── r[dash.auth.method-gate] end-to-end: ClearPoison unrouted ───────
+    # With enableMutatingMethods=false (the default; this fixture doesn't
+    # override it), the mutating GRPCRoute is absent → envoy has no
+    # route match for /rio.admin.AdminService/ClearPoison → 404.
+    #
+    # This is the LIVE proof that the helm-lint static assert (flake.nix
+    # helm-lint "mutating GRPCRoute fail-closed") holds at runtime: the
+    # operator actually reconciled a listener WITHOUT the mutating
+    # matches. Static helm-template + yq can't prove the operator's xDS
+    # translator respects the missing route; this curl can.
+    #
+    # NOT using -f here: we WANT to see the HTTP code. -f would make
+    # curl exit nonzero on 404 and k3s_server.succeed would fail.
+    # Instead, capture %{http_code} and assert on it.
+    with subtest("method-gate: ClearPoison returns 404 (unrouted)"):
+        code = k3s_server.succeed(
+            "printf '\\x00\\x00\\x00\\x00\\x00' | "
+            "curl -s -o /dev/null -w '%{http_code}' "
+            "-X POST http://localhost:18080/rio.admin.AdminService/ClearPoison "
+            "-H 'content-type: application/grpc-web+proto' "
+            "-H 'x-grpc-web: 1' "
+            "--data-binary @-"
+        ).strip()
+        print(f"ClearPoison http_code={code}")
+        # Envoy Gateway returns 404 when no GRPCRoute matches (the
+        # listener has no route for this path). If this starts
+        # returning 200, either enableMutatingMethods got flipped or
+        # the readonly route leaked a service-level match.
+        assert code == "404", (
+            f"ClearPoison was routed through the gateway (http_code={code}). "
+            "The mutating GRPCRoute should NOT be rendered with default "
+            "values — check dashboard.enableMutatingMethods."
+        )
+
+    # Positive control: the readonly ClusterStatus path DOES return 200
+    # (already proven by the 0x00-prefix assert above, but make the
+    # contrast explicit for the method-gate proof — same request shape,
+    # only the URL path differs).
+    with subtest("method-gate: ClusterStatus returns 200 (routed)"):
+        code = k3s_server.succeed(
+            "printf '\\x00\\x00\\x00\\x00\\x00' | "
+            "curl -s -o /dev/null -w '%{http_code}' "
+            "-X POST http://localhost:18080/rio.admin.AdminService/ClusterStatus "
+            "-H 'content-type: application/grpc-web+proto' "
+            "-H 'x-grpc-web: 1' "
+            "--data-binary @-"
+        ).strip()
+        print(f"ClusterStatus http_code={code}")
+        assert code == "200", (
+            f"ClusterStatus unexpectedly unrouted (http_code={code}). "
+            "The readonly GRPCRoute may have lost its match list."
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-envoy.pid) 2>/dev/null || true")

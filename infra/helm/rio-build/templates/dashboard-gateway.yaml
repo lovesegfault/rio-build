@@ -1,8 +1,9 @@
 {{- if .Values.dashboard.enabled }}
 {{- $ns := .Values.namespace.name -}}
 # r[impl dash.envoy.grpc-web-translate]
-#   (marker is documentary — tracey does not scan yaml; the r[verify]
-#    lives at nix/tests/default.nix which IS scanned)
+# r[impl dash.auth.method-gate]
+#   (markers are documentary — tracey does not scan yaml; the r[verify]
+#    for both lives at nix/tests/default.nix which IS scanned)
 #
 # Envoy Gateway CRDs. Attaching a GRPCRoute to a listener triggers
 # grpc_web filter injection into that listener's HTTP filter chain —
@@ -60,10 +61,20 @@ spec:
         kinds:
           - kind: GRPCRoute
 ---
+# ── Read-only methods: routed unconditionally ─────────────────────────
+# r[dash.auth.method-gate] — the method split is here. Status/list/log/
+# graph RPCs are idempotent reads; the dashboard hits these on every
+# page load. Exposing them via gRPC-Web is low-risk (worst case: an
+# attacker learns cluster state they could also learn from /metrics).
+#
+# SchedulerService: the dashboard only calls WatchBuild (streaming
+# status updates for the DAG view) and QueryBuildStatus (poll fallback).
+# SubmitBuild/CancelBuild are mutating — the production entrypoint for
+# those is ssh-ng via rio-gateway, not the dashboard.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute
 metadata:
-  name: rio-scheduler
+  name: rio-scheduler-readonly
   namespace: {{ $ns }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
@@ -71,16 +82,49 @@ spec:
   parentRefs:
     - name: rio-dashboard
   rules:
-    # Match AdminService + SchedulerService — everything the dashboard
-    # calls (see docs/src/components/dashboard.md Key Views table).
-    # No method gating in MVP; a malicious browser client can call
-    # ClearPoison etc. — phase 5b adds per-method authz.
     - matches:
-        - method:
-            service: rio.admin.AdminService
-        - method:
-            service: rio.scheduler.SchedulerService
+        - method: { service: rio.admin.AdminService, method: ClusterStatus }
+        - method: { service: rio.admin.AdminService, method: ListWorkers }
+        - method: { service: rio.admin.AdminService, method: ListBuilds }
+        - method: { service: rio.admin.AdminService, method: GetBuildLogs }
+        - method: { service: rio.admin.AdminService, method: ListTenants }
+        - method: { service: rio.admin.AdminService, method: GetBuildGraph }
+        - method: { service: rio.admin.AdminService, method: GetSizeClassStatus }
+        - method: { service: rio.scheduler.SchedulerService, method: WatchBuild }
+        - method: { service: rio.scheduler.SchedulerService, method: QueryBuildStatus }
       backendRefs:
         - name: rio-scheduler
           port: 9001
+{{- if .Values.dashboard.enableMutatingMethods }}
+---
+# ── Mutating methods: gated behind values flag ────────────────────────
+# ClearPoison   — un-brakes a deliberately blocked derivation
+# DrainWorker   — marks a worker draining; can stall the fleet if abused
+# CreateTenant  — writes PG rows; resource creation
+# TriggerGC     — deletes store paths; data loss potential
+#
+# These are NOT rendered by default (enableMutatingMethods: false).
+# With the route absent, envoy has no match → returns 404 on e.g.
+# POST /rio.admin.AdminService/ClearPoison. Use rio-cli with an mTLS
+# client cert for these until dashboard-native authz lands.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: rio-scheduler-mutating
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  parentRefs:
+    - name: rio-dashboard
+  rules:
+    - matches:
+        - method: { service: rio.admin.AdminService, method: ClearPoison }
+        - method: { service: rio.admin.AdminService, method: DrainWorker }
+        - method: { service: rio.admin.AdminService, method: CreateTenant }
+        - method: { service: rio.admin.AdminService, method: TriggerGC }
+      backendRefs:
+        - name: rio-scheduler
+          port: 9001
+{{- end }}
 {{- end }}

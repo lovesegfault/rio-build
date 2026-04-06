@@ -502,6 +502,12 @@ in
   #   (listener.go:424-425) actually fired. ~6min (k3s bring-up +
   #   operator reconcile). Heavy: +2 images (envoyproxy/gateway +
   #   envoy:distroless) — dedicated test so vm-cli-k3s stays fast.
+  # r[verify dash.auth.method-gate]
+  #   Same curl shape against ClearPoison → expects 404. The fixture
+  #   doesn't set dashboard.enableMutatingMethods so the mutating
+  #   GRPCRoute is absent. Proves the helm-template fail-closed holds
+  #   at runtime through the operator's xDS reconcile. Positive
+  #   control: ClusterStatus on the readonly route returns 200.
   vm-dashboard-gateway-k3s = dashboard-gateway {
     inherit pkgs common;
     fixture = k3sFull { envoyGatewayEnabled = true; };

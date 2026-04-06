@@ -405,6 +405,28 @@ dashboard:
   # version (v1.7.1 → envoy:distroless-v1.37.1); pin here so airgapped
   # VM tests and private-registry prod can override.
   envoyImage: docker.io/envoyproxy/envoy:distroless-v1.37.1
+  # ── Method-level authz (r[dash.auth.method-gate]) ─────────────────────
+  # Expose ClearPoison/DrainWorker/CreateTenant/TriggerGC via the
+  # dashboard gateway. Default false — the GRPCRoute for mutating
+  # methods is NOT rendered, so envoy returns 404 on those paths.
+  # Use rio-cli with an mTLS client cert for admin operations until
+  # dashboard-native authz lands. Flipping this to true is fail-open:
+  # any browser that can reach the gateway can issue mutating RPCs
+  # (CORS is advisory — a curl client ignores it).
+  enableMutatingMethods: false
+  # CORS allowed origins for gRPC-Web. The previous default was "*"
+  # (any origin could fetch admin RPCs). The dashboard nginx Service
+  # is the only legitimate browser origin in-cluster; external access
+  # (Ingress/LoadBalancer) should add its public hostname here.
+  # Override in prod values with the actual Ingress URL.
+  cors:
+    allowOrigins:
+      # In-cluster nginx Service DNS. Browsers don't normally reach
+      # this directly (they hit the Ingress), but it's a safe default
+      # that isn't "*". Port-forwarded dev sessions hit localhost,
+      # which is also NOT "*" — add localhost in values/dev.yaml if
+      # needed.
+      - "http://rio-dashboard.rio-system.svc.cluster.local"
 
 # ──────────────────────────────────────────────────────────────────────────
 # FUSE Device Plugin
