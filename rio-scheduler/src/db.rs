@@ -205,12 +205,16 @@ pub struct RecoveryDerivationRow {
     pub failed_workers: Vec<String>,
 }
 
-/// Row from `load_build_graph` nodes query. Thin — 5 strings, ~200B.
-/// Mirrors proto `GraphNode` exactly (NOT `DerivationNode`, which carries
+/// Row from `load_build_graph` nodes query. Thin — ~200B.
+/// Mirrors proto `GraphNode` (NOT `DerivationNode`, which carries
 /// ≤64KB `drv_content`). `pname` and `assigned_worker_id` are COALESCE'd
 /// to empty-string SQL-side to match proto3's non-optional string fields.
+///
+/// `derivation_id` is NOT in the proto — it's collected here so the edge
+/// query can filter to the returned node set (truncation correctness).
 #[derive(Debug, sqlx::FromRow)]
 pub struct GraphNodeRow {
+    pub derivation_id: Uuid,
     pub drv_path: String,
     pub pname: String,
     pub system: String,
@@ -1294,9 +1298,12 @@ impl SchedulerDb {
 
         // COALESCE for nullable columns (pname, assigned_worker_id) →
         // proto3 non-optional string is empty-string-for-null.
+        // derivation_id is carried so the edge query below can filter
+        // to THIS returned set (not the whole build).
         let nodes: Vec<GraphNodeRow> = sqlx::query_as(
             r#"
-            SELECT d.drv_path,
+            SELECT d.derivation_id,
+                   d.drv_path,
                    COALESCE(d.pname, '') AS pname,
                    d.system,
                    d.status,
@@ -1313,27 +1320,51 @@ impl SchedulerDb {
         .fetch_all(&self.pool)
         .await?;
 
-        // Both-endpoints-in-build: subquery on build_derivations for
-        // parent AND child. An edge to a derivation another build
-        // owns (shared drv) is excluded — dashboard sees only the
-        // subgraph the user submitted.
+        // r[impl dash.graph.degrade-threshold]
+        // Edge set MUST be a subgraph of the RETURNED node set, not the
+        // whole build. When the node query truncates at LIMIT, edges
+        // referencing truncated nodes would be dangling — the client's
+        // lookup-by-drv_path misses, either crashing the renderer or
+        // silently dropping the edge (both wrong).
+        //
+        // ANY($1) on both endpoints with node_ids = the actual returned
+        // derivation_ids is both the correctness fix AND an implicit
+        // bound: edge count is bounded by the induced subgraph over
+        // ≤5000 nodes, not the whole-build DAG. A sparse build DAG
+        // (typical fanout: 3-4× node count) caps naturally at ~20k.
+        //
+        // If nodes didn't truncate, node_ids IS the full build set —
+        // same rows as the old `WHERE IN (SELECT ... WHERE build_id)`
+        // subquery, but now it's impossible to return a dangling ref.
         //
         // retro P0027: dropped e.is_cutoff (always FALSE; Skipped is
         // a node status, carried in GraphNode.status).
-        let edges: Vec<GraphEdgeRow> = sqlx::query_as(
-            r#"
-            SELECT dp.drv_path AS parent_drv_path,
-                   dc.drv_path AS child_drv_path
-            FROM derivation_edges e
-            JOIN derivations dp ON dp.derivation_id = e.parent_id
-            JOIN derivations dc ON dc.derivation_id = e.child_id
-            WHERE e.parent_id IN (SELECT derivation_id FROM build_derivations WHERE build_id = $1)
-              AND e.child_id  IN (SELECT derivation_id FROM build_derivations WHERE build_id = $1)
-            "#,
-        )
-        .bind(build_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.derivation_id).collect();
+        let edges: Vec<GraphEdgeRow> = if node_ids.is_empty() {
+            // Unknown build or zero-derivation build — skip the roundtrip.
+            Vec::new()
+        } else {
+            sqlx::query_as(
+                r#"
+                SELECT dp.drv_path AS parent_drv_path,
+                       dc.drv_path AS child_drv_path
+                FROM derivation_edges e
+                JOIN derivations dp ON dp.derivation_id = e.parent_id
+                JOIN derivations dc ON dc.derivation_id = e.child_id
+                WHERE e.parent_id = ANY($1)
+                  AND e.child_id  = ANY($1)
+                "#,
+            )
+            .bind(&node_ids)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        // Operators spot builds approaching the implicit edge bound via
+        // the p99 of this histogram. A build with consistently high edge
+        // count (>10k) on a 5000-node cap is unusually dense and worth
+        // a look — either a legitimately weird closure or a DAG-merge bug.
+        metrics::histogram!("rio_scheduler_build_graph_edges").record(edges.len() as f64);
 
         Ok((nodes, edges, total as u32))
     }

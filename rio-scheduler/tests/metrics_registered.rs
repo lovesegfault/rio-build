@@ -58,6 +58,7 @@ const SCHEDULER_METRICS: &[&str] = &[
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_estimator_refresh_total",
+    "rio_scheduler_build_graph_edges",
 ];
 
 /// Recorder that captures names passed to `describe_*` and ignores

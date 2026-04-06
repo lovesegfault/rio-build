@@ -197,4 +197,9 @@ pub fn describe_metrics() {
         "rio_scheduler_estimator_refresh_total",
         "Duration estimator refresh cycles (re-reads build_history EMAs)"
     );
+    describe_histogram!(
+        "rio_scheduler_build_graph_edges",
+        "Edge count per GetBuildGraph response. High p99 (>10k) = unusually \
+         dense DAG approaching the implicit subgraph bound."
+    );
 }
