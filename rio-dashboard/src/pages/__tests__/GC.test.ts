@@ -7,11 +7,13 @@
 import { fireEvent, render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { adminMock, teardownStandardAfterEach } from '../../test-support/admin-mock';
 
-const { triggerGC } = vi.hoisted(() => ({ triggerGC: vi.fn() }));
-vi.mock('../../api/admin', () => ({ admin: { triggerGC } }));
+vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
 import GC from '../GC.svelte';
+
+const { triggerGC } = adminMock;
 
 function chunk(
   scanned: bigint,
@@ -29,9 +31,7 @@ function chunk(
 }
 
 describe('GC page', () => {
-  afterEach(() => {
-    triggerGC.mockReset();
-  });
+  afterEach(teardownStandardAfterEach);
 
   it('consumes 3 progress chunks and surfaces completion', async () => {
     triggerGC.mockImplementation(async function* () {
@@ -44,7 +44,9 @@ describe('GC page', () => {
     await fireEvent.submit(screen.getByRole('button', { name: /preview gc/i }).closest('form')!);
     // Drain the async generator: each yield schedules a microtask; tick()
     // flushes Svelte's scheduler, one Promise.resolve() per await inside
-    // the for-await loop. Three chunks → three settle rounds.
+    // the for-await loop. Three chunks → three settle rounds. NOT
+    // flushSvelte() — that's the fake-timer advance, this is bare
+    // microtask-drain (no vi.useFakeTimers() in this describe).
     for (let i = 0; i < 4; i++) {
       await tick();
       await Promise.resolve();

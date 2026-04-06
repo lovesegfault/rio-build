@@ -4,30 +4,25 @@
 // threshold.
 import { timestampFromMs } from '@bufbuild/protobuf/wkt';
 import { render, screen } from '@testing-library/svelte';
-import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  adminMock,
+  flushSvelte,
+  setupStandardBeforeEach,
+  teardownStandardAfterEach,
+} from '../../test-support/admin-mock';
 
-const { listWorkers } = vi.hoisted(() => ({ listWorkers: vi.fn() }));
-// DrainButton pulls admin.drainWorker — include a stub so the full-page
-// render doesn't crash on the missing method.
-vi.mock('../../api/admin', () => ({
-  admin: { listWorkers, drainWorker: vi.fn() },
-}));
+vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
 import Workers from '../Workers.svelte';
 
+const { listWorkers } = adminMock;
+
 describe('Workers page', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    // Fix "now" so ageMs is deterministic. 2026-01-01T00:01:00Z.
-    vi.setSystemTime(new Date('2026-01-01T00:01:00Z'));
-    vi.stubGlobal('confirm', vi.fn(() => true));
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    listWorkers.mockReset();
-    vi.useRealTimers();
-  });
+  // Fixed "now" = 2026-01-01T00:01:00Z (setupStandardBeforeEach default)
+  // so ageMs is deterministic against the heartbeat fixture timestamps.
+  beforeEach(() => setupStandardBeforeEach());
+  afterEach(teardownStandardAfterEach);
 
   function mkWorker(id: string, status: string, ageSeconds: number) {
     const now = Date.now();
@@ -49,8 +44,7 @@ describe('Workers page', () => {
     });
 
     render(Workers);
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     const table = screen.getByTestId('workers-table');
     expect(table).toHaveTextContent('w-fresh');
@@ -66,8 +60,7 @@ describe('Workers page', () => {
     });
 
     render(Workers);
-    await tick();
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     const cells = screen.getAllByTestId('heartbeat-cell');
     // First row (5s ago) — not stale.

@@ -6,14 +6,16 @@
 import { render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  adminMock,
+  flushSvelte,
+  setupStandardBeforeEach,
+  teardownStandardAfterEach,
+  toastMock,
+} from '../../test-support/admin-mock';
 
-const { drainWorker } = vi.hoisted(() => ({ drainWorker: vi.fn() }));
-vi.mock('../../api/admin', () => ({ admin: { drainWorker } }));
-
-const { toast } = vi.hoisted(() => ({
-  toast: { info: vi.fn(), error: vi.fn() },
-}));
-vi.mock('../../lib/toast', () => ({ toast }));
+vi.mock('../../api/admin', () => ({ admin: adminMock }));
+vi.mock('../../lib/toast', () => ({ toast: toastMock }));
 
 import DrainHarness, {
   getWorkers,
@@ -21,21 +23,11 @@ import DrainHarness, {
   setSeed,
 } from './DrainHarness.svelte';
 
-describe('DrainButton', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    // jsdom's confirm() is a real prompt; stub it to auto-accept so the
-    // click path proceeds past the guard.
-    vi.stubGlobal('confirm', vi.fn(() => true));
-  });
+const { drainWorker } = adminMock;
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    drainWorker.mockReset();
-    toast.info.mockReset();
-    toast.error.mockReset();
-    vi.useRealTimers();
-  });
+describe('DrainButton', () => {
+  beforeEach(() => setupStandardBeforeEach());
+  afterEach(teardownStandardAfterEach);
 
   function workers() {
     return [
@@ -64,7 +56,7 @@ describe('DrainButton', () => {
 
     // Resolve → status stays.
     resolve({ accepted: true, runningBuilds: 0 });
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('draining');
     // Other rows untouched.
     expect(screen.getByTestId('status-w-2')).toHaveTextContent('alive');
@@ -81,7 +73,7 @@ describe('DrainButton', () => {
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('draining');
 
     reject(new Error('scheduler 503'));
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('alive');
   });
 
@@ -132,7 +124,7 @@ describe('DrainButton', () => {
     ]);
 
     reject(new Error('scheduler 503'));
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     // Revert lands on w-target (idx=0 NOW), not w-c (stale idx=1).
     const ws = getWorkers();
@@ -158,11 +150,11 @@ describe('DrainButton', () => {
     // would hit `workers[0].status = ...` on undefined → TypeError.
     reassign([]);
     reject(new Error('already dead'));
-    await vi.advanceTimersByTimeAsync(0);
+    await flushSvelte();
 
     // No throw (findIndex→-1→no-op); toast.error still fires.
     expect(getWorkers()).toHaveLength(0);
-    expect(toast.error).toHaveBeenCalledWith(
+    expect(toastMock.error).toHaveBeenCalledWith(
       expect.stringContaining('w-gone'),
     );
   });
