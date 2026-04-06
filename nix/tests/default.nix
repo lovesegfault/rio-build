@@ -51,6 +51,7 @@ let
   leader-election = import ./scenarios/leader-election.nix;
   cli = import ./scenarios/cli.nix;
   fod-proxy = import ./scenarios/fod-proxy.nix;
+  netpol = import ./scenarios/netpol.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # Shared fixture for both scheduling splits — identical VM topology.
@@ -346,6 +347,21 @@ in
         "fodProxy.allowedDomains[0]" = "k3s-server";
       };
       extraImages = [ dockerImages.fod-proxy ];
+    };
+  };
+
+  # Worker egress NetworkPolicy: IMDS + public internet + k8s API all
+  # blocked. networkPolicy.enabled via extraValues (--set-string "true"
+  # is truthy for `{{ if }}` — same quirk as fodProxy.enabled above).
+  # vmtest-full.yaml defaults it to false; the override renders
+  # networkpolicy.yaml → rio-worker-egress into 02-workloads.yaml.
+  # Stock k3s kube-router enforces (P0220) — no Calico preload.
+  vm-netpol-k3s = netpol {
+    inherit pkgs common;
+    fixture = k3sFull {
+      extraValues = {
+        "networkPolicy.enabled" = "true";
+      };
     };
   };
 }
