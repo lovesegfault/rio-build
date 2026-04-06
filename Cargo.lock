@@ -6352,6 +6352,7 @@ dependencies = [
  "governor",
  "hex",
  "metrics",
+ "rand 0.9.2",
  "regex",
  "rio-common",
  "rio-nix",

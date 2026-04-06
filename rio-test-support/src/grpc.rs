@@ -51,6 +51,11 @@ pub struct MockStore {
     pub put_calls: Arc<RwLock<Vec<types::PathInfo>>>,
     /// If > 0, put_path decrements and returns Unavailable. For retry tests.
     pub fail_next_puts: Arc<AtomicU32>,
+    /// If > 0, put_path decrements and returns `Aborted("concurrent
+    /// PutPath in progress for this path; retry")` — matching the real
+    /// store's placeholder-contention response (`put_path.rs`). For
+    /// gateway I-068 retry tests.
+    pub abort_next_puts: Arc<AtomicU32>,
     /// If true, find_missing_paths returns Unavailable. For scheduler
     /// cache-check error-path tests.
     pub fail_find_missing: Arc<AtomicBool>,
@@ -108,6 +113,7 @@ impl Default for MockStore {
             paths: Arc::default(),
             put_calls: Arc::default(),
             fail_next_puts: Arc::default(),
+            abort_next_puts: Arc::default(),
             fail_find_missing: Arc::default(),
             fail_query_path_info: Arc::default(),
             fail_get_path: Arc::default(),
@@ -174,6 +180,17 @@ impl StoreService for MockStore {
             .is_ok()
         {
             return Err(Status::unavailable("mock: injected put failure"));
+        }
+        if self
+            .abort_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::aborted(
+                "concurrent PutPath in progress for this path; retry",
+            ));
         }
         let mut stream = request.into_inner();
         let first = stream
