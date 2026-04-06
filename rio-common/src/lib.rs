@@ -10,6 +10,7 @@ pub mod config;
 pub mod grpc;
 pub mod hmac;
 pub mod jwt;
+pub mod jwt_interceptor;
 pub mod limits;
 pub mod newtype;
 pub mod observability;

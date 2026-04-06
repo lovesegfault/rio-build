@@ -16,7 +16,7 @@ Each SSH connection is associated with exactly one tenant. See [`gw.auth.tenant-
 
 ### Signed Tenant Tokens
 
-> **Scheduled:** JWT token flow → [P0257](../.claude/work/plan-0257-jwt-lib-claims-sign-verify.md) (lib) + [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md) (issuance) + [P0259](../.claude/work/plan-0259-jwt-verify-middleware.md) (verify) + [P0260](../.claude/work/plan-0260-jwt-dual-mode-k8s-sighup.md) (dual-mode). Until the spine lands: `tenant_id` is an empty string in all gRPC metadata.
+> **Landed:** JWT token flow spine is complete — [P0257](../.claude/work/plan-0257-jwt-lib-claims-sign-verify.md) (lib) + [P0258](../.claude/work/plan-0258-jwt-issuance-gateway.md) (issuance) + [P0259](../.claude/work/plan-0259-jwt-verify-middleware.md) (verify middleware + jti revocation). K8s ConfigMap mount + SIGHUP hot-swap remain scheduled at [P0260](../.claude/work/plan-0260-jwt-dual-mode-k8s-sighup.md) — until then, the pubkey is `None` in scheduler/store `main.rs` and the interceptor is inert.
 
 Tenant identity is cryptographically bound using signed JWT tokens rather than plain gRPC metadata:
 

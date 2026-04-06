@@ -674,6 +674,25 @@ async fn main() -> anyhow::Result<()> {
         builder = builder.tls_config(tls)?;
     }
     builder
+        // r[impl gw.jwt.verify] — JWT tenant-token verify layer.
+        //
+        // `None` → interceptor is inert (pass-through on every call).
+        // Installed unconditionally so the builder type stays stable
+        // across the None/Some branch — no `InterceptedService<_, F>`
+        // vs plain server type divergence.
+        //
+        // Permissive-on-absent: health/worker/admin callers don't set
+        // x-rio-tenant-token → pass-through. Only the gateway sets it;
+        // only gateway-originated calls get verified. See the module
+        // docs in rio-common for the coexistence table.
+        //
+        // TODO(P0260): load VerifyingKey from ConfigMap mount, wrap in
+        // Arc<RwLock>, wire SIGHUP handler to hot-swap. Until then JWT
+        // verify is dormant — gateway's x-rio-tenant-token header (if
+        // sent) passes through unverified, Claims never attached.
+        .layer(tonic::service::InterceptorLayer::new(
+            rio_common::jwt_interceptor::jwt_interceptor(None),
+        ))
         .add_service(health_service)
         .add_service(
             SchedulerServiceServer::new(grpc_service.clone())

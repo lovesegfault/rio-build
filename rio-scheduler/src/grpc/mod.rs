@@ -359,6 +359,23 @@ impl SchedulerService for SchedulerGrpc {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
+
+        // Grab JWT Claims BEFORE into_inner() consumes the request.
+        // Extensions are part of the Request wrapper, not the proto
+        // body — into_inner() drops them. Clone is cheap: Claims is
+        // 4 fields (Uuid + 2×i64 + short String).
+        //
+        // `None` is the common path: dev mode (no pubkey configured),
+        // dual-mode fallback (gateway in SSH-comment mode, no header),
+        // or VM tests (no interceptor in test harness). `Some` only
+        // when the gateway is in JWT mode AND set the header AND the
+        // interceptor verified it — i.e., we have a cryptographically
+        // attested jti to check against the revocation table.
+        let jwt_claims = request
+            .extensions()
+            .get::<rio_common::jwt::Claims>()
+            .cloned();
+
         let req = request.into_inner();
 
         // Check backpressure before sending to actor
@@ -451,6 +468,54 @@ impl SchedulerService for SchedulerGrpc {
             })?;
             resolve_tenant_name(pool, tenant_name).await?
         };
+
+        // r[impl gw.jwt.verify] — scheduler-side jti revocation check.
+        //
+        // Gateway stays PG-free (stateless N-replica HA); the scheduler
+        // already has the pool open for tenant resolve above, so the
+        // revocation lookup piggybacks here. Store does NOT duplicate
+        // this — SubmitBuild is the ingress choke point for builds;
+        // everything downstream trusts that the scheduler validated.
+        //
+        // `jti` is read from the interceptor-attached Claims extension,
+        // NOT from a proto body field. The gateway never constructs
+        // `SubmitBuildRequest.jwt_jti` — that field does not exist.
+        // Zero wire redundancy: the jti travels once (inside the JWT),
+        // is parsed once (by the interceptor), and is read once (here).
+        // See r[gw.jwt.issue] for the mint-side story.
+        //
+        // Revoked → UNAUTHENTICATED, same code as a bad signature or
+        // expired token. From the client's perspective "your token is
+        // no longer valid" is one failure mode regardless of WHY.
+        //
+        // No-Claims (dev/dual-mode) → skip. Can't revoke what wasn't
+        // presented. In JWT mode, Claims are ALWAYS present by the
+        // time we get here: the interceptor either attached them or
+        // returned UNAUTHENTICATED upstream, never a third state.
+        if let Some(claims) = &jwt_claims {
+            // Same pool-presence gate as tenant resolve. If pool is
+            // None AND Claims are Some, something is misconfigured
+            // (JWT mode requires PG for revocation); fail loud.
+            let pool = self.pool.as_ref().ok_or_else(|| {
+                Status::failed_precondition(
+                    "jti revocation check requires database connection \
+                     (JWT mode enabled but scheduler pool is None)",
+                )
+            })?;
+            // EXISTS — short-circuits at first match, no row data
+            // transferred. PK index on jti makes this O(log n). The
+            // table is small (revocations are rare events) so this
+            // is ~1 index page hit.
+            let revoked: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jwt_revoked WHERE jti = $1)")
+                    .bind(&claims.jti)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| Status::internal(format!("jti revocation lookup failed: {e}")))?;
+            if revoked {
+                return Err(Status::unauthenticated("token revoked"));
+            }
+        }
 
         // Capture the current span's traceparent BEFORE sending to the
         // actor. Span context does not cross the mpsc channel boundary;
