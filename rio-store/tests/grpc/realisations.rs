@@ -21,6 +21,7 @@ async fn content_lookup_invalid_hash_length() -> TestResult {
         .client
         .content_lookup(ContentLookupRequest {
             content_hash: vec![0xAA; 16], // != 32
+            exclude_store_path: String::new(),
         })
         .await
         .expect_err("short hash → invalid");
@@ -38,6 +39,7 @@ async fn content_lookup_not_found_returns_empty_path() -> TestResult {
         .client
         .content_lookup(ContentLookupRequest {
             content_hash: vec![0xFF; 32],
+            exclude_store_path: String::new(),
         })
         .await?
         .into_inner();
@@ -65,6 +67,7 @@ async fn content_lookup_found_after_put_path() -> TestResult {
         .client
         .content_lookup(ContentLookupRequest {
             content_hash: nar_hash.to_vec(),
+            exclude_store_path: String::new(),
         })
         .await?
         .into_inner();

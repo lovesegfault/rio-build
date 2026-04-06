@@ -591,7 +591,15 @@ impl StoreService for StoreServiceImpl {
             )));
         }
 
-        match crate::content_index::lookup(&self.pool, &req.content_hash).await {
+        // Self-exclusion (store.content.self-exclude): empty string →
+        // None (proto3 has no optional-string, empty is the sentinel).
+        let exclude = if req.exclude_store_path.is_empty() {
+            None
+        } else {
+            Some(req.exclude_store_path.as_str())
+        };
+
+        match crate::content_index::lookup(&self.pool, &req.content_hash, exclude).await {
             Ok(Some(info)) => Ok(Response::new(ContentLookupResponse {
                 store_path: info.store_path.to_string(),
                 info: Some(info.into()),

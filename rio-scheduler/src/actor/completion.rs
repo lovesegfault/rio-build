@@ -415,6 +415,15 @@ impl DagActor {
                 }
                 let mut req = tonic::Request::new(rio_proto::types::ContentLookupRequest {
                     content_hash: output.output_hash.clone(),
+                    // Self-exclusion (store.content.self-exclude):
+                    // PutPath already wrote (output_hash, output_path)
+                    // into content_index before BuildComplete fired.
+                    // Without this, the lookup matches THIS build's
+                    // own upload → ca_output_unchanged=true on every
+                    // first-ever build → P0252 cascade skips
+                    // downstream that was NEVER built. Pass output_path
+                    // so the query answers "seen in a DIFFERENT path?"
+                    exclude_store_path: output.output_path.clone(),
                 });
                 rio_proto::interceptor::inject_current(req.metadata_mut());
                 let matched = match tokio::time::timeout(

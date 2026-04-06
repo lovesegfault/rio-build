@@ -421,6 +421,7 @@ async fn gt13_batch_content_lookup_finds_outputs() -> TestResult {
         let lookup = client
             .content_lookup(ContentLookupRequest {
                 content_hash: hash.to_vec(),
+                exclude_store_path: String::new(),
             })
             .await?
             .into_inner();

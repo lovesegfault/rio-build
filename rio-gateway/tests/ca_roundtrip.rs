@@ -139,6 +139,7 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
         .store_client
         .content_lookup(rio_proto::types::ContentLookupRequest {
             content_hash: nar_hash.to_vec(),
+            exclude_store_path: String::new(),
         })
         .await?
         .into_inner();
@@ -163,6 +164,7 @@ async fn test_content_lookup_miss_returns_empty() -> anyhow::Result<()> {
     let resp = store_client
         .content_lookup(rio_proto::types::ContentLookupRequest {
             content_hash: vec![0xffu8; 32],
+            exclude_store_path: String::new(),
         })
         .await?
         .into_inner();

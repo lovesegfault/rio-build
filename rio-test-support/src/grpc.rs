@@ -428,14 +428,23 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::ContentLookupRequest>,
     ) -> Result<Response<types::ContentLookupResponse>, Status> {
-        let content_hash = request.into_inner().content_hash;
+        let req = request.into_inner();
         // Scan stored paths for a nar_hash match. O(n) is fine for a
         // mock; real store has a PG index. First match wins (same
         // semantics as the real LIMIT 1 — multiple paths with same
         // content are all correct answers).
+        //
+        // Respects exclude_store_path (store.content.self-exclude):
+        // skip rows whose store_path equals the exclude. Empty
+        // exclude = no filter (proto3 empty-string sentinel). The
+        // real store's PG query has `AND n.store_path != $2`; this
+        // mirrors it so scheduler CA-compare tests can assert
+        // first-build → miss, second-build → match.
         let paths = self.paths.read().unwrap();
         for (store_path, (info, _nar)) in paths.iter() {
-            if info.nar_hash == content_hash {
+            if info.nar_hash == req.content_hash
+                && (req.exclude_store_path.is_empty() || store_path != &req.exclude_store_path)
+            {
                 return Ok(Response::new(types::ContentLookupResponse {
                     store_path: store_path.clone(),
                     info: Some(info.clone()),
