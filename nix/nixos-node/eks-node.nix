@@ -168,6 +168,19 @@ in
     environment.etc = {
       "cni/net.d/.keep".text = "";
       "containerd/config.d/10-rio.toml".source = containerdDropIn;
+      # kubelet defaults registryPullQPS=5, registryBurst=10. Ephemeral
+      # builders spawn in waves (hundreds on a fresh node within
+      # seconds); each pod's IfNotPresent check triggers a manifest
+      # pull (small — ~2 KB; layer blobs are prebake-warm). 5/s →
+      # `pull QPS exceeded` → ErrImagePull → ImagePullBackOff. ECR's
+      # own limit is 20 TPS/account/region for GetDownloadUrlForLayer,
+      # 1000 TPS for BatchGetImage — 50/100 here is well under.
+      "kubernetes/kubelet/config.json.d/20-rio-registry-qps.conf".text = builtins.toJSON {
+        apiVersion = "kubelet.config.k8s.io/v1beta1";
+        kind = "KubeletConfiguration";
+        registryPullQPS = 50;
+        registryBurst = 100;
+      };
     };
 
     # ── networking: systemd-networkd (AL2023 parity), not dhcpcd ──────
