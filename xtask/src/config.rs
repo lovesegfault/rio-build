@@ -41,8 +41,18 @@ pub struct XtaskConfig {
 fn default_tfstate_region() -> String {
     "us-east-2".into()
 }
+
+/// `RUST_LOG` directive: info baseline, debug for rio crates only.
+///
+/// EKS stress testing (I-003) found that a bare `"debug"` captures h2
+/// frame-by-frame, rustls handshakes, hyper connection pool churn, sqlx
+/// per-query, and kube-client per-request — thousands of lines per second
+/// under load, burying the actual rio signal. This directive keeps those
+/// infra crates at info while giving full debug visibility into rio code.
+pub const RIO_DEBUG: &str = "info,rio_gateway=debug,rio_scheduler=debug,rio_store=debug,rio_builder=debug,rio_controller=debug,rio_common=debug,rio_nix=debug,rio_proto=debug,rio_crds=debug";
+
 fn default_log_level() -> String {
-    "debug".into()
+    RIO_DEBUG.into()
 }
 
 impl XtaskConfig {
