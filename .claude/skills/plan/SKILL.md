@@ -76,16 +76,16 @@ Agent(
 )
 ```
 
-## 6. Record + truncate sink
+## 6. Record launch
 
-Append a `role=writer` row via `onibus state agent-row`. Then truncate the sink (writer has the data now):
+Append a `role=writer` row via `onibus state agent-row`:
 
 ```bash
 .claude/bin/onibus state agent-row \
   '{"plan":"docs-<runid>","role":"writer","agent_id":"<id>","worktree":"/root/src/rio-build/docs-<runid>","status":"running","note":"runid <runid>"}'
-
-: > .claude/state/followups-pending.jsonl  # default mode only — skip for --inline
 ```
+
+**Do NOT truncate the sink yet.** The prompt says "read the full sink" but if we truncate here the sink is already empty by the time the planner reads it (race: writer was launched with a rendered table, but the jsonl itself is the durable record). Truncation moves to step 7c — after the rows are durably captured in a commit. If QA bounces, the followups are still available for the next run.
 
 Note in your report: **agent types need a session restart to pick up.** If `rio-planner` is freshly added, the launch will fail with "unknown subagent_type" — restart the session first. Skills (this file) live-reload; agent defs don't.
 
@@ -126,3 +126,13 @@ Append `role=qa` row via `onibus state agent-row`.
 | WARN | Coordinator judgment: merge-anyway (terse batch task) or bounce-to-planner (complex feature, needs more prose). |
 
 A malformed doc that enters `dag.jsonl` wastes an implementer's time. The precondition catches bad `PlanFile.path`, missing deps, `r[plan.*]` pollution; the reviewer catches vague criteria and thin prose.
+
+### 7c. Truncate sink (post-merge — default mode only)
+
+Now that the rows are durably captured in a merged commit, truncate the sink:
+
+```bash
+: > .claude/state/followups-pending.jsonl  # default mode only — skip for --inline
+```
+
+If QA FAILed and you abandoned the run: **leave the sink alone** — the next `/plan` invocation re-renders the same followups. Nothing lost.

@@ -528,6 +528,38 @@ def test_behind_check_zero_when_current(tmp_repo: Path, monkeypatch):
     assert r.trivial_rebase is False  # not behind → not a trivial REBASE, just current
 
 
+def test_behind_check_no_phantom_self_collision(tmp_repo: Path, monkeypatch):
+    """P0306 T1 regression: 2-dot `diff HEAD..TGT` is tree-vs-tree — includes
+    OUR changes as 'undo', so `mine & theirs` always contains `mine`. 3-dot
+    `diff HEAD...TGT` (merge-base→TGT) is what TGT actually changed.
+
+    Distinct from test_behind_check_trivial_when_no_overlap: that test's
+    identical file contents trigger git rename detection (a.rs→b.rs rename,
+    --name-only shows only dest), which masks the 2-dot bug. Here file_a and
+    file_b have DIFFERENT content — no rename heuristic — proves the 3-dot fix."""
+    import onibus.git_ops
+    from onibus import INTEGRATION_BRANCH
+    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    # pX touches file_a (unique content); TGT advances with file_b (different unique
+    # content). No genuine overlap; no rename possibility.
+    _git(tmp_repo, "checkout", "-b", "pX")
+    (tmp_repo / "file_a").write_text("content unique to branch pX\n" * 3)
+    _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(x): a", "--no-verify")
+    _git(tmp_repo, "checkout", INTEGRATION_BRANCH)
+    (tmp_repo / "file_b").write_text("entirely different TGT content\n" * 5)
+    _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(y): b", "--no-verify")
+    _git(tmp_repo, "checkout", "pX")
+    r = onibus.git_ops.behind_check(tmp_repo)
+    assert r.behind == 1
+    # Before fix: file_collision == ["file_a"] (2-dot tree diff shows file_a
+    # as "deleted" going HEAD→TGT; intersected with mine={file_a} → phantom).
+    assert r.file_collision == [], (
+        f"phantom self-collision: {r.file_collision!r} — 2-dot theirs-side "
+        "includes our own changes as undo direction"
+    )
+    assert r.trivial_rebase is True
+
+
 # ─── cadence / lock-status / agent-start ─────────────────────────────────────
 
 
@@ -560,22 +592,189 @@ def test_cadence_zero_count_not_due(tmp_path: Path, monkeypatch):
     assert not r.consolidator.due  # 0 is not a cadence trigger
 
 
+def test_count_bump_records_merge_sha(tmp_repo: Path, monkeypatch):
+    """P0306 T5: count_bump() appends {mc, sha, ts} to merge-shas.jsonl.
+    This is the mc→SHA map _cadence_range indexes against. One row per merge;
+    append-only; last-row-wins for a given mc (handles set_to re-writes)."""
+    import json as _json
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    n = onibus.merge.count_bump()
+    assert n == 1
+    sha_file = state / "merge-shas.jsonl"
+    assert sha_file.exists(), "merge-shas.jsonl must be created on first bump"
+    rows = [_json.loads(line) for line in sha_file.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["mc"] == 1
+    assert rows[0]["sha"] == _git(tmp_repo, "rev-parse", INTEGRATION_BRANCH)
+    assert "ts" in rows[0]
+
+
+def test_cadence_range_indexes_by_merge_count(tmp_repo: Path, monkeypatch):
+    """P0306 T5: _cadence_range counts MERGES, not COMMITS. Merges are ff
+    (no merge commit) so each plan lands as N first-parent commits. At mc=14
+    this sprint: 7 plans since mc=7 spanned 33 commits, but commit-indexed
+    `git log -8` returned a 7-commit window — bughunter audited a rio-*/src
+    diff of zero lines, missed P0294 (-2821 LoC), P0290, P0276, P0215 entirely.
+
+    Fixture: 3 "plan merges" of 1/5/2 commits. _cadence_range(2) must span
+    mc=2..3 = 7 commits (plan B + plan C), NOT the last 3 commits (which
+    would miss most of plan B)."""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+
+    # Simulate 3 plan merges with 1, 5, 2 commits each. count_bump AFTER each
+    # batch (as merger does post-ff). Plan B is the bug trigger: multi-commit.
+    for mc, n_commits in [(1, 1), (2, 5), (3, 2)]:
+        for i in range(n_commits):
+            (tmp_repo / f"m{mc}_c{i}").write_text(f"merge {mc} commit {i}")
+            _git(tmp_repo, "add", "-A")
+            _git(tmp_repo, "commit", "-m", f"feat(x): m{mc} c{i}", "--no-verify")
+        onibus.merge.count_bump()  # records tip SHA at this mc
+
+    rng = onibus.merge._cadence_range(2)
+    assert rng is not None
+    # Both ends are pinned SHAs (no branch name — deterministic).
+    assert INTEGRATION_BRANCH not in rng
+    start, end = rng.split("..")
+    assert len(start) == 40 and len(end) == 40
+    # THE proof: 7 commits (plan B's 5 + plan C's 2), not 3 (commit-indexed).
+    count = _git(tmp_repo, "rev-list", "--count", rng)
+    assert count == "7", (
+        f"expected 7 commits (plan B=5 + plan C=2), got {count}. "
+        "Commit-indexed git log -(W+1) would return ~3 — missing most of plan B."
+    )
+    # Range stays stable even if branch advances afterward (pinned, not live ref).
+    (tmp_repo / "post").write_text("x")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "feat(x): post", "--no-verify")
+    assert _git(tmp_repo, "rev-list", "--count", rng) == "7"
+
+
+def test_cadence_range_none_when_insufficient_history(tmp_repo: Path, monkeypatch):
+    """Returns None until `window` merges accumulate post-fix. merge-shas.jsonl
+    has no rows for pre-P0306 history — one cadence cycle lost (bootstrap cost)."""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    # No sha file yet.
+    assert onibus.merge._cadence_range(5) is None
+    # Only 2 merges recorded; window=5 needs mc=current-5 which doesn't exist.
+    onibus.merge.count_bump()
+    onibus.merge.count_bump()
+    assert onibus.merge._cadence_range(5) is None
+    # window=1 DOES work now: start_mc = 2-1 = 1, both in map.
+    assert onibus.merge._cadence_range(1) is not None
+
+
+def test_cadence_range_last_row_wins_for_same_mc(tmp_repo: Path, monkeypatch):
+    """set_to re-writes can record the same mc twice (e.g., count-bump --set-to N
+    after a reset). Last row wins — the map is a dict rebuilt from jsonl order."""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    state = tmp_repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_repo)
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
+    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    onibus.merge.count_bump()  # mc=1, tip=initial
+    # Advance branch, then re-record mc=1 via set_to.
+    (tmp_repo / "x").write_text("x")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "feat(x): x", "--no-verify")
+    new_tip = _git(tmp_repo, "rev-parse", INTEGRATION_BRANCH)
+    onibus.merge.count_bump(set_to=1)  # same mc, different sha
+    onibus.merge.count_bump()  # mc=2
+    rng = onibus.merge._cadence_range(1)
+    assert rng is not None
+    start, _ = rng.split("..")
+    assert start == new_tip, "last row for mc=1 should win, not the first"
+
+
 def test_lock_status_ff_landed_when_tgt_moved(tmp_repo: Path, monkeypatch):
     """stale lock + $TGT moved since acquire → ff_landed=True."""
+    import json
+    from datetime import datetime, timedelta, timezone
     import onibus.merge
     state = tmp_repo / ".claude" / "state"
     state.mkdir(parents=True)
     monkeypatch.setattr(onibus.merge, "_LOCK_FILE", state / "merger.lock")
     monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", "HEAD")
-    import json
-    # Dead PID + stale main_at_acquire
+    # Aged past _LEASE_SECS + stale main_at_acquire
+    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
     (state / "merger.lock").write_text(json.dumps({
-        "pid": 999999, "agent_id": "x", "plan": "P1",
-        "main_at_acquire": "0000000", "acquired_at": "2026-01-01T00:00:00",
+        "agent_id": "x", "plan": "P1",
+        "main_at_acquire": "0000000", "acquired_at": old,
     }))
     r = onibus.merge.lock_status()
     assert r.held and r.stale
     assert r.ff_landed is True  # current HEAD != "0000000"
+
+
+def test_lock_stale_after_lease(tmp_path: Path, monkeypatch):
+    """P0306 T2: stale is time-lease (age > _LEASE_SECS), not PID-liveness.
+    PID of the fire-and-forget `onibus merge lock` subprocess is always dead
+    by the time anyone checks — false-positive stale on every merge."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    import onibus.merge
+    monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
+    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+    (tmp_path / "merger.lock").write_text(json.dumps({
+        "agent_id": "x", "plan": "P1",
+        "acquired_at": old, "main_at_acquire": "deadbee",
+    }))
+    r = onibus.merge.lock_status()
+    assert r.held is True
+    assert r.stale is True  # 31min > 30min lease
+
+
+def test_lock_fresh(tmp_path: Path, monkeypatch):
+    """P0306 T2: lock acquired 1min ago → NOT stale. Under the old PID check
+    this would have been stale=True (subprocess already exited)."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    import onibus.merge
+    monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    (tmp_path / "merger.lock").write_text(json.dumps({
+        "agent_id": "x", "plan": "P1",
+        "acquired_at": recent, "main_at_acquire": "deadbee",
+    }))
+    r = onibus.merge.lock_status()
+    assert r.held is True
+    assert r.stale is False  # 1min << 30min lease
+    assert r.ff_landed is None  # only computed when stale
+
+
+def test_lock_status_tolerates_naive_timestamp(tmp_path: Path, monkeypatch):
+    """Pre-T2 lock files stored naive timestamps. _lock_age_secs assumes UTC
+    rather than crashing on offset-naive/offset-aware subtraction."""
+    import json
+    import onibus.merge
+    monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
+    (tmp_path / "merger.lock").write_text(json.dumps({
+        "agent_id": "x", "plan": "P1",
+        "acquired_at": "2026-01-01T00:00:00",  # no +00:00 suffix
+        "main_at_acquire": "deadbee",
+    }))
+    r = onibus.merge.lock_status()  # must not raise TypeError
+    assert r.held is True
+    assert r.stale is True  # months old
 
 
 def test_agent_start_derives_worktree(tmp_path: Path, monkeypatch):

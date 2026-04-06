@@ -1,15 +1,17 @@
 """Merge machinery — lock, atomicity check, placeholder rename.
 
 Lock is kernel-atomic open(O_CREAT|O_EXCL), not flock() — the CLI exits
-immediately so an fd-held lock would release. Coordinator failed
-serialize-mergers discipline three times (P119/P0201, P0085/nbr-redesign,
-P0118/P0210). Prose constraint → mechanism.
+immediately so an fd-held lock would release. Staleness is time-lease
+(acquired_at age > _LEASE_SECS), not PID-liveness: the CLI subprocess
+that writes the lock exits immediately, so its PID is always dead by the
+time anyone checks. Coordinator failed serialize-mergers discipline three
+times (P119/P0201, P0085/nbr-redesign, P0118/P0210). Prose constraint →
+mechanism.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -47,11 +49,25 @@ from onibus.plan_doc import find_plan_doc, plan_doc_t_count
 
 _LOCK_FILE = STATE_DIR / "merger.lock"
 
+# Staleness threshold. The merge itself is ~10min (rebase + ff + .#ci cache-hit
+# re-validate); .#coverage-full is backgrounded so doesn't count against lease.
+# PID-liveness was the wrong mechanism: the `onibus merge lock` subprocess exits
+# immediately after writing the file (fire-and-forget CLI), so os.kill(pid, 0)
+# was always ProcessLookupError → stale=True → POISONED on every merge.
+_LEASE_SECS = 30 * 60
+
+
+def _lock_age_secs(content: dict) -> float:
+    acquired = datetime.fromisoformat(content["acquired_at"])
+    if acquired.tzinfo is None:
+        # Tolerate pre-T2 lock files with naive timestamps.
+        acquired = acquired.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - acquired).total_seconds()
+
 
 def lock(plan: str, agent_id: str) -> None:
     """Exit 0 with lock JSON on stdout; exit 4 with holder JSON on stderr if held."""
     content = {
-        "pid": os.getpid(),
         "agent_id": agent_id,
         "plan": plan,
         "acquired_at": datetime.now(timezone.utc).isoformat(),
@@ -68,13 +84,10 @@ def lock(plan: str, agent_id: str) -> None:
         sys.exit(0)
     except FileExistsError:
         existing = json.loads(_LOCK_FILE.read_text())
-        try:
-            os.kill(existing["pid"], 0)
-            alive = True
-        except (ProcessLookupError, PermissionError):
-            alive = False
+        age_s = _lock_age_secs(existing)
+        stale = age_s > _LEASE_SECS
         print(
-            json.dumps({"error": "lock-held", "holder": existing, "holder_alive": alive}),
+            json.dumps({"error": "lock-held", "holder": existing, "age_secs": age_s, "stale": stale}),
             file=sys.stderr,
         )
         sys.exit(4)
@@ -85,30 +98,36 @@ def unlock() -> None:
 
 
 def lock_status() -> LockStatus:
-    """stale = lock exists but holder PID dead → merger crashed mid-run.
+    """stale = lock age > _LEASE_SECS → merger crashed mid-run (or hung).
     ff_landed = comparison of content.main_at_acquire vs current $TGT —
     was prose-duplicated in dag-tick:23, dag-run:47, merger:41."""
     if not _LOCK_FILE.exists():
         return LockStatus(held=False, stale=False, content=None)
     content = json.loads(_LOCK_FILE.read_text())
-    try:
-        os.kill(content["pid"], 0)
-        alive = True
-    except (ProcessLookupError, PermissionError):
-        alive = False
+    age_s = _lock_age_secs(content)
+    stale = age_s > _LEASE_SECS
     ff_landed = None
-    if not alive:
+    if stale:
         current = subprocess.run(
             ["git", "rev-parse", "--short", INTEGRATION_BRANCH],
             capture_output=True, text=True,
         ).stdout.strip()
         ff_landed = current != content.get("main_at_acquire")
-    return LockStatus(held=True, stale=not alive, content=content, ff_landed=ff_landed)
+    return LockStatus(held=True, stale=stale, content=content, ff_landed=ff_landed)
 
 
 def count_bump(set_to: int | None = None) -> int:
-    """Cadence counter: mod 5 → consolidator, mod 7 → bughunter."""
+    """Cadence counter: mod 5 → consolidator, mod 7 → bughunter.
+
+    Also records the integration-branch tip SHA at this merge-count to
+    merge-shas.jsonl — _cadence_range() indexes by merge-count, not
+    commit-count. Merges are fast-forward (no merge commit), so each plan
+    lands as N first-parent commits; counting commits structurally misses
+    multi-commit plans. At mc=14 this sprint: 7 plans since mc=7 spanned
+    33 commits, but commit-indexed `git log -8` returned a 7-commit
+    window — bughunter audited a rio-*/src diff of literally zero lines."""
     count_file = STATE_DIR / "merge-count.txt"
+    sha_file = STATE_DIR / "merge-shas.jsonl"
     if set_to is not None:
         new = set_to
     else:
@@ -116,18 +135,57 @@ def count_bump(set_to: int | None = None) -> int:
         new = cur + 1
     count_file.parent.mkdir(parents=True, exist_ok=True)
     count_file.write_text(f"{new}\n")
+    # Record tip at THIS merge-count. Append-only; _cadence_range reads the
+    # last row with mc == (current - window). git failure (no integration
+    # branch in this cwd) is silent — count still bumps, sha just not recorded.
+    tip = subprocess.run(
+        ["git", "rev-parse", INTEGRATION_BRANCH],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if tip:
+        with sha_file.open("a") as f:
+            f.write(json.dumps({
+                "mc": new, "sha": tip,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }) + "\n")
     return new
 
 
 def _cadence_range(window: int) -> str | None:
-    """git range for the last W merges. (W+1)th-from-tip is commit-before-window."""
-    out = subprocess.run(
-        ["git", "log", "--first-parent", "--format=%H", f"-{window + 1}", INTEGRATION_BRANCH],
-        capture_output=True, text=True,
-    ).stdout.strip().splitlines()
-    if len(out) < window + 1:
-        return None  # not enough history yet
-    return f"{out[-1]}..{INTEGRATION_BRANCH}"
+    """git range for the last `window` PLAN MERGES (not commits).
+
+    Reads merge-shas.jsonl: start = SHA recorded at (current_mc - window),
+    end = SHA at current_mc. Both pinned. No commit-counting — count_bump()
+    records the tip after each ff-merge, so the map indexes by merge, and
+    each range covers however many commits that plan contained.
+
+    `A..B` excludes A — correct here: by_mc[start_mc] is the tip AFTER merge
+    start_mc landed, which is the boundary we want (audit everything merged in
+    (start_mc, current_mc]).
+
+    Returns None until `window` merges accumulate post-P0306 (merge-shas.jsonl
+    has no rows for pre-fix history). One cadence cycle lost; simpler than
+    backfill. merge-shas.jsonl is append-only in state/ (gitignored) — survives
+    across sessions, not across fresh clones."""
+    sha_file = STATE_DIR / "merge-shas.jsonl"
+    count_file = STATE_DIR / "merge-count.txt"
+    if not sha_file.exists() or not count_file.exists():
+        return None
+    current_mc = int(count_file.read_text().strip())
+    start_mc = current_mc - window
+    if start_mc < 0:
+        return None
+    # Last row per mc wins (handles set_to re-writes — e.g., `count-bump --set-to N`
+    # after a reset can re-record the same mc with a different tip).
+    by_mc: dict[int, str] = {}
+    for line in sha_file.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        by_mc[row["mc"]] = row["sha"]
+    if start_mc not in by_mc or current_mc not in by_mc:
+        return None  # gap in the map (pre-P0306 history, or start_mc=0 never recorded)
+    return f"{by_mc[start_mc]}..{by_mc[current_mc]}"
 
 
 def cadence() -> CadenceReport:
