@@ -116,6 +116,13 @@ validation rejects `ephemeral: true` with `maxConcurrentBuilds > 1` at
 `kubectl apply` time; `build_job` defensively overrides `RIO_MAX_BUILDS`
 to `"1"` regardless of the spec value.
 
+r[ctrl.pool.bloom-knob]
+`WorkerPoolSpec.bloomExpectedItems` (optional) injects
+`RIO_BLOOM_EXPECTED_ITEMS` into the worker container env. Unset →
+worker uses its compile-time default (50k). Same only-inject-when-set
+semantics as `fuseThreads` and `daemonTimeoutSecs`: injecting the
+default would pin it at controller-build time, not worker-build time.
+
 ### WorkerPoolSet
 
 > **Implemented (Phase 4c):** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`), per-class autoscaling (`r[ctrl.wps.autoscale]`). CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md).

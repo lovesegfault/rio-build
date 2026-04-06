@@ -591,6 +591,10 @@ fn build_container(
             if let Some(s) = wp.spec.daemon_timeout_secs {
                 e.push(env("RIO_DAEMON_TIMEOUT_SECS", &s.to_string()));
             }
+            // r[impl ctrl.pool.bloom-knob]
+            if let Some(n) = wp.spec.bloom_expected_items {
+                e.push(env("RIO_BLOOM_EXPECTED_ITEMS", &n.to_string()));
+            }
             if wp.spec.tls_secret_name.is_some() {
                 // Paths match the volume mount below and cert-
                 // manager's standard Secret key names.

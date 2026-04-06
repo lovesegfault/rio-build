@@ -416,6 +416,7 @@ mod tests {
             max_concurrent_builds: 1,
             fuse_cache_size: "10Gi".into(),
             fuse_threads: None,
+            bloom_expected_items: None,
             fuse_passthrough: None,
             daemon_timeout_secs: None,
             features: vec![],

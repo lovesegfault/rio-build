@@ -182,7 +182,9 @@ has climbed past the configured 1% nonlinearly. Saturation causes scheduler
 locality scoring to silently degrade (`count_missing()` undercounts →
 `W_LOCALITY` term → 0) with NO direct symptom in existing metrics. The filter
 never shrinks (evicted paths stay as stale positives); only restart clears it.
-Operators bump `bloom_expected_items` in `worker.toml` for long-lived pools.
+Operators set `spec.bloomExpectedItems` on the WorkerPool (injects
+`RIO_BLOOM_EXPECTED_ITEMS`); the pod restart that applies the CRD edit also
+resets the filter.
 
 r[obs.metric.transfer-volume]
 
@@ -305,6 +307,7 @@ The scheduler sets `x-rio-trace-id` in `SubmitBuild` response metadata to its ha
 - **Error budget burn rate:** Alert when the error budget consumption rate exceeds 14.4x the allowed rate over 1h (fast burn) or 6x over 6h (slow burn), following the multi-window multi-burn-rate approach.
 - **Saturation alerts:** PostgreSQL connection pool utilization > 80%, S3 rate limiting (429 responses), worker queue depth exceeding 2x worker count.
 - **Absence alerts:** No worker heartbeat received for > ~50-60s (the scheduler's effective deregistration threshold: 30s staleness + 3-tick confirmation). Indicates a worker has silently died or lost network connectivity.
+- **Bloom saturation:** `rio_worker_bloom_fill_ratio >= 0.5` on any worker. FUSE cache bloom filter has crossed the FPR-degradation threshold — scheduler locality scoring is silently undercounting. Remediation: set `spec.bloomExpectedItems` on the WorkerPool (the pod restart that applies the spec edit also resets the filter).
 
 ## Structured Logging
 

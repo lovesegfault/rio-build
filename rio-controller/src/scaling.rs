@@ -1288,6 +1288,7 @@ mod tests {
             node_selector: None,
             tolerations: None,
             fuse_threads: None,
+            bloom_expected_items: None,
             fuse_passthrough: None,
             daemon_timeout_secs: None,
             termination_grace_period_seconds: None,
