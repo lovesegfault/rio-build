@@ -1,0 +1,86 @@
+{{- if .Values.dashboard.enabled }}
+{{- $ns := .Values.namespace.name -}}
+# r[impl dash.envoy.grpc-web-translate]
+#   (marker is documentary — tracey does not scan yaml; the r[verify]
+#    lives at nix/tests/default.nix which IS scanned)
+#
+# Envoy Gateway CRDs. Attaching a GRPCRoute to a listener triggers
+# grpc_web filter injection into that listener's HTTP filter chain —
+# an Envoy Gateway implementation detail (NOT in the Gateway API
+# spec itself). Verified at v1.7.1: when the IR listener has
+# IsHTTP2=true (set by GRPCRoute attachment,
+# internal/gatewayapi/route.go:1293-1295), the translator appends
+# xdsfilters.GRPCWeb + xdsfilters.GRPCStats to the HTTP filter chain
+# (internal/xds/translator/listener.go:424-425).
+#
+# SINGLE LISTENER on purpose — dodges upstream bug
+# envoyproxy/gateway#7559 where the grpc_web filter is silently
+# omitted when a GRPCRoute attaches to a non-first listener on a
+# multi-listener Gateway. The dashboard only needs one HTTP listener
+# anyway.
+---
+# Cluster-scoped: one GatewayClass shared by however many dashboard
+# Gateways exist. parametersRef → EnvoyProxy in our namespace (the
+# operator resolves namespaced parametersRef since v1.1.0). The
+# EnvoyProxy object itself lives in dashboard-gateway-tls.yaml so
+# backendTLS and provider settings stay together.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: rio-dashboard
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: rio-dashboard-proxy
+    namespace: {{ $ns }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: rio-dashboard
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  gatewayClassName: rio-dashboard
+  # Single listener — see #7559 comment at top. Port 8080 is non-
+  # privileged so the envoy container doesn't need CAP_NET_BIND_SERVICE
+  # (EnvoyProxy.spec.provider.kubernetes.useListenerPortAsContainerPort
+  # defaults to false → port-shift for privileged ports, but 8080 is
+  # already ephemeral-range so the shift is a no-op).
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 8080
+      allowedRoutes:
+        kinds:
+          - kind: GRPCRoute
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: rio-scheduler
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  parentRefs:
+    - name: rio-dashboard
+  rules:
+    # Match AdminService + SchedulerService — everything the dashboard
+    # calls (see docs/src/components/dashboard.md Key Views table).
+    # No method gating in MVP; a malicious browser client can call
+    # ClearPoison etc. — phase 5b adds per-method authz.
+    - matches:
+        - method:
+            service: rio.admin.AdminService
+        - method:
+            service: rio.scheduler.SchedulerService
+      backendRefs:
+        - name: rio-scheduler
+          port: 9001
+{{- end }}

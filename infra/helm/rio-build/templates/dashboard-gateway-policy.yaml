@@ -1,0 +1,65 @@
+{{- if .Values.dashboard.enabled }}
+{{- $ns := .Values.namespace.name -}}
+---
+# CORS: grpc-web clients (browser fetch) need the grpc-* response
+# headers exposed or connect-web can't read the trailer status. The
+# spec.cors.allowOrigins pattern is
+#   ^(\*|https?://(\*|(\*.)?(([\w-]+\.?)+)?[\w-]+)(:\d{1,5})?)$
+# — bare "*" is a valid single-token match.
+#
+# Permissive MVP — tighten allowOrigins to the dashboard's served
+# origin post-MVP (once P0274 lands the nginx Deployment and its
+# Service hostname is known).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: rio-dashboard-cors
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: rio-dashboard
+  cors:
+    allowOrigins:
+      - "*"
+    allowMethods:
+      - POST
+      - OPTIONS
+    allowHeaders:
+      - content-type
+      - x-grpc-web
+      - x-user-agent
+      - grpc-timeout
+    exposeHeaders:
+      - grpc-status
+      - grpc-message
+      - grpc-status-details-bin
+---
+# Streaming timeout: GetBuildLogs / WatchBuild are long-lived server-
+# streams. Envoy's default stream_idle_timeout (5m) would cut a
+# quiet-but-open log stream (a build that prints nothing for 5
+# minutes isn't unusual for LLVM-cold-ccache). http.idleTimeout
+# defaults to 1h already; streamIdleTimeout is the load-bearing one.
+#
+# The CRD regex ^([0-9]{1,5}(h|m|s|ms)){1,4}$ rejects "0s" via CEL
+# webhook validation in some versions; 1h is a practical ceiling
+# (if a stream is truly quiet for an hour, the build is stuck).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: rio-dashboard-streaming
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: rio-dashboard
+  timeout:
+    http:
+      streamIdleTimeout: 1h
+{{- end }}

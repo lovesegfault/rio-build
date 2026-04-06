@@ -37,6 +37,7 @@ let
       ;
   };
   helmRender = import ../../helm-render.nix { inherit pkgs nixhelm system; };
+  envoyGatewayRender = import ../../envoy-gateway-render.nix { inherit pkgs nixhelm system; };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
   mkPkiK8s = import ../lib/pki-k8s.nix { inherit pkgs; };
   jwtKeys = import ../lib/jwt-keys.nix;
@@ -62,6 +63,15 @@ in
   # yaml] to flip workerPool.privileged:false + devicePlugin.enabled
   # without duplicating the full base values file.
   extraValuesFiles ? [ ],
+  # Envoy Gateway (dashboard gRPC-Web). Preloads envoyproxy/gateway +
+  # envoyproxy/envoy:distroless images, renders the gateway-helm chart
+  # as k3s manifests (CRDs+operator+certgen), sets dashboard.enabled=
+  # true in the rio chart so the Gateway/GRPCRoute/EnvoyProxy CRDs
+  # render. Adds a rio-dashboard-envoy-tls Secret to the PKI so the
+  # operator's client-cert ref resolves. Heavyweight — ~200MB of extra
+  # images and ~60s of operator reconcile time; only enable for
+  # dashboard-specific scenarios.
+  envoyGatewayEnabled ? false,
 }:
 let
   # ── Shared cluster secrets ──────────────────────────────────────────
@@ -94,6 +104,13 @@ let
     }
     // pkgs.lib.optionalAttrs jwtEnabled {
       "jwt.enabled" = true;
+    }
+    // pkgs.lib.optionalAttrs envoyGatewayEnabled {
+      # Renders dashboard-gateway*.yaml (Gateway/GRPCRoute/EnvoyProxy/
+      # SecurityPolicy/ClientTrafficPolicy/BackendTLSPolicy). These CRs
+      # sit in 02-workloads.yaml but don't match any 01-rbac kind, so
+      # they land in the workloads split correctly.
+      "dashboard.enabled" = true;
     };
     namespace = ns;
   };
@@ -104,7 +121,15 @@ let
   # works without cert-manager (which isn't in the airgap set —
   # phase4c). Makes the fixture representative of production: mTLS
   # on all gRPC links, plaintext health ports (9101/9102/9194).
-  pkiK8s = mkPkiK8s { inherit ns; };
+  #
+  # With envoyGatewayEnabled, also generates rio-dashboard-envoy (the
+  # envoy data-plane's client-cert for upstream mTLS to the scheduler).
+  # dashboard-gateway-tls.yaml's EnvoyProxy.spec.backendTLS.
+  # clientCertificateRef references this Secret.
+  pkiK8s = mkPkiK8s {
+    inherit ns;
+    extraComponents = pkgs.lib.optional envoyGatewayEnabled "dashboard-envoy";
+  };
 
   # ── Airgap image set ────────────────────────────────────────────────
   # Same list on BOTH nodes — pods land on either via scheduler whims
@@ -119,6 +144,14 @@ let
   rioImages = [
     dockerImages.all
     pulled.bitnami-postgresql
+  ]
+  ++ pkgs.lib.optionals envoyGatewayEnabled [
+    # Operator + certgen Job (same image). ~120MB compressed.
+    pulled.envoy-gateway
+    # Data-plane envoy. Pinned via EnvoyProxy.spec.provider.kubernetes.
+    # envoyDeployment.container.image in dashboard-gateway-tls.yaml —
+    # matches values.yaml dashboard.envoyImage default (v1.37.1).
+    pulled.envoy-distroless
   ]
   ++ extraImages;
 
@@ -138,7 +171,10 @@ let
   # (most images won't be 800MB) but eviction recovery is a nightmare
   # to debug — tmpfs is cheap insurance. The VM memory bump must cover
   # what's ACTUALLY written (tmpfs is lazy; unused cap costs nothing).
-  extraImagesBumpGiB = builtins.length extraImages;
+  #
+  # envoyGatewayEnabled adds 2 images (~200MB decompressed total) —
+  # counted as 1 bump unit (they're smaller than the squid stack).
+  extraImagesBumpGiB = builtins.length extraImages + (if envoyGatewayEnabled then 1 else 0);
   containerdTmpfsSize =
     if coverage then
       "${toString (4 + extraImagesBumpGiB)}G"
@@ -235,6 +271,20 @@ let
           "00-rio-crds".source = "${helmRendered}/00-crds.yaml";
           "01-rio-rbac".source = "${helmRendered}/01-rbac.yaml";
           "02-rio-workloads".source = "${helmRendered}/02-workloads.yaml";
+        }
+        // pkgs.lib.optionalAttrs envoyGatewayEnabled {
+          # Envoy Gateway operator + Gateway API CRDs. Alphabetical
+          # sort order (00-envoy-gateway-* < 00-rio-crds, `e` < `r`)
+          # means these apply first — the rio chart's dashboard-
+          # gateway*.yaml CRs in 02-rio-workloads need
+          # gateway.networking.k8s.io + gateway.envoyproxy.io CRDs
+          # to exist.
+          "00-envoy-gateway-crds".source = "${envoyGatewayRender}/00-envoy-gateway-crds.yaml";
+          "01-envoy-gateway-ns".source = "${envoyGatewayRender}/01-envoy-gateway-ns.yaml";
+          "01-envoy-gateway-rbac".source = "${envoyGatewayRender}/02-envoy-gateway-rbac.yaml";
+          "02-envoy-gateway".source = "${envoyGatewayRender}/03-envoy-gateway.yaml";
+        }
+        // {
           # Placeholder authorized_keys Secret so the gateway pod's
           # volume mount resolves (no unbound Secret → Pending) AND
           # load_authorized_keys() parses ≥1 key (empty file →

@@ -648,6 +648,36 @@
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
 
+                  # ── dashboard Gateway API CRDs ─────────────────────────────
+                  # dashboard.enabled=true MUST render exactly one each of
+                  # GatewayClass/Gateway/GRPCRoute/EnvoyProxy/SecurityPolicy/
+                  # ClientTrafficPolicy (+ BackendTLSPolicy when tls.enabled).
+                  # Any Go-template syntax error, bad nindent, or Values typo
+                  # surfaces here before the VM test has to spend 5min on k3s
+                  # bring-up to discover a YAML parse error.
+                  helm template rio . \
+                    --set dashboard.enabled=true \
+                    --set global.image.tag=test \
+                    --set postgresql.enabled=false \
+                    > /tmp/dash-on.yaml
+                  for k in GatewayClass Gateway GRPCRoute EnvoyProxy \
+                           SecurityPolicy ClientTrafficPolicy BackendTLSPolicy; do
+                    grep -qx "kind: $k" /tmp/dash-on.yaml || {
+                      echo "FAIL: dashboard.enabled=true did not render kind: $k" >&2
+                      exit 1
+                    }
+                  done
+                  # grpc_web filter auto-inject is a runtime property of Envoy
+                  # Gateway's xDS translator, not something helm-lint can prove
+                  # — the GRPCRoute existence + Gateway single-listener is the
+                  # static contract.
+                  n=$(yq 'select(.kind=="Gateway" and .metadata.name=="rio-dashboard")
+                          | .spec.listeners | length' /tmp/dash-on.yaml)
+                  test "$n" -eq 1 || {
+                    echo "FAIL: rio-dashboard Gateway must have exactly 1 listener (dodges #7559), got $n" >&2
+                    exit 1
+                  }
+
                   # ── JWT mount assertions (r[sec.jwt.pubkey-mount]) ──────────
                   # jwt.enabled=true MUST render the ConfigMap mount in
                   # scheduler+store and the Secret mount in gateway.
@@ -866,6 +896,8 @@
                 # k3s + smarter-device-manager image. Nonpriv e2e
                 # (device-plugin + hostUsers:false + cgroup rw-remount).
                 vm-security-nonpriv-k3s = 8;
+                # k3s + envoy-gateway operator (+2 images). No builds.
+                vm-dashboard-gateway-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
@@ -1475,6 +1507,12 @@
             helm-postgresql = subcharts.postgresql;
             helm-rook-ceph = subcharts.rook-ceph;
             helm-rook-ceph-cluster = subcharts.rook-ceph-cluster;
+            # Envoy Gateway operator (dashboard gRPC-Web translation).
+            # `just dev envoy-gateway` installs this before the rio chart
+            # so Gateway API / EnvoyProxy CRDs exist when dashboard-
+            # gateway*.yaml templates are applied.
+            helm-envoy-gateway = subcharts.gateway-helm;
+            helm-envoy-gateway-crds = subcharts.gateway-crds-helm;
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone
