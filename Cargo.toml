@@ -116,7 +116,7 @@ dashmap = "6"
 # Per-tenant rate limiting (phase4b gateway). DefaultKeyedRateLimiter
 # keyed on tenant_name (bounded keyspace — authorized_keys comment is
 # operator-controlled, not client-forgeable). No eviction needed.
-governor = "0.6"
+governor = "0.10"
 
 # --- phase2c: chunked CAS ---
 # Content-defined chunking. v2020 algorithm — Chunker::new(data, min, avg, max)
@@ -147,7 +147,12 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 # EdDSA (ed25519) signing — scheduler/store/controller verify the gateway's
 # signature + expiry on every gRPC call. The signing key lives in a K8s
 # Secret; the public key is distributed via ConfigMap.
-jsonwebtoken = "9"
+# v10: crypto is trait-based; must pick a backend. rust_crypto (pure-Rust,
+# includes ed25519-dalek which we already depend on) over aws_lc_rs (adds
+# a C dep + build-time bindgen). use_pem is default but we only use DER.
+jsonwebtoken = { version = "10", default-features = false, features = [
+  "rust_crypto",
+] }
 
 # --- phase2c: priority scheduling ---
 # BinaryHeap over f64 critical-path priority. f64 doesn't impl Ord (NaN);

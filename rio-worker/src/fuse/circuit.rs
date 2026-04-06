@@ -4,9 +4,13 @@
 //!
 //! Two trip conditions — EITHER opens the circuit:
 //!   (a) `threshold` (default 5) consecutive `ensure_cached` fetch failures
-//!   (b) `last_success.elapsed() > wall_clock_trip` (default 90s) — catches
-//!       the degraded-but-alive store (accepting connections, serving
-//!       slowly) without waiting for threshold × fetch_timeout.
+//!   (b) `last_success.elapsed() > wall_clock_trip` (default 90s) AND at
+//!       least one failure since last success — catches the degraded-but-
+//!       alive store (accepting connections, serving slowly) without waiting
+//!       for threshold × fetch_timeout. The failure-gate is critical: an
+//!       idle build (e.g., a 180s sleep with no store traffic) would
+//!       otherwise trip the breaker on its first post-sleep fetch, turning
+//!       a quiescent worker into a false-positive `store_degraded`.
 //!
 //! After `auto_close_after` (default 30s) the circuit goes half-open:
 //! [`check`](CircuitBreaker::check) returns `Ok` to let ONE fetch probe.
@@ -17,7 +21,7 @@
 //! 3-state shape, but that one is single-threaded-actor (plain `u32`);
 //! this one needs atomics because fuser's thread pool is multi-threaded.
 //
-// r[impl worker.fuse.circuit-breaker]
+// r[impl worker.fuse.circuit-breaker+2]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -142,10 +146,17 @@ impl<C: Clock> CircuitBreaker<C> {
 
         // ── Trip (b): degraded-store wall-clock check ─────────────────
         // Only fires after at least one prior success (last_success
-        // Some). A worker that's never fetched doesn't trip.
+        // Some) AND at least one failure since (consecutive_failures >0).
+        // The failure-gate distinguishes degraded from IDLE: a build that
+        // sleeps 180s with zero fetch attempts has a stale last_success
+        // but a healthy store. Without the gate, the first post-idle
+        // check() trips → EIO on the upload read → InfrastructureFailure
+        // → scheduler reassign loop. Observed: smoke-test step 7's
+        // `read -t 180` build restarted 6× before timeout.
         let last = *self.last_success.lock().unwrap();
         if let Some(t) = last
             && now.duration_since(t) > self.wall_clock_trip
+            && self.consecutive_failures.load(Ordering::Relaxed) > 0
         {
             let mut guard = self.open_since.lock().unwrap();
             // Re-check under lock: another thread may have opened.
@@ -265,7 +276,7 @@ mod tests {
 
     // ── Trip condition (a): consecutive-failure threshold ─────────────
 
-    // r[verify worker.fuse.circuit-breaker]
+    // r[verify worker.fuse.circuit-breaker+2]
     #[test]
     fn four_failures_stay_closed() {
         let b = breaker();
@@ -383,6 +394,7 @@ mod tests {
     fn wall_clock_trip_opens_after_prior_success() {
         let b = breaker();
         b.record(true); // last_success = now
+        b.record(false); // arm the wall-clock: ≥1 failure since success
         b.clock.advance(Duration::from_secs(89));
         assert!(b.check().is_ok(), "89s: under wall_clock_trip");
 
@@ -392,10 +404,48 @@ mod tests {
         assert!(b.is_open(), "wall-clock trip sets open_since");
     }
 
+    /// Regression: smoke-test step 7's `read -t 180` build. A build that
+    /// sleeps with no store traffic has a stale `last_success` but the
+    /// store is NOT degraded — it's idle. The first post-sleep fetch
+    /// must not trip. Gate: `consecutive_failures > 0`.
+    #[test]
+    fn wall_clock_trip_idle_no_failures_stays_closed() {
+        let b = breaker();
+        b.record(true); // last_success = now
+        // No failures recorded — the build is sleeping, not fetching.
+        b.clock.advance(Duration::from_secs(180));
+        assert!(
+            b.check().is_ok(),
+            "180s idle with 0 failures: store is idle, not degraded"
+        );
+        assert!(!b.is_open());
+
+        // A fetch goes through and succeeds — refreshes last_success.
+        b.record(true);
+        b.clock.advance(Duration::from_secs(50));
+        assert!(b.check().is_ok(), "50s after refresh: closed");
+    }
+
+    /// The wall-clock gate disarms on the next success: success →
+    /// failure (arms) → success (disarms) → idle 91s → no trip.
+    #[test]
+    fn wall_clock_trip_disarmed_by_intervening_success() {
+        let b = breaker();
+        b.record(true);
+        b.record(false); // arms
+        b.record(true); // disarms (resets consecutive_failures)
+        b.clock.advance(Duration::from_secs(91));
+        assert!(
+            b.check().is_ok(),
+            "failure→success disarms the gate; idle 91s is still idle"
+        );
+    }
+
     #[test]
     fn wall_clock_trip_then_probe_success_closes() {
         let b = breaker();
         b.record(true);
+        b.record(false); // arm the wall-clock gate
         b.clock.advance(Duration::from_secs(91));
         assert!(b.check().is_err(), "wall-clock trip");
 

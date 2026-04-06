@@ -5,13 +5,6 @@
 # NodePool/EC2NodeClass CRs live in the rio-build chart (gated by
 # karpenter.enabled — `just eks deploy` sets it from tofu outputs).
 
-# ECR Public token. The Karpenter chart is OCI at public.ecr.aws; the
-# ECR Public API is us-east-1 only regardless of cluster region — this
-# is the data source's own region override, not a provider alias.
-data "aws_ecrpublic_authorization_token" "karpenter" {
-  region = "us-east-1"
-}
-
 # Creates:
 #   - Controller IAM role + Pod Identity association (v21 of the
 #     submodule supports ONLY Pod Identity — no IRSA fallback)
@@ -43,14 +36,40 @@ module "karpenter" {
   create_pod_identity_association = true
 }
 
+locals {
+  karpenter_version = "1.10.0"
+}
+
+# Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/
+# directory on `helm upgrade` — only on first install. A version bump
+# on helm_release.karpenter below would leave stale CRDs (and skip new
+# ones like NodeOverlay, added in v1.7). The karpenter-crd chart ships
+# CRDs as templates/, which helm DOES upgrade.
+resource "helm_release" "karpenter_crd" {
+  name       = "karpenter-crd"
+  namespace  = "kube-system"
+  repository = "oci://public.ecr.aws/karpenter"
+  chart      = "karpenter-crd"
+  version    = local.karpenter_version
+
+  depends_on = [module.eks]
+}
+
 resource "helm_release" "karpenter" {
-  name                = "karpenter"
-  namespace           = "kube-system"
-  repository          = "oci://public.ecr.aws/karpenter"
-  repository_username = data.aws_ecrpublic_authorization_token.karpenter.user_name
-  repository_password = data.aws_ecrpublic_authorization_token.karpenter.password
-  chart               = "karpenter"
-  version             = "1.6.0"
+  name       = "karpenter"
+  namespace  = "kube-system"
+  # ECR Public supports anonymous pulls for public charts — no auth
+  # needed. Passing aws_ecrpublic_authorization_token credentials here
+  # causes intermittent 403s when the helm provider's OCI client picks
+  # up a stale token from ~/.config/helm/registry/config.json (populated
+  # by a prior run) instead of the fresh one terraform fetches.
+  repository = "oci://public.ecr.aws/karpenter"
+  chart      = "karpenter"
+  version    = local.karpenter_version
+
+  # CRDs come from helm_release.karpenter_crd — skip the baked-in
+  # crds/ dir to avoid dual ownership.
+  skip_crds = true
 
   # Karpenter's post-install webhook validation hook can flake on
   # first install. NodePool CRs (applied later by `just eks deploy`)
@@ -63,6 +82,16 @@ resource "helm_release" "karpenter" {
         clusterName       = module.eks.cluster_name
         clusterEndpoint   = module.eks.cluster_endpoint
         interruptionQueue = module.karpenter.queue_name
+        # NodeOverlay (alpha, v1.7+): declare extended-resource capacity
+        # on NodePools so Karpenter can bin-pack for smarter-devices/fuse
+        # BEFORE a node exists. Without this, worker pods requesting the
+        # extended resource deadlock cold-start (resource only advertised
+        # after the device-plugin DaemonSet registers on a running node).
+        # The NodeOverlay CR lives in the rio-build chart alongside
+        # NodePools.
+        featureGates = {
+          nodeOverlay = true
+        }
       }
       # Pin controller to system nodes — can't run Karpenter on
       # Karpenter-provisioned nodes (chicken-and-egg on first boot).
@@ -75,5 +104,5 @@ resource "helm_release" "karpenter" {
     })
   ]
 
-  depends_on = [module.eks, module.karpenter]
+  depends_on = [module.eks, module.karpenter, helm_release.karpenter_crd]
 }

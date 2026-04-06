@@ -331,6 +331,13 @@ karpenter:
           value: "true"
           effect: NoSchedule
       requirements:
+        # amd64 only: rio images are x86_64-only. Without this, m6g/m7g/
+        # r6g/r7g (ARM Graviton) are eligible → pod lands → exec format
+        # error → CrashLoopBackOff. rio-worker-preferred doesn't need it
+        # (c6a/c7a are AMD EPYC by family); this pool and rio-general do.
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: [m, r]
@@ -353,6 +360,12 @@ karpenter:
         rio.build/node-role: general
       taints: []
       requirements:
+        # amd64 only: same rationale as rio-worker-fallback. Observed:
+        # gateway pod scheduled on m6g.medium → exec format error on
+        # smoke-test rollout restart.
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: [m]
@@ -525,7 +538,18 @@ workerPool:
   # device plugin. It disables seccomp entirely (ADR-012:10) and
   # is unacceptable for multi-tenant (ADR-012:18). Production on
   # EKS/GKE with the device plugin deployed should NOT need this.
-  privileged: false
+  #
+  # EKS + Karpenter: currently MUST use privileged:true. The device-
+  # plugin path requests `smarter-devices/fuse` as a schedulable
+  # resource, but Karpenter doesn't know any EC2 instance type
+  # provides it (it's only advertised AFTER the device-plugin
+  # DaemonSet registers on a running node) — chicken-and-egg that
+  # deadlocks cold-start provisioning. startupTaints don't help
+  # (Karpenter still checks extended-resource capacity). Until
+  # Karpenter gains custom extended-resource declarations or a
+  # warm-pool floor is maintained, privileged is the working path.
+  # Tracked in followups-pending.jsonl (P-new, correctness).
+  privileged: true
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:

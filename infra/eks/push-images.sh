@@ -1,6 +1,9 @@
 #!/usr/bin/env nix-shell
-#!nix-shell -i bash -p awscli2 skopeo git nix
+#!nix-shell -i bash -p awscli2 skopeo git
 # shellcheck shell=bash
+#
+# NOTE: `nix` intentionally NOT in -p — nixpkgs' nix (2.31.x) hangs on
+# ssh-ng remote stores after eval. The system's patched nix on PATH works.
 #
 # push-images.sh — build all docker images and skopeo-copy to ECR,
 # tagged with the current git short-SHA. zstd layers, OCI manifest.
@@ -57,10 +60,24 @@ fi
 # Build the linkFarm aggregate. Out-link goes to a tmpdir so we
 # don't clobber ./result (which might be pointing at something
 # the user cares about — a workspace build, coverage, whatever).
+#
+# RIO_REMOTE_STORE (optional, e.g. ssh-ng://builder): build on a
+# remote store then copy back. Rust compilation is heavy — offloading
+# avoids slow local builds and leverages the remote's cache from CI
+# runs. Images must land locally for skopeo's docker-archive: reads.
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
-log "building images (nix build .#dockerImages)..."
-nix build "$REPO_ROOT#dockerImages" --out-link "$out/images"
+if [ -n "${RIO_REMOTE_STORE:-}" ]; then
+  log "building images on $RIO_REMOTE_STORE..."
+  outpath=$(nix build "$REPO_ROOT#dockerImages" -L --no-link --print-out-paths \
+    --eval-store auto --store "$RIO_REMOTE_STORE")
+  log "copying $outpath from $RIO_REMOTE_STORE..."
+  nix copy --from "$RIO_REMOTE_STORE" --no-check-sigs "$outpath"
+  ln -sfn "$outpath" "$out/images"
+else
+  log "building images locally (set RIO_REMOTE_STORE to offload)..."
+  nix build "$REPO_ROOT#dockerImages" -L --out-link "$out/images"
+fi
 
 # ECR auth — 12h token, fresh each run. skopeo login doesn't
 # consult policy (just writes an auth file), no --policy here.

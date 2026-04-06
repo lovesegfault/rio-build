@@ -127,12 +127,12 @@ pub fn sign(claims: &Claims, key: &SigningKey) -> Result<String, JwtError> {
 pub fn verify(token: &str, pubkey: &VerifyingKey) -> Result<Claims, JwtError> {
     // Raw 32-byte compressed Edwards point — NOT the SPKI DER
     // wrapper (`to_public_key_der()`). The name `from_ed_der` is a
-    // misnomer in jsonwebtoken v9: it just stores the bytes, and
-    // ring's `ED25519.verify` expects raw bytes. SPKI DER is ~44
-    // bytes with ASN.1 framing; ring would try to read that as a
-    // malformed 44-byte key → InvalidSignature on every verify. The
-    // sign-side IS genuinely PKCS#8 DER (ring parses it via
-    // `Ed25519KeyPair::from_pkcs8`) — the API is asymmetric.
+    // misnomer (carried over from v9 into v10/rust_crypto): it just
+    // stores the bytes, and ed25519-dalek's verify expects the raw
+    // 32-byte key. SPKI DER is ~44 bytes with ASN.1 framing; that
+    // would be read as a malformed 44-byte key → InvalidSignature on
+    // every verify. The sign-side IS genuinely PKCS#8 DER — the API
+    // is asymmetric.
     let decoding_key = DecodingKey::from_ed_der(pubkey.as_bytes());
 
     // Validation::new(EdDSA) defaults: validate_exp=true,
