@@ -136,16 +136,25 @@ fn default_target_queue() -> Option<u32> {
 /// `fuse_cache_size`, etc. deliberately omitted: those scale
 /// WITH class size (a "large" worker should have a bigger FUSE
 /// cache). A future plan can add them if the use case emerges.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolTemplate {
     /// Container image. Shared across classes — same worker
-    /// binary, different resource allocations. `None` here
-    /// means the reconciler errors (WorkerPoolSpec.image is
-    /// required); Option so a future per-class override is
-    /// possible.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    /// binary, different resource allocations. REQUIRED —
+    /// `WorkerPoolSpec.image` has no default. The reconciler's
+    /// child builder errors with `InvalidSpec` if this is empty.
+    pub image: String,
+
+    /// Target systems (e.g., `["x86_64-linux"]`). Shared across
+    /// classes — all size classes in one WPS run the same binary
+    /// on the same arch; separate arches warrant separate WPSes.
+    /// REQUIRED — child WorkerPool CEL rejects empty `systems[]`.
+    pub systems: Vec<String>,
+
+    /// requiredSystemFeatures this pool advertises. Shared
+    /// across classes for the same reason as `systems`.
+    #[serde(default)]
+    pub features: Vec<String>,
 
     /// Node selector. Shared because worker nodes are usually
     /// tainted/labeled uniformly (`rio.build/worker: "true"`),
@@ -168,6 +177,27 @@ pub struct PoolTemplate {
     /// big the worker is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seccomp_profile: Option<SeccompProfileKind>,
+
+    /// Privileged escape hatch. Shared — cluster runtime
+    /// constraints (containerd seccomp blocking mount(2)) are
+    /// the same for all class pods on a given node pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<bool>,
+
+    /// Host network. Shared — if one class needs hostNetwork
+    /// (e.g., bare-metal with NAR-heavy store traffic), all do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_network: Option<bool>,
+
+    /// mTLS client cert Secret name. Shared — same cert-manager
+    /// Certificate across all worker pods regardless of size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_secret_name: Option<String>,
+
+    /// FOD proxy URL. Shared — one Squid allowlist for the
+    /// whole cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fod_proxy_url: Option<String>,
 }
 
 /// Cutoff rebalancer config. The controller observes per-class
@@ -295,6 +325,9 @@ mod tests {
         // PoolTemplate
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("seccompProfile"));
+        assert!(json.contains("hostNetwork"));
+        assert!(json.contains("tlsSecretName"));
+        assert!(json.contains("fodProxyUrl"));
         // CutoffLearningConfig
         assert!(json.contains("minSamples"));
         assert!(json.contains("emaAlpha"));

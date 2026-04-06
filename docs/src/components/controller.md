@@ -118,7 +118,7 @@ to `"1"` regardless of the spec value.
 
 ### WorkerPoolSet
 
-> **Scheduled:** [P0232](../../.claude/work/plan-0232-wps-crd-struct-crdgen.md) (CRD types) + [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md) (reconciler) + [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md) (CutoffRebalancer). Until those land: size-class routing via multiple independent `WorkerPool` CRs, cutoffs static in `scheduler.toml`.
+> **Partially implemented (Phase 4c):** CRD types + child-builder reconciler landed. Status aggregation + per-class autoscaling → [P0234](../../.claude/work/plan-0234-wps-status-perclass-autoscaler-yjoin.md); CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md).
 
 r[ctrl.wps.reconcile]
 The WorkerPoolSet reconciler creates one child WorkerPool per `spec.classes[i]`, named `{wps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the WPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
@@ -197,7 +197,7 @@ r[ctrl.reconcile.owner-refs]
 - **WorkerPoolSet reconciler**: manages multiple `WorkerPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `WorkerPoolSet` status. Autoscales each class independently based on per-class queue depth from the scheduler.
 - **GC reconciler**: trigger store garbage collection on schedule.
 
-> **Scheduled:** WorkerPoolSet reconciler → [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md); scheduled GC → [P0212](../../.claude/work/plan-0212-gc-automation-cron.md). Until those land: GC is manual via `AdminService.TriggerGC`.
+> **Scheduled:** WorkerPoolSet status aggregation + per-class autoscaling → [P0234](../../.claude/work/plan-0234-wps-status-perclass-autoscaler-yjoin.md).
 
 ## RBAC
 

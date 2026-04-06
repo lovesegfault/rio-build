@@ -34,7 +34,7 @@ gRPC handler tasks send commands to the DAG actor and `await` responses. This el
 
 ## Scheduling Algorithm
 
-**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain, PrefetchHint (bloom-filtered `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value). **Scheduled:** CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md); WorkerPoolSet CRD → [P0232](../../.claude/work/plan-0232-wps-crd-struct-crdgen.md). Until those land: size-class cutoffs are operator-configured static values.
+**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain, PrefetchHint (bloom-filtered `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`, WorkerPoolSet CRD + child-pool reconciler. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value). **Scheduled:** CutoffRebalancer → [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md). Until it lands: size-class cutoffs are operator-configured static values.
 
 ```
 1. Receive derivation DAG from gateway
@@ -176,7 +176,7 @@ The `build_history` table also tracks peak resource usage (memory, CPU, output s
 
 ## Size-Class Routing
 
-> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Workers declare their class in the heartbeat. `WorkerPoolSet` CRD integration is deferred to Phase 4 — for now, cutoffs are operator-maintained static values.
+> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Workers declare their class in the heartbeat. The `WorkerPoolSet` CRD (Phase 4c) declares the class set and manages one child `WorkerPool` per class; cutoffs remain static until the CutoffRebalancer lands.
 
 When size classes are configured, the scheduler routes derivations to right-sized worker pools based on estimated duration and resource needs. This is inspired by [SITA-E (Size Interval Task Assignment with Equal load)](https://dl.acm.org/doi/10.1145/506147.506154), adapted for non-preemptible Nix builds.
 
