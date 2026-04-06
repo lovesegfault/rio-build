@@ -1,6 +1,8 @@
 """Tests for DAG-orchestration scripts.
 
-Run: pytest .claude/lib/
+Run: python3 -m pytest .claude/lib/
+(NOT bare `pytest` — see the DEV-SHELL DIVERGENCE note at flake.nix's
+checks.onibus-pytest for why the wrapper form shows spurious failures.)
 
 rio-build deltas:
   - fixture paths: crates/rix-*/ → rio-*/ (real crate paths)

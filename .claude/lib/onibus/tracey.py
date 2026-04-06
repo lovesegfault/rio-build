@@ -1,10 +1,11 @@
 """Tracey spec-coverage constants and marker extraction.
 
 Authoritative domain set derived from docs/src/**/*.md standalone r[domain.*]
-paragraphs. test_tracey_domains_matches_spec() catches drift — hardcoding the
-alternation at 8 sites previously missed `common`. `dash` seeded by P0245
-(pulled forward from P0284 so 6 dashboard plans don't tracey-validate-fail
-on merge).
+paragraphs. test_tracey_domains_matches_spec gates via checks.onibus-pytest —
+adding a domain to docs/src/components/ without touching TRACEY_DOMAINS below
+fails CI. (Hardcoding the alternation at 8 sites previously missed `common`;
+120bab69 renamed worker→builder+fetcher without touching this set and the drift
+went unnoticed until the test was wired into .#ci.)
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import re
 from pathlib import Path
 
 TRACEY_DOMAINS: frozenset[str] = frozenset({
-    "common", "ctrl", "dash", "gw", "obs", "proto", "sched", "sec", "store", "worker"
+    "builder", "common", "ctrl", "dash", "fetcher", "gw", "obs", "proto", "sched", "sec", "store"
 })
 TRACEY_DOMAIN_ALT = "|".join(sorted(TRACEY_DOMAINS))
 # Capture the full marker ID (domain.area.detail), not just the domain —
