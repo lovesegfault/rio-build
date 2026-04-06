@@ -106,10 +106,12 @@ async fn main() -> anyhow::Result<()> {
     // r[impl ctrl.pool.ephemeral]
     // Ephemeral mode: controller's build_job (ephemeral.rs) sets
     // RIO_EPHEMERAL=1 on Job pods. Worker exits after one build
-    // completes → pod terminates → Job goes Complete →
-    // ttlSecondsAfterFinished reaps it. Fresh pod per build = zero
-    // cross-build state (FUSE cache, overlayfs upper, filesystem
-    // are all emptyDir, wiped on pod termination).
+    // round (all maxConcurrentBuilds permits back; CRD CEL enforces
+    // max=1 in ephemeral mode so "one build round" == "one build")
+    // → pod terminates → Job goes Complete → ttlSecondsAfterFinished
+    // reaps it. Fresh pod per build = zero cross-build state (FUSE
+    // cache, overlayfs upper, filesystem are all emptyDir, wiped on
+    // pod termination).
     //
     // is_ok() not == "1": the controller sets "1" but any non-empty
     // value is a clear intent signal. Matches the pattern at
@@ -674,14 +676,20 @@ async fn main() -> anyhow::Result<()> {
                             // swap(true) gates to ONCE: the first
                             // assignment sees false and spawns; any
                             // subsequent assignment (shouldn't happen
-                            // in ephemeral mode once T1/T2 enforce
-                            // max_builds=1, but belt-and-suspenders)
-                            // sees true and skips. Previously this
-                            // spawned a fresh watcher per assignment —
-                            // with max>1, N watchers all blocked on
-                            // acquire_many(N), all fire at once when
-                            // the Nth build completes. Wasteful and
-                            // only accidentally correct for max=1.
+                            // in ephemeral mode — CRD CEL enforces
+                            // max=1, build_job defensively overrides
+                            // RIO_MAX_BUILDS to 1 — but belt-and-
+                            // suspenders) sees true and skips.
+                            // Previously this spawned a fresh watcher
+                            // per assignment — with max>1, N watchers
+                            // all blocked on acquire_many(N), all fire
+                            // at once when the Nth build completes.
+                            // Wasteful and only accidentally correct
+                            // for max=1. Under permit churn
+                            // (scheduler dispatches N<max then M more
+                            // before N completes) acquire_many may
+                            // never win; CEL forbids the config that
+                            // exposes the race.
                             if ephemeral
                                 && !ephemeral_watcher_spawned
                                     .swap(true, std::sync::atomic::Ordering::Relaxed)

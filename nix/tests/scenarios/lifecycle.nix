@@ -2005,6 +2005,69 @@ let
               timeout=90,
           )
 
+          # ── CEL: ephemeral + maxConcurrentBuilds>1 rejected ───────────
+          # The CRD CEL rule enforces maxConcurrentBuilds==1 in
+          # ephemeral mode (one-pod-per-build isolation breaks if a
+          # pod runs N builds — shared FUSE cache + overlayfs upper).
+          # Negative apply via --dry-run=server: admission-webhook
+          # CEL fires without actually creating the resource. fail()
+          # asserts non-zero exit; the message assert proves it
+          # failed at the RIGHT rule (not, say, systems=[] or image
+          # missing).
+          cel_reject = k3s_server.fail(
+              "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
+              "apiVersion: rio.build/v1alpha1\n"
+              "kind: WorkerPool\n"
+              "metadata:\n"
+              "  name: ephemeral-bad-maxbuilds\n"
+              "  namespace: ${ns}\n"
+              "spec:\n"
+              "  ephemeral: true\n"
+              "  replicas: {min: 0, max: 4}\n"
+              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
+              "  maxConcurrentBuilds: 4\n"
+              "  fuseCacheSize: 5Gi\n"
+              "  systems: [x86_64-linux]\n"
+              "  image: rio-all\n"
+              "EOF"
+          )
+          assert "maxConcurrentBuilds==1" in cel_reject, (
+              f"CEL should reject ephemeral+maxConcurrentBuilds>1 "
+              f"with the rule's message, got: {cel_reject!r}. If the "
+              f"apply succeeded or failed for a different reason, the "
+              f"CEL rule at workerpool.rs isn't in the deployed CRD."
+          )
+          print("ephemeral-pool CEL: ephemeral + maxConcurrentBuilds>1 "
+                "rejected at admission ✓")
+
+          # ── CEL: ephemeralDeadlineSeconds without ephemeral rejected ──
+          # The field only makes sense on Job pods (activeDeadlineSeconds);
+          # STS pools have no Jobs. CEL gates it to ephemeral:true.
+          cel_reject = k3s_server.fail(
+              "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
+              "apiVersion: rio.build/v1alpha1\n"
+              "kind: WorkerPool\n"
+              "metadata:\n"
+              "  name: sts-with-deadline\n"
+              "  namespace: ${ns}\n"
+              "spec:\n"
+              "  ephemeral: false\n"
+              "  ephemeralDeadlineSeconds: 7200\n"
+              "  replicas: {min: 1, max: 4}\n"
+              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
+              "  maxConcurrentBuilds: 1\n"
+              "  fuseCacheSize: 5Gi\n"
+              "  systems: [x86_64-linux]\n"
+              "  image: rio-all\n"
+              "EOF"
+          )
+          assert "ephemeralDeadlineSeconds" in cel_reject, (
+              f"CEL should reject ephemeralDeadlineSeconds on non-"
+              f"ephemeral pool, got: {cel_reject!r}"
+          )
+          print("ephemeral-pool CEL: ephemeralDeadlineSeconds without "
+                "ephemeral:true rejected at admission ✓")
+
           # Apply ephemeral WorkerPool. Spec mirrors vmtest-full.yaml's
           # default pool (image, privileged, resources, grace) except:
           # ephemeral=true, replicas.min=0 (CEL enforced), max=4.

@@ -43,6 +43,7 @@ pub fn test_workerpool_spec() -> WorkerPoolSpec {
     WorkerPoolSpec {
         replicas: Replicas { min: 2, max: 10 },
         ephemeral: false,
+        ephemeral_deadline_seconds: None,
         autoscaling: Autoscaling {
             metric: "queueDepth".into(),
             target_value: 5,

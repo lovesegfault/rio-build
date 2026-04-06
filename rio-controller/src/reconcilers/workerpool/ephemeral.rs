@@ -21,20 +21,22 @@
 //!
 //! # Why not a Scheduler→Controller RPC
 //!
-//! The plan (P0296) envisions the scheduler calling
-//! `CreateEphemeralWorker` on the controller at dispatch time. That
-//! requires: controller gains a gRPC server (it has none today),
-//! scheduler gains a "pool" concept (it has none — only workers with
-//! size_class), and new connection management / RBAC / NetworkPolicy.
+//! A push-mode RPC (scheduler calls controller at dispatch time)
+//! was considered and rejected. It would require: controller gains
+//! a gRPC server (it has none today), scheduler gains a "pool"
+//! concept (it has none — only workers with size_class), and new
+//! connection management / RBAC / NetworkPolicy.
 //!
 //! Polling ClusterStatus achieves the same outcome (Job spawned when
 //! work exists) with existing infrastructure. Latency is one
 //! reconciler requeue interval (~10s for ephemeral pools vs 5min for
 //! STS pools). For the "untrusted multi-tenant" use case where
 //! isolation > throughput, 10s added latency is acceptable. If
-//! sub-second dispatch becomes a requirement, the RPC path can be
-//! added later — the proto stub exists in `admin.proto`
-//! `ControllerService`.
+//! sub-second dispatch later becomes a hard requirement, an RPC
+//! path can be reintroduced WITH an implementer — don't land
+//! declaration-only proto (the previous speculative
+//! `ControllerService.CreateEphemeralWorker` was removed for
+//! exactly that reason).
 //!
 //! # Job naming
 //!
@@ -97,6 +99,15 @@ const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 /// before exiting) so there's no rio-side dependency on the Job
 /// sticking around.
 const JOB_TTL_SECS: i32 = 60;
+
+/// Default `activeDeadlineSeconds` when `WorkerPoolSpec.ephemeral_
+/// deadline_seconds` is unset. 3600 (1h): long enough that a matched
+/// dispatch + build completes in the common case; short enough that
+/// a wrong-pool spawn (worker heartbeats but never matches dispatch
+/// — queue depth was for a different pool's system/size_class)
+/// doesn't leak for the life of the cluster. Operators with known-
+/// long builds (LLVM, chromium) should raise this via the CRD.
+const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 
 // r[impl ctrl.pool.ephemeral]
 /// Reconcile an ephemeral WorkerPool: count active Jobs, poll queue
@@ -301,13 +312,21 @@ fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
 ///     -tight-loop on a node-local problem.
 ///   - `backoffLimit: 0` — same reasoning. One attempt.
 ///   - `ttlSecondsAfterFinished: 60` — K8s TTL controller reaps.
-///
-/// NOT set: `activeDeadlineSeconds`. The worker's own daemon
-/// timeout (from `spec.daemonTimeoutSecs`) + the per-build
-/// timeout from BuildOptions are the real limits. Setting a Job
-/// deadline would mean a legitimately slow build gets killed at
-/// a DIFFERENT point than the scheduler expects → inconsistent
-/// state (scheduler thinks it's running, pod is gone).
+///   - `activeDeadlineSeconds` — backstop for wrong-pool spawns.
+///     `reconcile_ephemeral` spawns from the CLUSTER-WIDE
+///     `queued_derivations` count, not pool-matching depth. A
+///     queue full of x86 work on an arm64 ephemeral pool
+///     triggers a spawn; the worker heartbeats, never matches
+///     dispatch, and would hang indefinitely. K8s kills the pod
+///     at deadline → Job Failed → TTL reaps. Default 1h; raise
+///     via `spec.ephemeralDeadlineSeconds` for known-long-build
+///     pools. This DOES bound build time too (K8s doesn't
+///     distinguish "worker idle" from "worker busy on 90min
+///     build"), so the default is a compromise — per-pool queue
+///     depth (phase5) is the proper fix. The state-inconsistency
+///     concern (scheduler thinks running, pod gone) is handled
+///     the same way any other pod-death is: heartbeat timeout →
+///     reassign.
 // r[impl ctrl.pool.ephemeral]
 pub(super) fn build_job(
     wp: &WorkerPool,
@@ -404,6 +423,17 @@ pub(super) fn build_job(
             completions: Some(1),
             backoff_limit: Some(0),
             ttl_seconds_after_finished: Some(JOB_TTL_SECS),
+            // r[impl ctrl.pool.ephemeral-deadline]
+            // Wrong-pool-spawn backstop: K8s kills the pod at
+            // deadline → Job Failed → TTL reaps. i64::from because
+            // the CRD field is u32 (negative deadline is
+            // meaningless, keeps the YAML author from a footgun).
+            active_deadline_seconds: Some(
+                wp.spec
+                    .ephemeral_deadline_seconds
+                    .map(i64::from)
+                    .unwrap_or(DEFAULT_EPHEMERAL_DEADLINE_SECS),
+            ),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
@@ -497,6 +527,16 @@ mod tests {
             spec.ttl_seconds_after_finished,
             Some(JOB_TTL_SECS),
             "completed Jobs must auto-reap"
+        );
+        // r[verify ctrl.pool.ephemeral-deadline]
+        // Wrong-pool-spawn backstop present, defaults to 3600 when
+        // the CRD field is unset (test_wp doesn't set it).
+        assert_eq!(
+            spec.active_deadline_seconds,
+            Some(DEFAULT_EPHEMERAL_DEADLINE_SECS),
+            "activeDeadlineSeconds backstop missing — wrong-pool \
+             spawns (worker never matches dispatch) would leak \
+             indefinitely"
         );
 
         let pod_spec = spec.template.spec.as_ref().unwrap();
