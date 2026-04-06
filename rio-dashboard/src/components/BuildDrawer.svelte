@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { BuildInfo } from '../gen/admin_types_pb';
   import BuildStatePill from './BuildStatePill.svelte';
+  import LogViewer from './LogViewer.svelte';
 
   // Svelte 5 callback prop — no createEventDispatcher churn, and the
   // parent can hand us a plain arrow that nulls out `selectedBuild`.
@@ -98,9 +99,14 @@
 
   <section class="tab-body">
     {#if activeTab === 'logs'}
-      <!-- TODO(P0279): LogViewer component — GetBuildLogs server-stream via
-           gRPC-Web, TextDecoder({fatal:false}) per r[dash.stream.log-tail]. -->
-      <p class="placeholder">log viewer — placeholder</p>
+      <!-- Keyed on buildId so switching builds (deep-link → different
+           drawer target) tears down the old stream and starts a fresh
+           one. Without the key Svelte reuses the component instance and
+           the IIFE inside createLogStream keeps draining the prior
+           build's fetch. -->
+      {#key build.buildId}
+        <LogViewer buildId={build.buildId} />
+      {/key}
     {:else}
       <!-- TODO(P0280): @xyflow/svelte DAG + dagre layout. Degrades to table
            above 2000 nodes per r[dash.graph.degrade-threshold]. -->

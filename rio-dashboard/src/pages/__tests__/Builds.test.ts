@@ -9,10 +9,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // Same hoisted-mock pattern as Cluster.test.ts: vi.mock is lifted above
 // all imports, so the vi.fn() ref has to come from vi.hoisted() or the
 // factory closes over undefined.
-const { listBuilds } = vi.hoisted(() => ({
+const { listBuilds, getBuildLogs } = vi.hoisted(() => ({
   listBuilds: vi.fn(),
+  // The drawer now embeds LogViewer (P0279), which fires getBuildLogs
+  // on mount. We only assert on the list/drawer frame here so a bare
+  // empty-generator stub keeps the IIFE from crashing on `undefined is
+  // not a function` — the log stream itself is covered in
+  // lib/__tests__/logStream.test.ts.
+  getBuildLogs: vi.fn(async function* () {}),
 }));
-vi.mock('../../api/admin', () => ({ admin: { listBuilds } }));
+vi.mock('../../api/admin', () => ({ admin: { listBuilds, getBuildLogs } }));
 
 import Builds from '../Builds.svelte';
 
@@ -85,9 +91,12 @@ describe('Builds', () => {
     const drawer = screen.getByTestId('build-drawer');
     expect(drawer).toHaveTextContent('click-target-id');
     expect(drawer).toHaveTextContent('succeeded');
-    // Tab placeholders exist — P0279/P0280 will swap the bodies.
+    // Both tab buttons render; Logs is active by default and now hosts
+    // the live LogViewer (P0279). Graph is still a placeholder until
+    // P0280 swaps it for the @xyflow DAG.
     expect(drawer).toHaveTextContent('Logs');
     expect(drawer).toHaveTextContent('Graph');
+    expect(screen.getByTestId('log-viewer')).toBeInTheDocument();
 
     // Close via backdrop click.
     await fireEvent.click(screen.getByTestId('drawer-backdrop'));

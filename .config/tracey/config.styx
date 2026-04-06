@@ -19,6 +19,13 @@
 // means a misplaced scenario-header marker is invisible → tracey keeps
 // the rule listed as untested → author notices. Tracey parses .nix
 // since upstream 31d0543 (arborium-nix tree-sitter grammar).
+//
+// Dashboard globs: tracey's `*` matches across `/` (not POSIX-style
+// single-segment), so `src/lib/*.ts` would descend into `__tests__/`
+// and double-count verify annotations (once via include, once via
+// test_include). Dashboard .ts files carrying r[impl ...] are listed
+// by explicit filename; the __tests__ directories get test_include
+// entries per-directory so vitest specs contribute verify coverage.
 
 specs (
   {
@@ -48,6 +55,7 @@ specs (
           rio-nix/src/**/*.rs
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs
+          rio-dashboard/src/lib/logStream.svelte.ts
         )
         exclude (
           target/**
@@ -58,6 +66,9 @@ specs (
           rio-proto/tests/**/*.rs
           rio-store/tests/**/*.rs
           nix/tests/default.nix
+          rio-dashboard/src/lib/__tests__/*.ts
+          rio-dashboard/src/components/__tests__/*.ts
+          rio-dashboard/src/pages/__tests__/*.ts
         )
       }
     )
