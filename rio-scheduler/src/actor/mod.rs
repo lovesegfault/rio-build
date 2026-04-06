@@ -1476,7 +1476,7 @@ impl DagActor {
                     if state.is_fixed_output {
                         continue;
                     }
-                    // r[impl sched.sizeclass.feature-filter]
+                    // r[impl sched.sizeclass.feature-filter+2]
                     // I-176: skip derivations a worker with
                     // `pool_features` couldn't build. Mirrors the
                     // `feature-missing` clause in rejection_reason()
@@ -1486,10 +1486,25 @@ impl DagActor {
                     // a kvm pool sees kvm-required work even when
                     // classify() buckets it into a class no kvm pool
                     // owns. `None` = no filter (CLI, status display).
-                    if let Some(pf) = pool_features
-                        && !state.required_features.iter().all(|f| pf.contains(f))
-                    {
-                        continue;
+                    if let Some(pf) = pool_features {
+                        // I-181: feature-gated pools (non-empty pf)
+                        // don't count featureless work — ∅ ⊆ anything
+                        // would over-spawn; the featureless pool owns
+                        // it. dispatch_ready's overflow walk tries the
+                        // cheapest pool first, so a kvm builder spawned
+                        // for ∅-feature work would idle until
+                        // activeDeadlineSeconds.
+                        if !pf.is_empty() && state.required_features.is_empty() {
+                            continue;
+                        }
+                        // I-176: subset check. Derivation needs a
+                        // feature this pool lacks → skip. ∅-pf
+                        // (featureless pool) passes only ∅-feature
+                        // derivations (all() over empty is vacuously
+                        // true, contains() over non-empty fails).
+                        if !state.required_features.iter().all(|f| pf.contains(f)) {
+                            continue;
+                        }
                     }
                     // Forecast: what class WOULD dispatch pick?
                     // Same inputs as dispatch.rs — est_duration stored
