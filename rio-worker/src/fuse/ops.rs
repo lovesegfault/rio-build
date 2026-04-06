@@ -358,12 +358,15 @@ impl Filesystem for NixStoreFs {
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
-        // TODO(P0269): guard with file.metadata()?.is_file() before
-        // open_backing. FUSE_DEV_IOC_BACKING_OPEN EPERMs on directory
-        // fds; open() on the FUSE root (ino=2) succeeds in File::open
-        // but then warns here on every mount. Harmless (fallback works)
-        // but noisy in VM test logs.
-        if self.passthrough {
+        // FUSE_DEV_IOC_BACKING_OPEN EPERMs on directory fds. open() on
+        // the FUSE root (ino=2) succeeds in File::open above but then
+        // open_backing fails, logging a spurious warning on every mount.
+        // Skip passthrough for non-regular files; the standard read()
+        // path handles them fine. metadata() failure is treated
+        // conservatively as "not a regular file" — fallback is cheap.
+        let is_regular_file = file.metadata().is_ok_and(|m| m.is_file());
+
+        if self.passthrough && is_regular_file {
             match reply.open_backing(&file) {
                 Ok(backing_id) => {
                     reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &backing_id);
