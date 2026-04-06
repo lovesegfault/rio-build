@@ -1764,18 +1764,134 @@ def test_check_fail_re_matches_non_vm_drv(tmp_path: Path, monkeypatch):
     assert _VM_FAIL_RE.findall(check_line) == []
     assert _CHECK_FAIL_RE.findall(check_line) == ["rio-tracey-validate"]
 
-    # P0517 aggregate-cascade concern: rio-cov-vm-total WOULD match
-    # _CHECK_FAIL_RE on failure, but the len(failing)>1 gate catches
-    # cascades. Two rio-* Cannot-build lines → not excusable, before
-    # by_drv lookup. No over-count re-introduction.
+    # P0517 aggregate-cascade concern → P0534 resolution: rio-cov-vm-total
+    # matches _CHECK_FAIL_RE on failure, but _AGGREGATE_DRVS set-subtracts
+    # it at extraction time. Two rio-* Cannot-build lines → one aggregate
+    # filtered → len(failing)==1 → known-flake saves. Before P0534, the
+    # aggregate inflated the count and :300's len>1 gate rejected.
     log.write_text(
         "error: Cannot build '/nix/store/aaa-rio-tracey-validate.drv'\n"
         "error: Cannot build '/nix/store/bbb-rio-cov-vm-total.drv'\n"
     )
     v = excusable(log)
+    assert v.excusable, (
+        f"aggregate cascade must be filtered; real fail rio-tracey-validate "
+        f"is a known-flake → should save. Got: {v.reason!r}"
+    )
+    assert v.failing_tests == ["rio-tracey-validate"]  # rio-cov-vm-total stripped
+    assert v.matched_flakes == ["rio-tracey-validate"]
+    assert "retry=Once" in v.reason
+
+
+def test_aggregate_drv_filter_restores_vm_flake_saves(tmp_path: Path, monkeypatch):
+    """P0534: P0532's exact scenario — VM flake + rio-ci aggregate cascade.
+
+    P0530's _CHECK_FAIL_RE matches rio-ci when ANY constituent fails and
+    cascades. vm-test-run-rio-observability fails → rio-ci cascade-fails
+    → _VM_FAIL_RE extracts rio-observability, _CHECK_FAIL_RE extracts
+    rio-ci → failing=[rio-observability, rio-ci] len=2 → :300 rejects.
+
+    P0509's known-flake saved P0445 (pre-P0530). Did NOT save P0532
+    (post-P0530, iter1 excusable=false citing "2 failures").
+
+    _AGGREGATE_DRVS set-subtracts rio-ci at extraction time → len=1 →
+    by_drv lookup → known-flake saves again.
+
+    Mutation-check: with "rio-ci" deleted from _AGGREGATE_DRVS, this
+    test FAILS with excusable=False (len>1 rejection — pre-P0534 bug).
+    """
+    import onibus.build
+    from onibus.build import _AGGREGATE_DRVS, excusable
+
+    kf = tmp_path / "known-flakes.jsonl"
+    log = tmp_path / "ci.log"
+    monkeypatch.setattr(onibus.build, "KNOWN_FLAKES", kf)
+
+    # P0509's rio-observability entry — the known-flake that saved P0445
+    # but NOT P0532. drv_name is what _VM_FAIL_RE captures from
+    # vm-test-run-rio-observability.drv.
+    obs_entry = KnownFlake(
+        test="vm-observability-metrics-settle",
+        drv_name="rio-observability",
+        symptom="prometheus scrape window races VM readiness",
+        root_cause="scrape-interval vs builder-startup jitter",
+        fix_owner="P0509",
+        fix_description="known-flake entry — retry once on metrics-settle race",
+        retry="Once",
+    )
+    kf.write_text(obs_entry.model_dump_json() + "\n")
+
+    # ─── Positive: P0532 iter1's log shape ──────────────────────────────────
+    # VM test fails → rio-ci aggregate cascades ("1 dependency failed").
+    # _VM_FAIL_RE → ["rio-observability"]; _CHECK_FAIL_RE matches rio-ci
+    # but _AGGREGATE_DRVS strips it → check_fails=[] → failing len=1 → saves.
+    log.write_text(
+        "error: Cannot build '/nix/store/abc123xyz-vm-test-run-rio-observability.drv'\n"
+        "       Reason: builder failed with exit code 1.\n"
+        "error: Cannot build '/nix/store/def456abc-rio-ci.drv'\n"
+        "       Reason: 1 dependency failed.\n"
+    )
+    v = excusable(log)
+    assert v.excusable, (
+        f"P0532 scenario: VM known-flake + rio-ci aggregate cascade must "
+        f"be excusable (aggregate filtered → len=1 → by_drv match). "
+        f"Got: {v.reason!r}, failing={v.failing_tests!r}"
+    )
+    assert v.failing_tests == ["rio-observability"], (
+        f"rio-ci must be filtered from failing[]; only the VM fail remains. "
+        f"Got: {v.failing_tests!r}"
+    )
+    assert v.matched_flakes == ["rio-observability"]
+    assert "retry=Once" in v.reason
+
+    # Mutation-check hook: this is the load-bearing filter entry. If rio-ci
+    # is NOT in _AGGREGATE_DRVS, the positive above fails with len=2.
+    # Encode it as a runtime assert so the mutation (delete "rio-ci" from
+    # the frozenset) breaks THIS test, not just the positive above — makes
+    # the exit-criterion mutation-check unambiguous.
+    assert "rio-ci" in _AGGREGATE_DRVS, (
+        "rio-ci must be in _AGGREGATE_DRVS — it's the .#ci aggregate that "
+        "cascades on every constituent fail. Without it, P0530's regression "
+        "(_CHECK_FAIL_RE extracts rio-ci → len>1 → known-flake broken) "
+        "returns. P0532 hit this."
+    )
+
+    # ─── Negative: aggregate as the ONLY fail ───────────────────────────────
+    # Impossible in practice (rio-ci only fails BECAUSE a constituent did,
+    # and that constituent also appears in the log) but proves the filter
+    # doesn't falsely excuse. rio-ci alone → check_fails=[] after filter
+    # → failing=[] → no-fails branch → NOT excusable.
+    log.write_text(
+        "error: Cannot build '/nix/store/def456abc-rio-ci.drv'\n"
+        "       Reason: 1 dependency failed.\n"
+    )
+    v = excusable(log)
+    assert not v.excusable, (
+        f"aggregate-only log must NOT be excusable (filtered → no-fails "
+        f"branch). Got: {v.reason!r}"
+    )
+    assert v.failing_tests == []
+    assert "no FAIL lines" in v.reason
+
+    # ─── Negative: two REAL fails (non-aggregate) still reject ──────────────
+    # Proves _AGGREGATE_DRVS doesn't over-filter — rio-tracey-validate and
+    # rio-clippy are both real checks.* drvs, neither in the frozenset.
+    # Two real fails → len>1 → reject (pre-P0534 multi-fail discipline
+    # still holds for NON-aggregate cases).
+    log.write_text(
+        "error: Cannot build '/nix/store/aaa111bbb-rio-tracey-validate.drv'\n"
+        "error: Cannot build '/nix/store/ccc222ddd-rio-clippy.drv'\n"
+    )
+    v = excusable(log)
     assert not v.excusable
     assert "2 failures" in v.reason
-    assert set(v.failing_tests) == {"rio-tracey-validate", "rio-cov-vm-total"}
+    assert set(v.failing_tests) == {"rio-tracey-validate", "rio-clippy"}
+
+    # ─── Frozenset completeness: all three plan-listed aggregates ───────────
+    # rio-cov-vm-total + rio-coverage-full are coverage-side aggregates
+    # (runCommand depending on per-test lcovs). Same cascade shape as
+    # rio-ci but on the .#coverage-full backgrounded path.
+    assert {"rio-ci", "rio-cov-vm-total", "rio-coverage-full"} <= _AGGREGATE_DRVS
 
 
 # ─── unassigned placeholder rename ───────────────────────────────────────────
