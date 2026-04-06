@@ -218,6 +218,9 @@ Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = 
 r[store.key.rotation-cluster-history]
 The cluster signing key MAY be rotated. Prior cluster public keys MUST remain in the trusted set for `sig_visibility_gate` verification until the grace period expires — otherwise paths signed under the old key become invisible to cross-tenant reads when `path_tenants` row count hits zero (CASCADE on tenant deletion). Prior keys are loaded from `cluster_key_history` alongside the active `Signer`.
 
+r[store.key.admin-cli]
+Cluster key rotation history and per-tenant signing keys MUST be manageable via `rio-cli keys`. The CLI validates pubkey entry format (`name:base64(32-byte-ed25519-pubkey)`) before INSERT — malformed entries are rejected with a specific reason (missing separator, bad base64, wrong length, invalid curve point). Retirement sets `retired_at`, preserving the audit trail; deletion is not exposed. Manual `psql` remains possible but bypasses validation — load-time checks (`r[store.key.rotation-cluster-history]`) catch malformed rows regardless.
+
 ### Realisation Signing
 
 CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv_hash, output_name, output_path, nar_hash)`. This provides integrity for content-addressed output mappings independently of narinfo signatures.

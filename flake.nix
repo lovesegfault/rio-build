@@ -1260,36 +1260,32 @@
           # result is a directory of symlinks to each constituent's output
           # (inspectable with `ls result/`).
           #
-          # All VM tests (including k3s scenarios) + 2min fuzz. On
-          # non-Linux, degrades to Rust checks + pre-commit only (VM
-          # tests and fuzz are both optionalAttrs isLinux upstream).
-          # Linux+KVM required for the full set.
-          ciBaseDrvs = [
-            rio-workspace
-            crateChecks.clippyCheck
-            crateChecks.nextest
-            crateChecks.docCheck
-            crateChecks.coverage
-            miscChecks.deny
-            miscChecks.tracey-validate
-            miscChecks.helm-lint
-            miscChecks.crds-drift
-            miscChecks.tfvars-fresh
-            rioDashboard
-            config.checks.pre-commit
-          ];
-
+          # Derived from config.checks — every check is a CI constituent.
+          # Before P0525 this was a manual list that had drifted to 44/45:
+          # codecov-matrix-sync (the one guarding codecov.yml drift) was
+          # missing, so after_n_builds went 2 commits stale before ee957551
+          # hand-patched it. `nix flake check` caught it; `.#ci` (the merge
+          # gate) did not. Deriving closes the class.
+          #
+          # config.checks is the flake-parts merged result: our checks
+          # attrset + git-hooks module's pre-commit. That attrset already
+          # //-merges vmTests and fuzz.runs, so they appear here without
+          # explicit addition. On non-Linux it's smaller (vmTests, fuzz,
+          # codecov-matrix-sync are all optionalAttrs isLinux upstream) —
+          # ci degrades to Rust checks + pre-commit automatically.
+          #
+          # builtins.attrValues is attr-name sorted → stable linkFarm hash.
           ci = pkgs.linkFarmFromDrvs "rio-ci" (
-            ciBaseDrvs
-            ++ builtins.attrValues fuzz.runs
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
-              builtins.attrValues vmTests
+            builtins.attrValues config.checks
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               # cov-smoke: one coverage-mode VM scenario, asserts
               # profraw→lcov pipeline works. ~5min. Catches
               # "coverage infra broken" at merge-gate instead of
               # 118 commits later via backgrounded coverage-full.
-              ++ [ coverage.smoke ]
-            )
+              # NOT a check (too slow for `nix flake check` on a
+              # non-KVM host) — CI-aggregate only.
+              coverage.smoke
+            ]
           );
 
           # --------------------------------------------------------------
@@ -2204,7 +2200,10 @@
                 .github/codecov.yml after_n_builds=${toString declared} but coverage matrix has ${toString expected} entries.
                 Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
               '';
-              pkgs.emptyFile;
+              # Named (not pkgs.emptyFile) so `ls result/` of .#ci shows
+              # which constituent this is — eval-time asserts are invisible
+              # otherwise once they pass.
+              pkgs.runCommand "rio-codecov-matrix-sync" { } "touch $out";
           };
 
           # Formatter for 'nix fmt'
