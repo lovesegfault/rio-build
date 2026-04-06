@@ -3,21 +3,24 @@
 use rio_test_support::metrics::{assert_emitted_metrics_described, assert_spec_metrics_described};
 
 /// Metric names from observability.md's Controller Metrics table.
-const CONTROLLER_METRICS: &[&str] = &[
-    "rio_controller_reconcile_duration_seconds",
-    "rio_controller_reconcile_errors_total",
-    "rio_controller_scaling_decisions_total",
-    "rio_controller_workerpool_replicas",
-    "rio_controller_gc_runs_total",
-];
+/// Derived at build time via build.rs → spec_metrics.txt.
+const SPEC_METRICS_RAW: &str = include_str!(concat!(env!("OUT_DIR"), "/spec_metrics.txt"));
 
 const EMITTED_METRICS: &str = include_str!(concat!(env!("OUT_DIR"), "/emitted_metrics.txt"));
 
 // r[verify obs.metric.controller]
 #[test]
 fn all_spec_metrics_have_describe_call() {
+    let spec_metrics: Vec<&str> = SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
+    // Floor-check: obs.md's Controller Metrics table has ≥5 rows.
+    // Guards against vacuous pass if the grep path breaks.
+    assert!(
+        spec_metrics.len() >= 5,
+        "spec_metrics.txt has only {} entries — build.rs grep broken?",
+        spec_metrics.len()
+    );
     assert_spec_metrics_described(
-        CONTROLLER_METRICS,
+        &spec_metrics,
         rio_controller::describe_metrics,
         "rio-controller",
     );

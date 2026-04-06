@@ -273,6 +273,12 @@
             # rio-controller tests — build-time presence check so a
             # missing profile fails compile, not silently at deploy).
             ./infra/helm/rio-build/files
+            # observability.md — build.rs greps the per-component
+            # metrics tables to derive SPEC_METRICS for the
+            # spec→describe check (see rio-test-support
+            # emit_spec_metrics_grep). Adding a row must break
+            # the nextest drv hash so drift is caught.
+            ./docs/src/observability.md
           ];
           c2nWorkspaceSrc = pkgs.lib.fileset.toSource {
             root = unfilteredRoot;
