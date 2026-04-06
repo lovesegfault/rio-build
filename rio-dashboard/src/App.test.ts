@@ -22,7 +22,7 @@ describe('App', () => {
     expect(screen.getByText('rio-dashboard')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Cluster' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Builds' })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Workers' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Executors' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'GC' })).toBeInTheDocument();
   });
 });

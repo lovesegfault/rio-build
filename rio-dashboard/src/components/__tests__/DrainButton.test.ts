@@ -18,7 +18,7 @@ vi.mock('../../api/admin', () => ({ admin: adminMock }));
 vi.mock('../../lib/toast', () => ({ toast: toastMock }));
 
 import DrainHarness, {
-  getWorkers,
+  getExecutors,
   reassign,
   setSeed,
 } from './DrainHarness.svelte';
@@ -127,7 +127,7 @@ describe('DrainButton', () => {
     await flushSvelte();
 
     // Revert lands on w-target (idx=0 NOW), not w-c (stale idx=1).
-    const ws = getWorkers();
+    const ws = getExecutors();
     expect(ws[0].executorId).toBe('w-target');
     expect(ws[0].status).toBe('alive'); // reverted
     expect(ws[1].executorId).toBe('w-c');
@@ -153,7 +153,7 @@ describe('DrainButton', () => {
     await flushSvelte();
 
     // No throw (findIndex→-1→no-op); toast.error still fires.
-    expect(getWorkers()).toHaveLength(0);
+    expect(getExecutors()).toHaveLength(0);
     expect(toastMock.error).toHaveBeenCalledWith(
       expect.stringContaining('w-gone'),
     );

@@ -1,6 +1,6 @@
 {
-  "uid": "rio-worker-utilization",
-  "title": "rio-build: Worker Utilization",
+  "uid": "rio-builder-utilization",
+  "title": "rio-build: Builder Utilization",
   "tags": ["rio-build"],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -23,8 +23,8 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "WorkerPool replicas (per pool)",
-      "description": "Desired vs actual replicas per WorkerPool. Labels: pool (pool name), kind (desired/actual).",
+      "title": "BuilderPool replicas (per pool)",
+      "description": "Desired vs actual replicas per BuilderPool. Labels: pool (pool name), kind (desired/actual).",
       "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
@@ -77,13 +77,13 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Worker CPU (cores)",
+      "title": "Builder CPU (cores)",
       "description": "Per-pod CPU usage from cAdvisor. Unit is cores (1.0 = one full core).",
       "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\"rio-worker.*\", container!=\"\"}[5m]))",
+          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\"rio-builder.*\", container!=\"\"}[5m]))",
           "legendFormat": "{{pod}}",
           "refId": "A"
         }
@@ -104,13 +104,13 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Worker memory (working set)",
+      "title": "Builder memory (working set)",
       "description": "Per-pod memory working set from cAdvisor.",
       "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\"rio-worker.*\", container!=\"\"})",
+          "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\"rio-builder.*\", container!=\"\"})",
           "legendFormat": "{{pod}}",
           "refId": "A"
         }

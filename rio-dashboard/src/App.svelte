@@ -11,8 +11,8 @@
   import Toast from './components/Toast.svelte';
   import Builds from './pages/Builds.svelte';
   import Cluster from './pages/Cluster.svelte';
+  import Executors from './pages/Executors.svelte';
   import GC from './pages/GC.svelte';
-  import Workers from './pages/Workers.svelte';
 </script>
 
 <Router>
@@ -21,7 +21,7 @@
     <ul>
       <li><Link to="/">Cluster</Link></li>
       <li><Link to="/builds">Builds</Link></li>
-      <li><Link to="/workers">Workers</Link></li>
+      <li><Link to="/executors">Executors</Link></li>
       <li><Link to="/gc">GC</Link></li>
     </ul>
   </nav>
@@ -32,7 +32,7 @@
          The slot receives route params via the let: binding. -->
     <Route path="/builds"><Builds /></Route>
     <Route path="/builds/:id" let:params><Builds id={params.id} /></Route>
-    <Route path="/workers"><Workers /></Route>
+    <Route path="/executors"><Executors /></Route>
     <Route path="/gc"><GC /></Route>
   </main>
 </Router>

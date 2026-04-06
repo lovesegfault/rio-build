@@ -49,7 +49,6 @@ r[ctrl.fetcherpool.reconcile]
 
 ### Scheduler routing
 
-r[sched.dispatch.fod-to-fetcher]
 
 The `ExecutorKind` enum (`Builder | Fetcher`) is added to the heartbeat payload and `ExecutorState`. `hard_filter()` gains one clause:
 
@@ -61,7 +60,6 @@ if drv.is_fixed_output != (executor.kind == ExecutorKind::Fetcher) {
 
 FODs route only to fetchers. Non-FODs route only to builders.
 
-r[sched.dispatch.no-fod-fallback]
 
 The overflow chain (`find_executor_with_overflow()`) is skipped for FODs --- fetchers have no size classes to overflow through. If no fetcher is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
 
@@ -69,7 +67,6 @@ The `CutoffRebalancer` operates on builder pools only. Fetcher replica count is 
 
 ### Executor enforcement
 
-r[builder.executor.kind-gate]
 
 `rio-builder` re-derives `is_fod` from the `.drv` itself (it already does, per `wkr-fod-flag-trust` remediation). If `is_fod` disagrees with the pod's `RIO_EXECUTOR_KIND`, the executor returns `ExecutorError::WrongKind` without spawning the daemon. Defense-in-depth --- the scheduler should never misroute, but a bug or a stale-generation race shouldn't grant a builder internet access.
 
