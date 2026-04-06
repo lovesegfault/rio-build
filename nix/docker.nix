@@ -99,8 +99,39 @@ let
   # Factored out so the `all` aggregate image (VM-test-only) can reuse
   # them. Worker is the only component that needs nix/fuse/mount at
   # runtime, but the aggregate must be a superset of every component.
+  #
+  # nixForBuilder: pkgs.nix with movePath() patched to fall back to a
+  # recursive copy on EXDEV (I-185). When the builder pod runs with
+  # hostUsers:false (ADR-012), rio-builder's overlayfs mount happens
+  # inside a non-init user namespace; the kernel then forces
+  # redirect_dir=off (and refuses redirect_dir=on). overlayfs without
+  # redirect_dir returns EXDEV for ANY rename(2) of a directory whose
+  # target parent is a merge-type dir — and the overlay root (= the
+  # chroot-store realStoreDir) is always merge-type. nix-daemon's
+  # post-build movePath(chroot/{out} -> realStoreDir/{out}) is a raw
+  # std::filesystem::rename with no fallback, so every DIRECTORY output
+  # fails (file outputs rename fine — the kernel restriction is
+  # directory-only). nix's moveFile() temp-then-rename fallback also
+  # hits the same EXDEV. The patch makes movePath() copy on EXDEV.
+  #
+  # appendPatches re-derives the whole nix component scope from the
+  # patched source; only nix-store and its reverse-deps actually
+  # rebuild differently. Rebuild is cached until pkgs.nix.src bumps.
+  #
+  # `.nix-cli` (not the umbrella nix-everything): nix-everything pulls
+  # in nix-functional-tests as a build-time dep; the local-overlay-
+  # store/stale-file-handle test fails in OUR build sandbox regardless
+  # of the patch (verified with a no-op README patch — same FAIL). The
+  # test exercises nix's own local-overlay:// store backend, which we
+  # don't use; nix-cli has bin/nix-daemon and is all the executor needs.
+  #
+  # Tracey: r[impl builder.overlay.userns-exdev] lives in overlay.rs
+  # (the mount that triggers the kernel restriction); docker.nix is
+  # outside the tracey impls.include set.
+  nixForBuilder = (pkgs.nix.appendPatches [ ./patches/nix-movepath-exdev-fallback.patch ]).nix-cli;
+
   builderExtraContents = [
-    pkgs.nix # nix-daemon --stdio, spawned per-build
+    nixForBuilder # nix-daemon --stdio, spawned per-build
     pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
     pkgs.util-linux # mount, umount for overlay teardown
     pkgs.busybox # sh/test/sleep for the wait-seccomp initContainer (builders.rs)
@@ -141,7 +172,7 @@ let
     # `Command::new("nix-daemon")` (no absolute path), relying on PATH.
     "PATH=${
       lib.makeBinPath [
-        pkgs.nix
+        nixForBuilder
         pkgs.fuse3
         pkgs.util-linux
       ]

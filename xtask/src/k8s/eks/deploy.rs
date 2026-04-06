@@ -89,6 +89,8 @@ pub async fn run(
     let ami_tag = ami_tag.as_str();
 
     let tf = tofu::outputs(TF_DIR)?;
+    let region = tf.get("region")?;
+    super::ami::assert_registered(ami_tag, &region).await?;
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
     let store_arn = tf.get("store_iam_role_arn")?;
