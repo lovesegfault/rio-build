@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::Provider;
+use crate::k8s::provider::{BuiltImages, Provider};
 use crate::{sh, tofu, ui};
 
 mod bootstrap;
@@ -26,16 +26,16 @@ impl Provider for Eks {
     }
 
     async fn provision(&self, cfg: &XtaskConfig, auto: bool) -> Result<()> {
-        ui::step("tofu init+apply", || async {
+        let backend = ui::step("resolve tfstate backend", || async {
             let aws = aws_config::load_from_env().await;
-            let backend = tofu::Backend {
+            Ok(tofu::Backend {
                 bucket: tofu::state_bucket(cfg, &aws).await?,
                 region: cfg.tfstate_region.clone(),
-            };
-            tofu::init(TF_DIR, &backend)?;
-            tofu::apply(TF_DIR, auto, &[])
+            })
         })
         .await?;
+        ui::step("tofu init", || async { tofu::init(TF_DIR, &backend) }).await?;
+        tofu::apply(TF_DIR, auto, &[]).await?;
         ui::step("kubeconfig", || async { kubeconfig() }).await
     }
 
@@ -43,8 +43,12 @@ impl Provider for Eks {
         kubeconfig()
     }
 
-    async fn push(&self, cfg: &XtaskConfig) -> Result<()> {
-        push::run(cfg).await
+    async fn build(&self, cfg: &XtaskConfig) -> Result<BuiltImages> {
+        push::build(cfg).await
+    }
+
+    async fn push(&self, images: &BuiltImages, cfg: &XtaskConfig) -> Result<()> {
+        push::push(images, cfg).await
     }
 
     async fn deploy(&self, cfg: &XtaskConfig) -> Result<()> {

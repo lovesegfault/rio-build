@@ -48,19 +48,13 @@ pub async fn run(which: Option<RegenCmd>, _cfg: &XtaskConfig) -> Result<()> {
         None => {
             // Umbrella: run the idempotent regenerators (not seccomp —
             // that's a network-dependent diff, not a regen).
-            ui::phase("regen", 6, || async {
+            ui::phase("regen", || async {
                 ui::step("hakari", hakari::run).await?;
-                ui::inc();
                 ui::step("sqlx", sqlx::run).await?;
-                ui::inc();
                 ui::step("crds", crds::run).await?;
-                ui::inc();
                 ui::step("grafana", || async { grafana::run() }).await?;
-                ui::inc();
                 ui::step("fuzz-lock", fuzz_lock::run).await?;
-                ui::inc();
                 ui::step("cargo-json", cargo_json::run).await?;
-                ui::inc();
                 Ok(())
             })
             .await

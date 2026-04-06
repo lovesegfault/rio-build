@@ -18,6 +18,7 @@ use tracing::info;
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
+use crate::k8s::provider::BuiltImages;
 use crate::sh::{cmd, repo_root, shell};
 use crate::{git, tofu, ui};
 
@@ -29,27 +30,30 @@ const ARCHES: &[(&str, &str)] = &[("x86_64-linux", "amd64"), ("aarch64-linux", "
 /// (local nix store), dest is our own ECR — no signatures to verify.
 const POLICY_JSON: &str = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
 
-pub async fn run(cfg: &XtaskConfig) -> Result<()> {
-    let ecr = tofu::output(TF_DIR, "ecr_registry")?;
-    let region = tofu::output(TF_DIR, "region")?;
-
+/// nix build both arch linkFarms. Independent of provision outputs —
+/// `up` joins this with provision concurrently.
+pub async fn build(cfg: &XtaskConfig) -> Result<BuiltImages> {
     let repo = git::open()?;
     let tag = git::image_tag(&repo)?;
     if tag.contains("-dirty-") {
         info!("dirty tree — tagging {tag}");
     }
 
-    let out = tempfile::tempdir()?;
-    let out_path = out.path();
+    let dir = tempfile::tempdir()?;
+    build_all(dir.path(), cfg).await?;
+    Ok(BuiltImages { dir, tag })
+}
 
-    // Build both arch linkFarms.
-    for (sys, arch) in ARCHES {
-        build_arch(sys, arch, out_path, cfg).await?;
-    }
+/// ECR login + skopeo copy + manifest lists. Needs tofu outputs
+/// (ecr_registry, region) so cannot run before provision.
+pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
+    let ecr = tofu::output(TF_DIR, "ecr_registry")?;
+    let region = tofu::output(TF_DIR, "region")?;
+    let tag = &images.tag;
+    let out_path = images.dir.path();
 
     // ECR auth via aws-sdk-ecr → skopeo login.
-    info!("ECR login ({ecr}, {region})");
-    ecr_login(&ecr, &region).await?;
+    ui::step(&format!("ECR login ({ecr})"), || ecr_login(&ecr, &region)).await?;
 
     // Policy file (skopeo --policy is a global flag, needs a file).
     let policy = out_path.join("policy.json");
@@ -123,14 +127,15 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
 
     // Manifest lists (OCI image index) per image. Sequential — small
     // metadata-only PUTs, ~1s each.
-    info!("creating multi-arch manifest lists");
-    let sh = shell()?;
     for name in &names {
-        info!("  rio-{name}:{tag} → {{amd64,arm64}}");
-        crate::sh::run(cmd!(
-            sh,
-            "manifest-tool push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
-        ))
+        ui::step(&format!("manifest rio-{name}:{tag}"), || async {
+            let sh = shell()?;
+            crate::sh::run(cmd!(
+                sh,
+                "manifest-tool push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
+            ))
+            .await
+        })
         .await?;
     }
 
@@ -145,35 +150,58 @@ pub async fn run(cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-async fn build_arch(sys: &str, arch: &str, out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
+async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     let sh = shell()?;
-    let link = out.join(format!("images-{arch}"));
-    let link_s = link.to_str().unwrap();
-    let attr = format!(".#packages.{sys}.dockerImages");
+    let attrs: Vec<String> = ARCHES
+        .iter()
+        .map(|(sys, _)| format!(".#packages.{sys}.dockerImages"))
+        .collect();
+
+    let store_args = match &cfg.remote_store {
+        Some(remote) => {
+            info!("building images on {remote} (both arches, single eval)");
+            vec![
+                "--eval-store".into(),
+                "auto".into(),
+                "--store".into(),
+                remote.clone(),
+            ]
+        }
+        None => {
+            info!("building images locally (both arches; set RIO_REMOTE_STORE to offload)");
+            vec![]
+        }
+    };
+    // Single command: --print-out-paths emits one store path per attr
+    // on stdout (in arg order), -L build log on stderr. A separate
+    // `nix path-info` re-eval can disagree with the build's eval under
+    // `--eval-store auto --store remote` — ask the build itself.
+    let (sa, at) = (&store_args, &attrs);
+    let out_paths = ui::step("nix build (multi-arch)", || {
+        crate::sh::run_read(cmd!(
+            sh,
+            "nix build -L --no-link --print-out-paths {sa...} {at...}"
+        ))
+    })
+    .await?;
+    let paths: Vec<&str> = out_paths.lines().collect();
+    anyhow::ensure!(
+        paths.len() == ARCHES.len(),
+        "nix build returned {} paths for {} attrs",
+        paths.len(),
+        ARCHES.len()
+    );
 
     if let Some(remote) = &cfg.remote_store {
-        info!("building {arch} images on {remote}");
-        // Two-step: run() captures stderr (nix's -L build log) into the
-        // spinner tail; then read() the resulting store path.
-        crate::sh::run(cmd!(
-            sh,
-            "nix build {attr} -L --no-link --eval-store auto --store {remote}"
-        ))
+        let p = &paths;
+        ui::step(&format!("nix copy from {remote}"), || {
+            crate::sh::run(cmd!(sh, "nix copy --from {remote} --no-check-sigs {p...}"))
+        })
         .await?;
-        let outpath = crate::sh::read(cmd!(
-            sh,
-            "nix path-info {attr} --eval-store auto --store {remote}"
-        ))?;
-        info!("copying {outpath} from {remote}");
-        crate::sh::run(cmd!(
-            sh,
-            "nix copy --from {remote} --no-check-sigs {outpath}"
-        ))
-        .await?;
-        std::os::unix::fs::symlink(&outpath, &link)?;
-    } else {
-        info!("building {arch} images locally (set RIO_REMOTE_STORE to offload)");
-        crate::sh::run(cmd!(sh, "nix build {attr} -L --out-link {link_s}")).await?;
+    }
+
+    for ((_, arch), path) in ARCHES.iter().zip(&paths) {
+        std::os::unix::fs::symlink(path, out.join(format!("images-{arch}")))?;
     }
     Ok(())
 }

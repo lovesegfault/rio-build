@@ -77,6 +77,42 @@ pub async fn run(cmd: xshell::Cmd<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Like [`run`] but returns captured stdout. Stderr still tails into
+/// the spinner. For commands that print a result on stdout while
+/// logging progress on stderr (e.g. `nix build --print-out-paths -L`).
+pub async fn run_read(cmd: xshell::Cmd<'_>) -> Result<String> {
+    let argv = cmd.to_string();
+    debug!("exec (run+read): {argv}");
+
+    let mut std_cmd: std::process::Command = cmd.quiet().into();
+    std_cmd.stdin(Stdio::null());
+    let mut child = tokio::process::Command::from(std_cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn: {argv}"))?;
+
+    let (out_buf, err_buf) = tokio::join!(
+        // Don't tail stdout — it's the return value, not progress.
+        async {
+            use tokio::io::AsyncReadExt;
+            let mut s = String::new();
+            let _ = child.stdout.take().unwrap().read_to_string(&mut s).await;
+            s
+        },
+        tail(child.stderr.take().unwrap(), &argv),
+    );
+    let status = child.wait().await?;
+
+    if !status.success() {
+        for line in err_buf.lines() {
+            tracing_indicatif::indicatif_eprintln!("  {} {line}", style("│").dim());
+        }
+        bail!("{argv}: {status}");
+    }
+    Ok(out_buf.trim_end().to_string())
+}
+
 /// Run a command that must interact with a tty (prompts for input).
 /// Always inherits stdio, regardless of verbosity.
 pub fn run_interactive(cmd: xshell::Cmd<'_>) -> Result<()> {
