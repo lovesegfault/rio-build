@@ -146,12 +146,21 @@ def count_bump(set_to: int | None = None, *, plan: int | None = None) -> int:
         cur = int(count_file.read_text().strip()) if count_file.exists() else 0
         new = cur + 1
     count_file.parent.mkdir(parents=True, exist_ok=True)
-    count_file.write_text(f"{new}\n")
-    # Record tip at THIS merge-count. Append-only; _cadence_range reads the
-    # last row with mc == (current - window). Explicit cwd — if the merger's
-    # bash-cwd is outside the repo entirely (e.g., a removed-worktree
-    # directory), a bare rev-parse fails → tip="" → mc→sha map gaps →
-    # _cadence_range returns None → cadence agents silently not spawned.
+    # Record tip at THIS merge-count FIRST — P0417's already-done scan
+    # checks merge-shas.jsonl for plan==plan_num before bumping. If
+    # count-file is written first and we crash before MergeSha, the scan
+    # sees no row → case-(a) → double-bump. Writing MergeSha first makes
+    # the crash window a cadence-gap (cadence agents skipped one tick)
+    # not a permanent off-by-one. _cadence_range dedupes by
+    # last-row-per-mc (dict comprehension), so duplicate-mc rows are
+    # harmless. tip=="" (bare rev-parse fail outside repo) → skip
+    # MergeSha but still bump count — same cadence-gap degradation.
+    # (P0420 swapped the order from count-file-first.)
+    #
+    # Explicit cwd — if the merger's bash-cwd is outside the repo
+    # entirely (e.g., a removed-worktree directory), a bare rev-parse
+    # fails → tip="" → mc→sha map gaps → _cadence_range returns None →
+    # cadence agents silently not spawned.
     tip = subprocess.run(
         ["git", "rev-parse", INTEGRATION_BRANCH],
         cwd=REPO_ROOT,
@@ -161,6 +170,7 @@ def count_bump(set_to: int | None = None, *, plan: int | None = None) -> int:
         append_jsonl(sha_file, MergeSha(
             mc=new, sha=tip, ts=datetime.now(timezone.utc), plan=plan,
         ))
+    count_file.write_text(f"{new}\n")
     return new
 
 
@@ -256,8 +266,10 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # count-bump MUST run AFTER amend — it records rev-parse
     # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
     # orphaned (reflog-only). This ordering was the P0319 fix; dag_flip
-    # keeps it correct by construction. P0417: pass plan so the
-    # already-done re-invocation check can find this row.
+    # keeps it correct by construction. P0417 passes plan so the
+    # already-done re-invocation check can find this row. P0420
+    # reordered count_bump internally (MergeSha row BEFORE count-file)
+    # so crash-between-writes degrades to a cadence-gap not double-bump.
     mc = count_bump(plan=plan_num)
     return DagFlipResult(
         plan=plan_num, amend_sha=amend_sha, mc=mc,
