@@ -1,6 +1,6 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
-use super::{PoisonedDerivationRow, SchedulerDb};
+use super::{PoisonedDerivationRow, SchedulerDb, TERMINAL_STATUS_SQL};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 impl SchedulerDb {
@@ -170,6 +170,76 @@ impl SchedulerDb {
         .execute(&self.pool)
         .await
         .map(|_| ())
+    }
+
+    // r[impl sched.db.clear-poison-batch]
+    /// Batch variant of [`clear_poison`]: one round-trip for N hashes
+    /// via `WHERE drv_hash = ANY($1)`. Same column set as the scalar.
+    ///
+    /// I-169: `merge.rs`' resubmit-reset path called `clear_poison`
+    /// per-hash inside the single-threaded actor — a 500-node resubmit
+    /// blocked heartbeat/dispatch for 500 sequential PG round-trips.
+    /// Same shape as [`update_derivation_status_batch`].
+    ///
+    /// [`clear_poison`]: Self::clear_poison
+    /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
+    pub async fn clear_poison_batch(&self, drv_hashes: &[DrvHash]) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let hashes: Vec<&str> = drv_hashes.iter().map(DrvHash::as_str).collect();
+        let result = sqlx::query!(
+            "UPDATE derivations
+             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
+                 status = 'created', updated_at = now()
+             WHERE drv_hash = ANY($1::text[])",
+            &hashes as &[&str],
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    // r[impl sched.db.derivations-gc]
+    /// Delete up to `limit` orphan-terminal `derivations` rows: status
+    /// is terminal AND no `build_derivations` link AND no `assignments`
+    /// row. Returns rows deleted.
+    ///
+    /// I-169.2: 1.16M `dependency_failed` rows accumulated. Terminal
+    /// rows are never re-read (recovery filters via
+    /// `TERMINAL_STATUS_SQL`); once the owning build is deleted
+    /// (008's `ON DELETE CASCADE` drops the `build_derivations` link)
+    /// nothing references them. Subselect-LIMIT — PG has no
+    /// `DELETE ... LIMIT` — so a 1M-row backlog drains over many
+    /// ticks instead of one long table lock.
+    ///
+    /// `NOT EXISTS assignments`: the FK on `assignments.derivation_id`
+    /// is still RESTRICT (028 dropped only the edges/build_derivations
+    /// FKs). A `completed` row that ran keeps its assignment until that
+    /// table's own retention sweeps it. `dependency_failed` rows (the
+    /// 1.16M case) never dispatched → no assignment → eligible
+    /// immediately.
+    ///
+    /// `derivation_edges` rows referencing deleted ids are left in
+    /// place (FK dropped in 028). They're harmless:
+    /// `load_edges_for_derivations` filters by `ANY(nonterminal_ids)`
+    /// on both endpoints, so orphans are never loaded.
+    pub async fn gc_orphan_terminal_derivations(&self, limit: i64) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(&format!(
+            "DELETE FROM derivations WHERE derivation_id IN (
+                 SELECT d.derivation_id FROM derivations d
+                 WHERE d.status IN {TERMINAL_STATUS_SQL}
+                   AND NOT EXISTS (SELECT 1 FROM build_derivations bd
+                                   WHERE bd.derivation_id = d.derivation_id)
+                   AND NOT EXISTS (SELECT 1 FROM assignments a
+                                   WHERE a.derivation_id = d.derivation_id)
+                 LIMIT $1
+             )"
+        ))
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Load poisoned derivations with their `poisoned_at` timestamps

@@ -675,7 +675,7 @@ impl DagActor {
                     kind,
                     ephemeral,
                 } => {
-                    let phantoms = self.handle_heartbeat(
+                    let (phantoms, became_idle) = self.handle_heartbeat(
                         &executor_id,
                         systems,
                         supported_features,
@@ -701,7 +701,18 @@ impl DagActor {
                     // ProcessCompletion / PrefetchComplete / MergeDag
                     // still dispatch inline (those unlock new work).
                     // r[impl sched.actor.dispatch-decoupled]
-                    self.dispatch_dirty = true;
+                    //
+                    // r[impl sched.dispatch.became-idle-immediate]
+                    // Carve-out: capacity 0→1 (fresh ephemeral, degrade
+                    // clear, drain clear) dispatches inline. ≤1 per
+                    // executor per spawn cycle — not the 29/s storm.
+                    // Steady-state (already-idle or already-busy) still
+                    // only sets dirty.
+                    if became_idle {
+                        self.dispatch_ready().await;
+                    } else {
+                        self.dispatch_dirty = true;
+                    }
                 }
                 ActorCommand::Tick => {
                     self.handle_tick().await;

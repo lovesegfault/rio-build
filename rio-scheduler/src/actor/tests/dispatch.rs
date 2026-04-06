@@ -1242,14 +1242,19 @@ async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
     Ok(())
 }
 
-/// I-163 Fix 1: Heartbeat sets `dispatch_dirty` instead of dispatching
-/// inline; `Tick` drains the flag. At 290 workers × 169ms/dispatch the
-/// inline path was ~5× actor capacity.
+/// I-163 Fix 1 + became-idle carve-out: steady-state Heartbeats set
+/// `dispatch_dirty` (drained by `Tick`); a Heartbeat that flips
+/// capacity 0→1 dispatches inline. At 290 workers × 169ms/dispatch
+/// the unconditional inline path was ~5× actor capacity — the 0→1
+/// edge is bounded by spawn rate, not heartbeat rate.
 ///
 /// Shape: merge with no worker (Ready, deferred) → connect_no_ack
-/// (Heartbeat sets dirty) → assert no Assignment yet → Tick → assert
-/// Assignment lands.
+/// (registration heartbeat = 0→1 → inline dispatch, cold-fallback
+/// places the node) → assert Assignment lands WITHOUT a Tick. Then a
+/// SECOND heartbeat for the now-busy worker is steady-state (0→0) →
+/// only dirty, no inline dispatch.
 // r[verify sched.actor.dispatch-decoupled]
+// r[verify sched.dispatch.became-idle-immediate]
 #[tokio::test]
 async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -1259,28 +1264,47 @@ async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), "i163-hb", PriorityClass::Scheduled).await?;
 
-    // Connected + Heartbeat. Heartbeat now sets dispatch_dirty=true
-    // and returns — no inline dispatch_ready.
+    // Connected + Heartbeat. Registration heartbeat is a 0→1 capacity
+    // edge → became_idle=true → inline dispatch_ready. Cold-fallback
+    // places the node on the freshly-registered worker (warm-gate
+    // sent a PrefetchHint but cold-fallback ignores warm).
     let mut rx = connect_executor_no_ack(&handle, "i163-w", "x86_64-linux", 1).await?;
-    barrier(&handle).await;
+    let a = recv_assignment(&mut rx).await;
+    assert!(
+        a.drv_path.contains("i163-hb"),
+        "registration heartbeat (0→1) must dispatch inline — \
+         r[sched.dispatch.became-idle-immediate]"
+    );
 
-    // Drain whatever the actor sent (PrefetchHint from
-    // on_worker_registered) and assert NO Assignment among it. Would
-    // FAIL on the pre-I-163 inline-dispatch path: the cold-fallback
-    // would have placed the node already.
+    // Second heartbeat: worker is now busy (running_build=Some) →
+    // capacity 0→0 → became_idle=false → only dispatch_dirty set.
+    // Queue another node; it must NOT dispatch on this heartbeat
+    // (worker has no capacity AND no 0→1 edge), only on Tick after
+    // capacity frees. Here we just assert no spurious second
+    // assignment from the steady-state heartbeat.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            ephemeral: false,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            executor_id: "i163-w".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            running_builds: vec![a.drv_path.clone()],
+        })
+        .await?;
+    barrier(&handle).await;
     while let Ok(m) = rx.try_recv() {
         use rio_proto::types::scheduler_message::Msg;
         assert!(
             !matches!(m.msg, Some(Msg::Assignment(_))),
-            "Heartbeat must not dispatch inline (I-163); got Assignment before Tick"
+            "steady-state heartbeat (0→0, busy) must not dispatch inline"
         );
     }
-
-    // Tick drains dispatch_dirty → dispatch_ready → cold-fallback
-    // places the node on the only registered worker.
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    let a = recv_assignment(&mut rx).await;
-    assert!(a.drv_path.contains("i163-hb"));
     Ok(())
 }
 

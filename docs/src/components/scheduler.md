@@ -35,6 +35,9 @@ gRPC handler tasks send commands to the DAG actor and `await` responses. This el
 r[sched.actor.dispatch-decoupled]
 `dispatch_ready` runs from state-change events (`MergeDag`, `ProcessCompletion`, `PrefetchComplete`) and from `Tick` when the `dispatch_dirty` flag is set. `Heartbeat` sets `dispatch_dirty` instead of dispatching inline --- at N workers / 10s heartbeat interval that is N/10 dispatch passes per second, and each pass costs one full-DAG batch-FOD scan plus a `ready_queue` drain. At 290 workers and a 27k-node DAG (I-163) the inline path generated ~5× actor capacity and pushed `actor_mailbox_depth` to 9.5k. Coalescing to once per Tick bounds the heartbeat-driven dispatch rate at 1/s regardless of fleet size.
 
+r[sched.dispatch.became-idle-immediate]
+A `Heartbeat` that transitions an executor's capacity 0→1 (fresh registration, `store_degraded` clear, `draining` clear, phantom drain) dispatches inline instead of deferring to `Tick`. This is the carve-out from `r[sched.actor.dispatch-decoupled]`: the 0→1 transition is at most once per executor per degrade/spawn cycle (not N/10 per second), and deferring it adds up to one full tick interval of idle time to every freshly-spawned ephemeral builder --- the controller spawned the pod *because* work is queued, so the slot is immediately useful. Steady-state heartbeats from already-idle or already-busy executors still only set `dispatch_dirty`.
+
 r[sched.admin.snapshot-cached]
 `AdminService.ClusterStatus` reads a `watch::channel` snapshot that the actor publishes once per `Tick`, instead of round-tripping `ActorCommand::ClusterSnapshot` through the mailbox. The handler itself is ~37µs; queuing it behind a saturated mailbox (I-163: 9.5k commands) made it time out at exactly the moment the autoscaler and operators need a reading. The cached value is at most one Tick (~1s) stale.
 
@@ -599,6 +602,12 @@ Batch INSERTs into `derivations` / `build_derivations` / `derivation_edges` MUST
 
 r[sched.db.partial-index-literal]
 Queries that filter by terminal status MUST interpolate the terminal-status list as a SQL literal (`NOT IN ('completed', ...)`), not bind it as a parameter (`<> ALL($1::text[])`). The partial index `derivations_status_idx` has a literal predicate; the planner can only prove a query's `WHERE` implies the index predicate at plan time, before bind values are known. A parameterized filter is opaque and forces a seq scan. The literal string and `DerivationStatus::is_terminal()` MUST stay in sync (drift-tested).
+
+r[sched.db.derivations-gc]
+Terminal `derivations` rows with no `build_derivations` link and no `assignments` row are deleted by a periodic Tick-driven sweep (batched `LIMIT 1000` per pass). Recovery never re-reads terminal rows (`WHERE status NOT IN <terminal>`); once the owning build is deleted (cascades `build_derivations`), the derivation row is unreachable. Without the sweep, `dependency_failed` rows from large failed closures accumulate unboundedly --- I-169.2 observed 1.16M rows.
+
+r[sched.db.clear-poison-batch]
+`clear_poison` has a `clear_poison_batch(&[DrvHash])` variant using `WHERE drv_hash = ANY($1)`. The merge-time resubmit-reset path (`reset_on_resubmit`) clears poison for every node a resubmit flipped from terminal to fresh; per-hash sequential calls inside the single-threaded actor cost N round-trips on the dispatch hot path.
 
 
 ### Schema (pseudo-DDL)

@@ -632,7 +632,7 @@ impl DagActor {
         draining: bool,
         kind: rio_proto::types::ExecutorKind,
         ephemeral: bool,
-    ) -> Vec<DrvHash> {
+    ) -> (Vec<DrvHash>, bool) {
         // I-048b: heartbeat for an executor without a stream entry is
         // dropped. Only `handle_worker_connected` (BuildExecution
         // stream open) creates entries. Allowing heartbeat to create
@@ -653,7 +653,7 @@ impl DagActor {
                 "heartbeat for unknown executor; dropping \
                  (stream not yet connected — scheduler restart race?)"
             );
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         // TOCTOU fix: a stale heartbeat must not clobber a fresh assignment.
@@ -685,6 +685,14 @@ impl DagActor {
             .executors
             .get(executor_id.as_str())
             .and_then(|w| w.running_build.clone());
+        // I-163: capture pre-heartbeat capacity for the 0→1 edge-detect
+        // (`r[sched.dispatch.became-idle-immediate]`). Read here, before
+        // adopt_heartbeat_build / field updates below — same "before any
+        // mutation" snapshot as `prev_running`.
+        let had_capacity = self
+            .executors
+            .get(executor_id.as_str())
+            .is_some_and(|w| w.has_capacity());
 
         // Keep the scheduler-assigned build if still in-flight.
         let prev_kept: Option<DrvHash> = prev_running.as_ref().and_then(|h| {
@@ -848,6 +856,18 @@ impl DagActor {
             None
         };
 
+        // r[impl sched.dispatch.became-idle-immediate]
+        // Capacity 0→1 edge: fresh registration (is_registered flip),
+        // store_degraded clear, draining_hb clear, or running_build
+        // cleared via reconcile/phantom. Computed AFTER all field
+        // writes above (running_build, store_degraded, draining_hb)
+        // and BEFORE on_worker_registered borrows &mut self. The
+        // caller (mod.rs Heartbeat arm) dispatches inline on this
+        // signal instead of deferring to Tick — at most one such
+        // transition per executor per spawn/degrade cycle, so this
+        // doesn't reintroduce the I-163 heartbeat-storm.
+        let became_idle = !had_capacity && worker.has_capacity();
+
         if !was_registered && worker.is_registered() {
             info!(executor_id = %executor_id, "worker fully registered (heartbeat + stream)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
@@ -857,7 +877,7 @@ impl DagActor {
             self.on_worker_registered(executor_id);
         }
 
-        confirmed_phantoms
+        (confirmed_phantoms, became_idle)
     }
 
     /// Reset confirmed-phantom derivations to Ready and re-queue.
@@ -1044,6 +1064,7 @@ impl DagActor {
         self.tick_process_expired_poisons(expired_poisons).await;
 
         self.tick_sweep_event_log();
+        self.tick_gc_orphan_derivations().await;
         self.tick_publish_gauges();
 
         // r[impl sched.actor.dispatch-decoupled]
@@ -1402,6 +1423,32 @@ impl DagActor {
                     }
                 }
             });
+        }
+    }
+
+    // r[impl sched.db.derivations-gc]
+    /// I-169.2: periodic sweep of orphan-terminal `derivations` rows.
+    /// Every 30th tick (~5min at the default 10s interval) → delete
+    /// ≤1000. A 1.16M backlog drains in ~4 days; steady-state churn
+    /// (terminal nodes per 5min from failed closures) is well under the
+    /// batch cap. Best-effort: PG error logs and retries next interval.
+    async fn tick_gc_orphan_derivations(&self) {
+        const DERIVATIONS_GC_EVERY: u64 = 30;
+        const DERIVATIONS_GC_BATCH: i64 = 1000;
+        if !self.tick_count.is_multiple_of(DERIVATIONS_GC_EVERY) {
+            return;
+        }
+        match self
+            .db
+            .gc_orphan_terminal_derivations(DERIVATIONS_GC_BATCH)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => {
+                debug!(deleted = n, "GC'd orphan-terminal derivation rows");
+                metrics::counter!("rio_scheduler_derivations_gc_deleted_total").increment(n);
+            }
+            Err(e) => warn!(error = %e, "derivations GC sweep failed; retrying next interval"),
         }
     }
 

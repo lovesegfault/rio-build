@@ -2363,3 +2363,77 @@ fn warm_gate_initial_hint_is_deterministic() {
          cap (proves fan-in sort fired)"
     );
 }
+
+// r[verify sched.dispatch.became-idle-immediate]
+/// I-163 carve-out: a heartbeat that flips capacity 0→1 dispatches
+/// inline, NOT deferred to Tick. Uses `store_degraded` true→false as
+/// the 0→1 trigger (warm-gate already open, isolates the edge-detect).
+///
+/// Regression shape: before the fix, step (4) only set `dispatch_dirty`
+/// and the assignment wouldn't appear until a `Tick` — `try_recv` after
+/// the barrier would be `Empty`.
+#[tokio::test]
+async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    // (1) Register + warm. Queue empty → on_worker_registered flips
+    // warm=true immediately (no PrefetchHint round-trip needed).
+    let mut rx = connect_executor(&handle, "w-idle", "x86_64-linux", 1).await?;
+
+    // (2) Degrade → capacity 1→0. Raw Heartbeat (no trailing Tick).
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: true,
+            ephemeral: false,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            executor_id: "w-idle".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            running_builds: vec![],
+        })
+        .await?;
+
+    // (3) Queue work. MergeDag dispatches inline but the only executor
+    // is degraded → derivation stays Ready in the queue.
+    let _ = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "idle-immediate",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "precondition: degraded executor must not receive assignment"
+    );
+
+    // (4) Un-degrade → capacity 0→1 → became_idle=true → dispatch_ready
+    // INLINE. NO Tick sent. barrier proves the heartbeat handler ran
+    // to completion; assignment must already be on the channel.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            ephemeral: false,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            executor_id: "w-idle".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            running_builds: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let a = recv_assignment(&mut rx).await;
+    assert_eq!(a.drv_path, test_drv_path("idle-immediate"));
+    Ok(())
+}

@@ -98,6 +98,10 @@ pub fn describe_metrics() {
         "Scheduler cache check (store FindMissingPaths) failures; alert if rate > 0 sustained"
     );
     describe_counter!(
+        "rio_scheduler_derivations_gc_deleted_total",
+        "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
+    );
+    describe_counter!(
         "rio_scheduler_size_class_promotions_total",
         "size_class_floor promotions on transient failure (I-170/I-177, labeled kind/from/to; \
          kind=fod|builder). Reactive upsize: a derivation that fails on class N retries on \

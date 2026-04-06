@@ -215,11 +215,17 @@ impl DagActor {
         // resubmit bound resets across leader failover — conservative,
         // matches `infra_retry_count`'s precedent. Best-effort like the
         // re-probe clear below.
-        for drv_hash in &merge_result.reset_on_resubmit {
-            if let Err(e) = self.db.clear_poison(drv_hash).await {
-                warn!(drv_hash = %drv_hash, error = %e,
-                      "failed to clear poison in PG for resubmit-reset node");
-            }
+        // r[impl sched.db.clear-poison-batch]
+        if let Err(e) = self
+            .db
+            .clear_poison_batch(&merge_result.reset_on_resubmit)
+            .await
+        {
+            warn!(
+                count = merge_result.reset_on_resubmit.len(),
+                error = %e,
+                "failed to clear poison in PG for resubmit-reset nodes"
+            );
         }
 
         // Transition build to active. If DB write fails, roll back everything.
