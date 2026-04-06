@@ -132,4 +132,16 @@ pub fn describe_metrics() {
         "Worker cgroup memory utilization: memory.current / memory.max. \
          0.0 if memory.max is unbounded ('max' literal)."
     );
+    describe_histogram!(
+        "rio_worker_upload_references_count",
+        "Reference count per output upload (references.len() after scan). \
+         Distribution of dependency fan-out per built path. Zero-heavy = \
+         mostly leaves; high p99 = wide transitive closures."
+    );
+    describe_counter!(
+        "rio_worker_stale_assignments_rejected_total",
+        "Assignments rejected due to stale generation (from a deposed \
+         scheduler leader). Nonzero during leader transitions is expected; \
+         sustained = scheduler lease flapping."
+    );
 }

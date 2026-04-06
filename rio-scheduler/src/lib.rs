@@ -183,6 +183,12 @@ pub fn describe_metrics() {
         "Derivations reset to Ready after running-since exceeded backstop (worker went silent)"
     );
     describe_counter!(
+        "rio_scheduler_build_timeouts_total",
+        "Builds failed by per-build wall-clock timeout (BuildOptions.build_timeout \
+         seconds since submission). Distinct from backstop_timeouts_total \
+         (per-derivation heuristic — worker went silent)."
+    );
+    describe_counter!(
         "rio_scheduler_recovery_total",
         "Scheduler state recoveries from PG after LeaderAcquired"
     );

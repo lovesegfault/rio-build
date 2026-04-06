@@ -108,6 +108,18 @@ pub fn describe_metrics() {
         "rio_store_gc_s3_key_enqueued_total",
         "S3 keys enqueued to pending_s3_deletes by GC sweep (zeroed-refcount chunks)."
     );
+    describe_gauge!(
+        "rio_store_gc_empty_refs_pct",
+        "Percent of sweep-eligible paths with zero references at GC time. \
+         High values trigger the 'suspicious GC sweep' error log (threshold \
+         configurable); sustained high = upstream ref-scanner likely broken."
+    );
+    describe_counter!(
+        "rio_store_sign_empty_refs_total",
+        "SignPath requests for non-CA paths with zero references. Suspicious \
+         for non-leaf derivations — GC cannot protect deps without the ref \
+         graph. Check worker ref-scanner if sustained."
+    );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
     // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)
