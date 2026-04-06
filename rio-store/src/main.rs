@@ -59,6 +59,13 @@ struct Config {
     /// — a chunk warmed by any is hot for all. Only relevant when
     /// chunk_backend != inline.
     chunk_cache_capacity_bytes: u64,
+    /// Global NAR reassembly buffer budget in bytes — total permits
+    /// across ALL concurrent PutPath handlers. Each handler acquires
+    /// `chunk.len()` permits before extending its accumulation Vec.
+    /// None → DEFAULT_NAR_BUDGET (8 × MAX_NAR_SIZE = 32 GiB). Lower
+    /// this on small-memory nodes; raise it if you have >8 concurrent
+    /// max-size uploads and RAM to match.
+    nar_buffer_budget_bytes: Option<u64>,
     /// ed25519 narinfo signing key path (Nix secret-key format:
     /// `name:base64-seed`). None = signing disabled (paths stored
     /// without our signature; still serveable, just unverified). The
@@ -107,6 +114,7 @@ impl Default for Config {
             // — the constant is crate-private so duplicated here,
             // but the config_defaults_are_stable test catches drift.
             chunk_cache_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            nar_buffer_budget_bytes: None,
             signing_key_path: None,
             cache_http_addr: None,
             // 9102 = gRPC (9002) + 100. Same +100 pattern as
@@ -316,6 +324,20 @@ async fn main() -> anyhow::Result<()> {
         Some(v) => store_service.with_hmac_verifier(v),
         None => store_service,
     };
+    // NAR buffer budget override. None → constructor already set
+    // DEFAULT_NAR_BUDGET (32 GiB); Some → replace the semaphore.
+    // `as usize`: lossless on 64-bit; on 32-bit (not a supported
+    // target) it would truncate, but so would DEFAULT_NAR_BUDGET.
+    let store_service = match cfg.nar_buffer_budget_bytes {
+        Some(budget) => {
+            info!(
+                budget_bytes = budget,
+                "NAR buffer budget overridden from config"
+            );
+            store_service.with_nar_budget(budget as usize)
+        }
+        None => store_service,
+    };
 
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there
@@ -466,6 +488,8 @@ mod tests {
         // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
         // constant changes, update this — the test catches drift.
         assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
+        // NAR budget override: None → DEFAULT_NAR_BUDGET (grpc/mod.rs).
+        assert!(d.nar_buffer_budget_bytes.is_none());
         assert!(d.signing_key_path.is_none());
         assert!(d.cache_http_addr.is_none());
         // Plaintext health listener for K8s probes when mTLS is on the main port.
@@ -596,6 +620,49 @@ mod tests {
                 }
                 other => panic!("expected Filesystem; got {other:?}"),
             }
+            Ok(())
+        });
+    }
+
+    /// P0218 T2: nar_buffer_budget_bytes TOML roundtrip via the real
+    /// `rio_common::config::load` path. Jail changes cwd to a temp dir;
+    /// `./store.toml` in there is picked up by load()'s `{component}.toml`
+    /// layer.
+    ///
+    /// The "value reaches StoreServer" half of this roundtrip is the
+    /// `with_nar_budget` builder test at grpc/put_path.rs —
+    /// `with_nar_budget(N)` → `available_permits() == N`. This test
+    /// covers the config-parse side; main()'s match at startup glues
+    /// the two.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn nar_buffer_budget_toml_roundtrip() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("store.toml", "nar_buffer_budget_bytes = 12345")?;
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert_eq!(
+                cfg.nar_buffer_budget_bytes,
+                Some(12345),
+                "store.toml nar_buffer_budget_bytes must thread through figment"
+            );
+            Ok(())
+        });
+    }
+
+    /// Absent from TOML → None, not Some(0). The struct-level
+    /// `#[serde(default)]` handles absence via Default::default(),
+    /// which sets None. main()'s match then keeps DEFAULT_NAR_BUDGET.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn nar_buffer_budget_absent_is_none() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("store.toml", r#"listen_addr = "0.0.0.0:9002""#)?;
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            assert!(
+                cfg.nar_buffer_budget_bytes.is_none(),
+                "absent key must not serialize to Some; got {:?}",
+                cfg.nar_buffer_budget_bytes
+            );
             Ok(())
         });
     }
