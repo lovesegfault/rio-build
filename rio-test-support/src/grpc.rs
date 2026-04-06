@@ -432,6 +432,14 @@ pub struct MockSchedulerOutcome {
     /// scripted events. Only applies in scripted mode. For gateway
     /// reconnect-on-transport-error tests.
     pub error_after_n: Option<(usize, tonic::Code)>,
+    /// Sleep this long between each scripted event. Only applies in
+    /// scripted mode. For mid-opcode-disconnect tests: gives the test
+    /// time to drop the client stream while the scheduler is still
+    /// sending Log events, so the gateway's next stderr.log write
+    /// gets BrokenPipe → `StreamProcessError::Wire`. Without this,
+    /// scripted events flood the mpsc channel synchronously and the
+    /// race between client-drop and stream-EOF is nondeterministic.
+    pub scripted_event_interval: Option<std::time::Duration>,
     /// If Some, WatchBuild returns a stream of these events (same
     /// build_id/sequence auto-fill as SubmitBuild scripted mode).
     /// For gateway reconnect tests: SubmitBuild stream errors →
@@ -500,9 +508,13 @@ impl SchedulerService for MockScheduler {
         // Scripted mode: send events verbatim, auto-fill build_id/sequence, close.
         if let Some(events) = outcome.scripted_events {
             let error_after_n = outcome.error_after_n;
+            let interval = outcome.scripted_event_interval;
             let n_events = events.len();
             tokio::spawn(async move {
                 for (seq, mut ev) in events.into_iter().enumerate() {
+                    if let Some(d) = interval {
+                        tokio::time::sleep(d).await;
+                    }
                     // Error injection: after sending N events, send an Err(Status)
                     // into the stream. Gateway's process_build_events maps this
                     // to StreamProcessError::Transport → triggers the reconnect loop.
