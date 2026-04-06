@@ -57,6 +57,11 @@ in
   # interceptor is DUAL-MODE (header-absent → pass-through), so
   # enabling JWT here doesn't break tests that don't send tokens.
   jwtEnabled ? false,
+  # Additional values files layered after vmtest-full.yaml (Helm -f
+  # last-wins). privileged-hardening-e2e passes [vmtest-full-nonpriv.
+  # yaml] to flip workerPool.privileged:false + devicePlugin.enabled
+  # without duplicating the full base values file.
+  extraValuesFiles ? [ ],
 }:
 let
   # ── Shared cluster secrets ──────────────────────────────────────────
@@ -71,6 +76,7 @@ let
   # RBAC before workloads.
   helmRendered = helmRender {
     valuesFile = ../../../infra/helm/rio-build/values/vmtest-full.yaml;
+    inherit extraValuesFiles;
     # jwt.publicKey / jwt.signingSeed are base64 strings — must go
     # through --set-string (extraSet), not --set (extraSetTyped would
     # try YAML-parsing the trailing `=` padding). Merged with caller's

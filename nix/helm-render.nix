@@ -21,6 +21,13 @@ in
 {
   # Path to a values file (typically values/vmtest.yaml).
   valuesFile,
+  # Additional values files layered AFTER valuesFile (-f is
+  # repeatable; last wins on key conflict). Used by the
+  # privileged-hardening-e2e scenario to layer vmtest-full-nonpriv.
+  # yaml on top of vmtest-full.yaml — the overlay stays minimal
+  # (only the privileged:false + devicePlugin:enabled flip) instead
+  # of duplicating the full 196-line base.
+  extraValuesFiles ? [ ],
   # --set-string overrides. Each becomes a "--set-string key=value"
   # arg. --set-string (not --set): Helm's --set coerces "3" to int 3,
   # which breaks EnvVar.value (must be string). All current callers
@@ -51,6 +58,7 @@ let
     k: "--set ${pkgs.lib.escapeShellArg "${k}=${builtins.toJSON extraSetTyped.${k}}"}"
   ) (builtins.attrNames extraSetTyped);
   setArgs = "${setStringArgs} ${setTypedArgs}";
+  extraValuesArgs = pkgs.lib.concatMapStringsSep " " (f: "-f ${f}") extraValuesFiles;
 in
 pkgs.runCommand "rio-helm-rendered"
   {
@@ -66,7 +74,7 @@ pkgs.runCommand "rio-helm-rendered"
     mkdir -p charts
     ln -s ${subcharts.postgresql} charts/postgresql
 
-    helm template rio . -n ${namespace} -f ${valuesFile} ${setArgs} > all.yaml
+    helm template rio . -n ${namespace} -f ${valuesFile} ${extraValuesArgs} ${setArgs} > all.yaml
 
     mkdir -p $out
     # CRDs come from infra/helm/crds/ (not the chart — Helm's crds/ dir

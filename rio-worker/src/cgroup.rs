@@ -303,6 +303,7 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         // production default (privileged=false + device plugin +
         // hostUsers:false, ADR-012), the container's cgroup mount
         // may be RO and this remount is load-bearing.
+        // r[impl worker.cgroup.ns-root-remount]
         nix::mount::mount(
             None::<&str>,
             CGROUP_ROOT,

@@ -54,7 +54,11 @@ let
 
   protocol = import ./scenarios/protocol.nix;
   scheduling = import ./scenarios/scheduling.nix;
-  security = import ./scenarios/security.nix;
+  # security exports { standalone, privileged-hardening-e2e } — two
+  # scenario functions sharing the same file. standalone uses the
+  # systemd fixture (mTLS/HMAC/tenant/validation); e2e uses k3sFull
+  # with the nonpriv values overlay (device-plugin + cgroup remount).
+  security = import ./scenarios/security.nix { inherit pkgs common; };
   observability = import ./scenarios/observability.nix;
   lifecycle = import ./scenarios/lifecycle.nix;
   leader-election = import ./scenarios/leader-election.nix;
@@ -63,6 +67,7 @@ let
   netpol = import ./scenarios/netpol.nix;
   chaos = import ./scenarios/chaos.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
+  pulled = import ../docker-pulled.nix { inherit pkgs; };
 
   # Shared fixture for both scheduling splits — identical VM topology.
   schedulingFixture = standalone {
@@ -278,8 +283,7 @@ in
   #   Single-test scenario (no subtests list). Markers at the wiring
   #   point per P0341 convention — scenario header prose explains which
   #   subtest proves each rule.
-  vm-security-standalone = security {
-    inherit pkgs common;
+  vm-security-standalone = security.standalone {
     fixture = standalone {
       workers = {
         worker = {
@@ -299,6 +303,32 @@ in
         pkgs.grpc-health-probe
         pkgs.postgresql
       ];
+    };
+  };
+
+  # r[verify sec.pod.fuse-device-plugin]
+  # r[verify sec.pod.host-users-false]
+  # r[verify worker.cgroup.ns-root-remount]
+  #   Non-privileged + device-plugin VM e2e. Every other k3s fixture
+  #   uses vmtest-full.yaml privileged:true (containerd mounts
+  #   /sys/fs/cgroup rw already, hostPath /dev/fuse works) — the
+  #   rw-remount and device-plugin paths were never exercised until
+  #   this scenario. builders.rs unit tests prove pod SHAPE renders
+  #   correctly; this proves it WORKS (DS Ready → extended resource
+  #   advertised → worker pod Ready with hostUsers:false → cgroup/leaf
+  #   exists + subtree_control writable → build completes over FUSE).
+  vm-security-nonpriv-k3s = security.privileged-hardening-e2e {
+    fixture = k3sFull {
+      # Layer vmtest-full-nonpriv.yaml on top of the base vmtest-full.
+      # yaml — flips workerPool.privileged:false + devicePlugin.enabled
+      # + overrides devicePlugin.image to match docker-pulled.nix.
+      extraValuesFiles = [
+        ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
+      ];
+      # smarter-device-manager is NOT in the default airgap set
+      # (only bitnami-postgresql + rio-all). Without this, the DS pod
+      # goes ImagePullBackOff (airgapped, no pull).
+      extraImages = [ pulled.smarter-device-manager ];
     };
   };
 
