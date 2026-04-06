@@ -95,11 +95,8 @@ cargo clippy --all-targets -- --deny warnings
 # Format (rustfmt + nixfmt + taplo)
 treefmt
 
-# Full local validation (build + clippy + nextest + docs + coverage + 30s fuzz smoke)
-nix build .#ci-local-fast
-
-# Full CI incl. NixOS VM tests (needs KVM)
-nix build .#ci-fast
+# Full CI (build + clippy + nextest + docs + coverage + 2min fuzz + NixOS VM tests; needs KVM)
+nix build .#ci
 ```
 
 The default dev shell uses **nightly** Rust so `cargo fuzz` works directly. CI checks use **stable** via `rust-toolchain.toml` — nightly-only code is rejected by `nix flake check`. Use `nix develop .#stable` for CI-parity local dev.

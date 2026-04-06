@@ -57,7 +57,7 @@ The window is narrow (MergeDag returned → first event sent is typically sub-mi
 | `.proto` change | no | **no** (gRPC metadata is out-of-band) |
 | Eliminates race | **no** — still double-submits, just moves the retry from client to gateway | **yes** — build_id available before any stream read |
 | Zombie build leak | yes (1 per scheduler blip during submit) | no |
-| Controller (`reconcilers/build.rs:313-315`, same bug) | still broken | fixed by same 3-line scheduler diff |
+| Controller (`reconcilers/build.rs:313-315`, same bug — file deleted in P0294) | still broken | fixed by same 3-line scheduler diff |
 | Request clone cost | `SubmitBuildRequest` has `Vec<DerivationNode>` + `Vec<DerivationEdge>` — up to `MAX_DAG_NODES` × ~256 KB drv_content. Clone-before-send for retry. | none |
 
 ### Why A looks tempting but isn't
@@ -369,7 +369,7 @@ The `:210` and `:213` diagnostics are in the legacy branch — they will only fi
 
 ## 7. Controller — same bug, follow-up
 
-`rio-controller/src/reconcilers/build.rs:257` + `:313-315`:
+`rio-controller/src/reconcilers/build.rs:257` + `:313-315` (file deleted in P0294):
 
 ```rust
 let stream = sched.submit_build(req).await?.into_inner();

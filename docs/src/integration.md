@@ -88,23 +88,20 @@ nix-eval-jobs --flake .#packages.x86_64-linux | \
 
 For a more sophisticated setup, use `nix-eval-jobs` with `--check-cache-status` to skip already-cached derivations, and parse the JSON output to submit builds with appropriate priorities.
 
-## Kubernetes: Build CRD
+## Programmatic build submission: gRPC
 
-For programmatic build submission from within the cluster:
+For build submission from within the cluster or automation, use the `SubmitBuild` RPC directly:
 
-```yaml
-apiVersion: rio.build/v1alpha1
-kind: Build
-metadata:
-  name: nightly-nixpkgs
-spec:
-  derivation: /nix/store/abc...-hello.drv   # must be a store path
-  priority: 50
-  timeoutSeconds: 7200
-  tenant: ci-team
+```bash
+# Via rio-cli (preferred for scripts)
+rio-cli submit /nix/store/abc...-hello.drv --priority 50 --timeout 7200 --tenant ci-team
+
+# Via grpcurl (low-level)
+grpcurl -plaintext -d '{"derivations": [{"drv_path": "/nix/store/abc...-hello.drv"}], "priority": 50}' \
+  rio-scheduler:50051 rio.scheduler.SchedulerService/SubmitBuild
 ```
 
-Note: The `derivation` field must be a valid store path. Evaluation is external to rio-build (see [Non-Goals](./introduction.md#non-goals)). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`).
+Note: The derivation must be a valid store path. Evaluation is external to rio-build (see [Non-Goals](./introduction.md#non-goals)). The `.drv` file must already exist in rio-store (uploaded via `wopAddToStoreNar` through a gateway session or `nix copy`).
 
 ## Pre-Populating the Store: `nix copy`
 

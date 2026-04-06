@@ -440,7 +440,7 @@ So there's a window (overlay setup + daemon spawn, potentially seconds under FUS
 
 **Scenario A (benign):** build completes normally → `Ok(ExecutionResult)` → `runtime.rs:327` arm, flag never read. No bug.
 
-**Scenario B (the bug):** build hits an **unrelated** executor error after the failed cancel — overlay teardown fails, daemon handshake fails, FOD verify panics. `runtime.rs:334` `Err` arm reads `build_cancelled.load()` → `true` → reports `Cancelled` instead of `InfrastructureFailure`. Operator sees "cancelled" in the Build CR status, assumes user action, never investigates the real infra fault.
+**Scenario B (the bug):** build hits an **unrelated** executor error after the failed cancel — overlay teardown fails, daemon handshake fails, FOD verify panics. `runtime.rs:334` `Err` arm reads `build_cancelled.load()` → `true` → reports `Cancelled` instead of `InfrastructureFailure`. Operator sees "cancelled" in the build status (via `rio-cli builds` or `QueryBuildStatus` gRPC), assumes user action, never investigates the real infra fault.
 
 **Scenario C (design-acknowledged, unchanged by this fix):** cancel arrives early, `ENOENT`, build proceeds and succeeds. The cancel is silently lost. `docs/src/components/worker.md:361` documents this as acceptable: "logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed)." This fix doesn't change scenario C — only scenario B.
 
@@ -615,7 +615,8 @@ So: set first, kill, **undo on `ENOENT`**. `ENOENT` is the only errno that defin
 # build-timeout — Build.spec.timeoutSeconds shorter than the build's sleep.
 #
 # Asserts THREE things:
-#   1. Build CR reaches phase=Failed (NOT phase=Pending-again, which would
+#   1. Build status reaches phase=Failed (via rio-cli builds or
+#      QueryBuildStatus gRPC — NOT phase=Pending-again, which would
 #      mean scheduler reassigned it as InfrastructureFailure).
 #   2. cgroup is GONE after failure (NOT leaked EBUSY — proves fix 1,
 #      cgroup.kill fired before Drop rmdir).
@@ -692,10 +693,10 @@ with subtest("build-timeout: spec.timeoutSeconds < build duration → TimedOut, 
     # metric: it should be 0 for this drv_hash now (terminal), and
     # rio_scheduler_builds_reassigned_total should NOT have incremented
     # for a timeout. We use the simpler proxy: phase reached Failed
-    # WITHOUT passing through Pending again. Check Build CR conditions
-    # history — there should be exactly ONE Building→Failed transition.
-    # (kubectl doesn't surface transition history easily; fall back to
-    # asserting the worker metric has outcome=timed_out.)
+    # WITHOUT passing through Pending again. Check build status via
+    # rio-cli or QueryBuildStatus gRPC — there should be exactly ONE
+    # Building→Failed transition. Fall back to asserting the worker
+    # metric has outcome=timed_out.
     #
     # Scrape via apiserver proxy (worker pod is distroless, no curl).
     # Port 9091 is the metrics port (common.nix). NOTE: use the numeric

@@ -4,7 +4,7 @@
 //! `cache_token` column (nullable) is matched against the incoming
 //! `Authorization: Bearer <token>` header. A valid token authenticates
 //! the request as that tenant (attached as [`AuthenticatedTenant`]
-//! extension for future per-tenant scoping in 4b).
+//! extension for per-tenant scoping).
 //!
 //! Unauthenticated access is NOT the default — `cache_allow_unauthenticated`
 //! must be explicitly set to `true`. When `false` and no tenants have

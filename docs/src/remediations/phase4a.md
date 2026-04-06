@@ -1456,135 +1456,135 @@ Complete index of all findings by ID, for PR cross-referencing.
 
 | ID | Severity | Theme | Primary file | Status |
 |---|---|---|---|---|
-| `sched-poisoned-orphan-spurious-succeeded` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:120-146` | OPEN |
-| `sched-id-to-hash-missing-poisoned` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:120-146` | OPEN |
-| `sched-recovery-comment-lies` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:169-174` | OPEN |
-| `sched-reap-collateral-poisoned` | P0 | §1.1 recovery | `rio-scheduler/src/dag/mod.rs:503-519` | OPEN |
-| `sched-cancel-loop-crash-window` | P0 | §1.1 recovery | `rio-scheduler/src/actor/build.rs:111-146` | OPEN |
-| `sched-transition-build-inmem-first` | P0 | §1.1 recovery | `rio-scheduler/src/actor/build.rs:414-443` | OPEN |
-| `pg-poisoned-status-without-poisoned-at` | P0 | §1.1 recovery | `rio-scheduler/src/actor/completion.rs:445-447` | OPEN |
-| `sched-check-build-completion-zero-zero` | P0 | §1.1 recovery | `rio-scheduler/src/actor/completion.rs` | OPEN |
-| `sched-recovery-bd-rows-continue` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:168` | OPEN |
-| `sched-stderr-last-empty-built-outputs` | P0 | §1.1 recovery | (downstream symptom) | OPEN |
-| `wkr-upload-refs-empty` | P0 | §1.2 refs | `rio-worker/src/upload.rs:224` | OPEN |
-| `store-gc-mark-walks-empty` | P0 | §1.2 refs | `rio-store/src/gc/mark.rs:102` | OPEN |
-| `store-sign-fingerprint-empty-refs` | P0 | §1.2 refs | `rio-store/src/grpc/mod.rs:204-224` | OPEN |
-| `wkr-sandbox-bindmount-missing-transitive` | P0 | §1.2 refs | `docs/src/components/worker.md:215` | OPEN |
-| `wkr-upload-deriver-empty` | P0 | §1.2 refs | `rio-worker/src/upload.rs:223` | OPEN |
-| `ctrl-drain-stream-early-exit-no-patch` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:861-864` | OPEN |
-| `ctrl-unknown-phase-infinite-cycle` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:419-428` | OPEN |
-| `ctrl-reconnect-exhaust-wipes-status` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:419-428` | OPEN |
-| `kube-status-ssa-wipes-cached-count` | P0 | §1.3 stuck-build | `rio-controller/src/crds/build.rs` | OPEN |
-| `tonic-controller-watchbuild-retry-burns-on-dead-stream` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:882-898` | OPEN |
-| `ctrl-no-periodic-requeue` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs` | OPEN |
-| `ctrl-no-owns-watch` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs` | OPEN |
-| `tonic-gateway-eager-connect-no-retry` | P0 | §1.4 eager-connect | `rio-gateway/src/main.rs:202,217,230` | OPEN |
-| `tonic-worker-eager-connect-no-retry` | P0 | §1.4 eager-connect | `rio-worker/src/main.rs:157,161,170` | OPEN |
-| `ci-codecov-after-n-builds-missing` | P0 | §1.5 coverage | `codecov.yml` | OPEN |
-| `wire-realisation-outpath-full-path` | P1 | §1.6 realisation | `rio-gateway/src/handler/opcodes_read.rs:558` | OPEN |
-| `wire-realisation-register-basename-rejected` | P1 | §1.6 realisation | `rio-gateway/src/handler/opcodes_read.rs:486` | OPEN |
-| `test-mock-store-no-validate-store-path` | P1 | §1.6 realisation | `rio-gateway/tests/common/grpc.rs:304-316` | OPEN |
-| `test-vm-protocol-wrong-opcode` | P1 | §1.6 realisation | `nix/tests/vm/phase2b/protocol.nix` | OPEN |
-| `gw-stderr-error-then-last-desync` | P1 | §2.1 stderr-desync | `rio-gateway/src/handler/build.rs:508-523,792-800` | OPEN |
-| `gw-stderr-build-derivation` | P1 | §2.1 stderr-desync | `rio-gateway/src/handler/build.rs:508-523` | OPEN |
-| `gw-stderr-build-paths-with-results` | P1 | §2.1 stderr-desync | `rio-gateway/src/handler/build.rs:792-800` | OPEN |
-| `kube-lease-renew-no-timeout` | P1 | §2.2 lease | `rio-scheduler/src/lease/election.rs:189,316` | OPEN |
-| `kube-lease-no-local-self-fence` | P1 | §2.2 lease | `rio-scheduler/src/lease/mod.rs:385-398` | OPEN |
-| `sched-recovery-complete-toctou` | P1 | §2.2 lease | `rio-scheduler/src/actor/recovery.rs` | OPEN |
-| `wkr-timeout-cgroup-orphan` | P1 | §2.3 cgroup | `rio-worker/src/executor/mod.rs:575-589` | OPEN |
-| `wkr-status-collapse` | P1 | §2.3 cgroup | `rio-worker/src/executor/mod.rs:736-744` | OPEN |
-| `wkr-timeout-is-infra` | P1 | §2.3 cgroup | `rio-worker/src/executor/stderr_loop.rs:95` | OPEN |
-| `proto-heartbeat-resources-zero-producer` | P1 | §2.4 proto | `rio-worker/src/heartbeat.rs` | OPEN |
-| `proto-heartbeat-response-generation-unread` | P1 | §2.4 proto | `rio-worker/src/heartbeat.rs` | OPEN |
-| `proto-build-options-subfields-ignored` | P1 | §2.4 proto | `rio-worker/src/executor/mod.rs` | OPEN |
-| `tonic-no-set-not-serving-scheduler` | P1 | §2.5 drain | `rio-scheduler/src/main.rs:427-429` | OPEN |
-| `tonic-no-set-not-serving-store` | P1 | §2.5 drain | `rio-store/src/main.rs:349` | OPEN |
-| `tonic-no-set-not-serving-gateway` | P1 | §2.5 drain | `rio-gateway/src/main.rs:254-258` | OPEN |
-| `tonic-actor-channelsend-wrong-code` | P1 | §2.5 drain | `rio-scheduler/src/grpc/mod.rs:138` | OPEN |
-| `pg-in-mem-mutation-inside-tx` | P1 | §2.6 pg-tx | `rio-scheduler/src/actor/merge.rs:385-389` | OPEN |
-| `pg-querybuilder-param-limit` | P1 | §2.6 pg-tx | `rio-scheduler/src/db.rs:630-661` | OPEN |
-| `pg-partial-index-unused-parameterized` | P1 | §2.6 pg-tx | `rio-scheduler/src/db.rs:23-25,579,859` | OPEN |
-| `test-mock-watch-build-ignores-since-sequence` | P1 | §2.7 mock-lies | `rio-gateway/tests/common/grpc.rs:507-549` | OPEN |
-| `test-mock-sequence-starts-at-zero` | P1 | §2.7 mock-lies | `rio-gateway/tests/common/grpc.rs:430-432` | OPEN |
-| `test-start-paused-real-tcp-spawn-blocking` | P1 | §2.7 mock-lies | `rio-worker/src/upload.rs` tests | OPEN |
-| `tonic-upload-start-paused-real-tcp` | P1 | §2.7 mock-lies | `rio-worker/src/upload.rs` tests | OPEN |
-| `obs-spawn-monitored-no-span-propagation` | P1 | §2.8 span | `rio-common/src/task.rs:21` | OPEN |
-| `obs-verify-required-fields-missing` | P1 | §2.8 span | (tracey rule gap) | OPEN |
-| `wkr-sigint-not-handled` | P1 | §2.9 sigint | `rio-worker/src/main.rs:386` | OPEN |
-| `wkr-hb-exit-bypasses-raii` | P1 | §2.9 sigint | `rio-worker/src/main.rs:431` | OPEN |
-| `fuse-wait-timeout-vs-stream-timeout` | P1 | §2.10 fuse | `rio-worker/src/fuse/fetch.rs:60-68` | OPEN |
-| `fuse-blockon-thread-exhaustion` | P1 | §2.10 fuse | `rio-worker/src/fuse/fetch.rs` | OPEN |
-| `fuse-index-disk-divergence` | P1 | §2.10 fuse | `rio-worker/src/fuse/index.rs` | OPEN |
-| `nix-make-text-unsorted-refs` | P1 | §2.11 make-text | `rio-nix/src/store_path.rs:218-221` | OPEN |
-| `nix-nar-unbounded-recursion` | P1 | §2.12 nar | `rio-nix/src/nar.rs:214,306` | OPEN |
-| `nix-nixbase32-decode-silent-overflow` | P1 | §2.12 nar | `rio-nix/src/store_path.rs:394-399` | OPEN |
-| `ssh-session-errors-swallowed` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs:136` | OPEN |
-| `ssh-unbounded-channels` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | OPEN |
-| `ssh-no-keepalive` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | OPEN |
-| `ssh-nagle-enabled` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | OPEN |
-| `ssh-auth-methods-all` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | OPEN |
-| `store-mark-not-in-null-trap` | P1 | §2.14 gc | `rio-store/src/gc/mark.rs:110` | OPEN |
-| `store-trigger-gc-unbounded-extra-roots` | P1 | §2.14 gc | `rio-store/src/grpc/admin.rs:69-79` | OPEN |
-| `store-nar-buffer-no-global-limit` | P1 | §2.14 gc | `rio-store/src/grpc/put_path.rs:360-395` | OPEN |
-| `pg-putpath-shared-lock-pool-exhaustion` | P1 | §2.14 gc | `rio-store/src/grpc/put_path.rs:298` | OPEN |
-| `tonic-gateway-first-event-no-reconnect` | P1 | §2.15 submit-gap | `rio-gateway/src/handler/build.rs:207-214` | OPEN |
-| `sched-failed-workers-pg-unbounded` | P2 | §3 scheduler | `rio-scheduler/src/db.rs:443` | OPEN |
-| `sched-resolve-tenant-no-trim` | P2 | §3 scheduler | `rio-scheduler/src/grpc/mod.rs:432` | OPEN |
-| `sched-terminal-statuses-no-enforce` | P2 | §3 scheduler | `rio-scheduler/src/db.rs:25` | OPEN |
-| `tonic-worker-reconnect-no-backoff` | P2 | §3 scheduler | `rio-worker/src/main.rs:522` | OPEN |
-| `wkr-scan-unfiltered` | P2 | §3 worker | `rio-worker/src/upload.rs:73-94` | OPEN |
-| `wkr-fod-flag-trust` | P2 | §3 worker | `rio-worker/src/executor/mod.rs:612` | OPEN |
-| `wkr-cancel-flag-stale` | P2 | §3 worker | `rio-worker/src/runtime.rs:193` | OPEN |
-| `store-append-sigs-unbounded-growth` | P2 | §3 store | `rio-store/src/queries.rs:232` | OPEN |
-| `store-pin-unvalidated-and-leaks-sqlx` | P2 | §3 store | `rio-store/src/grpc/admin.rs:320-400` | OPEN |
-| `store-client-hash-trusted` | P2 | §3 store | `rio-store/src/grpc/put_path.rs` | OPEN |
-| `store-grace-i32-cast-truncation` | P2 | §3 store | `rio-store/src/gc/mark.rs:113` | OPEN |
-| `ctrl-cleanup-blocks-reconcile-worker` | P2 | §3 controller | `rio-controller/src/reconcilers/mod.rs:413-448` | OPEN |
-| `ctrl-store-err-mislabeled` | P2 | §3 controller | `rio-controller/src/reconcilers/build.rs:201` | OPEN |
-| `ctrl-connect-store-outside-main` | P2 | §3 controller | `rio-controller/src/reconcilers/build.rs:201` | OPEN |
-| `common-redact-password-at-sign` | P2 | §3 common | `rio-common/src/config.rs:160` | OPEN |
-| `common-otel-empty-endpoint` | P2 | §3 common | `rio-common/src/observability.rs:149` | OPEN |
-| `common-otel-sample-rate-nan` | P2 | §3 common | `rio-common/src/observability.rs:155` | OPEN |
-| `gw-temp-roots-unbounded-insert-only` | P2 | §3 gateway | `rio-gateway/src/handler/opcodes_read.rs:180` | OPEN |
-| `gw-submit-build-bare-question-mark-no-stderr` | P2 | §3 gateway | `rio-gateway/src/handler/build.rs:203,210,213` | OPEN |
-| `cfg-worker-knobs-unreachable-in-k8s` | P2 | §3 config | `rio-controller/src/builders.rs` | OPEN |
-| `cfg-zero-interval-tokio-panic` | P2 | §3 config | `rio-scheduler/src/main.rs:481` | OPEN |
-| `pg-dual-migrate-race` | P2 | §3 pg | `rio-scheduler/src/main.rs`, `rio-store/src/main.rs` | OPEN |
-| `pg-zero-compile-time-checked-queries` | P2 | §3 pg | workspace-wide | OPEN |
-| `pg-drain-max-attempts-const-drift` | P2 | §3 pg | `rio-store/src/gc/drain.rs:22` | OPEN |
-| `wire-query-realisation-error-after-stderr-last` | P2 | §3 wire | `rio-gateway/src/handler/opcodes_read.rs:543-584` | OPEN |
-| `wire-synth-db-narhash-format-unverified` | P2 | §3 wire | `rio-worker/src/synth_db.rs:68` | OPEN |
+| `sched-poisoned-orphan-spurious-succeeded` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:120-146` | FIXED (rem-01) |
+| `sched-id-to-hash-missing-poisoned` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:120-146` | FIXED (rem-01) |
+| `sched-recovery-comment-lies` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:169-174` | FIXED (rem-01) |
+| `sched-reap-collateral-poisoned` | P0 | §1.1 recovery | `rio-scheduler/src/dag/mod.rs:503-519` | FIXED (rem-01) |
+| `sched-cancel-loop-crash-window` | P0 | §1.1 recovery | `rio-scheduler/src/actor/build.rs:111-146` | FIXED (rem-01) |
+| `sched-transition-build-inmem-first` | P0 | §1.1 recovery | `rio-scheduler/src/actor/build.rs:414-443` | FIXED (rem-01) |
+| `pg-poisoned-status-without-poisoned-at` | P0 | §1.1 recovery | `rio-scheduler/src/actor/completion.rs:445-447` | FIXED (rem-01) |
+| `sched-check-build-completion-zero-zero` | P0 | §1.1 recovery | `rio-scheduler/src/actor/completion.rs` | FIXED (rem-01) |
+| `sched-recovery-bd-rows-continue` | P0 | §1.1 recovery | `rio-scheduler/src/actor/recovery.rs:168` | FIXED (rem-01) |
+| `sched-stderr-last-empty-built-outputs` | P0 | §1.1 recovery | (downstream symptom) | FIXED (rem-01) |
+| `wkr-upload-refs-empty` | P0 | §1.2 refs | `rio-worker/src/upload.rs:224` | FIXED (rem-02) |
+| `store-gc-mark-walks-empty` | P0 | §1.2 refs | `rio-store/src/gc/mark.rs:102` | FIXED (rem-02) |
+| `store-sign-fingerprint-empty-refs` | P0 | §1.2 refs | `rio-store/src/grpc/mod.rs:204-224` | FIXED (rem-02) |
+| `wkr-sandbox-bindmount-missing-transitive` | P0 | §1.2 refs | `docs/src/components/worker.md:215` | FIXED (rem-02) |
+| `wkr-upload-deriver-empty` | P0 | §1.2 refs | `rio-worker/src/upload.rs:223` | FIXED (rem-02) |
+| `ctrl-drain-stream-early-exit-no-patch` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:861-864` | MOOT-P0294 |
+| `ctrl-unknown-phase-infinite-cycle` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:419-428` | MOOT-P0294 |
+| `ctrl-reconnect-exhaust-wipes-status` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:419-428` | MOOT-P0294 |
+| `kube-status-ssa-wipes-cached-count` | P0 | §1.3 stuck-build | `rio-controller/src/crds/build.rs` | MOOT-P0294 |
+| `tonic-controller-watchbuild-retry-burns-on-dead-stream` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs:882-898` | MOOT-P0294 |
+| `ctrl-no-periodic-requeue` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs` | MOOT-P0294 |
+| `ctrl-no-owns-watch` | P0 | §1.3 stuck-build | `rio-controller/src/reconcilers/build.rs` | MOOT-P0294 |
+| `tonic-gateway-eager-connect-no-retry` | P0 | §1.4 eager-connect | `rio-gateway/src/main.rs:202,217,230` | FIXED (rem-04) |
+| `tonic-worker-eager-connect-no-retry` | P0 | §1.4 eager-connect | `rio-worker/src/main.rs:157,161,170` | FIXED (rem-04) |
+| `ci-codecov-after-n-builds-missing` | P0 | §1.5 coverage | `codecov.yml` | FIXED (rem-05) |
+| `wire-realisation-outpath-full-path` | P1 | §1.6 realisation | `rio-gateway/src/handler/opcodes_read.rs:558` | FIXED (rem-06) |
+| `wire-realisation-register-basename-rejected` | P1 | §1.6 realisation | `rio-gateway/src/handler/opcodes_read.rs:486` | FIXED (rem-06) |
+| `test-mock-store-no-validate-store-path` | P1 | §1.6 realisation | `rio-gateway/tests/common/grpc.rs:304-316` | FIXED (rem-06) |
+| `test-vm-protocol-wrong-opcode` | P1 | §1.6 realisation | `nix/tests/vm/phase2b/protocol.nix` | FIXED (rem-06) |
+| `gw-stderr-error-then-last-desync` | P1 | §2.1 stderr-desync | `rio-gateway/src/handler/build.rs:508-523,792-800` | FIXED (rem-07) |
+| `gw-stderr-build-derivation` | P1 | §2.1 stderr-desync | `rio-gateway/src/handler/build.rs:508-523` | FIXED (rem-07) |
+| `gw-stderr-build-paths-with-results` | P1 | §2.1 stderr-desync | `rio-gateway/src/handler/build.rs:792-800` | FIXED (rem-07) |
+| `kube-lease-renew-no-timeout` | P1 | §2.2 lease | `rio-scheduler/src/lease/election.rs:189,316` | FIXED (rem-08) |
+| `kube-lease-no-local-self-fence` | P1 | §2.2 lease | `rio-scheduler/src/lease/mod.rs:385-398` | FIXED (rem-08) |
+| `sched-recovery-complete-toctou` | P1 | §2.2 lease | `rio-scheduler/src/actor/recovery.rs` | FIXED (rem-08) |
+| `wkr-timeout-cgroup-orphan` | P1 | §2.3 cgroup | `rio-worker/src/executor/mod.rs:575-589` | FIXED (rem-09) |
+| `wkr-status-collapse` | P1 | §2.3 cgroup | `rio-worker/src/executor/mod.rs:736-744` | FIXED (rem-09) |
+| `wkr-timeout-is-infra` | P1 | §2.3 cgroup | `rio-worker/src/executor/stderr_loop.rs:95` | FIXED (rem-09) |
+| `proto-heartbeat-resources-zero-producer` | P1 | §2.4 proto | `rio-worker/src/heartbeat.rs` | FIXED (rem-10) |
+| `proto-heartbeat-response-generation-unread` | P1 | §2.4 proto | `rio-worker/src/heartbeat.rs` | FIXED (rem-10) |
+| `proto-build-options-subfields-ignored` | P1 | §2.4 proto | `rio-worker/src/executor/mod.rs` | FIXED (rem-10) |
+| `tonic-no-set-not-serving-scheduler` | P1 | §2.5 drain | `rio-scheduler/src/main.rs:427-429` | FIXED (rem-11) |
+| `tonic-no-set-not-serving-store` | P1 | §2.5 drain | `rio-store/src/main.rs:349` | FIXED (rem-11) |
+| `tonic-no-set-not-serving-gateway` | P1 | §2.5 drain | `rio-gateway/src/main.rs:254-258` | FIXED (rem-11) |
+| `tonic-actor-channelsend-wrong-code` | P1 | §2.5 drain | `rio-scheduler/src/grpc/mod.rs:138` | FIXED (rem-11) |
+| `pg-in-mem-mutation-inside-tx` | P1 | §2.6 pg-tx | `rio-scheduler/src/actor/merge.rs:385-389` | FIXED (rem-12) |
+| `pg-querybuilder-param-limit` | P1 | §2.6 pg-tx | `rio-scheduler/src/db.rs:630-661` | FIXED (rem-12) |
+| `pg-partial-index-unused-parameterized` | P1 | §2.6 pg-tx | `rio-scheduler/src/db.rs:23-25,579,859` | FIXED (rem-12) |
+| `test-mock-watch-build-ignores-since-sequence` | P1 | §2.7 mock-lies | `rio-gateway/tests/common/grpc.rs:507-549` | FIXED (rem-13) |
+| `test-mock-sequence-starts-at-zero` | P1 | §2.7 mock-lies | `rio-gateway/tests/common/grpc.rs:430-432` | FIXED (rem-13) |
+| `test-start-paused-real-tcp-spawn-blocking` | P1 | §2.7 mock-lies | `rio-worker/src/upload.rs` tests | FIXED (rem-13) |
+| `tonic-upload-start-paused-real-tcp` | P1 | §2.7 mock-lies | `rio-worker/src/upload.rs` tests | FIXED (rem-13) |
+| `obs-spawn-monitored-no-span-propagation` | P1 | §2.8 span | `rio-common/src/task.rs:21` | FIXED (rem-14) |
+| `obs-verify-required-fields-missing` | P1 | §2.8 span | (tracey rule gap) | FIXED (rem-14) |
+| `wkr-sigint-not-handled` | P1 | §2.9 sigint | `rio-worker/src/main.rs:386` | FIXED (rem-15) |
+| `wkr-hb-exit-bypasses-raii` | P1 | §2.9 sigint | `rio-worker/src/main.rs:431` | FIXED (rem-15) |
+| `fuse-wait-timeout-vs-stream-timeout` | P1 | §2.10 fuse | `rio-worker/src/fuse/fetch.rs:60-68` | FIXED (rem-07) |
+| `fuse-blockon-thread-exhaustion` | P1 | §2.10 fuse | `rio-worker/src/fuse/fetch.rs` | FIXED (rem-07) |
+| `fuse-index-disk-divergence` | P1 | §2.10 fuse | `rio-worker/src/fuse/index.rs` | FIXED (rem-07) |
+| `nix-make-text-unsorted-refs` | P1 | §2.11 make-text | `rio-nix/src/store_path.rs:218-221` | FIXED (rem-07) |
+| `nix-nar-unbounded-recursion` | P1 | §2.12 nar | `rio-nix/src/nar.rs:214,306` | FIXED (rem-07) |
+| `nix-nixbase32-decode-silent-overflow` | P1 | §2.12 nar | `rio-nix/src/store_path.rs:394-399` | FIXED (rem-07) |
+| `ssh-session-errors-swallowed` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs:136` | FIXED (rem-07) |
+| `ssh-unbounded-channels` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | FIXED (rem-07) |
+| `ssh-no-keepalive` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | FIXED (rem-07) |
+| `ssh-nagle-enabled` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | FIXED (rem-07) |
+| `ssh-auth-methods-all` | P1 | §2.13 ssh | `rio-gateway/src/ssh/server.rs` | FIXED (rem-07) |
+| `store-mark-not-in-null-trap` | P1 | §2.14 gc | `rio-store/src/gc/mark.rs:110` | FIXED (rem-07) |
+| `store-trigger-gc-unbounded-extra-roots` | P1 | §2.14 gc | `rio-store/src/grpc/admin.rs:69-79` | FIXED (rem-07) |
+| `store-nar-buffer-no-global-limit` | P1 | §2.14 gc | `rio-store/src/grpc/put_path.rs:360-395` | FIXED (rem-07) |
+| `pg-putpath-shared-lock-pool-exhaustion` | P1 | §2.14 gc | `rio-store/src/grpc/put_path.rs:298` | FIXED (rem-07) |
+| `tonic-gateway-first-event-no-reconnect` | P1 | §2.15 submit-gap | `rio-gateway/src/handler/build.rs:207-214` | FIXED (rem-07) |
+| `sched-failed-workers-pg-unbounded` | P2 | §3 scheduler | `rio-scheduler/src/db.rs:443` | FIXED (rem-21) |
+| `sched-resolve-tenant-no-trim` | P2 | §3 scheduler | `rio-scheduler/src/grpc/mod.rs:432` | FIXED (rem-21) |
+| `sched-terminal-statuses-no-enforce` | P2 | §3 scheduler | `rio-scheduler/src/db.rs:25` | FIXED (rem-21) |
+| `tonic-worker-reconnect-no-backoff` | P2 | §3 scheduler | `rio-worker/src/main.rs:522` | FIXED (rem-21) |
+| `wkr-scan-unfiltered` | P2 | §3 worker | `rio-worker/src/upload.rs:73-94` | FIXED (rem-21) |
+| `wkr-fod-flag-trust` | P2 | §3 worker | `rio-worker/src/executor/mod.rs:612` | FIXED (rem-21) |
+| `wkr-cancel-flag-stale` | P2 | §3 worker | `rio-worker/src/runtime.rs:193` | FIXED (rem-21) |
+| `store-append-sigs-unbounded-growth` | P2 | §3 store | `rio-store/src/queries.rs:232` | FIXED (rem-21) |
+| `store-pin-unvalidated-and-leaks-sqlx` | P2 | §3 store | `rio-store/src/grpc/admin.rs:320-400` | FIXED (rem-21) |
+| `store-client-hash-trusted` | P2 | §3 store | `rio-store/src/grpc/put_path.rs` | FIXED (rem-21) |
+| `store-grace-i32-cast-truncation` | P2 | §3 store | `rio-store/src/gc/mark.rs:113` | FIXED (rem-21) |
+| `ctrl-cleanup-blocks-reconcile-worker` | P2 | §3 controller | `rio-controller/src/reconcilers/mod.rs:413-448` | FIXED (rem-21) |
+| `ctrl-store-err-mislabeled` | P2 | §3 controller | `rio-controller/src/reconcilers/build.rs:201` | MOOT-P0294 |
+| `ctrl-connect-store-outside-main` | P2 | §3 controller | `rio-controller/src/reconcilers/build.rs:201` | MOOT-P0294 |
+| `common-redact-password-at-sign` | P2 | §3 common | `rio-common/src/config.rs:160` | FIXED (rem-21) |
+| `common-otel-empty-endpoint` | P2 | §3 common | `rio-common/src/observability.rs:149` | FIXED (rem-21) |
+| `common-otel-sample-rate-nan` | P2 | §3 common | `rio-common/src/observability.rs:155` | FIXED (rem-21) |
+| `gw-temp-roots-unbounded-insert-only` | P2 | §3 gateway | `rio-gateway/src/handler/opcodes_read.rs:180` | FIXED (rem-21) |
+| `gw-submit-build-bare-question-mark-no-stderr` | P2 | §3 gateway | `rio-gateway/src/handler/build.rs:203,210,213` | FIXED (rem-21) |
+| `cfg-worker-knobs-unreachable-in-k8s` | P2 | §3 config | `rio-controller/src/builders.rs` | FIXED (rem-21) |
+| `cfg-zero-interval-tokio-panic` | P2 | §3 config | `rio-scheduler/src/main.rs:481` | FIXED (rem-21) |
+| `pg-dual-migrate-race` | P2 | §3 pg | `rio-scheduler/src/main.rs`, `rio-store/src/main.rs` | OPEN — TODO(phase4b) |
+| `pg-zero-compile-time-checked-queries` | P2 | §3 pg | workspace-wide | OPEN — TODO(phase4b) |
+| `pg-drain-max-attempts-const-drift` | P2 | §3 pg | `rio-store/src/gc/drain.rs:22` | FIXED (rem-21) |
+| `wire-query-realisation-error-after-stderr-last` | P2 | §3 wire | `rio-gateway/src/handler/opcodes_read.rs:543-584` | FIXED (rem-21) |
+| `wire-synth-db-narhash-format-unverified` | P2 | §3 wire | `rio-worker/src/synth_db.rs:68` | FIXED (rem-21) |
 | `obs-fallback-reads-unregistered` | P2 | §3 obs | `rio-worker` | FIXED (plan 14) |
-| `obs-watch-reconnects-unregistered` | P2 | §3 obs | `rio-controller` | OPEN |
-| `obs-recovery-histogram-success-only` | P2 | §3 obs | `rio-scheduler/src/actor/recovery.rs:329,379` | OPEN |
-| `nix-hash-no-proptest` | P3 | §4 test-cov | `rio-nix/src/hash.rs` | OPEN |
-| `nix-proptest-escapes` | P3 | §4 test-cov | `rio-nix/src/aterm.rs` | OPEN |
-| `wire-stderr-no-proptest` | P3 | §4 test-cov | `rio-gateway/src/handler/stderr.rs` | OPEN |
-| `wire-no-golden-query-substitutable-paths` | P3 | §4 test-cov | `rio-gateway/tests/golden/` | OPEN |
-| `wire-no-golden-query-valid-derivers` | P3 | §4 test-cov | `rio-gateway/tests/golden/` | OPEN |
-| `wire-no-golden-add-signatures` | P3 | §4 test-cov | `rio-gateway/tests/golden/` | OPEN |
-| `fuse-no-enospc-test` | P3 | §4 test-cov | `rio-worker/src/fuse/` | OPEN |
-| `gc-no-concurrent-putpath-test` | P3 | §4 test-cov | `rio-store/src/gc/` | OPEN |
-| `store-sign-no-proptest` | P3 | §4 test-cov | `rio-store/src/sign.rs` | OPEN |
-| `sched-dag-no-cycle-proptest` | P3 | §4 test-cov | `rio-scheduler/src/dag/` | OPEN |
-| `doc-observability-metric-name-drift` | P3 | §4 doc | `docs/src/observability.md` | OPEN |
-| `doc-fuse-five-constraint-not-colocated` | P3 | §4 doc | `rio-worker/src/fuse/` | OPEN |
-| `doc-grace-hours-default` | P3 | §4 doc | `docs/src/components/store.md` | OPEN |
-| `kube-last-sequence-negative-cast` | P3 | §4 robust | `rio-controller/src/reconcilers/build.rs` | OPEN |
-| `cli-status-partial-print` | P3 | §4 robust | `rio-cli/src/status.rs` | OPEN |
-| `test-pg-db-name-collision` | P3 | §4 robust | `rio-test-support/src/pg.rs` | OPEN |
-| `common-log-format-case-sensitive` | P3 | §4 robust | `rio-common/src/observability.rs` | OPEN |
-| `ssh-auth-timing-side-channel` | P3 | §4 robust | `rio-gateway/src/ssh/auth.rs` | OPEN |
-| `wkr-proc-stat-parse-panic` | P3 | §4 robust | `rio-worker/src/heartbeat.rs` | OPEN |
-| `store-narinfo-bom-reject` | P3 | §4 robust | `rio-store/src/narinfo.rs` | OPEN |
-| `sched-leader-gauge-never-zero` | P3 | §4 robust | `rio-scheduler/src/lease/mod.rs` | OPEN |
-| `wire-magic-numbers-unnamed` | P3 | §4 code-quality | `rio-nix/src/protocol/` | OPEN |
-| `sched-dag-node-mut-unwrap` | P3 | §4 code-quality | `rio-scheduler/src/dag/mod.rs` | OPEN |
-| `common-metrics-macro-duplication` | P3 | §4 code-quality | all `main.rs` | OPEN |
-| `gw-handler-mod-1200-lines` | P3 | §4 code-quality | `rio-gateway/src/handler/opcodes_read.rs` | OPEN |
-| `store-queries-mod-900-lines` | P3 | §4 code-quality | `rio-store/src/queries.rs` | OPEN |
-| `nix-wire-dead-read-bool` | P3 | §4 code-quality | `rio-nix/src/protocol/wire.rs` | OPEN |
-| `nix-fod-hash-modulo-omits-outpath` | LOW (was P0) | §5 downgraded | `rio-nix/src/hash.rs:69` | OPEN |
-| `nix-aterm-modulo-key-collision` | LOW (symptom of above) | §5 downgraded | `rio-nix/src/aterm.rs` | OPEN |
+| `obs-watch-reconnects-unregistered` | P2 | §3 obs | `rio-controller` | FIXED (rem-21) |
+| `obs-recovery-histogram-success-only` | P2 | §3 obs | `rio-scheduler/src/actor/recovery.rs:329,379` | FIXED (rem-21) |
+| `nix-hash-no-proptest` | P3 | §4 test-cov | `rio-nix/src/hash.rs` | FIXED (rem-21) |
+| `nix-proptest-escapes` | P3 | §4 test-cov | `rio-nix/src/aterm.rs` | FIXED (rem-21) |
+| `wire-stderr-no-proptest` | P3 | §4 test-cov | `rio-gateway/src/handler/stderr.rs` | FIXED (rem-21) |
+| `wire-no-golden-query-substitutable-paths` | P3 | §4 test-cov | `rio-gateway/tests/golden/` | FIXED (rem-21) |
+| `wire-no-golden-query-valid-derivers` | P3 | §4 test-cov | `rio-gateway/tests/golden/` | FIXED (rem-21) |
+| `wire-no-golden-add-signatures` | P3 | §4 test-cov | `rio-gateway/tests/golden/` | FIXED (rem-21) |
+| `fuse-no-enospc-test` | P3 | §4 test-cov | `rio-worker/src/fuse/` | FIXED (rem-21) |
+| `gc-no-concurrent-putpath-test` | P3 | §4 test-cov | `rio-store/src/gc/` | FIXED (rem-21) |
+| `store-sign-no-proptest` | P3 | §4 test-cov | `rio-store/src/sign.rs` | FIXED (rem-21) |
+| `sched-dag-no-cycle-proptest` | P3 | §4 test-cov | `rio-scheduler/src/dag/` | FIXED (rem-21) |
+| `doc-observability-metric-name-drift` | P3 | §4 doc | `docs/src/observability.md` | FIXED (rem-21) |
+| `doc-fuse-five-constraint-not-colocated` | P3 | §4 doc | `rio-worker/src/fuse/` | FIXED (rem-21) |
+| `doc-grace-hours-default` | P3 | §4 doc | `docs/src/components/store.md` | FIXED (rem-21) |
+| `kube-last-sequence-negative-cast` | P3 | §4 robust | `rio-controller/src/reconcilers/build.rs` | MOOT-P0294 |
+| `cli-status-partial-print` | P3 | §4 robust | `rio-cli/src/status.rs` | FIXED (rem-21) |
+| `test-pg-db-name-collision` | P3 | §4 robust | `rio-test-support/src/pg.rs` | FIXED (rem-21) |
+| `common-log-format-case-sensitive` | P3 | §4 robust | `rio-common/src/observability.rs` | FIXED (rem-21) |
+| `ssh-auth-timing-side-channel` | P3 | §4 robust | `rio-gateway/src/ssh/auth.rs` | FIXED (rem-21) |
+| `wkr-proc-stat-parse-panic` | P3 | §4 robust | `rio-worker/src/heartbeat.rs` | FIXED (rem-21) |
+| `store-narinfo-bom-reject` | P3 | §4 robust | `rio-store/src/narinfo.rs` | FIXED (rem-21) |
+| `sched-leader-gauge-never-zero` | P3 | §4 robust | `rio-scheduler/src/lease/mod.rs` | FIXED (rem-21) |
+| `wire-magic-numbers-unnamed` | P3 | §4 code-quality | `rio-nix/src/protocol/` | OPEN — TODO(phase4b) |
+| `sched-dag-node-mut-unwrap` | P3 | §4 code-quality | `rio-scheduler/src/dag/mod.rs` | OPEN — TODO(phase4b) |
+| `common-metrics-macro-duplication` | P3 | §4 code-quality | all `main.rs` | OPEN — TODO(phase4b) |
+| `gw-handler-mod-1200-lines` | P3 | §4 code-quality | `rio-gateway/src/handler/opcodes_read.rs` | OPEN — TODO(phase4b) |
+| `store-queries-mod-900-lines` | P3 | §4 code-quality | `rio-store/src/queries.rs` | OPEN — TODO(phase4b) |
+| `nix-wire-dead-read-bool` | P3 | §4 code-quality | `rio-nix/src/protocol/wire.rs` | OPEN — TODO(phase4b) |
+| `nix-fod-hash-modulo-omits-outpath` | LOW (was P0) | §5 downgraded | `rio-nix/src/hash.rs:69` | FIXED (rem-21) |
+| `nix-aterm-modulo-key-collision` | LOW (symptom of above) | §5 downgraded | `rio-nix/src/aterm.rs` | FIXED (rem-21) |
 
 **Totals:** 25 P0, 43 P1, 28 P2, 28 P3, 2 downgraded-LOW = **126 indexed findings** (deduplicated from 180+ raw findings; many raw findings were different entry points into the same root cause).

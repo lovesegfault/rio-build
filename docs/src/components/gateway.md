@@ -42,7 +42,7 @@ The opcodes below are the mandatory implementation set for a working `ssh-ng://`
 ### wopSetOptions (19) Field Sequence
 
 r[gw.opcode.set-options.field-order]
-The fields are sent in order, all as `u64` unless noted. `wopSetOptions` is **mandatory** as the first opcode after handshake --- Nix always sends it before any other operation.
+The fields are sent in order, all as `u64` unless noted. The **daemon-protocol** client (`ssh://`) sends `wopSetOptions` as the first opcode after handshake. The **ssh-ng** client does NOT send it (empirically verified P0215) --- `SSHStore::setOptions()` is an empty override. Client-side `--max-silent-time`/`--timeout` are silently non-functional over ssh-ng; see Override propagation below for the gateway-side fallback path.
 
 1. `keepFailed` (u64 bool)
 2. `keepGoing` (u64 bool)

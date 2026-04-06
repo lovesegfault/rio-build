@@ -10,7 +10,9 @@
 //! closure.
 //!
 //! Schema version 10 (Nix 2.20+). Tables: Config, ValidPaths, Refs,
-//! DerivationOutputs, Realisations (empty, for future CA support).
+//! DerivationOutputs, Realisations (empty pre-build by design — nix-daemon
+//! INSERTs here post-CA-build; rio never populates — scheduler resolves CA
+//! inputs before dispatch per phase5.md).
 //!
 //! Key conventions:
 //! - `registrationTime = 0` for input paths (not locally built)
@@ -90,7 +92,8 @@ const SCHEMA_VERSION: &str = "10";
 ///
 /// The database contains the minimum schema required for Nix 2.20+
 /// to recognize store paths: Config, ValidPaths, Refs, DerivationOutputs,
-/// and Realisations (empty, for future CA support).
+/// and Realisations (empty pre-build by design — nix-daemon writes it
+/// post-CA-build; rio never populates).
 #[instrument(skip_all, fields(path_count = paths.len(), drv_output_count = drv_outputs.len()))]
 pub async fn generate_db(
     db_path: &Path,
@@ -155,9 +158,11 @@ async fn create_schema(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
             PRIMARY KEY (drv, id),
             FOREIGN KEY (drv) REFERENCES ValidPaths(id)
         )"#,
-        // Realisations: currently empty (CA support deferred), but schema
-        // matches real Nix (outputPath is an INTEGER FK to ValidPaths(id),
-        // not a TEXT path — the real Nix daemon joins on the FK).
+        // Realisations: empty pre-build by design — nix-daemon INSERTs
+        // here post-CA-build; rio never populates (scheduler resolves CA
+        // inputs before dispatch per phase5.md). Schema matches real Nix
+        // (outputPath is an INTEGER FK to ValidPaths(id), not a TEXT
+        // path — the real Nix daemon joins on the FK).
         r#"CREATE TABLE IF NOT EXISTS Realisations (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
             drvPath TEXT NOT NULL,
@@ -496,7 +501,7 @@ mod tests {
 
         let mut conn = open_db(&db_path).await?;
 
-        // Realisations table should exist (empty, for future CA support)
+        // Realisations table should exist (empty pre-build by design)
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Realisations")
             .fetch_one(&mut conn)
             .await?;
