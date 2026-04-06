@@ -3,6 +3,8 @@
 use super::*;
 use rio_proto::validated::ValidatedPathInfo;
 use tokio::io::AsyncReadExt;
+use tokio::task::JoinSet;
+use tracing::Instrument;
 
 // r[impl gw.wire.framed-max-total]
 // Guard against future drift: if MAX_NAR_SIZE is bumped without
@@ -182,7 +184,29 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
     Ok(())
 }
 
-/// Stream a single entry from the wopAddMultipleToStore framed stream.
+/// Max NAR size to buffer for pipelined PutPath. Entries above this drain
+/// the in-flight set and stream synchronously. Reuses [`DRV_NAR_BUFFER_LIMIT`]
+/// — 16 MiB covers all `.drv` files plus typical sources (patches, scripts).
+/// At [`ADD_MULTIPLE_PIPELINE_DEPTH`] in flight × 16 MiB = 512 MiB worst-case
+/// buffered. Typical entries are KB-range so the real footprint is tiny.
+const ADD_MULTIPLE_PIPELINE_BUFFER: u64 = DRV_NAR_BUFFER_LIMIT;
+
+/// Max in-flight PutPath calls per `wopAddMultipleToStore` stream. The wire
+/// read stays sequential (entry N+1's metadata follows N's NAR bytes); only
+/// the store-side gRPC calls overlap. Store p50 ≈ 25ms — 32-way pipeline
+/// brings a 45k-entry closure from ~31min sequential to ~1min.
+const ADD_MULTIPLE_PIPELINE_DEPTH: usize = 32;
+
+/// One entry's wire metadata, parsed and validated. NAR bytes still on the wire.
+struct EntryHead {
+    path: StorePath,
+    path_str: String,
+    info: ValidatedPathInfo,
+    nar_size: u64,
+    nar_hash_bytes: Vec<u8>,
+}
+
+/// Read and validate one entry's metadata from the framed stream.
 ///
 /// Wire format (per Nix `Store::addMultipleToStore(Source &, ...)` in
 /// store-api.cc, called with protocol version 16):
@@ -197,12 +221,9 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
 ///   ca: string (empty if none)
 ///   NAR: narSize plain bytes (NOT framed — `addToStore(info, source)` reads
 ///        narSize bytes directly from the already-framed outer stream)
-async fn stream_one_entry<R: AsyncRead + Unpin>(
-    framed: &mut R,
-    store_client: &mut StoreServiceClient<Channel>,
-    jwt_token: Option<&str>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
-) -> anyhow::Result<()> {
+///
+/// Returns with the NAR bytes still unread — caller decides buffer vs stream.
+async fn read_entry_head<R: AsyncRead + Unpin>(framed: &mut R) -> anyhow::Result<EntryHead> {
     let path_str = wire::read_string(framed).await?;
     let deriver_str = wire::read_string(framed).await?;
     let nar_hash_str = wire::read_string(framed).await?;
@@ -252,41 +273,42 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
             source: e,
         })?;
 
-    // .drv files are small (typically <10KB, max ~10MB observed). Buffer
-    // them so try_cache_drv can parse the ATerm. Everything else streams.
-    if path.is_derivation() && nar_size <= DRV_NAR_BUFFER_LIMIT {
-        let mut nar_data = vec![0u8; nar_size as usize];
-        framed
-            .read_exact(&mut nar_data)
-            .await
-            .map_err(|e| GatewayError::NarRead {
-                context: format!("entry '{path_str}'"),
-                source: e,
-            })?;
-        try_cache_drv(&path, &nar_data, drv_cache);
-        grpc_put_path(store_client, jwt_token, info, nar_data)
-            .await
-            .map_err(|e| GatewayError::Store(format!("entry '{path_str}': {e}")))?;
-    } else {
-        if path.is_derivation() {
-            warn!(
-                path = %path, nar_size,
-                "oversize .drv NAR — streaming (not cached; resolve_derivation fetches from store later)"
-            );
-        }
-        grpc_put_path_streaming(
-            store_client,
-            jwt_token,
-            info,
-            framed,
-            nar_size,
-            nar_hash_bytes,
-        )
-        .await
-        .map_err(|e| GatewayError::Store(format!("entry '{path_str}': {e}")))?;
-    }
+    Ok(EntryHead {
+        path,
+        path_str,
+        info,
+        nar_size,
+        nar_hash_bytes,
+    })
+}
 
-    Ok(())
+/// Drain a JoinSet of `(index, Result)` pairs, returning the lowest-indexed
+/// error if any. With pipelining, completion order is nondeterministic; the
+/// lowest index is what sequential processing would have reported first.
+async fn drain_put_tasks(
+    tasks: &mut JoinSet<(u64, anyhow::Result<()>)>,
+) -> Option<(u64, anyhow::Error)> {
+    let mut first: Option<(u64, anyhow::Error)> = None;
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((idx, Err(e))) => {
+                if first.as_ref().is_none_or(|(j, _)| idx < *j) {
+                    first = Some((idx, e));
+                }
+            }
+            Ok((_, Ok(()))) => {}
+            Err(je) => {
+                // Cancelled or panicked. Report at u64::MAX so any real
+                // wire-index error wins lowest-index. Shouldn't happen in
+                // practice — we never call abort, and grpc_put_path doesn't
+                // panic on store errors.
+                if first.is_none() {
+                    first = Some((u64::MAX, anyhow::anyhow!("PutPath task join: {je}")));
+                }
+            }
+        }
+    }
+    first
 }
 
 // r[impl gw.opcode.mandatory-set]
@@ -547,16 +569,135 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
     tracing::Span::current().record("count", num_paths);
     debug!(num_paths, "wopAddMultipleToStore: processing entries");
 
+    // Pipeline: wire-read sequential (entry N+1's metadata follows N's NAR
+    // bytes — can't read ahead), store-call concurrent. The store does NOT
+    // validate references at PutPath time (rio-store/src/metadata/inline.rs:
+    // refs go into a `text[]` column, no FK, no existence check — they're
+    // walked by GC mark, not validated at insert), so reordering is safe
+    // even though Nix sends entries in topological order.
+    //
+    // I-052: live-measured ~20 paths/sec sequential (store p50=25ms). At
+    // 45k entries that's ~31 minutes before any build starts. 32-way
+    // overlap targets ~1 minute.
+    let mut tasks: JoinSet<(u64, anyhow::Result<()>)> = JoinSet::new();
+    let jwt_owned: Option<String> = jwt_token.map(str::to_owned);
+    let span = tracing::Span::current();
+
+    let mut fail: Option<(u64, anyhow::Error)> = None;
     for i in 0..num_paths {
-        if let Err(e) = stream_one_entry(&mut framed, store_client, jwt_token, drv_cache).await {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("wopAddMultipleToStore entry {i}/{num_paths} failed: {e}"),
-                ))
-                .await?;
-            return Err(e);
+        // Wire reads stay on this task — strictly sequential.
+        let head = match read_entry_head(&mut framed).await {
+            Ok(h) => h,
+            Err(e) => {
+                fail = Some((i, e));
+                break;
+            }
+        };
+
+        if head.nar_size <= ADD_MULTIPLE_PIPELINE_BUFFER {
+            // Buffer the NAR off the wire (sequential), then spawn the
+            // store call. drv_cache write happens HERE before the spawn —
+            // no shared-mutable concurrency.
+            let mut nar_data = vec![0u8; head.nar_size as usize];
+            if let Err(e) = framed.read_exact(&mut nar_data).await {
+                fail = Some((
+                    i,
+                    GatewayError::NarRead {
+                        context: format!("entry '{}'", head.path_str),
+                        source: e,
+                    }
+                    .into(),
+                ));
+                break;
+            }
+            try_cache_drv(&head.path, &nar_data, drv_cache);
+
+            // Backpressure: at depth, await one before spawning. If THAT
+            // result is an error, stop reading — bounds wasted wire-reads
+            // to ~PIPELINE_DEPTH past the failing index.
+            if tasks.len() >= ADD_MULTIPLE_PIPELINE_DEPTH
+                && let Some(joined) = tasks.join_next().await
+            {
+                match joined {
+                    Ok((idx, Err(e))) => {
+                        fail = Some((idx, e));
+                        break;
+                    }
+                    Err(je) => {
+                        fail = Some((u64::MAX, anyhow::anyhow!("PutPath task join: {je}")));
+                        break;
+                    }
+                    Ok((_, Ok(()))) => {}
+                }
+            }
+
+            let mut client = store_client.clone();
+            let jwt = jwt_owned.clone();
+            let path_str = head.path_str;
+            let info = head.info;
+            tasks.spawn(
+                async move {
+                    let r = grpc_put_path(&mut client, jwt.as_deref(), info, nar_data)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| {
+                            GatewayError::Store(format!("entry '{path_str}': {e}")).into()
+                        });
+                    (i, r)
+                }
+                .instrument(span.clone()),
+            );
+        } else {
+            // Oversize: drain in-flight first (preserves the "all prior
+            // entries committed before this one starts" property the
+            // sequential code had — not strictly required for refs, but
+            // keeps memory bounded), then stream synchronously.
+            if let Some(f) = drain_put_tasks(&mut tasks).await {
+                fail = Some(f);
+                break;
+            }
+            if head.path.is_derivation() {
+                warn!(
+                    path = %head.path, nar_size = head.nar_size,
+                    "oversize .drv NAR — streaming (not cached; resolve_derivation fetches from store later)"
+                );
+            }
+            if let Err(e) = grpc_put_path_streaming(
+                store_client,
+                jwt_token,
+                head.info,
+                &mut framed,
+                head.nar_size,
+                head.nar_hash_bytes,
+            )
+            .await
+            {
+                fail = Some((
+                    i,
+                    GatewayError::Store(format!("entry '{}': {e}", head.path_str)).into(),
+                ));
+                break;
+            }
         }
+    }
+
+    // Drain remaining in-flight. If a store-call error here is lower-index
+    // than a wire-read error from the loop, the store-call error wins —
+    // that's what sequential processing would have reported first.
+    if let Some((idx, e)) = drain_put_tasks(&mut tasks).await
+        && fail.as_ref().is_none_or(|(j, _)| idx < *j)
+    {
+        fail = Some((idx, e));
+    }
+
+    if let Some((idx, e)) = fail {
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!("wopAddMultipleToStore entry {idx}/{num_paths} failed: {e}"),
+            ))
+            .await?;
+        return Err(e);
     }
 
     // Drain to sentinel. After num_paths entries, only the u64(0) frame
