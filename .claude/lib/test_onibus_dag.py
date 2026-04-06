@@ -933,7 +933,7 @@ def test_rewrite_and_rename_derives_from_mapping_not_diff(tmp_repo: Path):
     assert diff == "", f"precondition: three-dot diff must be empty, got {diff!r}"
 
     mapping = [Rename(placeholder="912345601", assigned=318, slug="test-slug")]
-    onibus.merge._rewrite_and_rename(tmp_repo, mapping)
+    onibus.merge._rewrite_and_rename(tmp_repo, mapping, batch_docs=[])
 
     # The file was renamed (git mv ran — mapping-driven, always worked).
     assert not plan_doc.exists()

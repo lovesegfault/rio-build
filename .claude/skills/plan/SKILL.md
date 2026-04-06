@@ -38,6 +38,8 @@ printf '%06d' $(( $(date +%s) % 1000000 ))
 
 Six digits, unique per `/plan` invocation (collides only if two invocations land in the same second within an ~11-day window — coordinator is serial, so they don't). The writer computes its own placeholder numbers from this: `9<runid><NN>` where `NN` is the writer's local sequence (01, 02, …). Nine digits, starts with 9, so it never collides with a real plan number (≤4 digits). Same token goes in filename, dag.jsonl rows, links — `/merge-impl` rewrites them all with one string-replace at merge time. No counter, no TOCTOU: the writer can mint as many IDs as it needs.
 
+**T-placeholder scheme (batch-appends):** same pattern for T-numbers in batch docs — `T9<runid><NN>` per-doc sequence. Writer appends `### T9<runid>01 — …`, `### T9<runid>02 — …` to P0304; independently starts `T9<runid>01` for P0311. `/merge-impl`'s `rename_unassigned` assigns real sequential T-numbers (`T163`, `T164`, …) based on each doc's max-existing-T on the integration branch. See `rio-planner.md` § Batch-append T-numbering.
+
 ## 3. Check for existing batch targets
 
 ```bash
@@ -46,6 +48,8 @@ Six digits, unique per `/plan` invocation (collides only if two invocations land
 ```
 
 If a batch doc has `"status":"DONE"`, the writer creates a fresh batch doc instead of appending. Note this in the prompt.
+
+**Concurrency note:** multiple `/plan` invocations can be in-flight (one per followup flush). P-numbers and T-numbers both use the 9-digit placeholder scheme (P → `9<runid><NN>`, T → `T9<runid><NN>`) so writers never race on sequential numbers. The merger serializes assignment at merge time. If a batch doc appears in `git worktree list | grep docs-` (another writer is touching it), that's FINE — placeholders don't collide. The rebase may still textually conflict at file-end (both appended); keep-both resolution is trivially correct since T-headers are distinct placeholder tokens.
 
 ## 4. Compose the prompt
 

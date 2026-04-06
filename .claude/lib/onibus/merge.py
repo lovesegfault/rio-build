@@ -287,6 +287,12 @@ def atomicity_check(branch: str) -> AtomicityVerdict:
 
 _PLACEHOLDER_RE = re.compile(r"^plan-(9\d{8})-(.+)\.md$")
 _REAL_RE = re.compile(r"^plan-(\d{1,4})-")
+# T-placeholder: T9<runid><NN> — same 9-digit scheme as P-placeholders but
+# with a T prefix to disambiguate. Per-batch-doc sequences (not global) so
+# P0304's T959435401 and P0311's T959435401 are distinct placeholders.
+_T_PLACEHOLDER_RE = re.compile(r"\bT(9\d{8})\b")
+# Real T-header: ### T<N> — where N is ≤4 digits. Cap excludes placeholders.
+_T_HEADER_RE = re.compile(r"^### T(\d{1,4}) —", re.M)
 
 
 def _worktree_for(branch: str) -> Path:
@@ -319,7 +325,89 @@ def _next_real() -> int:
     return max(nums, default=0) + 1
 
 
-def _rewrite_and_rename(worktree: Path, mapping: list[Rename]) -> None:
+def _touched_batch_docs(worktree: Path, tgt: str) -> list[str]:
+    """Rel paths of batch-target docs (real 4-digit plan-0NNN-*.md) that
+    this branch modified relative to TGT.
+
+    Uses three-dot diff (TGT...HEAD) — pre-ff, so this sees the writer's
+    committed appends. NOT the P0325 concern: that was the P-rewrite's
+    `touched` set going empty post-ff (because three-dot diff is empty when
+    docs-tip == TGT-tip). This scan runs BEFORE ff, and filters to 4-digit
+    plan-0NNN- prefix which is disjoint from P-placeholder filenames
+    (9-digit plan-9ddddddNN-) by construction.
+
+    Shared by both the T-placeholder rewrite (P0401-T1) and the
+    P-placeholder cross-ref rewrite in batch docs (P0304-T30: writer
+    appends "see [P994957501](plan-994957501-foo.md)" to P0304's Tasks;
+    the P-rewrite pass at _rewrite_and_rename only iterates the new
+    plan-9ddddddNN-*.md files + dag.jsonl, so the batch-doc cross-ref
+    stays stale). 7 of 12 recent docs-merges needed coordinator
+    manual-sed for this."""
+    touched = git("diff", "--name-only", f"{tgt}...HEAD", cwd=worktree).splitlines()
+    return [
+        rel for rel in touched
+        if re.match(r"\.claude/work/plan-0\d{3}-", rel)
+        and (worktree / rel).exists()
+    ]
+
+
+def _find_t_placeholders(worktree: Path, batch_docs: list[str]) -> dict[str, list[str]]:
+    """rel_path → ordered unique T-placeholder tokens (the 9-digit part)."""
+    result: dict[str, list[str]] = {}
+    for rel in batch_docs:
+        text = (worktree / rel).read_text()
+        phs = _T_PLACEHOLDER_RE.findall(text)
+        if phs:
+            # Dedup preserving insertion order — same placeholder referenced
+            # in header + body cross-ref should map to one assignment.
+            result[rel] = list(dict.fromkeys(phs))
+    return result
+
+
+def _max_existing_t(worktree: Path, rel_path: str, tgt: str) -> int:
+    """Highest ### T<N> — header in the TGT-branch version of the doc.
+
+    Reads TGT (not working tree) so a rebased branch's own placeholder
+    headers (T9ddddddNN) don't pollute the max. Also defended by the
+    \\d{1,4} cap in _T_HEADER_RE."""
+    try:
+        tgt_text = git("show", f"{tgt}:{rel_path}", cwd=worktree)
+    except subprocess.CalledProcessError:
+        # Batch doc doesn't exist on TGT — new in this branch. Start at T1.
+        return 0
+    matches = _T_HEADER_RE.findall(tgt_text)
+    return max((int(m) for m in matches), default=0)
+
+
+def _rewrite_t_placeholders(
+    worktree: Path, tgt: str, batch_docs: list[str]
+) -> dict[str, dict[str, int]]:
+    """For each touched batch doc, assign real T-numbers to placeholders and
+    rewrite in-place. Returns rel_path → {placeholder: assigned_t}.
+
+    Per-doc sequence: each doc's assignments start from that doc's own
+    max-existing-T on TGT, not a global counter."""
+    found = _find_t_placeholders(worktree, batch_docs)
+    result: dict[str, dict[str, int]] = {}
+    for rel, phs in found.items():
+        start = _max_existing_t(worktree, rel, tgt) + 1
+        mapping = {ph: start + i for i, ph in enumerate(phs)}
+        p = worktree / rel
+        text = p.read_text()
+        new = text
+        for ph, assigned in mapping.items():
+            # Replace T<placeholder> → T<assigned> everywhere in this doc
+            # (headers, cross-refs, prose). No padding — T163 not T0163.
+            new = new.replace(f"T{ph}", f"T{assigned}")
+        if new != text:
+            atomic_write_text(p, new)
+        result[rel] = mapping
+    return result
+
+
+def _rewrite_and_rename(
+    worktree: Path, mapping: list[Rename], batch_docs: list[str]
+) -> None:
     # Rewrite set derived from mapping, not git diff. Three-dot diff
     # (INTEGRATION_BRANCH...HEAD) is empty when the docs branch has
     # already been ff-merged — docs-tip == sprint-1-tip → no commits
@@ -331,13 +419,18 @@ def _rewrite_and_rename(worktree: Path, mapping: list[Rename]) -> None:
     # The mapping already has everything needed: placeholder + slug →
     # filename. The plan .md file is where the placeholder lives in
     # prose (P924999901, [P924999901](plan-924999901-...)). dag.jsonl
-    # carries it as {"plan": 924999901, ...}. Rewrite both; no other
-    # file type carries placeholders (by construction — the planner
-    # only writes to .claude/work/plan-*.md and dag.jsonl).
+    # carries it as {"plan": 924999901, ...}. Rewrite both.
+    #
+    # batch_docs (P0304-T30 fix): batch-target docs (P0304/P0295/P0311)
+    # CROSS-REFERENCE P-placeholders when the writer appends a task that
+    # links to a same-run standalone plan — "see [P994957501](...)". The
+    # mapping-only iteration above misses these. 7/12 recent docs-merges
+    # required coordinator manual-sed before this fix.
     touched: list[str] = [
         f".claude/work/plan-{r.placeholder}-{r.slug}.md" for r in mapping
     ]
     touched.append(".claude/dag.jsonl")
+    touched.extend(batch_docs)
 
     for rel in touched:
         p = worktree / rel
@@ -385,20 +478,43 @@ def rename_unassigned(branch: str) -> RenameReport:
             f"{INTEGRATION_BRANCH} — fix them there manually)."
         )
 
+    # Enumerate touched batch-target docs once — shared by T-placeholder
+    # rewrite (P0401-T1) and P-cross-ref rewrite (P0304-T30).
+    batch_docs = _touched_batch_docs(worktree, INTEGRATION_BRANCH)
+
+    # T-placeholder rewrite FIRST. Writer uses 9<runid><NN> for BOTH
+    # P-placeholders and T-placeholders (per-doc sequences both start at
+    # 01), so the same 9-digit token can appear as T959435401 AND
+    # P959435401 in the same batch doc. The P-rewrite below does a bare
+    # str.replace("959435401", "0305") which would corrupt T959435401 →
+    # T0305. Running T-rewrite first consumes T959435401 → T4, leaving
+    # only P-contexts for the bare replace. Scan is pre-ff three-dot
+    # diff — see _touched_batch_docs for P0325 distinction.
+    t_map = _rewrite_t_placeholders(worktree, INTEGRATION_BRANCH, batch_docs)
+
     placeholders = _find_placeholders(worktree)
-    if not placeholders:
+    mapping: list[Rename] = []
+    if placeholders:
+        start = _next_real()
+        mapping = [
+            Rename(placeholder=ph, assigned=start + i, slug=slug)
+            for i, (ph, slug) in enumerate(placeholders)
+        ]
+        _rewrite_and_rename(worktree, mapping, batch_docs)
+
+    if not mapping and not t_map:
         return RenameReport(branch=branch, mapping=[], commit=None)
 
-    start = _next_real()
-    mapping = [
-        Rename(placeholder=ph, assigned=start + i, slug=slug)
-        for i, (ph, slug) in enumerate(placeholders)
-    ]
-    _rewrite_and_rename(worktree, mapping)
     git("add", "-u", cwd=worktree)
-    lo, hi = mapping[0].assigned, mapping[-1].assigned
-    label = f"P{lo:04d}" if lo == hi else f"P{lo:04d}-P{hi:04d}"
-    git("commit", "-m", f"docs: assign plan numbers {label}", cwd=worktree)
+    parts = []
+    if mapping:
+        lo, hi = mapping[0].assigned, mapping[-1].assigned
+        label = f"P{lo:04d}" if lo == hi else f"P{lo:04d}-P{hi:04d}"
+        parts.append(f"plan numbers {label}")
+    if t_map:
+        n_t = sum(len(m) for m in t_map.values())
+        parts.append(f"{n_t} T-number{'s' if n_t != 1 else ''} in {len(t_map)} batch doc{'s' if len(t_map) != 1 else ''}")
+    git("commit", "-m", f"docs: assign {' + '.join(parts)}", cwd=worktree)
     return RenameReport(
         branch=branch, mapping=mapping,
         commit=git("rev-parse", "--short", "HEAD", cwd=worktree),
