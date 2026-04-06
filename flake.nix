@@ -11,6 +11,35 @@
       };
     };
 
+    # Multi-version Nix compat matrix inputs (weekly tier — NOT in .#ci).
+    # See nix/golden-matrix.nix + docs/src/verification.md § Protocol
+    # Conformance. Each input provides a nix-daemon binary; the golden
+    # conformance suite runs once per daemon to surface protocol-version
+    # divergences early.
+    #
+    # No `nixpkgs.follows` — following our nixpkgs breaks both the 2.20
+    # and Lix builds (they pin specific nixpkgs revs for their own
+    # dependency constraints). Accepting the eval cost is cheap for a
+    # weekly-only target; the lock entries are inert until
+    # `.#golden-matrix` is built.
+    nix-stable = {
+      url = "github:NixOS/nix/2.20-maintenance";
+      # 2.20's flake predates the flake-parts split — minimal follows.
+      inputs.flake-compat.follows = "flake-compat";
+    };
+    nix-unstable = {
+      url = "github:NixOS/nix";
+      inputs = {
+        flake-compat.follows = "flake-compat";
+        flake-parts.follows = "flake-parts";
+        git-hooks-nix.follows = "git-hooks-nix";
+      };
+    };
+    lix = {
+      url = "git+https://git.lix.systems/lix-project/lix";
+      inputs.flake-compat.follows = "flake-compat";
+    };
+
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     flake-compat = {
@@ -810,6 +839,28 @@
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTests)
           );
 
+          # --------------------------------------------------------------
+          # Multi-Nix golden conformance matrix (weekly tier)
+          # --------------------------------------------------------------
+          #
+          # Runs golden_conformance against 4 daemon variants: pinned Nix,
+          # Nix 2.20-maintenance, Nix master, Lix. Weekly cron invokes
+          # `nix build .#golden-matrix`. NOT in `.#ci` — building three
+          # extra Nix source trees is a 60-90min cold-cache tax. Exported
+          # Linux-only at the `packages` site (the flake inputs eval fine
+          # on Darwin but `nix-daemon` needs a real unix socket + /nix
+          # layout, and we don't run the matrix on macs anyway).
+          # TODO(sprint-save): golden-matrix.nix is crane-based
+          # (craneLib.cargoNextest). Needs porting to c2nChecks nextest
+          # infrastructure — the crate2nix nextest runner uses reuse-build
+          # mode with synthesized metadata, not cargo invocation. Weekly-
+          # tier target, not in .#ci, so stubbed until port lands.
+          goldenMatrix = throw ''
+            golden-matrix needs crate2nix port (was craneLib.cargoNextest).
+            See nix/golden-matrix.nix — adapt mkMatrixRun to c2nChecks
+            nextest reuse-build path with per-variant RIO_GOLDEN_DAEMON_BIN.
+          '';
+
           # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
           # ──────────────────────────────────────────────────────────
@@ -1257,7 +1308,14 @@
           #   grep "KVM-PROBE" <log> | sort | uniq -c
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             pkgs.lib.mapAttrs (_: withMinCpu 5) (import ./nix/tests/kvm-probe.nix { inherit pkgs; })
-          );
+          )
+          # Multi-Nix golden matrix (weekly). Exported Linux-only:
+          # nix-daemon needs a unix socket; macOS matrix not supported.
+          # Under `packages` not `checks` → `nix flake check` won't
+          # build the three extra Nix source trees on every push.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            golden-matrix = goldenMatrix;
+          };
 
           # --------------------------------------------------------------
           # Apps (nix run .#<name>)

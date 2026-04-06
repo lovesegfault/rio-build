@@ -7,7 +7,24 @@
 - STDERR activity stripping handles daemon messages (START\_ACTIVITY/STOP\_ACTIVITY) that rio-build omits
 - Fields that legitimately differ (version\_string, trusted) are skipped via a configurable skip list
 
-> **Scheduled:** multi-version Nix compat matrix (2.20+, unstable, Lix) → [P0300](../.claude/work/plan-0300-multi-nix-compat-matrix.md). Until it lands: conformance tests run against the single Nix version pinned in `flake.nix`.
+### Multi-Nix compatibility matrix
+
+Per-push CI runs conformance tests against the single Nix version pinned in `flake.nix` (`inputs.nix`). The **weekly** tier runs the full matrix via `.#golden-matrix` — four daemon variants:
+
+| Variant | Source | Notes |
+|---------|--------|-------|
+| `nix-pinned` | `inputs.nix` (2.34.x) | Same as per-push CI — sanity row |
+| `nix-stable` | `github:NixOS/nix/2.20-maintenance` | Oldest supported protocol minor |
+| `nix-unstable` | `github:NixOS/nix` (master HEAD) | Surfaces breakage early |
+| `lix` | `git.lix.systems/lix-project/lix` | Fork — diverges on feature set, version string, opcode additions |
+
+Test harness reads `RIO_GOLDEN_DAEMON_BIN` (absolute daemon path) and `RIO_GOLDEN_DAEMON_VARIANT` (skip-list key). Per-variant skips live in `rio-gateway/tests/golden/daemon.rs::VARIANT_SKIP` — each row is `(variant, test_name, reason)`. The `reason` field is load-bearing: it documents WHY so the skip can be removed once upstream converges.
+
+Known Lix divergences:
+- Version string format (`"Lix N.N.N"` vs `"nix (Nix) N.N.N"`) — handled by the existing `SKIP_FIELDS` mechanism at field level
+- Daemon feature set advertised during handshake — `test_golden_live_handshake` skipped for Lix until the comparator tolerates feature-set supersets
+
+`nix build .#golden-matrix` produces a linkfarm keyed by variant; `ls result/` shows one dir per daemon.
 
 ## Fuzzing
 
@@ -99,9 +116,9 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 | Tier | Trigger | Tests | Aggregate target | Time Budget |
 |------|---------|-------|------------------|-------------|
 | CI | Every push | Unit tests, functional tests (real rio-store), clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
-| Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests | — | Unbounded |
+| Weekly | Scheduled | + golden-matrix (4 daemons), EKS cluster tests, chaos tests, load tests | `.#golden-matrix` | Unbounded |
 
-> **Scheduled:** criterion benchmarks → [P0221](../.claude/work/plan-0221-rio-bench-crate-hydra-doc.md); multi-Nix matrix → [P0300](../.claude/work/plan-0300-multi-nix-compat-matrix.md); `cargo-mutants` → [P0301](../.claude/work/plan-0301-cargo-mutants-ci.md).
+> **Scheduled:** criterion benchmarks → [P0221](../.claude/work/plan-0221-rio-bench-crate-hydra-doc.md); `cargo-mutants` → [P0301](../.claude/work/plan-0301-cargo-mutants-ci.md).
 
 ## VM Integration Tests
 

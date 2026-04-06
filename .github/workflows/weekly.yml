@@ -1,0 +1,33 @@
+name: weekly
+on:
+  schedule:
+    # 03:00 UTC Monday. Daemon builds are ~20-30min each cold-cache;
+    # running overnight keeps the spot fleet quiet during dev hours.
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC → niks3
+
+env:
+  NIKS3_URL: http://niks3.niks3.svc.cluster.local:5751
+
+jobs:
+  # Multi-Nix golden conformance matrix: 4 daemon variants × the
+  # golden_conformance test suite. See docs/src/verification.md
+  # § Multi-Nix compatibility matrix.
+  #
+  # Building the linkfarm pulls all four variant runs as one job —
+  # serialising on one runner is cheaper than fanning out (3 of the 4
+  # daemons share the same cargoArtifacts cache, so cold-start is the
+  # nix-daemon compile not the Rust compile).
+  golden-matrix:
+    runs-on: rio-ci
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+      - run: nix build .#golden-matrix --print-build-logs
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
