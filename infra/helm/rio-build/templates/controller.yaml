@@ -56,17 +56,13 @@ spec:
             - name: RIO_SCHEDULER_BALANCE_PORT
               value: {{ $c.schedulerBalancePort | quote }}
             {{- end }}
-            {{- if .Values.tls.enabled }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
-            {{- end }}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- if or .Values.tls.enabled .Values.coverage.enabled }}
           volumeMounts:
-            {{- if .Values.tls.enabled }}
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
-            {{- end }}
             {{- include "rio.covVolumeMount" . | nindent 12 }}
           {{- end }}
           # /healthz serves 200 once kube client + scheduler admin client
@@ -83,9 +79,7 @@ spec:
             {{- toYaml $c.resources | nindent 12 }}
       {{- if or .Values.tls.enabled .Values.coverage.enabled }}
       volumes:
-        {{- if .Values.tls.enabled }}
-        {{- include "rio.tlsVolume" "rio-controller-tls" | nindent 8 }}
-        {{- end }}
+        {{- include "rio.tlsVolume" (dict "root" . "name" "rio-controller-tls") | nindent 8 }}
         {{- include "rio.covVolume" . | nindent 8 }}
       {{- end }}
 {{- end }}

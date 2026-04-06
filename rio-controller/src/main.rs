@@ -10,6 +10,7 @@ use std::sync::Arc;
 use clap::Parser;
 use futures_util::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
+use k8s_openapi::api::batch::v1::Job;
 use kube::runtime::{Controller, watcher};
 use kube::{Api, Client};
 use serde::{Deserialize, Serialize};
@@ -337,8 +338,15 @@ async fn main() -> anyhow::Result<()> {
     // K8s sends SIGTERM on pod delete.
     let pools: Api<WorkerPool> = Api::all(client.clone());
     let stses: Api<StatefulSet> = Api::all(client.clone());
+    // .owns(Job): ephemeral-mode pools spawn one Job per build
+    // (reconcilers/workerpool/ephemeral.rs). Without this, re-spawn
+    // latency is the 10s poll interval; with it, kube-runtime
+    // watch fires on Job status change → <1s re-enqueue. Doesn't
+    // change poll semantics, just adds reactive triggers.
+    let jobs: Api<Job> = Api::all(client.clone());
     let wp_controller = Controller::new(pools, watcher::Config::default())
         .owns(stses, watcher::Config::default())
+        .owns(jobs, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(workerpool::reconcile, workerpool::error_policy, ctx.clone())
         .for_each(|res| async move {

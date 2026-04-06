@@ -317,12 +317,13 @@ pub fn teardown_overlay(mut mount: OverlayMount) -> Result<(), OverlayError> {
 
 /// Create the Nix state directory structure in the overlay upper layer.
 ///
-/// This creates `nix/var/nix/db/` under the upper directory so the
-/// synthetic SQLite DB can be placed there.
-pub fn prepare_nix_state_dirs(upper: &Path) -> Result<PathBuf, OverlayError> {
-    let db_dir = upper.join("nix/var/nix/db");
-    mkdir_all(&db_dir)?;
-    Ok(db_dir)
+/// Takes `synth_db` directly (caller passes [`OverlayMount::upper_synth_db`])
+/// — symmetric with how `setup_nix_conf` takes `upper_nix_conf()` instead of
+/// re-deriving the path. Centralizes the `nix/var/nix/db` path construction
+/// in one place (the `upper_synth_db` accessor).
+pub fn prepare_nix_state_dirs(synth_db: &Path) -> Result<PathBuf, OverlayError> {
+    mkdir_all(synth_db)?;
+    Ok(synth_db.to_path_buf())
 }
 
 // r[verify worker.overlay.per-build]
@@ -334,11 +335,12 @@ mod tests {
     #[test]
     fn test_prepare_nix_state_dirs() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let db_dir = prepare_nix_state_dirs(dir.path())?;
+        let synth_db = dir.path().join("nix/var/nix/db");
+        let db_dir = prepare_nix_state_dirs(&synth_db)?;
 
         assert!(db_dir.exists());
         assert!(db_dir.is_dir());
-        assert_eq!(db_dir, dir.path().join("nix/var/nix/db"));
+        assert_eq!(db_dir, synth_db);
         Ok(())
     }
 

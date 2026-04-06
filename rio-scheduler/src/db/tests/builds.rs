@@ -19,6 +19,7 @@ async fn test_update_build_status_pending_no_timestamps() -> anyhow::Result<()> 
         crate::state::PriorityClass::Scheduled,
         true,
         &Default::default(),
+        None,
     )
     .await?;
 

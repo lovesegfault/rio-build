@@ -284,6 +284,7 @@ pub(crate) async fn merge_single_node(
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })
@@ -313,6 +314,7 @@ pub(crate) async fn merge_dag(
                 options: BuildOptions::default(),
                 keep_going,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })

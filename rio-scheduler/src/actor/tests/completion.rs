@@ -1803,6 +1803,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
                     options: BuildOptions::default(),
                     keep_going: false,
                     traceparent: String::new(),
+                    jti: None,
                 },
                 reply: reply_tx,
             })

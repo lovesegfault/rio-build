@@ -169,7 +169,11 @@ pub struct WorkerPoolSpec {
     /// Maximum concurrent builds per worker pod. Maps to
     /// `RIO_MAX_BUILDS` env var. CEL: must be >= 1 (0 builds =
     /// pointless worker).
-    #[x_kube(validation = "self >= 1")]
+    #[x_kube(
+        validation = Rule::new("self >= 1").message(
+            "maxConcurrentBuilds must be >= 1 — a worker that runs 0 builds is a misconfiguration"
+        )
+    )]
     pub max_concurrent_builds: i32,
 
     /// FUSE cache size as a K8s Quantity string (e.g., "100Gi").
@@ -230,7 +234,11 @@ pub struct WorkerPoolSpec {
 
     /// Target systems (e.g., "x86_64-linux"). CEL: non-empty —
     /// a worker that builds nothing is a config error.
-    #[x_kube(validation = "size(self) > 0")]
+    #[x_kube(
+        validation = Rule::new("size(self) > 0").message(
+            "systems must be non-empty — a worker pool with no target systems accepts no work"
+        )
+    )]
     pub systems: Vec<String>,
 
     /// Size class name. Maps to `RIO_SIZE_CLASS` env. Scheduler
@@ -465,7 +473,11 @@ pub struct SeccompProfileKind {
 /// autoscaler picks within that based on queue depth.
 #[derive(Deserialize, Serialize, Clone, Debug, KubeSchema)]
 #[serde(rename_all = "camelCase")]
-#[x_kube(validation = "self.min <= self.max")]
+#[x_kube(
+    validation = Rule::new("self.min <= self.max").message(
+        "replicas.min must be <= replicas.max"
+    )
+)]
 pub struct Replicas {
     /// Floor. Autoscaler never scales below this, even with empty
     /// queue. Keeps a warm pool for fast dispatch when builds

@@ -61,6 +61,7 @@ async fn test_insert_build_derivation_idempotent() -> anyhow::Result<()> {
         crate::state::PriorityClass::Scheduled,
         true,
         &Default::default(),
+        None,
     )
     .await?;
     let drv_id = insert_test_derivation(&db, "aaa").await?;

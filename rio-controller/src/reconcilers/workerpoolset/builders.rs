@@ -162,7 +162,20 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         topology_spread: None,
     };
 
-    let mut wp = WorkerPool::new(&child_name(wps, class), spec);
+    let name = child_name(wps, class);
+    // RFC-1123 DNS label limit: Kubernetes resource names ≤63 chars.
+    // wps.name_any() and class.name are each apiserver-validated, but
+    // the concatenation `{wps}-{class}` can overflow. A 40-char WPS +
+    // 30-char class = 71 chars → cryptic 422 deep in apply path.
+    // Validate here for a clear InvalidSpec condition on the WPS.
+    if name.len() > 63 {
+        return Err(Error::InvalidSpec(format!(
+            "child WorkerPool name '{name}' is {} chars, exceeds 63-char RFC-1123 DNS label limit. \
+             Shorten the WorkerPoolSet name or the size-class name.",
+            name.len()
+        )));
+    }
+    let mut wp = WorkerPool::new(&name, spec);
 
     // `controller_owner_ref(&())`: the `&()` is DynamicType=() for
     // static CRDs (kube-rs type parameter). Returns None only if

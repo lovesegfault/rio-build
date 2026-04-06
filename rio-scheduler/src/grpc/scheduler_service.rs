@@ -220,6 +220,7 @@ impl SchedulerService for SchedulerGrpc {
             options,
             keep_going: req.keep_going,
             traceparent,
+            jti: jwt_claims.as_ref().map(|c| c.jti.clone()),
         };
         let cmd = ActorCommand::MergeDag {
             req,

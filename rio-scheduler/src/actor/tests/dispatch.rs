@@ -196,6 +196,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
                 },
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })
@@ -250,6 +251,7 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: known_tp.to_string(),
+                jti: None,
             },
             reply: reply_tx,
         })
@@ -312,6 +314,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: tp_first.to_string(),
+                jti: None,
             },
             reply: r1,
         })
@@ -331,6 +334,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: tp_second.to_string(),
+                jti: None,
             },
             reply: r2,
         })
@@ -404,6 +408,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: r1,
         })
@@ -424,6 +429,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: live_tp.to_string(),
+                jti: None,
             },
             reply: r2,
         })
@@ -500,6 +506,7 @@ async fn test_interactive_priority_boost() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })

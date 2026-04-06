@@ -27,6 +27,7 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
                 PriorityClass::Scheduled,
                 false,
                 &BuildOptions::default(),
+                None,
             )
             .await?;
         // Small sleep so submitted_at ordering is deterministic.
@@ -103,6 +104,7 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
             PriorityClass::Scheduled,
             false,
             &BuildOptions::default(),
+            None,
         )
         .await?;
     let resp = svc
@@ -155,6 +157,7 @@ async fn test_list_builds_cross_tenant_isolation() -> anyhow::Result<()> {
             PriorityClass::Scheduled,
             false,
             &BuildOptions::default(),
+            None,
         )
         .await?;
     let build_b = uuid::Uuid::new_v4();
@@ -165,6 +168,7 @@ async fn test_list_builds_cross_tenant_isolation() -> anyhow::Result<()> {
             PriorityClass::Scheduled,
             false,
             &BuildOptions::default(),
+            None,
         )
         .await?;
 

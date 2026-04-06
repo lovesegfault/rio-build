@@ -39,28 +39,40 @@ helm.sh/chart: {{ .root.Chart.Name }}-{{ .root.Chart.Version }}
 
 {{/*
 TLS mount block — volume + volumeMount + RIO_TLS__* env. Same for every
-component; only the secret name varies. Call from inside the container
-spec; the caller must also append the matching volumes: entry.
+component; only the secret name varies. Self-guarded on
+.Values.tls.enabled (renders nothing when disabled, so callers include
+unconditionally with `| nindent N`) — same pattern as rio.jwt* and
+rio.cov* below.
+
+rio.tlsVolume takes (dict "root" . "name" "rio-<component>-tls") because
+it needs BOTH the root context (for .Values.tls.enabled) AND the
+per-component secret name.
 */}}
 {{- define "rio.tlsEnv" -}}
+{{- if .Values.tls.enabled }}
 - name: RIO_TLS__CERT_PATH
   value: /etc/rio/tls/tls.crt
 - name: RIO_TLS__KEY_PATH
   value: /etc/rio/tls/tls.key
 - name: RIO_TLS__CA_PATH
   value: /etc/rio/tls/ca.crt
+{{- end }}
 {{- end -}}
 
 {{- define "rio.tlsVolumeMount" -}}
+{{- if .Values.tls.enabled }}
 - name: tls
   mountPath: /etc/rio/tls
   readOnly: true
+{{- end }}
 {{- end -}}
 
 {{- define "rio.tlsVolume" -}}
+{{- if .root.Values.tls.enabled }}
 - name: tls
   secret:
-    secretName: {{ . }}
+    secretName: {{ .name }}
+{{- end }}
 {{- end -}}
 
 {{/*

@@ -134,6 +134,11 @@ pub async fn run(
         {
             Ok(resp) => {
                 let r = resp.into_inner();
+                metrics::counter!(
+                    "rio_controller_disruption_drains_total",
+                    "result" => "sent"
+                )
+                .increment(1);
                 info!(
                     worker_id,
                     running = r.running_builds,
@@ -142,6 +147,11 @@ pub async fn run(
                 );
             }
             Err(e) => {
+                metrics::counter!(
+                    "rio_controller_disruption_drains_total",
+                    "result" => "rpc_error"
+                )
+                .increment(1);
                 warn!(
                     worker_id,
                     error = %e,

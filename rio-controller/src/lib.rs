@@ -94,4 +94,9 @@ pub fn describe_metrics() {
         "GC cron runs. result=success|connect_failure|rpc_failure. \
          connect_failure=store unreachable; rpc_failure=TriggerGC returned error or stream aborted."
     );
+    describe_counter!(
+        "rio_controller_disruption_drains_total",
+        "DisruptionTarget watcher DrainWorker calls. result=sent|rpc_error. \
+         Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
+    );
 }

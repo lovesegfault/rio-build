@@ -29,6 +29,7 @@ async fn test_merge_db_failure_rolls_back_memory() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })
@@ -78,6 +79,7 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })
@@ -135,6 +137,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         };
@@ -232,6 +235,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         };

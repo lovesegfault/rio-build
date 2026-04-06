@@ -266,6 +266,7 @@ async fn merge_chain(
                 options: Default::default(),
                 keep_going: true,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: tx,
         })

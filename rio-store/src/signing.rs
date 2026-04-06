@@ -207,40 +207,6 @@ impl TenantSigner {
     }
 
     // r[impl store.tenant.sign-key]
-    /// Sign with the tenant's active key if present, else the cluster key.
-    ///
-    /// Three paths to cluster-key fallback:
-    /// - `tenant_id = None` — path has no tenant attribution. No DB hit.
-    /// - `Some(tid)` + no `tenant_keys` row — tenant never set a key.
-    /// - `Some(tid)` + all rows revoked — tenant rotated to cluster.
-    ///
-    /// Returns `(signature, signed_with_tenant_key)` so callers can log
-    /// which branch fired (tenant vs cluster) without re-querying. The
-    /// bool is cheap and lets `maybe_sign` emit a branch label in the
-    /// debug line.
-    ///
-    /// DB failure (`TenantKeyLookup`) only happens when `tenant_id` is
-    /// `Some` — the `None` path is infallible modulo the return type.
-    pub async fn sign_for_tenant(
-        &self,
-        tenant_id: Option<uuid::Uuid>,
-        fingerprint: &str,
-    ) -> Result<(String, bool), SignerError> {
-        if let Some(tid) = tenant_id {
-            // Fully-qualified path to avoid `use crate::metadata` at
-            // the top of this file — keeps the module-cycle (metadata
-            // → signing for `Signer`, signing → metadata for the query)
-            // scoped to this one line instead of the whole file.
-            if let Some(tenant_signer) = crate::metadata::get_active_signer(&self.pool, tid)
-                .await
-                .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))?
-            {
-                return Ok((tenant_signer.sign(fingerprint), true));
-            }
-        }
-        Ok((self.cluster.sign(fingerprint), false))
-    }
-
     /// Resolve the signer for a tenant once — cluster-fallback applied.
     ///
     /// For callers that sign N times with the same `tenant_id` (e.g.,
@@ -249,19 +215,23 @@ impl TenantSigner {
     /// cheap to clone (String + 32-byte seed). Calling [`Signer::sign`]
     /// on the returned value is sync + infallible — no further DB hits.
     ///
-    /// Same fallback semantics as [`sign_for_tenant`](Self::sign_for_tenant):
-    /// `None` tenant, no active key, or revoked-only → cluster key. DB
-    /// failure ([`SignerError::TenantKeyLookup`]) propagates — the caller
-    /// decides whether to fall back (PutPathBatch does, matching
-    /// `maybe_sign`'s behavior).
+    /// Three paths to cluster-key fallback:
+    /// - `tenant_id = None` — path has no tenant attribution. No DB hit.
+    /// - `Some(tid)` + no `tenant_keys` row — tenant never set a key.
+    /// - `Some(tid)` + all rows revoked — tenant rotated to cluster.
+    ///
+    /// DB failure ([`SignerError::TenantKeyLookup`]) propagates — the
+    /// caller decides whether to fall back (PutPathBatch does, matching
+    /// `maybe_sign`'s behavior). The `None` path is infallible.
     pub async fn resolve_once(
         &self,
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<(Signer, bool), SignerError> {
         if let Some(tid) = tenant_id {
-            // Same module-cycle scoping note as sign_for_tenant above:
-            // the fully-qualified `crate::metadata::` path keeps the
-            // signing↔metadata cycle local to this one call site.
+            // Fully-qualified `crate::metadata::` path keeps the
+            // signing↔metadata cycle local to this one call site
+            // (metadata → signing for `Signer`, signing → metadata
+            // for the query) instead of a top-level `use`.
             if let Some(tenant_signer) = crate::metadata::get_active_signer(&self.pool, tid)
                 .await
                 .map_err(|e| SignerError::TenantKeyLookup(e.to_string()))?
@@ -553,7 +523,8 @@ mod tests {
             db.pool.clone(),
         );
         let fp = "1;/nix/store/x;sha256:y;42;";
-        let (sig_str, was_tenant) = ts.sign_for_tenant(Some(tid), fp).await.unwrap();
+        let (signer, was_tenant) = ts.resolve_once(Some(tid)).await.unwrap();
+        let sig_str = signer.sign(fp);
 
         assert!(was_tenant, "should have used tenant key");
         assert!(
@@ -592,7 +563,8 @@ mod tests {
             db.pool.clone(),
         );
         let fp = "1;/nix/store/x;sha256:y;42;";
-        let (sig_str, was_tenant) = ts.sign_for_tenant(Some(tid), fp).await.unwrap();
+        let (signer, was_tenant) = ts.resolve_once(Some(tid)).await.unwrap();
+        let sig_str = signer.sign(fp);
 
         assert!(!was_tenant, "no tenant key → cluster fallback");
         assert!(
@@ -625,7 +597,8 @@ mod tests {
             Signer::from_seed("cluster-1", &CLUSTER_SEED),
             db.pool.clone(),
         );
-        let (sig_str, was_tenant) = ts.sign_for_tenant(None, "fp").await.unwrap();
+        let (signer, was_tenant) = ts.resolve_once(None).await.unwrap();
+        let sig_str = signer.sign("fp");
 
         assert!(!was_tenant);
         assert!(sig_str.starts_with("cluster-1:"));
@@ -679,7 +652,7 @@ mod tests {
     }
 
     /// `resolve_once` with no tenant, or tenant without a key → cluster
-    /// signer. `was_tenant` false. Same fallback as `sign_for_tenant`.
+    /// signer. `was_tenant` false.
     #[tokio::test]
     async fn resolve_once_fallback_returns_cluster_signer() {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;

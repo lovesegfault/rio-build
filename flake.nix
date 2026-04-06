@@ -472,11 +472,8 @@
             # Env vars for test runners. PG_BIN so rio-test-support
             # finds initdb/postgres; RIO_GOLDEN_* so golden tests
             # don't try to `nix build` their fixture in-sandbox.
-            testEnv = {
+            testEnv = goldenTestEnv // {
               PG_BIN = "${pkgs.postgresql_18}/bin";
-              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-              RIO_GOLDEN_FORCE_HERMETIC = "1";
             };
             # nextest reuse-build runner. Synthesizes --cargo-metadata
             # and --binaries-metadata JSON from the crate2nix test
@@ -532,6 +529,17 @@
             outputHashAlgo = "sha256";
             outputHash = "sha256-ZofhPTz/XO99Dn3kQMcBaG3vHoMFiD9kHTTtuvf2KNM=";
           } "echo -n ca-golden-test-data > $out";
+
+          # Golden-test env vars — shared by nextest check, mutants,
+          # and golden-matrix. Adding a new golden-fixture env var
+          # here propagates to all runners. (Previously duplicated at
+          # each site; a new var would be easy to add to one and
+          # forget the rest.)
+          goldenTestEnv = {
+            RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+            RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+            RIO_GOLDEN_FORCE_HERMETIC = "1";
+          };
 
           # --------------------------------------------------------------
           # Non-rustc check derivations (shared by checks.* and ci aggregate)
@@ -1219,11 +1227,14 @@
               LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
               PG_BIN = "${pkgs.postgresql_18}/bin";
               # Golden fixture paths — the baseline run hits
-              # golden_conformance (workspace-wide). Same vars as
-              # crateChecks' testEnv; cargo-mutants inherits the env.
-              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-              RIO_GOLDEN_FORCE_HERMETIC = "1";
+              # golden_conformance (workspace-wide). `inherit` from
+              # the shared goldenTestEnv attrset so new golden
+              # fixture vars propagate here automatically.
+              inherit (goldenTestEnv)
+                RIO_GOLDEN_TEST_PATH
+                RIO_GOLDEN_CA_PATH
+                RIO_GOLDEN_FORCE_HERMETIC
+                ;
               NEXTEST_HIDE_PROGRESS_BAR = "1";
 
               # `--in-place`: mutate the unpacked source in $PWD

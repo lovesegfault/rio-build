@@ -222,7 +222,7 @@ async fn spawn_store_with_fake_jwt(
 ///
 /// This is the end-to-end proof that the full chain works:
 ///   P0259 interceptor attaches Claims → put_path extracts sub →
-///   maybe_sign(Some(tid)) → sign_for_tenant → tenant_keys lookup →
+///   maybe_sign(Some(tid)) → resolve_once → tenant_keys lookup →
 ///   tenant-key signature lands in narinfo.signatures.
 ///
 /// Mutation check: if maybe_sign were called with `None` instead of

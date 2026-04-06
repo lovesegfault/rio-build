@@ -121,7 +121,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_estimator_refresh_total` | Counter | Build-history estimator refresh ticks (60s cadence). *Internal — VM test sync signal.* |
 | `rio_scheduler_build_graph_edges` | Histogram | Edge count per `GetBuildGraph` response. Bounded by the induced subgraph over the node-cap (≤5000 nodes); a high p99 (>10k) means unusually dense DAGs. Suggested buckets: `[100, 500, 1000, 5000, 10000, 20000]`. |
 | `rio_scheduler_class_load_fraction` | Gauge | Load fraction per size class (adaptive rebalancer input) |
-| `rio_scheduler_ca_hash_compares_total` | Counter | CA cutoff-compare output-hash lookups against the content index on completion (labeled by `outcome`: `match`/`miss`/`skipped_after_miss`). High match ratio → CA derivations rebuilding identical content. `skipped_after_miss` counts outputs NOT looked up because an earlier output in the same derivation missed (short-circuit); the compare loop breaks early since the AND-fold result is already false. |
+| `rio_scheduler_ca_hash_compares_total` | Counter | CA cutoff-compare output-hash lookups against the content index on completion (labeled by `outcome`: `match`/`miss`/`skipped_after_miss`/`malformed`/`error`). High match ratio → CA derivations rebuilding identical content. `skipped_after_miss` counts outputs NOT looked up because an earlier output in the same derivation missed (short-circuit); the compare loop breaks early since the AND-fold result is already false. `malformed` = worker sent an empty output path; `error` = PG lookup failed or timed out (alert if rate>0). |
 | `rio_scheduler_ca_cutoff_saves_total` | Counter | Derivations skipped via CA early-cutoff (Queued→Skipped transitions). Each increment is one build that did NOT run because a CA dep's output matched the content index. |
 | `rio_scheduler_ca_cutoff_seconds_saved` | Counter | Sum of `est_duration` of skipped derivations. Lower-bound estimate of wall-clock saved (est_duration is the Estimator's EMA; a never-run derivation has the fallback, not actual). Divide by `saves_total` for avg-seconds-per-save. |
 | `rio_scheduler_ca_cutoff_depth_cap_hits_total` | Counter | CA cutoff cascade walks that hit `MAX_CASCADE_NODES` (1000). Non-zero → cascades truncated; pathological DAG shape or cap too low. |
@@ -210,6 +210,7 @@ r[obs.metric.controller]
 | `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
 | `rio_controller_gc_runs_total` | Counter | GC cron runs. `result=success\|connect_failure\|rpc_failure`. `connect_failure` = store unreachable (pod down, stale IP); `rpc_failure` = TriggerGC error or progress stream aborted. |
+| `rio_controller_disruption_drains_total` | Counter | DisruptionTarget watcher DrainWorker calls. `result=sent\|rpc_error`. Zero rate while evictions occur = watcher dead, falling back to SIGTERM self-drain. |
 
 ### Histogram Buckets
 

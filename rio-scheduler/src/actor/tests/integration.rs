@@ -245,6 +245,7 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
                 options: BuildOptions::default(),
                 keep_going: false,
                 traceparent: String::new(),
+                jti: None,
             },
             reply: reply_tx,
         })

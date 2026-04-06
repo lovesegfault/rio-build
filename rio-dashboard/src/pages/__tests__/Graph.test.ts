@@ -34,14 +34,29 @@ vi.mock('../../lib/graphLayout.worker?worker', () => ({
   },
 }));
 
+// Stub the sync layout path too: when truncated:false with few nodes,
+// Graph.svelte calls layoutGraph() which runs dagre + hands nodes to
+// SvelteFlow. SvelteFlow needs real DOM geometry jsdom can't provide.
+// Returning degraded:true routes to the table branch, keeping the
+// poll-loop semantics under test without the render-path complexity.
+vi.mock('../../lib/graphLayout', async (orig) => {
+  const actual = await orig<typeof import('../../lib/graphLayout')>();
+  return {
+    ...actual,
+    layoutGraph: () => ({ degraded: true, reason: 'test-stub', nodes: [] }),
+  };
+});
+
 import Graph from '../Graph.svelte';
 
 const { getBuildGraph } = adminMock;
 
-// truncated: true forces the degraded-table branch. The allTerminal
-// check and inflight gate both fire BEFORE the truncation early-return,
-// so the poll semantics under test are unaffected by the render path.
-function mkResp(statuses: string[]) {
+// truncated: true forces the degraded-table branch (no SvelteFlow, no
+// dagre — fast and jsdom-safe). The inflight gate fires BEFORE the
+// truncation check so that test is unaffected. The allTerminal check
+// is GUARDED on !truncated (truncated = visible-terminal doesn't
+// imply all-terminal) so the poll-stop test needs truncated:false.
+function mkResp(statuses: string[], truncated = true) {
   return {
     nodes: statuses.map((status, i) => ({
       drvPath: `/nix/store/${'a'.repeat(32)}-pkg-${i}.drv`,
@@ -51,7 +66,7 @@ function mkResp(statuses: string[]) {
       assignedWorkerId: '',
     })),
     edges: [],
-    truncated: true,
+    truncated,
     totalNodes: statuses.length,
   };
 }
@@ -96,9 +111,12 @@ describe('Graph page poll loop', () => {
     // no new calls. (The effect's unconditional fetchAndLayout-on-re-run
     // accounts for the third call — it's the poll-after-settle drain,
     // and the sig-match+patch path makes it cheap.)
+    // truncated:false so the !r.truncated allTerminal guard fires.
+    // 2 nodes < DEGRADE_THRESHOLD means this hits the SvelteFlow path;
+    // the layout worker is stubbed via adminMock so this stays jsdom-safe.
     getBuildGraph
-      .mockResolvedValueOnce(mkResp(['running', 'completed']))
-      .mockResolvedValue(mkResp(['completed', 'skipped']));
+      .mockResolvedValueOnce(mkResp(['running', 'completed'], false))
+      .mockResolvedValue(mkResp(['completed', 'skipped'], false));
 
     render(Graph, { props: { buildId: 'b-2' } });
     await flushSvelte();

@@ -131,3 +131,20 @@ pub fn make_path_info_for_nar(store_path: &str, nar: &[u8]) -> ValidatedPathInfo
     let digest: [u8; 32] = Sha256::digest(nar).into();
     make_path_info(store_path, nar, digest)
 }
+
+/// Seed an output file at `{tmp}/nix/store/{basename}` with the given
+/// content. Returns `(tmp_dir, store_dir)` — hold `tmp_dir` to keep the
+/// tempdir alive across the test.
+///
+/// Shared between rio-worker's FOD verification tests and upload tests
+/// (both need a file in a fake overlay-upper's nix/store).
+pub fn seed_store_output(
+    basename: &str,
+    content: &[u8],
+) -> std::io::Result<(tempfile::TempDir, std::path::PathBuf)> {
+    let tmp = tempfile::tempdir()?;
+    let store_dir = tmp.path().join("nix/store");
+    std::fs::create_dir_all(&store_dir)?;
+    std::fs::write(store_dir.join(basename), content)?;
+    Ok((tmp, store_dir))
+}
