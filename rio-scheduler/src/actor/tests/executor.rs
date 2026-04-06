@@ -39,6 +39,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: true,
+            ephemeral: false,
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -183,6 +184,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            ephemeral: false,
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -882,17 +884,19 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
 }
 
 // r[verify sched.fod.size-class-reactive]
-/// I-173: a FOD assigned to a tiny fetcher that disconnects while
-/// status==Assigned (Running ack never sent) MUST still get its
-/// `size_class_floor` promoted. Before the fix, promotion lived only
-/// in `record_failure_and_check_poison`, which the I-097 guard skips
-/// for Assigned-only disconnects — so an OOM'd fetcher (which often
-/// dies before the actor processes the Running ack) left floor=NULL
-/// and retry-stormed on tiny. Live: 14 OOMs, retry_count=0,
-/// size_class_floor=NULL.
+/// I-173: a FOD assigned to a tiny NON-ephemeral fetcher that
+/// disconnects while status==Assigned MUST get its `size_class_floor`
+/// promoted. DerivationStatus stays Assigned for the build's whole
+/// lifetime (Running is set only at completion via ensure_running()),
+/// so the production disconnect path is always Assigned-status.
+/// Non-ephemeral disconnect = unexpected death (plausibly OOM) →
+/// promote. Live: 14 OOMs, retry_count=0, size_class_floor=NULL
+/// before this promotion was wired.
 ///
 /// Also asserts I-097's invariant still holds (no failed_builders
 /// entry, status=Ready) — promotion is decoupled from poison-record.
+/// Converse (ephemeral disconnect → NO promote) at
+/// `test_ephemeral_disconnect_does_not_promote_floor`.
 #[tokio::test]
 async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
     use crate::assignment::FetcherSizeClassConfig;
@@ -944,7 +948,7 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
     assert_eq!(
         info.size_class_floor.as_deref(),
         Some("small"),
-        "I-173: Assigned-disconnect must promote FOD floor tiny→small"
+        "I-173: non-ephemeral Assigned-disconnect must promote FOD floor tiny→small"
     );
     // I-097 still holds: no failure recorded.
     assert!(
@@ -958,12 +962,11 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
 }
 
 // r[verify sched.builder.size-class-reactive]
-/// I-177: a non-FOD assigned to a tiny builder that disconnects while
-/// status==Assigned MUST get its `size_class_floor` promoted, same as
-/// the FOD path (I-173). Before the fix, `promote_size_class_floor`
-/// guarded on `is_fixed_output` → 103 tiny builders OOMKilled on
-/// bootstrap-stage0-glibc / llvm-src, floor stayed NULL, retry routed
-/// back to tiny → poison.
+/// I-177: a non-FOD assigned to a tiny NON-ephemeral builder that
+/// disconnects while status==Assigned MUST get its `size_class_floor`
+/// promoted, same as the FOD path (I-173). 103 tiny builders
+/// OOMKilled on bootstrap-stage0-glibc / llvm-src; without promotion
+/// floor stayed NULL, retry routed back to tiny → poison.
 ///
 /// Mirrors `test_assigned_disconnect_promotes_fod_floor` with a
 /// builder-kind executor + builder size_classes config.
@@ -1026,7 +1029,7 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
     assert_eq!(
         info.size_class_floor.as_deref(),
         Some("small"),
-        "I-177: Assigned-disconnect on tiny builder must promote floor tiny→small"
+        "I-177: non-ephemeral Assigned-disconnect must promote builder floor tiny→small"
     );
     // I-097 still holds: no failure recorded for Assigned-only disconnect.
     assert!(
@@ -1035,6 +1038,229 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
         info.failed_builders
     );
     assert_eq!(info.status, DerivationStatus::Ready);
+
+    Ok(())
+}
+
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect]
+/// I-188 (fix 1, defense-in-depth): a non-FOD assigned to a tiny
+/// EPHEMERAL builder that disconnects MUST NOT get its
+/// `size_class_floor` promoted. Ephemeral disconnect is the expected
+/// one-shot Job exit — not a size-adequacy signal. Without this gate
+/// the I-188 chain (ProcessCompletion → re-dispatch to freed slot →
+/// ephemeral exit → reassign → promote) walked the size ladder one
+/// class per derivation. Converse (non-ephemeral disconnect → DOES
+/// promote) at `test_assigned_disconnect_promotes_builder_floor`.
+///
+/// Tests Fix 1 in isolation from Fix 2: this disconnect is direct
+/// (ExecutorDisconnected), not via ProcessCompletion, so the
+/// draining-on-completion gate doesn't apply — only the
+/// reassign-side ephemeral check does.
+#[tokio::test]
+async fn test_ephemeral_disconnect_does_not_promote_floor() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ])
+    });
+
+    // Ephemeral builder, classed "tiny". connect_builder_classed +
+    // an extra heartbeat with ephemeral=true to set the flag (the
+    // existing helper is non-ephemeral).
+    let mut rx = connect_builder_classed(&handle, "b-eph", "x86_64-linux", "tiny").await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            ephemeral: true,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: Some("tiny".into()),
+            executor_id: "b-eph".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            running_builds: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let node = make_test_node("eph-glibc-188", "x86_64-linux");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("eph-glibc-188"));
+
+    // Ephemeral builder exits (one-shot) → disconnect with drv
+    // still Assigned. Status==Assigned is the production path
+    // (Running is only set at completion via ensure_running()).
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "b-eph".into(),
+        })
+        .await?;
+    barrier(&handle).await;
+    drop(rx);
+
+    let info = handle
+        .debug_query_derivation("eph-glibc-188")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.size_class_floor, None,
+        "I-188: ephemeral disconnect must NOT promote floor; got {:?}",
+        info.size_class_floor
+    );
+    assert!(
+        info.failed_builders.is_empty(),
+        "I-097: Assigned-only disconnect must not record failure"
+    );
+    assert_eq!(info.status, DerivationStatus::Ready);
+
+    Ok(())
+}
+
+// r[verify sched.ephemeral.no-redispatch-after-completion]
+/// I-188 (fix 2): an ephemeral executor that completes its one build
+/// is marked draining BEFORE `dispatch_ready` runs in the same actor
+/// turn, so the dependent that ProcessCompletion just unlocked is NOT
+/// re-assigned to the about-to-exit slot.
+///
+/// Setup: parent→child chain, single ephemeral builder. Parent
+/// dispatches → completes → child becomes Ready → dispatch_ready in
+/// the same ProcessCompletion turn would assign child to the freed
+/// slot pre-fix. Post-fix: builder is draining, child stays Ready.
+#[tokio::test]
+async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let mut rx = connect_executor_ephemeral(&handle, "eph-1", "x86_64-linux").await?;
+
+    // parent → child chain. Parent dispatches first (child blocked).
+    let parent = make_test_node("eph-parent", "x86_64-linux");
+    let child = make_test_node("eph-child", "x86_64-linux");
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![parent, child],
+        // Edge convention: (consumer, input). eph-child depends on
+        // eph-parent → eph-parent is the leaf, dispatches first.
+        vec![make_test_edge("eph-child", "eph-parent")],
+        false,
+    )
+    .await?;
+
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(
+        asgn.drv_path.contains("eph-parent"),
+        "parent dispatches first"
+    );
+
+    // Parent completes. ProcessCompletion: free slot → mark draining
+    // (ephemeral) → child Ready → dispatch_ready sees draining → skip.
+    complete_success_empty(&handle, "eph-1", "eph-parent").await?;
+    barrier(&handle).await;
+
+    // Builder is draining; child NOT assigned to it.
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "eph-1")
+        .expect("eph-1 exists");
+    assert!(
+        w.draining,
+        "I-188: ephemeral executor must be draining after completion"
+    );
+    assert_eq!(
+        w.running_count, 0,
+        "I-188: ephemeral executor must not be re-assigned post-completion"
+    );
+
+    let child_info = handle
+        .debug_query_derivation("eph-child")
+        .await?
+        .expect("child exists");
+    assert_eq!(
+        child_info.status,
+        DerivationStatus::Ready,
+        "child unlocked but NOT dispatched to draining ephemeral; got {:?}",
+        child_info.status
+    );
+
+    // Sensitivity: rx received NO second Assignment. try_recv (non-
+    // blocking) — anything queued would be the spurious re-dispatch.
+    match rx.try_recv() {
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        Ok(msg) => panic!(
+            "ephemeral executor received post-completion message: {:?}",
+            msg.msg
+        ),
+        Err(e) => panic!("unexpected channel state: {e:?}"),
+    }
+
+    Ok(())
+}
+
+// r[verify sched.ephemeral.no-redispatch-after-completion]
+/// I-188 control: a NON-ephemeral executor that completes a build is
+/// NOT marked draining; its freed slot is real capacity and the
+/// dependent dispatches to it in the same ProcessCompletion turn.
+/// Same parent→child chain as
+/// `test_ephemeral_completion_marks_draining_no_redispatch` but with
+/// `ephemeral=false` (the default `connect_executor`).
+#[tokio::test]
+async fn test_non_ephemeral_completion_allows_redispatch() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let mut rx = connect_executor(&handle, "sts-1", "x86_64-linux", 1).await?;
+
+    let parent = make_test_node("sts-parent", "x86_64-linux");
+    let child = make_test_node("sts-child", "x86_64-linux");
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![parent, child],
+        vec![make_test_edge("sts-child", "sts-parent")],
+        false,
+    )
+    .await?;
+
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("sts-parent"));
+
+    complete_success_empty(&handle, "sts-1", "sts-parent").await?;
+    barrier(&handle).await;
+
+    // NOT draining; child IS assigned to it.
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "sts-1")
+        .expect("sts-1 exists");
+    assert!(
+        !w.draining,
+        "non-ephemeral executor must NOT be draining after completion"
+    );
+
+    let asgn2 = recv_assignment(&mut rx).await;
+    assert!(
+        asgn2.drv_path.contains("sts-child"),
+        "non-ephemeral: child dispatches to freed slot in same turn"
+    );
 
     Ok(())
 }
@@ -1107,6 +1333,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -1686,6 +1913,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: true,
+            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -1734,6 +1962,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -1975,6 +2204,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
+            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,

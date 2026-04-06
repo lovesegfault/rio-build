@@ -161,6 +161,7 @@ pub async fn build_heartbeat_request(
     resources: &ResourceSnapshotHandle,
     store_degraded: bool,
     draining: bool,
+    ephemeral: bool,
 ) -> HeartbeatRequest {
     let current: Vec<String> = slot.running().into_iter().collect();
 
@@ -245,6 +246,11 @@ pub async fn build_heartbeat_request(
         // Scheduler routes FODs to fetchers only per
         // spec sched.dispatch.fod-to-fetcher.
         kind: executor_kind as i32,
+        // I-188: one-shot Job executor (RIO_EPHEMERAL). Scheduler
+        // marks draining-on-completion so dispatch doesn't re-assign
+        // to the about-to-exit slot. Static config, reported every
+        // heartbeat.
+        ephemeral,
     }
 }
 
@@ -1084,6 +1090,7 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
+            false,
         )
         .await;
         assert_eq!(req.running_builds, vec!["/nix/store/foo.drv".to_string()]);
@@ -1109,6 +1116,7 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
+            false,
         )
         .await;
         assert!(req.running_builds.is_empty());
@@ -1129,6 +1137,7 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
+            false,
         )
         .await;
         assert_eq!(req.size_class, "large");
@@ -1142,6 +1151,7 @@ mod tests {
             &slot,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
             false,
             false,
         )
@@ -1174,6 +1184,7 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             true,
             false,
+            false,
         )
         .await;
         assert!(
@@ -1194,9 +1205,52 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
+            false,
         )
         .await;
         assert!(!req.store_degraded);
+    }
+
+    /// I-188: `ephemeral` passes through to the proto field. main.rs
+    /// threads `RIO_EPHEMERAL` through HeartbeatCtx; this is the
+    /// contract — whatever bool main.rs resolves, the scheduler sees.
+    /// Scheduler-side consumption is `r[verify]`'d separately in
+    /// rio-scheduler (mark draining-on-completion).
+    #[tokio::test]
+    async fn test_heartbeat_ephemeral_passthrough() {
+        let slot = Arc::new(BuildSlot::default());
+        let req = build_heartbeat_request(
+            "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
+            &["x86_64-linux".into()],
+            &[],
+            "",
+            &slot,
+            None,
+            &ResourceSnapshotHandle::default(),
+            false,
+            false,
+            true,
+        )
+        .await;
+        assert!(req.ephemeral);
+
+        // Control: default path is NOT ephemeral.
+        let req = build_heartbeat_request(
+            "worker-1",
+            rio_proto::types::ExecutorKind::Builder,
+            &["x86_64-linux".into()],
+            &[],
+            "",
+            &slot,
+            None,
+            &ResourceSnapshotHandle::default(),
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(!req.ephemeral);
     }
 
     /// Regression: supported_features must reflect the config — if
@@ -1214,6 +1268,7 @@ mod tests {
             &slot,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
             false,
             false,
         )
@@ -1262,6 +1317,7 @@ mod tests {
             &slot,
             Some(&bloom),
             &ResourceSnapshotHandle::default(),
+            false,
             false,
             false,
         )
