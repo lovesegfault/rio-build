@@ -2164,10 +2164,13 @@ def test_dag_flip_refuses_wrong_branch_checked_out(dag_flip_repo):
         dag_flip(99)
 
 
-def test_dag_flip_already_done_noop(dag_flip_repo):
-    """If the dag row was pre-flipped (coordinator fast-path or re-invoked
-    merger), set_status writes an identical tree → nothing staged → amend
-    skipped. amend_sha='already-done', count still bumps.
+def test_dag_flip_already_done_case_a_coord_fastpath(dag_flip_repo):
+    """Case (a) — coordinator fast-path: ff + set_status DONE directly,
+    never ran dag_flip → merge-shas.jsonl has no row for this plan → bump.
+
+    If the dag row was pre-flipped, set_status writes an identical tree →
+    nothing staged → amend skipped. amend_sha='already-done', count bumps
+    (merge happened, mc never incremented).
 
     Seed via write_jsonl (not hand-written minimal JSON) — PlanRow has many
     default fields; set_status's rewrite serializes the full model. A
@@ -2188,6 +2191,77 @@ def test_dag_flip_already_done_noop(dag_flip_repo):
     assert result.unblocked == []
     # HEAD didn't move — no amend occurred.
     assert _git(repo, "rev-parse", "HEAD") == pre
+
+
+def test_dag_flip_already_done_case_b_reinvoke_idempotent(dag_flip_repo):
+    """P0417 regression (IRONIC — P0414 fixed within-run double-bump,
+    introduced re-invoke double-bump): merger crashes AFTER count_bump →
+    coordinator re-invokes dag_flip for same plan → must NOT bump again.
+
+    Simulates: seed dag with UNIMPL, call dag_flip(99) once (normal path,
+    amend + count_bump → mc=1), then call dag_flip(99) again. Second call
+    hits already-done (dag is DONE, nothing staged) → scans merge-shas
+    → finds plan=99 row from first call → returns mc=1 unchanged.
+
+    Pre-fix, second call would count_bump() → mc=2 → all future
+    _cadence_range() windows off-by-one."""
+    from onibus.jsonl import write_jsonl
+    from onibus.merge import dag_flip
+
+    repo, dag_path = dag_flip_repo
+    write_jsonl(dag_path, [PlanRow(plan=99, title="x", status="UNIMPL")])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: seed", "--no-verify")
+
+    # First invocation — normal path (amend + count_bump → mc=1)
+    r1 = dag_flip(99)
+    assert r1.amend_sha != "already-done"
+    assert r1.mc == 1
+
+    # Second invocation — already-done path; merge-shas has plan=99 row
+    # from r1 → returns that row's mc, no bump.
+    r2 = dag_flip(99)
+    assert r2.amend_sha == "already-done"
+    assert r2.mc == 1, (
+        f"re-invocation must NOT double-bump; got mc={r2.mc} "
+        f"(P0221-class bug P0414 was meant to prevent)"
+    )
+
+    # Count file confirms: still 1.
+    count_file = repo / ".claude" / "state" / "merge-count.txt"
+    assert int(count_file.read_text().strip()) == 1
+
+
+def test_dag_flip_already_done_case_a_preserves_old_rows(dag_flip_repo):
+    """Case (a) on a repo with older merge-shas rows (plan=None from
+    pre-P0417 or --set-to rewinds): plan=None rows must NOT match
+    plan=99 → still bumps. Regression guard for over-eager match."""
+    from onibus.jsonl import write_jsonl, append_jsonl
+    from onibus.merge import dag_flip
+    from onibus.models import MergeSha
+    from datetime import datetime, timezone
+
+    repo, dag_path = dag_flip_repo
+    write_jsonl(dag_path, [PlanRow(plan=99, title="x", status="DONE")])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: pre-flipped", "--no-verify")
+    pre = _git(repo, "rev-parse", "HEAD")
+
+    # Seed merge-shas with an older plan=None row (mc=1, different context).
+    sha_file = repo / ".claude" / "state" / "merge-shas.jsonl"
+    sha_file.parent.mkdir(parents=True, exist_ok=True)
+    # Also seed count-file so count_bump reads cur=1 → bumps to 2.
+    (repo / ".claude" / "state" / "merge-count.txt").write_text("1\n")
+    append_jsonl(sha_file, MergeSha(
+        mc=1, sha=pre, ts=datetime.now(timezone.utc), plan=None,
+    ))
+
+    result = dag_flip(99)
+    assert result.amend_sha == "already-done"
+    assert result.mc == 2, (
+        f"plan=None rows must not match plan=99; case (a) should still "
+        f"bump. Got mc={result.mc}"
+    )
 
 
 # ─── schema emission ─────────────────────────────────────────────────────────
