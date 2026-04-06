@@ -1,6 +1,8 @@
 //! See rio-scheduler/tests/metrics_registered.rs for rationale.
 
-use rio_test_support::metrics::{assert_emitted_metrics_described, assert_spec_metrics_described};
+use rio_test_support::metrics::{
+    assert_emitted_metrics_described, assert_histograms_have_buckets, assert_spec_metrics_described,
+};
 
 /// Metric names from observability.md's Gateway Metrics table.
 /// Derived at build time via build.rs → spec_metrics.txt.
@@ -31,6 +33,29 @@ fn all_emitted_metrics_are_described() {
         EMITTED_METRICS,
         5,
         rio_gateway::describe_metrics,
+        "rio-gateway",
+    );
+}
+
+// r[verify obs.metric.gateway]
+#[test]
+fn all_histograms_have_bucket_config() {
+    use rio_common::observability::HISTOGRAM_BUCKET_MAP;
+
+    // rio_gateway_opcode_duration_seconds: per-opcode latency. The
+    // fast opcodes (QueryPathInfo, IsValidPath, …) are sub-second
+    // gRPC round-trips and [0.005..10.0] fits. The build opcodes
+    // (BuildDerivation, BuildPathsWithResults) span minutes-hours,
+    // but those durations are tracked by
+    // rio_scheduler_build_duration_seconds with proper buckets — the
+    // opcode histogram's job is the FAST opcodes' p99, where +Inf for
+    // build opcodes is acceptable noise.
+    const DEFAULT_BUCKETS_OK: &[&str] = &["rio_gateway_opcode_duration_seconds"];
+
+    assert_histograms_have_buckets(
+        rio_gateway::describe_metrics,
+        HISTOGRAM_BUCKET_MAP,
+        DEFAULT_BUCKETS_OK,
         "rio-gateway",
     );
 }
