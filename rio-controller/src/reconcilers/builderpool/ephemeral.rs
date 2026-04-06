@@ -461,6 +461,18 @@ pub(super) fn build_job(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
+                    // I-126: I-090's bin-packing + consolidateAfter:30s on
+                    // the NodePool means karpenter evicts mid-build to
+                    // consolidate (observed: 3 builders evicted in ~2min
+                    // warming inputs for the same drv → cascading
+                    // reassigns). do-not-disrupt pins the pod for its
+                    // lifetime; the node consolidates AFTER Job completion.
+                    // Annotation goes on the POD TEMPLATE metadata, not
+                    // the Job's — karpenter reads pod annotations.
+                    annotations: Some(std::collections::BTreeMap::from([(
+                        "karpenter.sh/do-not-disrupt".into(),
+                        "true".into(),
+                    )])),
                     ..Default::default()
                 }),
                 spec: Some(pod_spec),
@@ -545,6 +557,27 @@ mod tests {
             "activeDeadlineSeconds backstop missing — wrong-pool \
              spawns (worker never matches dispatch) would leak \
              indefinitely"
+        );
+
+        // I-126: do-not-disrupt on the POD TEMPLATE metadata (not the
+        // Job's). Without it, karpenter evicts mid-build to consolidate
+        // (I-090 bin-packing makes the pod a consolidation candidate).
+        let pod_anns = spec
+            .template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.annotations.as_ref())
+            .expect("pod template must have annotations");
+        assert_eq!(
+            pod_anns
+                .get("karpenter.sh/do-not-disrupt")
+                .map(String::as_str),
+            Some("true"),
+            "I-126: ephemeral pods must opt out of karpenter disruption"
+        );
+        assert!(
+            job.metadata.annotations.is_none(),
+            "annotation belongs on pod template, not Job metadata"
         );
 
         let pod_spec = spec.template.spec.as_ref().unwrap();
