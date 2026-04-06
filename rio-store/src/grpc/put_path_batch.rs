@@ -255,7 +255,7 @@ impl StoreServiceImpl {
             .await
             {
                 Ok(i) => i,
-                Err(e) => bail!(metadata_status(
+                Err(e) => bail!(putpath_metadata_status(
                     "PutPathBatch: insert_manifest_uploading",
                     e
                 )),
@@ -264,6 +264,9 @@ impl StoreServiceImpl {
             if !inserted {
                 // Concurrent uploader owns the slot. For a batch, we can't
                 // partially proceed — bail the whole batch. Retriable.
+                metrics::counter!("rio_store_putpath_retries_total",
+                    "reason" => "concurrent_upload")
+                .increment(1);
                 bail!(Status::aborted(format!(
                     "output {idx}: concurrent upload in progress; retry"
                 )));
@@ -338,7 +341,10 @@ impl StoreServiceImpl {
                 // explicit cleanup (they were committed in phase 2's
                 // separate per-placeholder txs).
                 drop(tx);
-                bail!(metadata_status("PutPathBatch: complete_manifest_inline", e));
+                bail!(putpath_metadata_status(
+                    "PutPathBatch: complete_manifest_inline",
+                    e
+                ));
             }
             created[*idx as usize] = true;
         }

@@ -366,7 +366,10 @@ impl StoreServiceImpl {
             Ok(b) => b,
             Err(e) => {
                 drain_stream(&mut stream).await;
-                return Err(metadata_status("PutPath: insert_manifest_uploading", e));
+                return Err(putpath_metadata_status(
+                    "PutPath: insert_manifest_uploading",
+                    e,
+                ));
             }
         };
         if !inserted {
@@ -383,6 +386,9 @@ impl StoreServiceImpl {
                 }
                 _ => {
                     debug!(store_path = %info.store_path, "PutPath: concurrent upload in progress, aborting");
+                    metrics::counter!("rio_store_putpath_retries_total",
+                        "reason" => "concurrent_upload")
+                    .increment(1);
                     return Err(Status::aborted(
                         "concurrent PutPath in progress for this path; retry",
                     ));
@@ -611,7 +617,10 @@ impl StoreServiceImpl {
                     .await
             {
                 self.abort_upload(&full_info.store_path_hash).await;
-                return Err(metadata_status("PutPath: complete_manifest_inline", e));
+                return Err(putpath_metadata_status(
+                    "PutPath: complete_manifest_inline",
+                    e,
+                ));
             }
             debug!(store_path = %full_info.store_path.as_str(), "PutPath: inline upload completed");
         }

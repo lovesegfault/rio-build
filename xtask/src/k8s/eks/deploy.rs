@@ -259,6 +259,23 @@ pub async fn run(
             // scaler is enabled (store.yaml omits .spec.replicas).
             .set("componentScaler.store.enabled", "true")
             .set("store.pgMaxConnections", "200")
+            // I-147/I-150: production-scale resources. values.yaml defaults
+            // stay small so VM-test k3s (2-node QEMU) can schedule; EKS
+            // gets the real sizing here.
+            .set("controller.resources.requests.cpu", "8")
+            .set("controller.resources.requests.memory", "8Gi")
+            .set("controller.resources.limits.memory", "64Gi")
+            .set("store.resources.requests.cpu", "16")
+            .set("store.resources.requests.memory", "8Gi")
+            .set("store.resources.limits.memory", "32Gi")
+            .set("scheduler.resources.requests.cpu", "32")
+            .set("scheduler.resources.requests.memory", "16Gi")
+            .set("scheduler.resources.limits.memory", "64Gi")
+            .set("gateway.resources.requests.cpu", "32")
+            .set("gateway.resources.requests.memory", "16Gi")
+            .set("gateway.resources.limits.memory", "64Gi")
+            .set("fetcherDefaults.resources.requests.cpu", "2")
+            .set("fetcherDefaults.resources.limits.memory", "4Gi")
             .set("jwt.enabled", "true")
             .set("jwt.signingSeed", &jwt_seed_b64)
             .set("jwt.publicKey", &jwt_pubkey_b64)

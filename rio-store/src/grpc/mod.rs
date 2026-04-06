@@ -164,6 +164,32 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
     }
 }
 
+/// PutPath-scoped wrapper around [`metadata_status`]: increments
+/// `rio_store_putpath_retries_total{reason}` for retriable variants
+/// (the ones that map to `aborted`/`unavailable` and which the worker
+/// upload loop retries) before delegating. Same I-145 site as the
+/// log-level special-case above; separate fn because `metadata_status`
+/// is called from read RPCs (QueryPathInfo etc.) where the counter
+/// would be a misnomer.
+pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError) -> Status {
+    use metadata::MetadataError as M;
+    let reason = match &e {
+        M::Serialization => Some("serialization"),
+        M::Deadlock(_) => Some("deadlock"),
+        M::PlaceholderMissing { .. } => Some("placeholder_missing"),
+        M::Connection(_) => Some("connection"),
+        M::ResourceExhausted(_) => Some("resource_exhausted"),
+        // Non-retriable (NotFound/Conflict/Invariant/Malformed/Corrupt/
+        // Other) — not counted; the client won't retry an `internal`/
+        // `data_loss`/`already_exists`.
+        _ => None,
+    };
+    if let Some(reason) = reason {
+        metrics::counter!("rio_store_putpath_retries_total", "reason" => reason).increment(1);
+    }
+    metadata_status(context, e)
+}
+
 /// Validate a raw PathInfo message for PutPath/PutPathBatch.
 ///
 /// Shared validation shared by both upload RPCs: (1) nar_hash-empty
