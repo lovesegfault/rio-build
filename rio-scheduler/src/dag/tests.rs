@@ -806,6 +806,94 @@ fn test_merge_large_dag_perf_bound() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// I-140: time the per-completion / per-admin-RPC hot operations at the
+/// 153k-node scale that stalled dispatch in prod. These are all in-memory;
+/// the bound is "no accidental O(n²)". Prints raw timings for diagnosis.
+#[test]
+fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
+    const N: usize = 150_000;
+    const FANOUT: usize = 5;
+    let (nodes, edges) = make_wide_dag(N, FANOUT);
+
+    let mut dag = DerivationDag::new();
+    let build_id = Uuid::new_v4();
+    let result = dag.merge(build_id, &nodes, &edges, "")?;
+    // Mark first FANOUT nodes Completed (leaves) so find_newly_ready /
+    // update_ancestors have realistic work to do.
+    for i in 0..FANOUT {
+        let h = format!("h{i:08}");
+        dag.node_mut(&h)
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Completed);
+    }
+    // Put remaining nodes in Queued (compute_initial_states would do this).
+    for i in FANOUT..N {
+        let h = format!("h{i:08}");
+        dag.node_mut(&h)
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Queued);
+    }
+
+    let est = crate::estimator::Estimator::default();
+
+    macro_rules! time {
+        ($name:literal, $bound_ms:literal, $body:expr) => {{
+            let t = std::time::Instant::now();
+            let r = $body;
+            let el = t.elapsed();
+            eprintln!("I-140 bench [{}]: {:?}", $name, el);
+            assert!(
+                el.as_millis() < $bound_ms,
+                "I-140: {} took {:?} on {N}-node DAG (>{}ms bound)",
+                $name,
+                el,
+                $bound_ms
+            );
+            r
+        }};
+    }
+
+    time!("build_summary", 500, dag.build_summary(build_id));
+    time!("find_newly_ready", 100, dag.find_newly_ready("h00000000"));
+    time!("iter_nodes-count", 500, dag.iter_nodes().count());
+    time!(
+        "update_ancestors",
+        2000,
+        crate::critical_path::update_ancestors(&mut dag, "h00000000")
+    );
+    time!(
+        "compute_initial(critpath)",
+        15000,
+        crate::critical_path::compute_initial(&mut dag, &est, &result.newly_inserted)
+    );
+    time!(
+        "full_sweep",
+        15000,
+        crate::critical_path::full_sweep(&mut dag, &est)
+    );
+
+    // update_ancestors when the completed node WAS the unique max-child
+    // (priority strictly higher than siblings) — the dirty-flag stop
+    // doesn't fire and the walk goes the full DAG depth. Set node 0's
+    // priority above its siblings, propagate up, then complete it and
+    // propagate the drop back up.
+    dag.node_mut("h00000000").unwrap().priority = 1e9;
+    time!(
+        "update_ancestors(propagate-up)",
+        15000,
+        crate::critical_path::update_ancestors(&mut dag, "h00000000")
+    );
+    dag.node_mut("h00000000")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    time!(
+        "update_ancestors(deep)",
+        15000,
+        crate::critical_path::update_ancestors(&mut dag, "h00000000")
+    );
+    Ok(())
+}
+
 /// The interning INVARIANT: all DrvHash clones flowing out of DAG accessors
 /// are ptr-equal to the canonical key in `nodes`. This holds because
 /// `merge()` inserts clones of the SAME local Arc into `nodes`,

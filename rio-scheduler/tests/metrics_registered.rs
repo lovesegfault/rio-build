@@ -71,7 +71,15 @@ fn all_histograms_have_bucket_config() {
 
     // Histograms that genuinely fit [0.005..10.0]. See the
     // HISTOGRAM_BUCKET_MAP doc comment for the rationale on each.
-    const DEFAULT_BUCKETS_OK: &[&str] = &["rio_scheduler_recovery_duration_seconds"];
+    const DEFAULT_BUCKETS_OK: &[&str] = &[
+        "rio_scheduler_recovery_duration_seconds",
+        // Actor commands should be sub-second; the [0.005..10.0]
+        // default covers the "alert at p99>1s" range exactly. A
+        // command at 10s+ is already a head-of-line stall (I-140) —
+        // the +Inf bucket is the alert, finer resolution above 10s
+        // doesn't change the response.
+        "rio_scheduler_actor_cmd_seconds",
+    ];
 
     assert_histograms_have_buckets(
         rio_scheduler::describe_metrics,

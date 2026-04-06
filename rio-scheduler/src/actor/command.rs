@@ -428,6 +428,53 @@ pub enum ActorCommand {
     },
 }
 
+impl ActorCommand {
+    /// Static variant name for per-command latency instrumentation
+    /// (I-140). Used as the `cmd` label on the actor-loop histogram +
+    /// slow-WARN. `&'static str` so the metrics layer doesn't allocate
+    /// a label per command.
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            Self::MergeDag { .. } => "MergeDag",
+            Self::ProcessCompletion { .. } => "ProcessCompletion",
+            Self::CancelBuild { .. } => "CancelBuild",
+            Self::ExecutorConnected { .. } => "ExecutorConnected",
+            Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",
+            Self::PrefetchComplete { .. } => "PrefetchComplete",
+            Self::Heartbeat { .. } => "Heartbeat",
+            Self::Tick => "Tick",
+            Self::QueryBuildStatus { .. } => "QueryBuildStatus",
+            Self::WatchBuild { .. } => "WatchBuild",
+            Self::CleanupTerminalBuild { .. } => "CleanupTerminalBuild",
+            Self::ForwardLogBatch { .. } => "ForwardLogBatch",
+            Self::DrainExecutor { .. } => "DrainExecutor",
+            Self::ClusterSnapshot { .. } => "ClusterSnapshot",
+            Self::GetSizeClassSnapshot { .. } => "GetSizeClassSnapshot",
+            Self::CapacityManifest { .. } => "CapacityManifest",
+            Self::EstimatorStats { .. } => "EstimatorStats",
+            Self::GcRoots { .. } => "GcRoots",
+            Self::ListExecutors { .. } => "ListExecutors",
+            Self::ClearPoison { .. } => "ClearPoison",
+            Self::InspectBuildDag { .. } => "InspectBuildDag",
+            Self::LeaderAcquired => "LeaderAcquired",
+            Self::ReconcileAssignments => "ReconcileAssignments",
+            Self::DebugQueryWorkers { .. } => "DebugQueryWorkers",
+            #[cfg(test)]
+            Self::DebugQueryDerivation { .. } => "DebugQueryDerivation",
+            #[cfg(test)]
+            Self::DebugForceAssign { .. } => "DebugForceAssign",
+            #[cfg(test)]
+            Self::DebugBackdateRunning { .. } => "DebugBackdateRunning",
+            #[cfg(test)]
+            Self::DebugBackdateSubmitted { .. } => "DebugBackdateSubmitted",
+            #[cfg(test)]
+            Self::DebugClearDrvContent { .. } => "DebugClearDrvContent",
+            #[cfg(test)]
+            Self::DebugTripBreaker { .. } => "DebugTripBreaker",
+        }
+    }
+}
+
 /// Reply for `ActorCommand::DrainExecutor`.
 ///
 /// `accepted=false` only for unknown executor_id — NOT an error, the

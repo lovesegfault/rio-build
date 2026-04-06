@@ -876,6 +876,7 @@ impl DagActor {
         );
         self.build_events.remove(&build_id);
         self.build_sequences.remove(&build_id);
+        self.build_progress_at.remove(&build_id);
         self.builds.remove(&build_id);
         if let Err(db_e) = self.db.delete_build(build_id).await {
             warn!(

@@ -1246,3 +1246,246 @@ async fn test_handle_merge_dag_large_perf_bound() -> TestResult {
     assert_eq!(status.total_derivations, N as u32);
     Ok(())
 }
+
+// ===========================================================================
+// Large-DAG completion + re-dispatch perf bound (I-140)
+// ===========================================================================
+
+/// I-140: post-merge per-completion + per-heartbeat-dispatch perf bound on
+/// a 50k-node / ~250k-edge synthetic DAG against a real (ephemeral) PG.
+///
+/// The I-139 fix made `handle_merge_dag` fast, but build 019d559a then
+/// stalled at 1275/153821 (1244 cached + 31 built) — completions and
+/// heartbeats were processed, but admin RPCs timed out at 30s and new
+/// builders idle-timed-out after 120s with no assignment. The actor was
+/// alive but head-of-line blocked.
+///
+/// This test drives the actor THROUGH a merge, then exercises the two hot
+/// paths that fire on every step of the build:
+///   - `Heartbeat` → `dispatch_ready()` (per heartbeat, which is per
+///     ephemeral-builder-connect + ~10s thereafter)
+///   - `ProcessCompletion` → `handle_success_completion` (per drv done)
+///
+/// Same xact_commit-delta guard as I-139: per-node DB round-trips on
+/// either path show as ~N extra transactions; correct behavior is O(1)
+/// regardless of N. Wall-clock bound is loose (debug + ephemeral PG).
+#[tokio::test]
+async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
+    const N: usize = 50_000;
+    const FANOUT: usize = 5;
+
+    let (db, handle, _task) = setup().await;
+
+    async fn xact_commit(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_database")
+    }
+
+    let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
+    let nodes: Vec<_> = (0..N)
+        .map(|i| rio_proto::dag::DerivationNode {
+            drv_hash: format!("h{i:08}"),
+            drv_path: path(i),
+            ..make_test_node("x", "x86_64-linux")
+        })
+        .collect();
+    let mut edges = Vec::with_capacity(N * FANOUT);
+    for i in FANOUT..N {
+        for j in 1..=FANOUT {
+            edges.push(rio_proto::dag::DerivationEdge {
+                parent_drv_path: path(i),
+                child_drv_path: path(i - j),
+            });
+        }
+    }
+
+    let build_id = Uuid::new_v4();
+    let _rx = merge_dag(&handle, build_id, nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    // --- Heartbeat → dispatch_ready (no worker → all-defer) -----------
+    // Connect a worker. dispatch_ready fires on its Heartbeat AND on
+    // PrefetchComplete (connect_executor sends both). With one worker
+    // and FANOUT initial Ready leaves, this assigns 1 and defers the
+    // rest. The point is the drain-loop cost when ready_queue >> workers.
+    let xact_before = xact_commit(&db.pool).await;
+    let t = std::time::Instant::now();
+    let mut wrx = connect_executor(&handle, "w0", "x86_64-linux", 1).await?;
+    let assignment = recv_assignment(&mut wrx).await;
+    barrier(&handle).await;
+    let dispatch_elapsed = t.elapsed();
+    let dispatch_xact = xact_commit(&db.pool).await - xact_before;
+    eprintln!(
+        "I-140 dispatch bench: {N} nodes — connect+heartbeat+dispatch {dispatch_elapsed:?}, \
+         {dispatch_xact} PG xacts, assigned {}",
+        assignment.drv_path
+    );
+
+    // --- ProcessCompletion → handle_success_completion ----------------
+    // Complete the assigned leaf. This walks find_newly_ready (cheap) +
+    // update_ancestors (potentially deep) + 2× build_summary
+    // (O(N) each) + per-newly-ready persist_status round-trips.
+    let xact_before = xact_commit(&db.pool).await;
+    let t = std::time::Instant::now();
+    complete_success(&handle, "w0", &assignment.drv_path, "/nix/store/out0").await?;
+    barrier(&handle).await;
+    let complete_elapsed = t.elapsed();
+    let complete_xact = xact_commit(&db.pool).await - xact_before;
+    eprintln!(
+        "I-140 completion bench: {N} nodes — handle_completion {complete_elapsed:?}, \
+         {complete_xact} PG xacts"
+    );
+
+    // --- Second heartbeat → re-dispatch -------------------------------
+    // After completion the worker's slot is free. A heartbeat should
+    // assign the next Ready derivation. This is the path that stalled
+    // in prod: builder connects, heartbeats, gets nothing for 120s.
+    let xact_before = xact_commit(&db.pool).await;
+    let t = std::time::Instant::now();
+    let mut wrx2 = connect_executor(&handle, "w1", "x86_64-linux", 1).await?;
+    let assignment2 = recv_assignment(&mut wrx2).await;
+    barrier(&handle).await;
+    let redispatch_elapsed = t.elapsed();
+    let redispatch_xact = xact_commit(&db.pool).await - xact_before;
+    eprintln!(
+        "I-140 re-dispatch bench: {N} nodes — heartbeat+dispatch {redispatch_elapsed:?}, \
+         {redispatch_xact} PG xacts, assigned {}",
+        assignment2.drv_path
+    );
+
+    // --- Admin RPC under load -----------------------------------------
+    // ClusterSnapshot iterates the full DAG. With 50k nodes this should
+    // be tens-of-ms, not the 30s+ timeout seen in prod.
+    let t = std::time::Instant::now();
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::ClusterSnapshot { reply: tx })
+        .await?;
+    let _snap = rx.await?;
+    let snap_elapsed = t.elapsed();
+    eprintln!("I-140 ClusterSnapshot bench: {N} nodes — {snap_elapsed:?}");
+
+    // --- Bounds -------------------------------------------------------
+    // Each hot-path step must be O(1) PG xacts and O(N)-in-memory at
+    // worst — never O(N) PG round-trips, never O(N²) in-memory.
+    // 200-xact bound: assign is ~5 round-trips × FANOUT-ish, plus a
+    // handful of best-effort writes; loose enough for legitimate
+    // per-assignment work, tight enough that an O(N) regression (50k
+    // round-trips) is a hard fail.
+    for (label, xact, elapsed) in [
+        ("dispatch", dispatch_xact, dispatch_elapsed),
+        ("completion", complete_xact, complete_elapsed),
+        ("re-dispatch", redispatch_xact, redispatch_elapsed),
+    ] {
+        assert!(
+            xact < 200,
+            "I-140: {label} on {N}-node DAG issued {xact} PG transactions; \
+             O(N) round-trip regression"
+        );
+        assert!(
+            elapsed.as_secs() < 10,
+            "I-140: {label} on {N}-node DAG took {elapsed:?} (>10s); \
+             head-of-line block in single-threaded actor"
+        );
+    }
+    assert!(
+        snap_elapsed.as_secs() < 2,
+        "I-140: ClusterSnapshot on {N}-node DAG took {snap_elapsed:?} (>2s)"
+    );
+    Ok(())
+}
+
+/// I-140: many-worker churn on a large DAG. The single-completion test
+/// above is fast because `build_summary` (O(N) full-DAG scan) is only
+/// called a handful of times. The production stall was COMPOUNDED:
+/// `emit_progress` and `update_build_counts` each call `build_summary`
+/// per-assignment + per-completion + per-disconnect, and ephemeral
+/// builders churn at scale (controller spawns up to `replicas.max`
+/// pods when `queued_derivations` is large).
+///
+/// This test connects 30 workers, dispatches 30, completes 30,
+/// disconnects 30 — one full ephemeral-churn wave. Before the fix, each
+/// of the ~90 per-event `build_summary` calls walks the full 50k-node
+/// DAG (~25ms debug each ≈ 2.2s total); after the fix the per-event
+/// cost is O(1) counts + debounced O(N) progress.
+#[tokio::test]
+async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
+    const N: usize = 50_000;
+    const W: usize = 30;
+
+    let (_db, handle, _task) = setup().await;
+
+    // Flat DAG: W independent leaves + (N-W) chained-on-top. The W
+    // leaves are all Ready post-merge, so W workers each get one.
+    let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
+    let nodes: Vec<_> = (0..N)
+        .map(|i| rio_proto::dag::DerivationNode {
+            drv_hash: format!("h{i:08}"),
+            drv_path: path(i),
+            ..make_test_node("x", "x86_64-linux")
+        })
+        .collect();
+    let edges: Vec<_> = (W..N)
+        .map(|i| rio_proto::dag::DerivationEdge {
+            parent_drv_path: path(i),
+            child_drv_path: path(i - W),
+        })
+        .collect();
+
+    let build_id = Uuid::new_v4();
+    let _rx = merge_dag(&handle, build_id, nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    let t = std::time::Instant::now();
+    // --- wave: connect W → dispatch W → complete W → disconnect W ----
+    let mut rxs = Vec::with_capacity(W);
+    for w in 0..W {
+        rxs.push(connect_executor(&handle, &format!("w{w}"), "x86_64-linux", 1).await?);
+    }
+    let mut assigned = Vec::with_capacity(W);
+    for rx in &mut rxs {
+        assigned.push(recv_assignment(rx).await.drv_path);
+    }
+    for (w, drv) in assigned.iter().enumerate() {
+        complete_success(&handle, &format!("w{w}"), drv, "/nix/store/out").await?;
+    }
+    for w in 0..W {
+        handle
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: format!("w{w}").into(),
+            })
+            .await?;
+    }
+    barrier(&handle).await;
+    let wave_elapsed = t.elapsed();
+    eprintln!(
+        "I-140 churn bench: {N} nodes, {W} workers — connect+assign+complete+disconnect \
+         wave {wave_elapsed:?} ({:.1}ms/event)",
+        wave_elapsed.as_secs_f64() * 1000.0 / (4 * W) as f64
+    );
+
+    // 1.5s bound: 4×W=120 events. Pre-fix ≈ 90 build_summary scans
+    // (per-assign + 2×per-complete + per-disconnect) × ~20ms each ≈
+    // 1.8s debug. Post-fix: per-assign/disconnect emit_progress is
+    // debounced (→ ~2 scans total), per-complete shares ONE summary
+    // between counts+progress (→ 30 scans) = ~32×20ms ≈ 0.6s. Loose
+    // 1.5s bound for CI variance — the point is "doesn't degrade
+    // super-linearly with N×W".
+    assert!(
+        wave_elapsed.as_millis() < 1500,
+        "I-140: {W}-worker churn wave on {N}-node DAG took {wave_elapsed:?} (>1.5s); \
+         per-event O(N) build_summary scan compounds with ephemeral-builder \
+         churn rate — actor mailbox grows unboundedly under load"
+    );
+
+    // Correctness: completed_count must reflect the W completions
+    // exactly (incremental count must not drift from ground truth).
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.completed_derivations, W as u32);
+    assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
+    Ok(())
+}

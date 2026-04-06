@@ -88,6 +88,7 @@ r[obs.metric.scheduler]
 | `rio_scheduler_builds_active` | Gauge | Currently active builds |
 | `rio_scheduler_derivations_queued` | Gauge | Derivations waiting for assignment |
 | `rio_scheduler_derivations_running` | Gauge | Derivations currently building |
+| `rio_scheduler_actor_cmd_seconds` | Histogram | Per-`ActorCommand` handling latency (labeled by `cmd`). The DAG actor is single-threaded — a slow command head-of-line blocks every queued RPC. Alert on p99 > 1s sustained. |
 | `rio_scheduler_assignment_latency_seconds` | Histogram | Time from ready to assigned |
 | `rio_scheduler_build_duration_seconds` | Histogram | Total build duration |
 | `rio_scheduler_cache_hits_total` | Counter | Derivations served from cache (labeled by `source`: `scheduler`=TOCTOU check, `existing`=pre-existing completed) |

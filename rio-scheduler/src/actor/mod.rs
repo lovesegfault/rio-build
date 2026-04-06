@@ -46,6 +46,15 @@ pub const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
 /// hint in `dispatch.rs` — bump BOTH semantics by changing this once.
 pub(crate) const MAX_PREFETCH_PATHS: usize = 100;
 
+/// Minimum interval between `BuildProgress` emits for one build (I-140).
+/// `emit_progress` → `build_summary` is O(dag_nodes); on a 153k-node DAG
+/// that's ~15-60ms per call. Calling per-assign + per-complete +
+/// per-disconnect under ephemeral-builder churn compounds to >100% actor
+/// utilization. 250ms ≈ 4/s caps the scan rate well below the ~1s
+/// dashboard poll cadence. Callers that already hold a fresh summary use
+/// `emit_progress_with` directly (bypasses debounce — scan cost paid).
+const PROGRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Backpressure: reject new work above this fraction of channel capacity.
 const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
 
@@ -104,6 +113,13 @@ pub struct DagActor {
     build_events: HashMap<Uuid, broadcast::Sender<rio_proto::types::BuildEvent>>,
     /// Per-build sequence counters.
     build_sequences: HashMap<Uuid, u64>,
+    /// Per-build last-BuildProgress emit time. `emit_progress` debounces
+    /// against this — Progress is dashboard-only and `build_summary` is
+    /// O(dag_nodes), so emitting on every assign/complete/disconnect at
+    /// large-DAG × ephemeral-churn scale head-of-line blocks the actor
+    /// (I-140). Cleared on build terminal/cleanup with the other
+    /// `build_*` maps.
+    build_progress_at: HashMap<Uuid, Instant>,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
     /// Retry policy.
@@ -320,6 +336,7 @@ impl DagActor {
             builds: HashMap::new(),
             build_events: HashMap::new(),
             build_sequences: HashMap::new(),
+            build_progress_at: HashMap::new(),
             executors: HashMap::new(),
             retry_policy: RetryPolicy::default(),
             poison_config: PoisonConfig::default(),
@@ -505,6 +522,15 @@ impl DagActor {
             let queue_len = rx.len();
             let capacity = rx.max_capacity();
             self.update_backpressure(queue_len, capacity);
+
+            // I-140: per-command latency. The actor is single-threaded
+            // — one slow handler head-of-line blocks every queued
+            // command (admin RPCs timeout, heartbeats pile up, dispatch
+            // stalls). Export as a histogram + WARN over 1s so the next
+            // "actor wedged" report self-localizes from `kubectl logs`
+            // instead of needing a debugger attach.
+            let cmd_name = cmd.name();
+            let t_cmd = Instant::now();
 
             match cmd {
                 ActorCommand::MergeDag { req, reply } => {
@@ -713,6 +739,18 @@ impl DagActor {
                 ActorCommand::DebugTripBreaker { n, reply } => {
                     let _ = reply.send(self.handle_debug_trip_breaker(n));
                 }
+            }
+
+            let cmd_elapsed = t_cmd.elapsed();
+            metrics::histogram!("rio_scheduler_actor_cmd_seconds", "cmd" => cmd_name)
+                .record(cmd_elapsed.as_secs_f64());
+            if cmd_elapsed >= std::time::Duration::from_secs(1) {
+                warn!(
+                    cmd = cmd_name,
+                    elapsed = ?cmd_elapsed,
+                    mailbox_depth = queue_len,
+                    "actor command exceeded 1s; head-of-line blocking the mailbox"
+                );
             }
         }
 
@@ -1500,7 +1538,36 @@ impl DagActor {
     /// dumb — no stateful reconstruction from the DerivationEvent
     /// stream.
     pub(super) fn emit_progress(&mut self, build_id: Uuid) {
+        // I-140: debounce. Progress is dashboard-only; `build_summary`
+        // is O(dag_nodes). At 153k nodes that's ~60ms (debug) / ~15ms
+        // (release) per call. Calling per-assign + per-complete +
+        // per-disconnect under ephemeral-builder churn compounds to
+        // >100% actor utilization → mailbox grows unboundedly → admin
+        // RPCs timeout → builders idle-timeout with no assignment.
+        // 250ms ≈ 4/s max; the dashboard's poll cadence is ~1s anyway.
+        // The Tick-driven `tick_publish_gauges` provides the floor for
+        // metrics; this is the per-watcher event stream.
+        if self
+            .build_progress_at
+            .get(&build_id)
+            .is_some_and(|t| t.elapsed() < PROGRESS_DEBOUNCE)
+        {
+            return;
+        }
         let summary = self.dag.build_summary(build_id);
+        self.emit_progress_with(build_id, &summary);
+    }
+
+    /// [`emit_progress`] with a precomputed summary. Callers that
+    /// already hold a `build_summary` (e.g. `update_build_counts`
+    /// callers) pass it so the O(dag_nodes) scan runs once, not twice.
+    /// Bypasses the debounce — the caller paid for the scan, so emit.
+    pub(super) fn emit_progress_with(
+        &mut self,
+        build_id: Uuid,
+        summary: &crate::dag::BuildSummary,
+    ) {
+        self.build_progress_at.insert(build_id, Instant::now());
         self.emit_build_event(
             build_id,
             rio_proto::types::build_event::Event::Progress(rio_proto::types::BuildProgress {
@@ -1509,7 +1576,7 @@ impl DagActor {
                 queued: summary.queued,
                 total: summary.total,
                 critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
-                assigned_executors: summary.assigned_executors,
+                assigned_executors: summary.assigned_executors.clone(),
             }),
         );
     }

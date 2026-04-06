@@ -76,6 +76,12 @@ pub fn describe_metrics() {
         "Derivations currently building"
     );
     describe_histogram!(
+        "rio_scheduler_actor_cmd_seconds",
+        "Per-ActorCommand handling latency (labeled by cmd variant); \
+         the actor is single-threaded so a slow command head-of-line \
+         blocks every queued RPC"
+    );
+    describe_histogram!(
         "rio_scheduler_assignment_latency_seconds",
         "Time from ready to assigned"
     );
