@@ -62,7 +62,16 @@ const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
 const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 
 /// Number of events to retain in each build's event buffer for late subscribers.
-const BUILD_EVENT_BUFFER_SIZE: usize = 1024;
+///
+/// 4096 (was 1024 — I-144): `handle_merge_dag` calls `dispatch_ready()`
+/// BEFORE returning `event_rx`, so the initial dispatch burst (one
+/// Derivation::Started per ready node) lands in the ring before the
+/// SubmitBuild bridge starts draining. A 153k-node submission with ~500
+/// ready nodes plus Progress/Log emitted ~1.3k events synchronously →
+/// the bridge's first `recv()` was `Lagged`. 4096 gives headroom for the
+/// initial burst; the bridge now also continues across `Lagged` instead
+/// of dropping the receiver (see `bridge_build_events`).
+const BUILD_EVENT_BUFFER_SIZE: usize = 4096;
 
 /// Default cap on concurrent `QueryPathInfo` calls during merge-time
 /// eager substitute fetch. 16 balances throughput against the store's

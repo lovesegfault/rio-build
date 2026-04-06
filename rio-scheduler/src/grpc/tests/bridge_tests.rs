@@ -1,7 +1,7 @@
 //! `bridge_build_events` since-sequence replay + BuildEvent bridge tests.
 //!
 //! Split from the 1682L monolithic `grpc/tests.rs` (P0395). Covers the
-//! `bridge_build_events` function directly: broadcast-lag DATA_LOSS,
+//! `bridge_build_events` function directly: broadcast-lag continue (I-144),
 //! PG-backed replay + dedup watermark, post-subscribe dedup, PG-failure
 //! fallthrough, half-open range query, and UUID-v7 build_id ordering.
 //! These tests drive the bridge with a bare `broadcast::channel` rather
@@ -12,18 +12,26 @@ use super::*;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
-/// When a broadcast receiver lags (permanently misses events), the bridge
-/// sends DATA_LOSS and stops. Without this, a missed BuildCompleted would
-/// leave the client hanging forever.
+/// I-144: when a broadcast receiver lags, the bridge MUST keep the
+/// receiver alive (continue, not break). Breaking drops the receiver →
+/// `receiver_count() == 0` → orphan-watcher (5-min grace) auto-cancels
+/// a build the gateway is still actively watching. Under sustained
+/// burst (large DAG, many concurrent drvs) the gateway re-lagged on
+/// every reconnect and the build was orphan-cancelled at 1448/153821.
+///
+/// Asserts:
+///   1. After Lagged, `tx.receiver_count() > 0` (the bridge didn't drop
+///      its subscription — this is what orphan-watcher checks).
+///   2. Post-lag events are forwarded (the gap is skipped, stream
+///      continues — no DATA_LOSS, no break).
+// r[verify sched.backstop.orphan-watcher]
 #[tokio::test]
-async fn test_bridge_build_events_lagged_sends_data_loss() {
-    // Capacity 1 + send 3 before receiver subscribes → lag guaranteed.
-    let (tx, _keepalive_rx) = broadcast::channel(1);
-    let rx = tx.subscribe();
-    // Fill the channel past capacity so rx is lagged.
-    for i in 0..3u64 {
+async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
+    // Capacity 1 + send 3 → rx (subscribed at channel creation) lags by 2.
+    let (tx, rx) = broadcast::channel(1);
+    for i in 1..=3u64 {
         let _ = tx.send(rio_proto::types::BuildEvent {
-            build_id: format!("build-{i}"),
+            build_id: "b".into(),
             sequence: i,
             timestamp: None,
             event: None,
@@ -31,17 +39,42 @@ async fn test_bridge_build_events_lagged_sends_data_loss() {
     }
 
     let mut stream = bridge_build_events("test-bridge", rx, None);
-    // First poll: the bridge task's first recv() hits Lagged.
-    let first = stream.next().await.expect("should yield one item");
-    let status = first.expect_err("should be DATA_LOSS");
-    assert_eq!(status.code(), tonic::Code::DataLoss);
-    assert!(
-        status.message().contains("missed"),
-        "got: {}",
-        status.message()
+
+    // First poll: bridge's first recv() hits Lagged(2), continues, next
+    // recv() returns seq=3 (oldest still in the cap-1 ring). NOT an Err.
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("bridge should not hang post-lag")
+        .expect("stream should yield, not end");
+    let ev = first.expect("post-lag event must be Ok, not DATA_LOSS");
+    assert_eq!(
+        ev.sequence, 3,
+        "oldest in-ring event after Lagged reposition"
     );
-    // Stream should then end (bridge task broke out of the loop).
-    assert!(stream.next().await.is_none());
+
+    // The bridge task is still alive holding the receiver. This is the
+    // property orphan-watcher checks (executor.rs tick_check_orphaned_builds).
+    assert_eq!(
+        tx.receiver_count(),
+        1,
+        "I-144: bridge must hold the broadcast receiver across Lagged \
+         so orphan-watcher doesn't see receiver_count()==0"
+    );
+
+    // Subsequent events flow normally (bridge loop didn't break).
+    let _ = tx.send(rio_proto::types::BuildEvent {
+        build_id: "b".into(),
+        sequence: 4,
+        timestamp: None,
+        event: None,
+    });
+    let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("post-lag stream should keep yielding")
+        .expect("stream open")
+        .expect("Ok event");
+    assert_eq!(next.sequence, 4);
+    assert_eq!(tx.receiver_count(), 1, "still subscribed after second send");
 }
 
 /// UUID v7 build_ids are time-ordered: two submissions ~apart in time

@@ -210,10 +210,21 @@ pub(crate) struct EventReplay {
 ///
 /// `replay = None` → pure broadcast drain, no dedup (SubmitBuild).
 ///
-/// On `Lagged`, sends `DATA_LOSS` so the client fails cleanly instead of
-/// silently hanging on a missed terminal event. Lagged means we permanently
-/// missed n events; if `BuildCompleted` was among them the client would hang
-/// forever waiting for a terminal event that will never arrive.
+/// On `Lagged`, the bridge logs and CONTINUES (does not break or send
+/// `DATA_LOSS`). Tokio's `RecvError::Lagged(n)` repositions the receiver
+/// to the oldest in-ring event — it's still subscribed. Breaking here
+/// drops the receiver → `receiver_count() == 0` → orphan-watcher
+/// (`r[sched.backstop.orphan-watcher]`) starts the 5-min grace timer.
+/// Under sustained event burst (large DAG, many concurrent drvs emitting
+/// Log lines) the gateway can't drain fast enough and the bridge re-lags
+/// every reconnect, so the receiver keeps dropping → orphan-watcher
+/// eventually cancels a perfectly-watched build (I-144).
+///
+/// The gap is acceptable: Log events are recoverable via S3 (LogFlusher);
+/// Derivation/Progress events are UX-only. A terminal event lost in the
+/// gap is recovered by the Closed → `EofWithoutTerminal` → WatchBuild
+/// reconnect → `handle_watch_build` terminal-resend path (≤60s delay
+/// from `TERMINAL_CLEANUP_DELAY`).
 pub(crate) fn bridge_build_events(
     task_name: &'static str,
     mut bcast: broadcast::Receiver<rio_proto::types::BuildEvent>,
@@ -292,16 +303,26 @@ pub(crate) fn bridge_build_events(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // I-144: do NOT break. Breaking drops `bcast` →
+                    // `receiver_count() == 0` → orphan-watcher cancels
+                    // the build after grace even though the gateway is
+                    // still attached and would reconnect. Under burst
+                    // (large DAG initial dispatch, or hundreds of drvs
+                    // emitting Log lines) the gateway can't keep up and
+                    // re-lags on every reconnect — receiver_count stays
+                    // 0 long enough for orphan-cancel.
+                    //
+                    // The receiver is still valid post-Lagged (tokio
+                    // repositions it to the oldest in-ring event). The
+                    // gap is acceptable: Log recoverable via S3; a
+                    // missed terminal event surfaces via Closed →
+                    // EofWithoutTerminal → WatchBuild reconnect →
+                    // handle_watch_build terminal-resend.
                     warn!(
                         lagged = n,
-                        "build event subscriber lagged, some events lost"
+                        "build event subscriber lagged; {n} events skipped, continuing"
                     );
-                    let _ = tx
-                        .send(Err(Status::data_loss(format!(
-                            "missed {n} build events; re-subscribe via WatchBuild"
-                        ))))
-                        .await;
-                    break;
+                    continue;
                 }
             }
         }
