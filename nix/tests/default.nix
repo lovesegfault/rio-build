@@ -62,6 +62,7 @@ let
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
+  kvm-hostpath-spike = import ./scenarios/kvm-hostpath-spike.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # SLA-sizing fixture: one worker with RIO_BUILDER_SCRIPT pointing at
@@ -1183,4 +1184,11 @@ in
       "bootstrap-tenant"
     ];
   };
+}
+# Spike: P0564 — confirm /dev/kvm via extra-sandbox-paths (hostPath
+# analogue) reaches the Nix sandbox; supports dropping
+# smarter-device-manager. Rio-stack-independent → no profraws →
+# excluded from coverage mode (keeps codecov after_n_builds stable).
+// pkgs.lib.optionalAttrs (!coverage) {
+  vm-kvm-hostpath-spike = kvm-hostpath-spike { inherit pkgs common; };
 }
