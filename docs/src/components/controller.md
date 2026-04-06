@@ -374,6 +374,9 @@ When `componentScaler.store.enabled=true`, the helm chart MUST omit `Deployment.
 
 ## GC Cron
 
+r[ctrl.gc.startup-delay]
+The GC cron's FIRST tick MUST be delayed by `STARTUP_DELAY` (300 s) plus 0–60 s jitter from controller start. Firing at t≈0 collides GC mark with post-deploy validation traffic — every helm rollout caused `nix copy` to exhaust the gateway's `Aborted` retry budget (I-168). 5 minutes clears the deploy-then-stress window while keeping the "controller restart doesn't delay GC by 24 h" property.
+
 r[ctrl.gc.cron-schedule]
 Controller runs a GC cron reconciler: `tokio::select!` on
 `shutdown.cancelled()` vs `interval.tick()` (default 24h, configurable

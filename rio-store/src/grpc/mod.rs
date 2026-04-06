@@ -136,7 +136,7 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
         // advisory lock under SERIALIZABLE. Client retries on `aborted`;
         // logging at ERROR floods the log with thousands of spurious
         // entries during a normal GC cycle.
-        M::Serialization => debug!(
+        M::Serialization | M::GcMarkBusy => debug!(
             context,
             error = %e,
             "metadata layer: serialization conflict (expected during GC mark; client retries)"
@@ -148,6 +148,7 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
         M::Conflict(_) => Status::already_exists("conflict: path already exists"),
         M::Connection(_) => Status::unavailable("database connection failed; retry"),
         M::Serialization => Status::aborted("transaction serialization failure; retry"),
+        M::GcMarkBusy => Status::aborted("GC mark in progress; retry"),
         M::Deadlock(_) => Status::aborted("transaction deadlock detected; retry"),
         M::PlaceholderMissing { .. } => {
             Status::aborted("upload placeholder concurrently deleted; retry")
@@ -175,6 +176,7 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
     use metadata::MetadataError as M;
     let reason = match &e {
         M::Serialization => Some("serialization"),
+        M::GcMarkBusy => Some("gc_mark"),
         M::Deadlock(_) => Some("deadlock"),
         M::PlaceholderMissing { .. } => Some("placeholder_missing"),
         M::Connection(_) => Some("connection"),
