@@ -97,6 +97,9 @@ pub struct MockStore {
     /// set (not in `self.paths`) land in `substitutable_paths` — a
     /// present path is never substitutable.
     pub substitutable: Arc<RwLock<Vec<String>>>,
+    /// Records every `query_path_info` call's requested path. For
+    /// verifying r[sched.merge.substitute-fetch]'s eager-fetch loop.
+    pub qpi_calls: Arc<RwLock<Vec<String>>>,
 }
 
 impl Default for MockStore {
@@ -117,6 +120,7 @@ impl Default for MockStore {
             realisations: Arc::default(),
             tenant_quotas: Arc::default(),
             substitutable: Arc::default(),
+            qpi_calls: Arc::default(),
         }
     }
 }
@@ -420,6 +424,20 @@ impl StoreService for MockStore {
             ));
         }
         let store_path = request.into_inner().store_path;
+        self.qpi_calls.write().unwrap().push(store_path.clone());
+        // Substitution side-effect simulation: if the path is seeded
+        // as substitutable, materialize a minimal PathInfo on QPI —
+        // mirrors the real store's try_substitute_on_miss. The
+        // scheduler's r[sched.merge.substitute-fetch] eager-fetch
+        // depends on this returning Some rather than NotFound.
+        if self.substitutable.read().unwrap().contains(&store_path) {
+            return Ok(Response::new(types::PathInfo {
+                store_path: store_path.clone(),
+                nar_hash: vec![0u8; 32],
+                nar_size: 0,
+                ..Default::default()
+            }));
+        }
         let paths = self.paths.read().unwrap();
         // Exact match only. Hash-part prefix lookups go through
         // query_path_from_hash_part (below), not here — the gateway

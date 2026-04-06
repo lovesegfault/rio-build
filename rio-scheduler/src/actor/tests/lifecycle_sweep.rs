@@ -541,6 +541,7 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;
@@ -586,6 +587,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;
@@ -608,6 +610,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;

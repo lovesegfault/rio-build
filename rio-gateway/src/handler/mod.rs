@@ -15,7 +15,7 @@ use rio_nix::nar::{self, NarNode};
 use rio_nix::protocol::build::{
     BuildMode, BuildResult, BuildStatus, read_basic_derivation, write_build_result,
 };
-use rio_nix::protocol::derived_path::DerivedPath;
+use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
 use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{ActivityType, StderrError, StderrWriter};
 use rio_nix::protocol::wire;

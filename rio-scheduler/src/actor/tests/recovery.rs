@@ -270,6 +270,7 @@ async fn merge_chain(
                 keep_going: true,
                 traceparent: String::new(),
                 jti: None,
+                jwt_token: None,
             },
             reply: tx,
         })

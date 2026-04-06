@@ -1886,6 +1886,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
                     keep_going: false,
                     traceparent: String::new(),
                     jti: None,
+                    jwt_token: None,
                 },
                 reply: reply_tx,
             })

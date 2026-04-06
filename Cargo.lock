@@ -6408,6 +6408,7 @@ dependencies = [
  "dashmap",
  "figment",
  "flate2",
+ "futures-util",
  "hex",
  "http 1.4.0",
  "k8s-openapi",

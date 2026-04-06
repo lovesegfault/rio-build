@@ -378,9 +378,11 @@ async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
 async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
 
-    // Don't seed the .drv: handler filters paths whose store_path is NOT in
-    // the missing set. A Built path's store_path() is the .drv; if the .drv
-    // is missing from store, the handler reports it in willBuild.
+    // Don't seed the .drv: the handler tries to resolve it to output
+    // paths before querying FindMissingPaths. If the .drv isn't in the
+    // store (client hasn't uploaded it yet), resolution fails → the
+    // handler reports the .drv directly in willBuild without a store
+    // round-trip.
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
 
     wire_send!(&mut h.stream;
@@ -420,23 +422,41 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
 }
 
 // r[verify gw.opcode.query-missing]
-/// wopQueryMissing: substitutable paths land in willSubstitute, not
-/// willBuild. MockStore seeded with one substitutable + one
-/// build-only .drv → handler partitions by `substitutable_paths`.
+// r[verify store.substitute.upstream]
+/// wopQueryMissing: substitutable OUTPUT paths land in willSubstitute,
+/// not willBuild. The handler resolves each .drv to its output paths
+/// BEFORE querying FindMissingPaths — querying the .drv path itself
+/// (pre-P0471 behavior) always returns "present" since AddToStore
+/// just uploaded it, so substitution never fires.
 #[tokio::test]
 async fn test_query_missing_reports_will_substitute() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
 
+    // Two .drvs seeded with ATerm content so resolve_derivation works.
+    // sub.drv's output is substitutable (upstream cache has it);
+    // build.drv's output is not. Neither OUTPUT is present in
+    // MockStore.paths → both missing → partition kicks in.
+    let sub_out = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sub-out";
     let sub_drv = "/nix/store/22222222222222222222222222222222-sub.drv";
-    let build_drv = "/nix/store/33333333333333333333333333333333-build.drv";
+    let sub_aterm = format!(
+        r#"Derive([("out","{sub_out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{sub_out}")])"#
+    );
+    h.store.seed_with_content(sub_drv, sub_aterm.as_bytes());
 
-    // Seed MockStore: sub_drv is substitutable (upstream has it),
-    // build_drv is not. Neither is present in `paths` → both missing.
+    let build_out = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-build-out";
+    let build_drv = "/nix/store/33333333333333333333333333333333-build.drv";
+    let build_aterm = format!(
+        r#"Derive([("out","{build_out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{build_out}")])"#
+    );
+    h.store.seed_with_content(build_drv, build_aterm.as_bytes());
+
+    // Upstream has sub_out. The handler should query FindMissingPaths
+    // with [sub_out, build_out] — NOT [sub_drv, build_drv].
     h.store
         .substitutable
         .write()
         .unwrap()
-        .push(sub_drv.to_string());
+        .push(sub_out.to_string());
 
     wire_send!(&mut h.stream;
         u64: 40,
@@ -451,11 +471,11 @@ async fn test_query_missing_reports_will_substitute() -> anyhow::Result<()> {
     let _download_size = wire::read_u64(&mut h.stream).await?;
     let _nar_size = wire::read_u64(&mut h.stream).await?;
 
-    // The partition: substitutable-check fires BEFORE the Built
-    // match arm, so sub_drv lands in willSubstitute (not willBuild).
-    // This is what makes `nix build` show "1 path will be fetched"
-    // instead of "2 paths will be built".
-    assert_eq!(will_substitute, vec![sub_drv.to_string()]);
+    // willSubstitute holds the OUTPUT path (what gets fetched).
+    // willBuild holds the .drv path (what gets built). This is what
+    // makes `nix build` show "1 path will be fetched" instead of
+    // "2 paths will be built".
+    assert_eq!(will_substitute, vec![sub_out.to_string()]);
     assert_eq!(will_build, vec![build_drv.to_string()]);
     assert!(unknown.is_empty());
 

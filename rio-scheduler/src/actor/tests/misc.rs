@@ -216,6 +216,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
             keep_going: false,
             traceparent: String::new(),
             jti: None,
+            jwt_token: None,
         },
     )
     .await?;
@@ -328,6 +329,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
                 keep_going: false,
                 traceparent: String::new(),
                 jti: None,
+                jwt_token: None,
             },
             reply: reply_tx,
         })

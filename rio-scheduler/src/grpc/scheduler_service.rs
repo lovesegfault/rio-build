@@ -58,6 +58,24 @@ impl SchedulerService for SchedulerGrpc {
             .get::<rio_common::jwt::TenantClaims>()
             .cloned();
 
+        // Also grab the RAW token string for re-inject on downstream
+        // store calls (merge-time FindMissingPaths). Claims are the
+        // DECODED payload (jti for revocation); the raw token is the
+        // OPAQUE header we re-emit so the store's interceptor can do
+        // its own verify → tenant_id extraction → upstream probe.
+        //
+        // Read from metadata (the interceptor leaves it in place after
+        // verify), not from extensions. to_str() failure is unreachable
+        // here — the interceptor already rejected non-ASCII tokens
+        // upstream with UNAUTHENTICATED — but map to None defensively
+        // rather than unwrap so a future interceptor change can't
+        // panic the handler.
+        let jwt_token = request
+            .metadata()
+            .get(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+
         let req = request.into_inner();
 
         // Check backpressure before sending to actor
@@ -222,6 +240,7 @@ impl SchedulerService for SchedulerGrpc {
             keep_going: req.keep_going,
             traceparent,
             jti: jwt_claims.as_ref().map(|c| c.jti.clone()),
+            jwt_token,
         };
         let cmd = ActorCommand::MergeDag {
             req,

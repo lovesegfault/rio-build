@@ -188,6 +188,7 @@ async fn drain_once(actor: &ActorHandle, dag: Dag) -> Duration {
                 keep_going: false,
                 traceparent: String::new(),
                 jti: None,
+                jwt_token: None,
             },
             reply: reply_tx,
         })

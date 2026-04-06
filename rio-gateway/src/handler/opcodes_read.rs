@@ -775,12 +775,70 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         })
         .collect();
 
-    let store_paths: Vec<String> = derived
-        .iter()
-        .map(|dp| dp.store_path().to_string())
-        .collect();
+    // Resolve DerivedPath → concrete store paths for the FindMissingPaths
+    // query. For Opaque, the path IS the query path. For Built, we must
+    // resolve the .drv to its OUTPUT paths — querying the .drv path is
+    // semantically wrong: the .drv was just uploaded via AddToStore so
+    // it's always "present", and the store's substitution probe fires
+    // on OUTPUT paths, not .drv paths. Before P0471 this returned
+    // willBuild for everything cacheable.
+    //
+    // `query_paths[i]` maps back to `derived` via `query_src[i]`: the
+    // index into `derived` that produced this query path. One Built
+    // DerivedPath with N outputs fans out to N query_paths entries,
+    // all pointing at the same derived[idx].
+    let mut query_paths: Vec<String> = Vec::new();
+    let mut query_src: Vec<usize> = Vec::new();
+    // .drv paths forced to willBuild without a store query: the .drv
+    // couldn't be resolved (not in store — client needs to upload then
+    // build) or the output is floating-CA (path unknown until built).
+    let mut forced_build: HashSet<String> = HashSet::new();
 
-    let req = with_jwt(types::FindMissingPathsRequest { store_paths }, jwt_token)?;
+    for (idx, dp) in derived.iter().enumerate() {
+        match dp {
+            DerivedPath::Opaque(p) => {
+                query_paths.push(p.to_string());
+                query_src.push(idx);
+            }
+            DerivedPath::Built { drv, outputs } => {
+                let drv_data = match resolve_derivation(drv, store_client, drv_cache).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            drv = %drv, error = %e,
+                            "wopQueryMissing: .drv not resolvable, reporting willBuild"
+                        );
+                        forced_build.insert(drv.to_string());
+                        continue;
+                    }
+                };
+                for out in drv_data.outputs() {
+                    let matches = match outputs {
+                        OutputSpec::All => true,
+                        OutputSpec::Names(names) => names.iter().any(|n| n == out.name()),
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    if out.path().is_empty() {
+                        // Floating-CA: output path computed post-build
+                        // from NAR hash. Can't query; must build.
+                        forced_build.insert(drv.to_string());
+                    } else {
+                        query_paths.push(out.path().to_string());
+                        query_src.push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    let req = with_jwt(
+        types::FindMissingPathsRequest {
+            store_paths: query_paths.clone(),
+        },
+        jwt_token,
+    )?;
     let (missing_set, substitutable_set): (HashSet<String>, HashSet<String>) =
         match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.find_missing_paths(req)).await
         {
@@ -800,38 +858,37 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
 
     // wopQueryMissing response is three StorePathSets (willBuild,
     // willSubstitute, unknown) — plain store paths, NOT DerivedPath
-    // wire strings. For Built paths, report the .drv; echoing the raw
-    // `...drv!out` string makes the Nix client fail StorePath::parse
-    // on '!'.
+    // wire strings. willSubstitute carries OUTPUT paths (what the
+    // client will fetch); willBuild carries .drv paths (what the
+    // client will build). Echoing `...drv!out` fails the client's
+    // StorePath::parse on '!'.
     //
-    // Partition: missing ∩ substitutable → willSubstitute (client shows
-    // "N paths will be fetched"); missing ∩ ¬substitutable → willBuild
-    // (Built) or unknown (Opaque). Substitutable-check first so a path
-    // that's both buildable AND substitutable lands in willSubstitute
-    // — the store fetching it is cheaper than the worker building it.
-    let mut will_build = Vec::new();
+    // Partition per query_path: present → skip; missing ∩ substitutable
+    // → willSubstitute(output_path); missing ∩ ¬substitutable →
+    // willBuild(drv) for Built, unknown(path) for Opaque.
+    // Substitutable-check first so a path that's both buildable AND
+    // substitutable lands in willSubstitute — fetching beats building.
+    let mut will_build: HashSet<String> = forced_build;
     let mut will_substitute = Vec::new();
     let mut unknown = Vec::new();
 
-    for dp in derived {
-        let sp = dp.store_path();
-        if !missing_set.contains(sp.as_str()) {
+    for (path, &src_idx) in query_paths.iter().zip(query_src.iter()) {
+        if !missing_set.contains(path) {
             continue;
         }
-        if substitutable_set.contains(sp.as_str()) {
-            will_substitute.push(sp.as_str().to_string());
+        if substitutable_set.contains(path) {
+            will_substitute.push(path.clone());
             continue;
         }
-        match dp {
+        match &derived[src_idx] {
             DerivedPath::Built { drv, .. } => {
-                if let Err(e) = resolve_derivation(&drv, store_client, drv_cache).await {
-                    tracing::warn!(drv = %drv, error = %e, "failed to resolve derivation in wopQueryMissing");
-                }
-                will_build.push(drv.as_str().to_string());
+                will_build.insert(drv.to_string());
             }
-            DerivedPath::Opaque(path) => unknown.push(path.as_str().to_string()),
+            DerivedPath::Opaque(p) => unknown.push(p.to_string()),
         }
     }
+
+    let will_build: Vec<String> = will_build.into_iter().collect();
 
     stderr.finish().await?;
     let w = stderr.inner_mut();

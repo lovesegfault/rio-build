@@ -19,6 +19,10 @@ rio-proto = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+# P0473: concurrent QueryPathInfo fan-out for eager substitute fetch
+# (r[sched.merge.substitute-fetch]). FuturesUnordered keeps the
+# actor-blocking window bounded when a DAG has hundreds of paths.
+futures-util = { workspace = true }
 # grpc.health.v1.Health for K8s readiness probes. C3 gates SERVING on
 # is_leader so the K8s Service routes only to the leader replica.
 tonic-health = { workspace = true }

@@ -169,6 +169,12 @@ The scheduler maintains a single global DAG across all concurrent build requests
 r[sched.merge.shared-priority-max]
 Each derivation node tracks a set of interested builds. Shared derivations are built once; all interested builds are notified on completion. **A shared derivation's priority is `max(priority of all interested builds)`, updated on merge.** When a new build raises a shared node's priority, the node's position in the priority queue is updated.
 
+r[sched.merge.substitute-probe]
+The merge-time cache check (`check_cached_outputs`) MUST forward the submitting session's JWT (`x-rio-tenant-token`) on its `FindMissingPaths` store call, and MUST treat paths in the response's `substitutable_paths` as cache hits. Without the JWT, the store's per-tenant upstream probe is skipped and `substitutable_paths` stays empty --- the scheduler then dispatches builds for paths the store could fetch.
+
+r[sched.merge.substitute-fetch]
+Before marking a substitutable-probed derivation as completed, the scheduler MUST eagerly trigger the store's NAR fetch for each substitutable path by issuing `QueryPathInfo` with the session JWT. `FindMissingPaths`'s probe is HEAD-only; the builder's later FUSE `GetPath` calls carry no JWT (`&[]` metadata) so the store's `try_substitute_on_miss` short-circuits and the build fails with ENOENT on inputs the scheduler claimed were cached. Fetches MUST be issued concurrently (a DAG can have hundreds of substitutable paths) and bounded by the actor's gRPC timeout, since the call blocks the single-threaded actor event loop. A fetch that fails or returns NotFound demotes that path from the substitutable set --- the derivation falls through to normal dispatch instead of being marked completed against a phantom cache hit.
+
 r[sched.dag.build-scoped-roots]
 `find_roots(build_id)` MUST treat a derivation as a root for a given
 build if no parent *interested in that build* depends on it. The global
