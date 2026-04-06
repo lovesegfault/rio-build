@@ -220,8 +220,11 @@ let
         #
         # Pattern matches /rio.admin.AdminService/* and
         # /rio.scheduler.SchedulerService/* — the two services the
-        # dashboard calls (GRPCRoute matches the same).
-        location ~ ^/rio\.(admin|scheduler)\./ {
+        # dashboard calls (GRPCRoute matches the same). No trailing
+        # / after the second \. — the next token is the ServiceName
+        # (AdminService, SchedulerService), not a path segment. The
+        # / comes AFTER the service name.
+        location ~ ^/rio\.(admin|scheduler)\. {
           proxy_pass http://envoy_gateway;
           proxy_http_version 1.1;
 

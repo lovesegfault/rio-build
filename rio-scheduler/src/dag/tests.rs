@@ -1244,3 +1244,174 @@ fn build_summary_skipped_counts_as_completed() -> anyhow::Result<()> {
     assert_eq!(s.total, 2);
     Ok(())
 }
+
+// r[verify sched.ca.cutoff-propagate]
+/// H1 regression (P0399): verify-rejected parent of Skipped must be
+/// Ready-promotable, not stuck Queued.
+///
+/// Chain A→B→C: A completes unchanged. Cascade verifies B (output in
+/// store) → B Skipped. Cascade REJECTS C (output NOT in store) → C
+/// stays Queued. C's only dep is B (now Skipped). Without the fix,
+/// `find_newly_ready(B)` returns [] because `all_deps_completed(C)`
+/// checked `== Completed` only. With the fix (matches!
+/// Completed|Skipped), it returns [C].
+///
+/// The completion handler runs `find_newly_ready` per-Skipped after
+/// the cascade (T2), so C is promoted to Ready instead of hanging
+/// Queued forever.
+#[test]
+fn cascade_rejected_parent_promoted_not_stuck() {
+    let mut dag = chain_dag(3);
+    // A=h00000 Completed, B=h00001 Queued, C=h00002 Queued.
+    // Verify accepts B only — C's output does NOT exist in store
+    // (first-build guard; bughunt-mc196).
+    let (skipped, _) = dag.cascade_cutoff("h00000", |h| h.as_str() == "h00001");
+
+    assert_eq!(
+        skipped,
+        vec!["h00001".to_string()],
+        "only B skipped; C rejected by verify"
+    );
+    assert_eq!(
+        dag.node("h00001").unwrap().status(),
+        DerivationStatus::Skipped
+    );
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Queued,
+        "C stays Queued after cascade (verify rejected)"
+    );
+
+    // H1 CORE ASSERTION: find_newly_ready from the Skipped node
+    // must return C. Pre-fix, all_deps_completed(C) was false
+    // (B's status Skipped != Completed) → [] → C stuck forever.
+    let ready = dag.find_newly_ready("h00001");
+    assert_eq!(
+        ready,
+        vec!["h00002".to_string()],
+        "C must be Ready-promotable: only dep B is Skipped (output-equivalent)"
+    );
+
+    // The completion-handler loop (T2) would now transition C.
+    // Simulate it here at the DAG level:
+    for s in &skipped {
+        for r in dag.find_newly_ready(s) {
+            dag.node_mut(&r)
+                .unwrap()
+                .transition(DerivationStatus::Ready)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        dag.node("h00002").unwrap().status(),
+        DerivationStatus::Ready,
+        "post-loop: C is Ready, not stuck Queued"
+    );
+}
+
+// r[verify sched.merge.dedup]
+/// H2 regression (P0399): merge a new node X depending on
+/// pre-existing Skipped Y. compute_initial_states must return X as
+/// Ready, not Queued.
+///
+/// Pre-fix, all_deps_completed(X) was false (Y Skipped != Completed)
+/// → X goes Queued. Y is terminal; no event ever calls
+/// find_newly_ready(Y) for X → stuck forever.
+#[test]
+fn merge_new_node_depending_on_skipped_goes_ready() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+
+    // Build 1: Y alone.
+    dag.merge(build1, &[make_node("Y", "x86_64-linux")], &[], "")?;
+    // Y is Skipped (from a prior cascade in build 1).
+    dag.node_mut("Y")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Skipped);
+
+    // Build 2: X depending on pre-existing Y.
+    let build2 = Uuid::new_v4();
+    let newly = dag
+        .merge(
+            build2,
+            &[
+                make_node("X", "x86_64-linux"),
+                make_node("Y", "x86_64-linux"),
+            ],
+            &[make_edge("X", "Y")],
+            "",
+        )?
+        .newly_inserted;
+    // Dedup: Y already exists, only X is newly inserted.
+    assert_eq!(newly, HashSet::from(["X".into()]));
+
+    // H2 CORE ASSERTION: X must be Ready, not Queued. Its only
+    // dep Y is Skipped (output-equivalent; CA cutoff verified the
+    // output exists in the store).
+    let transitions = dag.compute_initial_states(&newly);
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].0, "X");
+    assert_eq!(
+        transitions[0].1,
+        DerivationStatus::Ready,
+        "X with Skipped-only dep must go Ready (pre-fix went Queued → hang)"
+    );
+    Ok(())
+}
+
+/// Negative guard: all_deps_completed must NOT accept
+/// failure-terminal states (Poisoned/DependencyFailed/Cancelled).
+/// Those are terminal but their outputs do NOT exist in the store.
+/// A node depending on them must cascade DependencyFailed via
+/// any_dep_terminally_failed, NOT go Ready.
+///
+/// Ensures T1 didn't over-widen to `is_terminal()`.
+#[test]
+fn all_deps_completed_rejects_failure_terminal() -> anyhow::Result<()> {
+    for bad_status in [
+        DerivationStatus::Poisoned,
+        DerivationStatus::DependencyFailed,
+        DerivationStatus::Cancelled,
+    ] {
+        let mut dag = DerivationDag::new();
+        let build = Uuid::new_v4();
+        dag.merge(
+            build,
+            &[
+                make_node("X", "x86_64-linux"),
+                make_node("Y", "x86_64-linux"),
+            ],
+            &[make_edge("X", "Y")],
+            "",
+        )?;
+        dag.node_mut("Y").unwrap().set_status_for_test(bad_status);
+
+        assert!(
+            !dag.all_deps_completed("X"),
+            "{bad_status:?} dep → all_deps_completed must be FALSE \
+             (output unavailable; X should cascade DependencyFailed, not go Ready)"
+        );
+    }
+
+    // Positive control: Completed and Skipped DO satisfy.
+    for ok_status in [DerivationStatus::Completed, DerivationStatus::Skipped] {
+        let mut dag = DerivationDag::new();
+        let build = Uuid::new_v4();
+        dag.merge(
+            build,
+            &[
+                make_node("X", "x86_64-linux"),
+                make_node("Y", "x86_64-linux"),
+            ],
+            &[make_edge("X", "Y")],
+            "",
+        )?;
+        dag.node_mut("Y").unwrap().set_status_for_test(ok_status);
+
+        assert!(
+            dag.all_deps_completed("X"),
+            "{ok_status:?} dep → all_deps_completed must be TRUE (output available)"
+        );
+    }
+    Ok(())
+}

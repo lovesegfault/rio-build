@@ -14938,8 +14938,20 @@
           "packageId": "clap"
         },
         {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
+        },
+        {
+          "name": "rio-crds",
+          "packageId": "rio-crds"
         },
         {
           "name": "rio-proto",
@@ -14977,8 +14989,8 @@
       ],
       "devDependencies": [
         {
-          "name": "k8s-openapi",
-          "packageId": "k8s-openapi"
+          "name": "http",
+          "packageId": "http 1.4.0"
         },
         {
           "name": "rio-test-support",
@@ -15636,6 +15648,10 @@
           "packageId": "aws-sdk-s3"
         },
         {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
           "name": "clap",
           "packageId": "clap"
         },
@@ -15646,6 +15662,10 @@
         {
           "name": "flate2",
           "packageId": "flate2"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
         },
         {
           "name": "k8s-openapi",

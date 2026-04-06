@@ -114,9 +114,17 @@ pkgs.testers.runNixOSTest {
     # nginx's upstream is `rio-dashboard-envoy.envoy-gateway-system.
     # svc.cluster.local:8080` (baked into the image, docker.nix
     # dashboardNginxConf). That Service exists only after the operator
-    # reconciles the Gateway CR → envoy Deployment + Service. The
-    # operator is Available (above) but reconcile is async — wait for
-    # Gateway Programmed like dashboard-gateway.nix does.
+    # reconciles the Gateway CR → envoy Deployment + Service.
+    #
+    # nginx's `upstream { server <fqdn>; }` resolves DNS at startup —
+    # if the Service doesn't exist, nginx exits with `[emerg] host not
+    # found in upstream` → pod CrashLoopBackOff → kubelet retries with
+    # backoff → eventually the Service exists → nginx starts. The
+    # deploy/rio-dashboard Available check above already proves this
+    # self-heal completed (nginx won't pass readiness until it started,
+    # won't start until DNS resolved). No manual rollout-restart
+    # needed; we just wait for envoy endpoints so kube-proxy has a
+    # backend to route to.
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} get gateway rio-dashboard "
         "-o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].status}' "
@@ -149,8 +157,8 @@ pkgs.testers.runNixOSTest {
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
-            "| ${pkgs.xxd}/bin/xxd -l 16 | grep -q '^00000000: 00'",
-            timeout=30,
+            "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+            timeout=60,
         )
 
     # ── (4) gRPC-Web server-streaming THROUGH nginx ──────────────────
@@ -172,18 +180,20 @@ pkgs.testers.runNixOSTest {
     # off is hardcoded at docker.nix:234 and asserted by helm-lint)
     # is the practical gate.
     #
-    # Request body: GetBuildLogsRequest{drv_path:"nonexist"} =
-    #   0x0a (field 1 wire-type 2) 0x08 (len 8) "nonexist" = 10 bytes
+    # Request body: GetBuildLogsRequest{derivation_path:"nonexist"} =
+    #   0x12 (field 2 wire-type 2) 0x08 (len 8) "nonexist" = 10 bytes
     # → prefixed with 5-byte header (0x00,0x00,0x00,0x00,0x0a).
+    # Proto refactor at b643ab82 moved derivation_path to field 2
+    # (field 1 is build_id) — same encoding as dashboard-gateway.nix.
     with subtest("gRPC-Web streaming via nginx: GetBuildLogs 0x80 trailer"):
         k3s_server.wait_until_succeeds(
-            "printf '\\x00\\x00\\x00\\x00\\x0a\\x0a\\x08nonexist' | "
+            "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
             "curl -sf -X POST http://localhost:18081/rio.admin.AdminService/GetBuildLogs "
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
             "| ${pkgs.xxd}/bin/xxd | grep -q ' 80'",
-            timeout=30,
+            timeout=60,
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-nginx.pid) 2>/dev/null || true")

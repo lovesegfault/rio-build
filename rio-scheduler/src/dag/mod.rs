@@ -441,16 +441,28 @@ impl DerivationDag {
         }
     }
 
-    /// Check whether all dependencies of a derivation are completed.
+    // r[impl sched.state.transitions]
+    /// Check whether all dependencies of a derivation are satisfied
+    /// (output available). `Completed` and `Skipped` are both
+    /// acceptable: `Skipped` means CA cutoff verified the output
+    /// already exists in the store (see [`Self::cascade_cutoff`]'s
+    /// verify closure). A dep in any other state — including other
+    /// terminal states like `Poisoned`/`DependencyFailed`/`Cancelled`
+    /// — means the output is NOT available; the caller should route
+    /// through [`Self::any_dep_terminally_failed`] instead (cascades
+    /// `DependencyFailed` rather than promoting to `Ready`).
     pub fn all_deps_completed(&self, drv_hash: &str) -> bool {
         let Some(children) = self.children.get(drv_hash) else {
             return true; // No dependencies
         };
 
         children.iter().all(|child_hash| {
-            self.nodes
-                .get(child_hash)
-                .is_some_and(|n| n.status() == DerivationStatus::Completed)
+            self.nodes.get(child_hash).is_some_and(|n| {
+                matches!(
+                    n.status(),
+                    DerivationStatus::Completed | DerivationStatus::Skipped
+                )
+            })
         })
     }
 
@@ -469,7 +481,9 @@ impl DerivationDag {
             self.nodes.get(child_hash).is_some_and(|n| {
                 matches!(
                     n.status(),
-                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+                    DerivationStatus::Poisoned
+                        | DerivationStatus::DependencyFailed
+                        | DerivationStatus::Cancelled
                 )
             })
         })
