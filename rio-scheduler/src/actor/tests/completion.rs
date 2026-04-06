@@ -6,6 +6,209 @@
 use super::*;
 use tracing_test::traced_test;
 
+// r[verify sched.ca.cutoff-compare]
+/// CA early-cutoff compare: on successful completion of an `is_ca`
+/// derivation, `handle_success_completion` looks up each output's
+/// nar_hash in the content index. All-match → `ca_output_unchanged =
+/// true`. The metric is labeled `{outcome=match|miss}`.
+///
+/// Three scenarios in one test (shared MockStore + actor setup, which
+/// is the expensive part):
+///   1. Output hash matches a seeded content-index entry → `true`,
+///      counter{match} += 1.
+///   2. Output hash doesn't match anything → `false`, counter{miss}
+///      += 1.
+///   3. Non-CA derivation → hook skipped entirely, counter untouched,
+///      flag stays `false` regardless of whether the hash would've
+///      matched. Proves the `is_ca` guard.
+///
+/// AND-fold correctness (multi-output with [match, miss] → `false`)
+/// is covered by sending two BuiltOutputs in scenario 2.
+#[tokio::test]
+async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _db = test_db;
+
+    // Seed a content-index entry: MockStore's content_lookup scans
+    // stored paths for nar_hash == content_hash. The nar_hash here is
+    // what the worker reports as `output_hash` on completion.
+    let seeded_out = test_store_path("ca-seeded-out");
+    let (_nar, seeded_hash) = store.seed_with_content(&seeded_out, b"reproducible");
+
+    let _rx = connect_worker(&handle, "ca-worker", "x86_64-linux", 4).await?;
+
+    let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
+    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
+
+    // ─── Scenario 1: CA + matching hash → unchanged=true ───────────
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-match");
+    let mut node = make_test_node("ca-match", "x86_64-linux");
+    node.is_content_addressed = true;
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Precondition: merged as is_ca.
+    let pre = handle
+        .debug_query_derivation("ca-match")
+        .await?
+        .expect("exists");
+    assert!(pre.is_ca, "precondition: merged with is_ca=true");
+    assert!(!pre.ca_output_unchanged, "default false before completion");
+
+    let match_before = recorder.get(match_key);
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "ca-worker".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: seeded_out.clone(),
+                    // output_hash = seeded nar_hash → ContentLookup finds it.
+                    output_hash: seeded_hash.to_vec(),
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-match")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        info.ca_output_unchanged,
+        "CA + all-outputs-matched → ca_output_unchanged=true"
+    );
+    assert_eq!(
+        recorder.get(match_key) - match_before,
+        1,
+        "one matched output → counter{{outcome=match}} +1.\nCounters: {:#?}",
+        recorder.all_keys()
+    );
+
+    // ─── Scenario 2: CA + mixed [match, miss] → AND-fold → false ───
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ca-mixed");
+    let mut node = make_test_node("ca-mixed", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.output_names = vec!["out".into(), "dev".into()];
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let miss_before = recorder.get(miss_key);
+    let match_before2 = recorder.get(match_key);
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "ca-worker".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                built_outputs: vec![
+                    // First output matches (same seeded hash).
+                    rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: seeded_out.clone(),
+                        output_hash: seeded_hash.to_vec(),
+                    },
+                    // Second output: unknown hash → miss.
+                    rio_proto::types::BuiltOutput {
+                        output_name: "dev".into(),
+                        output_path: test_store_path("ca-mixed-dev"),
+                        output_hash: vec![0xabu8; 32],
+                    },
+                ],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ca-mixed")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Completed);
+    assert!(
+        !info.ca_output_unchanged,
+        "AND-fold: [match, miss] → ca_output_unchanged=false (not last-iter-wins)"
+    );
+    assert_eq!(
+        recorder.get(match_key) - match_before2,
+        1,
+        "mixed: one match recorded"
+    );
+    assert_eq!(
+        recorder.get(miss_key) - miss_before,
+        1,
+        "mixed: one miss recorded"
+    );
+
+    // ─── Scenario 3: non-CA → hook skipped ─────────────────────────
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("ia-skip");
+    let node = make_test_node("ia-skip", "x86_64-linux"); // is_content_addressed=false
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let match_before3 = recorder.get(match_key);
+    let miss_before3 = recorder.get(miss_key);
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "ca-worker".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::build_types::BuildResult {
+                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                // Hash WOULD match if the hook ran — proves the
+                // is_ca guard, not a coincidental miss.
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: test_store_path("ia-skip-out"),
+                    output_hash: seeded_hash.to_vec(),
+                }],
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+
+    let info = handle
+        .debug_query_derivation("ia-skip")
+        .await?
+        .expect("exists");
+    assert!(!info.is_ca);
+    assert!(
+        !info.ca_output_unchanged,
+        "non-CA → hook skipped, flag stays false"
+    );
+    assert_eq!(
+        recorder.get(match_key),
+        match_before3,
+        "non-CA → no match increment"
+    );
+    assert_eq!(
+        recorder.get(miss_key),
+        miss_before3,
+        "non-CA → no miss increment"
+    );
+
+    Ok(())
+}
+
 /// TransientFailure: retry on a different worker up to max_retries (default 2).
 #[tokio::test]
 async fn test_transient_retry_different_worker() -> TestResult {

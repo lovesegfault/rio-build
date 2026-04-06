@@ -227,4 +227,11 @@ pub fn describe_metrics() {
         "Edge count per GetBuildGraph response. High p99 (>10k) = unusually \
          dense DAG approaching the implicit subgraph bound."
     );
+    describe_counter!(
+        "rio_scheduler_ca_hash_compares_total",
+        "CA early-cutoff output-hash lookups against the content index on \
+         successful completion (labeled by outcome=match|miss). High match \
+         ratio → CA derivations rebuilding identical content; cutoff-propagate \
+         (P0252) will skip downstream work."
+    );
 }
