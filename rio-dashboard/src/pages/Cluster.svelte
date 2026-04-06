@@ -4,6 +4,7 @@
   // click-build → DAG → click-node → log-stream chain is closed by the
   // Builds list + Graph node-click + LogViewer plans; this page proves
   // the browser → Envoy → scheduler round-trip works for a unary RPC.
+  import { navigate } from 'svelte-routing';
   import { admin } from '../api/admin';
   import type { ClusterStatusResponse } from '../gen/admin_types_pb';
 
@@ -47,4 +48,11 @@
     <dt>Derivations</dt>
     <dd>{status.queuedDerivations} queued / {status.runningDerivations} running</dd>
   </dl>
+  <!-- Management actions. GC is on its own page because TriggerGC is a
+       server-stream — the progress UI needs space and unmount-cancel.
+       navigate() (not <Link>) so Cluster.svelte stays testable in
+       isolation without a Router context wrapper. -->
+  <p>
+    <button type="button" onclick={() => navigate('/gc')}>Run GC…</button>
+  </p>
 {/if}
