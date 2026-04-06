@@ -967,3 +967,252 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
 
     Ok(())
 }
+
+// -----------------------------------------------------------------------------
+// CA recovery-resolve: fetch ATerm from store when drv_content empty
+// -----------------------------------------------------------------------------
+
+/// Receive the next WorkAssignment, skipping over PrefetchHint messages.
+/// Parent dispatch sends a hint before the assignment when the parent
+/// has DAG children with `expected_output_paths` set.
+async fn recv_assignment_skip_prefetch(
+    rx: &mut mpsc::Receiver<rio_proto::types::SchedulerMessage>,
+) -> rio_proto::types::WorkAssignment {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("recv_assignment_skip_prefetch: timeout")
+            .expect("recv_assignment_skip_prefetch: channel closed");
+        match msg.msg {
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => return a,
+            Some(rio_proto::types::scheduler_message::Msg::Prefetch(_)) => continue,
+            other => panic!("recv_assignment_skip_prefetch: unexpected {other:?}"),
+        }
+    }
+}
+
+/// Build a CA-on-CA fixture: (child_node, parent_node, parent_aterm,
+/// placeholder, child_modular_hash, realized_path).
+///
+/// Parent is floating-CA with one inputDrv = child. Child is
+/// floating-CA with `ca_modular_hash` set (so `collect_ca_inputs`
+/// picks it up). The placeholder is what `resolve_ca_inputs` will
+/// replace with `realized_path` once the child's realisation is in PG.
+fn ca_on_ca_fixture() -> (
+    rio_proto::dag::DerivationNode,
+    rio_proto::dag::DerivationNode,
+    String,
+    String,
+    [u8; 32],
+    String,
+) {
+    use crate::ca::downstream_placeholder;
+    use rio_nix::store_path::StorePath;
+
+    let child_path = test_drv_path("ca-child");
+    let child_modular: [u8; 32] = [0xCA; 32];
+    let realized_path = test_store_path("ca-child-realized-out");
+
+    let placeholder =
+        downstream_placeholder(&StorePath::parse(&child_path).unwrap(), "out").unwrap();
+
+    // Parent's ATerm: floating-CA output ("sha256" algo, empty hash,
+    // empty path), one inputDrv = child, placeholder in env.DEP.
+    let parent_aterm = format!(
+        r#"Derive([("out","","sha256","")],[("{child_path}",["out"])],[],"x86_64-linux","/bin/sh",["-c","build"],[("DEP","{placeholder}"),("out",""),("system","x86_64-linux")])"#
+    );
+
+    let mut child = make_test_node("ca-child", "x86_64-linux");
+    child.is_content_addressed = true;
+    child.ca_modular_hash = child_modular.to_vec();
+    // expected_output_paths can stay empty — parent's PrefetchHint
+    // will be empty and skipped (leaf child → no hint anyway).
+
+    let mut parent = make_test_node("ca-parent", "x86_64-linux");
+    parent.is_content_addressed = true;
+    parent.drv_content = parent_aterm.clone().into_bytes();
+
+    (
+        child,
+        parent,
+        parent_aterm,
+        placeholder,
+        child_modular,
+        realized_path,
+    )
+}
+
+// r[verify sched.ca.resolve+2]
+/// Recovered CA-on-CA dispatch: scheduler restart cleared
+/// `drv_content`, but the store has the `.drv` — `maybe_resolve_ca`
+/// fetches it via `GetPath`, NAR-unwraps, and resolves placeholders.
+///
+/// Flow:
+///   1. Seed MockStore with parent's ATerm bytes at its `.drv` path
+///      (as a single-file NAR — same as `nix-store --dump` of a `.drv`).
+///   2. Seed PG `realisations` with child's `(modular_hash, "out")` →
+///      `realized_path`.
+///   3. Merge CA-on-CA DAG (parent depends on child, both CA).
+///   4. Child dispatches. Clear parent's `drv_content` (simulate
+///      recovery).
+///   5. Complete child → parent becomes Ready → `maybe_resolve_ca`
+///      sees empty `drv_content` → fetches from MockStore → unwraps
+///      NAR → `resolve_ca_inputs` rewrites placeholder.
+///   6. Parent's `WorkAssignment.drv_content` contains the realized
+///      path, not the placeholder.
+#[tokio::test]
+async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let (child, parent, parent_aterm, placeholder, child_modular, realized_path) =
+        ca_on_ca_fixture();
+
+    // Seed MockStore: parent's ATerm wrapped in a single-file NAR
+    // at its .drv store path. `seed_with_content` does the NAR wrap.
+    store.seed_with_content(&parent.drv_path, parent_aterm.as_bytes());
+
+    // Seed PG realisations: child's (modular_hash, "out") → realized.
+    // This is what `resolve_ca_inputs` queries to map placeholder →
+    // realized path.
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(&realized_path)
+    .bind([0u8; 32].as_slice())
+    .execute(&test_db.pool)
+    .await?;
+
+    let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
+
+    // Merge: child + parent, edge parent → child.
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![make_test_edge("ca-parent", "ca-child")],
+        false,
+    )
+    .await?;
+
+    // Child dispatches first (leaf → Ready immediately).
+    let a1 = recv_assignment_skip_prefetch(&mut rx).await;
+    assert!(a1.drv_path.contains("ca-child"), "child dispatches first");
+
+    // Clear parent's drv_content BEFORE completing child — actor
+    // processes serially, so the clear lands before the completion
+    // fires dispatch_ready for the parent.
+    let cleared = handle.debug_clear_drv_content("ca-parent").await?;
+    assert!(cleared, "parent should be in DAG");
+
+    // Complete child → parent becomes Ready → dispatch fires →
+    // maybe_resolve_ca sees empty drv_content → fetches from store.
+    complete_success(
+        &handle,
+        "ca-w",
+        "ca-child",
+        &test_store_path("ca-child-out"),
+    )
+    .await?;
+
+    let a2 = recv_assignment_skip_prefetch(&mut rx).await;
+    assert!(a2.drv_path.contains("ca-parent"));
+
+    // The load-bearing assertions: drv_content was fetched + resolved.
+    assert!(
+        !a2.drv_content.is_empty(),
+        "drv_content must be fetched from store, not left empty"
+    );
+    let text = std::str::from_utf8(&a2.drv_content).expect("ATerm is ASCII");
+    assert!(
+        !text.contains(&placeholder),
+        "placeholder {placeholder:?} must be replaced post-fetch-and-resolve"
+    );
+    assert!(
+        text.contains(&realized_path),
+        "realized path {realized_path:?} must be present in resolved ATerm"
+    );
+
+    Ok(())
+}
+
+/// Fail-safe preserved: store unreachable → dispatch still proceeds
+/// with empty `drv_content`. Same degrade as before the fetch
+/// existed — worker fails on placeholder, self-heals via retry after
+/// a fresh `SubmitBuild` re-merges with inline `drv_content`.
+///
+/// Also covers `store_client = None` via the early `?` in
+/// `fetch_drv_content_from_store` — this test uses the explicit
+/// `fail_get_path` knob instead (closer to a real store outage).
+#[tokio::test]
+async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let (child, parent, _parent_aterm, _placeholder, child_modular, _realized_path) =
+        ca_on_ca_fixture();
+
+    // Seed the realisation (so the ONLY failure is the store fetch,
+    // not a missing-realisation — we're testing the fetch fallback
+    // specifically).
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(test_store_path("irrelevant"))
+    .bind([0u8; 32].as_slice())
+    .execute(&test_db.pool)
+    .await?;
+
+    let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![make_test_edge("ca-parent", "ca-child")],
+        false,
+    )
+    .await?;
+
+    let a1 = recv_assignment_skip_prefetch(&mut rx).await;
+    assert!(a1.drv_path.contains("ca-child"));
+
+    // Clear parent's drv_content AND make GetPath fail. Order matters:
+    // actor serializes, so both land before the completion's dispatch.
+    let cleared = handle.debug_clear_drv_content("ca-parent").await?;
+    assert!(cleared);
+    store
+        .fail_get_path
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    complete_success(
+        &handle,
+        "ca-w",
+        "ca-child",
+        &test_store_path("ca-child-out"),
+    )
+    .await?;
+
+    let a2 = recv_assignment_skip_prefetch(&mut rx).await;
+    assert!(a2.drv_path.contains("ca-parent"));
+
+    // Fail-safe: store fetch failed → drv_content stays empty →
+    // worker will fetch + fail on placeholder + retry. Same degrade
+    // as before the store-fetch shortcut existed.
+    assert!(
+        a2.drv_content.is_empty(),
+        "store fetch failed → drv_content must stay empty (degrade preserved)"
+    );
+
+    Ok(())
+}
