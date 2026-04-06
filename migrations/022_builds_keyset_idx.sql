@@ -1,0 +1,25 @@
+-- no-transaction
+-- Keyset pagination index for AdminService.ListBuilds cursor mode.
+--
+-- Row-value WHERE `(submitted_at, build_id) < (x, y)` + `ORDER BY
+-- submitted_at DESC, build_id DESC` needs a matching composite btree.
+-- PK is build_id only (001_scheduler.sql:17); without this index the
+-- keyset query seq-scans on large tables — defeats the "O(limit) per
+-- page regardless of depth" guarantee.
+--
+-- `-- no-transaction` marker (line 1) tells sqlx-migrate to skip the
+-- implicit BEGIN/COMMIT wrapper — CREATE INDEX CONCURRENTLY cannot run
+-- inside a transaction block. Precedent: 011_refscan_backfill_idx.sql:1.
+-- MUST be the only statement in this file: PG treats a multi-statement
+-- simple-query string as an implicit transaction block even with the
+-- explicit wrapper suppressed.
+--
+-- DESC-DESC ordering matches the query's ORDER BY exactly — PG can use
+-- the index for both the row-value filter and the sort, avoiding a
+-- separate Sort node. CONCURRENTLY for production-safe deploy (no
+-- ACCESS EXCLUSIVE lock on builds during index build). IF NOT EXISTS
+-- for idempotency across re-runs; if CONCURRENTLY fails mid-build it
+-- may leave an INVALID index behind — recovery is DROP INDEX
+-- builds_keyset_idx then re-run this migration.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS builds_keyset_idx
+    ON builds (submitted_at DESC, build_id DESC);

@@ -272,9 +272,11 @@ pub struct DerivationRow {
 ///
 /// `submitted_at_micros`: `EXTRACT(EPOCH)*1e6` gives fractional seconds
 /// with µs precision; `::bigint` truncates to integer microseconds.
-/// Matches PG's native TIMESTAMPTZ resolution, so `to_timestamp(x/1e6)`
-/// in `list_builds_keyset` round-trips exactly — no silent equal-rows-
-/// skipped-by-cursor bug at page boundaries.
+/// Matches PG's native TIMESTAMPTZ resolution. `list_builds_keyset`'s
+/// WHERE reconstructs the timestamp via integer-seconds-plus-microsecond
+/// -remainder so the round-trip is exact (see its doc comment — direct
+/// bigint÷1e6 through `to_timestamp(float8)` would lose precision near
+/// the 16-significant-figure IEEE754 limit).
 const LIST_BUILDS_SELECT: &str = r#"
     SELECT
         b.build_id,
@@ -358,13 +360,27 @@ impl SchedulerDb {
     /// `(i64::MAX, Uuid::max())` for the first page (unbounded).
     ///
     /// Row-value comparison `(a, b) < (x, y)` is SQL-standard
-    /// lexicographic: `a < x OR (a = x AND b < y)`. PG implements it
-    /// directly on the native TIMESTAMPTZ, which is why we pass the
-    /// micros back through `to_timestamp($3/1e6)` rather than comparing
-    /// on the EXTRACT'd bigint — keeps the comparison on the indexed
-    /// column type so the planner can use the PK-implied btree. The
-    /// `1e6` round-trip (EXTRACT→bigint→to_timestamp) preserves PG's
-    /// native microsecond precision exactly — no lossy cast.
+    /// lexicographic: `a < x OR (a = x AND b < y)`. Uses
+    /// `builds_keyset_idx` (migration 022) — composite DESC-DESC matches
+    /// this query's ORDER BY, so the planner does an index-scan + no Sort.
+    ///
+    /// Cursor-timestamp reconstruction: `to_timestamp($3/1e6)` alone would
+    /// pass through `to_timestamp(double precision)`, coercing a ~16-digit
+    /// value (~1.74×10⁹ seconds with 6-decimal microsecond fraction) to
+    /// float8 — right at the IEEE754 limit, so a page-boundary row could
+    /// lose a microsecond and be skipped or duplicated. Instead, split
+    /// into integer seconds (bigint÷1000000, exact in float8 — seconds
+    /// are ~10⁹, way under 2⁵³) plus an integer-microsecond interval
+    /// (`modulo × interval '1 microsecond'`). Both halves are exact; the
+    /// sum is a TIMESTAMPTZ with the same microsecond as the source.
+    ///
+    /// Returns `Vec<BuildListRow>` WITHOUT a total count. `count_builds`
+    /// is an O(n) seq-scan; calling it per page defeats the O(limit)-per-
+    /// page guarantee. The first page comes through
+    /// [`list_builds`](Self::list_builds) (offset mode), which does compute
+    /// total; subsequent pages carry it client-side. If a caller needs a
+    /// total on a cursor-only walk, they can call `list_builds(limit=0)`
+    /// once or use `count_builds` directly.
     pub async fn list_builds_keyset(
         &self,
         status_opt: Option<&str>,
@@ -372,13 +388,15 @@ impl SchedulerDb {
         limit: i64,
         cursor_micros: i64,
         cursor_id: Uuid,
-    ) -> Result<(i64, Vec<BuildListRow>), sqlx::Error> {
-        let total = self.count_builds(status_opt, tenant_filter).await?;
-        let rows: Vec<BuildListRow> = sqlx::query_as(&format!(
+    ) -> Result<Vec<BuildListRow>, sqlx::Error> {
+        sqlx::query_as(&format!(
             "{LIST_BUILDS_SELECT}
             WHERE ($1::text IS NULL OR b.status = $1)
               AND ($2::uuid IS NULL OR b.tenant_id = $2)
-              AND (b.submitted_at, b.build_id) < (to_timestamp($3::bigint / 1e6), $4::uuid)
+              AND (b.submitted_at, b.build_id)
+                  < ( to_timestamp($3::bigint / 1000000)
+                      + ($3::bigint % 1000000) * interval '1 microsecond',
+                      $4::uuid )
             GROUP BY b.build_id
             ORDER BY b.submitted_at DESC, b.build_id DESC
             LIMIT $5"
@@ -389,9 +407,7 @@ impl SchedulerDb {
         .bind(cursor_id)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await?;
-
-        Ok((total, rows))
+        .await
     }
 
     async fn count_builds(
