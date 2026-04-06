@@ -72,7 +72,7 @@
   - `components/scheduler.md:37,123,156` — remove `CutoffRebalancer`/`WorkerPoolSet` deferral blocks.
   - `components/scheduler.md:384,392,398,413` — remove "deferred to Phase 4" on tenant FK + index.
   - `components/controller.md:30,43,100` — remove WPS deferral, update `BuildStatus` conditions block.
-  - `components/worker.md:190,194` — references NOT empty (4b NAR scanner). Atomic multi-output stays deferred to Phase 5.
+  - `components/builder.md:190,194` — references NOT empty (4b NAR scanner). Atomic multi-output stays deferred to Phase 5.
   - `capacity-planning.md:64` — `WorkerPoolSet` CRD implemented.
   - `decisions/015-size-class-routing.md:54-58` — update implementation status.
   - `challenges.md:73,100,138` — FUSE circuit breaker + WPS shipped. Staggered scheduling stays deferred.

@@ -60,7 +60,7 @@ Worker pods MUST set `hostUsers: false` to activate Kubernetes user-namespace
 isolation (K8s 1.33+). Container UIDs are remapped to unprivileged host UIDs;
 `CAP_SYS_ADMIN` applies only within the user namespace. A container escape
 gaining `CAP_SYS_ADMIN` cannot affect the host or other pods. See
-[ADR-012](./decisions/012-privileged-worker-pods.md#kubernetes-user-namespace-isolation).
+[ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
 The `privileged: true` escape hatch (for k3s/kind clusters lacking the device
 plugin) skips `hostUsers: false` — privileged containers cannot be
 user-namespaced.
@@ -76,9 +76,9 @@ non-privileged security context. `privileged: true` remains an escape hatch
 for k3s/kind clusters lacking the device plugin; it falls back to the
 hostPath mechanism and MUST NOT be the production default.
 
-> **seccomp:** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is available — see `r[worker.seccomp.localhost-profile]` below.
+> **seccomp:** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is available — see `r[builder.seccomp.localhost-profile]` below.
 
-r[worker.seccomp.localhost-profile]
+r[builder.seccomp.localhost-profile]
 Worker pods MAY be configured with a Localhost seccomp profile (`WorkerPoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's ~40-syscall denylist. The profile JSON lives at `infra/helm/rio-build/files/seccomp-rio-worker.json` and MUST be installed at `/var/lib/kubelet/seccomp/rio-worker.json` on every node before the WorkerPool is applied (node-level install is outside rio-controller's scope — use a DaemonSet or node-prep script). VM test fixtures use RuntimeDefault; Localhost is production-only. Default remains RuntimeDefault.
 
 ### Boundary 4: Binary Cache HTTP → External Clients
@@ -172,18 +172,17 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 ### Build-Time Secrets
 
 - **Threat**: Fixed-output derivations (FODs) needing credentials (e.g., private GitHub repos) require network access and authentication during build.
-- **Mitigation**: Route FOD network traffic through a forward proxy (e.g., Squid) with domain allowlisting. The proxy allowlist is configurable per tenant. See [P0243](../../.claude/work/plan-0243-vm-fod-proxy-scenario.md).
+- **Mitigation**: FODs execute on dedicated fetcher pods with open egress; the FOD hash check is the integrity boundary. Per-tenant credentials are injected via fetcher pod env from Secrets, never via builder pods. See [ADR-019](./decisions/019-builder-fetcher-split.md).
 
-### FOD Network Egress
+### FOD Network Isolation
 
-- **Threat**: FOD builds require internet egress, which conflicts with the worker NetworkPolicy that blocks all external traffic.
-- **Design**: FOD builds are routed through a dedicated HTTP/HTTPS forward proxy (e.g., Squid) deployed as a ClusterIP service within the cluster.
-  - Workers detect FOD builds (output hash is known in advance) and set `http_proxy`/`https_proxy` environment variables pointing to the proxy.
-  - The worker NetworkPolicy adds an egress exception allowing traffic to the proxy service on its listening port.
-  - The proxy enforces a domain allowlist (configurable per deployment; default: `cache.nixos.org`, `github.com`, `gitlab.com`, common source forges).
-  - All proxied requests are logged for audit. Requests to non-allowlisted domains are rejected.
-  - Non-FOD builds retain the full egress deny NetworkPolicy --- no proxy access.
-- **Phase**: Implemented (Phase 3b). See `infra/helm/rio-build/templates/fod-proxy.yaml` (Squid + allowlist) and the worker's `spawn_daemon_in_namespace` (`fod_proxy` param, injects env only when `is_fixed_output`).
+- **Threat**: FOD builds require internet egress. A compromised build could exfiltrate secrets or call home; a compromised upstream could serve tampered content.
+- **Design**: Per [ADR-019](./decisions/019-builder-fetcher-split.md) §Network isolation, builds and fetches run on separate executor kinds with opposite network policies:
+  - **Builders** (`rio-builders` namespace) are airgapped — egress to CoreDNS, rio-scheduler, rio-store only. No internet, no proxy. See `r[builder.netpol.airgap]`.
+  - **Fetchers** (`rio-fetchers` namespace) get egress to `0.0.0.0/0` on ports 80/443, **minus** RFC1918, link-local, and loopback. See `r[fetcher.netpol.egress-open]`.
+  - The FOD hash check (`r[builder.fod.verify-hash]`) is the integrity backstop: tampered content fails `verify_fod_hashes()` before upload.
+  - The scheduler NEVER routes a FOD to a builder, even under fetcher pressure (`r[sched.dispatch.no-fod-fallback]`).
+- **Formerly:** the Squid `fod-proxy` with domain allowlisting. Deleted in ADR-019 — the hash check is sufficient; a domain allowlist adds operational friction for marginal gain.
 
 ### Log Injection
 
@@ -222,7 +221,7 @@ exfiltrate.
 |---|---|---|
 | Pod lifetime | `WorkerPoolSpec.ephemeral: true` + `maxConcurrentBuilds: 1` (CEL-enforced) | Zero cross-build state; no cache/overlay poisoning |
 | User namespace | `hostUsers: false` (K8s 1.33+) | `CAP_SYS_ADMIN` scoped to unprivileged host UIDs (see limitation #2) |
-| Seccomp | `WorkerPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[worker.seccomp.localhost-profile]`) |
+| Seccomp | `WorkerPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[builder.seccomp.localhost-profile]`) |
 | Node isolation | Dedicated tainted node pool | Sandbox escape confined to worker nodes |
 | Network | NetworkPolicy egress deny + FOD proxy allowlist | No exfil to arbitrary endpoints |
 
@@ -235,10 +234,10 @@ dispatch latency).
 
 1. **The Nix sandbox is NOT a security boundary.** It prevents builds from accessing undeclared inputs (purity) but does not prevent a determined attacker from escaping. For multi-tenant deployments, the security boundary is the worker pod + node isolation.
 
-2. **Workers require `CAP_SYS_ADMIN`.** This capability enables mount namespace manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[worker.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `WorkerPoolSpec.seccompProfile: {type: Localhost, localhostProfile: rio-worker.json}`. Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Worker pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-worker-pods.md#kubernetes-user-namespace-isolation).
+2. **Workers require `CAP_SYS_ADMIN`.** This capability enables mount namespace manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[builder.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `WorkerPoolSpec.seccompProfile: {type: Localhost, localhostProfile: rio-worker.json}`. Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Worker pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
 
-3. **`CAP_SYS_ADMIN` is held throughout build execution.** The worker cannot drop `CAP_SYS_ADMIN` between overlay setup and build completion because the Nix sandbox itself requires mount namespace manipulation. A sandbox escape gives the attacker `CAP_SYS_ADMIN` capabilities within the user namespace (see mitigation in #2). Additional mitigations: RuntimeDefault or Localhost seccomp (`r[worker.seccomp.localhost-profile]`), dedicated node pools, and NetworkPolicy. Future work: explore splitting the worker into a privileged setup process and an unprivileged build supervisor.
+3. **`CAP_SYS_ADMIN` is held throughout build execution.** The worker cannot drop `CAP_SYS_ADMIN` between overlay setup and build completion because the Nix sandbox itself requires mount namespace manipulation. A sandbox escape gives the attacker `CAP_SYS_ADMIN` capabilities within the user namespace (see mitigation in #2). Additional mitigations: RuntimeDefault or Localhost seccomp (`r[builder.seccomp.localhost-profile]`), dedicated node pools, and NetworkPolicy. Future work: explore splitting the worker into a privileged setup process and an unprivileged build supervisor.
 
 4. **Cross-tenant chunk deduplication leaks build activity.** A tenant can probe `FindMissingChunks` to determine whether another tenant has built a specific package. Mitigation: scope `FindMissingChunks` per tenant (at the cost of dedup savings) or accept the risk with documentation.
 
-5. **Fixed-output derivations (FODs) need network access.** FOD builds (fetchurl, fetchgit) require egress to the internet, which conflicts with the worker NetworkPolicy. FOD traffic is routed through a forward proxy with domain allowlisting (see [FOD Network Egress](#fod-network-egress)).
+5. **Fixed-output derivations (FODs) need network access.** FOD builds (fetchurl, fetchgit) require egress to the internet, which conflicts with the builder airgap. FODs route to dedicated fetcher pods with open egress; the hash check is the integrity boundary (see [FOD Network Isolation](#fod-network-isolation)).

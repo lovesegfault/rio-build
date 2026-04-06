@@ -646,7 +646,7 @@ This is the direct verification of §1. Needs a MockStore that stalls
 /// Fetch), assert at least one WAIT_SLICE debug-log fired, release the
 /// gate, join all, assert every result is Ok(path) with identical path.
 ///
-/// r[verify worker.fuse.lookup-caches]  (waiters don't spuriously fail)
+/// r[verify builder.fuse.lookup-caches]  (waiters don't spuriously fail)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
     let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
@@ -717,7 +717,7 @@ if applicable — if not, this is a clean first instance.
 /// detects the divergence, purges the row, re-fetches, and succeeds.
 /// Before the §3 fix, this returned Ok(path-that-doesn't-exist) forever.
 ///
-/// r[verify worker.fuse.cache-lru]  (index self-heals on disk divergence)
+/// r[verify builder.fuse.cache-lru]  (index self-heals on disk divergence)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ensure_cached_self_heals_index_disk_divergence() {
     let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;

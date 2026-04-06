@@ -371,7 +371,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 biased;
 
-                // r[impl worker.shutdown.sigint]
+                // r[impl builder.shutdown.sigint]
                 _ = shutdown.cancelled() => {
                     break StreamEnd::Shutdown;
                 }

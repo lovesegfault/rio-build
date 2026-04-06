@@ -29,7 +29,7 @@ rio-build is a **build execution backend**, not a complete CI/CD system. The fol
 - **Notification hooks**: No email, Slack, or webhook notifications on build completion. These belong in the CI layer above rio-build.
 - **Eval scheduling / jobsets**: No equivalent of Hydra's jobset model. For periodic rebuilds, use cron + `nix-eval-jobs` + rio-build. See [Integration](./integration.md) for patterns.
 - **macOS (Darwin) workers**: The worker architecture (FUSE, overlayfs, Linux namespaces) is Linux-only. Darwin builds require a separate worker architecture (future work).
-- **Recursive Nix**: Derivations that invoke Nix internally (`__recursive` / `recursive-nix`) are not supported. Workers disable substitution and remote builders to prevent build hook recursion. See [worker configuration](./components/worker.md#worker-nix-configuration).
+- **Recursive Nix**: Derivations that invoke Nix internally (`__recursive` / `recursive-nix`) are not supported. Workers disable substitution and remote builders to prevent build hook recursion. See [worker configuration](./components/builder.md#builder-nix-configuration).
 
 ## When to Use rio-build
 

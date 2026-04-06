@@ -1,9 +1,9 @@
 ---
 name: check
-description: Fast remote checks — clippy + fmt via nix-build-remote. Skips nextest + VM tests. Use during the edit loop; let .#ci catch the rest before merge. rio-build CANNOT nix-build locally.
+description: Fast local checks — clippy + fmt. Skips nextest + VM tests. Use during the edit loop; let .#ci catch the rest before merge.
 ---
 
-**rio-build constraint:** local `nix build` crashes the machine. All checks go through `nix-build-remote`.
+Builds run locally (this host handles x86_64+aarch64 KVM directly; nxb-dev retired 2026-03).
 
 Run, in order:
 

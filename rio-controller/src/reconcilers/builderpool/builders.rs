@@ -971,7 +971,7 @@ fn build_container(
 /// apiserver. Defensive because seccomp is a security control —
 /// fail-closed (RuntimeDefault is the floor, never fall through to
 /// Unconfined on a typo).
-// r[impl worker.seccomp.localhost-profile]
+// r[impl builder.seccomp.localhost-profile]
 fn build_seccomp_profile(kind: Option<&SeccompProfileKind>) -> SeccompProfile {
     match kind.map(|k| k.type_.as_str()) {
         Some("Localhost") => SeccompProfile {

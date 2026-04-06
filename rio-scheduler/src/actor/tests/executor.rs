@@ -689,7 +689,7 @@ async fn test_per_build_timeout_zero_means_unlimited() -> TestResult {
     Ok(())
 }
 
-// r[verify worker.heartbeat.store-degraded]
+// r[verify builder.heartbeat.store-degraded]
 /// Heartbeat with store_degraded=true excludes the worker from
 /// best_executor() dispatch. End-to-end: heartbeat → ExecutorState.store_
 /// degraded → has_capacity()=false → best_executor() filters out →

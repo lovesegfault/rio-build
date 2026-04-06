@@ -2,7 +2,7 @@
 
 **A Kubernetes-native distributed build backend for Nix.**
 
-rio-build speaks Nix's own wire protocol (`ssh-ng://`), so from Nix's perspective it *is* a remote store and builder — no client patches, no wrapper scripts. From Kubernetes' perspective it's an operator that schedules build DAGs across worker pods with chunk-deduplicated storage and cache-locality-aware placement.
+rio-build speaks Nix's own wire protocol (`ssh-ng://`), so from Nix's perspective it *is* a remote store and builder — no client patches, no wrapper scripts. From Kubernetes' perspective it's an operator that schedules build DAGs across builder pods with chunk-deduplicated storage and cache-locality-aware placement.
 
 ```bash
 nix build --store ssh-ng://rio .#your-package
@@ -17,7 +17,7 @@ rio-build fills the gap:
 - **Protocol-native** — implements the Nix worker protocol directly; zero custom client tooling
 - **DAG-aware scheduling** — critical-path priority, transfer-cost-weighted locality, size-class routing
 - **Chunked CAS** — FastCDC + BLAKE3 cross-build deduplication, inline fast-path for small NARs
-- **FUSE worker stores** — lazy on-demand fetch from CAS, local SSD caching, per-build overlay isolation
+- **FUSE builder stores** — lazy on-demand fetch from CAS, local SSD caching, per-build overlay isolation
 - **CA-ready** — store schema and scheduler support content-addressed derivations from day one
 - **Observable** — structured JSON logging, Prometheus metrics, OTLP tracing
 
@@ -49,13 +49,13 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
              │ (bidi gRPC stream)    │ gRPC + HTTP
              ▼                       ▼
    ┌──────────────────────────────────────────────┐
-   │            rio-worker (K8s pods)             │
+   │            rio-builder (K8s pods)            │
    │  FUSE /nix/store  •  per-build overlayfs     │
    │  synthetic SQLite db  •  nix-daemon sandbox  │
    │  cgroup v2 per-build resource tracking       │
    └──────────────────────────────────────────────┘
 
-   rio-controller (K8s operator): WorkerPool/WorkerPoolSet CRDs, StatefulSet
+   rio-controller (K8s operator): BuilderPool/FetcherPool CRDs, StatefulSet
    reconciliation, autoscaling, drain-aware termination.
 ```
 
@@ -75,8 +75,8 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
 | `rio-gateway` | SSH server + Nix worker protocol frontend |
 | `rio-scheduler` | DAG scheduler, critical-path priority, size-class routing |
 | `rio-store` | Chunked CAS, narinfo signing, binary-cache HTTP server |
-| `rio-worker` | Build executor, FUSE store, overlayfs isolation, cgroup metering |
-| `rio-controller` | Kubernetes operator (WorkerPool/WorkerPoolSet CRDs, autoscaler) |
+| `rio-builder` | Build executor, FUSE store, overlayfs isolation, cgroup metering |
+| `rio-controller` | Kubernetes operator (BuilderPool/FetcherPool CRDs, autoscaler) |
 | `rio-crds` | Kubernetes CRD types (kube-derive), shared between controller and CLI |
 | `rio-cli` | Admin CLI (trigger GC, tenant mgmt, backfill, dry-run introspection) |
 | `rio-bench` | Criterion benchmarks (wire parsers, chunker, scheduler hot paths) |
@@ -122,7 +122,7 @@ nix build .#fuzz-nightly-wire_primitives                     # 10min
 Per-phase NixOS VM tests validate end-to-end behavior against a real `nix` client:
 
 ```bash
-nix build .#checks.x86_64-linux.vm-phase2a   # 4 VMs, distributed 2-worker build
+nix build .#checks.x86_64-linux.vm-phase2a   # 4 VMs, distributed 2-builder build
 nix build .#checks.x86_64-linux.vm-phase3a   # 3 VMs, k3s + controller + CRDs
 ```
 

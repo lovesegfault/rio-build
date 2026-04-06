@@ -332,7 +332,7 @@ message HeartbeatRequest {
   // Scheduler treats like `draining`: `has_capacity()` returns false.
   // Cleared when breaker closes/half-opens. Default false — wire-compatible
   // (old executors don't send it, scheduler reads false).
-  // Spec: r[worker.heartbeat.store-degraded]
+  // Spec: r[builder.heartbeat.store-degraded]
   bool store_degraded = 9;
   // What role this executor plays — builder (airgapped) or fetcher
   // (open egress, FOD-only). Default BUILDER (wire-compatible: old

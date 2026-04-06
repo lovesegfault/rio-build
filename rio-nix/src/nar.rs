@@ -309,7 +309,7 @@ fn parse_directory(r: &mut impl Read, depth: usize) -> Result<NarNode> {
                     source: e,
                 })?;
 
-                // r[impl worker.nar.entry-name-safety]
+                // r[impl builder.nar.entry-name-safety]
                 // Path-traversal guard: reject names that Path::join would
                 // interpret as upward (`..`) or absolute (`/...`), plus
                 // NUL (filesystem-invalid) and `.`/empty (self-reference).
@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // r[verify worker.nar.entry-name-safety]
+    // r[verify builder.nar.entry-name-safety]
     // Path-traversal guard: parse_directory rejects dangerous entry
     // names before any filesystem call. Each test hand-crafts a NAR
     // directory with a single bad entry name and asserts InvalidEntryName.

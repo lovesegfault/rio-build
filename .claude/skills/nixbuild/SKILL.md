@@ -1,6 +1,6 @@
 ---
 name: nixbuild
-description: Remote build via nix build --store ssh-ng://nxb-dev with structured log lifecycle. Use for ALL .#ci / .#coverage-full runs. rio-build CANNOT nix-build locally (3 prior machine crashes) — this is the ONLY way to build.
+description: Local nix build with structured log lifecycle. Use for ALL .#ci / .#coverage-full runs. This host handles x86_64+aarch64 KVM builds directly (nxb-dev retired 2026-03).
 ---
 
 ## Invocation
@@ -21,22 +21,14 @@ description: Remote build via nix build --store ssh-ng://nxb-dev with structured
 ## What it runs
 
 ```
-nix build --no-link --eval-store auto --store ssh-ng://nxb-dev -L <target>
+nix build --no-link --print-out-paths -L <target>
 ```
 
-`--eval-store auto` because the flake source is on local disk. `--store ssh-ng://nxb-dev` builds on the fleet (ssh_config `Host nxb-dev` + wildcard `User root`/`Port 2222` resolve the HA address). `--no-link` because the output lands remote — a local `result/` symlink would dangle.
+Local build — this host handles x86_64+aarch64 KVM directly. Outputs land in the local `/nix/store`. `--no-link` keeps the worktree clean; callers that want `./result` use `--link`.
 
-Supersedes the `nix-build-remote` wrapper. `nix build --store` is atomic: either succeeds (output exists remote) or fails. No more "dispatch died silently, rc=0 but invalid output" failure mode.
+`store_path` is the first outpath from `--print-out-paths` (single-output derivations; `.#coverage-full` is single-output with subdirectories inside). `--copy` is a no-op kept for API compat (outputs are already local).
 
-With `--copy`, after a green build:
-
-```
-nix copy --no-check-sigs --from ssh-ng://nxb-dev <outpaths>
-```
-
-`store_path` is the first outpath from `--print-out-paths` (single-output derivations; `.#coverage-full` is single-output with subdirectories inside).
-
-With `--link` (implies `--copy`), also creates `./result` → local store path. Use for `.#crds` regen (`cp result/*.yaml infra/helm/...`) and `.#coverage-html` (`open result/index.html`). Without `--link`, `store_path` in the JSON is still the handle — `ln -sf $(jq -r .store_path) result` is the manual equivalent.
+With `--link`, creates `./result` → store path. Use for `.#crds` regen (`cp result/*.yaml infra/helm/...`) and `.#coverage-html` (`open result/index.html`). Without `--link`, `store_path` in the JSON is still the handle — `ln -sf $(jq -r .store_path) result` is the manual equivalent.
 
 ## `--coverage <branch> <merged_at>`
 

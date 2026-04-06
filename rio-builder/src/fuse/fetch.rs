@@ -734,7 +734,7 @@ mod tests {
     /// the fetcher completes, guard drops, notify_all wakes all waiters, and
     /// every call returns Ok(path).
     ///
-    // r[verify worker.fuse.lookup-caches]
+    // r[verify builder.fuse.lookup-caches]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
         let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
@@ -787,7 +787,7 @@ mod tests {
     /// Before the self-heal fix, this returned Ok(path-that-doesn't-exist)
     /// forever — every subsequent lookup would ENOENT in the caller's stat.
     ///
-    // r[verify worker.fuse.cache-lru]
+    // r[verify builder.fuse.cache-lru]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ensure_cached_self_heals_index_disk_divergence() {
         let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;

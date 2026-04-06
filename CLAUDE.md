@@ -98,34 +98,6 @@ Pre-commit hooks run treefmt automatically on commit.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
 - **tracey MCP (optional):** `nix develop -c tracey ai --claude` registers the tracey MCP server + installs the annotation skill. After registration, Claude Code can query `tracey_uncovered` / `tracey_untested` / `tracey_rule` during dev sessions. The daemon caches scan results — `rm -rf .tracey/` to force rescan.
 
-### `nix develop -c … 2>&1 | foo` hangs forever
-
-The `ssh-ng://nxb-*` substituters spawn SSH ControlMaster daemons (`ssh nxb-prod -M -N -S /tmp/nix-<pid>-<rand>/ssh.sock`) that daemonize to PPID=1 and **inherit stderr (fd 2)** from the nix process. Nix redirects their stdin/stdout to /dev/null but not stderr. When you run `nix develop -c cmd 2>&1 | tail`, stderr becomes the pipe — the orphaned SSH daemons hold the write side open forever, so the pipe reader never sees EOF. `</dev/null` does **not** fix this (stdin isn't the problem).
-
-**Safe patterns when piping `nix develop`/`nix build` output:**
-
-```bash
-# BAD — hangs when nix queries ssh-ng:// substituters
-nix develop -c cargo build 2>&1 | tee log
-
-# GOOD — pipe stdout only, stderr goes to terminal/parent
-nix develop -c cargo build | tee log
-
-# GOOD — stderr to a file, pipe stdout
-nix develop -c cargo build 2>log.err | tee log.out
-
-# GOOD — capture both without a pipe
-nix develop -c cargo build &>log; tail log
-
-# GOOD — process substitution (SSH inherits real fd, not the pipe)
-nix develop -c cargo build > >(tee log) 2>&1
-```
-
-**Cleanup:** orphaned SSH masters accumulate (found 360 after two days). Periodic sweep:
-```bash
-pkill -f 'ssh nxb-(prod|dev) -M -N' 2>/dev/null
-```
-
 ### Migration files are frozen after they ship
 
 `sqlx::migrate!()` checksums `.sql` files by content (SHA-384 over the full file body, including comments). Editing a comment changes the checksum → persistent-DB deploys fail with `VersionMismatch`. Hit twice pre-production before P0353 froze it.
@@ -138,7 +110,7 @@ pkill -f 'ssh nxb-(prod|dev) -M -N' 2>/dev/null
 
 Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `onibus dag render` for display. File-collision matrix is live-computed via `onibus collisions top` / `onibus collisions check`.
 
-**Every implementation MUST pass `/nixbuild .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. **NEVER `nix build` locally** — 3 prior machine crashes; ALWAYS `/nixbuild .#ci` (see skill for mechanism).
+**Every implementation MUST pass `/nixbuild .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. `/nixbuild` runs `nix build` locally (this host handles x86_64+aarch64 KVM directly) with structured log lifecycle — use it over raw `nix build` for the log capture.
 
 ### DAG runner workflow
 
@@ -219,8 +191,8 @@ Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` st
 subtests = [
   # r[verify store.gc.tenant-retention]
   "gc-sweep"
-  # r[verify worker.upload.references-scanned]
-  # r[verify worker.upload.deriver-populated]
+  # r[verify builder.upload.references-scanned]
+  # r[verify builder.upload.deriver-populated]
   # r[verify store.gc.two-phase]
   "refs-end-to-end"
 ];

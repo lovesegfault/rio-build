@@ -161,9 +161,11 @@ r[obs.metric.store]
 | `rio_store_put_path_bytes_total` | Counter | Bytes accepted via PutPath (nar_size on success) |
 | `rio_store_get_path_bytes_total` | Counter | Bytes served via GetPath (nar_size on stream start) |
 
-### Worker Metrics
+### Builder Metrics
 
-r[obs.metric.worker]
+> Per [ADR-019](./decisions/019-builder-fetcher-split.md) §Observability, the former `rio_worker_*` metrics are now `rio_builder_*`. New scheduler-side metrics `rio_scheduler_fod_queue_depth` and `rio_scheduler_fetcher_utilization` track the builder/fetcher split; rows added when the emitters land.
+
+r[obs.metric.builder]
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_builder_builds_total` | Counter | Total builds executed (labeled by `outcome`: `success`/`failure`/`cancelled`/`timed_out`/`log_limit`/`infra_failure`) |
@@ -205,8 +207,8 @@ resets the filter.
 r[obs.metric.transfer-volume]
 Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop: gateway (`rio_gateway_bytes_total{direction}`), store (`rio_store_{put,get}_path_bytes_total`), worker (`rio_builder_{upload,fuse_fetch}_bytes_total`). Summing these across the topology gives a full picture of data movement — e.g., `rate(rio_builder_fuse_fetch_bytes_total[5m])` vs `rate(rio_builder_upload_bytes_total[5m])` shows whether a worker is input-bound or output-bound.
 
-r[obs.metric.worker-util]
-Worker utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled from the worker's parent cgroup every 10s by `utilization_reporter_loop`. The same loop publishes a `ResourceSnapshot` that the heartbeat reads for `HeartbeatRequest.resources` — one sampling site means Prometheus and `ListWorkers` always agree. These capture the whole worker tree (rio-worker + per-build sub-cgroups + all subprocesses). CPU fraction >1.0 on multi-core is expected under full load. Memory fraction stays 0.0 if `memory.max` is unbounded — only meaningful when the pod has a memory limit configured.
+r[obs.metric.builder-util]
+Builder utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled from the builder's parent cgroup every 10s by `utilization_reporter_loop`. The same loop publishes a `ResourceSnapshot` that the heartbeat reads for `HeartbeatRequest.resources` — one sampling site means Prometheus and `ListWorkers` always agree. These capture the whole builder tree (rio-builder + per-build sub-cgroups + all subprocesses). CPU fraction >1.0 on multi-core is expected under full load. Memory fraction stays 0.0 if `memory.max` is unbounded — only meaningful when the pod has a memory limit configured.
 
 ### Controller Metrics
 

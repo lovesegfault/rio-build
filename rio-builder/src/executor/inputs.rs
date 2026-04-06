@@ -1,5 +1,5 @@
 //! Input fetching: .drv from store, metadata, input closure, FOD hash verification.
-// r[impl worker.fod.verify-hash]
+// r[impl builder.fod.verify-hash]
 
 use std::path::Path;
 
@@ -344,7 +344,7 @@ pub(super) async fn compute_input_closure(
     Ok(closure.into_iter().collect())
 }
 
-// r[verify worker.fod.verify-hash]
+// r[verify builder.fod.verify-hash]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,7 +740,7 @@ mod tests {
     /// sensitivity proof: same output bytes, direct-only candidate set →
     /// transitive ref is missed. That's the exact shape of the original bug.
     ///
-    // r[verify worker.upload.references-scanned]
+    // r[verify builder.upload.references-scanned]
     #[tokio::test]
     async fn test_candidate_set_is_transitive_not_direct() -> anyhow::Result<()> {
         use rio_nix::refscan::{CandidateSet, RefScanSink};

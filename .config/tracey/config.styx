@@ -3,8 +3,8 @@
 // Spec-coverage configuration for rio-build.
 //
 // Single spec "rio" with prefix `r` (inferred from markers). Requirement
-// IDs carry the domain: r[gw.*], r[sched.*], r[store.*], r[worker.*],
-// r[ctrl.*], r[obs.*], r[sec.*], r[proto.*].
+// IDs carry the domain: r[gw.*], r[sched.*], r[store.*], r[builder.*],
+// r[fetcher.*], r[ctrl.*], r[obs.*], r[sec.*], r[proto.*].
 //
 // test_include semantics: matched files allow ONLY `verify` annotations —
 // using `impl` in a test file is a hard error. That's why inline
@@ -35,7 +35,8 @@ specs (
       docs/src/components/gateway.md
       docs/src/components/scheduler.md
       docs/src/components/store.md
-      docs/src/components/worker.md
+      docs/src/components/builder.md
+      docs/src/components/fetcher.md
       docs/src/components/controller.md
       docs/src/components/dashboard.md
       docs/src/components/proto.md

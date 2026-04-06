@@ -1,4 +1,4 @@
-# ADR-005: Worker Store Model (FUSE + Overlay + Synthetic SQLite DB)
+# ADR-005: Builder Store Model (FUSE + Overlay + Synthetic SQLite DB)
 
 ## Status
 Accepted
@@ -13,7 +13,7 @@ Each worker runs a custom FUSE filesystem (the `fuse` module in `rio-worker`) mo
 - Caches fetched content on local SSD with LRU eviction.
 - Exploits store path immutability: cached data never needs invalidation.
 
-Each build gets a per-build overlayfs (see `rio-worker/src/overlay.rs`, r[worker.overlay.stacked-lower]):
+Each build gets a per-build overlayfs (see `rio-worker/src/overlay.rs`, r[builder.overlay.stacked-lower]):
 - **Lower layer (stacked):** `/nix/store:{fuse_mount}` — the host's real `/nix/store` first, then the FUSE mount. Host-store-first ensures `nix-daemon` and its runtime dependencies remain reachable after the overlay is bind-mounted at `/nix/store` in the child's mount namespace. FUSE second provides rio-store-served paths.
 - **Upper layer:** `{overlay_base_dir}/{build_id}/upper/nix/store/` on a local-disk emptyDir volume (controller-managed). Must be a real filesystem (ext4/xfs), not the container's overlayfs root — overlayfs-as-upperdir cannot create `trusted.*` xattrs and fails with `EINVAL`.
 - **Merged:** bind-mounted to `/nix/store` inside a per-build mount namespace. Outputs written by `nix-daemon` land in `{upper}/nix/store/{hash}-{name}`.

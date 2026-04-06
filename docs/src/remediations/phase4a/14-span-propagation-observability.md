@@ -544,7 +544,7 @@ metric set (`observability.md` tables), so each gets its own assertion list.
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 /// Metric names from observability.md's Worker Metrics table.
-/// Keep in sync; the tracey rule `r[obs.metric.worker]` on
+/// Keep in sync; the tracey rule `r[obs.metric.builder]` on
 /// `describe_metrics()` is the spec link, this is the enforcement.
 const WORKER_METRICS: &[&str] = &[
     "rio_worker_builds_total",
@@ -564,7 +564,7 @@ const WORKER_METRICS: &[&str] = &[
     "rio_worker_memory_fraction",
 ];
 
-// r[verify obs.metric.worker]
+// r[verify obs.metric.builder]
 #[test]
 fn all_spec_metrics_appear_in_scrape() {
     let recorder = PrometheusBuilder::new().build_recorder();

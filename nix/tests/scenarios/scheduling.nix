@@ -29,7 +29,7 @@
 #   and nix-daemon's sandbox need unshare(CLONE_NEWNS); wrong order → fail.
 #
 # obs.metric.scheduler — verify marker at default.nix:subtests[load-50drv]
-# obs.metric.worker — verify marker at default.nix:subtests[load-50drv]
+# obs.metric.builder — verify marker at default.nix:subtests[load-50drv]
 # obs.metric.store — verify marker at default.nix:subtests[load-50drv]
 #
 # worker.fuse.lookup-caches — verify marker at default.nix:subtests[fanout]
@@ -1147,7 +1147,7 @@ let
           # `systemctl stop` would send SIGTERM (KillSignal default) —
           # that path already works (rio-common::signal::shutdown_signal
           # watched SIGTERM from day one). SIGINT tests the NEW code
-          # at main.rs:503 (r[impl worker.shutdown.sigint]).
+          # at main.rs:503 (r[impl builder.shutdown.sigint]).
           wsmall2.succeed("systemctl kill -s INT rio-builder.service")
 
           # Unit reaches inactive when main() returns. NOT

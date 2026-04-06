@@ -2,7 +2,7 @@
 //!
 //! Moby's default.json has conditional blocks keyed on capabilities.
 //! Flatten for the caps the worker HAS, remove the syscalls we deny
-//! (per security.md r[worker.seccomp.localhost-profile]), then diff.
+//! (per security.md r[builder.seccomp.localhost-profile]), then diff.
 //!
 //! The flattening is approximate — moby's format has arch-specific
 //! blocks, minKernel conditionals. Produces a diff for HUMAN REVIEW.

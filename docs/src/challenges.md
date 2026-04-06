@@ -33,9 +33,9 @@ Workers need a functional `/nix/store`. The FUSE + overlay approach introduces c
 - The FUSE daemon must handle concurrent file access from multiple builds efficiently
 - Upper layer cleanup between builds must be deterministic (unique per-build directories, never reused)
 - The FUSE SSD cache requires LRU eviction and disk pressure monitoring
-- The namespace ordering (FUSE mount → overlayfs → nix sandbox) must be correct; see [worker.md](components/worker.md)
+- The namespace ordering (FUSE mount → overlayfs → nix sandbox) must be correct; see [builder.md](components/builder.md)
 
-**Decided approach:** Each worker runs a FUSE filesystem (`rio-fuse`) that lazily fetches store paths from rio-store. Each build gets a per-build overlayfs with **stacked lowers** (host `/nix/store` first so nix-daemon and its dependencies are reachable, FUSE mount second for lazily-fetched paths) and a per-build synthetic SQLite database in the upper layer. This avoids shared mutable state, eliminates shared PV infrastructure, and provides local-disk performance via SSD caching. See [worker.md](components/worker.md) for full details.
+**Decided approach:** Each worker runs a FUSE filesystem (`rio-fuse`) that lazily fetches store paths from rio-store. Each build gets a per-build overlayfs with **stacked lowers** (host `/nix/store` first so nix-daemon and its dependencies are reachable, FUSE mount second for lazily-fetched paths) and a per-build synthetic SQLite database in the upper layer. This avoids shared mutable state, eliminates shared PV infrastructure, and provides local-disk performance via SSD caching. See [builder.md](components/builder.md) for full details.
 
 ## 6. Failure Semantics
 
@@ -96,7 +96,7 @@ When rio-store is overloaded or degraded, FUSE cache misses on workers become sl
 - **Scheduler cache-check circuit breaker:** the scheduler's `FindMissingPaths` cache-check trips open after 5 consecutive failures (`CacheCheckBreaker`). While open, SubmitBuild is rejected with `StoreUnavailable` instead of queueing every derivation as a cache miss. Half-open probe closes the breaker on the first success; auto-closes after 30s even without a probe.
 - **Scheduler backpressure:** actor-queue-depth hysteresis (80% activate, 60% deactivate) refuses new submissions when the actor is overloaded. Not store-health-aware --- it responds to actor congestion regardless of cause.
 - **Worker leaked-mount refusal:** the worker tracks overlay mounts that failed teardown (`max_leaked_mounts`, default 3) and refuses new builds above the threshold. This bounds FUSE-failure blast radius but does not directly signal store unavailability.
-- **Worker FUSE circuit breaker:** the worker tracks consecutive store-fetch failures; when the breaker opens, `HeartbeatRequest.store_degraded` is set and the scheduler excludes the worker from assignment via `has_capacity()`. See `r[worker.fuse.circuit-breaker]` + `r[worker.heartbeat.store-degraded]`.
+- **Worker FUSE circuit breaker:** the worker tracks consecutive store-fetch failures; when the breaker opens, `HeartbeatRequest.store_degraded` is set and the scheduler excludes the worker from assignment via `has_capacity()`. See `r[builder.fuse.circuit-breaker]` + `r[builder.heartbeat.store-degraded]`.
 
 ## 12. Scheduler In-Memory DAG Scalability
 
@@ -124,7 +124,7 @@ The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. Under heav
 - Benchmark FUSE read latency (p50, p99) during the Phase 1a spike under concurrent load
 - Compare against direct filesystem reads to quantify overhead
 - The `fuser` crate supports multi-threaded FUSE dispatch; ensure this is enabled
-- **FUSE passthrough mode (Linux 6.9+):** For cached paths on local SSD, FUSE passthrough (`FUSE_PASSTHROUGH`) eliminates the `read()` context switch by handing off file descriptors to the backing files. See [rio-worker: FUSE Passthrough Mode](./components/worker.md#fuse-passthrough-mode-linux-69).
+- **FUSE passthrough mode (Linux 6.9+):** For cached paths on local SSD, FUSE passthrough (`FUSE_PASSTHROUGH`) eliminates the `read()` context switch by handing off file descriptors to the backing files. See [rio-worker: FUSE Passthrough Mode](./components/builder.md#fuse-passthrough-mode-linux-69).
 - **File handle caching:** Keep backing file handles open across reads. Passthrough only helps for `read()` on already-open files; `lookup()` and `open()` still traverse userspace. Builds that open many small files once (header-heavy C++) won't benefit from passthrough alone --- they need reduced `open()` overhead via kernel entry/attribute caching (high TTL on immutable store paths).
 - If FUSE overhead exceeds 2x vs direct reads even with all mitigations, consider the bind-mount fallback
 

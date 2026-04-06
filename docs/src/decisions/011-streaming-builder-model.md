@@ -1,4 +1,4 @@
-# ADR-011: Streaming Worker Model
+# ADR-011: Streaming Builder Model
 
 ## Status
 Accepted

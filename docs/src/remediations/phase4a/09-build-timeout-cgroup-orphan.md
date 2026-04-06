@@ -71,7 +71,7 @@ So the **only** orphan path runs through lines 575–589 with a live builder. No
     // an empty cgroup is a no-op — so we call it unconditionally rather
     // than branching on build_result.is_err().
     //
-    // r[impl worker.cgroup.kill-on-teardown]
+    // r[impl builder.cgroup.kill-on-teardown]
     if let Err(e) = build_cgroup.kill() {
         // ENOENT shouldn't happen (we hold the BuildCgroup, Drop hasn't
         // run); EACCES would mean delegation is broken. Log and fall
@@ -231,7 +231,7 @@ Pull the conversion into a free function so it's unit-testable without spinning 
 /// Exhaustive: no `_` arm. Adding a new BuildStatus variant in rio-nix
 /// is a compile error here until the mapping decision is made.
 ///
-/// r[impl worker.status.nix-to-proto]
+/// r[impl builder.status.nix-to-proto]
 pub(crate) fn nix_failure_to_proto(
     nix: rio_nix::protocol::build::BuildStatus,
 ) -> BuildResultStatus {
@@ -381,7 +381,7 @@ A build timeout means "the executor did its job perfectly; the build itself didn
     // error mid-STDERR-loop IS an executor fault (daemon died, pipe
     // corrupted) — that `?` stays.
     //
-    // r[impl worker.timeout.no-reassign]
+    // r[impl builder.timeout.no-reassign]
     let build_result = match tokio::time::timeout(
         build_timeout,
         read_build_stderr_loop(stdout, batcher, log_tx),
@@ -442,7 +442,7 @@ So there's a window (overlay setup + daemon spawn, potentially seconds under FUS
 
 **Scenario B (the bug):** build hits an **unrelated** executor error after the failed cancel — overlay teardown fails, daemon handshake fails, FOD verify panics. `runtime.rs:334` `Err` arm reads `build_cancelled.load()` → `true` → reports `Cancelled` instead of `InfrastructureFailure`. Operator sees "cancelled" in the build status (via `rio-cli builds` or `QueryBuildStatus` gRPC), assumes user action, never investigates the real infra fault.
 
-**Scenario C (design-acknowledged, unchanged by this fix):** cancel arrives early, `ENOENT`, build proceeds and succeeds. The cancel is silently lost. `docs/src/components/worker.md:361` documents this as acceptable: "logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed)." This fix doesn't change scenario C — only scenario B.
+**Scenario C (design-acknowledged, unchanged by this fix):** cancel arrives early, `ENOENT`, build proceeds and succeeds. The cancel is silently lost. `docs/src/components/builder.md:361` documents this as acceptable: "logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed)." This fix doesn't change scenario C — only scenario B.
 
 ### Fix: clear flag on `ENOENT`, keep set-before-kill ordering
 
@@ -480,7 +480,7 @@ So: set first, kill, **undo on `ENOENT`**. `ENOENT` is the only errno that defin
             // cgroup-create, but the window is narrow and the backstop
             // already covers it.
             //
-            // r[impl worker.cancel.flag-clear-enoent]
+            // r[impl builder.cancel.flag-clear-enoent]
             cancelled.store(false, std::sync::atomic::Ordering::Release);
             tracing::debug!(
                 drv_path,
@@ -519,7 +519,7 @@ So: set first, kill, **undo on `ENOENT`**. `ENOENT` is the only errno that defin
     /// stable. If someone changes TimedOut → TransientFailure (which
     /// would reintroduce the reassignment storm), this test fails.
     ///
-    /// r[verify worker.status.nix-to-proto]
+    /// r[verify builder.status.nix-to-proto]
     #[test]
     fn test_nix_failure_to_proto_is_exhaustive_and_stable() {
         use rio_nix::protocol::build::BuildStatus as Nix;
@@ -549,7 +549,7 @@ So: set first, kill, **undo on `ENOENT`**. `ENOENT` is the only errno that defin
     /// TimedOut must NOT map to anything the scheduler reassigns. This
     /// is the load-bearing invariant for the reassignment-storm fix.
     ///
-    /// r[verify worker.timeout.no-reassign]
+    /// r[verify builder.timeout.no-reassign]
     #[test]
     fn test_timed_out_is_not_reassignable() {
         use rio_nix::protocol::build::BuildStatus as Nix;
@@ -574,7 +574,7 @@ So: set first, kill, **undo on `ENOENT`**. `ENOENT` is the only errno that defin
     /// Cancel arrives before cgroup exists → kill ENOENT → flag cleared.
     /// An unrelated Err later must NOT be misclassified as Cancelled.
     ///
-    /// r[verify worker.cancel.flag-clear-enoent]
+    /// r[verify builder.cancel.flag-clear-enoent]
     #[test]
     fn test_cancel_enoent_clears_flag() {
         let registry = CancelRegistry::default();
@@ -609,8 +609,8 @@ So: set first, kill, **undo on `ENOENT`**. `ENOENT` is the only errno that defin
 **Fixture:** `drvs.mkTrivial { marker = "lifecycle-timeout"; sleepSecs = 30; }` with `Build.spec.timeoutSeconds: 5`.
 
 ```python
-# r[verify worker.cgroup.kill-on-teardown]
-# r[verify worker.timeout.no-reassign]
+# r[verify builder.cgroup.kill-on-teardown]
+# r[verify builder.timeout.no-reassign]
 #
 # build-timeout — Build.spec.timeoutSeconds shorter than the build's sleep.
 #
@@ -789,12 +789,12 @@ with subtest("build-timeout: spec.timeoutSeconds < build duration → TimedOut, 
 
 ## 6. Spec + tracey
 
-Tracey markers: `r[worker.cgroup.kill-on-teardown]`, `r[worker.timeout.no-reassign]`, `r[worker.status.nix-to-proto]`, `r[worker.cancel.flag-clear-enoent]` — all in [`worker.md`](../../components/worker.md).
+Tracey markers: `r[builder.cgroup.kill-on-teardown]`, `r[builder.timeout.no-reassign]`, `r[builder.status.nix-to-proto]`, `r[builder.cancel.flag-clear-enoent]` — all in [`worker.md`](../../components/builder.md).
 
-- `r[worker.cgroup.kill-on-teardown]`: after `daemon.wait()` returns, executor writes `cgroup.kill` and drains `cgroup.procs` before dropping `BuildCgroup` (`daemon.kill()` only reaches direct child; builder is grandchild).
-- `r[worker.timeout.no-reassign]`: build timeout produces `Ok(BuildResult { status: TimedOut })`, not `Err(ExecutorError)` — timeout is a build outcome, not infrastructure failure (would otherwise reassign forever).
-- `r[worker.status.nix-to-proto]`: Nix→proto `BuildStatus` mapping is exhaustive (no `_` arm); only `MiscFailure`/`NoSubstituters` collapse to `PermanentFailure`.
-- `r[worker.cancel.flag-clear-enoent]`: if `try_cancel_build`'s `cgroup.kill` write returns `ENOENT` (raced ahead of `BuildCgroup::create`), the `cancelled` flag is cleared.
+- `r[builder.cgroup.kill-on-teardown]`: after `daemon.wait()` returns, executor writes `cgroup.kill` and drains `cgroup.procs` before dropping `BuildCgroup` (`daemon.kill()` only reaches direct child; builder is grandchild).
+- `r[builder.timeout.no-reassign]`: build timeout produces `Ok(BuildResult { status: TimedOut })`, not `Err(ExecutorError)` — timeout is a build outcome, not infrastructure failure (would otherwise reassign forever).
+- `r[builder.status.nix-to-proto]`: Nix→proto `BuildStatus` mapping is exhaustive (no `_` arm); only `MiscFailure`/`NoSubstituters` collapse to `PermanentFailure`.
+- `r[builder.cancel.flag-clear-enoent]`: if `try_cancel_build`'s `cgroup.kill` write returns `ENOENT` (raced ahead of `BuildCgroup::create`), the `cancelled` flag is cleared.
 
 None overlap existing rules — `worker.cancel.cgroup-kill` is the cancel path specifically; the first above adds the teardown path.
 

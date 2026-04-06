@@ -3,7 +3,7 @@
 //! Scans the overlay upper layer for new store paths, serializes each as
 //! a NAR, computes SHA-256, and uploads via `StoreService.PutPath` gRPC
 //! with retry on failure.
-// r[impl worker.upload.multi-output]
+// r[impl builder.upload.multi-output]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -158,7 +158,7 @@ async fn upload_output(
     })?;
 
     // --- Pre-scan for references -------------------------------------
-    // r[impl worker.upload.references-scanned]
+    // r[impl builder.upload.references-scanned]
     // Single extra disk read through RefScanSink ONLY (no hash, no
     // network). spawn_blocking because dump_path_streaming is sync I/O.
     //
@@ -293,7 +293,7 @@ async fn do_upload_streaming(
         nar_hash: Vec::new(), // EMPTY → triggers trailer mode on the store
         nar_size: 0,          //         (real values arrive in trailer)
         store_path_hash: Vec::new(),
-        // r[impl worker.upload.deriver-populated]
+        // r[impl builder.upload.deriver-populated]
         deriver: deriver.to_string(),
         references: references.to_vec(),
         registration_time: 0,
@@ -504,7 +504,7 @@ impl Write for HashingChannelWriter {
 /// Upload all new outputs from the overlay upper layer.
 ///
 /// Pipeline:
-/// 1. **Idempotency pre-check** (`r[worker.upload.idempotent-precheck]`):
+/// 1. **Idempotency pre-check** (`r[builder.upload.idempotent-precheck]`):
 ///    `FindMissingPaths` filters out outputs the store already has. Skipped
 ///    outputs get their `UploadResult` from `QueryPathInfo` — zero disk reads.
 /// 2. **≥2 remaining → `PutPathBatch`** for cross-output atomicity
@@ -531,7 +531,7 @@ pub async fn upload_all_outputs(
     }
 
     // --- Idempotency pre-check -------------------------------------------
-    // r[impl worker.upload.idempotent-precheck]
+    // r[impl builder.upload.idempotent-precheck]
     //
     // Batch-check all outputs against the store BEFORE reading any bytes
     // from disk. Outputs with a `'complete'` manifest are skipped: the
@@ -903,7 +903,7 @@ async fn upload_outputs_batch(
     Ok(results)
 }
 
-// r[verify worker.upload.multi-output]
+// r[verify builder.upload.multi-output]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1161,8 +1161,8 @@ mod tests {
     const DEP_HASH_A: &str = "7rjj5xmrxb3n63wlk6mzlwxzxbvg7r3a";
     const DEP_HASH_B: &str = "v5sv61sszx301i0x6xysaqzla09nksnd";
 
-    /// r[verify worker.upload.references-scanned]
-    /// r[verify worker.upload.deriver-populated]
+    /// r[verify builder.upload.references-scanned]
+    /// r[verify builder.upload.deriver-populated]
     ///
     /// End-to-end: output file embeds a store-path string → pre-scan finds
     /// it → PathInfo.references arrives at MockStore non-empty. Also checks
@@ -1330,7 +1330,7 @@ mod tests {
     // Idempotent pre-check (FindMissingPaths → skip already-present outputs)
     // -----------------------------------------------------------------------
 
-    /// r[verify worker.upload.idempotent-precheck]
+    /// r[verify builder.upload.idempotent-precheck]
     ///
     /// Output already in store → zero PutPath calls, UploadResult carries
     /// the STORE's nar_hash (not a freshly-computed one). This is the
