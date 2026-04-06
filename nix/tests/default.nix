@@ -582,9 +582,8 @@ in
   #   data-plane Service; asserts DATA frame 0x00 prefix (unary
   #   ClusterStatus) + trailer frame prefix 80 00 00 00 (streaming
   #   GetBuildLogs). The frame-prefix grep proves the grpc_web filter
-  #   doesn't
-  #   buffer server-streams — load-bearing for WatchBuild / live log
-  #   tail. Also greps the envoy /config_dump for
+  #   doesn't buffer server-streams — load-bearing for WatchBuild /
+  #   live log tail. Also greps the envoy /config_dump for
   #   envoy.filters.http.grpc_web to prove the GRPCRoute auto-inject
   #   (listener.go:424-425) actually fired. ~6min (k3s bring-up +
   #   operator reconcile). Heavy: +2 images (envoyproxy/gateway +

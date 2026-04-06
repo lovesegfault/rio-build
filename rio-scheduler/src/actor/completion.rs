@@ -571,12 +571,25 @@ impl DagActor {
                     debug!(
                         drv_hash = %drv_hash,
                         output_name = %output.output_name,
-                        "CA cutoff-compare: empty output_path, counting as miss"
+                        "CA cutoff-compare: empty output_path, counting as malformed"
                     );
+                    metrics::counter!(
+                        "rio_scheduler_ca_hash_compares_total",
+                        "outcome" => "malformed"
+                    )
+                    .increment(1);
                     all_matched = false;
                     continue;
                 }
-                let matched = match tokio::time::timeout(
+                // Outcome labels: match/miss distinguish "prior build
+                // found" vs "novel content" (both healthy). error
+                // distinguishes "PG blip/timeout" (infra problem —
+                // alert if rate>0). malformed catches worker-sent
+                // garbage. High miss-rate is normal; high error-rate
+                // means investigate PG. Cutoff semantics unchanged:
+                // all non-match fold to all_matched=false → safe
+                // don't-skip.
+                let (matched, outcome) = match tokio::time::timeout(
                     CA_CUTOFF_LOOKUP_TIMEOUT,
                     crate::ca::query_prior_realisation(
                         self.db.pool(),
@@ -593,24 +606,24 @@ impl DagActor {
                         // the cascade can discover what was built
                         // downstream of it.
                         prior_seeds.push((prior.drv_hash.to_vec(), prior.output_name));
-                        true
+                        (true, "match")
                     }
-                    Ok(Ok(None)) => false,
+                    Ok(Ok(None)) => (false, "miss"),
                     Ok(Err(e)) => {
                         debug!(drv_hash = %drv_hash, error = %e,
-                               "CA cutoff-compare: prior-realisation lookup failed, counting as miss");
-                        false
+                               "CA cutoff-compare: prior-realisation lookup failed");
+                        (false, "error")
                     }
                     Err(_elapsed) => {
                         debug!(drv_hash = %drv_hash, timeout = ?CA_CUTOFF_LOOKUP_TIMEOUT,
-                               "CA cutoff-compare: prior-realisation lookup timed out, counting as miss");
-                        false
+                               "CA cutoff-compare: prior-realisation lookup timed out");
+                        (false, "error")
                     }
                 };
                 all_matched &= matched;
                 metrics::counter!(
                     "rio_scheduler_ca_hash_compares_total",
-                    "outcome" => if matched { "match" } else { "miss" }
+                    "outcome" => outcome
                 )
                 .increment(1);
                 // Short-circuit: one miss means the derivation's
@@ -1305,6 +1318,12 @@ impl DagActor {
         self.persist_status(drv_hash, DerivationStatus::Ready, None)
             .await;
         self.push_ready(drv_hash.clone());
+
+        // Dashboard: Running → Ready state change. emit_progress so
+        // the dashboard sees the retry requeue.
+        for build_id in self.get_interested_builds(drv_hash) {
+            self.emit_progress(build_id);
+        }
     }
 
     pub(super) async fn handle_permanent_failure(

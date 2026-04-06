@@ -402,6 +402,11 @@ dashboard:
   # nix/docker.nix (nginx upstream hostname — baked at image build time,
   # not templated). Change BOTH together.
   envoyGatewayNamespace: envoy-gateway-system
+  # ClientTrafficPolicy.timeout.http.streamIdleTimeout — kills a quiet
+  # server-stream (GetBuildLogs, WatchBuild) after this. Envoy's default
+  # is 5m which is too aggressive for slow builds. 1h is a practical
+  # ceiling (if a stream is truly quiet for an hour, the build is stuck).
+  streamIdleTimeout: 1h
   # EnvoyProxy.spec.provider.kubernetes.envoyService.type — ClusterIP
   # by default (nginx sits in-cluster and proxies to this Service).
   # Set to NodePort for VM tests or LoadBalancer for direct external

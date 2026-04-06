@@ -1013,8 +1013,7 @@ fn ca_on_ca_fixture() -> (
     let child_modular: [u8; 32] = [0xCA; 32];
     let realized_path = test_store_path("ca-child-realized-out");
 
-    let placeholder =
-        downstream_placeholder(&StorePath::parse(&child_path).unwrap(), "out").unwrap();
+    let placeholder = downstream_placeholder(&StorePath::parse(&child_path).unwrap(), "out");
 
     // Parent's ATerm: floating-CA output ("sha256" algo, empty hash,
     // empty path), one inputDrv = child, placeholder in env.DEP.

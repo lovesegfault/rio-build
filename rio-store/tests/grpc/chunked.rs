@@ -443,8 +443,8 @@ async fn gt13_batch_content_lookup_finds_outputs() -> TestResult {
 /// paths gets `Status::aborted("concurrent upload in progress")` until
 /// the 2h orphan sweep reclaims stale `'uploading'` rows.
 ///
-/// P0342 fixed the lone `?` at `:275` (`.map_err(...)?` on
-/// `insert_manifest_uploading`). This test catches any future
+/// P0342 fixed the lone `?` on `insert_manifest_uploading` (the
+/// `.map_err(...)?` call). This test catches any future
 /// reintroduction: every error return in phase-2/phase-3 MUST go
 /// through `bail!` — no bare `?` after the first placeholder may be
 /// pushed.
@@ -470,8 +470,8 @@ fn put_path_batch_impl_no_question_mark_bypass() {
     let body = &src[start..end];
 
     // Phase-2/3: after placeholders MAY be inserted (phase-2's
-    // `owned_placeholders.push` at :284 happens inside a loop — output-0
-    // is pushed before output-1's insert runs). A `?` anywhere in
+    // `owned_placeholders.push` happens inside the per-output loop —
+    // output-0 is pushed before output-1's insert runs). A `?` anywhere in
     // phase-2/3 leaks output-0's placeholder if output-1 errors.
     //
     // Phase-1 (stream drain) never pushes placeholders, so a `?` there
@@ -494,20 +494,21 @@ fn put_path_batch_impl_no_question_mark_bypass() {
     );
 }
 
-/// Phase-2 loop iteration: output-0's placeholder is inserted at
-/// `:284`, then output-1's `insert_manifest_uploading` returns
-/// `Ok(false)` (pre-seeded conflict — concurrent uploader owns it).
-/// The `bail!` at `:280` must call `abort_batch()` → delete output-0's
-/// placeholder too. Without cleanup, output-0 is wedged: next batch
-/// hits `!inserted` on output-0's stale placeholder → aborts forever
+/// Phase-2 loop iteration: output-0's placeholder is pushed via
+/// `owned_placeholders.push`, then output-1's
+/// `insert_manifest_uploading` returns `Ok(false)` (pre-seeded
+/// conflict — concurrent uploader owns it). The `!inserted` branch's
+/// `bail!` must call `abort_batch()` → delete output-0's placeholder
+/// too. Without cleanup, output-0 is wedged: next batch hits
+/// `!inserted` on output-0's stale placeholder → aborts forever
 /// (until the 2h orphan sweep).
 ///
-/// NOTE: this tests the `:280` `bail!` path (the `!inserted` branch),
-/// which shares `abort_batch` with the `:275` fix. The `:275` path
-/// (`insert_manifest_uploading` returning `Err`, not `Ok(false)`)
-/// requires PG fault injection mid-handler — covered statically by
-/// [`put_path_batch_impl_no_question_mark_bypass`] instead. Both paths
-/// reach the same `abort_batch` cleanup.
+/// NOTE: this tests the `!inserted` branch's `bail!`, which shares
+/// `abort_batch` with the `Err(e) => bail!(metadata_status(...))` path
+/// (`insert_manifest_uploading` returning `Err`, not `Ok(false)`).
+/// That Err path requires PG fault injection mid-handler — covered
+/// statically by [`put_path_batch_impl_no_question_mark_bypass`]
+/// instead. Both paths reach the same `abort_batch` cleanup.
 // r[verify store.atomic.multi-output]
 #[tokio::test]
 async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
@@ -524,7 +525,7 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
     // Pre-seed an 'uploading' placeholder for output-1 via raw SQL
     // (simulates a concurrent uploader owning the slot).
     // `insert_manifest_uploading` for output-1 will return `Ok(false)`
-    // → `:277` `!inserted` → `:280` bail!.
+    // → `!inserted` branch → bail!.
     //
     // Can't call `rio_store::metadata::insert_manifest_uploading`
     // directly — the `metadata` module is `pub(crate)`. Inline the two

@@ -59,7 +59,7 @@ impl Autoscaler {
         sc_resp: &GetSizeClassStatusResponse,
         pools: &[WorkerPool],
     ) {
-        let child_name = format!("{}-{}", wps.name_any(), class.name);
+        let child_name = crate::reconcilers::workerpoolset::builders::child_name(wps, class);
         let wps_ns = wps.namespace().unwrap_or_default();
 
         // r[impl ctrl.wps.autoscale]

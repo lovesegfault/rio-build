@@ -182,7 +182,14 @@
       </thead>
       <tbody>
         {#each builds as b (b.buildId)}
-          <tr data-testid="build-row" onclick={() => (selected = b)}>
+          <!-- svelte-ignore a11y_interactive_supports_focus -->
+          <tr
+            data-testid="build-row"
+            role="button"
+            tabindex="0"
+            onclick={() => (selected = b)}
+            onkeydown={(e) => e.key === 'Enter' && (selected = b)}
+          >
             <td>
               <code class="build-id" title={b.buildId}>
                 {b.buildId.slice(0, 8)}…

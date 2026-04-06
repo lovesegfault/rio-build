@@ -19,15 +19,19 @@
 
   let {
     buildId,
+    // TODO(P0280): drvPath live once node-click wires it. Currently
+    // dead in practice — BuildDrawer.svelte passes only buildId.
     drvPath = undefined,
-    // Test-only hook: jsdom layout is all-zeros so the scroll-derived
-    // viewport range can't be exercised. A test stubs this to assert
-    // slice bounds directly. Production never passes it.
-    viewportOverride = undefined,
+    // @internal test-only hook: jsdom layout is all-zeros so the
+    // scroll-derived viewport range can't be exercised. A test stubs
+    // this to assert slice bounds directly. Production never passes it.
+    // Underscore prefix signals "don't use this" in autocomplete.
+    _viewportOverride = undefined,
   }: {
     buildId: string;
     drvPath?: string;
-    viewportOverride?: { start: number; end: number };
+    /** @internal test-only — jsdom layout is all-zeros; tests stub the viewport directly. */
+    _viewportOverride?: { start: number; end: number };
   } = $props();
 
   // One stream per mount. Unmount aborts the underlying fetch via the
@@ -92,16 +96,16 @@
   // Visible-slice bounds, reactive to both scroll position and line
   // count. Reading `stream.lines.length` tracks the runes-proxied array
   // — push() bumps .length and this $derived reruns. When
-  // viewportOverride is supplied (tests), use it verbatim and skip the
+  // _viewportOverride is supplied (tests), use it verbatim and skip the
   // arithmetic. In production the override is undefined; the derived
   // falls through to scroll math. The Math.min on endIdx clamps to the
   // array length so a near-bottom scroll doesn't slice past the end.
   const viewport = $derived.by(() => {
     const n = stream.lines.length;
-    if (viewportOverride) {
+    if (_viewportOverride) {
       return {
-        start: Math.max(0, Math.min(viewportOverride.start, n)),
-        end: Math.max(0, Math.min(viewportOverride.end, n)),
+        start: Math.max(0, Math.min(_viewportOverride.start, n)),
+        end: Math.max(0, Math.min(_viewportOverride.end, n)),
       };
     }
     const start = Math.max(0, Math.floor(scrollTop / lineH) - OVERSCAN);
@@ -143,7 +147,7 @@
   {/if}
   {#if stream.truncated}
     <div class="truncated" data-testid="log-truncated">
-      — earlier output truncated —
+      — {stream.droppedLines.toLocaleString()} earlier lines truncated —
     </div>
   {/if}
   <div

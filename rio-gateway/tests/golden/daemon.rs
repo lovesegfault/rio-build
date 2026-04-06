@@ -34,11 +34,18 @@ pub fn daemon_bin() -> String {
 /// `RIO_GOLDEN_DAEMON_VARIANT` to one of: `"nix-stable"` (2.20),
 /// `"nix-unstable"` (master), `"lix"`.
 pub fn daemon_variant() -> &'static str {
-    match std::env::var("RIO_GOLDEN_DAEMON_VARIANT").as_deref() {
-        Ok("nix-stable") => "nix-stable",
-        Ok("nix-unstable") => "nix-unstable",
-        Ok("lix") => "lix",
-        _ => "nix-pinned",
+    match std::env::var("RIO_GOLDEN_DAEMON_VARIANT") {
+        Err(_) => "nix-pinned", // unset → default
+        Ok(s) => match s.as_str() {
+            "nix-pinned" => "nix-pinned",
+            "nix-stable" => "nix-stable",
+            "nix-unstable" => "nix-unstable",
+            "lix" => "lix",
+            other => panic!(
+                "RIO_GOLDEN_DAEMON_VARIANT={other:?} unrecognized; \
+                 allowed: nix-pinned, nix-stable, nix-unstable, lix"
+            ),
+        },
     }
 }
 
@@ -82,6 +89,35 @@ pub fn skip_for_variant(test_name: &str) -> bool {
         }
     }
     false
+}
+
+/// Every `VARIANT_SKIP` test_name must match a real test fn in
+/// `golden_conformance.rs`. Hand-maintained list — if a test is renamed
+/// and the skip row isn't updated, this test catches the drift (the
+/// skip would otherwise silently never fire).
+#[test]
+fn variant_skip_names_are_real() {
+    const REAL_TESTS: &[&str] = &[
+        "test_golden_live_handshake",
+        "test_golden_live_is_valid_path_found",
+        "test_golden_live_is_valid_path_not_found",
+        "test_golden_live_query_path_info",
+        "test_golden_live_query_path_info_not_found",
+        "test_golden_live_query_valid_paths",
+        "test_golden_live_add_temp_root",
+        "test_golden_live_query_missing",
+        "test_golden_live_nar_from_path",
+        "test_golden_live_query_path_from_hash_part_not_found",
+        "test_golden_live_query_path_from_hash_part_found",
+        "test_golden_live_query_path_from_hash_part_ca",
+        "test_golden_live_add_signatures",
+    ];
+    for &(_variant, test_name, _reason) in VARIANT_SKIP {
+        assert!(
+            REAL_TESTS.contains(&test_name),
+            "VARIANT_SKIP refs unknown test {test_name:?} — renamed or typo?"
+        );
+    }
 }
 
 /// How to read data after STDERR_LAST in the STDERR message loop.

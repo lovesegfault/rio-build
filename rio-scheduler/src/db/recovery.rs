@@ -170,6 +170,15 @@ impl SchedulerDb {
     /// if a derivation was added between COUNT and SELECT). Acceptable
     /// for a 5s-poll dashboard; builds don't add derivations post-submit
     /// anyway.
+    // NOTE(fault-line): load_build_graph + read_event_log live here
+    // because they were physically inside the pre-split :1123 "recovery"
+    // banner. Neither is actually a recovery-on-LeaderAcquired query —
+    // load_build_graph serves AdminService.GetBuildGraph (dashboard viz),
+    // read_event_log serves grpc bridge replay. If a future plan touches
+    // both, consider extracting to db/admin_reads.rs. The
+    // r[impl dash.graph.degrade-threshold] marker at the 5000-node cap
+    // IS correctly placed (scheduler implements server-side cap
+    // regardless of which db/ file hosts it).
     pub async fn load_build_graph(
         &self,
         build_id: Uuid,

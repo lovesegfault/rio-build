@@ -54,6 +54,7 @@ impl StoreServiceImpl {
         request: Request<Streaming<PutPathBatchRequest>>,
     ) -> Result<Response<PutPathBatchResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        let start = std::time::Instant::now();
 
         // HMAC check once for the whole batch. Claims (if any) apply to
         // every output — each output's path must be in expected_outputs.
@@ -234,6 +235,8 @@ impl StoreServiceImpl {
             match metadata::check_manifest_complete(&self.pool, &accum.store_path_hash).await {
                 Ok(true) => {
                     accum.already_complete = true;
+                    metrics::counter!("rio_store_put_path_total", "result" => "exists")
+                        .increment(1);
                     continue;
                 }
                 Ok(false) => {}
@@ -384,6 +387,8 @@ impl StoreServiceImpl {
             }
         }
 
+        metrics::histogram!("rio_store_put_path_duration_seconds")
+            .record(start.elapsed().as_secs_f64());
         Ok(Response::new(PutPathBatchResponse { created }))
     }
 

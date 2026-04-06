@@ -237,7 +237,10 @@ def dag_flip(plan_num: int) -> DagFlipResult:
             for row in read_jsonl(sha_file, MergeSha):
                 if row.plan == plan_num:
                     prior_mc = row.mc
-                    break
+                    # no break — last-row-per-plan wins (post-rewind
+                    # via --set-to may have multiple plan=N rows;
+                    # latest is correct per _cadence_range's
+                    # last-row-per-mc semantics)
         if prior_mc is not None:
             # case (b): already bumped at prior run
             return DagFlipResult(

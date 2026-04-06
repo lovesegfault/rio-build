@@ -57,3 +57,15 @@ It is intended for k3s/kind clusters lacking the FUSE device plugin
 or idmap-mount support. Production on EKS/GKE should use
 privileged:false (the chart default).
 {{- end }}
+
+{{- if and .Values.dashboard.enabled (has "http://rio-dashboard.rio-system.svc.cluster.local" .Values.dashboard.cors.allowOrigins) }}
+
+── Dashboard CORS origin ──────────────────────────────────────────────
+WARNING: dashboard.cors.allowOrigins contains the placeholder in-cluster
+hostname. Browsers cannot produce this Origin — override with your
+Ingress/LoadBalancer URL in values:
+  dashboard:
+    cors:
+      allowOrigins:
+        - "https://rio.<your-domain>"
+{{- end }}

@@ -102,8 +102,12 @@ pub mod dag {
     };
 }
 
-/// Re-export of build-lifecycle-domain types from [`types`]. Sourced from
-/// `proto/build_types.proto`. Same dual-path semantics as [`dag`].
+/// Re-export of build-lifecycle-domain types from [`types`]. Sourced
+/// from `proto/build_types.proto`. Same dual-path semantics as [`dag`].
+///
+/// `dag::` migration is complete (zero `types::Derivation*` refs
+/// remain). `build_types::` migration is opportunistic — existing
+/// `types::` paths are valid, new code SHOULD use `build_types::`.
 pub mod build_types {
     pub use crate::types::{
         BuildCancelled, BuildCompleted, BuildEvent, BuildFailed, BuildInputsResolved,
@@ -113,6 +117,18 @@ pub mod build_types {
         PrefetchHint, ProgressUpdate, QueryBuildRequest, SchedulerMessage, SubmitBuildRequest,
         WatchBuildRequest, WorkAssignment, WorkAssignmentAck, WorkerMessage, WorkerRegister,
         build_event, scheduler_message, worker_message,
+    };
+}
+
+/// Re-export of admin-domain types from [`types`]. Sourced from
+/// `proto/admin_types.proto`. Same dual-path semantics as [`dag`].
+pub mod admin_types {
+    pub use crate::types::{
+        BuildInfo, BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
+        CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse,
+        GetBuildLogsRequest, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
+        ListBuildsRequest, ListBuildsResponse, ListTenantsResponse, ListWorkersRequest,
+        ListWorkersResponse, SizeClassStatus, TenantInfo, WorkerInfo,
     };
 }
 

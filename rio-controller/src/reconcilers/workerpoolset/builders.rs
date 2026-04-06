@@ -40,8 +40,16 @@ const DEFAULT_FUSE_CACHE_SIZE: &str = "50Gi";
 /// name — so the pool name is for operator readability, not
 /// dispatch. Keeping the class name as the suffix means `kubectl
 /// get wp` shows the structure at a glance.
-pub(super) fn child_name(wps: &WorkerPoolSet, class: &SizeClassSpec) -> String {
+pub(crate) fn child_name(wps: &WorkerPoolSet, class: &SizeClassSpec) -> String {
     format!("{}-{}", wps.name_any(), class.name)
+}
+
+/// Same naming as [`child_name`] but taking bare strings. Used by
+/// scaling module which has `class_name: &str` not a full
+/// `SizeClassSpec`. Single source of truth for the `{wps}-{class}`
+/// convention.
+pub(crate) fn child_name_str(wps_name: &str, class_name: &str) -> String {
+    format!("{wps_name}-{class_name}")
 }
 
 /// Build one child WorkerPool for one size class.
@@ -85,10 +93,9 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
 
     // Autoscaling: `target_value` from the class's
     // `target_queue_per_replica`. The WorkerPool autoscaler reads
-    // this, so per-class scaling "just works" once the child
-    // exists — no per-class autoscaler loop needed in P0233
-    // (P0234 adds the per-class GetSizeClassStatus plumbing for
-    // STATUS aggregation, which is orthogonal).
+    // this, so per-class scaling "just works" once the child exists.
+    // Per-class STATUS aggregation uses GetSizeClassStatus plumbing
+    // in scaling::per_class::scale_wps_class (orthogonal concern).
     let autoscaling = Autoscaling {
         metric: "queueDepth".into(),
         // `target_queue_per_replica` is Option<u32>; Autoscaling.

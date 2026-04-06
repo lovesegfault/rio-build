@@ -60,14 +60,15 @@ exclude_re = [
   "metrics::",
   "^describe_",
 
-  # wire/mod.rs:87,158 — `if pad > 0` → `>= 0` in read_bytes/write_bytes.
-  # reason: pad is usize; `>= 0` is always true. The branch body reads/
-  # writes a `&pad_buf[..pad]` slice — with pad=0 that's a 0-byte slice,
-  # which is a no-op for both `read_exact` and `write_all`. Behavior is
-  # byte-identical to the original `> 0` guard.
-  "wire/mod\\.rs:87:12: replace > with >= in read_bytes",
-  "wire/mod\\.rs:158:16: replace > with >= in write_bytes",
-
+  # wire/mod.rs — `if total > MAX_FRAMED_TOTAL` boundary mutations
+  # NOTE: line:col anchors are drift-brittle — re-verify after any
+  # wire/mod.rs edit above the hardcoded lines. A cargo mutants --list
+  # grep-check tripwire is deferred until drift hits in practice.
+  #
+  # (The former pad-guard exclusions at :87/:158 were removed — the
+  # guards themselves were deleted as perf no-ops, eliminating both
+  # the exclusion AND the drift problem.)
+  #
   # wire/mod.rs:230 — `if total > MAX_FRAMED_TOTAL` boundary mutations
   # in the eager `read_framed_stream` (no configurable max, hardcoded
   # 1 GiB).

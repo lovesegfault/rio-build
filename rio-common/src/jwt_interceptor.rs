@@ -580,10 +580,9 @@ mod tests {
     #[test]
     fn load_jwt_pubkey_from_file() {
         let (_, vk) = keypair(0x55);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(vk.as_bytes());
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), format!("{b64}\n")).unwrap();
+        std::fs::write(tmp.path(), encode_pubkey_file(&vk)).unwrap();
 
         let loaded = load_jwt_pubkey(tmp.path()).expect("load from file");
         assert_eq!(loaded.as_bytes(), vk.as_bytes());

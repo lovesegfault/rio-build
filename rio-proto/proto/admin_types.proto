@@ -57,9 +57,9 @@ message ListBuildsRequest {
   uint32 offset = 3;                     // Pagination offset (unstable under concurrent inserts — prefer cursor)
   // Optional: filter by tenant NAME (scheduler resolves to UUID). Empty = all tenants.
   string tenant_filter = 4;
-  // Opaque keyset cursor. base64(version_byte || submitted_at_micros_i64_be || build_id_uuid_16b).
-  // Version prefix = change encoding later without wire break. When set, offset is ignored
-  // (cursor wins). Pass the prior page's next_cursor here to fetch the next page.
+  // Opaque keyset cursor — pass the prior page's next_cursor verbatim.
+  // When set, offset is ignored (cursor wins). Server encodes; clients
+  // treat as an opaque token.
   optional string cursor = 5;
 }
 

@@ -70,6 +70,12 @@
   # plane Deployment — that envoy image is NOT referenced by the chart
   # (it's compiled into the operator as a default) so it's a separate
   # pullImage below.
+  #
+  # NO helm-lint assert for this image (unlike envoy-distroless below):
+  # gateway-helm uses bare tags, no chart-side digest-pin to compare
+  # against. The imageDigest here is ONLY used by dockerTools.pullImage
+  # to verify the layer fetch — a stale digest after a finalImageTag
+  # bump surfaces as an FOD hash mismatch at eval time (already caught).
   envoy-gateway = pkgs.dockerTools.pullImage {
     imageName = "registry-1.docker.io/envoyproxy/gateway";
     imageDigest = "sha256:8bb273728bacf981cb2862ed11a6ba8b70970e3b31e3a00429f34f8478c94b8b";

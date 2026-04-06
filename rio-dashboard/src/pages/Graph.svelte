@@ -174,10 +174,11 @@
     try {
       // Terminal-settle check. `r.nodes.length > 0` guards the trivial
       // every([])→true — an empty response (build not yet populated, or
-      // ListWatcher race) must NOT stop polling. The server's truncated
-      // subset is fine here: if the first 5000 are all terminal the
-      // tail almost certainly is too (scheduler walks the DAG forward).
-      if (r.nodes.length > 0 && r.nodes.every((n) => TERMINAL.has(n.status))) {
+      // ListWatcher race) must NOT stop polling. `!r.truncated` guards
+      // against stopping on a partial view: insertion-order truncation
+      // means roots settle first (normal DAG progress) while the tail
+      // may still be running. Keep polling when truncated.
+      if (!r.truncated && r.nodes.length > 0 && r.nodes.every((n) => TERMINAL.has(n.status))) {
         allTerminal = true;
       }
 

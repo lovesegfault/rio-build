@@ -472,6 +472,20 @@ let
         )
         return build_id
 
+    def grpcurl_json_stream(out: str) -> list[dict]:
+        """Parse grpcurl's concatenated-JSON output (one pretty-printed
+        object per stream message). Returns list of dicts. Empty input →
+        empty list. Leading non-JSON (warnings, kubectl port-forward
+        chatter from 2>&1) is skipped by seeking to the first `{`;
+        inter-object gaps re-seek to the next `{`."""
+        dec, objs = json.JSONDecoder(), []
+        idx = out.find("{")
+        while 0 <= idx < len(out):
+            obj, idx = dec.raw_decode(out, idx)
+            objs.append(obj)
+            idx = out.find("{", idx)
+        return objs
+
     # ── SSH + seed ────────────────────────────────────────────────────
     # fixture.sshKeySetup (NOT common.sshKeySetup): patches the
     # rio-gateway-ssh Secret + rollout-restarts the gateway Deployment.
@@ -1230,16 +1244,8 @@ let
           # grpcurl emits one PRETTY-PRINTED JSON object per stream message
           # (proto3 camelCase, multi-line with indented fields). Parse
           # structurally — substring match on "delete"/"path" is satisfied
-          # by any error like "failed to delete, path unknown". raw_decode
-          # loop handles the multi-line format AND any leading non-JSON
-          # noise from port-forward's stderr (2>&1).
-          dec = json.JSONDecoder()
-          gc_msgs = []
-          idx = result.find("{")
-          while 0 <= idx < len(result):
-              obj, idx = dec.raw_decode(result, idx)
-              gc_msgs.append(obj)
-              idx = result.find("{", idx)
+          # by any error like "failed to delete, path unknown".
+          gc_msgs = grpcurl_json_stream(result)
           complete_msgs = [m for m in gc_msgs if m.get("isComplete")]
           assert complete_msgs, (
               f"expected at least one GCProgress with isComplete=true; "
@@ -1526,14 +1532,8 @@ let
           # proto3 JSON uint64 is a STRING ("1" not 1). pathsCollected
           # EXACTLY "1" is THE assertion: without backdate, it's 0 (or
           # absent — proto3 omits zero-value) and we've proven nothing
-          # about the loop body. Same raw_decode loop as gc-dry-run.
-          dec = json.JSONDecoder()
-          gc_msgs = []
-          idx = result.find("{")
-          while 0 <= idx < len(result):
-              obj, idx = dec.raw_decode(result, idx)
-              gc_msgs.append(obj)
-              idx = result.find("{", idx)
+          # about the loop body.
+          gc_msgs = grpcurl_json_stream(result)
           complete_msgs = [m for m in gc_msgs if m.get("isComplete")]
           assert complete_msgs, (
               f"expected GCProgress.isComplete=true; got {len(gc_msgs)} "
@@ -1726,12 +1726,7 @@ let
                   '{"dry_run": false, "grace_period_hours": 24, "force": true}',
                   "rio.admin.AdminService/TriggerGC",
               )
-              d = json.JSONDecoder()
-              msgs, i = [], out.find("{")
-              while 0 <= i < len(out):
-                  obj, i = d.raw_decode(out, i)
-                  msgs.append(obj)
-                  i = out.find("{", i)
+              msgs = grpcurl_json_stream(out)
               finals = [m for m in msgs if m.get("isComplete")]
               assert finals, f"no isComplete in GC stream: {out[:500]}"
               # proto3 omits zero-value uint64; .get → "0" default.
@@ -1872,15 +1867,7 @@ let
               '{"dry_run": false, "grace_period_hours": 24, "force": true}',
               "rio.admin.AdminService/TriggerGC",
           )
-          # raw_decode loop: grpcurl emits one pretty-printed JSON object
-          # per GCProgress stream message. Same pattern as gc-sweep.
-          dec = json.JSONDecoder()
-          gc_msgs = []
-          idx = result.find("{")
-          while 0 <= idx < len(result):
-              obj, idx = dec.raw_decode(result, idx)
-              gc_msgs.append(obj)
-              idx = result.find("{", idx)
+          gc_msgs = grpcurl_json_stream(result)
           final = [m for m in gc_msgs if m.get("isComplete")][-1]
           # proto3 JSON omits zero-valued uint64 fields. pathsCollected=0
           # → the field is ABSENT, not "0". .get() with default "0".
@@ -1922,13 +1909,7 @@ let
               '{"dry_run": false, "grace_period_hours": 24, "force": true}',
               "rio.admin.AdminService/TriggerGC",
           )
-          dec = json.JSONDecoder()
-          gc_msgs = []
-          idx = result.find("{")
-          while 0 <= idx < len(result):
-              obj, idx = dec.raw_decode(result, idx)
-              gc_msgs.append(obj)
-              idx = result.find("{", idx)
+          gc_msgs = grpcurl_json_stream(result)
           final = [m for m in gc_msgs if m.get("isComplete")][-1]
           assert final.get("pathsCollected") == "2", (
               "after unpin, BOTH dep+consumer should be swept "
@@ -2206,6 +2187,17 @@ let
               "k3s kubectl -n ${ns} get jobs "
               "-l rio.build/pool=ephemeral -o name | wc -l"
           ).strip())
+          # Precondition self-assert BEFORE the check it guards:
+          # jobs_before must be ≥1, otherwise the >= check below is
+          # vacuous (0 >= 0 passes even if nothing happened). Firing
+          # this BEFORE build 2 means failure messages point at the
+          # right problem (build 1 never spawned) instead of the
+          # wrong one (build 2 comparison).
+          assert jobs_before >= 1, (
+              f"PRECONDITION: jobs_before must be ≥1 (build 1 should "
+              f"have spawned one); got {jobs_before}. If 0, build 1 "
+              f"never reached the Job-spawn path."
+          )
 
           # Foreground build this time — we don't need to observe
           # mid-flight state, just that it completes.
@@ -2231,14 +2223,6 @@ let
               f"spawned, possibly old one reaped), got {jobs_after}. "
               f"If jobs_after < jobs_before, build 2 was served by a "
               f"REUSED pod — ephemeral mode is broken."
-          )
-          # Precondition self-assert (guards "proves nothing"):
-          # jobs_before must be ≥1, otherwise the >= check is vacuous
-          # (0 >= 0 passes even if nothing happened).
-          assert jobs_before >= 1, (
-              f"jobs_before must be ≥1 (build 1 should have spawned one); "
-              f"got {jobs_before}. If 0, build 1 never reached the Job-"
-              f"spawn path."
           )
 
           # ── Cleanup ───────────────────────────────────────────────────

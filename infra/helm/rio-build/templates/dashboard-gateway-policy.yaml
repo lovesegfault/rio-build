@@ -95,5 +95,5 @@ spec:
       name: rio-dashboard
   timeout:
     http:
-      streamIdleTimeout: 1h
+      streamIdleTimeout: {{ .Values.dashboard.streamIdleTimeout | default "1h" }}
 {{- end }}

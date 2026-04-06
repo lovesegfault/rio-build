@@ -34,6 +34,7 @@ export type LogStream = {
   readonly done: boolean;
   readonly err: Error | null;
   readonly truncated: boolean;
+  readonly droppedLines: number;
   destroy: () => void;
 };
 
@@ -42,6 +43,7 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
   let done = $state(false);
   let err = $state<Error | null>(null);
   let truncated = $state(false);
+  let droppedLines = $state(0);
   const ctrl = new AbortController();
 
   (async () => {
@@ -49,8 +51,10 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
       // sinceLine: 0n always fetches from the top. The field is uint64 on
       // the wire → bigint in the generated TS. A resume-from-offset would
       // look at `chunk.firstLineNumber + chunk.lines.length` but the
-      // reconnect-on-transient-error story is a later plan; for now the
-      // stream lives and dies with the component.
+      // reconnect-on-transient-error story is not yet scoped (no plan
+      // owns it — would ride along with a P0392-adjacent virtualization
+      // follow-on if one is written). For now the stream lives and dies
+      // with the component.
       const stream = admin.getBuildLogs(
         { buildId, derivationPath: drvPath ?? '', sinceLine: 0n },
         { signal: ctrl.signal },
@@ -83,6 +87,7 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
           const excess = lines.length - (MAX_LINES - DROP_LINES);
           lines.splice(0, excess);
           truncated = true;
+          droppedLines += excess;
         }
         // The scheduler sets is_complete on the final chunk once the
         // build terminates (success or failure). We stop iterating
@@ -121,6 +126,9 @@ export function createLogStream(buildId: string, drvPath?: string): LogStream {
     },
     get truncated() {
       return truncated;
+    },
+    get droppedLines() {
+      return droppedLines;
     },
     destroy: () => ctrl.abort(),
   };

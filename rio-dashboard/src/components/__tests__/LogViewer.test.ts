@@ -142,7 +142,7 @@ describe('LogViewer', () => {
     const { container } = render(LogViewer, {
       props: {
         buildId: 'b-override',
-        viewportOverride: { start: 400, end: 430 },
+        _viewportOverride: { start: 400, end: 430 },
       },
     });
 
@@ -209,7 +209,7 @@ describe('LogViewer', () => {
         destroy: vi.fn(),
       });
       const { container } = render(LogViewer, {
-        props: { buildId: 'b-a11y', viewportOverride: { start: 10, end: 20 } },
+        props: { buildId: 'b-a11y', _viewportOverride: { start: 10, end: 20 } },
       });
       const spacers = container.querySelectorAll('.spacer');
       const top = spacers[0] as HTMLElement;

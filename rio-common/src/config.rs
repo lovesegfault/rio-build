@@ -37,6 +37,35 @@
 //!
 //! The two-struct split makes each side clean: clap sees Optional,
 //! serde sees Required-With-Default, and figment bridges them.
+//!
+//! # Standing-guard tests
+//!
+//! Each binary's `main.rs` (or `config.rs` for rio-worker) carries a
+//! pair of `figment::Jail` tests: `all_subconfigs_roundtrip_toml` (writes
+//! a TOML with every known sub-config table, asserts each field loads)
+//! and `all_subconfigs_default_when_absent` (empty TOML → compiled
+//! defaults hold). These catch the P0219 failure mode: a builder
+//! `with_X()` method exists but `Config` has no corresponding field, so
+//! TOML-driven deployments silently get the hardcoded default.
+//!
+//! The test scaffolding (`#[test]` + `figment::Jail::expect_with`) is
+//! identical across all 5 crates. NOT macro-extracted: the `ADD IT HERE`
+//! edit-point is the entire purpose — making it obvious where to add the
+//! next sub-config's roundtrip assertion. Each crate's banner is a
+//! 1-line pointer to this section.
+//!
+//! ## Known limitation: ADD-IT-HERE is advisory, not enforced
+//!
+//! The standing-guard pair asserts that KNOWN sub-config tables
+//! roundtrip; it does NOT catch a NEW sub-config you forgot to add to
+//! the test. Worker's test already omits scalar fields
+//! (`fuse_cache_size_gb`, `log_rate_limit`, `daemon_timeout_secs`)
+//! setting the precedent. A build.rs grep-vs-TOML-literal cross-check
+//! was considered and rejected (overkill for 5 crates; would itself
+//! drift). When adding a `Config.newfield` of non-primitive type
+//! (sub-table), you MUST update `all_subconfigs_roundtrip_toml` +
+//! `_default_when_absent` in that crate's main.rs. The doc-comment is
+//! the enforcement.
 
 use std::path::PathBuf;
 
@@ -132,6 +161,10 @@ pub fn ensure_required_path(
     field: &str,
     component: &str,
 ) -> anyhow::Result<()> {
+    // Lossy is fine here: this is a trim-then-empty check for operator-
+    // facing error messages, not a parse path. A non-UTF-8 config path
+    // would fail at file-open anyway — the empty-check is the point.
+    #[allow(clippy::disallowed_methods)]
     ensure_required(&value.to_string_lossy(), field, component)
 }
 

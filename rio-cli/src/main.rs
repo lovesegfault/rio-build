@@ -510,6 +510,12 @@ async fn main() -> anyhow::Result<()> {
         // Dispatched above (before gRPC connect). The early match
         // consumes the Wps variant and returns; this arm is reached
         // only if the dispatch order is broken — fail loud.
+        //
+        // NOT splitting Cmd into KubeCmd|GrpcCmd yet: single kube-
+        // only variant, and the unreachable! fails loud on first
+        // invocation (not silent). When a SECOND kube-only
+        // subcommand lands (e.g., a WorkerPool describe that
+        // doesn't need admin RPC), reconsider the split.
         Cmd::Wps(_) => unreachable!("Wps handled before gRPC connect"),
     }
     Ok(())

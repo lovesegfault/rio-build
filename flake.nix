@@ -815,12 +815,12 @@
                     --set-string jwt.signingSeed=dGVzdA== \
                     --set global.image.tag=test \
                     --set postgresql.enabled=false \
-                    > /tmp/jwt-on.yaml
+                    > $TMPDIR/jwt-on.yaml
 
                   # 3 = scheduler + store + gateway. Each gets exactly one
                   # RIO_JWT__KEY_PATH env var. >3 would mean a template got
                   # included twice (leaky nindent loop); <3 = missing include.
-                  n=$(grep -c RIO_JWT__KEY_PATH /tmp/jwt-on.yaml)
+                  n=$(grep -c RIO_JWT__KEY_PATH $TMPDIR/jwt-on.yaml)
                   test "$n" -eq 3 || {
                     echo "FAIL: expected 3 RIO_JWT__KEY_PATH (sched+store+gw), got $n" >&2
                     exit 1
@@ -835,7 +835,7 @@
                     yq "select(.kind==\"Deployment\" and .metadata.name==\"$dep\")
                         | .spec.template.spec.volumes[]
                         | select(.name==\"jwt-pubkey\")
-                        | .configMap.name" /tmp/jwt-on.yaml \
+                        | .configMap.name" $TMPDIR/jwt-on.yaml \
                       | grep -qx rio-jwt-pubkey || {
                       echo "FAIL: $dep missing jwt-pubkey configMap volume" >&2
                       exit 1
@@ -844,7 +844,7 @@
                     yq "select(.kind==\"Deployment\" and .metadata.name==\"$dep\")
                         | .spec.template.spec.containers[0].volumeMounts[]
                         | select(.name==\"jwt-pubkey\")
-                        | .mountPath" /tmp/jwt-on.yaml \
+                        | .mountPath" $TMPDIR/jwt-on.yaml \
                       | grep -qx /etc/rio/jwt || {
                       echo "FAIL: $dep missing jwt-pubkey volumeMount at /etc/rio/jwt" >&2
                       exit 1
@@ -853,7 +853,7 @@
                     yq "select(.kind==\"Deployment\" and .metadata.name==\"$dep\")
                         | .spec.template.spec.containers[0].env[]
                         | select(.name==\"RIO_JWT__KEY_PATH\")
-                        | .value" /tmp/jwt-on.yaml \
+                        | .value" $TMPDIR/jwt-on.yaml \
                       | grep -qx /etc/rio/jwt/ed25519_pubkey || {
                       echo "FAIL: $dep RIO_JWT__KEY_PATH != /etc/rio/jwt/ed25519_pubkey" >&2
                       exit 1
@@ -864,7 +864,7 @@
                   yq 'select(.kind=="Deployment" and .metadata.name=="rio-gateway")
                       | .spec.template.spec.volumes[]
                       | select(.name=="jwt-signing")
-                      | .secret.secretName' /tmp/jwt-on.yaml \
+                      | .secret.secretName' $TMPDIR/jwt-on.yaml \
                     | grep -qx rio-jwt-signing || {
                     echo "FAIL: gateway missing jwt-signing Secret volume" >&2
                     exit 1
@@ -872,7 +872,7 @@
                   yq 'select(.kind=="Deployment" and .metadata.name=="rio-gateway")
                       | .spec.template.spec.containers[0].env[]
                       | select(.name=="RIO_JWT__KEY_PATH")
-                      | .value' /tmp/jwt-on.yaml \
+                      | .value' $TMPDIR/jwt-on.yaml \
                     | grep -qx /etc/rio/jwt/ed25519_seed || {
                     echo "FAIL: gateway RIO_JWT__KEY_PATH != /etc/rio/jwt/ed25519_seed" >&2
                     exit 1
@@ -887,10 +887,10 @@
                     --set global.image.tag=test \
                     --set tls.enabled=false \
                     --set postgresql.enabled=false \
-                    > /tmp/jwt-off.yaml
-                  ! grep -q 'RIO_JWT__KEY_PATH\|jwt-pubkey\|jwt-signing' /tmp/jwt-off.yaml || {
+                    > $TMPDIR/jwt-off.yaml
+                  ! grep -q 'RIO_JWT__KEY_PATH\|jwt-pubkey\|jwt-signing' $TMPDIR/jwt-off.yaml || {
                     echo "FAIL: jwt mount rendered with jwt.enabled=false (default)" >&2
-                    grep -n 'RIO_JWT__KEY_PATH\|jwt-pubkey\|jwt-signing' /tmp/jwt-off.yaml >&2
+                    grep -n 'RIO_JWT__KEY_PATH\|jwt-pubkey\|jwt-signing' $TMPDIR/jwt-off.yaml >&2
                     exit 1
                   }
 
@@ -1440,6 +1440,11 @@
                 name = "check-mutants-marker";
                 entry = toString (
                   pkgs.writeShellScript "check-mutants-marker" ''
+                    # Marker verified for cargo-mutants 26.2.0 —
+                    # MUTATION_MARKER_COMMENT const at src/mutate.rs
+                    # upstream. If a cargo-mutants bump changes the
+                    # marker string, this hook SILENTLY passes —
+                    # re-verify on major-version bumps.
                     # Only scan .rs files (cargo-mutants only touches Rust).
                     # grep -l for file-list, exit 1 if any match.
                     if git diff --cached --name-only -- '*.rs' \

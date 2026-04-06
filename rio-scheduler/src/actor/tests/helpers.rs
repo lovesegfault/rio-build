@@ -198,9 +198,12 @@ pub(crate) async fn setup_with_worker(
     Ok((db, handle, task, rx))
 }
 
-/// Connect a worker (stream + heartbeat) so it becomes fully registered.
-/// Returns the mpsc::Receiver for scheduler→worker messages.
-pub(crate) async fn connect_worker(
+/// Connect a worker (stream + heartbeat) WITHOUT the automatic
+/// `PrefetchComplete` ACK. For warm-gate tests that need to observe
+/// the initial `PrefetchHint` arrival and/or prove dispatch blocks
+/// until the ACK. Shared `Heartbeat` field list — when
+/// `ActorCommand::Heartbeat` grows a field, one edit not two.
+pub(crate) async fn connect_worker_no_ack(
     handle: &ActorHandle,
     worker_id: &str,
     system: &str,
@@ -226,6 +229,18 @@ pub(crate) async fn connect_worker(
             running_builds: vec![],
         })
         .await?;
+    Ok(stream_rx)
+}
+
+/// Connect a worker (stream + heartbeat) so it becomes fully registered.
+/// Returns the mpsc::Receiver for scheduler→worker messages.
+pub(crate) async fn connect_worker(
+    handle: &ActorHandle,
+    worker_id: &str,
+    system: &str,
+    max_builds: u32,
+) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
+    let stream_rx = connect_worker_no_ack(handle, worker_id, system, max_builds).await?;
     // Warm-gate: unconditionally ACK so the worker flips warm=true
     // regardless of whether on_worker_registered sent an initial
     // PrefetchHint (it only does so when the ready queue is non-

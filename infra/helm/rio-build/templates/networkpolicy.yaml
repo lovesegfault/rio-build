@@ -206,7 +206,7 @@ spec:
       app.kubernetes.io/name: rio-dashboard
   policyTypes: [Egress]
   egress:
-    # Can't resolve rio-dashboard-envoy.envoy-gateway-system.svc
+    # Can't resolve rio-dashboard-envoy.{{ .Values.dashboard.envoyGatewayNamespace }}.svc
     # without CoreDNS.
     - to:
         - namespaceSelector:

@@ -72,20 +72,33 @@
     {/if}
   </dl>
 
-  <nav class="tabs">
+  <nav class="tabs" role="tablist">
     <button
       type="button"
+      role="tab"
+      id="tab-logs"
+      aria-selected={activeTab === 'logs'}
+      aria-controls="tabpanel-body"
       class:active={activeTab === 'logs'}
       onclick={() => (activeTab = 'logs')}>Logs</button
     >
     <button
       type="button"
+      role="tab"
+      id="tab-graph"
+      aria-selected={activeTab === 'graph'}
+      aria-controls="tabpanel-body"
       class:active={activeTab === 'graph'}
       onclick={() => (activeTab = 'graph')}>Graph</button
     >
   </nav>
 
-  <section class="tab-body">
+  <section
+    class="tab-body"
+    role="tabpanel"
+    id="tabpanel-body"
+    aria-labelledby="tab-{activeTab}"
+  >
     {#if activeTab === 'logs'}
       <!-- Keyed on buildId so switching builds (deep-link → different
            drawer target) tears down the old stream and starts a fresh

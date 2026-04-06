@@ -241,6 +241,18 @@ impl DagActor {
         self.reassign_derivations(&to_reassign, Some(worker_id))
             .await;
 
+        // Dashboard: running count dropped by to_reassign.len();
+        // assigned_workers set lost this worker. Without emit_progress
+        // here, a quiet build shows stale state until the next
+        // unrelated dispatch/completion.
+        let affected: std::collections::HashSet<Uuid> = to_reassign
+            .iter()
+            .flat_map(|h| self.get_interested_builds(h))
+            .collect();
+        for build_id in affected {
+            self.emit_progress(build_id);
+        }
+
         if was_registered {
             metrics::gauge!("rio_scheduler_workers_active").decrement(1.0);
         }
