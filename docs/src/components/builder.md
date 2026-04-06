@@ -488,6 +488,9 @@ When the nix-daemon returns `MiscFailure` with an error message indicating a mis
 r[builder.shutdown.sigint]
 The builder handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path. Returning from `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit handlers fire (LLVM profraw flush).
 
+r[builder.shutdown.idle-no-reregister]
+On SIGTERM with an idle build slot, the builder MUST break the reconnect loop without sending a fresh `ExecutorRegister`. The reconnect-under-drain machinery exists so an in-flight build's `CompletionReport` reaches the (possibly new) leader; an idle slot has nothing to report. Re-registering bumps the scheduler's `workers_active`, and the heartbeat task (aborted only after the loop exits) keeps `last_heartbeat` fresh until the process actually exits --- under coverage instrumentation the profraw atexit write delays that by ~80s (I-195, GHA 24018216226). The same fast-path applies on any subsequent `'reconnect` iteration where `draining=true` and the slot has since gone idle.
+
 r[builder.ephemeral.exit-aborts-heartbeat]
 On exit from the reconnect loop (ephemeral single-shot done, idle timeout, or drain complete), the builder MUST abort the heartbeat task before `run_drain()`. A live heartbeat with a closed BuildExecution stream presents to the scheduler as an undispatchable zombie executor (I-142). `run_drain()` itself MUST be bounded by a hard timeout (5s) --- it is best-effort deregistration, redundant with the stream-close `ExecutorDisconnected` path, and must not block the process from reaching `drop(fuse_session)`.
 

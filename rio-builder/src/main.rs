@@ -380,32 +380,13 @@ async fn main() -> anyhow::Result<()> {
     // clock; we want to react immediately, not after the next gap in
     // assignments.
     'reconnect: loop {
-        // I-063: drain transition. swap is the test-and-set — only the
-        // FIRST iteration after SIGTERM enters the body. Hoisted to the
+        // I-063 drain transition + I-195 idle fast-path. Hoisted to the
         // top of 'reconnect (not inside the inner select) so it fires
         // regardless of which select arm was active when SIGTERM
         // arrived: all three `shutdown.cancelled()` arms below
-        // `continue 'reconnect` to reach this. The reconnect loop then
-        // KEEPS RUNNING — completions for in-flight builds reach the
-        // current leader (even if the scheduler restarts under us) via
-        // the same relay machinery as steady-state. Exit only when
-        // `drain_done` fires (in_flight=0).
-        if shutdown.is_cancelled() && !draining.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            info!(
-                in_flight = u8::from(slot.is_busy()),
-                "shutdown signal received, draining \
-                 (stream stays connected for completion reports)"
-            );
-            // Watcher: same wait_idle synchronization the ephemeral
-            // path uses. Spawned (not awaited): the reconnect loop
-            // keeps the stream alive; the select arms below pick up
-            // the notification.
-            let watch_slot = Arc::clone(&slot);
-            let done = Arc::clone(&drain_done);
-            tokio::spawn(async move {
-                watch_slot.wait_idle().await;
-                done.notify_one();
-            });
+        // `continue 'reconnect` to reach this.
+        if reconnect_drain_gate(&shutdown, &draining, &slot, &drain_done).is_break() {
+            break 'reconnect;
         }
 
         // Fresh per-connection outbound channel. The relay pumps
@@ -812,6 +793,63 @@ async fn main() -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     Ok(())
+}
+
+/// Top-of-`'reconnect` drain handling. Called each iteration BEFORE
+/// the fresh `ExecutorRegister` send.
+///
+/// I-063 drain transition: on the FIRST call after SIGTERM (`swap` is
+/// the test-and-set), set `draining=true` and spawn the idle-watcher
+/// → `drain_done` notifier. The reconnect loop then KEEPS RUNNING —
+/// completions for an in-flight build reach the current leader (even
+/// across scheduler restart) via the same relay machinery as steady-
+/// state. Exit when `drain_done` fires (in_flight=0).
+///
+/// I-195 idle fast-path: returns `Break` when `draining` AND the slot
+/// is idle. The reconnect-under-drain machinery exists so an in-flight
+/// build's CompletionReport reaches the leader; an idle slot has
+/// nothing to report. Re-registering would bump the scheduler's
+/// `workers_active`, and the heartbeat task (aborted only AFTER the
+/// loop exits) keeps `last_heartbeat` fresh until process exit. Under
+/// coverage instrumentation the profraw atexit write delays exit by
+/// ~80s (GHA 24018216226) — `cov_factor` in `lifecycle.nix` band-
+/// aided that; this is the structural fix. Covers both the first
+/// SIGTERM iteration with an already-idle slot AND any later
+/// iteration where the slot has since gone idle (e.g. build completed
+/// during a stream-retry sleep).
+// r[impl builder.shutdown.idle-no-reregister]
+fn reconnect_drain_gate(
+    shutdown: &rio_common::signal::Token,
+    draining: &std::sync::atomic::AtomicBool,
+    slot: &Arc<rio_builder::runtime::BuildSlot>,
+    drain_done: &Arc<tokio::sync::Notify>,
+) -> std::ops::ControlFlow<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if shutdown.is_cancelled() && !draining.swap(true, Relaxed) {
+        info!(
+            in_flight = u8::from(slot.is_busy()),
+            "shutdown signal received, draining \
+             (stream stays connected for completion reports)"
+        );
+        // Watcher: same wait_idle synchronization the ephemeral path
+        // uses. Spawned (not awaited): the reconnect loop keeps the
+        // stream alive; the select arms pick up the notification.
+        // Spawned even when idle (the Break below skips the select):
+        // wait_idle returns immediately, notify_one stores one permit
+        // that nothing consumes — harmless, and keeps the busy/idle
+        // paths uniform for the watcher's lifecycle.
+        let watch_slot = Arc::clone(slot);
+        let done = Arc::clone(drain_done);
+        tokio::spawn(async move {
+            watch_slot.wait_idle().await;
+            done.notify_one();
+        });
+    }
+    if draining.load(Relaxed) && !slot.is_busy() {
+        info!("draining with idle slot; exiting reconnect loop without re-register");
+        return std::ops::ControlFlow::Break(());
+    }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Exit-time deregister. The wait-for-in-flight is already done by
@@ -1602,6 +1640,71 @@ mod tests {
             .expect("wait_idle wakes when guard drops")
             .expect("watcher didn't panic");
         assert!(slot.running().is_none());
+    }
+
+    /// I-195: SIGTERM with an idle slot must NOT re-register. The
+    /// reconnect-under-drain machinery exists for in-flight
+    /// CompletionReports; an idle slot has nothing to drain. `Break`
+    /// here means the call site `break 'reconnect`s BEFORE the
+    /// `ExecutorRegister` send → scheduler never sees a spurious
+    /// `workers_active` bump that lingers through profraw atexit.
+    ///
+    /// `#[tokio::test]` for the watcher `tokio::spawn` inside the
+    /// gate; the gate function itself is sync.
+    // r[verify builder.shutdown.idle-no-reregister]
+    #[tokio::test]
+    async fn drain_gate_idle_slot_breaks_without_reregister() {
+        use rio_builder::runtime::BuildSlot;
+        use std::ops::ControlFlow;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+        let shutdown = rio_common::signal::Token::new();
+        let draining = AtomicBool::new(false);
+        let slot = Arc::new(BuildSlot::default());
+        let drain_done = Arc::new(tokio::sync::Notify::new());
+
+        // Steady state: no SIGTERM → Continue (proceed to Register).
+        assert_eq!(
+            reconnect_drain_gate(&shutdown, &draining, &slot, &drain_done),
+            ControlFlow::Continue(()),
+            "no SIGTERM → reconnect loop opens stream as normal"
+        );
+        assert!(!draining.load(Relaxed));
+
+        // SIGTERM, idle slot → Break on the FIRST gate call. This is
+        // the I-195 fix: pre-fix, the loop would Continue here, send
+        // ExecutorRegister, THEN break via drain_done.
+        shutdown.cancel();
+        assert_eq!(
+            reconnect_drain_gate(&shutdown, &draining, &slot, &drain_done),
+            ControlFlow::Break(()),
+            "SIGTERM + idle slot → break before ExecutorRegister"
+        );
+        assert!(draining.load(Relaxed), "drain transition still fires");
+
+        // SIGTERM, BUSY slot → Continue (in-flight build needs the
+        // stream for its CompletionReport).
+        let shutdown2 = rio_common::signal::Token::new();
+        let draining2 = AtomicBool::new(false);
+        let slot2 = Arc::new(BuildSlot::default());
+        let guard = slot2.try_claim("/nix/store/aaa-x.drv").unwrap();
+        shutdown2.cancel();
+        assert_eq!(
+            reconnect_drain_gate(&shutdown2, &draining2, &slot2, &drain_done),
+            ControlFlow::Continue(()),
+            "SIGTERM + busy slot → keep stream open for completion"
+        );
+        assert!(draining2.load(Relaxed));
+
+        // Subsequent iteration: build completed during a retry sleep,
+        // slot now idle, draining already true → Break (don't
+        // re-register just to immediately drain_done).
+        drop(guard);
+        assert_eq!(
+            reconnect_drain_gate(&shutdown2, &draining2, &slot2, &drain_done),
+            ControlFlow::Break(()),
+            "draining + slot went idle on later iteration → break"
+        );
     }
 
     /// Missed-notification race: guard drops BETWEEN the watcher's
