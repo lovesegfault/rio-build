@@ -51,7 +51,7 @@ mod manifest;
 use builders::*;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// Finalizer name. Kubebuilder convention: `{kind}.{group}/{suffix}`
 /// — the kind is the authoritative part (which controller owns this),

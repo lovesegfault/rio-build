@@ -195,16 +195,20 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::crds::builderpoolset::{BuilderPoolSetSpec, PoolTemplate};
     use k8s_openapi::api::core::v1::ResourceRequirements;
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
     /// Construct a test WPS with the given class names. Each class
     /// gets a dummy (empty) ResourceRequirements — the builder
     /// doesn't validate it (apiserver does on apply), so empty is
     /// fine for pure-struct unit tests.
-    fn test_wps_with_classes(names: &[&str]) -> BuilderPoolSet {
+    ///
+    /// `pub(crate)`: the mock-apiserver tests in `mod.rs` reuse
+    /// this (same pattern as `builderpool/tests/mod.rs` fixtures).
+    pub(crate) fn test_wps_with_classes(names: &[&str]) -> BuilderPoolSet {
         let classes: Vec<SizeClassSpec> = names
             .iter()
             .enumerate()
@@ -358,6 +362,82 @@ mod tests {
             // this to filter queue depth per-class.
             assert_eq!(child.spec.size_class, class.name);
         }
+    }
+
+    /// I-119 regression: `class.resources` propagates to the child,
+    /// AND mutating the BPS class resources yields a child with the
+    /// NEW resources. The reconciler SSA-applies the result of this
+    /// builder every reconcile (mod.rs `apply()`); SSA with the same
+    /// field manager + force replaces the previously-owned subtree.
+    /// So "rebuilt child has new resources" + "apply() always SSA-
+    /// patches" (covered by `apply_ssa_patches_child_resources` in
+    /// mod.rs) together prove update-on-change.
+    ///
+    /// Live symptom that prompted this: BPS edited `tiny.resources.
+    /// requests.ephemeral-storage` 10Gi→2Gi; child `x86-64-tiny`
+    /// stayed at 10Gi. The builder was correct; the test pins it.
+    #[test]
+    fn class_resources_propagate_on_rebuild() {
+        let mut wps = test_wps_with_classes(&["tiny"]);
+        let requests = |mem: &str| {
+            Some(std::collections::BTreeMap::from([(
+                "memory".to_string(),
+                Quantity(mem.to_string()),
+            )]))
+        };
+
+        // First build: 1Gi.
+        wps.spec.classes[0].resources = ResourceRequirements {
+            requests: requests("1Gi"),
+            ..Default::default()
+        };
+        let child = build_child_builderpool(&wps, &wps.spec.classes[0]).unwrap();
+        assert_eq!(
+            child
+                .spec
+                .resources
+                .as_ref()
+                .and_then(|r| r.requests.as_ref())
+                .and_then(|r| r.get("memory")),
+            Some(&Quantity("1Gi".into())),
+            "first build: class.resources → child.spec.resources"
+        );
+
+        // Mutate BPS class resources → 2Gi → rebuild.
+        wps.spec.classes[0].resources = ResourceRequirements {
+            requests: requests("2Gi"),
+            ..Default::default()
+        };
+        let child = build_child_builderpool(&wps, &wps.spec.classes[0]).unwrap();
+        assert_eq!(
+            child
+                .spec
+                .resources
+                .as_ref()
+                .and_then(|r| r.requests.as_ref())
+                .and_then(|r| r.get("memory")),
+            Some(&Quantity("2Gi".into())),
+            "rebuild after spec edit: child.spec.resources reflects NEW value"
+        );
+
+        // The SSA wire body (what apply() sends) must serialize the
+        // resources too — apiVersion+kind for SSA, spec.resources
+        // for the actual update. A `skip_serializing_if` accident on
+        // BuilderPoolSpec.resources would make this silently no-op
+        // on the apiserver while the struct-level assert above still
+        // passed.
+        let body = serde_json::to_value(&child).unwrap();
+        assert_eq!(
+            body.get("apiVersion").and_then(|v| v.as_str()),
+            Some("rio.build/v1alpha1"),
+            "SSA body needs GVK"
+        );
+        assert_eq!(
+            body.pointer("/spec/resources/requests/memory")
+                .and_then(|v| v.as_str()),
+            Some("2Gi"),
+            "SSA body carries spec.resources (not skipped/nulled)"
+        );
     }
 
     /// Empty template.image is an InvalidSpec error, not a

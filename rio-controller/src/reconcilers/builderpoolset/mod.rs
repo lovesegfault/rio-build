@@ -456,7 +456,135 @@ pub fn error_policy(wps: Arc<BuilderPoolSet>, err: &Error, ctx: Arc<Ctx>) -> Act
 // r[verify ctrl.wps.cutoff-status]
 #[cfg(test)]
 mod tests {
+    use super::builders::tests::test_wps_with_classes;
     use super::*;
+    use crate::fixtures::{ApiServerVerifier, Scenario};
+    use crate::reconcilers::builderpool::tests::test_ctx;
+    use k8s_openapi::api::core::v1::ResourceRequirements;
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+    /// Scenarios for one `apply()` pass: per-class child PATCH, then
+    /// the prune LIST. The admin RPC (`get_size_class_status`) hits
+    /// the dead `127.0.0.1:1` channel from `test_ctx` → Err → status
+    /// patch skipped (best-effort by design), so no further scenarios.
+    ///
+    /// `body_contains` on the child PATCH asserts the SSA body
+    /// carries the resource value — this is the I-119 regression
+    /// hook (a create-only path or a serialization skip would fail
+    /// here on the second reconcile).
+    fn apply_scenarios(child_names: &[&str], body_contains: &'static str) -> Vec<Scenario> {
+        let mut s: Vec<Scenario> = child_names
+            .iter()
+            .map(|name| Scenario {
+                method: http::Method::PATCH,
+                path_contains: Box::leak(format!("/builderpools/{name}").into_boxed_str()),
+                body_contains: Some(body_contains),
+                status: 200,
+                // Response is parsed but unused by apply(); minimal
+                // valid BuilderPool envelope.
+                body_json: serde_json::json!({
+                    "apiVersion": "rio.build/v1alpha1",
+                    "kind": "BuilderPool",
+                    "metadata": { "name": name, "namespace": "rio" },
+                    "spec": {
+                        "replicas": { "min": 0, "max": 1 },
+                        "autoscaling": { "metric": "queueDepth", "targetValue": 1 },
+                        "systems": ["x86_64-linux"],
+                        "sizeClass": name,
+                        "image": "x",
+                    },
+                })
+                .to_string(),
+            })
+            .collect();
+        // prune_stale_children LIST — empty: nothing to prune.
+        s.push(Scenario::ok(
+            http::Method::GET,
+            "/builderpools?",
+            serde_json::json!({
+                "apiVersion": "rio.build/v1alpha1",
+                "kind": "BuilderPoolList",
+                "items": [],
+            })
+            .to_string(),
+        ));
+        s
+    }
+
+    /// I-119: `apply()` SSA-patches child BuilderPools every
+    /// reconcile, so a `spec.classes[].resources` edit on the
+    /// parent propagates on the NEXT reconcile (not just on first
+    /// create). Two reconciles back-to-back with different memory
+    /// values; assert the patch body sent to the apiserver carries
+    /// the per-reconcile value AND that the request is SSA
+    /// (`fieldManager=` + `force=true` in the query).
+    ///
+    /// Live symptom: BPS edited tiny→2Gi, child stayed 10Gi. This
+    /// test proves the controller sends the right patch; if the
+    /// child still doesn't update on a real cluster, the cause is
+    /// outside this reconciler (stale image / CRD schema).
+    #[tokio::test]
+    async fn apply_ssa_patches_child_resources() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let ctx = test_ctx(client);
+
+        let mut wps = test_wps_with_classes(&["tiny"]);
+        let set_mem = |wps: &mut BuilderPoolSet, mem: &str| {
+            wps.spec.classes[0].resources = ResourceRequirements {
+                requests: Some(std::collections::BTreeMap::from([(
+                    "memory".to_string(),
+                    Quantity(mem.to_string()),
+                )])),
+                ..Default::default()
+            };
+        };
+
+        // Two reconciles' worth of scenarios in one verifier run
+        // (run() consumes self). First pass asserts body has 1Gi;
+        // second pass asserts 2Gi. A create-only-if-missing path
+        // (the I-119 bug class) would either skip the second PATCH
+        // (verifier panics on unconsumed scenario) or send a stale
+        // body — both fail here.
+        let mut scenarios = apply_scenarios(&["test-wps-tiny"], r#""memory":"1Gi""#);
+        scenarios.extend(apply_scenarios(&["test-wps-tiny"], r#""memory":"2Gi""#));
+        let guard = verifier.run(scenarios);
+
+        // ---- First reconcile: 1Gi ----
+        set_mem(&mut wps, "1Gi");
+        apply(Arc::new(wps.clone()), &ctx)
+            .await
+            .expect("first apply ok");
+
+        // ---- Second reconcile: 2Gi (parent spec edited) ----
+        set_mem(&mut wps, "2Gi");
+        apply(Arc::new(wps), &ctx).await.expect("second apply ok");
+
+        guard.verified().await;
+    }
+
+    /// `apply()` uses server-side apply for child patches:
+    /// `fieldManager=rio-controller-wps` + `force=true` in the
+    /// query string. SSA is what makes the loop create-OR-update
+    /// idempotent — a regression to POST/create or merge-patch
+    /// would break I-119's update-on-change guarantee even if
+    /// `apply_ssa_patches_child_resources` kept passing (a mock
+    /// can't tell merge-patch from SSA by body alone).
+    #[tokio::test]
+    async fn apply_uses_server_side_apply() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let ctx = test_ctx(client);
+        let wps = test_wps_with_classes(&["tiny"]);
+
+        let mut scenarios = apply_scenarios(&["test-wps-tiny"], r#""kind":"BuilderPool""#);
+        // Override path_contains on the child PATCH to assert the
+        // SSA query param. Substring match (Scenario semantics) so
+        // param order doesn't matter.
+        scenarios[0].path_contains = Box::leak(format!("fieldManager={MANAGER}").into_boxed_str());
+        let guard = verifier.run(scenarios);
+
+        apply(Arc::new(wps), &ctx).await.expect("apply ok");
+        guard.verified().await;
+    }
 
     fn test_class_status(name: &str, cutoff: f64, queued: u64) -> ClassStatus {
         ClassStatus {
