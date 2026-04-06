@@ -17,4 +17,28 @@ service SchedulerService {
 
   // Cancel a running or pending build.
   rpc CancelBuild(rio.types.CancelBuildRequest) returns (rio.types.CancelBuildResponse);
+
+  // Resolve a tenant name to its UUID. Called by the gateway during
+  // SSH auth_publickey to get the UUID for JWT Claims.sub — the
+  // gateway is PG-free (r[sched.tenant.resolve]) so it can't query
+  // the tenants table directly. One round-trip per SSH connect, not
+  // per-request. InvalidArgument on unknown name; empty name is
+  // caller-side gated (gateway doesn't call for empty comment).
+  rpc ResolveTenant(ResolveTenantRequest) returns (ResolveTenantResponse);
+}
+
+message ResolveTenantRequest {
+  // Tenant name from the gateway's authorized_keys entry comment.
+  // Same value that would go in SubmitBuildRequest.tenant_name in
+  // dual-mode fallback. Non-empty (gateway gates empty comment →
+  // single-tenant mode → no JWT mint, no resolve call).
+  string tenant_name = 1;
+}
+
+message ResolveTenantResponse {
+  // UUID in hyphenated string form. Parsed by the gateway into
+  // uuid::Uuid for Claims.sub. String (not bytes) because that's
+  // the tenants.tenant_id column's text representation and it's
+  // human-readable in gRPC traces.
+  string tenant_id = 1;
 }

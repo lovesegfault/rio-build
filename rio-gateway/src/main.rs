@@ -52,6 +52,12 @@ struct Config {
     /// = plaintext (dev mode). The gateway's INCOMING connections
     /// are SSH — TLS doesn't apply there.
     tls: rio_common::tls::TlsConfig,
+    /// JWT issuance. `key_path` → K8s Secret mount at
+    /// `/etc/rio/jwt/ed25519_seed` (see helm jwt-signing-secret.yaml).
+    /// Unset = JWT disabled (dual-mode SSH-comment fallback path).
+    /// Env: `RIO_JWT__KEY_PATH`, `RIO_JWT__REQUIRED`,
+    /// `RIO_JWT__RESOLVE_TIMEOUT_MS`.
+    jwt: rio_common::config::JwtConfig,
     /// Seconds to wait after SIGTERM between health=NOT_SERVING and
     /// stopping the SSH accept loop. Gives kubelet readinessProbe
     /// (periodSeconds: 5) + NLB target deregistration time. 0 = no
@@ -81,6 +87,7 @@ impl Default for Config {
             // pattern keeps it discoverable without a doc lookup.
             health_addr: "0.0.0.0:9190".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
+            jwt: rio_common::config::JwtConfig::default(),
             drain_grace_secs: 6,
         }
     }
@@ -337,7 +344,55 @@ async fn main() -> anyhow::Result<()> {
     let host_key = rio_gateway::load_or_generate_host_key(&cfg.host_key)?;
     let authorized_keys = rio_gateway::load_authorized_keys(&cfg.authorized_keys)?;
 
+    // JWT signing key — K8s Secret mount. File format: 32-byte ed25519
+    // seed, base64'd (the operator's `openssl rand -base64 32` output,
+    // Secret-mounted). NOT PKCS#8 DER — SigningKey::from_bytes takes
+    // raw seed. See helm templates/jwt-signing-secret.yaml.
+    //
+    // required=true + key_path=None is a misconfiguration: can't mint,
+    // can't degrade → every SSH connect would be rejected. Fail loud at
+    // startup (clear error) instead of rejecting every connection at
+    // runtime (operator wonders why SSH is broken).
+    anyhow::ensure!(
+        !(cfg.jwt.required && cfg.jwt.key_path.is_none()),
+        "jwt.required=true but jwt.key_path is unset — cannot mint JWTs, \
+         would reject every SSH connection (set RIO_JWT__KEY_PATH or \
+         unset RIO_JWT__REQUIRED)"
+    );
+
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys);
+    let server = match &cfg.jwt.key_path {
+        None => {
+            info!("JWT issuance disabled (no key_path); dual-mode SSH-comment fallback");
+            server
+        }
+        Some(path) => {
+            // Same parse shape as load_jwt_pubkey but for the SIGNING
+            // side: trim_ascii for ConfigMap/Secret mount trailing \n,
+            // base64-decode, 32-byte check, SigningKey::from_bytes.
+            // Not extracted to rio-common because the gateway is the
+            // ONLY process that holds the signing key (asymmetric:
+            // scheduler/store only get the pubkey). A "shared" helper
+            // for a single call site is abstraction overhead.
+            use base64::Engine;
+            let raw = std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("read JWT signing seed from {}: {e}", path.display())
+            })?;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(raw.trim_ascii())
+                .map_err(|e| anyhow::anyhow!("JWT signing seed base64 decode: {e}"))?;
+            let arr: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!(
+                    "JWT signing seed must be exactly 32 bytes after base64 decode, got {} \
+                     (expected raw ed25519 seed, not PKCS#8 DER)",
+                    v.len()
+                )
+            })?;
+            let key = ed25519_dalek::SigningKey::from_bytes(&arr);
+            info!(path = %path.display(), required = cfg.jwt.required, "JWT issuance enabled");
+            server.with_jwt_signing_key(key, cfg.jwt.clone())
+        }
+    };
 
     info!(
         listen_addr = %cfg.listen_addr,
@@ -382,6 +437,11 @@ mod tests {
         assert!(d.host_key.as_os_str().is_empty());
         assert!(d.authorized_keys.as_os_str().is_empty());
         assert_eq!(d.drain_grace_secs, 6);
+        // JWT: disabled by default. Existing deployments (no Secret
+        // mounted) keep working via the SSH-comment fallback path.
+        assert!(!d.jwt.required);
+        assert!(d.jwt.key_path.is_none());
+        assert_eq!(d.jwt.resolve_timeout_ms, 500);
     }
 
     /// clap --help must still work (no panics in derive expansion).

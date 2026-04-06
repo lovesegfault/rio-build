@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use ed25519_dalek::SigningKey;
+use rio_common::config::JwtConfig;
 use rio_common::jwt;
 use rio_common::signal::Token as CancellationToken;
 use rio_proto::SchedulerServiceClient;
@@ -41,8 +42,13 @@ const MAX_CHANNELS_PER_CONNECTION: usize = 4;
 ///
 /// Spec (`r[gw.jwt.claims]`) says "SSH session duration + grace" —
 /// but we don't know the session duration at mint time. This is the
-/// static upper bound. TODO(P0260): if SIGHUP key rotation lands,
-/// revisit whether token refresh on long sessions is needed.
+/// static upper bound. SIGHUP key rotation (T3) swaps the VERIFY
+/// key on scheduler/store; tokens minted under the old signing key
+/// become unverifiable post-swap. A long session that spans a
+/// rotation will see `UNAUTHENTICATED` on its next gRPC call → the
+/// client (nix) retries → new SSH connect → new token under the new
+/// key. Token refresh on long sessions would avoid the one failed
+/// call, but the retry-on-reconnect path already handles it.
 const JWT_SESSION_TTL_SECS: i64 = 3600 + 300;
 
 // r[impl gw.jwt.issue]
@@ -164,8 +170,13 @@ pub struct GatewayServer {
     /// `x-rio-tenant-token` header is never set; downstream services
     /// fall back to `SubmitBuildRequest.tenant_name` per
     /// `r[gw.jwt.dual-mode]`). `Some` → every accepted SSH connection
-    /// gets a minted token. P0260 wires this from a K8s Secret mount.
+    /// attempts a ResolveTenant round-trip + mint.
     jwt_signing_key: Option<Arc<SigningKey>>,
+    /// JWT policy — `required` controls whether mint failure is fatal
+    /// (reject SSH auth) or degradable (fall back to tenant_name).
+    /// `resolve_timeout_ms` bounds the ResolveTenant RPC. Cloned
+    /// into every ConnectionHandler.
+    jwt_config: JwtConfig,
 }
 
 impl GatewayServer {
@@ -182,19 +193,23 @@ impl GatewayServer {
             scheduler_client,
             authorized_keys: Arc::new(authorized_keys),
             jwt_signing_key: None,
+            jwt_config: JwtConfig::default(),
         }
     }
 
     /// Enable JWT issuance. Until called, `auth_publickey` accepts
     /// without minting (dual-mode fallback path). After: every
-    /// accepted connection mints a token via [`mint_session_jwt`].
+    /// accepted connection attempts a ResolveTenant round-trip +
+    /// [`mint_session_jwt`]. Whether mint FAILURE is fatal depends
+    /// on `config.required`.
     ///
     /// Builder-style (`self` → `Self`) so main.rs composes it:
-    /// `GatewayServer::new(...).with_jwt_signing_key(k)`. Keeps
+    /// `GatewayServer::new(...).with_jwt_signing_key(k, cfg)`. Keeps
     /// `new()` stable for existing call sites (tests, VM fixtures)
     /// that don't care about JWT.
-    pub fn with_jwt_signing_key(mut self, key: SigningKey) -> Self {
+    pub fn with_jwt_signing_key(mut self, key: SigningKey, config: JwtConfig) -> Self {
         self.jwt_signing_key = Some(Arc::new(key));
+        self.jwt_config = config;
         self
     }
 
@@ -286,6 +301,7 @@ impl russh::server::Server for GatewayServer {
             scheduler_client: self.scheduler_client.clone(),
             authorized_keys: Arc::clone(&self.authorized_keys),
             jwt_signing_key: self.jwt_signing_key.clone(),
+            jwt_config: self.jwt_config.clone(),
             sessions: HashMap::new(),
             tenant_name: String::new(),
             jwt_token: None,
@@ -358,6 +374,9 @@ pub struct ConnectionHandler {
     /// `Clone` (zeroize-on-drop semantics) but we need one per
     /// connection handler.
     jwt_signing_key: Option<Arc<SigningKey>>,
+    /// JWT policy. `required` → whether mint failure rejects auth.
+    /// `resolve_timeout_ms` → ResolveTenant RPC timeout.
+    jwt_config: JwtConfig,
     /// Tenant name from the matched `authorized_keys` entry's comment
     /// field. Set in `auth_publickey` when a key matches. Passed to
     /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
@@ -387,6 +406,78 @@ impl ConnectionHandler {
         metrics::counter!("rio_gateway_connections_total", "result" => "new").increment(1);
         metrics::gauge!("rio_gateway_connections_active").increment(1.0);
         info!(peer = ?self.peer_addr, "new SSH connection");
+    }
+
+    /// ResolveTenant round-trip + JWT mint. Called from
+    /// `auth_publickey` when `jwt_signing_key` is `Some` and
+    /// `tenant_name` is non-empty.
+    ///
+    /// Returns `(token, jti)` on success. Error covers: RPC timeout,
+    /// scheduler unavailable, unknown tenant (InvalidArgument), UUID
+    /// parse failure, mint failure (corrupt key). Caller decides
+    /// reject-vs-degrade based on `jwt_config.required`.
+    ///
+    /// The RPC is bounded by `resolve_timeout_ms`. A slow/stuck
+    /// scheduler makes SSH auth slow by AT MOST that much — the
+    /// round-trip is once per connect, so a 500ms penalty is
+    /// acceptable (and invisible when warm: PG index lookup + RPC
+    /// overhead is ~1-2ms). The timeout wraps the WHOLE RPC future,
+    /// not just the connect — a scheduler that accepts the RPC but
+    /// then blocks on PG is also covered.
+    ///
+    /// NOT cached across connections: each SSH connect gets a fresh
+    /// resolve. The tenants table is tiny and the lookup is indexed;
+    /// a per-gateway cache would need TTL/invalidation when a tenant
+    /// is added/renamed, which is complexity for no measurable win at
+    /// typical connect rates.
+    async fn resolve_and_mint(
+        &mut self,
+        signing_key: &SigningKey,
+    ) -> anyhow::Result<(String, String)> {
+        use rio_proto::scheduler::ResolveTenantRequest;
+
+        let timeout = std::time::Duration::from_millis(self.jwt_config.resolve_timeout_ms);
+        let req = tonic::Request::new(ResolveTenantRequest {
+            tenant_name: self.tenant_name.clone(),
+        });
+
+        // `scheduler_client` is `SchedulerServiceClient<Channel>`.
+        // The tonic-generated `resolve_tenant` method takes `&mut self`
+        // — clone here so we don't hold a &mut borrow across the
+        // await (auth_publickey is `&mut self` already, and the
+        // compiler doesn't like stacked &muts through field paths).
+        // Channel is Arc-backed; the clone is a pointer copy.
+        let mut client = self.scheduler_client.clone();
+
+        let resp = tokio::time::timeout(timeout, client.resolve_tenant(req))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "ResolveTenant timed out after {}ms (scheduler slow or unreachable)",
+                    timeout.as_millis()
+                )
+            })?
+            .map_err(|status| {
+                // The scheduler's InvalidArgument includes the tenant
+                // name in the message (resolve_tenant_name's format
+                // string). Pass it through — "unknown tenant: foo" is
+                // more actionable than "RPC failed".
+                anyhow::anyhow!(
+                    "ResolveTenant RPC: {} ({})",
+                    status.message(),
+                    status.code()
+                )
+            })?;
+
+        let tenant_id: uuid::Uuid = resp.into_inner().tenant_id.parse().map_err(|e| {
+            // Should be unreachable — the scheduler's handler does
+            // `Uuid::to_string()` on a UUID it just read from PG. If
+            // this fires, the scheduler is serving garbage.
+            anyhow::anyhow!("scheduler returned unparseable tenant_id UUID: {e}")
+        })?;
+
+        let (token, claims) = mint_session_jwt(tenant_id, signing_key)?;
+        Ok((token, claims.jti))
     }
 }
 
@@ -475,34 +566,80 @@ impl Handler for ConnectionHandler {
         if let Some(matched) = matched {
             self.tenant_name = matched.comment().trim().to_string();
 
-            // Mint a per-session JWT. jti is fresh per SSH connect —
-            // it is the revocation lookup key (scheduler checks
-            // jwt_revoked table) and the audit key (builds.jwt_jti).
-            // NOT the rate-limit key; that's Claims.sub.
+            // r[impl gw.jwt.dual-mode]
             //
-            // TODO(P0260): `mint_session_jwt` wants the tenant UUID,
-            // but we only have the NAME here. The gateway is PG-free
-            // (r[sched.tenant.resolve] — scheduler owns the tenants
-            // table), so resolving name→UUID needs a scheduler
-            // round-trip. No such RPC exists yet. P0260 already owns
-            // the dual-mode wiring + K8s Secret load; it MUST also
-            // either (a) add a ResolveTenant RPC called here, or
-            // (b) change the authorized_keys comment convention to
-            // carry the UUID directly. Until then `jwt_signing_key`
-            // stays None (main.rs never calls `with_jwt_signing_key`),
-            // so this block is dead code. The `_ = signing_key`
-            // discard is intentional — keeps the key bound so the
-            // TODO-closer has an obvious anchor.
-            if let Some(signing_key) = &self.jwt_signing_key {
-                let _ = signing_key;
-                // let tenant_id: uuid::Uuid = /* P0260: resolve self.tenant_name */;
-                // match mint_session_jwt(tenant_id, signing_key) {
-                //     Ok((token, claims)) => {
-                //         debug!(jti = %claims.jti, "minted session JWT");
-                //         self.jwt_token = Some(token);
-                //     }
-                //     Err(e) => warn!(error = %e, "JWT mint failed; continuing without token"),
-                // }
+            // Dual-mode PERMANENT. Two branches maintained forever:
+            //
+            //   signing_key = None  → JWT disabled. Fall through to
+            //     Auth::Accept; tenant identity flows via
+            //     SubmitBuildRequest.tenant_name. This is the
+            //     r[gw.auth.tenant-from-key-comment] path, unbumped.
+            //
+            //   signing_key = Some  → attempt mint. ResolveTenant
+            //     round-trip to scheduler (gateway is PG-free per
+            //     r[sched.tenant.resolve]). On success: mint + store
+            //     in self.jwt_token → SessionContext → handler/build.rs
+            //     injects as x-rio-tenant-token. On FAILURE
+            //     (timeout, unknown tenant, mint error):
+            //       required=true  → reject SSH auth
+            //       required=false → degrade (jwt_token stays None,
+            //                        fallback path same as key=None)
+            //
+            // The round-trip is once-per-SSH-connect, not per-request
+            // (jwt_token is on ConnectionHandler, shared across all
+            // channels). Bounded by resolve_timeout_ms (default 500).
+            //
+            // Empty tenant_name (single-tenant mode) skips the RPC
+            // entirely — no JWT for single-tenant, same as key=None.
+            // The scheduler's ResolveTenant rejects empty-name
+            // (caller-error contract); gating here avoids the
+            // pointless call.
+            // Arc::clone out of the Option before calling the &mut
+            // helper — `&self.jwt_signing_key` would hold an immutable
+            // borrow of self across the &mut self.resolve_and_mint
+            // call (E0502). The Arc clone is a pointer copy; the
+            // SigningKey itself isn't cloned (zeroize-on-drop still
+            // fires exactly once, on the original Arc's last drop).
+            if let Some(signing_key) = self.jwt_signing_key.clone()
+                && !self.tenant_name.is_empty()
+            {
+                match self.resolve_and_mint(&signing_key).await {
+                    Ok((token, jti)) => {
+                        debug!(jti = %jti, tenant = %self.tenant_name, "minted session JWT");
+                        self.jwt_token = Some(token);
+                    }
+                    Err(e) if self.jwt_config.required => {
+                        // required=true: mint failure is an AUTH
+                        // failure. Return reject (NOT an Err —
+                        // russh::Error would close the whole TCP
+                        // connection; reject lets the client know
+                        // auth failed and disconnect cleanly).
+                        warn!(
+                            error = %e,
+                            tenant = %self.tenant_name,
+                            peer = ?self.peer_addr,
+                            "JWT mint failed and jwt.required=true; rejecting SSH auth"
+                        );
+                        metrics::counter!(
+                            "rio_gateway_connections_total",
+                            "result" => "rejected_jwt"
+                        )
+                        .increment(1);
+                        return Ok(Auth::reject());
+                    }
+                    Err(e) => {
+                        // required=false: degrade. jwt_token stays
+                        // None → handler/build.rs skips header inject
+                        // → scheduler reads tenant_name from proto.
+                        // Same behavior as key=None / pre-JWT.
+                        warn!(
+                            error = %e,
+                            tenant = %self.tenant_name,
+                            "JWT mint failed; degrading to tenant_name fallback"
+                        );
+                        metrics::counter!("rio_gateway_jwt_mint_degraded_total").increment(1);
+                    }
+                }
             }
 
             metrics::counter!("rio_gateway_connections_total", "result" => "accepted").increment(1);

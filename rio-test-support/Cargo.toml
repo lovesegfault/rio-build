@@ -17,6 +17,7 @@ tonic = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }
 # spawn_mock_store_inproc: in-process duplex transport so
 # `#[tokio::test(start_paused = true)]` doesn't auto-advance timeouts
 # while real TCP is pending.

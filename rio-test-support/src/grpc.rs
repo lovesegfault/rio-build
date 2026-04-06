@@ -569,6 +569,15 @@ pub struct MockScheduler {
     /// the gateway's reconnect sent the correct resume point (see
     /// `r[gw.reconnect.since-seq]`).
     pub watch_calls: Arc<RwLock<Vec<(String, u64)>>>,
+    /// ResolveTenant calls received: tenant_name. For asserting the
+    /// gateway called resolve during SSH auth (JWT mint path).
+    pub resolve_tenant_calls: Arc<RwLock<Vec<String>>>,
+    /// UUID the mock returns for ResolveTenant. `None` → returns
+    /// InvalidArgument "unknown tenant" (for testing the gateway's
+    /// graceful-degrade path). Default is `None` — tests that don't
+    /// set this get the unknown-tenant behavior, which is safe for
+    /// existing tests that never call ResolveTenant anyway.
+    pub resolve_tenant_uuid: Arc<RwLock<Option<uuid::Uuid>>>,
 }
 
 impl MockScheduler {
@@ -794,6 +803,26 @@ impl SchedulerService for MockScheduler {
         Ok(Response::new(types::CancelBuildResponse {
             cancelled: true,
         }))
+    }
+
+    async fn resolve_tenant(
+        &self,
+        request: Request<rio_proto::scheduler::ResolveTenantRequest>,
+    ) -> Result<Response<rio_proto::scheduler::ResolveTenantResponse>, Status> {
+        let req = request.into_inner();
+        self.resolve_tenant_calls
+            .write()
+            .unwrap()
+            .push(req.tenant_name.clone());
+        match *self.resolve_tenant_uuid.read().unwrap() {
+            Some(id) => Ok(Response::new(rio_proto::scheduler::ResolveTenantResponse {
+                tenant_id: id.to_string(),
+            })),
+            None => Err(Status::invalid_argument(format!(
+                "unknown tenant: {}",
+                req.tenant_name
+            ))),
+        }
     }
 }
 

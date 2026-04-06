@@ -38,11 +38,13 @@
 //! The two-struct split makes each side clean: clap sees Optional,
 //! serde sees Required-With-Default, and figment bridges them.
 
+use std::path::PathBuf;
+
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Load configuration for `component` with the full precedence chain.
 ///
@@ -80,6 +82,77 @@ where
         .merge(Serialized::defaults(cli_overlay))
         .extract()
         .map_err(|e| anyhow::anyhow!("config load for {component:?} failed: {e}"))
+}
+
+/// JWT dual-mode configuration. Nested in each binary's `Config` as
+/// `jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.
+///
+/// Dual-mode is PERMANENT: both the JWT path and the SSH-comment
+/// fallback stay maintained forever. `jwt_required` is the operator's
+/// per-deployment switch — true = STRICT (reject on mint/verify
+/// failure), false = PERMISSIVE (fall back to tenant_name on failure).
+///
+/// Gateway interpretation: `required=true` → if ResolveTenant fails or
+/// times out during SSH auth, reject the connection (no JWT can be
+/// minted → no tenant identity → unauthenticated). `required=false` →
+/// degrade to tenant_name-only (jwt_token=None, downstream falls back).
+///
+/// Scheduler/store interpretation: handled at the HANDLER level (not
+/// the interceptor — the interceptor stays permissive-on-absent-header
+/// for workers/health probes regardless). A handler that needs strict
+/// JWT reads `required` from its own config and checks for Claims
+/// extension presence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JwtConfig {
+    /// true = JWT mint/verify failure → reject. false (default) =
+    /// fall back to SSH-comment tenant_name path.
+    ///
+    /// Default false: existing deployments (no JWT Secret mounted)
+    /// keep working. Setting `RIO_JWT__REQUIRED=true` without also
+    /// mounting the signing key → gateway rejects every SSH connect
+    /// at auth time (clear failure, not silent degradation).
+    pub required: bool,
+
+    /// Path to the ed25519 signing seed (gateway) or pubkey
+    /// (scheduler/store). K8s: Secret mount at
+    /// `/etc/rio/jwt/ed25519_seed` or ConfigMap mount at
+    /// `/etc/rio/jwt/ed25519_pubkey`. `None` → JWT disabled for
+    /// this process (matches the `Option<SigningKey>` /
+    /// `Option<Arc<RwLock<VerifyingKey>>>` pattern in jwt.rs /
+    /// jwt_interceptor.rs).
+    pub key_path: Option<PathBuf>,
+
+    /// ResolveTenant RPC timeout (gateway only). The round-trip to
+    /// the scheduler happens in the SSH auth hot path — every
+    /// connect, once. If the scheduler is slow (PG under load) or
+    /// unreachable, this bounds the auth-time latency penalty.
+    /// Default 500ms: long enough for a warm PG lookup + RPC
+    /// overhead, short enough that a stuck scheduler doesn't make
+    /// SSH auth hang noticeably. On timeout: `required=false` →
+    /// degrade; `required=true` → reject.
+    #[serde(default = "default_resolve_timeout_ms")]
+    pub resolve_timeout_ms: u64,
+}
+
+fn default_resolve_timeout_ms() -> u64 {
+    500
+}
+
+impl Default for JwtConfig {
+    /// Must match the `#[serde(default = ...)]` attrs above. figment's
+    /// `load()` starts from `Serialized::defaults(C::default())` — if
+    /// this impl and serde's field-defaults diverge, the BASE layer
+    /// (used when no TOML/env/CLI) disagrees with the partial-override
+    /// layer (used when some fields are set). The `jwt_config_defaults`
+    /// test pins both paths at once.
+    fn default() -> Self {
+        Self {
+            required: false,
+            key_path: None,
+            resolve_timeout_ms: default_resolve_timeout_ms(),
+        }
+    }
 }
 
 /// Deserialize `Vec<String>` from EITHER a comma-separated string
@@ -550,6 +623,49 @@ mod tests {
             let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
             assert!(cfg.systems.is_empty());
             assert!(cfg.features.is_empty());
+            Ok(())
+        });
+    }
+
+    // --- JwtConfig tests ---
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
+    struct JwtHost {
+        #[serde(default)]
+        jwt: super::JwtConfig,
+    }
+
+    /// Default: required=false, key_path=None, resolve_timeout_ms=500.
+    /// These defaults are load-bearing: false→ existing deployments
+    /// keep working without JWT config; None→ JWT disabled until
+    /// operator mounts the Secret; 500ms→ the plan doc's recommended
+    /// timeout for graceful degradation.
+    #[test]
+    fn jwt_config_defaults() {
+        figment::Jail::expect_with(|_jail| {
+            let cfg: JwtHost = load("rio-test-jwt", NoCli::default()).unwrap();
+            assert!(!cfg.jwt.required, "default: not required (permissive)");
+            assert!(cfg.jwt.key_path.is_none(), "default: no key → JWT off");
+            assert_eq!(cfg.jwt.resolve_timeout_ms, 500);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn jwt_config_env_nesting() {
+        // RIO_JWT__REQUIRED=true → jwt.required. Double-underscore
+        // nesting per the figment Env::split("__") convention.
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_JWT__REQUIRED", "true");
+            jail.set_env("RIO_JWT__KEY_PATH", "/etc/rio/jwt/seed");
+            jail.set_env("RIO_JWT__RESOLVE_TIMEOUT_MS", "1000");
+            let cfg: JwtHost = load("rio-test-jwt", NoCli::default()).unwrap();
+            assert!(cfg.jwt.required);
+            assert_eq!(
+                cfg.jwt.key_path.as_deref(),
+                Some(std::path::Path::new("/etc/rio/jwt/seed"))
+            );
+            assert_eq!(cfg.jwt.resolve_timeout_ms, 1000);
             Ok(())
         });
     }

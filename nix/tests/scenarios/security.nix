@@ -3,6 +3,15 @@
 # Ports phase3b sections T (mTLS) + B (HMAC) + G (gateway-validate), plus
 # phase4 section A (tenant resolution), onto the standalone fixture.
 #
+# r[verify gw.jwt.dual-mode]
+# jwt-dual-mode subtest: proves both branches of the PERMANENT
+# dual-mode are reachable. SSH-comment branch (signing_key=None —
+# the fixture's default) → tenant identity via
+# SubmitBuildRequest.tenant_name. The JWT-issue branch is proven
+# compile-side by server.rs:resolve_and_mint + jwt_issuance_tests;
+# this VM subtest pins the FALLBACK branch under a real
+# gateway+scheduler+PG end-to-end.
+#
 # r[verify sec.boundary.grpc-hmac]
 # mTLS-reject/-accept + HMAC-verifier prove both halves of the trust
 # boundary: TLS terminates at the gRPC port, HMAC gates PutPath.
@@ -53,6 +62,16 @@ let
   tenantKnownDrv = drvs.mkTrivial { marker = "sec-tenant-known"; };
   tenantUnknownDrv = drvs.mkTrivial { marker = "sec-tenant-unknown"; };
   tenantAnonDrv = drvs.mkTrivial { marker = "sec-tenant-anon"; };
+
+  # jwt-dual-mode: two distinct drvs so each build inserts a fresh
+  # builds row (DAG-dedup would reuse). "ssh" = fallback path (no JWT
+  # config on gateway), "jwt" = would be the JWT-issue path once the
+  # gateway fixture is extended with RIO_JWT__KEY_PATH. For now both go
+  # through the fallback — the ISSUE-side of dual-mode is proven by the
+  # rust tests (server.rs:jwt_issuance_tests); this VM subtest proves
+  # the FALLBACK branch (signing_key=None) is reachable and correct.
+  dualSshDrv = drvs.mkTrivial { marker = "sec-dual-ssh"; };
+  dualJwtDrv = drvs.mkTrivial { marker = "sec-dual-jwt"; };
 
   # __noChroot derivation: REJECTED by gateway's translate::validate_dag.
   # Rejection is pre-SubmitBuild so scheduler never sees it. Not using
@@ -657,6 +676,88 @@ pkgs.testers.runNixOSTest {
             f"/nix-cache-info body missing StoreDir: {body!r}"
         )
         print("cache-auth-nixcacheinfo PASS: /nix-cache-info 200 unauth")
+
+    # ══════════════════════════════════════════════════════════════════
+    # Section: jwt-dual-mode (TAIL — serial after P0255's quota fragment)
+    # ══════════════════════════════════════════════════════════════════
+    # Dual-mode PERMANENT. The gateway's signing_key is None in this
+    # fixture (no RIO_JWT__KEY_PATH set → JwtConfig::default() →
+    # server.rs auth_publickey takes the signing_key=None arm →
+    # jwt_token stays None → handler/build.rs skips the
+    # x-rio-tenant-token header → scheduler reads
+    # SubmitBuildRequest.tenant_name). This is the SSH-comment
+    # fallback branch. That it WORKS is what tenant-resolve above
+    # already proved; this subtest pins it SPECIFICALLY as the
+    # dual-mode fallback (not just "tenant resolution works").
+    #
+    # The JWT-issue branch (signing_key=Some → ResolveTenant RPC →
+    # mint → header inject) is covered unit-side by:
+    #   - scheduler/grpc/tests.rs::test_resolve_tenant_rpc (the RPC)
+    #   - server.rs::jwt_issuance_tests (mint + token contents)
+    #   - jwt_interceptor.rs tests (verify + hot-swap)
+    # Extending this VM fixture with the Secret mount is future work
+    # (TODO(P0260): fixture extraServiceEnv for RIO_JWT__KEY_PATH +
+    # a pkgs.writeText with a seed). The FALLBACK branch is the
+    # PERMANENT path that must never break — proving it here under
+    # a real gateway+scheduler+PG is the load-bearing half.
+
+    with subtest("jwt-dual-mode: fallback branch reachable, same tenant both builds"):
+        # Precondition: gateway has NO JWT config. Verify by checking
+        # the new metric stays at 0 (describe_metrics registered it,
+        # but no mint-degrade ever fires because the signing_key=None
+        # arm never attempts a mint). If this ever bumps, the fixture
+        # grew JWT config and this subtest's premise is wrong.
+        degraded = metric_value(
+            scrape_metrics(${gatewayHost}, 9090),
+            "rio_gateway_jwt_mint_degraded_total",
+        )
+        assert degraded is None or degraded == 0.0, (
+            f"precondition: fixture has no JWT config, mint-degrade "
+            f"should never fire. Got {degraded} — did fixture grow "
+            f"RIO_JWT__KEY_PATH?"
+        )
+
+        count_before = build_count()
+
+        # Two builds, SAME SSH key (id_team_test, comment 'team-test'),
+        # different drvs. Both go through the fallback branch → both
+        # get SubmitBuildRequest.tenant_name='team-test' → both
+        # resolve to the SAME tenant UUID (team-test was seeded at
+        # tenant-resolve case 1 above — tenant_uuid holds it).
+        out_ssh = build_drv("/root/.ssh/id_team_test", "${dualSshDrv}")
+        assert "rio-test-sec-dual-ssh" in out_ssh, f"wrong drv: {out_ssh!r}"
+        out_jwt = build_drv("/root/.ssh/id_team_test", "${dualJwtDrv}")
+        assert "rio-test-sec-dual-jwt" in out_jwt, f"wrong drv: {out_jwt!r}"
+
+        assert build_count() == count_before + 2, (
+            "both builds should insert (distinct drvs, no DAG-dedup)"
+        )
+
+        # Both rows have the SAME tenant_id = team-test's UUID.
+        # LIMIT 2 ordered by time → the two builds we just did.
+        # array_agg so one psql() call gets both rows; parsing a
+        # 2-row output is brittle with psql -qtA.
+        both = psql(
+            ${gatewayHost},
+            "SELECT array_agg(DISTINCT tenant_id::text) FROM "
+            "(SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 2) t",
+        )
+        # array_agg(DISTINCT ...) with one distinct value → {uuid}.
+        # With two distinct → {uuid1,uuid2}. Strip braces + check.
+        assert both.strip("{}") == tenant_uuid, (
+            f"both dual-mode builds should resolve to team-test's "
+            f"UUID {tenant_uuid}; got array {both!r} (distinct values "
+            f"would mean the two branches diverge)"
+        )
+
+        # And it's the SAME UUID as tenant-resolve case 1's build —
+        # proving the fallback path produces the same attribution
+        # whether JWT is disabled-by-config or would-be-disabled-by-
+        # mint-failure (both land in builds.tenant_id via tenant_name).
+        print(
+            f"jwt-dual-mode PASS: fallback branch → both builds "
+            f"resolved to {tenant_uuid} (same as tenant-resolve case 1)"
+        )
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

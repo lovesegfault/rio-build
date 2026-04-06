@@ -524,6 +524,109 @@ async fn test_submit_build_empty_tenant_is_none() {
     assert_eq!(db_tenant, None);
 }
 
+// r[verify sched.tenant.resolve]
+/// ResolveTenant RPC: known name → UUID string, unknown → InvalidArgument,
+/// empty → InvalidArgument (caller error). Exercises the RPC path the
+/// gateway calls during JWT mint — same `resolve_tenant_name` helper as
+/// SubmitBuild's inline resolve, but different empty-name contract (RPC
+/// rejects empty; SubmitBuild treats it as single-tenant Ok(None)).
+#[tokio::test]
+async fn test_resolve_tenant_rpc() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+
+    // Seed one tenant. INSERT RETURNING so we know the ground-truth UUID.
+    let expected: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
+            .bind("team-resolve")
+            .fetch_one(&db.pool)
+            .await
+            .expect("tenant seed");
+
+    // Known → Ok. tenant_id is UUID hyphenated-string form — assert we
+    // can PARSE it back (not just string-compare) to catch any future
+    // format drift between the handler's .to_string() and uuid's parse.
+    let resp = grpc
+        .resolve_tenant(Request::new(rio_proto::scheduler::ResolveTenantRequest {
+            tenant_name: "team-resolve".into(),
+        }))
+        .await
+        .expect("known tenant resolves");
+    let got: uuid::Uuid = resp
+        .into_inner()
+        .tenant_id
+        .parse()
+        .expect("tenant_id must be parseable UUID");
+    assert_eq!(got, expected);
+
+    // Unknown → InvalidArgument with the name in the message (same
+    // diagnostics contract as SubmitBuild's inline resolve).
+    let err = grpc
+        .resolve_tenant(Request::new(rio_proto::scheduler::ResolveTenantRequest {
+            tenant_name: "no-such-team".into(),
+        }))
+        .await
+        .expect_err("unknown → Err");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("no-such-team"),
+        "error should name the tenant: {}",
+        err.message()
+    );
+
+    // Empty → InvalidArgument. This differs from SubmitBuild (where
+    // empty → Ok(None) single-tenant). The RPC contract is: gateway
+    // gates empty-comment BEFORE calling (single-tenant mode skips JWT
+    // mint entirely), so empty here = caller bug.
+    let err = grpc
+        .resolve_tenant(Request::new(rio_proto::scheduler::ResolveTenantRequest {
+            tenant_name: String::new(),
+        }))
+        .await
+        .expect_err("empty → Err (caller error, not single-tenant)");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("empty"),
+        "error should say 'empty': {}",
+        err.message()
+    );
+}
+
+/// ResolveTenant is NOT leader-gated. A standby replica can answer —
+/// it's a read-only PG query, no actor interaction. Gating on
+/// leadership would make SSH auth latency depend on leader-election
+/// state (bad for the gateway).
+#[tokio::test]
+async fn test_resolve_tenant_works_on_standby() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+
+    // Flip to standby. Internal field access (same-module test).
+    grpc.is_leader
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let expected: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
+            .bind("standby-resolve")
+            .fetch_one(&db.pool)
+            .await
+            .expect("tenant seed");
+
+    // SubmitBuild WOULD fail here (leader-gated). ResolveTenant doesn't.
+    let resp = grpc
+        .resolve_tenant(Request::new(rio_proto::scheduler::ResolveTenantRequest {
+            tenant_name: "standby-resolve".into(),
+        }))
+        .await
+        .expect("standby still resolves — not leader-gated");
+    assert_eq!(
+        resp.into_inner().tenant_id.parse::<uuid::Uuid>().unwrap(),
+        expected
+    );
+}
+
 /// SubmitBuild with more edges than MAX_DAG_EDGES should be rejected
 /// (DoS prevention: O(edges) merge loop).
 #[tokio::test]

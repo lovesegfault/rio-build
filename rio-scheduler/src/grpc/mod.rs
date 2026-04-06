@@ -666,6 +666,55 @@ impl SchedulerService for SchedulerGrpc {
             cancelled,
         }))
     }
+
+    // r[impl sched.tenant.resolve]
+    /// Name→UUID resolution exposed as an RPC for the gateway's JWT
+    /// mint path. Same `resolve_tenant_name` helper as SubmitBuild's
+    /// inline resolve — one source of truth for the lookup.
+    ///
+    /// NOT leader-gated: tenant lookup is a read-only PG query, no
+    /// actor interaction, safe on any replica. The gateway calls this
+    /// during SSH `auth_publickey` (before any build submission), so
+    /// gating on leadership would make SSH auth latency depend on
+    /// leader-election state. A standby replica with a pool can
+    /// answer just as correctly as the leader.
+    ///
+    /// Empty name → InvalidArgument (not Ok("") — the caller shouldn't
+    /// be calling at all for single-tenant mode; empty here means a
+    /// bug in the gateway's gate). This differs from SubmitBuild's
+    /// inline resolve (empty → Ok(None)), which is intentional:
+    /// SubmitBuild's empty-name is a VALID state (single-tenant),
+    /// ResolveTenant's empty-name is a CALLER ERROR.
+    #[instrument(skip(self, request), fields(rpc = "ResolveTenant"))]
+    async fn resolve_tenant(
+        &self,
+        request: Request<rio_proto::scheduler::ResolveTenantRequest>,
+    ) -> Result<Response<rio_proto::scheduler::ResolveTenantResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        let name = req.tenant_name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument(
+                "tenant_name is empty (gateway should gate single-tenant mode before calling)",
+            ));
+        }
+
+        let pool = self.pool.as_ref().ok_or_else(|| {
+            Status::failed_precondition("tenant resolution requires database connection")
+        })?;
+
+        // `resolve_tenant_name` returns Ok(None) for empty input and
+        // Err(InvalidArgument) for unknown. We already handled empty
+        // above, so None here is unreachable — but match defensively.
+        let tenant_id = resolve_tenant_name(pool, name)
+            .await?
+            .ok_or_else(|| Status::internal("resolve_tenant_name returned None for non-empty"))?;
+
+        Ok(Response::new(rio_proto::scheduler::ResolveTenantResponse {
+            tenant_id: tenant_id.to_string(),
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
