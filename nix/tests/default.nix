@@ -569,7 +569,17 @@ in
 
   vm-lifecycle-recovery-k3s = lifecycleMod.mkTest {
     name = "recovery";
-    subtests = [ "recovery" ];
+    subtests = [
+      "recovery"
+      # r[verify sched.store-client.reconnect]
+      #   store-rollout: rollout restart deploy/rio-store → scheduler's
+      #   lazy Channel re-resolves DNS and reconnects to the new pod.
+      #   Post-rollout build succeeds WITHOUT scheduler restart.
+      #   After recovery (not before): recovery leaves the cluster in
+      #   a settled state (q==0 r==0 drain at recovery's end), so
+      #   store-rollout starts from a clean baseline.
+      "store-rollout"
+    ];
   };
 
   vm-lifecycle-autoscale-k3s = lifecycleAutoscaleMod.mkTest {

@@ -117,6 +117,46 @@ pub async fn connect_store(addr: &str) -> anyhow::Result<StoreServiceClient<Chan
         .max_encoding_message_size(crate::max_message_size()))
 }
 
+/// Lazy-connect store client with HTTP/2 keepalive.
+///
+/// Unlike [`connect_store`], this does NOT establish a TCP connection at
+/// call time — the channel connects on first RPC and RE-RESOLVES DNS on
+/// each reconnect. This is the difference between "connection pinned to
+/// the pod IP that DNS resolved to at startup" (eager) and "connection
+/// follows the Service's current endpoint" (lazy).
+///
+/// The eager variant breaks on store rollout: old pod terminates → TCP
+/// connection drops → eager Channel's cached IP is stale → RPCs fail
+/// with `Unavailable` forever. Lazy re-resolves and reconnects on the
+/// next RPC.
+///
+/// Keepalive (30s interval, 10s timeout, while-idle) detects half-open
+/// connections within ~40s instead of waiting for kernel TCP timeout
+/// (minutes). Without while-idle, an idle channel wouldn't notice the
+/// peer vanished until the next RPC — keepalive surfaces it proactively.
+///
+/// Returns `Err` only on malformed `addr` (scheme parse) or bad TLS
+/// config — never on connection failure (that's deferred to first RPC).
+/// So callers can drop their retry loop: the channel ALWAYS constructs.
+pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
+    let (scheme, tls) = match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
+        Some(tls) => ("https", Some(tls.clone())),
+        None => ("http", None),
+    };
+    let mut ep = tonic::transport::Endpoint::from_shared(format!("{scheme}://{addr}"))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
+    if let Some(tls) = tls {
+        ep = ep.tls_config(tls)?;
+    }
+    let ch = ep.connect_lazy();
+    Ok(StoreServiceClient::new(ch)
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size()))
+}
+
 /// Connect to the scheduler service (gateway-facing).
 pub async fn connect_scheduler(
     addr: &str,
