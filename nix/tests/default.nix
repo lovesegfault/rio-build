@@ -88,6 +88,7 @@ let
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
+  componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
   pulled = import ../docker-pulled.nix { inherit pkgs; };
@@ -654,6 +655,34 @@ in
   # exists+ownerRef after). Fresh fixture → clean state → fast
   # finalizers (no in-flight builds to drain). ~4min boot + ~3min
   # subtests.
+  # r[verify ctrl.scaler.component]
+  # r[verify ctrl.scaler.ratio-learn]
+  # r[verify store.admin.get-load]
+  # r[verify obs.metric.store-pg-pool]
+  #   ComponentScaler e2e: CR status populated → 30-leaf slowFanout
+  #   drives predicted=ceil(30/seedRatio=10)=3 → store Deployment
+  #   /scale patched > min within 90s; controller pod restart
+  #   preserves .status.learnedRatio; helm-rendered store has no
+  #   .spec.replicas under any manager except the reconciler's.
+  #
+  # Own scenario (not a lifecycle fragment): needs componentScaler.
+  # store.enabled=true in the fixture, which changes the rendered
+  # store Deployment shape — would invalidate every other lifecycle
+  # subtest's "store has 1 replica" assumption. seedRatio=10 +
+  # min=1 max=4 keeps the scale-up provable inside the 2-node VM's
+  # pod budget.
+  vm-componentscaler-k3s = componentscaler {
+    inherit pkgs common;
+    fixture = k3sFull {
+      extraValuesTyped = {
+        "componentScaler.store.enabled" = true;
+        "componentScaler.store.min" = 1;
+        "componentScaler.store.max" = 4;
+        "componentScaler.store.seedRatio" = 10;
+      };
+    };
+  };
+
   vm-lifecycle-wps-k3s = lifecycleMod.mkTest {
     name = "wps";
     subtests = [

@@ -345,6 +345,19 @@ The autoscaler MUST check `metadata.deletionTimestamp` and skip pools being dele
 - Scale-down: react slowly (e.g., 10m window) to avoid killing workers that may be needed again soon.
 - Never scale below `WorkerPool.spec.replicas.min`.
 
+## ComponentScaler
+
+r[ctrl.scaler.component]
+The controller reconciles `ComponentScaler` CRs into `apps/v1 Deployment {targetRef} /scale` patches. `desired_replicas = clamp(ceil(Σ(queued+running) / status.learnedRatio), spec.replicas.min, spec.replicas.max)` where `Σ(queued+running)` comes from `AdminService.GetSizeClassStatus` (the **predictive** signal — scheduler knows N builders are about to exist before they exist; store scales ahead of the burst). Scale-down is held for 5 minutes after the last scale-up and limited to −1/tick. Reconcile interval: 10s.
+
+r[ctrl.scaler.ratio-learn]
+`status.learnedRatio` self-calibrates against `max(StoreAdminService.GetLoad().pg_pool_utilization)` over the `spec.loadEndpoint` headless-service endpoints (the **observed** signal). Asymmetric correction: `load > spec.loadThresholds.high` (default 0.8) → immediate `current+1` AND `learnedRatio *= 0.95` (under-provisioning is dangerous — I-105 cascade); `load < spec.loadThresholds.low` (default 0.3) for 30 consecutive ticks → `learnedRatio *= 1.02` (over-provisioning is cheap). The ratio persists in `.status` so a controller restart resumes from the learned value, not `spec.seedRatio`.
+
+r[store.admin.get-load]
+`StoreAdminService.GetLoad` returns `pg_pool_utilization = (pool.size − pool.num_idle) / max_connections` for the replica it's called on. The ComponentScaler reconciler polls every store pod (DNS-resolving the headless service) and uses the max as `observedLoadFactor`. The handler also publishes `rio_store_pg_pool_utilization` so Prometheus sees the same value the controller acted on.
+
+When `componentScaler.store.enabled=true`, the helm chart MUST omit `Deployment.spec.replicas` from the rendered store template — otherwise `helm upgrade` resets the replica count and fights the controller. The controller's `/scale` patches use field-manager `rio-controller-componentscaler` (distinct from helm's apply manager).
+
 ## GC Cron
 
 r[ctrl.gc.cron-schedule]

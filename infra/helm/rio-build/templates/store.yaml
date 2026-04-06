@@ -8,9 +8,17 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
+  {{- if not .Values.componentScaler.store.enabled }}
   # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
   # a PG advisory lock, so concurrent replica startup is safe.
+  #
+  # OMITTED when componentScaler.store.enabled=true: the ComponentScaler
+  # reconciler patches deployments/scale; if helm also rendered
+  # .spec.replicas here, every `helm upgrade` would reset it and fight
+  # the controller. K8s defaults an absent .spec.replicas to 1 on first
+  # apply; the reconciler's first 10s tick corrects to spec.replicas.min.
   replicas: {{ $s.replicas | default 1 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "rio.selectorLabels" "rio-store" | nindent 6 }}

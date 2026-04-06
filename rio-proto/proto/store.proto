@@ -165,4 +165,14 @@ service StoreAdminService {
 
   // Remove an upstream by (tenant_id, url). NOT_FOUND if no match.
   rpc RemoveUpstream(rio.types.RemoveUpstreamRequest) returns (google.protobuf.Empty);
+
+  // Per-replica load snapshot for the ComponentScaler reconciler.
+  // Returns pg_pool_utilization = (pool.size - pool.num_idle) / max_
+  // connections — the fraction of the PG connection pool that is
+  // checked out RIGHT NOW. The controller polls this on every store
+  // pod (via headless-svc DNS) and takes the max across replicas as
+  // the observed load signal that calibrates the learned builders-
+  // per-replica ratio. I-105: PG pool exhaustion is the cliff that
+  // cascades into FUSE circuit-trip; this is the leading indicator.
+  rpc GetLoad(rio.types.GetLoadRequest) returns (rio.types.GetLoadResponse);
 }

@@ -405,6 +405,20 @@ message TenantQuotaResponse {
   optional uint64 limit_bytes = 2;  // tenants.gc_max_store_bytes. NULL in PG → absent → no limit.
 }
 
+// StoreAdminService.GetLoad — per-replica load snapshot for the
+// ComponentScaler. The controller polls each store pod (headless-svc
+// DNS fan-out) and uses max(pg_pool_utilization) to calibrate the
+// learned builders-per-replica ratio.
+message GetLoadRequest {}
+
+message GetLoadResponse {
+  // (pool.size() - pool.num_idle()) / max_connections. Range [0.0,
+  // 1.0] under normal conditions; can momentarily read >1.0 if size()
+  // races num_idle() (separate non-atomic loads) — the consumer
+  // compares against a 0.8 threshold so a transient >1.0 is harmless.
+  float pg_pool_utilization = 1;
+}
+
 // VerifyChunks audit: head-object every non-deleted chunk in PG, report
 // PG-says-exists-but-backend-says-no. I-040 diagnostic — catches chunks
 // stranded by key-format changes (or genuinely lost). Server-streaming;

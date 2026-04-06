@@ -382,7 +382,26 @@ const STORE_HEALTH_SERVICE: &str = "rio.store.StoreService";
 
 /// Default TLS domain for store connections. First SAN in
 /// `infra/helm/rio-build/templates/cert-manager.yaml`.
-const STORE_TLS_DOMAIN: &str = "rio-store";
+pub const STORE_TLS_DOMAIN: &str = "rio-store";
+
+/// Connect a `StoreAdminServiceClient` to a SPECIFIC pod IP (not the
+/// balanced channel). The ComponentScaler reconciler fans out
+/// `GetLoad` to every store pod — it needs each pod's individual
+/// reading, so the p2c balanced channel (which would route all calls
+/// to one or two pods) is the wrong tool.
+///
+/// Uses `build_endpoint` so the TLS-domain override applies (cert
+/// SAN is `rio-store`, not the pod IP). Without this, mTLS deployments
+/// fail the SAN check on every per-pod connect.
+pub async fn connect_store_admin_at(
+    addr: SocketAddr,
+) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
+    let ep = build_endpoint(addr, STORE_TLS_DOMAIN)?;
+    let ch = ep.connect().await?;
+    Ok(crate::StoreAdminServiceClient::new(ch)
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size()))
+}
 
 /// Connect to rio-store via a health-aware balanced channel.
 ///

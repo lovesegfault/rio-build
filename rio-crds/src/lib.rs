@@ -16,6 +16,7 @@
 
 pub mod builderpool;
 pub mod builderpoolset;
+pub mod componentscaler;
 pub mod fetcherpool;
 
 // ----- schemars helpers for k8s-openapi passthrough types -----------

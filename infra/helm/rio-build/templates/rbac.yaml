@@ -152,6 +152,25 @@ rules:
   - apiGroups: [rio.build]
     resources: [fetcherpools/finalizers]
     verbs: [update]
+  # ComponentScaler: predictive store autoscaling. The reconciler reads
+  # spec, writes status (learnedRatio persists across restarts), and
+  # patches the target Deployment's /scale subresource. No create/
+  # delete — operators apply the CR via this chart.
+  - apiGroups: [rio.build]
+    resources: [componentscalers]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [rio.build]
+    resources: [componentscalers/status]
+    verbs: [get, patch, update]
+  # Deployment read for current .spec.replicas + /scale subresource for
+  # the patch. The controller previously had NO apps/deployments rights
+  # — BuilderPool/FetcherPool reconcilers manage StatefulSets only.
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    verbs: [get, patch, update]
   # Owned children. `create` because SSA PATCH creates if missing but some
   # clusters still check `create` perm.
   - apiGroups: [apps]

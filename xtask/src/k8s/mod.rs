@@ -394,7 +394,10 @@ where
     let key = crate::ssh::privkey_path(cfg)?;
     let _guard = ui::step("establish tunnel", || p.tunnel(port)).await?;
 
-    let store = format!("ssh-ng://rio@localhost:{port}?ssh-key={}", key.display());
+    let store = format!(
+        "ssh-ng://rio@localhost:{port}?compress=true&ssh-key={}",
+        key.display()
+    );
     info!("store: {store}");
 
     let shell = sh::shell()?;

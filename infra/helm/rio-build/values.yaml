@@ -273,6 +273,37 @@ store:
     limits: {memory: 4Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
+# ComponentScaler — predictive replica autoscaling
+# ──────────────────────────────────────────────────────────────────────────
+# When enabled, the controller reconciles a ComponentScaler CR into
+# deployments/scale patches on rio-store. desired = ceil(Σ(queued+
+# running) / learnedRatio), corrected against max(GetLoad) across
+# store pods. learnedRatio persists in .status across controller
+# restarts.
+#
+# Disabled by default: existing static-replica deployments unchanged.
+# EKS opts in via xtask deploy. With enabled=true, store.replicas
+# (above) is IGNORED — store.yaml omits .spec.replicas so helm upgrade
+# doesn't fight the controller.
+componentScaler:
+  store:
+    enabled: false
+    min: 2
+    # Aurora 16ACU ≈ 2800 max_connections / 200 pgMaxConnections = 14.
+    # Raise alongside Aurora ACU; lower if pgMaxConnections is raised.
+    max: 14
+    # Empirically ~70 builders/replica (555-on-8, I-110); seed at 50
+    # to start slightly over-provisioned and let the ratio EMA up.
+    seedRatio: 50.0
+    loadThresholds:
+      # >0.8: immediate +1 + ratio×0.95. PG pool exhaustion is a
+      # cliff (I-105) — react fast.
+      high: 0.8
+      # <0.3 for 30 consecutive ticks (5min): ratio×1.02. Over-
+      # provisioning is cheap — react slow.
+      low: 0.3
+
+# ──────────────────────────────────────────────────────────────────────────
 # rio-scheduler
 # ──────────────────────────────────────────────────────────────────────────
 # Leader-elected via K8s Lease. replicas=2: ONE dispatches; standby merges
@@ -333,10 +364,11 @@ gateway:
   schedulerBalanceHost: rio-scheduler-headless
   schedulerBalancePort: 9001
   # Cap on transitive input derivations resolved per build (DoS guard).
-  # 100k ≈ 8 MB of path strings per session. Raise if a single build's
-  # DAG (e.g. building all of nixpkgs) exceeds this — the rejection
-  # error names this knob. Lower on memory-constrained gateway pods.
-  maxTransitiveInputs: 100000
+  # Matches gateway wire MAX_COLLECTION_COUNT (1M). drv_cache ≈ 1-3GB at
+  # the cap (parsed Derivation, not just path strings); gateway memory
+  # limit raised to 4Gi (I-134) to accommodate. Lower on memory-
+  # constrained gateway pods (I-135).
+  maxTransitiveInputs: 1048576
   # I-064 graceful drain. SIGTERM → readiness=NotServing → wait
   # drainGraceSecs (NLB target deregister) → stop accepting SSH → wait
   # sessionDrainSecs for open sessions to close → exit.

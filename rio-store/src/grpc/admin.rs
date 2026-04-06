@@ -16,9 +16,10 @@ use tracing::{debug, info, instrument, warn};
 use rio_common::grpc::StatusExt;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::{
-    AddUpstreamRequest, GcProgress, GcRequest, ListUpstreamsRequest, ListUpstreamsResponse,
-    PinPathRequest, PinPathResponse, RemoveUpstreamRequest, ResignPathsRequest,
-    ResignPathsResponse, UpstreamInfo, VerifyChunksProgress, VerifyChunksRequest,
+    AddUpstreamRequest, GcProgress, GcRequest, GetLoadRequest, GetLoadResponse,
+    ListUpstreamsRequest, ListUpstreamsResponse, PinPathRequest, PinPathResponse,
+    RemoveUpstreamRequest, ResignPathsRequest, ResignPathsResponse, UpstreamInfo,
+    VerifyChunksProgress, VerifyChunksRequest,
 };
 
 use crate::backend::chunk::ChunkBackend;
@@ -98,6 +99,26 @@ impl StoreAdminServiceImpl {
     pub fn with_signer(mut self, signer: Arc<TenantSigner>) -> Self {
         self.signer = Some(signer);
         self
+    }
+
+    /// Compute `(checked_out / max_connections)` for the PG pool.
+    ///
+    /// `pool.size()` is total connections (idle + in-use); `num_idle()`
+    /// is the idle subset. Both are non-atomic separate loads, so
+    /// `size - idle` can momentarily go negative under churn —
+    /// `saturating_sub` floors at 0. `max_connections` from
+    /// `pool.options()` is the configured ceiling (the `pgMax
+    /// Connections` chart value), not the high-water mark; that's the
+    /// denominator the I-105 cliff is measured against (Aurora's
+    /// `max_connections / replicas`, not "however many we happen to
+    /// have open").
+    ///
+    /// Extracted so the gRPC handler and any future periodic gauge
+    /// updater share one formula.
+    pub(crate) fn pg_pool_utilization(pool: &PgPool) -> f32 {
+        let max = pool.options().get_max_connections().max(1);
+        let in_use = pool.size().saturating_sub(pool.num_idle() as u32);
+        in_use as f32 / max as f32
     }
 
     /// Per-row body for ResignPaths wet-run: reassemble NAR, scan
@@ -910,6 +931,30 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         }
         Ok(Response::new(()))
     }
+
+    /// Per-replica load snapshot for the ComponentScaler reconciler.
+    ///
+    /// Side-effect: also publishes `rio_store_pg_pool_utilization` so
+    /// Prometheus sees the same value the controller acted on. The
+    /// controller's 10s tick is the de-facto gauge update cadence —
+    /// no separate background updater. If no ComponentScaler is
+    /// deployed, the gauge stays at its pre-registered 0.0 (which is
+    /// truthful: with `replicas` chart-fixed there's nothing acting
+    /// on it anyway).
+    // r[impl store.admin.get-load]
+    // r[impl obs.metric.store-pg-pool]
+    #[instrument(skip(self, _request), fields(rpc = "GetLoad"))]
+    async fn get_load(
+        &self,
+        _request: Request<GetLoadRequest>,
+    ) -> Result<Response<GetLoadResponse>, Status> {
+        let util = Self::pg_pool_utilization(&self.pool);
+        metrics::gauge!("rio_store_pg_pool_utilization").set(util as f64);
+        debug!(pg_pool_utilization = util, "GetLoad");
+        Ok(Response::new(GetLoadResponse {
+            pg_pool_utilization: util,
+        }))
+    }
 }
 
 /// Parse the proto's string tenant_id into a Uuid. Proto uses string
@@ -961,6 +1006,52 @@ mod tests {
     use crate::test_helpers::{StoreSeed, path_hash};
     use rio_proto::StoreAdminService;
     use rio_test_support::TestDb;
+
+    /// GetLoad reflects checked-out connections as a fraction of
+    /// `max_connections`.
+    ///
+    /// sqlx's `size()`/`num_idle()` are non-atomic separate loads,
+    /// TestDb's pool may have background activity (min-connections
+    /// maintenance, reaper), and PoolConnection's Drop returns the
+    /// connection via a spawned task (NOT synchronously) — so we
+    /// don't assert an exact baseline or post-release value. We
+    /// assert only: (a) range `[0, 1]`, (b) with two connections
+    /// HELD, utilization is at least `2/max`. The "in-use, not size
+    /// or num_idle" property is documented at `pg_pool_utilization`
+    /// and follows from the formula by inspection.
+    // r[verify store.admin.get-load]
+    // r[verify obs.metric.store-pg-pool]
+    #[tokio::test]
+    async fn get_load_tracks_in_use_connections() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        let max = db.pool.options().get_max_connections() as f32;
+
+        async fn load(svc: &StoreAdminServiceImpl) -> f32 {
+            svc.get_load(Request::new(GetLoadRequest {}))
+                .await
+                .expect("get_load")
+                .into_inner()
+                .pg_pool_utilization
+        }
+
+        let baseline = load(&svc).await;
+        assert!(
+            (0.0..=1.0).contains(&baseline),
+            "baseline utilization out of range: {baseline}"
+        );
+
+        let c1 = db.pool.acquire().await.expect("acquire");
+        let c2 = db.pool.acquire().await.expect("acquire");
+        let busy = load(&svc).await;
+        assert!(
+            busy >= 2.0 / max - f32::EPSILON,
+            "two held connections → util ≥ 2/max ({}); got {busy}",
+            2.0 / max
+        );
+        assert!(busy <= 1.0, "utilization must not exceed 1.0; got {busy}");
+        drop((c1, c2));
+    }
     use rio_test_support::fixtures::test_store_path;
 
     /// PinPath for a path NOT in narinfo → FK violation → success=

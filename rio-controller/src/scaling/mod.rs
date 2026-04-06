@@ -12,6 +12,7 @@
 //! onto the cluster-wide loop — same shape as P0356's
 //! `grpc/mod.rs` split.
 
+pub mod component;
 pub mod per_class;
 pub mod standalone;
 
