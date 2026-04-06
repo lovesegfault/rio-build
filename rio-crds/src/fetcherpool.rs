@@ -22,10 +22,17 @@ fn default_true() -> bool {
     true
 }
 
-/// FetcherPool spec. Fetchers are network-bound, not CPU-predictable,
-/// so no size-class. The reconciler labels pods `rio.build/role:
+/// FetcherPool spec. The reconciler labels pods `rio.build/role:
 /// fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
 /// true`, stricter seccomp).
+///
+/// Optionally size-classed via `classes[]` (I-170): fetchers run
+/// arbitrary code (the FOD's `builder` script) and a large source
+/// unpack+NAR-serialize can OOM a 2Gi pod. Unlike BuilderPoolSet
+/// there is no a-priori signal (no `build_samples` history, no
+/// duration cutoff) — the scheduler routes FODs to the smallest
+/// class by default and reactively promotes on transient failure
+/// (`r[sched.fod.size-class-reactive]`).
 ///
 /// `KubeSchema` alongside `CustomResource`: same pattern as
 /// BuilderPoolSpec. No CEL on this struct yet, but KubeSchema
@@ -57,6 +64,17 @@ fn default_true() -> bool {
         "!has(self.ephemeralDeadlineSeconds) || self.ephemeral"
     ).message(
         "ephemeralDeadlineSeconds is only valid with ephemeral:true — the field sets the Job's activeDeadlineSeconds; STS pools have no Jobs"
+    )
+)]
+// CEL: classes[] and resources are mutually exclusive. When classes is
+// non-empty, per-class resources apply; the top-level field would be
+// ambiguous (which class does it size?). When classes is empty, the
+// single STS uses top-level resources — current behavior, back-compat.
+#[x_kube(
+    validation = Rule::new(
+        "size(self.classes) == 0 || !has(self.resources)"
+    ).message(
+        "classes[] and resources are mutually exclusive — set per-class resources in classes[].resources, or omit classes[] for a single-size pool"
     )
 )]
 #[serde(rename_all = "camelCase")]
@@ -129,12 +147,38 @@ pub struct FetcherPoolSpec {
     #[schemars(schema_with = "crate::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
-    /// K8s resource requests/limits. Fetchers are lighter than
-    /// builders (network-bound, not CPU) — typical: 500m/1Gi.
-    /// `any_object` passthrough — see builderpool.rs for why.
+    /// K8s resource requests/limits for a single-size pool. Fetchers
+    /// are typically lighter than builders (network-bound) — 500m/1Gi
+    /// default. Mutually exclusive with `classes[]` (CEL-enforced):
+    /// when `classes` is non-empty, per-class resources apply and this
+    /// field MUST be unset. `any_object` passthrough — see
+    /// builderpool.rs for why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<ResourceRequirements>,
+
+    /// Optional size classes (I-170). When empty (default), single
+    /// STS/Job-set at `spec.resources` — original behavior. When
+    /// non-empty, the reconciler stamps one StatefulSet (or
+    /// ephemeral Job loop) per class; each registers with
+    /// `size_class = name` so the scheduler can route by
+    /// `DerivationState.size_class_floor`.
+    ///
+    /// Unlike `BuilderPoolSet.classes[]` there is NO `cutoff_secs` —
+    /// fetchers have no a-priori duration estimate (FODs are excluded
+    /// from `build_samples`; ADR-019). Routing is reactive only: a
+    /// FOD that fails on class N retries on class N+1. Order classes
+    /// smallest→largest; the scheduler treats `classes[0]` as the
+    /// default floor.
+    ///
+    /// NOT a separate `FetcherPoolSet` CRD: the BuilderPoolSet→child
+    /// indirection exists for per-class autoscaling targets keyed on
+    /// per-class queue depth. Fetcher classes are expected to be
+    /// `[tiny, small]` with `small` rarely used — flat `classes[]`
+    /// on the existing CRD is simpler. Promote to a *Set CRD later
+    /// if per-class autoscaling matters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<FetcherSizeClass>,
 
     /// mTLS Secret name (tls.crt/tls.key/ca.crt) for outgoing gRPC
     /// to scheduler + store. Same cert as builders (same binary,
@@ -151,6 +195,40 @@ pub struct FetcherPoolSpec {
     /// builderpool.rs's `host_users` doc for the full diagnostic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
+}
+
+/// One fetcher size class. Mirrors `SizeClassSpec` minus
+/// `cutoff_secs` — fetchers route by reactive floor only, not
+/// duration estimate. The scheduler's `[[fetcher_size_classes]]`
+/// config carries just the names (for ordering); per-class
+/// `resources` live here on the controller side.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FetcherSizeClass {
+    /// Class name. Becomes the StatefulSet name suffix
+    /// (`rio-fetcher-{pool}-{name}`) AND the `RIO_SIZE_CLASS` env
+    /// the executor reports in its heartbeat. Convention: "tiny" /
+    /// "small"; nothing enforces that.
+    pub name: String,
+
+    /// K8s resource requests/limits for this class's fetcher pods.
+    /// NON-Option: distinct resource profiles are the entire point
+    /// of size classes. `any_object` passthrough — see
+    /// builderpool.rs for why.
+    #[schemars(schema_with = "crate::any_object")]
+    pub resources: ResourceRequirements,
+
+    /// Replica floor for this class's StatefulSet. `None` = inherit
+    /// `spec.replicas.min`. Per-class because "tiny" wants warm
+    /// replicas (most FODs land here) while "small" tolerates
+    /// scale-from-zero (rare promotions; +30s spinup is fine for a
+    /// drv that already burned a retry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_replicas: Option<i32>,
+
+    /// Replica ceiling. `None` = inherit `spec.replicas.max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_replicas: Option<i32>,
 }
 
 /// FetcherPool status. Reconciler + autoscaler write; `kubectl get fp`
@@ -211,10 +289,38 @@ mod tests {
         assert!(json.contains("readyReplicas"));
         assert!(json.contains("desiredReplicas"));
         assert!(json.contains("lastScaleTime"));
+        // FetcherSizeClass nested
+        assert!(json.contains("minReplicas"));
+        assert!(json.contains("maxReplicas"));
         // Negative: no snake_case leaked as a property KEY.
         assert!(!json.contains("\"node_selector\":"));
         assert!(!json.contains("\"ready_replicas\":"));
         assert!(!json.contains("\"desired_replicas\":"));
+        assert!(!json.contains("\"min_replicas\":"));
+    }
+
+    /// `classes` defaults to empty (back-compat: existing FetcherPool
+    /// YAMLs without the field deserialize as single-size pools).
+    #[test]
+    fn classes_default_empty() {
+        let yaml = r#"
+            replicas: {min: 0, max: 8}
+            autoscaling: {metric: fodQueueDepth, targetValue: 5}
+            image: rio-fetcher:test
+            systems: [x86_64-linux]
+        "#;
+        let spec: FetcherPoolSpec = serde_yml::from_str(yaml).expect("deserializes");
+        assert!(spec.classes.is_empty(), "absent → empty (back-compat)");
+    }
+
+    /// The `classes`/`resources` mutual-exclusion CEL rule renders.
+    /// Absence means a misformed spec with BOTH set is accepted at
+    /// admission; the reconciler would silently ignore one.
+    #[test]
+    fn classes_resources_cel_renders() {
+        let crd = FetcherPool::crd();
+        let json = serde_json::to_string(&crd).expect("serializes");
+        assert!(json.contains("size(self.classes) == 0 || !has(self.resources)"));
     }
 
     /// Replicas inherits the `min <= max` CEL rule from BuilderPool's

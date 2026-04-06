@@ -217,6 +217,13 @@ pub struct DagActor {
     /// `.await` on the same task blocks the executor thread. See
     /// dispatch.rs: guards are dropped before any await boundary.
     size_classes: Arc<parking_lot::RwLock<Vec<crate::assignment::SizeClassConfig>>>,
+    /// Fetcher size-class config (I-170). Empty = feature off (single
+    /// fetcher pool, no class filter — original behavior). Ordered
+    /// smallest→largest; `find_executor_with_overflow`'s FOD branch
+    /// walks from `DerivationState.size_class_floor` upward. Plain
+    /// `Vec` (not `Arc<RwLock>`): no rebalancer mutates this — it's
+    /// just an ordered name list, config-static after construction.
+    fetcher_size_classes: Vec<crate::assignment::FetcherSizeClassConfig>,
     /// ADR-020 capacity manifest headroom. Applied by both
     /// `compute_capacity_manifest` (manifest RPC) and the dispatch-time
     /// resource-fit filter. Config-global; per-pool later if needed.
@@ -380,6 +387,7 @@ impl DagActor {
             generation: Arc::new(AtomicU64::new(1)),
             self_tx: None,
             size_classes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            fetcher_size_classes: Vec::new(),
             headroom_mult: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER,
             configured_cutoffs: Vec::new(),
             log_flush_tx: None,
@@ -454,6 +462,20 @@ impl DagActor {
             .map(|c| (c.name.clone(), c.cutoff_secs))
             .collect();
         self.size_classes = Arc::new(parking_lot::RwLock::new(classes));
+        self
+    }
+
+    /// Inject fetcher size-class config (I-170). Empty vec (the
+    /// default) = no fetcher class filter → FODs route to any
+    /// fetcher (original behavior). Separate from `with_size_classes`:
+    /// builder classes carry `cutoff_secs` and feed the rebalancer;
+    /// fetcher classes are just an ordered name list for reactive
+    /// promotion.
+    pub fn with_fetcher_size_classes(
+        mut self,
+        classes: Vec<crate::assignment::FetcherSizeClassConfig>,
+    ) -> Self {
+        self.fetcher_size_classes = classes;
         self
     }
 
@@ -783,6 +805,14 @@ impl DagActor {
                     let _ = reply.send(self.handle_debug_backdate_submitted(build_id, secs_ago));
                 }
                 #[cfg(test)]
+                ActorCommand::DebugForcePoisoned {
+                    drv_hash,
+                    retry_count,
+                    reply,
+                } => {
+                    let _ = reply.send(self.handle_debug_force_poisoned(&drv_hash, retry_count));
+                }
+                #[cfg(test)]
                 ActorCommand::DebugClearDrvContent { drv_hash, reply } => {
                     let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
                 }
@@ -1020,6 +1050,7 @@ impl DagActor {
             retry_count: s.retry_count,
             assigned_executor: s.assigned_executor.as_ref().map(|w| w.to_string()),
             assigned_size_class: s.assigned_size_class.clone(),
+            size_class_floor: s.size_class_floor.clone(),
             output_paths: s.output_paths.clone(),
             failed_builders: s.failed_builders.iter().map(|w| w.to_string()).collect(),
             failure_count: s.failure_count,
@@ -1097,6 +1128,19 @@ impl DagActor {
             return false;
         };
         build.submitted_at = backdate(secs_ago);
+        true
+    }
+
+    /// Force a derivation into `Poisoned` with the given `retry_count`.
+    /// For the I-169 resubmit-bound tests.
+    #[cfg(test)]
+    fn handle_debug_force_poisoned(&mut self, drv_hash: &str, retry_count: u32) -> bool {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return false;
+        };
+        state.set_status_for_test(DerivationStatus::Poisoned);
+        state.retry_count = retry_count;
+        state.poisoned_at = Some(std::time::Instant::now());
         true
     }
 

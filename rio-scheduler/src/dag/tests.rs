@@ -195,32 +195,10 @@ fn test_merge_resets_failed_preserves_interest() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Negative: Poisoned must NOT be reset on resubmit. It has a 24h TTL for
-/// a reason (failed on 3+ workers). `handle_merge_dag` handles this via
-/// `first_dep_failed` → build fails fast with a clear error.
-#[test]
-fn test_merge_does_not_reset_poisoned() -> anyhow::Result<()> {
-    let mut dag = DerivationDag::new();
-    let build1 = Uuid::new_v4();
-    let nodes = vec![make_node("hashP", "x86_64-linux")];
-
-    dag.merge(build1, &nodes, &[], "")?;
-    dag.nodes
-        .get_mut("hashP")
-        .expect("hashP")
-        .set_status_for_test(DerivationStatus::Poisoned);
-
-    let build2 = Uuid::new_v4();
-    let result = dag.merge(build2, &nodes, &[], "")?;
-
-    // Poisoned stays poisoned — NOT in newly_inserted.
-    assert!(
-        !result.newly_inserted.contains("hashP"),
-        "Poisoned must not be reset on resubmit (24h TTL is authoritative)"
-    );
-    assert_eq!(dag.nodes["hashP"].status(), DerivationStatus::Poisoned);
-    Ok(())
-}
+// Removed (I-169): the former `test_merge_does_not_reset_poisoned` asserted
+// Poisoned was unconditionally NOT retriable on resubmit. Superseded by
+// `test_merge_resets_poisoned_under_retry_limit` (under-limit → reset) +
+// `test_merge_keeps_poisoned_at_retry_limit` (at-limit → not reset) below.
 
 /// Worker-side timeout scenario: `BuildResultStatus::TimedOut` →
 /// `handle_timeout_failure` → child Cancelled, parent DependencyFailed
@@ -283,6 +261,103 @@ fn test_merge_resets_timeout_cascade() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// I-169: a `Poisoned` node with `retry_count < POISON_RESUBMIT_RETRY_LIMIT`
+/// resets on resubmit. retry_count is carried over so the bound accumulates
+/// across resubmits. Surfaced in `reset_on_resubmit` so the actor can
+/// `db.clear_poison`.
+///
+/// Sensitivity: before the fix, Poisoned was unconditionally NOT retriable.
+/// I-167's `?id=` patch poisoned, then 27k DependencyFailed dependents
+/// re-derived from the still-poisoned parent on every resubmit → fail-fast.
+// r[verify sched.merge.poisoned-resubmit-bounded]
+#[test]
+fn test_merge_resets_poisoned_under_retry_limit() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![
+        make_node("parentI", "x86_64-linux"),
+        make_node("childI", "x86_64-linux"),
+    ];
+    let edges = vec![make_edge("parentI", "childI")];
+
+    dag.merge(build1, &nodes, &edges, "")?;
+    {
+        let child = dag.nodes.get_mut("childI").expect("childI");
+        child.set_status_for_test(DerivationStatus::Poisoned);
+        child.retry_count = 2;
+    }
+    dag.nodes
+        .get_mut("parentI")
+        .expect("parentI")
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &edges, "")?;
+
+    // Both reset: child was Poisoned-under-limit, parent was DependencyFailed.
+    assert!(
+        result.newly_inserted.contains("childI"),
+        "I-169: Poisoned with retry_count=2 (< {}) must reset on resubmit",
+        crate::state::POISON_RESUBMIT_RETRY_LIMIT
+    );
+    assert!(result.newly_inserted.contains("parentI"));
+    assert!(
+        result.reset_on_resubmit.iter().any(|h| h == "childI"),
+        "reset Poisoned node surfaced in reset_on_resubmit for db.clear_poison"
+    );
+    let child = &dag.nodes["childI"];
+    assert_eq!(child.status(), DerivationStatus::Created);
+    assert_eq!(
+        child.retry_count, 2,
+        "retry_count carried over across reset so the bound accumulates"
+    );
+
+    // compute_initial_states: child has no deps → Ready; parent's only
+    // dep (child) is fresh Created → not terminally failed → Queued.
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&result.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(states["childI"], DerivationStatus::Ready);
+    assert_eq!(
+        states["parentI"],
+        DerivationStatus::Queued,
+        "I-169: parent no longer re-derives DependencyFailed — dep was reset"
+    );
+    Ok(())
+}
+
+/// I-169 bound: at `retry_count >= POISON_RESUBMIT_RETRY_LIMIT`, `Poisoned`
+/// stays Poisoned on resubmit. 24h TTL or `ClearPoison` are the only overrides.
+// r[verify sched.merge.poisoned-resubmit-bounded]
+#[test]
+fn test_merge_keeps_poisoned_at_retry_limit() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let build1 = Uuid::new_v4();
+    let nodes = vec![make_node("hashL", "x86_64-linux")];
+
+    dag.merge(build1, &nodes, &[], "")?;
+    {
+        let n = dag.nodes.get_mut("hashL").expect("hashL");
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry_count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let build2 = Uuid::new_v4();
+    let result = dag.merge(build2, &nodes, &[], "")?;
+
+    assert!(
+        !result.newly_inserted.contains("hashL"),
+        "Poisoned at retry limit ({}) must NOT reset — bound holds",
+        crate::state::POISON_RESUBMIT_RETRY_LIMIT
+    );
+    assert!(result.reset_on_resubmit.is_empty());
+    assert_eq!(dag.nodes["hashL"].status(), DerivationStatus::Poisoned);
+    // build2 still gains interest (pre-existing-node arm).
+    assert!(dag.nodes["hashL"].interested_builds.contains(&build2));
+    Ok(())
+}
+
 /// DependencyFailed reset is self-correcting when dep is STILL Poisoned:
 /// `compute_initial_states` re-checks `any_dep_terminally_failed` and
 /// puts the parent back in DependencyFailed. Same fast-fail, just via
@@ -298,10 +373,13 @@ fn test_merge_resets_depfailed_but_rederives_if_dep_still_poisoned() -> anyhow::
     let edges = vec![make_edge("parentD", "childD")];
 
     dag.merge(build1, &nodes, &edges, "")?;
-    dag.nodes
-        .get_mut("childD")
-        .expect("childD")
-        .set_status_for_test(DerivationStatus::Poisoned);
+    {
+        let child = dag.nodes.get_mut("childD").expect("childD");
+        child.set_status_for_test(DerivationStatus::Poisoned);
+        // At/above the resubmit-retry limit so the child stays Poisoned
+        // (this test exercises the dep-STILL-poisoned re-derive path).
+        child.retry_count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    }
     dag.nodes
         .get_mut("parentD")
         .expect("parentD")
@@ -310,7 +388,7 @@ fn test_merge_resets_depfailed_but_rederives_if_dep_still_poisoned() -> anyhow::
     let build2 = Uuid::new_v4();
     let result = dag.merge(build2, &nodes, &edges, "")?;
 
-    // Parent reset (DependencyFailed is retriable), child NOT (Poisoned isn't).
+    // Parent reset (DependencyFailed is retriable), child NOT (Poisoned at limit).
     assert!(result.newly_inserted.contains("parentD"));
     assert!(!result.newly_inserted.contains("childD"));
     assert_eq!(dag.nodes["childD"].status(), DerivationStatus::Poisoned);
@@ -336,11 +414,12 @@ fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
     let leaf_nodes = vec![make_node("leafP", "x86_64-linux")];
     dag.merge(build1, &leaf_nodes, &[], "")?;
 
-    // Poison it.
-    dag.nodes
-        .get_mut("leafP")
-        .expect("leafP")
-        .set_status_for_test(DerivationStatus::Poisoned);
+    // Poison it (at the resubmit-retry limit so re-merge doesn't reset it).
+    {
+        let leaf = dag.nodes.get_mut("leafP").expect("leafP");
+        leaf.set_status_for_test(DerivationStatus::Poisoned);
+        leaf.retry_count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    }
 
     assert!(!dag.any_dep_terminally_failed("leafP")); // no deps
 

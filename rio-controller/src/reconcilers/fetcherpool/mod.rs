@@ -6,8 +6,12 @@
 //! Service, autoscaled on `queued_fod_derivations`. Both apply the
 //! stricter security posture per ADR-019 §Sandbox hardening.
 //!
-//! Still simpler than [`builderpool`](super::builderpool): no
-//! size-class (fetches are network-bound), no PDB, no manifest mode.
+//! Optionally size-classed via `spec.classes[]` (I-170): when
+//! non-empty, one StatefulSet (or ephemeral Job loop) per class;
+//! each registers `RIO_SIZE_CLASS=name` so the scheduler can route
+//! by `size_class_floor`. Still simpler than
+//! [`builderpool`](super::builderpool): no PDB, no manifest mode,
+//! no duration-cutoff rebalancer.
 // TODO(P0455): add the ctrl.fetcherpool.reconcile impl marker once
 // ADR-019 is in tracey spec_include (the rule is defined in
 // decisions/019 but tracey only scans components/ today).
@@ -26,7 +30,7 @@ use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{info, warn};
 
 use crate::crds::builderpool::SeccompProfileKind;
-use crate::crds::fetcherpool::FetcherPool;
+use crate::crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::common::sts::{self, ExecutorRole, ExecutorStsParams, sts_name};
 use crate::reconcilers::{Ctx, error_key};
@@ -93,15 +97,70 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
         Error::InvalidSpec("FetcherPool has no metadata.uid (not from apiserver?)".into())
     })?;
 
-    let params = executor_params(&fp)?;
+    // r[impl ctrl.fetcherpool.classes]
+    // I-170: when `classes` is non-empty, stamp one STS+Service per
+    // class. When empty (back-compat), single STS at `spec.resources`.
+    // Status aggregates ready/desired across classes.
+    let mut total_ready = 0i32;
+    let mut total_desired = 0i32;
+    if fp.spec.classes.is_empty() {
+        let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, &name, None).await?;
+        total_ready += ready;
+        total_desired += desired;
+    } else {
+        for class in &fp.spec.classes {
+            let pool_name = format!("{name}-{}", class.name);
+            let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, &pool_name, Some(class)).await?;
+            total_ready += ready;
+            total_desired += desired;
+        }
+    }
+
+    // ── Status ──────────────────────────────────────────────────
+    // Partial: reconciler owns readyReplicas/desiredReplicas;
+    // autoscaler owns lastScaleTime/conditions via a separate
+    // field-manager. Same SSA split as builderpool.
+    let fp_api: Api<FetcherPool> = Api::namespaced(ctx.client.clone(), &ns);
+    let ar = FetcherPool::api_resource();
+    fp_api
+        .patch_status(
+            &name,
+            &PatchParams::apply(MANAGER).force(),
+            &Patch::Apply(serde_json::json!({
+                "apiVersion": ar.api_version,
+                "kind": ar.kind,
+                "status": {
+                    "readyReplicas": total_ready,
+                    "desiredReplicas": total_desired,
+                },
+            })),
+        )
+        .await?;
+
+    info!(pool = %name, classes = fp.spec.classes.len(), "reconciled FetcherPool");
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Apply one STS+Service for a single size-class (or the unclassed
+/// pool when `class` is `None`). Returns `(ready, desired)` from
+/// the resulting STS for status aggregation.
+async fn apply_one(
+    fp: &FetcherPool,
+    ctx: &Ctx,
+    ns: &str,
+    oref: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    pool_name: &str,
+    class: Option<&FetcherSizeClass>,
+) -> Result<(i32, i32)> {
+    let params = executor_params(fp, class)?;
     let labels = sts::executor_labels(&params);
-    let sts_name = sts_name(&name, ExecutorRole::Fetcher);
+    let sts_name = sts_name(pool_name, ExecutorRole::Fetcher);
 
     // ── Headless Service ────────────────────────────────────────
     let svc = Service {
         metadata: ObjectMeta {
             name: Some(sts_name.clone()),
-            namespace: Some(ns.clone()),
+            namespace: Some(ns.into()),
             owner_references: Some(vec![oref.clone()]),
             labels: Some(labels.clone()),
             ..Default::default()
@@ -120,7 +179,7 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
         }),
         ..Default::default()
     };
-    Api::<Service>::namespaced(ctx.client.clone(), &ns)
+    Api::<Service>::namespaced(ctx.client.clone(), ns)
         .patch(
             &sts_name,
             &PatchParams::apply(MANAGER).force(),
@@ -134,20 +193,24 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
     // reconciles. The autoscaler ("rio-controller-autoscaler") owns
     // `spec.replicas` after that; sending it here with .force()
     // would revert every scale decision back to min.
-    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
+    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
     let existing = sts_api.get_opt(&sts_name).await?;
-    let initial_replicas = existing.is_none().then_some(fp.spec.replicas.min);
+    // Per-class min override falls back to pool-wide replicas.min.
+    let min = class
+        .and_then(|c| c.min_replicas)
+        .unwrap_or(fp.spec.replicas.min);
+    let initial_replicas = existing.is_none().then_some(min);
     // For status.desiredReplicas: read what's actually on the STS
     // (autoscaler's last decision, or min on first create).
     let current_replicas = existing
         .as_ref()
         .and_then(|s| s.spec.as_ref())
         .and_then(|s| s.replicas)
-        .unwrap_or(fp.spec.replicas.min);
+        .unwrap_or(min);
 
     let sts = sts::build_executor_statefulset(
         &params,
-        oref,
+        oref.clone(),
         &ctx.scheduler_addrs(),
         &ctx.store_addrs(),
         initial_replicas,
@@ -160,30 +223,8 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
         )
         .await?;
 
-    // ── Status ──────────────────────────────────────────────────
-    // Partial: reconciler owns readyReplicas/desiredReplicas;
-    // autoscaler owns lastScaleTime/conditions via a separate
-    // field-manager. Same SSA split as builderpool.
     let sts_status = applied.status.unwrap_or_default();
-    let fp_api: Api<FetcherPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let ar = FetcherPool::api_resource();
-    fp_api
-        .patch_status(
-            &name,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(serde_json::json!({
-                "apiVersion": ar.api_version,
-                "kind": ar.kind,
-                "status": {
-                    "readyReplicas": sts_status.ready_replicas.unwrap_or(0),
-                    "desiredReplicas": current_replicas,
-                },
-            })),
-        )
-        .await?;
-
-    info!(pool = %name, "reconciled FetcherPool");
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok((sts_status.ready_replicas.unwrap_or(0), current_replicas))
 }
 
 /// Cleanup: ownerRef GC handles the STS + Service. Fetches are
@@ -196,7 +237,17 @@ async fn cleanup(fp: Arc<FetcherPool>, _ctx: &Ctx) -> Result<Action> {
 
 /// Convert `FetcherPool` → `ExecutorStsParams` with fetcher-specific
 /// hardening defaults.
-fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
+///
+/// `class`: when `Some`, overrides `pool_name` suffix, `resources`,
+/// and injects `RIO_SIZE_CLASS` so the executor reports it in
+/// heartbeat (`r[ctrl.fetcherpool.classes]`). When `None`, single-
+/// pool behavior at `spec.resources` (back-compat). Security
+/// posture (read-only rootfs, seccomp, node placement) is identical
+/// across classes — only resources + size_class env vary.
+fn executor_params(
+    fp: &FetcherPool,
+    class: Option<&FetcherSizeClass>,
+) -> Result<ExecutorStsParams> {
     let cache_gb = sts::parse_quantity_to_gb(FETCHER_FUSE_CACHE)?;
 
     // ADR-019 §Node isolation: fetchers land on dedicated nodes via
@@ -230,8 +281,23 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
         // marker here (readOnlyRootFilesystem half) once ADR-019 is
         // in tracey spec_include.
         read_only_root_fs: true,
-        extra_env: vec![],
-        pool_name: fp.name_any(),
+        // r[impl ctrl.fetcherpool.classes]
+        // RIO_SIZE_CLASS: same env builders use (sts.rs:710 reads it
+        // from extra_env). The executor copies this into
+        // HeartbeatRequest.size_class → ExecutorState.size_class →
+        // hard_filter's size-class match clause. Unclassed pool
+        // (`class=None`) leaves it empty → executor reports
+        // size_class=None → hard_filter passes through (back-compat).
+        extra_env: class
+            .map(|c| vec![sts::env("RIO_SIZE_CLASS", &c.name)])
+            .unwrap_or_default(),
+        // Per-class pool_name → STS name `rio-fetcher-{pool}-{class}`.
+        // executor_labels reads this for the `rio.build/pool` label
+        // so the per-class headless Service selector matches.
+        pool_name: match class {
+            Some(c) => format!("{}-{}", fp.name_any(), c.name),
+            None => fp.name_any(),
+        },
         namespace: fp
             .namespace()
             .ok_or_else(|| Error::InvalidSpec("FetcherPool has no namespace".into()))?,
@@ -244,7 +310,12 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
         // Fetchers don't advertise features — FODs route by
         // is_fixed_output alone, not by feature set.
         features: vec![],
-        resources: fp.spec.resources.clone(),
+        // Per-class resources override; CEL guarantees spec.resources
+        // is None when classes is non-empty, so the `or` is for the
+        // unclassed back-compat path.
+        resources: class
+            .map(|c| c.resources.clone())
+            .or_else(|| fp.spec.resources.clone()),
         fuse_cache_gb: cache_gb,
         fuse_cache_quantity: Quantity(FETCHER_FUSE_CACHE.into()),
         fuse_threads: None,
@@ -297,6 +368,7 @@ pub fn error_policy(fp: Arc<FetcherPool>, err: &Error, ctx: Arc<Ctx>) -> Action 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::core::v1::ResourceRequirements;
 
     fn mk(min: i32, max: i32) -> FetcherPool {
         use crate::crds::builderpool::{Autoscaling, Replicas};
@@ -315,6 +387,7 @@ mod tests {
                 node_selector: None,
                 tolerations: None,
                 resources: None,
+                classes: vec![],
                 tls_secret_name: None,
                 host_users: None,
             },
@@ -329,7 +402,7 @@ mod tests {
     #[test]
     fn labels_include_fetcher_role() {
         let fp = mk(2, 8);
-        let params = executor_params(&fp).unwrap();
+        let params = executor_params(&fp, None).unwrap();
         let labels = sts::executor_labels(&params);
         assert_eq!(labels.get("rio.build/role"), Some(&"fetcher".into()));
         assert_eq!(labels.get("rio.build/pool"), Some(&"test".into()));
@@ -340,7 +413,7 @@ mod tests {
     #[test]
     fn security_posture_is_strict() {
         let fp = mk(1, 1);
-        let params = executor_params(&fp).unwrap();
+        let params = executor_params(&fp, None).unwrap();
         assert!(params.read_only_root_fs);
         assert!(!params.privileged);
         let sp = params.seccomp_profile.as_ref().unwrap();
@@ -356,7 +429,7 @@ mod tests {
     #[test]
     fn node_placement_defaults_to_fetcher_pool() {
         let fp = mk(1, 1);
-        let params = executor_params(&fp).unwrap();
+        let params = executor_params(&fp, None).unwrap();
         assert_eq!(
             params
                 .node_selector
@@ -376,7 +449,7 @@ mod tests {
     fn operator_placement_overrides_default() {
         let mut fp = mk(1, 1);
         fp.spec.node_selector = Some(BTreeMap::from([("custom".into(), "yes".into())]));
-        let params = executor_params(&fp).unwrap();
+        let params = executor_params(&fp, None).unwrap();
         assert_eq!(
             params.node_selector.as_ref().unwrap().get("custom"),
             Some(&"yes".into())
@@ -388,6 +461,106 @@ mod tests {
                 .unwrap()
                 .contains_key("rio.build/node-role")
         );
+    }
+
+    // r[verify ctrl.fetcherpool.classes]
+    /// I-170: per-class params carry `RIO_SIZE_CLASS=<name>`, the
+    /// per-class resources, and a `{pool}-{class}` pool_name (→ STS
+    /// name `rio-fetcher-{pool}-{class}`). Security posture is
+    /// identical to the unclassed path.
+    #[test]
+    fn per_class_params_set_size_class_and_resources() {
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let fp = mk(2, 8);
+        let class = FetcherSizeClass {
+            name: "small".into(),
+            resources: ResourceRequirements {
+                limits: Some(BTreeMap::from([("memory".into(), Quantity("8Gi".into()))])),
+                ..Default::default()
+            },
+            min_replicas: Some(0),
+            max_replicas: Some(4),
+        };
+        let params = executor_params(&fp, Some(&class)).unwrap();
+        // RIO_SIZE_CLASS injected via extra_env (sts.rs appends it
+        // after the base env set).
+        let env: BTreeMap<_, _> = params
+            .extra_env
+            .iter()
+            .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
+            .collect();
+        assert_eq!(env.get("RIO_SIZE_CLASS"), Some(&"small"));
+        // pool_name carries the class suffix → sts_name disambiguates.
+        assert_eq!(params.pool_name, "test-small");
+        assert_eq!(
+            sts_name(&params.pool_name, ExecutorRole::Fetcher),
+            "rio-fetcher-test-small"
+        );
+        // Per-class resources, NOT spec.resources (which is None).
+        assert_eq!(
+            params
+                .resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .and_then(|l| l.get("memory")),
+            Some(&Quantity("8Gi".into()))
+        );
+        // Security posture unchanged across classes — only
+        // resources + size_class env vary.
+        assert!(params.read_only_root_fs);
+        assert!(!params.privileged);
+    }
+
+    // r[verify ctrl.fetcherpool.classes]
+    /// I-170: a FetcherPool with `classes=[tiny, small]` produces two
+    /// distinct STS names. The reconciler iterates `spec.classes` and
+    /// stamps one STS+Service per class; this verifies the name
+    /// derivation (the apply loop itself needs a kube-apiserver mock).
+    #[test]
+    fn classes_produce_distinct_sts_names() {
+        let mut fp = mk(2, 8);
+        fp.spec.classes = vec![
+            FetcherSizeClass {
+                name: "tiny".into(),
+                resources: ResourceRequirements::default(),
+                min_replicas: None,
+                max_replicas: None,
+            },
+            FetcherSizeClass {
+                name: "small".into(),
+                resources: ResourceRequirements::default(),
+                min_replicas: None,
+                max_replicas: None,
+            },
+        ];
+        let names: Vec<_> = fp
+            .spec
+            .classes
+            .iter()
+            .map(|c| {
+                sts_name(
+                    &executor_params(&fp, Some(c)).unwrap().pool_name,
+                    ExecutorRole::Fetcher,
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["rio-fetcher-test-tiny", "rio-fetcher-test-small"]
+        );
+    }
+
+    /// Unclassed path: `class=None` → no RIO_SIZE_CLASS env, bare
+    /// pool_name. Back-compat with pre-I-170 FetcherPools.
+    #[test]
+    fn unclassed_params_no_size_class_env() {
+        let fp = mk(2, 8);
+        let params = executor_params(&fp, None).unwrap();
+        assert!(
+            params.extra_env.is_empty(),
+            "unclassed → executor reports size_class=None → hard_filter passes through"
+        );
+        assert_eq!(params.pool_name, "test");
     }
 
     /// STS name is `rio-{role}-{pool}` (I-104) — pool name is the

@@ -29,20 +29,17 @@ spec:
         description: Auto-generated derived type for FetcherPoolSpec via `CustomResource`
         properties:
           spec:
-            description: 'FetcherPool spec. Fetchers are network-bound, not CPU-predictable,
-
-              so no size-class. The reconciler labels pods `rio.build/role:
-
-              fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
-
-              true`, stricter seccomp).
-
-
-              `KubeSchema` alongside `CustomResource`: same pattern as
-
-              BuilderPoolSpec. No CEL on this struct yet, but KubeSchema
-
-              keeps the door open without a re-derive.'
+            description: "FetcherPool spec. The reconciler labels pods `rio.build/role:\n\
+              fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:\n\
+              true`, stricter seccomp).\n\nOptionally size-classed via `classes[]`\
+              \ (I-170): fetchers run\narbitrary code (the FOD's `builder` script)\
+              \ and a large source\nunpack+NAR-serialize can OOM a 2Gi pod. Unlike\
+              \ BuilderPoolSet\nthere is no a-priori signal (no `build_samples` history,\
+              \ no\nduration cutoff) \u2014 the scheduler routes FODs to the smallest\n\
+              class by default and reactively promotes on transient failure\n(`r[sched.fod.size-class-reactive]`).\n\
+              \n`KubeSchema` alongside `CustomResource`: same pattern as\nBuilderPoolSpec.\
+              \ No CEL on this struct yet, but KubeSchema\nkeeps the door open without\
+              \ a re-derive."
             properties:
               autoscaling:
                 description: 'Autoscaling policy. Same struct as BuilderPool. The
@@ -75,6 +72,73 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              classes:
+                description: "Optional size classes (I-170). When empty (default),\
+                  \ single\nSTS/Job-set at `spec.resources` \u2014 original behavior.\
+                  \ When\nnon-empty, the reconciler stamps one StatefulSet (or\nephemeral\
+                  \ Job loop) per class; each registers with\n`size_class = name`\
+                  \ so the scheduler can route by\n`DerivationState.size_class_floor`.\n\
+                  \nUnlike `BuilderPoolSet.classes[]` there is NO `cutoff_secs` \u2014\
+                  \nfetchers have no a-priori duration estimate (FODs are excluded\n\
+                  from `build_samples`; ADR-019). Routing is reactive only: a\nFOD\
+                  \ that fails on class N retries on class N+1. Order classes\nsmallest\u2192\
+                  largest; the scheduler treats `classes[0]` as the\ndefault floor.\n\
+                  \nNOT a separate `FetcherPoolSet` CRD: the BuilderPoolSet\u2192\
+                  child\nindirection exists for per-class autoscaling targets keyed\
+                  \ on\nper-class queue depth. Fetcher classes are expected to be\n\
+                  `[tiny, small]` with `small` rarely used \u2014 flat `classes[]`\n\
+                  on the existing CRD is simpler. Promote to a *Set CRD later\nif\
+                  \ per-class autoscaling matters."
+                items:
+                  description: "One fetcher size class. Mirrors `SizeClassSpec` minus\n\
+                    `cutoff_secs` \u2014 fetchers route by reactive floor only, not\n\
+                    duration estimate. The scheduler's `[[fetcher_size_classes]]`\n\
+                    config carries just the names (for ordering); per-class\n`resources`\
+                    \ live here on the controller side."
+                  properties:
+                    maxReplicas:
+                      description: Replica ceiling. `None` = inherit `spec.replicas.max`.
+                      format: int32
+                      nullable: true
+                      type: integer
+                    minReplicas:
+                      description: 'Replica floor for this class''s StatefulSet. `None`
+                        = inherit
+
+                        `spec.replicas.min`. Per-class because "tiny" wants warm
+
+                        replicas (most FODs land here) while "small" tolerates
+
+                        scale-from-zero (rare promotions; +30s spinup is fine for
+                        a
+
+                        drv that already burned a retry).'
+                      format: int32
+                      nullable: true
+                      type: integer
+                    name:
+                      description: 'Class name. Becomes the StatefulSet name suffix
+
+                        (`rio-fetcher-{pool}-{name}`) AND the `RIO_SIZE_CLASS` env
+
+                        the executor reports in its heartbeat. Convention: "tiny"
+                        /
+
+                        "small"; nothing enforces that.'
+                      type: string
+                    resources:
+                      description: "K8s resource requests/limits for this class's\
+                        \ fetcher pods.\nNON-Option: distinct resource profiles are\
+                        \ the entire point\nof size classes. `any_object` passthrough\
+                        \ \u2014 see\nbuilderpool.rs for why."
+                      nullable: true
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                  required:
+                  - name
+                  - resources
+                  type: object
+                type: array
               ephemeral:
                 default: true
                 description: "Ephemeral mode: one Job per FOD instead of a StatefulSet.\
@@ -154,9 +218,12 @@ spec:
                 - message: replicas.min must be <= replicas.max
                   rule: self.min <= self.max
               resources:
-                description: "K8s resource requests/limits. Fetchers are lighter than\n\
-                  builders (network-bound, not CPU) \u2014 typical: 500m/1Gi.\n`any_object`\
-                  \ passthrough \u2014 see builderpool.rs for why."
+                description: "K8s resource requests/limits for a single-size pool.\
+                  \ Fetchers\nare typically lighter than builders (network-bound)\
+                  \ \u2014 500m/1Gi\ndefault. Mutually exclusive with `classes[]`\
+                  \ (CEL-enforced):\nwhen `classes` is non-empty, per-class resources\
+                  \ apply and this\nfield MUST be unset. `any_object` passthrough\
+                  \ \u2014 see\nbuilderpool.rs for why."
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
@@ -209,6 +276,10 @@ spec:
                 \ \u2014 the field sets the Job's activeDeadlineSeconds; STS pools\
                 \ have no Jobs"
               rule: '!has(self.ephemeralDeadlineSeconds) || self.ephemeral'
+            - message: "classes[] and resources are mutually exclusive \u2014 set\
+                \ per-class resources in classes[].resources, or omit classes[] for\
+                \ a single-size pool"
+              rule: size(self.classes) == 0 || !has(self.resources)
           status:
             description: 'FetcherPool status. Reconciler + autoscaler write; `kubectl
               get fp`

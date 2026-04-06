@@ -1407,3 +1407,177 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     assert_eq!(post.running_derivations, 1);
     Ok(())
 }
+
+// r[verify sched.fod.size-class-reactive]
+// r[verify sched.dispatch.no-fod-fallback]
+/// I-170: a FOD with `size_class_floor=small` skips tiny-class
+/// fetchers. The overflow chain walks fetcher classes from `floor`
+/// upward — never the builder size_classes chain (the builder
+/// `with_size_classes` config is empty here; the FOD branch reads
+/// `fetcher_size_classes` only).
+#[tokio::test]
+async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
+    use crate::assignment::FetcherSizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_fetcher_size_classes(vec![
+            FetcherSizeClassConfig {
+                name: "tiny".into(),
+            },
+            FetcherSizeClassConfig {
+                name: "small".into(),
+            },
+        ])
+        // Zero backoff so the retry redispatches on the next Tick
+        // (default is 5s exponential — test would need to sleep).
+        .with_retry_policy(crate::RetryPolicy {
+            backoff_base_secs: 0.0,
+            ..Default::default()
+        })
+    });
+
+    // Two tiny fetchers, one small. With floor=None the FOD would
+    // route to a tiny (smallest class, two free executors). With
+    // floor=small it MUST route to f-small.
+    let mut tiny1_rx = connect_fetcher_classed(&handle, "f-tiny-1", "x86_64-linux", "tiny").await?;
+    let mut tiny2_rx = connect_fetcher_classed(&handle, "f-tiny-2", "x86_64-linux", "tiny").await?;
+    let mut small_rx = connect_fetcher_classed(&handle, "f-small", "x86_64-linux", "small").await?;
+
+    // Seed a FOD and force its floor to "small" via a prior failure
+    // (the only way size_class_floor is set in production). Merge,
+    // let it dispatch to tiny, report failure → floor bumps; then
+    // it must redispatch to small.
+    let mut node = make_test_node("oom-fod", "x86_64-linux");
+    node.is_fixed_output = true;
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    // First dispatch: floor=None → smallest class = tiny.
+    // One of the tiny fetchers gets it. Drain whichever.
+    barrier(&handle).await;
+    let (first_exec, first_asgn) = tokio::select! {
+        a = recv_assignment(&mut tiny1_rx) => ("f-tiny-1", a),
+        a = recv_assignment(&mut tiny2_rx) => ("f-tiny-2", a),
+    };
+    assert!(first_asgn.drv_path.contains("oom-fod"));
+    assert!(
+        small_rx.try_recv().is_err(),
+        "floor=None: small fetcher should NOT receive (overflow walks up only when smaller class is full)"
+    );
+
+    // Simulate OOM: executor reports TransientFailure →
+    // handle_transient_failure → record_failure_and_check_poison
+    // → size_class_floor promoted tiny→small. (The production
+    // OOM path is ExecutorDisconnected → reassign_derivations,
+    // which lands in the same record_failure_and_check_poison
+    // helper; TransientFailure is the simpler test driver.)
+    complete_failure(
+        &handle,
+        first_exec,
+        "oom-fod",
+        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        "simulated OOM",
+    )
+    .await?;
+    tick(&handle).await?;
+
+    let state = handle
+        .debug_query_derivation("oom-fod")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        state.size_class_floor.as_deref(),
+        Some("small"),
+        "transient failure on tiny → floor promoted to small"
+    );
+
+    // Second dispatch: floor=small. The remaining tiny fetcher is
+    // free but MUST be skipped; small gets it.
+    let asgn = recv_assignment(&mut small_rx).await;
+    assert!(asgn.drv_path.contains("oom-fod"));
+    assert!(
+        tiny1_rx.try_recv().is_err() && tiny2_rx.try_recv().is_err(),
+        "floor=small: tiny fetchers must be skipped even when free"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.fod.size-class-reactive]
+/// I-170: floor clamps at the largest class. A FOD that fails on
+/// the largest configured fetcher class keeps `floor = largest`;
+/// `next_fetcher_class(largest)` returns None.
+#[tokio::test]
+async fn fod_size_class_floor_clamps_at_largest() -> TestResult {
+    use crate::assignment::{FetcherSizeClassConfig, next_fetcher_class};
+
+    let classes = vec![
+        FetcherSizeClassConfig {
+            name: "tiny".into(),
+        },
+        FetcherSizeClassConfig {
+            name: "small".into(),
+        },
+    ];
+    assert_eq!(
+        next_fetcher_class("tiny", &classes).as_deref(),
+        Some("small")
+    );
+    assert_eq!(
+        next_fetcher_class("small", &classes),
+        None,
+        "largest → None (clamp)"
+    );
+    assert_eq!(
+        next_fetcher_class("unknown", &classes),
+        None,
+        "unknown class (config changed mid-run) → None, no promotion"
+    );
+    assert_eq!(
+        next_fetcher_class("tiny", &[]),
+        None,
+        "feature off → no promotion"
+    );
+    Ok(())
+}
+
+// r[verify sched.fod.size-class-reactive]
+/// I-170 back-compat: with `fetcher_size_classes` empty (default),
+/// FOD dispatch is unchanged — no class filter, any free fetcher.
+/// `size_class_floor` stays None across failures (nothing to
+/// promote to).
+#[tokio::test]
+async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    // Fetcher with NO size_class declared (pre-I-170 pool).
+    let mut rx = connect_executor_no_ack_kind(
+        &handle,
+        "f-unclassed",
+        "x86_64-linux",
+        1,
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: "f-unclassed".into(),
+            paths_fetched: 0,
+        })
+        .await?;
+
+    let mut node = make_test_node("plain-fod", "x86_64-linux");
+    node.is_fixed_output = true;
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("plain-fod"));
+    let state = handle
+        .debug_query_derivation("plain-fod")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        state.size_class_floor, None,
+        "feature off: floor stays None"
+    );
+    Ok(())
+}

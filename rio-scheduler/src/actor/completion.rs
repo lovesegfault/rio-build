@@ -335,12 +335,51 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
     ) -> bool {
+        // r[impl sched.fod.size-class-reactive]
+        // I-170: capture the failed executor's size_class BEFORE the
+        // mutable node borrow. A FOD that failed on class N gets its
+        // floor bumped to class N+1 so the next dispatch skips
+        // already-tried sizes. Promotes on ANY recorded failure (no
+        // clean OOM signal at the scheduler — pod death is a
+        // disconnect); over-promoting is cheap, FODs rarely retry.
+        // Called from all three failure paths (handle_transient_
+        // failure, reassign_derivations was_running, recovery
+        // reconcile) so promotion is uniform.
+        let failed_class = self
+            .executors
+            .get(executor_id)
+            .and_then(|e| e.size_class.clone());
         if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_builders.insert(executor_id.clone());
             // Unconditional (doesn't check HashSet::insert's bool) —
             // same worker counts twice. Only used when
             // require_distinct_workers=false.
             state.failure_count += 1;
+            if state.is_fixed_output
+                && let Some(from) = failed_class
+                && let Some(to) =
+                    crate::assignment::next_fetcher_class(&from, &self.fetcher_size_classes)
+            {
+                // Only bump UP. A FOD already at floor=small that
+                // happens to fail on a tiny executor (overflow placed
+                // it there, or floor reset on recovery) shouldn't
+                // demote — but `next_fetcher_class(tiny)` = small,
+                // which equals current floor, so the assignment is a
+                // no-op. A genuine bump (floor=None→small, or
+                // tiny→small) lands here.
+                if state.size_class_floor.as_ref() != Some(&to) {
+                    info!(
+                        drv_hash = %drv_hash, from = %from, to = %to,
+                        "FOD transient failure: promoting size_class_floor"
+                    );
+                    metrics::counter!(
+                        "rio_scheduler_fod_size_class_promotions_total",
+                        "from" => from, "to" => to.clone()
+                    )
+                    .increment(1);
+                    state.size_class_floor = Some(to);
+                }
+            }
         }
         if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,

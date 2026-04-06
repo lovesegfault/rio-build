@@ -1,5 +1,10 @@
 {{- if .Values.scheduler.enabled }}
 {{- $s := .Values.scheduler -}}
+{{- /* I-170: ConfigMap renders if EITHER builder size-classes or fetcher
+       classes are configured. The scheduler's classify() reads
+       [[size_classes]]; the FOD floor walk reads [[fetcher_size_classes]].
+       Both array-of-tables (can't env-encode). */ -}}
+{{- $hasClasses := or $s.sizeClasses .Values.fetcherPool.classes -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,11 +34,11 @@ spec:
     metadata:
       labels:
         {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 8 }}
-      {{- if $s.sizeClasses }}
+      {{- if $hasClasses }}
       annotations:
         # Scheduler reads /etc/rio/scheduler.toml once at boot; kubelet
         # CM-remount alone doesn't trigger reload. Roll on class change.
-        checksum/size-classes: {{ toJson $s.sizeClasses | sha256sum }}
+        checksum/size-classes: {{ list (toJson $s.sizeClasses) (toJson .Values.fetcherPool.classes) | join "" | sha256sum }}
       {{- end }}
     spec:
       serviceAccountName: rio-scheduler
@@ -109,12 +114,12 @@ spec:
             - name: RIO_SUBSTITUTE_MAX_CONCURRENT
               value: {{ $s.substituteMaxConcurrent | quote }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
-          {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $s.sizeClasses }}
+          {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $hasClasses }}
           volumeMounts:
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
             {{- include "rio.covVolumeMount" . | nindent 12 }}
             {{- include "rio.jwtVerifyVolumeMount" . | nindent 12 }}
-            {{- if $s.sizeClasses }}
+            {{- if $hasClasses }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
             # ConfigMap carries [[size_classes]] entries; everything else
             # stays env-driven (figment merges TOML under env).
@@ -157,12 +162,12 @@ spec:
             failureThreshold: 12
           resources:
             {{- toYaml $s.resources | nindent 12 }}
-      {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $s.sizeClasses }}
+      {{- if or .Values.tls.enabled .Values.coverage.enabled .Values.jwt.enabled $hasClasses }}
       volumes:
         {{- include "rio.tlsVolume" (dict "root" . "name" "rio-scheduler-tls") | nindent 8 }}
         {{- include "rio.covVolume" . | nindent 8 }}
         {{- include "rio.jwtVerifyVolume" . | nindent 8 }}
-        {{- if $s.sizeClasses }}
+        {{- if $hasClasses }}
         - name: config
           configMap:
             name: rio-scheduler-config
@@ -212,7 +217,7 @@ spec:
     - name: grpc
       port: 9001
       targetPort: grpc
-{{- if $s.sizeClasses }}
+{{- if $hasClasses }}
 ---
 # Mounted at /etc/rio/scheduler.toml. figment merges this UNDER env (RIO_*
 # wins), so only [[size_classes]] lives here — array-of-tables can't be
@@ -236,6 +241,13 @@ data:
     {{- with .cpuLimitCores }}
     cpu_limit_cores = {{ printf "%.1f" (float64 .) }}
     {{- end }}
+    {{- end }}
+    {{- /* I-170: ordered fetcher class names for reactive promotion.
+           Single source of truth — same .Values.fetcherPool.classes
+           that fetcherpool.yaml renders into the CRD. */ -}}
+    {{- range .Values.fetcherPool.classes }}
+    [[fetcher_size_classes]]
+    name = {{ .name | quote }}
     {{- end }}
 {{- end }}
 {{- end }}

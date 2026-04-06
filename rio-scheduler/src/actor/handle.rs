@@ -52,6 +52,9 @@ pub struct DebugDerivationInfo {
     pub retry_count: u32,
     pub assigned_executor: Option<String>,
     pub assigned_size_class: Option<String>,
+    /// FOD reactive size-class floor (I-170). For asserting
+    /// `r[sched.fod.size-class-reactive]` promotion-on-failure.
+    pub size_class_floor: Option<String>,
     pub output_paths: Vec<String>,
     /// Distinct worker IDs that have failed this derivation. For
     /// asserting InfrastructureFailure does NOT populate this.
@@ -107,6 +110,7 @@ impl ActorHandle {
             store_client,
             log_flush_tx,
             size_classes,
+            Vec::new(),
             // Test/bench default: poison+retry match `DagActor::new`'s
             // hardcoded defaults. Only production main.rs loads these
             // from scheduler.toml.
@@ -140,6 +144,7 @@ impl ActorHandle {
         store_client: Option<StoreServiceClient<Channel>>,
         log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
         size_classes: Vec<crate::assignment::SizeClassConfig>,
+        fetcher_size_classes: Vec<crate::assignment::FetcherSizeClassConfig>,
         poison_config: PoisonConfig,
         retry_policy: RetryPolicy,
         substitute_max_concurrent: usize,
@@ -152,6 +157,7 @@ impl ActorHandle {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let mut actor = DagActor::new(db, store_client)
             .with_size_classes(size_classes)
+            .with_fetcher_size_classes(fetcher_size_classes)
             .with_substitute_concurrency(substitute_max_concurrent)
             .with_headroom_mult(headroom_mult)
             // r[impl sched.retry.per-worker-budget]
@@ -375,6 +381,24 @@ impl ActorHandle {
         self.send_unchecked(ActorCommand::DebugBackdateSubmitted {
             build_id,
             secs_ago,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
+
+    /// Test-only: force a derivation into `Poisoned` with the given
+    /// `retry_count`. Returns `false` if not found.
+    #[cfg(test)]
+    pub async fn debug_force_poisoned(
+        &self,
+        drv_hash: &str,
+        retry_count: u32,
+    ) -> Result<bool, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugForcePoisoned {
+            drv_hash: drv_hash.to_string(),
+            retry_count,
             reply: tx,
         })
         .await?;

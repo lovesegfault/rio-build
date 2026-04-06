@@ -799,8 +799,9 @@ in
   # device-plugin overlay as vm-security-nonpriv-k3s. Seccomp profile
   # delivered at runtime by testScript (security-profiles-operator
   # not airgapped). fetcherPool enabled via extraValues with name=
-  # "default" (I-104 naming → pod rio-fetcher-default-0)
-  # and image=rio-all (same aggregate image all pods use). Systems
+  # "default" + classes=[tiny,small] (I-170 → pod
+  # rio-fetcher-default-tiny-0) and image=rio-all (same aggregate
+  # image all pods use). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
   # the hard_filter can_build check. nodeSelector/tolerations left
   # at reconciler defaults — scenario labels k3s-agent at runtime.

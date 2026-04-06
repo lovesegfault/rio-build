@@ -83,8 +83,9 @@ impl DerivationStatus {
     /// `Poisoned`, it goes back to `DependencyFailed` (same fast-fail). If the
     /// dep was `Cancelled` (reset by this same merge), it goes `Queued`/`Ready`.
     ///
-    /// NOT retriable: `Completed` (cache hit), `Poisoned` (failed on 3+
-    /// workers, 24h TTL is the safety valve — use ClearPoison to override).
+    /// NOT retriable here: `Completed` (cache hit), `Poisoned` (handled at
+    /// the [`DerivationState`] level — needs `retry_count` for the bounded
+    /// check; see [`DerivationState::is_retriable_on_resubmit`]).
     pub fn is_retriable_on_resubmit(self) -> bool {
         matches!(
             self,
@@ -372,6 +373,32 @@ pub struct DerivationState {
     /// duration > 2× the class cutoff). `None` = size-classes not
     /// configured, or never assigned.
     pub assigned_size_class: Option<String>,
+    /// Minimum size-class for the NEXT dispatch (I-170, FOD-only).
+    /// Reactive promotion: when a FOD fails transiently (typically
+    /// OOMKilled → executor disconnect — there's no clean OOM signal
+    /// at the scheduler), `record_failure_and_check_poison` bumps
+    /// this to the next-larger fetcher class. `find_executor_with_
+    /// overflow` then walks fetcher classes from this floor upward
+    /// instead of starting at the smallest.
+    ///
+    /// `None` = never failed → route to `fetcher_size_classes[0]`
+    /// (or no class filter if fetcher classes unconfigured).
+    ///
+    /// Over-promotes on ANY transient failure (node preemption,
+    /// network blip), not just OOM. Acceptable: FODs rarely retry,
+    /// and a one-class bump is cheap ("rare that a fetcher ever
+    /// goes beyond tiny or small"). If signal fidelity matters
+    /// later, the controller can post a typed `OomKilled` result
+    /// from `pod.status.containerStatuses[].terminated.reason`.
+    ///
+    /// **NOT persisted** (in-mem only). Recovery resets to `None` →
+    /// a scheduler restart between OOM and retry sends the FOD back
+    /// to tiny → one wasted retry. Same conservative-degradation
+    /// class as `infra_retry_count` / `assigned_size_class` above.
+    /// TODO(P0556): persist as `derivations.size_class_floor`
+    /// nullable text column so the OOM loop doesn't resume across
+    /// scheduler failover.
+    pub size_class_floor: Option<String>,
     /// Bucketed memory estimate for the resource-fit placement filter
     /// (ADR-020 §5). `hard_filter` checks `worker.memory_total_bytes
     /// >= est` as a hard filter preceding transfer-cost scoring.
@@ -524,6 +551,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             assigned_size_class: None,
+            size_class_floor: None,
             est_memory_bytes: None, // set at dispatch time
             drv_content: node.drv_content.clone(),
             retry_count: 0,
@@ -605,6 +633,7 @@ impl DerivationState {
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
             assigned_size_class: None, // lossy; misclassification detector skips None
+            size_class_floor: None,    // lossy; one wasted retry on tiny post-recovery
             est_memory_bytes: None,    // lossy; recomputed at next dispatch
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
@@ -684,6 +713,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             assigned_size_class: None,
+            size_class_floor: None,
             est_memory_bytes: None,
             drv_content: Vec::new(),
             retry_count: 0,
@@ -783,6 +813,27 @@ impl DerivationState {
         }
     }
 
+    // r[impl sched.merge.poisoned-resubmit-bounded]
+    /// Whether a resubmit of THIS node should reset it for re-dispatch.
+    ///
+    /// Wraps [`DerivationStatus::is_retriable_on_resubmit`] (the
+    /// unconditionally-retriable states) and adds the bounded `Poisoned`
+    /// case: a `Poisoned` node resets iff `retry_count <
+    /// POISON_RESUBMIT_RETRY_LIMIT`. An explicit client re-submission is
+    /// retry intent — the operator presumably fixed the underlying cause
+    /// (I-169: I-167's `?id=` patch poisoned, then 27k dependents
+    /// re-derived `DependencyFailed` from the still-poisoned parent on
+    /// every resubmit). `retry_count` is carried over across the reset
+    /// (`dag::merge`) so the bound accumulates: at the default poison
+    /// threshold (3) this allows roughly two poison cycles before the
+    /// node sticks. At/above the limit, 24h TTL or `ClearPoison` are the
+    /// only overrides.
+    pub fn is_retriable_on_resubmit(&self) -> bool {
+        self.status.is_retriable_on_resubmit()
+            || (self.status == DerivationStatus::Poisoned
+                && self.retry_count < POISON_RESUBMIT_RETRY_LIMIT)
+    }
+
     /// Reset all failure-tracking fields. Call after a cache-hit
     /// transition from Poisoned/DependencyFailed/Failed to Completed
     /// (I-099/I-094) — the prior failures are moot once the output
@@ -852,6 +903,14 @@ impl PoisonConfig {
         count >= self.threshold
     }
 }
+
+/// Max `retry_count` at which a `Poisoned` node still resets on explicit
+/// resubmit. At/above this, the node stays `Poisoned` and the build
+/// fail-fasts (24h TTL or `ClearPoison` to override). `retry_count` is
+/// carried over across resets so this accumulates: at the default poison
+/// threshold (3 distinct workers) ≈ two poison cycles. See
+/// [`DerivationState::is_retriable_on_resubmit`].
+pub const POISON_RESUBMIT_RETRY_LIMIT: u32 = 6;
 
 /// Poison TTL: duration after which a poisoned derivation is reset to created.
 /// 24h in production. Short in tests so poison-expiry can be observed without

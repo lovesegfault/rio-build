@@ -71,6 +71,34 @@ pub struct SizeClassConfig {
     pub cpu_limit_cores: Option<f64>,
 }
 
+/// One fetcher size-class in the operator's config. Unlike
+/// [`SizeClassConfig`] there is NO `cutoff_secs` / `mem_limit_bytes`:
+/// FODs have no a-priori signal (excluded from `build_samples`,
+/// ADR-019), so routing is reactive only — a FOD that fails on
+/// `classes[i]` retries on `classes[i+1]`. The scheduler needs only
+/// the ORDER (smallest→largest) to compute "next larger"; per-class
+/// resources live on the controller side (`FetcherPool.spec.classes`).
+///
+/// `[[fetcher_size_classes]]` array-of-tables in scheduler.toml,
+/// parallel to `[[size_classes]]`. Empty = feature off (single
+/// fetcher pool, no class filter — original behavior).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetcherSizeClassConfig {
+    pub name: String,
+}
+
+/// Next-larger fetcher class after `current`, or `None` if `current`
+/// is already the largest (or unknown). Clamps at the top: a FOD
+/// that OOMs on the largest class stays there until poison.
+///
+/// Config order is authoritative (smallest→largest); this does NOT
+/// sort. Unlike builder classes there's no `cutoff_secs` to sort by
+/// — the operator declares the order.
+pub fn next_fetcher_class(current: &str, classes: &[FetcherSizeClassConfig]) -> Option<String> {
+    let idx = classes.iter().position(|c| c.name == current)?;
+    classes.get(idx + 1).map(|c| c.name.clone())
+}
+
 /// Classify a derivation into a size-class.
 ///
 /// `None` = no classification (size-classes not configured, optional feature).

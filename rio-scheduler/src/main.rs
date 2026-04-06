@@ -40,6 +40,19 @@ struct Config {
     /// No CLI override — this is structural deploy config, not a knob
     /// you tweak per-invocation. Change it in scheduler.toml.
     size_classes: Vec<rio_scheduler::SizeClassConfig>,
+    /// Fetcher size-class config (I-170). Empty = single-pool mode
+    /// (no class filter on FOD dispatch). Just `{name}` per entry,
+    /// ordered smallest→largest — the scheduler needs the ORDER to
+    /// compute "next larger" for reactive promotion; per-class
+    /// resources live on the controller side (`FetcherPool.spec.
+    /// classes[]`). MUST match `fetcherPool.classes[].name` in the
+    /// helm chart (single source of truth: scheduler.yaml renders
+    /// both from `.Values.fetcherPool.classes`). TOML:
+    ///   [[fetcher_size_classes]]
+    ///   name = "tiny"
+    ///   [[fetcher_size_classes]]
+    ///   name = "small"
+    fetcher_size_classes: Vec<rio_scheduler::FetcherSizeClassConfig>,
     /// Plaintext health listen address for K8s probes when mTLS is on.
     /// Shares the same HealthReporter as the main server → leadership
     /// toggles propagate. Only listens if server TLS is configured.
@@ -116,6 +129,7 @@ impl Default for Config {
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
             size_classes: Vec::new(),
+            fetcher_size_classes: Vec::new(),
             // 9101 = gRPC (9001) + 100. Same +100 pattern as
             // gateway. Only used when server TLS is configured.
             health_addr: rio_common::default_addr(9101),
@@ -387,6 +401,12 @@ async fn main() -> anyhow::Result<()> {
             "size-class routing enabled"
         );
     }
+    if !cfg.fetcher_size_classes.is_empty() {
+        info!(
+            classes = ?cfg.fetcher_size_classes.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            "fetcher size-class routing enabled (reactive)"
+        );
+    }
 
     // ---- Leader election (gated on RIO_LEASE_NAME) ----
     // None → non-K8s mode: is_leader=true immediately, generation
@@ -463,6 +483,7 @@ async fn main() -> anyhow::Result<()> {
         store_client,
         log_flush_tx,
         cfg.size_classes,
+        cfg.fetcher_size_classes,
         cfg.poison,
         cfg.retry,
         cfg.substitute_max_concurrent,
@@ -770,8 +791,16 @@ async fn init_db_pool(
     let pool = match rio_proto::client::connect_with_retry(
         shutdown,
         || {
+            // r[impl store.db.pool-idle-timeout]
+            // Aurora Serverless v2 scales max_connections with ACU; at
+            // min_capacity=0.5 that's ~105 usable slots. idle_timeout=60s
+            // + min_connections=2 shrinks a burst-grown pool back to
+            // baseline so idle conns don't count against Aurora's limit
+            // (I-171). See rio-store init_db_pool for the full budget.
             sqlx::postgres::PgPoolOptions::new()
                 .max_connections(10)
+                .min_connections(2)
+                .idle_timeout(std::time::Duration::from_secs(60))
                 .connect(database_url)
         },
         Some(MAX_TRIES),
