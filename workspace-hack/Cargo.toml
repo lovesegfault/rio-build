@@ -190,7 +190,7 @@ zeroize = { version = "1" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
-nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
+nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "socket", "user"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
@@ -204,7 +204,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["simd", "with-alloc"] }
-nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "user"] }
+nix = { version = "0.31", features = ["fs", "hostname", "mman", "mount", "sched", "signal", "socket", "user"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }

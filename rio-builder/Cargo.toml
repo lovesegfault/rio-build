@@ -12,6 +12,14 @@ description = "Build executor with FUSE store for rio-build"
 name = "rio-builder"
 path = "src/main.rs"
 
+[[bin]]
+name = "spike_digest_fuse"
+path = "src/bin/spike_digest_fuse.rs"
+
+[[bin]]
+name = "spike_mountd"
+path = "src/bin/spike_mountd.rs"
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
@@ -21,6 +29,7 @@ path = "src/main.rs"
 # per-crate feature override hook.
 default = ["test-fixtures"]
 test-fixtures = ["dep:toml"]
+
 
 [dependencies]
 rio-common = { workspace = true }

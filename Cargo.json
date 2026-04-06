@@ -15943,6 +15943,10 @@
         {
           "name": "libc",
           "packageId": "libc"
+        },
+        {
+          "name": "memoffset",
+          "packageId": "memoffset"
         }
       ],
       "buildDependencies": [
@@ -15956,11 +15960,13 @@
         "feature",
         "fs",
         "hostname",
+        "memoffset",
         "mman",
         "mount",
         "process",
         "sched",
         "signal",
+        "socket",
         "uio",
         "user"
       ],
@@ -20614,6 +20620,14 @@
         {
           "name": "rio-builder",
           "path": "src/main.rs"
+        },
+        {
+          "name": "spike_digest_fuse",
+          "path": "src/bin/spike_digest_fuse.rs"
+        },
+        {
+          "name": "spike_mountd",
+          "path": "src/bin/spike_mountd.rs"
         }
       ],
       "libCrateTypes": [

@@ -953,9 +953,14 @@
               # nixos-node boots no rio-* binaries (nodeadm + kubelet only) —
               # zero profraws, so a coverage-mode rebuild is wasted CI time
               # and would skew after_n_builds.
+              #
+              # composefs-spike-priv: pure spike binary; no r[impl]-annotated
+              # code, no profraws produced. Including it would bump
+              # after_n_builds for zero coverage signal.
               [
                 "vm-lifecycle-prod-parity-k3s"
                 "vm-nixos-node"
+                "vm-composefs-spike-priv"
                 # Lix client variant: rio-side coverage is identical to
                 # vm-protocol-warm-standalone (only the client differs,
                 # and the client isn't instrumented). Excluding keeps
