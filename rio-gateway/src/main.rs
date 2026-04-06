@@ -79,7 +79,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:2222".parse().unwrap(),
+            listen_addr: rio_common::default_addr(2222),
             // scheduler_addr/store_addr/host_key/authorized_keys have no
             // sensible default — they're deployment-specific. Empty here +
             // a post-load check in main() gives a clear "required" error
@@ -91,12 +91,12 @@ impl Default for Config {
             store_addr: String::new(),
             host_key: std::path::PathBuf::new(),
             authorized_keys: std::path::PathBuf::new(),
-            metrics_addr: "0.0.0.0:9090".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9090),
             // 9190 = gateway's metrics port (9090) + 100. Scheduler
             // health piggybacks on its gRPC port (9001), store on 9002.
             // Gateway has no gRPC port so needs its own. The +100
             // pattern keeps it discoverable without a doc lookup.
-            health_addr: "0.0.0.0:9190".parse().unwrap(),
+            health_addr: rio_common::default_addr(9190),
             tls: rio_common::tls::TlsConfig::default(),
             jwt: rio_common::config::JwtConfig::default(),
             drain_grace_secs: 6,
@@ -153,31 +153,33 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
-/// Config validation — bounds checks on operator-settable fields.
-///
-/// Extracted from `main()` so the checks are unit-testable without
-/// spinning up the full gateway (gRPC connect, SSH listener). See
-/// rio-scheduler/src/main.rs validate_config for the scrutiny recipe.
-fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    // Required-field checks that `#[serde(default)]` can't express
-    // (figment's "missing field" error for `String` defaulting to `""`
-    // is a silent success, not an error).
-    use rio_common::config::{ensure_required as required, ensure_required_path as required_path};
-    required(&cfg.scheduler_addr, "scheduler_addr", "gateway")?;
-    required(&cfg.store_addr, "store_addr", "gateway")?;
-    required_path(&cfg.host_key, "host_key", "gateway")?;
-    required_path(&cfg.authorized_keys, "authorized_keys", "gateway")?;
-    // jwt.required=true + key_path=None is a misconfiguration: can't
-    // mint, can't degrade → every SSH connect would be rejected. Fail
-    // loud at startup (clear error) instead of rejecting every
-    // connection at runtime (operator wonders why SSH is broken).
-    anyhow::ensure!(
-        !(cfg.jwt.required && cfg.jwt.key_path.is_none()),
-        "jwt.required=true but jwt.key_path is unset — cannot mint JWTs, \
-         would reject every SSH connection (set RIO_JWT__KEY_PATH or \
-         unset RIO_JWT__REQUIRED)"
-    );
-    Ok(())
+impl rio_common::config::ValidateConfig for Config {
+    /// Bounds checks on operator-settable fields. Extracted from
+    /// `main()` so the checks are unit-testable without spinning up
+    /// the full gateway (gRPC connect, SSH listener).
+    fn validate(&self) -> anyhow::Result<()> {
+        // Required-field checks that `#[serde(default)]` can't express
+        // (figment's "missing field" error for `String` defaulting to `""`
+        // is a silent success, not an error).
+        use rio_common::config::{
+            ensure_required as required, ensure_required_path as required_path,
+        };
+        required(&self.scheduler_addr, "scheduler_addr", "gateway")?;
+        required(&self.store_addr, "store_addr", "gateway")?;
+        required_path(&self.host_key, "host_key", "gateway")?;
+        required_path(&self.authorized_keys, "authorized_keys", "gateway")?;
+        // jwt.required=true + key_path=None is a misconfiguration: can't
+        // mint, can't degrade → every SSH connect would be rejected. Fail
+        // loud at startup (clear error) instead of rejecting every
+        // connection at runtime (operator wonders why SSH is broken).
+        anyhow::ensure!(
+            !(self.jwt.required && self.jwt.key_path.is_none()),
+            "jwt.required=true but jwt.key_path is unset — cannot mint JWTs, \
+             would reject every SSH connection (set RIO_JWT__KEY_PATH or \
+             unset RIO_JWT__REQUIRED)"
+        );
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -224,7 +226,8 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    validate_config(&cfg)?;
+    use rio_common::config::ValidateConfig as _;
+    cfg.validate()?;
 
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
@@ -434,6 +437,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_common::config::ValidateConfig as _;
 
     /// Regression guard: a silent drift in `Config::default()` would change
     /// behavior under VM tests (which set only the required fields via env
@@ -601,7 +605,7 @@ mod tests {
     fn config_rejects_whitespace_scheduler_addr() {
         let mut cfg = test_valid_config();
         cfg.scheduler_addr = "   ".into();
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("scheduler_addr is required"),
             "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
@@ -625,7 +629,8 @@ mod tests {
         for (field, patch) in cases {
             let mut cfg = test_valid_config();
             patch(&mut cfg);
-            let err = validate_config(&cfg)
+            let err = cfg
+                .validate()
                 .expect_err("cleared required field must be rejected")
                 .to_string();
             assert!(
@@ -643,7 +648,7 @@ mod tests {
         let mut cfg = test_valid_config();
         cfg.jwt.required = true;
         cfg.jwt.key_path = None;
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("jwt.required"), "{err}");
     }
 
@@ -653,11 +658,13 @@ mod tests {
     /// key_path=None is fine).
     #[test]
     fn config_accepts_valid() {
-        validate_config(&test_valid_config()).expect("valid config should pass");
+        test_valid_config()
+            .validate()
+            .expect("valid config should pass");
         // And required=true WITH key_path is fine.
         let mut cfg = test_valid_config();
         cfg.jwt.required = true;
         cfg.jwt.key_path = Some("/etc/rio/jwt/ed25519_seed".into());
-        validate_config(&cfg).expect("required+key_path should pass");
+        cfg.validate().expect("required+key_path should pass");
     }
 }

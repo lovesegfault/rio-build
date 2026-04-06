@@ -33,11 +33,14 @@ fn path_info_for_computed(
 }
 
 /// Parse reference path strings into `StorePath`s, formatting the first error with context.
-fn parse_reference_paths(refs: &[String], context: &str) -> anyhow::Result<Vec<StorePath>> {
+fn parse_reference_paths(refs: &[String], context: &str) -> Result<Vec<StorePath>, GatewayError> {
     refs.iter()
         .map(|s| {
-            StorePath::parse(s)
-                .map_err(|e| anyhow::anyhow!("invalid reference path '{s}' for {context}: {e}"))
+            StorePath::parse(s).map_err(|e| GatewayError::InvalidReference {
+                path: s.clone(),
+                context: context.to_string(),
+                source: e,
+            })
         })
         .collect()
 }
@@ -187,17 +190,23 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
 
     debug!(path = %path_str, nar_size, "wopAddMultipleToStore entry");
 
-    let path = StorePath::parse(&path_str)
-        .map_err(|e| anyhow::anyhow!("invalid store path '{path_str}': {e}"))?;
+    let path = StorePath::parse(&path_str).map_err(|e| GatewayError::InvalidStorePath {
+        path: path_str.clone(),
+        source: e,
+    })?;
 
-    let nar_hash_bytes = hex::decode(&nar_hash_str)
-        .map_err(|e| anyhow::anyhow!("entry '{path_str}': invalid narHash hex: {e}"))?;
+    let nar_hash_bytes = hex::decode(&nar_hash_str).map_err(|e| GatewayError::InvalidHex {
+        context: format!("entry '{path_str}' narHash"),
+        source: e,
+    })?;
 
     if nar_size > rio_common::limits::MAX_NAR_SIZE {
-        return Err(anyhow::anyhow!(
-            "entry '{path_str}': nar_size {nar_size} exceeds MAX_NAR_SIZE {}",
-            rio_common::limits::MAX_NAR_SIZE
-        ));
+        return Err(GatewayError::NarTooLarge {
+            context: format!("entry '{path_str}'"),
+            got: nar_size,
+            max: rio_common::limits::MAX_NAR_SIZE,
+        }
+        .into());
     }
 
     let raw_info = types::PathInfo {
@@ -212,8 +221,11 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
         signatures: sigs,
         content_address: ca_str,
     };
-    let info = ValidatedPathInfo::try_from(raw_info)
-        .map_err(|e| anyhow::anyhow!("entry '{path_str}': {e}"))?;
+    let info =
+        ValidatedPathInfo::try_from(raw_info).map_err(|e| GatewayError::InvalidPathInfo {
+            context: format!("entry '{path_str}'"),
+            source: e,
+        })?;
 
     // .drv files are small (typically <10KB, max ~10MB observed). Buffer
     // them so try_cache_drv can parse the ATerm. Everything else streams.
@@ -222,11 +234,14 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
         framed
             .read_exact(&mut nar_data)
             .await
-            .map_err(|e| anyhow::anyhow!("entry '{path_str}': NAR read: {e}"))?;
+            .map_err(|e| GatewayError::NarRead {
+                context: format!("entry '{path_str}'"),
+                source: e,
+            })?;
         try_cache_drv(&path, &nar_data, drv_cache);
         grpc_put_path(store_client, info, nar_data)
             .await
-            .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
+            .map_err(|e| GatewayError::Store(format!("entry '{path_str}': {e}")))?;
     } else {
         if path.is_derivation() {
             warn!(
@@ -236,7 +251,7 @@ async fn stream_one_entry<R: AsyncRead + Unpin>(
         }
         grpc_put_path_streaming(store_client, info, framed, nar_size, nar_hash_bytes)
             .await
-            .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
+            .map_err(|e| GatewayError::Store(format!("entry '{path_str}': {e}")))?;
     }
 
     Ok(())

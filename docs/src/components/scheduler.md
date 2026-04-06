@@ -15,7 +15,7 @@ Receives derivation build requests, analyzes the DAG, and publishes work to work
 - Closure-locality affinity: score workers by normalized transfer cost, using bloom filter approximation from worker heartbeats
 - Priority queue with inter-build priority (CI > interactive > scheduled) and intra-build priority (critical path)
 - IFD prioritization: builds that block evaluation get maximum priority (detected by protocol sequencing --- `wopBuildDerivation` arriving before `wopBuildPathsWithResults` on the same session)
-- CA early cutoff: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved. Compare implemented ([P0251](../../../.claude/work/plan-0251-ca-cutoff-compare-completion.md)); propagate is [P0252](../../../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md)
+- CA early cutoff: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved. Compare implemented ([P0251](../../../.claude/work/plan-0251-ca-cutoff-compare.md)); propagate is [P0252](../../../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md)
 - Work reassignment: when a worker fails (stream closed, heartbeat timeout), reassign its in-flight derivations to another worker. _Slow-worker speculative reassignment (actual\_time > estimated\_time × 3) is not currently implemented._
 - Poison derivation tracking: mark derivations that fail on 3+ different workers; auto-expire after 24h. See [Error Taxonomy](../errors.md) for details.
 

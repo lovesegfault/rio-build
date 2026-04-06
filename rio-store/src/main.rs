@@ -123,7 +123,7 @@ impl Default for Config {
         Self {
             listen_addr: "0.0.0.0:9002".into(),
             database_url: String::new(),
-            metrics_addr: "0.0.0.0:9092".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9092),
             chunk_backend: ChunkBackendKind::default(),
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
             // — the constant is crate-private so duplicated here,
@@ -134,7 +134,7 @@ impl Default for Config {
             cache_http_addr: None,
             // 9102 = gRPC (9002) + 100. Same +100 pattern as
             // gateway (9090→9190). Only used when TLS is on.
-            health_addr: "0.0.0.0:9102".parse().unwrap(),
+            health_addr: rio_common::default_addr(9102),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
@@ -172,13 +172,15 @@ struct CliArgs {
     drain_grace_secs: Option<u64>,
 }
 
-/// Config validation — see rio-scheduler/src/main.rs validate_config.
-/// Only one check today (database_url) but creates the hook for gc.*,
-/// chunk_backend.*, signing.* bounds as they become operator-settable.
-fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    use rio_common::config::ensure_required as required;
-    required(&cfg.database_url, "database_url", "store")?;
-    Ok(())
+impl rio_common::config::ValidateConfig for Config {
+    /// Only one check today (database_url) but creates the hook for
+    /// gc.*, chunk_backend.*, signing.* bounds as they become
+    /// operator-settable.
+    fn validate(&self) -> anyhow::Result<()> {
+        use rio_common::config::ensure_required as required;
+        required(&self.database_url, "database_url", "store")?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -194,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("store", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("store")?;
 
-    validate_config(&cfg)?;
+    use rio_common::config::ValidateConfig as _;
+    cfg.validate()?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
@@ -208,22 +211,7 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_store::describe_metrics();
 
-    // Connect to PostgreSQL. URL is logged with password redacted.
-    info!(
-        url = %rio_common::config::redact_db_url(&cfg.database_url),
-        "connecting to PostgreSQL"
-    );
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&cfg.database_url)
-        .await?;
-    info!("PostgreSQL connection established");
-
-    sqlx::migrate!("../migrations")
-        .run(&pool)
-        .await
-        .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
-    info!("database migrations applied");
+    let pool = init_db_pool(&cfg.database_url).await?;
 
     // grpc.health.v1.Health. Starts NOT_SERVING (the `set_serving::<>` call
     // below flips it). K8s readiness probe hits this — NOT_SERVING until
@@ -257,51 +245,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Construct the chunk backend + ONE shared ChunkCache. The cache
-    // Arc is cloned into all three consumers (StoreServiceImpl,
-    // ChunkServiceImpl, CacheServerState) — a chunk warmed by GetPath
-    // is hot for GetChunk and for the binary-cache /nar/ endpoint.
-    //
-    // `?` on backend construction: filesystem mkdir fail or S3
-    // bad-region means we can't store chunks — startup error, not
-    // degraded mode. Inline backend can't fail (just None).
-    let chunk_cache: Option<Arc<ChunkCache>> = match &cfg.chunk_backend {
-        ChunkBackendKind::Inline => {
-            info!("chunk backend: inline (all NARs in PG manifests.inline_blob)");
-            None
-        }
-        ChunkBackendKind::Filesystem { base_dir } => {
-            info!(base_dir = %base_dir.display(), "chunk backend: filesystem");
-            // Eagerly creates the 256-subdir fanout. `?` — if the
-            // disk is read-only or the path is garbage, better to
-            // fail here than on the first PutPath with a cryptic
-            // ENOENT deep in the put() call.
-            let backend: Arc<dyn ChunkBackend> = Arc::new(FilesystemChunkBackend::new(base_dir)?);
-            Some(Arc::new(ChunkCache::with_capacity(
-                backend,
-                cfg.chunk_cache_capacity_bytes,
-            )))
-        }
-        ChunkBackendKind::S3 { bucket, prefix } => {
-            info!(%bucket, %prefix, "chunk backend: S3");
-            // Credentials from the aws-sdk default chain (env vars,
-            // IMDS, etc). NOT in our config — we don't want secrets
-            // in TOML. If credentials are missing, the first PutPath
-            // will fail with a clear AWS error; we don't eagerly
-            // verify here (would need a HeadBucket or similar, and
-            // credentials might not be available YET if IMDS is
-            // slow — better to start serving and fail the first
-            // chunk op than to race IMDS).
-            let aws_cfg = aws_config::load_from_env().await;
-            let client = aws_sdk_s3::Client::new(&aws_cfg);
-            let backend: Arc<dyn ChunkBackend> =
-                Arc::new(S3ChunkBackend::new(client, bucket.clone(), prefix.clone()));
-            Some(Arc::new(ChunkCache::with_capacity(
-                backend,
-                cfg.chunk_cache_capacity_bytes,
-            )))
-        }
-    };
+    let chunk_cache =
+        init_chunk_backend(&cfg.chunk_backend, cfg.chunk_cache_capacity_bytes).await?;
 
     // Load the narinfo signing key. `None` path → `None` signer (not
     // an error — signing is optional). Bad path / bad format → `?`
@@ -401,36 +346,14 @@ async fn main() -> anyhow::Result<()> {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }
 
-    // Binary-cache HTTP server (narinfo + nar.zst routes). Spawned
-    // concurrently with the gRPC server (which blocks on serve()
-    // below). Only if configured — this is optional; the gRPC
-    // store works without it.
     if let Some(http_addr) = cfg.cache_http_addr {
-        let state = Arc::new(CacheServerState {
-            pool: pool.clone(),
-            // Same Arc again. /nar/ reassembly hits the same moka
-            // LRU as GetPath.
-            chunk_cache: chunk_cache.clone(),
-            allow_unauthenticated: cfg.cache_allow_unauthenticated,
-        });
-        let router = cache_server::router(state);
-        let http_shutdown = shutdown.clone();
-        rio_common::task::spawn_monitored("cache-http-server", async move {
-            info!(addr = %http_addr, "starting binary-cache HTTP server");
-            match tokio::net::TcpListener::bind(http_addr).await {
-                Ok(listener) => {
-                    if let Err(e) = axum::serve(listener, router)
-                        .with_graceful_shutdown(http_shutdown.cancelled_owned())
-                        .await
-                    {
-                        error!(error = %e, "cache HTTP server failed");
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, addr = %http_addr, "cache HTTP bind failed");
-                }
-            }
-        });
+        spawn_cache_http(
+            http_addr,
+            pool.clone(),
+            chunk_cache.clone(),
+            cfg.cache_allow_unauthenticated,
+            shutdown.clone(),
+        );
     }
 
     let max_msg_size = rio_proto::max_message_size();
@@ -512,9 +435,124 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── bootstrap helpers (extracted from main) ──────────────────────────
+
+/// Connect to PostgreSQL and run migrations. URL is logged with
+/// password redacted.
+async fn init_db_pool(database_url: &str) -> anyhow::Result<sqlx::PgPool> {
+    info!(
+        url = %rio_common::config::redact_db_url(database_url),
+        "connecting to PostgreSQL"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(database_url)
+        .await?;
+    info!("PostgreSQL connection established");
+
+    sqlx::migrate!("../migrations")
+        .run(&pool)
+        .await
+        .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
+    info!("database migrations applied");
+
+    Ok(pool)
+}
+
+/// Construct the chunk backend + ONE shared `ChunkCache`.
+///
+/// The cache Arc is cloned into all three consumers
+/// (`StoreServiceImpl`, `ChunkServiceImpl`, `CacheServerState`) — a
+/// chunk warmed by GetPath is hot for GetChunk and for the
+/// binary-cache `/nar/` endpoint.
+///
+/// `?` on backend construction: filesystem mkdir fail or S3
+/// bad-region means we can't store chunks — startup error, not
+/// degraded mode. Inline backend can't fail (returns `None`).
+async fn init_chunk_backend(
+    kind: &ChunkBackendKind,
+    cache_capacity_bytes: u64,
+) -> anyhow::Result<Option<Arc<ChunkCache>>> {
+    Ok(match kind {
+        ChunkBackendKind::Inline => {
+            info!("chunk backend: inline (all NARs in PG manifests.inline_blob)");
+            None
+        }
+        ChunkBackendKind::Filesystem { base_dir } => {
+            info!(base_dir = %base_dir.display(), "chunk backend: filesystem");
+            // Eagerly creates the 256-subdir fanout. `?` — if the
+            // disk is read-only or the path is garbage, better to
+            // fail here than on the first PutPath with a cryptic
+            // ENOENT deep in the put() call.
+            let backend: Arc<dyn ChunkBackend> = Arc::new(FilesystemChunkBackend::new(base_dir)?);
+            Some(Arc::new(ChunkCache::with_capacity(
+                backend,
+                cache_capacity_bytes,
+            )))
+        }
+        ChunkBackendKind::S3 { bucket, prefix } => {
+            info!(%bucket, %prefix, "chunk backend: S3");
+            // Credentials from the aws-sdk default chain (env vars,
+            // IMDS, etc). NOT in our config — we don't want secrets
+            // in TOML. If credentials are missing, the first PutPath
+            // will fail with a clear AWS error; we don't eagerly
+            // verify here (would need a HeadBucket or similar, and
+            // credentials might not be available YET if IMDS is
+            // slow — better to start serving and fail the first
+            // chunk op than to race IMDS).
+            let aws_cfg = aws_config::load_from_env().await;
+            let client = aws_sdk_s3::Client::new(&aws_cfg);
+            let backend: Arc<dyn ChunkBackend> =
+                Arc::new(S3ChunkBackend::new(client, bucket.clone(), prefix.clone()));
+            Some(Arc::new(ChunkCache::with_capacity(
+                backend,
+                cache_capacity_bytes,
+            )))
+        }
+    })
+}
+
+/// Binary-cache HTTP server (narinfo + nar.zst routes).
+///
+/// Spawned concurrently with the gRPC server (which blocks on serve()
+/// in main()). This is optional; the gRPC store works without it.
+/// `chunk_cache` is the same Arc as GetPath — `/nar/` reassembly
+/// hits the same moka LRU.
+fn spawn_cache_http(
+    http_addr: std::net::SocketAddr,
+    pool: sqlx::PgPool,
+    chunk_cache: Option<Arc<ChunkCache>>,
+    allow_unauthenticated: bool,
+    shutdown: rio_common::signal::Token,
+) {
+    let state = Arc::new(CacheServerState {
+        pool,
+        chunk_cache,
+        allow_unauthenticated,
+    });
+    let router = cache_server::router(state);
+    rio_common::task::spawn_monitored("cache-http-server", async move {
+        info!(addr = %http_addr, "starting binary-cache HTTP server");
+        match tokio::net::TcpListener::bind(http_addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await
+                {
+                    error!(error = %e, "cache HTTP server failed");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, addr = %http_addr, "cache HTTP bind failed");
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_common::config::ValidateConfig as _;
 
     #[test]
     fn config_defaults_are_stable() {
@@ -844,7 +882,7 @@ mod tests {
             database_url: String::new(),
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("database_url"), "{err}");
     }
 
@@ -856,7 +894,7 @@ mod tests {
     fn config_rejects_whitespace_database_url() {
         let mut cfg = test_valid_config();
         cfg.database_url = "   ".into();
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("database_url is required"),
             "whitespace-only database_url must be rejected as empty, got: {err}"
@@ -867,6 +905,8 @@ mod tests {
     /// rejection tests test ONLY their mutation.
     #[test]
     fn config_accepts_valid() {
-        validate_config(&test_valid_config()).expect("valid config should pass");
+        test_valid_config()
+            .validate()
+            .expect("valid config should pass");
     }
 }

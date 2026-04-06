@@ -79,9 +79,9 @@ impl Default for Config {
             store_addr: String::new(),
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
-            metrics_addr: "0.0.0.0:9094".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9094),
             // Same +100 pattern as gateway/worker.
-            health_addr: "0.0.0.0:9194".parse().unwrap(),
+            health_addr: rio_common::default_addr(9194),
             // Match ScalingTiming::default(). Duplicated rather
             // than .as_secs()-ing from the Default impl to avoid
             // a const-fn dance — keep them in sync when changing.
@@ -119,47 +119,44 @@ struct CliArgs {
 
 // ----- main --------------------------------------------------------------------
 
-/// Config validation — bounds checks on operator-settable fields.
-///
-/// Extracted from `main()` so the checks are unit-testable without
-/// spinning up the full controller (kube-client connect, reconciler
-/// spawn). Every `ensure!` documents a specific crash or silent-wrong
-/// that occurs AFTER startup if the bad value gets through.
-///
-/// See rio-scheduler/src/main.rs for the scrutiny recipe: grep for
-/// `interval(..<field>)` / `from_secs(<field>)` in consumer code;
-/// check what happens at 0, negative, very-large.
-fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    use rio_common::config::ensure_required as required;
-    required(&cfg.scheduler_addr, "scheduler_addr", "controller")?;
-    // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
-    // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
-    // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
-    // (logged, controller survives, but autoscaling silently dead).
-    // Fail fast at config load instead.
-    anyhow::ensure!(
-        cfg.autoscaler_poll_secs > 0,
-        "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
-    );
-    // These three feed Duration::from_secs but NOT tokio::interval —
-    // 0 value is DEGRADED (thrash / no-cooldown) not PANIC. Still
-    // reject to prevent operator foot-shooting.
-    anyhow::ensure!(
-        cfg.autoscaler_scale_up_window_secs > 0,
-        "autoscaler_scale_up_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
-        cfg.autoscaler_scale_up_window_secs
-    );
-    anyhow::ensure!(
-        cfg.autoscaler_scale_down_window_secs > 0,
-        "autoscaler_scale_down_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
-        cfg.autoscaler_scale_down_window_secs
-    );
-    anyhow::ensure!(
-        cfg.autoscaler_min_interval_secs > 0,
-        "autoscaler_min_interval_secs must be > 0 (got {}); 0 → no rate-limit on scale ops",
-        cfg.autoscaler_min_interval_secs
-    );
-    Ok(())
+impl rio_common::config::ValidateConfig for Config {
+    /// Bounds checks on operator-settable fields. Extracted from
+    /// `main()` so the checks are unit-testable without spinning up
+    /// the full controller (kube-client connect, reconciler spawn).
+    /// Every `ensure!` documents a specific crash or silent-wrong
+    /// that occurs AFTER startup if the bad value gets through.
+    fn validate(&self) -> anyhow::Result<()> {
+        use rio_common::config::ensure_required as required;
+        required(&self.scheduler_addr, "scheduler_addr", "controller")?;
+        // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
+        // `from_secs(self.autoscaler_poll_secs)` into interval() —
+        // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
+        // (logged, controller survives, but autoscaling silently dead).
+        // Fail fast at config load instead.
+        anyhow::ensure!(
+            self.autoscaler_poll_secs > 0,
+            "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
+        );
+        // These three feed Duration::from_secs but NOT tokio::interval —
+        // 0 value is DEGRADED (thrash / no-cooldown) not PANIC. Still
+        // reject to prevent operator foot-shooting.
+        anyhow::ensure!(
+            self.autoscaler_scale_up_window_secs > 0,
+            "autoscaler_scale_up_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
+            self.autoscaler_scale_up_window_secs
+        );
+        anyhow::ensure!(
+            self.autoscaler_scale_down_window_secs > 0,
+            "autoscaler_scale_down_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
+            self.autoscaler_scale_down_window_secs
+        );
+        anyhow::ensure!(
+            self.autoscaler_min_interval_secs > 0,
+            "autoscaler_min_interval_secs must be > 0 (got {}); 0 → no rate-limit on scale ops",
+            self.autoscaler_min_interval_secs
+        );
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -203,7 +200,8 @@ async fn main() -> anyhow::Result<()> {
         info!("client mTLS enabled for outgoing gRPC");
     }
 
-    validate_config(&cfg)?;
+    use rio_common::config::ValidateConfig as _;
+    cfg.validate()?;
     // store_addr is injected into worker pod containers as
     // RIO_STORE_ADDR. Workers with an empty store addr fail their
     // first PutPath with a tonic malformed-URI error — deep inside
@@ -532,6 +530,7 @@ fn spawn_health_server(addr: std::net::SocketAddr, shutdown: rio_common::signal:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_common::config::ValidateConfig as _;
 
     #[test]
     fn config_defaults_are_stable() {
@@ -655,7 +654,7 @@ mod tests {
             autoscaler_poll_secs: 0,
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("autoscaler_poll_secs"), "{err}");
     }
 
@@ -665,7 +664,7 @@ mod tests {
             scheduler_addr: String::new(),
             ..test_valid_config()
         };
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("scheduler_addr"), "{err}");
     }
 
@@ -677,7 +676,7 @@ mod tests {
     fn config_rejects_whitespace_scheduler_addr() {
         let mut cfg = test_valid_config();
         cfg.scheduler_addr = "   ".into();
-        let err = validate_config(&cfg).unwrap_err().to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("scheduler_addr is required"),
             "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
@@ -688,7 +687,9 @@ mod tests {
     /// rejection tests above are testing ONLY their mutation.
     #[test]
     fn config_accepts_valid() {
-        validate_config(&test_valid_config()).expect("valid config should pass");
+        test_valid_config()
+            .validate()
+            .expect("valid config should pass");
     }
 
     /// Health server speaks enough HTTP to satisfy a K8s probe.

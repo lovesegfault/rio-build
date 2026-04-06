@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rio_nix::derivation::{Derivation, DerivationError};
+use rio_nix::derivation::{Derivation, DerivationError, write_aterm_string};
 use rio_nix::store_path::{StorePath, StorePathError, nixbase32};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -775,25 +775,6 @@ fn serialize_resolved<'a>(
     out.push_str("])");
 
     out
-}
-
-/// ATerm string escaping — mirrors `aterm.rs:write_aterm_string`.
-/// Duplicated here because `rio_nix::derivation`'s helper is
-/// crate-private. 12 lines of escaping is cheaper than making it
-/// `pub` for one cross-crate caller.
-fn write_aterm_string(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
 }
 
 // ---------------------------------------------------------------------------

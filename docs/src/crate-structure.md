@@ -133,6 +133,7 @@ src/
 ├── store_path.rs      # StorePath + nixbase32
 ├── nar.rs             # NAR streaming read/write/extract
 ├── narinfo.rs         # NarInfo parse/serialize + fingerprint()
+├── refscan.rs         # Reference scanner: Aho-Corasick over nixbase32 store-path hashes
 └── hash.rs            # NixHash (SHA-256, SHA-512, BLAKE2)
 ```
 
@@ -168,6 +169,8 @@ src/
 ├── main.rs
 ├── server.rs          # russh SSH server
 ├── session.rs         # Per-client session state
+├── quota.rs           # Per-tenant store-quota check (pre-SubmitBuild reject)
+├── ratelimit.rs       # Per-tenant connection/opcode rate limiter (token-bucket)
 ├── translate.rs       # Nix protocol ↔ gRPC translation helpers
 └── handler/
     ├── mod.rs         # Opcode dispatch loop
@@ -192,6 +195,7 @@ src/
 │   ├── merge.rs       # DAG merge: cache-check, dedupe, transitions
 │   ├── dispatch.rs    # Ready-queue drain → worker assignment
 │   ├── completion.rs  # CompletionReport handler + EMA update + cascade
+│   ├── recovery.rs    # Post-LeaderAcquired state reload + ReconcileAssignments
 │   ├── worker.rs      # Heartbeat merge + worker liveness
 │   └── tests/         # Per-handler unit tests (split from old coverage.rs)
 │       ├── mod.rs
@@ -201,9 +205,11 @@ src/
 │       ├── merge.rs       # DAG merge + dedupe + cache-check
 │       ├── dispatch.rs    # Ready-queue drain + assignment
 │       ├── completion.rs  # CompletionReport + cascade
+│       ├── recovery.rs    # State reload + reconcile
 │       ├── worker.rs      # Heartbeat + liveness
 │       ├── keep_going.rs  # keep_going=true/false cascade behavior
 │       ├── fault.rs       # Store errors, circuit breaker, poison
+│       ├── misc.rs        # Small cross-cutting tests
 │       └── integration.rs # Multi-handler scenarios
 ├── state/
 │   ├── mod.rs         # PriorityClass, re-exports
@@ -215,20 +221,46 @@ src/
 │   ├── mod.rs         # Dag: node/edge storage, reverse-deps walk
 │   └── tests.rs
 ├── grpc/
-│   ├── mod.rs         # gRPC service impl → actor message send
-│   └── tests.rs
+│   ├── mod.rs         # gRPC service wiring → actor message send
+│   ├── actor_guards.rs    # Leader-guard + actor-alive request interceptors
+│   ├── scheduler_service.rs # SchedulerService impl (SubmitBuild, WatchBuild, CancelBuild)
+│   ├── worker_service.rs    # WorkerService impl (BuildExecution stream, Heartbeat)
+│   └── tests/         # bridge, guards, stream, submit
 ├── logs/
 │   ├── mod.rs         # LogBuffers: DashMap ring buffers per derivation
 │   └── flush.rs       # LogFlusher: S3 gzip PUT on completion
 ├── admin/
-│   ├── mod.rs         # AdminService impl: ClusterStatus/ListWorkers/ListBuilds/GetBuildLogs/DrainWorker
-│   └── tests.rs
+│   ├── mod.rs         # AdminService impl dispatch
+│   ├── builds.rs      # ListBuilds / GetBuild / CancelBuild
+│   ├── gc.rs          # TriggerGC / GCStatus
+│   ├── graph.rs       # GetBuildGraph (induced-subgraph walk, node cap)
+│   ├── logs.rs        # GetBuildLogs (ring buffer + S3 replay)
+│   ├── sizeclass.rs   # GetCutoffs / SetCutoffs
+│   ├── tenants.rs     # ListTenants / tenant quota inspect
+│   ├── workers.rs     # ListWorkers / DrainWorker / ClusterStatus
+│   └── tests/         # per-handler admin tests
+├── ca/
+│   ├── mod.rs         # CA early-cutoff: output-hash compare against content index
+│   └── resolve.rs     # CA derivation resolution (inputDrvs placeholder → realized path rewrite)
+├── db/
+│   ├── mod.rs         # PG pool + transaction helpers
+│   ├── assignments.rs # derivation→worker assignment rows
+│   ├── batch.rs       # Batched multi-row INSERT helpers
+│   ├── builds.rs      # builds table CRUD + terminal transitions
+│   ├── derivations.rs # derivations table CRUD + status transitions
+│   ├── history.rs     # build_history EMA UPSERT (duration + peak-mem)
+│   ├── live_pins.rs   # GC live-pin rows (non-terminal build outputs)
+│   ├── recovery.rs    # Non-terminal state reload queries
+│   ├── tenants.rs     # tenant rows + quota columns
+│   └── tests/         # per-module PG integration tests
+├── lease/
+│   ├── mod.rs         # LeaseState enum + leader-guard helpers
+│   └── election.rs    # Kubernetes Lease-based leader election (HOSTNAME-driven identity)
 ├── assignment.rs      # Worker scoring (bloom locality + load) + size-class classify()
 ├── critical_path.rs   # Bottom-up priority computation + incremental update
-├── db.rs              # build_history EMA UPSERT + PG helpers
 ├── estimator.rs       # Duration/memory estimates from build_history
 ├── event_log.rs       # BuildEvent ring buffer + PG replay for WatchBuild since_sequence
-├── lease.rs           # Kubernetes Lease-based leader election (HOSTNAME-driven identity)
+├── rebalancer.rs      # SITA-E adaptive size-class cutoff recompute (hourly pass)
 └── queue.rs           # ReadyQueue: BinaryHeap with lazy invalidation
 ```
 
@@ -243,9 +275,18 @@ src/
 │   └── chunk.rs       # S3-compatible chunk backend
 ├── grpc/
 │   ├── mod.rs         # StoreService + ChunkService skeleton
+│   ├── admin.rs       # Store AdminService (GCStatus, TriggerGC, tenant-key mgmt)
 │   ├── put_path.rs    # PutPath streaming handler
+│   ├── put_path_batch.rs # PutPathBatch (multi-NAR streaming, shared tx)
 │   ├── get_path.rs    # GetPath streaming handler
 │   └── chunk.rs       # GetChunk / FindMissingChunks
+├── gc/
+│   ├── mod.rs         # GC orchestrator + two-phase mark/sweep entry
+│   ├── mark.rs        # Mark phase: reachability walk from live pins + tenant roots
+│   ├── sweep.rs       # Sweep phase: narinfo DELETE + chunk refcount decrement
+│   ├── drain.rs       # pending_s3_deletes drain task (batched S3 DeleteObjects)
+│   ├── orphan.rs      # sweep_orphan_chunks: grace-TTL reap of refcount=0 chunks
+│   └── tenant.rs      # Per-tenant retention policy + tenant-scoped mark
 ├── cas.rs             # moka chunk cache + singleflight + BLAKE3 verify
 ├── chunker.rs         # FastCDC content-defined chunking
 ├── manifest.rs        # Chunk-list serialize/deserialize
@@ -253,12 +294,16 @@ src/
 │   ├── mod.rs         # MetadataStore struct + transaction helpers
 │   ├── inline.rs      # Small-NAR inline storage (no chunk manifest)
 │   ├── chunked.rs     # Large-NAR chunked storage (manifest-backed)
-│   └── queries.rs     # Shared SELECT/UPDATE helpers + narinfo_cols! macro
+│   ├── queries.rs     # Shared SELECT/UPDATE helpers + narinfo_cols! macro
+│   └── tenant_keys.rs # Per-tenant signing-key rows (load + rotate)
+├── migrations.rs      # Per-migration M_NNN doc-consts (rationale/history — SQL files are frozen)
 ├── content_index.rs   # content_hash → store_path (CA early cutoff)
 ├── realisations.rs    # CA realisation storage (Register/Query)
 ├── signing.rs         # ed25519 narinfo signing
 ├── validate.rs        # ValidatedPathInfo checks (hash, refs, size)
-└── cache_server.rs    # axum binary-cache HTTP (narinfo + nar.zst)
+└── cache_server/
+    ├── mod.rs         # axum binary-cache HTTP (narinfo + nar.zst)
+    └── auth.rs        # Per-tenant Bearer-token auth + narinfo filter
 ```
 
 ### rio-worker — Build executor
@@ -299,19 +344,26 @@ src/
 ├── lib.rs
 ├── main.rs            # rustls CryptoProvider::install_default() + controller watch loop
 ├── bin/
-│   └── crdgen.rs      # Emit WorkerPool CRD YAML (serde_yml, write-only)
+│   └── crdgen.rs      # Emit WorkerPool/WorkerPoolSet CRD YAML (serde_yml, write-only)
 ├── error.rs           # ControllerError + finalizer::Error<Self> boxed recursion
 ├── fixtures.rs        # Test fixtures: fake kube::Client via tower-test mock::pair()
-├── scaling.rs         # Autoscaler: queue-depth poll + STS replica patch (separate field-manager, skip deletionTimestamp)
-├── crds/
-│   ├── mod.rs         # schema_with=any_object for k8s-openapi fields (avoid {} schema)
-│   └── workerpool.rs  # WorkerPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
+├── scaling/
+│   ├── mod.rs         # Autoscaler entry: queue-depth poll + STS replica patch
+│   ├── standalone.rs  # Single-WorkerPool autoscaler (separate field-manager, skip deletionTimestamp)
+│   ├── per_class.rs   # WorkerPoolSet per-class autoscaler (y-join across child pools)
+│   └── tests.rs
 └── reconcilers/
     ├── mod.rs         # Controller::new() + error_policy + requeue intervals
-    └── workerpool/
-        ├── mod.rs     # WorkerPool reconcile: ensure STS/SVC/CM + drain finalizer
-        ├── builders.rs # STS/Service/ConfigMap object builders (labels, volumes, envFrom)
-        └── tests.rs
+    ├── gc_schedule.rs # GCSchedule reconcile: cron → store TriggerGC RPC
+    ├── workerpool/
+    │   ├── mod.rs     # WorkerPool reconcile: ensure STS/SVC/CM + drain finalizer
+    │   ├── builders.rs # STS/Service/ConfigMap object builders (labels, volumes, envFrom)
+    │   ├── disruption.rs # PodDisruptionBudget builder + minAvailable computation
+    │   ├── ephemeral.rs  # Ephemeral-volume sizing + StorageClass selection
+    │   └── tests/     # apply, builders, disruption
+    └── workerpoolset/
+        ├── mod.rs     # WorkerPoolSet reconcile: child WorkerPool fan-out + status aggregate
+        └── builders.rs # Child-WorkerPool spec builders (per-class overrides)
 ```
 
 ### rio-test-support — Test harness
@@ -322,5 +374,26 @@ src/
 ├── pg.rs              # Ephemeral PostgreSQL (initdb + postgres via PG_BIN)
 ├── wire.rs            # wire_bytes! macro, handshake/setOptions/stderr helpers
 ├── grpc.rs            # MockStore, MockScheduler, server spawn helpers
+├── kube_mock.rs       # Fake kube::Client via tower-test mock::pair() + apiserver response helpers
+├── metrics.rs         # In-process metrics recorder + snapshot-for-assert
+├── metrics_grep.rs    # Parse Prometheus text-format for VM-test metric assertions
 └── fixtures.rs        # test_store_path, test_drv_path, NAR builders
+```
+
+### rio-crds — Kubernetes CRD types
+
+```
+src/
+├── lib.rs             # schema_with=any_object for k8s-openapi fields (avoid {} schema)
+├── workerpool.rs      # WorkerPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
+└── workerpoolset.rs   # WorkerPoolSet CRD spec/status (per-class child-pool fan-out)
+```
+
+### rio-cli — Operator CLI
+
+```
+src/
+├── main.rs            # clap CLI entry + AdminService client wiring
+├── cutoffs.rs         # `rio cutoffs get/set` — size-class cutoff inspect/override
+└── wps.rs             # `rio wps status/scale` — WorkerPoolSet per-class status + manual scale
 ```

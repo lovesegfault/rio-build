@@ -213,6 +213,10 @@ impl StoreAdminServiceImpl {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::grpc::internal_error("ResignPaths: update refs+sig", e))?;
+                // Invariant: new_sig is Some iff self.signer is Some —
+                // the `.map()` that produced new_sig above ties them.
+                // This arm only runs when signer exists, so unwrap is
+                // structurally safe (not runtime-faith).
                 debug!(store_path, refs = new_refs.len(), key = %self.signer.as_ref().unwrap().cluster_key_name(), "backfilled refs + re-signed");
             }
             None => {
@@ -463,8 +467,8 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         let cursor_bytes: Vec<u8> = if req.cursor.is_empty() {
             Vec::new()
         } else {
-            hex::decode(&req.cursor).map_err(|_| {
-                Status::invalid_argument("cursor must be hex-encoded store_path_hash")
+            hex::decode(&req.cursor).map_err(|e| {
+                Status::invalid_argument(format!("cursor must be hex-encoded store_path_hash: {e}"))
             })?
         };
 

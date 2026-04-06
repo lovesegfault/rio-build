@@ -563,23 +563,7 @@ impl DagActor {
                     let _ = reply.send(cleared);
                 }
                 ActorCommand::ListWorkers { reply } => {
-                    let snapshots = self
-                        .workers
-                        .values()
-                        .map(|w| command::WorkerSnapshot {
-                            worker_id: w.worker_id.clone(),
-                            systems: w.systems.clone(),
-                            supported_features: w.supported_features.clone(),
-                            max_builds: w.max_builds,
-                            running_builds: w.running_builds.len() as u32,
-                            draining: w.draining,
-                            size_class: w.size_class.clone(),
-                            connected_since: w.connected_since,
-                            last_heartbeat: w.last_heartbeat,
-                            last_resources: w.last_resources,
-                        })
-                        .collect();
-                    let _ = reply.send(snapshots);
+                    let _ = reply.send(self.handle_list_workers());
                 }
                 ActorCommand::DrainWorker {
                     worker_id,
@@ -590,93 +574,14 @@ impl DagActor {
                     let _ = reply.send(result);
                 }
                 ActorCommand::ForwardLogBatch { drv_path, batch } => {
-                    // Resolve drv_path → drv_hash → interested_builds, then
-                    // emit BuildEvent::Log on each build's broadcast channel.
-                    // The gateway already handles Event::Log (handler/build.rs
-                    // :27-32) — it translates to STDERR_NEXT for the Nix client.
-                    //
-                    // Unknown drv_path → drop silently. Two legitimate cases:
-                    // (a) batch arrived after CleanupTerminalBuild removed the
-                    //     DAG entry (race between worker stream and actor loop
-                    //     — the build is done, gateway already saw Completed,
-                    //     late log lines are irrelevant);
-                    // (b) malformed batch from a buggy worker. Neither warrants
-                    //     a warn!() — (a) is expected, (b) would spam.
-                    if let Some(hash) = self.drv_path_to_hash(&drv_path) {
-                        let lines = batch.lines.len() as u64;
-                        for build_id in self.get_interested_builds(&hash) {
-                            // batch.clone(): BuildLogBatch has Vec<Vec<u8>> so
-                            // this is a deep copy. For 64 lines × 100 bytes
-                            // that's ~6.5KB × N interested builds. Typically
-                            // N=1 (one gateway per build). If profiling ever
-                            // shows this hot, Arc<BuildLogBatch> in BuildEvent.
-                            self.emit_build_event(
-                                build_id,
-                                rio_proto::types::build_event::Event::Log(batch.clone()),
-                            );
-                        }
-                        // Metric: proves worker → scheduler → actor pipeline
-                        // works. vm-phase2b asserts this > 0. The gateway →
-                        // client leg (STDERR_NEXT rendering) depends on the
-                        // Nix client's verbosity and activity-context handling
-                        // — not something we control, so not asserted on in
-                        // the VM test. The ring buffer + AdminService give
-                        // the authoritative log-serving path; STDERR_NEXT is
-                        // a convenience tail that may or may not render.
-                        metrics::counter!("rio_scheduler_log_lines_forwarded_total")
-                            .increment(lines);
-                    }
+                    self.handle_forward_log_batch(&drv_path, batch);
                 }
                 ActorCommand::GcRoots { reply } => {
-                    // Collect expected_output_paths ∪ output_paths
-                    // from all non-terminal derivations. These are
-                    // the live-build roots that GC must NOT delete —
-                    // either the worker is about to upload them
-                    // (expected) or just did (output). Both cases:
-                    // don't race the upload.
-                    //
-                    // Dedup via HashSet: the same drv can appear in
-                    // multiple builds (shared dependency) → same
-                    // expected_output_paths would be duplicated
-                    // N× in the roots list. The store's mark CTE
-                    // handles dups correctly, but it's wasted
-                    // network + CTE work.
-                    let roots: Vec<String> = self
-                        .dag
-                        .iter_nodes()
-                        .filter(|(_, s)| !s.status().is_terminal())
-                        .flat_map(|(_, s)| {
-                            s.expected_output_paths
-                                .iter()
-                                .chain(s.output_paths.iter())
-                                .cloned()
-                        })
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    let _ = reply.send(roots);
+                    let _ = reply.send(self.handle_gc_roots());
                 }
                 ActorCommand::LeaderAcquired => {
                     self.handle_leader_acquired().await;
-                    // Schedule reconciliation ~45s out via WeakSender.
-                    // Same pattern as schedule_terminal_cleanup.
-                    // Workers have ~45s (3× heartbeat + slack) to
-                    // reconnect after scheduler restart. Any
-                    // Assigned/Running derivation whose worker
-                    // DIDN'T reconnect by then gets reconciled
-                    // (Completed if outputs in store, else reset).
-                    if let Some(weak_tx) = self.self_tx.clone() {
-                        rio_common::task::spawn_monitored("reconcile-timer", async move {
-                            tokio::time::sleep(RECONCILE_DELAY).await;
-                            if let Some(tx) = weak_tx.upgrade()
-                                && tx.try_send(ActorCommand::ReconcileAssignments).is_err()
-                            {
-                                tracing::warn!("reconcile command dropped (channel full)");
-                                metrics::counter!("rio_scheduler_reconcile_dropped_total")
-                                    .increment(1);
-                            }
-                        });
-                    }
+                    self.schedule_reconcile_timer();
                     // Immediate dispatch attempt after recovery. If
                     // workers haven't reconnected yet, dispatch finds
                     // no candidates → no-op. If they HAVE (workers
@@ -691,36 +596,11 @@ impl DagActor {
                 }
                 #[cfg(test)]
                 ActorCommand::DebugQueryWorkers { reply } => {
-                    let workers: Vec<_> = self
-                        .workers
-                        .values()
-                        .map(|w| DebugWorkerInfo {
-                            worker_id: w.worker_id.to_string(),
-                            is_registered: w.is_registered(),
-                            running_count: w.running_builds.len(),
-                            running_builds: w
-                                .running_builds
-                                .iter()
-                                .map(|h| h.to_string())
-                                .collect(),
-                        })
-                        .collect();
-                    let _ = reply.send(workers);
+                    let _ = reply.send(self.handle_debug_query_workers());
                 }
                 #[cfg(test)]
                 ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
-                    let info = self.dag.node(&drv_hash).map(|s| DebugDerivationInfo {
-                        status: s.status(),
-                        retry_count: s.retry_count,
-                        assigned_worker: s.assigned_worker.as_ref().map(|w| w.to_string()),
-                        assigned_size_class: s.assigned_size_class.clone(),
-                        output_paths: s.output_paths.clone(),
-                        failed_workers: s.failed_workers.iter().map(|w| w.to_string()).collect(),
-                        failure_count: s.failure_count,
-                        is_ca: s.is_ca,
-                        ca_output_unchanged: s.ca_output_unchanged,
-                    });
-                    let _ = reply.send(info);
+                    let _ = reply.send(self.handle_debug_query_derivation(&drv_hash));
                 }
                 #[cfg(test)]
                 ActorCommand::DebugForceAssign {
@@ -728,41 +608,7 @@ impl DagActor {
                     worker_id,
                     reply,
                 } => {
-                    // Force Ready→Assigned (or Failed→Ready→Assigned)
-                    // bypassing backoff + failed_workers exclusion.
-                    // For retry/poison tests that need to drive
-                    // multiple completion cycles without waiting
-                    // for real backoff. Clears backoff_until.
-                    let ok = if let Some(state) = self.dag.node_mut(&drv_hash) {
-                        // If not already Ready, try to get there.
-                        // Assigned/Running → reset_to_ready, Failed →
-                        // transition Ready, Ready → no-op.
-                        let prepped = match state.status() {
-                            DerivationStatus::Ready => true,
-                            DerivationStatus::Assigned | DerivationStatus::Running => {
-                                state.reset_to_ready().is_ok()
-                            }
-                            DerivationStatus::Failed => {
-                                state.transition(DerivationStatus::Ready).is_ok()
-                            }
-                            _ => false, // terminal or pre-Ready: can't force
-                        };
-                        if prepped {
-                            state.backoff_until = None;
-                            state.assigned_worker = Some(worker_id.clone());
-                            // Add to worker's running set so subsequent
-                            // complete_failure finds a consistent state.
-                            if let Some(w) = self.workers.get_mut(&worker_id) {
-                                w.running_builds.insert((&*drv_hash).into());
-                            }
-                            state.transition(DerivationStatus::Assigned).is_ok()
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    let _ = reply.send(ok);
+                    let _ = reply.send(self.handle_debug_force_assign(&drv_hash, &worker_id));
                 }
                 #[cfg(test)]
                 ActorCommand::DebugBackdateRunning {
@@ -770,32 +616,7 @@ impl DagActor {
                     secs_ago,
                     reply,
                 } => {
-                    // Force to Running with running_since backdated.
-                    // Used by backstop-timeout tests (handle_tick
-                    // checks Running + running_since > threshold).
-                    // The cfg(test) backstop floor is 0s so any
-                    // secs_ago > 0 triggers the backstop on Tick.
-                    let ok = if let Some(state) = self.dag.node_mut(&drv_hash) {
-                        // Transition to Running if not already there.
-                        // Assigned → Running is a valid transition;
-                        // Ready/Created would fail (need Assigned
-                        // first). DebugForceAssign → Assigned, then
-                        // this → Running is the typical test sequence.
-                        let running = match state.status() {
-                            DerivationStatus::Running => true,
-                            DerivationStatus::Assigned => {
-                                state.transition(DerivationStatus::Running).is_ok()
-                            }
-                            _ => false,
-                        };
-                        if running {
-                            state.running_since = Some(backdate(secs_ago));
-                        }
-                        running
-                    } else {
-                        false
-                    };
-                    let _ = reply.send(ok);
+                    let _ = reply.send(self.handle_debug_backdate_running(&drv_hash, secs_ago));
                 }
                 #[cfg(test)]
                 ActorCommand::DebugBackdateSubmitted {
@@ -803,46 +624,249 @@ impl DagActor {
                     secs_ago,
                     reply,
                 } => {
-                    // Backdate submitted_at for per-build-timeout tests.
-                    // handle_tick's r[sched.timeout.per-build] check uses
-                    // submitted_at.elapsed() — a std::time::Instant, which
-                    // tokio paused time cannot mock (and paused time breaks
-                    // PG pool timeouts anyway).
-                    let ok = if let Some(build) = self.builds.get_mut(&build_id) {
-                        build.submitted_at = backdate(secs_ago);
-                        true
-                    } else {
-                        false
-                    };
-                    let _ = reply.send(ok);
+                    let _ = reply.send(self.handle_debug_backdate_submitted(build_id, secs_ago));
                 }
                 #[cfg(test)]
                 ActorCommand::DebugClearDrvContent { drv_hash, reply } => {
-                    // Clear drv_content to simulate post-recovery
-                    // state (DAG reloaded from PG, drv_content not
-                    // persisted). For CA recovery-fetch tests.
-                    let ok = if let Some(state) = self.dag.node_mut(&drv_hash) {
-                        state.drv_content.clear();
-                        true
-                    } else {
-                        false
-                    };
-                    let _ = reply.send(ok);
+                    let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
                 }
                 #[cfg(test)]
                 ActorCommand::DebugTripBreaker { n, reply } => {
-                    // Trip the cache-check circuit breaker directly.
-                    // For CA cutoff-compare breaker-gate tests —
-                    // bypasses the N-failing-SubmitBuild dance.
-                    for _ in 0..n {
-                        let _ = self.cache_breaker.record_failure();
-                    }
-                    let _ = reply.send(self.cache_breaker.is_open());
+                    let _ = reply.send(self.handle_debug_trip_breaker(n));
                 }
             }
         }
 
         info!("DAG actor shutting down");
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch-arm handlers extracted from run_inner
+    // -----------------------------------------------------------------------
+
+    fn handle_list_workers(&self) -> Vec<command::WorkerSnapshot> {
+        self.workers
+            .values()
+            .map(|w| command::WorkerSnapshot {
+                worker_id: w.worker_id.clone(),
+                systems: w.systems.clone(),
+                supported_features: w.supported_features.clone(),
+                max_builds: w.max_builds,
+                running_builds: w.running_builds.len() as u32,
+                draining: w.draining,
+                size_class: w.size_class.clone(),
+                connected_since: w.connected_since,
+                last_heartbeat: w.last_heartbeat,
+                last_resources: w.last_resources,
+            })
+            .collect()
+    }
+
+    /// Resolve drv_path → drv_hash → interested_builds, then emit
+    /// `BuildEvent::Log` on each build's broadcast channel. The gateway
+    /// already handles Event::Log (handler/build.rs:27-32) — it
+    /// translates to STDERR_NEXT for the Nix client.
+    ///
+    /// Unknown drv_path → drop silently. Two legitimate cases:
+    /// (a) batch arrived after CleanupTerminalBuild removed the DAG
+    ///     entry (race between worker stream and actor loop — the
+    ///     build is done, gateway already saw Completed, late log
+    ///     lines are irrelevant);
+    /// (b) malformed batch from a buggy worker. Neither warrants a
+    ///     `warn!()` — (a) is expected, (b) would spam.
+    fn handle_forward_log_batch(&mut self, drv_path: &str, batch: rio_proto::types::BuildLogBatch) {
+        let Some(hash) = self.drv_path_to_hash(drv_path) else {
+            return;
+        };
+        let lines = batch.lines.len() as u64;
+        for build_id in self.get_interested_builds(&hash) {
+            // batch.clone(): BuildLogBatch has Vec<Vec<u8>> so this is
+            // a deep copy. For 64 lines × 100 bytes that's ~6.5KB × N
+            // interested builds. Typically N=1 (one gateway per build).
+            // If profiling ever shows this hot, Arc<BuildLogBatch> in
+            // BuildEvent.
+            self.emit_build_event(
+                build_id,
+                rio_proto::types::build_event::Event::Log(batch.clone()),
+            );
+        }
+        // Metric: proves worker → scheduler → actor pipeline works.
+        // vm-phase2b asserts this > 0. The gateway → client leg
+        // (STDERR_NEXT rendering) depends on the Nix client's
+        // verbosity and activity-context handling — not something we
+        // control, so not asserted on in the VM test. The ring buffer
+        // + AdminService give the authoritative log-serving path;
+        // STDERR_NEXT is a convenience tail that may or may not render.
+        metrics::counter!("rio_scheduler_log_lines_forwarded_total").increment(lines);
+    }
+
+    /// Collect `expected_output_paths ∪ output_paths` from all
+    /// non-terminal derivations. These are the live-build roots that
+    /// GC must NOT delete — either the worker is about to upload them
+    /// (expected) or just did (output). Both cases: don't race the
+    /// upload.
+    ///
+    /// Dedup via HashSet: the same drv can appear in multiple builds
+    /// (shared dependency) → same expected_output_paths would be
+    /// duplicated N× in the roots list. The store's mark CTE handles
+    /// dups correctly, but it's wasted network + CTE work.
+    fn handle_gc_roots(&self) -> Vec<String> {
+        self.dag
+            .iter_nodes()
+            .filter(|(_, s)| !s.status().is_terminal())
+            .flat_map(|(_, s)| {
+                s.expected_output_paths
+                    .iter()
+                    .chain(s.output_paths.iter())
+                    .cloned()
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Schedule reconciliation ~45s out via WeakSender. Same pattern as
+    /// `schedule_terminal_cleanup`. Workers have ~45s (3× heartbeat +
+    /// slack) to reconnect after scheduler restart. Any
+    /// Assigned/Running derivation whose worker DIDN'T reconnect by
+    /// then gets reconciled (Completed if outputs in store, else reset).
+    fn schedule_reconcile_timer(&self) {
+        let Some(weak_tx) = self.self_tx.clone() else {
+            return;
+        };
+        rio_common::task::spawn_monitored("reconcile-timer", async move {
+            tokio::time::sleep(RECONCILE_DELAY).await;
+            if let Some(tx) = weak_tx.upgrade()
+                && tx.try_send(ActorCommand::ReconcileAssignments).is_err()
+            {
+                tracing::warn!("reconcile command dropped (channel full)");
+                metrics::counter!("rio_scheduler_reconcile_dropped_total").increment(1);
+            }
+        });
+    }
+
+    // ----- cfg(test) debug handlers ----------------------------------
+
+    #[cfg(test)]
+    fn handle_debug_query_workers(&self) -> Vec<DebugWorkerInfo> {
+        self.workers
+            .values()
+            .map(|w| DebugWorkerInfo {
+                worker_id: w.worker_id.to_string(),
+                is_registered: w.is_registered(),
+                running_count: w.running_builds.len(),
+                running_builds: w.running_builds.iter().map(|h| h.to_string()).collect(),
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn handle_debug_query_derivation(&self, drv_hash: &str) -> Option<DebugDerivationInfo> {
+        self.dag.node(drv_hash).map(|s| DebugDerivationInfo {
+            status: s.status(),
+            retry_count: s.retry_count,
+            assigned_worker: s.assigned_worker.as_ref().map(|w| w.to_string()),
+            assigned_size_class: s.assigned_size_class.clone(),
+            output_paths: s.output_paths.clone(),
+            failed_workers: s.failed_workers.iter().map(|w| w.to_string()).collect(),
+            failure_count: s.failure_count,
+            is_ca: s.is_ca,
+            ca_output_unchanged: s.ca_output_unchanged,
+        })
+    }
+
+    /// Force Ready→Assigned (or Failed→Ready→Assigned) bypassing
+    /// backoff + failed_workers exclusion. For retry/poison tests
+    /// that need to drive multiple completion cycles without waiting
+    /// for real backoff. Clears `backoff_until`.
+    #[cfg(test)]
+    fn handle_debug_force_assign(&mut self, drv_hash: &str, worker_id: &WorkerId) -> bool {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return false;
+        };
+        // If not already Ready, try to get there. Assigned/Running →
+        // reset_to_ready, Failed → transition Ready, Ready → no-op.
+        let prepped = match state.status() {
+            DerivationStatus::Ready => true,
+            DerivationStatus::Assigned | DerivationStatus::Running => {
+                state.reset_to_ready().is_ok()
+            }
+            DerivationStatus::Failed => state.transition(DerivationStatus::Ready).is_ok(),
+            _ => false, // terminal or pre-Ready: can't force
+        };
+        if !prepped {
+            return false;
+        }
+        state.backoff_until = None;
+        state.assigned_worker = Some(worker_id.clone());
+        let assigned = state.transition(DerivationStatus::Assigned).is_ok();
+        // Add to worker's running set so subsequent complete_failure
+        // finds a consistent state.
+        if let Some(w) = self.workers.get_mut(worker_id) {
+            w.running_builds.insert(drv_hash.into());
+        }
+        assigned
+    }
+
+    /// Force to Running with `running_since` backdated. Used by
+    /// backstop-timeout tests (`handle_tick` checks Running +
+    /// `running_since > threshold`). The cfg(test) backstop floor is
+    /// 0s so any `secs_ago > 0` triggers the backstop on Tick.
+    #[cfg(test)]
+    fn handle_debug_backdate_running(&mut self, drv_hash: &str, secs_ago: u64) -> bool {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return false;
+        };
+        // Transition to Running if not already there. Assigned →
+        // Running is a valid transition; Ready/Created would fail
+        // (need Assigned first). DebugForceAssign → Assigned, then
+        // this → Running is the typical test sequence.
+        let running = match state.status() {
+            DerivationStatus::Running => true,
+            DerivationStatus::Assigned => state.transition(DerivationStatus::Running).is_ok(),
+            _ => false,
+        };
+        if running {
+            state.running_since = Some(backdate(secs_ago));
+        }
+        running
+    }
+
+    /// Backdate `submitted_at` for per-build-timeout tests.
+    /// `handle_tick`'s `r[sched.timeout.per-build]` check uses
+    /// `submitted_at.elapsed()` — a `std::time::Instant`, which tokio
+    /// paused time cannot mock (and paused time breaks PG pool
+    /// timeouts anyway).
+    #[cfg(test)]
+    fn handle_debug_backdate_submitted(&mut self, build_id: Uuid, secs_ago: u64) -> bool {
+        let Some(build) = self.builds.get_mut(&build_id) else {
+            return false;
+        };
+        build.submitted_at = backdate(secs_ago);
+        true
+    }
+
+    /// Clear `drv_content` to simulate post-recovery state (DAG
+    /// reloaded from PG, drv_content not persisted). For CA
+    /// recovery-fetch tests.
+    #[cfg(test)]
+    fn handle_debug_clear_drv_content(&mut self, drv_hash: &str) -> bool {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return false;
+        };
+        state.drv_content.clear();
+        true
+    }
+
+    /// Trip the cache-check circuit breaker directly. For CA
+    /// cutoff-compare breaker-gate tests — bypasses the
+    /// N-failing-SubmitBuild dance.
+    #[cfg(test)]
+    fn handle_debug_trip_breaker(&mut self, n: u32) -> bool {
+        for _ in 0..n {
+            let _ = self.cache_breaker.record_failure();
+        }
+        self.cache_breaker.is_open()
     }
 
     // -----------------------------------------------------------------------

@@ -15,6 +15,7 @@ use thiserror::Error;
 mod aterm;
 mod hash;
 
+pub use aterm::write_aterm_string;
 pub use hash::hash_derivation_modulo;
 
 /// Errors from parsing or hashing ATerm derivations.

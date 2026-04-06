@@ -48,22 +48,23 @@ fn encode_cursor(submitted_at_micros: i64, build_id: Uuid) -> String {
 /// Decode an opaque cursor back to `(submitted_at_micros, build_id)`.
 ///
 /// Rejects:
-///   - non-base64 → `InvalidArgument("bad cursor")` (client bug or URL
-///     mangling)
+///   - non-base64 → `InvalidArgument("bad cursor: <decode err>")`
+///     (client bug or URL mangling)
 ///   - wrong length → `InvalidArgument("bad cursor length")` (truncated
 ///     or a non-cursor string fed through)
 ///   - unknown version byte → `InvalidArgument("bad cursor version")`
 ///     (cursor from a future scheduler — shouldn't happen in practice
 ///     since cursors are short-lived page tokens, not stored state)
 ///
-/// The error STRINGS are intentionally low-detail: the cursor is opaque,
-/// so there's nothing actionable for the client beyond "start over from
-/// page 1". The CODES are InvalidArgument (not Internal) because these
-/// are all client-supplied-garbage cases.
+/// The error STRINGS are low-detail (the cursor is opaque, so there's
+/// nothing actionable for the client beyond "start over from page 1")
+/// but include the underlying decode error for operator debugging. The
+/// CODES are InvalidArgument (not Internal) because these are all
+/// client-supplied-garbage cases.
 fn decode_cursor(s: &str) -> Result<(i64, Uuid), Status> {
     let buf = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
-        .map_err(|_| Status::invalid_argument("bad cursor"))?;
+        .map_err(|e| Status::invalid_argument(format!("bad cursor: {e}")))?;
     // Version-byte first, length second: a future v2 cursor with
     // different length would get "bad cursor length" (misleading) if
     // length were checked first. Version-first enables multi-version
@@ -218,11 +219,12 @@ mod tests {
     /// Bad inputs map to InvalidArgument with distinct messages.
     #[test]
     fn cursor_rejects_garbage() {
-        // Not base64.
-        assert_eq!(
-            decode_cursor("not!base64!").unwrap_err().message(),
-            "bad cursor"
-        );
+        // Not base64 — message includes the decode error detail.
+        let msg = decode_cursor("not!base64!")
+            .unwrap_err()
+            .message()
+            .to_string();
+        assert!(msg.starts_with("bad cursor: "), "got: {msg}");
         // Empty buffer → version check fails (is_empty guard).
         let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([] as [u8; 0]);
         assert_eq!(

@@ -1,7 +1,6 @@
 //! Store-query helpers using gRPC.
 
 use super::*;
-use anyhow::anyhow;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
 use tokio::io::AsyncReadExt;
@@ -13,7 +12,7 @@ pub(super) async fn grpc_query_path_info(
 ) -> anyhow::Result<Option<ValidatedPathInfo>> {
     rio_proto::client::query_path_info_opt(store_client, store_path, DEFAULT_GRPC_TIMEOUT)
         .await
-        .map_err(|e| anyhow::anyhow!("gRPC QueryPathInfo failed: {e}"))
+        .map_err(|e| GatewayError::Store(format!("QueryPathInfo failed: {e}")).into())
 }
 
 /// Check validity via QueryPathInfo -- returns true if path exists.
@@ -75,7 +74,7 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
         )),
     })
     .await
-    .map_err(|_| anyhow!("PutPath channel closed before metadata"))?;
+    .map_err(|_| GatewayError::GrpcStream("PutPath channel closed before metadata".into()))?;
 
     // Drive the gRPC call. Clone: tonic Channel is Arc-backed.
     let mut client = store_client.clone();
@@ -102,12 +101,17 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
             nar_reader
                 .read_exact(&mut chunk[..n])
                 .await
-                .map_err(|e| anyhow!("NAR read at {} of {nar_size}: {e}", nar_size - remaining))?;
+                .map_err(|e| GatewayError::NarRead {
+                    context: format!("at {} of {nar_size}", nar_size - remaining),
+                    source: e,
+                })?;
             tx.send(types::PutPathRequest {
                 msg: Some(types::put_path_request::Msg::NarChunk(chunk[..n].to_vec())),
             })
             .await
-            .map_err(|_| anyhow!("PutPath channel closed mid-stream (store error?)"))?;
+            .map_err(|_| {
+                GatewayError::GrpcStream("PutPath channel closed mid-stream (store error?)".into())
+            })?;
             remaining -= n as u64;
         }
 
@@ -121,7 +125,7 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
             )),
         })
         .await
-        .map_err(|_| anyhow!("PutPath channel closed before trailer"))?;
+        .map_err(|_| GatewayError::GrpcStream("PutPath channel closed before trailer".into()))?;
         Ok(())
     }
     .await;
@@ -130,7 +134,7 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
 
     let rpc_result = rpc
         .await
-        .map_err(|e| anyhow!("PutPath task panicked: {e}"))?;
+        .map_err(|e| GatewayError::GrpcStream(format!("PutPath task panicked: {e}")))?;
 
     // Error priority: pump error > rpc error (pump error is the root cause;
     // a short read causes the rpc to see a truncated stream, but the useful
@@ -148,5 +152,5 @@ pub(super) async fn grpc_get_path(
 ) -> anyhow::Result<Option<(ValidatedPathInfo, Vec<u8>)>> {
     rio_proto::client::get_path_nar(store_client, store_path, GRPC_STREAM_TIMEOUT, MAX_NAR_SIZE)
         .await
-        .map_err(|e| anyhow::anyhow!("gRPC GetPath for {store_path}: {e}"))
+        .map_err(|e| GatewayError::Store(format!("GetPath for {store_path}: {e}")).into())
 }

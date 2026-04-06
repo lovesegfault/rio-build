@@ -393,7 +393,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             // Sending STDERR_ERROR here would produce the exact
             // ERROR→LAST desync remediation 07 fixes.
             let _ = stderr.log(&format!("SubmitBuild RPC failed: {e}\n")).await;
-            return Err(anyhow::anyhow!("SubmitBuild failed: {e}"));
+            return Err(GatewayError::Scheduler(format!("SubmitBuild failed: {e}")).into());
         }
     };
 
@@ -445,15 +445,18 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     let _ = stderr
                         .log("scheduler closed stream before first event (legacy path, no build_id to reconnect)\n")
                         .await;
-                    return Err(anyhow::anyhow!(
-                        "empty build event stream (legacy scheduler, no header)"
-                    ));
+                    return Err(GatewayError::Scheduler(
+                        "empty build event stream (legacy scheduler, no header)".into(),
+                    )
+                    .into());
                 }
                 Err(e) => {
                     let _ = stderr
                         .log(&format!("build event stream error on first read: {e}\n"))
                         .await;
-                    return Err(anyhow::anyhow!("build event stream error: {e}"));
+                    return Err(
+                        GatewayError::Scheduler(format!("build event stream error: {e}")).into(),
+                    );
                 }
             };
             let id = first.build_id.clone();

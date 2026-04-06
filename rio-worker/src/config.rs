@@ -160,11 +160,11 @@ impl Default for Config {
             fuse_passthrough: true,
             fuse_fetch_timeout_secs: 180,
             overlay_base_dir: "/var/rio/overlays".into(),
-            metrics_addr: "0.0.0.0:9093".parse().unwrap(),
+            metrics_addr: rio_common::default_addr(9093),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
             // gateway (9090→9190). Scheduler/store piggyback health
             // on their gRPC ports; worker+gateway have no gRPC server.
-            health_addr: "0.0.0.0:9193".parse().unwrap(),
+            health_addr: rio_common::default_addr(9193),
             // configuration.md:68-69 specs these defaults.
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
