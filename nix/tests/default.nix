@@ -72,6 +72,7 @@ let
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
+  substitute = import ./scenarios/substitute.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
   pulled = import ../docker-pulled.nix { inherit pkgs; };
 
@@ -250,6 +251,68 @@ in
     };
     cold = true;
   };
+
+  # Upstream binary-cache substitution: fake cache on client VM, store
+  # fetches + ingests on QueryPathInfo miss. Validates the P0462/P0463
+  # chain at the store-gRPC level (NOT through ssh-ng — gateway read-
+  # opcode handlers don't yet propagate x-rio-tenant-token; see
+  # TODO(P0465) in the scenario file).
+  #
+  # JWT: store needs RIO_JWT__KEY_PATH set so the interceptor attaches
+  # TenantClaims → request_tenant_id() → Some(tid) → substitution fires.
+  # jwt-keys.nix test pubkey (seed=0x42×32) via pkgs.writeText →
+  # store-path in VM closure. The scenario signs matching JWTs with the
+  # seed via PyJWT.
+  #
+  # signingKeyFile: sig_mode=add needs a rio-side Signer. Fixed test
+  # seed → key name "rio-vm-test-1" (the scenario asserts this exact
+  # name in narinfo.signatures). Nix secret-key format: name:base64seed.
+  #
+  # 0 workers: no builds, pure store-side test. workers={} → empty
+  # workerNodes attrset → just control+client VMs.
+  #
+  # r[verify store.substitute.upstream]
+  #   substitute-cold-fetch: miss → HTTP GET narinfo → sig-verify →
+  #   GET nar → CAS ingest → narinfo INSERT. Metric + psql assertions.
+  # r[verify store.substitute.sig-mode]
+  #   substitute-sig-mode-add: sig_mode=add → BOTH upstream AND rio
+  #   sigs in narinfo.signatures.
+  # r[verify store.substitute.tenant-sig-visibility]
+  #   substitute-cross-tenant-gate: tenant C (untrusted key) → NotFound
+  #   on A-substituted path; tenant B (trusts same key) → visible.
+  #   Dynamic re-trust proves per-request trusted_keys read.
+  vm-substitute-standalone =
+    let
+      jwtKeys = import ./lib/jwt-keys.nix;
+      jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+      # 32×0x55 seed, base64-encoded. Distinct from jwtKeys (0x42) so
+      # a JWT-sig/narinfo-sig mixup would fail loudly.
+      rioSigningKey = pkgs.writeText "rio-signing-key" "rio-vm-test-1:VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+    in
+    substitute {
+      inherit pkgs common;
+      fixture = standalone {
+        workers = { };
+        extraStoreConfig = {
+          signingKeyFile = "${rioSigningKey}";
+          extraConfig = ''
+            [jwt]
+            key_path = "${jwtPubkey}"
+          '';
+        };
+        # grpcurl + postgresql (psql) on control for direct store
+        # probing + narinfo table inspection.
+        extraPackages = [
+          pkgs.grpcurl
+          pkgs.postgresql_18
+        ];
+        # Open :8080 on client for the fake-upstream http.server. The
+        # store (on control) fetches http://client:8080/<hash>.narinfo.
+        extraClientModules = [
+          { networking.firewall.allowedTCPPorts = [ 8080 ]; }
+        ];
+      };
+    };
 
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
   # Same 3-worker fixture (wsmall1/wsmall2/wlarge + size-classes) for
