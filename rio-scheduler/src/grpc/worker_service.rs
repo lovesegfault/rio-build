@@ -69,7 +69,7 @@ impl WorkerService for SchedulerGrpc {
                 stream_tx: actor_tx,
             })
             .await
-            .map_err(|_| Status::unavailable("scheduler actor unavailable"))?;
+            .map_err(Self::actor_error_to_status)?;
 
         // Bridge actor_rx -> output_tx, wrapping in Ok()
         rio_common::task::spawn_monitored("build-exec-bridge", async move {

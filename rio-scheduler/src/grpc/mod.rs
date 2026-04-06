@@ -11,11 +11,12 @@
 //! changes no longer conflict with heartbeat/stream-dispatch changes.
 // r[impl proto.stream.bidi]
 
+pub(crate) mod actor_guards;
 mod scheduler_service;
 mod worker_service;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
@@ -112,33 +113,15 @@ impl SchedulerGrpc {
     }
 
     /// Check if the actor is alive; return UNAVAILABLE if dead (panicked).
+    /// Delegates to [`actor_guards::check_actor_alive`].
     pub(super) fn check_actor_alive(&self) -> Result<(), Status> {
-        if !self.actor.is_alive() {
-            return Err(Status::unavailable(
-                "scheduler actor is unavailable (panicked or exited)",
-            ));
-        }
-        Ok(())
+        actor_guards::check_actor_alive(&self.actor)
     }
 
-    // r[impl sched.grpc.leader-guard]
     /// Return UNAVAILABLE when this replica is not the leader.
-    /// Called at the top of every handler, before any actor
-    /// interaction. Standby replicas keep the gRPC server up
-    /// (so the process is Ready from K8s's PoV) but refuse all
-    /// RPCs — clients with a health-aware balanced channel see
-    /// NOT_SERVING from grpc.health.v1 and route elsewhere.
-    ///
-    /// A bare `Status::unavailable` (not `Status::failed_precondition`)
-    /// because tonic's p2c balancer ejects endpoints on
-    /// UNAVAILABLE-at-connection but NOT on RPC-level errors;
-    /// clients retry on UNAVAILABLE by convention (health-aware
-    /// balancer has already removed us, so retry goes to leader).
+    /// Delegates to [`actor_guards::ensure_leader`].
     pub(super) fn ensure_leader(&self) -> Result<(), Status> {
-        if !self.is_leader.load(Ordering::Relaxed) {
-            return Err(Status::unavailable("not leader (standby replica)"));
-        }
-        Ok(())
+        actor_guards::ensure_leader(&self.is_leader)
     }
 
     /// Convert an ActorError to a tonic Status.
@@ -152,8 +135,12 @@ impl SchedulerGrpc {
             // actor panicked OR it exited on its shutdown-token arm
             // during drain. UNAVAILABLE (retriable) not INTERNAL —
             // BalancedChannel clients retry on the next replica; with
-            // INTERNAL they'd surface the error to the user.
-            ActorError::ChannelSend => Status::unavailable("scheduler actor is unavailable"),
+            // INTERNAL they'd surface the error to the user. Same
+            // string as `actor_guards::check_actor_alive` so operators
+            // grep for one signature, not two.
+            ActorError::ChannelSend => {
+                Status::unavailable("scheduler actor is unavailable (panicked or exited)")
+            }
             ActorError::Database(e) => Status::internal(format!("database error: {e}")),
             ActorError::Dag(e) => Status::internal(format!("DAG merge failed: {e}")),
             ActorError::MissingDbId { .. } => Status::internal(err.to_string()),

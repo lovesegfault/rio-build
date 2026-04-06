@@ -4,30 +4,21 @@
 //! `ClusterStatus`, `DrainWorker`, `TriggerGC`, `ListWorkers`,
 //! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`.
 //!
-//! `GetBuildLogs` has two data sources (per `observability.md:44-50`):
-//!
-//! | Build State | Source |
-//! |---|---|
-//! | Active | Ring buffer (in-memory, most recent) |
-//! | Completed | S3 (gzipped blob, seekable via PG `build_logs.s3_key`) |
-//!
-//! We check the ring buffer FIRST: if the derivation is still active, the
-//! ring buffer has the freshest lines (the S3 blob, if any, is a 30s-stale
-//! periodic snapshot). Only if the ring buffer is empty do we fall back to
-//! S3 — which means the derivation finished and the flusher drained it.
+//! Per-RPC bodies live in submodules (`logs`, `gc`, `tenants`,
+//! `builds`, `workers`, `graph`, `sizeclass`). This file holds only the
+//! [`AdminServiceImpl`] state struct + thin wrapper methods that
+//! delegate into the submodules. Split from a single 861L file (P0383)
+//! after collision count hit 20.
 
-use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime};
 
 use aws_sdk_s3::Client as S3Client;
-use flate2::read::GzDecoder;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
@@ -36,22 +27,21 @@ use rio_proto::types::{
     CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse, GcProgress,
     GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
     GetSizeClassStatusRequest, GetSizeClassStatusResponse, ListBuildsRequest, ListBuildsResponse,
-    ListTenantsResponse, ListWorkersRequest, ListWorkersResponse, TenantInfo,
+    ListTenantsResponse, ListWorkersRequest, ListWorkersResponse,
 };
 
 use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
 
 mod builds;
+mod gc;
 mod graph;
+mod logs;
 mod sizeclass;
+mod tenants;
 mod workers;
 
-/// Chunk size for streaming S3-fetched log lines back to the client.
-/// The whole log is gunzipped into memory first (we need to do line
-/// splitting on decompressed data), then re-chunked for the gRPC stream.
-/// 256 lines/chunk balances message count vs. per-message size.
-const CHUNK_LINES: usize = 256;
+pub use gc::spawn_store_size_refresh;
 
 pub struct AdminServiceImpl {
     /// Shared with `SchedulerGrpc` — same Arc, same DashMap.
@@ -98,44 +88,6 @@ pub struct AdminServiceImpl {
     shutdown: rio_common::signal::Token,
 }
 
-/// Spawn a background task that refreshes `store_size_bytes` every 60s
-/// via a PG query on the shared store DB. Scheduler already has the pool
-/// (same database as the store). Follows the `scheduler_live_pins`
-/// cross-layer precedent.
-pub fn spawn_store_size_refresh(
-    pool: PgPool,
-    shutdown: rio_common::signal::Token,
-) -> Arc<std::sync::atomic::AtomicU64> {
-    let size = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let size_clone = Arc::clone(&size);
-    rio_common::task::spawn_monitored("store-size-refresh", async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    tracing::debug!("store-size-refresh shutting down");
-                    break;
-                }
-                _ = interval.tick() => {}
-            }
-            match sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(SUM(nar_size), 0)::bigint FROM narinfo",
-            )
-            .fetch_one(&pool)
-            .await
-            {
-                Ok(bytes) => {
-                    size_clone.store(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "store_size refresh failed");
-                }
-            }
-        }
-    });
-    size
-}
-
 impl AdminServiceImpl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -161,182 +113,21 @@ impl AdminServiceImpl {
         }
     }
 
-    /// Actor-dead check. Same pattern as `SchedulerGrpc::check_actor_alive`
-    /// (grpc/mod.rs:~180) — if the actor panicked, all commands would
-    /// hang on a closed channel. Return UNAVAILABLE early instead.
+    /// Actor-dead check. Delegates to the shared
+    /// [`actor_guards::check_actor_alive`](crate::grpc::actor_guards)
+    /// so the error string stays in lockstep with `SchedulerGrpc`.
     fn check_actor_alive(&self) -> Result<(), Status> {
-        if !self.actor.is_alive() {
-            return Err(Status::unavailable(
-                "scheduler actor not running (internal error)",
-            ));
-        }
-        Ok(())
+        crate::grpc::actor_guards::check_actor_alive(&self.actor)
     }
 
-    // r[impl sched.grpc.leader-guard]
-    /// Same as `SchedulerGrpc::ensure_leader`. Admin RPCs mutate
-    /// state (DrainWorker, ClearPoison, CreateTenant, TriggerGC)
-    /// or reflect actor state (ClusterStatus, ListWorkers) —
-    /// standby has no actor authority and its view is stale.
+    /// Leader guard. Admin RPCs mutate state (DrainWorker,
+    /// ClearPoison, CreateTenant, TriggerGC) or reflect actor state
+    /// (ClusterStatus, ListWorkers) — standby has no actor authority
+    /// and its view is stale. Delegates to the shared
+    /// [`actor_guards::ensure_leader`](crate::grpc::actor_guards).
     fn ensure_leader(&self) -> Result<(), Status> {
-        if !self.is_leader.load(Ordering::Relaxed) {
-            return Err(Status::unavailable("not leader (standby replica)"));
-        }
-        Ok(())
+        crate::grpc::actor_guards::ensure_leader(&self.is_leader)
     }
-
-    /// Try the ring buffer. Returns `Some` if the derivation has any lines
-    /// buffered (i.e., it's active or just-completed-not-yet-drained).
-    fn try_ring_buffer(&self, drv_path: &str, since: u64) -> Option<Vec<BuildLogChunk>> {
-        let lines = self.log_buffers.read_since(drv_path, since);
-        if lines.is_empty() {
-            return None;
-        }
-        // Group into CHUNK_LINES-sized chunks. Each chunk carries the
-        // first_line_number of its first line for client-side ordering.
-        let mut chunks = Vec::new();
-        for group in lines.chunks(CHUNK_LINES) {
-            let first_line = group[0].0;
-            chunks.push(BuildLogChunk {
-                derivation_path: drv_path.to_string(),
-                lines: group.iter().map(|(_n, bytes)| bytes.clone()).collect(),
-                first_line_number: first_line,
-                is_complete: false, // ring buffer = still active
-            });
-        }
-        // Mark the LAST chunk is_complete=false too — the derivation is
-        // still running. The client should re-poll for more.
-        Some(chunks)
-    }
-
-    /// Fetch from S3, gunzip, split lines, chunk. The whole blob comes
-    /// into memory during gunzip — acceptable for build logs (bounded
-    /// by the worker's `log_size_limit` of 100 MiB, which gzips to
-    /// ~10 MiB). True streaming gunzip would need an async GzDecoder
-    /// that yields lines, which flate2 doesn't have natively.
-    async fn try_s3(
-        &self,
-        build_id: &uuid::Uuid,
-        drv_hash: &str,
-        since: u64,
-    ) -> Result<Option<Vec<BuildLogChunk>>, Status> {
-        let Some((s3, bucket)) = &self.s3 else {
-            // No S3 configured. Can't serve completed logs.
-            return Ok(None);
-        };
-
-        // PG lookup: find the s3_key. The flusher wrote this row with
-        // is_complete=true on the final flush.
-        let row: Option<(String, i64)> = sqlx::query_as(
-            "SELECT s3_key, line_count FROM build_logs
-             WHERE build_id = $1 AND drv_hash = $2 AND is_complete = true",
-        )
-        .bind(build_id)
-        .bind(drv_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Status::internal(format!("PG query failed: {e}")))?;
-
-        let Some((s3_key, _line_count)) = row else {
-            return Ok(None); // not in S3 either → truly not found
-        };
-
-        debug!(s3_key = %s3_key, "serving build log from S3");
-
-        // S3 GET + full-body drain.
-        let resp = s3
-            .get_object()
-            .bucket(bucket)
-            .key(&s3_key)
-            .send()
-            .await
-            .map_err(|e| Status::unavailable(format!("S3 GetObject failed: {e}")))?;
-        let gzipped = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| Status::unavailable(format!("S3 body read failed: {e}")))?
-            .into_bytes();
-
-        // Gunzip in spawn_blocking — same rationale as the flusher's gzip.
-        let drv_hash_owned = drv_hash.to_string();
-        let chunks =
-            tokio::task::spawn_blocking(move || gunzip_and_chunk(&gzipped, &drv_hash_owned, since))
-                .await
-                .map_err(|e| Status::internal(format!("gunzip task panicked: {e}")))?
-                .map_err(|e| Status::internal(format!("gunzip failed: {e}")))?;
-
-        Ok(Some(chunks))
-    }
-}
-
-/// Gunzip the blob, split on `\n`, apply `since` filtering, chunk.
-/// Standalone so spawn_blocking can take it without `self`.
-///
-/// `drv_label` goes into `BuildLogChunk.derivation_path`. The S3 path uses
-/// `drv_hash` but the proto field is called `derivation_path` — we put the
-/// hash there since that's all we have at this point (the ring-buffer path
-/// uses the real drv_path, but for completed builds the DAG entry is gone).
-fn gunzip_and_chunk(
-    gzipped: &[u8],
-    drv_label: &str,
-    since: u64,
-) -> std::io::Result<Vec<BuildLogChunk>> {
-    let mut decoder = GzDecoder::new(gzipped);
-    let mut raw = Vec::new();
-    decoder.read_to_end(&mut raw)?;
-
-    // Split on \n. The flusher joins with \n so every line gets a trailing
-    // \n — split() gives an empty last element, which we skip.
-    // Line numbers are the index into this split, starting from 0 (the
-    // flusher writes them in buffer order, which IS line-number order).
-    let mut chunks = Vec::new();
-    let mut buf: Vec<Vec<u8>> = Vec::with_capacity(CHUNK_LINES);
-    let mut chunk_first_line = since;
-
-    for (n, line) in raw.split(|b| *b == b'\n').enumerate() {
-        let n = n as u64;
-        if n < since {
-            continue; // client already has this line
-        }
-        // Skip the trailing empty element from the final \n. (An ACTUAL
-        // empty log line is uncommon but valid — we keep those. The
-        // distinguisher is whether it's the very last element.)
-        // We don't know we're at the last element until the iterator ends,
-        // so: collect all, then strip a trailing empty. Simpler: check if
-        // this is the last byte position. But `split()` doesn't give us
-        // that. Simplest: if line is empty AND it's past line_count, skip.
-        // Actually: the flusher writes `line\nline\nline\n` — split gives
-        // [line, line, line, ""]. The "" is always the last element.
-        // We handle it after the loop.
-        buf.push(line.to_vec());
-        if buf.len() >= CHUNK_LINES {
-            chunks.push(BuildLogChunk {
-                derivation_path: drv_label.to_string(),
-                lines: std::mem::take(&mut buf),
-                first_line_number: chunk_first_line,
-                is_complete: false,
-            });
-            chunk_first_line = n + 1;
-        }
-    }
-    // Strip the trailing empty from the final-\n split artifact.
-    if buf.last().is_some_and(|l| l.is_empty()) {
-        buf.pop();
-    }
-    if !buf.is_empty() {
-        chunks.push(BuildLogChunk {
-            derivation_path: drv_label.to_string(),
-            lines: buf,
-            first_line_number: chunk_first_line,
-            is_complete: false,
-        });
-    }
-    // Mark the LAST chunk is_complete=true. From S3 = derivation finished.
-    if let Some(last) = chunks.last_mut() {
-        last.is_complete = true;
-    }
-    Ok(chunks)
 }
 
 #[tonic::async_trait]
@@ -361,77 +152,11 @@ impl AdminService for AdminServiceImpl {
         // body frame the browser CAN read.
         // r[impl dash.journey.build-to-logs]
         if let Err(status) = self.ensure_leader() {
-            return Ok(Response::new(err_stream(status)));
+            return Ok(Response::new(logs::err_stream(status)));
         }
         let req = request.into_inner();
-
-        // Validate: need at least derivation_path. build_id is needed only
-        // for the S3 path (PG lookup is keyed on it); ring buffer is keyed
-        // on drv_path alone.
-        if req.derivation_path.is_empty() {
-            return Ok(Response::new(err_stream(Status::invalid_argument(
-                "derivation_path is required (build_id is optional if the \
-                 derivation is still active)",
-            ))));
-        }
-
-        // Step 1: Ring buffer (active or just-completed-not-yet-drained).
-        if let Some(chunks) = self.try_ring_buffer(&req.derivation_path, req.since_line) {
-            debug!(
-                drv_path = %req.derivation_path,
-                chunks = chunks.len(),
-                "serving from ring buffer"
-            );
-            return Ok(Response::new(chunks_to_stream(chunks)));
-        }
-
-        // Step 2: S3 (completed). Need build_id for the PG lookup.
-        if req.build_id.is_empty() {
-            return Ok(Response::new(err_stream(Status::not_found(format!(
-                "derivation {:?} has no active ring buffer and build_id was \
-                 not provided for S3 lookup. If the build completed, retry \
-                 with build_id.",
-                req.derivation_path
-            )))));
-        }
-        let build_id: uuid::Uuid = match req.build_id.parse() {
-            Ok(id) => id,
-            Err(e) => {
-                return Ok(Response::new(err_stream(Status::invalid_argument(
-                    format!("invalid build_id UUID: {e}"),
-                ))));
-            }
-        };
-
-        // For the S3 path, we need drv_hash, not drv_path. The spec's
-        // S3 key format is `logs/{build_id}/{drv_hash}.log.gz`. The client
-        // typically has drv_path (that's what the gateway speaks). We
-        // could resolve drv_path→drv_hash via the actor, but the DAG entry
-        // is likely gone by now (CleanupTerminalBuild removes it ~30s after
-        // completion). Instead: accept EITHER in derivation_path. If it
-        // parses as a store path, use the hash-name part; otherwise assume
-        // it's already a hash.
-        //
-        // This is a soft interface contract. The phase4 dashboard will know
-        // both and pass drv_hash explicitly.
-        let drv_hash = extract_drv_hash(&req.derivation_path);
-
-        match self.try_s3(&build_id, &drv_hash, req.since_line).await {
-            Ok(Some(chunks)) => {
-                debug!(
-                    drv_hash = %drv_hash,
-                    chunks = chunks.len(),
-                    "serving from S3"
-                );
-                Ok(Response::new(chunks_to_stream(chunks)))
-            }
-            Ok(None) => Ok(Response::new(err_stream(Status::not_found(format!(
-                "no log found for build {build_id} derivation {drv_hash:?} \
-                 (not in ring buffer or S3). Either the derivation produced \
-                 no output, or the flusher hasn't uploaded yet."
-            ))))),
-            Err(status) => Ok(Response::new(err_stream(status))),
-        }
+        let stream = logs::get_build_logs(&self.log_buffers, &self.s3, &self.pool, req).await;
+        Ok(Response::new(stream))
     }
 
     /// Cluster-wide counts for the controller's autoscaling loop.
@@ -526,21 +251,6 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(resp))
     }
 
-    /// Proxy to store's `StoreAdminService.TriggerGC` after
-    /// populating `extra_roots` from the scheduler's live builds.
-    ///
-    /// Flow:
-    /// 1. `ActorCommand::GcRoots` → collect expected_output_paths
-    ///    from all non-terminal derivations. These may not be in
-    ///    narinfo yet (worker hasn't uploaded); the store's mark
-    ///    phase includes them as root seeds so in-flight outputs
-    ///    aren't collected.
-    /// 2. Connect to store, call TriggerGC with the populated
-    ///    extra_roots + client's dry_run/grace_period.
-    /// 3. Proxy the store's GCProgress stream back to the client.
-    ///
-    /// If store is unreachable: UNAVAILABLE (not UNIMPLEMENTED —
-    /// the RPC IS implemented, store is just down). Client retries.
     #[instrument(skip(self, request), fields(rpc = "TriggerGC"))]
     async fn trigger_gc(
         &self,
@@ -549,92 +259,10 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
-        let mut req = request.into_inner();
-
-        // Step 1: collect extra_roots from the actor. send_unchecked
-        // bypasses backpressure — GC is operator-initiated, rare,
-        // and should work even when the scheduler is saturated.
-        let mut extra_roots = self
-            .actor
-            .query_unchecked(|reply| ActorCommand::GcRoots { reply })
-            .await
-            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
-
-        // Merge with any client-provided extra_roots (unusual but
-        // allowed — maybe the client has additional pins).
-        req.extra_roots.append(&mut extra_roots);
-        let extra_count = req.extra_roots.len();
-
-        debug!(
-            dry_run = req.dry_run,
-            grace_hours = ?req.grace_period_hours,
-            extra_roots = extra_count,
-            "proxying TriggerGC to store with live-build roots"
-        );
-
-        // Step 2: connect to store admin service. Same TLS config
-        // as connect_store (OnceLock CLIENT_TLS).
-        let mut store_admin = rio_proto::client::connect_store_admin(&self.store_addr)
-            .await
-            .map_err(|e| Status::unavailable(format!("store admin connect failed: {e}")))?;
-
-        // Step 3: proxy the call. The store's stream becomes OUR
-        // stream — we wrap it in a forwarding task. inject_current
-        // so the store's link_parent can stitch the trace chain.
-        let mut tonic_req = tonic::Request::new(req);
-        rio_proto::interceptor::inject_current(tonic_req.metadata_mut());
-        let store_stream = store_admin
-            .trigger_gc(tonic_req)
-            .await
-            .map_err(|e| Status::internal(format!("store TriggerGC failed: {e}")))?
-            .into_inner();
-
-        // Forward store's progress stream to the client. A small
-        // channel + forwarding task: the store stream isn't
-        // directly compatible with our TriggerGCStream type (we
-        // declare it as ReceiverStream).
-        let (tx, rx) = mpsc::channel::<Result<GcProgress, Status>>(8);
-        let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
-            let mut store_stream = store_stream;
-            loop {
-                // biased: check shutdown first. A store-side sweep
-                // can go minutes between progress messages; without
-                // this arm the task holds the store channel alive
-                // past main()'s lease_loop.await.
-                let msg = tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {
-                        tracing::debug!("TriggerGC forward: shutdown, dropping store stream");
-                        break;
-                    }
-                    m = store_stream.message() => m,
-                };
-                match msg {
-                    Ok(Some(progress)) => {
-                        if tx.send(Ok(progress)).await.is_err() {
-                            // Client disconnected. Let the store-
-                            // side GC finish (it's already running);
-                            // just stop forwarding.
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        // Store stream EOF (GC complete). Drop tx
-                        // → client sees stream end.
-                        break;
-                    }
-                    Err(e) => {
-                        // Store error mid-stream. Forward the error;
-                        // client decides whether to retry.
-                        let _ = tx.send(Err(e)).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let req = request.into_inner();
+        let stream =
+            gc::trigger_gc(&self.actor, &self.store_addr, self.shutdown.clone(), req).await?;
+        Ok(Response::new(stream))
     }
 
     /// Mark a worker draining: `has_capacity()` returns false, dispatch
@@ -718,13 +346,8 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
-        let rows = db
-            .list_tenants()
-            .await
-            .map_err(|e| Status::internal(format!("db: {e}")))?;
-        Ok(Response::new(ListTenantsResponse {
-            tenants: rows.into_iter().map(tenant_row_to_proto).collect(),
-        }))
+        let resp = tenants::list_tenants(&db).await?;
+        Ok(Response::new(resp))
     }
 
     // r[impl sched.admin.create-tenant]
@@ -736,61 +359,9 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         let req = request.into_inner();
-        // NormalizedName trims + rejects empty AND interior whitespace.
-        // The same normalization runs at every read path (gateway
-        // server.rs, cache auth.rs, SubmitBuild) — storing the
-        // normalized form here means every `WHERE tenant_name = $1`
-        // lookup matches. Without it, " team-a " never matches
-        // 'team-a' and the operator spends an afternoon staring at
-        // invisible whitespace. Interior-whitespace rejection
-        // (`"team a"` → `InteriorWhitespace`) catches the typo class
-        // where an authorized_keys comment has a space instead of a
-        // dash — the tenant would be unreachable otherwise.
-        let tenant_name = NormalizedName::new(&req.tenant_name)
-            .map_err(|e| Status::invalid_argument(format!("invalid tenant_name: {e}")))?;
-        let cache_token = req.cache_token.as_deref().map(str::trim);
-        if cache_token.is_some_and(str::is_empty) {
-            return Err(Status::invalid_argument(
-                "cache_token must not be empty string (omit field for no-cache-auth)",
-            ));
-        }
-        // u32→i32 / u64→i64 would wrap to negative for out-of-range
-        // values (PG stores INTEGER/BIGINT signed). GC with negative
-        // retention is undefined downstream.
-        let gc_retention_hours = req
-            .gc_retention_hours
-            .map(|h| {
-                i32::try_from(h).map_err(|_| {
-                    Status::invalid_argument("gc_retention_hours out of range (max 2^31-1)")
-                })
-            })
-            .transpose()?;
-        let gc_max_store_bytes = req
-            .gc_max_store_bytes
-            .map(|b| {
-                i64::try_from(b).map_err(|_| {
-                    Status::invalid_argument("gc_max_store_bytes out of range (max 2^63-1)")
-                })
-            })
-            .transpose()?;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
-        let row = db
-            .create_tenant(
-                &tenant_name,
-                gc_retention_hours,
-                gc_max_store_bytes,
-                cache_token,
-            )
-            .await
-            .map_err(|e| Status::internal(format!("db: {e}")))?
-            .ok_or_else(|| {
-                Status::already_exists(format!(
-                    "tenant '{tenant_name}' already exists (or cache_token collision)"
-                ))
-            })?;
-        Ok(Response::new(CreateTenantResponse {
-            tenant: Some(tenant_row_to_proto(row)),
-        }))
+        let resp = tenants::create_tenant(&db, req).await?;
+        Ok(Response::new(resp))
     }
 
     /// PG-backed DAG snapshot for dashboard viz. No actor round-trip —
@@ -832,65 +403,6 @@ impl AdminService for AdminServiceImpl {
         let resp = sizeclass::get_size_class_status(&self.actor, &db).await?;
         Ok(Response::new(resp))
     }
-}
-
-fn tenant_row_to_proto(row: crate::db::TenantRow) -> TenantInfo {
-    TenantInfo {
-        tenant_id: row.tenant_id.to_string(),
-        tenant_name: row.tenant_name,
-        gc_retention_hours: row.gc_retention_hours as u32,
-        gc_max_store_bytes: row.gc_max_store_bytes.map(|b| b as u64),
-        created_at: Some(prost_types::Timestamp {
-            seconds: row.created_at,
-            nanos: 0,
-        }),
-        has_cache_token: row.has_cache_token,
-    }
-}
-
-/// Convert a Vec<Chunk> into a ReceiverStream. The chunks are already
-/// fully materialized (we either read the ring buffer or gunzipped S3
-/// into memory), so there's no backpressure benefit to streaming — but
-/// the gRPC API is streaming, so we honor it.
-fn chunks_to_stream(chunks: Vec<BuildLogChunk>) -> ReceiverStream<Result<BuildLogChunk, Status>> {
-    let (tx, rx) = mpsc::channel(chunks.len().max(1));
-    tokio::spawn(async move {
-        for chunk in chunks {
-            if tx.send(Ok(chunk)).await.is_err() {
-                break; // client disconnected
-            }
-        }
-    });
-    ReceiverStream::new(rx)
-}
-
-/// Wrap a Status in a stream that yields a single `Err(status)` then ends.
-///
-/// For server-streaming RPCs consumed via grpc-web (the dashboard),
-/// returning `Err(Status)` directly from the handler makes tonic emit a
-/// Trailers-Only response — `grpc-status` lives in the HTTP headers with
-/// zero body. Envoy's grpc_web filter passes that through as-is, and the
-/// browser fetch API can't read HTTP trailers — the dashboard sees a
-/// silent 200.
-///
-/// Yielding `Err` from the stream instead makes tonic emit a normal
-/// HEADERS frame followed by TRAILERS; Envoy encodes the trailers as a
-/// length-prefixed body frame with flag `0x80`, which fetch CAN read.
-fn err_stream<T: Send + 'static>(status: Status) -> ReceiverStream<Result<T, Status>> {
-    let (tx, rx) = mpsc::channel(1);
-    // try_send: capacity is 1 and we're the sole sender, can't fail.
-    let _ = tx.try_send(Err(status));
-    ReceiverStream::new(rx)
-}
-
-/// Extract a drv_hash-shaped key from a derivation_path-ish input.
-///
-/// `/nix/store/{32-char-hash}-{name}.drv` → `{32-char-hash}-{name}.drv`
-/// Already-hash-shaped input → unchanged.
-fn extract_drv_hash(s: &str) -> String {
-    s.strip_prefix(rio_nix::store_path::STORE_PREFIX)
-        .unwrap_or(s)
-        .to_string()
 }
 
 #[cfg(test)]

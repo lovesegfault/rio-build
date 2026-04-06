@@ -1,3 +1,4 @@
+use super::logs::{extract_drv_hash, gunzip_and_chunk};
 use super::*;
 use crate::actor::tests::setup_actor;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -5,6 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_mocks::{RuleMode, mock, mock_client};
 use rio_proto::types::BuildLogBatch;
 use rio_test_support::{TestDb, seed_tenant};
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 
