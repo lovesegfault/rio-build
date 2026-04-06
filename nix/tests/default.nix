@@ -65,7 +65,9 @@ let
   cli = import ./scenarios/cli.nix;
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
   dashboard = import ./scenarios/dashboard.nix;
-  fod-proxy = import ./scenarios/fod-proxy.nix;
+  # fod-proxy scenario removed per ADR-019 — Squid proxy deleted;
+  # fetchers get direct egress. The FOD hash check is the integrity
+  # boundary. See fetcher.netpol.egress-open (follow-on plan).
   netpol = import ./scenarios/netpol.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
@@ -404,7 +406,7 @@ in
   #   names after a build — presence proves describe_*! wiring AND
   #   actual increments (metrics-rs registers on first increment).
   # r[verify obs.metric.bloom-fill-ratio]
-  #   metrics-registered subtest asserts rio_worker_bloom_fill_ratio
+  #   metrics-registered subtest asserts rio_builder_bloom_fill_ratio
   #   gauge present on the busy worker with 0.0 < fill < 0.5 after
   #   a chain build — proves the 10s heartbeat emit is wired AND
   #   FUSE inserts populated the filter.
@@ -510,15 +512,15 @@ in
   };
 
   # r[verify ctrl.pdb.workers]
-  #   pdb-ownerref: fixture's `default` WorkerPool → reconciler
+  #   pdb-ownerref: fixture's `default` BuilderPool → reconciler
   #   SSA-applies `default-pdb` with maxUnavailable=1 + ownerRef
-  #   [0]→WorkerPool. Delete `default` → ownerRef cascade GCs the
+  #   [0]→BuilderPool. Delete `default` → ownerRef cascade GCs the
   #   PDB. Unit test (tests.rs:550) proves struct shape; this proves
   #   SSA-apply + K8s GC end-to-end.
   # r[verify ctrl.wps.reconcile]
   #   wps-lifecycle: apply 3-class WPS → 3 child WorkerPools named
   #   `{wps}-{class}` each with sizeClass=class.name + ownerRef[0]=
-  #   WorkerPoolSet (controller=true). Delete WPS → finalizer
+  #   BuilderPoolSet (controller=true). Delete WPS → finalizer
   #   cleanup explicitly deletes children; ownerRef GC as fallback.
   # r[verify ctrl.wps.autoscale]
   #   wps-lifecycle asserts each child's .spec.autoscaling.targetValue
@@ -527,7 +529,7 @@ in
   #   are unit-tested in scaling.rs.
   #
   # Own split (not folded into core/autoscale): pdb-ownerref deletes
-  # the `default` WorkerPool, which core's disruption-drain needs
+  # the `default` BuilderPool, which core's disruption-drain needs
   # intact and autoscale's finalizer already deletes (can't check
   # exists+ownerRef after). Fresh fixture → clean state → fast
   # finalizers (no in-flight builds to drain). ~4min boot + ~3min
@@ -604,35 +606,15 @@ in
     fixture = k3sFull { envoyGatewayEnabled = true; };
   };
 
-  # Squid forward proxy for FOD fetches — allowlist enforcement + the
-  # rio-worker is_fod gate (http_proxy env only for FOD builds).
-  # fodProxy.enabled via extraValues (--set-string "true" is truthy in
-  # `{{ if }}`). allowedDomains[0]=k3s-server — despite the [0] syntax,
-  # --set-string replaces the whole list (helm quirk: indexed set on a
-  # values.yaml-defined list creates a fresh 1-element list instead of
-  # merging). Exactly what the test wants: k3s-server is the ONLY
-  # allowed dstdomain; the denied case (`k3s-agent`) is a clean
-  # ACL miss. No ConfigMap patch + squid restart needed (R8).
-  #
-  # extraImages=[dockerImages.fod-proxy]: dockerImages.all has no squid
-  # (it's rio-workspace binaries only). Without this, the rio-fod-proxy
-  # pod goes ImagePullBackOff (airgapped VM — no pull).
-  vm-fod-proxy-k3s = fod-proxy {
-    inherit pkgs common;
-    fixture = k3sFull {
-      extraValues = {
-        "fodProxy.enabled" = "true";
-        "fodProxy.allowedDomains[0]" = "k3s-server";
-      };
-      extraImages = [ dockerImages.fod-proxy ];
-    };
-  };
+  # vm-fod-proxy-k3s removed per ADR-019 — Squid proxy deleted. FODs
+  # route to FetcherPool with direct egress + hash-check integrity
+  # boundary. Scenario file deleted too.
 
-  # Worker egress NetworkPolicy: IMDS + public internet + k8s API all
+  # Builder egress NetworkPolicy: IMDS + public internet + k8s API all
   # blocked. networkPolicy.enabled via extraValues (--set-string "true"
-  # is truthy for `{{ if }}` — same quirk as fodProxy.enabled above).
+  # is truthy for `{{ if }}`).
   # vmtest-full.yaml defaults it to false; the override renders
-  # networkpolicy.yaml → rio-worker-egress into 02-workloads.yaml.
+  # networkpolicy.yaml → rio-builder-egress into 02-workloads.yaml.
   # Stock k3s kube-router enforces (P0220) — no Calico preload.
   vm-netpol-k3s = netpol {
     inherit pkgs common;

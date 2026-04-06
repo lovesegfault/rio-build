@@ -67,8 +67,8 @@
 >
   <span class="pname">{data.pname || '(unnamed)'}</span>
   <span class="hash">{hash}</span>
-  {#if data.workerId && (data.status === 'running' || data.status === 'assigned')}
-    <span class="worker" title="assigned worker">{data.workerId}</span>
+  {#if data.executorId && (data.status === 'running' || data.status === 'assigned')}
+    <span class="worker" title="assigned executor">{data.executorId}</span>
   {/if}
 </div>
 <Handle type="source" position={Position.Bottom} />

@@ -19,7 +19,7 @@
 //! - `nar_hash`: **hard-fail** if not 32 bytes — SHA-256 is the only hash
 //!   we speak on the wire; anything else is protocol corruption.
 //! - `references`: **hard-fail** on any invalid entry — references feed
-//!   into the worker's synthetic Nix SQLite DB (`synth_db.rs`), where a
+//!   into the builder's synthetic Nix SQLite DB (`synth_db.rs`), where a
 //!   malformed path in the `Refs` table is a correctness/security issue.
 //! - `deriver`: **soft-fail** — the Nix daemon sends empty deriver for
 //!   source paths; `NarinfoRow.deriver` is `Option<String>`. Hard-failing

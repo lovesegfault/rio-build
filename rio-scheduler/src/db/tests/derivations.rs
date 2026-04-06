@@ -22,7 +22,7 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
 
     // Single atomic call: sets status='poisoned' AND poisoned_at=now()
-    // AND assigned_worker_id=NULL. No separate status update needed.
+    // AND assigned_builder_id=NULL. No separate status update needed.
     db.persist_poisoned(&drv_hash).await?;
 
     // Verify all three columns updated in one statement.
@@ -35,7 +35,7 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     .await?;
     assert_eq!(status, "poisoned");
     assert!(has_ts, "poisoned_at must be set in the same statement");
-    assert!(worker.is_none(), "assigned_worker_id must be NULLed");
+    assert!(worker.is_none(), "assigned_builder_id must be NULLed");
 
     let rows = db.load_poisoned_derivations().await?;
     assert_eq!(rows.len(), 1, "persist_poisoned should make row loadable");

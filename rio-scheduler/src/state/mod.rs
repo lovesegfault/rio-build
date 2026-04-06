@@ -1,9 +1,9 @@
-//! Scheduler state types: derivation/build/worker state machines.
+//! Scheduler state types: derivation/build/executor state machines.
 //!
 //! Submodules (glob-re-exported for zero external churn):
 //! - `derivation` — [`DerivationStatus`] + [`DerivationState`] + POISON consts
 //! - `build` — [`BuildState`] + [`BuildInfo`] + [`BuildOptions`]
-//! - `worker` — [`WorkerState`] + [`RetryPolicy`]
+//! - `executor` — [`ExecutorState`] + [`RetryPolicy`]
 //!
 //! This file holds cross-cutting types:
 //! - [`PriorityClass`] — used by both queue.rs and build.rs
@@ -17,16 +17,16 @@
 
 mod build;
 mod derivation;
+mod executor;
 mod newtypes;
-mod worker;
 
 pub use build::*;
 pub use derivation::*;
-pub use newtypes::{DrvHash, WorkerId};
-pub use worker::*;
+pub use executor::*;
+pub use newtypes::{DrvHash, ExecutorId};
 
 /// Heartbeat constants. Re-exported from rio-common so the scheduler's
-/// timeout check derives from the same source of truth as the worker's
+/// timeout check derives from the same source of truth as the executor's
 /// send interval. `timeout = interval × max_missed` is computed in
 /// rio-common; scheduler only needs the derived timeout + the divisor.
 pub use rio_common::limits::{HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS};

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/admin_types.proto",
                 // Service definition files (each a distinct package).
                 "proto/scheduler.proto",
-                "proto/worker.proto",
+                "proto/builder.proto",
                 "proto/store.proto",
                 "proto/admin.proto",
             ],

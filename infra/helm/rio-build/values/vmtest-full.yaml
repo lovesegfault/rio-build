@@ -44,12 +44,12 @@ networkPolicy:
 # smarter-device-manager needs (a) its own airgap image and (b) kubelet
 # to honor hostUsers:false (containerd 1.7+ with idmap-mounts support).
 # k3s's bundled containerd version varies; for deterministic CI, use the
-# privileged:true escape hatch (workerPool.privileged below). Production
+# privileged:true escape hatch (builderPool.privileged below). Production
 # on EKS/GKE leaves devicePlugin.enabled=true (the chart default).
 devicePlugin:
   enabled: false
 
-# Busybox image not in the airgap set + workerPool.privileged=true below
+# Busybox image not in the airgap set + builderPool.privileged=true below
 # disables seccomp at the runtime level anyway. The nonpriv variant
 # (vmtest-full-nonpriv.yaml) uses seccompProfile: Unconfined for the
 # same reason (no Localhost delivery in airgap VM). Production on
@@ -123,14 +123,11 @@ gateway:
     # client uses StrictHostKeyChecking=no.
     hostKeySecret: ""
 
-fodProxy:
-  enabled: false
-
-workerPool:
+builderPool:
   enabled: true
   name: default
   replicas:
-    # Scenarios that need >1 use --set workerPool.replicas.min=2.
+    # Scenarios that need >1 use --set builderPool.replicas.min=2.
     # min=1 so there's always a worker ready (protocol-cold doesn't
     # want to wait for autoscaling).
     min: 1
@@ -144,8 +141,8 @@ workerPool:
   features: []
   sizeClass: ""
   # Same aggregate image as control-plane pods. builders.rs sets
-  # `command: ["/bin/rio-worker"]` unconditionally (no-op for prod's
-  # rio-worker image whose Entrypoint is already rio-worker).
+  # `command: ["/bin/rio-builder"]` unconditionally (no-op for prod's
+  # rio-builder image whose Entrypoint is already rio-builder).
   image: rio-all
   # Smaller than prod defaults — k3s agent VM is 4GB.
   resources:
@@ -163,7 +160,7 @@ workerPool:
   # Default is 7200 (2h, for LLVM-cold-ccache builds). Test builds
   # are ≤90s sleeps. 180s covers the longest + drain overhead.
   # Also bounds the finalizer's cleanup() wait (grace + 60s) —
-  # without this, a stuck/never-Ready pod-1 stalls WorkerPool
+  # without this, a stuck/never-Ready pod-1 stalls BuilderPool
   # delete for 2h (STS terminates reverse-ordinal; pod-0 waits).
   terminationGracePeriodSeconds: 180
   # No Karpenter nodepools → no dedicated worker nodes. Workers

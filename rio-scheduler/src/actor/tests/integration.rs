@@ -350,8 +350,8 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     // Connect worker with capacity-1 stream channel so we can fill it.
     let (stream_tx, mut stream_rx) = mpsc::channel(1);
     handle
-        .send_unchecked(ActorCommand::WorkerConnected {
-            worker_id: "tight-worker".into(),
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "tight-worker".into(),
             stream_tx,
         })
         .await?;
@@ -379,7 +379,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let worker = workers
         .iter()
-        .find(|w| w.worker_id == "tight-worker")
+        .find(|w| w.executor_id == "tight-worker")
         .expect("tight-worker registered");
     assert_eq!(
         worker.running_count, 1,
@@ -409,7 +409,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
             resources: None,
             bloom: None,
             size_class: None,
-            worker_id: "tight-worker".into(),
+            executor_id: "tight-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 2,
@@ -421,7 +421,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let worker = workers
         .iter()
-        .find(|w| w.worker_id == "tight-worker")
+        .find(|w| w.executor_id == "tight-worker")
         .expect("tight-worker registered");
     assert_eq!(
         worker.running_count, 2,
@@ -474,7 +474,7 @@ async fn test_forward_log_batch_reaches_interested_build() -> TestResult {
         derivation_path: test_drv_path("logtest"),
         lines: vec![b"hello from worker".to_vec(), b"second line".to_vec()],
         first_line_number: 0,
-        worker_id: "w1".into(),
+        executor_id: "w1".into(),
     };
     handle
         .send_unchecked(ActorCommand::ForwardLogBatch {
@@ -529,7 +529,7 @@ async fn test_forward_log_batch_unknown_drv_path_dropped() -> TestResult {
                     .into(),
                 lines: vec![b"orphan".to_vec()],
                 first_line_number: 0,
-                worker_id: "w1".into(),
+                executor_id: "w1".into(),
             },
         })
         .await?;
@@ -543,7 +543,7 @@ async fn test_forward_log_batch_unknown_drv_path_dropped() -> TestResult {
                 derivation_path: test_drv_path("knowndrv"),
                 lines: vec![b"sentinel".to_vec()],
                 first_line_number: 0,
-                worker_id: "w1".into(),
+                executor_id: "w1".into(),
             },
         })
         .await?;
@@ -602,7 +602,7 @@ async fn test_forward_log_batch_fanout_to_multiple_interested_builds() -> TestRe
                 derivation_path: test_drv_path("shared-drv"),
                 lines: vec![b"fanout-line".to_vec()],
                 first_line_number: 0,
-                worker_id: "w1".into(),
+                executor_id: "w1".into(),
             },
         })
         .await?;

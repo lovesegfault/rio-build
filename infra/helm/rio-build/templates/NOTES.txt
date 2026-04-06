@@ -10,11 +10,11 @@ rio-build installed to namespace {{ .Values.namespace.name }}.
 
 ── FUSE device plugin (smarter-device-manager) ────────────────────────
 The rio-device-plugin DaemonSet exposes /dev/fuse as the
-`smarter-devices/fuse` extended resource. Worker pods request it via
+`smarter-devices/fuse` extended resource. Builder pods request it via
 resources.limits instead of a hostPath volume.
 
 Prerequisites:
-  • /dev/fuse present on every worker node (kernel FUSE module loaded).
+  • /dev/fuse present on every builder node (kernel FUSE module loaded).
     On most distros: `modprobe fuse` or ensure `fuse` is in modules-load.
   • Container runtime with idmap-mount support (containerd ≥ 1.7,
     CRI-O ≥ 1.25) for hostUsers:false to work. EKS/GKE managed
@@ -22,30 +22,30 @@ Prerequisites:
 
 Verify:
   kubectl get node -o json | jq '.items[].status.allocatable["smarter-devices/fuse"]'
-  — should show {{ .Values.devicePlugin.fuseMaxDevices }} on worker nodes.
+  — should show {{ .Values.devicePlugin.fuseMaxDevices }} on builder nodes.
 {{- end }}
 
-{{- if and (not .Values.workerPool.privileged) .Values.seccompInstaller.enabled }}
+{{- if and (not .Values.builderPool.privileged) .Values.seccompInstaller.enabled }}
 
 ── Seccomp Localhost profile ──────────────────────────────────────────
-The rio-seccomp-installer DaemonSet delivers the rio-worker profile to
-/var/lib/kubelet/seccomp/profiles/rio-worker.json on every worker node.
-Worker pods use seccompProfile: Localhost (RuntimeDefault + pivot_root
+The rio-seccomp-installer DaemonSet delivers the rio-builder profile to
+/var/lib/kubelet/seccomp/profiles/rio-builder.json on every builder node.
+Builder pods use seccompProfile: Localhost (RuntimeDefault + pivot_root
 − ptrace/bpf/setns/process_vm_*).
 
 Verify:
   kubectl -n {{ .Values.namespace.name }} get ds rio-seccomp-installer
   kubectl -n {{ .Values.namespace.name }} get pod -l app.kubernetes.io/name=rio-seccomp-installer
 
-Worker pods may briefly show ContainerCreating on a fresh node until
+Builder pods may briefly show ContainerCreating on a fresh node until
 the DS initContainer drops the file (seconds). See docs/src/security.md
 r[worker.seccomp.localhost-profile].
 {{- end }}
 
-{{- if .Values.workerPool.privileged }}
+{{- if .Values.builderPool.privileged }}
 
 ── privileged:true escape hatch ───────────────────────────────────────
-WARNING: workerPool.privileged=true is active. This disables seccomp
+WARNING: builderPool.privileged=true is active. This disables seccomp
 entirely and is UNACCEPTABLE for multi-tenant deployments (ADR-012).
 It is intended for k3s/kind clusters lacking the FUSE device plugin
 or idmap-mount support. Production on EKS/GKE should use

@@ -550,7 +550,7 @@ data:
     }
   worker-utilization.json: |
     {
-      "uid": "rio-worker-utilization",
+      "uid": "rio-builder-utilization",
       "title": "rio-build: Worker Utilization",
       "tags": ["rio-build"],
       "timezone": "browser",
@@ -634,7 +634,7 @@ data:
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
             {
-              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\"rio-worker.*\", container!=\"\"}[5m]))",
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~\"rio-builder.*\", container!=\"\"}[5m]))",
               "legendFormat": "{{pod}}",
               "refId": "A"
             }
@@ -661,7 +661,7 @@ data:
           "datasource": {"type": "prometheus", "uid": "${datasource}"},
           "targets": [
             {
-              "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\"rio-worker.*\", container!=\"\"})",
+              "expr": "sum by (pod) (container_memory_working_set_bytes{pod=~\"rio-builder.*\", container!=\"\"})",
               "legendFormat": "{{pod}}",
               "refId": "A"
             }

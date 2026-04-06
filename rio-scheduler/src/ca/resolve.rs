@@ -656,10 +656,10 @@ pub async fn walk_dependent_realisations(
 ///
 /// **Why the scheduler inserts** (not the worker): the gateway's
 /// `wopRegisterDrvOutput` handler inserts realisations for the Nix
-/// wire-protocol path (client → gateway → store). But the rio-worker
+/// wire-protocol path (client → gateway → store). But the rio-builder
 /// speaks gRPC, not wire protocol — its upload flow is `PutPath →
 /// CompletionReport`, with no RegisterRealisation call. Without this
-/// insert, a CA-on-CA chain built entirely by rio-workers never lands
+/// insert, a CA-on-CA chain built entirely by rio-builders never lands
 /// a realisation row, so the next dispatch's `query_realisation`
 /// returns `None` → `RealisationMissing` → dispatch-unresolved →
 /// worker crashes on the empty-string output path from the floating-
@@ -668,7 +668,7 @@ pub async fn walk_dependent_realisations(
 ///
 /// `signatures` is empty: the scheduler doesn't sign (phase 5
 /// concern). The gateway path populates signatures from the wire
-/// JSON; a rio-worker-built realisation is unsigned until a later
+/// JSON; a rio-builder-built realisation is unsigned until a later
 /// signing pass (or never, for private deployments).
 #[instrument(skip(pool), fields(drv_hash = hex::encode(modular_hash), output = %output_name))]
 pub async fn insert_realisation(

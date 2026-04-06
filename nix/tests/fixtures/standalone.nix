@@ -39,7 +39,7 @@ in
 
   # mTLS + HMAC. Builds a PKI (lib/pki.nix), applies RIO_TLS__* env
   # to all services. Gateway gets CN=rio-gateway cert (HMAC bypass);
-  # scheduler/store get CN=control; workers get CN=rio-worker.
+  # scheduler/store get CN=control; workers get CN=rio-builder.
   withPki ? false,
 
   # opentelemetry-collector on control (OTLP gRPC :4317, file exporter
@@ -220,7 +220,7 @@ in
     control.wait_for_open_port(4317)
   ''
   + lib.concatMapStrings (w: ''
-    ${w}.wait_for_unit("rio-worker.service")
+    ${w}.wait_for_unit("rio-builder.service")
   '') workerNames
   # All workers registered at scheduler. Exact count, not `[1-9]`.
   # Handles the stream-then-heartbeat gauge race (58c0145) by waiting

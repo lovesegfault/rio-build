@@ -606,7 +606,7 @@ async fn test_watch_build_after_cancel_replays_cancelled() -> TestResult {
 ///
 /// Dispatch emits DerivationStarted → Progress (in that order, same
 /// interested_builds loop iteration). The Progress snapshot reflects
-/// the post-assign state: running=1, the worker is in assigned_workers.
+/// the post-assign state: running=1, the worker is in assigned_executors.
 /// critical_path_remaining_secs is Some (always populated — even if
 /// the estimator gave 0).
 #[tokio::test]
@@ -657,9 +657,9 @@ async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
     assert_eq!(progress.queued, 0);
     assert_eq!(progress.total, 1);
     assert_eq!(
-        progress.assigned_workers,
+        progress.assigned_executors,
         vec!["prog-w"],
-        "dispatch sets assigned_worker before emitting; Progress must carry it"
+        "dispatch sets assigned_executor before emitting; Progress must carry it"
     );
     assert!(
         progress.critical_path_remaining_secs.is_some(),

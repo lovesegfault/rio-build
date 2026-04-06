@@ -1,7 +1,7 @@
 {{- if .Values.devicePlugin.enabled }}
 {{- $dp := .Values.devicePlugin -}}
 # smarter-device-manager: exposes /dev/fuse as an extended resource
-# (smarter-devices/fuse) so worker pods request it via resources.limits
+# (smarter-devices/fuse) so builder pods request it via resources.limits
 # instead of a hostPath volume.
 #
 # Why this matters (ADR-012):
@@ -15,7 +15,7 @@
 #     major 10 minor 229 by default. The only alternative is privileged:true,
 #     which contradicts the entire point of granular caps.
 #
-# DaemonSet runs on worker nodes only (nodeSelector matches workerPool's).
+# DaemonSet runs on builder nodes only (nodeSelector matches builderPool's).
 # The plugin registers with kubelet's device-plugin API; kubelet then
 # advertises node.status.allocatable["smarter-devices/fuse"]=<nummaxdevices>.
 ---
@@ -57,7 +57,7 @@ spec:
         app.kubernetes.io/part-of: rio-build
     spec:
       # priorityClassName system-node-critical: device plugins must be
-      # running before worker pods can schedule (kubelet won't advertise
+      # running before builder pods can schedule (kubelet won't advertise
       # the extended resource until the plugin registers). Without this,
       # a node under memory pressure might evict the plugin → all workers
       # on that node become Unschedulable.
@@ -77,7 +77,7 @@ spec:
           securityContext:
             # The plugin itself needs privileged to inspect /dev and
             # write to the kubelet device-plugin socket. This is the
-            # one privileged pod per node; worker pods (the actual
+            # one privileged pod per node; builder pods (the actual
             # attack surface — they run arbitrary build code) stay
             # unprivileged.
             privileged: true

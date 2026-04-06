@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/part-of: rio-build
     {{- with .Values.namespace.podSecurityLabel }}
     # Workers need SYS_ADMIN (FUSE mount); restricted/baseline PSA reject it.
-    # Workers live in SAME namespace (WorkerPool CRD is namespaced,
+    # Workers live in SAME namespace (BuilderPool CRD is namespaced,
     # reconciler creates STS there).
     pod-security.kubernetes.io/enforce: {{ . }}
     {{- end }}

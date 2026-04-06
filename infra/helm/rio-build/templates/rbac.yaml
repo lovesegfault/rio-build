@@ -44,15 +44,15 @@ metadata:
 automountServiceAccountToken: false
 {{- end }}
 ---
-# Worker SA is always created — WorkerPool reconciler references it even
+# Worker SA is always created — BuilderPool reconciler references it even
 # when nothing else in this chart is enabled (vmtest profile).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: rio-worker
+  name: rio-builder
   namespace: {{ $ns }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-worker" "component" "worker") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "rio-builder" "component" "worker") | nindent 4 }}
 automountServiceAccountToken: false
 {{- if .Values.scheduler.enabled }}
 ---
@@ -101,11 +101,11 @@ rules:
   - apiGroups: [rio.build]
     resources: [workerpools/finalizers]
     verbs: [update]
-  # WorkerPoolSet: aggregating CRD — one WPS spawns one child WorkerPool
+  # BuilderPoolSet: aggregating CRD — one WPS spawns one child BuilderPool
   # per size class. Reconciler watches WPS, SSA-applies child WPs, refreshes
   # per-class status. No `create`/`delete` — operators `kubectl apply` the
   # WPS; reconciler only reads it + patches metadata.finalizers (`update`)
-  # and status (below). Child WorkerPool lifecycle is covered by the rule
+  # and status (below). Child BuilderPool lifecycle is covered by the rule
   # above.
   - apiGroups: [rio.build]
     resources: [workerpoolsets]
@@ -137,7 +137,7 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch]
-  # Headless Service per WorkerPool. Created by apply(), deleted by ownerRef GC.
+  # Headless Service per BuilderPool. Created by apply(), deleted by ownerRef GC.
   - apiGroups: [""]
     resources: [services]
     verbs: [get, list, watch, create, update, patch, delete]
@@ -148,15 +148,15 @@ rules:
   - apiGroups: [events.k8s.io]
     resources: [events]
     verbs: [create, patch]
-  # Per-WorkerPool PDB (maxUnavailable=1) managed by reconciler.
+  # Per-BuilderPool PDB (maxUnavailable=1) managed by reconciler.
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, update, patch, delete]
-  # Ephemeral WorkerPool (spec.ephemeral=true): per-assignment Jobs
+  # Ephemeral BuilderPool (spec.ephemeral=true): per-assignment Jobs
   # instead of StatefulSet. reconcile_ephemeral lists Jobs by label
   # to count active-vs-ceiling, creates new Jobs when queued > 0.
   # `delete` not needed — ttlSecondsAfterFinished reaps; ownerRef GC
-  # handles WorkerPool-delete cleanup.
+  # handles BuilderPool-delete cleanup.
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create]

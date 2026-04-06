@@ -1,7 +1,7 @@
 //! Shared configuration, observability, and utility types.
 //!
 //! Leaf crate — no `rio-*` dependencies. Provides the `string_newtype!` macro
-//! and [`DrvHash`](newtype::DrvHash) / [`WorkerId`](newtype::WorkerId) shared
+//! and [`DrvHash`](newtype::DrvHash) / [`ExecutorId`](newtype::ExecutorId) shared
 //! across the workspace, plus [`limits`] constants, [`observability`] init,
 //! and the self-describing [`BloomFilter`](bloom::BloomFilter).
 

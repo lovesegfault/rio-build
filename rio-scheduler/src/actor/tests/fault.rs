@@ -34,7 +34,7 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
     // Success with start/stop times so the EMA branch is reached.
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "fault-worker".into(),
+            executor_id: "fault-worker".into(),
             drv_key: test_drv_path("fault-hash"),
             result: rio_proto::build_types::BuildResult {
                 status: rio_proto::build_types::BuildResultStatus::Built.into(),
@@ -80,7 +80,7 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
     let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux", 1).await?;
     // Pad worker so the all-workers-failed clamp doesn't poison after
     // a single failure — we need the retry-persist branch, not poison.
-    let _pad = connect_worker(&handle, "tfault-pad", "aarch64-linux", 1).await?;
+    let _pad = connect_executor(&handle, "tfault-pad", "aarch64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let _evt_rx =

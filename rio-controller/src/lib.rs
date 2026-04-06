@@ -1,6 +1,6 @@
 //! Kubernetes operator for rio-build.
 //!
-//! Watches `WorkerPool` CRDs, reconciles worker StatefulSets,
+//! Watches `BuilderPool` CRDs, reconciles worker StatefulSets,
 //! autoscales based on `AdminService.ClusterStatus` queue depth.
 //!
 //! # Architecture
@@ -8,13 +8,13 @@
 //! ```text
 //!   kube-apiserver
 //!        │
-//!        │ watch: WorkerPool, StatefulSet
+//!        │ watch: BuilderPool, StatefulSet
 //!        ▼
 //! ┌──────────────────────────────────────┐
 //! │ rio-controller                        │
 //! │                                       │
 //! │  ┌─────────────────────────────────┐  │
-//! │  │ WorkerPool reconciler           │  │
+//! │  │ BuilderPool reconciler           │  │
 //! │  │  - ensure StatefulSet exists    │  │
 //! │  │  - sync spec (resources, caps)  │  │
 //! │  │  - patch status.replicas        │  │
@@ -29,7 +29,7 @@
 //! │  └─────────────────────────────────┘  │
 //! └──────────────────────────────────────┘
 //!        │
-//!        │ gRPC: AdminService (ClusterStatus, DrainWorker)
+//!        │ gRPC: AdminService (ClusterStatus, DrainExecutor)
 //!        ▼
 //!   rio-scheduler
 //! ```
@@ -45,7 +45,7 @@
 
 // CRD types live in rio-crds (extracted so rio-cli can use them
 // without pulling the full reconciler stack). Re-exported as `crds`
-// so existing `crate::crds::workerpool::...` paths still work.
+// so existing `crate::crds::builderpool::...` paths still work.
 pub use rio_crds as crds;
 pub mod error;
 #[cfg(test)]
@@ -53,7 +53,7 @@ pub(crate) mod fixtures;
 pub mod reconcilers;
 pub mod scaling;
 
-pub use crds::workerpool::{WorkerPool, WorkerPoolSpec, WorkerPoolStatus};
+pub use crds::builderpool::{BuilderPool, BuilderPoolSpec, BuilderPoolStatus};
 
 /// Register `# HELP` descriptions for all controller metrics.
 ///
@@ -69,13 +69,13 @@ pub fn describe_metrics() {
 
     describe_histogram!(
         "rio_controller_reconcile_duration_seconds",
-        "Reconcile loop latency. reconciler=workerpool|workerpoolset. \
+        "Reconcile loop latency. reconciler=builderpool|builderpoolset. \
          Recorded on both success and error paths — long durations + errors \
          = slow/timing-out apiserver."
     );
     describe_counter!(
         "rio_controller_reconcile_errors_total",
-        "Reconcile errors. reconciler=workerpool|workerpoolset, error_kind=kube|finalizer|invalid_spec|conflict. \
+        "Reconcile errors. reconciler=builderpool|builderpoolset, error_kind=kube|finalizer|invalid_spec|conflict. \
          error_kind is the variant discriminator (stable, low cardinality). \
          Sustained rate > 0 = check controller logs."
     );
@@ -86,7 +86,7 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_controller_workerpool_replicas",
-        "WorkerPool replica counts. kind=actual|desired, pool=namespace/name. \
+        "BuilderPool replica counts. kind=actual|desired, pool=namespace/name. \
          Gap between actual and desired = StatefulSet rollout lag or stabilization window."
     );
     describe_counter!(
@@ -96,7 +96,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_disruption_drains_total",
-        "DisruptionTarget watcher DrainWorker calls. result=sent|rpc_error. \
+        "DisruptionTarget watcher DrainExecutor calls. result=sent|rpc_error. \
          Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
     );
 }

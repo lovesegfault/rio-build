@@ -16,7 +16,7 @@
 //! - [`state`]: Derivation and build state machines
 //! - `queue`: FIFO ready queue
 //! - [`db`]: PostgreSQL persistence (sqlx)
-//! - [`grpc`]: SchedulerService + WorkerService gRPC implementations
+//! - [`grpc`]: SchedulerService + ExecutorService gRPC implementations
 
 pub mod actor;
 pub mod admin;
@@ -110,7 +110,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_warm_gate_fallback_total",
-        "best_worker() fell back to cold workers because NO warm worker \
+        "best_executor() fell back to cold workers because NO warm worker \
          passed the hard filter. Single-worker clusters and mass scale-up \
          expect nonzero; sustained high rate = workers never warming \
          (PrefetchComplete not arriving — check worker logs)."

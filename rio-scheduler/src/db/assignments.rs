@@ -3,7 +3,7 @@
 use uuid::Uuid;
 
 use super::{AssignmentStatus, SchedulerDb};
-use crate::state::WorkerId;
+use crate::state::ExecutorId;
 
 impl SchedulerDb {
     /// Create a new assignment record. Returns the assignment_id.
@@ -18,7 +18,7 @@ impl SchedulerDb {
     pub async fn insert_assignment(
         &self,
         derivation_id: Uuid,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
         generation: i64,
     ) -> Result<Uuid, sqlx::Error> {
         let row: (Uuid,) = sqlx::query_as(
@@ -36,7 +36,7 @@ impl SchedulerDb {
             "#,
         )
         .bind(derivation_id)
-        .bind(worker_id.as_str())
+        .bind(executor_id.as_str())
         .bind(generation)
         .fetch_one(&self.pool)
         .await?;

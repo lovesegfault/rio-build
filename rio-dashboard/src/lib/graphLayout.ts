@@ -14,7 +14,7 @@ export type DrvNodeData = {
   pname: string;
   drvPath: string;
   status: string;
-  workerId: string;
+  executorId: string;
 };
 
 // xyflow's Node generic needs Record<string, unknown>-compatible data;
@@ -186,7 +186,7 @@ export function toXyflow(
       pname: n.pname,
       drvPath: n.drvPath,
       status: n.status,
-      workerId: n.assignedWorkerId,
+      executorId: n.assignedExecutorId,
     },
     class: `drv-${statusClass(n.status)}`,
   }));

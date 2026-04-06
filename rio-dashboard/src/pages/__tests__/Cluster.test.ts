@@ -27,9 +27,9 @@ describe('Cluster', () => {
 
   it('renders cluster counts from the RPC', async () => {
     clusterStatus.mockResolvedValue({
-      totalWorkers: 5,
-      activeWorkers: 3,
-      drainingWorkers: 1,
+      totalExecutors: 5,
+      activeExecutors: 3,
+      drainingExecutors: 1,
       pendingBuilds: 12,
       activeBuilds: 4,
       queuedDerivations: 200,
@@ -59,9 +59,9 @@ describe('Cluster', () => {
 
   it('clears the poll interval on unmount', async () => {
     clusterStatus.mockResolvedValue({
-      totalWorkers: 0,
-      activeWorkers: 0,
-      drainingWorkers: 0,
+      totalExecutors: 0,
+      activeExecutors: 0,
+      drainingExecutors: 0,
       pendingBuilds: 0,
       activeBuilds: 0,
       queuedDerivations: 0,

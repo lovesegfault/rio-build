@@ -46,11 +46,11 @@ impl SchedulerDb {
             r"
             SELECT derivation_id, drv_hash, drv_path, pname, system, status,
                    required_features,
-                   assigned_builder_id AS assigned_worker_id,
+                   assigned_builder_id,
                    retry_count,
                    expected_output_paths, output_names, is_fixed_output,
                    is_ca,
-                   failed_builders AS failed_workers
+                   failed_builders
             FROM derivations
             WHERE status NOT IN {TERMINAL_STATUS_SQL}
             "
@@ -193,7 +193,7 @@ impl SchedulerDb {
                 .fetch_one(&self.pool)
                 .await?;
 
-        // COALESCE for nullable columns (pname, assigned_worker_id) →
+        // COALESCE for nullable columns (pname, assigned_builder_id) →
         // proto3 non-optional string is empty-string-for-null.
         // derivation_id is carried so the edge query below can filter
         // to THIS returned set (not the whole build).
@@ -204,7 +204,7 @@ impl SchedulerDb {
                    COALESCE(d.pname, '') AS pname,
                    d.system,
                    d.status,
-                   COALESCE(d.assigned_builder_id, '') AS assigned_worker_id
+                   COALESCE(d.assigned_builder_id, '') AS assigned_builder_id
             FROM derivations d
             JOIN build_derivations bd ON bd.derivation_id = d.derivation_id
             WHERE bd.build_id = $1

@@ -22,7 +22,7 @@ global:
   #   "info,rio_gateway=trace"           gateway at trace, rest at info
   #   "warn,rio_scheduler::actor=debug"  one module at debug, rest at warn
   # Empty string → env var omitted → binary's built-in "info" fallback.
-  # Worker pods inherit the controller's RUST_LOG verbatim (builders.rs
+  # Builder pods inherit the controller's RUST_LOG verbatim (builders.rs
   # reads its own env and passes it through), so one knob covers all.
   logLevel: "info"
 
@@ -30,7 +30,7 @@ namespace:
   create: true
   name: rio-system
   # Workers need SYS_ADMIN (FUSE mount); restricted/baseline PSA reject it.
-  # Workers live in SAME namespace (WorkerPool CRD is namespaced, reconciler
+  # Builders live in SAME namespace (BuilderPool CRD is namespaced, reconciler
   # creates STS there). Possible future split: workers → dedicated privileged
   # ns, control plane → baseline.
   podSecurityLabel: privileged
@@ -110,7 +110,7 @@ networkPolicy:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-controller
 # ──────────────────────────────────────────────────────────────────────────
-# K8s operator. Watches WorkerPool CRDs, reconciles StatefulSets.
+# K8s operator. Watches BuilderPool CRDs, reconciles StatefulSets.
 # HARD replicas=1: NOT leader-elected. Two controllers fight — both SSA-patch
 # same StatefulSet, fieldManager conflicts. kube-runtime handles concurrent
 # reconcile within one process but not across processes. 30s reschedule gap
@@ -118,7 +118,7 @@ networkPolicy:
 controller:
   enabled: true
   image: rio-controller
-  # Addresses passed through to worker pods via the controller's env.
+  # Addresses passed through to builder pods via the controller's env.
   # Lazy-connected per-reconcile — transient scheduler outage doesn't kill
   # the controller.
   schedulerAddr: rio-scheduler:9001
@@ -233,44 +233,6 @@ gateway:
     requests: {cpu: 250m, memory: 256Mi}
     limits: {memory: 1Gi}
 
-# ──────────────────────────────────────────────────────────────────────────
-# rio-fod-proxy
-# ──────────────────────────────────────────────────────────────────────────
-# Squid forward proxy for FOD (fixed-output derivation) fetches. FODs need
-# internet; default NetworkPolicy denies all worker egress. Worker → Squid
-# (cluster IP, allowed by NetPol exception) → internet. Squid's allowlist =
-# FODs can ONLY fetch from known source hosts. Defense in depth: FOD sandbox
-# already verifies output hash (malicious source can't inject content that
-# PASSES) but could exfiltrate via request if builder compromised.
-# Harmless if unused — ~50MB, idle, no traffic unless a WorkerPool points at it.
-fodProxy:
-  enabled: true
-  image: rio-fod-proxy
-  # URL the WorkerPool CR points workers at. Empty → templated to the
-  # in-cluster Service DNS name (http://rio-fod-proxy.<ns>.svc:3128).
-  # Override if the proxy runs outside this chart (mesh sidecar,
-  # centralized egress proxy, different port).
-  url: ""
-  # Squid `acl allowed_domains dstdomain`. `.example.com` matches example.com
-  # AND subdomains. Covers the vast majority of nixpkgs fetchurl sources.
-  allowedDomains:
-    - .nixos.org
-    - .github.com
-    - .githubusercontent.com
-    - .gitlab.com
-    - .crates.io
-    - .pypi.org
-    - .pythonhosted.org
-    - .npmjs.org
-    - .rubygems.org
-    - .golang.org
-    - .debian.org
-    - .kernel.org
-    - .sourceforge.net
-    - .gnu.org
-  resources:
-    requests: {cpu: 100m, memory: 128Mi}
-    limits: {memory: 256Mi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # Karpenter NodePools + EC2NodeClass
@@ -287,29 +249,29 @@ karpenter:
   clusterName: ""   # from tofu output cluster_name
   nodeRoleName: ""  # from tofu output karpenter_node_role_name
   # bottlerocket@latest: container-optimized, immutable root fs, smaller
-  # attack surface. Worker pods need CAP_SYS_ADMIN (FUSE) + hostUsers:false
+  # attack surface. Builder pods need CAP_SYS_ADMIN (FUSE) + hostUsers:false
   # (containerd ≥ 1.7 idmap mounts) — Bottlerocket ships both.
   amiAlias: bottlerocket@latest
   # Bottlerocket data volume (/dev/xvdb — container images + emptyDir +
-  # logs). AMI default is ~20GB; worker pods request 25Gi ephemeral-
+  # logs). AMI default is ~20GB; builder pods request 25Gi ephemeral-
   # storage (fuseCacheSize + headroom). Size for a few workers bin-packed
   # on one node plus image layers. gp3 at 100Gi is ~$8/mo per node.
   dataVolumeSize: 100Gi
 
   # Three NodePools, one EC2NodeClass. Weighted priority: Karpenter tries
   # high-weight first, falls through if pod doesn't fit or capacity is
-  # unavailable. Forward-compat with phase 4c: WorkerPoolSet creates pools
+  # unavailable. Forward-compat with phase 4c: BuilderPoolSet creates pools
   # with different resources → Karpenter bin-packs across the size range
   # the NodePool requirements allow. No NodePool rework needed.
   nodePools:
     # Worker preferred: c6a/c7a (AMD EPYC compute-optimized). Tainted so
-    # ONLY worker pods (with the matching toleration) land here.
-    - name: rio-worker-preferred
+    # ONLY builder pods (with the matching toleration) land here.
+    - name: rio-builder-preferred
       weight: 100
       labels:
-        rio.build/node-role: worker
+        rio.build/node-role: builder
       taints:
-        - key: rio.build/worker
+        - key: rio.build/builder
           value: "true"
           effect: NoSchedule
       requirements:
@@ -326,12 +288,12 @@ karpenter:
     # Worker fallback: m/r categories, any family. If c-capacity is
     # unavailable (rare on-demand, common for spot) Karpenter falls
     # through here.
-    - name: rio-worker-fallback
+    - name: rio-builder-fallback
       weight: 10
       labels:
-        rio.build/node-role: worker
+        rio.build/node-role: builder
       taints:
-        - key: rio.build/worker
+        - key: rio.build/builder
           value: "true"
           effect: NoSchedule
       requirements:
@@ -362,7 +324,7 @@ karpenter:
         rio.build/node-role: general
       taints: []
       requirements:
-        # No arch constraint: multi-arch images (see rio-worker-fallback
+        # No arch constraint: multi-arch images (see rio-builder-fallback
         # comment). Gateway/scheduler/store/controller all have arm64
         # builds; m6g/m7g Graviton is now a valid target.
         - key: karpenter.k8s.aws/instance-category
@@ -460,11 +422,11 @@ dashboard:
 # FUSE Device Plugin
 # ──────────────────────────────────────────────────────────────────────────
 # smarter-device-manager DaemonSet: exposes /dev/fuse as an extended
-# resource (smarter-devices/fuse). Worker pods request it via
+# resource (smarter-devices/fuse). Builder pods request it via
 # resources.limits instead of a hostPath volume, which makes
 # hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
 #
-# enabled=true by default because workerPool.privileged=false (below)
+# enabled=true by default because builderPool.privileged=false (below)
 # depends on it. Disable on clusters where privileged:true is the escape
 # hatch (k3s/kind without node-level device-plugin support).
 devicePlugin:
@@ -473,21 +435,21 @@ devicePlugin:
   # <repo>:<new-tag> --format '{{.Digest}}'` on upstream releases. Tag
   # portion is cosmetic (kubelet pulls by digest). The helm-lint check
   # enforces the pin (a prior default referenced a never-published
-  # upstream tag → ImagePullBackOff → worker pods Pending on a
+  # upstream tag → ImagePullBackOff → builder pods Pending on a
   # default-values deploy).
   image: ghcr.io/smarter-project/smarter-device-manager:v1.20.12@sha256:228f7f44594a3182571559e62f2e3fe8a3f26180fb5dd7fc0cb7bf7d22a5bbcd
   # Per-node ceiling on how many pods can claim /dev/fuse. Each worker
-  # pod requests 1. Set this >= max worker pods per node (which is
+  # pod requests 1. Set this >= max builder pods per node (which is
   # typically 1 given the resource requests below, but bursty
   # autoscaling + small nodes could pack more).
   fuseMaxDevices: 100
-  # Same nodeSelector as workerPool: plugin runs on worker nodes only.
+  # Same nodeSelector as builderPool: plugin runs on builder nodes only.
   # Control-plane nodes don't need /dev/fuse.
   nodeSelector:
-    rio.build/node-role: worker
+    rio.build/node-role: builder
   # Tolerate the worker-node taint so the DaemonSet schedules there.
   tolerations:
-    - key: rio.build/worker
+    - key: rio.build/builder
       operator: Equal
       value: "true"
       effect: NoSchedule
@@ -495,13 +457,13 @@ devicePlugin:
 # ──────────────────────────────────────────────────────────────────────────
 # Seccomp profile installer (DaemonSet)
 # ──────────────────────────────────────────────────────────────────────────
-# Delivers files/seccomp-rio-worker.json to /var/lib/kubelet/seccomp/
-# profiles/ on worker nodes so workerPool.seccompProfile.type=Localhost
+# Delivers files/seccomp-rio-builder.json to /var/lib/kubelet/seccomp/
+# profiles/ on builder nodes so builderPool.seccompProfile.type=Localhost
 # works. Karpenter-provisioned Bottlerocket nodes have no node-prep hook
 # — the DS initContainer is the delivery mechanism.
 #
 # Disable on clusters where the profile is baked into the node image or
-# where workerPool.seccompProfile.type != Localhost (RuntimeDefault,
+# where builderPool.seccompProfile.type != Localhost (RuntimeDefault,
 # Unconfined, or privileged:true escape hatch).
 seccompInstaller:
   enabled: true
@@ -509,24 +471,24 @@ seccompInstaller:
   # docker://busybox:<tag> --format '{{.Digest}}'`. Same pin-policy
   # as devicePlugin.image above (helm-lint enforces it).
   image: public.ecr.aws/docker/library/busybox:1.36.1@sha256:b9598f8c98e24d0ad42c1742c32516772c3aa2151011ebaf639089bd18c605b8
-  # Same nodeSelector/tolerations as devicePlugin + workerPool: worker
-  # nodes only. Control-plane + general nodes don't run worker pods,
+  # Same nodeSelector/tolerations as devicePlugin + builderPool: worker
+  # nodes only. Control-plane + general nodes don't run builder pods,
   # don't need the profile.
   nodeSelector:
-    rio.build/node-role: worker
+    rio.build/node-role: builder
   tolerations:
-    - key: rio.build/worker
+    - key: rio.build/builder
       operator: Equal
       value: "true"
       effect: NoSchedule
 
 # ──────────────────────────────────────────────────────────────────────────
-# Default WorkerPool
+# Default BuilderPool
 # ──────────────────────────────────────────────────────────────────────────
-# One-size-fits-all baseline for phase 4b — phase 4c WorkerPoolSet
+# One-size-fits-all baseline for phase 4b — phase 4c BuilderPoolSet
 # supersedes with per-size-class pools. When WPS lands, set enabled=false
 # here and apply a WPS CR instead.
-workerPool:
+builderPool:
   enabled: false
   name: default
   replicas:
@@ -546,10 +508,10 @@ workerPool:
   sizeClass: ""   # unclassified — scheduler with size_classes configured
                   # would reject this; phase 4b baseline doesn't configure
                   # size_classes
-  image: rio-worker
+  image: rio-builder
   # Phase 4b placeholder. Fits on c6a.large (2 vCPU / 4Gi) and up.
   # Karpenter picks cheapest-fit — request, not node-size mandate.
-  # TODO(P0435): WorkerPoolSet derives this from build_history per
+  # TODO(P0435): BuilderPoolSet derives this from build_history per
   # size class.
   resources:
     requests:
@@ -574,7 +536,7 @@ workerPool:
   # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
   # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist (not
   # Bottlerocket-specific — same gap on AL2023). The Localhost profile
-  # (files/seccomp-rio-worker.json, delivered by seccompInstaller DS) is
+  # (files/seccomp-rio-builder.json, delivered by seccompInstaller DS) is
   # RuntimeDefault + pivot_root − {ptrace, bpf, setns, process_vm_*}.
   # Keeps granular caps, container_t SELinux confinement, and the
   # device-plugin /dev/fuse path while denying the syscalls a
@@ -597,17 +559,40 @@ workerPool:
   seccompProfile:
     type: Localhost
     # Relative to /var/lib/kubelet/seccomp/. seccompInstaller DS drops
-    # the file at profiles/rio-worker.json on every worker node.
-    localhostProfile: profiles/rio-worker.json
+    # the file at profiles/rio-builder.json on every builder node.
+    localhostProfile: profiles/rio-builder.json
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:
-    - key: rio.build/worker
+    - key: rio.build/builder
       operator: Equal
       value: "true"
       effect: NoSchedule
   nodeSelector:
-    rio.build/node-role: worker
+    rio.build/node-role: builder
+
+# ──────────────────────────────────────────────────────────────────────────
+# Default FetcherPool (SKELETON — reconciler wiring is a follow-on plan)
+# ──────────────────────────────────────────────────────────────────────────
+# FOD-only executors with open internet egress. See ADR-019.
+fetcherPool:
+  enabled: false
+  name: rio-fetchers
+  replicas: 2
+  systems: [x86_64-linux]
+  # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
+  # the image (nix/docker.nix rio-fetcher wraps rio-builder).
+  image: rio-fetcher
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 2Gi}
+  tolerations:
+    - key: rio.build/fetcher
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    rio.build/node-role: fetcher
 
 # ──────────────────────────────────────────────────────────────────────────
 # Conditional subchart: PG (dev only). From nixhelm (FOD), not vendored.

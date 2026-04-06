@@ -25,7 +25,7 @@ export type RawNode = {
   pname: string;
   system: string;
   status: string;
-  assignedWorkerId: string;
+  assignedExecutorId: string;
 };
 
 export type RawEdge = {

@@ -14,7 +14,7 @@
 # not just rio-gateway).
 #
 # Controller is excluded (needs a K8s API server). Worker runs in a QEMU
-# microVM (rio-worker-vm, disabled by default — start from TUI or CLI).
+# microVM (rio-builder-vm, disabled by default — start from TUI or CLI).
 
 version: "0.5"
 
@@ -135,7 +135,7 @@ processes:
 
   # Worker in a QEMU microVM (needs KVM). Disabled by default — start from
   # the process-compose TUI (select it, press 's') or via CLI.
-  rio-worker-vm:
+  rio-builder-vm:
     command: |
       set -euo pipefail
       if [ ! -e /dev/kvm ]; then
@@ -143,7 +143,7 @@ processes:
         exit 0
       fi
       nix build .#worker-vm -o result-worker-vm --log-format bar-with-logs
-      exec result-worker-vm/bin/run-rio-worker-dev-vm
+      exec result-worker-vm/bin/run-rio-builder-dev-vm
     disabled: true
     depends_on:
       rio-scheduler:

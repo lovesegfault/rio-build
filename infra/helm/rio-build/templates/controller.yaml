@@ -48,7 +48,7 @@ spec:
             - name: RIO_STORE_ADDR
               value: {{ $c.storeAddr | quote }}
             {{- if $c.schedulerBalanceHost }}
-            # Passed through to worker pods. Workers DNS-resolve the headless
+            # Passed through to builder pods. Workers DNS-resolve the headless
             # Service, health-probe pod IPs, route to leader. Unset → workers
             # fall back to single-channel.
             - name: RIO_SCHEDULER_BALANCE_HOST

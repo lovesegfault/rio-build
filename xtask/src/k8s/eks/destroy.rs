@@ -1,6 +1,6 @@
 //! Tear down the EKS deployment.
 //!
-//! WorkerPool finalizers hold pods → NLB → tofu destroy blocks.
+//! BuilderPool finalizers hold pods → NLB → tofu destroy blocks.
 //! Karpenter NodeClaims must also be deleted BEFORE tofu destroys
 //! helm_release.karpenter — otherwise EC2 instances are orphaned.
 
@@ -13,10 +13,10 @@ use crate::{tofu, ui};
 
 pub async fn run() -> Result<()> {
     let sh = shell()?;
-    ui::step("delete WorkerPools", || {
+    ui::step("delete BuilderPools", || {
         crate::sh::run(cmd!(
             sh,
-            "kubectl -n {NS} delete workerpool --all --wait=true --ignore-not-found"
+            "kubectl -n {NS} delete builderpool --all --wait=true --ignore-not-found"
         ))
     })
     .await?;

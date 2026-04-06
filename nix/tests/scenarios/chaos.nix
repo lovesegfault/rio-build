@@ -203,7 +203,7 @@ pkgs.testers.runNixOSTest {
         # the upload.rs internal loop. Grep both: if timing jitter lets
         # metadata-fetch through, the upload-retry path fires instead.
         worker.wait_until_succeeds(
-            f"journalctl -u rio-worker --since=@{mark} --no-pager | "
+            f"journalctl -u rio-builder --since=@{mark} --no-pager | "
             "grep -qE 'upload attempt failed|input metadata fetch failed'",
             timeout=30,
         )
@@ -243,9 +243,9 @@ pkgs.testers.runNixOSTest {
         #   fetch and the scheduler re-assigned
         # Either proves the retry mechanism iterated after the RST.
         worker.succeed(
-            f"journalctl -u rio-worker --since=@{mark} --no-pager | "
+            f"journalctl -u rio-builder --since=@{mark} --no-pager | "
             "grep -q 'retrying upload' || "
-            f"[ $(journalctl -u rio-worker --since=@{mark} --no-pager | "
+            f"[ $(journalctl -u rio-builder --since=@{mark} --no-pager | "
             "grep -c 'received work assignment.*chaos-reset') -ge 2 ]"
         )
 
@@ -254,7 +254,7 @@ pkgs.testers.runNixOSTest {
         # = zero (good); registered with value 0.0 also good.
         m = scrape_metrics(worker, 9093)
         exhausted = metric_value(
-            m, "rio_worker_uploads_total", labels='{status="exhausted"}'
+            m, "rio_builder_uploads_total", labels='{status="exhausted"}'
         ) or 0.0
         assert exhausted == 0.0, (
             f"upload retries exhausted ({exhausted}×) — heal too slow"

@@ -9,7 +9,7 @@ members = [
   "rio-scheduler",
   "rio-store",
   "rio-test-support",
-  "rio-worker",
+  "rio-builder",
   "rio-crds",
   "rio-bench",
   "workspace-hack",

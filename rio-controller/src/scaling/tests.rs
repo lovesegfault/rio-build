@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use kube::ResourceExt;
 
 use super::*;
-use crate::crds::workerpool::WorkerPool;
-use crate::crds::workerpoolset::WorkerPoolSet;
+use crate::crds::builderpool::BuilderPool;
+use crate::crds::builderpoolset::BuilderPoolSet;
 
 // ---- sts_replicas_patch: SSA body shape ----
 
@@ -23,7 +23,7 @@ use crate::crds::workerpoolset::WorkerPoolSet;
 /// `{"spec":{"replicas":N}}` silently fails every scale. This
 /// test is a tripwire: if someone strips the GVK fields "for
 /// brevity," this breaks.
-/// WorkerPool status patch needs apiVersion+kind (same SSA
+/// BuilderPool status patch needs apiVersion+kind (same SSA
 /// requirement as the STS replicas patch). Also verify it's a
 /// PARTIAL status: replicas/ready/desired absent (reconciler's
 /// fields), lastScaleTime + conditions present (ours).
@@ -39,7 +39,7 @@ fn wp_status_patch_has_gvk_and_partial_status() {
     );
     assert_eq!(
         patch.get("kind").and_then(|v| v.as_str()),
-        Some("WorkerPool")
+        Some("BuilderPool")
     );
 
     let status = patch.get("status").expect("status key");
@@ -355,7 +355,7 @@ fn stabilization_desired_wobble_resets() {
 
 // r[verify ctrl.wps.autoscale]
 /// `is_wps_owned` must return true for pools with a
-/// `controller=true` WorkerPoolSet owner reference, false
+/// `controller=true` BuilderPoolSet owner reference, false
 /// otherwise. The distinction is LOAD-BEARING: a false
 /// positive makes standalone pools silently un-scaled; a
 /// false negative makes WPS children double-scaled (the
@@ -368,19 +368,19 @@ fn is_wps_owned_detects_controller_ownerref() {
     let spec = crate::fixtures::test_workerpool_spec();
 
     // Standalone pool: no owner reference at all.
-    let standalone = WorkerPool::new("standalone-pool", spec.clone());
+    let standalone = BuilderPool::new("standalone-pool", spec.clone());
     assert!(
         !is_wps_owned(&standalone),
         "no ownerRef → NOT WPS-owned (standalone pools must be scaled by the cluster-wide loop)"
     );
 
-    // WPS child: ownerRef kind=WorkerPoolSet, controller=true.
-    // Mirrors what builders::build_child_workerpool sets via
+    // WPS child: ownerRef kind=BuilderPoolSet, controller=true.
+    // Mirrors what builders::build_child_builderpool sets via
     // controller_owner_ref(&()).
-    let mut wps_child = WorkerPool::new("test-wps-small", spec.clone());
+    let mut wps_child = BuilderPool::new("test-wps-small", spec.clone());
     wps_child.metadata.owner_references = Some(vec![OwnerReference {
         api_version: "rio.build/v1alpha1".into(),
-        kind: "WorkerPoolSet".into(),
+        kind: "BuilderPoolSet".into(),
         name: "test-wps".into(),
         uid: "wps-uid-456".into(),
         controller: Some(true),
@@ -388,12 +388,12 @@ fn is_wps_owned_detects_controller_ownerref() {
     }]);
     assert!(
         is_wps_owned(&wps_child),
-        "WorkerPoolSet ownerRef with controller=true → WPS-owned"
+        "BuilderPoolSet ownerRef with controller=true → WPS-owned"
     );
 
     // Owned by something ELSE (e.g., a Helm chart adopting a
-    // WorkerPool). controller=true but wrong kind.
-    let mut other_owned = WorkerPool::new("other-owned", spec.clone());
+    // BuilderPool). controller=true but wrong kind.
+    let mut other_owned = BuilderPool::new("other-owned", spec.clone());
     other_owned.metadata.owner_references = Some(vec![OwnerReference {
         api_version: "apps/v1".into(),
         kind: "Deployment".into(),
@@ -404,17 +404,17 @@ fn is_wps_owned_detects_controller_ownerref() {
     }]);
     assert!(
         !is_wps_owned(&other_owned),
-        "non-WorkerPoolSet ownerRef → NOT WPS-owned (kind check is load-bearing)"
+        "non-BuilderPoolSet ownerRef → NOT WPS-owned (kind check is load-bearing)"
     );
 
     // WPS ownerRef but controller=None (garbage-collection
     // owner, not controller). The reconciler always sets
     // controller=true; this case shouldn't happen but
     // defensive: controller=None means NOT controller-owned.
-    let mut gc_only = WorkerPool::new("gc-only", spec);
+    let mut gc_only = BuilderPool::new("gc-only", spec);
     gc_only.metadata.owner_references = Some(vec![OwnerReference {
         api_version: "rio.build/v1alpha1".into(),
-        kind: "WorkerPoolSet".into(),
+        kind: "BuilderPoolSet".into(),
         name: "test-wps".into(),
         uid: "wps-uid-789".into(),
         controller: None,
@@ -431,14 +431,14 @@ fn is_wps_owned_detects_controller_ownerref() {
 // Test helpers for the find_wps_child cases. These mirror the
 // builders::tests::test_wps_with_classes pattern but live here
 // because that helper is in a private #[cfg(test)] mod inside
-// builders.rs (unreachable cross-module). WorkerPoolSpec shape
+// builders.rs (unreachable cross-module). BuilderPoolSpec shape
 // is pulled from crate::fixtures::test_workerpool_spec — the
 // single touch point for E0063 on field adds.
 //
 // pub(super) so per_class.rs's tests can reuse them.
 
-pub(super) fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> WorkerPoolSet {
-    use crate::crds::workerpoolset::{PoolTemplate, SizeClassSpec, WorkerPoolSetSpec};
+pub(super) fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> BuilderPoolSet {
+    use crate::crds::builderpoolset::{BuilderPoolSetSpec, PoolTemplate, SizeClassSpec};
     use k8s_openapi::api::core::v1::ResourceRequirements;
     let classes = class_names
         .iter()
@@ -451,32 +451,32 @@ pub(super) fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> WorkerPool
             resources: ResourceRequirements::default(),
         })
         .collect();
-    let spec = WorkerPoolSetSpec {
+    let spec = BuilderPoolSetSpec {
         classes,
         pool_template: PoolTemplate {
-            image: "rio-worker:test".into(),
+            image: "rio-builder:test".into(),
             systems: vec!["x86_64-linux".into()],
             ..Default::default()
         },
         cutoff_learning: None,
     };
-    let mut wps = WorkerPoolSet::new(name, spec);
+    let mut wps = BuilderPoolSet::new(name, spec);
     wps.metadata.uid = Some(format!("{name}-uid"));
     wps.metadata.namespace = Some(ns.into());
     wps
 }
 
-pub(super) fn test_wp_in_ns(name: &str, ns: &str) -> WorkerPool {
-    let mut wp = WorkerPool::new(name, crate::fixtures::test_workerpool_spec());
+pub(super) fn test_wp_in_ns(name: &str, ns: &str) -> BuilderPool {
+    let mut wp = BuilderPool::new(name, crate::fixtures::test_workerpool_spec());
     wp.metadata.namespace = Some(ns.into());
     wp
 }
 
-pub(super) fn with_wps_owner(mut wp: WorkerPool, wps_name: &str, wps_uid: &str) -> WorkerPool {
+pub(super) fn with_wps_owner(mut wp: BuilderPool, wps_name: &str, wps_uid: &str) -> BuilderPool {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     wp.metadata.owner_references = Some(vec![OwnerReference {
         api_version: "rio.build/v1alpha1".into(),
-        kind: "WorkerPoolSet".into(),
+        kind: "BuilderPoolSet".into(),
         name: wps_name.into(),
         uid: wps_uid.into(),
         controller: Some(true),

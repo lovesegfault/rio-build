@@ -117,13 +117,13 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: rio-worker-tls
+  name: rio-builder-tls
   namespace: {{ $ns }}
   labels:
-    app.kubernetes.io/name: rio-worker
+    app.kubernetes.io/name: rio-builder
     app.kubernetes.io/part-of: rio-build
 spec:
-  secretName: rio-worker-tls
+  secretName: rio-builder-tls
   duration: 2160h
   renewBefore: 720h
   privateKey:
@@ -134,6 +134,6 @@ spec:
     kind: Issuer
     name: rio-ca-issuer
   dnsNames:
-    - rio-worker
+    - rio-builder
     - "*.{{ $ns }}.svc.cluster.local"
 {{- end }}

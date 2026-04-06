@@ -1,0 +1,62 @@
+[package]
+name = "rio-builder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Build executor with FUSE store for rio-build"
+
+[[bin]]
+name = "rio-builder"
+path = "src/main.rs"
+
+[dependencies]
+rio-common = { workspace = true }
+rio-nix = { workspace = true }
+rio-proto = { workspace = true }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+# google.protobuf.Timestamp in BuildResult.start_time/stop_time.
+# Scheduler guards update_build_history on these being Some.
+prost-types = { workspace = true }
+fuser = { workspace = true }
+sqlx = { workspace = true }
+nix = { workspace = true }
+sha2 = { workspace = true }
+# FOD hash verification: Nix FODs can declare sha1/sha256/sha512.
+# Round 4 Z8: sha1 FODs were rejected with a false-positive because
+# verify_fod_hashes hardcoded SHA-256.
+sha1 = { workspace = true }
+hex = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+# /healthz + /readyz HTTP endpoints. Worker has no gRPC server
+# (it's a gRPC CLIENT of the scheduler) so tonic-health doesn't fit.
+# axum on a separate port. K8s readinessProbe hits /readyz.
+axum = { workspace = true }
+scopeguard = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+rio-test-support = { workspace = true }
+# Router::oneshot for health.rs tests (ServiceExt trait).
+tower = { workspace = true, features = ["util"] }
+# figment::Jail for config.rs all_subconfigs standing-guard tests.
+figment = { workspace = true, features = ["test"] }
+
+[build-dependencies]
+# build.rs greps metric-emit literals for the emit→describe check.
+# Already transitive in Cargo.lock; zero new lockfile churn.
+regex = { workspace = true }

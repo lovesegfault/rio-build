@@ -2,7 +2,7 @@
 #
 # NOT builtin:fetchurl — that needs system="builtin" which the vmtest-full
 # workerPool.systems=[x86_64-linux] doesn't advertise. busybox wget honors
-# http_proxy env (the whole point: rio-worker's is_fod gate sets it on the
+# http_proxy env (the whole point: rio-builder's is_fod gate sets it on the
 # daemon, Nix's FOD sandbox passes it through to the builder).
 #
 # The proxy chain under test:

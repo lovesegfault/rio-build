@@ -54,7 +54,7 @@
 #   health at all).
 #
 # ctrl.autoscale.skip-deleting — verify marker at default.nix:subtests[finalizer]
-#   finalizer subtest deletes the WorkerPool and waits ~300s for pod
+#   finalizer subtest deletes the BuilderPool and waits ~300s for pod
 #   termination. The autoscaler's 30s poll fires DURING that window;
 #   scaling.rs:222 deletion_timestamp.is_some() skip-gate MUST fire
 #   or the autoscaler would race the finalizer's scale-to-0.
@@ -125,17 +125,17 @@
 #
 # ctrl.pdb.workers — verify marker at default.nix:subtests[pdb-ownerref]
 #   pdb-ownerref: build_pdb (builders.rs:178) produces `{pool}-pdb`
-#   with maxUnavailable=1 + ownerReferences[0]→WorkerPool. Asserts
+#   with maxUnavailable=1 + ownerReferences[0]→BuilderPool. Asserts
 #   against the fixture's `default` pool: `default-pdb` exists,
-#   spec.maxUnavailable=1, ownerRef[0].kind=WorkerPool, GC'd on
-#   WorkerPool delete (ownerRef cascade). Unit test tests.rs:550
+#   spec.maxUnavailable=1, ownerRef[0].kind=BuilderPool, GC'd on
+#   BuilderPool delete (ownerRef cascade). Unit test tests.rs:550
 #   proves the struct shape; this proves the reconciler SSA-applies it
 #   AND K8s GC honors the ownerRef end-to-end.
 #
 # ctrl.wps.reconcile — verify marker at default.nix:subtests[wps-lifecycle]
 # ctrl.wps.autoscale — verify marker at default.nix:subtests[wps-lifecycle]
-#   wps-lifecycle: apply a 3-class WPS → WorkerPoolSet reconciler
-#   (workerpoolset/mod.rs:131) creates 3 child WorkerPools named
+#   wps-lifecycle: apply a 3-class WPS → BuilderPoolSet reconciler
+#   (builderpoolset/mod.rs:131) creates 3 child WorkerPools named
 #   `{wps}-{class}` with sizeClass=class.name + ownerReferences[0]→WPS
 #   + controller=true. Delete WPS → finalizer cleanup explicitly
 #   deletes each child (mod.rs:375), ownerRef GC as fallback. The
@@ -185,7 +185,7 @@ let
   # recovery loads nothing → hollow test.
   #
   # 60s (was 90s): the FUSE circuit breaker's wall_clock_trip default is
-  # 90s (rio-worker/src/fuse/circuit.rs DEFAULT_WALL_CLOCK_TRIP). With
+  # 90s (rio-builder/src/fuse/circuit.rs DEFAULT_WALL_CLOCK_TRIP). With
   # sleepSecs=90 the gap between the slow build's input fetch and the
   # post-recovery recoveryDrv's input fetch is ~95-100s, tripping the
   # circuit → EIO → handle_infrastructure_failure retry loop → test
@@ -991,7 +991,7 @@ let
           )
           timed_out_line = [
               l for l in worker_metrics.splitlines()
-              if 'rio_worker_builds_total' in l
+              if 'rio_builder_builds_total' in l
               and 'outcome="timed_out"' in l
               and not l.startswith('#')
           ]
@@ -1283,7 +1283,7 @@ let
           kubectl("scale statefulset default-workers --replicas=2")
 
           # Reconciler observed the change (via .owns watch), reconciled,
-          # patched WorkerPool.status.desiredReplicas. This IS the
+          # patched BuilderPool.status.desiredReplicas. This IS the
           # reconcile — if it were going to stomp replicas, it would have
           # done so in the same apply() call. Accept 1 OR 2: with the 10s
           # scale-down window (controller.extraEnv[3]), the autoscaler may
@@ -1291,7 +1291,7 @@ let
           # desiredReplicas reflecting a NON-STALE value proves reconcile
           # ran after our scale.
           k3s_server.wait_until_succeeds(
-              "dr=$(k3s kubectl -n ${ns} get workerpool default "
+              "dr=$(k3s kubectl -n ${ns} get builderpool default "
               "-o jsonpath='{.status.desiredReplicas}'); "
               'test "$dr" = 1 -o "$dr" = 2',
               timeout=20,
@@ -1319,7 +1319,7 @@ let
           # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
           kubectl("scale statefulset default-workers --replicas=1")
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get workerpool default "
+              "test \"$(k3s kubectl -n ${ns} get builderpool default "
               "-o jsonpath='{.status.desiredReplicas}')\" = 1",
               timeout=20,
           )
@@ -1336,7 +1336,7 @@ let
       # (a) SSA patch body includes apiVersion+kind — without them the STS
       # patch 400s "apiVersion must be set" → warn log → autoscaler
       # silently never scales (phase3a.nix:819-823), (b) autoscaler patches
-      # WorkerPool.status.lastScaleTime via its SEPARATE field-manager.
+      # BuilderPool.status.lastScaleTime via its SEPARATE field-manager.
       #
       # Timing: controller.extraEnv sets poll/up-window/min-interval = 3s
       # (default 30s would mean ~60s to first scale — too slow). With
@@ -1374,12 +1374,12 @@ let
               timeout=60,
           )
 
-          # WorkerPool.status.lastScaleTime set (RFC3339 string, non-
+          # BuilderPool.status.lastScaleTime set (RFC3339 string, non-
           # empty). Owned by the autoscaler's SSA field-manager (distinct
           # from the reconciler's — otherwise reconcile would clobber it
           # to None every cycle).
           k3s_server.wait_until_succeeds(
-              "sc=$(k3s kubectl -n ${ns} get workerpool default "
+              "sc=$(k3s kubectl -n ${ns} get builderpool default "
               "-o jsonpath='{.status.lastScaleTime}'); "
               "test -n \"$sc\"",
               timeout=20,
@@ -1387,7 +1387,7 @@ let
 
           # Scaling condition explains WHY replicas changed.
           kubectl(
-              "get workerpool default "
+              "get builderpool default "
               "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "
               "grep -q ScaledUp"
           )
@@ -1443,15 +1443,15 @@ let
               f"  all scaling series: {cm.get('rio_controller_scaling_decisions_total', {})!r}"
           )
 
-          # ScaledDown K8s Event on the WorkerPool. The autoscaler's
+          # ScaledDown K8s Event on the BuilderPool. The autoscaler's
           # recorder.publish path for Direction::Down (scaling.rs:359).
           events_down = kubectl(
               "get events "
-              "--field-selector involvedObject.name=default,involvedObject.kind=WorkerPool,reason=ScaledDown "
+              "--field-selector involvedObject.name=default,involvedObject.kind=BuilderPool,reason=ScaledDown "
               "-o name"
           ).strip()
           assert events_down, (
-              "expected ScaledDown K8s Event on WorkerPool/default, got none"
+              "expected ScaledDown K8s Event on BuilderPool/default, got none"
           )
           print(f"autoscaler PASS: STS scaled 1→2→1, up={scale_up} down={scale_down}")
     '';
@@ -1989,7 +1989,7 @@ let
           cel_reject = k3s_server.fail(
               "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
               "apiVersion: rio.build/v1alpha1\n"
-              "kind: WorkerPool\n"
+              "kind: BuilderPool\n"
               "metadata:\n"
               "  name: ephemeral-bad-maxbuilds\n"
               "  namespace: ${ns}\n"
@@ -2007,7 +2007,7 @@ let
               f"CEL should reject ephemeral+maxConcurrentBuilds>1 "
               f"with the rule's message, got: {cel_reject!r}. If the "
               f"apply succeeded or failed for a different reason, the "
-              f"CEL rule at workerpool.rs isn't in the deployed CRD."
+              f"CEL rule at builderpool.rs isn't in the deployed CRD."
           )
           print("ephemeral-pool CEL: ephemeral + maxConcurrentBuilds>1 "
                 "rejected at admission ✓")
@@ -2018,7 +2018,7 @@ let
           cel_reject = k3s_server.fail(
               "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
               "apiVersion: rio.build/v1alpha1\n"
-              "kind: WorkerPool\n"
+              "kind: BuilderPool\n"
               "metadata:\n"
               "  name: sts-with-deadline\n"
               "  namespace: ${ns}\n"
@@ -2040,7 +2040,7 @@ let
           print("ephemeral-pool CEL: ephemeralDeadlineSeconds without "
                 "ephemeral:true rejected at admission ✓")
 
-          # Apply ephemeral WorkerPool. Spec mirrors vmtest-full.yaml's
+          # Apply ephemeral BuilderPool. Spec mirrors vmtest-full.yaml's
           # default pool (image, privileged, resources, grace) except:
           # ephemeral=true, replicas.min=0 (CEL enforced), max=4.
           # Heredoc via stdin: kubectl apply -f - with EOF. The YAML
@@ -2049,7 +2049,7 @@ let
           k3s_server.succeed(
               "k3s kubectl apply -f - <<'EOF'\n"
               "apiVersion: rio.build/v1alpha1\n"
-              "kind: WorkerPool\n"
+              "kind: BuilderPool\n"
               "metadata:\n"
               "  name: ephemeral\n"
               "  namespace: ${ns}\n"
@@ -2071,13 +2071,13 @@ let
               # tlsSecretName: vmtest-full.yaml sets tls.enabled=true, so
               # the scheduler requires mTLS on its gRPC port. The Helm-
               # rendered default pool gets this via `{{- if .Values.tls.
-              # enabled }} tlsSecretName: rio-worker-tls {{- end }}`
-              # (templates/workerpool.yaml:37-39); inline YAML here must
+              # enabled }} tlsSecretName: rio-builder-tls {{- end }}`
+              # (templates/builderpool.yaml:37-39); inline YAML here must
               # spell it out. Without it, builders.rs skips the RIO_TLS__*
               # env + tls volume → ephemeral worker connects plaintext →
               # TLS handshake fails → never heartbeats → build stuck
               # queued forever.
-              "  tlsSecretName: rio-worker-tls\n"
+              "  tlsSecretName: rio-builder-tls\n"
               "  privileged: true\n"
               "  terminationGracePeriodSeconds: 60\n"
               "  nodeSelector: null\n"
@@ -2105,7 +2105,7 @@ let
           # ceiling). reconcile_ephemeral runs on first apply even with
           # queued=0 — it patches status then requeues at 10s.
           k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${ns} get workerpool ephemeral "
+              "test \"$(k3s kubectl -n ${ns} get builderpool ephemeral "
               "-o jsonpath='{.status.desiredReplicas}')\" = 4",
               timeout=120,
           )
@@ -2249,11 +2249,11 @@ let
           # spec.ephemeral and returns immediately (no STS scale-to-0,
           # no DrainWorker loop). In-flight Jobs finish naturally;
           # ownerRef GC deletes them.
-          kubectl("delete workerpool ephemeral --wait=false")
+          kubectl("delete builderpool ephemeral --wait=false")
           # CR gone quickly — finalizer removed on first cleanup() call.
           # 30s is generous; should be <5s in practice.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get workerpool ephemeral 2>/dev/null",
+              "! k3s kubectl -n ${ns} get builderpool ephemeral 2>/dev/null",
               timeout=30,
           )
           print("ephemeral-pool PASS: no STS, Job spawned per build, "
@@ -2267,7 +2267,7 @@ let
       # P0285: makes the 4 lying comments TRUE. Before this watcher,
       # DrainWorker{force:true} had ZERO prod callers — both construction
       # sites set force:false. The watcher (rio-controller/src/reconcilers/
-      # workerpool/disruption.rs) observes the K8s-set DisruptionTarget
+      # builderpool/disruption.rs) observes the K8s-set DisruptionTarget
       # condition and calls force=true.
       #
       # Flow: K8s eviction API → pod.status.conditions[DisruptionTarget]
@@ -2401,7 +2401,7 @@ let
 
     finalizer = ''
       # ══════════════════════════════════════════════════════════════════
-      # finalizer — delete WorkerPool → pod gone → CR gone → workers=0
+      # finalizer — delete BuilderPool → pod gone → CR gone → workers=0
       # ══════════════════════════════════════════════════════════════════
       #   The autoscaler's 30s poll fires DURING this subtest (~300s wall
       #   time). scaling.rs:222 `if pool.metadata.deletion_timestamp.is_some()
@@ -2409,15 +2409,15 @@ let
       #   a being-deleted pool, racing the finalizer's scale-to-0. The test
       #   passing (pod gone + CR gone) proves the skip gate works.
       #
-      # Runs LAST: deletes the only WorkerPool, so no workers exist after.
+      # Runs LAST: deletes the only BuilderPool, so no workers exist after.
       # Finalizer's cleanup(): DrainWorker + scale STS → 0 + wait for pod
       # termination + remove finalizer. Queue is already empty (autoscaler
       # drained) → acquire_many succeeds immediately → no blocking.
-      with subtest("finalizer: delete WorkerPool → drain → pod gone → CR gone"):
+      with subtest("finalizer: delete BuilderPool → drain → pod gone → CR gone"):
           # --wait=false: don't block kubectl on the finalizer. We assert
           # each stage with its own timeout so a hang points at the exact
           # stage (pod-gone vs CR-gone vs workers_active).
-          kubectl("delete workerpool default --wait=false")
+          kubectl("delete builderpool default --wait=false")
 
           # Pod gone. Proves: STS scaled to 0, SIGTERM drain exited
           # cleanly (no in-flight builds), finalizer removed (K8s could
@@ -2435,9 +2435,9 @@ let
               timeout=300,
           )
 
-          # WorkerPool CR gone (finalizer removed → K8s deleted it).
+          # BuilderPool CR gone (finalizer removed → K8s deleted it).
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get workerpool default 2>/dev/null",
+              "! k3s kubectl -n ${ns} get builderpool default 2>/dev/null",
               timeout=30,
           )
 
@@ -2447,29 +2447,29 @@ let
               "grep -qx 'rio_scheduler_workers_active 0'",
               timeout=30,
           )
-          print("finalizer PASS: WorkerPool deleted, pod drained, scheduler saw disconnect")
+          print("finalizer PASS: BuilderPool deleted, pod drained, scheduler saw disconnect")
     '';
 
     pdb-ownerref = ''
       # ══════════════════════════════════════════════════════════════════
-      # pdb-ownerref — `{pool}-pdb` exists, ownerRef→WorkerPool, GC'd
+      # pdb-ownerref — `{pool}-pdb` exists, ownerRef→BuilderPool, GC'd
       # ══════════════════════════════════════════════════════════════════
       # Proves build_pdb (builders.rs:178) produces a real K8s PDB when
-      # the WorkerPool reconciler SSA-applies it. The fixture's `default`
-      # WorkerPool (vmtest-full.yaml) comes up → reconciler creates
-      # `default-pdb` with maxUnavailable=1 + ownerRef[0]=WorkerPool.
+      # the BuilderPool reconciler SSA-applies it. The fixture's `default`
+      # BuilderPool (vmtest-full.yaml) comes up → reconciler creates
+      # `default-pdb` with maxUnavailable=1 + ownerRef[0]=BuilderPool.
       # Delete `default` → finalizer drains + removes → K8s ownerRef GC
       # cascade takes the PDB.
       #
-      # Runs FIRST in the wps split (fresh fixture, `default` WorkerPool
+      # Runs FIRST in the wps split (fresh fixture, `default` BuilderPool
       # intact). Disruptive: deletes `default` — subsequent fragments
       # must not need it.
-      with subtest("pdb-ownerref: PDB exists, owned by WorkerPool, GC'd on delete"):
+      with subtest("pdb-ownerref: PDB exists, owned by BuilderPool, GC'd on delete"):
           pdb = "default-pdb"
 
           # ── PDB exists with maxUnavailable=1 ──────────────────────────
           # The reconciler's first apply() runs during waitReady (CRD
-          # watch fires on the fixture's WorkerPool create). By the time
+          # watch fires on the fixture's BuilderPool create). By the time
           # the prelude returns, `default-pdb` should exist. 30s margin
           # for the SSA patch + k3s apiserver admission lag.
           k3s_server.wait_until_succeeds(
@@ -2478,8 +2478,8 @@ let
               timeout=30,
           )
 
-          # ── ownerReferences[0] → WorkerPool ───────────────────────────
-          # controller=true, kind=WorkerPool, name=default. K8s GC
+          # ── ownerReferences[0] → BuilderPool ───────────────────────────
+          # controller=true, kind=BuilderPool, name=default. K8s GC
           # cascades when the owner is deleted IFF controller=true (or
           # blockOwnerDeletion — same effect for GC). The reconciler's
           # controller_owner_ref(&()) sets controller=true.
@@ -2487,9 +2487,9 @@ let
               f"get pdb {pdb} "
               "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
           ).strip()
-          assert owner_kind == "WorkerPool", (
-              f"expected ownerRef[0].kind=WorkerPool, got {owner_kind!r}. "
-              f"Without ownerRef, WorkerPool delete leaks the PDB."
+          assert owner_kind == "BuilderPool", (
+              f"expected ownerRef[0].kind=BuilderPool, got {owner_kind!r}. "
+              f"Without ownerRef, BuilderPool delete leaks the PDB."
           )
           owner_name = kubectl(
               f"get pdb {pdb} "
@@ -2508,21 +2508,21 @@ let
               f"it for cascade), got {owner_ctrl!r}"
           )
 
-          # ── Delete WorkerPool → PDB GC'd ──────────────────────────────
+          # ── Delete BuilderPool → PDB GC'd ──────────────────────────────
           # --wait=false: don't block kubectl on the finalizer. The
           # finalizer's cleanup (DrainWorker + scale STS→0 + wait for
           # pods gone + remove finalizer) completes fast here — no
           # in-flight builds (fresh fixture, no subtest submitted any).
           # terminationGracePeriodSeconds=180 still applies to the pod,
           # but with no builds the worker SIGTERM-exits immediately.
-          kubectl("delete workerpool default --wait=false")
+          kubectl("delete builderpool default --wait=false")
 
-          # WorkerPool CR gone first (finalizer removed → K8s deletes).
+          # BuilderPool CR gone first (finalizer removed → K8s deletes).
           # 120s: grace=180s would apply if SIGTERM hung, but idle
           # worker exits in <5s. 120s absorbs the finalizer's
           # DRAIN_WAIT_SLOP (60s) + k3s controller-manager GC sweep lag.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get workerpool default 2>/dev/null",
+              "! k3s kubectl -n ${ns} get builderpool default 2>/dev/null",
               timeout=120,
           )
 
@@ -2534,21 +2534,21 @@ let
               f"! k3s kubectl -n ${ns} get pdb {pdb} 2>/dev/null",
               timeout=30,
           )
-          print(f"pdb-ownerref PASS: {pdb} GC'd after WorkerPool delete")
+          print(f"pdb-ownerref PASS: {pdb} GC'd after BuilderPool delete")
     '';
 
     wps-lifecycle = ''
       # ══════════════════════════════════════════════════════════════════
       # wps-lifecycle — apply WPS → 3 children → delete → children gone
       # ══════════════════════════════════════════════════════════════════
-      # Proves the WorkerPoolSet reconciler end-to-end: apply a 3-class
-      # WPS → reconciler's per-class loop (workerpoolset/mod.rs:131)
+      # Proves the BuilderPoolSet reconciler end-to-end: apply a 3-class
+      # WPS → reconciler's per-class loop (builderpoolset/mod.rs:131)
       # creates 3 child WorkerPools named `{wps}-{class}` → each child
-      # carries sizeClass=class.name + ownerRef[0]=WorkerPoolSet
+      # carries sizeClass=class.name + ownerRef[0]=BuilderPoolSet
       # (controller=true). Delete WPS → finalizer cleanup() explicitly
       # deletes each child (mod.rs:375); ownerRef GC is the fallback.
       #
-      # RUNS AFTER pdb-ownerref: the `default` WorkerPool is gone (no
+      # RUNS AFTER pdb-ownerref: the `default` BuilderPool is gone (no
       # STS worker to steal dispatches if the child pools' autoscaler
       # ever decided to scale up — but replicas.min=0 default means
       # they don't). Doesn't strictly require it, but keeps the
@@ -2568,12 +2568,12 @@ let
           # privileged:true matches the fixture (vmtest-full.yaml).
           #
           # Heredoc-via-stdin, same pattern as ephemeral-pool's
-          # WorkerPool apply. Inline YAML so the fragment is
+          # BuilderPool apply. Inline YAML so the fragment is
           # self-contained (no external fixture file to drift).
           k3s_server.succeed(
               "k3s kubectl apply -f - <<'EOF'\n"
               "apiVersion: rio.build/v1alpha1\n"
-              "kind: WorkerPoolSet\n"
+              "kind: BuilderPoolSet\n"
               "metadata:\n"
               "  name: test-wps\n"
               "  namespace: ${ns}\n"
@@ -2600,18 +2600,18 @@ let
 
           # ── 3 children appear, correct sizeClass + ownerRef ───────────
           # child_name = "{wps}-{class.name}" (builders.rs:43). The
-          # reconciler's .owns(WorkerPool) watch fires on CR create
+          # reconciler's .owns(BuilderPool) watch fires on CR create
           # (<1s); SSA-apply for each child is fast (no pod create
           # at replicas.min=0). 30s absorbs the reconcile tick +
           # 3× apiserver admission.
           for cls in ["small", "medium", "large"]:
               child = f"test-wps-{cls}"
               k3s_server.wait_until_succeeds(
-                  f"k3s kubectl -n ${ns} get workerpool {child} 2>/dev/null",
+                  f"k3s kubectl -n ${ns} get builderpool {child} 2>/dev/null",
                   timeout=30,
               )
               sc = kubectl(
-                  f"get workerpool {child} "
+                  f"get builderpool {child} "
                   "-o jsonpath='{.spec.sizeClass}'"
               ).strip()
               assert sc == cls, (
@@ -2620,7 +2620,7 @@ let
                   f"these diverge, scheduler routing breaks."
               )
               owner = kubectl(
-                  f"get workerpool {child} "
+                  f"get builderpool {child} "
                   "-o jsonpath='{.metadata.ownerReferences[0].name}'"
               ).strip()
               assert owner == "test-wps", (
@@ -2628,11 +2628,11 @@ let
                   f"got {owner!r}"
               )
               owner_kind = kubectl(
-                  f"get workerpool {child} "
+                  f"get builderpool {child} "
                   "-o jsonpath='{.metadata.ownerReferences[0].kind}'"
               ).strip()
-              assert owner_kind == "WorkerPoolSet", (
-                  f"expected {child} ownerRef[0].kind=WorkerPoolSet, "
+              assert owner_kind == "BuilderPoolSet", (
+                  f"expected {child} ownerRef[0].kind=BuilderPoolSet, "
                   f"got {owner_kind!r}"
               )
               # autoscaling.targetValue = class.targetQueuePerReplica
@@ -2640,7 +2640,7 @@ let
               # per-class autoscaler wiring — each child carries its
               # own target, not a shared WPS-level value.
               tv = kubectl(
-                  f"get workerpool {child} "
+                  f"get builderpool {child} "
                   "-o jsonpath='{.spec.autoscaling.targetValue}'"
               ).strip()
               assert tv == "5", (
@@ -2651,18 +2651,18 @@ let
 
           # ── Delete WPS → children GC'd ────────────────────────────────
           # --wait=false: don't block on the WPS finalizer. cleanup()
-          # (workerpoolset/mod.rs:371) explicitly deletes each child
-          # with 404 tolerance. Each child then runs ITS OWN WorkerPool
+          # (builderpoolset/mod.rs:371) explicitly deletes each child
+          # with 404 tolerance. Each child then runs ITS OWN BuilderPool
           # finalizer (DrainWorker + scale STS→0 — trivially fast at
           # replicas=0) before K8s GC deletes STS/Service/PDB.
-          kubectl("delete workerpoolset test-wps --wait=false")
+          kubectl("delete builderpoolset test-wps --wait=false")
 
           # WPS CR gone: finalizer removed → K8s deletes. 60s: cleanup
           # iterates 3 children × (delete RPC + child finalizer). At
           # replicas=0, child finalizers complete in <5s each (no pods
           # to drain). 60s absorbs k3s controller lag.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get workerpoolset test-wps 2>/dev/null",
+              "! k3s kubectl -n ${ns} get builderpoolset test-wps 2>/dev/null",
               timeout=60,
           )
 
@@ -2671,7 +2671,7 @@ let
           # Checked per-child so a hang names which class stuck.
           for cls in ["small", "medium", "large"]:
               k3s_server.wait_until_succeeds(
-                  f"! k3s kubectl -n ${ns} get workerpool test-wps-{cls} 2>/dev/null",
+                  f"! k3s kubectl -n ${ns} get builderpool test-wps-{cls} 2>/dev/null",
                   timeout=30,
               )
 

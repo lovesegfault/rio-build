@@ -125,7 +125,7 @@ impl StoreServiceImpl {
     /// `hmac_bypass_cns` → bypass. This means: to upload without a
     /// token, you need a CA-signed cert whose identity is explicitly
     /// allowlisted. mTLS + HMAC together = defense in depth; a
-    /// compromised worker cert (CN=rio-worker, not in allowlist)
+    /// compromised worker cert (CN=rio-builder, not in allowlist)
     /// does NOT bypass — it must present a valid token restricting
     /// it to the scheduler-assigned output paths.
     pub(super) fn verify_assignment_token<T>(
@@ -657,10 +657,10 @@ mod tests {
 
     #[test]
     fn cert_cn_parses_worker() {
-        let der = make_cert_with_cn("rio-worker");
-        // CN=rio-worker → returned as-is. verify_assignment_token
+        let der = make_cert_with_cn("rio-builder");
+        // CN=rio-builder → returned as-is. verify_assignment_token
         // will reject this in the None-token path (non-gateway CN with no token → PERMISSION_DENIED).
-        assert_eq!(cert_cn(&der), Some("rio-worker".into()));
+        assert_eq!(cert_cn(&der), Some("rio-builder".into()));
     }
 
     #[test]
@@ -710,10 +710,10 @@ mod tests {
     }
 
     /// SAN DNSName NOT in allowlist → no bypass. Worker-issued certs
-    /// (SAN=rio-worker) must still present a token.
+    /// (SAN=rio-builder) must still present a token.
     #[test]
     fn san_mismatch_does_not_bypass() {
-        let der = make_cert_with_san(&["rio-worker"], None);
+        let der = make_cert_with_san(&["rio-builder"], None);
         assert!(!cert_identity_in_allowlist(
             &der,
             &["rio-gateway".to_string()]

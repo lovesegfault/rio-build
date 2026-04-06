@@ -196,13 +196,13 @@ pub struct PoisonedDerivationRow {
     pub drv_path: String,
     pub pname: Option<String>,
     pub system: String,
-    pub failed_workers: Vec<String>,
+    pub failed_builders: Vec<String>,
     pub elapsed_secs: f64,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
 /// columns from `batch_upsert_derivations` plus live-state fields
-/// (retry_count, assigned_worker_id, failed_workers).
+/// (retry_count, assigned_builder_id, failed_builders).
 #[derive(Debug, sqlx::FromRow)]
 pub struct RecoveryDerivationRow {
     pub derivation_id: Uuid,
@@ -212,18 +212,18 @@ pub struct RecoveryDerivationRow {
     pub system: String,
     pub status: String,
     pub required_features: Vec<String>,
-    pub assigned_worker_id: Option<String>,
+    pub assigned_builder_id: Option<String>,
     pub retry_count: i32,
     pub expected_output_paths: Vec<String>,
     pub output_names: Vec<String>,
     pub is_fixed_output: bool,
     pub is_ca: bool,
-    pub failed_workers: Vec<String>,
+    pub failed_builders: Vec<String>,
 }
 
 /// Row from `load_build_graph` nodes query. Thin — ~200B.
 /// Mirrors proto `GraphNode` (NOT `DerivationNode`, which carries
-/// ≤64KB `drv_content`). `pname` and `assigned_worker_id` are COALESCE'd
+/// ≤64KB `drv_content`). `pname` and `assigned_builder_id` are COALESCE'd
 /// to empty-string SQL-side to match proto3's non-optional string fields.
 ///
 /// `derivation_id` is NOT in the proto — it's collected here so the edge
@@ -235,7 +235,7 @@ pub struct GraphNodeRow {
     pub pname: String,
     pub system: String,
     pub status: String,
-    pub assigned_worker_id: String,
+    pub assigned_builder_id: String,
 }
 
 /// Row from `load_build_graph` edges query. Mirrors proto `GraphEdge`.

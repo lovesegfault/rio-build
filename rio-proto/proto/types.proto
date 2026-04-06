@@ -5,8 +5,8 @@ package rio.types;
 // package. After P0376 domain split:
 //
 //   - dag.proto          — DerivationNode/Edge/Event*, GraphNode/Edge, GetBuildGraph*
-//   - build_types.proto  — BuildEvent*, SubmitBuild*, BuildResult*, Worker/Scheduler stream, Heartbeat*
-//   - admin_types.proto  — ClusterStatus*, ListWorkers*/Builds*/Tenants*, Drain/Poison/SizeClass*
+//   - build_types.proto  — BuildEvent*, SubmitBuild*, BuildResult*, Executor/Scheduler stream, Heartbeat*
+//   - admin_types.proto  — ClusterStatus*, ListExecutors*/Builds*/Tenants*, Drain/Poison/SizeClass*
 //   - types.proto (this) — ResourceUsage, BloomFilter, PathInfo, store/chunk/GC/realisation RPCs
 //
 // All four share `package rio.types;` → prost merges into one `rio.types.rs`.
@@ -27,15 +27,15 @@ enum BuildResultStatus {
   BUILD_RESULT_STATUS_DEPENDENCY_FAILED = 7;
   BUILD_RESULT_STATUS_LOG_LIMIT_EXCEEDED = 8;
   BUILD_RESULT_STATUS_OUTPUT_REJECTED = 9;
-  BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE = 10; // Worker infra issue (not build)
-  BUILD_RESULT_STATUS_CANCELLED = 11;      // Explicit cancel (CancelBuild RPC or DrainWorker force)
+  BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE = 10; // Executor infra issue (not build)
+  BUILD_RESULT_STATUS_CANCELLED = 11;      // Explicit cancel (CancelBuild RPC or DrainExecutor force)
   BUILD_RESULT_STATUS_TIMED_OUT = 12;      // Configured timeout exceeded; scheduler treats as permanent-no-reassign
   BUILD_RESULT_STATUS_NOT_DETERMINISTIC = 13; // nix-daemon --check / repeat-build mismatch (reproducibility triage)
   BUILD_RESULT_STATUS_INPUT_REJECTED = 14; // nix-daemon rejected .drv inputs (distinct from OutputRejected post-build hash mismatch)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Worker resource / bloom (shared: HeartbeatRequest + WorkerInfo)
+// Executor resource / bloom (shared: HeartbeatRequest + ExecutorInfo)
 // ───────────────────────────────────────────────────────────────────────────
 
 // Self-describing Bloom filter for store path membership testing.
@@ -55,7 +55,7 @@ enum BloomHashAlgorithm {
   reserved 1, 2;
   reserved "BLOOM_HASH_ALGORITHM_MURMUR3_128", "BLOOM_HASH_ALGORITHM_XXHASH64";
   // blake3 split into double-hash indices (Kirsch-Mitzenmacher). Chosen
-  // because it's PORTABLE — the bloom filter is a wire protocol (worker
+  // because it's PORTABLE — the bloom filter is a wire protocol (executor
   // builds it, scheduler queries it); AES-NI-based hashes like gxhash
   // produce different output on different architectures, which would
   // turn every query into a false negative on a heterogeneous cluster.
@@ -63,7 +63,7 @@ enum BloomHashAlgorithm {
   BLOOM_HASH_ALGORITHM_BLAKE3_256 = 3;
 }
 
-// Worker resource usage reported in heartbeats and progress updates.
+// Executor resource usage reported in heartbeats and progress updates.
 message ResourceUsage {
   double cpu_fraction = 1;                // CPU usage as fraction [0.0, 1.0]
   uint64 memory_used_bytes = 2;           // Current memory usage
@@ -99,8 +99,8 @@ message PathInfo {
 // The store rejects non-empty metadata hash as a protocol violation
 // (hash-upfront mode is not supported — trailer only).
 //
-// Both the gateway (chunk_nar_for_put) and worker (single-pass tee upload)
-// use this shape. The worker reads the file once, hashing + streaming
+// Both the gateway (chunk_nar_for_put) and builder (single-pass tee upload)
+// use this shape. The builder reads the file once, hashing + streaming
 // simultaneously (peak memory ~256KiB). The gateway has the NAR buffered
 // but still sends the hash in the trailer for uniformity.
 message PutPathRequest {
@@ -293,14 +293,14 @@ message GCRequest {
   optional uint32 grace_period_hours = 2;
   // Scheduler-populated: expected output paths for all non-terminal
   // derivations (live builds). Protects in-flight build outputs that
-  // may not be in narinfo yet (worker hasn't uploaded). The store's
+  // may not be in narinfo yet (builder hasn't uploaded). The store's
   // mark phase includes these as root seeds.
   repeated string extra_roots = 3;
   // Bypass the empty-refs safety gate. Use ONLY if you've verified
   // the empty-ref paths are genuinely ref-free (static binaries,
   // fetchurl outputs with missing CA field, etc.). The gate exists
   // to prevent catastrophic sweep on stores populated before the
-  // worker reference scanner shipped (pre-refscan data has ~100%
+  // builder reference scanner shipped (pre-refscan data has ~100%
   // empty refs → GC would collect everything past grace).
  bool force = 4;
 }
@@ -335,7 +335,7 @@ message TenantQuotaResponse {
 }
 
 // ResignPaths backfill job: re-scan NAR references + re-sign for paths
-// uploaded before the worker refscan fix (narinfo.refs_backfilled=FALSE,
+// uploaded before the builder refscan fix (narinfo.refs_backfilled=FALSE,
 // migration 010). Cursor-paginated; empty response cursor = complete.
 message ResignPathsRequest {
   string cursor = 1;     // Hex store_path_hash to resume after. Empty = start. Opaque — pass verbatim.

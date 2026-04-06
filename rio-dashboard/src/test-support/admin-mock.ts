@@ -3,7 +3,7 @@
 // PROBLEM: every page/component test that renders a management-action
 // child (DrainButton, ClearPoisonButton, the BuildDrawer's embedded
 // LogViewer) needs that child's RPC stubbed even if the test never
-// clicks it — otherwise `admin.drainWorker is not a function` at
+// clicks it — otherwise `admin.drainExecutor is not a function` at
 // render-time. Pre-P0389 every test file re-derived the same
 // vi.hoisted/vi.mock/fake-timer/flush dance; each new page test started
 // from a copy of DrainButton.test.ts.
@@ -43,11 +43,11 @@ import { type Mock, vi } from 'vitest';
 const emptyStream = async function* () {};
 export const adminMock = {
   clusterStatus: vi.fn(),
-  listWorkers: vi.fn(),
+  listExecutors: vi.fn(),
   listBuilds: vi.fn(),
   getBuildLogs: vi.fn(emptyStream) as Mock,
   triggerGC: vi.fn(emptyStream) as Mock,
-  drainWorker: vi.fn(),
+  drainExecutor: vi.fn(),
   clearPoison: vi.fn(),
   listPoisoned: vi.fn(),
   listTenants: vi.fn(),

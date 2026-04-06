@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dag::DerivationDag;
-use crate::state::{DerivationState, DrvHash, WorkerId, WorkerState};
+use crate::state::{DerivationState, DrvHash, ExecutorId, ExecutorState};
 
 /// One size-class in the operator's cutoff config.
 ///
@@ -172,9 +172,9 @@ const W_LOAD: f64 = 0.3;
 
 /// Hard filter: capacity, system/feature match, not-previously-failed,
 /// and size-class. The SAME predicate that both warm-pass and cold-
-/// fallback use in [`best_worker`] — extracted so the two passes
+/// fallback use in [`best_executor`] — extracted so the two passes
 /// can't drift.
-fn hard_filter(w: &WorkerState, drv: &DerivationState, target_class: Option<&str>) -> bool {
+fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&str>) -> bool {
     w.has_capacity()
         && w.can_build(&drv.system, &drv.required_features)
         // Exclude workers that previously failed this derivation.
@@ -184,7 +184,7 @@ fn hard_filter(w: &WorkerState, drv: &DerivationState, target_class: Option<&str
         // Without this, a transient fail would re-dispatch to the
         // SAME broken worker (2-worker cluster with one bad worker
         // → oscillate forever until poison threshold).
-        && !drv.failed_workers.contains(&w.worker_id)
+        && !drv.failed_builders.contains(&w.executor_id)
         // Size-class filter. If the scheduler is classifying
         // (target is Some), workers MUST declare a class. An
         // unclassified worker when the scheduler has size_classes
@@ -206,17 +206,17 @@ fn hard_filter(w: &WorkerState, drv: &DerivationState, target_class: Option<&str
 ///
 /// `target_class` is the size-class filter. `None` = size-classes not
 /// configured on this scheduler (optional feature).
-pub fn best_worker(
-    workers: &HashMap<WorkerId, WorkerState>,
+pub fn best_executor(
+    workers: &HashMap<ExecutorId, ExecutorState>,
     drv: &DerivationState,
     dag: &DerivationDag,
     target_class: Option<&str>,
-) -> Option<WorkerId> {
+) -> Option<ExecutorId> {
     // r[impl sched.assign.warm-gate]
     // --- Hard filter: warm-gate two-pass ---
     // First pass: warm workers only. This is the normal path once a
     // worker has ACKed its initial PrefetchHint (PrefetchComplete).
-    let warm_candidates: Vec<&WorkerState> = workers
+    let warm_candidates: Vec<&ExecutorState> = workers
         .values()
         .filter(|w| w.warm && hard_filter(w, drv, target_class))
         .collect();
@@ -226,10 +226,10 @@ pub fn best_worker(
     // can't deadlock. The gate is an optimization, not a correctness
     // constraint. Cold workers still go through the SAME hard_filter
     // (capacity/features/class) — we're only relaxing `warm`.
-    let candidates: Vec<&WorkerState> = if !warm_candidates.is_empty() {
+    let candidates: Vec<&ExecutorState> = if !warm_candidates.is_empty() {
         warm_candidates
     } else {
-        let cold: Vec<&WorkerState> = workers
+        let cold: Vec<&ExecutorState> = workers
             .values()
             .filter(|w| hard_filter(w, drv, target_class))
             .collect();
@@ -251,7 +251,7 @@ pub fn best_worker(
     // Short-circuit: one candidate → no scoring needed. Common in
     // small deployments or when only one worker has the right features.
     if candidates.len() == 1 {
-        return Some(candidates[0].worker_id.clone());
+        return Some(candidates[0].executor_id.clone());
     }
 
     // --- Closure approximation: children's expected output paths ---
@@ -301,7 +301,7 @@ pub fn best_worker(
         .min_by(|(_, a), (_, b)| a.partial_cmp(b).expect("scores are never NaN"))
         .expect("candidates non-empty (checked above)");
 
-    Some(candidates[best_idx].worker_id.clone())
+    Some(candidates[best_idx].executor_id.clone())
 }
 
 /// Count how many input paths the worker's bloom filter says are MISSING.
@@ -317,7 +317,7 @@ pub fn best_worker(
 /// but covers the bulk of what the worker's FUSE will actually fetch.
 ///
 /// Used by:
-/// - [`best_worker`] for bloom-locality scoring (workers with these
+/// - [`best_executor`] for bloom-locality scoring (workers with these
 ///   paths cached are preferred)
 /// - dispatch.rs for [`PrefetchHint`] (tell the chosen worker to
 ///   warm these before the build starts)
@@ -363,7 +363,7 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 }
 
 /// spend time fetching we didn't account for.
-fn count_missing(worker: &WorkerState, input_paths: &[String]) -> usize {
+fn count_missing(worker: &ExecutorState, input_paths: &[String]) -> usize {
     let Some(bloom) = &worker.bloom else {
         // No filter = everything missing. This is the pessimistic
         // assumption — a worker that doesn't report its cache gets
@@ -383,8 +383,8 @@ mod tests {
     use rio_common::bloom::BloomFilter;
     use rio_test_support::fixtures::{make_derivation_node, make_edge};
 
-    fn make_worker(id: &str, max: u32, running: u32) -> WorkerState {
-        let mut w = WorkerState::new(id.into());
+    fn make_worker(id: &str, max: u32, running: u32) -> ExecutorState {
+        let mut w = ExecutorState::new(id.into());
         w.systems = vec!["x86_64-linux".into()];
         w.max_builds = max;
         w.running_builds = (0..running).map(|i| format!("run-{i}").into()).collect();
@@ -401,21 +401,21 @@ mod tests {
         DerivationState::try_from_node(&make_derivation_node("test-drv", "x86_64-linux")).unwrap()
     }
 
-    fn workers_map(ws: Vec<WorkerState>) -> HashMap<WorkerId, WorkerState> {
-        ws.into_iter().map(|w| (w.worker_id.clone(), w)).collect()
+    fn workers_map(ws: Vec<ExecutorState>) -> HashMap<ExecutorId, ExecutorState> {
+        ws.into_iter().map(|w| (w.executor_id.clone(), w)).collect()
     }
 
     #[test]
     fn no_candidates_returns_none() {
         let workers = workers_map(vec![make_worker("full", 2, 2)]); // at capacity
         let dag = DerivationDag::new();
-        assert_eq!(best_worker(&workers, &make_drv(), &dag, None), None);
+        assert_eq!(best_executor(&workers, &make_drv(), &dag, None), None);
     }
 
     #[test]
     fn failed_worker_excluded() {
         // Two workers, both idle + capable. drv has worker-a in
-        // failed_workers → best_worker MUST pick worker-b. Without
+        // failed_builders → best_executor MUST pick worker-b. Without
         // the exclusion, a 2-worker cluster with one broken worker
         // would oscillate: fail → reassign to same worker → fail
         // → ... until poison threshold. With exclusion: second
@@ -426,30 +426,30 @@ mod tests {
         ]);
         let dag = DerivationDag::new();
         let mut drv = make_drv();
-        drv.failed_workers.insert("worker-a".into());
+        drv.failed_builders.insert("worker-a".into());
 
-        let chosen = best_worker(&workers, &drv, &dag, None);
+        let chosen = best_executor(&workers, &drv, &dag, None);
         assert_eq!(
             chosen,
             Some("worker-b".into()),
-            "worker-a excluded via failed_workers → worker-b is the only candidate"
+            "worker-a excluded via failed_builders → worker-b is the only candidate"
         );
 
         // ALL workers failed → None (caller defers). This is where
-        // poison detection kicks in (failed_workers.len() >= 3 →
+        // poison detection kicks in (failed_builders.len() >= 3 →
         // handle_transient_failure poisons).
-        drv.failed_workers.insert("worker-b".into());
+        drv.failed_builders.insert("worker-b".into());
         assert_eq!(
-            best_worker(&workers, &drv, &dag, None),
+            best_executor(&workers, &drv, &dag, None),
             None,
-            "all workers in failed_workers → nobody eligible"
+            "all workers in failed_builders → nobody eligible"
         );
     }
 
     /// When `worker_count < poison_threshold` and ALL workers have failed
-    /// this derivation, `best_worker` returns None (everyone fails the
-    /// `failed_workers` exclusion in `hard_filter`). This is CORRECT at
-    /// the assignment layer — `best_worker` has no business poisoning.
+    /// this derivation, `best_executor` returns None (everyone fails the
+    /// `failed_builders` exclusion in `hard_filter`). This is CORRECT at
+    /// the assignment layer — `best_executor` has no business poisoning.
     ///
     /// The starvation this used to cause (derivation stuck in Ready
     /// forever, never poisoned because `len=2 < threshold=3`, never
@@ -468,21 +468,21 @@ mod tests {
         let dag = DerivationDag::new();
         let mut drv = make_drv();
 
-        // Both workers failed. failed_workers.len() == 2 < 3 →
+        // Both workers failed. failed_builders.len() == 2 < 3 →
         // PoisonConfig::is_poisoned alone would NOT poison, but
         // handle_transient_failure's worker_count clamp now does.
-        drv.failed_workers.insert("worker-a".into());
-        drv.failed_workers.insert("worker-b".into());
+        drv.failed_builders.insert("worker-a".into());
+        drv.failed_builders.insert("worker-b".into());
 
-        // best_worker still returns None (both excluded via
-        // failed_workers) — correct. The caller
+        // best_executor still returns None (both excluded via
+        // failed_builders) — correct. The caller
         // (handle_transient_failure) poisons BEFORE this state is
         // reachable in the dispatch loop, so the None here is never
         // observed in production.
         assert_eq!(
-            best_worker(&workers, &drv, &dag, None),
+            best_executor(&workers, &drv, &dag, None),
             None,
-            "all workers in failed_workers → best_worker correctly returns \
+            "all workers in failed_builders → best_executor correctly returns \
              None; handle_transient_failure poisons upstream via \
              worker_count clamp so this Ready-but-undispatchable state \
              is never reached"
@@ -493,11 +493,11 @@ mod tests {
         // the 2nd failure lands — no poison, dispatch resumes).
         let mut workers3 = workers;
         let c = make_worker("worker-c", 4, 0);
-        workers3.insert(c.worker_id.clone(), c);
+        workers3.insert(c.executor_id.clone(), c);
         assert_eq!(
-            best_worker(&workers3, &drv, &dag, None),
+            best_executor(&workers3, &drv, &dag, None),
             Some("worker-c".into()),
-            "fresh worker not in failed_workers → dispatch resumes"
+            "fresh worker not in failed_builders → dispatch resumes"
         );
     }
 
@@ -505,7 +505,7 @@ mod tests {
     fn single_candidate_short_circuits() {
         let workers = workers_map(vec![make_worker("only", 4, 1)]);
         let dag = DerivationDag::new();
-        let result = best_worker(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(result.as_deref(), Some("only"));
     }
 
@@ -518,7 +518,7 @@ mod tests {
             make_worker("idle", 4, 0), // load = 0.0
         ]);
         let dag = DerivationDag::new();
-        let result = best_worker(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(result.as_deref(), Some("idle"));
     }
 
@@ -552,7 +552,7 @@ mod tests {
         .unwrap();
 
         let drv = DerivationState::try_from_node(&drv_proto).unwrap();
-        let result = best_worker(&workers, &drv, &dag, None);
+        let result = best_executor(&workers, &drv, &dag, None);
 
         // has-inputs: missing=0, load=0.25. score = 0*0.7 + 0.25*0.3 = 0.075
         // no-inputs: missing=2 (no bloom → all missing), normalized=1.0.
@@ -589,7 +589,7 @@ mod tests {
         .unwrap();
 
         let drv = DerivationState::try_from_node(&drv_proto).unwrap();
-        let result = best_worker(&workers, &drv, &dag, None);
+        let result = best_executor(&workers, &drv, &dag, None);
 
         // A: cost=0, load=0.5. score = 0*0.7 + 0.5*0.3 = 0.15
         // B: cost=1, load=0.0. score = 1*0.7 + 0.0*0.3 = 0.70
@@ -608,11 +608,11 @@ mod tests {
         let dag = DerivationDag::new();
 
         // Target=large → only large passes.
-        let result = best_worker(&workers, &make_drv(), &dag, Some("large"));
+        let result = best_executor(&workers, &make_drv(), &dag, Some("large"));
         assert_eq!(result.as_deref(), Some("large"));
 
         // Target=None → both pass (filter disabled).
-        let result = best_worker(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), &dag, None);
         assert!(result.is_some()); // either one
     }
 
@@ -628,14 +628,14 @@ mod tests {
         let workers = workers_map(vec![unclassified]);
         let dag = DerivationDag::new();
 
-        let result = best_worker(&workers, &make_drv(), &dag, Some("large"));
+        let result = best_executor(&workers, &make_drv(), &dag, Some("large"));
         assert_eq!(
             result, None,
             "unclassified worker must be rejected when scheduler is classifying"
         );
 
         // Sanity: same worker IS accepted when scheduler not classifying.
-        let result = best_worker(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(result.as_deref(), Some("misconfigured"));
     }
 
@@ -663,7 +663,7 @@ mod tests {
         // Warm-gate first-pass: only "warm" passes. Cold (better-
         // scored by load) is filtered out. "warm" is the ONLY
         // candidate → picked despite higher load.
-        let result = best_worker(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(
             result.as_deref(),
             Some("warm"),
@@ -694,7 +694,7 @@ mod tests {
         // With zero warm candidates, fallback uses cold workers with
         // the SAME hard_filter (capacity/features) then scores.
         // "b" has lower load (0.0 vs 0.25) → wins.
-        let result = best_worker(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(
             result.as_deref(),
             Some("b"),
@@ -724,7 +724,7 @@ mod tests {
         let workers = workers_map(vec![cold, warm]);
         let dag = DerivationDag::new();
 
-        let result = best_worker(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(
             result.as_deref(),
             Some("warm-ready"),

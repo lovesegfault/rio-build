@@ -8,7 +8,7 @@ metadata:
   name: rio-nix-conf
   namespace: {{ .Values.namespace.name }}
   labels:
-    {{- include "rio.labels" (dict "root" . "name" "rio-worker" "component" "worker") | nindent 4 }}
+    {{- include "rio.labels" (dict "root" . "name" "rio-builder" "component" "worker") | nindent 4 }}
 data:
   nix.conf: |
     # No remote builders. The worker IS the builder — it runs

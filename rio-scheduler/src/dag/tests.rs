@@ -802,7 +802,7 @@ fn test_interning_invariant_across_maps() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// BuildSummary: critpath_remaining + assigned_workers (P0270)
+// BuildSummary: critpath_remaining + assigned_executors (P0270)
 // ---------------------------------------------------------------------------
 
 /// Walk a node through Created→Queued→Ready→Assigned→Running. The state
@@ -813,10 +813,10 @@ fn advance_to_running(dag: &mut DerivationDag, hash: &str, worker: &str) {
     n.transition(DerivationStatus::Ready).unwrap();
     n.transition(DerivationStatus::Assigned).unwrap();
     n.transition(DerivationStatus::Running).unwrap();
-    n.assigned_worker = Some(worker.into());
+    n.assigned_executor = Some(worker.into());
 }
 
-/// Plan doc T3: 2 running + 1 queued → assigned_workers.len() == 2.
+/// Plan doc T3: 2 running + 1 queued → assigned_executors.len() == 2.
 /// Plus dedup: a third running drv on the SAME worker as the first
 /// must not inflate the count. BTreeSet collection guarantees both
 /// dedup and sorted order.
@@ -860,7 +860,7 @@ fn build_summary_assigned_workers_dedup() -> anyhow::Result<()> {
 
     // The main assert: 2 distinct workers, sorted.
     assert_eq!(
-        s.assigned_workers,
+        s.assigned_executors,
         vec!["worker-alpha", "worker-beta"],
         "dedup(3 running on 2 workers) = 2 workers, BTreeSet-sorted"
     );
@@ -910,8 +910,8 @@ fn build_summary_critpath_excludes_terminal() -> anyhow::Result<()> {
 
     // Terminal nodes also contribute no worker.
     assert!(
-        s.assigned_workers.is_empty(),
-        "completed node's assigned_worker is cleared by the real transition path, \
+        s.assigned_executors.is_empty(),
+        "completed node's assigned_executor is cleared by the real transition path, \
          but even if it weren't, Running|Assigned arm is the only collector"
     );
 
@@ -958,7 +958,7 @@ fn build_summary_no_running_empty_workers() -> anyhow::Result<()> {
         .transition(DerivationStatus::Queued)?;
 
     let s = dag.build_summary(build);
-    assert!(s.assigned_workers.is_empty());
+    assert!(s.assigned_executors.is_empty());
     assert_eq!(s.queued, 1);
     // critpath still reflects the queued node — it's non-terminal.
     // Default priority is 0.0 (we didn't set it), so critpath is 0.

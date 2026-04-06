@@ -86,8 +86,8 @@ fn put_path_request_empty_oneof_is_none() {
 
 #[test]
 fn worker_message_empty_oneof_is_none() {
-    use rio_proto::types::WorkerMessage;
-    let empty = WorkerMessage { msg: None };
+    use rio_proto::types::ExecutorMessage;
+    let empty = ExecutorMessage { msg: None };
     assert!(empty.msg.is_none());
 }
 

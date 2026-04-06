@@ -25,18 +25,18 @@ async fn test_stale_completion_dropped() -> TestResult {
     // Merge a single node. Connect worker A, dispatch to A.
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "stale-drv", PriorityClass::Scheduled).await?;
-    let mut rx_a = connect_worker(&handle, "stale-a", "x86_64-linux", 1).await?;
+    let mut rx_a = connect_executor(&handle, "stale-a", "x86_64-linux", 1).await?;
     let asgn = recv_assignment(&mut rx_a).await;
     assert!(asgn.drv_path.contains("stale-drv"));
 
     // Disconnect A → reassign. Connect B → dispatch to B.
     handle
-        .send_unchecked(ActorCommand::WorkerDisconnected {
-            worker_id: "stale-a".into(),
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "stale-a".into(),
         })
         .await?;
     drop(rx_a);
-    let mut rx_b = connect_worker(&handle, "stale-b", "x86_64-linux", 1).await?;
+    let mut rx_b = connect_executor(&handle, "stale-b", "x86_64-linux", 1).await?;
     let asgn_b = recv_assignment(&mut rx_b).await;
     assert!(asgn_b.drv_path.contains("stale-drv"));
 
@@ -45,7 +45,7 @@ async fn test_stale_completion_dropped() -> TestResult {
         .debug_query_derivation("stale-drv")
         .await?
         .expect("exists");
-    assert_eq!(pre.assigned_worker.as_deref(), Some("stale-b"));
+    assert_eq!(pre.assigned_executor.as_deref(), Some("stale-b"));
 
     // Send STALE completion from A (no longer owns the derivation).
     // Before the fix: this corrupts state (transitions based on A's
@@ -57,7 +57,7 @@ async fn test_stale_completion_dropped() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        post.assigned_worker.as_deref(),
+        post.assigned_executor.as_deref(),
         Some("stale-b"),
         "stale completion from A must not clobber B's assignment"
     );
@@ -95,7 +95,7 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
 
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "nobump-drv", PriorityClass::Scheduled).await?;
-    let mut rx = connect_worker(&handle, "nobump-w", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "nobump-w", "x86_64-linux", 1).await?;
     let _asgn = recv_assignment(&mut rx).await;
 
     // Precondition: Assigned, never Running.
@@ -109,8 +109,8 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
     // Disconnect → reassign_derivations. Before the fix:
     // retry_count++. After: no bump (was never Running).
     handle
-        .send_unchecked(ActorCommand::WorkerDisconnected {
-            worker_id: "nobump-w".into(),
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "nobump-w".into(),
         })
         .await?;
     barrier(&handle).await;
@@ -127,23 +127,23 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
 }
 
 // r[verify sched.retry.per-worker-budget]
-/// Starvation guard intersects failed_workers with LIVE workers. A
+/// Starvation guard intersects failed_builders with LIVE workers. A
 /// stale failed-worker entry (worker disconnected after recording)
 /// must not count toward the all-workers-failed check.
 ///
-/// Scenario: A fails transiently → failed_workers={A}. A disconnects.
+/// Scenario: A fails transiently → failed_builders={A}. A disconnects.
 /// B connects. Force-assign to B → B fails transiently. Old len
-/// check: failed_workers={A,B}.len()==2 >= live_count==1 → no,
+/// check: failed_builders={A,B}.len()==2 >= live_count==1 → no,
 /// that poisons anyway. Actually the distinguishing case:
-/// failed_workers={A (dead)}, live={B}. Force-assign B, B fails.
-/// failed_workers={A,B}, live={B}. Both checks poison (correct).
+/// failed_builders={A (dead)}, live={B}. Force-assign B, B fails.
+/// failed_builders={A,B}, live={B}. Both checks poison (correct).
 ///
-/// The REAL distinguishing case: failed_workers={A}, A disconnects,
+/// The REAL distinguishing case: failed_builders={A}, A disconnects,
 /// B connects alone. Force-assign B (bypass backoff), B fails.
-/// During B's failure handler: live={B}, failed_workers={A,B} after
+/// During B's failure handler: live={B}, failed_builders={A,B} after
 /// record. Both approaches poison. Still not distinguishing.
 ///
-/// Actual bug scenario: failed_workers has 2 dead workers, 1 live
+/// Actual bug scenario: failed_builders has 2 dead workers, 1 live
 /// worker connected. Old: len==2>=1 poisons on ANY failure. New:
 /// only if the live worker fails. Test: A,B fail (both still
 /// connected, 3rd worker C present → no poison). A,B disconnect.
@@ -153,11 +153,11 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
 /// Wait: the check fires DURING handle_transient_failure, BEFORE
 /// record_failure adds the reporting worker. No — re-reading
 /// completion.rs: record_failure_and_check_poison runs FIRST, THEN
-/// the starvation check reads failed_workers (which already includes
+/// the starvation check reads failed_builders (which already includes
 /// the reporting worker). So after C fails: failed={A,B,C}, live={C}.
 /// Old: 3>=1→poison. New: C∈{A,B,C}→poison. Same.
 ///
-/// Actual distinguishing case: failed_workers contains MORE entries
+/// Actual distinguishing case: failed_builders contains MORE entries
 /// than live workers (e.g. failed={A,B}, live={C}), C has NOT
 /// failed. Old check would trigger on the NEXT failure report which
 /// necessarily adds the live worker. The intersection check also
@@ -179,9 +179,9 @@ async fn test_starvation_intersects_live() -> TestResult {
     // B fails. failed={A,B}, len=2<3. Live={B,C}.
     // Old starvation check: len==2 >= live_count==2 → POISON.
     // New intersection check: C∉{A,B} → NOT all live failed → no poison.
-    let mut rx_a = connect_worker(&handle, "starv-a", "x86_64-linux", 1).await?;
-    let _rx_b = connect_worker(&handle, "starv-b", "x86_64-linux", 1).await?;
-    let _rx_c = connect_worker(&handle, "starv-c", "x86_64-linux", 1).await?;
+    let mut rx_a = connect_executor(&handle, "starv-a", "x86_64-linux", 1).await?;
+    let _rx_b = connect_executor(&handle, "starv-b", "x86_64-linux", 1).await?;
+    let _rx_c = connect_executor(&handle, "starv-c", "x86_64-linux", 1).await?;
     let _asgn = recv_assignment(&mut rx_a).await;
 
     let ok = handle.debug_force_assign("starv-drv", "starv-a").await?;
@@ -197,8 +197,8 @@ async fn test_starvation_intersects_live() -> TestResult {
     barrier(&handle).await;
 
     handle
-        .send_unchecked(ActorCommand::WorkerDisconnected {
-            worker_id: "starv-a".into(),
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "starv-a".into(),
         })
         .await?;
     barrier(&handle).await;
@@ -221,15 +221,15 @@ async fn test_starvation_intersects_live() -> TestResult {
     assert_ne!(
         info.status,
         DerivationStatus::Poisoned,
-        "dead A in failed_workers must not count toward starvation; \
+        "dead A in failed_builders must not count toward starvation; \
          live={{B,C}}, failed={{A,B}}, C∉failed → no poison. Got {:?}",
         info.status
     );
     assert_eq!(
-        info.failed_workers.len(),
+        info.failed_builders.len(),
         2,
-        "failed_workers={{A,B}}; got {:?}",
-        info.failed_workers
+        "failed_builders={{A,B}}; got {:?}",
+        info.failed_builders
     );
 
     Ok(())

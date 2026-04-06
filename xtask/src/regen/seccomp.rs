@@ -23,7 +23,7 @@ const DENIED: &[&str] = &[
 ];
 
 pub async fn run(tag: &str) -> Result<()> {
-    let ours = repo_root().join("infra/helm/rio-build/files/seccomp-rio-worker.json");
+    let ours = repo_root().join("infra/helm/rio-build/files/seccomp-rio-builder.json");
     let url =
         format!("https://raw.githubusercontent.com/moby/moby/{tag}/profiles/seccomp/default.json");
 

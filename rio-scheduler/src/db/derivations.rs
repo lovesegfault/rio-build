@@ -1,7 +1,7 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
 use super::{PoisonedDerivationRow, SchedulerDb};
-use crate::state::{DerivationStatus, DrvHash, WorkerId};
+use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 impl SchedulerDb {
     /// Update a derivation's status.
@@ -9,7 +9,7 @@ impl SchedulerDb {
         &self,
         drv_hash: &DrvHash,
         status: DerivationStatus,
-        assigned_worker: Option<&WorkerId>,
+        assigned_executor: Option<&ExecutorId>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             r#"
@@ -19,7 +19,7 @@ impl SchedulerDb {
             "#,
             drv_hash.as_str(),
             status.as_str(),
-            assigned_worker.map(WorkerId::as_str),
+            assigned_executor.map(ExecutorId::as_str),
         )
         .execute(&self.pool)
         .await?;
@@ -36,7 +36,7 @@ impl SchedulerDb {
     /// blocked heartbeats/dispatch for ~1000 RTTs. `ANY($1::text[])`
     /// collapses that to one round-trip.
     ///
-    /// `assigned_worker_id` is NULLed: all current batch callers are
+    /// `assigned_builder_id` is NULLed: all current batch callers are
     /// terminal transitions (Cancelled) where the assignment is over.
     /// If a future caller needs per-row worker IDs, add a UNNEST
     /// variant — don't make this one variadic.
@@ -76,13 +76,13 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Append a worker ID to a derivation's `failed_workers` array.
+    /// Append a worker ID to a derivation's `failed_builders` array.
     ///
     /// Called from `handle_transient_failure` and `reassign_derivations`
     /// (worker disconnect mid-build) so recovery can rebuild the
-    /// HashSet that feeds best_worker exclusion + poison detection.
+    /// HashSet that feeds best_executor exclusion + poison detection.
     ///
-    /// The `WHERE NOT ($2 = ANY(failed_workers))` guard makes this a
+    /// The `WHERE NOT ($2 = ANY(failed_builders))` guard makes this a
     /// no-op when the worker is already recorded. PG arrays are NOT
     /// sets — without the guard, a flapping worker (disconnect →
     /// reconnect → disconnect) would append duplicates unboundedly.
@@ -92,14 +92,14 @@ impl SchedulerDb {
     pub async fn append_failed_worker(
         &self,
         drv_hash: &DrvHash,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations \
              SET failed_builders = array_append(failed_builders, $2), updated_at = now() \
              WHERE drv_hash = $1 AND NOT ($2 = ANY(failed_builders))",
             drv_hash.as_str(),
-            worker_id.as_str(),
+            executor_id.as_str(),
         )
         .execute(&self.pool)
         .await?;
@@ -115,7 +115,7 @@ impl SchedulerDb {
     /// `load_poisoned_derivations` (filtered by `poisoned_at IS NOT NULL`)
     /// — poison TTL tracking silently broken for those rows.
     ///
-    /// `assigned_worker_id` is NULLed: a poisoned derivation has no
+    /// `assigned_builder_id` is NULLed: a poisoned derivation has no
     /// assignment. Matches the in-mem semantics the caller should enforce.
     pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
@@ -130,7 +130,7 @@ impl SchedulerDb {
         .map(|_| ())
     }
 
-    /// Clear poison state: NULL `poisoned_at`, empty `failed_workers`,
+    /// Clear poison state: NULL `poisoned_at`, empty `failed_builders`,
     /// zero `retry_count`, status='created'. Used by ClearPoison admin
     /// RPC + TTL expiry in `handle_tick`.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
@@ -159,7 +159,7 @@ impl SchedulerDb {
     /// can never be in this state.
     ///
     /// Returns minimal fields — poisoned rows aren't dispatched, just
-    /// TTL-tracked. The `failed_workers` count matters for display;
+    /// TTL-tracked. The `failed_builders` count matters for display;
     /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
     /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
     pub async fn load_poisoned_derivations(
@@ -168,7 +168,7 @@ impl SchedulerDb {
         sqlx::query_as(
             r#"
             SELECT derivation_id, drv_hash, drv_path, pname, system,
-                   failed_builders AS failed_workers,
+                   failed_builders,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
                        0.0

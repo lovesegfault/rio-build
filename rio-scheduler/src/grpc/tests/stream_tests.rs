@@ -7,7 +7,9 @@
 //! completion, empty stream).
 
 use super::*;
-use rio_proto::{SchedulerServiceServer, WorkerService, WorkerServiceClient, WorkerServiceServer};
+use rio_proto::{
+    ExecutorService, ExecutorServiceClient, ExecutorServiceServer, SchedulerServiceServer,
+};
 use rio_test_support::fixtures::test_drv_path;
 use std::time::Duration;
 use tokio_stream::StreamExt;
@@ -15,8 +17,8 @@ use tokio_stream::StreamExt;
 // r[verify proto.stream.bidi]
 /// End-to-end BuildExecution bidirectional stream.
 ///
-/// Spins up an in-process WorkerServiceServer backed by a real actor,
-/// connects a mock worker via gRPC, sends WorkerRegister + Heartbeat,
+/// Spins up an in-process ExecutorServiceServer backed by a real actor,
+/// connects a mock worker via gRPC, sends ExecutorRegister + Heartbeat,
 /// submits a build via SchedulerService, receives WorkAssignment on the
 /// stream, sends CompletionReport, verifies build completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -24,26 +26,26 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _actor_task) = setup_actor(db.pool.clone());
 
-    // Spin up in-process gRPC server (SchedulerService + WorkerService).
+    // Spin up in-process gRPC server (SchedulerService + ExecutorService).
     let grpc = SchedulerGrpc::new_for_tests(handle.clone());
     let router = tonic::transport::Server::builder()
         .add_service(SchedulerServiceServer::new(grpc.clone()))
-        .add_service(WorkerServiceServer::new(grpc));
+        .add_service(ExecutorServiceServer::new(grpc));
     let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;
-    let mut worker_client = WorkerServiceClient::new(channel.clone());
+    let mut worker_client = ExecutorServiceClient::new(channel.clone());
     let mut sched_client = rio_proto::SchedulerServiceClient::new(channel);
 
-    // Open BuildExecution stream. First message MUST be WorkerRegister.
-    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(32);
+    // Open BuildExecution stream. First message MUST be ExecutorRegister.
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Register(
-                rio_proto::types::WorkerRegister {
-                    worker_id: "e2e-worker".into(),
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "e2e-worker".into(),
                 },
             )),
         })
@@ -59,7 +61,8 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
     // Send Heartbeat to fully register (stream + heartbeat).
     worker_client
         .heartbeat(rio_proto::types::HeartbeatRequest {
-            worker_id: "e2e-worker".into(),
+            executor_id: "e2e-worker".into(),
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 1,
@@ -103,8 +106,8 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
 
     // Send CompletionReport back on the stream.
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Completion(
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Completion(
                 rio_proto::types::CompletionReport {
                     drv_path: work.drv_path.clone(),
                     result: Some(rio_proto::build_types::BuildResult {
@@ -182,22 +185,22 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
 
     let router = tonic::transport::Server::builder()
         .add_service(SchedulerServiceServer::new(grpc.clone()))
-        .add_service(WorkerServiceServer::new(grpc));
+        .add_service(ExecutorServiceServer::new(grpc));
     let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;
-    let mut worker_client = WorkerServiceClient::new(channel.clone());
+    let mut worker_client = ExecutorServiceClient::new(channel.clone());
     let mut sched_client = rio_proto::SchedulerServiceClient::new(channel);
 
-    // Open BuildExecution stream with WorkerRegister.
-    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(32);
+    // Open BuildExecution stream with ExecutorRegister.
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(32);
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Register(
-                rio_proto::types::WorkerRegister {
-                    worker_id: "log-e2e-worker".into(),
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "log-e2e-worker".into(),
                 },
             )),
         })
@@ -208,7 +211,8 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     // Heartbeat to fully register.
     worker_client
         .heartbeat(rio_proto::types::HeartbeatRequest {
-            worker_id: "log-e2e-worker".into(),
+            executor_id: "log-e2e-worker".into(),
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
             max_builds: 1,
             ..Default::default()
@@ -241,11 +245,11 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
         derivation_path: work.drv_path.clone(),
         lines: vec![b"wire-line-0".to_vec(), b"wire-line-1".to_vec()],
         first_line_number: 0,
-        worker_id: "log-e2e-worker".into(),
+        executor_id: "log-e2e-worker".into(),
     };
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::LogBatch(log_batch)),
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::LogBatch(log_batch)),
         })
         .await?;
 
@@ -297,7 +301,8 @@ async fn test_heartbeat_rejects_too_many_running_builds() {
     let too_many: Vec<String> = (0..1001).map(|i| format!("/nix/store/{i}.drv")).collect();
 
     let req = Request::new(rio_proto::types::HeartbeatRequest {
-        worker_id: "test-worker".into(),
+        executor_id: "test-worker".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
         systems: vec!["x86_64-linux".into()],
         supported_features: vec![],
         max_builds: 1,
@@ -325,12 +330,12 @@ async fn test_heartbeat_rejects_too_many_running_builds() {
 // BuildExecution stream: malformed-message handling
 // ===========================================================================
 
-/// Helper: set up an in-process WorkerService server backed by a
+/// Helper: set up an in-process ExecutorService server backed by a
 /// live actor. Returns (actor_handle, worker_client, _server, _db).
 /// The server task + actor task are held alive via returned guards.
 async fn setup_worker_svc() -> anyhow::Result<(
     ActorHandle,
-    WorkerServiceClient<tonic::transport::Channel>,
+    ExecutorServiceClient<tonic::transport::Channel>,
     tokio::task::JoinHandle<()>, // server guard
     tokio::task::JoinHandle<()>, // actor guard
     TestDb,
@@ -339,7 +344,7 @@ async fn setup_worker_svc() -> anyhow::Result<(
     let (handle, actor_task) = setup_actor(db.pool.clone());
 
     let grpc = SchedulerGrpc::new_for_tests(handle.clone());
-    let router = tonic::transport::Server::builder().add_service(WorkerServiceServer::new(grpc));
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
@@ -347,16 +352,16 @@ async fn setup_worker_svc() -> anyhow::Result<(
         .await?;
     Ok((
         handle,
-        WorkerServiceClient::new(channel),
+        ExecutorServiceClient::new(channel),
         server,
         actor_task,
         db,
     ))
 }
 
-/// Duplicate WorkerRegister on an established stream → warn + ignore,
+/// Duplicate ExecutorRegister on an established stream → warn + ignore,
 /// stream stays open. A buggy/retrying worker that re-sends Register
-/// after stream open shouldn't be kicked — the worker_id is already
+/// after stream open shouldn't be kicked — the executor_id is already
 /// bound, a re-Register is a no-op. Kicking would cause a disconnect
 /// + reassign cascade for no good reason.
 ///
@@ -365,18 +370,18 @@ async fn setup_worker_svc() -> anyhow::Result<(
 /// traced_test's subscriber is thread-local to the test thread. We
 /// assert on observable state instead: if the duplicate Register
 /// were NOT ignored, the recv loop would break → stream close →
-/// WorkerDisconnected → worker removed from actor.workers.
+/// ExecutorDisconnected → worker removed from actor.executors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()> {
     let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
 
-    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(8);
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(8);
     // First Register (opens stream).
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Register(
-                rio_proto::types::WorkerRegister {
-                    worker_id: "dup-worker".into(),
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "dup-worker".into(),
                 },
             )),
         })
@@ -389,10 +394,10 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
     // + ignored. We can't check the log (thread-local subscriber) so
     // we assert the post-condition: stream stays open.
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Register(
-                rio_proto::types::WorkerRegister {
-                    worker_id: "dup-worker".into(),
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "dup-worker".into(),
                 },
             )),
         })
@@ -403,10 +408,10 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
 
     // Stream should still be open: worker is still in the actor's
     // workers map. If the duplicate Register caused a break/error,
-    // WorkerDisconnected would have fired and removed the entry.
+    // ExecutorDisconnected would have fired and removed the entry.
     let workers = handle.debug_query_workers().await?;
     assert!(
-        workers.iter().any(|w| w.worker_id == "dup-worker"),
+        workers.iter().any(|w| w.executor_id == "dup-worker"),
         "worker should still be connected after duplicate Register \
          (stream stayed open, no spurious disconnect)"
     );
@@ -434,12 +439,12 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
     let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
 
     // Open stream + Register.
-    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(8);
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(8);
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Register(
-                rio_proto::types::WorkerRegister {
-                    worker_id: "none-worker".into(),
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "none-worker".into(),
                 },
             )),
         })
@@ -450,7 +455,8 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
     // Heartbeat to fully register so dispatch works.
     worker_client
         .heartbeat(rio_proto::types::HeartbeatRequest {
-            worker_id: "none-worker".into(),
+            executor_id: "none-worker".into(),
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
             systems: vec!["x86_64-linux".into()],
             max_builds: 1,
             ..Default::default()
@@ -479,8 +485,8 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
 
     // Send CompletionReport with result: None.
     stream_tx
-        .send(rio_proto::types::WorkerMessage {
-            msg: Some(rio_proto::types::worker_message::Msg::Completion(
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Completion(
                 rio_proto::types::CompletionReport {
                     drv_path: work.drv_path.clone(),
                     result: None, // malformed!
@@ -499,7 +505,7 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
     // silently dropped, the drv would stay stuck Assigned from the
     // first dispatch and no second assignment would ever come.
     //
-    // InfrastructureFailure does NOT insert into failed_workers and
+    // InfrastructureFailure does NOT insert into failed_builders and
     // does NOT set backoff — so the same worker is immediately
     // re-eligible and re-dispatch is synchronous in the actor.
     let reassignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
@@ -522,7 +528,7 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
     );
 
     // Barrier + verify the infra handler ran (not the transient
-    // handler). failed_workers empty = handle_infrastructure_failure;
+    // handler). failed_builders empty = handle_infrastructure_failure;
     // if it had "none-worker" = wrong match arm (regression).
     crate::actor::tests::barrier(&handle).await;
     let info = handle
@@ -530,10 +536,10 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
         .await?
         .expect("drv exists");
     assert!(
-        info.failed_workers.is_empty(),
+        info.failed_builders.is_empty(),
         "synthesized InfrastructureFailure must route to handle_infrastructure_failure \
-         (NOT handle_transient_failure), got failed_workers={:?}",
-        info.failed_workers
+         (NOT handle_transient_failure), got failed_builders={:?}",
+        info.failed_builders
     );
     assert_eq!(
         info.retry_count, 0,
@@ -551,7 +557,7 @@ async fn test_build_execution_empty_stream_rejected() -> anyhow::Result<()> {
     let (_handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
 
     // Open stream, immediately close (no Register sent).
-    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(1);
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(1);
     drop(stream_tx); // close before sending anything
 
     let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);

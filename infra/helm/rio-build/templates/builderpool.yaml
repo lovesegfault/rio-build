@@ -1,0 +1,59 @@
+{{- if .Values.builderPool.enabled }}
+{{- $bp := .Values.builderPool -}}
+---
+apiVersion: rio.build/v1alpha1
+kind: BuilderPool
+metadata:
+  name: {{ $bp.name }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+    rio.build/role: builder
+spec:
+  replicas:
+    min: {{ $bp.replicas.min }}
+    max: {{ $bp.replicas.max }}
+  autoscaling:
+    metric: {{ $bp.autoscaling.metric }}
+    targetValue: {{ $bp.autoscaling.targetValue }}
+  maxConcurrentBuilds: {{ $bp.maxConcurrentBuilds }}
+  fuseCacheSize: {{ $bp.fuseCacheSize }}
+  systems:
+    {{- toYaml $bp.systems | nindent 4 }}
+  features:
+    {{- toYaml $bp.features | nindent 4 }}
+  sizeClass: {{ $bp.sizeClass | quote }}
+  # fodProxyUrl removed per ADR-019: builders are airgapped; FODs
+  # route to FetcherPool which has direct egress. Squid is gone.
+  image: {{ include "rio.image" (list . $bp.image) }}
+  {{- if .Values.tls.enabled }}
+  tlsSecretName: rio-builder-tls
+  {{- end }}
+  # Phase 4b placeholder — phase 4c BuilderPoolSet replaces this with
+  # per-size-class requests derived from build_history. Without it,
+  # Karpenter doesn't know what to provision (zero-request pods
+  # schedule anywhere, including nodes too small).
+  resources:
+    {{- toYaml $bp.resources | nindent 4 }}
+  privileged: {{ $bp.privileged }}
+  {{- if hasKey $bp "hostUsers" }}
+  # Explicit override — see BuilderPoolSpec.host_users doc. hasKey (not
+  # `with`) so `hostUsers: false` renders (with skips falsy values).
+  hostUsers: {{ $bp.hostUsers }}
+  {{- end }}
+  {{- with $bp.seccompProfile }}
+  seccompProfile:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $bp.terminationGracePeriodSeconds }}
+  terminationGracePeriodSeconds: {{ . }}
+  {{- end }}
+  {{- with $bp.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $bp.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

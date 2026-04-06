@@ -51,7 +51,7 @@ let
   # inbound gRPC). cert-manager.yaml uses a wildcard for belt-and-
   # suspenders; the SAN isn't actually verified on the client side
   # (scheduler only checks CA-signed).
-  workerSans = "DNS:rio-worker,DNS:*.${ns}.svc.cluster.local";
+  workerSans = "DNS:rio-builder,DNS:*.${ns}.svc.cluster.local";
 
   # RSA (not ECDSA): pki.nix uses RSA + PKCS#1, rustls accepts both.
   # cert-manager uses ECDSA+PKCS8 but RSA is simpler with openssl
@@ -85,18 +85,18 @@ let
         '') components}
 
         # ── Worker cert ─────────────────────────────────────────────
-        mkdir -p $out/rio-worker
+        mkdir -p $out/rio-builder
         openssl req -newkey rsa:2048 -nodes \
-          -keyout $out/rio-worker/tls.key -out /tmp/worker.csr \
-          -subj "/CN=rio-worker"
+          -keyout $out/rio-builder/tls.key -out /tmp/worker.csr \
+          -subj "/CN=rio-builder"
         openssl x509 -req -in /tmp/worker.csr \
           -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-          -out $out/rio-worker/tls.crt -days 3650 \
+          -out $out/rio-builder/tls.crt -days 3650 \
           -extfile <(printf 'subjectAltName=${workerSans}')
-        cp $out/ca.crt $out/rio-worker/ca.crt
+        cp $out/ca.crt $out/rio-builder/ca.crt
       '';
 
-  secretNames = map (c: "rio-${c}") components ++ [ "rio-worker" ];
+  secretNames = map (c: "rio-${c}") components ++ [ "rio-builder" ];
 in
 {
   inherit pki;

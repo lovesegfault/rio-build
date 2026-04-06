@@ -4,7 +4,7 @@
 # Controller tolerates 30s restart gap. Store outage → PutPath/GetPath fail,
 # scheduler's circuit-breaker handles gracefully, workers retry.
 #
-# Workers don't get a PDB here either — WorkerPool reconciler creates
+# Workers don't get a PDB here either — BuilderPool reconciler creates
 # per-pool PDBs (maxUnavailable=1) with ownerRef → GC on delete.
 # See build_pdb in builders.rs.
 

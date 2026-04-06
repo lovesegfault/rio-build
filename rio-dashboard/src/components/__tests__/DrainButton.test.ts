@@ -2,7 +2,7 @@
 // the RPC resolves, keeps it on success, and reverts on error. These
 // assertions pin down that the Svelte 5 $bindable() roundtrip actually
 // mutates the parent-owned array (the rune proxy is deep, so an in-place
-// `workers[idx].status = ...` is reactive without reassigning the array).
+// `executors[idx].status = ...` is reactive without reassigning the array).
 import { render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -23,25 +23,25 @@ import DrainHarness, {
   setSeed,
 } from './DrainHarness.svelte';
 
-const { drainWorker } = adminMock;
+const { drainExecutor } = adminMock;
 
 describe('DrainButton', () => {
   beforeEach(() => setupStandardBeforeEach());
   afterEach(teardownStandardAfterEach);
 
-  function workers() {
+  function executors() {
     return [
-      { workerId: 'w-1', status: 'alive' },
-      { workerId: 'w-2', status: 'alive' },
+      { executorId: 'w-1', status: 'alive' },
+      { executorId: 'w-2', status: 'alive' },
     ];
   }
 
   it('optimistically flips to draining before the RPC resolves', async () => {
     let resolve!: (v: unknown) => void;
-    drainWorker.mockReturnValue(new Promise((r) => (resolve = r)));
+    drainExecutor.mockReturnValue(new Promise((r) => (resolve = r)));
 
-    setSeed(workers());
-    render(DrainHarness, { props: { workerId: 'w-1' } });
+    setSeed(executors());
+    render(DrainHarness, { props: { executorId: 'w-1' } });
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('alive');
 
     screen.getByTestId('drain-btn').click();
@@ -49,8 +49,8 @@ describe('DrainButton', () => {
 
     // Optimistic: status flipped BEFORE the promise resolved.
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('draining');
-    expect(drainWorker).toHaveBeenCalledWith({
-      workerId: 'w-1',
+    expect(drainExecutor).toHaveBeenCalledWith({
+      executorId: 'w-1',
       force: false,
     });
 
@@ -64,10 +64,10 @@ describe('DrainButton', () => {
 
   it('reverts on error', async () => {
     let reject!: (e: unknown) => void;
-    drainWorker.mockReturnValue(new Promise((_, r) => (reject = r)));
+    drainExecutor.mockReturnValue(new Promise((_, r) => (reject = r)));
 
-    setSeed(workers());
-    render(DrainHarness, { props: { workerId: 'w-1' } });
+    setSeed(executors());
+    render(DrainHarness, { props: { executorId: 'w-1' } });
     screen.getByTestId('drain-btn').click();
     await tick();
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('draining');
@@ -79,36 +79,36 @@ describe('DrainButton', () => {
 
   it('does nothing when confirm() declines', async () => {
     vi.stubGlobal('confirm', vi.fn(() => false));
-    drainWorker.mockResolvedValue({ accepted: true, runningBuilds: 0 });
+    drainExecutor.mockResolvedValue({ accepted: true, runningBuilds: 0 });
 
-    setSeed(workers());
-    render(DrainHarness, { props: { workerId: 'w-1' } });
+    setSeed(executors());
+    render(DrainHarness, { props: { executorId: 'w-1' } });
     screen.getByTestId('drain-btn').click();
     await tick();
 
-    expect(drainWorker).not.toHaveBeenCalled();
+    expect(drainExecutor).not.toHaveBeenCalled();
     expect(screen.getByTestId('status-w-1')).toHaveTextContent('alive');
   });
 
-  it('disables for non-alive workers', () => {
-    setSeed([{ workerId: 'w-1', status: 'draining' }]);
-    render(DrainHarness, { props: { workerId: 'w-1' } });
+  it('disables for non-alive executors', () => {
+    setSeed([{ executorId: 'w-1', status: 'draining' }]);
+    render(DrainHarness, { props: { executorId: 'w-1' } });
     expect(screen.getByTestId('drain-btn')).toBeDisabled();
   });
 
-  it('revert-on-error keys on workerId, not pre-await index', async () => {
-    // 3 workers, target is at index 1. A 5s refresh tick lands mid-RPC
+  it('revert-on-error keys on executorId, not pre-await index', async () => {
+    // 3 executors, target is at index 1. A 5s refresh tick lands mid-RPC
     // and removes w-a → target shifts to index 0. The pre-P0377 code
     // would revert stale idx=1 (w-c), not the target.
     let reject!: (e: unknown) => void;
-    drainWorker.mockReturnValue(new Promise((_, r) => (reject = r)));
+    drainExecutor.mockReturnValue(new Promise((_, r) => (reject = r)));
 
     setSeed([
-      { workerId: 'w-a', status: 'alive' },
-      { workerId: 'w-target', status: 'alive' },
-      { workerId: 'w-c', status: 'alive' },
+      { executorId: 'w-a', status: 'alive' },
+      { executorId: 'w-target', status: 'alive' },
+      { executorId: 'w-c', status: 'alive' },
     ]);
-    render(DrainHarness, { props: { workerId: 'w-target' } });
+    render(DrainHarness, { props: { executorId: 'w-target' } });
     screen.getByTestId('drain-btn').click();
     await tick();
     // Optimistic set landed on the correct row (sync path, no race yet).
@@ -116,11 +116,11 @@ describe('DrainButton', () => {
       'draining',
     );
 
-    // Simulate the parent's refresh() reassigning workers: w-a dropped,
+    // Simulate the parent's refresh() reassigning executors: w-a dropped,
     // positions shift. w-target now at idx=0; stale idx=1 would hit w-c.
     reassign([
-      { workerId: 'w-target', status: 'draining' },
-      { workerId: 'w-c', status: 'alive' },
+      { executorId: 'w-target', status: 'draining' },
+      { executorId: 'w-c', status: 'alive' },
     ]);
 
     reject(new Error('scheduler 503'));
@@ -128,26 +128,26 @@ describe('DrainButton', () => {
 
     // Revert lands on w-target (idx=0 NOW), not w-c (stale idx=1).
     const ws = getWorkers();
-    expect(ws[0].workerId).toBe('w-target');
+    expect(ws[0].executorId).toBe('w-target');
     expect(ws[0].status).toBe('alive'); // reverted
-    expect(ws[1].workerId).toBe('w-c');
+    expect(ws[1].executorId).toBe('w-c');
     expect(ws[1].status).toBe('alive'); // untouched
     // DOM view agrees with the proxy state.
     expect(screen.getByTestId('status-w-target')).toHaveTextContent('alive');
     expect(screen.getByTestId('status-w-c')).toHaveTextContent('alive');
   });
 
-  it('revert is a no-op when worker removed mid-await', async () => {
+  it('revert is a no-op when executor removed mid-await', async () => {
     let reject!: (e: unknown) => void;
-    drainWorker.mockReturnValue(new Promise((_, r) => (reject = r)));
+    drainExecutor.mockReturnValue(new Promise((_, r) => (reject = r)));
 
-    setSeed([{ workerId: 'w-gone', status: 'alive' }]);
-    render(DrainHarness, { props: { workerId: 'w-gone' } });
+    setSeed([{ executorId: 'w-gone', status: 'alive' }]);
+    render(DrainHarness, { props: { executorId: 'w-gone' } });
     screen.getByTestId('drain-btn').click();
     await tick();
 
     // Scheduler swept w-gone between click and error. Pre-P0377 code
-    // would hit `workers[0].status = ...` on undefined → TypeError.
+    // would hit `executors[0].status = ...` on undefined → TypeError.
     reassign([]);
     reject(new Error('already dead'));
     await flushSvelte();

@@ -1,21 +1,21 @@
 <script lang="ts">
-  // Workers page: listWorkers poll + per-row DrainButton. The load bar
+  // Workers page: listExecutors poll + per-row DrainButton. The load bar
   // and >30s-stale heartbeat are the two operator affordances that a
-  // metrics dashboard can't give you: the bar is per-worker capacity
+  // metrics dashboard can't give you: the bar is per-executor capacity
   // (not aggregate), the red-timestamp is the "something's wrong with
   // this node, go look at its pod" signal.
   import { admin } from '../api/admin';
   import DrainButton from '../components/DrainButton.svelte';
-  import type { WorkerInfo } from '../api/types';
+  import type { ExecutorInfo } from '../api/types';
   import { fmtTsRel, tsToMs } from '../lib/buildInfo';
 
-  // 30s matches the scheduler's dead-worker threshold (heartbeat period
+  // 30s matches the scheduler's dead-executor threshold (heartbeat period
   // is 10s, dead after 3 misses — see scheduler spec). A heartbeat
   // older than that and still status=alive means the scheduler hasn't
   // swept yet; the operator gets the heads-up first.
   const STALE_MS = 30_000;
 
-  let workers = $state<WorkerInfo[]>([]);
+  let executors = $state<ExecutorInfo[]>([]);
   let error = $state<string | null>(null);
   // now is rune state so the "Xs ago" strings re-render on each poll
   // tick without re-fetching. The poll interval updates both.
@@ -23,8 +23,8 @@
 
   async function refresh() {
     try {
-      const resp = await admin.listWorkers({ statusFilter: '' });
-      workers = resp.workers;
+      const resp = await admin.listExecutors({ statusFilter: '' });
+      executors = resp.executors;
       now = Date.now();
       error = null;
     } catch (e) {
@@ -38,7 +38,7 @@
     return () => clearInterval(id);
   });
 
-  function loadPct(w: WorkerInfo): number {
+  function loadPct(w: ExecutorInfo): number {
     return w.maxBuilds > 0
       ? Math.round((w.runningBuilds / w.maxBuilds) * 100)
       : 0;
@@ -46,14 +46,14 @@
 </script>
 
 {#if error}
-  <div role="alert">listWorkers failed: {error}</div>
-{:else if workers.length === 0}
-  <p>no workers</p>
+  <div role="alert">listExecutors failed: {error}</div>
+{:else if executors.length === 0}
+  <p>no executors</p>
 {:else}
   <table data-testid="workers-table">
     <thead>
       <tr>
-        <th>worker</th>
+        <th>executor</th>
         <th>status</th>
         <th>load</th>
         <th>size class</th>
@@ -62,13 +62,13 @@
       </tr>
     </thead>
     <tbody>
-      {#each workers as w (w.workerId)}
-        <!-- Absent heartbeat (worker registered but never beat) is
+      {#each executors as w (w.executorId)}
+        <!-- Absent heartbeat (executor registered but never beat) is
              treated as stale; display reads "—" via fmtTsRel. -->
         {@const hb = tsToMs(w.lastHeartbeat)}
         {@const stale = hb === undefined || now - hb > STALE_MS}
         <tr>
-          <td>{w.workerId}</td>
+          <td>{w.executorId}</td>
           <td
             ><span
               class="pill pill-{w.status}"
@@ -86,7 +86,7 @@
           <td class:stale data-testid="heartbeat-cell"
             >{fmtTsRel(w.lastHeartbeat, now)}</td
           >
-          <td><DrainButton workerId={w.workerId} bind:workers /></td>
+          <td><DrainButton executorId={w.executorId} bind:executors /></td>
         </tr>
       {/each}
     </tbody>

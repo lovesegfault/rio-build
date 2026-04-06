@@ -1,7 +1,7 @@
 //! `ListBuilds` RPC tests.
 //!
 //! Split from the 1732L monolithic `admin/tests.rs` (P0386) to mirror the
-//! `admin/builds.rs` submodule seam. `ListWorkers` lives in
+//! `admin/builds.rs` submodule seam. `ListExecutors` lives in
 //! `workers_tests.rs` (mirrors `admin/workers.rs`).
 
 use std::collections::HashSet;

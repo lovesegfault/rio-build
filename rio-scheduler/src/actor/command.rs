@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::state::{BuildOptions, DrvHash, PriorityClass, WorkerId};
+use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 
 #[cfg(test)]
-use super::handle::{DebugDerivationInfo, DebugWorkerInfo};
+use super::handle::{DebugDerivationInfo, DebugExecutorInfo};
 
 /// Request payload for [`ActorCommand::MergeDag`].
 #[derive(Debug)]
@@ -48,7 +48,7 @@ pub enum ActorCommand {
 
     /// Process a completion report from a worker.
     ProcessCompletion {
-        worker_id: WorkerId,
+        executor_id: ExecutorId,
         /// Either a drv_hash OR a full drv_path — handle_completion resolves both.
         /// Workers send drv_path; tests sometimes send drv_hash directly.
         drv_key: String,
@@ -76,32 +76,32 @@ pub enum ActorCommand {
     },
 
     /// A worker opened a BuildExecution stream.
-    WorkerConnected {
-        worker_id: WorkerId,
+    ExecutorConnected {
+        executor_id: ExecutorId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
     },
 
     /// A worker's BuildExecution stream closed.
-    WorkerDisconnected { worker_id: WorkerId },
+    ExecutorDisconnected { executor_id: ExecutorId },
 
     /// A worker ACKed its initial `PrefetchHint` with `PrefetchComplete`.
-    /// Flips `WorkerState.warm = true` so `best_worker()` starts
+    /// Flips `ExecutorState.warm = true` so `best_executor()` starts
     /// considering this worker on the warm-pass. Spec:
     /// `r[sched.assign.warm-gate]`.
     ///
-    /// `send_unchecked`: same reasoning as WorkerConnected/Heartbeat.
+    /// `send_unchecked`: same reasoning as ExecutorConnected/Heartbeat.
     /// Dropping this under backpressure would leave a warmed worker
     /// permanently cold in the scheduler's view — dispatchable capacity
     /// sitting idle right when the scheduler is busiest. Feedback loop.
     PrefetchComplete {
-        worker_id: WorkerId,
+        executor_id: ExecutorId,
         /// Observability only — the warm flip gates on receipt, not count.
         paths_fetched: u32,
     },
 
     /// Periodic heartbeat from a worker.
     Heartbeat {
-        worker_id: WorkerId,
+        executor_id: ExecutorId,
         /// Systems this worker can build for. Usually single-element
         /// but multi-arch workers (e.g., qemu-user-static) declare
         /// multiple. can_build() any-matches against the derivation's
@@ -114,20 +114,20 @@ pub enum ActorCommand {
         running_builds: Vec<String>,
         /// Parsed bloom filter from local_paths. `None` = worker didn't
         /// send one (old worker, or FUSE not mounted). Stored on
-        /// WorkerState for assignment scoring.
+        /// ExecutorState for assignment scoring.
         bloom: Option<rio_common::bloom::BloomFilter>,
         /// Size-class from worker config (e.g. "small", "large"). gRPC
-        /// maps empty-string → None. Stored on WorkerState for the
-        /// classify() → best_worker() filter.
+        /// maps empty-string → None. Stored on ExecutorState for the
+        /// classify() → best_executor() filter.
         size_class: Option<String>,
         /// ResourceUsage from the heartbeat. Prost generates Option for
         /// message fields; worker always populates, so None is defensive
-        /// (shouldn't happen). Stored on WorkerState as `last_resources`
-        /// for `ListWorkers`.
+        /// (shouldn't happen). Stored on ExecutorState as `last_resources`
+        /// for `ListExecutors`.
         resources: Option<rio_proto::types::ResourceUsage>,
         /// FUSE circuit breaker open — worker can't fetch from store.
         /// Proto bool, field 9: wire-default false (old workers don't
-        /// send it). Stored on WorkerState; `has_capacity()` gates on
+        /// send it). Stored on ExecutorState; `has_capacity()` gates on
         /// it the same as `draining`.
         store_degraded: bool,
     },
@@ -183,13 +183,13 @@ pub enum ActorCommand {
     /// Mark a worker draining: stop sending new assignments.
     ///
     /// Called by the worker itself (step 1 of SIGTERM drain) or by
-    /// the controller (WorkerPool finalizer cleanup). Idempotent: an
+    /// the controller (BuilderPool finalizer cleanup). Idempotent: an
     /// already-draining worker replies `accepted=true` with the same
     /// running count. Unknown worker → `accepted=false, running=0`
     /// (not an error; the worker may have already disconnected).
     ///
     /// `force=true` additionally reassigns in-flight builds (same path
-    /// as `WorkerDisconnected`). Use case: operator-initiated forced
+    /// as `ExecutorDisconnected`). Use case: operator-initiated forced
     /// drain when the worker is unhealthy but still heartbeating —
     /// don't wait 2h for builds to complete, reassign now. The
     /// worker's builds will still run to completion on the worker
@@ -201,8 +201,8 @@ pub enum ActorCommand {
     /// MUST land — dropping it under backpressure would leave a
     /// shutting-down worker accepting new assignments right when
     /// capacity is shrinking. That's a feedback loop into MORE load.
-    DrainWorker {
-        worker_id: WorkerId,
+    DrainExecutor {
+        executor_id: ExecutorId,
         force: bool,
         reply: oneshot::Sender<DrainResult>,
     },
@@ -249,12 +249,12 @@ pub enum ActorCommand {
     /// that may not be in narinfo yet (worker hasn't uploaded).
     GcRoots { reply: oneshot::Sender<Vec<String>> },
 
-    /// Snapshot all workers for `AdminService.ListWorkers`.
+    /// Snapshot all workers for `AdminService.ListExecutors`.
     /// O(workers) scan; acceptable for dashboard polling.
     /// `send_unchecked`: same rationale as `ClusterSnapshot` —
     /// dashboard needs a reading even (especially) under saturation.
-    ListWorkers {
-        reply: oneshot::Sender<Vec<WorkerSnapshot>>,
+    ListExecutors {
+        reply: oneshot::Sender<Vec<ExecutorSnapshot>>,
     },
 
     /// Clear poison state for a derivation: in-mem reset + PG clear.
@@ -282,14 +282,14 @@ pub enum ActorCommand {
 
     /// Post-recovery worker reconciliation (spec step 6). Scheduled
     /// ~45s after recovery via WeakSender. For each Assigned/Running
-    /// derivation: if assigned_worker NOT in self.workers →
+    /// derivation: if assigned_executor NOT in self.executors →
     /// query store → Completed (orphan) or reset to Ready.
     ReconcileAssignments,
 
     /// Test-only: query worker states.
     #[cfg(test)]
     DebugQueryWorkers {
-        reply: oneshot::Sender<Vec<DebugWorkerInfo>>,
+        reply: oneshot::Sender<Vec<DebugExecutorInfo>>,
     },
 
     /// Test-only: query a derivation's state.
@@ -304,14 +304,14 @@ pub enum ActorCommand {
     /// poison tests that need to drive multiple completion cycles
     /// without waiting for real backoff durations.
     ///
-    /// With backoff + failed_workers exclusion, dispatch won't
+    /// With backoff + failed_builders exclusion, dispatch won't
     /// re-assign immediately after a failure. This helper lets tests
     /// control the state machine directly instead of waiting for
     /// real backoff durations.
     #[cfg(test)]
     DebugForceAssign {
         drv_hash: String,
-        worker_id: WorkerId,
+        executor_id: ExecutorId,
         reply: oneshot::Sender<bool>,
     },
 
@@ -367,9 +367,9 @@ pub enum ActorCommand {
     },
 }
 
-/// Reply for `ActorCommand::DrainWorker`.
+/// Reply for `ActorCommand::DrainExecutor`.
 ///
-/// `accepted=false` only for unknown worker_id — NOT an error, the
+/// `accepted=false` only for unknown executor_id — NOT an error, the
 /// worker may have disconnected (preStop races with stream close on
 /// SIGTERM). Caller treats `accepted=false, running=0` as "nothing to
 /// wait for, proceed."
@@ -383,12 +383,13 @@ pub struct DrainResult {
     pub running_builds: u32,
 }
 
-/// Point-in-time worker snapshot for `AdminService.ListWorkers`.
-/// Internal (not proto) — `admin.rs` translates to `WorkerInfo`.
+/// Point-in-time executor snapshot for `AdminService.ListExecutors`.
+/// Internal (not proto) — `admin.rs` translates to `ExecutorInfo`.
 /// `Instant` fields are converted to wall-clock `SystemTime` there.
 #[derive(Debug, Clone)]
-pub struct WorkerSnapshot {
-    pub worker_id: WorkerId,
+pub struct ExecutorSnapshot {
+    pub executor_id: ExecutorId,
+    pub kind: rio_proto::types::ExecutorKind,
     pub systems: Vec<String>,
     pub supported_features: Vec<String>,
     pub max_builds: u32,
@@ -439,11 +440,11 @@ pub struct SizeClassSnapshot {
 pub struct ClusterSnapshot {
     /// `workers.len()`. Includes unregistered (stream-only or
     /// heartbeat-only) and draining.
-    pub total_workers: u32,
+    pub total_executors: u32,
     /// `is_registered() && !draining`. The dispatchable population.
-    pub active_workers: u32,
+    pub active_executors: u32,
     /// `draining` flag set.
-    pub draining_workers: u32,
+    pub draining_executors: u32,
     /// `BuildState::Pending` — merged but not yet active.
     pub pending_builds: u32,
     /// `BuildState::Active` — at least one derivation dispatched.

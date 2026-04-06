@@ -6,8 +6,8 @@ use super::*;
 /// Test-only: snapshot of worker state for assertions.
 #[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct DebugWorkerInfo {
-    pub worker_id: String,
+pub struct DebugExecutorInfo {
+    pub executor_id: String,
     pub is_registered: bool,
     pub running_count: usize,
     pub running_builds: Vec<String>,
@@ -19,12 +19,12 @@ pub struct DebugWorkerInfo {
 pub struct DebugDerivationInfo {
     pub status: DerivationStatus,
     pub retry_count: u32,
-    pub assigned_worker: Option<String>,
+    pub assigned_executor: Option<String>,
     pub assigned_size_class: Option<String>,
     pub output_paths: Vec<String>,
     /// Distinct worker IDs that have failed this derivation. For
     /// asserting InfrastructureFailure does NOT populate this.
-    pub failed_workers: Vec<String>,
+    pub failed_builders: Vec<String>,
     /// Flat failure counter (non-distinct mode). For asserting
     /// same-worker failures count under `require_distinct_workers=false`.
     pub failure_count: u32,
@@ -234,7 +234,7 @@ impl ActorHandle {
 
     /// Test-only: query all worker states.
     #[cfg(test)]
-    pub async fn debug_query_workers(&self) -> Result<Vec<DebugWorkerInfo>, ActorError> {
+    pub async fn debug_query_workers(&self) -> Result<Vec<DebugExecutorInfo>, ActorError> {
         let (tx, rx) = oneshot::channel();
         self.send_unchecked(ActorCommand::DebugQueryWorkers { reply: tx })
             .await?;
@@ -257,7 +257,7 @@ impl ActorHandle {
     }
 
     /// Test-only: force a derivation to Assigned for a given
-    /// worker, bypassing dispatch's backoff + failed_workers
+    /// worker, bypassing dispatch's backoff + failed_builders
     /// exclusion. For retry/poison tests that drive multiple
     /// completion cycles. Returns `false` if the derivation
     /// couldn't be forced (terminal state, not found).
@@ -265,12 +265,12 @@ impl ActorHandle {
     pub async fn debug_force_assign(
         &self,
         drv_hash: &str,
-        worker_id: &str,
+        executor_id: &str,
     ) -> Result<bool, ActorError> {
         let (tx, rx) = oneshot::channel();
         self.send_unchecked(ActorCommand::DebugForceAssign {
             drv_hash: drv_hash.to_string(),
-            worker_id: worker_id.into(),
+            executor_id: executor_id.into(),
             reply: tx,
         })
         .await?;

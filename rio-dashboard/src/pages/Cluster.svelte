@@ -49,7 +49,7 @@
 {:else}
   <dl data-testid="cluster-status">
     <dt>Workers</dt>
-    <dd>{status.activeWorkers} active / {status.totalWorkers} total</dd>
+    <dd>{status.activeExecutors} active / {status.totalExecutors} total</dd>
     <dt>Builds</dt>
     <dd>{status.pendingBuilds} pending / {status.activeBuilds} active</dd>
     <dt>Derivations</dt>

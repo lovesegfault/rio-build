@@ -44,11 +44,11 @@ impl DagActor {
         &self,
         drv_hash: &DrvHash,
         status: DerivationStatus,
-        worker_id: Option<&WorkerId>,
+        executor_id: Option<&ExecutorId>,
     ) {
         if let Err(e) = self
             .db
-            .update_derivation_status(drv_hash, status, worker_id)
+            .update_derivation_status(drv_hash, status, executor_id)
             .await
         {
             error!(drv_hash = %drv_hash, ?status, error = %e,
@@ -324,7 +324,7 @@ impl DagActor {
     /// reached. Caller decides: poison_and_cascade if true,
     /// reset_to_ready + retry if false.
     ///
-    /// Both `failed_workers` (HashSet — for distinct-mode + best_worker
+    /// Both `failed_builders` (HashSet — for distinct-mode + best_executor
     /// exclusion) and `failure_count` (flat counter — for non-distinct
     /// mode) are updated; [`PoisonConfig::is_poisoned`] picks the
     /// right one. The in-mem insert comes first (scheduler-
@@ -333,17 +333,17 @@ impl DagActor {
     pub(super) async fn record_failure_and_check_poison(
         &mut self,
         drv_hash: &DrvHash,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
     ) -> bool {
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.failed_workers.insert(worker_id.clone());
+            state.failed_builders.insert(executor_id.clone());
             // Unconditional (doesn't check HashSet::insert's bool) —
             // same worker counts twice. Only used when
             // require_distinct_workers=false.
             state.failure_count += 1;
         }
-        if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
-            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e,
+        if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
+            error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
                    "failed to persist failed_worker");
         }
         self.dag
@@ -356,10 +356,10 @@ impl DagActor {
     // ProcessCompletion
     // -----------------------------------------------------------------------
 
-    #[instrument(skip(self, result), fields(worker_id = %worker_id, drv_key = %drv_key))]
+    #[instrument(skip(self, result), fields(executor_id = %executor_id, drv_key = %drv_key))]
     pub(super) async fn handle_completion(
         &mut self,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
         // gRPC layer passes CompletionReport.drv_path; may be a drv_hash in tests.
         drv_key: &str,
         result: rio_proto::build_types::BuildResult,
@@ -424,13 +424,13 @@ impl DagActor {
         // r[impl sched.completion.idempotent]
         // Stale-report guard: if this completion is from a worker that no
         // longer owns the derivation (reassigned after disconnect/timeout),
-        // drop it. The current assigned_worker's report is authoritative.
-        if let Some(assigned) = &state.assigned_worker
-            && assigned != worker_id
+        // drop it. The current assigned_executor's report is authoritative.
+        if let Some(assigned) = &state.assigned_executor
+            && assigned != executor_id
         {
             debug!(
                 drv_hash = %drv_hash,
-                stale_worker = %worker_id,
+                stale_worker = %executor_id,
                 current_worker = %assigned,
                 "dropping stale completion report"
             );
@@ -444,7 +444,7 @@ impl DagActor {
                 self.handle_success_completion(
                     drv_hash,
                     &result,
-                    worker_id,
+                    executor_id,
                     (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
                 )
                 .await;
@@ -452,14 +452,14 @@ impl DagActor {
             rio_proto::build_types::BuildResultStatus::TransientFailure => {
                 // Build ran, exited non-zero. Counts toward poison — 3
                 // workers all seeing this means it's not actually transient.
-                self.handle_transient_failure(drv_hash, worker_id).await;
+                self.handle_transient_failure(drv_hash, executor_id).await;
             }
             // r[impl sched.retry.per-worker-budget]
             rio_proto::build_types::BuildResultStatus::InfrastructureFailure => {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
-                // WITHOUT inserting into failed_workers.
-                self.handle_infrastructure_failure(drv_hash, worker_id)
+                // WITHOUT inserting into failed_builders.
+                self.handle_infrastructure_failure(drv_hash, executor_id)
                     .await;
             }
             rio_proto::build_types::BuildResultStatus::PermanentFailure
@@ -473,7 +473,7 @@ impl DagActor {
             // InputRejected: corrupt/invalid .drv. Same .drv on another
             // worker is still corrupt.
             | rio_proto::build_types::BuildResultStatus::InputRejected => {
-                self.handle_permanent_failure(drv_hash, &result.error_msg, worker_id)
+                self.handle_permanent_failure(drv_hash, &result.error_msg, executor_id)
                     .await;
             }
             // TimedOut: same inputs → same timeout. Auto-reassigning is
@@ -484,20 +484,20 @@ impl DagActor {
             // resubmit via DerivationStatus::is_retriable_on_resubmit.
             // Poisoned's 24h TTL is way too aggressive for a timeout.
             rio_proto::build_types::BuildResultStatus::TimedOut => {
-                self.handle_timeout_failure(drv_hash, &result.error_msg, worker_id)
+                self.handle_timeout_failure(drv_hash, &result.error_msg, executor_id)
                     .await;
             }
             rio_proto::build_types::BuildResultStatus::Cancelled => {
                 // Worker reports Cancelled after cgroup.kill. The
                 // scheduler already transitioned the DerivationState
                 // when it SENT the CancelSignal (see handle_cancel_
-                // build / handle_drain_worker), so this report is
+                // build / handle_drain_executor), so this report is
                 // expected but needs no further action on the
                 // derivation itself. Just the worker-capacity cleanup
                 // below. Log at debug: every CancelBuild generates
                 // one of these per running drv, and it's the happy
                 // path for cancel.
-                debug!(drv_hash = %drv_hash, worker_id = %worker_id,
+                debug!(drv_hash = %drv_hash, executor_id = %executor_id,
                        "cancelled completion report (expected after CancelSignal)");
             }
             rio_proto::build_types::BuildResultStatus::Unspecified => {
@@ -506,12 +506,12 @@ impl DagActor {
                     status = result.status,
                     "unknown build result status, treating as transient failure"
                 );
-                self.handle_transient_failure(drv_hash, worker_id).await;
+                self.handle_transient_failure(drv_hash, executor_id).await;
             }
         }
 
         // Free worker capacity
-        if let Some(worker) = self.workers.get_mut(worker_id) {
+        if let Some(worker) = self.executors.get_mut(executor_id) {
             worker.running_builds.remove(drv_hash);
         }
 
@@ -523,7 +523,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         result: &rio_proto::build_types::BuildResult,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
     ) {
@@ -537,7 +537,7 @@ impl DagActor {
                 // is lost; downstream derivations will never be released.
                 error!(
                     drv_hash = %drv_hash,
-                    worker_id = %worker_id,
+                    executor_id = %executor_id,
                     current_state = ?state.status(),
                     error = %e,
                     "worker reported success but Running->Completed transition rejected; build will hang"
@@ -566,7 +566,7 @@ impl DagActor {
         // `.drv` → reads `out.path() == ""` → `invalid store path ""`.
         //
         // The gateway's `wopRegisterDrvOutput` handler inserts for the
-        // Nix wire-protocol path, but rio-workers don't speak wire
+        // Nix wire-protocol path, but rio-builders don't speak wire
         // protocol — their upload is `PutPath → CompletionReport`
         // only. This insert closes the gap.
         //
@@ -1233,7 +1233,7 @@ impl DagActor {
     /// In-mem: node removed from the DAG entirely — next submit re-inserts
     /// it fresh with full proto fields and runs it through
     /// `compute_initial_states`. PG: `db.clear_poison()` sets
-    /// status='created', NULLs `poisoned_at`/`retry_count`/`failed_workers`.
+    /// status='created', NULLs `poisoned_at`/`retry_count`/`failed_builders`.
     ///
     /// PG first, in-mem second — if PG fails the operator's retry
     /// finds in-mem still Poisoned and can proceed. The previous
@@ -1265,28 +1265,28 @@ impl DagActor {
     pub(super) async fn handle_transient_failure(
         &mut self,
         drv_hash: &DrvHash,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
     ) {
         // Record failure (in-mem HashSet insert + PG append,
         // best-effort) + get poison verdict in one call — same
         // helper as reassign_derivations (worker.rs) and
         // handle_reconcile_assignments (recovery.rs).
         let reached_poison = self
-            .record_failure_and_check_poison(drv_hash, worker_id)
+            .record_failure_and_check_poison(drv_hash, executor_id)
             .await;
 
         // r[impl sched.retry.per-worker-budget]
         // Starvation guard: clamp effective threshold to worker_count.
         // If worker_count < configured threshold and ALL connected
-        // workers are in failed_workers, best_worker returns None
-        // forever (hard_filter's failed_workers exclusion rejects
+        // workers are in failed_builders, best_executor returns None
+        // forever (hard_filter's failed_builders exclusion rejects
         // everyone). Without this, a 2-worker cluster where both fail
         // sits in Ready indefinitely — never poisons (len=2 <
         // threshold=3), never dispatches. Poison now so the operator
         // gets a signal instead of a silent stuck derivation.
         //
         // Starvation = every LIVE worker has failed this derivation.
-        // failed_workers may contain dead workers (disconnected since
+        // failed_builders may contain dead workers (disconnected since
         // recording); intersect with the live set so a single stale
         // failed-worker entry + one live worker doesn't false-poison.
         //
@@ -1294,15 +1294,15 @@ impl DagActor {
         // disconnected mid-failure) shouldn't auto-poison — the
         // derivation CAN dispatch once workers reconnect.
         let all_workers_failed = !reached_poison
-            && !self.workers.is_empty()
+            && !self.executors.is_empty()
             && self
                 .dag
                 .node(drv_hash)
-                .is_some_and(|s| self.workers.keys().all(|w| s.failed_workers.contains(w)));
+                .is_some_and(|s| self.executors.keys().all(|w| s.failed_builders.contains(w)));
         if all_workers_failed {
             warn!(
                 drv_hash = %drv_hash,
-                worker_count = self.workers.len(),
+                worker_count = self.executors.len(),
                 configured_threshold = self.poison_config.threshold,
                 "all live workers failed — poisoning below configured threshold \
                  (effective threshold clamped to live worker set)"
@@ -1335,7 +1335,7 @@ impl DagActor {
 
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 state.retry_count += 1;
-                state.assigned_worker = None;
+                state.assigned_executor = None;
             }
 
             if let Err(e) = self.db.increment_retry_count(drv_hash).await {
@@ -1379,7 +1379,7 @@ impl DagActor {
     }
 
     /// InfrastructureFailure: worker-local problem, not the build's fault.
-    /// Reset to Ready and retry WITHOUT inserting into `failed_workers`.
+    /// Reset to Ready and retry WITHOUT inserting into `failed_builders`.
     ///
     /// InfrastructureFailure is the worker saying "I can't right now."
     /// If it's still broken, it'll fail again. If it's recovered
@@ -1404,7 +1404,7 @@ impl DagActor {
     pub(super) async fn handle_infrastructure_failure(
         &mut self,
         drv_hash: &DrvHash,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -1420,7 +1420,7 @@ impl DagActor {
             state.ensure_running();
             warn!(
                 drv_hash = %drv_hash,
-                worker_id = %worker_id,
+                executor_id = %executor_id,
                 infra_retry_count = state.infra_retry_count,
                 max = self.retry_policy.max_infra_retries,
                 "infrastructure failure: max_infra_retries exhausted, poisoning"
@@ -1434,7 +1434,7 @@ impl DagActor {
                   "infrastructure failure: reset_to_ready failed, skipping");
             return;
         }
-        // NO insert into failed_workers (infra is worker-local, not
+        // NO insert into failed_builders (infra is worker-local, not
         // build-local). NO retry_count++ (infra doesn't eat transient
         // budget). NO backoff (re-dispatch immediately; P0211's
         // store_degraded check excludes still-broken workers). But DO
@@ -1442,7 +1442,7 @@ impl DagActor {
         state.infra_retry_count += 1;
         info!(
             drv_hash = %drv_hash,
-            worker_id = %worker_id,
+            executor_id = %executor_id,
             infra_retry_count = state.infra_retry_count,
             "infrastructure failure — retry without poison count"
         );
@@ -1461,7 +1461,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         error_msg: &str,
-        _worker_id: &WorkerId,
+        _executor_id: &ExecutorId,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -1533,7 +1533,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         error_msg: &str,
-        _worker_id: &WorkerId,
+        _executor_id: &ExecutorId,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;

@@ -63,7 +63,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
 
     // Connect a 1-slot worker. Heartbeat/PrefetchComplete triggers
     // dispatch_ready, which pops the highest-priority node.
-    let mut rx = connect_worker(&handle, "prio-w", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "prio-w", "x86_64-linux", 1).await?;
 
     // First assignment MUST be shared-x: it carries INTERACTIVE_BOOST
     // (via build_hi's interest), filler-y does not. Without the bump,

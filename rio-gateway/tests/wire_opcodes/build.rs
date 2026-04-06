@@ -658,7 +658,7 @@ async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> 
             })),
             ev(build_event::Event::Log(types::BuildLogBatch {
                 derivation_path: String::new(),
-                worker_id: String::new(),
+                executor_id: String::new(),
                 lines: vec![b"building foo".to_vec(), b"linking".to_vec()],
                 first_line_number: 0,
             })),
@@ -709,7 +709,7 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
                 derivation_path: target.clone(),
                 status: Some(types::derivation_event::Status::Started(
                     types::DerivationStarted {
-                        worker_id: "w1".into(),
+                        executor_id: "w1".into(),
                     },
                 )),
             })),
@@ -776,7 +776,7 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
                 derivation_path: target.clone(),
                 status: Some(types::derivation_event::Status::Started(
                     types::DerivationStarted {
-                        worker_id: "w1".into(),
+                        executor_id: "w1".into(),
                     },
                 )),
             })),
@@ -1426,7 +1426,7 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
         .map(|i| {
             ev(build_event::Event::Log(types::BuildLogBatch {
                 derivation_path: String::new(),
-                worker_id: String::new(),
+                executor_id: String::new(),
                 lines: vec![format!("building step {i}").into_bytes()],
                 first_line_number: 0,
             }))
@@ -1577,7 +1577,7 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
         .map(|i| {
             ev(build_event::Event::Log(types::BuildLogBatch {
                 derivation_path: String::new(),
-                worker_id: String::new(),
+                executor_id: String::new(),
                 lines: vec![format!("building step {i}").into_bytes()],
                 first_line_number: 0,
             }))

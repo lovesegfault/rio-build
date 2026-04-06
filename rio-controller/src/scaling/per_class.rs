@@ -1,4 +1,4 @@
-//! WPS per-class autoscaler: scale each `WorkerPoolSet` child
+//! WPS per-class autoscaler: scale each `BuilderPoolSet` child
 //! pool using PER-CLASS queue depth from `GetSizeClassStatus`.
 //!
 //! `scale_wps_class` is an inherent method on [`Autoscaler`]
@@ -19,8 +19,8 @@ use tracing::{debug, info, warn};
 
 use rio_proto::types::GetSizeClassStatusResponse;
 
-use crate::crds::workerpool::WorkerPool;
-use crate::crds::workerpoolset::WorkerPoolSet;
+use crate::crds::builderpool::BuilderPool;
+use crate::crds::builderpoolset::BuilderPoolSet;
 
 use super::standalone::Autoscaler;
 use super::{
@@ -33,10 +33,10 @@ impl Autoscaler {
     ///
     /// Looks up the class's `queued` from `GetSizeClassStatus`
     /// (not cluster-wide `ClusterStatus.queued_derivations`).
-    /// Falls through to the child WorkerPool's own `autoscaling.
+    /// Falls through to the child BuilderPool's own `autoscaling.
     /// target_value` / `replicas.{min,max}` — those were set by
     /// the WPS reconciler from `SizeClassSpec` (see
-    /// `workerpoolset/builders.rs::build_child_workerpool`).
+    /// `builderpoolset/builders.rs::build_child_builderpool`).
     ///
     /// Same stabilization mechanics as `scale_one` (shared
     /// `ScaleState` by pool key). Patches the child's StatefulSet
@@ -46,24 +46,24 @@ impl Autoscaler {
     /// grep managedFields` shows which scaler owns the replica
     /// count.
     ///
-    /// Skips children whose WorkerPool has `deletionTimestamp`
+    /// Skips children whose BuilderPool has `deletionTimestamp`
     /// (same finalizer-fight avoidance as the standalone loop).
     ///
-    /// `pools`: the already-listed WorkerPools from `tick()`.
+    /// `pools`: the already-listed BuilderPools from `tick()`.
     /// We look up the child here rather than re-GETting — saves
     /// one apiserver call per class per tick.
     pub(super) async fn scale_wps_class(
         &mut self,
-        wps: &WorkerPoolSet,
-        class: &crate::crds::workerpoolset::SizeClassSpec,
+        wps: &BuilderPoolSet,
+        class: &crate::crds::builderpoolset::SizeClassSpec,
         sc_resp: &GetSizeClassStatusResponse,
-        pools: &[WorkerPool],
+        pools: &[BuilderPool],
     ) {
-        let child_name = crate::reconcilers::workerpoolset::builders::child_name(wps, class);
+        let child_name = crate::reconcilers::builderpoolset::builders::child_name(wps, class);
         let wps_ns = wps.namespace().unwrap_or_default();
 
         // r[impl ctrl.wps.autoscale]
-        // Find the child WorkerPool in the already-listed set.
+        // Find the child BuilderPool in the already-listed set.
         // Two-key symmetry with `is_wps_owned`: the standalone-
         // pool loop skips pools WITH a WPS ownerRef; this loop
         // must skip pools WITHOUT. A name-match without ownerRef
@@ -105,7 +105,7 @@ impl Autoscaler {
             .map(|c| c.queued)
             .unwrap_or(0);
 
-        // Bounds come from the CHILD WorkerPool's spec (which the
+        // Bounds come from the CHILD BuilderPool's spec (which the
         // WPS reconciler set from SizeClassSpec). Reading from
         // the child rather than re-deriving from `class.*` keeps
         // this in sync with what the reconciler actually applied
@@ -124,7 +124,7 @@ impl Autoscaler {
         );
 
         let key = pool_key(child);
-        let sts_name = format!("{child_name}-workers");
+        let sts_name = format!("{child_name}-builders");
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &wps_ns);
 
         // Current from STS (same pattern as scale_one — reconciler
@@ -247,7 +247,7 @@ mod tests {
     /// The WPS autoscaler SSA-patches STS replicas with field
     /// manager `rio-controller-wps-autoscaler` — distinct from
     /// `rio-controller-autoscaler` (standalone pools) and
-    /// `rio-controller` (WorkerPool reconciler). SSA tracks
+    /// `rio-controller` (BuilderPool reconciler). SSA tracks
     /// `managedFields` per manager; the apiserver uses this to
     /// merge ownership. The unit-test-level proof that SSA is
     /// engaged: `fieldManager=...` appears in the PATCH query
@@ -280,7 +280,7 @@ mod tests {
             serde_json::json!({
                 "apiVersion": "apps/v1",
                 "kind": "StatefulSet",
-                "metadata": { "name": "test-wps-small-workers", "namespace": "rio" },
+                "metadata": { "name": "test-wps-small-builders", "namespace": "rio" },
                 "spec": { "replicas": 4 },
             })
             .to_string(),
@@ -293,7 +293,7 @@ mod tests {
         let patch = sts_replicas_patch(4);
         sts_api
             .patch(
-                "test-wps-small-workers",
+                "test-wps-small-builders",
                 &PatchParams::apply(WPS_AUTOSCALER_MANAGER).force(),
                 &Patch::Apply(&patch),
             )

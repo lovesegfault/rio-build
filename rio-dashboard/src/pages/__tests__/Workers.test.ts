@@ -1,5 +1,5 @@
-// Workers page: ListWorkers render + heartbeat-stale classification.
-// The >30s-ago → red-cell rule is the operator's dead-worker signal;
+// Workers page: ListExecutors render + heartbeat-stale classification.
+// The >30s-ago → red-cell rule is the operator's dead-executor signal;
 // this test pins it down with fixture timestamps on either side of the
 // threshold.
 import { timestampFromMs } from '@bufbuild/protobuf/wkt';
@@ -16,7 +16,7 @@ vi.mock('../../api/admin', () => ({ admin: adminMock }));
 
 import Workers from '../Workers.svelte';
 
-const { listWorkers } = adminMock;
+const { listExecutors } = adminMock;
 
 describe('Workers page', () => {
   // Fixed "now" = 2026-01-01T00:01:00Z (setupStandardBeforeEach default)
@@ -24,10 +24,10 @@ describe('Workers page', () => {
   beforeEach(() => setupStandardBeforeEach());
   afterEach(teardownStandardAfterEach);
 
-  function mkWorker(id: string, status: string, ageSeconds: number) {
+  function mkExecutor(id: string, status: string, ageSeconds: number) {
     const now = Date.now();
     return {
-      workerId: id,
+      executorId: id,
       systems: [],
       supportedFeatures: [],
       maxBuilds: 4,
@@ -39,8 +39,8 @@ describe('Workers page', () => {
   }
 
   it('renders rows with status pills and load bars', async () => {
-    listWorkers.mockResolvedValue({
-      workers: [mkWorker('w-fresh', 'alive', 5), mkWorker('w-old', 'alive', 45)],
+    listExecutors.mockResolvedValue({
+      executors: [mkExecutor('w-fresh', 'alive', 5), mkExecutor('w-old', 'alive', 45)],
     });
 
     render(Workers);
@@ -55,8 +55,8 @@ describe('Workers page', () => {
   });
 
   it('flags >30s-stale heartbeat', async () => {
-    listWorkers.mockResolvedValue({
-      workers: [mkWorker('w-fresh', 'alive', 5), mkWorker('w-stale', 'alive', 45)],
+    listExecutors.mockResolvedValue({
+      executors: [mkExecutor('w-fresh', 'alive', 5), mkExecutor('w-stale', 'alive', 45)],
     });
 
     render(Workers);

@@ -1,7 +1,7 @@
 //! AdminService gRPC implementation.
 //!
 //! All RPCs are fully implemented as of phase4a: `GetBuildLogs`,
-//! `ClusterStatus`, `DrainWorker`, `TriggerGC`, `ListWorkers`,
+//! `ClusterStatus`, `DrainExecutor`, `TriggerGC`, `ListExecutors`,
 //! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`,
 //! `GetBuildGraph`, `GetSizeClassStatus`.
 //!
@@ -25,10 +25,10 @@ use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
-    CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse, GcProgress,
-    GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
+    CreateTenantRequest, CreateTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
+    GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse, GetBuildLogsRequest,
     GetSizeClassStatusRequest, GetSizeClassStatusResponse, ListBuildsRequest, ListBuildsResponse,
-    ListPoisonedResponse, ListTenantsResponse, ListWorkersRequest, ListWorkersResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse,
     PoisonedDerivation,
 };
 
@@ -36,12 +36,12 @@ use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
 
 mod builds;
+mod executors;
 mod gc;
 mod graph;
 mod logs;
 mod sizeclass;
 mod tenants;
-mod workers;
 
 pub use gc::spawn_store_size_refresh;
 
@@ -53,7 +53,7 @@ pub struct AdminServiceImpl {
     /// buffer still serves active builds.
     s3: Option<(S3Client, String)>, // (client, bucket)
     pool: PgPool,
-    /// For `ClusterStatus` / `DrainWorker` — sends query commands into
+    /// For `ClusterStatus` / `DrainExecutor` — sends query commands into
     /// the actor event loop. `ClusterSnapshot` bypasses backpressure
     /// (`send_unchecked`): the autoscaler needs a reading especially
     /// when saturated. Dropping the query under load would blind the
@@ -122,9 +122,9 @@ impl AdminServiceImpl {
         crate::grpc::actor_guards::check_actor_alive(&self.actor)
     }
 
-    /// Leader guard. Admin RPCs mutate state (DrainWorker,
+    /// Leader guard. Admin RPCs mutate state (DrainExecutor,
     /// ClearPoison, CreateTenant, TriggerGC) or reflect actor state
-    /// (ClusterStatus, ListWorkers) — standby has no actor authority
+    /// (ClusterStatus, ListExecutors) — standby has no actor authority
     /// and its view is stale. Delegates to the shared
     /// [`actor_guards::ensure_leader`](crate::grpc::actor_guards).
     fn ensure_leader(&self) -> Result<(), Status> {
@@ -198,9 +198,9 @@ impl AdminService for AdminServiceImpl {
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
         Ok(Response::new(ClusterStatusResponse {
-            total_workers: snap.total_workers,
-            active_workers: snap.active_workers,
-            draining_workers: snap.draining_workers,
+            total_executors: snap.total_executors,
+            active_executors: snap.active_executors,
+            draining_executors: snap.draining_executors,
             pending_builds: snap.pending_builds,
             active_builds: snap.active_builds,
             queued_derivations: snap.queued_derivations,
@@ -213,16 +213,16 @@ impl AdminService for AdminServiceImpl {
     }
 
     // r[impl sched.admin.list-workers]
-    #[instrument(skip(self, request), fields(rpc = "ListWorkers"))]
-    async fn list_workers(
+    #[instrument(skip(self, request), fields(rpc = "ListExecutors"))]
+    async fn list_executors(
         &self,
-        request: Request<ListWorkersRequest>,
-    ) -> Result<Response<ListWorkersResponse>, Status> {
+        request: Request<ListExecutorsRequest>,
+    ) -> Result<Response<ListExecutorsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
-        let resp = workers::list_workers(&self.actor, &req.status_filter).await?;
+        let resp = executors::list_executors(&self.actor, &req.status_filter).await?;
         Ok(Response::new(resp))
     }
 
@@ -271,49 +271,49 @@ impl AdminService for AdminServiceImpl {
     /// Mark a worker draining: `has_capacity()` returns false, dispatch
     /// skips it. In-flight builds continue. Called by:
     ///   - Worker's SIGTERM handler (step 1 of drain)
-    ///   - Controller's WorkerPool finalizer cleanup
+    ///   - Controller's BuilderPool finalizer cleanup
     ///
     /// `force=true` reassigns in-flight builds — the worker's nix-daemon
     /// keeps running them (we can't reach into its process tree) but the
     /// scheduler redispatches to fresh workers. Wasteful but unblocks.
     ///
-    /// Unknown worker_id → `accepted=false, running=0`. NOT an error:
-    /// SIGTERM may race with stream close (WorkerDisconnected removes
+    /// Unknown executor_id → `accepted=false, running=0`. NOT an error:
+    /// SIGTERM may race with stream close (ExecutorDisconnected removes
     /// the entry). The caller proceeds as if drain succeeded.
     ///
-    /// Empty worker_id → InvalidArgument. Catches the proto-default
+    /// Empty executor_id → InvalidArgument. Catches the proto-default
     /// (empty string) before it gets interpreted as "worker named ''
     /// not found."
-    #[instrument(skip(self, request), fields(rpc = "DrainWorker"))]
-    async fn drain_worker(
+    #[instrument(skip(self, request), fields(rpc = "DrainExecutor"))]
+    async fn drain_executor(
         &self,
-        request: Request<DrainWorkerRequest>,
-    ) -> Result<Response<DrainWorkerResponse>, Status> {
+        request: Request<DrainExecutorRequest>,
+    ) -> Result<Response<DrainExecutorResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
 
-        if req.worker_id.is_empty() {
-            return Err(Status::invalid_argument("worker_id is required"));
+        if req.executor_id.is_empty() {
+            return Err(Status::invalid_argument("executor_id is required"));
         }
 
         // send_unchecked: drain MUST land even under backpressure. A
         // shutting-down worker accepting new assignments is a feedback
         // loop into MORE load — exactly what we don't want.
-        let worker_id = req.worker_id.into();
+        let executor_id = req.executor_id.into();
         let force = req.force;
         let result = self
             .actor
-            .query_unchecked(|reply| ActorCommand::DrainWorker {
-                worker_id,
+            .query_unchecked(|reply| ActorCommand::DrainExecutor {
+                executor_id,
                 force,
                 reply,
             })
             .await
             .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
-        Ok(Response::new(DrainWorkerResponse {
+        Ok(Response::new(DrainExecutorResponse {
             accepted: result.accepted,
             running_builds: result.running_builds,
         }))
@@ -360,7 +360,7 @@ impl AdminService for AdminServiceImpl {
             .into_iter()
             .map(|r| PoisonedDerivation {
                 drv_path: r.drv_path,
-                failed_workers: r.failed_workers,
+                failed_executors: r.failed_builders,
                 poisoned_secs_ago: r.elapsed_secs.max(0.0) as u64,
             })
             .collect();

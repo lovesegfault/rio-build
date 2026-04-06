@@ -26,7 +26,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // Port-forward to the gateway Service (instead of SSM→NLB).
         let _tunnel =
         "establish tunnel" [+TUNNEL_STEPS]                => tunnel(LOCAL_PORT);
-        "workerpool reconcile"                            => chaos::step_workerpool_reconciled(&client);
+        "builderpool reconcile"                            => chaos::step_workerpool_reconciled(&client);
         "trivial build"    [+chaos::SMOKE_BUILD_STEPS]    => chaos::smoke_build("fast", 5, &store_url);
         "rio-cli status"                                  => chaos::step_status(&client);
         "worker-kill chaos" [+chaos::WORKER_KILL_STEPS]   => chaos::step_worker_kill(&client, &store_url);

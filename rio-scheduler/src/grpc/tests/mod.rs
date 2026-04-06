@@ -16,7 +16,7 @@ use super::*;
 use crate::MIGRATOR;
 use crate::actor::tests::{make_test_node, setup_actor};
 // P0356: the trait impls moved to scheduler_service.rs / worker_service.rs.
-// `use super::*` no longer pulls in `SchedulerService` / `WorkerService` /
+// `use super::*` no longer pulls in `SchedulerService` / `ExecutorService` /
 // `Request` as a side effect; tests call the trait methods on
 // `SchedulerGrpc` directly so the traits must be in scope.
 use rio_proto::SchedulerService;

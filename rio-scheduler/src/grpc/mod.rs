@@ -1,4 +1,4 @@
-//! gRPC service implementations for SchedulerService and WorkerService.
+//! gRPC service implementations for SchedulerService and ExecutorService.
 //!
 //! Both services run in the same scheduler binary. They communicate with the
 //! DAG actor via the `ActorHandle`.
@@ -11,8 +11,8 @@
 //! changes no longer conflict with heartbeat/stream-dispatch changes.
 
 pub(crate) mod actor_guards;
+mod executor_service;
 mod scheduler_service;
-mod worker_service;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

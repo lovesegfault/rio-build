@@ -23,7 +23,7 @@ fn now_unix() -> u64 {
 /// Build a valid Claims with the given expected_outputs and sign it.
 fn sign_claims(outputs: Vec<String>, expiry_offset_secs: i64) -> String {
     let claims = AssignmentClaims {
-        worker_id: "test-worker".into(),
+        executor_id: "test-worker".into(),
         drv_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         expected_outputs: outputs,
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
@@ -119,7 +119,7 @@ async fn hmac_wrong_key_signed_rejected() -> TestResult {
     // Sign with a DIFFERENT key → MAC mismatch.
     let wrong_key = b"different-key-different-signature!!";
     let claims = AssignmentClaims {
-        worker_id: "evil".into(),
+        executor_id: "evil".into(),
         drv_hash: "00".repeat(32),
         expected_outputs: vec![path.clone()],
         expiry_unix: now_unix() + 60,

@@ -18,7 +18,7 @@
 #   └────────────────────────────────────┼────────────────────┘
 #                                        │
 #   ┌─────── worker ───────┐             │
-#   │  rio-worker          │─────────────┘
+#   │  rio-builder          │─────────────┘
 #   │  storeAddr=control:29002                   ┌── client ──┐
 #   │  schedulerAddr=control:9001  (unproxied)   │  nix       │
 #   └──────────────────────┘                     └────────────┘
@@ -196,7 +196,7 @@ _: {
         "journalctl -u rio-scheduler --no-pager | "
         "grep -q 'scheduler-side cache check disabled'"
     )
-    worker.wait_for_unit("rio-worker.service")
+    worker.wait_for_unit("rio-builder.service")
     control.wait_until_succeeds(
         "curl -sf http://localhost:9091/metrics | "
         "grep -x 'rio_scheduler_workers_active 1'",

@@ -4,7 +4,7 @@ use rio_test_support::TestDb;
 
 use super::insert_test_derivation;
 use crate::db::{AssignmentStatus, SchedulerDb};
-use crate::state::WorkerId;
+use crate::state::ExecutorId;
 
 /// Non-terminal status (Pending re-set) → completed_at stays NULL.
 #[tokio::test]
@@ -13,7 +13,7 @@ async fn test_update_assignment_status_pending_no_completed_at() -> anyhow::Resu
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let drv_id = insert_test_derivation(&db, "bbb").await?;
-    db.insert_assignment(drv_id, &WorkerId::from("worker-1"), 1)
+    db.insert_assignment(drv_id, &ExecutorId::from("worker-1"), 1)
         .await?;
 
     db.update_assignment_status(drv_id, AssignmentStatus::Pending)
@@ -37,7 +37,7 @@ async fn test_update_assignment_status_completed_sets_completed_at() -> anyhow::
     let db = SchedulerDb::new(test_db.pool.clone());
 
     let drv_id = insert_test_derivation(&db, "ccc").await?;
-    db.insert_assignment(drv_id, &WorkerId::from("worker-1"), 1)
+    db.insert_assignment(drv_id, &ExecutorId::from("worker-1"), 1)
         .await?;
 
     db.update_assignment_status(drv_id, AssignmentStatus::Completed)

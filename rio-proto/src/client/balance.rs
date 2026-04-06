@@ -27,7 +27,7 @@
 //!
 //! `BalancedChannel::new` awaits the first probe cycle before
 //! returning. Without this, the p2c starts empty and the first RPC
-//! fails "no ready endpoints" --- which in the gateway/worker is a
+//! fails "no ready endpoints" --- which in the gateway/builder is a
 //! fail-fast `?` out of `main()`.
 
 // r[impl sched.grpc.leader-guard]
@@ -344,13 +344,13 @@ pub async fn connect_scheduler_balanced(
     Ok((client, bc))
 }
 
-/// Like `connect_scheduler_balanced` but for `WorkerServiceClient`.
+/// Like `connect_scheduler_balanced` but for `ExecutorServiceClient`.
 /// Same balance channel (same health probe, same endpoint set)
-/// but wrapped in the worker-facing client.
-pub async fn connect_worker_balanced(
+/// but wrapped in the executor-facing client.
+pub async fn connect_executor_balanced(
     host: String,
     port: u16,
-) -> anyhow::Result<(crate::WorkerServiceClient<Channel>, BalancedChannel)> {
+) -> anyhow::Result<(crate::ExecutorServiceClient<Channel>, BalancedChannel)> {
     let bc = BalancedChannel::new(
         host,
         port,
@@ -359,7 +359,7 @@ pub async fn connect_worker_balanced(
         DEFAULT_PROBE_INTERVAL,
     )
     .await?;
-    let client = crate::WorkerServiceClient::new(bc.channel())
+    let client = crate::ExecutorServiceClient::new(bc.channel())
         .max_decoding_message_size(crate::max_message_size())
         .max_encoding_message_size(crate::max_message_size());
     Ok((client, bc))

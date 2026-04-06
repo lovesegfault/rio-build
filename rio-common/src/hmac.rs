@@ -43,7 +43,7 @@ pub struct AssignmentClaims {
     /// Worker the assignment was for. Not checked on verify (the store
     /// doesn't know which worker is calling — mTLS identifies the cert
     /// but not the pod name), but useful for audit logs.
-    pub worker_id: String,
+    pub executor_id: String,
     /// Derivation hash. Ties the token to a specific build; a worker
     /// can't reuse one derivation's token for another.
     pub drv_hash: String,
@@ -265,7 +265,7 @@ mod tests {
             .unwrap()
             .as_secs();
         AssignmentClaims {
-            worker_id: "test-worker".into(),
+            executor_id: "test-builder".into(),
             drv_hash: "abc123".into(),
             expected_outputs: vec![
                 "/nix/store/aaa-hello".into(),
@@ -462,7 +462,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let old_json = serde_json::json!({
-            "worker_id": "w",
+            "executor_id": "w",
             "drv_hash": "d",
             "expected_outputs": ["/nix/store/p"],
             "expiry_unix": now + 3600,
@@ -498,6 +498,6 @@ mod tests {
         // The JSON string is human-readable (operator can debug a
         // failing token by base64-decoding the first part).
         let json_str = String::from_utf8(claims_json).unwrap();
-        assert!(json_str.contains("\"worker_id\":\"test-worker\""));
+        assert!(json_str.contains("\"executor_id\":\"test-builder\""));
     }
 }

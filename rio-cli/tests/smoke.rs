@@ -83,24 +83,24 @@ async fn unary_subcommands_exit_ok() -> anyhow::Result<()> {
     );
     assert_ok("cutoffs", run_cli(&addr, &["cutoffs"]));
     assert_ok(
-        "drain-worker",
-        run_cli(&addr, &["drain-worker", "worker-0"]),
+        "drain-executor",
+        run_cli(&addr, &["drain-executor", "builder-0"]),
     );
     assert_ok(
         "drain-worker --force",
-        run_cli(&addr, &["drain-worker", "worker-0", "--force"]),
+        run_cli(&addr, &["drain-executor", "builder-0", "--force"]),
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn drain_worker_not_found_message() -> anyhow::Result<()> {
+async fn drain_executor_not_found_message() -> anyhow::Result<()> {
     let (_admin, addr, _handle) = spawn_mock_admin().await?;
 
-    // MockAdmin's drain_worker returns DrainWorkerResponse::default()
+    // MockAdmin's drain_executor returns DrainExecutorResponse::default()
     // — accepted=false. The CLI should print the "not found" branch,
     // not the "draining <id>" branch.
-    let (status, stdout, stderr) = run_cli(&addr, &["drain-worker", "worker-0"]);
+    let (status, stdout, stderr) = run_cli(&addr, &["drain-executor", "builder-0"]);
     assert!(status.success(), "drain-worker: {stderr}");
     assert!(
         stdout.contains("not found"),
@@ -134,7 +134,7 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     assert!(status.success(), "workers --json: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("workers --json not valid JSON: {e}\n{stdout}"));
-    assert!(v.get("workers").is_some_and(|w| w.is_array()));
+    assert!(v.get("executors").is_some_and(|w| w.is_array()));
 
     // builds --json: same shape check.
     let (status, stdout, stderr) = run_cli(&addr, &["builds", "--json"]);
@@ -147,8 +147,8 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     let (status, stdout, stderr) = run_cli(&addr, &["status", "--json"]);
     assert!(status.success(), "status --json: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
-    assert!(v.get("total_workers").is_some()); // flattened StatusJson field
-    assert!(v.get("workers").is_some_and(|w| w.is_array()));
+    assert!(v.get("total_executors").is_some()); // flattened StatusJson field
+    assert!(v.get("executors").is_some_and(|w| w.is_array()));
 
     // cutoffs --json: named key (not bare array), same as workers/builds.
     let (status, stdout, stderr) = run_cli(&addr, &["cutoffs", "--json"]);
@@ -156,14 +156,14 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
     assert!(v.get("classes").is_some_and(|c| c.is_array()));
 
-    // drain-worker --json: inline struct with worker_id echoed back
+    // drain-executor --json: inline struct with executor_id echoed back
     // and the two proto response fields.
-    let (status, stdout, stderr) = run_cli(&addr, &["drain-worker", "worker-0", "--json"]);
-    assert!(status.success(), "drain-worker --json: {stderr}");
+    let (status, stdout, stderr) = run_cli(&addr, &["drain-executor", "builder-0", "--json"]);
+    assert!(status.success(), "drain-executor --json: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
     assert_eq!(
-        v.get("worker_id").and_then(|w| w.as_str()),
-        Some("worker-0")
+        v.get("executor_id").and_then(|w| w.as_str()),
+        Some("builder-0")
     );
     assert!(v.get("accepted").is_some_and(|a| a.is_boolean()));
     assert!(v.get("running_builds").is_some_and(|r| r.is_u64()));
@@ -195,7 +195,7 @@ async fn human_output_empty_state_messages() -> anyhow::Result<()> {
     // human-readable path should print the "(no X)" placeholder, not
     // an empty table header or nothing at all.
     let (_, stdout, _) = run_cli(&addr, &["workers"]);
-    assert!(stdout.contains("(no workers)"), "workers: {stdout}");
+    assert!(stdout.contains("(no executors)"), "executors: {stdout}");
 
     let (_, stdout, _) = run_cli(&addr, &["builds"]);
     assert!(stdout.contains("(no builds"), "builds: {stdout}");
@@ -222,7 +222,7 @@ async fn status_human_output_has_all_sections() -> anyhow::Result<()> {
     // labels cli.nix greps for.
     let (status, stdout, stderr) = run_cli(&addr, &["status"]);
     assert!(status.success(), "status: {stderr}");
-    for label in ["workers:", "builds:", "queue:", "store:"] {
+    for label in ["executors:", "builds:", "queue:", "store:"] {
         assert!(stdout.contains(label), "status missing {label}:\n{stdout}");
     }
     Ok(())

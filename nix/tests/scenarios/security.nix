@@ -225,10 +225,10 @@ in
             print("mtls-reject-grpc PASS: no-client-cert rejected on 9001 + 9002")
 
         with subtest("mtls-accept: connect with valid client cert succeeds"):
-            # Use the DEDICATED client cert (CN=rio-worker), not server.crt.
+            # Use the DEDICATED client cert (CN=rio-builder), not server.crt.
             # Reusing server.crt would work (same CA) but wouldn't prove
             # the CLIENT cert verification path — a client-cert-only check
-            # might reject CN=control. client.crt has CN=rio-worker (the
+            # might reject CN=control. client.crt has CN=rio-builder (the
             # actual worker identity); using it proves client-auth truly
             # validates against the CA, not server identity.
             #
@@ -250,7 +250,7 @@ in
                 "-tls-client-key ${pki}/client.key "
                 "-tls-server-name localhost"
             )
-            print("mtls-accept PASS: client cert (CN=rio-worker) accepted on 9001 + 9002")
+            print("mtls-accept PASS: client cert (CN=rio-builder) accepted on 9001 + 9002")
 
         with subtest("mtls-health-shared: plaintext health port spawned when TLS on"):
             # The scheduler/store spawn a SECOND plaintext server on
@@ -1150,7 +1150,7 @@ in
 
             # privileged absent or false on the worker container. The
             # controller's build_container() only sets privileged:true
-            # when the WorkerPool spec has it; false → field omitted.
+            # when the BuilderPool spec has it; false → field omitted.
             sc = pod["spec"]["containers"][0].get("securityContext", {})
             assert not sc.get("privileged", False), (
                 f"worker container still privileged: securityContext={sc}"

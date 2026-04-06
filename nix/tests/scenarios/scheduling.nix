@@ -33,7 +33,7 @@
 # obs.metric.store — verify marker at default.nix:subtests[load-50drv]
 #
 # worker.fuse.lookup-caches — verify marker at default.nix:subtests[fanout]
-#   fanout asserts rio_worker_fuse_cache_misses_total ≥1 on each small
+#   fanout asserts rio_builder_fuse_cache_misses_total ≥1 on each small
 #   worker. Nonzero misses prove lookup()→ensure_cached()→materialize
 #   ran and the inode→realpath mapping is cached (ops.rs:52+).
 #
@@ -50,7 +50,7 @@
 #   values (not grep '[1-9]') so CI logs show actual-vs-expected on failure.
 #
 # worker.shutdown.sigint — verify marker at default.nix:subtests[sigint-graceful]
-#   sigint-graceful sends SIGINT (not SIGTERM) to rio-worker on wsmall2
+#   sigint-graceful sends SIGINT (not SIGTERM) to rio-builder on wsmall2
 #   and asserts ExecMainCode=1 + ExecMainStatus=0 → main() RETURNED
 #   (stack unwound, Drop ran) rather than death-by-signal. Also guards
 #   .#coverage-full: main() returning → atexit fires → profraw flushes.
@@ -219,7 +219,7 @@ let
           # registration metadata wrong).
           for w in small_workers:
               assert_metric_ge(w, 9093,
-                  "rio_worker_builds_total", 1.0, labels='{outcome="success"}')
+                  "rio_builder_builds_total", 1.0, labels='{outcome="success"}')
 
           # FUSE fetch: each SMALL worker pulled ≥1 path from rio-store
           # (busybox must be fetched before any build runs). lookup()
@@ -229,7 +229,7 @@ let
           # wlarge never built anything → never fetched anything.
           for w in small_workers:
               assert_metric_ge(w, 9093,
-                  "rio_worker_fuse_cache_misses_total", 1.0)
+                  "rio_builder_fuse_cache_misses_total", 1.0)
 
           # wsmall2 runs with RIO_FUSE_PASSTHROUGH=false (default.nix).
           # Its reads go through the userspace FUSE callback instead of
@@ -237,7 +237,7 @@ let
           # read() actually ran — passthrough bypasses it entirely.
           # wsmall1 (passthrough ON) should be near-zero or absent.
           assert_metric_ge(wsmall2, 9093,
-              "rio_worker_fuse_fallback_reads_total", 1.0)
+              "rio_builder_fuse_fallback_reads_total", 1.0)
 
           # Store: received 5 build outputs via PutPath (+ busybox seed).
           # ≥5 to be robust against retries.
@@ -389,9 +389,9 @@ let
           # wlarge's worker_builds_total incremented (proves DISPATCH,
           # not just classification).
           wl_before = metric_value(wlarge_before,
-              "rio_worker_builds_total", '{outcome="success"}') or 0.0
+              "rio_builder_builds_total", '{outcome="success"}') or 0.0
           wl_after = metric_value(wlarge_after,
-              "rio_worker_builds_total", '{outcome="success"}') or 0.0
+              "rio_builder_builds_total", '{outcome="success"}') or 0.0
           assert wl_after >= wl_before + 1, (
               f"wlarge should have built bigthing; "
               f"before={wl_before}, after={wl_after}"
@@ -401,11 +401,11 @@ let
           # than metrics but proves end-to-end — the derivation name
           # never appeared in their logs at all.
           wlarge.succeed(
-              "journalctl -u rio-worker --no-pager | grep 'rio-2c-bigthing'"
+              "journalctl -u rio-builder --no-pager | grep 'rio-2c-bigthing'"
           )
           for w in small_workers:
               w.fail(
-                  "journalctl -u rio-worker --no-pager | grep 'rio-2c-bigthing'"
+                  "journalctl -u rio-builder --no-pager | grep 'rio-2c-bigthing'"
               )
     '';
 
@@ -497,7 +497,7 @@ let
           for _ in range(30):
               for w in small_workers:
                   c = w.succeed(
-                      "journalctl -u rio-worker --no-pager | "
+                      "journalctl -u rio-builder --no-pager | "
                       "grep -c 'rio-test-sched-reassign' || true"
                   ).strip()
                   if int(c or "0") > 0:
@@ -514,7 +514,7 @@ let
           # SIGKILL the assigned worker. systemd restarts it (Restart=
           # on-failure) but the scheduler sees the gRPC stream drop
           # immediately → increments disconnects → requeues the build.
-          assigned.succeed("systemctl kill -s KILL rio-worker.service")
+          assigned.succeed("systemctl kill -s KILL rio-builder.service")
 
           # Wait for the background build to complete. Worst case: the
           # first attempt ran ~20s before kill, then a fresh 25s run on
@@ -548,7 +548,7 @@ let
           # Wait for the killed worker to come back before collectCoverage
           # (otherwise its profraw from pre-kill is all we get, and the
           # workers_active count is wrong for any later scenario runs).
-          assigned.wait_for_unit("rio-worker.service")
+          assigned.wait_for_unit("rio-builder.service")
     '';
 
     cgroup = ''
@@ -681,7 +681,7 @@ let
           # we'd see "lookup: not found" (trace, not warn) and these
           # three would be 0 — the slow paths never entered.
           slowpath_warns = wsmall1.succeed(
-              "journalctl -u rio-worker --no-pager | "
+              "journalctl -u rio-builder --no-pager | "
               "grep -cE 'failed after ensure_cached' || echo 0"
           ).strip()
           assert int(slowpath_warns) >= 3, (
@@ -696,7 +696,7 @@ let
           # breaks it out by message. readlink/open/readdir each have
           # their own warn text.
           breakdown = wsmall1.succeed(
-              "journalctl -u rio-worker --no-pager | "
+              "journalctl -u rio-builder --no-pager | "
               "grep 'failed after ensure_cached' | "
               "grep -oE '(open|readlink|readdir) failed' | sort | uniq -c"
           ).strip()
@@ -772,7 +772,7 @@ let
           # If this is 0 but elapsed is in-range, the nix-daemon enforced
           # it instead — rio-side backstop didn't fire (impl bug).
           warn_count = wlarge.succeed(
-              "journalctl -u rio-worker --no-pager | "
+              "journalctl -u rio-builder --no-pager | "
               "grep -c 'silent for maxSilentTime' || true"
           ).strip()
           assert int(warn_count or "0") >= 1, (
@@ -787,7 +787,7 @@ let
           # worker, it would have run 60s and succeeded (no silence config).
           for w in small_workers:
               w.fail(
-                  "journalctl -u rio-worker --no-pager | "
+                  "journalctl -u rio-builder --no-pager | "
                   "grep 'rio-sched-silence'"
               )
 
@@ -926,7 +926,7 @@ let
           # cgroup (worker.nix:180). `find -print -quit` stops at first
           # match; `| grep .` fails on empty output (find exits 0 on
           # no-match) so the Python-side rc check works.
-          cgroup_parent = "/sys/fs/cgroup/system.slice/rio-worker.service"
+          cgroup_parent = "/sys/fs/cgroup/system.slice/rio-builder.service"
           assigned = None
           cgroup_path = None
           for _ in range(30):
@@ -997,7 +997,7 @@ let
           # Worker logged the kill path (runtime.rs:238). No kubelet
           # http2-stream flake here (standalone journald, not k8s).
           assigned.succeed(
-              "journalctl -u rio-worker --no-pager | "
+              "journalctl -u rio-builder --no-pager | "
               "grep 'build cancelled via cgroup.kill'"
           )
 
@@ -1139,7 +1139,7 @@ let
           # Poll the worker's in-flight gauge until 0.
           wsmall2.wait_until_succeeds(
               "curl -sf localhost:9093/metrics | "
-              "grep -qE '^rio_worker_builds_active 0$'",
+              "grep -qE '^rio_builder_builds_active 0$'",
               timeout=60,
           )
 
@@ -1148,7 +1148,7 @@ let
           # that path already works (rio-common::signal::shutdown_signal
           # watched SIGTERM from day one). SIGINT tests the NEW code
           # at main.rs:503 (r[impl worker.shutdown.sigint]).
-          wsmall2.succeed("systemctl kill -s INT rio-worker.service")
+          wsmall2.succeed("systemctl kill -s INT rio-builder.service")
 
           # Unit reaches inactive when main() returns. NOT
           # wait_for_unit (that waits for active). 30s: drain is
@@ -1157,7 +1157,7 @@ let
           # is-active exits 3 when inactive → pipefail kills the
           # pipeline before grep runs. show always exits 0.
           wsmall2.wait_until_succeeds(
-              "systemctl show rio-worker.service -p ActiveState "
+              "systemctl show rio-builder.service -p ActiveState "
               "| grep -qx ActiveState=inactive",
               timeout=30,
           )
@@ -1166,7 +1166,7 @@ let
           # (Code=1) + Status=0. SIGINT default handler →
           # CLD_KILLED (Code=2) + Status=2.
           exit_info = wsmall2.succeed(
-              "systemctl show rio-worker.service "
+              "systemctl show rio-builder.service "
               "-p ExecMainCode -p ExecMainStatus"
           )
           assert "ExecMainCode=1" in exit_info, (
@@ -1218,8 +1218,8 @@ let
           # Restart for later fragments + collectCoverage. systemd
           # Restart=on-failure (worker.nix:191) does NOT fire for
           # exit 0 (it's on-FAILURE). Must start manually.
-          wsmall2.succeed("systemctl start rio-worker.service")
-          wsmall2.wait_for_unit("rio-worker.service")
+          wsmall2.succeed("systemctl start rio-builder.service")
+          wsmall2.wait_for_unit("rio-builder.service")
           # Wait for FUSE remount so subsequent fragments (none
           # currently, but collectCoverage + future additions) see
           # a consistent state. FUSE mount happens early in main().

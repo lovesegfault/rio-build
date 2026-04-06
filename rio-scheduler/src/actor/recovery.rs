@@ -71,8 +71,8 @@ impl DagActor {
         // takeover). On acquire, PG is the single source of truth
         // — clear the standby's partial in-mem view, reload.
         //
-        // DON'T clear self.workers: those are live connections
-        // (WorkerConnected + Heartbeat), not persisted state. A
+        // DON'T clear self.executors: those are live connections
+        // (ExecutorConnected + Heartbeat), not persisted state. A
         // worker connected to the standby is still connected.
         self.dag = DerivationDag::new();
         self.ready_queue.clear();
@@ -514,26 +514,26 @@ impl DagActor {
     ///
     /// Scheduled via WeakSender delay (~45s = 3× heartbeat + slack)
     /// AFTER recovery. For each Assigned/Running derivation: if
-    /// `assigned_worker` NOT in `self.workers` (worker didn't
+    /// `assigned_executor` NOT in `self.executors` (worker didn't
     /// reconnect after scheduler restart) → query store for output
     /// existence → if all present: Completed (orphan completion
     /// while scheduler was down), else reset_to_ready + retry++.
     ///
-    /// Workers ARE in self.workers (survived): they'll send
+    /// Workers ARE in self.executors (survived): they'll send
     /// CompletionReport or heartbeat showing the build still
     /// running — normal handling resumes.
     #[instrument(skip(self))]
     pub(super) async fn handle_reconcile_assignments(&mut self) {
-        // Collect (drv_hash, assigned_worker, expected_outputs)
+        // Collect (drv_hash, assigned_executor, expected_outputs)
         // for Assigned/Running with unknown workers. Clone before
         // mutating (node_mut borrow).
         //
-        // worker_id is Option: Assigned/Running with assigned_worker
+        // executor_id is Option: Assigned/Running with assigned_executor
         // =None is inconsistent state (shouldn't happen, but recovery
         // loads from PG which could have drifted). We still reconcile
         // it (check store for outputs → Completed, else Ready) rather
         // than silently skipping and leaving it stuck forever.
-        let orphaned: Vec<(DrvHash, Option<WorkerId>, Vec<String>)> = self
+        let orphaned: Vec<(DrvHash, Option<ExecutorId>, Vec<String>)> = self
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
@@ -542,8 +542,8 @@ impl DagActor {
                     DerivationStatus::Assigned | DerivationStatus::Running
                 )
             })
-            .filter_map(|(h, s)| match s.assigned_worker.as_ref() {
-                Some(w) if self.workers.contains_key(w) => {
+            .filter_map(|(h, s)| match s.assigned_executor.as_ref() {
+                Some(w) if self.executors.contains_key(w) => {
                     // Worker reconnected. Cross-check running_builds:
                     // if the worker's heartbeat doesn't include this
                     // drv_hash, the assignment is phantom — PG says
@@ -557,7 +557,7 @@ impl DagActor {
                     // reconnected. This cross-check reconciles them.
                     let hash: DrvHash = h.into();
                     if self
-                        .workers
+                        .executors
                         .get(w)
                         .is_some_and(|ws| ws.running_builds.contains(&hash))
                     {
@@ -565,7 +565,7 @@ impl DagActor {
                         // completion report will arrive normally.
                         None
                     } else {
-                        warn!(drv_hash = %hash, worker_id = %w,
+                        warn!(drv_hash = %hash, executor_id = %w,
                               "reconcile: worker reconnected but phantom Assigned (not in worker.running_builds) — reconciling");
                         Some((hash, Some(w.clone()), s.expected_output_paths.clone()))
                     }
@@ -588,7 +588,7 @@ impl DagActor {
             "reconciling orphaned assignments (worker didn't reconnect)"
         );
 
-        for (drv_hash, worker_id, expected_outputs) in orphaned {
+        for (drv_hash, executor_id, expected_outputs) in orphaned {
             // Query store: are all outputs present? If so, the
             // build completed while the scheduler was down —
             // transition Completed (orphan completion). Else, the
@@ -620,7 +620,7 @@ impl DagActor {
 
             if all_present {
                 // Orphan completion: transition Completed.
-                info!(drv_hash = %drv_hash, worker_id = ?worker_id,
+                info!(drv_hash = %drv_hash, executor_id = ?executor_id,
                       "reconcile: orphan completion (outputs found in store)");
                 // Capture interested_builds BEFORE transitioning —
                 // check_build_completion (below) needs to know which
@@ -647,7 +647,7 @@ impl DagActor {
                         continue;
                     }
                     state.output_paths = expected_outputs;
-                    state.assigned_worker = None;
+                    state.assigned_executor = None;
                 }
                 self.persist_status(&drv_hash, DerivationStatus::Completed, None)
                     .await;
@@ -697,7 +697,7 @@ impl DagActor {
                 // Worker died mid-build. Record the failure (in-mem
                 // + PG) + check poison threshold (same helper as
                 // reassign_derivations).
-                let should_poison = if let Some(w) = &worker_id {
+                let should_poison = if let Some(w) = &executor_id {
                     self.record_failure_and_check_poison(&drv_hash, w).await
                 } else {
                     self.dag
@@ -706,13 +706,13 @@ impl DagActor {
                         .unwrap_or(false)
                 };
                 if should_poison {
-                    info!(drv_hash = %drv_hash, worker_id = ?worker_id,
+                    info!(drv_hash = %drv_hash, executor_id = ?executor_id,
                           "reconcile: poison threshold reached, poisoning");
                     self.poison_and_cascade(&drv_hash).await;
                     continue;
                 }
 
-                info!(drv_hash = %drv_hash, worker_id = ?worker_id,
+                info!(drv_hash = %drv_hash, executor_id = ?executor_id,
                       "reconcile: worker didn't reconnect, resetting to Ready");
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
                     if let Err(e) = state.reset_to_ready() {

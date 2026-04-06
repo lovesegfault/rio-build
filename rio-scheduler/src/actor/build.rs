@@ -43,10 +43,10 @@ impl DagActor {
         // yet dispatched, or shared with another build) are handled
         // by the existing orphan-removal / keep-running paths.
         //
-        // Collect (drv_path, worker_id) for each such derivation.
+        // Collect (drv_path, executor_id) for each such derivation.
         // drv_path (not drv_hash) because that's what CancelSignal
         // and the worker's cancel registry are keyed on.
-        let to_cancel: Vec<(DrvHash, String, WorkerId)> = self
+        let to_cancel: Vec<(DrvHash, String, ExecutorId)> = self
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
@@ -57,10 +57,10 @@ impl DagActor {
                     && s.interested_builds.contains(&build_id)
             })
             .filter_map(|(h, s)| {
-                // assigned_worker should always be Some for Assigned/
+                // assigned_executor should always be Some for Assigned/
                 // Running, but be defensive. h is &str (iter_nodes
                 // returns HashMap's &str keys) — .into() to DrvHash.
-                s.assigned_worker
+                s.assigned_executor
                     .as_ref()
                     .map(|w| (h.into(), s.drv_path().to_string(), w.clone()))
             })
@@ -83,7 +83,7 @@ impl DagActor {
         // heartbeats/completions/dispatch for the duration. Batching
         // collapses that to 2 round-trips regardless of N.
         let mut transitioned: Vec<&str> = Vec::with_capacity(to_cancel.len());
-        for (drv_hash, drv_path, worker_id) in &to_cancel {
+        for (drv_hash, drv_path, executor_id) in &to_cancel {
             // Transition FIRST. If it fails (state changed under
             // us — completion arrived between the collect above and
             // here), skip the signal — the build finished naturally.
@@ -93,10 +93,10 @@ impl DagActor {
                            "cancel transition failed (completion raced us), skipping signal");
                     continue;
                 }
-                state.assigned_worker = None;
+                state.assigned_executor = None;
             }
             transitioned.push(drv_hash.as_str());
-            if let Some(worker) = self.workers.get(worker_id)
+            if let Some(worker) = self.executors.get(executor_id)
                 && let Some(tx) = &worker.stream_tx
                 && let Err(e) = tx.try_send(rio_proto::types::SchedulerMessage {
                     msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
@@ -107,7 +107,7 @@ impl DagActor {
                     )),
                 })
             {
-                debug!(worker_id = %worker_id, drv_hash = %drv_hash, error = %e,
+                debug!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
                        "cancel signal dropped (stream full/closed)");
                 metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
             }
@@ -115,7 +115,7 @@ impl DagActor {
             // counted against their capacity. They'll re-report it
             // on next heartbeat but our reconcile logic keeps
             // scheduler-authoritative.
-            if let Some(worker) = self.workers.get_mut(worker_id) {
+            if let Some(worker) = self.executors.get_mut(executor_id) {
                 worker.running_builds.remove(drv_hash);
             }
         }
@@ -262,7 +262,7 @@ impl DagActor {
             finished_at: None,
             error_summary: build.error_summary.clone().unwrap_or_default(),
             critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
-            assigned_workers: summary.assigned_workers,
+            assigned_executors: summary.assigned_executors,
         })
     }
 

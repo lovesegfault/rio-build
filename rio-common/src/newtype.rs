@@ -167,11 +167,11 @@ macro_rules! arc_string_newtype {
 // Shared newtype instances
 // ---------------------------------------------------------------------------
 //
-// These identifiers cross crate boundaries (scheduler <-> worker <-> proto),
+// These identifiers cross crate boundaries (scheduler <-> builder <-> proto),
 // so they live here rather than in a single consumer crate.
 //
 // Both use Arc<str> backing: the scheduler's DAG clones DrvHash ~40×/merge
-// for edge storage, priority queue entries, and cascade walks. WorkerId is
+// for edge storage, priority queue entries, and cascade walks. ExecutorId is
 // cloned per-heartbeat into reconciled sets. Arc makes those clones free.
 
 arc_string_newtype! {
@@ -189,9 +189,11 @@ arc_string_newtype! {
 }
 
 arc_string_newtype! {
-    /// Worker identifier newtype (e.g., `"worker-0"` or a UUID).
+    /// Executor identifier newtype (e.g., `"builder-0"`, `"fetcher-2"`,
+    /// or a UUID). Covers both builder and fetcher pods — the scheduler
+    /// distinguishes by `ExecutorState.kind`, not by ID prefix.
     /// `Arc<str>` backing — clone is an atomic refcount bump, not alloc.
-    pub struct WorkerId
+    pub struct ExecutorId
 }
 
 #[cfg(test)]

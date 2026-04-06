@@ -69,7 +69,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         "NLB target health"                           => step_nlb_health(&client, &aws, &region);
         let _tunnel =
         "SSM tunnel"        [+SSM_TUNNEL_STEPS]       => ssm_tunnel(LOCAL_PORT);
-        "workerpool reconcile"                        => step_workerpool_reconciled(&client);
+        "builderpool reconcile"                        => step_workerpool_reconciled(&client);
         "trivial build (cold-start ~2-3min)"
                             [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
         "rio-cli status"                              => step_status(&client);
@@ -338,8 +338,8 @@ pub async fn ssh_banner(port: u16) -> Option<()> {
 }
 
 pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
-    use rio_crds::workerpool::WorkerPool;
-    let api: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
+    use rio_crds::builderpool::BuilderPool;
+    let api: Api<BuilderPool> = Api::namespaced(client.clone(), NS);
     ui::poll_in(Duration::from_secs(5), 12, || {
         let api = api.clone();
         async move {
@@ -388,8 +388,8 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
         smoke_build("slow", 180, &store_url).await
     }));
 
-    use rio_crds::workerpool::WorkerPool;
-    let wp: Api<WorkerPool> = Api::namespaced(client.clone(), NS);
+    use rio_crds::builderpool::BuilderPool;
+    let wp: Api<BuilderPool> = Api::namespaced(client.clone(), NS);
     ui::poll(">=2 ready workers", Duration::from_secs(10), 18, || {
         let wp = wp.clone();
         async move {

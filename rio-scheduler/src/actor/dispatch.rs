@@ -101,10 +101,10 @@ impl DagActor {
                 // wasteful); a "large" build CANNOT go to "small"
                 // (would under-provision). So overflow walks UP only.
                 let (eligible_worker, chosen_class) =
-                    self.find_worker_with_overflow(&drv_hash, target_class.as_deref());
+                    self.find_executor_with_overflow(&drv_hash, target_class.as_deref());
 
                 match eligible_worker {
-                    Some(worker_id) => {
+                    Some(executor_id) => {
                         // Record what class we ACTUALLY routed to (may
                         // be larger than target if we overflowed).
                         // Misclassification detector reads this at
@@ -120,7 +120,7 @@ impl DagActor {
                             .increment(1);
                         }
 
-                        if self.assign_to_worker(&drv_hash, &worker_id).await {
+                        if self.assign_to_worker(&drv_hash, &executor_id).await {
                             dispatched_any = true;
                         } else {
                             // Assignment send failed (worker stream full or
@@ -173,25 +173,25 @@ impl DagActor {
     /// Find a worker for this derivation, starting at `target_class` and
     /// overflowing to progressively larger classes if needed.
     ///
-    /// Returns `(worker_id, class_actually_used)`. Both None if nobody
+    /// Returns `(executor_id, class_actually_used)`. Both None if nobody
     /// can take it (wrong system, all full, no workers).
     ///
     /// Overflow direction: small → large only. A slow build on a small
     /// worker would dominate that worker's single slot; a fast build on
     /// a large worker is just slightly wasteful. scheduler.md:178.
-    fn find_worker_with_overflow(
+    fn find_executor_with_overflow(
         &self,
         drv_hash: &DrvHash,
         target_class: Option<&str>,
-    ) -> (Option<WorkerId>, Option<String>) {
+    ) -> (Option<ExecutorId>, Option<String>) {
         let Some(drv_state) = self.dag.node(drv_hash) else {
             return (None, None);
         };
 
-        // No classification configured → single best_worker call with
+        // No classification configured → single best_executor call with
         // no filter. Fast path for deployments without size-classes.
         let Some(target) = target_class else {
-            let w = crate::assignment::best_worker(&self.workers, drv_state, &self.dag, None);
+            let w = crate::assignment::best_executor(&self.executors, drv_state, &self.dag, None);
             return (w, None);
         };
 
@@ -204,7 +204,7 @@ impl DagActor {
         // via estimator refresh) and the sort is 2-4 elements.
         //
         // Read guard lives through the chain walk — no `.await` in
-        // this fn, so it's safe. best_worker is sync.
+        // this fn, so it's safe. best_executor is sync.
         let classes = self.size_classes.read();
         let target_cutoff = crate::assignment::cutoff_for(target, &classes);
         let mut chain: Vec<(&str, f64)> = classes
@@ -223,7 +223,7 @@ impl DagActor {
         // Walk the chain: first class with an available worker wins.
         for (class, _) in chain {
             if let Some(w) =
-                crate::assignment::best_worker(&self.workers, drv_state, &self.dag, Some(class))
+                crate::assignment::best_executor(&self.executors, drv_state, &self.dag, Some(class))
             {
                 return (Some(w), Some(class.to_string()));
             }
@@ -238,7 +238,7 @@ impl DagActor {
     pub(super) async fn assign_to_worker(
         &mut self,
         drv_hash: &DrvHash,
-        worker_id: &WorkerId,
+        executor_id: &ExecutorId,
     ) -> bool {
         // Transition ready -> assigned. Do this FIRST (before recording latency
         // or clearing ready_at) so a rejected transition doesn't pollute metrics.
@@ -249,7 +249,7 @@ impl DagActor {
                 // status != Ready guard. Log so operators can spot races.
                 warn!(
                     drv_hash = %drv_hash,
-                    worker_id = %worker_id,
+                    executor_id = %executor_id,
                     current = ?state.status(),
                     error = %e,
                     "Ready->Assigned transition rejected in assign_to_worker (TOCTOU)"
@@ -270,7 +270,7 @@ impl DagActor {
             // fresh computed backoff from the (incremented)
             // retry_count.
             state.backoff_until = None;
-            state.assigned_worker = Some(worker_id.clone());
+            state.assigned_executor = Some(executor_id.clone());
         }
 
         // Single atomic load. The lease task may fetch_add the
@@ -287,7 +287,7 @@ impl DagActor {
         let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
 
         // Update DB (non-terminal: log failure, don't block dispatch)
-        self.persist_status(drv_hash, DerivationStatus::Assigned, Some(worker_id))
+        self.persist_status(drv_hash, DerivationStatus::Assigned, Some(executor_id))
             .await;
 
         // Create assignment in DB. PG BIGINT is signed; cast at THIS
@@ -298,20 +298,20 @@ impl DagActor {
             && let Some(db_id) = state.db_id
             && let Err(e) = self
                 .db
-                .insert_assignment(db_id, worker_id, generation as i64)
+                .insert_assignment(db_id, executor_id, generation as i64)
                 .await
         {
-            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e, "failed to insert assignment record");
+            error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e, "failed to insert assignment record");
         }
 
         // Track on worker
-        if let Some(worker) = self.workers.get_mut(worker_id) {
+        if let Some(worker) = self.executors.get_mut(executor_id) {
             worker.running_builds.insert(drv_hash.clone());
         }
 
         // Auto-pin: write input-closure paths to scheduler_live_pins
         // so GC's mark CTE protects them. Same closure
-        // approximation as send_prefetch_hint and best_worker
+        // approximation as send_prefetch_hint and best_executor
         // scoring (approx_input_closure). Best-effort: PG failure
         // logs + continues; 24h grace period is the fallback.
         // Empty for leaf derivations → no-op.
@@ -331,7 +331,7 @@ impl DagActor {
         // A few seconds of head-start on a multi-minute fetch
         // is the win.
         //
-        // Same closure approximation as best_worker's bloom
+        // Same closure approximation as best_executor's bloom
         // scoring (approx_input_closure) — if scoring said "w1
         // has most of these," the hint should be "the few w1
         // DOESN'T have." Consistent approximation = consistent
@@ -343,7 +343,7 @@ impl DagActor {
         // likely also fail → the reset_to_ready cleanup below
         // handles it. If only the HINT fails, the build still
         // works, just fetches on-demand via FUSE.
-        self.send_prefetch_hint(worker_id, drv_hash);
+        self.send_prefetch_hint(executor_id, drv_hash);
 
         // CA input resolution: rewrite placeholder paths in
         // env/args/builder to realized output paths before
@@ -398,7 +398,7 @@ impl DagActor {
                 let timeout_secs = if build_opts.build_timeout > 0 {
                     build_opts.build_timeout
                 } else {
-                    // Match rio-worker's DEFAULT_DAEMON_TIMEOUT.
+                    // Match rio-builder's DEFAULT_DAEMON_TIMEOUT.
                     // Can't reference the const cross-crate, so
                     // duplicate the value. 7200s = 2h.
                     7200
@@ -417,7 +417,7 @@ impl DagActor {
                     .unwrap_or(0)
                     .saturating_add(timeout_secs.saturating_mul(2));
                 signer.sign(&rio_common::hmac::AssignmentClaims {
-                    worker_id: worker_id.to_string(),
+                    executor_id: executor_id.to_string(),
                     drv_hash: drv_hash.to_string(),
                     expected_outputs: state.expected_output_paths.clone(),
                     // Floating-CA: output path is computed post-build
@@ -433,7 +433,7 @@ impl DagActor {
             } else {
                 // Legacy unsigned: format-string. Store with
                 // hmac_verifier=None accepts this.
-                format!("{worker_id}-{drv_hash}-{generation}")
+                format!("{executor_id}-{drv_hash}-{generation}")
             };
 
             let assignment = rio_proto::types::WorkAssignment {
@@ -461,12 +461,12 @@ impl DagActor {
                 )),
             };
 
-            if let Some(worker) = self.workers.get(worker_id)
+            if let Some(worker) = self.executors.get(executor_id)
                 && let Some(tx) = &worker.stream_tx
                 && let Err(e) = tx.try_send(msg)
             {
                 warn!(
-                    worker_id = %worker_id,
+                    executor_id = %executor_id,
                     drv_hash = %drv_hash,
                     error = %e,
                     "failed to send assignment to worker"
@@ -474,7 +474,7 @@ impl DagActor {
                 // Clean up worker tracking (we added drv_hash above;
                 // without this, the worker appears to have this derivation
                 // running, causing a phantom capacity leak).
-                if let Some(worker) = self.workers.get_mut(worker_id) {
+                if let Some(worker) = self.executors.get_mut(executor_id) {
                     worker.running_builds.remove(drv_hash);
                 }
                 // Reset state: Assigned -> Ready. Caller (dispatch_ready)
@@ -490,7 +490,7 @@ impl DagActor {
                     // may eventually catch this, but it's a visible hang until then.
                     error!(
                         drv_hash = %drv_hash,
-                        worker_id = %worker_id,
+                        executor_id = %executor_id,
                         current = ?state.status(),
                         error = %e,
                         "reset_to_ready failed after assignment send failure; derivation orphaned in Assigned"
@@ -536,7 +536,7 @@ impl DagActor {
                     derivation_path: self.drv_path_or_hash_fallback(drv_hash),
                     status: Some(rio_proto::dag::derivation_event::Status::Started(
                         rio_proto::dag::DerivationStarted {
-                            worker_id: worker_id.to_string(),
+                            executor_id: executor_id.to_string(),
                         },
                     )),
                 }),
@@ -548,7 +548,7 @@ impl DagActor {
             self.emit_progress(*build_id);
         }
 
-        debug!(drv_hash = %drv_hash, worker_id = %worker_id, "assigned derivation to worker");
+        debug!(drv_hash = %drv_hash, executor_id = %executor_id, "assigned derivation to worker");
         metrics::counter!("rio_scheduler_assignments_total").increment(1);
         true
     }
@@ -556,7 +556,7 @@ impl DagActor {
     /// Send a PrefetchHint for the chosen worker to warm its FUSE
     /// cache. Best-effort: `try_send`, failure logs at debug.
     ///
-    /// Same closure approximation as [`best_worker`]'s scoring
+    /// Same closure approximation as [`best_executor`]'s scoring
     /// (both call `approx_input_closure`). Bloom-filtered against
     /// the worker's last heartbeat filter: skip paths the worker
     /// PROBABLY has. False positives (bloom says yes, worker
@@ -570,11 +570,11 @@ impl DagActor {
     /// No bloom = send everything (pessimistic, same as scoring).
     /// Empty hint (everything filtered) = don't send the message
     /// at all (saves one try_send for the common case where
-    /// best_worker picked a warm worker — that's the point of
+    /// best_executor picked a warm worker — that's the point of
     /// bloom-locality scoring).
     ///
-    /// [`best_worker`]: crate::assignment::best_worker
-    fn send_prefetch_hint(&self, worker_id: &WorkerId, drv_hash: &DrvHash) {
+    /// [`best_executor`]: crate::assignment::best_executor
+    fn send_prefetch_hint(&self, executor_id: &ExecutorId, drv_hash: &DrvHash) {
         let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
         if input_paths.is_empty() {
             // Leaf derivation (no DAG children). Nothing to prefetch.
@@ -587,8 +587,8 @@ impl DagActor {
         // (heartbeat interval) but that's fine — a stale positive
         // means we skip hinting for a path the worker evicted
         // since last heartbeat; the build fetches it on-demand.
-        let Some(worker) = self.workers.get(worker_id.as_str()) else {
-            // Worker gone between best_worker and here? Actor is
+        let Some(worker) = self.executors.get(executor_id.as_str()) else {
+            // Worker gone between best_executor and here? Actor is
             // single-threaded so this shouldn't happen, but be
             // defensive (the if-let Some(state) at the top of the
             // caller is the same kind of guard).
@@ -619,7 +619,7 @@ impl DagActor {
         }
 
         if to_prefetch.is_empty() {
-            // Everything filtered = best_worker picked a warm worker.
+            // Everything filtered = best_executor picked a warm worker.
             // Exactly what bloom-locality scoring is FOR. No hint
             // message needed.
             return;
@@ -648,7 +648,7 @@ impl DagActor {
                 }
                 Err(e) => {
                     debug!(
-                        worker_id = %worker_id,
+                        executor_id = %executor_id,
                         drv_hash = %drv_hash,
                         error = %e,
                         "prefetch hint dropped (channel full; assignment may also fail)"
@@ -818,7 +818,7 @@ impl DagActor {
     /// regular file, so [`rio_nix::nar::extract_single_file`] unwraps
     /// it to the raw ATerm. This is the same path the worker takes
     /// when `WorkAssignment.drv_content` is empty
-    /// ([`rio-worker/src/executor/inputs.rs::fetch_drv_from_store`]).
+    /// ([`rio-builder/src/executor/inputs.rs::fetch_drv_from_store`]).
     ///
     /// Returns `None` on any failure: store unconfigured
     /// (`store_client = None`, test mode), `GetPath` error, timeout,
