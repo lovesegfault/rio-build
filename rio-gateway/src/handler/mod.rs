@@ -103,11 +103,11 @@ pub struct ClientOptions {
 ///   **canonical** name `"timeout"`, not the alias `"build-timeout"` — so
 ///   [`Self::build_timeout`] keying on `"build-timeout"` below would miss it.
 ///
-/// r[sched.timeout.per-build] is therefore reachable **only via gRPC
-/// `SubmitBuildRequest.build_timeout`** (rio-cli, direct API consumers), not
-/// via `nix-build --option`.
+/// The `sched.timeout.per-build` spec requirement is therefore reachable
+/// **only via gRPC `SubmitBuildRequest.build_timeout`** (rio-cli, direct
+/// API consumers), not via `nix-build --option`.
 ///
-/// TODO(P0311): If rio-gateway ever advertises `set-options-map-only` AND the
+/// WONTFIX(P0310): If rio-gateway ever advertises `set-options-map-only` AND the
 /// flake's nix input is bumped past 32827b9fb, this block goes live. Fix the
 /// `build_timeout` key (`"timeout"` not `"build-timeout"`) and delete the
 /// override-wins logic in `max_silent_time()` before relying on either.
@@ -497,7 +497,7 @@ mod tests {
     // override since 088ef8175, P0310 source-verified) and NEVER put
     // max-silent-time in argv. These accessors go live only if rio-gateway
     // advertises `set-options-map-only` AND the flake nix input bumps
-    // past 32827b9fb (TODO(P0311)). Tests kept to pin the accessor
+    // past 32827b9fb (WONTFIX(P0310)). Tests kept to pin the accessor
     // semantics for that future path.
 
     /// Override-wins logic reads `max-silent-time` from overrides.

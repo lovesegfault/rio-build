@@ -9,7 +9,6 @@
 //! struct, constructors, and common helpers. Split from a single 1087L
 //! file (P0356) after collision count hit 33 — SubmitBuild/WatchBuild
 //! changes no longer conflict with heartbeat/stream-dispatch changes.
-// r[impl proto.stream.bidi]
 
 pub(crate) mod actor_guards;
 mod scheduler_service;

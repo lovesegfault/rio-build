@@ -22,6 +22,7 @@ use super::SchedulerGrpc;
 impl WorkerService for SchedulerGrpc {
     type BuildExecutionStream = ReceiverStream<Result<rio_proto::types::SchedulerMessage, Status>>;
 
+    // r[impl proto.stream.bidi]
     #[instrument(skip(self, request), fields(rpc = "BuildExecution"))]
     async fn build_execution(
         &self,

@@ -119,7 +119,7 @@ pub(crate) struct Config {
     /// (rio-cli → `SubmitBuildRequest.build_options.max_silent_time`).
     /// Upstream fix 32827b9fb adds selective ssh-ng forwarding but requires
     /// the daemon to advertise `set-options-map-only`, which rio-gateway does
-    /// not — tracked under TODO(P0311).
+    /// not — tracked under WONTFIX(P0310).
     pub(crate) max_silent_time_secs: u64,
     /// mTLS for outgoing gRPC (scheduler + store). Env: `RIO_TLS__*`.
     /// Unset = plaintext.

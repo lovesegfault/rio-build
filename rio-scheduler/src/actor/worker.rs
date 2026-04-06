@@ -733,7 +733,7 @@ impl DagActor {
     }
 
     /// Wall-clock limit on the ENTIRE build from submission. Distinct from:
-    ///   - `r[sched.backstop.timeout]` in [`Self::tick_scan_dag`] (per-derivation
+    ///   - `sched.backstop.timeout` spec marker in [`Self::tick_scan_dag`] (per-derivation
     ///     heuristic: est×3)
     ///   - worker-side daemon floor at `actor/build.rs` `build_options_for_derivation`
     ///     (also receives `build_timeout` as `min_nonzero` per-derivation —
