@@ -93,6 +93,13 @@ pub struct LogBatcher {
 }
 
 impl LogBatcher {
+    /// Derivation path this batcher is collecting logs for. Exposed so
+    /// the stderr loop can tag `BuildPhase` messages without threading
+    /// `drv_path` separately through `read_build_stderr_loop`.
+    pub fn drv_path(&self) -> &str {
+        &self.drv_path
+    }
+
     /// Create a new log batcher for the given derivation.
     pub fn new(drv_path: String, executor_id: String, limits: LogLimits) -> Self {
         let now = Instant::now();

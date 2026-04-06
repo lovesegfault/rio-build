@@ -82,10 +82,37 @@ let
       };
     in
     crate_:
+    let
+      # cargo-hakari's job is feature unification at LOCK time. crate2nix
+      # reads Cargo.lock directly (features already baked into each dep's
+      # `resolvedDefaultFeatures`), so building workspace-hack's 116 deps
+      # is pure overhead — every leaf already builds the deps it actually
+      # uses, with the unified feature set, from the lock. Stub it to
+      # zero deps so per-crate targets don't drag in the whole workspace
+      # closure: `.#rio-builder` 491→344 rust drvs, `.#rio-nix` 429→87.
+      # docker images consume `memberBins` per-component, so the win
+      # carries through to `.#docker-builder` etc.
+      #
+      # NOTE: this must intercept `crate_` here, not via
+      # `defaultCrateOverrides` below — buildRustCrate threads
+      # `dependencies`/`buildDependencies` through makeOverridable
+      # defaults from the original `crate_` (build-rust-crate
+      # default.nix:506-507), so the crateOverrides merge at
+      # default.nix:238 never reaches them.
+      crate_' =
+        if crate_.crateName == "workspace-hack" then
+          crate_
+          // {
+            dependencies = [ ];
+            buildDependencies = [ ];
+          }
+        else
+          crate_;
+    in
     (base (
-      crate_
+      crate_'
       // {
-        extraRustcOpts = remapOpts ++ globalExtraRustcOpts ++ (crate_.extraRustcOpts or [ ]);
+        extraRustcOpts = remapOpts ++ globalExtraRustcOpts ++ (crate_'.extraRustcOpts or [ ]);
       }
       // lib.optionalAttrs (globalExtraRustcOpts != [ ]) {
         # Discard build-time profraws. Test runners override at
@@ -448,6 +475,26 @@ let
     mkdir -p $out/bin
     cp -L ${workspace}/bin/* $out/bin/
   '';
+
+  # Per-member binary-only derivations — same closure-scrub treatment as
+  # workspaceBins/workspaceBinsCov but one derivation per crate, so each
+  # docker image can include only the binary it ships instead of the full
+  # workspace bundle. lib-only members (rio-common, rio-nix, …) have no
+  # bin/ and will fail at build if referenced here — correct, only bin
+  # crates belong in image contents.
+  mkMemberBins =
+    strip:
+    lib.mapAttrs (
+      name: m:
+      pkgs.runCommand "${name}-bin" { disallowedReferences = [ rustStable ]; } ''
+        mkdir -p $out/bin
+        cp -L ${m.build}/bin/* $out/bin/
+        ${lib.optionalString strip ''
+          chmod -R u+w $out/bin
+          ${pkgs.binutils}/bin/strip $out/bin/*
+        ''}
+      ''
+    ) cargoNix.workspaceMembers;
 in
 {
   inherit cargoNix;
@@ -472,4 +519,12 @@ in
   # Each is a single buildRustCrate derivation — the whole point of
   # per-crate caching.
   members = lib.mapAttrs (_: m: m.build) cargoNix.workspaceMembers;
+
+  # Per-member stripped bins (docker.nix consumer). Same shape as
+  # `members` but each is a scrubbed bin/ only — closure ~glibc+syslibs.
+  memberBins = mkMemberBins true;
+
+  # Unstripped variant for coverage-mode docker images (see
+  # workspaceBinsCov).
+  memberBinsCov = mkMemberBins false;
 }

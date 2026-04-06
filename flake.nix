@@ -342,9 +342,15 @@
             };
 
           # Workspace binaries (crate2nix per-crate build, stripped in
-          # nix/crate2nix.nix). What docker images, VM tests,
-          # worker-vm, and crdgen consume.
+          # nix/crate2nix.nix). What VM tests, worker-vm, crdgen, and
+          # the docker `all` aggregate consume.
           rio-workspace = crateBuild.workspaceBins;
+
+          # Per-crate stripped bins, keyed by crate name (rio-gateway,
+          # rio-builder, …). docker.nix consumes these so each image
+          # only carries the binary it ships — the wshack-nix stub win
+          # (657→~344 rust drvs for builder) reaches the image build.
+          rio-crates = crateBuild.memberBins;
 
           # Coverage-instrumented workspace. crate2nix parallel tree
           # with globalExtraRustcOpts=["-Cinstrument-coverage"]. Used
@@ -353,6 +359,7 @@
           # needs). remap-path-prefix at compile time collapses the
           # closure to glibc+syslibs — fits k3s containerd tmpfs.
           rio-workspace-cov = crateBuildCov.workspaceBinsCov;
+          rio-crates-cov = crateBuildCov.memberBinsCov;
 
           # Source tree for genhtml (nix/coverage.nix cd's here so
           # genhtml can resolve repo-relative lcov paths to source
@@ -1278,11 +1285,17 @@
           mkDockerImages =
             {
               rio-workspace,
+              rio-crates,
               coverage ? false,
             }:
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
               import ./nix/docker.nix {
-                inherit pkgs rio-workspace coverage;
+                inherit
+                  pkgs
+                  rio-workspace
+                  rio-crates
+                  coverage
+                  ;
                 # Dashboard only for the non-coverage image set.
                 # nginx+static has no LLVM instrumentation and the
                 # coverage VM fixture doesn't deploy it — passing
@@ -1292,7 +1305,7 @@
                 rioDashboard = if coverage then null else rioDashboard;
               }
             );
-          dockerImages = mkDockerImages { inherit rio-workspace; };
+          dockerImages = mkDockerImages { inherit rio-workspace rio-crates; };
 
           # NixOS EKS node AMI builder (ADR-021). Exposed below as
           # packages.node-ami-{x86_64,aarch64}. The amazon-image.nix
@@ -1494,6 +1507,7 @@
                 rio-workspace = rio-workspace-cov;
                 dockerImages = mkDockerImages {
                   rio-workspace = rio-workspace-cov;
+                  rio-crates = rio-crates-cov;
                   coverage = true;
                 };
                 coverage = true;

@@ -58,6 +58,11 @@ spec:
             {{- include "rio.jwtSignEnv" . | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "[::]:2222"
+            # actBuild machineName field — what nom shows as "on <name>".
+            # The cluster appears as one machine to ssh-ng clients;
+            # per-pod executor IDs are an abstraction leak.
+            - name: RIO_GATEWAY_MACHINE_NAME
+              value: {{ .Values.gateway.machineName | default .Values.karpenter.clusterName | default "" | quote }}
             - name: RIO_DRAIN_GRACE_SECS
               value: {{ $g.drainGraceSecs | quote }}
             - name: RIO_SESSION_DRAIN_SECS

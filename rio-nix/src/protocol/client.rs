@@ -404,6 +404,7 @@ mod tests {
                     "building",
                     0,
                     0,
+                    &[],
                 )
                 .await?;
             w.stop_activity(1).await?;

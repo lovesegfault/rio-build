@@ -209,6 +209,12 @@ pub enum ActorCommand {
         batch: rio_proto::types::BuildLogBatch,
     },
 
+    /// Forward a build-phase change to interested gateways via
+    /// `emit_build_event`. Same `try_send`-under-backpressure semantics
+    /// as [`ForwardLogBatch`](Self::ForwardLogBatch) — a dropped phase
+    /// is a cosmetic nom regression, not a hang. Fire-and-forget.
+    ForwardPhase { phase: rio_proto::types::BuildPhase },
+
     /// Mark a worker draining: stop sending new assignments.
     ///
     /// Called by the worker itself (step 1 of SIGTERM drain) or by
@@ -478,6 +484,7 @@ impl ActorCommand {
             Self::WatchBuild { .. } => "WatchBuild",
             Self::CleanupTerminalBuild { .. } => "CleanupTerminalBuild",
             Self::ForwardLogBatch { .. } => "ForwardLogBatch",
+            Self::ForwardPhase { .. } => "ForwardPhase",
             Self::DrainExecutor { .. } => "DrainExecutor",
             Self::ClusterSnapshot { .. } => "ClusterSnapshot",
             Self::GetSizeClassSnapshot { .. } => "GetSizeClassSnapshot",

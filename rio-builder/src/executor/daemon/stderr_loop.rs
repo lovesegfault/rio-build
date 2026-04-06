@@ -356,6 +356,36 @@ where
                             LineOutcome::Break(r) => break r,
                         }
                     }
+                    // r[impl builder.stderr.forward-set-phase]
+                    // STDERR_RESULT{104 SetPhase}: forward as BuildPhase so
+                    // the gateway can emit resSetPhase against the per-drv
+                    // activity → nom shows "buildPhase"/"installPhase". NOT
+                    // batched (state edge, not spew); does NOT reset the
+                    // silence deadline (a build that only emits phase
+                    // markers but no actual output is still "silent" by
+                    // the maxSilentTime contract — same rule as the
+                    // Progress chatter below).
+                    Some(Ok(StderrMessage::Result { result_type, fields, .. }))
+                        if result_type == 104
+                            && matches!(fields.first(), Some(ResultField::String(_))) =>
+                    {
+                        let ResultField::String(phase) = &fields[0] else {
+                            unreachable!("match guard above proved String")
+                        };
+                        let msg = ExecutorMessage {
+                            msg: Some(executor_message::Msg::Phase(
+                                rio_proto::types::BuildPhase {
+                                    derivation_path: batcher.drv_path().to_owned(),
+                                    phase: phase.clone(),
+                                },
+                            )),
+                        };
+                        if log_tx.send(msg).await.is_err() {
+                            break Ok(Some(misc_fail(
+                                "log channel closed during build (scheduler stream gone)",
+                            )));
+                        }
+                    }
                     // Other Result types (Progress, SetExpected, etc.) and
                     // activity lifecycle messages — discard.
                     Some(Ok(
@@ -601,6 +631,7 @@ mod tests {
                     "building",
                     0,
                     0,
+                    &[],
                 )
                 .await?;
             w.stop_activity(aid).await?;
@@ -1157,6 +1188,7 @@ mod tests {
                     "building '/nix/store/xxx-rio-fod-fetch.drv'",
                     0,
                     0,
+                    &[],
                 )
                 .await?;
             // Builder output: wget's 403 line, forwarded as
@@ -1165,7 +1197,7 @@ mod tests {
             // least up to here, and the worker forwards it.
             w.result(
                 aid,
-                101,
+                rio_nix::protocol::stderr::ResultType::BuildLogLine,
                 &[ResultField::String(
                     "wget: server returned error: HTTP/1.1 403 Forbidden".into(),
                 )],
@@ -1224,13 +1256,57 @@ mod tests {
         Ok(())
     }
 
+    // r[verify builder.stderr.forward-set-phase]
+    /// STDERR_RESULT{104 SetPhase} is forwarded as a `BuildPhase`
+    /// `ExecutorMessage` (not batched, not a log line).
+    #[tokio::test]
+    async fn test_stderr_loop_forwards_set_phase() -> anyhow::Result<()> {
+        use rio_nix::protocol::stderr::{ResultField, ResultType};
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            w.result(
+                42,
+                ResultType::SetPhase,
+                &[ResultField::String("buildPhase".into())],
+            )
+            .await?;
+            w.result(
+                42,
+                ResultType::BuildLogLine,
+                &[ResultField::String("compiling".into())],
+            )
+            .await?;
+            w.finish().await?;
+        }
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
+
+        let (result, msgs) = run_loop(buf).await;
+        result.expect("should succeed");
+        // Phase arrives as its own ExecutorMessage::Phase, separate from
+        // the LogBatch containing "compiling".
+        let phases: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match &m.msg {
+                Some(executor_message::Msg::Phase(p)) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(phases.len(), 1, "msgs: {msgs:?}");
+        assert_eq!(phases[0].phase, "buildPhase");
+        assert_eq!(phases[0].derivation_path, "/nix/store/test.drv");
+        // The log line still lands in a LogBatch.
+        assert_eq!(count_log_lines(&msgs), 1);
+        Ok(())
+    }
+
     /// STDERR_RESULT with result_type=101 (BuildLogLine) is captured as a
     /// log line. This is how modern nix-daemon actually sends builder
     /// output — NOT as raw STDERR_NEXT. Latent phase2a bug caught by
     /// vm-phase2b's log-pipeline assertion.
     #[tokio::test]
     async fn test_stderr_loop_result_build_log_line_captured() -> anyhow::Result<()> {
-        use rio_nix::protocol::stderr::ResultField;
+        use rio_nix::protocol::stderr::{ResultField, ResultType};
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
@@ -1238,22 +1314,30 @@ mod tests {
             // activity_id 42 is arbitrary (we don't use it).
             w.result(
                 42,
-                101,
+                ResultType::BuildLogLine,
                 &[ResultField::String("compiling foo.c".to_string())],
             )
             .await?;
-            w.result(42, 101, &[ResultField::String("linking foo".to_string())])
-                .await?;
+            w.result(
+                42,
+                ResultType::BuildLogLine,
+                &[ResultField::String("linking foo".to_string())],
+            )
+            .await?;
             // result_type 107 = PostBuildLogLine — also captured.
             w.result(
                 42,
-                107,
+                ResultType::PostBuildLogLine,
                 &[ResultField::String("post-build hook output".to_string())],
             )
             .await?;
             // result_type 105 = Progress — discarded (not a log line).
-            w.result(42, 105, &[ResultField::Int(50), ResultField::Int(100)])
-                .await?;
+            w.result(
+                42,
+                ResultType::Progress,
+                &[ResultField::Int(50), ResultField::Int(100)],
+            )
+            .await?;
             w.finish().await?;
         }
         buf.extend(build_result_bytes(&BuildResult::success()).await?);
@@ -1274,14 +1358,14 @@ mod tests {
     /// limits as STDERR_NEXT.
     #[tokio::test]
     async fn test_stderr_loop_result_build_log_line_subject_to_limits() -> anyhow::Result<()> {
-        use rio_nix::protocol::stderr::ResultField;
+        use rio_nix::protocol::stderr::{ResultField, ResultType};
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
             for i in 0..10 {
                 w.result(
                     1,
-                    101,
+                    ResultType::BuildLogLine,
                     &[ResultField::String(format!("spew-via-result {i}"))],
                 )
                 .await?;

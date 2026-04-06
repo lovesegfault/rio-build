@@ -17,7 +17,9 @@ use rio_nix::protocol::build::{
 };
 use rio_nix::protocol::derived_path::{DerivedPath, OutputSpec};
 use rio_nix::protocol::opcodes::WorkerOp;
-use rio_nix::protocol::stderr::{ActivityType, StderrError, StderrWriter};
+use rio_nix::protocol::stderr::{
+    ActivityType, ResultField, ResultType, StderrError, StderrWriter, verbosity,
+};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
 use rio_proto::SchedulerServiceClient;

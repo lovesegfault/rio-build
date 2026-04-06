@@ -16,7 +16,14 @@
 # stubs (nix-daemon drops privs to nixbld). Gateway/scheduler/store are minimal.
 {
   pkgs,
+  # Full workspace bin bundle (all rio-* binaries, stripped). Only the
+  # `all` aggregate image still uses this — per-component images take
+  # individual entries from rio-crates instead.
   rio-workspace,
+  # Per-crate stripped bin derivations, keyed rio-gateway / rio-builder
+  # / … (crate2nix.nix memberBins). Each image lists exactly the crates
+  # it ships so its build closure doesn't pull in unrelated binaries.
+  rio-crates,
   # Svelte SPA dist/ output (nix/dashboard.nix). Nullable: the coverage-
   # mode mkDockerImages call site doesn't thread it through (dashboard
   # is nginx+static — no rio binary, no LLVM instrumentation). The
@@ -343,6 +350,11 @@ let
   mkImage =
     {
       name,
+      # Per-crate bin derivations (rio-crates.* entries) shipped in this
+      # image. The first one is the entrypoint binary. buildLayeredImage
+      # content-addresses layers, so shared deps (glibc, openssl, …)
+      # still collapse into shared layers across images.
+      bins,
       # Override the image name independently of the entrypoint binary
       # name. Used for the fetcher image: same rio-builder binary,
       # different RIO_EXECUTOR_KIND env, distinct image name so k8s
@@ -371,10 +383,10 @@ let
       # 60 is a reasonable sweet spot for our closure sizes.
       maxLayers = 60;
 
-      contents = baseContents ++ [ rio-workspace ] ++ extraContents;
+      contents = baseContents ++ bins ++ extraContents;
 
       config = {
-        Entrypoint = [ "${rio-workspace}/bin/rio-${name}" ];
+        Entrypoint = [ "${lib.head bins}/bin/rio-${name}" ];
         Env = baseEnv ++ extraEnv;
         Labels = mkLabels "rio-${name} — Nix build orchestration";
       }
@@ -384,21 +396,26 @@ in
 rec {
   gateway = mkImage {
     name = "gateway";
+    bins = [ rio-crates.rio-gateway ];
     user = nonrootUser;
     extraContents = nonrootEtc;
   };
-  # Scheduler also carries rio-cli (admin client) — buildLayeredImage's
-  # `contents` symlinks rio-workspace/bin/* into /bin/, so `kubectl exec
-  # deploy/rio-scheduler -- rio-cli create-tenant foo` resolves via the
-  # default /bin in PATH. The pod's RIO_TLS__* env (from tls-mounts.yaml)
-  # gives rio-cli mTLS to localhost:9001 for free.
+  # r[impl sec.image.control-plane-minimal]
+  # Control-plane images carry ONLY the component binary. rio-cli is NOT
+  # bundled here — admin ops run it locally via `cargo xtask k8s cli`
+  # (with_cli_tunnel port-forwards 9001/9002 + fetches mTLS client cert).
+  # See xtask/src/k8s/mod.rs and the spec marker above; bundling tooling
+  # in a control-plane image is an execution primitive in a compromised
+  # pod.
   scheduler = mkImage {
     name = "scheduler";
+    bins = [ rio-crates.rio-scheduler ];
     user = nonrootUser;
     extraContents = nonrootEtc;
   };
   store = mkImage {
     name = "store";
+    bins = [ rio-crates.rio-store ];
     user = nonrootUser;
     extraContents = nonrootEtc;
   };
@@ -410,6 +427,7 @@ rec {
   # reads SSL_CERT_FILE for the initial client config probe).
   controller = mkImage {
     name = "controller";
+    bins = [ rio-crates.rio-controller ];
     user = nonrootUser;
     extraContents = nonrootEtc;
   };
@@ -511,6 +529,7 @@ rec {
   # Builder needs the nix toolchain + FUSE runtime + mount utilities.
   builder = mkImage {
     name = "builder";
+    bins = [ rio-crates.rio-builder ];
     extraContents = builderExtraContents;
     extraEnv = builderExtraEnv;
     extraCommands = builderExtraCommands;
@@ -523,6 +542,7 @@ rec {
   fetcher = mkImage {
     name = "builder"; # Entrypoint is still /bin/rio-builder
     imageName = "rio-fetcher";
+    bins = [ rio-crates.rio-builder ];
     extraContents = builderExtraContents;
     extraEnv = builderExtraEnv ++ [ "RIO_EXECUTOR_KIND=fetcher" ];
     extraCommands = builderExtraCommands;
@@ -535,7 +555,7 @@ rec {
   # archive is NOT pulled. It's `ctr image import`ed into containerd's
   # content store at AMI bake time (kubelet preStart, eks-node.nix) so
   # the first pod's ECR pull finds most layer blobs already local and
-  # fetches only the delta (typically the ~10 MB rio-workspace top layer,
+  # fetches only the delta (typically the ~10 MB rio-builder top layer,
   # or zero if AMI and deploy are at the same commit).
   #
   # ONE oci: layout, two skopeo copies: the destination's content-
@@ -635,9 +655,8 @@ rec {
         echo OK > $out
       '';
 
-  # ── VM-test aggregate: all five rio binaries, one image ──────────────
-  # The five per-component images share the same rio-workspace closure
-  # and differ ONLY in Entrypoint. k3s airgap-imports serially and
+  # ── VM-test aggregate: all rio binaries, one image ───────────────────
+  # k3s airgap-imports serially and
   # alphabetically before kubelet starts — five near-identical ~170MB
   # tarballs decompress back-to-back, burning ~125s of wall time under
   # TCG (k3s-full.nix:280). This image carries every component (builder's
@@ -665,7 +684,7 @@ rec {
 # ── Dashboard: nginx + SPA static bundle ───────────────────────────────
 # No rio binary — just nginx serving the Svelte dist/ and proxying
 # /rio.* gRPC-Web POSTs to the Envoy Gateway Service. Can't use mkImage
-# (that's built around a rio-workspace Entrypoint).
+# (that's built around a rio-* binary Entrypoint).
 #
 # optionalAttrs: the coverage-mode mkDockerImages call site doesn't
 # pass rioDashboard (nginx+static has no LLVM instrumentation). The
