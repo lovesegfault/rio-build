@@ -123,29 +123,21 @@ Only after `.#ci` is green (coverage is backgrounded, not a gate). If cleanup fa
 
 ```bash
 N=<plan-number-without-P-prefix>   # e.g. 134 for p134
-.claude/bin/onibus dag set-status $N DONE
-.claude/bin/onibus dag unblocked-by $N    # JSON — plans entering frontier because of this merge
-.claude/bin/onibus merge queue-consume "P$N"  # remove from merge-queue.jsonl (no accumulation)
-.claude/bin/onibus dag render
-git add .claude/dag.jsonl
-git commit --amend --no-edit
-# count-bump MUST run AFTER amend — it records HEAD in merge-shas.jsonl for
-# the mc→SHA cadence map. Pre-amend HEAD is orphaned (reflog-only) after amend.
-.claude/bin/onibus merge count-bump
+.claude/bin/onibus merge dag-flip $N
 .claude/bin/onibus merge cadence           # CadenceReport — {count, consolidator.due, bughunter.due, ranges}
 ```
 
-Include `unblocked-by` output in `report.unblocked` and `cadence` output in `report.cadence` (the `MergerReport` schema has both). Coordinator reads these instead of re-querying.
+`merge dag-flip` returns `DagFlipResult` JSON: `{plan, amend_sha, mc, unblocked, queue_consumed}`. The compound does set-status DONE → queue-consume → git-add → amend → count-bump with **explicit `cwd=REPO_ROOT` at every git call** — the merger agent's bash-cwd is not reliable (P0401: amended to d1449fad but sprint-1 stayed at 4fc05cfe; the amend ran in a context where the branch-ref didn't follow HEAD, leaving the commit reflog-only). Python owns cwd now; bash doesn't.
 
-**Amend, not a fresh commit.** The dag-flip folds into the plan's last commit — no `docs(dag): P$N DONE` noise in `git log` (~25% of rix's log was this). Safe because: (a) nobody's rebased onto this HEAD yet — it just ff-merged; (b) `merger.lock` at step 0 serializes; (c) `.#ci` (step 5) already passed on the code, the flip is dag.jsonl-only. `dag_delta_commit` in the report = same as `hash` (the merged-to SHA after amend).
+Include `unblocked` in `report.unblocked` and `cadence` output in `report.cadence` (the `MergerReport` schema has both). Coordinator reads these instead of re-querying. **`amend_sha` IS the final `hash` in the MergerReport.** If `amend_sha == "already-done"`, the dag row was pre-flipped (coordinator fast-path or re-invoked merger) — harmless no-op; report `dag_delta_commit: already-done`.
 
-`merge count-bump` is **owned here**. Classifier permits the onibus CLI (raw `echo N > merge-count.txt` was the form that got blocked as self-modification). Coordinator does NOT pre-bump on inferred merges — that causes double-bumps when the notification lags. The count write is gitignored state (`.claude/state/merge-count.txt`); not part of the amend.
+**Amend, not a fresh commit.** The dag-flip folds into the plan's last commit — no `docs(dag): P$N DONE` noise in `git log` (~25% of rix's log was this). Safe because: (a) nobody's rebased onto this HEAD yet — it just ff-merged; (b) `merger.lock` at step 0 serializes; (c) `.#ci` (step 5) already passed on the code, the flip is dag.jsonl-only. `dag_delta_commit` in the report = `amend_sha` (the merged-to SHA after amend).
 
-`merge cadence` is the single source of truth for the 5/7 constants — reads `merge-count.txt` and computes which agents are due plus their git ranges. Merger reports; coordinator spawns.
+**Preconditions enforced by `dag-flip`:** REPO_ROOT must have `$TGT` checked out (fails loud if not — the amend would move the wrong branch). Post-check: if `rev-parse $TGT != rev-parse HEAD` after amend (unreachable given the precondition, but belt-and-suspenders), `update-ref refs/heads/$TGT HEAD` recovers.
 
-If the row was already DONE, `dag set-status` is a no-op, `git add` stages nothing, `--amend --no-edit` rewrites with identical tree — harmless. Report `dag_delta_commit: already-done`.
+Count-bump is **owned by dag-flip**. Classifier permits the onibus CLI (raw `echo N > merge-count.txt` was the form that got blocked as self-modification). Coordinator does NOT pre-bump on inferred merges — that causes double-bumps when the notification lags. The count write is gitignored state (`.claude/state/merge-count.txt`); not part of the amend. dag-flip runs count-bump AFTER amend (P0319 ordering) so merge-shas.jsonl records the reachable SHA.
 
-Capture the commit hash: `git rev-parse --short HEAD`.
+`merge cadence` is the single source of truth for the 5/7 constants — reads `merge-count.txt` and computes which agents are due plus their git ranges. Merger reports; coordinator spawns. Kept as a separate call (read-only, doesn't need cwd-pinning, and the merger includes it in the report separately).
 
 ### 8. Scan for behind-worktrees (informational)
 
