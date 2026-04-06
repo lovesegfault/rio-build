@@ -1,0 +1,19 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "checkJs": false,
+    "isolatedModules": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "//": "vite.config.ts/vitest.config.ts excluded: vitest@2 bundles vite@5 types which clash with our vite@6 — runtime works, svelte-check can't reconcile. Config files are runtime-validated by vite anyway. vitest.setup.ts included so @testing-library/jest-dom/vitest module augmentation is visible to tests.",
+  "include": ["src/**/*.ts", "src/**/*.svelte", "vitest.setup.ts"]
+}

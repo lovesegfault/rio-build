@@ -457,6 +457,11 @@
             ];
           };
 
+          # rio-dashboard Svelte SPA (lint + test + svelte-check + vite build
+          # in sandbox). src is scoped to rio-dashboard/ — Rust changes don't
+          # invalidate this drv.
+          rioDashboard = import ./nix/dashboard.nix { inherit pkgs; };
+
           # --------------------------------------------------------------
           # Golden conformance test fixtures
           # --------------------------------------------------------------
@@ -794,6 +799,7 @@
             miscChecks.deny
             miscChecks.tracey-validate
             miscChecks.helm-lint
+            rioDashboard
             config.checks.pre-commit
           ];
 
@@ -833,6 +839,7 @@
                 inherit (c2nChecks) nextest;
                 inherit (miscChecks) deny tracey-validate helm-lint;
                 inherit (config.checks) pre-commit;
+                dashboard = rioDashboard;
               };
               # 2min fuzz runs, one matrix entry per target. Keys are
               # fuzz-<target> (from nix/fuzz.nix). On a cold cache each
@@ -978,6 +985,11 @@
                 # Cargo.lock changes. PoC — see
                 # .claude/notes/crate2nix-migration-assessment.md.
                 crate2nixCli
+
+                # Dashboard dev: `pnpm install --lockfile-only` (hash bumps),
+                # `pnpm run dev` (vite dev server with Envoy proxy).
+                nodejs
+                pnpm_10
 
                 # Deploy tooling for infra/eks/. Large closures (awscli2
                 # pulls python3 + botocore) but the user asked for
@@ -1250,6 +1262,7 @@
             clippy = c2nChecks.clippyCheck;
             doc = c2nChecks.docCheck;
             inherit (c2nChecks) nextest coverage;
+            dashboard = rioDashboard;
           }
           // miscChecks
           # 2min fuzz runs (Linux-only). Compiled binaries shared
