@@ -747,14 +747,31 @@ impl DagActor {
         // this fn, so it's safe. best_executor is sync.
         let classes = self.size_classes.read();
         let target_cutoff = crate::assignment::cutoff_for(target, &classes);
+        // r[impl sched.builder.size-class-reactive]
+        // I-177: clamp the chain start at `size_class_floor`. A
+        // non-FOD that OOM'd on tiny gets floor=small via
+        // `promote_size_class_floor`; the EMA classifier (success-
+        // only samples) still says tiny, so without this clamp the
+        // chain would re-start at tiny → re-OOM → poison. A floor
+        // not in the current config (stale after a config change)
+        // degrades to no-clamp via `cutoff_for() = None` — same
+        // graceful fallback as the FOD branch's `unwrap_or(0)`.
+        let floor_cutoff = drv_state
+            .size_class_floor
+            .as_deref()
+            .and_then(|f| crate::assignment::cutoff_for(f, &classes));
+        let start_cutoff = match (target_cutoff, floor_cutoff) {
+            (Some(t), Some(f)) => Some(t.max(f)),
+            (t, f) => t.or(f),
+        };
         let mut chain: Vec<(&str, f64)> = classes
             .iter()
             .filter(|c| {
-                // Target itself (== cutoff) or larger.
-                // target_cutoff=None shouldn't happen (target came
-                // FROM classify which reads the same config) but be
-                // defensive: if None, include everything.
-                target_cutoff.is_none_or(|t| c.cutoff_secs >= t)
+                // Target itself (== cutoff) or larger, raised to
+                // floor. start_cutoff=None shouldn't happen (target
+                // came FROM classify which reads the same config)
+                // but be defensive: if None, include everything.
+                start_cutoff.is_none_or(|t| c.cutoff_secs >= t)
             })
             .map(|c| (c.name.as_str(), c.cutoff_secs))
             .collect();

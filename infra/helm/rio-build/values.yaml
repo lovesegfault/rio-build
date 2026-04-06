@@ -532,6 +532,49 @@ karpenter:
       limits: {cpu: 2000}
       consolidateAfter: 30s
 
+    # Builder metal: bare-metal instances expose /dev/kvm (nested virt)
+    # for nixos-test / qemu-kvm derivations (requiredSystemFeatures =
+    # ["kvm"]). Tainted rio.build/kvm so ONLY pools with features:[kvm]
+    # land here (controller appends the toleration — r[ctrl.builderpool.
+    # kvm-device]). Arch-agnostic: I-098's per-pod kubernetes.io/arch
+    # nodeSelector picks c7a.metal-48xl vs c7g.metal etc. Weight 1 +
+    # tight cpu limit + short consolidateAfter: metal is expensive
+    # (~$5-10/hr each), don't let Karpenter prefer it for non-kvm pods
+    # that happen to tolerate both taints, and reap aggressively.
+    - name: rio-builder-metal
+      weight: 1
+      labels:
+        rio.build/node-role: builder
+        rio.build/kvm: "true"
+      taints:
+        - key: rio.build/builder
+          value: "true"
+          effect: NoSchedule
+        - key: rio.build/kvm
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: [c, m, r]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
+        # instance-size=metal* covers metal, metal-24xl, metal-48xl
+        # across c/m/r gen6+ (incl. Graviton c7g.metal). Karpenter's
+        # well-known label — no instance-type enumeration needed.
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: [metal, metal-24xl, metal-48xl]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      # ~2-3 metal hosts max (96-192 vCPU each). nixos-test derivations
+      # are rare relative to the general build stream; queue a little
+      # rather than burn $$ on idle metal.
+      limits: {cpu: 512}
+      consolidateAfter: 30s
+
     # r[impl fetcher.node.dedicated]
     #
     # Fetcher: dedicated NodePool with rio.build/fetcher taint. Keeps
@@ -670,10 +713,19 @@ dashboard:
 # ──────────────────────────────────────────────────────────────────────────
 # FUSE Device Plugin
 # ──────────────────────────────────────────────────────────────────────────
-# smarter-device-manager DaemonSet: exposes /dev/fuse as an extended
-# resource (smarter-devices/fuse). Builder pods request it via
-# resources.limits instead of a hostPath volume, which makes
+# smarter-device-manager: exposes /dev/fuse (and /dev/kvm on .metal) as
+# extended resources (smarter-devices/{fuse,kvm}). Builder pods request
+# them via resources.limits instead of a hostPath volume, which makes
 # hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
+#
+# Delivery mode is keyed off karpenter.enabled:
+#   - karpenter.enabled=true  (EKS): Bottlerocket static pod via
+#     EC2NodeClass userData (karpenter.yaml). kubelet starts the plugin
+#     locally at node boot — ~1-2s to register vs ~5-15s for the DS
+#     schedule + pull + register path. Updates roll via Karpenter Drift.
+#   - karpenter.enabled=false (k3s/kind/VM tests): DaemonSet
+#     (device-plugin.yaml). nodeSelector/nodeAffinity/tolerations below
+#     apply to this path only; static pods are node-local and ignore them.
 #
 # enabled=true by default because builderPoolDefaults.privileged=false (below)
 # depends on it. Disable on clusters where privileged:true is the escape
@@ -692,9 +744,16 @@ devicePlugin:
   # typically 1 given the resource requests below, but bursty
   # autoscaling + small nodes could pack more).
   fuseMaxDevices: 100
+  # Per-node ceiling on /dev/kvm claims. Only metal nodes have /dev/kvm
+  # (the plugin advertises 0 elsewhere). A single .metal box hosts many
+  # qemu-kvm guests concurrently; 100 matches fuseMaxDevices so the
+  # binding constraint stays cpu/memory, not the device count.
+  kvmMaxDevices: 100
   # r[impl sec.pod.fuse-device-plugin]
   # r[impl fetcher.node.dedicated]
   #
+  # DaemonSet-path scheduling (karpenter.enabled=false ONLY — the static-
+  # pod path ignores these; kubelet starts it on every rio-default node).
   # Schedule on BOTH builder AND fetcher nodes. FetcherPool pods request
   # smarter-devices/fuse:1 same as BuilderPool (both use FUSE-backed
   # store mounts). nodeSelector is matchLabels-only (no set-based In);
@@ -718,6 +777,14 @@ devicePlugin:
       value: "true"
       effect: NoSchedule
     - key: rio.build/fetcher
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    # Metal NodePool carries an additional rio.build/kvm taint (kvm pods
+    # only). The DS must tolerate it to advertise smarter-devices/{fuse,
+    # kvm} there — without this, kvm-feature pods Pending forever (same
+    # failure mode as the missing fetcher toleration above).
+    - key: rio.build/kvm
       operator: Equal
       value: "true"
       effect: NoSchedule
@@ -754,6 +821,10 @@ securityProfilesOperator:
       value: "true"
       effect: NoSchedule
     - key: rio.build/fetcher
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    - key: rio.build/kvm
       operator: Equal
       value: "true"
       effect: NoSchedule

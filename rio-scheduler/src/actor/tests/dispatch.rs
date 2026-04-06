@@ -1581,3 +1581,127 @@ async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.builder.size-class-reactive]
+/// I-177: a non-FOD with `size_class_floor=small` skips tiny-class
+/// builders even when classify() says tiny. The overflow chain starts
+/// at `max(classify(), floor)`. Before the fix, the non-FOD branch
+/// ignored floor entirely → a build that OOM'd on tiny was re-routed
+/// to tiny by the (success-only) EMA classifier → poison-loop.
+#[tokio::test]
+async fn builder_size_class_floor_skips_smaller() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ])
+        // Zero backoff so the retry redispatches on the next Tick
+        // (default is 5s exponential — test would need to sleep).
+        .with_retry_policy(crate::RetryPolicy {
+            backoff_base_secs: 0.0,
+            ..Default::default()
+        })
+    });
+
+    // Two tiny builders, one small. With floor=None and est_dur=30s
+    // (no build_history → DEFAULT_DURATION_SECS), classify() picks
+    // tiny. With floor=small the overflow chain MUST start at small.
+    let mut tiny1_rx = connect_builder_classed(&handle, "b-tiny-1", "x86_64-linux", "tiny").await?;
+    let mut tiny2_rx = connect_builder_classed(&handle, "b-tiny-2", "x86_64-linux", "tiny").await?;
+    let mut small_rx = connect_builder_classed(&handle, "b-small", "x86_64-linux", "small").await?;
+
+    let node = make_test_node("glibc-177", "x86_64-linux");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    // First dispatch: floor=None, classify()=tiny → one of the tiny
+    // builders gets it.
+    barrier(&handle).await;
+    let (first_exec, first_asgn) = tokio::select! {
+        a = recv_assignment(&mut tiny1_rx) => ("b-tiny-1", a),
+        a = recv_assignment(&mut tiny2_rx) => ("b-tiny-2", a),
+    };
+    assert!(first_asgn.drv_path.contains("glibc-177"));
+    assert!(
+        small_rx.try_recv().is_err(),
+        "floor=None, classify=tiny: small builder should NOT receive (overflow walks up only when smaller class is full)"
+    );
+
+    // Simulate OOM via TransientFailure → record_failure_and_check_
+    // poison → promote_size_class_floor → floor=small.
+    complete_failure(
+        &handle,
+        first_exec,
+        "glibc-177",
+        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        "simulated OOM",
+    )
+    .await?;
+    tick(&handle).await?;
+
+    let state = handle
+        .debug_query_derivation("glibc-177")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        state.size_class_floor.as_deref(),
+        Some("small"),
+        "I-177: transient failure on tiny builder → floor promoted to small"
+    );
+
+    // Second dispatch: classify() still says tiny (no successful
+    // sample), but floor=small clamps the chain start. The other
+    // tiny builder is free but MUST be skipped; small gets it.
+    let asgn = recv_assignment(&mut small_rx).await;
+    assert!(asgn.drv_path.contains("glibc-177"));
+    assert!(
+        tiny1_rx.try_recv().is_err() && tiny2_rx.try_recv().is_err(),
+        "floor=small: tiny builders must be skipped even when free and classify()=tiny"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.builder.size-class-reactive]
+/// I-177: `next_builder_class` orders by `cutoff_secs`, not config
+/// order. Clamps at largest; unknown/empty → None.
+#[test]
+fn next_builder_class_cutoff_ordered() {
+    use crate::assignment::{SizeClassConfig, next_builder_class};
+    let mk = |name: &str, cutoff: f64| SizeClassConfig {
+        name: name.into(),
+        cutoff_secs: cutoff,
+        mem_limit_bytes: u64::MAX,
+        cpu_limit_cores: None,
+    };
+    // Deliberately unsorted config order — next_builder_class must
+    // sort by cutoff, not by Vec position.
+    let classes = vec![mk("large", 3600.0), mk("tiny", 30.0), mk("small", 300.0)];
+    assert_eq!(
+        next_builder_class("tiny", &classes).as_deref(),
+        Some("small")
+    );
+    assert_eq!(
+        next_builder_class("small", &classes).as_deref(),
+        Some("large")
+    );
+    assert_eq!(
+        next_builder_class("large", &classes),
+        None,
+        "largest clamps"
+    );
+    assert_eq!(next_builder_class("unknown", &classes), None);
+    assert_eq!(next_builder_class("tiny", &[]), None, "feature off");
+}

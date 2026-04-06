@@ -248,7 +248,7 @@ async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Opti
     let by_class = match ctx
         .admin
         .clone()
-        .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {})
+        .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest::default())
         .await
     {
         Ok(resp) => resp

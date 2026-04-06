@@ -204,7 +204,7 @@ impl Ctx {
         let resp = self
             .admin
             .clone()
-            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {})
+            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest::default())
             .await?
             .into_inner();
         *cache = Some((Instant::now(), resp.clone()));

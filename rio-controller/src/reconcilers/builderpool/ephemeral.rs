@@ -311,18 +311,29 @@ pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
 /// backstop reaps wrong-class Jobs after 1h.
 async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32, tonic::Status> {
     if !wp.spec.size_class.is_empty() {
+        // I-176: pass `spec.features` so the scheduler excludes
+        // derivations whose `required_features` this pool's workers
+        // can't satisfy (mirrors hard_filter's `feature-missing`).
+        // `filter_features=true` even when `features` is empty: a
+        // featureless pool then sees only featureless work — it stops
+        // spawning builders that hard_filter rejects on dispatch.
         let resp = ctx
             .admin
             .clone()
-            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {})
+            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {
+                pool_features: wp.spec.features.clone(),
+                filter_features: true,
+            })
             .await?
             .into_inner();
-        if let Some(c) = resp.classes.iter().find(|c| c.name == wp.spec.size_class) {
-            // I-143: intersect with this pool's systems. Class-wide
-            // `queued` includes other-arch derivations this pool can
-            // never build → wrong-arch spawns at ceiling. Falls back
-            // to the scalar if the scheduler predates the breakdown.
-            let queued = crate::scaling::class_queued_for_systems(c, &wp.spec.systems);
+        // I-143 (per-system) + I-176 (per-feature, cross-class for
+        // feature-gated pools). See class_queued_for_pool() doc.
+        if let Some(queued) = crate::scaling::class_queued_for_pool(
+            &resp,
+            &wp.spec.size_class,
+            &wp.spec.systems,
+            &wp.spec.features,
+        ) {
             // proto field is u64; spawn_count takes u32. Saturate —
             // a queue > 4 billion derivations is pathological but
             // shouldn't wrap to 0 (would scale DOWN under extreme

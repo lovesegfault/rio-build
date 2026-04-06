@@ -33,6 +33,23 @@ use crate::error::{Error, Result};
 /// no hostPath volume needed, so `hostUsers: false` works (ADR-012).
 const FUSE_DEVICE_RESOURCE: &str = "smarter-devices/fuse";
 
+/// Same device-plugin mechanism for `/dev/kvm`. Only `.metal` EC2
+/// instance types expose `/dev/kvm` (nested virt); the plugin
+/// advertises 0 elsewhere. Requested only when [`KVM_FEATURE`] is in
+/// `spec.features`.
+const KVM_DEVICE_RESOURCE: &str = "smarter-devices/kvm";
+
+/// Nix `system-features` string that signals "this builder runs
+/// qemu-kvm". When present in `spec.features`, the pod gets
+/// [`KVM_DEVICE_RESOURCE`] in resources + `rio.build/kvm` nodeSelector
+/// + toleration so it lands on the metal NodePool.
+const KVM_FEATURE: &str = "kvm";
+
+/// Node label set on the metal NodePool (values.yaml `karpenter.
+/// nodePools[rio-builder-metal].labels`). Pairs with the same-key
+/// taint.
+const KVM_NODE_LABEL: &str = "rio.build/kvm";
+
 /// Pod label carrying the executor role. Scheduler routing, network
 /// policies, and `kubectl get pods -l rio.build/role=fetcher` all
 /// key on this.
@@ -190,6 +207,15 @@ pub struct ExecutorStsParams {
     pub tls_secret_name: Option<String>,
     /// `None` → 7200s (2h).
     pub termination_grace_period_seconds: Option<i64>,
+}
+
+impl ExecutorStsParams {
+    /// Pool advertises the `kvm` Nix system-feature → pod needs
+    /// `/dev/kvm` (device resource + metal nodeSelector + toleration).
+    /// See `r[ctrl.builderpool.kvm-device]`.
+    fn wants_kvm(&self) -> bool {
+        self.features.iter().any(|f| f == KVM_FEATURE)
+    }
 }
 
 /// Labels for the StatefulSet, headless Service, pod template, and
@@ -631,9 +657,35 @@ pub fn build_executor_pod_spec(
             {
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());
             }
+            // r[impl ctrl.builderpool.kvm-device]
+            // features:[kvm] → land on the metal NodePool. Operator-set
+            // value wins (or_insert) so a non-Karpenter cluster with a
+            // different kvm-capable label can override. Unconditional
+            // wrt privileged: even a privileged pod needs a host that
+            // actually has /dev/kvm.
+            if p.wants_kvm() {
+                ns.entry(KVM_NODE_LABEL.into()).or_insert("true".into());
+            }
             if ns.is_empty() { None } else { Some(ns) }
         },
-        tolerations: p.tolerations.clone(),
+        tolerations: {
+            let mut t = p.tolerations.clone().unwrap_or_default();
+            // r[impl ctrl.builderpool.kvm-device]
+            // Metal NodePool is tainted rio.build/kvm=true:NoSchedule so
+            // non-kvm builders don't bin-pack onto $$ metal. Append
+            // (don't replace) — the operator-set rio.build/builder
+            // toleration must survive.
+            if p.wants_kvm() {
+                t.push(Toleration {
+                    key: Some(KVM_NODE_LABEL.into()),
+                    operator: Some("Equal".into()),
+                    value: Some("true".into()),
+                    effect: Some("NoSchedule".into()),
+                    ..Default::default()
+                });
+            }
+            if t.is_empty() { None } else { Some(t) }
+        },
 
         ..Default::default()
     }
@@ -811,20 +863,25 @@ fn build_executor_container(
         }),
 
         // r[impl sec.pod.fuse-device-plugin]
-        // Operator resources + device-plugin FUSE request. Privileged
-        // escape hatch: no FUSE resource (hostPath + privileged
-        // bypasses device cgroup).
+        // r[impl ctrl.builderpool.kvm-device]
+        // Operator resources + device-plugin FUSE request, plus
+        // /dev/kvm when features:[kvm]. Privileged escape hatch: no
+        // device resources (privileged bypasses device cgroup; FUSE
+        // uses hostPath, kvm relies on the rio.build/kvm nodeSelector
+        // for placement and sees /dev/kvm directly).
         resources: if privileged {
             p.resources.clone()
         } else {
             let mut r = p.resources.clone().unwrap_or_default();
-            let fuse = (FUSE_DEVICE_RESOURCE.to_string(), Quantity("1".into()));
-            r.limits
-                .get_or_insert_with(BTreeMap::new)
-                .insert(fuse.0.clone(), fuse.1.clone());
-            r.requests
-                .get_or_insert_with(BTreeMap::new)
-                .insert(fuse.0, fuse.1);
+            let limits = r.limits.get_or_insert_with(BTreeMap::new);
+            let requests = r.requests.get_or_insert_with(BTreeMap::new);
+            let one = Quantity("1".into());
+            limits.insert(FUSE_DEVICE_RESOURCE.into(), one.clone());
+            requests.insert(FUSE_DEVICE_RESOURCE.into(), one.clone());
+            if p.wants_kvm() {
+                limits.insert(KVM_DEVICE_RESOURCE.into(), one.clone());
+                requests.insert(KVM_DEVICE_RESOURCE.into(), one);
+            }
             Some(r)
         },
 

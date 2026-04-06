@@ -112,10 +112,11 @@ let
       wlarge = {
         sizeClass = "large";
         # maxSilentTime enforcement. Only wlarge: small workers run
-        # reassignDrv (25s silent sleep) which would trip a silence
-        # threshold. bigthing (the only other drv routed to wlarge)
-        # echoes immediately — no silence exposure. The max-silent-time
-        # subtest routes silenceDrv here via build_history seed.
+        # cancelDrv (300s silent sleep) which would trip a silence
+        # threshold. bigthing echoes immediately; reassignDrv echoes
+        # every 5s (I-177: it lands here after the SIGKILL promotes
+        # floor small→large). The max-silent-time subtest routes
+        # silenceDrv here via build_history seed.
         #
         # Worker-side config because the Nix ssh-ng client does NOT
         # send wopSetOptions (protocol 1.38) — client --max-silent-time
@@ -392,6 +393,7 @@ in
           # handshake's virtual setOptions() call runs regardless).
           "setoptions-unreachable"
           "cancel-timing"
+          # r[verify sched.builder.size-class-reactive]
           "reassign"
           # r[verify obs.metric.scheduler]
           # r[verify obs.metric.builder]

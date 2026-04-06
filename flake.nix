@@ -1009,6 +1009,77 @@
                     exit 1
                   }
 
+                  # ── r[sec.pod.fuse-device-plugin] static-pod delivery ───────
+                  # karpenter.enabled=true MUST render the device-plugin as a
+                  # Bottlerocket static pod in EC2NodeClass userData (not a
+                  # DaemonSet). The DaemonSet path is for k3s/kind only —
+                  # asserted via /tmp/default.yaml above (default values have
+                  # karpenter.enabled=false → DaemonSet renders → digest-pin
+                  # loop covers its image).
+                  helm template rio . \
+                    --set karpenter.enabled=true \
+                    --set karpenter.clusterName=ci \
+                    --set karpenter.nodeRoleName=ci-role \
+                    --set global.image.tag=test \
+                    --set postgresql.enabled=false \
+                    > $TMPDIR/karp-on.yaml
+                  yq 'select(.kind=="EC2NodeClass") | .spec.userData' \
+                    $TMPDIR/karp-on.yaml > $TMPDIR/userdata.toml
+                  grep -x '\[settings.kubernetes.static-pods.rio-device-plugin\]' \
+                    $TMPDIR/userdata.toml >/dev/null || {
+                    echo "FAIL: karpenter.enabled=true userData missing static-pods.rio-device-plugin section" >&2
+                    cat $TMPDIR/userdata.toml >&2
+                    exit 1
+                  }
+                  # Decode the manifest and assert it's a well-formed Pod with
+                  # BOTH devicematch entries (fuse + kvm — kvm added dd9a5c41,
+                  # must not drift between DS and static-pod paths) and a
+                  # digest-pinned image (b64-encoded → invisible to the
+                  # third-party-digest loop above, so re-assert here).
+                  sed -n 's/^manifest = "\(.*\)"$/\1/p' $TMPDIR/userdata.toml \
+                    | base64 -d > $TMPDIR/static-pod.yaml
+                  test "$(yq '.kind' $TMPDIR/static-pod.yaml)" = Pod || {
+                    echo "FAIL: static-pod manifest .kind != Pod" >&2
+                    cat $TMPDIR/static-pod.yaml >&2
+                    exit 1
+                  }
+                  # Main container = third-party smarter-device-manager →
+                  # MUST be digest-pinned. initContainer = first-party
+                  # rio-seccomp-bootstrap (tag-based like all rio images)
+                  # — already pulled at boot by the bootstrap-container.
+                  yq '.spec.containers[0].image' $TMPDIR/static-pod.yaml \
+                    | grep -v '@sha256:' && {
+                    echo "FAIL: static-pod smarter-device-manager image not digest-pinned" >&2
+                    exit 1
+                  } || true
+                  yq '.spec.initContainers[0].image' $TMPDIR/static-pod.yaml \
+                    | grep '^rio-seccomp-bootstrap:' >/dev/null || {
+                    echo "FAIL: static-pod initContainer not rio-seccomp-bootstrap" >&2
+                    exit 1
+                  }
+                  for dm in '\^fuse\$' '\^kvm\$'; do
+                    yq '.spec.initContainers[0].args[0]' $TMPDIR/static-pod.yaml \
+                      | grep -- "devicematch: $dm" >/dev/null || {
+                      echo "FAIL: static-pod conf.yaml missing devicematch: $dm" >&2
+                      exit 1
+                    }
+                  done
+                  # DaemonSet MUST NOT render alongside the static pod — the two
+                  # would race to register the same kubelet socket.
+                  ! yq 'select(.kind=="DaemonSet") | .metadata.name' \
+                    $TMPDIR/karp-on.yaml | grep -x rio-device-plugin >/dev/null || {
+                    echo "FAIL: rio-device-plugin DaemonSet rendered with karpenter.enabled=true (should be static-pod only)" >&2
+                    exit 1
+                  }
+                  # NodeOverlay (synthetic capacity) MUST still render — the
+                  # static pod shrinks the boot→register window but does not
+                  # eliminate the cold-start bin-packing deadlock.
+                  yq 'select(.kind=="NodeOverlay") | .metadata.name' \
+                    $TMPDIR/karp-on.yaml | grep -x rio-builder-fuse >/dev/null || {
+                    echo "FAIL: NodeOverlay rio-builder-fuse missing with karpenter.enabled=true" >&2
+                    exit 1
+                  }
+
                   touch $out
                 '';
 

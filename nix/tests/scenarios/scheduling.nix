@@ -69,10 +69,28 @@ let
   # reassign: slow build, no pname → estimator default → "small" class.
   # 25s gives the test ~20s to find+kill the assigned worker before the
   # build would naturally finish.
-  reassignDrv = drvs.mkTrivial {
-    marker = "sched-reassign";
-    sleepSecs = 25;
-  };
+  #
+  # I-177: after the SIGKILL, promote_size_class_floor bumps small→large
+  # and the retry lands on wlarge — which has RIO_MAX_SILENT_TIME_SECS=10
+  # (for the silence subtest). mkTrivial's single-sleep would TimedOut
+  # there, so this drv echoes every 5s to keep the silence watchdog fed.
+  reassignDrv = pkgs.writeText "drv-sched-reassign.nix" ''
+    { busybox }:
+    derivation {
+      name = "rio-test-sched-reassign";
+      system = builtins.currentSystem;
+      builder = "''${busybox}/bin/sh";
+      args = [ "-c" '''
+        i=0
+        while [ $i -lt 5 ]; do
+          echo sched-reassign-tick-$i
+          ''${busybox}/bin/busybox sleep 5
+          i=$((i+1))
+        done
+        echo sched-reassign > $out
+      ''' ];
+    }
+  '';
 
   # cancel-timing: 300s sleep — cancelled long before natural end. No
   # pname → default "small" class → lands on wsmall1 OR wsmall2. 300s
@@ -480,6 +498,9 @@ let
       # → redispatch → completes on a different worker.
       with subtest("reassign: SIGKILL mid-build, build completes elsewhere"):
           disc_before = scrape_metrics(${gatewayHost}, 9091)
+          promo_before = metric_value(disc_before,
+              "rio_scheduler_size_class_promotions_total",
+              '{kind="builder",from="small",to="large"}') or 0.0
 
           # Start the slow build in a background thread. Thread-safe:
           # the NixOS test driver's Machine.succeed() can overlap across
@@ -493,11 +514,11 @@ let
           bg_thread = threading.Thread(target=_bg, daemon=True)
           bg_thread.start()
 
-          # Find which SMALL worker got the assignment. No-pname drv →
-          # estimator default → "small" class. With 2 small workers
-          # idle and 0 builds in flight, it MUST go to wsmall1 or
-          # wsmall2. If neither logs the marker within 30s, the build
-          # either hung in SubmitBuild or routed to wlarge (both bugs).
+          # Find which SMALL worker got the FIRST assignment. No-pname
+          # drv → estimator default → "small" class, floor=None. With
+          # 2 small workers idle and 0 builds in flight, it MUST go to
+          # wsmall1 or wsmall2. If neither logs the marker within 30s,
+          # the build hung in SubmitBuild (bug).
           assigned = None
           for _ in range(30):
               for w in small_workers:
@@ -548,6 +569,26 @@ let
           assert d_after >= d_before + 1, (
               f"SIGKILL should increment disconnects by >=1; "
               f"before={d_before}, after={d_after}"
+          )
+
+          # I-177: the disconnect promoted size_class_floor small→large
+          # (no clean OOM signal at scheduler — any disconnect promotes;
+          # over-promoting one class is cheap vs poison-loop on tiny).
+          # The retry routed to wlarge, not the surviving small worker.
+          promo_after = metric_value(disc_after,
+              "rio_scheduler_size_class_promotions_total",
+              '{kind="builder",from="small",to="large"}') or 0.0
+          assert promo_after >= promo_before + 1, (
+              f"I-177: SIGKILL on small builder should promote "
+              f"size_class_floor; before={promo_before}, after={promo_after}"
+          )
+          wlarge_got = wlarge.succeed(
+              "journalctl -u rio-builder --no-pager | "
+              "grep -c 'rio-test-sched-reassign' || true"
+          ).strip()
+          assert int(wlarge_got or "0") > 0, (
+              "I-177: retry after SIGKILL should route to wlarge "
+              "(floor promoted small→large)"
           )
 
           # Wait for the killed worker to come back before collectCoverage

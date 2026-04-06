@@ -180,7 +180,7 @@ async fn apply(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
     match ctx
         .admin
         .clone()
-        .get_size_class_status(GetSizeClassStatusRequest {})
+        .get_size_class_status(GetSizeClassStatusRequest::default())
         .await
     {
         Ok(resp) => {

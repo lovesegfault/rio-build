@@ -25,17 +25,25 @@ const SAMPLE_LOOKBACK_DAYS: u32 = 7;
 
 /// Query the actor for the size-class snapshot, join DB sample counts,
 /// convert to proto.
+///
+/// `pool_features`: I-176 feature filter — `None` = unfiltered (CLI,
+/// status display); `Some(f)` = count only Ready derivations whose
+/// `required_features ⊆ f` (per-pool ephemeral spawn decisions).
 // r[impl sched.admin.sizeclass-status]
 pub(super) async fn get_size_class_status(
     actor: &ActorHandle,
     db: &SchedulerDb,
+    pool_features: Option<Vec<String>>,
 ) -> Result<GetSizeClassStatusResponse, Status> {
     // send_unchecked: the WPS autoscaler (P0234) reads this to set
     // per-class replica targets. Dropping under backpressure blinds
     // the autoscaler exactly when it should scale up — same
     // reasoning as ClusterStatus.
     let (snapshots, fod_snapshots) = actor
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
+            pool_features,
+            reply,
+        })
         .await
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 

@@ -309,6 +309,56 @@ pub(crate) fn class_queued_for_systems(
         .sum()
 }
 
+/// Queue depth relevant to a feature-gated ephemeral pool, given a
+/// FEATURE-FILTERED `GetSizeClassStatus` response (the caller passed
+/// `pool_features` so the scheduler already excluded derivations this
+/// pool can't build).
+///
+/// I-176: when `features` is non-empty, sum [`class_queued_for_systems`]
+/// across ALL classes — not just the pool's own `size_class`. Dispatch
+/// overflow walks UP the class chain (`find_executor_with_overflow`),
+/// so a `tiny`-classified kvm derivation routes to the `xlarge`-kvm
+/// pool if that's the only kvm-capable pool. Reading only `xlarge`'s
+/// count would leave `queued=0` → never spawn → derivation deadlocks
+/// at `feature-missing` on the featureless tiny pool's spawn.
+///
+/// When `features` is empty: single-class lookup as before — a
+/// featureless pool is one of N per-class pools, no cross-class
+/// concern (overflow is handled by the LARGER featureless pool
+/// spawning, which it does because its own class count is correct).
+///
+/// Returns `None` when `size_class` isn't in the response (scheduler
+/// doesn't know that class) so the caller can fall through to
+/// `cluster_status`. With non-empty `features` and a non-empty
+/// response, returns the cross-class sum even if `size_class` itself
+/// is absent — the feature filter makes every class entry relevant.
+// r[impl ctrl.pool.per-feature-class-depth]
+pub(crate) fn class_queued_for_pool(
+    resp: &rio_proto::types::GetSizeClassStatusResponse,
+    size_class: &str,
+    systems: &[String],
+    features: &[String],
+) -> Option<u64> {
+    if !features.is_empty() {
+        // Cross-class sum. Empty response (size-classes off) → fall
+        // through to cluster_status (None), same as the single-class
+        // path's "class not found".
+        if resp.classes.is_empty() {
+            return None;
+        }
+        return Some(
+            resp.classes
+                .iter()
+                .map(|c| class_queued_for_systems(c, systems))
+                .sum(),
+        );
+    }
+    resp.classes
+        .iter()
+        .find(|c| c.name == size_class)
+        .map(|c| class_queued_for_systems(c, systems))
+}
+
 /// Compute desired replicas from queue metrics.
 ///
 /// The formula: `ceil(queued / target)` gives how many workers

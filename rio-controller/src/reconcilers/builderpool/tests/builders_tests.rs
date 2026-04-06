@@ -481,6 +481,119 @@ fn statefulset_fuse_device_merges_with_operator_resources() {
     assert_eq!(requests.get("memory").map(|q| q.0.as_str()), Some("4Gi"));
 }
 
+// r[verify ctrl.builderpool.kvm-device]
+#[test]
+fn statefulset_kvm_feature_adds_device_nodeselector_toleration() {
+    // Fixture wp has features=["kvm"]. The controller derives the
+    // device-cgroup request + metal-NodePool scheduling constraints
+    // from that one feature string — operator doesn't set them
+    // explicitly (mirrors I-098's arch derivation from systems).
+    let wp = test_wp();
+    assert!(wp.spec.features.iter().any(|f| f == "kvm"), "precondition");
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    // smarter-devices/kvm:1 in resources.{limits,requests} alongside
+    // fuse. kubelet → device-plugin → /dev/kvm in device cgroup.
+    let resources = pod.containers[0].resources.as_ref().unwrap();
+    for map in [resources.limits.as_ref(), resources.requests.as_ref()] {
+        let m = map.expect("set");
+        assert_eq!(
+            m.get("smarter-devices/kvm").map(|q| q.0.as_str()),
+            Some("1"),
+            "one /dev/kvm per builder pod"
+        );
+        assert_eq!(
+            m.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+            Some("1"),
+            "kvm request doesn't clobber fuse"
+        );
+    }
+
+    // rio.build/kvm=true nodeSelector — lands on the metal NodePool.
+    // The I-098 arch selector survives alongside.
+    let ns = pod.node_selector.as_ref().expect("nodeSelector set");
+    assert_eq!(ns.get("rio.build/kvm").map(String::as_str), Some("true"));
+    assert_eq!(
+        ns.get("kubernetes.io/arch").map(String::as_str),
+        Some("amd64"),
+        "arch selector preserved"
+    );
+
+    // rio.build/kvm toleration appended (metal NodePool is tainted).
+    let tols = pod.tolerations.as_ref().expect("tolerations set");
+    let kvm_tol = tols
+        .iter()
+        .find(|t| t.key.as_deref() == Some("rio.build/kvm"))
+        .expect("kvm toleration appended");
+    assert_eq!(kvm_tol.value.as_deref(), Some("true"));
+    assert_eq!(kvm_tol.effect.as_deref(), Some("NoSchedule"));
+}
+
+// r[verify ctrl.builderpool.kvm-device]
+#[test]
+fn statefulset_no_kvm_feature_no_kvm_wiring() {
+    // The CONDITIONAL is the load-bearing part: a non-kvm pool must
+    // NOT request smarter-devices/kvm (would Pending forever — no
+    // non-metal node advertises it) and must NOT tolerate the metal
+    // taint (would bin-pack cheap builds onto $$ metal).
+    let mut wp = test_wp();
+    wp.spec.features = vec!["big-parallel".into()];
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    let resources = pod.containers[0].resources.as_ref().unwrap();
+    assert!(
+        !resources
+            .limits
+            .as_ref()
+            .unwrap()
+            .contains_key("smarter-devices/kvm"),
+        "no kvm device request without features:[kvm]"
+    );
+    assert!(
+        pod.node_selector
+            .as_ref()
+            .is_none_or(|ns| !ns.contains_key("rio.build/kvm")),
+        "no kvm nodeSelector without features:[kvm]"
+    );
+    assert!(
+        pod.tolerations
+            .as_ref()
+            .is_none_or(|t| !t.iter().any(|t| t.key.as_deref() == Some("rio.build/kvm"))),
+        "no kvm toleration without features:[kvm]"
+    );
+}
+
+// r[verify ctrl.builderpool.kvm-device]
+#[test]
+fn statefulset_kvm_privileged_keeps_selector_drops_device() {
+    // Privileged escape hatch bypasses device cgroup → no resource
+    // request. But the pod still needs a host that HAS /dev/kvm, so
+    // nodeSelector + toleration stay.
+    let mut wp = test_wp();
+    wp.spec.privileged = Some(true);
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    let resources = pod.containers[0].resources.as_ref();
+    assert!(
+        resources.is_none_or(|r| r
+            .limits
+            .as_ref()
+            .is_none_or(|l| !l.contains_key("smarter-devices/kvm"))),
+        "privileged → no device-plugin request"
+    );
+    assert_eq!(
+        pod.node_selector
+            .as_ref()
+            .and_then(|ns| ns.get("rio.build/kvm"))
+            .map(String::as_str),
+        Some("true"),
+        "privileged still needs metal placement"
+    );
+}
+
 // r[verify sec.pod.host-users-false]
 #[test]
 fn statefulset_host_users_false_when_unprivileged() {

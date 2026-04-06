@@ -30,6 +30,36 @@ const SIZE_CLASSES_JSON: &str = r#"[
   {"name":"xlarge","cutoffSecs":7200,"memLimitBytes":34359738368,"cpuLimitCores":8.0}
 ]"#;
 
+/// `builderPoolSets[]` (helm list — replaced wholesale, hence one const).
+/// Per-arch general sets use `builderPoolSetDefaults.classes` (5-tier).
+/// Per-arch kvm sets override `classes` to a single xlarge bucket (NixOS
+/// VM tests are uniformly heavy — no point tiering) and `poolTemplate.
+/// features` to the standard nixpkgs VM-test feature triple. The
+/// controller derives the metal nodeSelector, rio.build/kvm toleration,
+/// and smarter-devices/kvm resource from `features:[kvm]`
+/// (`r[ctrl.builderpool.kvm-device]`) — NOT set here.
+///
+/// Validate end-to-end after deploy by building a derivation with
+/// `requiredSystemFeatures = ["kvm" "nixos-test"]` through the gateway:
+///   cargo xtask k8s -p eks rsb -- nix build -L --store ssh-ng://… \
+///     'nixpkgs#nixosTests.simple'
+/// Scheduler routes it to the `{arch}-kvm-xlarge` pool; Karpenter
+/// provisions a `.metal` node; pod gets `/dev/kvm` via smarter-devices.
+const BUILDER_POOL_SETS_JSON: &str = r#"[
+  {"name":"x86-64","systems":["x86_64-linux"]},
+  {"name":"aarch64","systems":["aarch64-linux"]},
+  {"name":"x86-64-kvm","systems":["x86_64-linux"],
+   "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
+   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
+     "resources":{"requests":{"cpu":"8","memory":"16Gi","ephemeral-storage":"60Gi"},
+                  "limits":{"memory":"32Gi"}}}]},
+  {"name":"aarch64-kvm","systems":["aarch64-linux"],
+   "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
+   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
+     "resources":{"requests":{"cpu":"8","memory":"16Gi","ephemeral-storage":"60Gi"},
+                  "limits":{"memory":"32Gi"}}}]}
+]"#;
+
 pub async fn run(
     cfg: &XtaskConfig,
     log_level: &str,
@@ -184,10 +214,7 @@ pub async fn run(
             .set_json("builderPools", "[]")
             .set("builderPoolSetDefaults.enabled", "true")
             .set("builderPoolSetDefaults.poolTemplate.ephemeral", "true")
-            .set_json(
-                "builderPoolSets",
-                r#"[{"name":"x86-64","systems":["x86_64-linux"]},{"name":"aarch64","systems":["aarch64-linux"]}]"#,
-            )
+            .set_json("builderPoolSets", BUILDER_POOL_SETS_JSON)
             // scheduler.sizeClasses MUST agree with builderPoolSetDefaults.
             // classes (names + cutoffs). memLimitBytes ≈ the class's
             // resources.limits.memory — a build whose EMA peak exceeds

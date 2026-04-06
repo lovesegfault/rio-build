@@ -72,9 +72,15 @@ hostPath mechanism is incompatible with `hostUsers: false` — the kernel
 rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding). The
 device plugin adds `/dev/fuse` to the container's device cgroup allowlist
 without a hostPath volume, enabling both `hostUsers: false` and the
-non-privileged security context. `privileged: true` remains an escape hatch
-for k3s/kind clusters lacking the device plugin; it falls back to the
-hostPath mechanism and MUST NOT be the production default.
+non-privileged security context. On EKS (`karpenter.enabled=true`) the
+plugin runs as a Bottlerocket **static pod** delivered via EC2NodeClass
+userData (`settings.kubernetes.static-pods`), so kubelet registers the
+extended resource at node boot without a DaemonSet scheduling round-trip;
+on k3s/kind the plugin runs as a DaemonSet. Both modes share one
+`conf.yaml` (the `rio.devicePluginConf` Helm helper) covering `^fuse$` and
+`^kvm$`. `privileged: true` remains an escape hatch for clusters lacking
+the device plugin; it falls back to the hostPath mechanism and MUST NOT be
+the production default.
 
 r[sec.psa.control-plane-restricted]
 

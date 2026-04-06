@@ -503,7 +503,7 @@ async fn size_class_snapshot_preserves_configured_after_rebalance() {
         g[1].cutoff_secs = 2100.0;
     }
 
-    let snap = actor.compute_size_class_snapshot();
+    let snap = actor.compute_size_class_snapshot(None);
     assert_eq!(snap.len(), 2);
 
     // Sorted by effective cutoff ascending.
@@ -530,11 +530,104 @@ async fn size_class_snapshot_preserves_configured_after_rebalance() {
 async fn size_class_snapshot_empty_when_unconfigured() {
     let db = TestDb::new(&MIGRATOR).await;
     let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
-    let snap = actor.compute_size_class_snapshot();
+    let snap = actor.compute_size_class_snapshot(None);
     assert!(
         snap.is_empty(),
         "unconfigured size-classes → empty snapshot"
     );
+}
+
+/// I-176: `pool_features` filters Ready derivations by
+/// `required_features ⊆ pool_features` — the same subset check
+/// `rejection_reason()` applies. A kvm derivation classified as `tiny`
+/// (trivial runCommand wrapper) MUST count toward the kvm pool's view
+/// and MUST NOT count toward a featureless pool's view, regardless of
+/// which class `classify()` puts it in. Without this, the featureless
+/// pool spawns a builder that hard_filter rejects (`feature-missing`),
+/// and the kvm pool reads `queued{its_class}=0` and never spawns —
+/// deadlock.
+// r[verify sched.sizeclass.feature-filter]
+#[tokio::test]
+async fn size_class_snapshot_feature_filter() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
+        crate::assignment::SizeClassConfig {
+            name: "tiny".into(),
+            cutoff_secs: 60.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+        crate::assignment::SizeClassConfig {
+            name: "xlarge".into(),
+            cutoff_secs: 3600.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        },
+    ]);
+
+    // 3 Ready derivations, all classify as `tiny` (no estimator
+    // samples → est_duration=None → smallest class):
+    //   a: required_features=[]             — featureless work
+    //   b: required_features=["kvm"]        — needs kvm
+    //   c: required_features=["kvm","nixos-test"] — the I-176 trigger
+    actor.test_inject_ready("a", None, "x86_64-linux");
+    actor.test_inject_ready_with_features("b", None, "x86_64-linux", &["kvm"]);
+    actor.test_inject_ready_with_features("c", None, "x86_64-linux", &["kvm", "nixos-test"]);
+
+    // --- Unfiltered (None): backward compat — counts all 3. ---
+    let snap = actor.compute_size_class_snapshot(None);
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    assert_eq!(tiny.queued, 3, "unfiltered: all 3 Ready in tiny");
+    assert_eq!(
+        tiny.queued_by_system.get("x86_64-linux").copied(),
+        Some(3),
+        "per-system breakdown matches scalar"
+    );
+
+    // --- Featureless pool (Some([])): only `a` passes. ---
+    // `[] ⊆ []` ✓; `["kvm"] ⊆ []` ✗; `["kvm","nixos-test"] ⊆ []` ✗.
+    let snap = actor.compute_size_class_snapshot(Some(&[]));
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    assert_eq!(
+        tiny.queued, 1,
+        "featureless pool: kvm derivations excluded → no wasted spawn"
+    );
+    assert_eq!(tiny.queued_by_system.get("x86_64-linux").copied(), Some(1));
+
+    // --- kvm pool (Some(["kvm","nixos-test","big-parallel"])): all 3. ---
+    // `[] ⊆ pf` ✓; `["kvm"] ⊆ pf` ✓; `["kvm","nixos-test"] ⊆ pf` ✓.
+    // The kvm pool over-counts `a` (featureless work it COULD build
+    // but the general pool will likely take); spawn_count's active-
+    // subtraction self-corrects. The load-bearing assertion: `b`+`c`
+    // are visible — without this the kvm pool never spawns (I-176).
+    let kvm_pf: Vec<String> = ["kvm", "nixos-test", "big-parallel"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let snap = actor.compute_size_class_snapshot(Some(&kvm_pf));
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    assert_eq!(
+        tiny.queued, 3,
+        "kvm pool: counts derivations its workers would pass hard_filter for"
+    );
+
+    // --- kvm-only pool (Some(["kvm"])): `a` + `b`, NOT `c`. ---
+    // `["kvm","nixos-test"] ⊆ ["kvm"]` is false — `nixos-test` missing.
+    // Mirrors hard_filter exactly: a kvm-only worker can't build a
+    // derivation that also needs nixos-test.
+    let kvm_only: Vec<String> = vec!["kvm".into()];
+    let snap = actor.compute_size_class_snapshot(Some(&kvm_only));
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    assert_eq!(
+        tiny.queued, 2,
+        "kvm-only pool: excludes derivations needing nixos-test too"
+    );
+
+    // xlarge stays 0 in all views — feature filtering doesn't move
+    // derivations between classes (classify() is feature-blind by
+    // design; the controller's cross-class sum handles overflow).
+    let xlarge = snap.iter().find(|s| s.name == "xlarge").unwrap();
+    assert_eq!(xlarge.queued, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -905,7 +998,10 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
     // Snapshot before dispatch: 3 queued in small (est_dur=0 →
     // smallest covering class), 0 running.
     let (snap, _fod) = handle
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
+            pool_features: None,
+            reply,
+        })
         .await?;
     assert_eq!(snap.len(), 2);
     let small = snap.iter().find(|s| s.name == "small").unwrap();
@@ -955,7 +1051,10 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
         .expect("assignment not dropped");
 
     let (snap, _fod) = handle
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
+            pool_features: None,
+            reply,
+        })
         .await?;
     let small = snap.iter().find(|s| s.name == "small").unwrap();
     assert_eq!(
@@ -1018,7 +1117,10 @@ async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> Te
     .await?;
 
     let (snap, _fod) = handle
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
+            pool_features: None,
+            reply,
+        })
         .await?;
     assert_eq!(snap.len(), 2);
 

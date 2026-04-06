@@ -725,9 +725,12 @@ impl DagActor {
                 ActorCommand::ClusterSnapshot { reply } => {
                     let _ = reply.send(self.compute_cluster_snapshot());
                 }
-                ActorCommand::GetSizeClassSnapshot { reply } => {
+                ActorCommand::GetSizeClassSnapshot {
+                    pool_features,
+                    reply,
+                } => {
                     let _ = reply.send((
-                        self.compute_size_class_snapshot(),
+                        self.compute_size_class_snapshot(pool_features.as_deref()),
                         self.compute_fod_size_class_snapshot(),
                     ));
                 }
@@ -1385,10 +1388,21 @@ impl DagActor {
     /// O(dag_nodes + n_classes) per call. The classify() inside the
     /// loop is O(n_classes) but n_classes is ~3-5. Total cost is
     /// dominated by the node iteration, same as `compute_cluster_snapshot`.
+    ///
+    /// `pool_features`: I-176 feature filter. `None` = unfiltered.
+    /// `Some(f)` = only count Ready derivations whose
+    /// `required_features ⊆ f` — the same subset check
+    /// `rejection_reason()`'s `feature-missing` clause applies. The
+    /// controller passes `BuilderPool.spec.features` here so each
+    /// pool's spawn decision sees only derivations its workers could
+    /// accept.
     // pub(crate) for the configured-vs-effective test (tests/misc.rs)
     // which exercises it on a bare (unspawned) actor so it can mutate
     // size_classes directly to simulate a rebalancer pass.
-    pub(crate) fn compute_size_class_snapshot(&self) -> Vec<SizeClassSnapshot> {
+    pub(crate) fn compute_size_class_snapshot(
+        &self,
+        pool_features: Option<&[String]>,
+    ) -> Vec<SizeClassSnapshot> {
         // Take a read lock for the whole computation. Rebalancer
         // writes hourly; contention is near-zero. Dropped at end of
         // scope (no await in this fn).
@@ -1460,6 +1474,21 @@ impl DagActor {
                     // is reported via ClusterSnapshot.queued_fod_
                     // derivations → FetcherPool autoscaler.
                     if state.is_fixed_output {
+                        continue;
+                    }
+                    // r[impl sched.sizeclass.feature-filter]
+                    // I-176: skip derivations a worker with
+                    // `pool_features` couldn't build. Mirrors the
+                    // `feature-missing` clause in rejection_reason()
+                    // — a kvm derivation never counts toward a
+                    // featureless pool's spawn decision (it would
+                    // spawn a builder that hard_filter rejects), and
+                    // a kvm pool sees kvm-required work even when
+                    // classify() buckets it into a class no kvm pool
+                    // owns. `None` = no filter (CLI, status display).
+                    if let Some(pf) = pool_features
+                        && !state.required_features.iter().all(|f| pf.contains(f))
+                    {
                         continue;
                     }
                     // Forecast: what class WOULD dispatch pick?
@@ -1675,6 +1704,19 @@ impl DagActor {
     /// merge-proto-node dance.
     #[cfg(test)]
     pub(crate) fn test_inject_ready(&mut self, hash: &str, pname: Option<&str>, system: &str) {
+        self.test_inject_ready_with_features(hash, pname, system, &[]);
+    }
+
+    /// [`Self::test_inject_ready`] with `required_features` populated.
+    /// For the I-176 feature-filter snapshot tests.
+    #[cfg(test)]
+    pub(crate) fn test_inject_ready_with_features(
+        &mut self,
+        hash: &str,
+        pname: Option<&str>,
+        system: &str,
+        required_features: &[&str],
+    ) {
         let row = crate::db::RecoveryDerivationRow {
             derivation_id: uuid::Uuid::new_v4(),
             drv_hash: hash.to_string(),
@@ -1682,7 +1724,7 @@ impl DagActor {
             pname: pname.map(String::from),
             system: system.to_string(),
             status: "ready".into(),
-            required_features: vec![],
+            required_features: required_features.iter().map(|s| s.to_string()).collect(),
             assigned_builder_id: None,
             retry_count: 0,
             expected_output_paths: vec![],

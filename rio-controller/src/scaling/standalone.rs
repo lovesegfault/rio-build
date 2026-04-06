@@ -145,7 +145,7 @@ impl Autoscaler {
 
         let sc_resp = self
             .scheduler
-            .get_size_class_status(GetSizeClassStatusRequest {})
+            .get_size_class_status(GetSizeClassStatusRequest::default())
             .await
             .map(|r| r.into_inner())
             .unwrap_or_else(|e| {

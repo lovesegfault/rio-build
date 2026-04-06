@@ -55,6 +55,23 @@ spec:
     source = {{ include "rio.image" (list . "rio-seccomp-bootstrap") }}
     mode = "once"
     essential = true
+    {{- if .Values.devicePlugin.enabled }}
+    # r[impl sec.pod.fuse-device-plugin]
+    # Static pod: kubelet starts smarter-device-manager locally at node
+    # boot from the base64 manifest below (rio.devicePluginPodManifest
+    # helper). Replaces the DaemonSet on EKS — no schedule + DS-controller
+    # + image-pull round-trip before the extended resource registers
+    # (~5-15s → ~1-2s). Same image (digest-pinned devicePlugin.image),
+    # same conf.yaml (rio.devicePluginConf), kubelet-managed restart.
+    # Updates roll via Karpenter Drift (userData change → node replace),
+    # same blast radius as the seccomp bootstrap above. NodeOverlay
+    # below STILL needed: Karpenter bin-packs against synthetic capacity
+    # before any node exists; the static pod supplies runtime ground
+    # truth once kubelet is up.
+    [settings.kubernetes.static-pods.rio-device-plugin]
+    enabled = true
+    manifest = {{ include "rio.devicePluginPodManifest" . | b64enc | quote }}
+    {{- end }}
   # Bottlerocket has two volumes: /dev/xvda (OS, ~2GB, immutable) and
   # /dev/xvdb (container data — images, emptyDir, logs). The AMI default
   # for xvdb is ~20GB, which Karpenter treats as the allocatable
@@ -73,11 +90,13 @@ spec:
 # NodeOverlay: tells Karpenter that worker-role instances provide
 # smarter-devices/fuse capacity BEFORE the node exists. Solves the
 # cold-start deadlock: builder pods request smarter-devices/fuse:1, but
-# the device-plugin DaemonSet only advertises that resource AFTER a
-# node boots and the DaemonSet registers — so from zero nodes Karpenter
-# can't bin-pack and never provisions. The overlay declares the capacity
-# synthetically; once the node is up, the device-plugin registers the
-# real capacity (same value, devicePlugin.fuseMaxDevices).
+# the device-plugin only advertises that resource AFTER a node boots and
+# the plugin registers with kubelet — so from zero nodes Karpenter can't
+# bin-pack and never provisions. The overlay declares the capacity
+# synthetically; once the node is up, the static-pod device-plugin (see
+# userData above) registers the real capacity (same value,
+# devicePlugin.fuseMaxDevices). The static pod shrinks the boot→register
+# window to ~1-2s but does NOT eliminate it — overlay stays required.
 #
 # Alpha feature — requires settings.featureGates.nodeOverlay=true on the
 # Karpenter controller (set in infra/eks/karpenter.tf).
@@ -88,16 +107,40 @@ metadata:
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  # Match builder + fetcher NodePools via node-role. NOT rio-general
-  # (no executor pods there, no device-plugin DaemonSet there —
-  # advertising a resource that never materializes would wedge
-  # scheduling).
+  # Match builder + fetcher NodePools via node-role. NOT rio-general:
+  # the static-pod device-plugin DOES run there (rio-default userData is
+  # shared across all NodePools) and will advertise fuse capacity at
+  # runtime, but executor pods carry node-role selectors that exclude
+  # general anyway. Keeping the overlay narrow means Karpenter never
+  # provisions a rio-general node FOR a fuse-requesting pod at cold start.
   requirements:
     - key: rio.build/node-role
       operator: In
       values: [builder, fetcher]
   capacity:
     smarter-devices/fuse: {{ .Values.devicePlugin.fuseMaxDevices | quote }}
+---
+# NodeOverlay (kvm): synthetic smarter-devices/kvm capacity for the metal
+# NodePool. Same cold-start deadlock as fuse above — a kvm-feature pod
+# requests smarter-devices/kvm:1, but no node advertises it until the
+# static-pod device-plugin registers on a booted metal node. Matches by
+# the rio.build/kvm label (only the metal NodePool sets it) so non-metal
+# builder nodes don't falsely advertise kvm — the device-plugin would
+# correct it to 0 post-boot, but Karpenter would have already wasted a
+# provision cycle.
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: rio-builder-kvm
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  requirements:
+    - key: rio.build/kvm
+      operator: In
+      values: ["true"]
+  capacity:
+    smarter-devices/kvm: {{ .Values.devicePlugin.kvmMaxDevices | quote }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1

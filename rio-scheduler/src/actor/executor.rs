@@ -373,18 +373,20 @@ impl DagActor {
             let should_poison = match lost_worker {
                 Some(executor_id) => {
                     // r[impl sched.fod.size-class-reactive]
-                    // I-173: promote FOD floor REGARDLESS of
-                    // was_running. An OOM'd fetcher disconnects with
-                    // the drv often still Assigned (Running ack
-                    // unprocessed); over-promoting is cheap, retry-
-                    // storm on tiny is not. Uses `lost_worker_class`
-                    // captured before executor removal — the
-                    // self.executors lookup inside record_failure_
-                    // and_check_poison misses on the disconnect path.
-                    if self.dag.node(drv_hash).is_some_and(|s| s.is_fixed_output) {
-                        self.promote_fod_size_class_floor(drv_hash, lost_worker_class)
-                            .await;
-                    }
+                    // r[impl sched.builder.size-class-reactive]
+                    // I-173/I-177: promote size_class_floor
+                    // REGARDLESS of was_running, FOD or not. An
+                    // OOM'd executor disconnects with the drv often
+                    // still Assigned (Running ack unprocessed);
+                    // over-promoting is cheap, retry-storm on tiny
+                    // is not. Uses `lost_worker_class` captured
+                    // before executor removal — the self.executors
+                    // lookup inside record_failure_and_check_poison
+                    // misses on the disconnect path. The helper
+                    // branches on is_fixed_output to pick which
+                    // class list to walk.
+                    self.promote_size_class_floor(drv_hash, lost_worker_class)
+                        .await;
                     if was_running {
                         self.record_failure_and_check_poison(drv_hash, executor_id)
                             .await
