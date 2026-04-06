@@ -55,6 +55,13 @@ const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 /// Number of events to retain in each build's event buffer for late subscribers.
 const BUILD_EVENT_BUFFER_SIZE: usize = 1024;
 
+/// Default cap on concurrent `QueryPathInfo` calls during merge-time
+/// eager substitute fetch. 16 balances throughput against the store's
+/// S3 connection-pool ceiling (~10-20 aws-sdk default). Unbounded
+/// fan-out at ~1k paths causes "dispatch failure" → ~20% false demotes.
+/// Overridable via `RIO_SUBSTITUTE_MAX_CONCURRENT`.
+pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 16;
+
 /// Delay before cleaning up terminal build state. Allows late WatchBuild
 /// subscribers to receive the terminal event before the broadcast sender
 /// is dropped.
@@ -121,6 +128,14 @@ pub struct DagActor {
     /// rio-scheduler's test build links against rio-common built WITHOUT
     /// `cfg(test)`, so a test-gated constant there is invisible here.
     grpc_timeout: std::time::Duration,
+    /// Max in-flight `QueryPathInfo` calls during merge-time eager
+    /// substitute fetch (r[sched.merge.substitute-fetch]). Bounds
+    /// `buffer_unordered(N)` in `check_cached_outputs`. Unbounded
+    /// fan-out of ~1k concurrent QPI calls saturates the store's S3
+    /// connection pool → "dispatch failure" → false demotes. Default
+    /// [`DEFAULT_SUBSTITUTE_CONCURRENCY`] (16). Overridable via
+    /// `RIO_SUBSTITUTE_MAX_CONCURRENT` env or scheduler.toml.
+    substitute_max_concurrent: usize,
     /// Circuit breaker for the cache-check FindMissingPaths call. Owned by
     /// the actor (single-threaded, no lock needed). Checked/updated in
     /// `merge.rs::check_cached_outputs`.
@@ -289,6 +304,7 @@ impl DagActor {
             db,
             store_client,
             grpc_timeout: rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            substitute_max_concurrent: DEFAULT_SUBSTITUTE_CONCURRENCY,
             cache_breaker: CacheCheckBreaker::default(),
             estimator: Estimator::default(),
             tick_count: 0,
@@ -386,6 +402,16 @@ impl DagActor {
     /// this is plumbed rather than `cfg(test)`-gated.
     pub fn with_grpc_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.grpc_timeout = timeout;
+        self
+    }
+
+    /// Override the eager-substitute-fetch concurrency cap. Production
+    /// sets via `RIO_SUBSTITUTE_MAX_CONCURRENT`; tests leave the
+    /// default. See the
+    /// [`substitute_max_concurrent`](Self#structfield.substitute_max_concurrent)
+    /// field doc.
+    pub fn with_substitute_concurrency(mut self, n: usize) -> Self {
+        self.substitute_max_concurrent = n;
         self
     }
 

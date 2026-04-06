@@ -42,6 +42,8 @@ pub use assignment::SizeClassConfig;
 // pub, but the re-export keeps main.rs's imports uniform with
 // `SizeClassConfig` (crate-root path, no deep-module reach-in).
 pub use state::{PoisonConfig, RetryPolicy};
+// Default for main.rs Config's `#[serde(default = ...)]` fn.
+pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
 
 /// Shared sqlx migrator for the `migrations/` directory. See
 /// rio-store's MIGRATOR for rationale — same pattern.
