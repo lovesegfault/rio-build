@@ -1235,45 +1235,9 @@ async fn gc_gate_ignores_grace_window() {
 
 ### 5.5 Tracey markers
 
-**New spec text** in `docs/src/components/worker.md` (replacing the "Phase deferral" paragraph at :190):
+Tracey markers: `r[worker.upload.references-scanned]`, `r[worker.upload.deriver-populated]` — see [`worker.md`](../../components/worker.md) (replaces the former "Phase deferral" paragraph). The first covers the pre-upload NAR reference scan (Boyer-Moore-style skip-scan over 32-char nixbase32 prefixes against `resolved_input_srcs ∪ drv.outputs()`, populating `PathInfo.references` as a separate disk-read-only pre-pass before the upload retry loop); the second covers `PathInfo.deriver` being set to `assignment.drv_path` plumbed through `upload_all_outputs`.
 
-```markdown
-r[worker.upload.references-scanned]
-
-Before upload, the worker scans each output's NAR for references to paths
-in the candidate set `resolved_input_srcs ∪ drv.outputs()`. The scan
-matches 32-character nixbase32 hash prefixes using a Boyer-Moore-style
-skip-scan (matching Nix's `libstore/references.cc`). Matched paths
-populate `PathInfo.references` on the `PutPath` metadata message. The
-scan is a separate pre-pass over the NAR bytes (disk read only, no hash,
-no network) executed once before the upload retry loop.
-
-r[worker.upload.deriver-populated]
-
-`PathInfo.deriver` is set to the `.drv` store path of the derivation
-being built. The deriver is known at `execute_build` entry (it's
-`assignment.drv_path`) and plumbed through `upload_all_outputs`.
-```
-
-**New spec text** in `docs/src/components/store.md`:
-
-```markdown
-r[store.signing.empty-refs-warn]
-
-When signing a narinfo for a non-content-addressed path with empty
-`references`, the store emits a `warn!` log and increments
-`rio_store_sign_empty_refs_total`. The signing proceeds (no upload
-rejection) — this is a detection aid, not an enforcement point.
-
-r[store.gc.empty-refs-gate]
-
-Before the mark phase, `TriggerGC` checks the ratio of sweep-eligible
-narinfo rows with empty `references` AND empty `content_address`. If
-the ratio exceeds 10% (configurable), GC is refused with
-`FailedPrecondition` unless the request sets `force=true`. This
-prevents catastrophic sweep on a store populated before the worker
-reference scanner was deployed.
-```
+Tracey markers: `r[store.signing.empty-refs-warn]`, `r[store.gc.empty-refs-gate]` — see [`store.md`](../../components/store.md). The first covers the `warn!` log + `rio_store_sign_empty_refs_total` counter when signing a non-CA path with empty `references` (detection aid, not enforcement); the second covers the `TriggerGC` pre-mark gate that refuses GC with `FailedPrecondition` if >10% of sweep-eligible rows have empty `references` AND empty `content_address` (unless `force=true`).
 
 | Rule ID | `r[impl]` site | `r[verify]` site |
 |---|---|---|

@@ -346,12 +346,7 @@ But `from_poisoned_row` is also called for derivations whose build ALREADY termi
 
 ## 2. Tracey rule
 
-**New spec text** — insert in `docs/src/components/scheduler.md` after the existing recovery section (after `r[sched.recovery.gate-dispatch]` at line 335, before `## Worker Registration Protocol` at line 351):
-
-```markdown
-r[sched.recovery.poisoned-failed-count]
-Recovered builds whose derivations include failure-terminal states (Poisoned, DependencyFailed, Cancelled) MUST count those derivations in `failed`, not omit them from the denominator. A build whose only non-success-terminal derivation was poisoned before the crash transitions to `Failed` after recovery, never `Succeeded`. Concretely: `load_poisoned_derivations` rows are inserted into the recovery-time `id_to_hash` map so the `build_derivations` join resolves them, so `build_summary` counts them, so `check_build_completion` sees `failed > 0`.
-```
+Tracey marker: `r[sched.recovery.poisoned-failed-count]` — see [`scheduler.md`](../../components/scheduler.md) (recovery section, after `r[sched.recovery.gate-dispatch]`). Recovered builds whose derivations include failure-terminal states MUST count those in `failed`, not omit them from the denominator; `load_poisoned_derivations` rows are inserted into the recovery-time `id_to_hash` map so `check_build_completion` sees `failed > 0`.
 
 **Annotation sites:**
 

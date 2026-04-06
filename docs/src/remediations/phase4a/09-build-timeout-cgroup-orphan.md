@@ -788,23 +788,14 @@ with subtest("build-timeout: spec.timeoutSeconds < build duration → TimedOut, 
 
 ## 6. Spec + tracey
 
-Three new rules in `docs/src/components/worker.md`:
+Tracey markers: `r[worker.cgroup.kill-on-teardown]`, `r[worker.timeout.no-reassign]`, `r[worker.status.nix-to-proto]`, `r[worker.cancel.flag-clear-enoent]` — all in [`worker.md`](../../components/worker.md).
 
-```markdown
-r[worker.cgroup.kill-on-teardown]
-After `daemon.wait()` returns (success or timeout), the executor writes `cgroup.kill` and waits for `cgroup.procs` to drain before dropping `BuildCgroup`. `daemon.kill()` only reaches the direct child; the builder is a grandchild forked by nix-daemon and survives in the cgroup. Without the tree-kill, `BuildCgroup::Drop`'s `rmdir()` returns `EBUSY` and the cgroup leaks — the next build of the same derivation on the same worker fails `EEXIST` at `BuildCgroup::create`.
+- `r[worker.cgroup.kill-on-teardown]`: after `daemon.wait()` returns, executor writes `cgroup.kill` and drains `cgroup.procs` before dropping `BuildCgroup` (`daemon.kill()` only reaches direct child; builder is grandchild).
+- `r[worker.timeout.no-reassign]`: build timeout produces `Ok(BuildResult { status: TimedOut })`, not `Err(ExecutorError)` — timeout is a build outcome, not infrastructure failure (would otherwise reassign forever).
+- `r[worker.status.nix-to-proto]`: Nix→proto `BuildStatus` mapping is exhaustive (no `_` arm); only `MiscFailure`/`NoSubstituters` collapse to `PermanentFailure`.
+- `r[worker.cancel.flag-clear-enoent]`: if `try_cancel_build`'s `cgroup.kill` write returns `ENOENT` (raced ahead of `BuildCgroup::create`), the `cancelled` flag is cleared.
 
-r[worker.timeout.no-reassign]
-Build timeout (`BuildOptions.build_timeout` exceeded during the STDERR loop) produces `Ok(BuildResult { status: TimedOut })`, not `Err(ExecutorError)`. Timeout is a build outcome — the executor did its job; the build didn't finish. Reporting it as an executor error would classify it as `InfrastructureFailure`, which the scheduler reassigns: same build, same inputs, same timeout, forever.
-
-r[worker.status.nix-to-proto]
-The Nix→proto `BuildStatus` mapping is exhaustive (no `_` arm) and 1:1 for every Nix failure variant that has a semantic proto equivalent. `TimedOut`, `LogLimitExceeded`, `NotDeterministic`, `InputRejected`, `OutputRejected`, `CachedFailure`, `DependencyFailed` each map to their own proto variant. Only `MiscFailure` and `NoSubstituters` collapse to `PermanentFailure` — both are already catch-alls on the Nix side.
-
-r[worker.cancel.flag-clear-enoent]
-If `try_cancel_build`'s `cgroup.kill` write returns `ENOENT` (cgroup doesn't exist yet — cancel raced ahead of `BuildCgroup::create`), the `cancelled` flag is cleared. The kill did not happen; leaving the flag set would misclassify a later unrelated `ExecutorError` as `Cancelled`, hiding the real infrastructure fault from the operator.
-```
-
-Run `tracey bump` if any of these overlap existing rules (they don't — `worker.cancel.cgroup-kill` is about the cancel path specifically, this adds the teardown path).
+None overlap existing rules — `worker.cancel.cgroup-kill` is the cancel path specifically; the first above adds the teardown path.
 
 ---
 
