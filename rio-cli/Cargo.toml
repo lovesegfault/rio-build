@@ -25,3 +25,18 @@ rustls = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rio-test-support = { workspace = true }
+# k8s-openapi feature-activation stub. rio-cli has no k8s code, but
+# rio-test-support→kube→k8s-openapi, and k8s-openapi's build.rs requires
+# a version feature or it panics at compile time. Workspace builds get
+# v1_35 via feature unification from rio-scheduler/rio-controller; a
+# bare `cargo test -p rio-cli` does NOT unify those in. This is the
+# "binary crate names it directly" escape hatch the k8s-openapi error
+# message asks for.
+#
+# Pre-existing: `cargo test -p rio-gateway` has the same failure. Fix
+# for the other consumers is out of scope here.
+k8s-openapi = { workspace = true }
