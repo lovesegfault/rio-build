@@ -591,14 +591,68 @@ impl DerivationDag {
         eligible
     }
 
+    /// Generic BFS walk collecting all nodes reachable via
+    /// `expand(current, visited)` from `trigger`, capped at `max_nodes`
+    /// pops. Pure, non-mutating — the caller decides what to do with
+    /// the result (transition, store-verify, persist).
+    ///
+    /// Used by:
+    /// - [`Self::cascade_cutoff`] — Queued→Skipped propagation
+    /// - [`crate::actor::DagActor`]'s `verify_cutoff_candidates` —
+    ///   over-approximate candidate collection for a batched
+    ///   FindMissingPaths RPC
+    ///
+    /// The `expand` closure receives `(current, &visited_so_far)` so
+    /// it can implement speculative-skipped semantics (see
+    /// [`Self::find_cutoff_eligible_speculative`] — treats
+    /// provisional-visited nodes as already-Skipped).
+    ///
+    /// Returns `(reachable, cap_hit)`. Deduplication via `visited`
+    /// HashSet — diamond DAGs are safe.
+    ///
+    /// Associated fn (not `&self`) to avoid overlapping borrows when
+    /// `expand` needs to call `&self` methods while the caller is
+    /// `&mut self` (see [`Self::cascade_cutoff`]).
+    pub fn speculative_cascade_reachable<F>(
+        trigger: &DrvHash,
+        max_nodes: usize,
+        mut expand: F,
+    ) -> (Vec<DrvHash>, bool)
+    where
+        F: FnMut(&DrvHash, &HashSet<DrvHash>) -> Vec<DrvHash>,
+    {
+        let mut reachable = Vec::new();
+        let mut visited: HashSet<DrvHash> = HashSet::new();
+        let mut frontier = vec![trigger.clone()];
+        let mut pops = 0usize;
+        let mut cap_hit = false;
+        while let Some(current) = frontier.pop() {
+            if pops >= max_nodes {
+                cap_hit = true;
+                break;
+            }
+            for next in expand(&current, &visited) {
+                if visited.insert(next.clone()) {
+                    reachable.push(next.clone());
+                    frontier.push(next);
+                }
+            }
+            pops += 1;
+        }
+        (reachable, cap_hit)
+    }
+
     // r[impl sched.ca.cutoff-propagate]
     /// Cascade CA-cutoff Skip transitions starting from a trigger node.
     ///
-    /// Walks downstream: for each frontier node, finds cutoff-eligible
-    /// parents via [`Self::find_cutoff_eligible`], transitions them to
-    /// `Skipped` IFF `verify(hash)` returns true, and adds them to the
-    /// frontier. Transitivity: A unchanged → B skipped → C depended
-    /// only on B → C eligible.
+    /// Two-phase: (1) BFS-collect all verified-eligible downstream
+    /// nodes via [`Self::speculative_cascade_reachable`], passing the
+    /// visited set to [`Self::find_cutoff_eligible_speculative`] so
+    /// already-collected nodes are treated as-if-Skipped for
+    /// transitive eligibility (A unchanged → B would-skip → C depended
+    /// only on B → C eligible). (2) Bulk-transition the collected set
+    /// to `Skipped`. The `&mut self.nodes` second pass happens AFTER
+    /// the `&self` walk returns — no borrow overlap.
     ///
     /// The `verify` closure gates against the self-match hazard
     /// (bughunt-mc196): `ca_output_unchanged` can be `true` for a
@@ -608,7 +662,9 @@ impl DerivationDag {
     /// would be Skipped even though their outputs have NEVER been
     /// built. The completion handler passes a closure that checks
     /// `expected_output_paths` exist in the store; tests pass `|_| true`
-    /// for pure walk testing.
+    /// for pure walk testing. Unverified nodes are filtered out of
+    /// `expand`'s return → not added to visited → not treated
+    /// as-if-Skipped → their parents stay ineligible (cascade halts).
     ///
     /// Depth-capped at [`MAX_CASCADE_DEPTH`]. Returns
     /// `(skipped_hashes, depth_cap_hit)`.
@@ -617,38 +673,27 @@ impl DerivationDag {
         trigger: &str,
         mut verify: impl FnMut(&DrvHash) -> bool,
     ) -> (Vec<DrvHash>, bool) {
-        let mut skipped = Vec::new();
         let Some(start) = self.canonical(trigger) else {
-            return (skipped, false);
+            return (Vec::new(), false);
         };
-        let mut frontier = vec![start];
-        let mut depth = 0usize;
-        let mut cap_hit = false;
-        while let Some(current) = frontier.pop() {
-            if depth >= MAX_CASCADE_DEPTH {
-                cap_hit = true;
-                break;
+        let (candidates, cap_hit) =
+            Self::speculative_cascade_reachable(&start, MAX_CASCADE_DEPTH, |current, visited| {
+                self.find_cutoff_eligible_speculative(current, visited)
+                    .into_iter()
+                    .filter(&mut verify)
+                    .collect()
+            });
+        let mut skipped = Vec::with_capacity(candidates.len());
+        for hash in candidates {
+            // Queued→Skipped. All candidates were Queued when
+            // collected (find_cutoff_eligible_speculative only
+            // returns Queued nodes); the HashSet dedup in the
+            // walker guarantees each hash appears once.
+            if let Some(state) = self.nodes.get_mut(&hash)
+                && state.transition(DerivationStatus::Skipped).is_ok()
+            {
+                skipped.push(hash);
             }
-            for eligible in self.find_cutoff_eligible(&current) {
-                // Defensive gate: only skip if the downstream node's
-                // output already exists in the store. Without this, a
-                // self-matched ca_output_unchanged (first-ever build)
-                // would skip never-built downstream nodes.
-                if !verify(&eligible) {
-                    continue;
-                }
-                let Some(state) = self.nodes.get_mut(&eligible) else {
-                    continue;
-                };
-                // Queued→Skipped. Idempotent self-transition returns
-                // Ok(from==to); double-visits via diamond DAGs are
-                // harmless (Skipped is no longer Queued on re-visit).
-                if state.transition(DerivationStatus::Skipped).is_ok() {
-                    skipped.push(eligible.clone());
-                    frontier.push(eligible);
-                }
-            }
-            depth += 1;
         }
         (skipped, cap_hit)
     }

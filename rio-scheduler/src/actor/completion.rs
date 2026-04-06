@@ -74,30 +74,19 @@ impl DagActor {
         };
 
         // Speculative BFS: collect all POTENTIAL candidates by
-        // walking find_cutoff_eligible with a local provisional-
-        // skipped set. This over-approximates (assumes every
-        // eligible would be skipped) — fine, we only use it to
-        // batch the store RPC. The actual cascade re-checks
-        // eligibility and only skips verified nodes.
-        let mut candidates: Vec<DrvHash> = Vec::new();
-        let mut provisional: HashSet<DrvHash> = HashSet::new();
-        let mut frontier = vec![trigger.clone()];
-        let mut depth = 0usize;
-        while let Some(current) = frontier.pop() {
-            if depth >= crate::dag::MAX_CASCADE_DEPTH {
-                break;
-            }
-            for eligible in self
-                .dag
-                .find_cutoff_eligible_speculative(&current, &provisional)
-            {
-                if provisional.insert(eligible.clone()) {
-                    candidates.push(eligible.clone());
-                    frontier.push(eligible);
-                }
-            }
-            depth += 1;
-        }
+        // walking find_cutoff_eligible with a provisional-skipped
+        // set. This over-approximates (assumes every eligible would
+        // be skipped) — fine, we only use it to batch the store
+        // RPC. The actual cascade re-checks eligibility and only
+        // skips verified nodes.
+        let (candidates, _cap) = crate::dag::DerivationDag::speculative_cascade_reachable(
+            trigger,
+            crate::dag::MAX_CASCADE_DEPTH,
+            |current, provisional| {
+                self.dag
+                    .find_cutoff_eligible_speculative(current, provisional)
+            },
+        );
         if candidates.is_empty() {
             return HashSet::new();
         }
@@ -1173,6 +1162,13 @@ impl DagActor {
     ///
     /// Without this, keepGoing builds with a poisoned leaf hang forever:
     /// parents stay Queued, so completed+failed never reaches total.
+    //
+    // Same BFS-frontier shape as speculative_cascade_reachable but
+    // async (per-step persist_status().await) + walks get_parents()
+    // unconditionally rather than eligibility-gated. Not migrated —
+    // see P0405-T3 route-(a). If a 4th async walker appears, consider
+    // route-(b): collect-then-batch-persist (safe because recovery
+    // re-cascades from the original poisoned leaf on partial persist).
     pub(super) async fn cascade_dependency_failure(&mut self, poisoned_hash: &DrvHash) {
         let mut to_visit: Vec<DrvHash> = self.dag.get_parents(poisoned_hash);
         let mut visited: HashSet<DrvHash> = HashSet::new();
