@@ -45,27 +45,23 @@ pub mod tenant;
 
 /// PG advisory lock ID for TriggerGC. Arbitrary constant — just
 /// needs to not collide with other advisory locks in the schema
-/// (only GC_MARK_LOCK_ID below). "rOGC" ASCII + 1.
+/// (currently the only one). "rOGC" ASCII + 1.
 ///
 /// Serializes GC-vs-GC: two concurrent TriggerGC calls would
 /// waste work and produce misleading stats. `pg_try_advisory_lock`
 /// (non-blocking) — second caller gets "already running".
+///
+/// I-192: there is no longer a mark-vs-PutPath lock. PutPath's
+/// `insert_manifest_uploading` writes `references` into the
+/// placeholder narinfo at INSERT time; sweep's per-path re-check
+/// (`narinfo."references" @> ARRAY[Q]`, fresh READ-COMMITTED snapshot
+/// over ALL narinfo including `'uploading'`) is the sole load-bearing
+/// guard. The mark lock was released before sweep anyway, so it never
+/// participated in sweep-time safety — it only made PutPath wait for
+/// the mark CTE, which doesn't change whether Q ends up in
+/// `unreachable` or whether the re-check saves it. See
+/// `r[store.gc.sweep-recheck]`.
 pub const GC_LOCK_ID: i64 = 0x724F_4743_0001;
-
-/// PG advisory lock ID for the mark-vs-PutPath race.
-///
-/// PutPath takes this SHARED (`pg_advisory_lock_shared`) around
-/// the placeholder insert → complete_manifest window. Mark takes
-/// this EXCLUSIVE (`pg_advisory_lock`) around `compute_unreachable`.
-/// Sweep does NOT hold it — instead it re-checks references
-/// per-path inside the FOR UPDATE tx (GIN-indexed).
-///
-/// This gives: mark blocks PutPath for ~1s (CTE duration),
-/// sweep doesn't block PutPath at all. If a PutPath completes
-/// BETWEEN mark and sweep with a reference to a marked-unreachable
-/// path, sweep's re-check catches it and skips the delete
-/// (`rio_store_gc_path_resurrected_total` metric).
-pub const GC_MARK_LOCK_ID: i64 = 0x724F_4743_0002;
 
 use std::sync::Arc;
 
@@ -139,24 +135,21 @@ const GC_EMPTY_REFS_THRESHOLD_PCT: f64 = 10.0;
 ///
 /// # Advisory lock choreography
 ///
-/// Two session-scoped locks, two pool connections:
+/// One session-scoped lock, one pool connection:
 ///
-/// 1. **[`GC_LOCK_ID`]** (outer, `pg_try_advisory_lock`): serializes
-///    GC-vs-GC. Held for the full run. Non-blocking — second caller
-///    gets a `false` back → "already running" terminal progress msg.
+/// **[`GC_LOCK_ID`]** (`pg_try_advisory_lock`): serializes GC-vs-GC.
+/// Held for the full run. Non-blocking — second caller gets a `false`
+/// back → "already running" terminal progress msg.
 ///
-/// 2. **[`GC_MARK_LOCK_ID`]** (inner, `pg_advisory_lock`): exclusive
-///    against PutPath's shared lock around the placeholder insert.
-///    Held ONLY for `compute_unreachable` (~1s CTE), released BEFORE
-///    sweep so PutPath isn't blocked during the longer sweep phase.
-///    Sweep's per-path re-check catches any race that slips through
-///    the window between mark-release and sweep-start.
-///
-/// Both use `scopeguard::guard(conn, |c| c.detach())` so ANY exit
-/// (error, task cancellation, panic) detaches the pool connection →
-/// PG auto-releases on connection close. The happy path DEFUSES the
+/// Uses `scopeguard::guard(conn, |c| c.detach())` so ANY exit (error,
+/// task cancellation, panic) detaches the pool connection → PG
+/// auto-releases on connection close. The happy path DEFUSES the
 /// guard (`ScopeGuard::into_inner`) and explicitly unlocks (cheaper
 /// than detach — returns conn to pool).
+///
+/// There is no mark-vs-PutPath lock (I-192) — sweep's per-path
+/// reference re-check is the sole concurrency guard. PutPath runs
+/// freely throughout mark and sweep.
 ///
 /// # Errors
 ///
@@ -250,55 +243,12 @@ pub async fn run_gc(
     }
 
     // --- Mark phase ---
-    // Mark-vs-PutPath lock: take GC_MARK_LOCK_ID EXCLUSIVE for the mark
-    // CTE only (~1s for typical store). PutPath takes this SHARED,
-    // transaction-scoped — only ~ms around the placeholder insert
-    // (NOT held for the full upload; the placeholder narinfo carries
-    // its references from commit, so the upload itself is unprotected
-    // by design). Mark blocks until no placeholder-insert tx is in
-    // flight. This guarantees the reference graph seen by mark is
-    // consistent: no PutPath can add a new reference to a path mark
-    // is about to declare dead.
-    //
-    // Uses a SEPARATE connection (mark_lock_conn) from
-    // lock_conn (GC_LOCK_ID) — both are session-scoped, but
-    // keeping them on separate connections means we can drop
-    // mark_lock_conn immediately after mark returns (releasing
-    // the PutPath-blocking lock early) while GC_LOCK_ID stays
-    // held through sweep.
-    let mark_lock_conn = pool.acquire().await.map_err(|e| {
-        warn!(error = %e, "GC: pool acquire for mark lock failed");
-        Status::internal(format!("mark lock acquire: {e}"))
-    });
-    let mark_lock_conn = match mark_lock_conn {
-        Ok(c) => c,
-        Err(e) => {
-            gc_unlock(lock_conn).await;
-            return Err(e);
-        }
-    };
-    // scopeguard: if mark fails or task is cancelled, the
-    // connection is DETACHED (not returned to pool) → PG
-    // auto-releases the session-scoped lock on connection
-    // close. On success we explicitly unlock + defuse below.
-    let mut mark_lock_guard = scopeguard::guard(mark_lock_conn, |c| {
-        // detach() removes from pool; dropping the detached
-        // Connection closes it → PG releases session lock.
-        let _ = c.detach();
-    });
-
-    // Acquire exclusive. Blocks until no PutPath holds shared.
-    if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(GC_MARK_LOCK_ID)
-        .execute(&mut **mark_lock_guard)
-        .await
-    {
-        warn!(error = %e, "GC: mark advisory lock query failed");
-        gc_unlock(lock_conn).await;
-        return Err(Status::internal(format!("mark lock: {e}")));
-        // mark_lock_guard detached by scopeguard
-    }
-
+    // No mark-vs-PutPath lock (I-192). Mark's CTE takes a point-in-time
+    // MVCC snapshot; a PutPath placeholder that commits after the
+    // snapshot is invisible to mark but visible to sweep's per-path
+    // re-check (fresh READ-COMMITTED snapshot over ALL narinfo). The
+    // re-check is the load-bearing guard; the lock added nothing on
+    // top — it was released before sweep anyway.
     let unreachable =
         match mark::compute_unreachable(pool, params.grace_hours, &params.extra_roots).await {
             Ok(u) => u,
@@ -306,22 +256,8 @@ pub async fn run_gc(
                 warn!(error = %e, "GC: mark phase failed");
                 gc_unlock(lock_conn).await;
                 return Err(Status::internal(format!("mark phase: {e}")));
-                // mark_lock_guard detached by scopeguard
             }
         };
-
-    // Mark done — release the mark lock EXPLICITLY (early,
-    // before sweep) and defuse the scopeguard. PutPath can now
-    // proceed; sweep's per-path re-check handles any race.
-    let mut mark_lock_conn = scopeguard::ScopeGuard::into_inner(mark_lock_guard);
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(GC_MARK_LOCK_ID)
-        .execute(&mut *mark_lock_conn)
-        .await
-    {
-        warn!(error = %e, "GC: mark advisory unlock failed (continuing — conn drop will release)");
-    }
-    drop(mark_lock_conn); // returns to pool (lock already released)
 
     // Progress after mark: scanned count. We don't have
     // a "total paths" count cheaply (would need COUNT(*)
@@ -1018,5 +954,182 @@ mod tests {
             err.to_string().contains("chunks_refcount_nonneg"),
             "expected CHECK constraint violation, got: {err}"
         );
+    }
+
+    /// I-192 liveness: `run_gc` (full mark+sweep orchestration)
+    /// concurrent with a burst of `insert_manifest_uploading` calls.
+    /// Every insert MUST succeed — GC never blocks PutPath. This IS
+    /// the I-168/I-192 user-facing symptom: before this change, the
+    /// inserts would block on `GC_MARK_LOCK_ID` shared and return
+    /// `GcMarkBusy` → gRPC `Aborted` after the retry budget.
+    ///
+    /// `multi_thread`: GC and the insert burst must actually
+    /// interleave on separate executor threads.
+    ///
+    /// Safety (re-check correctness) is proven deterministically by
+    /// [`gc_mark_then_insert_then_sweep_preserves_referenced`] below
+    /// and `sweep::tests::sweep_recheck_sees_uploading_placeholder`;
+    /// a free-running race here can't distinguish "P_i committed
+    /// before re-check" from "P_i committed after Q_i's DELETE"
+    /// (the latter is a legitimate post-GC dangling ref, not a bug).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_gc_concurrent_with_placeholder_inserts_liveness() {
+        use crate::test_helpers::{StoreSeed, path_hash};
+        use rio_test_support::fixtures::test_store_path;
+
+        const N: usize = 100;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed N old, unrooted targets Q_i (48h, past grace=2h) so GC
+        // has real mark+sweep work to do while inserts run.
+        let mut targets = Vec::with_capacity(N);
+        for i in 0..N {
+            let q = test_store_path(&format!("i192-live-target-{i:03}"));
+            StoreSeed::raw_path(&q)
+                .created_hours_ago(48)
+                .seed(&db.pool)
+                .await;
+            targets.push(q);
+        }
+
+        // GC task: full run_gc (GC_LOCK_ID + mark + sweep).
+        // force=true: empty-refs gate would refuse on this synthetic
+        // DB; not what we're testing.
+        let pool_gc = db.pool.clone();
+        let (tx, mut rx) = mpsc::channel(64);
+        let gc = tokio::spawn(async move {
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let stats = run_gc(
+                &pool_gc,
+                None,
+                GcParams {
+                    dry_run: false,
+                    force: true,
+                    grace_hours: 2,
+                    extra_roots: vec![],
+                },
+                tx,
+                &rio_common::signal::Token::new(),
+            )
+            .await
+            .expect("run_gc");
+            drain.await.ok();
+            stats
+        });
+
+        // Insert burst: N placeholders P_i with refs=[Q_i], concurrent
+        // with GC. Each insert MUST succeed — no lock to contend on.
+        let mut insert_tasks = Vec::with_capacity(N);
+        for (i, q) in targets.iter().cloned().enumerate() {
+            let pool = db.pool.clone();
+            insert_tasks.push(tokio::spawn(async move {
+                let p = test_store_path(&format!("i192-live-uploader-{i:03}"));
+                crate::metadata::insert_manifest_uploading(&pool, &path_hash(&p), &p, &[q])
+                    .await
+                    .expect("insert_manifest_uploading must not fail under concurrent GC")
+            }));
+        }
+        for t in insert_tasks {
+            assert!(t.await.unwrap(), "fresh path → placeholder inserted");
+        }
+
+        let stats = gc.await.unwrap().expect("GC_LOCK_ID free → Some(stats)");
+        // Accounting sanity: sweep saw at most N candidates.
+        assert!(
+            stats.paths_deleted + stats.paths_resurrected <= N as u64,
+            "stats out of bounds: {stats:?}"
+        );
+    }
+
+    /// I-192 safety, deterministic: glue `compute_unreachable` →
+    /// concurrent placeholder inserts → `sweep` so the inserts land
+    /// PRECISELY in the mark-snapshot/sweep-recheck window the removed
+    /// lock used to close. Asserts every target survives via the
+    /// re-check alone. This is the end-to-end form of
+    /// `mark::tests::placeholder_refs_protect_closure` (mark side) +
+    /// `sweep::tests::sweep_recheck_sees_uploading_placeholder` (sweep
+    /// side) at N=100 with real concurrency on the insert burst.
+    // r[verify store.gc.sweep-recheck]
+    // r[verify store.put.placeholder-refs]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gc_mark_then_insert_then_sweep_preserves_referenced() {
+        use crate::test_helpers::{StoreSeed, path_hash};
+        use rio_test_support::fixtures::test_store_path;
+
+        const N: usize = 100;
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed N old, unrooted targets Q_i.
+        let mut targets = Vec::with_capacity(N);
+        for i in 0..N {
+            let q = test_store_path(&format!("i192-safe-target-{i:03}"));
+            let h = StoreSeed::raw_path(&q)
+                .created_hours_ago(48)
+                .seed(&db.pool)
+                .await;
+            targets.push((q, h));
+        }
+
+        // T0: mark snapshot. All Q_i unreachable (no P_i exists yet).
+        let unreachable = mark::compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert_eq!(unreachable.len(), N, "all targets unreachable pre-insert");
+
+        // T1: 100 concurrent placeholder inserts P_i refs=[Q_i]. All
+        // commit AFTER mark's snapshot, BEFORE sweep — the exact window.
+        let mut insert_tasks = Vec::with_capacity(N);
+        for (i, (q, _)) in targets.iter().cloned().enumerate() {
+            let pool = db.pool.clone();
+            insert_tasks.push(tokio::spawn(async move {
+                let p = test_store_path(&format!("i192-safe-uploader-{i:03}"));
+                crate::metadata::insert_manifest_uploading(&pool, &path_hash(&p), &p, &[q])
+                    .await
+                    .expect("insert must succeed (no GC lock to contend on)")
+            }));
+        }
+        for t in insert_tasks {
+            assert!(t.await.unwrap());
+        }
+
+        // T2: sweep with mark's stale unreachable list. Re-check must
+        // resurrect EVERY Q_i.
+        let stats = sweep::sweep(
+            &db.pool,
+            None,
+            unreachable,
+            false,
+            &rio_common::signal::Token::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_deleted, 0, "no referenced path may be swept");
+        assert_eq!(
+            stats.paths_resurrected, N as u64,
+            "every target resurrected by re-check"
+        );
+
+        // No dangling references anywhere.
+        let dangling: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM narinfo n
+             CROSS JOIN LATERAL unnest(n."references") r
+             WHERE NOT EXISTS (SELECT 1 FROM narinfo n2 WHERE n2.store_path = r)
+            "#,
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(dangling, 0, "no placeholder may reference a swept path");
+
+        // Every Q_i's narinfo still exists.
+        for (_, h) in &targets {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)",
+            )
+            .bind(h)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(exists, "Q's narinfo must survive sweep");
+        }
     }
 }

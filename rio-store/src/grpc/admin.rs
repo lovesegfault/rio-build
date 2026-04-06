@@ -333,12 +333,12 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
-        // Bound extra_roots BEFORE spawning. Mark runs under
-        // GC_MARK_LOCK_ID exclusive; a 10M-element array stalls the CTE
-        // on unnest() and blocks every PutPath (shared side of same lock)
-        // for the duration. Separate from DEFAULT_MAX_BATCH_PATHS (1M,
-        // sized for client closures) — GcRoots actor sends ~tens, 100k
-        // is already implausible here.
+        // Bound extra_roots BEFORE spawning. A 10M-element array stalls
+        // the mark CTE on unnest() — GC no longer blocks PutPath
+        // (I-192), but a multi-minute mark still ties up GC_LOCK_ID and
+        // skews `paths_resurrected`. Separate from
+        // DEFAULT_MAX_BATCH_PATHS (1M, sized for client closures) —
+        // GcRoots actor sends ~tens, 100k is already implausible here.
         rio_common::grpc::check_bound("extra_roots", req.extra_roots.len(), MAX_GC_EXTRA_ROOTS)?;
         // Syntactically valid store paths only. Not-in-narinfo is fine
         // (in-flight outputs, mark's seed-d handles it); garbage strings

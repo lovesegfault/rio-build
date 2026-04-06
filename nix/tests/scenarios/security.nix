@@ -1304,7 +1304,7 @@ in
         # (mkdir would EROFS without the remount), and subtree_control
         # has controllers enabled (write would EROFS without the remount).
         with subtest("cgroup-remount: /sys/fs/cgroup writable + /leaf created"):
-            # rio-all image has no shell/coreutils — `kubectl exec -- test`
+            # rio-builder image has no shell/coreutils — `kubectl exec -- test`
             # / `cat` fail with "executable file not found in $PATH".
             # Proof via two host-side signals instead:
             #

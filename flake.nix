@@ -1284,7 +1284,6 @@
           # images with the instrumented workspace (dockerImagesCov below).
           mkDockerImages =
             {
-              rio-workspace,
               rio-crates,
               coverage ? false,
             }:
@@ -1292,7 +1291,6 @@
               import ./nix/docker.nix {
                 inherit
                   pkgs
-                  rio-workspace
                   rio-crates
                   coverage
                   ;
@@ -1305,7 +1303,7 @@
                 rioDashboard = if coverage then null else rioDashboard;
               }
             );
-          dockerImages = mkDockerImages { inherit rio-workspace rio-crates; };
+          dockerImages = mkDockerImages { inherit rio-crates; };
 
           # NixOS EKS node AMI builder (ADR-021). Exposed below as
           # packages.node-ami-{x86_64,aarch64}. The amazon-image.nix
@@ -1506,7 +1504,6 @@
               (mkVmTests {
                 rio-workspace = rio-workspace-cov;
                 dockerImages = mkDockerImages {
-                  rio-workspace = rio-workspace-cov;
                   rio-crates = rio-crates-cov;
                   coverage = true;
                 };
@@ -2274,11 +2271,17 @@
             docker-controller = dockerImages.controller;
             docker-bootstrap = dockerImages.bootstrap;
             docker-dashboard = dockerImages.dashboard;
-            docker-all = dockerImages.all;
             # AMI layer-cache seed (oci-archive tarball, both
             # builder+fetcher refs). NOT pushed to ECR — baked into
             # the NixOS node AMI's containerd content store.
             docker-executor-seed = dockerImages.executorSeed;
+            # k3s VM-test seed (oci-archive tarball, all 6 component
+            # refs, deduped layers). NOT pushed to ECR — preloaded via
+            # services.k3s.images in nix/tests/fixtures/k3s-full.nix.
+            # Replaces the former docker-all aggregate (W1: that image
+            # was pushed to ECR via the linkFarm below despite never
+            # being used on EKS).
+            docker-vmtest-seed = dockerImages.vmTestSeed;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
               pkgs.lib.mapAttrsToList
                 (name: drv: {
@@ -2286,13 +2289,15 @@
                   path = drv;
                 })
                 (
-                  # executorSeed is an oci-archive (not docker-archive)
-                  # and goes to the AMI, not ECR; the parity attr is a
-                  # check, not an image. push.rs walks this linkFarm —
-                  # both would break its `skopeo copy docker-archive:`.
+                  # executorSeed/vmTestSeed are oci-archive (not docker-
+                  # archive) and go to AMI/k3s respectively, not ECR; the
+                  # parity attr is a check, not an image. push.rs walks
+                  # this linkFarm — all three would break its `skopeo
+                  # copy docker-archive:`.
                   builtins.removeAttrs dockerImages [
                     "executorSeed"
                     "executorSeedLayerParity"
+                    "vmTestSeed"
                   ]
                 )
             );

@@ -16,10 +16,6 @@
 # stubs (nix-daemon drops privs to nixbld). Gateway/scheduler/store are minimal.
 {
   pkgs,
-  # Full workspace bin bundle (all rio-* binaries, stripped). Only the
-  # `all` aggregate image still uses this — per-component images take
-  # individual entries from rio-crates instead.
-  rio-workspace,
   # Per-crate stripped bin derivations, keyed rio-gateway / rio-builder
   # / … (crate2nix.nix memberBins). Each image lists exactly the crates
   # it ships so its build closure doesn't pull in unrelated binaries.
@@ -89,6 +85,33 @@ let
       ${lib.escapeShellArgs ociSkopeoCopyArgs} \
       docker-archive:${src} ${dest}
   '';
+
+  # ── Multi-manifest OCI seed builder ───────────────────────────────────
+  # Packs N docker-archive images into ONE oci: layout via repeated
+  # skopeo copies, then tars it. The destination's content-addressed
+  # blobs/sha256/ dedups shared layers across images, so the seed is
+  # ~union(layers) not Σ(per-image-size). index.json ends up with N
+  # manifests[] entries; `ctr image import --local` (or k3s's agent
+  # airgap-images preload, which uses the same containerd importer)
+  # registers all N refs from one tarball + one decompress pass.
+  #
+  # `oci:DIR:REF` (skopeo's oci-layout transport), then tar — NOT
+  # `oci-archive:` directly. oci-archive: is single-manifest; the layout
+  # transport is what supports the multi-ref dedup.
+  mkSeed =
+    { name, images }:
+    pkgs.runCommand "rio-${name}-seed.oci.tar"
+      {
+        nativeBuildInputs = [
+          pkgs.skopeo
+          pkgs.gnutar
+        ];
+      }
+      ''
+        d=$TMPDIR/oci
+        ${lib.concatMapStrings ({ ref, archive }: ociSkopeoCopy archive "oci:$d:${ref}") images}
+        tar -C $d -cf $out .
+      '';
 
   # Common to all images. cacert for TLS (S3, gRPC with mTLS if enabled),
   # tzdata so log timestamps aren't UTC-only.
@@ -558,34 +581,25 @@ rec {
   # fetches only the delta (typically the ~10 MB rio-builder top layer,
   # or zero if AMI and deploy are at the same commit).
   #
-  # ONE oci: layout, two skopeo copies: the destination's content-
-  # addressed blobs/sha256/ dedups the second copy's layers against the
-  # first (builder and fetcher share every layer — only config.Env
-  # differs), so the seed is ~124 MB not 2×114 MB. index.json ends up
-  # with two manifests[] entries; `ctr image import --local` registers
-  # both refs from one call. Ref names use seed.local/ so they're
-  # obviously not pull-addressable; the names are GC roots only (the
-  # io.cri-containerd.pinned label on them keeps kubelet image-GC from
-  # deleting the record, the record's existence keeps containerd
-  # content-GC from deleting the layer blobs).
-  #
-  # `oci:DIR:REF` (skopeo's oci-layout transport), then tar — NOT
-  # `oci-archive:` directly. oci-archive: is single-manifest; the layout
-  # transport is what supports the multi-ref dedup.
-  executorSeed =
-    pkgs.runCommand "rio-executor-seed.oci.tar"
+  # builder and fetcher share every layer — only config.Env differs — so
+  # mkSeed's blob dedup yields ~124 MB not 2×114 MB. Ref names use
+  # seed.local/ so they're obviously not pull-addressable; the names are
+  # GC roots only (the io.cri-containerd.pinned label on them keeps
+  # kubelet image-GC from deleting the record, the record's existence
+  # keeps containerd content-GC from deleting the layer blobs).
+  executorSeed = mkSeed {
+    name = "executor";
+    images = [
       {
-        nativeBuildInputs = [
-          pkgs.skopeo
-          pkgs.gnutar
-        ];
+        ref = "seed.local/rio-builder:prebaked";
+        archive = builder;
       }
-      ''
-        d=$TMPDIR/oci
-        ${ociSkopeoCopy builder "oci:$d:seed.local/rio-builder:prebaked"}
-        ${ociSkopeoCopy fetcher "oci:$d:seed.local/rio-fetcher:prebaked"}
-        tar -C $d -cf $out .
-      '';
+      {
+        ref = "seed.local/rio-fetcher:prebaked";
+        archive = fetcher;
+      }
+    ];
+  };
 
   # The load-bearing check: executorSeed's layer-blob digests MUST equal
   # what push.rs would put in ECR, or the warm is a no-op. Re-runs the
@@ -655,31 +669,48 @@ rec {
         echo OK > $out
       '';
 
-  # ── VM-test aggregate: all rio binaries, one image ───────────────────
-  # k3s airgap-imports serially and
-  # alphabetically before kubelet starts — five near-identical ~170MB
-  # tarballs decompress back-to-back, burning ~125s of wall time under
-  # TCG (k3s-full.nix:280). This image carries every component (builder's
-  # contents are the superset) with NO Entrypoint; pods set `command:`
-  # per container instead. One decompress cycle instead of five.
+  # ── VM-test seed: all 6 per-component images, one OCI archive ────────
+  # k3s airgap-imports serially before kubelet starts — six per-component
+  # docker-archives would decompress back-to-back (~125s wall under TCG,
+  # k3s-full.nix:280) and re-expand the same shared layers six times.
+  # mkSeed packs all six manifests into ONE oci-layout tarball with
+  # blob-level dedup, so the import is one decompress pass over
+  # union(layers). k3s's agent-images preload (services.k3s.images)
+  # walks index.json and registers all six refs; pods then reference
+  # `rio-<component>:dev` directly with no `command:` override.
   #
-  # NOT for prod — ECR pushes distinct per-component images (skopeo
-  # docker-archive: transport) so rolling one component doesn't touch
-  # the others. VM tests don't have that constraint.
-  all = buildZstd {
-    name = "rio-all";
-    tag = "dev";
-    maxLayers = 60;
-    contents = baseContents ++ [ rio-workspace ] ++ builderExtraContents;
-    config = {
-      # No Entrypoint. buildLayeredImage's `contents` symlinks
-      # rio-workspace/bin/* into /bin/, so pods use
-      # `command: ["/bin/rio-gateway"]` etc.
-      Env = baseEnv ++ builderExtraEnv;
-      Labels = mkLabels "rio-all — all rio components (VM-test aggregate)";
+  # Replaces the former `all` aggregate (one image, all binaries, no
+  # Entrypoint, pods set command:). That image pulled in rio-workspace
+  # (every binary) which forced building all 657 crate deps even when
+  # only granular images were needed, AND was pushed to ECR via the
+  # dockerImages linkFarm where it was never used (W1, PLAN-DEPLOY-WINS).
+  # vmTestSeed is excluded from the linkFarm (oci-archive, not
+  # docker-archive — push.rs's skopeo docker-archive: would reject it).
+  #
+  # Refs MUST be fully-normalized (docker.io/library/…). containerd's
+  # OCI importer registers org.opencontainers.image.ref.name verbatim
+  # — unlike docker-archive RepoTags which it normalizes. CRI then
+  # looks up the pod's `image: rio-gateway` as `docker.io/library/
+  # rio-gateway:dev` (familiar-name normalization). A bare `rio-gateway:
+  # dev` ref is an exact-string miss → ErrImagePull in the airgapped VM.
+  vmTestSeed =
+    let
+      dev = n: archive: {
+        ref = "docker.io/library/rio-${n}:dev";
+        inherit archive;
+      };
+    in
+    mkSeed {
+      name = "vmtest";
+      images = [
+        (dev "gateway" gateway)
+        (dev "scheduler" scheduler)
+        (dev "store" store)
+        (dev "controller" controller)
+        (dev "builder" builder)
+        (dev "fetcher" fetcher)
+      ];
     };
-    extraCommands = builderExtraCommands;
-  };
 }
 # ── Dashboard: nginx + SPA static bundle ───────────────────────────────
 # No rio binary — just nginx serving the Svelte dist/ and proxying

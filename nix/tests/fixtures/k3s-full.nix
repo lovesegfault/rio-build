@@ -60,10 +60,10 @@ in
   # --set overrides layered on top of vmtest-full.yaml. scenarios/
   # lifecycle.nix passes autoscaler tuning (pollSecs=3 etc).
   extraValues ? { },
-  # Extra images for the airgap set. dockerImages.all covers every rio-*
-  # binary but NOT squid (dockerImages.fod-proxy is a separate image).
-  # Scenarios that enable fodProxy.enabled=true need the squid image
-  # preloaded or the pod goes ImagePullBackOff (airgapped — no pull).
+  # Extra images for the airgap set. dockerImages.vmTestSeed covers every
+  # rio-* component but NOT squid (dockerImages.fod-proxy is a separate
+  # image). Scenarios that enable fodProxy.enabled=true need the squid
+  # image preloaded or the pod goes ImagePullBackOff (airgapped — no pull).
   extraImages ? [ ],
   # JWT pubkey mount — scheduler+store get the rio-jwt-pubkey ConfigMap
   # mounted at /etc/rio/jwt; gateway gets the rio-jwt-signing Secret.
@@ -182,13 +182,15 @@ let
   # (especially scheduler.replicas=2 antiAffinity). fod-proxy/bootstrap
   # excluded (disabled in vmtest-full.yaml).
   #
-  # `all` replaces the five per-component images (gateway/scheduler/
-  # store/controller/worker): they share the same rio-workspace
-  # closure and differed only in Entrypoint. k3s imports serially
-  # alphabetically before kubelet — one tarball decompress instead
-  # of five. vmtest-full.yaml sets `command:` per pod.
+  # vmTestSeed is ONE multi-manifest oci-archive (six rio-<component>:dev
+  # refs, blob-deduped layers). k3s imports serially before kubelet — one
+  # tarball decompress registers all six refs, vs six per-component
+  # docker-archives that would re-expand the same shared layers six times.
+  # Per-component refs mean vmtest-full.yaml uses each image's own
+  # Entrypoint (no `command:` override). Replaces the former `all`
+  # aggregate (one image, all binaries) — see nix/docker.nix vmTestSeed.
   rioImages = [
-    dockerImages.all
+    dockerImages.vmTestSeed
     pulled.bitnami-postgresql
   ]
   ++ pkgs.lib.optionals envoyGatewayEnabled [
@@ -522,10 +524,12 @@ rec {
     # ── Airgap import complete on BOTH nodes (BEFORE agent-ready) ───
     # k3s imports airgap images SERIALLY (alphabetically) via a
     # goroutine that runs BEFORE kubelet starts. Under TCG (non-KVM
-    # fallback): system bundle (pause/CNI/bitnami) first, then rio-*
-    # bundle. bitnami is NOT last — rio-all (~170MB) comes after.
-    # Gate on pause (minimal kubelet pod infra) + rio-all (the one
-    # rio image, replaces the former 5-image bundle).
+    # fallback): system bundle (pause/CNI/bitnami) first, then the
+    # rio vmTestSeed oci-archive. bitnami is NOT last — the seed
+    # (~union of all 6 component layers) comes after. Gate on pause
+    # (minimal kubelet pod infra) + rio-gateway (any one of the six
+    # refs the seed registers — they all land from one import, so one
+    # ref present ⇒ seed import done).
     # timeout=240 post containerd-tmpfs fix (24c8537). Pre-tmpfs, agent
     # rio-controller import hit 170s vs 35-40s typical (5× builder-disk
     # tail). Tmpfs collapses that to CPU-bound decompress.
@@ -537,7 +541,7 @@ rec {
             "k3s ctr images ls -q | grep -q 'bitnami/postgresql'", timeout=240
         )
         n.wait_until_succeeds(
-            "k3s ctr images ls -q | grep -q 'rio-all'", timeout=600
+            "k3s ctr images ls -q | grep -q 'rio-gateway'", timeout=600
         )
 
     # ── Server node registered (kubelet up, images imported) ────────
@@ -549,7 +553,7 @@ rec {
     # Ready) is sufficient: Ready needs CNI which needs flannel which
     # needs the node to exist first.
     # TODO(P0304): timeout=600 predates containerd-tmpfs (same story as
-    # the rio-all gate above). ~180s typical under TCG; reduce to 300
+    # the rio-* seed gate above). ~180s typical under TCG; reduce to 300
     # once tmpfs is verified to have collapsed the builder-disk tail.
     k3s_server.wait_until_succeeds(
         "k3s kubectl get node k3s-server 2>/dev/null",

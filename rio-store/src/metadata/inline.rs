@@ -8,63 +8,8 @@
 //! `nar_size = 0` so a concurrent successful upload is never touched).
 
 use super::*;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use tracing::{debug, instrument};
-
-/// Bounded retry budget for the shared `GC_MARK_LOCK_ID` acquisition in
-/// [`insert_manifest_uploading`]. With [`MARK_LOCK_JITTER_MS`] this gives
-/// a ~2–5 s window — sized to outlast `compute_unreachable` on a
-/// tens-of-thousands-row narinfo table (I-168).
-const MARK_LOCK_ATTEMPTS: u32 = 10;
-
-/// Per-attempt sleep range (ms) for [`acquire_mark_lock_shared`].
-/// 200–500 ms: long enough that 1024 concurrent waiters (32 sessions ×
-/// 32-deep pipeline) don't hammer PG with try-lock queries every 50 ms;
-/// short enough that the median waiter sees ≤2 attempts once mark
-/// releases.
-const MARK_LOCK_JITTER_MS: (u64, u64) = (200, 500);
-
-/// Begin a transaction holding `GC_MARK_LOCK_ID` shared (txn-scoped).
-///
-/// `try` variant in a bounded loop instead of the blocking
-/// `pg_advisory_xact_lock_shared`: the blocking form holds a pool
-/// connection for the full wait, and PG `lock_timeout` does NOT bound
-/// advisory-lock waits — `statement_timeout` would, but that holds the
-/// conn for the duration too. With 1024 concurrent waiters × 50-conn
-/// pool that's a `PoolTimedOut` cascade. The loop drops the txn
-/// (rollback → conn returned to pool) BEFORE sleeping, so waiters
-/// occupy zero connections between attempts.
-///
-/// Returns the open transaction on success (caller commits/rolls back;
-/// the xact-scoped lock releases at txn end). Returns
-/// [`MetadataError::GcMarkBusy`] on exhaustion.
-// r[impl store.put.gc-mark-retry]
-async fn acquire_mark_lock_shared(pool: &PgPool) -> Result<Transaction<'_, Postgres>> {
-    for attempt in 1..=MARK_LOCK_ATTEMPTS {
-        let mut tx = pool.begin().await?;
-        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock_shared($1)")
-            .bind(crate::gc::GC_MARK_LOCK_ID)
-            .fetch_one(&mut *tx)
-            .await?;
-        if locked {
-            return Ok(tx);
-        }
-        // Roll back NOW so the conn goes back to the pool before the
-        // sleep. Dropping the tx is sufficient (sqlx auto-rolls back on
-        // drop), but the explicit drop makes the ordering load-bearing.
-        drop(tx);
-        if attempt < MARK_LOCK_ATTEMPTS {
-            debug!(
-                attempt,
-                max = MARK_LOCK_ATTEMPTS,
-                "GC_MARK_LOCK_ID held exclusive; retrying shared acquire after jitter"
-            );
-            let (lo, hi) = MARK_LOCK_JITTER_MS;
-            tokio::time::sleep(super::jitter_range(lo, hi)).await;
-        }
-    }
-    Err(MetadataError::GcMarkBusy)
-}
 
 /// Begin a new upload: insert placeholder narinfo + manifest rows.
 ///
@@ -74,20 +19,21 @@ async fn acquire_mark_lock_shared(pool: &PgPool) -> Result<Transaction<'_, Postg
 /// `delete_manifest_uploading` identify placeholders without touching a
 /// concurrent successful upload of the same path.
 ///
-/// `references` is populated on the placeholder so GC mark's CTE walks
-/// them from the instant this tx commits — the closure is protected
-/// WITHOUT holding a session lock for the full upload duration. This is
-/// the structural fix for pool exhaustion: previously PutPath held a
-/// dedicated pool connection (shared `GC_MARK_LOCK_ID`) from placeholder
-/// insert through complete (~40s for 4 GiB @ 100 MB/s); 21st concurrent
-/// upload → PoolTimedOut. Now the lock is transaction-scoped (~ms).
+/// `references` is populated on the placeholder so the closure is protected
+/// from GC at the instant this tx commits — no advisory lock needed
+/// (I-192). Mark's CTE may or may not see this row depending on snapshot
+/// timing; either way the references reach sweep:
+///
+/// - Placeholder commits BEFORE mark's CTE snapshot → seed (b) walks it.
+/// - Placeholder commits AFTER mark's CTE snapshot → sweep's per-path
+///   re-check (`narinfo."references" @> ARRAY[Q]`, fresh READ-COMMITTED
+///   snapshot, scans `'uploading'` rows too) finds it and resurrects Q.
+///
+/// See `r[store.gc.sweep-recheck]` for the full race trace.
 ///
 /// Returns `true` if inserted, `false` if another upload already holds a
 /// placeholder (caller should re-check `check_manifest_complete` — the race
-/// winner may have finished). Returns `MetadataError::GcMarkBusy` if GC
-/// mark holds `GC_MARK_LOCK_ID` exclusive for longer than
-/// [`MARK_LOCK_ATTEMPTS`]×[`MARK_LOCK_JITTER_MS`] (retriable; maps to
-/// ABORTED).
+/// winner may have finished).
 #[instrument(skip(pool, references), fields(store_path_hash = hex::encode(store_path_hash), refs = references.len()))]
 pub async fn insert_manifest_uploading(
     pool: &PgPool,
@@ -95,13 +41,14 @@ pub async fn insert_manifest_uploading(
     store_path: &str,
     references: &[String],
 ) -> Result<bool> {
-    let mut tx = acquire_mark_lock_shared(pool).await?;
+    let mut tx = pool.begin().await?;
 
     // narinfo placeholder first (manifests has FK to narinfo). ON CONFLICT
     // DO NOTHING: if another uploader already inserted, we don't clobber.
-    // REFERENCES POPULATED HERE — mark's CTE walks them from the instant
-    // this tx commits. This is what lets the lock be tx-scoped instead of
-    // held for the full upload: the placeholder itself protects its refs.
+    // REFERENCES POPULATED HERE — this is what makes the placeholder itself
+    // protect its closure (via mark seed (b) or sweep re-check) without an
+    // advisory lock.
+    // r[impl store.put.placeholder-refs]
     sqlx::query(
         r#"
         INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size,
@@ -311,97 +258,4 @@ pub async fn check_manifest_complete(pool: &PgPool, store_path_hash: &[u8]) -> R
     .await?;
 
     Ok(exists)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rio_test_support::TestDb;
-
-    // r[verify store.put.gc-mark-retry]
-    /// I-168 reproduction: hold `GC_MARK_LOCK_ID` exclusive on a
-    /// session-level connection, spawn `insert_manifest_uploading`
-    /// concurrently, release the exclusive at t≈1 s. The insert MUST
-    /// succeed (proves the bounded-retry loop waits and re-acquires)
-    /// instead of returning the old single-shot `Serialization` error.
-    ///
-    /// Uses session-level `pg_advisory_lock` (NOT xact-level) so the
-    /// holder doesn't need an open transaction across the sleep — the
-    /// lock survives until explicit `pg_advisory_unlock` or connection
-    /// close. Mirrors `gc/mod.rs:run_gc`, which uses the session-level
-    /// form.
-    #[tokio::test]
-    async fn insert_retries_across_gc_mark_window() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-
-        // Dedicated holder connection. Session-level exclusive lock.
-        let mut holder = db.pool.acquire().await.unwrap();
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(crate::gc::GC_MARK_LOCK_ID)
-            .execute(&mut *holder)
-            .await
-            .unwrap();
-
-        // Release after ~1 s — within the 10×200–500 ms retry window
-        // but well past a single attempt, so the test fails on the old
-        // single-shot behavior.
-        let release = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(crate::gc::GC_MARK_LOCK_ID)
-                .execute(&mut *holder)
-                .await
-                .unwrap();
-            // holder dropped here → conn returned to pool.
-        });
-
-        let store_path_hash = vec![0x68u8; 32];
-        let path = rio_test_support::fixtures::test_store_path("gc-mark-retry");
-        let inserted = insert_manifest_uploading(&db.pool, &store_path_hash, &path, &[])
-            .await
-            .expect("insert should succeed after mark releases within retry window");
-        assert!(inserted, "fresh path → placeholder inserted");
-
-        release.await.unwrap();
-    }
-
-    // r[verify store.put.gc-mark-retry]
-    /// Negative: if mark holds exclusive for the ENTIRE retry window,
-    /// the insert returns `GcMarkBusy` (not `Serialization`, not a
-    /// hang). Proves the loop is bounded and the new variant surfaces.
-    #[tokio::test]
-    async fn insert_exhausts_retry_returns_gc_mark_busy() {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-
-        let mut holder = db.pool.acquire().await.unwrap();
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(crate::gc::GC_MARK_LOCK_ID)
-            .execute(&mut *holder)
-            .await
-            .unwrap();
-
-        // Bound the whole call so a regression to the blocking
-        // `pg_advisory_xact_lock_shared` form would fail the test
-        // instead of hanging it. 10×500 ms = 5 s max; 8 s ceiling.
-        let store_path_hash = vec![0x69u8; 32];
-        let path = rio_test_support::fixtures::test_store_path("gc-mark-busy");
-        let err = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            insert_manifest_uploading(&db.pool, &store_path_hash, &path, &[]),
-        )
-        .await
-        .expect("retry loop must be bounded (no blocking-lock regression)")
-        .expect_err("exclusive held for full window → GcMarkBusy");
-        assert!(
-            matches!(err, MetadataError::GcMarkBusy),
-            "got {err:?}, expected GcMarkBusy"
-        );
-
-        // Release so the holder conn drops cleanly.
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(crate::gc::GC_MARK_LOCK_ID)
-            .execute(&mut *holder)
-            .await
-            .unwrap();
-    }
 }

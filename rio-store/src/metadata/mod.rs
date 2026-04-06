@@ -84,20 +84,6 @@ pub enum MetadataError {
     #[error("serialization failure (retry)")]
     Serialization,
 
-    /// GC mark currently holds [`crate::gc::GC_MARK_LOCK_ID`] exclusive
-    /// and the bounded shared-lock retry in `insert_manifest_uploading`
-    /// exhausted its budget. Retriable — mark releases when the
-    /// `compute_unreachable` CTE finishes. Maps to `aborted`.
-    ///
-    /// Distinct from [`Serialization`](Self::Serialization): that's a
-    /// real PG `40001`; this is advisory-lock contention. Separate
-    /// variant so the metric `reason` label and the client-facing
-    /// message tell the operator *which* retriable condition fired
-    /// (I-168: previously overloaded `Serialization`, made the
-    /// post-deploy GC collision look like a PG isolation bug).
-    #[error("GC mark in progress (retry)")]
-    GcMarkBusy,
-
     /// Deadlock detected (PG code 40P01). Two transactions have a
     /// circular lock-wait on overlapping row sets. Retriable — PG
     /// aborted one txn; retry will likely succeed. Prevention: sort
@@ -542,7 +528,6 @@ mod tests {
                 Code::Unavailable,
             ),
             (MetadataError::Serialization, Code::Aborted),
-            (MetadataError::GcMarkBusy, Code::Aborted),
             (
                 MetadataError::Deadlock(sqlx::Error::PoolClosed),
                 Code::Aborted,
@@ -660,7 +645,6 @@ mod tests {
             MetadataError::Conflict(s) => MetadataError::Conflict(s.clone()),
             MetadataError::Connection(_) => MetadataError::Connection(sqlx::Error::PoolClosed),
             MetadataError::Serialization => MetadataError::Serialization,
-            MetadataError::GcMarkBusy => MetadataError::GcMarkBusy,
             MetadataError::Deadlock(_) => MetadataError::Deadlock(sqlx::Error::PoolClosed),
             MetadataError::PlaceholderMissing { store_path } => MetadataError::PlaceholderMissing {
                 store_path: store_path.clone(),

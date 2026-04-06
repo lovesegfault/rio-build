@@ -494,7 +494,7 @@ in
         "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
       };
       # smarter-device-manager is NOT in the default airgap set
-      # (only bitnami-postgresql + rio-all). Without this, the DS pod
+      # (only bitnami-postgresql + the rio-* seed). Without this, the DS pod
       # goes ImagePullBackOff (airgapped, no pull).
       extraImages = [ pulled.smarter-device-manager ];
     };
@@ -804,8 +804,8 @@ in
   # delivered at runtime by testScript (security-profiles-operator
   # not airgapped). fetcherPool enabled via extraValues with name=
   # "default" + classes=[tiny,small] (I-170/P0556 → pod
-  # rio-fetcher-tiny-0) and image=rio-all (same aggregate
-  # image all pods use). Systems
+  # rio-fetcher-tiny-0) and image=rio-fetcher (per-component ref
+  # from the vmTestSeed preload). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
   # the hard_filter can_build check. nodeSelector/tolerations left
   # at reconciler defaults — scenario labels k3s-agent at runtime.
@@ -854,7 +854,7 @@ in
             # routing, not autoscaling. autoscaling block inherits from
             # base values.yaml (helm coalesce).
             replicas: {min: 1, max: 1}
-            image: rio-all
+            image: rio-fetcher
             # builtin:fetchurl FOD has system=builtin; hard_filter's
             # can_build check needs the fetcher to advertise it.
             systems: [x86_64-linux, builtin]

@@ -73,12 +73,12 @@ bootstrap:
 
 controller:
   enabled: true
-  # All rio pods share one airgap image (see nix/docker.nix `all`).
-  # k3s imports serially+alphabetically before kubelet; five near-
-  # identical tarballs → five decompress cycles. One image, pods set
-  # command: per container. /bin/rio-* symlinked by buildLayeredImage.
-  image: rio-all
-  command: ["/bin/rio-controller"]
+  # Per-component image refs (rio-<name>:dev). All six are preloaded
+  # via ONE multi-manifest oci-archive (nix/docker.nix vmTestSeed →
+  # services.k3s.images) so k3s does one decompress over deduped layers,
+  # not six. Each image's Entrypoint is /bin/rio-<name> — no command:
+  # override needed.
+  image: rio-controller
   # In-cluster Service DNS. hostNetwork=false — unlike vmtest.yaml,
   # everything is in-cluster so CoreDNS works.
   hostNetwork: false
@@ -92,16 +92,14 @@ controller:
 
 store:
   enabled: true
-  image: rio-all
-  command: ["/bin/rio-store"]
+  image: rio-store
   chunkBackend:
     # inline = NARs in PG. No MinIO/Rook airgapped.
     kind: inline
 
 scheduler:
   enabled: true
-  image: rio-all
-  command: ["/bin/rio-scheduler"]
+  image: rio-scheduler
   # 2 replicas → podAntiAffinity spreads across k3s server + agent.
   # Exercises leader election for scenarios/leader-election.nix.
   replicas: 2
@@ -110,8 +108,7 @@ scheduler:
 
 gateway:
   enabled: true
-  image: rio-all
-  command: ["/bin/rio-gateway"]
+  image: rio-gateway
   # 1 replica: no LB in VM. podAntiAffinity renders only at replicas>1.
   replicas: 1
   schedulerAddr: rio-scheduler.rio-system:9001
@@ -151,10 +148,10 @@ builderPoolDefaults:
   fuseCacheSize: 5Gi
   features: []
   sizeClass: ""
-  # Same aggregate image as control-plane pods. builders.rs sets
-  # `command: ["/bin/rio-builder"]` unconditionally (no-op for prod's
-  # rio-builder image whose Entrypoint is already rio-builder).
-  image: rio-all
+  # Per-component ref from the same vmTestSeed preload as control-plane
+  # pods. builders.rs sets `command: ["/bin/rio-builder"]` unconditionally
+  # (no-op here — rio-builder's Entrypoint is already rio-builder).
+  image: rio-builder
   # Smaller than prod defaults — k3s agent VM is 4GB. Memory limit at
   # 2× request caps one builder at half the node (I-005).
   resources:
