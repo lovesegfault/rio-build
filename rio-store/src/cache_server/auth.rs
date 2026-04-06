@@ -162,7 +162,7 @@ fn unauthorized(msg: &'static str) -> Response {
 mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request as HttpRequest, routing::get};
-    use rio_test_support::TestDb;
+    use rio_test_support::{TenantSeed, TestDb};
     use tower::ServiceExt;
 
     use crate::MIGRATOR;
@@ -217,10 +217,10 @@ mod tests {
     #[tokio::test]
     async fn auth_required_no_header_tokens_exist_401() {
         let db = TestDb::new(&MIGRATOR).await;
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("team-a")
+            .with_cache_token("secret")
+            .seed(&db.pool)
+            .await;
 
         let app = test_router(CacheAuth {
             pool: db.pool.clone(),
@@ -242,10 +242,10 @@ mod tests {
     #[tokio::test]
     async fn valid_token_authenticates() {
         let db = TestDb::new(&MIGRATOR).await;
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("team-a")
+            .with_cache_token("secret")
+            .seed(&db.pool)
+            .await;
 
         let app = test_router(CacheAuth {
             pool: db.pool.clone(),
@@ -268,10 +268,10 @@ mod tests {
     #[tokio::test]
     async fn invalid_token_401() {
         let db = TestDb::new(&MIGRATOR).await;
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("team-a")
+            .with_cache_token("secret")
+            .seed(&db.pool)
+            .await;
 
         let app = test_router(CacheAuth {
             pool: db.pool.clone(),
@@ -302,10 +302,10 @@ mod tests {
         // grpcurl JSON sends "" thinking it means "no cache access").
         // CreateTenant now rejects this, but defend at the auth layer
         // too in case the row was written via direct SQL.
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('misconfigured', '')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("misconfigured")
+            .with_cache_token("")
+            .seed(&db.pool)
+            .await;
 
         let app = test_router(CacheAuth {
             pool: db.pool.clone(),
@@ -337,10 +337,10 @@ mod tests {
     #[tokio::test]
     async fn whitespace_only_bearer_token_rejected_even_with_whitespace_cache_token() {
         let db = TestDb::new(&MIGRATOR).await;
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('ws', '   ')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("ws")
+            .with_cache_token("   ")
+            .seed(&db.pool)
+            .await;
 
         let app = test_router(CacheAuth {
             pool: db.pool.clone(),
@@ -371,10 +371,10 @@ mod tests {
     #[tokio::test]
     async fn bearer_with_leading_whitespace_trimmed_and_matches() {
         let db = TestDb::new(&MIGRATOR).await;
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("team-a")
+            .with_cache_token("secret")
+            .seed(&db.pool)
+            .await;
 
         let app = test_router(CacheAuth {
             pool: db.pool.clone(),
@@ -400,10 +400,10 @@ mod tests {
     #[tokio::test]
     async fn bearer_scheme_case_insensitive() {
         let db = TestDb::new(&MIGRATOR).await;
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("team-a")
+            .with_cache_token("secret")
+            .seed(&db.pool)
+            .await;
 
         let app = test_router(CacheAuth {
             pool: db.pool.clone(),

@@ -5,8 +5,8 @@ use crate::actor::tests::{make_test_node, setup_actor};
 use rio_proto::SchedulerServiceServer;
 use rio_proto::WorkerServiceClient;
 use rio_proto::WorkerServiceServer;
-use rio_test_support::TestDb;
 use rio_test_support::fixtures::test_drv_path;
+use rio_test_support::{TestDb, seed_tenant};
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
@@ -464,12 +464,7 @@ async fn test_submit_build_resolves_known_tenant() {
     let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
 
     // Seed the tenants table.
-    let tenant_uuid: uuid::Uuid =
-        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
-            .bind("team-alpha")
-            .fetch_one(&db.pool)
-            .await
-            .expect("tenant insert");
+    let tenant_uuid = seed_tenant(&db.pool, "team-alpha").await;
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("resolve-tenant-drv", "x86_64-linux")],
@@ -644,13 +639,8 @@ async fn test_resolve_tenant_rpc() {
     let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
 
-    // Seed one tenant. INSERT RETURNING so we know the ground-truth UUID.
-    let expected: uuid::Uuid =
-        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
-            .bind("team-resolve")
-            .fetch_one(&db.pool)
-            .await
-            .expect("tenant seed");
+    // Seed one tenant so we know the ground-truth UUID.
+    let expected = seed_tenant(&db.pool, "team-resolve").await;
 
     // Known → Ok. tenant_id is UUID hyphenated-string form — assert we
     // can PARSE it back (not just string-compare) to catch any future
@@ -715,12 +705,7 @@ async fn test_resolve_tenant_works_on_standby() {
     grpc.is_leader
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
-    let expected: uuid::Uuid =
-        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
-            .bind("standby-resolve")
-            .fetch_one(&db.pool)
-            .await
-            .expect("tenant seed");
+    let expected = seed_tenant(&db.pool, "standby-resolve").await;
 
     // SubmitBuild WOULD fail here (leader-gated). ResolveTenant doesn't.
     let resp = grpc

@@ -314,7 +314,7 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_test_support::TestDb;
+    use rio_test_support::{TestDb, seed_tenant};
     use sqlx::PgPool;
 
     /// Seed a complete path (narinfo + manifests status='complete').
@@ -371,18 +371,8 @@ mod tests {
         let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tenant-scoped";
         let (ph, _) = seed_complete(&db.pool, path, Some(b"blob")).await;
 
-        let tenant_a: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name) VALUES ('a') RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        let tenant_b: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name) VALUES ('b') RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        let tenant_a = seed_tenant(&db.pool, "a").await;
+        let tenant_b = seed_tenant(&db.pool, "b").await;
 
         // Attribute only to tenant A.
         sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")

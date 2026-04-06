@@ -517,12 +517,7 @@ mod tests {
         key_name: &str,
         seed: &[u8; 32],
     ) -> uuid::Uuid {
-        let tid: uuid::Uuid =
-            sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
-                .bind(tenant_name)
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let tid = rio_test_support::seed_tenant(pool, tenant_name).await;
         sqlx::query(
             "INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) \
              VALUES ($1, $2, $3)",
@@ -590,12 +585,7 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
 
         // Tenant exists but has NO tenant_keys row.
-        let tid: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name) VALUES ('ts-no-key') RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        let tid = rio_test_support::seed_tenant(&db.pool, "ts-no-key").await;
 
         let ts = TenantSigner::new(
             Signer::from_seed("cluster-1", &CLUSTER_SEED),
@@ -695,12 +685,7 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
 
         // Tenant with NO key (fallback path #2).
-        let tid: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name) VALUES ('ro-no-key') RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        let tid = rio_test_support::seed_tenant(&db.pool, "ro-no-key").await;
 
         let ts = TenantSigner::new(
             Signer::from_seed("cluster-1", &CLUSTER_SEED),

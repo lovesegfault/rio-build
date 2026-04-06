@@ -1592,7 +1592,48 @@ mod tests {
     // Direct DB integration tests via TestDb
     // -----------------------------------------------------------------------
 
-    use rio_test_support::TestDb;
+    use rio_test_support::{TenantSeed, TestDb, seed_tenant};
+
+    /// TenantSeed: columns not `.with_*()`'d take their schema default.
+    /// Proves the Option-bind plumbing — `gc_retention_hours` is `NOT
+    /// NULL DEFAULT 168`, so bare seeds get 168 (not NULL); `cache_token`
+    /// is nullable, so bare seeds get NULL. Lives here (not in
+    /// rio-test-support) because rio-scheduler already dev-depends on
+    /// rio-test-support — reversing that for a smoke test isn't worth it.
+    #[tokio::test]
+    async fn tenant_seed_optional_columns() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let bare = seed_tenant(&db.pool, "bare").await;
+        let full = TenantSeed::new("full")
+            .with_retention_hours(48)
+            .with_cache_token("sekrit")
+            .seed(&db.pool)
+            .await;
+
+        let (bare_retention, bare_token): (i32, Option<String>) = sqlx::query_as(
+            "SELECT gc_retention_hours, cache_token FROM tenants WHERE tenant_id = $1",
+        )
+        .bind(bare)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            bare_retention, 168,
+            "bare seed → schema DEFAULT 168 (NOT NULL)"
+        );
+        assert_eq!(bare_token, None, "bare seed → cache_token NULL");
+
+        let (full_retention, full_token): (i32, Option<String>) = sqlx::query_as(
+            "SELECT gc_retention_hours, cache_token FROM tenants WHERE tenant_id = $1",
+        )
+        .bind(full)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(full_retention, 48);
+        assert_eq!(full_token.as_deref(), Some("sekrit"));
+    }
 
     #[test]
     fn test_assignment_status_as_str_exhaustive() {

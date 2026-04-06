@@ -462,7 +462,7 @@ mod tests {
     use crate::signing::Signer;
     use axum::body::Body;
     use axum::http::Request;
-    use rio_test_support::TestDb;
+    use rio_test_support::{TenantSeed, TestDb};
     use tower::ServiceExt;
 
     /// Build a Router backed by real PG + memory chunk backend.
@@ -582,10 +582,10 @@ mod tests {
         // Seed a tenant with a token so unauthed requests to authed
         // routes get 401 (not the 503 "misconfigured" fallback — we
         // want to prove /nix-cache-info bypasses a LIVE auth layer).
-        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        TenantSeed::new("team-a")
+            .with_cache_token("secret")
+            .seed(&db.pool)
+            .await;
 
         let backend = Arc::new(MemoryChunkBackend::new());
         let cache = Arc::new(ChunkCache::new(
@@ -774,22 +774,15 @@ mod tests {
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
 
-        // Two tenants with distinct cache_tokens. INSERT…RETURNING
-        // the tenant_ids so we can seed path_tenants precisely.
-        let tenant_a: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name, cache_token) \
-             VALUES ('tenant-a', 'token-a') RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        let tenant_b: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO tenants (tenant_name, cache_token) \
-             VALUES ('tenant-b', 'token-b') RETURNING tenant_id",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        // Two tenants with distinct cache_tokens.
+        let tenant_a = TenantSeed::new("tenant-a")
+            .with_cache_token("token-a")
+            .seed(&db.pool)
+            .await;
+        let tenant_b = TenantSeed::new("tenant-b")
+            .with_cache_token("token-b")
+            .seed(&db.pool)
+            .await;
 
         // Seed a path. seed_path writes narinfo + manifest (both
         // status=complete). No path_tenants row yet — neither tenant

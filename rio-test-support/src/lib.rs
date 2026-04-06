@@ -16,6 +16,7 @@ pub mod wire;
 
 // Re-export at crate root — TestDb is the most-used type.
 pub use pg::TestDb;
+pub use pg::{TenantSeed, seed_tenant};
 
 /// Standard return type for `#[test]` / `#[tokio::test]` bodies.
 /// Lets tests use `?` instead of `.unwrap()`.

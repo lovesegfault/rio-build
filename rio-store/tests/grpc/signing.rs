@@ -249,11 +249,7 @@ async fn put_path_with_tenant_jwt_signs_with_tenant_key() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
 
     // --- 1. Seed tenant + active key ----------------------------------
-    let tenant_id: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO tenants (tenant_name) VALUES ('tsign-e2e') RETURNING tenant_id",
-    )
-    .fetch_one(&db.pool)
-    .await?;
+    let tenant_id = rio_test_support::seed_tenant(&db.pool, "tsign-e2e").await;
     sqlx::query("INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) VALUES ($1, $2, $3)")
         .bind(tenant_id)
         .bind("tenant-e2e-1")
@@ -353,11 +349,7 @@ async fn put_path_without_jwt_claims_falls_back_to_cluster_key() -> TestResult {
     // tenant_keys with some garbage UUID, it'd probably miss this
     // anyway — but a seeded row rules out "empty table gave us the
     // right answer for the wrong reason".
-    let decoy_tid: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO tenants (tenant_name) VALUES ('tsign-decoy') RETURNING tenant_id",
-    )
-    .fetch_one(&s.db.pool)
-    .await?;
+    let decoy_tid = rio_test_support::seed_tenant(&s.db.pool, "tsign-decoy").await;
     sqlx::query("INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) VALUES ($1, $2, $3)")
         .bind(decoy_tid)
         .bind("decoy-never-used-1")

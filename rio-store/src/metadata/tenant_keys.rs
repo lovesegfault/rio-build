@@ -56,17 +56,7 @@ pub async fn get_active_signer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_test_support::TestDb;
-
-    /// Insert a tenant, return its UUID. `tenant_name` must be unique
-    /// per test (UNIQUE constraint).
-    async fn seed_tenant(pool: &PgPool, name: &str) -> Uuid {
-        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
-            .bind(name)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-    }
+    use rio_test_support::{TestDb, seed_tenant};
 
     async fn seed_key(pool: &PgPool, tenant_id: Uuid, key_name: &str, seed: &[u8]) {
         sqlx::query(
