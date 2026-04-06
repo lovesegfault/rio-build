@@ -179,6 +179,35 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
+            // Resubmit-retry: if the existing node is Cancelled or Failed,
+            // remove it so the else-branch below re-inserts fresh state and
+            // it flows through `compute_initial_states` → `newly_inserted`.
+            // Without this, a Cancelled node left by a timed-out build
+            // (reap misses it — `cancel_build_derivations` removes interest
+            // BEFORE `remove_build_interest_and_reap`'s `was_interested`
+            // check) makes the resubmitted build hang: merge adds interest
+            // but `compute_initial_states` only iterates newly-inserted, and
+            // `handle_merge_dag`'s pre-existing-node match ignores Cancelled.
+            //
+            // Edges are NOT scrubbed: `children`/`parents` are keyed by hash
+            // string, so they stay valid across the remove+reinsert. The merge's
+            // own edge loop re-adds this submission's edges idempotently.
+            //
+            // Prior interested_builds are carried over so any OTHER build
+            // that was stuck on this Cancelled node also benefits from the
+            // reset.
+            let prior_interest = if self
+                .nodes
+                .get(&drv_hash)
+                .is_some_and(|n| n.status().is_retriable_on_resubmit())
+            {
+                self.nodes
+                    .remove(&drv_hash)
+                    .map(|old| old.interested_builds)
+            } else {
+                None
+            };
+
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
@@ -205,6 +234,11 @@ impl DerivationDag {
                         source: e,
                     })?;
                 state.interested_builds.insert(build_id);
+                // Carry over interested_builds from the removed retriable
+                // node (if any) — other stuck builds get the reset too.
+                if let Some(prior) = prior_interest {
+                    state.interested_builds.extend(prior);
+                }
                 state.traceparent = submitter_traceparent.to_string();
                 // All three inserts clone the SAME Arc — they're mutually
                 // ptr-equal. This is what makes path_to_hash.get().cloned()

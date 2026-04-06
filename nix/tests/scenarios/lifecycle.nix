@@ -973,19 +973,41 @@ let
           print(f"build-timeout: sched_timeouts={sched_timeouts}, "
                 f"worker_timed_out={worker_timed_out}")
 
-          # ── Assertion 4 DISABLED: scheduler doesn't re-dispatch ──────
-          # terminal-state drvs. After TimedOut, resubmitting the same
-          # drvPath is accepted (buildId returned) but never dispatched
-          # to a worker — DAG node is terminal. Never validated because
-          # KVM was broken when 3231206d added this. Assertions 1-3
-          # already prove kill-on-teardown works (cgroup removed, metrics
-          # incremented). The EEXIST-leak check would need either:
-          #   (a) scheduler support for re-dispatching terminal drvs, OR
-          #   (b) a second drv with different drvPath but same cgroup name
-          # TODO(sprint-save-followup): file plan for (a) or implement (b).
-          print("build-timeout PASS: assertions 1-3 passed; "
-                "assertion 4 (resubmit-same-drv) disabled — "
-                "scheduler doesn't re-dispatch terminal-state drvs")
+          # ── Assertion 4: same drv, second build succeeds. ────────────
+          # Proves the leak really is closed, not just "rmdir warned".
+          # Without kill-on-teardown: BuildCgroup::create → mkdir →
+          # EEXIST (leaked cgroup from attempt 1 still has the sleep-30
+          # process). With the fix: clean slate.
+          #
+          # No buildTimeout this time — let the 30s sleep complete.
+          # submit_build_grpc handles port-allocation + swallow-
+          # DeadlineExceeded. We don't need completion — just successful
+          # re-dispatch + cgroup recreation (no EEXIST). The helper
+          # asserts buildId was returned; EEXIST would surface before
+          # any BuildEvent and fail that assert with the error output.
+          #
+          # DEPENDS ON: scheduler re-dispatching terminal-state drvs.
+          # The DAG node goes terminal after TimedOut; resubmit must
+          # clear and re-queue. fix-resubmit-terminal lands that path.
+          submit_build_grpc({
+              "nodes": [{
+                  "drvPath": drv_path,
+                  "drvHash": drv_path,
+                  "system": "${pkgs.stdenv.hostPlatform.system}",
+                  "outputNames": ["out"],
+              }],
+              "edges": [],
+          }, max_time=3)
+          # Cgroup reappeared — concrete proof no EEXIST in
+          # BuildCgroup::create. Same dirname (same drv_path → same
+          # sanitize_build_id). `| grep .` so wait_until_succeeds retries.
+          cgroup_retry = worker_vm.wait_until_succeeds(
+              "find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
+              "-print -quit 2>/dev/null | grep .",
+              timeout=120,
+          ).strip()
+          print(f"build-timeout PASS: same-drv re-dispatched, "
+                f"cgroup recreated at {cgroup_retry} (no EEXIST leak)")
     '';
 
     recovery = ''
@@ -1952,11 +1974,12 @@ let
       # emptyDir" property is structural — K8s guarantees it.
       with subtest("ephemeral-pool: no STS, Job spawned, pod reaped, second build = new Job"):
           # Precondition: no STS workers. The finalizer fragment (run
-          # before this) deletes the default pool. If this assert fires,
-          # assertChains ordering is wrong.
+          # before this) deletes the default pool. 90s: finalizer drain
+          # + scheduler disconnect-detect + metric-update can lag under
+          # KVM-speed test ordering or TCG slowness.
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=30,
+              timeout=90,
           )
 
           # Apply ephemeral WorkerPool. Spec mirrors vmtest-full.yaml's
@@ -2026,7 +2049,7 @@ let
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${ns} get workerpool ephemeral "
               "-o jsonpath='{.status.desiredReplicas}')\" = 4",
-              timeout=30,
+              timeout=120,
           )
 
           # ── Build 1: Job spawned, completes, pod reaped ───────────────
@@ -2086,14 +2109,35 @@ let
           )
 
           # Pod goes Succeeded (worker exited 0 after its one build).
-          # Not checking Job.status.succeeded directly — K8s Job
-          # controller may lag a tick. Checking pod phase is tighter.
+          # Filter by job-name label: .items[0] on all pods would pick
+          # whichever sorts first (possibly a newer Job's pod if the
+          # reconciler spawned another). Filter to job1's pod specifically.
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${ns} get pods "
-              "-l rio.build/pool=ephemeral "
+              f"-l job-name={job1} "
               "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
-              timeout=30,
+              timeout=120,
           )
+
+          # ── Runaway-spawn guard ───────────────────────────────────────
+          # spawn_count (ephemeral.rs) subtracts active Jobs from queued
+          # — one queued derivation spawns ONE Job, not one per 10s tick
+          # until ceiling. Bound ≤2: 1 for the build + 1 slop for a
+          # status-patch-then-list race (a fresh Job may briefly show
+          # status=None before the Job controller populates it). Pre-fix
+          # this hit 4 (ceiling) under KVM-speed; a regression to the
+          # old queued.min(headroom) formula would trip this assertion.
+          job_count = int(k3s_server.succeed(
+              "k3s kubectl -n ${ns} get jobs "
+              "-l rio.build/pool=ephemeral -o name | wc -l"
+          ).strip())
+          assert job_count <= 2, (
+              f"ephemeral Job count {job_count} > 2 for a single queued "
+              f"derivation — spawn_count should subtract active Jobs "
+              f"(queued.saturating_sub(active)), not spawn every tick. "
+              f"Pre-fix this hit replicas.max=4."
+          )
+          print(f"ephemeral-pool: job_count={job_count} ≤ 2 (spawn_count subtracts active)")
 
           # ── Build 2: fresh Job (not reusing build 1's pod) ────────────
           # ttlSecondsAfterFinished=60 may not have reaped job1 yet
@@ -2268,12 +2312,26 @@ let
           #
           # Leader lookup fresh (recovery subtest may have changed it;
           # core doesn't run recovery, but leader_pod() is idempotent).
-          k3s_server.wait_until_succeeds(
-              "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-              "  -o jsonpath='{.spec.holderIdentity}') && "
-              "k3s kubectl -n ${ns} logs $leader --since=120s "
-              "| grep -q 'force-drain'",
-              timeout=60,
+          # Same /var/log/pods approach as primary — kubectl logs has
+          # http2:stream-closed under poll load. Scheduler replicas=2,
+          # either node may have the leader.
+          deadline = time.time() + 60
+          found = False
+          while time.time() < deadline:
+              for node in [k3s_server, k3s_agent]:
+                  rc, _ = node.execute(
+                      "shopt -s nullglob; "
+                      "cat /var/log/pods/${ns}_rio-scheduler-*/scheduler/*.log "
+                      "2>/dev/null | grep -q 'force-drain'"
+                  )
+                  if rc == 0:
+                      found = True
+                      break
+              if found:
+                  break
+              time.sleep(2)
+          assert found, (
+              "scheduler never logged 'force-drain' within 60s on either node"
           )
 
           print("disruption-drain PASS: watcher fired DrainWorker force=true, "

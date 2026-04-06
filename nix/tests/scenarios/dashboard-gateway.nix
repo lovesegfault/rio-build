@@ -117,30 +117,29 @@ pkgs.testers.runNixOSTest {
     # The grpc_web filter name is "envoy.filters.http.grpc_web" —
     # present iff the GRPCRoute's IsHTTP2 trigger fired
     # (listener.go:424-425).
-    # Filter-chain check is BEST-EFFORT: under KVM-speed, certgen
-    # flannel-race → `secret "envoy-gateway" not found` → controller
-    # cert-mount backoff → xDS push delayed past any reasonable poll.
-    # The curl gate below is the REAL proof (exercises grpc-web end-to-
-    # end). config_dump check is diagnostic only — print what we see.
     with subtest("grpc_web filter present: auto-inject via GRPCRoute"):
-        pod = k3s_server.succeed(
-            "k3s kubectl -n ${egNs} get pod "
+        # NUMERIC port (19000), not named — k3s apiserver panics on
+        # named-port resolution failure (same gotcha as waitReady's
+        # leader-metrics scrape, k3s-full.nix:~500).
+        # Field-selector phase=Running: certgen-race/controller-restart
+        # can leave a terminating pod; .items[0] without filter picks
+        # whichever sorts first. Re-lookup each poll iteration (pod name
+        # changes on restart). The certgen flannel-race is real
+        # (secret-not-found → cert-mount backoff → delayed xDS push),
+        # but 60s is enough for the controller to recover and push
+        # config — if grpc_web never appears, the GRPCRoute wiring is
+        # broken, not just slow.
+        k3s_server.wait_until_succeeds(
+            "pod=$(k3s kubectl -n ${egNs} get pod "
             "-l gateway.envoyproxy.io/owning-gateway-name=rio-dashboard "
             "--field-selector=status.phase=Running "
-            "-o jsonpath='{.items[0].metadata.name}'"
-        ).strip()
-        cfg = k3s_server.succeed(
+            "-o jsonpath='{.items[0].metadata.name}'); "
+            "test -n \"$pod\" && "
             "k3s kubectl get --raw "
-            f"'/api/v1/namespaces/${egNs}/pods/{pod}:19000/proxy/config_dump' "
-            "2>&1 | wc -c || echo 0"
-        ).strip()
-        has_filter = k3s_server.execute(
-            "k3s kubectl get --raw "
-            f"'/api/v1/namespaces/${egNs}/pods/{pod}:19000/proxy/config_dump' "
-            "2>&1 | grep -q grpc_web"
-        )[0] == 0
-        print(f"grpc_web filter check: pod={pod} cfg_size={cfg} "
-              f"has_grpc_web={has_filter} (best-effort; curl gate is authoritative)")
+            "\"/api/v1/namespaces/${egNs}/pods/$pod:19000/proxy/config_dump\" "
+            "2>&1 | grep -q grpc_web",
+            timeout=60,
+        )
 
     # ── curl gate: unary + trailer-frame ────────────────────────────────
     # Port-forward to the envoy Service (cluster DNS isn't resolvable
@@ -191,27 +190,26 @@ pkgs.testers.runNixOSTest {
     # curl would either timeout or the trailer would be HTTP chunked
     # without the 0x80 frame marker.
     with subtest("gRPC-Web streaming: GetBuildLogs trailer 0x80 byte"):
-        # DISABLED: 8+ fix iterations (sprint-save pos600 v10-v19), still
-        # times out. ClusterStatus (unary) above proves grpc-web IS working.
-        # GetBuildLogs (streaming) returns Status::not_found for nonexistent
-        # drv (verified handler admin/mod.rs:377). Tried: timeout 30→90,
-        # proto field 0x0a→0x12 (b643ab82 refactor), curl -sf→-s. Response
-        # never contains 0x80. Possible causes: envoy-gateway grpc_web
-        # filter buffering server-streaming-with-immediate-error differently,
-        # OR tonic's Err(Status) for streaming RPCs not producing a stream
-        # body at all (HTTP-only trailers). Added at pos518, never passed.
-        # TODO(sprint-save-followup): investigate envoy grpc_web streaming
-        # trailer encoding; consider grpcurl instead of raw curl bytes.
-        out = k3s_server.succeed(
+        # Root cause of the 8+ earlier failures (sprint-save v10-v19):
+        # tonic's `Err(Status)` return from a server-streaming handler
+        # emits a Trailers-Only response — grpc-status in the HTTP
+        # HEADERS, zero body. Envoy passes that through and curl sees
+        # an empty body. Handler now returns Ok(stream-yielding-Err),
+        # so tonic emits HEADERS→TRAILERS and Envoy encodes trailers
+        # as a 0x80 body frame.
+        #
+        # wait_until_succeeds: GRPCRoute backendRef load-balances across
+        # scheduler replicas; a non-leader hit yields Unavailable (also
+        # a 0x80 trailer, but may race with leader election startup).
+        k3s_server.wait_until_succeeds(
             "printf '\\x00\\x00\\x00\\x00\\x0a\\x12\\x08nonexist' | "
-            "curl -s -w '\\nHTTP:%{http_code}\\n' "
-            "-X POST http://localhost:18080/rio.admin.AdminService/GetBuildLogs "
+            "curl -sf -X POST http://localhost:18080/rio.admin.AdminService/GetBuildLogs "
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
-            "| ${pkgs.xxd}/bin/xxd || true"
+            "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 80'",
+            timeout=90,
         )
-        print(f"GetBuildLogs DIAG (best-effort, never validated): {out[:500]}")
 
     # ── r[dash.auth.method-gate] end-to-end: ClearPoison unrouted ───────
     # With enableMutatingMethods=false (the default; this fixture doesn't
