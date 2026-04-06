@@ -110,6 +110,25 @@ pub(super) const CPU_CLASS_LABEL: &str = "rio.build/cpu-class";
 /// stable sentinel.
 pub(super) const FLOOR_CLASS: &str = "floor";
 
+/// Per-tick cap on Failed-Job deletes. A crash-loop accumulates 1
+/// Failed Job per 10s tick (8640/day). At 20/tick the sweep
+/// outruns accumulation (20 > 1) and clears an 8640-Job backlog
+/// in ~72 min — bounded delete burst when the operator fixes the
+/// image after a day of crash-loop. Operators wanting instant
+/// clear: `kubectl delete jobs -l rio.build/sizing=manifest
+/// --field-selector status.successful=0`.
+pub(super) const FAILED_SWEEP_PER_TICK: usize = 20;
+
+/// Emit `CrashLoopDetected` Warning when Failed-Job count crosses
+/// this. 3 Failed Jobs from a pool with `backoff_limit=0` is 3
+/// consecutive pod crashes — strong crash-loop signal, not a
+/// transient one-off.
+pub(super) const CRASH_LOOP_WARN_THRESHOLD: usize = 3;
+
+/// K8s Event reason for manifest crash-loop detection (Failed Jobs
+/// accumulating under `backoff_limit=0`).
+const REASON_CRASH_LOOP: &str = "CrashLoopDetected";
+
 /// `(est_memory_bytes, est_cpu_millicores)` — the grouping key.
 /// Scheduler-side bucketing (admin_types.proto:234) rounds memory to
 /// nearest 4GiB, cpu to nearest 2000m, so the keyspace is coarse by
@@ -205,6 +224,19 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                 && s.and_then(|st| st.failed).unwrap_or(0) == 0
         })
         .collect();
+    // Failed Jobs: not supply, not capacity, but still ours to reap.
+    // backoff_limit=0 means one pod crash → Job Failed permanently.
+    // Under crash-loop (bad image, OOM-on-start) these accumulate at
+    // 1/tick; sweep them alongside idle-surplus deletes. Bounded-per-
+    // tick — see FAILED_SWEEP_PER_TICK. failed_total is the pre-cap
+    // count for the Warning event; the sweep acts on the capped
+    // slice.
+    let failed_total = jobs
+        .items
+        .iter()
+        .filter(|j| j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0)
+        .count();
+    let failed_jobs = select_failed_jobs(&jobs.items);
     let supply = inventory_by_bucket(&active_jobs);
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
     let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
@@ -353,6 +385,64 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                 warn!(
                     pool = %name, error = %e, reapable = ?reapable.keys().collect::<Vec<_>>(),
                     "ListExecutors failed; skipping scale-down this tick (can't verify idle)"
+                );
+            }
+        }
+    }
+
+    // ---- Scale-down: sweep Failed Jobs ----
+    // Separate from the reapable pass above: Failed Jobs need no
+    // idle-check (no running pod to interrupt — status.failed > 0
+    // means the pod already terminated). Runs unconditionally; a
+    // crash-loop accumulates Failed Jobs regardless of whether any
+    // bucket is surplus. select_failed_jobs bounds to
+    // FAILED_SWEEP_PER_TICK internally.
+    //
+    // CrashLoopDetected: operator visibility via `kubectl describe
+    // builderpool`. The message interpolates a coarse tier
+    // (crash_loop_tier), not the exact count — K8s deduplicates
+    // events by (reason, message), so a stable message lets the
+    // apiserver collapse per-tick emits into one event with a
+    // rising .count. Exact count would change every tick → no dedup
+    // → event flood compounding the Job flood.
+    if failed_total >= CRASH_LOOP_WARN_THRESHOLD {
+        use kube::runtime::events::{Event as KubeEvent, EventType};
+        ctx.publish_event(
+            wp,
+            &KubeEvent {
+                type_: EventType::Warning,
+                reason: REASON_CRASH_LOOP.into(),
+                note: Some(format!(
+                    "{} Failed manifest Jobs (backoff_limit=0); check \
+                     pod logs for crash cause. Sweeping up to {} per \
+                     tick. To clear immediately: kubectl delete jobs \
+                     -l {SIZING_LABEL}={SIZING_MANIFEST} \
+                     --field-selector status.successful=0",
+                    crash_loop_tier(failed_total),
+                    FAILED_SWEEP_PER_TICK,
+                )),
+                action: "Sweep".into(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
+    for job in &failed_jobs {
+        let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        match jobs_api.delete(job_name, &DeleteParams::default()).await {
+            Ok(_) => {
+                info!(
+                    pool = %name, job = %job_name,
+                    "swept Failed manifest Job (backoff_limit=0 crash)"
+                );
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                debug!(pool = %name, job = %job_name, "Failed Job already deleted");
+            }
+            Err(e) => {
+                warn!(
+                    pool = %name, job = %job_name, error = %e,
+                    "failed to sweep Failed Job; will retry next tick"
                 );
             }
         }
@@ -731,6 +821,44 @@ pub(super) fn update_idle_and_reapable(
 /// worker. The window is bounded by one reconcile tick (~10s), and
 /// the scheduler's dispatch loop handles transient worker loss
 /// anyway (heartbeat timeout → reassign).
+// r[impl ctrl.pool.manifest-failed-sweep]
+/// Select Failed Jobs for sweep. Failed = `status.failed > 0`
+/// (`backoff_limit=0` means one pod crash → terminal). No
+/// idle-check: a Failed Job's pod has already terminated — nothing
+/// to interrupt. Bounded to [`FAILED_SWEEP_PER_TICK`]; a day-long
+/// crash-loop leaves ~8640 Failed Jobs, firing 8640 deletes in one
+/// tick would be its own incident.
+///
+/// The filter is the inverse of the active-Job predicate at the
+/// inventory site (`status.failed == 0 && status.succeeded == 0`).
+/// A Job with `succeeded > 0` is NOT swept — manifest pods loop
+/// (no `RIO_EPHEMERAL=1`), so Complete only happens on deliberate
+/// scale-down; the reapable pass already handles those.
+pub(super) fn select_failed_jobs(jobs: &[Job]) -> Vec<&Job> {
+    jobs.iter()
+        .filter(|j| j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0)
+        .take(FAILED_SWEEP_PER_TICK)
+        .collect()
+}
+
+/// Coarse Failed-Job-count tier for the `CrashLoopDetected` event
+/// message. K8s deduplicates events by `(reason, message)` — an
+/// exact count changes every tick (sweep races re-create, so the
+/// count fluctuates), preventing dedup. Three tiers give operators
+/// order-of-magnitude visibility while keeping the message stable
+/// enough for the apiserver to collapse per-tick emits.
+///
+/// Must only be called when `count >= CRASH_LOOP_WARN_THRESHOLD`
+/// (the event gate); the base tier is that threshold.
+pub(super) fn crash_loop_tier(count: usize) -> &'static str {
+    debug_assert!(count >= CRASH_LOOP_WARN_THRESHOLD);
+    match count {
+        50.. => "50+",
+        10.. => "10+",
+        _ => "3+",
+    }
+}
+
 pub(super) fn select_deletable_jobs<'a>(
     active_jobs: &[&'a Job],
     reapable: &BTreeMap<Bucket, usize>,
@@ -922,11 +1050,11 @@ pub(super) fn build_manifest_job(
             // deletion (scale-down above) + ownerRef GC (BuilderPool
             // delete) are the ONLY Job-removal paths.
             //
-            // Known gap: crashed Jobs accumulate in the namespace
-            // without TTL (filtered from supply so no under-spawn
-            // bug, but never deleted — `kubectl get jobs` clutters).
-            // Followup needed: Failed-Job sweep in the scale-down
-            // pass, or restore TTL fenced against scale-down races.
+            // Crashed Jobs are swept by select_failed_jobs in the
+            // scale-down pass. Spec: `ctrl.pool.manifest-failed-
+            // sweep` in docs/src/components/controller.md. No TTL
+            // here: TTL-based reaping would race deliberate
+            // scale-down deletes.
             //
             // NO active_deadline_seconds — manifest pods are
             // long-lived. Scale-down (above) handles the

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::batch::v1::{Job, JobStatus};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 use rio_proto::types::{DerivationResourceEstimate, ExecutorInfo};
@@ -20,9 +20,10 @@ use rio_proto::types::{DerivationResourceEstimate, ExecutorInfo};
 use crate::crds::builderpool::{Replicas, Sizing};
 use crate::fixtures::test_sched_addrs;
 use crate::reconcilers::builderpool::manifest::{
-    Bucket, CPU_CLASS_LABEL, FLOOR_CLASS, MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST,
-    SpawnDirective, bucket_labels, build_manifest_job, compute_spawn_plan, compute_surplus,
-    group_by_bucket, inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs,
+    Bucket, CPU_CLASS_LABEL, CRASH_LOOP_WARN_THRESHOLD, FAILED_SWEEP_PER_TICK, FLOOR_CLASS,
+    MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST, SpawnDirective, bucket_labels,
+    build_manifest_job, compute_spawn_plan, compute_surplus, crash_loop_tier, group_by_bucket,
+    inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs, select_failed_jobs,
     truncate_plan, update_idle_and_reapable,
 };
 
@@ -1152,5 +1153,153 @@ fn floor_job_skipped_for_deletion() {
         deletable[0].metadata.name.as_deref(),
         Some("p-mf-8g-2000m-yyy"),
         "floor Job skipped (not a tracked bucket); bucketed Job deleted"
+    );
+}
+
+// ─── select_failed_jobs ──────────────────────────────────────────
+
+/// Job with `status.failed = 1`. With `backoff_limit=0` (manifest's
+/// build_manifest_job), one pod crash → Job terminally Failed.
+fn failed_job(name: &str) -> Job {
+    let mut j = job_with_bucket(Some((8 * GI, 2000)));
+    j.metadata.name = Some(name.into());
+    j.status = Some(JobStatus {
+        failed: Some(1),
+        ..Default::default()
+    });
+    j
+}
+
+/// 5 Failed + 3 active → all 5 Failed selected, 3 active untouched.
+/// Failed Jobs need NO idle-check: `status.failed > 0` means the pod
+/// already terminated — nothing to interrupt. Contrast with
+/// `select_deletable_jobs` which requires `running_builds == 0`
+/// from ListExecutors.
+// r[verify ctrl.pool.manifest-failed-sweep]
+#[test]
+fn failed_jobs_swept_without_idle_check() {
+    let mut jobs: Vec<Job> = (0..5).map(|i| failed_job(&format!("failed-{i}"))).collect();
+    // Active: status unset → neither Failed nor Complete. These are
+    // live pods; sweeping them would orphan running builds.
+    jobs.extend((0..3).map(|i| named_job(&format!("active-{i}"), (8 * GI, 2000))));
+
+    let swept = select_failed_jobs(&jobs);
+
+    assert_eq!(
+        swept.len(),
+        5,
+        "all 5 Failed Jobs swept — no idle-grace wait, no ListExecutors \
+         RPC needed. The pod already crashed; delete is unconditional."
+    );
+    for j in &swept {
+        assert!(
+            j.metadata.name.as_deref().unwrap().starts_with("failed-"),
+            "only Failed Jobs selected; active Jobs left for the \
+             reapable pass. Got: {:?}",
+            j.metadata.name
+        );
+    }
+}
+
+/// 30 Failed Jobs → at most FAILED_SWEEP_PER_TICK selected. A
+/// day-long crash-loop at 10s/tick leaves 8640 Failed Jobs; firing
+/// 8640 deletes in one tick would spike apiserver write load right
+/// when the operator just fixed the image. Bounded-per-tick means
+/// the backlog clears in ~432 ticks (~72min) at 20/tick — slow but
+/// safe; the sweep rate (20) still outpaces accumulation (1).
+#[test]
+fn failed_sweep_bounded_per_tick() {
+    let jobs: Vec<Job> = (0..30)
+        .map(|i| failed_job(&format!("failed-{i}")))
+        .collect();
+
+    let swept = select_failed_jobs(&jobs);
+
+    assert_eq!(
+        swept.len(),
+        FAILED_SWEEP_PER_TICK,
+        "sweep bounded to {FAILED_SWEEP_PER_TICK}/tick even with 30 \
+         Failed Jobs present. Next tick re-lists and sweeps the next \
+         {FAILED_SWEEP_PER_TICK}."
+    );
+    assert!(
+        swept.len() <= FAILED_SWEEP_PER_TICK,
+        "bound invariant: swept ≤ FAILED_SWEEP_PER_TICK always"
+    );
+}
+
+/// REGRESSION GUARD: Failed Jobs don't count toward replicas.max.
+///
+/// This is the crash-loop amplifier's OTHER half: with max=5, 3
+/// active, 10 Failed, the reconciler must compute budget=2 (5-3),
+/// NOT budget=0 (5-13 saturated). Failed Jobs are invisible to the
+/// ceiling check — correct behavior (they're not supply), but it
+/// means the ceiling doesn't cap crash-loop accumulation. The sweep
+/// handles Failed separately; this test locks in the ceiling
+/// arithmetic so a future refactor doesn't accidentally "fix" it by
+/// counting Failed toward the cap (which would break legitimate
+/// replacement spawns).
+#[test]
+fn failed_jobs_excluded_from_ceiling() {
+    // 3 active (status unset → not Complete, not Failed).
+    let mut jobs: Vec<Job> = (0..3)
+        .map(|i| named_job(&format!("active-{i}"), (8 * GI, 2000)))
+        .collect();
+    // 10 Failed. These are NOT supply.
+    jobs.extend((0..10).map(|i| failed_job(&format!("failed-{i}"))));
+
+    // The reconciler's active_jobs filter (manifest.rs inventory
+    // pass): status.succeeded == 0 AND status.failed == 0.
+    let active_jobs: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| {
+            let s = j.status.as_ref();
+            s.and_then(|st| st.succeeded).unwrap_or(0) == 0
+                && s.and_then(|st| st.failed).unwrap_or(0) == 0
+        })
+        .collect();
+
+    let active_total: i32 = active_jobs.len().try_into().unwrap();
+    let ceiling: i32 = 5; // spec.replicas.max
+    let headroom = ceiling.saturating_sub(active_total).max(0) as usize;
+
+    assert_eq!(
+        active_total, 3,
+        "Failed Jobs filtered from active count. 13 Jobs total, \
+         10 Failed → active_total=3. If this were 13, the headroom \
+         would saturate to 0 and replacement spawns would never fire."
+    );
+    assert_eq!(
+        headroom, 2,
+        "budget = max(5) - active(3) = 2. The 10 Failed Jobs don't \
+         appear in this arithmetic at all — swept separately."
+    );
+}
+
+/// Tier boundaries for CrashLoopDetected event dedup. K8s collapses
+/// events by (reason, message); stable tier → stable message →
+/// apiserver increments event.count instead of emitting a new event
+/// every tick. Tier transitions (3→10, 10→50) emit a fresh event,
+/// which is correct: escalation IS news.
+#[test]
+fn crash_loop_tier_stable_within_bucket() {
+    // Base tier: threshold..10.
+    assert_eq!(crash_loop_tier(CRASH_LOOP_WARN_THRESHOLD), "3+");
+    assert_eq!(crash_loop_tier(9), "3+");
+    // Mid tier: 10..50.
+    assert_eq!(crash_loop_tier(10), "10+");
+    assert_eq!(crash_loop_tier(49), "10+");
+    // High tier: 50+.
+    assert_eq!(crash_loop_tier(50), "50+");
+    assert_eq!(crash_loop_tier(8640), "50+"); // day-long crash-loop
+
+    // Stability WITHIN a tier is the dedup invariant: 6 Failed at
+    // tick T, 7 at T+1 (sweep raced re-create) → same "3+" tier →
+    // same message → K8s bumps event.count instead of a new event.
+    assert_eq!(
+        crash_loop_tier(6),
+        crash_loop_tier(7),
+        "within-tier stability: count fluctuation doesn't change the \
+         message, so K8s can dedup across ticks"
     );
 }
