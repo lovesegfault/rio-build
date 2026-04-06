@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 from onibus import KNOWN_FLAKES, REPO_ROOT, STATE_DIR
@@ -202,6 +203,21 @@ _INFRA_ERROR_RE = re.compile(
 # Retry-roulette let 180+ merges ship without VM coverage; never again.
 _TCG_MARKERS = ()  # empty — no TCG excusability
 
+# Retry restrictiveness: Never (no retry) > Once > Twice (most permissive).
+# Lower index = more restrictive = wins when multiple entries share a drv_name.
+_RETRY_RESTRICTIVENESS = ("Never", "Once", "Twice")
+
+
+def _most_restrictive(entries: list[KnownFlake]) -> KnownFlake:
+    """Pick the entry whose retry policy is most restrictive.
+
+    Multiple known-flake rows legitimately share a drv_name (one VM drv,
+    several subtest flakes). When the drv fails CI we can't tell WHICH subtest
+    tripped, so we conservatively honor the strictest policy: if ANY entry
+    says Never, treat the drv as Never. P0527.
+    """
+    return min(entries, key=lambda e: _RETRY_RESTRICTIVENESS.index(e.retry))
+
 
 def excusable(log_path: Path) -> ExcusableVerdict:
     """If .#ci is red on exactly one test AND that test is a known-flake with
@@ -229,15 +245,30 @@ def excusable(log_path: Path) -> ExcusableVerdict:
     flake_rows = read_jsonl(KNOWN_FLAKES, KnownFlake)
     # Two match surfaces: nextest fails match against `test` (crate::path form);
     # VM fails match against `drv_name` (rio-lifecycle-* form).
+    # by_drv is list-valued: one VM drv CAN have multiple flake entries (distinct
+    # subtests — e.g. rio-lifecycle-core has flannel-race + disruption-drain).
+    # P0527: dict-comprehension here was last-entry-wins on dupe drv_name;
+    # matched_row.retry below read a file-order-dependent entry.
     by_test = {f.test: f for f in flake_rows}
-    by_drv = {f.drv_name: f for f in flake_rows if f.drv_name}
+    by_drv: dict[str, list[KnownFlake]] = defaultdict(list)
+    for f in flake_rows:
+        if f.drv_name:
+            by_drv[f.drv_name].append(f)
 
     matched = sorted(
         set(t for t in nextest_fails if t in by_test)
         | set(d for d in vm_fails if d in by_drv)
     )
-    # For reason-string: the KnownFlake object, not just the key
-    matched_row = (by_test.get(matched[0]) or by_drv.get(matched[0])) if matched else None
+    # For reason-string: the KnownFlake object, not just the key.
+    # drv-key lookups pick the MOST RESTRICTIVE retry policy across all
+    # entries for that drv — if any entry says Never, the drv is Never.
+    matched_row = None
+    if matched:
+        key = matched[0]
+        if key in by_test:
+            matched_row = by_test[key]
+        elif key in by_drv:
+            matched_row = _most_restrictive(by_drv[key])
 
     if not failing:
         reason, ok = "no FAIL lines (nextest) or Cannot-build lines (VM) in log", False
