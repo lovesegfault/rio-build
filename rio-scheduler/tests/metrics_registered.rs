@@ -15,7 +15,9 @@
 //! register — so `describe_metrics()` alone produces an empty scrape.
 //! The custom recorder below intercepts `describe_*` directly.
 
-use rio_test_support::metrics::{assert_emitted_metrics_described, assert_spec_metrics_described};
+use rio_test_support::metrics::{
+    assert_emitted_metrics_described, assert_histograms_have_buckets, assert_spec_metrics_described,
+};
 
 /// Metric names from observability.md's Scheduler Metrics table.
 /// Keep in sync; the tracey rule `r[obs.metric.scheduler]` on
@@ -82,6 +84,31 @@ fn all_emitted_metrics_are_described() {
         EMITTED_METRICS,
         30,
         rio_scheduler::describe_metrics,
+        "rio-scheduler",
+    );
+}
+
+// r[verify obs.metric.scheduler]
+// Every histogram described by rio_scheduler must have a
+// HISTOGRAM_BUCKET_MAP entry (or be in DEFAULT_BUCKETS_OK). The existing
+// describe-only test catches "forgot to describe" but NOT "forgot to
+// configure buckets" — a histogram with only describe_histogram! and no
+// Matcher::Full gets default [0.005..10.0] buckets. For count-type or
+// long-duration metrics, every sample lands in +Inf and p99 is unusable.
+// This caught rio_scheduler_build_graph_edges (P0321): described, emitted,
+// spec'd with suggested buckets — but init_metrics had no Matcher for it.
+#[test]
+fn all_histograms_have_bucket_config() {
+    use rio_common::observability::HISTOGRAM_BUCKET_MAP;
+
+    // Histograms that genuinely fit [0.005..10.0]. See the
+    // HISTOGRAM_BUCKET_MAP doc comment for the rationale on each.
+    const DEFAULT_BUCKETS_OK: &[&str] = &["rio_scheduler_recovery_duration_seconds"];
+
+    assert_histograms_have_buckets(
+        rio_scheduler::describe_metrics,
+        HISTOGRAM_BUCKET_MAP,
+        DEFAULT_BUCKETS_OK,
         "rio-scheduler",
     );
 }
