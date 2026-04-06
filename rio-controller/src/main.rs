@@ -55,6 +55,12 @@ struct Config {
     /// full up→down cycle within the test timeout.
     autoscaler_scale_down_window_secs: u64,
     autoscaler_min_interval_secs: u64,
+    /// GC cron interval (hours). 0 = disabled (reconciler not
+    /// spawned). The cron calls StoreAdminService.TriggerGC with
+    /// default params (dry_run=false, force=false, store's 2h
+    /// grace). `store_addr` is the connect target — StoreAdminService
+    /// is hosted on the store's gRPC port alongside StoreService.
+    gc_interval_hours: u64,
     /// mTLS client config for outgoing gRPC (scheduler + store).
     /// Set via `RIO_TLS__*`. The controller's K8s API connection
     /// has its own TLS (kube client, in-cluster service account
@@ -81,6 +87,9 @@ impl Default for Config {
             autoscaler_scale_up_window_secs: 30,
             autoscaler_scale_down_window_secs: 600,
             autoscaler_min_interval_secs: 30,
+            // 24h: typical store growth between sweeps is a few
+            // thousand paths. Lower values are fine for VM tests.
+            gc_interval_hours: 24,
             tls: rio_common::tls::TlsConfig::default(),
         }
     }
@@ -329,6 +338,35 @@ async fn main() -> anyhow::Result<()> {
     let autoscaler = Autoscaler::new(client, admin, timing, recorder);
     rio_common::task::spawn_monitored("autoscaler", autoscaler.run(shutdown.clone()));
 
+    // ---- GC cron ----
+    // Gated on gc_interval_hours > 0. 0 = disabled (operators who
+    // want manual-only GC via rio-cli). Also gated on store_addr
+    // non-empty — we already warned above if it's empty (workers
+    // will break too); don't also spawn a cron that will never
+    // connect. Both gates log so the absence is diagnosable.
+    //
+    // No leader-gate: controller is single-replica by design
+    // (controller.md — no leader election). If replicas>1 by
+    // misconfig, the store's GC_LOCK_ID advisory lock serializes
+    // concurrent TriggerGC calls (see gc_schedule module doc).
+    if cfg.gc_interval_hours > 0 && !cfg.store_addr.is_empty() {
+        let gc_tick = std::time::Duration::from_secs(cfg.gc_interval_hours * 3600);
+        rio_common::task::spawn_monitored(
+            "gc-cron",
+            rio_controller::reconcilers::gc_schedule::run(
+                cfg.store_addr.clone(),
+                gc_tick,
+                shutdown.clone(),
+            ),
+        );
+    } else {
+        info!(
+            gc_interval_hours = cfg.gc_interval_hours,
+            store_addr_set = !cfg.store_addr.is_empty(),
+            "GC cron disabled"
+        );
+    }
+
     info!("controller running");
     // WorkerPool controller runs until SIGTERM (graceful_shutdown_on
     // drains in-flight reconciles).
@@ -411,6 +449,7 @@ mod tests {
         assert!(d.scheduler_addr.is_empty(), "required, no default");
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9094");
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9194");
+        assert_eq!(d.gc_interval_hours, 24, "GC cron defaults to daily");
     }
 
     #[test]

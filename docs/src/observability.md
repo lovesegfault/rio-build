@@ -137,6 +137,8 @@ r[obs.metric.store]
 | `rio_store_hmac_bypass_total` | Counter | PutPath calls that skipped HMAC verification via mTLS CN bypass (labeled by `cn`). Expected `cn="rio-gateway"` only. |
 | `rio_store_gc_path_resurrected_total` | Counter | Paths skipped by GC sweep because a reference appeared between mark and sweep (sweep's per-path reference re-check caught it). |
 | `rio_store_gc_chunk_resurrected_total` | Counter | S3 deletes skipped by the drain task because chunk refcount re-check found the chunk back in use (TOCTOU guard via `pending_s3_deletes.blake3_hash`). |
+| `rio_store_gc_path_swept_total` | Counter | Paths deleted by GC sweep (`narinfo` DELETE + CASCADE). Monotonic over store lifetime; `rate()` ≈ GC throughput. Not incremented on dry-run. |
+| `rio_store_gc_s3_key_enqueued_total` | Counter | S3 keys enqueued to `pending_s3_deletes` by GC sweep (chunks that hit refcount=0). Gap vs `rio_store_s3_deletes_pending` gauge decreasing = drain keeping up. |
 | `rio_store_s3_deletes_pending` | Gauge | Rows in `pending_s3_deletes` with `attempts < 10`. Normal operation: near-zero. |
 | `rio_store_s3_deletes_stuck` | Gauge | Rows in `pending_s3_deletes` with `attempts >= 10` (max retries exhausted). Alert if > 0: manual investigation needed. |
 | `rio_store_put_path_bytes_total` | Counter | Bytes accepted via PutPath (nar_size on success) |
@@ -184,7 +186,7 @@ r[obs.metric.controller]
 | `rio_controller_reconcile_errors_total` | Counter | Reconcile errors (labeled by reconciler) |
 | `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
-| `rio_controller_gc_runs_total` *(Phase 4+)* | Counter | GC runs (labeled by result: success/failure) — not yet emitted |
+| `rio_controller_gc_runs_total` | Counter | GC cron runs. `result=success\|connect_failure\|rpc_failure`. `connect_failure` = store unreachable (pod down, stale IP); `rpc_failure` = TriggerGC error or progress stream aborted. |
 
 ### Histogram Buckets
 

@@ -39,6 +39,8 @@ const STORE_METRICS: &[&str] = &[
     "rio_store_s3_deletes_pending",
     "rio_store_s3_deletes_stuck",
     "rio_store_gc_chunk_resurrected_total",
+    "rio_store_gc_path_swept_total",
+    "rio_store_gc_s3_key_enqueued_total",
 ];
 
 /// Recorder that captures names passed to `describe_*` and ignores

@@ -10,6 +10,7 @@
 //! scratch, reads current state, computes desired, applies the
 //! diff via server-side apply. Reconciling twice is a no-op.
 
+pub mod gc_schedule;
 pub mod workerpool;
 
 use kube::Client;
