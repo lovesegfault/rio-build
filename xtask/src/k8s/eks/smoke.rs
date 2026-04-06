@@ -87,7 +87,10 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
 pub async fn step_tenant(client: &kube::Client) -> Result<()> {
     info!("bootstrapping tenant '{TENANT}'");
     let out = run_in_scheduler(client, NS, &["rio-cli", "create-tenant", TENANT]).await?;
-    if !out.contains("created") && !out.to_lowercase().contains("already exists") {
+    // print_tenant format: "tenant <name> (<uuid>)  gc_retention=..."
+    // AlreadyExists is printed on re-run (idempotent).
+    if !out.contains(&format!("tenant {TENANT}")) && !out.to_lowercase().contains("already exists")
+    {
         bail!("create-tenant failed: {out}");
     }
     Ok(())
@@ -454,14 +457,20 @@ pub async fn step_worker_kill(client: &kube::Client, store_url: &str) -> Result<
     })
     .await?;
 
-    ui::step("verify disconnect counter increased", || async {
-        let after = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
-        info!("before={before} after={after}");
-        if after <= before {
-            bail!("disconnect counter didn't increase (scheduler missed the kill?)");
-        }
-        Ok(())
-    })
+    // The build reassigns fast (seconds) but the killed pod's graceful
+    // SIGTERM shutdown takes up to terminationGracePeriodSeconds (~30s
+    // default) before the gRPC stream actually closes. Poll until the
+    // counter moves or give up.
+    ui::poll(
+        "disconnect counter increased",
+        Duration::from_secs(5),
+        12,
+        || async {
+            let after = sched_metric(client, "rio_scheduler_worker_disconnects_total").await?;
+            info!("before={before} after={after}");
+            Ok((after > before).then_some(()))
+        },
+    )
     .await
 }
 

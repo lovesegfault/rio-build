@@ -8,8 +8,8 @@ locals {
   # linkFarm and pushes everything, so a drift shows up as "repository
   # does not exist" at push time.
   rio_images = [
-    "gateway", "scheduler", "store", "controller", "worker",
-    "fod-proxy", "bootstrap", "dashboard", "all",
+    "gateway", "scheduler", "store", "controller", "builder",
+    "fetcher", "bootstrap", "dashboard", "all",
   ]
 }
 
@@ -23,6 +23,11 @@ resource "aws_ecr_repository" "rio" {
   # If you need to re-push (e.g., after a flake.lock bump that
   # changed the closure), make a new commit.
   image_tag_mutability = "IMMUTABLE"
+
+  # Allow tofu destroy even when images exist. Repo renames (e.g.
+  # worker→builder) otherwise fail with RepositoryNotEmptyException
+  # and require manual `aws ecr delete-repository --force`.
+  force_delete = true
 
   # Scan on push: free AWS ECR vulnerability scanning. Scans the
   # image layers against CVE databases. Results show in the ECR

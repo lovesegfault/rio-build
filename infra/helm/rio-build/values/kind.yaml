@@ -58,6 +58,27 @@ store:
 postgresql:
   enabled: true
 
+builderPool:
+  enabled: true
+  name: default
+  # min=2: smoke's worker-kill chaos step needs ≥2 to kill one
+  # mid-build and verify reassignment.
+  replicas: {min: 2, max: 3}
+  image: rio-builder
+  systems: [x86_64-linux, builtin]
+  # kind's docker-in-docker containerd doesn't support the device-
+  # plugin path cleanly; privileged:true is the escape hatch.
+  privileged: true
+
+fetcherPool:
+  enabled: true
+  # Matches values.yaml default — smoke.rs expects this name.
+  name: rio-fetchers
+  replicas: 1
+  image: rio-fetcher
+  systems: [x86_64-linux, builtin]
+  hostUsers: true
+
 rustfs:
   enabled: true
   replicaCount: 1
@@ -78,3 +99,7 @@ rustfs:
   # controller, so this would be a dangling resource.
   ingress:
     enabled: false
+  # Chart default is local-path (k3s's provisioner). kind ships
+  # rancher.io/local-path as class "standard".
+  storageclass:
+    name: standard

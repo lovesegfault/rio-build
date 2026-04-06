@@ -226,7 +226,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             helm::rollback("rio", NS, rev)
         }
         K8sCmd::History => helm::history("rio", NS),
-        K8sCmd::Status { json } => status::run(&*p, kind, json).await,
+        K8sCmd::Status { json } => status::run(&*p, kind, cfg, json).await,
         K8sCmd::Up {
             auto,
             nodes,

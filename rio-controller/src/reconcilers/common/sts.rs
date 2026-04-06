@@ -264,8 +264,15 @@ pub fn build_executor_pod_spec(
                 command: Some(vec![
                     "/bin/sh".into(),
                     "-c".into(),
+                    // `test -s` (non-empty), not `test -f` (exists):
+                    // seccomp-installer DS uses atomic cp+mv but a
+                    // killed DS pod could leave a partial. A truncated
+                    // profile loads with a partial ALLOW list →
+                    // cryptic EACCES on syscalls that should be
+                    // allowed, persisting until a new image forces a
+                    // new cgroup path.
                     format!(
-                        "until test -f /host-seccomp/{profile}; do \
+                        "until test -s /host-seccomp/{profile}; do \
                          echo 'waiting for seccomp profile {profile}...'; \
                          sleep 2; done"
                     ),

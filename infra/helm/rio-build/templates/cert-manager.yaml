@@ -1,16 +1,21 @@
 {{- if and .Values.tls.enabled (eq .Values.tls.provisioner "cert-manager") }}
 {{- $ns := .Values.namespace.name -}}
+{{- $nsStore := .Values.namespaces.store.name -}}
+{{- $nsBuilders := .Values.namespaces.builders.name -}}
+{{- $nsFetchers := .Values.namespaces.fetchers.name -}}
 # Architecture:
 #   1. selfsigned-bootstrap ClusterIssuer bootstraps a root CA cert
-#      (isCA: true, self-signed).
-#   2. rio-ca-issuer (namespaced Issuer, NOT ClusterIssuer) reads that root
-#      CA Secret and issues leaf certs. MUST be namespaced: cert-manager's
-#      `ca:` issuer type reads the Secret from ITS OWN namespace — a
-#      ClusterIssuer would look in cert-manager's install namespace, not
-#      ours. We want the CA Secret in our namespace (least privilege — only
-#      rio pods can read it; other tenants' Issuers can't).
-#   3. Per-component Certificate: each gets tls.crt/tls.key/ca.crt. ca.crt
-#      is SAME for all (the root). tls.crt is unique with appropriate SANs.
+#      (isCA: true, self-signed) INTO cert-manager's namespace.
+#   2. rio-ca-issuer ClusterIssuer reads that root CA Secret and issues
+#      leaf certs into any namespace. MUST be ClusterIssuer: the 4-ns
+#      split (rio-system/rio-store/rio-builders/rio-fetchers) means leaf
+#      certs live in different namespaces, and a namespaced Issuer can
+#      only issue into its own ns. ClusterIssuer's `ca:` type reads the
+#      Secret from cert-manager's install namespace, so the root CA
+#      lives there.
+#   3. Per-component Certificate in ITS OWN namespace: each gets
+#      tls.crt/tls.key/ca.crt. ca.crt is SAME for all (the root).
+#      tls.crt is unique with appropriate SANs.
 ---
 # Only used to sign the root CA cert below, then ignored. Bootstrap.
 apiVersion: cert-manager.io/v1
@@ -25,6 +30,9 @@ spec:
 # The root CA cert. 10y duration: rotating the root means re-issuing EVERY
 # leaf + restarting every pod to pick up new ca.crt. Rare, deliberate event.
 #
+# Lives in cert-manager's namespace so the ClusterIssuer below can read it
+# (ClusterIssuer ca: secrets are resolved from cert-manager's install ns).
+#
 # encoding: PKCS8 is REQUIRED for EC keys. cert-manager defaults to ECDSA
 # P256; without PKCS8, emitted key has legacy `BEGIN EC PRIVATE KEY` header
 # that rustls's PEM parser rejects. NOT a values knob — this is load-bearing.
@@ -32,7 +40,7 @@ apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: rio-root-ca
-  namespace: {{ $ns }}
+  namespace: cert-manager
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
@@ -49,10 +57,9 @@ spec:
     name: rio-selfsigned-bootstrap
 ---
 apiVersion: cert-manager.io/v1
-kind: Issuer
+kind: ClusterIssuer
 metadata:
   name: rio-ca-issuer
-  namespace: {{ $ns }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
@@ -72,21 +79,28 @@ Leaf certs. Shared settings:
     be in SANs. `localhost` is there so in-pod tooling (rio-cli via
     kubectl exec — see rio-cli/src/main.rs) can talk to the local
     process with the same RIO_TLS__* env.
+  - Each cert lives in its component's namespace (4-ns split): k8s can't
+    mount cross-namespace secrets.
 */}}
 
-{{- range $component := list "scheduler" "store" "gateway" "controller" }}
-{{- $svc := printf "rio-%s" $component }}
+{{- $certs := list
+  (dict "svc" "rio-scheduler"  "ns" $ns)
+  (dict "svc" "rio-gateway"    "ns" $ns)
+  (dict "svc" "rio-controller" "ns" $ns)
+  (dict "svc" "rio-store"      "ns" $nsStore)
+}}
+{{- range $c := $certs }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: {{ $svc }}-tls
-  namespace: {{ $ns }}
+  name: {{ $c.svc }}-tls
+  namespace: {{ $c.ns }}
   labels:
-    app.kubernetes.io/name: {{ $svc }}
+    app.kubernetes.io/name: {{ $c.svc }}
     app.kubernetes.io/part-of: rio-build
 spec:
-  secretName: {{ $svc }}-tls
+  secretName: {{ $c.svc }}-tls
   duration: 2160h
   renewBefore: 720h
   privateKey:
@@ -94,36 +108,44 @@ spec:
     size: 256
     encoding: PKCS8
   issuerRef:
-    kind: Issuer
+    kind: ClusterIssuer
     name: rio-ca-issuer
   dnsNames:
-    - {{ $svc }}
-    - {{ $svc }}.{{ $ns }}
-    - {{ $svc }}.{{ $ns }}.svc
-    - {{ $svc }}.{{ $ns }}.svc.cluster.local
+    - {{ $c.svc }}
+    - {{ $c.svc }}.{{ $c.ns }}
+    - {{ $c.svc }}.{{ $c.ns }}.svc
+    - {{ $c.svc }}.{{ $c.ns }}.svc.cluster.local
     - localhost
 {{- end }}
 
+{{- /*
+Executor certs (builder + fetcher): wildcard SAN. StatefulSet headless-
+Service pod DNS is <pod>.<svc>.<ns>.svc.cluster.local. Each pod has its
+own DNS but shares ONE cert — per-pod certs would require the controller
+to create Certificate objects per pod. Scheduler doesn't verify WHICH
+executor, just CA-signed.
+
+Wildcard caveat: `*.X` matches ONE label only. Executors don't RECEIVE
+gRPC so server SAN doesn't strictly matter — purely client-cert. Wildcard
+is belt-and-suspenders for future metrics scrape etc.
+*/}}
+
+{{- $execCerts := list
+  (dict "name" "rio-builder-tls" "ns" $nsBuilders "cn" "rio-builder")
+  (dict "name" "rio-fetcher-tls" "ns" $nsFetchers "cn" "rio-fetcher")
+}}
+{{- range $c := $execCerts }}
 ---
-# Worker cert: wildcard SAN. StatefulSet's headless-Service pod DNS is
-# <pod>.<svc>.<ns>.svc.cluster.local. Each pod has its own DNS but shares
-# ONE cert — per-pod certs would require the controller to create
-# Certificate objects per pod. Scheduler doesn't verify WHICH worker, just
-# CA-signed.
-#
-# Wildcard caveat: `*.X` matches ONE label only. Workers don't RECEIVE gRPC
-# so server SAN doesn't strictly matter — purely client-cert. Wildcard is
-# belt-and-suspenders for future metrics scrape etc.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: rio-builder-tls
-  namespace: {{ $ns }}
+  name: {{ $c.name }}
+  namespace: {{ $c.ns }}
   labels:
-    app.kubernetes.io/name: rio-builder
+    app.kubernetes.io/name: {{ $c.cn }}
     app.kubernetes.io/part-of: rio-build
 spec:
-  secretName: rio-builder-tls
+  secretName: {{ $c.name }}
   duration: 2160h
   renewBefore: 720h
   privateKey:
@@ -131,9 +153,10 @@ spec:
     size: 256
     encoding: PKCS8
   issuerRef:
-    kind: Issuer
+    kind: ClusterIssuer
     name: rio-ca-issuer
   dnsNames:
-    - rio-builder
-    - "*.{{ $ns }}.svc.cluster.local"
+    - {{ $c.cn }}
+    - "*.{{ $c.ns }}.svc.cluster.local"
+{{- end }}
 {{- end }}

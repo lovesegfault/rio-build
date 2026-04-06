@@ -1833,7 +1833,13 @@
                     # `cargo xtask regen sqlx` unsets this locally to regenerate.
                     SQLX_OFFLINE = "true";
                     RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
-                    shellHook = config.pre-commit.installationScript;
+                    # Repo-local kubeconfig: xtask k8s writes here, so
+                    # direct kubectl/helm in the shell hits the same
+                    # cluster. Matches xtask/src/sh.rs:kubeconfig_path().
+                    shellHook = ''
+                      export KUBECONFIG="$PWD/.kube/config"
+                      ${config.pre-commit.installationScript}
+                    '';
                   }
                 );
             in
