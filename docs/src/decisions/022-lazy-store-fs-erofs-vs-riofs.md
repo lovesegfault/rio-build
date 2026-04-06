@@ -1,11 +1,11 @@
-# ADR-022: Lazy /nix/store filesystem — EROFS+fscache vs custom riofs kmod
+# ADR-022: Lazy /nix/store filesystem — EROFS+fscache vs custom riofs kmod vs composefs-style
 
-Status: Accepted (Path A — EROFS+fscache)
+Status: **Superseded 2026-04-05 — Path C (composefs-style); see §5.** Prior status: Accepted (Path A — EROFS+fscache).
 
 ---
 
 
-**Scope:** deep technical comparison of the two phase-2 candidates from [PLAN-KERNEL-FS.md](PLAN-KERNEL-FS.md) §2.1/§2.2/§2.6. V1/V8/V9 are now answered with primary sources.
+**Scope:** deep technical comparison of phase-2 candidates from [PLAN-KERNEL-FS.md](PLAN-KERNEL-FS.md) §2.1/§2.2/§2.6. V1/V8/V9 are answered with primary sources. **§3a (Path C)** added 2026-04-05 after spike validation; original §2/§3 retained as the evaluation record.
 
 ---
 
@@ -364,26 +364,150 @@ Kernel-version-locked; rebuilds with `boot.kernelPackages`. KASAN dev variant: `
 
 ---
 
+## 3a. Candidate C — composefs-style (EROFS metadata + overlay redirect → digest-addressed FUSE lower)
+
+**Added 2026-04-05.** Not evaluated in the original A-vs-B analysis. The mechanism is the one [composefs](https://github.com/containers/composefs) ships for ostree/podman: an EROFS image carrying **metadata only** (inodes, dirents, sizes, modes, xattrs — zero data blocks), stacked under overlayfs with a second **data-only lower** holding files named by content digest. Each regular-file inode in the metadata layer carries `trusted.overlay.redirect=/ab/<blake3>` + `trusted.overlay.metacopy`; overlayfs follows the redirect **lazily on first `open()`**, not at `mount(2)`.
+
+Relative to A: no fscache, no cachefiles daemon, no device table, no `(cookie,off)→nar_offset` reverse-map. Relative to B: no kernel code. The data-only lower is a thin FUSE mount serving `lookup(digest) → open → read` — back to FUSE, but **only for cold `open()`**, which is exactly where JIT-fetch-by-digest should block. Warm `read()` is page-cache via the overlay; `stat`/`readdir` never leave the kernel.
+
+### C.1 Mount stack and lookup path
+
+r[builder.fs.composefs-stack]
+
+The builder mounts three layers: (1) EROFS metadata image loop-mounted RO; (2) digest-addressed FUSE at `/mnt/objects`; (3) `overlay -o ro,lowerdir=<erofs>::<objects>,metacopy=on,redirect_dir=on` at `/nix/store`. The `::` separator marks the FUSE mount as a **data-only lower** ([`Documentation/filesystems/overlayfs.rst`](https://docs.kernel.org/filesystems/overlayfs.html#data-only-lower-layers)) — overlayfs will not `lookup()` into it for path resolution, only follow absolute redirects.
+
+| Syscall | Resolved by | FUSE upcalls |
+|---|---|---|
+| `stat`/`getattr` | EROFS inode (kernel) | 0 |
+| `readdir` | EROFS dirents (kernel) | 0 |
+| `open` (cold) | overlayfs follows `redirect` xattr → FUSE `lookup(prefix-dir)` + `lookup(digest)` + `open` | **2 lookup + 1 open**, depth-independent |
+| `read` (cold) | FUSE `read` upcalls, ~128 KiB/req via readahead | O(filesize / 128 KiB) |
+| `read` (warm) | page cache | **0** |
+
+§1's killer constraint — FUSE passthrough binds one backing fd at `open()` so a 200 MB partially-hot `.so` either upcalls every read or blocks open — **does not apply here in the same shape.** The FUSE lower serves whole-file content; partial materialization is at file granularity, not range granularity. A 200 MB `libLLVM.so` with 4 MB hot blocks `open()` for the whole file on first touch (~1.3 s on cluster net). This is **worse than A/B for that one case** and is the primary trade-off C makes; see §C.7.
+
+### C.2 Encoder — `mkcomposefs --from-file`
+
+r[builder.fs.stub-isize]
+
+The metadata image must encode each regular file's **real `i_size`** with zero data blocks. overlayfs metacopy surfaces the metadata layer's `i_size` to `stat()`; a stub encoded with `i_size=0` reports 0 to userspace even though `read()` returns full data — `mmap(len=st_size)` then maps nothing. Bare `mkfs.erofs` over a directory of 0-byte staging files is therefore **insufficient**.
+
+[`mkcomposefs --from-file`](https://github.com/containers/composefs/blob/main/man/composefs-dump.md) takes a `composefs-dump(5)` text manifest (one line per node: escaped path, size, mode, nlink, uid, gid, rdev, mtime, **payload** = redirect target, content, **digest**) and emits the EROFS image directly — no staging dir, no per-file `setxattr`, correct `i_size`. The dump format is line-oriented and trivially generated from a `NarIndex` walk; rio's encoder is a `NarIndex → dump-text` serializer plus either a subprocess call or a port of [`libcomposefs/lcfs-writer-erofs.c`](https://github.com/containers/composefs/blob/main/libcomposefs/lcfs-writer-erofs.c) (~1.2 kLoC C, dual GPL-2.0/Apache-2.0).
+
+r[builder.fs.metacopy-xattr-shape]
+
+`trusted.overlay.metacopy` must be either zero-length (legacy) or ≥4 bytes encoding `struct ovl_metacopy { u8 version; u8 len; u8 flags; u8 _pad; /* optional fsverity digest */ }`. 1-3 bytes → kernel `EIO "metacopy xattr too small"`. mkcomposefs writes the zero-length form when the dump's digest field is `-`.
+
+### C.3 Builder mount sequence
+
+Replacing [`mount_fuse_background()`](rio-builder/src/fuse/mod.rs:494):
+
+```rust
+pub fn mount_composefs_background(mount_point: &Path, objects_dir: &Path,
+                                  meta_image: &Path, clients: StoreClients,
+                                  rt: Handle) -> Result<ComposefsMount> {
+    // 1. Digest-FUSE at objects_dir. Serves /<2hex>/<62hex> by file_digest.
+    //    FOPEN_KEEP_CACHE so the page cache persists across opens.
+    let fuse = rt.spawn(digest_fuse::serve(objects_dir.to_owned(), clients));
+
+    // 2. Loop-mount EROFS metadata image (read-only, no fscache).
+    let loop_dev = losetup_ro(meta_image)?;
+    nix::mount::mount(Some(loop_dev.as_path()), &meta_mnt, Some("erofs"),
+        MsFlags::MS_RDONLY | MsFlags::MS_NODEV, None::<&str>)?;
+
+    // 3. Overlay: metadata layer + data-only (::) digest layer.
+    nix::mount::mount(Some("overlay"), mount_point, Some("overlay"),
+        MsFlags::MS_RDONLY,
+        Some(format!("lowerdir={}::{},metacopy=on,redirect_dir=on,userxattr=off",
+                     meta_mnt.display(), objects_dir.display()).as_str()))?;
+    Ok(ComposefsMount { mount_point, fuse, loop_dev })
+}
+```
+
+**No upcall-before-mount ordering hazard** (cf. §A.3 step 2): overlayfs does not follow redirects at `mount()`, so the FUSE handler can come up concurrently. **No build-start merge step** (cf. §A.3): one EROFS image per closure, generated from the union of the closure's `NarIndex` rows — same input as A's merge but emitted as composefs-dump text, no device-table renumbering.
+
+### C.4 Digest-FUSE handler
+
+r[builder.fs.digest-fuse-open]
+
+The data-only lower is a `fuser` filesystem rooted at `objects_dir` exposing exactly two directory levels: 256 prefix dirs (`00`..`ff`) and leaf files named by the remaining 62 hex chars of `blake3(file_content)`. `lookup(prefix, name)` consults a `file_digest → (size, executable)` map populated from the closure's `NarIndex`; unknown digests return `ENOENT`. `open` JIT-fetches the file by digest (see §C.7 for the fetch shape) and returns `FOPEN_KEEP_CACHE`. `read` serves from the materialized buffer/backing-file. The handler reuses [`rio-builder/src/fuse/fetch.rs`](rio-builder/src/fuse/fetch.rs)'s bounded-memory chunk fan-out; the lookup key changes from `store_path` to `file_digest`.
+
+This is **the only FUSE in the stack**, and it is hit only on cold `open()`. Spike-measured cold lookups are exactly 2 regardless of the merged path's depth — overlayfs walks the EROFS dirent chain in-kernel, then the redirect is one absolute jump.
+
+### C.5 Spike evidence
+
+Three nixosTest VMs on branch `worktree-agent-acf26042` ([`9c162024`](../../nix/tests/scenarios/composefs-spike.nix), [`a1394c0b`](../../nix/tests/scenarios/composefs-spike-scale.nix), `9415f9e2`); chromium-146 closure topology (357 store paths, 23 218 regular files, 8 221 dirs, 3 374 symlinks) with synthetic file content:
+
+| Metric | Measured |
+|---|---|
+| `mount -t overlay` wall-clock | **<10 ms** (below `time(1)` granularity) |
+| FUSE upcalls during mount | lookup=0 getattr=0 open=0 read=0 |
+| EROFS metadata image (mkcomposefs) | **5.3 MiB** (≈228 B/file), encoded in **70 ms** |
+| `find -type f` over 23 218 files | 60 ms, **0 FUSE upcalls** |
+| `find -printf %s` sum over 23 218 files | 1 795 354 094 B == manifest, 120 ms, **0 FUSE upcalls** |
+| Cold `lookup` upcalls (any depth) | **2** (prefix + digest) |
+| Cold `read` upcalls, 31 MB file | 244 (≈128 KiB/req) |
+| **Warm `read` upcalls** | **0** (all samples) |
+| FUSE handler peak RSS | 8.9 MB |
+
+Against A's targets: mount **<10 ms vs ~70 ms** (357 eager OPENs × ~200 µs); warm-read identical; metadata footprint 5.3 MiB vs ~15 MB boot-blob budget.
+
+### C.6 Integrity — fs-verity does not apply; per-file blake3 in handler
+
+r[builder.fs.file-digest-integrity]
+
+composefs's native integrity story embeds an fs-verity digest in the metacopy xattr; the kernel checks it against the backing file's fs-verity measurement at `open()`. **This requires fs-verity enabled on the lower filesystem**, which a FUSE lower cannot provide. Per-file integrity for C therefore lives in the digest-FUSE handler: on `open`, after materializing the file, blake3 the bytes and compare against the requested digest before returning. The digest is the filename — the check is structural. This is the `file_digest` field proposed independently as a `NarIndexEntry` extension; here it is load-bearing.
+
+What C **doesn't** have that B does: in-kernel range verification. C trusts the FUSE handler not to lie about the bytes it serves; B's `read_folio` could verify chunk digests kernel-side. For rio's threat model (builder is the FUSE server; builder is already trusted to not corrupt its own build), this is not a regression from A.
+
+### C.7 Failure modes and the partial-file trade-off
+
+| Failure | Kernel behavior | rio handling |
+|---|---|---|
+| **FUSE handler crash** | overlayfs `open()` on a redirect target → `ENOTCONN`. Existing open files keep their page-cache content (warm reads unaffected). | Supervisor respawns; next `open()` reconnects. **No D-state**, no `restore` dance. Simpler than A. |
+| **FUSE handler hung mid-fetch** | `open()` blocks in `S` (interruptible — FUSE, not folio lock). | Per-spawn `tokio::timeout` returns `EIO` to the open; build fails loudly. Same shape as today's `jit_fetch_timeout`. |
+| **Redirect target ENOENT** | overlayfs `open()` → `ENOENT`. | Handler returns ENOENT only for digests outside the closure's declared-input allowlist — correct (JIT fetch imperative). |
+| **Partial-file hot ranges** | First `open()` of a 200 MB `.so` blocks for the whole file. Subsequent reads of any range are page-cache. | **The trade-off.** Mitigations: (i) `file_digest → chunk_list` lets the handler stream into a backing file and return from `open()` after the first chunk, with `read()` upcalling for not-yet-fetched ranges (= the FUSE behavior §1 rejected — but only for the *first* open of that file, ever, on that node); (ii) node-local digest cache means the second build to touch `libLLVM.so` pays 0. V11 + a "p99 file size in hot set" measurement gate whether (i) is needed. |
+
+### C.8 Kconfig (NixOS)
+
+```nix
+boot.kernelPatches = [{
+  name = "overlay-composefs";
+  patch = null;
+  extraStructuredConfig = with lib.kernel; {
+    EROFS_FS         = yes;
+    OVERLAY_FS       = yes;       # nixpkgs default =m
+    FUSE_FS          = yes;
+    # No EROFS_FS_ONDEMAND, no CACHEFILES — C doesn't use fscache.
+  };
+}];
+```
+
+All three are stock-on in essentially every distro; the patch block is for `=y` over `=m` only.
+
+---
+
 ## 4. Head-to-head
 
-| Axis | **(A) EROFS + fscache** | **(B) `riofs` kmod (C)** |
-|---|---|---|
-| **Total LoC owned** | **~2 700** = 0 kernel + ~1 200 daemon (poll loop, reverse-map, cookie idx) + ~950 rio-store (encoder + PutPath + migration) + ~400 builder merge + ~150 nix/helm. Plus ~400 LoC vendored Nydus protocol parsing (Apache-2.0, attributed). | **~3 600** = ~2 800 kernel C + ~500 builder (`/dev/riofs` loop + `.riom` serializer) + **0 rio-store** + ~100 `nix/kmod/` + ~200 VM-test scaffolding. (Rust path: +~1 500 carried rust-vfs — don't.) |
-| **Distribution of complexity** | All userspace; 100% `cargo nextest`-able; bugs = wrong bytes (build fails its checksum, loud). The fiddly part (reverse-map) is `proptest`-able. | ~800 LoC genuinely-novel kernel (read_folio + ring + waiters); ~2 000 romfs-shaped boilerplate. Bugs = hung folio lock, UAF on evicted chunk, `copy_from_user` length error. Dev loop = VM rebuild (~2-3 min). |
-| **rio-store write-path Δ** | +encoder, +PutPath hook, +migration, +S3 object class, +GC wiring, +backfill job. | **None.** |
-| **Build-start latency added** | ~15 MB boot-blob batch fetch + in-mem merge of ~300 k inodes (V4: target <200 ms; cache merged result per-closure-hash on STS pods to amortize). | `.riom` serialize from already-in-memory `ManifestHint`s — **~10 ms**. |
-| **Persistent artifacts** | `boot/<narhash>.erofs` per store path in S3 (~0.3% of NAR size). GC-tracked. | **None.** |
-| **Cold-miss latency** | `read_folio` → netfs → fscache → cachefiles xarray → poll wake → user `read` → reverse-map (~5 µs) → `GetChunk×k` (**~2-8 ms**) → assemble → `pwrite` → ioctl → fill folio. ≈ **net + ~40 µs + ≤512 KiB over-fetch.** | `read_folio` → kfifo push → poll wake → user `read` → `GetChunk×1` (**~2-8 ms**) → `write` → `copy_from_user` → `memcpy_to_folio` → `complete_all`. ≈ **net + ~15 µs, no over-fetch.** B saves ~25 µs + ≤256 KiB/miss; **both dominated by network RTT — effective tie.** |
-| **Warm-read latency** (page cache hit) | `filemap_read` → folio uptodate → copy. **No fs code runs.** | Identical. **Exact tie.** |
-| **Cross-path chunk dedup** (two NARs share a chunk — kernel caches once?) | **No.** cachefiles key = `(cookie, byte-range)`. Same chunk in two paths = two upcalls, two SSD extents. Dedup only in userspace moka (2nd upcall ~50 µs not ~5 ms). | **Yes** with optional kernel digest cache (§B.2): one upcall fills all waiters across files. v0 without it: same as A. **B wins iff V11 shows >5% intra-closure sharing AND we build the cache.** |
-| **Daemon-crash blast radius** | In-flight readers `D` on folio lock; next daemon writes `restore`, kernel re-delivers, readers unblock, **mounts survive, build continues**. Best-in-class. | Design choice. Cheap path: `.release` errors waiters → build `-EIO` → pod restart (~30 s lost). Match A: +~100 LoC re-dump-on-reopen. **A by default; tie if B spends the LoC.** |
-| **Daemon-hang** | Reader `D` forever (no kernel timeout). Mitigate: per-spawn `tokio::timeout` → on expiry pwrite zeros + complete → build fails checksum. | Same problem, same mitigation. |
-| **Debugging** | Userspace: `tracing`/`tokio-console`. Kernel: **upstream** `trace_events/{erofs,cachefiles,netfs,fscache}/*`; `bpftrace` works day-1; `/proc/fs/fscache/stats`. Hung task = upstream's bug. | Userspace: same. Kernel: **we write** `TRACE_EVENT(riofs_*)` (~50 LoC); then `bpftrace`/ftrace work. Oops/hung-folio = **our** vmcore: `crash`/`drgn`/`decode_stacktrace.sh`/KASAN. NixOS makes the KASAN-kernel VM-test cheap, but it's still our afternoon. |
-| **Upstream review/fuzz** | LKML-reviewed, syzkaller-covered, CVE-tracked (Gao Xiang, David Howells). | None unless we run it. syzkaller descriptors for `.riom` mount-blob + `/dev/riofs` proto ≈ ~200 LoC syz-lang (V10). |
-| **API churn** | **uapi-frozen** (`cachefiles.h` is `include/uapi/`; EROFS on-disk is versioned). | **Internal API** — ~40% of releases touch a signature we implement. ~1 d/quarter under NixOS's deliberate-bump model. |
-| **Kernel config (NixOS)** | 5-line `extraStructuredConfig`. | ~30-line `nix/kmod/riofs.nix` + `extraModulePackages`. Both trivial. |
-| **Time to first prototype** | **~3 wk.** Wk1: Kconfig + vendored cachefiles loop + 1-path bootstrap. Wk2: in-process encoder + golden tests via loop-device mount (`EROFS_FS_BACKED_BY_FILE` is on everywhere — can validate encoder without fscache). Wk3: merge + multi-path + overlay flip. | **~4 wk** (C). Wk1: romfs-clone, static tree, mount+overlay+stat works. Wk2: miscdev ring + `read_folio` + Rust stub. Wk3: `.riom` serializer + `readahead` + first real build under VM-test. Wk4: KASAN soak + first oops + fix. |
-| **Exit cost** | Delete daemon + encoder; `boot/*` are dead S3 → GC sweeps; revert `extraStructuredConfig`. **Low.** | Delete `nix/kmod/` + `extraModulePackages` line. **No persistent data.** **Marginally lower.** |
+| Axis | **(A) EROFS + fscache** | **(B) `riofs` kmod** | **(C) composefs-style** |
+|---|---|---|---|
+| **Total LoC owned** | **~2 700** = 0 kernel + ~1 200 daemon (poll loop, reverse-map, cookie idx) + ~950 rio-store (encoder + PutPath + migration) + ~400 builder merge + ~150 nix/helm. Plus ~400 LoC vendored Nydus protocol parsing (Apache-2.0, attributed). | **~3 600** = ~2 800 kernel C + ~500 builder (`/dev/riofs` loop + `.riom` serializer) + **0 rio-store** + ~100 `nix/kmod/` + ~200 VM-test scaffolding. (Rust path: +~1 500 carried rust-vfs — don't.) | **~1 400** = 0 kernel + ~450 digest-FUSE (reuses `fuse/fetch.rs` fan-out) + ~250 `NarIndex→dump` serializer + ~300 rio-store (`file_digest` in NarIndex, PutPath blake3-per-file) + ~250 builder mount + ~150 nix/helm. Subprocess `mkcomposefs`; porting `lcfs-writer-erofs.c` is +~1 200 if shell-out is unacceptable. |
+| **Distribution of complexity** | All userspace; 100% `cargo nextest`-able; bugs = wrong bytes (build fails its checksum, loud). The fiddly part (reverse-map) is `proptest`-able. | ~800 LoC genuinely-novel kernel (read_folio + ring + waiters); ~2 000 romfs-shaped boilerplate. Bugs = hung folio lock, UAF on evicted chunk, `copy_from_user` length error. Dev loop = VM rebuild (~2-3 min). | All userspace; **no reverse-map, no merge-splice, no cookie state machine.** The fiddly part is the dump-text escaper (`proptest`-able against `mkcomposefs` round-trip). Digest-FUSE is a subset of today's `fuse/ops.rs`. |
+| **rio-store write-path Δ** | +encoder, +PutPath hook, +migration, +S3 object class, +GC wiring, +backfill job. | **None.** | +`file_digest` per `NarIndexEntry` (one blake3 per regular file during `nar_ls`; bytes already in RAM). No new S3 object class. |
+| **Build-start latency added** | ~15 MB boot-blob batch fetch + in-mem merge of ~300 k inodes (V4: target <200 ms; cache merged result per-closure-hash on STS pods to amortize). | `.riom` serialize from already-in-memory `ManifestHint`s — **~10 ms**. | `NarIndex` rows → dump text → `mkcomposefs` → 5.3 MiB image in **70 ms** measured; + loop-mount + overlay mount **<10 ms**. **No eager OPEN per device-slot.** |
+| **Persistent artifacts** | `boot/<narhash>.erofs` per store path in S3 (~0.3% of NAR size). GC-tracked. | **None.** | **None required.** Metadata image generated per-build from `NarIndex` rows; optionally cache per-closure-hash on node SSD. |
+| **Cold-miss latency** | `read_folio` → netfs → fscache → cachefiles xarray → poll wake → user `read` → reverse-map (~5 µs) → `GetChunk×k` (**~2-8 ms**) → assemble → `pwrite` → ioctl → fill folio. ≈ **net + ~40 µs + ≤512 KiB over-fetch.** | `read_folio` → kfifo push → poll wake → user `read` → `GetChunk×1` (**~2-8 ms**) → `write` → `copy_from_user` → `memcpy_to_folio` → `complete_all`. ≈ **net + ~15 µs, no over-fetch.** B saves ~25 µs + ≤256 KiB/miss; **both dominated by network RTT — effective tie.** | `open()` → overlay redirect → 2 FUSE lookups + 1 open → fetch **whole file** by digest → return. ≈ **net × (filesize / chunksize).** Range-granular A/B; **file-granular C.** Cold cost is *higher* for large partially-touched files; *lower* for small files (no over-fetch, no reverse-map). See §C.7. |
+| **Warm-read latency** (page cache hit) | `filemap_read` → folio uptodate → copy. **No fs code runs.** | Identical. **Exact tie.** | Identical. **Exact tie** — spike-verified 0 upcalls. |
+| **Cross-path dedup** (kernel caches once?) | **No.** cachefiles key = `(cookie, byte-range)`. Same chunk in two paths = two upcalls, two SSD extents. Dedup only in userspace moka (2nd upcall ~50 µs not ~5 ms). | **Yes** with optional kernel digest cache (§B.2): one upcall fills all waiters across files. v0 without it: same as A. **B wins iff V11 shows >5% intra-closure sharing AND we build the cache.** | **Yes, structurally** at file granularity. Two paths redirecting to `/ab/<digest>` open the **same inode** — one page-cache copy, one node-SSD copy, one fetch ever. No optional cache to build. |
+| **Daemon-crash blast radius** | In-flight readers `D` on folio lock; next daemon writes `restore`, kernel re-delivers, readers unblock, **mounts survive, build continues**. Best-in-class. | Design choice. Cheap path: `.release` errors waiters → build `-EIO` → pod restart (~30 s lost). Match A: +~100 LoC re-dump-on-reopen. **A by default; tie if B spends the LoC.** | In-flight `open()` → `ENOTCONN` (FUSE), build `-EIO`. **No `D`-state** (FUSE waits are `S`, interruptible). Warm reads unaffected. Supervisor respawn → next open works. **Simpler than A's `restore` dance; same loss as B's cheap path.** |
+| **Daemon-hang** | Reader `D` forever (no kernel timeout). Mitigate: per-spawn `tokio::timeout` → on expiry pwrite zeros + complete → build fails checksum. | Same problem, same mitigation. | `open()` blocks in `S`; per-spawn `tokio::timeout` → `EIO`. Same mitigation, **interruptible wait**. |
+| **Debugging** | Userspace: `tracing`/`tokio-console`. Kernel: **upstream** `trace_events/{erofs,cachefiles,netfs,fscache}/*`; `bpftrace` works day-1; `/proc/fs/fscache/stats`. Hung task = upstream's bug. | Userspace: same. Kernel: **we write** `TRACE_EVENT(riofs_*)` (~50 LoC); then `bpftrace`/ftrace work. Oops/hung-folio = **our** vmcore: `crash`/`drgn`/`decode_stacktrace.sh`/KASAN. NixOS makes the KASAN-kernel VM-test cheap, but it's still our afternoon. | Userspace: `tracing` + FUSE upcall counters. Kernel: **upstream** `trace_events/{erofs,overlayfs,fuse}/*`. The whole hot path is page cache + overlay + EROFS — three of the most-exercised subsystems in container workloads. |
+| **Upstream review/fuzz** | LKML-reviewed, syzkaller-covered, CVE-tracked (Gao Xiang, David Howells). | None unless we run it. syzkaller descriptors for `.riom` mount-blob + `/dev/riofs` proto ≈ ~200 LoC syz-lang (V10). | LKML-reviewed (overlayfs metacopy/redirect: Amir Goldstein; EROFS: Gao Xiang; composefs: Alexander Larsson). The exact stack ships in podman/ostree. |
+| **API churn** | **uapi-frozen** (`cachefiles.h` is `include/uapi/`; EROFS on-disk is versioned). | **Internal API** — ~40% of releases touch a signature we implement. ~1 d/quarter under NixOS's deliberate-bump model. | **uapi-frozen** (overlayfs mount opts, `trusted.overlay.*` xattrs, EROFS on-disk, FUSE protocol). composefs-dump(5) is versioned. |
+| **Kernel config (NixOS)** | 5-line `extraStructuredConfig`. | ~30-line `nix/kmod/riofs.nix` + `extraModulePackages`. Both trivial. | **None required** beyond `=y` over `=m` (EROFS/OVERLAY/FUSE all stock-on). |
+| **Time to first prototype** | **~3 wk.** Wk1: Kconfig + vendored cachefiles loop + 1-path bootstrap. Wk2: in-process encoder + golden tests via loop-device mount (`EROFS_FS_BACKED_BY_FILE` is on everywhere — can validate encoder without fscache). Wk3: merge + multi-path + overlay flip. | **~4 wk.** Wk1: romfs-clone, static tree, mount+overlay+stat works. Wk2: miscdev ring + `read_folio` + Rust stub. Wk3: `.riom` serializer + `readahead` + first real build under VM-test. Wk4: KASAN soak + first oops + fix. | **~2 wk.** Wk1: `file_digest` in NarIndex + dump serializer + digest-FUSE (subset of existing `fuse/ops.rs`). Wk2: mount wiring + first real build + node-SSD digest cache. **Spike already has the VM harness** (§C.5). |
+| **Exit cost** | Delete daemon + encoder; `boot/*` are dead S3 → GC sweeps; revert `extraStructuredConfig`. **Low.** | Delete `nix/kmod/` + `extraModulePackages` line. **No persistent data.** **Marginally lower.** | Delete digest-FUSE + dump serializer. **No persistent data, no Kconfig.** **Lowest.** |
 
 ### 4.1 What the table doesn't capture
 
@@ -397,9 +521,15 @@ Kernel-version-locked; rebuilds with `boot.kernelPackages`. KASAN dev variant: `
 
 **B's chunk-native protocol is elegant but cheap to forgo.** A's reverse-map is ~150 LoC of binary search; the over-fetch is <512 KiB against a moka cache that already holds whole chunks. The wall-clock cost of A's impedance mismatch is microseconds per cold miss against millisecond network RTTs.
 
+**C trades range-granular cold-miss for everything else.** A and B can serve a 4 MB hot range of a 200 MB file without fetching the other 196 MB; C fetches the whole 200 MB on first `open()`. In exchange C drops the cachefiles daemon, the device-slot ceiling, the eager-OPEN mount cost, the reverse-map, and the rio-store S3 artifact — and gains structural per-file dedup that A cannot achieve and B only achieves with an optional kernel cache. Whether the trade is favorable depends on workload shape: if builds touch many small-to-medium files fully (compilers reading headers, linkers reading whole `.o`s) C wins outright; if builds seek into large archives, A/B's range granularity matters. The node-local digest cache amortizes C's penalty to one fetch per unique file per node lifetime.
+
 ---
 
 ## 5. Recommendation
+
+> **Superseded 2026-04-05.** The original recommendation below chose A over B without evaluating C. Spike evidence (§C.5) shows C dominates A on mount latency (<10 ms vs ~70 ms), matches A on the warm path, achieves kernel-side per-file dedup A structurally cannot, and is ~half the owned LoC with no cachefiles daemon and no rio-store S3 artifact. **New decision: Path C**, with A retained as the documented fallback if overlay-on-FUSE-data-only-lower exhibits an unforeseen production issue. The partial-file trade-off (§C.7) is C's known cost; gate mitigation (i) on a "p99 first-touched-file size" measurement alongside V11.
+
+### 5.0 Original recommendation (retained for the record)
 
 **With NixOS neutralizing deployment, this is close — but A (EROFS+fscache) remains the recommendation, with B as a credible 2-week parallel spike if the team has kernel-C appetite.**
 
@@ -445,8 +575,14 @@ Our code:
 - `/home/bemeurer/src/rio-build/main/rio-proto/proto/types.proto`
 - `/home/bemeurer/src/rio-build/main/rio-builder/src/fuse/{mod,ops,fetch}.rs`, `overlay.rs`
 
+Path C primary (read for §3a):
+- [`containers/composefs`](https://github.com/containers/composefs) — mechanism, `mkcomposefs`, [`composefs-dump(5)`](https://github.com/containers/composefs/blob/main/man/composefs-dump.md), [`lcfs-writer-erofs.c`](https://github.com/containers/composefs/blob/main/libcomposefs/lcfs-writer-erofs.c)
+- [`Documentation/filesystems/overlayfs.rst` §Data-only lower layers, §Metadata only copy up](https://docs.kernel.org/filesystems/overlayfs.html)
+- [`fs/overlayfs/util.c` `ovl_get_redirect_xattr`/`ovl_check_metacopy_xattr`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/util.c) — `struct ovl_metacopy` shape
+- [snix castore data model](https://snix.dev/docs/components/castore/data-model/) — the per-file merkle that motivated evaluating C
+- Spike: [`nix/tests/scenarios/composefs-spike.nix`](../../nix/tests/scenarios/composefs-spike.nix), [`composefs-spike-scale.nix`](../../nix/tests/scenarios/composefs-spike-scale.nix), [`rio-worker/src/bin/spike_digest_fuse.rs`](../../rio-worker/src/bin/spike_digest_fuse.rs); commits `9c162024`, `a1394c0b`, `9415f9e2` on `worktree-agent-acf26042`
+
 Background:
-- [`containers/composefs`](https://github.com/containers/composefs) — overlay-on-erofs-on-fscache in production
 - cachefiles failover [`c8383054506c`](https://git.kernel.org/linus/c8383054506c) (6.4)
 - [`twoliter`](https://github.com/bottlerocket-os/twoliter) (informational)
 
