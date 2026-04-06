@@ -367,10 +367,13 @@ gateway:
     # real Secret so both replicas present the same host key.
     hostKeySecret: ""
   resources:
-    # Gateway buffers NAR uploads in-memory (streaming via tee — ~1MB per
-    # concurrent upload since phase2b's dump_path_streaming).
-    requests: {cpu: 250m, memory: 256Mi}
-    limits: {memory: 1Gi}
+    # Gateway buffers NAR uploads in-memory (~1MB/concurrent upload, streaming
+    # via tee). The dominant cost is drv_cache (parsed Derivation per uploaded
+    # .drv, capped at maxTransitiveInputs per session): a 100k-path closure ≈
+    # 150-300MB/session (I-134). 4Gi headroom for a few concurrent large-DAG
+    # sessions.
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 4Gi}
 
 
 # ──────────────────────────────────────────────────────────────────────────
