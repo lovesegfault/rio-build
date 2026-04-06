@@ -148,6 +148,17 @@ _VM_FAIL_RE = re.compile(
     re.MULTILINE,
 )
 
+# P0304-T10: TCG/KVM-denied supplementary grant. When a VM test fails on builder-
+# side KVM infrastructure (not code), the drv won't be in known-flakes.jsonl but
+# the log carries distinctive markers. These are infra-always-excusable — the
+# drv is byte-identical on retry, so re-allocation to a different builder is the
+# only fix. Checked AFTER `failing` is computed (inside `elif not matched:`),
+# preserving the 1-failure-exactly discipline.
+_TCG_MARKERS = (
+    "KVM-DENIED-BUILDER",            # P0313 preamble marker (exit-77 path)
+    "failed to initialize kvm",      # QEMU-native (exit-1 path, P0316)
+)
+
 
 def excusable(log_path: Path) -> ExcusableVerdict:
     """If .#ci is red on exactly one test AND that test is a known-flake with
@@ -176,7 +187,13 @@ def excusable(log_path: Path) -> ExcusableVerdict:
     elif len(failing) > 1:
         reason, ok = f"{len(failing)} failures — excusable requires exactly 1", False
     elif not matched:
-        reason, ok = f"{failing[0]!r} not in known-flakes.jsonl (neither test nor drv_name)", False
+        # P0304-T10 supplementary grant: VM-fail + TCG marker = infra-excusable
+        # even if drv isn't in known-flakes. The 1-failure discipline above
+        # already excludes co-occurring real failures (nextest FAIL + VM TCG).
+        if failing[0] in vm_fails and any(m in text for m in _TCG_MARKERS):
+            reason, ok = f"{failing[0]!r} TCG-marker present — builder-side KVM infra, retry", True
+        else:
+            reason, ok = f"{failing[0]!r} not in known-flakes.jsonl (neither test nor drv_name)", False
     elif matched_row.retry == "Never":
         reason, ok = f"{matched[0]!r} is known-flake but retry=Never — investigate, don't retry", False
     else:
