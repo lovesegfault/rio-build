@@ -54,8 +54,9 @@ pub struct WorkerState {
     ///
     /// Set by `AdminService.DrainWorker` which the worker's SIGTERM
     /// handler calls as step 1 of preStop. `has_capacity()` checks this
-    /// so `best_worker()` filters draining workers out — no explicit
-    /// filter in assignment.rs needed. In-flight builds continue; no
+    /// (and `store_degraded` below) so `best_worker()` filters both out
+    /// — no explicit filter in assignment.rs needed. In-flight builds
+    /// continue; no
     /// new work. The worker then waits for in-flight completion (step
     /// 2) and exits. terminationGracePeriodSeconds=7200 gives 2h.
     ///
@@ -74,6 +75,14 @@ pub struct WorkerState {
     /// assignment before the next DrainWorker call (which the preStop
     /// hook sends on every SIGTERM, so it would re-drain).
     pub draining: bool,
+    /// FUSE circuit breaker open on the worker — it can't fetch inputs
+    /// from rio-store. Treated like `draining`: `has_capacity()` returns
+    /// false, `best_worker()` excludes it. Unlike `draining`, this is
+    /// two-way: the worker clears it when the breaker closes/half-opens
+    /// (next heartbeat). Wire-default false — old workers don't send it.
+    ///
+    /// Set from `HeartbeatRequest.store_degraded` in `handle_heartbeat`.
+    pub store_degraded: bool,
     /// When this WorkerState was created (= stream open or first
     /// heartbeat, whichever came first via `entry().or_insert_with()`).
     /// Reported in `ListWorkers`.
@@ -102,6 +111,7 @@ impl WorkerState {
             bloom: None,
             size_class: None,
             draining: false,
+            store_degraded: false,
             connected_since: Instant::now(),
             last_resources: None,
         }
@@ -121,11 +131,14 @@ impl WorkerState {
 
     /// Whether this worker has available build capacity.
     ///
-    /// `!draining` first: short-circuit the arithmetic for draining
-    /// workers. `best_worker()` calls this in a hot-ish loop over
-    /// candidates; a draining worker is common during scale-down.
+    /// `!draining && !store_degraded` first: short-circuit the
+    /// arithmetic for excluded workers. `best_worker()` calls this in
+    /// a hot-ish loop over candidates; draining workers are common
+    /// during scale-down, degraded workers during store outages.
+    // r[impl worker.heartbeat.store-degraded]
     pub fn has_capacity(&self) -> bool {
         !self.draining
+            && !self.store_degraded
             && self.is_registered()
             && (self.running_builds.len() as u32) < self.max_builds
     }
@@ -252,6 +265,42 @@ mod tests {
         );
         // Worker with features can still build featureless derivs.
         assert!(w.can_build("x86_64-linux", &[]));
+    }
+
+    /// store_degraded gates has_capacity() regardless of arithmetic.
+    /// Set every OTHER capacity input favorably (not draining, fully
+    /// registered, running=0 < max=4) so the only reason has_capacity
+    /// can return false is the store_degraded flag itself.
+    ///
+    /// Precondition assert proves the test is not trivially passing:
+    /// with store_degraded=false, the same worker DOES have capacity.
+    #[test]
+    fn has_capacity_gates_on_store_degraded() {
+        let mut w = registered_worker(vec!["x86_64-linux"], vec![]);
+        w.max_builds = 4;
+        // running_builds empty by default → 0 < 4, arithmetic passes.
+        assert!(!w.draining, "precondition: not draining");
+        assert!(
+            w.has_capacity(),
+            "precondition: healthy worker has capacity (test would \
+             pass trivially without this — store_degraded=true below \
+             must be the ONLY reason has_capacity flips)"
+        );
+
+        w.store_degraded = true;
+        assert!(
+            !w.has_capacity(),
+            "store_degraded=true → has_capacity false even with \
+             running=0 < max=4 and draining=false"
+        );
+
+        // Two-way (unlike draining): clearing the flag restores
+        // capacity. Worker recovers when the FUSE breaker closes.
+        w.store_degraded = false;
+        assert!(
+            w.has_capacity(),
+            "store_degraded cleared → capacity restored"
+        );
     }
 
     /// Empty systems = not registered. Prevents a misconfigured

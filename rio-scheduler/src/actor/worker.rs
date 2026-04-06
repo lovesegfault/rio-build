@@ -284,7 +284,7 @@ impl DagActor {
         }
     }
 
-    // 9 args — all independent heartbeat fields. A struct would add
+    // 10 args — all independent heartbeat fields. A struct would add
     // boilerplate at every call site for an internal-only method.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_heartbeat(
@@ -297,6 +297,7 @@ impl DagActor {
         bloom: Option<rio_common::bloom::BloomFilter>,
         size_class: Option<String>,
         resources: Option<rio_proto::types::ResourceUsage>,
+        store_degraded: bool,
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
@@ -377,6 +378,18 @@ impl DagActor {
         // ListWorkers rather than flashing None.
         if resources.is_some() {
             worker.last_resources = resources;
+        }
+        // store_degraded: overwrite unconditionally (bool, no Option
+        // ambiguity). false→true transition logged at info — a worker
+        // dropping out of the assignment pool mid-run is operationally
+        // interesting. true→false (recovery) also logged: symmetry.
+        // Steady-state (same value both sides) is silent.
+        let was_degraded = worker.store_degraded;
+        worker.store_degraded = store_degraded;
+        if !was_degraded && store_degraded {
+            info!(worker_id = %worker_id, "marked store-degraded; removing from assignment pool");
+        } else if was_degraded && !store_degraded {
+            info!(worker_id = %worker_id, "store-degraded cleared; returning to assignment pool");
         }
 
         if !was_registered && worker.is_registered() {

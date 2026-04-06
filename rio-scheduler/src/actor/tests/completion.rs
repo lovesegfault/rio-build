@@ -752,6 +752,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
         .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
             resources: None,
             bloom: None,
             size_class: Some("small".into()),

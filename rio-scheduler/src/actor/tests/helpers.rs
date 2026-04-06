@@ -98,6 +98,7 @@ pub(crate) async fn connect_worker(
         .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
             resources: None,
             bloom: None,
             size_class: None,

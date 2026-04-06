@@ -69,6 +69,7 @@ impl InstantWorker {
                 bloom: None,
                 size_class: None,
                 resources: None,
+                store_degraded: false,
             })
             .await?;
         Ok(Self {

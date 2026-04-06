@@ -105,6 +105,11 @@ pub enum ActorCommand {
         /// (shouldn't happen). Stored on WorkerState as `last_resources`
         /// for `ListWorkers`.
         resources: Option<rio_proto::types::ResourceUsage>,
+        /// FUSE circuit breaker open — worker can't fetch from store.
+        /// Proto bool, field 9: wire-default false (old workers don't
+        /// send it). Stored on WorkerState; `has_capacity()` gates on
+        /// it the same as `draining`.
+        store_degraded: bool,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).

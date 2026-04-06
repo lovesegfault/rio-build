@@ -332,6 +332,7 @@ mod tests {
             bloom: None,
             size_class: None,
             draining: false,
+            store_degraded: false,
             connected_since: Instant::now(),
             last_resources: None,
         };

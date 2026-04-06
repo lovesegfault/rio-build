@@ -870,6 +870,7 @@ impl WorkerService for SchedulerGrpc {
             bloom,
             size_class,
             resources: req.resources,
+            store_degraded: req.store_degraded,
         };
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load

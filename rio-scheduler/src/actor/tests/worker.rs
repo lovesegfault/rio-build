@@ -42,6 +42,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // race: worker sent heartbeat before receiving/acking the assignment.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
             resources: None,
             bloom: None,
             size_class: None,
@@ -270,6 +271,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     // know" to be clearly distinguishable).
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
             resources: None,
             bloom: None,
             size_class: None,
@@ -694,6 +696,112 @@ async fn test_per_build_timeout_zero_means_unlimited() -> TestResult {
         rio_proto::types::BuildState::Active as i32,
         "build with build_timeout=0 should never time out; got state={}",
         status.state
+    );
+
+    Ok(())
+}
+
+// r[verify worker.heartbeat.store-degraded]
+/// Heartbeat with store_degraded=true excludes the worker from
+/// best_worker() dispatch. End-to-end: heartbeat → WorkerState.store_
+/// degraded → has_capacity()=false → best_worker() filters out →
+/// derivation stays Ready (no assignment).
+///
+/// Then: heartbeat with store_degraded=false → worker returns to the
+/// pool → dispatch fires → derivation Assigned. This proves the
+/// two-way nature (unlike draining, which is one-way) at the actor
+/// level, not just the has_capacity() unit level.
+///
+/// Single-worker setup isolates the exclusion: if the degraded worker
+/// were still a candidate, the derivation would go Assigned immediately
+/// on merge (only one worker, it's the best by default).
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
+    // Register worker the normal way (store_degraded=false via
+    // connect_worker). It's healthy and eligible.
+    let (_db, handle, _task, mut rx) =
+        setup_with_worker("degraded-worker", "x86_64-linux", 4).await?;
+
+    // Mark it degraded BEFORE merging any work. The heartbeat also
+    // triggers dispatch_ready (actor/mod.rs:432) but the ready queue
+    // is empty, so that's a no-op. The point is WorkerState.store_
+    // degraded is set by the time the merge below runs.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: true,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            worker_id: "degraded-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Transition logged at info (false → true).
+    assert!(
+        logs_contain("marked store-degraded; removing from assignment pool"),
+        "false→true transition should log at info"
+    );
+
+    // Merge a derivation. MergeDag calls dispatch_ready afterward
+    // (actor/mod.rs MergeDag arm). With the only worker degraded,
+    // best_worker() returns None → derivation stays Ready.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "sd-drv", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    let info = handle
+        .debug_query_derivation("sd-drv")
+        .await?
+        .expect("sd-drv exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "degraded worker excluded → derivation stays Ready (not Assigned)"
+    );
+    // No assignment in the worker stream either. try_recv after
+    // barrier: any dispatch message would be queued by now.
+    assert!(
+        rx.try_recv().is_err(),
+        "no assignment should land on a degraded worker's stream"
+    );
+
+    // Recovery: clear the flag. This heartbeat ALSO triggers
+    // dispatch_ready → best_worker() now finds the worker →
+    // derivation goes Assigned.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            worker_id: "degraded-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+        })
+        .await?;
+
+    // Assignment should arrive now. recv_assignment has its own 2s
+    // timeout — a missing dispatch fails loudly here rather than
+    // hanging.
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path("sd-drv"),
+        "recovered worker gets the pending assignment"
+    );
+
+    // true → false recovery also logged.
+    assert!(
+        logs_contain("store-degraded cleared; returning to assignment pool"),
+        "true→false recovery should log at info"
     );
 
     Ok(())
