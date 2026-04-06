@@ -491,23 +491,37 @@ mod tests {
         }
     }
 
-    /// `--option max-silent-time N` lands in overrides, not the positional
-    /// slot. ssh-ng clients send positional=0, overrides=[("max-silent-time","N")].
+    // These tests exercise the ClientOptions accessors DESPITE the code
+    // path being UNREACHABLE via ssh-ng:// (see impl-block doc above).
+    // ssh-ng clients NEVER send wopSetOptions (ssh-store.cc empty
+    // override since 088ef8175, P0310 source-verified) and NEVER put
+    // max-silent-time in argv. These accessors go live only if rio-gateway
+    // advertises `set-options-map-only` AND the flake nix input bumps
+    // past 32827b9fb (TODO(P0311)). Tests kept to pin the accessor
+    // semantics for that future path.
+
+    /// Override-wins logic reads `max-silent-time` from overrides.
+    /// **Unreachable via ssh-ng** — and also NOT the daemon-socket path:
+    /// remote-store.cc:131 erases max-silent-time from overrides before
+    /// sending (positional-only). This branch is speculative for a future
+    /// protocol rev.
     #[test]
     fn max_silent_time_reads_from_overrides() {
         let o = opts(0, vec![("max-silent-time".into(), "5".into())]);
         assert_eq!(o.max_silent_time(), 5);
     }
 
-    /// Override wins even when positional is nonzero — explicit user
-    /// `--option` is authoritative.
+    /// Override wins even when positional is nonzero. Same unreachability
+    /// caveat as above.
     #[test]
     fn max_silent_time_override_wins_over_positional() {
         let o = opts(60, vec![("max-silent-time".into(), "5".into())]);
         assert_eq!(o.max_silent_time(), 5);
     }
 
-    /// No override → fall back to positional (older clients, direct API).
+    /// No override → fall back to positional. This is the ONLY live
+    /// branch for `unix://` daemon-socket clients (remote-store.cc:119
+    /// sends maxSilentTime positionally, :131 erases from overrides).
     #[test]
     fn max_silent_time_falls_back_to_positional() {
         let o = opts(30, vec![("other-key".into(), "x".into())]);
