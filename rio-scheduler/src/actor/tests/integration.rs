@@ -470,9 +470,9 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
 ///
 /// Uses `setup()` (no worker): we send ForwardLogBatch directly to the actor,
 /// not via the gRPC BuildExecution stream. With no worker, no dispatch happens,
-/// so the event stream is quiet after BuildStarted — makes the drain loop
+/// so the event stream is quiet after InputsResolved — makes the drain loop
 /// deterministic. (With a worker, DerivationStarted would arrive AFTER
-/// BuildStarted when dispatch fires, which is a perfectly valid ordering but
+/// InputsResolved when dispatch fires, which is a perfectly valid ordering but
 /// complicates the drain.)
 #[tokio::test]
 async fn test_forward_log_batch_reaches_interested_build() -> TestResult {
@@ -482,12 +482,15 @@ async fn test_forward_log_batch_reaches_interested_build() -> TestResult {
         merge_single_node(&handle, build_id, "logtest", PriorityClass::Scheduled).await?;
 
     // Drain merge-time events. With no worker present, dispatch is a no-op,
-    // so after BuildStarted the stream goes quiet until we push a log batch.
+    // so after InputsResolved the stream goes quiet until we push a log
+    // batch. Merge-time sequence: [DerivationCached*] → Started →
+    // InputsResolved. Breaking on InputsResolved (not Started) ensures
+    // we've consumed the full merge-time burst.
     loop {
         let ev = events.recv().await?;
         if matches!(
             ev.event,
-            Some(rio_proto::types::build_event::Event::Started(_))
+            Some(rio_proto::types::build_event::Event::InputsResolved(_))
         ) {
             break;
         }
@@ -532,12 +535,12 @@ async fn test_forward_log_batch_unknown_drv_path_dropped() -> TestResult {
     let mut events =
         merge_single_node(&handle, build_id, "knowndrv", PriorityClass::Scheduled).await?;
 
-    // Drain merge-time events.
+    // Drain merge-time events (through InputsResolved — last merge-time event).
     loop {
         let ev = events.recv().await?;
         if matches!(
             ev.event,
-            Some(rio_proto::types::build_event::Event::Started(_))
+            Some(rio_proto::types::build_event::Event::InputsResolved(_))
         ) {
             break;
         }
@@ -605,13 +608,13 @@ async fn test_forward_log_batch_fanout_to_multiple_interested_builds() -> TestRe
     let mut events2 =
         merge_single_node(&handle, build2, "shared-drv", PriorityClass::Scheduled).await?;
 
-    // Drain merge-time events on both.
+    // Drain merge-time events on both (through InputsResolved).
     for events in [&mut events1, &mut events2] {
         loop {
             let ev = events.recv().await?;
             if matches!(
                 ev.event,
-                Some(rio_proto::types::build_event::Event::Started(_))
+                Some(rio_proto::types::build_event::Event::InputsResolved(_))
             ) {
                 break;
             }

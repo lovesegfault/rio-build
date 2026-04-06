@@ -75,6 +75,7 @@ message BuildEvent {
     BuildCompleted completed = 8;
     BuildFailed failed = 9;
     BuildCancelled cancelled = 10;
+    BuildInputsResolved inputs_resolved = 11;
   }
 }
 
@@ -82,6 +83,23 @@ message BuildStarted {
   uint32 total_derivations = 1;             // Total nodes in DAG
   uint32 cached_derivations = 2;            // Already in store
 }
+
+// Scheduler's store cache-check is complete; dispatch begins next.
+// Fires AFTER BuildStarted, BEFORE the first DerivationEvent::Started.
+// Marks the boundary between "resolving what's already built" and
+// "building what isn't" — the cached/total split was reported in
+// BuildStarted; this signals the scheduler is done with store queries
+// and is moving to dispatch_ready().
+//
+// Empty message: the signal IS the event. If a gateway wants to
+// surface "N derivations to build" via STDERR_NEXT, it subtracts
+// BuildStarted.cached from BuildStarted.total.
+//
+// Originally intended for the Build CRD's InputsResolved condition
+// (phase4c A3), but P0294 ripped that CRD. The event survives for the
+// gateway path — `nix build` clients may want to know when the
+// scheduler has finished cache-resolution.
+message BuildInputsResolved {}
 
 message BuildProgress {
   uint32 completed = 1;                     // Derivations completed so far

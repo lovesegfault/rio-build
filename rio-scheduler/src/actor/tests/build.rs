@@ -434,6 +434,126 @@ async fn test_watch_build_after_failure_replays_failed() -> TestResult {
     Ok(())
 }
 
+/// BuildInputsResolved fires between BuildStarted and the first
+/// dispatch-phase event. On a fresh single-node build with a worker
+/// present, the merge-time event sequence is:
+///   Started → InputsResolved → DerivationEvent::Started (dispatch fired)
+///
+/// This is the signal boundary: "store cache-check done, moving to
+/// dispatch." Originally destined for the Build CRD's InputsResolved
+/// condition; survives for gateway STDERR_NEXT (P0294 ripped the CRD).
+#[tokio::test]
+async fn test_inputs_resolved_fires_between_started_and_dispatch() -> TestResult {
+    use rio_proto::types::build_event::Event;
+
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("inputs-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let mut events =
+        merge_single_node(&handle, build_id, "inputs-drv", PriorityClass::Scheduled).await?;
+
+    // Collect all merge-time + dispatch events. Single-node fresh
+    // build with no cache hits: no DerivationCached events — the
+    // sequence is tight. Drain until DerivationEvent::Started (the
+    // first dispatch-phase event) OR timeout.
+    let mut seq = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event within 2s")?;
+        let discriminant = match &ev.event {
+            Some(Event::Started(_)) => "Started",
+            Some(Event::InputsResolved(_)) => "InputsResolved",
+            Some(Event::Derivation(d)) => match &d.status {
+                Some(rio_proto::types::derivation_event::Status::Started(_)) => "DrvStarted",
+                other => panic!("unexpected DerivationEvent status: {other:?}"),
+            },
+            other => panic!("unexpected event in merge sequence: {other:?}"),
+        };
+        seq.push((ev.sequence, discriminant));
+        if discriminant == "DrvStarted" {
+            break;
+        }
+    }
+
+    // Precondition: we actually collected enough to assert ordering.
+    // Without this, a "proves nothing" shortcut (e.g., the loop
+    // breaking on the first iteration) would pass trivially.
+    assert!(
+        seq.len() >= 3,
+        "expected ≥3 events (Started, InputsResolved, DrvStarted); got {seq:?}"
+    );
+
+    // Find positions by discriminant.
+    let pos = |name: &str| {
+        seq.iter()
+            .position(|(_, d)| *d == name)
+            .unwrap_or_else(|| panic!("{name} missing from sequence {seq:?}"))
+    };
+    let started_at = pos("Started");
+    let resolved_at = pos("InputsResolved");
+    let drv_at = pos("DrvStarted");
+
+    assert!(
+        started_at < resolved_at,
+        "Started must precede InputsResolved: {seq:?}"
+    );
+    assert!(
+        resolved_at < drv_at,
+        "InputsResolved must precede first dispatch: {seq:?}"
+    );
+
+    // Sequence numbers are monotonic — emit_build_event bumps seq
+    // per call; InputsResolved consumed a seq between them.
+    assert!(
+        seq[started_at].0 < seq[resolved_at].0 && seq[resolved_at].0 < seq[drv_at].0,
+        "sequence numbers must be strictly increasing: {seq:?}"
+    );
+
+    Ok(())
+}
+
+/// InputsResolved also fires on the all-cached fast path — "resolved
+/// to zero work" is still resolved. No worker needed: with no worker
+/// AND no cache hits, a fresh node would sit Created forever (dispatch
+/// is a no-op). So we observe this via sequence alone: Started →
+/// InputsResolved → (no dispatch, build waits). The test just checks
+/// InputsResolved arrives even when dispatch_ready() is a no-op.
+#[tokio::test]
+async fn test_inputs_resolved_fires_without_worker() -> TestResult {
+    use rio_proto::types::build_event::Event;
+
+    // No worker: dispatch_ready() is a no-op. The event must still fire.
+    let (_db, handle, _task) = setup().await;
+    let build_id = Uuid::new_v4();
+    let mut events =
+        merge_single_node(&handle, build_id, "noworker-drv", PriorityClass::Scheduled).await?;
+
+    let mut saw_started = false;
+    let mut saw_resolved = false;
+    // Two recv()s suffice: fresh node, no cache-hit events, no
+    // dispatch events. Merge emits exactly Started → InputsResolved.
+    for _ in 0..2 {
+        let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event within 2s")?;
+        match ev.event {
+            Some(Event::Started(_)) => saw_started = true,
+            Some(Event::InputsResolved(_)) => {
+                assert!(
+                    saw_started,
+                    "InputsResolved arrived before Started (ordering bug)"
+                );
+                saw_resolved = true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(saw_resolved, "InputsResolved never fired");
+
+    Ok(())
+}
+
 /// Same for Cancelled.
 #[tokio::test]
 async fn test_watch_build_after_cancel_replays_cancelled() -> TestResult {
