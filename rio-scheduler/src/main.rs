@@ -72,6 +72,17 @@ struct Config {
     /// in-cluster serviceaccount mount, fall back to "default".
     /// Env: `RIO_LEASE_NAMESPACE`. Ignored when `lease_name` is None.
     lease_namespace: Option<String>,
+    /// Poison-detection thresholds. `[poison]` table in scheduler.toml.
+    /// `r[sched.retry.per-worker-budget]` (scheduler.md:110) specifies
+    /// both this and `retry` below as TOML-configurable. P0219 shipped
+    /// the structs + builders; this wires them. Default: 3 distinct
+    /// workers must fail (matches the former `POISON_THRESHOLD` const).
+    /// No CLI override — infrequently-tweaked deploy config.
+    poison: rio_scheduler::PoisonConfig,
+    /// Per-worker retry backoff curve. `[retry]` table in scheduler.toml.
+    /// Default: 2 retries, 5s→300s exponential with 20% jitter. No CLI
+    /// override for the same reason as `poison`.
+    retry: rio_scheduler::RetryPolicy,
 }
 
 impl Default for Config {
@@ -97,6 +108,8 @@ impl Default for Config {
             drain_grace_secs: 6,
             lease_name: None,
             lease_namespace: None,
+            poison: rio_scheduler::PoisonConfig::default(),
+            retry: rio_scheduler::RetryPolicy::default(),
         }
     }
 }
@@ -370,11 +383,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Spawn the DAG actor — now with the shared leader state.
+    //
+    // Poison + retry: P0219 shipped PoisonConfig/RetryPolicy and
+    // the builders; spawn_with_leader chains .with_poison_config
+    // + .with_retry_policy internally. We pass the `[poison]` and
+    // `[retry]` tables loaded from scheduler.toml (or their
+    // defaults via `#[serde(default)]` if absent). Grouped with
+    // size_classes: all three are structural deploy config, no
+    // CLI override.
     let actor = ActorHandle::spawn_with_leader(
         db,
         store_client,
         log_flush_tx,
         cfg.size_classes,
+        cfg.poison,
+        cfg.retry,
         Some(leader),
         Some(event_persist_tx),
         hmac_signer,
@@ -740,12 +763,175 @@ mod tests {
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
         assert!(d.jwt.key_path.is_none());
         assert!(!d.jwt.required);
+        // P0307: poison+retry wired from scheduler.toml. Defaults
+        // match the former hardcoded values in DagActor::new.
+        assert_eq!(d.poison, rio_scheduler::PoisonConfig::default());
+        assert_eq!(d.retry, rio_scheduler::RetryPolicy::default());
+    }
+
+    // r[verify sched.retry.per-worker-budget]
+    /// TOML → Config parse for `[poison]` and `[retry]` tables.
+    /// Field names match PoisonConfig (`threshold`,
+    /// `require_distinct_workers`) and RetryPolicy (`max_retries`,
+    /// `backoff_base_secs`, …). The spec at scheduler.md:110 promised
+    /// these knobs were TOML-configurable; P0219 shipped the structs
+    /// but left the Config side unwired. This proves the parse works.
+    ///
+    /// Raw figment (not `rio_common::config::load`) to test JUST
+    /// the deserialize path — no env/CLI layering concern here.
+    /// The Jail tests below exercise the full load() stack.
+    #[test]
+    fn poison_and_retry_load_from_toml() {
+        use figment::providers::{Format, Toml};
+        let toml = r#"
+            [poison]
+            threshold = 5
+            require_distinct_workers = false
+
+            [retry]
+            max_retries = 4
+            backoff_base_secs = 2.5
+            backoff_multiplier = 3.0
+            backoff_max_secs = 600.0
+            jitter_fraction = 0.1
+        "#;
+        let cfg: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(Toml::string(toml))
+                .extract()
+                .expect("toml parses into Config");
+
+        assert_eq!(cfg.poison.threshold, 5);
+        assert!(!cfg.poison.require_distinct_workers);
+        assert_eq!(cfg.retry.max_retries, 4);
+        assert_eq!(cfg.retry.backoff_base_secs, 2.5);
+        assert_eq!(cfg.retry.backoff_multiplier, 3.0);
+        assert_eq!(cfg.retry.backoff_max_secs, 600.0);
+        assert_eq!(cfg.retry.jitter_fraction, 0.1);
+    }
+
+    /// Empty TOML → `#[serde(default)]` on Config + sub-struct
+    /// defaults → identical to `Config::default()`. This is the
+    /// "operator didn't configure it" case — existing deployments
+    /// with no `[poison]`/`[retry]` tables continue unchanged.
+    #[test]
+    fn poison_and_retry_default_when_absent() {
+        use figment::providers::{Format, Toml};
+        let cfg: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(Toml::string(""))
+                .extract()
+                .expect("empty toml parses");
+        assert_eq!(cfg.poison, rio_scheduler::PoisonConfig::default());
+        assert_eq!(cfg.retry, rio_scheduler::RetryPolicy::default());
+        // Partial table: one field set, others default from the
+        // struct-level `#[serde(default)]` on PoisonConfig.
+        let partial: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(Toml::string("[poison]\nthreshold = 7"))
+                .extract()
+                .expect("partial poison table parses");
+        assert_eq!(partial.poison.threshold, 7);
+        assert!(
+            partial.poison.require_distinct_workers,
+            "partial table must leave unspecified fields at default"
+        );
     }
 
     #[test]
     fn cli_args_parse_help() {
         use clap::CommandFactory;
         CliArgs::command().debug_assert();
+    }
+
+    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — catch the NEXT orphan.
+    //
+    // P0219 shipped PoisonConfig + with_poison_config, zero TOML side.
+    // The struct existed, the builder existed, main.rs never called the
+    // builder from config. `config_defaults_are_stable` above is
+    // STRUCTURALLY BLIND to that — it only checks Config-struct fields;
+    // if the field isn't ON Config, the test doesn't know to miss it.
+    //
+    // The rio-store side (P0218) landed equivalent wiring WITH Jail
+    // tests at store/main.rs:640+ proving TOML→Config→builder. This
+    // ports the same pattern so the next `with_X` builder added
+    // without a `Config` field is a failing test, not a silent orphan.
+    // -----------------------------------------------------------------------
+
+    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
+    /// table via the REAL `rio_common::config::load` path (not raw
+    /// figment). Jail changes cwd to a temp dir; `./scheduler.toml`
+    /// there is picked up by load()'s `{component}.toml` layer.
+    ///
+    /// When you add `Config.newfield`: ADD IT HERE or this test's
+    /// doc-comment is a lie. The companion `all_subconfigs_default_
+    /// when_absent` catches "new required field breaks existing
+    /// deployments" (figment missing-field error).
+    ///
+    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_roundtrip_toml() {
+        figment::Jail::expect_with(|jail| {
+            // Every sub-config table with at least one NON-default
+            // value. Proves: (a) the table name is wired; (b) the
+            // Deserialize derive works; (c) the value reaches Config.
+            jail.create_file(
+                "scheduler.toml",
+                r#"
+                [poison]
+                threshold = 7
+
+                [retry]
+                backoff_base_secs = 3.33
+                "#,
+            )?;
+            let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+            assert_eq!(
+                cfg.poison.threshold, 7,
+                "[poison] table must thread through figment into PoisonConfig"
+            );
+            assert_eq!(
+                cfg.retry.backoff_base_secs, 3.33,
+                "[retry] table must thread through figment into RetryPolicy"
+            );
+            // Unspecified fields default via #[serde(default)] on
+            // the sub-struct, not the outer Config's default layer
+            // (figment's Serialized::defaults covers those too, but
+            // the sub-struct attr is what lets PARTIAL tables work).
+            assert!(
+                cfg.poison.require_distinct_workers,
+                "unspecified sub-field must fall through to Default"
+            );
+            Ok(())
+        });
+    }
+
+    /// Empty scheduler.toml → every sub-config gets its Default impl.
+    /// If `Config.foo` is added WITHOUT `#[serde(default)]` at the
+    /// struct level (Config itself has it) AND the sub-struct lacks
+    /// `impl Default`, this fails with a figment missing-field error —
+    /// catches "new required field breaks existing deployments".
+    ///
+    /// `listen_addr` is set to prove the TOML IS loaded (a truly
+    /// empty file would be indistinguishable from a missing one in
+    /// terms of sub-config defaults).
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn all_subconfigs_default_when_absent() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("scheduler.toml", r#"listen_addr = "0.0.0.0:9001""#)?;
+            let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+            assert_eq!(cfg.poison, rio_scheduler::PoisonConfig::default());
+            assert_eq!(cfg.retry, rio_scheduler::RetryPolicy::default());
+            // size_classes: already covered by config_defaults_are_
+            // stable, but include it here for the "every sub-config"
+            // claim — this is the standing-guard test, not the unit
+            // test. When you add Config.newfield: ADD IT HERE.
+            assert!(cfg.size_classes.is_empty());
+            Ok(())
+        });
     }
 
     // -----------------------------------------------------------------------

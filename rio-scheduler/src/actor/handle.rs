@@ -70,6 +70,11 @@ impl ActorHandle {
             store_client,
             log_flush_tx,
             size_classes,
+            // Test/bench default: poison+retry match `DagActor::new`'s
+            // hardcoded defaults. Only production main.rs loads these
+            // from scheduler.toml.
+            PoisonConfig::default(),
+            RetryPolicy::default(),
             None,
             None,
             None,
@@ -96,6 +101,8 @@ impl ActorHandle {
         store_client: Option<StoreServiceClient<Channel>>,
         log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
         size_classes: Vec<crate::assignment::SizeClassConfig>,
+        poison_config: PoisonConfig,
+        retry_policy: RetryPolicy,
         leader: Option<crate::lease::LeaderState>,
         event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
         hmac_signer: Option<rio_common::hmac::HmacSigner>,
@@ -104,6 +111,18 @@ impl ActorHandle {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let mut actor = DagActor::new(db, store_client)
             .with_size_classes(size_classes)
+            // r[impl sched.retry.per-worker-budget]
+            // scheduler.md:110 — "Both knobs are configurable via
+            // scheduler.toml". P0219 shipped the structs + builders;
+            // this threads the TOML-loaded values through. The
+            // `DagActor::new` defaults (RetryPolicy::default(),
+            // PoisonConfig::default()) are immediately replaced by
+            // whatever main.rs loaded — which is ALSO Default::
+            // default() in the no-config case via `#[serde(default)]`.
+            // Net effect: same behavior unless the operator writes
+            // a `[poison]` or `[retry]` table.
+            .with_poison_config(poison_config)
+            .with_retry_policy(retry_policy)
             .with_shutdown_token(shutdown);
         if let Some(flush_tx) = log_flush_tx {
             actor = actor.with_log_flusher(flush_tx);

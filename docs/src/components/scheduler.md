@@ -118,11 +118,28 @@ build's fault. `TransientFailure` (build ran, exited non-zero, might
 succeed elsewhere) DOES count. Worker disconnect DOES count — a build
 that crashes the daemon 3× is poisoned; false-positives from unrelated
 worker deaths are cleared by `rio-cli poison clear`. Both knobs are
-configurable via `scheduler.toml`: `poison_threshold` (default 3,
-current POISON_THRESHOLD), `require_distinct_workers` (default true —
+configurable via `scheduler.toml`: `threshold` (default 3, the former
+`POISON_THRESHOLD` const), `require_distinct_workers` (default true —
 HashSet semantics; false = any N failures poison, for single-worker
-dev deployments). `failed_workers` persisted to PG; infrastructure
-retry count is in-memory only.
+dev deployments). The retry backoff curve is likewise a `[retry]`
+table. `failed_workers` persisted to PG; infrastructure retry count
+is in-memory only.
+
+```toml
+# scheduler.toml — poison + retry knobs. All fields optional; absent
+# keys fall through to the Default impl shown in comments.
+[poison]
+threshold = 3                      # failures before derivation is poisoned
+require_distinct_workers = true    # HashSet: N DISTINCT workers must fail
+                                   # (false = flat counter; single-worker dev)
+
+[retry]
+max_retries = 2                    # retries for transient failures
+backoff_base_secs = 5.0            # first-attempt backoff
+backoff_multiplier = 2.0           # exponential growth
+backoff_max_secs = 300.0           # clamp (inf would panic from_secs_f64)
+jitter_fraction = 0.2              # ± fractional jitter on each backoff
+```
 
 r[sched.admin.list-workers]
 
