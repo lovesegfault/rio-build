@@ -236,11 +236,17 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_retries: 2,
-            // 10× the transient bound: a genuinely flapping executor
-            // gets plenty of attempts before giving up, but a
-            // deterministic misclassified failure poisons within
-            // seconds-to-minutes instead of looping for hours.
-            max_infra_retries: 20,
+            // InfrastructureFailure has NO backoff (re-dispatch is
+            // immediate) so a misclassified permanent failure hot-loops.
+            // Observed: 12 derivations cycled 146 times in 6 minutes
+            // when an S3 auth failure was reported as infra. Each cycle
+            // re-ran the full build. At 20 (the old default), that's
+            // ~240 wasted builds before the batch poisons. At 5, a
+            // genuinely flapping worker still gets a fair shot (5
+            // immediate retries finishes in seconds for a fast build)
+            // but a permanent failure surfaces as poison in under a
+            // minute instead of chewing through the cluster.
+            max_infra_retries: 5,
             backoff_base_secs: 5.0,
             backoff_multiplier: 2.0,
             backoff_max_secs: 300.0,

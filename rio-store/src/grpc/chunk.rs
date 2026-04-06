@@ -231,7 +231,7 @@ impl ChunkService for ChunkServiceImpl {
             .backend()
             .put(&digest, Bytes::from(buf))
             .await
-            .map_err(|e| internal_error("PutChunk backend put", e))?;
+            .map_err(|e| storage_error("PutChunk backend put", e))?;
 
         // PG row at refcount=0. `created_at` DEFAULT now() is the
         // grace-TTL clock start. `ON CONFLICT DO NOTHING`: if another

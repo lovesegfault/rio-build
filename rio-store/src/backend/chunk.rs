@@ -28,8 +28,63 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use bytes::Bytes;
 use tracing::debug;
+
+/// Marker error: backend rejected the request due to auth/config, not a
+/// transient fault. When this is in an anyhow chain, the grpc layer maps
+/// to `FailedPrecondition` (non-retriable) instead of `Internal` — so a
+/// client seeing STS AccessDenied fails fast instead of retrying forever.
+///
+/// Unit struct (no fields): the detailed message lives in the anyhow
+/// `.context(...)` layer above this marker. The marker's only job is to
+/// be `downcast_ref`-able from the grpc layer.
+#[derive(Debug, thiserror::Error)]
+#[error("storage backend authentication/configuration error")]
+pub struct BackendAuthError;
+
+/// Classify an AWS SDK error as permanent auth/config failure vs transient.
+///
+/// Covers two shapes:
+/// 1. **Service-level auth** — request reached S3, S3 replied with an
+///    auth error code. `ProvideErrorMetadata::code()` exposes these.
+/// 2. **Credential-provider auth** — request never left: STS
+///    AssumeRoleWithWebIdentity denied, IMDS unreachable, expired
+///    token, etc. Surfaces as `DispatchFailure` with `.code() == None`
+///    and the denial buried in the source chain. The Display impl
+///    flattens the chain — string-matching is imprecise but the
+///    alternative is exhaustively matching aws-smithy internal types.
+///
+/// False negative (auth error classified as transient) → client retries
+/// a few times then gives up; annoying but safe. False positive
+/// (transient classified as auth) → client gives up on a recoverable
+/// error; bad. The code-list is conservative (well-known AWS auth
+/// codes only) and the string match is narrowed to the flattened
+/// Display specifically to bias toward false negatives.
+fn is_permanent_auth_error<E: ProvideErrorMetadata + std::fmt::Display>(e: &E) -> bool {
+    // Service-level: explicit S3/IAM error codes.
+    if let Some(code) = e.code()
+        && matches!(
+            code,
+            "AccessDenied"
+                | "InvalidAccessKeyId"
+                | "SignatureDoesNotMatch"
+                | "TokenRefreshRequired"
+                | "ExpiredToken"
+                | "InvalidToken"
+        )
+    {
+        return true;
+    }
+    // Credential-provider level: STS denial or credential-chain
+    // exhaustion buried in DispatchFailure. Display flattens the
+    // source chain. "AccessDenied" catches the STS response body;
+    // "credentials" (lowercase) catches the sdk's own "failed to
+    // load credentials" wrapper.
+    let display = format!("{e}");
+    display.contains("AccessDenied") || display.contains("credentials")
+}
 
 /// Trait for chunk storage backends.
 #[async_trait::async_trait]
@@ -361,6 +416,18 @@ pub struct S3ChunkBackend {
 
 impl S3ChunkBackend {
     pub fn new(client: Client, bucket: String, prefix: String) -> Self {
+        // Normalize: strip trailing slashes. `s3_key()` below joins with
+        // a literal "/chunks/", so a prefix of "chunks/" would produce
+        // "chunks//chunks/ab/..." — which S3 treats as a DISTINCT key
+        // from "chunks/chunks/ab/..." (no path normalization). Observed
+        // on EKS with `prefix = "chunks/"` from the Helm chart: every
+        // PutObject wrote to the double-slash key, every GetObject
+        // looked there too (consistent with itself), but inspection/
+        // cleanup tooling that expects the documented key scheme missed
+        // them. Stripping leading slashes too would be surprising (a
+        // prefix of "/foo" is unusual but intentional); trailing is
+        // almost always a config mistake.
+        let prefix = prefix.trim_end_matches('/').to_string();
         Self {
             client,
             bucket,
@@ -392,7 +459,18 @@ impl ChunkBackend for S3ChunkBackend {
             .body(data.into())
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("S3 PutObject failed for {key}: {e}"))?;
+            .map_err(|e| {
+                let msg = format!("S3 PutObject failed for {key}: {e}");
+                if is_permanent_auth_error(&e) {
+                    // Root the anyhow chain at BackendAuthError so the
+                    // grpc layer's storage_error() can downcast_ref it.
+                    // The detailed message is .context() on top — logs
+                    // see the full chain, client sees only the category.
+                    anyhow::Error::new(BackendAuthError).context(msg)
+                } else {
+                    anyhow::anyhow!(msg)
+                }
+            })?;
 
         Ok(())
     }
@@ -743,9 +821,33 @@ mod tests {
             format!("myprefix/chunks/ab/{}", "ab".repeat(32))
         );
 
-        let no_prefix = S3ChunkBackend::new(client, "b".into(), "".into());
+        let no_prefix = S3ChunkBackend::new(client.clone(), "b".into(), "".into());
         assert_eq!(
             no_prefix.s3_key(&HASH_C),
+            format!("chunks/ab/{}", "ab".repeat(32))
+        );
+
+        // Trailing slash normalized away at construction. Regression:
+        // Helm chart set prefix="chunks/" → "chunks//chunks/ab/..." keys.
+        let trailing = S3ChunkBackend::new(client.clone(), "b".into(), "chunks/".into());
+        assert_eq!(
+            trailing.s3_key(&HASH_C),
+            format!("chunks/chunks/ab/{}", "ab".repeat(32)),
+            "trailing slash in prefix must not produce double-slash key"
+        );
+        assert!(!trailing.s3_key(&HASH_C).contains("//"));
+
+        // Multiple trailing slashes also stripped.
+        let multi_trailing = S3ChunkBackend::new(client.clone(), "b".into(), "prod///".into());
+        assert_eq!(
+            multi_trailing.s3_key(&HASH_C),
+            format!("prod/chunks/ab/{}", "ab".repeat(32))
+        );
+
+        // Prefix of just "/" → same as empty.
+        let slash_only = S3ChunkBackend::new(client, "b".into(), "/".into());
+        assert_eq!(
+            slash_only.s3_key(&HASH_C),
             format!("chunks/ab/{}", "ab".repeat(32))
         );
     }

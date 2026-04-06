@@ -765,7 +765,7 @@ pub(super) fn truncate_plan(plan: &[SpawnDirective], budget: usize) -> Vec<Spawn
             }
             // Hand out the residue (remaining - distributed), largest-
             // remainder first. Stable sort preserves plan-order on ties.
-            residues.sort_by(|a, b| b.1.cmp(&a.1));
+            residues.sort_by_key(|&(_, r)| std::cmp::Reverse(r));
             for (i, _) in residues.into_iter().take(remaining - distributed) {
                 out[i].count += 1;
             }
