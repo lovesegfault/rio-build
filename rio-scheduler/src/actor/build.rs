@@ -252,8 +252,10 @@ impl DagActor {
         Ok(rio_proto::types::BuildStatus {
             build_id: build_id.to_string(),
             state: proto_state.into(),
-            total_derivations: summary.total,
-            completed_derivations: summary.completed,
+            // I-111: summary.{total,completed} are DAG-relative; after
+            // recovery the DAG only holds non-terminal-at-recovery drvs.
+            total_derivations: build.total_count,
+            completed_derivations: build.recovered_completed + summary.completed,
             cached_derivations: build.cached_count,
             running_derivations: summary.running,
             failed_derivations: summary.failed,
@@ -362,11 +364,17 @@ impl DagActor {
         // I-103: persist denormalized counts so list_builds is O(LIMIT).
         // Best-effort — these are display columns; recovery re-runs this
         // for active builds, so a missed write self-heals on failover.
-        let total = build.derivation_hashes.len() as u32;
+        // I-111: persist ABSOLUTE counts. After recovery the DAG only
+        // holds drvs that were non-terminal at recovery, so
+        // summary.completed and derivation_hashes.len() are relative to
+        // that subset. total_count + recovered_completed are seeded from
+        // PG at recovery (0-offset for fresh builds).
+        let total = build.total_count;
+        let completed = build.recovered_completed + summary.completed;
         let cached = build.cached_count;
         if let Err(e) = self
             .db
-            .persist_build_counts(build_id, total, summary.completed, cached)
+            .persist_build_counts(build_id, total, completed, cached)
             .await
         {
             debug!(build_id = %build_id, error = %e,

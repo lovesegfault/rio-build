@@ -336,6 +336,80 @@ async fn test_recovery_completes_all_terminal_build() -> TestResult {
     Ok(())
 }
 
+/// I-111: recovery must seed total/completed/cached from the
+/// `builds.{total,completed,cached}_drvs` denorm columns, NOT recompute
+/// from the in-memory DAG. The DAG only loads non-terminal drvs, so
+/// `derivation_hashes.len()` after recovery is the *remaining* count,
+/// not the total. Pre-fix, `update_build_counts` persisted that back to
+/// PG and the dashboard showed 0/443 for a build that was at 1111/1555.
+#[tokio::test]
+async fn test_recovery_seeds_denorm_counts_from_pg() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: write a 3-drv chain via a real actor ---
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let _rx = merge_chain(
+            &handle,
+            build_id,
+            &["i111-a", "i111-b", "i111-c"],
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate: 2 of 3 drvs completed (terminal — NOT loaded into DAG
+    // at recovery), 1 remains queued. Denorm columns say 100/50/12 —
+    // deliberately distinct from what the DAG would compute (3/0/0
+    // pre-fix would persist as 1/0/0 since only 1 drv loads).
+    sqlx::query(
+        "UPDATE derivations SET status = 'completed' \
+         WHERE drv_hash IN ('i111-a', 'i111-b')",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE builds SET total_drvs = 100, completed_drvs = 50, cached_drvs = 12 \
+         WHERE build_id = $1",
+    )
+    .bind(build_id)
+    .execute(&db.pool)
+    .await?;
+
+    // --- Phase 2: fresh actor recovers ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // recover_from_pg's post-load sweep calls update_build_counts for
+    // every active build. Pre-fix that wrote (1, 0, 0) — derivation_
+    // hashes.len()=1, summary.completed=0. Post-fix it writes
+    // (total_count=100, recovered_completed+0=50, cached_count=12).
+    let (total, completed, cached): (i32, i32, i32) = sqlx::query_as(
+        "SELECT total_drvs, completed_drvs, cached_drvs FROM builds WHERE build_id = $1",
+    )
+    .bind(build_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        (total, completed, cached),
+        (100, 50, 12),
+        "recovery must preserve PG denorm counts, not recompute from DAG"
+    );
+
+    // In-memory BuildStatus should also report the absolute counts.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.total_derivations, 100, "total_derivations");
+    assert_eq!(status.completed_derivations, 50, "completed_derivations");
+    assert_eq!(status.cached_derivations, 12, "cached_derivations");
+
+    Ok(())
+}
+
 /// Merge a linear chain: nodes[0] ← nodes[1] ← ... ← nodes[n-1]
 /// (each depends on the previous). Helper for recovery tests that
 /// need a multi-node DAG in PG.

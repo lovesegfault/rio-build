@@ -815,7 +815,7 @@ impl StoreService for StoreServiceImpl {
     /// I-110: builder closure-BFS path. Local-only — NO upstream
     /// substitution and NO sig-visibility gate (both add per-path
     /// round-trips, defeating the batch). Callers needing those use
-    /// [`query_path_info`]. The builder (the only current caller) sends
+    /// `query_path_info`. The builder (the only current caller) sends
     /// no tenant token, so neither would apply anyway.
     #[instrument(skip(self, request), fields(rpc = "BatchQueryPathInfo"))]
     async fn batch_query_path_info(
