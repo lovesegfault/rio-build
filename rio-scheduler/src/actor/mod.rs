@@ -161,6 +161,15 @@ pub struct DagActor {
     /// `.await` on the same task blocks the executor thread. See
     /// dispatch.rs: guards are dropped before any await boundary.
     size_classes: Arc<parking_lot::RwLock<Vec<crate::assignment::SizeClassConfig>>>,
+    /// Static TOML cutoffs, captured once in `with_size_classes()`
+    /// BEFORE the rebalancer's first write. The rebalancer mutates
+    /// `size_classes[i].cutoff_secs` in-place hourly; without this
+    /// snapshot, there's no way to report drift to operators.
+    /// `(name, cutoff_secs)` pairs — HashMap would be idiomatic but
+    /// Vec preserves config order (matters for the RPC response which
+    /// sorts by effective cutoff, but configured order is useful for
+    /// logging).
+    configured_cutoffs: Vec<(String, f64)>,
     /// Channel to the LogFlusher task. Completion handlers `try_send` a
     /// FlushRequest here so the S3 upload is ordered AFTER the state
     /// transition (hybrid model: buffer outside actor, flush triggered by
@@ -272,6 +281,7 @@ impl DagActor {
             generation: Arc::new(AtomicU64::new(1)),
             self_tx: None,
             size_classes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            configured_cutoffs: Vec::new(),
             log_flush_tx: None,
             // Default true: non-K8s mode, always leader.
             // with_leader_flag() overrides for K8s deployments.
@@ -323,6 +333,13 @@ impl DagActor {
     /// tests don't need it, and deployments without size-class routing
     /// (VM tests phase1a/1b/2a/2b) leave size_classes unconfigured.
     pub fn with_size_classes(mut self, classes: Vec<crate::assignment::SizeClassConfig>) -> Self {
+        // Snapshot the as-loaded cutoffs BEFORE the rebalancer sees
+        // them. GetSizeClassSnapshot reports both: effective (mutated
+        // hourly) vs configured (this snapshot) for drift visibility.
+        self.configured_cutoffs = classes
+            .iter()
+            .map(|c| (c.name.clone(), c.cutoff_secs))
+            .collect();
         self.size_classes = Arc::new(parking_lot::RwLock::new(classes));
         self
     }
@@ -489,6 +506,9 @@ impl DagActor {
                 }
                 ActorCommand::ClusterSnapshot { reply } => {
                     let _ = reply.send(self.compute_cluster_snapshot());
+                }
+                ActorCommand::GetSizeClassSnapshot { reply } => {
+                    let _ = reply.send(self.compute_size_class_snapshot());
                 }
                 ActorCommand::ClearPoison { drv_hash, reply } => {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
@@ -914,6 +934,121 @@ impl DagActor {
             queued_derivations: self.ready_queue.len() as u32,
             running_derivations,
         }
+    }
+
+    /// Compute per-size-class snapshot for `GetSizeClassStatus`.
+    ///
+    /// Three passes:
+    /// 1. `size_classes.read()` → effective cutoffs (post-rebalancer)
+    /// 2. `configured_cutoffs` lookup → static TOML cutoffs
+    /// 3. Single `iter_nodes()` pass: for each derivation, increment
+    ///    the appropriate class's `queued` or `running` counter.
+    ///
+    /// For **queued**: Ready-status derivations. They haven't been
+    /// dispatched yet so `assigned_size_class` is None. We call
+    /// `classify()` with the SAME inputs dispatch would use
+    /// (est_duration + estimator peaks) — this is a forecast, not a
+    /// fact. If the rebalancer shifts cutoffs between this call and
+    /// actual dispatch, the class may differ. Acceptable for an
+    /// operator view.
+    ///
+    /// For **running**: Assigned/Running derivations. Use
+    /// `assigned_size_class` directly — that's the class we ACTUALLY
+    /// routed to (may be larger than classify() would give if we
+    /// overflowed due to no capacity in the target class).
+    ///
+    /// O(dag_nodes + n_classes) per call. The classify() inside the
+    /// loop is O(n_classes) but n_classes is ~3-5. Total cost is
+    /// dominated by the node iteration, same as `compute_cluster_snapshot`.
+    // pub(crate) for the configured-vs-effective test (tests/misc.rs)
+    // which exercises it on a bare (unspawned) actor so it can mutate
+    // size_classes directly to simulate a rebalancer pass.
+    pub(crate) fn compute_size_class_snapshot(&self) -> Vec<SizeClassSnapshot> {
+        // Take a read lock for the whole computation. Rebalancer
+        // writes hourly; contention is near-zero. Dropped at end of
+        // scope (no await in this fn).
+        let classes = self.size_classes.read();
+        if classes.is_empty() {
+            // Feature off — return empty. Handler maps to empty
+            // response which the CLI can render as "size-class
+            // routing disabled."
+            return Vec::new();
+        }
+
+        // name → index into `snapshots`. classify() and
+        // assigned_size_class both return names, not indices.
+        let mut index: HashMap<String, usize> = HashMap::with_capacity(classes.len());
+        let mut snapshots: Vec<SizeClassSnapshot> = classes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                index.insert(c.name.clone(), i);
+                // configured_cutoffs lookup: linear scan is fine for
+                // ~3-5 classes. Falls back to effective if not found
+                // (shouldn't happen — both populated from the same
+                // config in with_size_classes, but defensive against
+                // a future config-reload path that forgets one).
+                let configured = self
+                    .configured_cutoffs
+                    .iter()
+                    .find(|(n, _)| n == &c.name)
+                    .map(|(_, cut)| *cut)
+                    .unwrap_or(c.cutoff_secs);
+                SizeClassSnapshot {
+                    name: c.name.clone(),
+                    effective_cutoff_secs: c.cutoff_secs,
+                    configured_cutoff_secs: configured,
+                    queued: 0,
+                    running: 0,
+                }
+            })
+            .collect();
+
+        // Single pass: classify or look up per derivation.
+        for (_, state) in self.dag.iter_nodes() {
+            match state.status() {
+                DerivationStatus::Ready => {
+                    // Forecast: what class WOULD dispatch pick?
+                    // Same inputs as dispatch.rs:82-92 — est_duration
+                    // stored on the state at merge time; peak_memory
+                    // / peak_cpu from the estimator.
+                    if let Some(class) = crate::assignment::classify(
+                        state.est_duration,
+                        self.estimator
+                            .peak_memory(state.pname.as_deref(), &state.system),
+                        self.estimator
+                            .peak_cpu(state.pname.as_deref(), &state.system),
+                        &classes,
+                    ) && let Some(&i) = index.get(&class)
+                    {
+                        snapshots[i].queued += 1;
+                    }
+                }
+                DerivationStatus::Assigned | DerivationStatus::Running => {
+                    // Fact: what class DID we dispatch to?
+                    // assigned_size_class reflects overflow — if the
+                    // target was "small" but only "large" had
+                    // capacity, this says "large". That's the
+                    // operator-relevant answer for "where are my
+                    // workers busy?"
+                    if let Some(class) = &state.assigned_size_class
+                        && let Some(&i) = index.get(class)
+                    {
+                        snapshots[i].running += 1;
+                    }
+                }
+                // Terminal + pre-Ready: neither queued nor running.
+                _ => {}
+            }
+        }
+
+        // Sort by effective cutoff ascending — smallest class first.
+        // The proto doc says "sorted by effective_cutoff_secs";
+        // consumers (P0236's CLI table, P0234's autoscaler) can rely
+        // on this order. total_cmp for NaN-safety (same defense as
+        // assignment.rs:106).
+        snapshots.sort_by(|a, b| a.effective_cutoff_secs.total_cmp(&b.effective_cutoff_secs));
+        snapshots
     }
 
     // -----------------------------------------------------------------------

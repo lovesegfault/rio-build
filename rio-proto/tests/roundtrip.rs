@@ -9,7 +9,7 @@
 //! and the new receiver reads the proto3 default.
 
 use prost::Message;
-use rio_proto::types::HeartbeatRequest;
+use rio_proto::types::{GetSizeClassStatusResponse, HeartbeatRequest, SizeClassStatus};
 
 /// `store_degraded` (field 9) defaults to false through a full
 /// encode/decode cycle. Wire-compatibility: an old worker that
@@ -22,4 +22,39 @@ fn heartbeat_request_store_degraded_default_false() {
     let bytes = req.encode_to_vec();
     let decoded = HeartbeatRequest::decode(&*bytes).unwrap();
     assert!(!decoded.store_degraded);
+}
+
+/// `SizeClassStatus` roundtrip. The dashboard (P0236) and autoscaler
+/// (P0234) both decode this; a field-number collision or type mismatch
+/// would silently zero a field on decode. Pin all six fields survive.
+///
+/// double fields get NaN-safety from prost (encodes NaN, decodes NaN)
+/// but we don't send NaN — the actor computes from finite cutoffs.
+/// Pinning a specific nonzero value here catches "field not wired"
+/// (which would read as 0.0).
+#[test]
+fn sizeclass_status_proto_roundtrip() {
+    let orig = GetSizeClassStatusResponse {
+        classes: vec![
+            SizeClassStatus {
+                name: "small".into(),
+                effective_cutoff_secs: 62.5,
+                configured_cutoff_secs: 60.0,
+                queued: 5,
+                running: 3,
+                sample_count: 142,
+            },
+            SizeClassStatus {
+                name: "large".into(),
+                effective_cutoff_secs: 1800.0,
+                configured_cutoff_secs: 1800.0,
+                queued: 0,
+                running: 1,
+                sample_count: 17,
+            },
+        ],
+    };
+    let bytes = orig.encode_to_vec();
+    let decoded = GetSizeClassStatusResponse::decode(&*bytes).unwrap();
+    assert_eq!(orig, decoded);
 }

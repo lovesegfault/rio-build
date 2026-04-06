@@ -991,3 +991,44 @@ message CreateEphemeralWorkerResponse {
   // it as infra-failure if no heartbeat within a timeout.
   string job_name = 1;
 }
+
+// ── SITA-E size-class status (GetSizeClassStatus) ──────────────────────
+// Live snapshot of the rebalancer's state: effective vs configured
+// cutoffs, per-class queue depth, sample counts. HUB for P0234
+// (autoscaler reads effective_cutoff), P0236 (CLI prints table), P0237
+// (CLI embeds in WPS describe).
+
+message SizeClassStatus {
+  string name = 1;
+  // Current (post-rebalancer) cutoff. The rebalancer EMA-smooths this
+  // hourly against build_samples — drifts from configured over time.
+  double effective_cutoff_secs = 2;
+  // Static TOML cutoff (scheduler.toml `[[size_classes]]` cutoff_secs).
+  // Drift visibility: if effective diverged 3× from configured, either
+  // the workload shifted or the initial config was off.
+  double configured_cutoff_secs = 3;
+  // Derivations in ready-queue that WOULD classify into this class.
+  // Computed by classify() on each Ready-status derivation's
+  // est_duration — the same call dispatch_ready() makes. O(n) in
+  // ready-queue depth; fine for an operator/autoscaler-facing RPC.
+  uint64 queued = 4;
+  // Derivations currently Assigned/Running on workers of this class.
+  // Counted via DerivationState.assigned_size_class (set at dispatch
+  // time, may reflect overflow — a small build on a large worker
+  // counts as "running in large").
+  uint64 running = 5;
+  // build_samples rows in the rebalancer's lookback window (default 7
+  // days) whose duration_secs falls within this class's effective
+  // cutoff band. Feeds the "is the rebalancer working off enough data
+  // for this class?" operator question.
+  uint64 sample_count = 6;
+}
+
+message GetSizeClassStatusRequest {}
+
+message GetSizeClassStatusResponse {
+  // Sorted by effective_cutoff_secs ascending (smallest class first).
+  // Empty = size-classes not configured on this scheduler (optional
+  // feature).
+  repeated SizeClassStatus classes = 1;
+}

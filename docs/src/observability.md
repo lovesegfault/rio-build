@@ -217,6 +217,9 @@ For the scheduler specifically, whose readinessProbe is `tcpSocket` (not gRPC he
 
 The drain grace period is configurable via `drain_grace_secs` (default 6; `RIO_DRAIN_GRACE_SECS=0` disables drain for tests).
 
+r[common.task.periodic-biased]
+Periodic background tasks (interval-driven loops with a shutdown arm) MUST use `biased;` ordering in their `tokio::select!` so shutdown cancellation wins deterministically over a ready interval tick. Without `biased;`, tokio randomizes branch selection for fairness; a task may execute one more tick-body after cancellation fires, which delays graceful shutdown by up to one interval (seconds to hours depending on the task). The `rio_common::task::spawn_periodic` helper encapsulates this pattern. Stateful loops that cannot use the helper MUST inline `biased;` at their `select!`.
+
 ## Distributed Tracing
 
 rio-build uses OpenTelemetry for distributed tracing with trace context propagation via gRPC metadata.
