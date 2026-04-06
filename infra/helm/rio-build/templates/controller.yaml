@@ -28,10 +28,12 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
+      {{- include "rio.podSecurityContext" . | nindent 6 }}
       containers:
         - name: controller
           image: {{ include "rio.image" (list . $c.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- include "rio.containerSecurityContext" . | nindent 10 }}
           {{- with $c.command }}
           command: {{ toJson . }}
           {{- end }}

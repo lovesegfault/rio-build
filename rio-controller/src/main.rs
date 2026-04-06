@@ -4,6 +4,15 @@
 //! driven reconcile) and the Autoscaler::run (30s poll loop).
 //! The Controller terminates on SIGTERM via graceful_shutdown_on;
 //! the Autoscaler is spawn_monitored with its own shutdown token.
+//!
+// r[impl sec.psa.control-plane-restricted]
+//! rio-controller (and scheduler/gateway/store) run under PSA
+//! `restricted` — runAsNonRoot (UID 65532), drop-ALL, seccomp:
+//! RuntimeDefault, readOnlyRootFilesystem. The securityContext
+//! lives in `infra/helm/rio-build/templates/_helpers.tpl`
+//! (`rio.podSecurityContext` / `rio.containerSecurityContext`);
+//! image-level `config.User` in `nix/docker.nix`. No CAP_SYS_ADMIN,
+//! no FUSE, no raw sockets — plain gRPC + kube-apiserver client.
 
 use std::sync::Arc;
 

@@ -440,6 +440,7 @@ in
 
   # r[verify sec.pod.fuse-device-plugin]
   # r[verify builder.cgroup.ns-root-remount]
+  # r[verify sec.psa.control-plane-restricted]
   #   Non-privileged + device-plugin VM e2e. hostUsers:false NOT
   #   exercised here — k3s's containerd (systemd cgroup driver)
   #   doesn't chown the pod cgroup to the userns root; worker mkdir

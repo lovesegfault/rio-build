@@ -14,7 +14,7 @@ metadata:
     kubernetes.io/metadata.name: {{ $ns.name }}
     # ADR-019: privileged narrows to the two namespaces whose pods
     # actually need CAP_SYS_ADMIN (FUSE mount). Control plane + store
-    # drop to baseline.
+    # drop to restricted (runAsNonRoot, drop-ALL, seccomp:RuntimeDefault).
     pod-security.kubernetes.io/enforce: {{ $ns.psa }}
 {{- end }}
 {{- end }}

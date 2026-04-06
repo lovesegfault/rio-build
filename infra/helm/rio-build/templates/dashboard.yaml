@@ -32,10 +32,18 @@ spec:
       # No privileged ops: nginx listens on 8080 (not 80) so we don't
       # need CAP_NET_BIND_SERVICE. No fsGroup — no writable volumes
       # that need group-ownership (emptyDir is world-writable /tmp).
+      # seccompProfile: PSA restricted (rio-system namespace) requires
+      # it set; RuntimeDefault blocks the ~40 syscalls nginx doesn't
+      # need. NOT using rio.podSecurityContext helper — that sets UID
+      # 65532 (distroless nonroot) and skips on coverage.enabled;
+      # nginx uses 65534 (nobody) and has no LLVM instrumentation
+      # (static SPA + proxy, no rio binary).
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534   # nobody
         runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         # SPA serve + gRPC-Web proxy to Envoy Gateway Service. Config
         # is baked into the image (nix/docker.nix dashboardNginxConf)

@@ -111,11 +111,11 @@ let
       "dashboard.envoyImage" = pulled.envoy-distroless.destNameTag;
     })
     // (pkgs.lib.optionalAttrs coverage {
-      # PSA baseline (ADR-019 default for control-plane) blocks the
+      # PSA restricted (ADR-019 default for control-plane) blocks the
       # hostPath "cov" volume (_helpers.tpl rio.covVolume) that
       # collects LLVM profraws to the node filesystem. Coverage is a
       # test-only mode; bumping to privileged here keeps production
-      # values.yaml at baseline (r[sec.psa.control-plane-restricted]).
+      # values.yaml at restricted (r[sec.psa.control-plane-restricted]).
       "namespaces.system.psa" = "privileged";
       "namespaces.store.psa" = "privileged";
     })
