@@ -8,6 +8,13 @@
 # Airgapped: all images preloaded via services.k3s.images. NodePort
 # gateway (no cloud LB). Inline chunk backend (no S3).
 
+dualStack:
+  # k3s-full.nix runs dual-stack (61d547cd / P0542). v6-primary ordering
+  # so getaddrinfo clients try AAAA first. Chart default leaves
+  # ipFamilies unset (single-stack-safe); explicit here because this
+  # overlay's cluster is known dual-stack.
+  ipFamilies: [IPv6, IPv4]
+
 global:
   image:
     tag: dev
