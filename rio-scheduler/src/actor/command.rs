@@ -13,7 +13,8 @@ use crate::estimator::BucketedEstimate;
 use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 
 #[cfg(test)]
-use super::handle::{DebugDerivationInfo, DebugExecutorInfo};
+use super::handle::DebugDerivationInfo;
+use super::handle::DebugExecutorInfo;
 
 /// Request payload for [`ActorCommand::MergeDag`].
 #[derive(Debug)]
@@ -324,8 +325,11 @@ pub enum ActorCommand {
     /// query store → Completed (orphan) or reset to Ready.
     ReconcileAssignments,
 
-    /// Test-only: query worker states.
-    #[cfg(test)]
+    /// Actor in-memory executor map snapshot. I-048b/c diagnostic:
+    /// surfaces `has_stream`/`warm`/`kind` per entry — what
+    /// `dispatch_ready()` filters on, not what PG `last_seen` claims.
+    /// Promoted from cfg(test) for the `DebugListExecutors` RPC; tests
+    /// keep using it for assertions.
     DebugQueryWorkers {
         reply: oneshot::Sender<Vec<DebugExecutorInfo>>,
     },

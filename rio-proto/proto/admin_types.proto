@@ -176,6 +176,55 @@ message InspectBuildDagResponse {
   repeated string live_executor_ids = 2;
 }
 
+// Actor in-memory snapshot of one executor's connection state. Unlike
+// ExecutorInfo (PG-backed via ListExecutors), this reads the live
+// `self.executors` HashMap — what dispatch_ready() sees. The I-048b/c
+// signal: an entry with has_stream=false is a zombie (heartbeat-created,
+// no BuildExecution stream — dispatch can never reach it). PG last_seen
+// shows it [alive]; the actor knows it's dead.
+message DebugExecutorState {
+  string executor_id = 1;
+  // stream_tx.is_some(). false = no BuildExecution bidi stream connected
+  // to THIS leader. PG may show last_seen recent (heartbeat is unary,
+  // succeeds independently). I-048b zombies have has_stream=false: entry
+  // exists, no stream. The smoking gun for "PG says alive, actor disagrees".
+  bool has_stream = 2;
+  // has_stream && !systems.is_empty(). Dispatch's hard filter — false
+  // means this entry is invisible to assignment.
+  bool is_registered = 3;
+  // Warm-gate. false = waiting on PrefetchComplete ACK; dispatch blocked
+  // unless no warm worker passes the hard filter (cold-fallback). Warm
+  // builders prevent that fallback for cold ones — explains "registered
+  // but never gets work".
+  bool warm = 4;
+  // Builder vs fetcher. FOD dispatch only routes to fetchers, non-FOD only
+  // to builders, no fallback. A queued FOD with zero fetcher entries here
+  // = stuck (the I-048c symptom: fod_queue=3 fetcher_util=0.00).
+  ExecutorKind kind = 5;
+  // Populated by first heartbeat. Empty = stream connected, no heartbeat
+  // arrived yet (the gap is_registered checks for).
+  repeated string systems = 6;
+  // Instant::elapsed() on last_heartbeat. Staleness of the actor's view.
+  // PG last_seen may be more recent if heartbeats reach PG but the actor's
+  // entry was created stale (or vice versa post-failover).
+  uint64 last_heartbeat_ago_secs = 7;
+  // running_builds.len(). Count of derivations the actor THINKS this
+  // worker is building. Can drift from worker's own view (TOCTOU,
+  // I-032-style lost completions).
+  uint32 running_count = 8;
+  // The drv hashes themselves. For diffing against InspectBuildDag's
+  // assigned_executor — a derivation Assigned to an executor not in this
+  // list (or one whose has_stream=false) is stuck.
+  repeated string running_builds = 9;
+}
+
+message DebugListExecutorsResponse {
+  // One per entry in the actor's self.executors HashMap. Empty on a
+  // standby (actor map cleared on lease loss) — useful diagnostic info
+  // in itself; this RPC deliberately does NOT reject on standby.
+  repeated DebugExecutorState executors = 1;
+}
+
 // Tenant info for ListTenants/CreateTenant.
 message TenantInfo {
   string tenant_id = 1;                  // UUID as string

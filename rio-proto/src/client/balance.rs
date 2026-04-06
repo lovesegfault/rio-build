@@ -52,7 +52,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// balance feed (Insert) and the health probe itself need to
 /// connect to pod IPs with the same TLS config.
 fn build_endpoint(addr: SocketAddr, tls_domain: &str) -> anyhow::Result<Endpoint> {
-    match super::client_tls() {
+    let ep = match super::client_tls() {
         Some(tls) => {
             // domain_name overrides the SNI + SAN-verify domain.
             // The connect URI's host (the pod IP) is still what
@@ -66,23 +66,30 @@ fn build_endpoint(addr: SocketAddr, tls_domain: &str) -> anyhow::Result<Endpoint
                 SocketAddr::V4(_) => format!("https://{}:{}", addr.ip(), addr.port()),
                 SocketAddr::V6(a) => format!("https://[{}]:{}", a.ip(), a.port()),
             };
-            Ok(Endpoint::from_shared(uri)?
+            Endpoint::from_shared(uri)?
                 .tls_config(tls.domain_name(tls_domain))?
-                // Keepalive on the balanced channel matters less
-                // (we rediscover every probe_interval anyway) but
-                // doesn't hurt. Match connect_channel's defaults
-                // by NOT setting it --- tonic's default is no
-                // keepalive.
-                .connect_timeout(PROBE_TIMEOUT))
+                .connect_timeout(PROBE_TIMEOUT)
         }
         None => {
             let uri = match addr {
                 SocketAddr::V4(_) => format!("http://{}:{}", addr.ip(), addr.port()),
                 SocketAddr::V6(a) => format!("http://[{}]:{}", a.ip(), a.port()),
             };
-            Ok(Endpoint::from_shared(uri)?.connect_timeout(PROBE_TIMEOUT))
+            Endpoint::from_shared(uri)?.connect_timeout(PROBE_TIMEOUT)
         }
-    }
+    };
+    // h2 keepalive is NOT optional here. Probe rediscovery emits
+    // Change::Remove --- that drops the endpoint from the p2c selection
+    // pool, but does NOT close existing TCP connections. In-flight bidi
+    // streams stay pinned to the dead peer until something at the
+    // transport layer errors. Without h2 keepalive that "something" is
+    // kernel TCP keepalive, ~2h on Linux defaults.
+    //
+    // I-048c: scheduler SIGKILL (no FIN) --- fetchers went 7 minutes
+    // silent to the new leader. Both the bidi build stream AND the unary
+    // heartbeat share this Channel, so neither pierced the dead h2
+    // connection. ~40s detection (30s PING + 10s PONG timeout) bounds it.
+    Ok(super::with_h2_keepalive(ep))
 }
 
 /// Probe one endpoint's health. Returns true iff the named service

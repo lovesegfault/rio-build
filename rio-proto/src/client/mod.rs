@@ -84,6 +84,27 @@ pub(crate) fn client_tls() -> Option<ClientTlsConfig> {
 /// (even cross-AZ) and bounds the failure mode.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Apply h2 keepalive: 30s PING interval, 10s PONG timeout, while-idle.
+///
+/// Detects half-open connections in ~40s (next PING + PONG timeout)
+/// instead of falling through to kernel TCP keepalive --- Linux default
+/// `tcp_keepalive_time` is 7200s (2h). Without this, an ungracefully
+/// dead peer (SIGKILL, netsplit, OOM-kill --- anything that skips FIN)
+/// leaves the connection silently stuck until the kernel notices.
+///
+/// `while_idle`: send PINGs even with no in-flight requests. Without
+/// it, an idle channel never probes --- the peer can vanish and the
+/// next RPC blocks until kernel TCP timeout. With it, the h2 layer
+/// fires `GoAway` proactively, all streams error, callers reconnect.
+///
+/// Factored out after I-048c: the balanced channel diverged from
+/// `connect_store_lazy` and went 7 minutes dark on scheduler SIGKILL.
+pub(crate) fn with_h2_keepalive(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
+    ep.http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+}
+
 async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     // `get().and_then(|o| o.as_ref())` collapses both "OnceLock not
     // initialized" and "initialized with None" to plaintext. Tests
@@ -143,11 +164,10 @@ pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Chann
         Some(tls) => ("https", Some(tls.clone())),
         None => ("http", None),
     };
-    let mut ep = tonic::transport::Endpoint::from_shared(format!("{scheme}://{addr}"))?
-        .connect_timeout(CONNECT_TIMEOUT)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(10))
-        .keep_alive_while_idle(true);
+    let mut ep = with_h2_keepalive(
+        tonic::transport::Endpoint::from_shared(format!("{scheme}://{addr}"))?
+            .connect_timeout(CONNECT_TIMEOUT),
+    );
     if let Some(tls) = tls {
         ep = ep.tls_config(tls)?;
     }

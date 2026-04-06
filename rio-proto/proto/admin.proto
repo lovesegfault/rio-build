@@ -53,6 +53,14 @@ service AdminService {
   // that is NOT in the live stream pool, dispatch is stuck forever.
   rpc InspectBuildDag(rio.types.InspectBuildDagRequest) returns (rio.types.InspectBuildDagResponse);
 
+  // Actor in-memory executor map snapshot. Unlike ListExecutors (PG
+  // last_seen), this reads the live self.executors HashMap. I-048b/c
+  // diagnostic: PG showed fetchers [alive], actor map was empty (stream
+  // not connected to new leader post-failover) — four wrong hypotheses
+  // before finding it. has_stream=false on an entry = zombie. NOT
+  // gated on ensure_leader(): a standby's empty map is itself useful.
+  rpc DebugListExecutors(google.protobuf.Empty) returns (rio.types.DebugListExecutorsResponse);
+
   // List all tenants.
   rpc ListTenants(google.protobuf.Empty) returns (rio.types.ListTenantsResponse);
 
