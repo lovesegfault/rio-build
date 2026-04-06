@@ -494,6 +494,7 @@ mod tests {
             Scenario {
                 method: http::Method::PUT,
                 path_contains: "/leases/rio-sched",
+                body_contains: None,
                 status: 409,
                 body_json: status_409(),
             },
@@ -522,6 +523,7 @@ mod tests {
             Scenario {
                 method: http::Method::PUT,
                 path_contains: "/leases/rio-sched",
+                body_contains: None,
                 status: 409,
                 body_json: status_409(),
             },
@@ -553,6 +555,7 @@ mod tests {
             Scenario {
                 method: http::Method::GET,
                 path_contains: "/leases/rio-sched",
+                body_contains: None,
                 status: 404,
                 body_json: json!({
                     "kind": "Status", "apiVersion": "v1",

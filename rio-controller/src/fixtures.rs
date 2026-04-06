@@ -74,6 +74,7 @@ pub fn apply_ok_scenarios(
         Scenario {
             method: http::Method::GET,
             path_contains: Box::leak(format!("/statefulsets/{sts_name}").into_boxed_str()),
+            body_contains: None,
             status: 404,
             // kube's get_opt parses the 404 body as a Status, not a
             // StatefulSet. Standard K8s NotFound shape.

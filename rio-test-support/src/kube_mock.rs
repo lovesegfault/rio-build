@@ -13,6 +13,7 @@
 use std::pin::pin;
 
 use http::{Request, Response};
+use http_body_util::BodyExt;
 use kube::Client;
 use kube::client::Body;
 use tokio::task::JoinHandle;
@@ -31,6 +32,11 @@ pub struct Scenario {
     /// Substring the path must contain. E.g., "/statefulsets/
     /// test-pool-workers" — matches regardless of query params.
     pub path_contains: &'static str,
+    /// Optional substring the REQUEST body must contain. For
+    /// asserting that the code under test sent a specific field
+    /// (e.g., `"resourceVersion"` in a merge-patch). None = no
+    /// body assertion (most tests don't care).
+    pub body_contains: Option<&'static str>,
     /// Response status. 200 for happy path, 404 for "not found."
     pub status: u16,
     /// Response body as JSON string. Use `r#"..."#` for literal
@@ -44,6 +50,7 @@ impl Scenario {
         Self {
             method,
             path_contains,
+            body_contains: None,
             status: 200,
             body_json,
         }
@@ -145,6 +152,28 @@ impl ApiServerVerifier {
                     "scenario {i}: path {got_path:?} doesn't contain {:?}",
                     scenario.path_contains
                 );
+
+                if let Some(want) = scenario.body_contains {
+                    // Collect the request body to assert on its
+                    // content. kube::client::Body is a hyper-style
+                    // stream; BodyExt::collect drains it to bytes.
+                    let bytes = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("request body collectible")
+                        .to_bytes();
+                    // kube only emits UTF-8 JSON — from_utf8 never
+                    // fails here, and a surprise non-UTF-8 body is
+                    // worth loud panic (clippy disallows the lossy
+                    // variant workspace-wide to catch parse paths).
+                    let body =
+                        std::str::from_utf8(&bytes).expect("kube request body is UTF-8 JSON");
+                    assert!(
+                        body.contains(want),
+                        "scenario {i}: request body {body:?} doesn't contain {want:?}"
+                    );
+                }
 
                 send.send_response(
                     Response::builder()
