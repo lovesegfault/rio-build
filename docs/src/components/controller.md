@@ -98,9 +98,11 @@ mechanism is ClusterStatus polling; a push-mode RPC was considered and
 rejected (see `ephemeral.rs` § Why not a Scheduler→Controller RPC).
 
 **RBAC:** the controller's ClusterRole grants `batch/jobs` verbs
-`[get, list, watch, create]`. `delete` not needed —
-`ttlSecondsAfterFinished` reaps; ownerRef GC handles WorkerPool-delete
-cleanup.
+`[get, list, watch, create, delete]`. For ephemeral mode alone,
+`delete` is unneeded (`ttlSecondsAfterFinished` reaps; ownerRef GC
+handles pool-delete cleanup). `delete` is required for manifest mode's
+per-bucket scale-down (`r[ctrl.pool.manifest-scaledown]`) — manifest
+pods don't self-terminate so there's no TTL to reap them.
 
 **Cleanup:** the finalizer's `cleanup()` branches on `spec.ephemeral` and
 returns immediately (no STS to scale to 0, no long-lived workers to
@@ -146,6 +148,14 @@ Manifest-spawned Jobs carry `rio.build/memory-class={n}Gi` and
 `rio.build/cpu-class={n}m` labels. Operators can `kubectl get job -l
 rio.build/memory-class=48Gi` to see the 48Gi fleet; the reconciler uses
 the same labels for its inventory count.
+
+r[ctrl.pool.manifest-scaledown]
+
+Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-class, cpu-class)` bucket for `SCALE_DOWN_WINDOW` (600s default), the controller deletes `surplus` Jobs from that bucket. Deletion skips Jobs whose pods are mid-build (`running_builds > 0` from `ListExecutors`). Demand returning before the window elapses resets the clock.
+
+r[ctrl.pool.manifest-long-lived]
+
+Manifest-spawned pods do NOT set `RIO_EPHEMERAL=1`. The worker's main loop does not exit after one build — it heartbeats, accepts any derivation that fits its `memory_total_bytes`, and idles. `ttlSecondsAfterFinished` is not set on the Job (the pod never self-terminates). Scale-down is entirely controller-driven.
 
 r[ctrl.pool.manifest-single-build]
 `BuilderPool.spec.sizing=Manifest` requires `maxConcurrentBuilds == 1`.
@@ -268,7 +278,7 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 | `""` (core) | pods | get, list, watch |
 | `""` (core) | services | get, list, watch, create, update, patch, delete |
 | `""` (core) | events | create, patch |
-| `batch` | jobs | get, list, watch, create |
+| `batch` | jobs | get, list, watch, create, delete |
 
 Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).
 

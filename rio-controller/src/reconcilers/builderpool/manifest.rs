@@ -27,15 +27,18 @@
 //!      `rio.build/pool={name},rio.build/sizing=manifest`, extract
 //!      each Job's bucket from `rio.build/memory-class` +
 //!      `rio.build/cpu-class` labels → same-shaped map.
-//!   4. **Diff**: per bucket, `deficit = demand.saturating_sub(supply)`.
-//!      Over-provisioned (supply > demand) → zero spawns. Scale-DOWN
-//!      (reaping surplus Jobs) is P0505's job — this reconciler only
-//!      scales UP.
-//!   5. **Cold-start floor**: `queued_derivations - manifest.len()`
+//!   4. **Diff UP**: per bucket, `deficit = demand.saturating_sub(
+//!      supply)`. Over-provisioned (supply > demand) → zero spawns.
+//!   5. **Diff DOWN**: per bucket, `surplus = supply.saturating_sub(
+//!      demand)`. A bucket surplus for `scale_down_window` (600s
+//!      default, same as STS autoscaler anti-flap) → delete surplus
+//!      Jobs. Skips Jobs whose pods are mid-build (`running_builds
+//!      > 0` via `ListExecutors`).
+//!   6. **Cold-start floor**: `queued_derivations - manifest.len()`
 //!      derivations have no `build_history` sample → manifest omits
 //!      them (proto doc at `admin_types.proto:249`). Spawn those at
 //!      `spec.resources` (the operator-configured floor).
-//!   6. **Spawn**: per deficit, `build_pod_spec(..., Some(resources))`.
+//!   7. **Spawn**: per deficit, `build_pod_spec(..., Some(resources))`.
 //!      Label `rio.build/memory-class={n}Gi`, `rio.build/cpu-class={n}m`.
 //!      Name `{pool}-mf-{mem}g-{cpu}m-{random6}`.
 //!
@@ -56,16 +59,18 @@
 //! manifest mode is for RIGHT-SIZING (heterogeneous workloads).
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{PodTemplateSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, ListParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, Resource, ResourceExt};
-use rio_proto::types::{DerivationResourceEstimate, GetCapacityManifestRequest};
+use rio_proto::types::{
+    DerivationResourceEstimate, ExecutorInfo, GetCapacityManifestRequest, ListExecutorsRequest,
+};
 use tracing::{debug, info, warn};
 
 use crate::crds::builderpool::BuilderPool;
@@ -80,14 +85,6 @@ use super::{MANAGER, POOL_LABEL};
 /// one interval before a pod is spawned for it. See ephemeral.rs's
 /// `EPHEMERAL_REQUEUE` doc for the latency-vs-apiserver-load tradeoff.
 const MANIFEST_REQUEUE: Duration = Duration::from_secs(10);
-
-/// `ttlSecondsAfterFinished` on manifest Jobs. Manifest pods loop
-/// (no `RIO_EPHEMERAL=1`), so "finished" = worker crashed/OOM'd or
-/// scheduler drained it. 60s matches ephemeral — long enough for
-/// `kubectl logs` debugging, short enough that dead Jobs don't pile
-/// up in the inventory count (a Failed-but-unreap'd Job with the
-/// right labels would count as supply → under-spawn).
-const JOB_TTL_SECS: i32 = 60;
 
 /// Manifest sizing mode label. Distinguishes manifest Jobs from
 /// ephemeral Jobs when both are running for the same pool (edge case:
@@ -212,9 +209,22 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
     let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
 
-    // ---- Diff ----
+    // ---- Diff: spawn (scale-up) ----
     let plan = compute_spawn_plan(&demand, &supply, cold_start, cold_start_supply);
     let to_spawn: usize = plan.iter().map(|d| d.count).sum();
+
+    // ---- Diff: surplus (scale-down) ----
+    // Per-bucket idle grace. A bucket surplus for `scale_down_window`
+    // → eligible for delete. State lives across reconcile ticks in
+    // Ctx (keyed by `{ns}/{name}` — same pool across ticks, same
+    // idle clock). Lock held for one map update.
+    let surplus = compute_surplus(&demand, &supply);
+    let pool_key = format!("{ns}/{name}");
+    let reapable: BTreeMap<Bucket, usize> = {
+        let mut state = ctx.manifest_idle.lock().expect("manifest_idle poisoned");
+        let idle = state.entry(pool_key).or_default();
+        update_idle_and_reapable(idle, &surplus, Instant::now(), ctx.scale_down_window)
+    };
 
     // ---- Spawn ----
     // Ceiling: same `spec.replicas.max` cap as ephemeral. A manifest
@@ -274,6 +284,78 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
             cold_start, active_total, ceiling,
             "no manifest Jobs to spawn"
         );
+    }
+
+    // ---- Scale-down: delete reapable Jobs ----
+    // Only poll ListExecutors if there's actually something to reap
+    // — common case is empty (nothing surplus long enough). Saves
+    // an RPC per tick on the hot path.
+    if !reapable.is_empty() {
+        // Fail-open: RPC down → can't verify idle → delete nothing.
+        // Scale-up (above) is unaffected. Same fail-open philosophy
+        // as the poll phase — a transient scheduler blip shouldn't
+        // orphan builds.
+        //
+        // status_filter: "alive" excludes draining/dead. A draining
+        // executor might have running_builds > 0 (finishing what it
+        // has) — we want those visible. But a DEAD executor (hasn't
+        // heartbeat in timeout) with running_builds > 0 is stale
+        // data. Actually "" (no filter) is safest: we match by pod-
+        // name prefix, and a dead executor's Job is either already
+        // Failed (filtered from active_jobs) or about to be. An
+        // extra-conservative skip costs one more tick, not a bug.
+        match ctx
+            .admin
+            .clone()
+            .list_executors(ListExecutorsRequest {
+                status_filter: String::new(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                let executors = resp.into_inner().executors;
+                let deletable = select_deletable_jobs(&active_jobs, &reapable, &executors);
+                for job in deletable {
+                    // name is Some (select_deletable_jobs skips None).
+                    let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+                    // Background propagation: K8s deletes the Job's
+                    // pod asynchronously. Pod gets SIGTERM → worker's
+                    // drain handler (acquire_many on build semaphore)
+                    // exits cleanly. We've already verified
+                    // running_builds == 0, so the semaphore is
+                    // immediately acquirable.
+                    match jobs_api.delete(job_name, &DeleteParams::default()).await {
+                        Ok(_) => {
+                            info!(
+                                pool = %name, job = %job_name,
+                                bucket = ?parse_bucket_from_labels(job),
+                                "deleted surplus manifest Job (idle grace elapsed)"
+                            );
+                        }
+                        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                            // Already gone (another reconcile tick
+                            // raced us, or ownerRef GC). Fine.
+                            debug!(pool = %name, job = %job_name, "Job already deleted");
+                        }
+                        Err(e) => {
+                            // Don't abort the whole reconcile on one
+                            // delete failure — log and continue. Next
+                            // tick retries (Job is still surplus).
+                            warn!(
+                                pool = %name, job = %job_name, error = %e,
+                                "failed to delete surplus manifest Job; will retry next tick"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    pool = %name, error = %e, reapable = ?reapable.keys().collect::<Vec<_>>(),
+                    "ListExecutors failed; skipping scale-down this tick (can't verify idle)"
+                );
+            }
+        }
     }
 
     // ---- Status patch ----
@@ -402,7 +484,8 @@ pub(super) fn bucket_labels(bucket: Option<Bucket>) -> (String, String) {
 /// For each bucket in `demand`: spawn `demand - supply` (saturating).
 /// A bucket in `supply` but NOT in `demand` (over-provisioned, or
 /// the derivation completed between ticks) → zero spawns for that
-/// bucket (no negative spawn; scale-down is P0505's job).
+/// bucket (no negative spawn; scale-down is [`compute_surplus`]'s
+/// job, applied separately in the reconcile loop).
 ///
 /// Cold-start: `cold_start_demand - cold_start_supply` Jobs at `None`
 /// (→ `spec.resources` floor). Same subtraction as ephemeral's
@@ -525,6 +608,181 @@ pub(super) fn truncate_plan(plan: &[SpawnDirective], budget: usize) -> Vec<Spawn
     }
 
     out.into_iter().filter(|d| d.count > 0).collect()
+}
+
+/// Compute per-bucket surplus: `supply - demand` where positive.
+///
+/// Mirror of [`compute_spawn_plan`] for the scale-DOWN direction.
+/// Iterates `supply` (not `demand`) — a bucket in supply but absent
+/// from demand is by definition surplus with `demand = 0` (the
+/// derivation completed, or the queue drained). That's the PRIMARY
+/// scale-down case: work finished, pod idles.
+///
+/// Cold-start (floor) is NOT tracked here. Floor Jobs are
+/// one-shot-ish (cold-start derivations get `build_history` samples
+/// on first run → move to regular buckets → floor demand naturally
+/// trends to 0). Tracking floor idle would also require
+/// `Option<Bucket>` keys throughout; not worth the API bloat when
+/// the floor set self-shrinks.
+///
+/// Pure — no K8s, no clock. T4's unit-test target.
+pub(super) fn compute_surplus(
+    demand: &BTreeMap<Bucket, usize>,
+    supply: &BTreeMap<Bucket, usize>,
+) -> BTreeMap<Bucket, usize> {
+    let mut out = BTreeMap::new();
+    for (&bucket, &have) in supply {
+        let want = demand.get(&bucket).copied().unwrap_or(0);
+        let surplus = have.saturating_sub(want);
+        if surplus > 0 {
+            out.insert(bucket, surplus);
+        }
+    }
+    out
+}
+
+// r[impl ctrl.pool.manifest-scaledown]
+/// Update per-bucket idle timestamps and return buckets eligible
+/// for scale-down.
+///
+/// Three-phase:
+///   1. **Prune**: drop `idle_since` entries for buckets no longer
+///      surplus. Demand returned (or all those Jobs died) → reset
+///      the clock. Next time they go surplus, the window restarts.
+///   2. **Record**: for each currently-surplus bucket, stamp `now`
+///      iff no timestamp exists. A bucket surplus last tick AND
+///      this tick keeps its old timestamp (window accumulates).
+///   3. **Elect**: return `(bucket, surplus_count)` pairs where the
+///      window has elapsed. Caller deletes up to `surplus_count`
+///      Jobs from each.
+///
+/// The `&mut BTreeMap` is the per-pool entry in `Ctx::manifest_idle`
+/// (lock held for the duration of this call — a few map ops).
+///
+/// `now` as a parameter (not `Instant::now()` inline) → tests can
+/// simulate elapsed time by passing `now + window + 1s` without
+/// real sleeps. Same pattern as `check_stabilization` in
+/// `scaling/mod.rs`.
+pub(super) fn update_idle_and_reapable(
+    idle_since: &mut BTreeMap<Bucket, Instant>,
+    surplus: &BTreeMap<Bucket, usize>,
+    now: Instant,
+    window: Duration,
+) -> BTreeMap<Bucket, usize> {
+    // Prune: bucket no longer surplus → clock resets. `retain`
+    // mutates in place. A bucket that went surplus → demand
+    // returned at 300s → surplus again at 400s starts its 600s
+    // window FROM 400s, not from 0s. Plan T4 case 3.
+    idle_since.retain(|b, _| surplus.contains_key(b));
+
+    // Record: new surplus buckets get stamped. `or_insert` (not
+    // `insert`) — an already-stamped bucket keeps its timestamp.
+    for &b in surplus.keys() {
+        idle_since.entry(b).or_insert(now);
+    }
+
+    // Elect: window elapsed → reapable. `>=` not `>`: a bucket idle
+    // for EXACTLY the window is reapable (matches the plan's 601s
+    // test, avoids a dead second between 600 and 601).
+    surplus
+        .iter()
+        .filter(|(b, _)| {
+            // idle_since[b] is guaranteed present (just inserted
+            // above). `[b]` panics on absence — correct; if it's
+            // missing, or_insert is broken.
+            now.duration_since(idle_since[b]) >= window
+        })
+        .map(|(&b, &c)| (b, c))
+        .collect()
+}
+
+// r[impl ctrl.pool.manifest-scaledown]
+/// Select Jobs safe to delete from the reapable buckets.
+///
+/// "Safe" = pod confirmed idle via `ListExecutors`
+/// (`running_builds == 0`). The `executor_id → Job` match relies on
+/// K8s Job-pod naming: the pod is `{job_name}-{5-char-random}`, and
+/// `executor_id` IS the pod name (`RIO_WORKER_ID=$(POD_NAME)` via
+/// downward API in `build_pod_spec` — see `builderpool/mod.rs`
+/// cleanup-phase comment).
+///
+/// Three states per Job:
+///   - **Idle** (matching executor, `running_builds == 0`): delete
+///   - **Busy** (matching executor, `running_builds > 0`): skip.
+///     "Don't delete a Job mid-build." Deleting orphans the build
+///     (pod SIGTERM'd mid-compilation → scheduler must reassign).
+///   - **Unknown** (no matching executor): skip. Pod starting up
+///     (not heartbeating yet), or disconnected between RPC calls.
+///     Can't prove idle → conservative. Pod-startup is the common
+///     case; a Job we spawned last tick shouldn't be immediately
+///     reaped just because the executor hasn't registered.
+///
+/// Per-bucket cap: at most `reapable[bucket]` Jobs from each bucket.
+/// If surplus=3 but only 2 are idle, delete 2. Next tick re-diffs;
+/// the remaining 1 (once its build finishes) becomes eligible.
+///
+/// BTreeMap iteration order → deterministic (stable Job delete
+/// ordering across ticks; operators see consistent `kubectl get
+/// events` ordering).
+///
+/// Race window: executor reports idle at RPC-time, scheduler
+/// dispatches to it a millisecond later, we delete the Job. Plan
+/// risk §2 accepts this — scheduler retries dispatch on the next
+/// worker. The window is bounded by one reconcile tick (~10s), and
+/// the scheduler's dispatch loop handles transient worker loss
+/// anyway (heartbeat timeout → reassign).
+pub(super) fn select_deletable_jobs<'a>(
+    active_jobs: &[&'a Job],
+    reapable: &BTreeMap<Bucket, usize>,
+    executors: &[ExecutorInfo],
+) -> Vec<&'a Job> {
+    // Per-bucket delete budget. Decremented as we select; exhausted
+    // → skip remaining Jobs in that bucket.
+    let mut budget: BTreeMap<Bucket, usize> = reapable.clone();
+
+    let mut out = Vec::new();
+    for &job in active_jobs {
+        // Bucket: floor (None) or unparseable → skip (not tracked).
+        let Some(bucket) = parse_bucket_from_labels(job) else {
+            continue;
+        };
+        // Reapable + budget left?
+        let Some(remaining) = budget.get_mut(&bucket) else {
+            continue;
+        };
+        if *remaining == 0 {
+            continue;
+        }
+        // Idle check. Job name → pod-name prefix. `{job}-` with
+        // trailing dash: Job "pool-mf-8g-2000m-abc" matches pod
+        // "pool-mf-8g-2000m-abc-xyzwq", NOT pod of a different Job
+        // "pool-mf-8g-2000m-abcdef-xyzwq".
+        let Some(job_name) = job.metadata.name.as_deref() else {
+            continue; // Job without a name — can't delete by name anyway
+        };
+        let prefix = format!("{job_name}-");
+        match executors
+            .iter()
+            .find(|e| e.executor_id.starts_with(&prefix))
+        {
+            Some(e) if e.running_builds == 0 => {
+                // Confirmed idle. Safe to delete.
+                out.push(job);
+                *remaining -= 1;
+            }
+            Some(_) => {
+                // Busy. Skip. Plan T4 case 4: 3 surplus, 1 busy →
+                // delete at most 2.
+            }
+            None => {
+                // Unknown. Conservative skip (pod-startup or RPC
+                // race). If this Job's pod never registers, it'll
+                // eventually crash/get-stuck and Job status goes
+                // Failed → filtered from active_jobs → replaced.
+            }
+        }
+    }
+    out
 }
 
 /// Build `ResourceRequirements` from a bucket. Both requests AND
@@ -653,10 +911,26 @@ pub(super) fn build_manifest_job(
             parallelism: Some(1),
             completions: Some(1),
             backoff_limit: Some(0),
-            ttl_seconds_after_finished: Some(JOB_TTL_SECS),
+            // r[impl ctrl.pool.manifest-long-lived]
+            // NO ttl_seconds_after_finished. Manifest pods loop
+            // (no RIO_EPHEMERAL=1), so "finished" only happens on
+            // crash/OOM. A crashed Job is already filtered from
+            // active_jobs (status.failed > 0 check in the inventory
+            // pass), so it doesn't count as supply → replacement
+            // spawns next tick. TTL-based reaping would race the
+            // controller's deliberate scale-down deletes. Controller
+            // deletion (scale-down above) + ownerRef GC (BuilderPool
+            // delete) are the ONLY Job-removal paths.
+            //
+            // Known gap: crashed Jobs accumulate in the namespace
+            // without TTL (filtered from supply so no under-spawn
+            // bug, but never deleted — `kubectl get jobs` clutters).
+            // Followup needed: Failed-Job sweep in the scale-down
+            // pass, or restore TTL fenced against scale-down races.
+            //
             // NO active_deadline_seconds — manifest pods are
-            // long-lived. P0505 (scale-down grace) will drain them
-            // via DrainExecutor when the bucket's demand drops.
+            // long-lived. Scale-down (above) handles the
+            // demand-dropped case.
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),

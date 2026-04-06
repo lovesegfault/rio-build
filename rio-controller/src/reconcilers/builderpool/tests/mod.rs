@@ -77,5 +77,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         scheduler_balance_port: 9001,
         recorder,
         error_counts: Default::default(),
+        manifest_idle: Default::default(),
+        scale_down_window: std::time::Duration::from_secs(600),
     })
 }

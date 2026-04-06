@@ -300,6 +300,11 @@ async fn main() -> anyhow::Result<()> {
         store_addr: cfg.store_addr.clone(),
         recorder: recorder.clone(),
         error_counts: Default::default(),
+        manifest_idle: Default::default(),
+        // Same cfg source as the Autoscaler's ScalingTiming below —
+        // manifest-mode scale-down reuses the STS autoscaler's
+        // grace window (same anti-flap rationale, per-bucket).
+        scale_down_window: std::time::Duration::from_secs(cfg.autoscaler_scale_down_window_secs),
     });
 
     // ---- BuilderPool controller ----

@@ -10,18 +10,20 @@
 //! Plan 503 T4.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
-use rio_proto::types::DerivationResourceEstimate;
+use rio_proto::types::{DerivationResourceEstimate, ExecutorInfo};
 
 use crate::crds::builderpool::{Replicas, Sizing};
 use crate::fixtures::test_sched_addrs;
 use crate::reconcilers::builderpool::manifest::{
     Bucket, CPU_CLASS_LABEL, FLOOR_CLASS, MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST,
-    SpawnDirective, bucket_labels, build_manifest_job, compute_spawn_plan, group_by_bucket,
-    inventory_by_bucket, parse_bucket_from_labels, truncate_plan,
+    SpawnDirective, bucket_labels, build_manifest_job, compute_spawn_plan, compute_surplus,
+    group_by_bucket, inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs,
+    truncate_plan, update_idle_and_reapable,
 };
 
 use super::*;
@@ -41,6 +43,9 @@ fn test_manifest_wp() -> BuilderPool {
     wp.metadata.namespace = Some("rio".into());
     wp
 }
+
+/// Default scale-down window (matches `ScalingTiming::default`).
+const WINDOW: Duration = Duration::from_secs(600);
 
 /// Minimal Job with manifest labels. Status unset → "active"
 /// (not Complete, not Failed). The reconciler only reads
@@ -628,7 +633,13 @@ fn job_spec_load_bearing_fields() {
     let spec = job.spec.as_ref().unwrap();
     assert_eq!(spec.backoff_limit, Some(0), "K8s must not retry");
     assert_eq!(spec.parallelism, Some(1));
-    assert!(spec.ttl_seconds_after_finished.is_some());
+    // r[verify ctrl.pool.manifest-long-lived]
+    assert_eq!(
+        spec.ttl_seconds_after_finished, None,
+        "manifest pods never self-terminate (no RIO_EPHEMERAL) → \
+         controller deletion is the only scale-down path → TTL \
+         would race it"
+    );
     assert_eq!(
         spec.active_deadline_seconds, None,
         "manifest pods are long-lived — no deadline (wrong-pool-spawn \
@@ -638,6 +649,7 @@ fn job_spec_load_bearing_fields() {
     let pod_spec = spec.template.spec.as_ref().unwrap();
     assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
 
+    // r[verify ctrl.pool.manifest-long-lived]
     // NO RIO_EPHEMERAL — manifest pods loop. An accidental
     // RIO_EPHEMERAL=1 here would make every manifest pod exit
     // after one build → constant respawn churn.
@@ -708,5 +720,437 @@ fn job_name_format_cold_start() {
     assert!(
         name.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    );
+}
+
+// ─── compute_surplus ─────────────────────────────────────────────
+
+/// Mirror of `diff_three_demand_one_supply_spawns_two`: same input,
+/// opposite direction. supply>demand → surplus; supply≤demand → zero.
+#[test]
+fn surplus_is_supply_minus_demand() {
+    let b8 = (8 * GI, 2000);
+    let b32 = (32 * GI, 4000);
+
+    let mut demand = BTreeMap::new();
+    demand.insert(b8, 1);
+    // b32: no demand (derivation completed, or queue drained)
+
+    let mut supply = BTreeMap::new();
+    supply.insert(b8, 5);
+    supply.insert(b32, 2);
+
+    let surplus = compute_surplus(&demand, &supply);
+
+    assert_eq!(surplus.get(&b8), Some(&4), "5 - 1 = 4");
+    assert_eq!(
+        surplus.get(&b32),
+        Some(&2),
+        "supply-only bucket: 2 - 0 = 2 (the PRIMARY scale-down case — work finished)"
+    );
+}
+
+/// Deficit buckets (demand > supply) are NOT in the surplus map.
+/// No `count: 0` noise, no negative wraparound.
+#[test]
+fn surplus_omits_deficit_buckets() {
+    let b8 = (8 * GI, 2000);
+    let b32 = (32 * GI, 4000);
+
+    let mut demand = BTreeMap::new();
+    demand.insert(b8, 3);
+    demand.insert(b32, 1);
+
+    let mut supply = BTreeMap::new();
+    supply.insert(b8, 1); // deficit
+    supply.insert(b32, 1); // exactly met
+
+    let surplus = compute_surplus(&demand, &supply);
+    assert!(
+        surplus.is_empty(),
+        "deficit + exactly-met → no surplus. Got: {surplus:?}"
+    );
+}
+
+// ─── update_idle_and_reapable ────────────────────────────────────
+//
+// All tests simulate elapsed time via `Instant` arithmetic (no real
+// sleeps — CI noisy neighbors make those flaky). Same pattern as
+// `scaling/tests.rs::stabilization_*`.
+//
+// The function takes `now` as a parameter; tests advance it by
+// adding to a fixed `t0` base. `idle_since` timestamps are stamped
+// at whatever `now` was passed, so the window check is pure
+// subtraction.
+
+/// Plan T4 case 1: bucket surplus for 599s → NOT reapable.
+/// Window is 600s; one second short of the threshold.
+// r[verify ctrl.pool.manifest-scaledown]
+#[test]
+fn surplus_599s_not_reapable() {
+    let b8 = (8 * GI, 2000);
+    let surplus = BTreeMap::from([(b8, 3)]);
+    let mut idle = BTreeMap::new();
+
+    let t0 = Instant::now();
+    // First tick: stamps t0.
+    let r0 = update_idle_and_reapable(&mut idle, &surplus, t0, WINDOW);
+    assert!(r0.is_empty(), "freshly surplus → not reapable");
+    assert_eq!(idle.get(&b8), Some(&t0), "idle_since stamped at t0");
+
+    // 599s later: window not elapsed.
+    let t599 = t0 + Duration::from_secs(599);
+    let r599 = update_idle_and_reapable(&mut idle, &surplus, t599, WINDOW);
+    assert!(
+        r599.is_empty(),
+        "599s < 600s window → not reapable. Got: {r599:?}"
+    );
+    assert_eq!(
+        idle.get(&b8),
+        Some(&t0),
+        "timestamp preserved (still surplus; or_insert, not insert)"
+    );
+}
+
+/// Plan T4 case 2: bucket surplus for 601s → reapable, surplus count
+/// propagated. `>=` threshold: exactly 600s is ALSO reapable.
+// r[verify ctrl.pool.manifest-scaledown]
+#[test]
+fn surplus_601s_reapable() {
+    let b8 = (8 * GI, 2000);
+    let surplus = BTreeMap::from([(b8, 3)]);
+    let mut idle = BTreeMap::new();
+
+    let t0 = Instant::now();
+    update_idle_and_reapable(&mut idle, &surplus, t0, WINDOW);
+
+    // Exactly 600s: `>=` threshold → reapable.
+    let t600 = t0 + WINDOW;
+    let r600 = update_idle_and_reapable(&mut idle, &surplus, t600, WINDOW);
+    assert_eq!(
+        r600.get(&b8),
+        Some(&3),
+        "exactly at window → reapable (>= not >); surplus count = 3"
+    );
+
+    // 601s: definitely past.
+    let t601 = t0 + Duration::from_secs(601);
+    let r601 = update_idle_and_reapable(&mut idle, &surplus, t601, WINDOW);
+    assert_eq!(r601.get(&b8), Some(&3), "601s > 600s → reapable");
+}
+
+/// Plan T4 case 3: demand returns mid-window → clock resets. Surplus
+/// again → must wait the FULL window from the new surplus-start,
+/// NOT from the original t0.
+///
+/// The scenario: 48Gi bucket goes surplus (no 48Gi builds queued).
+/// At t=300s, a 48Gi derivation enters the queue → demand returns
+/// → bucket no longer surplus → idle_since cleared. That build
+/// finishes at t=400s → surplus again. The window restarts at
+/// t=400s; bucket isn't reapable until t=1000s (400s + 600s).
+// r[verify ctrl.pool.manifest-scaledown]
+#[test]
+fn demand_returns_resets_clock() {
+    let b48 = (48 * GI, 4000);
+    let mut idle = BTreeMap::new();
+
+    let t0 = Instant::now();
+
+    // t0: bucket goes surplus. Stamp.
+    let surplus = BTreeMap::from([(b48, 2)]);
+    update_idle_and_reapable(&mut idle, &surplus, t0, WINDOW);
+    assert_eq!(idle.get(&b48), Some(&t0));
+
+    // t=300s: demand returns (bucket no longer surplus). Clock clears.
+    let t300 = t0 + Duration::from_secs(300);
+    let empty = BTreeMap::new();
+    let r300 = update_idle_and_reapable(&mut idle, &empty, t300, WINDOW);
+    assert!(r300.is_empty());
+    assert!(
+        !idle.contains_key(&b48),
+        "demand returned → idle_since cleared (retain prunes it)"
+    );
+
+    // t=400s: surplus again. Stamp at t400, NOT t0.
+    let t400 = t0 + Duration::from_secs(400);
+    update_idle_and_reapable(&mut idle, &surplus, t400, WINDOW);
+    assert_eq!(
+        idle.get(&b48),
+        Some(&t400),
+        "re-surplus → fresh stamp at t400"
+    );
+
+    // t=601s: would have been reapable from t0 (601 > 600), but the
+    // clock reset at t400. Only 201s elapsed since re-surplus → NOT
+    // reapable. THIS is the anti-flap check.
+    let t601 = t0 + Duration::from_secs(601);
+    let r601 = update_idle_and_reapable(&mut idle, &surplus, t601, WINDOW);
+    assert!(
+        r601.is_empty(),
+        "t601 - t400 = 201s < 600s → not reapable. \
+         Without the reset, this would wrongly delete. Got: {r601:?}"
+    );
+
+    // t=1000s: 600s since t400 → reapable.
+    let t1000 = t0 + Duration::from_secs(1000);
+    let r1000 = update_idle_and_reapable(&mut idle, &surplus, t1000, WINDOW);
+    assert_eq!(
+        r1000.get(&b48),
+        Some(&2),
+        "t1000 - t400 = 600s ≥ window → reapable"
+    );
+}
+
+/// A surplus bucket that DISAPPEARS entirely (all Jobs died, or
+/// operator manually deleted them) is pruned from idle_since. No
+/// stale entry if that bucket later reappears.
+#[test]
+fn vanished_bucket_pruned_from_idle() {
+    let b8 = (8 * GI, 2000);
+    let b32 = (32 * GI, 4000);
+    let mut idle = BTreeMap::new();
+
+    let t0 = Instant::now();
+
+    // Both surplus initially.
+    let both = BTreeMap::from([(b8, 1), (b32, 1)]);
+    update_idle_and_reapable(&mut idle, &both, t0, WINDOW);
+    assert_eq!(idle.len(), 2);
+
+    // b32's Job died → no longer in supply → no longer surplus.
+    // b8 still surplus.
+    let just_b8 = BTreeMap::from([(b8, 1)]);
+    update_idle_and_reapable(&mut idle, &just_b8, t0 + Duration::from_secs(100), WINDOW);
+    assert_eq!(idle.len(), 1, "b32 pruned");
+    assert!(idle.contains_key(&b8), "b8 retained");
+    assert!(!idle.contains_key(&b32), "b32 cleared — no stale entry");
+}
+
+// ─── select_deletable_jobs ───────────────────────────────────────
+//
+// Tests the executor_id → Job matching + idle check. ExecutorInfo
+// is constructed minimal (only executor_id + running_builds matter).
+// K8s Job-pod naming: pod is `{job_name}-{random5}`, executor_id
+// IS the pod name (downward API).
+
+/// Minimal ExecutorInfo. Only `executor_id` + `running_builds` are
+/// read by `select_deletable_jobs`; the rest is prost defaults.
+fn executor(id: &str, running: u32) -> ExecutorInfo {
+    ExecutorInfo {
+        executor_id: id.into(),
+        running_builds: running,
+        ..Default::default()
+    }
+}
+
+/// Job with a name + bucket labels. `select_deletable_jobs` matches
+/// by name prefix; `job_with_bucket` (the existing fixture) has no
+/// name, so this is a named variant.
+fn named_job(name: &str, bucket: Bucket) -> Job {
+    let mut j = job_with_bucket(Some(bucket));
+    j.metadata.name = Some(name.into());
+    j
+}
+
+/// Plan T4 case 4: 3 Jobs surplus, 1 is mid-build → delete at most
+/// 2. The busy Job is skipped; only confirmed-idle Jobs are selected.
+// r[verify ctrl.pool.manifest-scaledown]
+#[test]
+fn busy_job_skipped_for_deletion() {
+    let b8 = (8 * GI, 2000);
+    let jobs = [
+        named_job("pool-mf-8g-2000m-aaa", b8),
+        named_job("pool-mf-8g-2000m-bbb", b8),
+        named_job("pool-mf-8g-2000m-ccc", b8),
+    ];
+    let refs: Vec<&Job> = jobs.iter().collect();
+
+    // Executors: aaa idle, bbb BUSY (running_builds=1), ccc idle.
+    // K8s pod naming: `{job}-{5char}` → prefix match.
+    let executors = [
+        executor("pool-mf-8g-2000m-aaa-xyzwq", 0),
+        executor("pool-mf-8g-2000m-bbb-pqrst", 1), // mid-build!
+        executor("pool-mf-8g-2000m-ccc-lmnop", 0),
+    ];
+
+    // All 3 surplus, all 3 in the reapable budget.
+    let reapable = BTreeMap::from([(b8, 3)]);
+
+    let deletable = select_deletable_jobs(&refs, &reapable, &executors);
+
+    assert_eq!(
+        deletable.len(),
+        2,
+        "3 surplus, 1 busy → delete at most 2. Deleting bbb would \
+         orphan its build (SIGTERM mid-compilation → scheduler \
+         reassigns, work wasted). Got: {:?}",
+        deletable
+            .iter()
+            .map(|j| j.metadata.name.as_deref())
+            .collect::<Vec<_>>()
+    );
+    // The two idle Jobs are selected; busy bbb is NOT.
+    let names: Vec<&str> = deletable
+        .iter()
+        .map(|j| j.metadata.name.as_deref().unwrap())
+        .collect();
+    assert!(names.contains(&"pool-mf-8g-2000m-aaa"));
+    assert!(names.contains(&"pool-mf-8g-2000m-ccc"));
+    assert!(
+        !names.contains(&"pool-mf-8g-2000m-bbb"),
+        "busy Job NOT in deletable set"
+    );
+}
+
+/// Per-bucket budget cap: surplus=1 means delete at most 1, even if
+/// 3 Jobs are idle. Next tick re-diffs; if still surplus, deletes
+/// the next one. Prevents over-delete when surplus shrinks between
+/// the idle-stamp and the delete (demand partially returned).
+#[test]
+fn surplus_budget_caps_deletions_per_bucket() {
+    let b8 = (8 * GI, 2000);
+    let jobs = [
+        named_job("p-mf-8g-2000m-aaa", b8),
+        named_job("p-mf-8g-2000m-bbb", b8),
+        named_job("p-mf-8g-2000m-ccc", b8),
+    ];
+    let refs: Vec<&Job> = jobs.iter().collect();
+
+    // All idle.
+    let executors = [
+        executor("p-mf-8g-2000m-aaa-11111", 0),
+        executor("p-mf-8g-2000m-bbb-22222", 0),
+        executor("p-mf-8g-2000m-ccc-33333", 0),
+    ];
+
+    // Only 1 surplus (demand=2, supply=3 → surplus=1).
+    let reapable = BTreeMap::from([(b8, 1)]);
+
+    let deletable = select_deletable_jobs(&refs, &reapable, &executors);
+    assert_eq!(
+        deletable.len(),
+        1,
+        "surplus=1 → delete exactly 1, not all 3 idle Jobs"
+    );
+}
+
+/// Unknown executor state (no matching ExecutorInfo) → conservative
+/// skip. Pod starting up (not heartbeating yet), or RPC-timing race.
+/// "Don't delete a Job mid-build" extends to "don't delete a Job
+/// whose state you can't verify".
+#[test]
+fn unknown_executor_state_skipped() {
+    let b8 = (8 * GI, 2000);
+    let jobs = [
+        named_job("p-mf-8g-2000m-known", b8),
+        named_job("p-mf-8g-2000m-ghost", b8),
+    ];
+    let refs: Vec<&Job> = jobs.iter().collect();
+
+    // Only "known" has a registered executor.
+    let executors = [executor("p-mf-8g-2000m-known-abcde", 0)];
+
+    let reapable = BTreeMap::from([(b8, 2)]);
+
+    let deletable = select_deletable_jobs(&refs, &reapable, &executors);
+    assert_eq!(deletable.len(), 1);
+    assert_eq!(
+        deletable[0].metadata.name.as_deref(),
+        Some("p-mf-8g-2000m-known"),
+        "only the confirmed-idle Job; ghost (no executor) skipped \
+         — might be starting up, can't prove idle"
+    );
+}
+
+/// Prefix match boundary: `{job}-` with trailing dash. Job
+/// "p-mf-8g-2000m-abc" must NOT match executor of a DIFFERENT Job
+/// "p-mf-8g-2000m-abcdef" (whose pod is "p-mf-8g-2000m-abcdef-
+/// {5char}"). Random suffixes make collisions astronomically
+/// unlikely, but the trailing dash is defense in depth.
+#[test]
+fn prefix_match_requires_trailing_dash() {
+    let b8 = (8 * GI, 2000);
+    // Two Jobs where one's name is a prefix of the other.
+    let jobs = [
+        named_job("p-mf-8g-2000m-abc", b8),
+        named_job("p-mf-8g-2000m-abcdef", b8),
+    ];
+    let refs: Vec<&Job> = jobs.iter().collect();
+
+    // Only abcdef's pod is registered (and idle). abc's pod is not
+    // registered. A naive `starts_with("p-mf-8g-2000m-abc")` (no
+    // dash) would falsely match "p-mf-8g-2000m-abcdef-xxxxx" →
+    // wrongly conclude Job "abc" is idle.
+    let executors = [executor("p-mf-8g-2000m-abcdef-zzzzz", 0)];
+
+    let reapable = BTreeMap::from([(b8, 2)]);
+
+    let deletable = select_deletable_jobs(&refs, &reapable, &executors);
+    assert_eq!(deletable.len(), 1);
+    assert_eq!(
+        deletable[0].metadata.name.as_deref(),
+        Some("p-mf-8g-2000m-abcdef"),
+        "only the Job whose pod is registered. Job 'abc' has no \
+         registered pod → unknown → skipped. Trailing dash in \
+         '{{job}}-' prevents the prefix collision."
+    );
+}
+
+/// Jobs in non-reapable buckets are ignored. Multi-bucket scenario:
+/// 8Gi reapable (window elapsed), 32Gi NOT reapable (still within
+/// window). Only 8Gi Jobs are eligible.
+#[test]
+fn non_reapable_bucket_ignored() {
+    let b8 = (8 * GI, 2000);
+    let b32 = (32 * GI, 4000);
+    let jobs = [
+        named_job("p-mf-8g-2000m-aaa", b8),
+        named_job("p-mf-32g-4000m-bbb", b32),
+    ];
+    let refs: Vec<&Job> = jobs.iter().collect();
+
+    // Both idle.
+    let executors = [
+        executor("p-mf-8g-2000m-aaa-11111", 0),
+        executor("p-mf-32g-4000m-bbb-22222", 0),
+    ];
+
+    // Only b8 reapable (b32's window hasn't elapsed).
+    let reapable = BTreeMap::from([(b8, 1)]);
+
+    let deletable = select_deletable_jobs(&refs, &reapable, &executors);
+    assert_eq!(deletable.len(), 1);
+    assert_eq!(
+        deletable[0].metadata.name.as_deref(),
+        Some("p-mf-8g-2000m-aaa"),
+        "32Gi Job skipped — bucket not in reapable map"
+    );
+}
+
+/// Floor Jobs (`bucket_labels(None)` → "floor") are skipped.
+/// `parse_bucket_from_labels` returns None for floor → the
+/// `let Some(bucket) = ... else continue` bails early.
+#[test]
+fn floor_job_skipped_for_deletion() {
+    let b8 = (8 * GI, 2000);
+    let mut floor_job = job_with_bucket(None);
+    floor_job.metadata.name = Some("p-mf-floorg-floorm-xxx".into());
+    let bucketed = named_job("p-mf-8g-2000m-yyy", b8);
+    let jobs = [floor_job, bucketed];
+    let refs: Vec<&Job> = jobs.iter().collect();
+
+    let executors = [
+        executor("p-mf-floorg-floorm-xxx-11111", 0),
+        executor("p-mf-8g-2000m-yyy-22222", 0),
+    ];
+
+    let reapable = BTreeMap::from([(b8, 1)]);
+
+    let deletable = select_deletable_jobs(&refs, &reapable, &executors);
+    assert_eq!(deletable.len(), 1);
+    assert_eq!(
+        deletable[0].metadata.name.as_deref(),
+        Some("p-mf-8g-2000m-yyy"),
+        "floor Job skipped (not a tracked bucket); bucketed Job deleted"
     );
 }
