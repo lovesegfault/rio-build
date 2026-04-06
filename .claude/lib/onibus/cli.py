@@ -55,7 +55,7 @@ _MODELS = {
         "BehindReport", "BehindCheck", "CadenceReport", "LockStatus",
         "ReconcileReport", "ExcusableVerdict", "AtomicityVerdict", "TraceyCoverage",
         "RenameReport", "CollisionReport", "TickReport", "StopSnapshot", "Worktree",
-        "DagFlipResult",
+        "DagFlipResult", "FastPathVerdict",
     )
 }
 
@@ -328,6 +328,24 @@ def _cmd_merge(args: argparse.Namespace) -> int:
                 "clear": gate_is_clear(r.gate, dag),
             }))
         return 0
+    if c == "queue-halted":
+        reason = merge.queue_halted()
+        if reason:
+            print(reason, end="")
+            return 1
+        return 0
+    if c == "clear-halt":
+        print("cleared" if merge.clear_halt() else "not-halted")
+        return 0
+    if c == "clause4-check":
+        if args.schema:
+            _schema_exit(_MODELS["FastPathVerdict"])
+        _emit(merge.clause4_check(args.base))
+        return 0
+    if c == "record-green":
+        h = merge.record_green_ci_hash()
+        print(h or "eval-failed")
+        return 0
     if c == "atomicity-check":
         if args.schema:
             _schema_exit(_MODELS["AtomicityVerdict"])
@@ -552,6 +570,10 @@ def main(argv: list[str] | None = None) -> int:
     sp = g.add_parser("dag-flip"); sp.add_argument("plan", type=int); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("queue"); sp.add_argument("json_row")
     g.add_parser("queue-gates")
+    g.add_parser("queue-halted")
+    g.add_parser("clear-halt")
+    sp = g.add_parser("clause4-check"); sp.add_argument("base"); sp.add_argument("--schema", action="store_true")
+    g.add_parser("record-green")
     for name in ("atomicity-check", "rename-unassigned", "preflight", "rebase-anchored", "ff-try"):
         sp = g.add_parser(name); sp.add_argument("branch"); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("convco-check"); sp.add_argument("range"); sp.add_argument("--schema", action="store_true")

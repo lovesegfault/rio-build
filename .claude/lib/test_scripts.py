@@ -36,6 +36,7 @@ from onibus.models import (
     AgentRow,
     CollisionRow,
     CoverageResult,
+    FastPathVerdict,
     Followup,
     FollowupOrigin,
     Gate,
@@ -823,6 +824,82 @@ def test_gate_plan_merged_clears_when_done(tmp_path: Path):
     assert gate_is_clear(ci_gate, empty) is True
     log.write_text("...\nbuild failed\n")
     assert gate_is_clear(ci_gate, empty) is False
+
+
+def test_fast_path_red_test_halts(tmp_path: Path, monkeypatch):
+    """P0479 regression: Clause-4 fast-path let red tests through. A diff
+    that adds a red #[test] must HALT, not SKIP. The old "test-only = skip"
+    category check merged a red test attr → 118-commit .#coverage-full break.
+
+    Mock: diff adds `#[test] fn always_fails() { panic!() }`, nextest run
+    returns rc=1. Assert clause4_check → HALT, sentinel written."""
+    import onibus.merge as m
+
+    # Redirect STATE_DIR so the sentinel write doesn\'t pollute real state.
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(m, "_QUEUE_HALTED", state / "queue-halted")
+    monkeypatch.setattr(m, "_LAST_GREEN_HASH", state / "last-green-ci-hash")
+
+    # Mock nix eval: hash CHANGED (new test = new drv input).
+    monkeypatch.setattr(m, "_ci_drv_hash", lambda: "/nix/store/NEW-ci.drv")
+    (state / "last-green-ci-hash").write_text("/nix/store/OLD-ci.drv")
+
+    # Mock git diff: one added test fn.
+    diff_output = (
+        "+#[test]\n"
+        "+fn always_fails() {\n"
+        "+    panic!(\"red\")\n"
+        "+}\n"
+    )
+    def fake_git(*args, **kw):
+        if args[0] == "diff" and "--unified=3" in args:
+            return diff_output
+        if args[0] == "diff" and "--name-only" in args:
+            return "rio-store/tests/manifest.rs"
+        return ""
+    monkeypatch.setattr(m, "git", fake_git)
+
+    # Mock nextest: the new test is RED.
+    monkeypatch.setattr(
+        m, "_run_new_tests",
+        lambda names: (1, "FAIL always_fails: panicked at \'red\'")
+    )
+
+    verdict = m.clause4_check("HEAD~1")
+
+    assert verdict.decision == "HALT", (
+        f"expected HALT (red new-test), got {verdict.decision}: {verdict.reason}"
+    )
+    assert "always_fails" in verdict.new_tests
+    assert (state / "queue-halted").exists(), "sentinel not written on HALT"
+    assert "always_fails" in (state / "queue-halted").read_text()
+
+    # Inverse: if the new test is GREEN, decision is RUN_FULL (hash changed
+    # → full gate still needed), NOT SKIP (old broken behavior).
+    (state / "queue-halted").unlink()
+    monkeypatch.setattr(m, "_run_new_tests", lambda names: (0, "PASS always_fails"))
+    verdict = m.clause4_check("HEAD~1")
+    assert verdict.decision == "RUN_FULL"
+    assert verdict.new_tests == ["always_fails"]
+    assert not (state / "queue-halted").exists()
+
+    # Hash-identical path: SKIP is valid ONLY here.
+    monkeypatch.setattr(m, "_ci_drv_hash", lambda: "/nix/store/OLD-ci.drv")
+    verdict = m.clause4_check("HEAD~1")
+    assert verdict.decision == "SKIP"
+    assert verdict.ci_hash == verdict.last_green_hash
+
+
+def test_fast_path_verdict_model_roundtrips():
+    """FastPathVerdict — all three decisions validate, Literal rejects typos."""
+    for d in ("SKIP", "HALT", "RUN_FULL"):
+        v = FastPathVerdict(decision=d, reason="test")
+        assert FastPathVerdict.model_validate_json(v.model_dump_json()).decision == d
+    with pytest.raises(ValidationError):
+        FastPathVerdict(decision="skip", reason="lowercase rejected")
+    with pytest.raises(ValidationError):
+        FastPathVerdict(decision="PASS", reason="not a valid decision")
 
 
 def test_gate_manual_never_auto_clears():

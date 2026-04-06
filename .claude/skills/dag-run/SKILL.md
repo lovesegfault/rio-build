@@ -13,6 +13,14 @@ git rev-parse --abbrev-ref HEAD  # verify coordinator worktree is checked out to
 
 The coordinator worktree (`/root/src/rio-build/main`) must have `$TGT` checked out — mergers run `git merge --ff-only` from here, so HEAD determines what advances. `main` stays at the last stable cut.
 
+**Queue-halted check (pre-dispatch, every loop iteration):**
+
+```bash
+.claude/bin/onibus merge queue-halted
+```
+
+Nonempty output → the merger wrote `.claude/state/queue-halted` (clause-4 found red new-tests, or `.#ci` broke in a way that stacking more merges won't fix). **Do NOT dispatch new `/implement` calls.** Surface the reason, fix the root cause, then `onibus merge clear-halt` and resume. The sentinel is the mechanical stop that prose constraint ("don't merge past red") kept failing to enforce — 118-commit `.#coverage-full` break was the cost.
+
 Loop:
 
 1. **Frontier.** `.claude/bin/onibus dag launchable --parallel 10` → sorted by `(effective_priority desc, impact desc)`, collision-free. Priority propagates backward through deps — bump a blocked plan and its blockers inherit that priority on the frontier. `onibus dag set-priority <N> <1-100>` (default 50); bump flake-owners to ~90 when adding a known-flake. `--verbose` shows `(eff=N←)` for propagated priorities. Launch via `/implement <N>`. Throttle: ~10 parallel is a **ceiling**, not a batch size — keep slot count near ceiling continuously. Write each launch via:
