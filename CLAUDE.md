@@ -215,8 +215,8 @@ Format: `TODO(P0NNN): <what>` where `P0NNN` is the plan number that will close t
 // post-upsert (race: concurrent PutPath can bump refcount between).
 
 // GOOD: points to the blocking plan
-// TODO(P0286): this path is unreachable under privileged:true. Device
-// plugin + hostUsers:false make it live.
+// TODO(P0NNN): this path is unreachable under the escape-hatch
+// config. Exercise it once the production path (see ADR-NNN) lands.
 
 // BAD: no plan tag — nothing schedules this
 // TODO: fix this later
@@ -237,6 +237,17 @@ Format: `TODO(P0NNN): <what>` where `P0NNN` is the plan number that will close t
 - No plan owns it — write a plan, don't leave an orphan TODO
 
 **Audit periodically:** `grep -rn 'TODO[^(]' rio-*/src/` finds untagged TODOs (should be zero). `grep -rn 'TODO(P0NNN)' rio-*/src/` where the plan is DONE finds stale TODOs the plan should have closed.
+
+**Format for explicitly-not-doing:** `WONTFIX(P0NNN): <why>` where `P0NNN` is the plan whose investigation concluded this won't be fixed. Unlike TODO, WONTFIX does NOT schedule future work — it's a grep-able marker that someone looked at this and decided against it. The plan doc contains the rationale.
+
+```rust
+// WONTFIX(P0310): ssh-ng client options are dropped client-side — Nix
+// overrides setOptions() with an empty body (088ef8175, intentional).
+// The accessor stays for future-proofing if rio ever advertises
+// `set-options-map-only`; until then this path is unreachable.
+```
+
+Audit: `grep -rn 'WONTFIX[^(]' rio-*/src/` finds untagged WONTFIX (should be zero).
 
 ## Protocol Implementation Guidelines
 

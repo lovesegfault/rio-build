@@ -265,7 +265,7 @@ const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
 /// histogram in this file. Range is 0..~20K (induced subgraph over the
 /// 5000-node cap at realistic 4× edge density). Default Prometheus buckets
 /// `[0.005..10.0]` are useless here — every sample lands in `+Inf`. These
-/// match the suggested buckets at observability.md:119.
+/// match the suggested buckets in observability.md's Histogram Buckets table.
 const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
 
 /// Histogram bucket boundaries for `rio_worker_upload_references_count`.

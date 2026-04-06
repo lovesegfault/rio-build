@@ -18,6 +18,7 @@ const WORKER_METRICS: &[&str] = &[
     "rio_worker_overlay_teardown_failures_total",
     "rio_worker_prefetch_total",
     "rio_worker_upload_bytes_total",
+    "rio_worker_upload_skipped_idempotent_total",
     "rio_worker_upload_references_count",
     "rio_worker_fuse_fetch_bytes_total",
     "rio_worker_fuse_index_divergence_total",
@@ -25,6 +26,7 @@ const WORKER_METRICS: &[&str] = &[
     "rio_worker_cpu_fraction",
     "rio_worker_memory_fraction",
     "rio_worker_stale_assignments_rejected_total",
+    "rio_worker_bloom_fill_ratio",
 ];
 
 const EMITTED_METRICS: &str = include_str!(concat!(env!("OUT_DIR"), "/emitted_metrics.txt"));
