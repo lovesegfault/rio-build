@@ -41,8 +41,8 @@ mod inputs;
 
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
 use inputs::{
-    WARM_OVERALL_DEADLINE, compute_input_closure, fetch_drv_from_store, prefetch_manifests,
-    verify_fod_hashes, warm_inputs_in_fuse,
+    compute_input_closure, fetch_drv_from_store, prefetch_manifests, verify_fod_hashes,
+    warm_inputs_in_fuse, warm_overall_deadline,
 };
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
@@ -450,6 +450,7 @@ pub async fn execute_build(
     let ResolvedInputs {
         basic_drv,
         input_paths,
+        input_sized,
         input_metadata,
     } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
@@ -485,6 +486,13 @@ pub async fn execute_build(
         tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, before warm)");
         return Err(ExecutorError::Cancelled);
     }
+    // I-178: size-aware warm deadline. A 1.9 GB input at the flat 90 s
+    // wall detached the fetch thread mid-stream → daemon ENOENT →
+    // PermanentFailure poison. The 90 s floor stays for small closures
+    // (I-165 thundering-herd bound); large closures get Σnar_size /
+    // (MIN_THROUGHPUT × CONCURRENCY) + slop.
+    let total_nar_bytes: u64 = input_sized.iter().map(|(_, sz)| *sz).sum();
+    let warm_deadline = warm_overall_deadline(total_nar_bytes);
     let warm = async {
         if let Some(cache) = &env.fuse_cache {
             prefetch_manifests(store_client, cache, &input_paths).await;
@@ -494,8 +502,8 @@ pub async fn execute_build(
             env.fuse_cache.as_ref(),
             store_client,
             env.fuse_fetch_timeout,
-            &input_paths,
-            WARM_OVERALL_DEADLINE,
+            &input_sized,
+            warm_deadline,
         )
         .await;
     };
@@ -833,10 +841,15 @@ struct ResolvedInputs {
     /// Sent to nix-daemon via wopBuildDerivation.
     basic_drv: rio_nix::derivation::BasicDerivation,
     /// Full transitive input closure (BFS over QueryPathInfo references,
-    /// seeded from input_srcs + resolved inputDrv outputs). Used for the
-    /// FUSE warm and the output reference-scan candidate set. Derived
-    /// from `input_metadata` (each entry's `.path`).
+    /// seeded from input_srcs + resolved inputDrv outputs). Used for
+    /// `prefetch_manifests` and the output reference-scan candidate
+    /// set. Derived from `input_metadata` (each entry's `.path`).
     input_paths: Vec<String>,
+    /// `(path, nar_size)` for every closure path. Used for the FUSE
+    /// warm — I-178: per-path timeout and overall deadline scale with
+    /// NAR size so a 1.9 GB input isn't aborted at the flat 60 s.
+    /// Derived from `input_metadata` alongside `input_paths`.
+    input_sized: Vec<(String, u64)>,
     /// PathInfo for every closure path, captured during the BFS so the
     /// synth DB ValidPaths table can be built without a second
     /// QueryPathInfo pass (I-106).
@@ -968,10 +981,20 @@ async fn resolve_inputs(
     let input_metadata =
         compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
     let input_paths: Vec<String> = input_metadata.iter().map(|m| m.path.clone()).collect();
+    // I-178: project (path, nar_size) for warm_inputs_in_fuse. SynthPathInfo
+    // already has nar_size from BatchQueryPathInfo (authoritative; the
+    // ManifestHint.info.nar_size is best-effort). Two projections from
+    // input_metadata is cheaper than passing &input_metadata around — the
+    // other consumers (prefetch_manifests, ref-scan) want plain &[String].
+    let input_sized: Vec<(String, u64)> = input_metadata
+        .iter()
+        .map(|m| (m.path.clone(), m.nar_size))
+        .collect();
 
     Ok(ResolvedInputs {
         basic_drv,
         input_paths,
+        input_sized,
         input_metadata,
     })
 }
@@ -1191,6 +1214,37 @@ async fn collect_outputs(
     assignment_token: &str,
 ) -> Result<BuildOutputs, ExecutorError> {
     if !build_result.status.is_success() {
+        // I-178: daemon ENOENT on a closure input is worker-local
+        // materialization failure (warm timeout / FUSE EIO / I-043
+        // negative-dentry), NOT a build defect. Reclassify so the
+        // scheduler retries instead of poisoning. Checked BEFORE the
+        // generic nix_failure_to_proto collapse (MiscFailure →
+        // PermanentFailure).
+        if is_input_materialization_failure(
+            build_result.status,
+            &build_result.error_msg,
+            input_paths,
+        ) {
+            // r[impl obs.metric.input-materialization-failures]
+            metrics::counter!("rio_builder_input_materialization_failures_total").increment(1);
+            tracing::warn!(
+                drv_path = %drv_path,
+                error = %build_result.error_msg,
+                "daemon ENOENT on closure input — reclassifying MiscFailure → \
+                 InfrastructureFailure (warm timeout / FUSE EIO / I-043 race)"
+            );
+            return Ok(BuildOutputs {
+                proto_result: ProtoBuildResult {
+                    status: BuildResultStatus::InfrastructureFailure.into(),
+                    error_msg: format!(
+                        "input materialization failed (I-043/I-178): {}",
+                        build_result.error_msg
+                    ),
+                    ..Default::default()
+                },
+                output_size_bytes: 0,
+            });
+        }
         tracing::warn!(
             drv_path = %drv_path,
             status = ?build_result.status,
@@ -1491,6 +1545,47 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
         .collect()
 }
 
+/// True iff the daemon's `MiscFailure` is `getting attributes of path
+/// '<p>': No such file or directory` where `<p>` is in the build's
+/// input closure.
+///
+/// I-178: that pattern means the daemon's sandbox-setup `lstat(input)`
+/// hit overlay → FUSE → ENOENT (warm timeout, FUSE EIO, or the I-043
+/// negative-dentry race). The input was verified present in rio-store
+/// by `compute_input_closure` (BatchQueryPathInfo only returns found
+/// paths); its absence at sandbox-setup is a worker-local
+/// materialization failure, NOT a build defect. Reporting
+/// `PermanentFailure` poisons the derivation; `InfrastructureFailure`
+/// lets the scheduler retry on a fresh worker.
+///
+/// String-matching the daemon's error is brittle but the message is
+/// stable since Nix 2.3 (`libstore/posix-fs-canonicalise.cc`). The
+/// `<p> ∈ input_paths` membership check is the load-bearing guard — a
+/// genuinely-missing path NOT in the closure stays `PermanentFailure`.
+///
+// r[impl builder.result.input-enoent-is-infra]
+pub(crate) fn is_input_materialization_failure(
+    nix_status: rio_nix::protocol::build::BuildStatus,
+    error_msg: &str,
+    input_paths: &[String],
+) -> bool {
+    use rio_nix::protocol::build::BuildStatus;
+    if nix_status != BuildStatus::MiscFailure {
+        return false;
+    }
+    // Single substring extract between the first '…' pair after the
+    // marker. nix-daemon formats: `getting attributes of path
+    // '/nix/store/…': No such file or directory`. The closure is
+    // ≤ ~2k entries; linear scan is fine on the failure path.
+    let Some(rest) = error_msg.split("getting attributes of path '").nth(1) else {
+        return false;
+    };
+    let Some(path) = rest.split('\'').next() else {
+        return false;
+    };
+    input_paths.iter().any(|p| p == path)
+}
+
 /// Map a Nix daemon BuildStatus (failure path only — caller has already
 /// branched on is_success()) to the proto BuildResultStatus reported to
 /// the scheduler.
@@ -1731,6 +1826,64 @@ mod tests {
             nix_failure_to_proto(Nix::NoSubstituters),
             Proto::PermanentFailure
         );
+    }
+
+    /// I-178: daemon `MiscFailure` with `getting attributes of path
+    /// '<input>': No such file or directory` is a worker-local
+    /// materialization failure (warm timeout / FUSE EIO / I-043 race),
+    /// not a build defect. The membership check is load-bearing — a
+    /// path NOT in the closure stays PermanentFailure.
+    // r[verify builder.result.input-enoent-is-infra]
+    #[test]
+    fn test_is_input_materialization_failure() {
+        use rio_nix::protocol::build::BuildStatus as Nix;
+
+        let input = "/nix/store/54f75pjisgzabcdefghijklmnopqrstu-source".to_string();
+        let other = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string();
+        let closure = vec![input.clone(), other.clone()];
+        let enoent = format!(
+            "while setting up the build environment: getting attributes of \
+             path '{input}': No such file or directory"
+        );
+
+        // MiscFailure + matching path → true (reclassify to infra).
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, &enoent, &closure),
+            "ENOENT on closure input must reclassify"
+        );
+
+        // MiscFailure + path NOT in closure → false (genuine missing
+        // dep — leave as PermanentFailure).
+        let foreign = "getting attributes of path \
+                       '/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ghost': \
+                       No such file or directory";
+        assert!(
+            !is_input_materialization_failure(Nix::MiscFailure, foreign, &closure),
+            "ENOENT on non-closure path must NOT reclassify"
+        );
+
+        // Non-MiscFailure status + matching path → false (status guard).
+        assert!(
+            !is_input_materialization_failure(Nix::PermanentFailure, &enoent, &closure),
+            "status guard: only MiscFailure is reclassified"
+        );
+
+        // MiscFailure + unrelated message → false.
+        assert!(
+            !is_input_materialization_failure(
+                Nix::MiscFailure,
+                "builder for '/nix/store/...-foo.drv' failed with exit code 1",
+                &closure,
+            ),
+            "unrelated MiscFailure message must NOT reclassify"
+        );
+
+        // Empty closure → false (vacuous membership).
+        assert!(!is_input_materialization_failure(
+            Nix::MiscFailure,
+            &enoent,
+            &[]
+        ));
     }
 
     /// `resolve_inputs` fetches each inputDrv from the store, resolves

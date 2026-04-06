@@ -26,17 +26,65 @@ use super::{ExecutorError, MAX_PARALLEL_FETCHES};
 /// the I-165 thundering-herd that motivated the deadline was 86 builders
 /// warming simultaneously; per-builder fan-out stays small so the
 /// aggregate doesn't re-saturate the store. See [`warm_inputs_in_fuse`].
-const WARM_FUSE_CONCURRENCY: usize = 4;
+pub(super) const WARM_FUSE_CONCURRENCY: usize = 4;
 
-/// Overall deadline for [`warm_inputs_in_fuse`]. Well above happy-path
-/// p99 warm (`rio_builder_input_warm_duration_seconds` histogram), well
-/// below the 300s store-side `GRPC_STREAM_TIMEOUT`. I-165: without this,
-/// a saturated store backs up every fuser thread in `block_on(GetPath)`
-/// and warm hangs for `fetch_timeout × ceil(inputs / fetch_sem)` —
-/// observed 47 min at 86-builder thundering herd. Warm is best-effort;
-/// a partial warm that later hits the I-043 negative-dentry race is
-/// recoverable, a 47-min uncancellable hang is not.
+/// Floor of the overall deadline for [`warm_inputs_in_fuse`]. Well above
+/// happy-path p99 warm (`rio_builder_input_warm_duration_seconds`
+/// histogram), well below the 300s store-side `GRPC_STREAM_TIMEOUT`.
+/// I-165: without a deadline, a saturated store backs up every fuser
+/// thread in `block_on(GetPath)` and warm hangs for `fetch_timeout ×
+/// ceil(inputs / fetch_sem)` — observed 47 min at 86-builder thundering
+/// herd. Warm is best-effort; a partial warm that later hits the I-043
+/// negative-dentry race is recoverable, a 47-min uncancellable hang is
+/// not.
+///
+/// I-178: this is now the FLOOR. The effective deadline is
+/// [`warm_overall_deadline`] — `max(this, Σnar_size / (MIN_THROUGHPUT ×
+/// CONCURRENCY) + 30s)` — so a single 1.9 GB input doesn't detach the
+/// warm thread mid-fetch.
 pub(super) const WARM_OVERALL_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Minimum expected store→builder throughput for warm-timeout sizing.
+/// I-178: 15 MiB/s is a conservative floor — half the ~30 MB/s observed
+/// in cluster (`rio_builder_fuse_fetch_bytes_total` ÷
+/// `rio_builder_fuse_fetch_duration_seconds`). A 1.9 GB NAR at this
+/// floor needs ≈127 s; the previous flat 60 s per-path timeout aborted
+/// the fetch mid-stream → daemon ENOENT → PermanentFailure poison.
+///
+/// Tune DOWN if `rio_builder_input_materialization_failures_total` is
+/// sustained nonzero (means real throughput is below this floor —
+/// cross-AZ builders, S3 throttle).
+pub(super) const WARM_MIN_THROUGHPUT_BPS: u64 = 15 * 1024 * 1024;
+
+/// Per-path warm timeout: `max(base, nar_size / MIN_THROUGHPUT)`.
+///
+/// `base` is `fuse_fetch_timeout` (60 s) so small paths are unchanged
+/// from pre-I-178 behavior. Large paths get a size-proportional budget.
+/// This is the WARM path only — the FUSE-callback path
+/// (`ensure_cached`'s `self.fetch_timeout`) stays at the flat 60 s per
+/// the I-165 circuit-breaker rationale (config.rs:89-105).
+// r[impl builder.input.warm-bounded+3]
+pub(super) fn warm_per_path_timeout(base: Duration, nar_size: u64) -> Duration {
+    base.max(Duration::from_secs(
+        nar_size.div_ceil(WARM_MIN_THROUGHPUT_BPS),
+    ))
+}
+
+/// Overall warm deadline: `max(WARM_OVERALL_DEADLINE, Σnar_size /
+/// (MIN_THROUGHPUT × CONCURRENCY) + 30s slop)`.
+///
+/// Without this a single large input would still detach at the 90 s
+/// wall even though its per-path timeout is 127 s — survivable post-
+/// I-165c (the detached userspace thread completes and the daemon's
+/// `WaitFor` wakes to a populated cache), but it spuriously bumps
+/// `rio_builder_input_warm_timeout_total` and burns a blocking-pool
+/// slot across the daemon-spawn boundary.
+pub(super) fn warm_overall_deadline(total_nar_bytes: u64) -> Duration {
+    let throughput_bound = Duration::from_secs(
+        total_nar_bytes.div_ceil(WARM_MIN_THROUGHPUT_BPS * WARM_FUSE_CONCURRENCY as u64),
+    ) + Duration::from_secs(30);
+    WARM_OVERALL_DEADLINE.max(throughput_bound)
+}
 
 /// Hash algorithm for FOD output verification. Maps from Nix's
 /// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
@@ -258,25 +306,36 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// `fuse_cache: None` (unit tests without a live FUSE mount) skips stage
 /// (1) and stats the tempdir directly — preserves the existing test shell
 /// without needing a `Cache`+gRPC fixture for closure-walk coverage.
-#[instrument(skip_all, fields(input_count = input_paths.len()))]
+#[instrument(skip_all, fields(input_count = inputs.len()))]
 pub(super) async fn warm_inputs_in_fuse(
     fuse_mount_point: &Path,
     fuse_cache: Option<&Arc<Cache>>,
     store_client: &StoreServiceClient<Channel>,
-    fetch_timeout: Duration,
-    input_paths: &[String],
+    base_fetch_timeout: Duration,
+    inputs: &[(String, u64)],
     deadline: Duration,
 ) {
-    // r[impl builder.input.warm-bounded+2]
+    // r[impl builder.input.warm-bounded+3]
     let cache = fuse_cache.cloned();
     let client = store_client.clone();
     warm_inputs_bounded(
         fuse_mount_point,
-        input_paths,
+        inputs,
         deadline,
-        move |basename, fuse_path| {
+        move |basename, fuse_path, nar_size| {
             let cache = cache.clone();
             let client = client.clone();
+            // I-178: per-path timeout scales with NAR size so a 1.9 GB
+            // input gets ≈127 s instead of the flat 60 s that aborted
+            // it mid-stream. `base_fetch_timeout` (the FUSE-callback
+            // 60 s) is the floor so small paths are unchanged.
+            //
+            // TODO(I-180): `collect_nar_stream` buffers the whole NAR
+            // in RAM before extraction; a tiny (1 Gi) builder OOMs on
+            // a 1.8 GB input regardless of timeout. I-177's
+            // size_class_floor promotes such builds; I-180 is the
+            // streaming-extract structural fix.
+            let per_path_timeout = warm_per_path_timeout(base_fetch_timeout, nar_size);
             async move {
                 // Stage 1: materialize via the cache's own fetch path. The
                 // spawn_blocking thread parks in userspace `block_on(gRPC)`
@@ -286,7 +345,7 @@ pub(super) async fn warm_inputs_in_fuse(
                     let rt = tokio::runtime::Handle::current();
                     let bn = basename.clone();
                     let on_disk = tokio::task::spawn_blocking(move || {
-                        prefetch_path_blocking(&cache, &client, &rt, fetch_timeout, &bn)
+                        prefetch_path_blocking(&cache, &client, &rt, per_path_timeout, &bn)
                     })
                     .await
                     .map_err(WarmErr::Join)?
@@ -347,26 +406,30 @@ enum WarmErr {
 /// untestable without that fixture.
 async fn warm_inputs_bounded<F, Fut>(
     fuse_mount_point: &Path,
-    input_paths: &[String],
+    inputs: &[(String, u64)],
     deadline: Duration,
     warm_one: F,
 ) where
-    F: Fn(String, PathBuf) -> Fut,
+    F: Fn(String, PathBuf, u64) -> Fut,
     Fut: Future<Output = Result<(), WarmErr>>,
 {
     let warm_start = std::time::Instant::now();
 
-    // Owned (basename, fuse_path) pairs collected up-front so the spawned
-    // futures are 'static (closures move owned data in; no borrow on
-    // `input_paths` survives the .await).
-    let warm_paths: Vec<(String, PathBuf)> = input_paths
+    // Owned (basename, fuse_path, nar_size) triples collected up-front
+    // so the spawned futures are 'static (closures move owned data in;
+    // no borrow on `inputs` survives the .await).
+    let warm_paths: Vec<(String, PathBuf, u64)> = inputs
         .iter()
-        .filter_map(|p| {
+        .filter_map(|(p, nar_size)| {
             // Malformed paths (no /nix/store/ prefix) would have failed
             // compute_input_closure's QueryPathInfo with InvalidArgument
             // already; skip silently as defense-in-depth.
             let basename = p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?;
-            Some((basename.to_owned(), fuse_mount_point.join(basename)))
+            Some((
+                basename.to_owned(),
+                fuse_mount_point.join(basename),
+                *nar_size,
+            ))
         })
         .collect();
     let total = warm_paths.len();
@@ -377,8 +440,8 @@ async fn warm_inputs_bounded<F, Fut>(
     let warmed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let warm_all = stream::iter(warm_paths)
-        .map(|(basename, fuse_path)| {
-            let fut = warm_one(basename, fuse_path);
+        .map(|(basename, fuse_path, nar_size)| {
+            let fut = warm_one(basename, fuse_path, nar_size);
             async {
                 match fut.await {
                     Ok(()) => {
@@ -1493,10 +1556,16 @@ mod tests {
     async fn test_warm_inputs_all_present() {
         let dir = tempfile::tempdir().expect("tempdir");
         let inputs = vec![
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string(),
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world".to_string(),
+            (
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string(),
+                1024,
+            ),
+            (
+                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world".to_string(),
+                1024,
+            ),
         ];
-        for p in &inputs {
+        for (p, _) in &inputs {
             let basename = p.strip_prefix("/nix/store/").unwrap();
             std::fs::write(dir.path().join(basename), b"x").expect("write");
         }
@@ -1519,8 +1588,14 @@ mod tests {
     async fn test_warm_inputs_missing_tolerated() {
         let dir = tempfile::tempdir().expect("tempdir");
         let inputs = vec![
-            "/nix/store/cccccccccccccccccccccccccccccccc-missing".to_string(),
-            "/nix/store/dddddddddddddddddddddddddddddddd-also-missing".to_string(),
+            (
+                "/nix/store/cccccccccccccccccccccccccccccccc-missing".to_string(),
+                0,
+            ),
+            (
+                "/nix/store/dddddddddddddddddddddddddddddddd-also-missing".to_string(),
+                0,
+            ),
         ];
 
         warm_inputs_in_fuse(
@@ -1541,9 +1616,12 @@ mod tests {
     async fn test_warm_inputs_skips_malformed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let inputs = vec![
-            "no-prefix-at-all".to_string(),
-            "/wrong/prefix/foo".to_string(),
-            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-valid".to_string(),
+            ("no-prefix-at-all".to_string(), 0),
+            ("/wrong/prefix/foo".to_string(), 0),
+            (
+                "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-valid".to_string(),
+                1024,
+            ),
         ];
         std::fs::write(
             dir.path().join("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-valid"),
@@ -1568,8 +1646,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_warm_inputs_mixed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let present = "/nix/store/ffffffffffffffffffffffffffffffff-present".to_string();
-        let missing = "/nix/store/00000000000000000000000000000000-missing".to_string();
+        let present = (
+            "/nix/store/ffffffffffffffffffffffffffffffff-present".to_string(),
+            1024,
+        );
+        let missing = (
+            "/nix/store/00000000000000000000000000000000-missing".to_string(),
+            0,
+        );
         std::fs::write(
             dir.path().join("ffffffffffffffffffffffffffffffff-present"),
             b"x",
@@ -1585,6 +1669,122 @@ mod tests {
             WARM_OVERALL_DEADLINE,
         )
         .await;
+    }
+
+    /// I-178: per-path timeout = max(base, nar_size / MIN_THROUGHPUT).
+    /// A 2 GB NAR at 15 MiB/s ≈ 131 s; the base 60 s would have aborted
+    /// it mid-stream → daemon ENOENT → PermanentFailure poison. A 1 KB
+    /// NAR keeps the base.
+    // r[verify builder.input.warm-bounded+3]
+    #[test]
+    fn test_warm_per_path_timeout_scales_with_nar_size() {
+        let base = Duration::from_secs(60);
+
+        // Small input: floor at base.
+        assert_eq!(warm_per_path_timeout(base, 1024), base);
+        assert_eq!(warm_per_path_timeout(base, 0), base);
+
+        // 2 GB input: ceil(2_000_000_000 / 15_728_640) = 128 s > 60 s.
+        let two_gb = warm_per_path_timeout(base, 2_000_000_000);
+        assert!(
+            two_gb >= Duration::from_secs(127),
+            "2 GB @ 15 MiB/s floor must get ≥127 s, got {two_gb:?}"
+        );
+        assert!(
+            two_gb < Duration::from_secs(200),
+            "sanity upper bound (catches MIN_THROUGHPUT being lowered \
+             without revisiting this test): {two_gb:?}"
+        );
+
+        // The 1.9 GB NAR from the I-178 incident.
+        let i178 = warm_per_path_timeout(base, 1_901_554_624);
+        assert!(
+            i178 > base,
+            "I-178's 1.9 GB input must exceed the 60 s base that poisoned it"
+        );
+    }
+
+    /// I-178: overall deadline grows with Σnar_size so a single large
+    /// input doesn't detach at the 90 s floor while its per-path
+    /// timeout is still 127 s.
+    #[test]
+    fn test_warm_overall_deadline_scales_with_total_size() {
+        // Small closure: 90 s floor.
+        assert_eq!(warm_overall_deadline(0), WARM_OVERALL_DEADLINE);
+        assert_eq!(
+            warm_overall_deadline(10 * 1024 * 1024),
+            WARM_OVERALL_DEADLINE
+        );
+
+        // 8 GB closure at 15 MiB/s × 4 lanes = ~131 s + 30 s slop > 90 s.
+        let eight_gb = warm_overall_deadline(8_000_000_000);
+        assert!(
+            eight_gb > WARM_OVERALL_DEADLINE,
+            "8 GB closure must push past the 90 s floor, got {eight_gb:?}"
+        );
+        // Exit criterion: deadline ≥ Σ / (THROUGHPUT × CONCURRENCY).
+        let min_expected = Duration::from_secs(
+            8_000_000_000 / (WARM_MIN_THROUGHPUT_BPS * WARM_FUSE_CONCURRENCY as u64),
+        );
+        assert!(
+            eight_gb >= min_expected,
+            "deadline {eight_gb:?} must cover throughput bound {min_expected:?}"
+        );
+    }
+
+    /// I-178: `warm_inputs_bounded` threads `nar_size` to `warm_one` so
+    /// the production closure can compute a per-path timeout. Feed one
+    /// 2 GB and one 1 KB entry; assert the closure observes each path's
+    /// own size and the derived per-path timeout matches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_bounded_threads_nar_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = (
+            "/nix/store/33333333333333333333333333333333-big".to_string(),
+            2_000_000_000u64,
+        );
+        let small = (
+            "/nix/store/44444444444444444444444444444444-small".to_string(),
+            1024u64,
+        );
+
+        let seen: Arc<std::sync::Mutex<Vec<(String, u64, Duration)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cl = Arc::clone(&seen);
+        let base = Duration::from_secs(60);
+
+        warm_inputs_bounded(
+            dir.path(),
+            &[big, small],
+            Duration::from_secs(5),
+            move |basename, _fuse_path, nar_size| {
+                let seen = Arc::clone(&seen_cl);
+                async move {
+                    let timeout = warm_per_path_timeout(base, nar_size);
+                    seen.lock().unwrap().push((basename, nar_size, timeout));
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        let seen = seen.lock().unwrap();
+        let (_, big_size, big_to) = seen
+            .iter()
+            .find(|(b, _, _)| b.ends_with("-big"))
+            .expect("big seen");
+        let (_, small_size, small_to) = seen
+            .iter()
+            .find(|(b, _, _)| b.ends_with("-small"))
+            .expect("small seen");
+
+        assert_eq!(*big_size, 2_000_000_000);
+        assert!(
+            *big_to >= Duration::from_secs(127),
+            "2 GB input must get ≥127 s, got {big_to:?}"
+        );
+        assert_eq!(*small_size, 1024);
+        assert_eq!(*small_to, base, "1 KB input keeps base timeout");
     }
 
     /// I-165 / I-165c: a per-path warm op that hangs indefinitely
@@ -1610,15 +1810,21 @@ mod tests {
     /// `rio_builder_input_warm_timeout_total ≥ 1` within
     /// deadline+slop) needs the chaos fixture extended to proxy
     /// worker→store. Tracked as a Tier-2 followup.
-    // r[verify builder.input.warm-bounded+2]
+    // r[verify builder.input.warm-bounded+3]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_warm_inputs_deadline_bounds_stalled_fetch() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Two inputs: one resolves instantly, one stalls. Partial-warm
         // accounting should reflect 1 warmed, 1 skipped (not failed —
         // skipped is `total - warmed - failed`).
-        let fast = "/nix/store/11111111111111111111111111111111-fast".to_string();
-        let slow = "/nix/store/22222222222222222222222222222222-stall".to_string();
+        let fast = (
+            "/nix/store/11111111111111111111111111111111-fast".to_string(),
+            1024,
+        );
+        let slow = (
+            "/nix/store/22222222222222222222222222222222-stall".to_string(),
+            1024,
+        );
         std::fs::write(
             dir.path().join("11111111111111111111111111111111-fast"),
             b"x",
@@ -1632,7 +1838,7 @@ mod tests {
             dir.path(),
             &[fast, slow],
             deadline,
-            |basename, p| async move {
+            |basename, p, _nar_size| async move {
                 if basename.ends_with("-stall") {
                     // Pure-async hang: dropped cleanly when the timeout
                     // drops the buffer_unordered stream. No spawn_blocking,

@@ -365,7 +365,9 @@ mod tests {
              threshold is live. 60s × 5 = 300s to circuit-open; detached \
              warm-stat threads unpark within 60s. A drift back to 600 \
              means warm hangs for ~10min per 3-path batch under store \
-             saturation."
+             saturation. I-178: this is the FUSE-CALLBACK timeout only; \
+             the warm path uses a per-path size-scaled timeout \
+             (warm_per_path_timeout) — do NOT re-unify them."
         );
         assert!(
             d.fuse_passthrough,
