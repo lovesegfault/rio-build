@@ -324,18 +324,15 @@ async fn main() -> anyhow::Result<()> {
             tonic_health::server::HealthService,
         >>()
         .await;
-    let health_addr = cfg.health_addr;
-    let health_shutdown = serve_shutdown.clone();
-    rio_common::task::spawn_monitored("health-server", async move {
-        info!(addr = %health_addr, "starting gRPC health server");
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(health_service)
-            .serve_with_shutdown(health_addr, health_shutdown.cancelled_owned())
-            .await
-        {
-            tracing::error!(error = %e, "health server failed");
-        }
-    });
+    // Gateway has no tonic main-server (SSH accept loop instead). Health
+    // is always on a separate plaintext port. Same shared-reporter
+    // pattern applies: the SIGTERM drain loop above flips NOT_SERVING
+    // via this reporter.
+    rio_common::server::spawn_health_plaintext(
+        health_service,
+        cfg.health_addr,
+        serve_shutdown.clone(),
+    );
 
     let host_key = rio_gateway::load_or_generate_host_key(&cfg.host_key)?;
     let authorized_keys = rio_gateway::load_authorized_keys(&cfg.authorized_keys)?;

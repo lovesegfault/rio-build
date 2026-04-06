@@ -625,42 +625,17 @@ async fn main() -> anyhow::Result<()> {
     let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
         .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
 
-    // r[impl sched.health.shared-reporter]
-    // We need a second `HealthServer` instance for the plaintext
-    // listener that shares the SAME status map as the main one.
-    // `HealthServer<HealthService>` is Clone (tonic-generated
-    // wrapper over an `Arc<RwLock<HashMap>>`), so cloning shares
-    // the underlying state — the toggle loop writes once, both
-    // servers see it.
-    let health_service_plain = health_service.clone();
-
-    if let Some(ref tls) = server_tls {
-        // Spawn the plaintext health-only server. It runs
-        // concurrently with the main (blocking) serve() below.
-        let health_addr = cfg.health_addr;
-        info!(addr = %health_addr, "spawning plaintext health server for K8s probes (mTLS on main port)");
-        // serve_shutdown (child), not the parent: the K8s probe
-        // hits THIS port when mTLS is on. If it exits on the
-        // parent, the probe gets ECONNREFUSED instead of
-        // NOT_SERVING — same bug, different symptom.
-        let health_plain_shutdown = serve_shutdown.clone();
-        rio_common::task::spawn_monitored("health-plaintext", async move {
-            if let Err(e) = tonic::transport::Server::builder()
-                .add_service(health_service_plain)
-                .serve_with_shutdown(health_addr, health_plain_shutdown.cancelled_owned())
-                .await
-            {
-                tracing::error!(error = %e, "plaintext health server failed");
-            }
-        });
+    if server_tls.is_some() {
+        // r[impl sched.health.shared-reporter]
+        // HealthServer<HealthService> clone shares the underlying
+        // Arc<RwLock<HashMap>> status map — the toggle loop writes
+        // once, both ports see it. See rio_common::server docs.
+        rio_common::server::spawn_health_plaintext(
+            health_service.clone(),
+            cfg.health_addr,
+            serve_shutdown.clone(),
+        );
         info!("server mTLS enabled — clients must present CA-signed certs");
-        // Shadow `health_service` is already moved into the main
-        // builder below (it's used once). We cloned BEFORE moving.
-        // Discard `tls` temp — we only needed the `is_some()` check
-        // for the conditional. The actual ServerTlsConfig goes into
-        // `builder.tls_config()` next. `let _ = tls` suppresses the
-        // unused-borrow warning from the ref pattern.
-        let _ = tls;
     }
 
     info!(
