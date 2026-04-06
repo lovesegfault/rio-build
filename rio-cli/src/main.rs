@@ -22,6 +22,8 @@ use rio_proto::types::{
     ListWorkersResponse, TenantInfo, WorkerInfo,
 };
 
+mod cutoffs;
+
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
 /// and cheap (ClusterStatus, ListWorkers, ListBuilds, CreateTenant,
 /// ListTenants) — 30s covers a scheduler under load. Unbounded `.await?`
@@ -46,7 +48,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// NOT used for streaming AdminService RPCs (TriggerGC, GetBuildLogs)
 /// — those need per-message progress, not a whole-call deadline. If
 /// a future subcommand adds one, wrap the stream-drain loop instead.
-async fn rpc<T>(
+pub(crate) async fn rpc<T>(
     what: &str,
     fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 ) -> anyhow::Result<T> {
@@ -176,6 +178,11 @@ enum Cmd {
         /// Derivation hash (the `drv_hash`, not the full store path).
         drv_hash: String,
     },
+    /// Size-class cutoff status: configured vs effective (post-rebalancer
+    /// EMA drift), per-class queue/running counts, sample-window size.
+    /// Surfaces how far SITA-E has drifted from the static TOML config
+    /// and whether each class has enough samples to trust its cutoff.
+    Cutoffs,
 }
 
 #[tokio::main]
@@ -477,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("{drv_hash}: not poisoned (nothing to clear)");
             }
         }
+        Cmd::Cutoffs => cutoffs::run(as_json, &mut client).await?,
     }
     Ok(())
 }
@@ -500,7 +508,7 @@ async fn main() -> anyhow::Result<()> {
 /// Print a serde value as pretty JSON. Single emission point so all
 /// `--json` output is consistent (pretty, trailing newline, errors
 /// propagate).
-fn json<T: Serialize>(v: &T) -> anyhow::Result<()> {
+pub(crate) fn json<T: Serialize>(v: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }

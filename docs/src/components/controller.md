@@ -129,6 +129,12 @@ The WPS reconciler writes per-class `effective_cutoff_secs` + `queued` to WPS st
 r[ctrl.wps.autoscale]
 Per-class autoscaling: for each WPS child WorkerPool, compute `desired = clamp(queued / target_queue_per_replica, min_replicas, max_replicas)` and SSA-patch `spec.replicas` with field manager `rio-controller-wps-autoscaler` (distinct from the reconciler's field manager — SSA merges field ownership). Skip children with non-nil `deletionTimestamp`.
 
+r[ctrl.wps.prune-stale]
+The WPS reconciler prunes child WorkerPools whose `size_class` no longer appears in `spec.classes`. Prune matches by ownerRef UID (not name-prefix — robust to WPS renames); deletes are best-effort (404-tolerant, logged on other errors, non-fatal so a stuck child doesn't wedge the whole reconcile). Without prune, a removed-class child is orphaned: the standalone autoscaler skips it (has ownerRef), the per-class autoscaler skips it (not in `spec.classes` iteration) — neither scales it.
+
+r[ctrl.pool.bloom-knob]
+`WorkerPoolSpec.bloomExpectedItems` (optional) injects `RIO_BLOOM_EXPECTED_ITEMS` into the worker container env. Unset → worker uses its compile-time default (50k). Same only-inject-when-set semantics as `fuseThreads` and `daemonTimeoutSecs`: injecting the default would pin it at controller-build time, not worker-build time.
+
 For deployments with heavy-tailed build workloads, `WorkerPoolSet` defines multiple size-class worker pools with different resource allocations. The scheduler routes derivations to the appropriate pool based on estimated duration. See [ADR-015](../decisions/015-size-class-routing.md) for the design rationale.
 
 ```yaml
