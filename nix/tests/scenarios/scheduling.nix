@@ -1136,12 +1136,25 @@ let
           # or systemd Restart=on-failure churn) may have left stale
           # profraws. A strict "file exists" check would pass for the
           # wrong reason.
-          # find (not ls-glob): ls exits 2 on no-match → under pipefail
-          # the pipeline fails → `|| echo 0` would fire → "0\n0". find
-          # exits 0 on no-match.
+          # shopt nullglob: glob-no-match expands to empty (not literal);
+          # printf '%s\n' on empty → one blank line → wc -l = 1, so use
+          # a for-loop counter instead. Plain ls fails under pipefail;
+          # find fails if dir doesn't exist. This form is pipefail-safe.
           profraw_before = int(wsmall2.succeed(
-              "find /var/lib/rio/cov -name '*.profraw' 2>/dev/null | wc -l"
+              "shopt -s nullglob; "
+              "n=0; for f in /var/lib/rio/cov/*.profraw; do n=$((n+1)); done; "
+              "echo $n"
           ).strip())
+
+          # Prior subtests (reassign) may have landed a sleepSecs=25 build
+          # on wsmall2. SIGINT-drain waits for in-flight builds; without
+          # waiting for idle first, the 30s timeout can't cover 25s+drain.
+          # Poll the worker's in-flight gauge until 0.
+          wsmall2.wait_until_succeeds(
+              "curl -sf localhost:9093/metrics | "
+              "grep -qE '^rio_worker_builds_active 0$'",
+              timeout=60,
+          )
 
           # SIGINT, not SIGTERM. systemctl kill delivers to MainPID.
           # `systemctl stop` would send SIGTERM (KillSignal default) —
@@ -1152,10 +1165,13 @@ let
 
           # Unit reaches inactive when main() returns. NOT
           # wait_for_unit (that waits for active). 30s: drain is
-          # near-instant with no in-flight builds, but connect_admin
-          # to a still-live scheduler can take a few seconds under TCG.
+          # near-instant with no in-flight builds (enforced above).
+          # `systemctl show -p ActiveState` (not `is-active | grep`):
+          # is-active exits 3 when inactive → pipefail kills the
+          # pipeline before grep runs. show always exits 0.
           wsmall2.wait_until_succeeds(
-              "systemctl is-active rio-worker.service | grep -qx inactive",
+              "systemctl show rio-worker.service -p ActiveState "
+              "| grep -qx ActiveState=inactive",
               timeout=30,
           )
 
@@ -1197,7 +1213,9 @@ let
           _cov_mode = ${if common.coverage then "True" else "False"}
           if _cov_mode:
               profraw_after = int(wsmall2.succeed(
-                  "find /var/lib/rio/cov -name '*.profraw' 2>/dev/null | wc -l"
+                  "shopt -s nullglob; "
+                  "n=0; for f in /var/lib/rio/cov/*.profraw; do n=$((n+1)); done; "
+                  "echo $n"
               ).strip())
               assert profraw_after > profraw_before, (
                   f"graceful SIGINT should flush a fresh profraw via "
