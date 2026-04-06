@@ -27,6 +27,7 @@ fn sign_claims(outputs: Vec<String>, expiry_offset_secs: i64) -> String {
         drv_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         expected_outputs: outputs,
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
+        is_ca: false,
     };
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
@@ -122,6 +123,7 @@ async fn hmac_wrong_key_signed_rejected() -> TestResult {
         drv_hash: "00".repeat(32),
         expected_outputs: vec![path.clone()],
         expiry_unix: now_unix() + 60,
+        is_ca: false,
     };
     let bad_token = HmacSigner::from_key(wrong_key.to_vec()).sign(&claims);
 

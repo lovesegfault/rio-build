@@ -584,12 +584,17 @@ pub fn build_ca_test_path() -> String {
         return p;
     }
 
+    // --no-substitute: remote ssh-ng substituters may not implement
+    // wopQueryRealisation (CA query opcode), failing with "unimplemented
+    // worker op". The fixture derivation is trivial and builds in <1s
+    // locally, so skip substituter queries entirely.
     let output = std::process::Command::new("nix")
         .env("NIX_CONFIG", NIX_CONFIG)
         .args([
             "build",
             "--impure",
             "--no-link",
+            "--no-substitute",
             "--print-out-paths",
             "--expr",
             r#"derivation {
@@ -779,8 +784,8 @@ impl Drop for DaemonGuard {
 /// Start a local nix-daemon on a temporary Unix socket.
 ///
 /// Outside sandboxes: symlinks `/nix/var/nix/*` into a temp dir so the
-/// daemon sees the real store db. Inside hermetic build sandboxes
-/// (nixbuild.net), `/nix/var/nix` doesn't exist — the symlink step is a
+/// daemon sees the real store db. Inside hermetic remote build
+/// sandboxes, `/nix/var/nix` doesn't exist — the symlink step is a
 /// no-op and the daemon starts with an empty db. We then register the
 /// golden fixture paths via `nix-store --register-validity` so queries
 /// find them.

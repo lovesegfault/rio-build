@@ -286,8 +286,8 @@ pkgs.testers.runNixOSTest {
     # curl would either timeout or the trailer would be HTTP chunked
     # without the 0x80 frame marker.
     with subtest("gRPC-Web streaming: GetBuildLogs trailer 0x80 byte"):
-        # Root cause of the 8+ earlier failures (sprint-save v10-v19):
-        # tonic's `Err(Status)` return from a server-streaming handler
+        # Root cause of earlier empty-body failures here: tonic's
+        # `Err(Status)` return from a server-streaming handler
         # emits a Trailers-Only response — grpc-status in the HTTP
         # HEADERS, zero body. Envoy passes that through and curl sees
         # an empty body. Handler now returns Ok(stream-yielding-Err),

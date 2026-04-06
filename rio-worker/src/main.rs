@@ -29,14 +29,9 @@ const HEARTBEAT_INTERVAL: Duration =
 /// scheduler/gateway/controller/store — the validation target is the
 /// call-site, not the struct.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or worker.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.store_addr.is_empty(),
-        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or worker.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.scheduler_addr, "scheduler_addr", "worker")?;
+    required(&cfg.store_addr, "store_addr", "worker")?;
     Ok(())
 }
 
@@ -1014,6 +1009,21 @@ mod tests {
                 "error for cleared {field} must name it: {err}"
             );
         }
+    }
+
+    /// Whitespace-only scheduler_addr must be rejected as empty.
+    /// Regression guard for `ensure_required`'s trim — pre-helper,
+    /// bare `is_empty()` accepted `"   "`, startup failed later at
+    /// gRPC connect with "invalid socket address syntax: '  '".
+    #[test]
+    fn config_rejects_whitespace_scheduler_addr() {
+        let mut cfg = test_valid_config();
+        cfg.scheduler_addr = "   ".into();
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("scheduler_addr is required"),
+            "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
+        );
     }
 
     /// Baseline: `test_valid_config()` itself passes — proves

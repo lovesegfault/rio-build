@@ -129,10 +129,8 @@ struct CliArgs {
 /// `interval(..<field>)` / `from_secs(<field>)` in consumer code;
 /// check what happens at 0, negative, very-large.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.scheduler_addr.is_empty(),
-        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or controller.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.scheduler_addr, "scheduler_addr", "controller")?;
     // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
     // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
     // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
@@ -643,6 +641,21 @@ mod tests {
         };
         let err = validate_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("scheduler_addr"), "{err}");
+    }
+
+    /// Whitespace-only scheduler_addr must be rejected as empty.
+    /// Regression guard for `ensure_required`'s trim — pre-helper,
+    /// bare `is_empty()` accepted `"   "`, startup failed later at
+    /// gRPC connect with a cryptic transport error.
+    #[test]
+    fn config_rejects_whitespace_scheduler_addr() {
+        let mut cfg = test_valid_config();
+        cfg.scheduler_addr = "   ".into();
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("scheduler_addr is required"),
+            "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
+        );
     }
 
     /// Baseline: `test_valid_config()` itself passes — proves the

@@ -425,7 +425,7 @@ pub fn build_ca_realisation_in_daemon(socket: &str, state_dir: &Path) -> (String
 }
 ```
 
-**Hermetic-sandbox caveat:** `/bin/sh` doesn't exist in the nixbuild.net sandbox. Guard this test with the same hermetic-skip pattern as `build_ca_test_path()` — check for `RIO_GOLDEN_CA_PATH` or `linked_db` and `#[ignore]`/skip if hermetic. The VM test (Step 6, option B) is the hermetic backstop.
+**Hermetic-sandbox caveat:** `/bin/sh` doesn't exist in hermetic remote build sandboxes. Guard this test with the same hermetic-skip pattern as `build_ca_test_path()` — check for `RIO_GOLDEN_CA_PATH` or `linked_db` and `#[ignore]`/skip if hermetic. The VM test (Step 6, option B) is the hermetic backstop.
 
 #### Approach B: register-then-query (simpler, daemon-side write + read roundtrip)
 

@@ -84,6 +84,57 @@ where
         .map_err(|e| anyhow::anyhow!("config load for {component:?} failed: {e}"))
 }
 
+/// Validate a required string config field is non-empty (after trim).
+///
+/// Returns `Ok(())` if `value.trim()` is non-empty, `Err(anyhow)` with
+/// a standardized message otherwise. The CLI flag and env var names
+/// are derived from `field` by convention: `field_name` → flag
+/// `--field-name`, env `RIO_FIELD_NAME`. All 10 call-sites across
+/// the 5 binaries follow this convention today; if a field ever
+/// diverges (unlikely — clap's `#[arg(long)]` and figment's
+/// `Env::prefixed("RIO_")` both derive the same way), add a sibling
+/// with explicit args rather than loosening this one.
+///
+/// DRYs the 10× identical `ensure!(!field.is_empty(), "X is required
+/// (set --flag, RIO_ENV, or crate.toml)")` template spread across 5
+/// crates' `validate_config()` — P0416 spread it 4× (pre-P0416, only
+/// scheduler had 2); P0425 consolidates + adds trim.
+///
+/// The trim catches `RIO_FOO="  "` whitespace-typo — pre-helper, bare
+/// `is_empty()` accepted it, startup failed with a cryptic tcp-connect
+/// "invalid socket address syntax" buried in logs. Rejecting at
+/// config-load puts the clear "X is required" message at the top of
+/// the startup log instead.
+///
+/// The trim is validation-only: the HELPER does not return the
+/// trimmed value, callers continue to use the original `value` (which
+/// may still have leading/trailing whitespace). gRPC endpoint parsing
+/// tolerates leading/trailing whitespace; if a consumer surfaces that
+/// does not, switch the Config field's type to apply trim at
+/// deserialize-time instead of layering it on here.
+pub fn ensure_required(value: &str, field: &str, component: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.trim().is_empty(),
+        "{field} is required (set --{flag}, RIO_{env}, or {component}.toml)",
+        flag = field.replace('_', "-"),
+        env = field.to_uppercase(),
+    );
+    Ok(())
+}
+
+/// [`ensure_required`] for `PathBuf` fields. Same trim-then-empty
+/// check on the path's string form (via `to_string_lossy` — non-UTF-8
+/// paths are vanishingly unlikely for operator-set config, and would
+/// fail downstream anyway). The gateway's `host_key` /
+/// `authorized_keys` are the 2 `PathBuf` sites of the 10.
+pub fn ensure_required_path(
+    value: &std::path::Path,
+    field: &str,
+    component: &str,
+) -> anyhow::Result<()> {
+    ensure_required(&value.to_string_lossy(), field, component)
+}
+
 /// JWT dual-mode configuration. Nested in each binary's `Config` as
 /// `jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.
 ///
@@ -724,5 +775,71 @@ mod tests {
             redact_db_url("postgres://admin:a@b@c@db.example.com:5432/rio"),
             "postgres://admin:***@db.example.com:5432/rio"
         );
+    }
+
+    // --- ensure_required tests ---
+
+    /// Whitespace-only must be rejected as empty. This is the
+    /// correctness fix motivating the helper: pre-trim, `"   "`.
+    /// is_empty() == false → validation silently passes → cryptic
+    /// "invalid socket address syntax" at gRPC connect.
+    #[test]
+    fn ensure_required_rejects_whitespace_only() {
+        let err = ensure_required("   ", "scheduler_addr", "gateway")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("scheduler_addr is required"),
+            "whitespace-only must be rejected as empty, got: {err}"
+        );
+    }
+
+    /// Padded-but-nonempty passes. The trim is validation-only —
+    /// the helper does NOT return the trimmed value; caller's
+    /// `cfg.field` still has the padding. gRPC endpoint parsing
+    /// tolerates it; if a consumer surfaces that doesn't, move
+    /// the trim to deserialize-time.
+    #[test]
+    fn ensure_required_accepts_padded_nonempty() {
+        ensure_required("  http://foo  ", "addr", "gateway")
+            .expect("padded-but-nonempty should pass");
+    }
+
+    /// Flag/env/toml filename derived from field + component by
+    /// convention. All 10 production call-sites follow this
+    /// convention (clap's `#[arg(long)]` and figment's
+    /// `Env::prefixed("RIO_")` both derive identically).
+    #[test]
+    fn ensure_required_derives_flag_and_env() {
+        let err = ensure_required("", "database_url", "store")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--database-url"), "flag derived: {err}");
+        assert!(err.contains("RIO_DATABASE_URL"), "env derived: {err}");
+        assert!(err.contains("store.toml"), "toml from component: {err}");
+    }
+
+    /// PathBuf variant — delegates through the string helper after
+    /// `to_string_lossy()`. Covers gateway's `host_key` /
+    /// `authorized_keys` PathBuf sites.
+    #[test]
+    fn ensure_required_path_rejects_empty_and_whitespace() {
+        // Empty PathBuf.
+        let err = ensure_required_path(std::path::Path::new(""), "host_key", "gateway")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host_key is required"), "{err}");
+        assert!(err.contains("--host-key"), "{err}");
+        assert!(err.contains("RIO_HOST_KEY"), "{err}");
+        // Whitespace-only PathBuf — same trim-check.
+        ensure_required_path(std::path::Path::new("  "), "host_key", "gateway")
+            .expect_err("whitespace-only path must be rejected");
+        // Nonempty passes.
+        ensure_required_path(
+            std::path::Path::new("/etc/rio/host_key"),
+            "host_key",
+            "gateway",
+        )
+        .expect("real path should pass");
     }
 }

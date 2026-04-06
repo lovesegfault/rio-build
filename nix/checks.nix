@@ -453,7 +453,7 @@ let
         // {
           nativeBuildInputs = runtimeTestInputs;
           RUST_BACKTRACE = "1";
-          # nixbuild.net can under-provision (one run got 3.2GB —
+          # Remote builders can under-provision (one run got 3.2GB —
           # postgres + 16 tokio test threads OOM'd). Lower than
           # crane's 64/65536 workspace-wide pin — per-crate test
           # runs are lighter.
@@ -534,7 +534,7 @@ let
           echo "  running $(basename $t)" | tee -a $out/log
           # --test-threads=8: TestDb::new names databases by
           # SystemTime::now().as_nanos(). With libtest's default
-          # NCPU threads (64 on nixbuild.net), two tests can hit
+          # NCPU threads (64 on large remote builders), two tests can hit
           # the same nanosecond → CREATE DATABASE unique-constraint
           # violation. 8 threads makes collision vanishingly rare
           # and is still plenty for per-crate test parallelism.
@@ -833,7 +833,7 @@ let
           # sequences by default; disable for log greppability.
           CARGO_TERM_COLOR = "never";
           NEXTEST_HIDE_PROGRESS_BAR = "1";
-          # Same nixbuild.net resource floor as the libtest runner.
+          # Same remote-builder resource floor as the libtest runner.
           NIXBUILDNET_MIN_CPU = "16";
           NIXBUILDNET_MIN_MEM = "16384";
         }
@@ -915,7 +915,7 @@ let
         # LLVM_PROFILE_FILE must be an absolute path set BEFORE the
         # test binary exec's — the runtime reads it at startup.
         # $TMPDIR is the sandbox-writable scratch; /build is the
-        # nixbuild.net build root but not always writable at
+        # remote-builder build root but not always writable at
         # arbitrary subdirs.
         mkdir -p $TMPDIR/profraw
         export LLVM_PROFILE_FILE="$TMPDIR/profraw/%m-%p.profraw"

@@ -176,14 +176,9 @@ struct CliArgs {
 /// .*<field>)` / `Duration::from_secs_f64(<field>)` in consumer code;
 /// check what happens at 0, negative, very-large, NaN.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.store_addr.is_empty(),
-        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or scheduler.toml)"
-    );
-    anyhow::ensure!(
-        !cfg.database_url.is_empty(),
-        "database_url is required (set --database-url, RIO_DATABASE_URL, or scheduler.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.store_addr, "store_addr", "scheduler")?;
+    required(&cfg.database_url, "database_url", "scheduler")?;
     // `tokio::time::interval(ZERO)` panics. The tick loop feeds
     // `from_secs(cfg.tick_interval_secs)` straight in — `tick_interval_
     // secs = 0` would crash the scheduler on spawn, AFTER migrations
@@ -343,21 +338,56 @@ async fn main() -> anyhow::Result<()> {
 
     let db = SchedulerDb::new(pool.clone());
 
-    // Connect to store for scheduler-side cache checks (closes TOCTOU between
-    // gateway FindMissingPaths and DAG merge). Non-fatal if connect fails;
-    // the actor will skip cache checks and log a warning.
-    let store_client = match rio_proto::client::connect_store(&cfg.store_addr).await {
-        Ok(client) => {
-            info!(store_addr = %cfg.store_addr, "connected to store for cache checks");
-            Some(client)
-        }
-        Err(e) => {
-            tracing::warn!(
-                store_addr = %cfg.store_addr,
-                error = %e,
-                "failed to connect to store; scheduler-side cache check disabled"
-            );
-            None
+    // Connect to store for scheduler-side cache checks (closes TOCTOU
+    // between gateway FindMissingPaths and DAG merge) AND CA cutoff
+    // verification (verify_cutoff_candidates bails on None).
+    //
+    // Bounded retry, not one-shot: both scheduler and store run
+    // sqlx::migrate!() against the same DB. When systemd starts them
+    // near-simultaneously (After=rio-store.service only orders the
+    // fork, not readiness), the two pg_advisory_lock + DDL sequences
+    // can interleave into a PG "deadlock detected" — one process
+    // loses and exits. If store loses, it's dead for RestartSec=5s
+    // right when we try to connect here. A single attempt then
+    // disables CA cutoff for the entire process lifetime (ca-cutoff
+    // VM test: delta=0.0, before=0.0, after=0.0).
+    //
+    // 8 tries × 2s = 16s covers store's RestartSec=5s + its own
+    // migrate + listen. Still non-fatal after exhaustion — a
+    // genuinely unreachable store degrades to cache-check-disabled
+    // rather than blocking scheduler startup indefinitely (unlike
+    // gateway's unbounded loop, which is correct there because
+    // gateway without store is useless).
+    let store_client = {
+        const MAX_TRIES: u32 = 8;
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            match rio_proto::client::connect_store(&cfg.store_addr).await {
+                Ok(client) => {
+                    info!(store_addr = %cfg.store_addr, "connected to store for cache checks");
+                    break Some(client);
+                }
+                Err(e) if tries < MAX_TRIES => {
+                    tracing::warn!(
+                        store_addr = %cfg.store_addr,
+                        error = %e,
+                        tries,
+                        "store connect failed; retrying in 2s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        store_addr = %cfg.store_addr,
+                        error = %e,
+                        tries,
+                        "store connect failed after retries; \
+                         scheduler-side cache check + CA cutoff disabled"
+                    );
+                    break None;
+                }
+            }
         }
     };
 
@@ -971,6 +1001,25 @@ mod tests {
             database_url: "postgres://localhost/test".into(),
             ..Config::default()
         }
+    }
+
+    /// Whitespace-only store_addr must be rejected as empty.
+    /// Regression guard for `ensure_required`'s trim: pre-helper,
+    /// bare `is_empty()` accepted `"   "`, startup failed later with
+    /// a cryptic "invalid socket address syntax" buried in connect
+    /// logs. The helper's trim catches it at config-load with the
+    /// clear "X is required" message instead. If this test ever
+    /// passes validation, `ensure_required` has regressed to bare
+    /// `is_empty()`.
+    #[test]
+    fn config_rejects_whitespace_store_addr() {
+        let mut cfg = test_valid_config();
+        cfg.store_addr = "   ".into();
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("store_addr is required"),
+            "whitespace-only store_addr must be rejected as empty, got: {err}"
+        );
     }
 
     // r[verify sched.retry.per-worker-budget]

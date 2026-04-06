@@ -108,7 +108,7 @@ in
   # — NO IFD (builtins.readFile). The pki derivation is non-deterministic
   # (openssl genrsa = random keys). With IFD, the Secret content came
   # from the LOCAL eval-time build; the test's ${pki} store path might
-  # be REBUILT on nixbuild.net with different keys. Same path, different
+  # be REBUILT on the remote builder with different keys. Same path, different
   # contents → grpcurl's -cacert doesn't match the server cert's CA →
   # "crypto/rsa: verification error". Observed v23.
   #

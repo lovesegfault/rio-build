@@ -176,10 +176,8 @@ struct CliArgs {
 /// Only one check today (database_url) but creates the hook for gc.*,
 /// chunk_backend.*, signing.* bounds as they become operator-settable.
 fn validate_config(cfg: &Config) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !cfg.database_url.is_empty(),
-        "database_url is required (set --database-url, RIO_DATABASE_URL, or store.toml)"
-    );
+    use rio_common::config::ensure_required as required;
+    required(&cfg.database_url, "database_url", "store")?;
     Ok(())
 }
 
@@ -848,6 +846,21 @@ mod tests {
         };
         let err = validate_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("database_url"), "{err}");
+    }
+
+    /// Whitespace-only database_url must be rejected as empty.
+    /// Regression guard for `ensure_required`'s trim — pre-helper,
+    /// bare `is_empty()` accepted `"   "`, sqlx connect failed later
+    /// with a cryptic URL-parse error buried in startup logs.
+    #[test]
+    fn config_rejects_whitespace_database_url() {
+        let mut cfg = test_valid_config();
+        cfg.database_url = "   ".into();
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("database_url is required"),
+            "whitespace-only database_url must be rejected as empty, got: {err}"
+        );
     }
 
     /// Baseline: `test_valid_config()` itself passes — proves
