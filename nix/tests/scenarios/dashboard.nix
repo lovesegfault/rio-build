@@ -35,6 +35,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-dashboard-curl";
+  skipTypeCheck = true;
 
   # Bring-up ~4min + operator reconcile ~60s + nginx pod schedule ~30s +
   # curls <15s. 900s matches vm-dashboard-gateway-k3s.
@@ -43,7 +44,7 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.kvmCheck}
+    ${common.kvmPreopen}
     ${common.assertions}
 
     start_all()
@@ -148,7 +149,7 @@ pkgs.testers.runNixOSTest {
             "-H 'content-type: application/grpc-web+proto' "
             "-H 'x-grpc-web: 1' "
             "--data-binary @- "
-            "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+            "| ${pkgs.xxd}/bin/xxd -l 16 | grep -q '^00000000: 00'",
             timeout=30,
         )
 

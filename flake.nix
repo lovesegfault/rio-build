@@ -649,21 +649,56 @@
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
 
-                  # ── devicePlugin.image digest-pin (r[sec.pod.fuse-device-plugin]) ──
-                  # devicePlugin.image MUST be digest-pinned. A floating tag that
-                  # doesn't exist upstream yields ImagePullBackOff → smarter-
-                  # devices/fuse never registers → worker pods requesting it sit
-                  # Pending → silent cluster brick on a default-values deploy.
-                  # A prior default pointed at a never-published upstream tag.
-                  # Digest-pin prevents both the broken-tag case and tag-reuse
-                  # drift. yq drills into the DaemonSet pod spec (not grep —
-                  # @sha256: appears in comments too).
-                  img=$(yq 'select(.kind=="DaemonSet" and .metadata.name=="rio-device-plugin")
-                            | .spec.template.spec.containers[0].image' /tmp/default.yaml)
-                  case "$img" in
-                    *@sha256:*) ;;
-                    *) echo "FAIL: devicePlugin.image not digest-pinned (got: $img)" >&2; exit 1 ;;
-                  esac
+                  # dash-on: all CRD kinds + third-party images present. Rendered
+                  # here (before the digest-pin loop below and the Gateway API
+                  # CRD checks after) so one render feeds both.
+                  helm template rio . \
+                    --set dashboard.enabled=true \
+                    --set global.image.tag=test \
+                    --set postgresql.enabled=false \
+                    > /tmp/dash-on.yaml
+
+                  # ── Third-party image digest-pin enforcement ────────────────
+                  # Every image that isn't a rio-build image (those get `:test`
+                  # from --set global.image.tag=test above) MUST be digest-
+                  # pinned. A floating third-party tag that doesn't exist /
+                  # gets deleted / gets overwritten upstream → ImagePullBackOff
+                  # → component-specific silent brick:
+                  #   - devicePlugin: smarter-devices/fuse never registers →
+                  #     worker pods Pending (a prior default pointed at a
+                  #     never-published upstream tag; r[sec.pod.fuse-device-plugin])
+                  #   - envoyImage: gRPC-Web translation dead → dashboard loads
+                  #     but every RPC fails (r[dash.envoy.grpc-web-translate])
+                  #   - <future>: same failure mode, this loop catches it pre-merge
+                  #
+                  # yq drills into every container spec (DaemonSet + Deployment
+                  # + StatefulSet + Job) plus the EnvoyProxy CRD's image path
+                  # (different shape — .spec.provider.kubernetes.envoyDeployment
+                  # .container.image, not .spec.template.spec.containers[]).
+                  # Runs over BOTH default.yaml (prod profile) and dash-on.yaml
+                  # (dashboard-enabled superset). Filters out :test-tagged rio
+                  # images and fails on any remaining bare-tag image. @sha256:
+                  # is the pin marker. Subchart images (bitnami/ PG) are a
+                  # separate supply-chain boundary — postgresql.enabled=false
+                  # in both renders so they don't appear here.
+                  thirdparty=$(yq eval-all '
+                    ( select(.kind=="DaemonSet" or .kind=="Deployment"
+                             or .kind=="StatefulSet" or .kind=="Job")
+                      | .spec.template.spec.containers[].image ),
+                    ( select(.kind=="EnvoyProxy")
+                      | .spec.provider.kubernetes.envoyDeployment.container.image )
+                  ' /tmp/default.yaml /tmp/dash-on.yaml \
+                    | grep -v ':test$' \
+                    | grep -v '^---$' | grep -v '^null$' \
+                    | sort -u)
+                  echo "third-party images in default+dash-on renders:" >&2
+                  echo "$thirdparty" >&2
+                  bad=$(echo "$thirdparty" | grep -v '@sha256:' || true)
+                  if [ -n "$bad" ]; then
+                    echo "FAIL: third-party image(s) not digest-pinned:" >&2
+                    echo "$bad" >&2
+                    exit 1
+                  fi
 
                   # ── dashboard Gateway API CRDs ─────────────────────────────
                   # dashboard.enabled=true MUST render exactly one each of
@@ -671,12 +706,8 @@
                   # ClientTrafficPolicy (+ BackendTLSPolicy when tls.enabled).
                   # Any Go-template syntax error, bad nindent, or Values typo
                   # surfaces here before the VM test has to spend 5min on k3s
-                  # bring-up to discover a YAML parse error.
-                  helm template rio . \
-                    --set dashboard.enabled=true \
-                    --set global.image.tag=test \
-                    --set postgresql.enabled=false \
-                    > /tmp/dash-on.yaml
+                  # bring-up to discover a YAML parse error. (/tmp/dash-on.yaml
+                  # rendered above, before the third-party image loop.)
                   for k in GatewayClass Gateway GRPCRoute EnvoyProxy \
                            SecurityPolicy ClientTrafficPolicy BackendTLSPolicy; do
                     grep -qx "kind: $k" /tmp/dash-on.yaml || {
