@@ -540,6 +540,33 @@ async fn main() -> anyhow::Result<()> {
     let store_size_bytes =
         rio_scheduler::admin::spawn_store_size_refresh(pool.clone(), shutdown.clone());
 
+    // build_samples retention: delete rows older than 30 days, hourly.
+    // 30d > rebalancer's 7d query window (P0229) with margin.
+    //
+    // Fresh SchedulerDb from pool.clone() — `db` was moved into the
+    // actor at ActorHandle::spawn_with_leader above. PgPool is
+    // Arc-backed; SchedulerDb::new is just { pool }, so this is a
+    // 1-pointer clone. Placed before AdminServiceImpl::new which
+    // terminally moves `pool`.
+    {
+        let db = SchedulerDb::new(pool.clone());
+        let shutdown = shutdown.clone();
+        rio_common::task::spawn_monitored("build-samples-retention", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                match db.delete_samples_older_than(30).await {
+                    Ok(0) => {}
+                    Ok(n) => info!(rows_deleted = n, "build_samples retention sweep"),
+                    Err(e) => tracing::warn!(?e, "build_samples retention failed"),
+                }
+            }
+        });
+    }
+
     let admin_service = AdminServiceImpl::new(
         log_buffers,
         admin_s3,
