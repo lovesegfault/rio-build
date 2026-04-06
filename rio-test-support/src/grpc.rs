@@ -1016,6 +1016,60 @@ pub async fn spawn_grpc_server(
     (addr, handle)
 }
 
+/// Generic variant of [`spawn_grpc_server`] for routers with layers.
+///
+/// `Server::builder().layer(...)` changes `Router<Identity>` →
+/// `Router<Stack<L, Identity>>`, which the non-generic
+/// [`spawn_grpc_server`] can't accept. This variant passes the layer
+/// parameter through to tonic's own generic `serve_with_incoming`.
+///
+/// ```ignore
+/// let router = Server::builder()
+///     .layer(InterceptorLayer::new(fake_interceptor))
+///     .add_service(FooServer::new(foo));
+/// let (addr, handle) = spawn_grpc_server_layered(router).await;
+/// ```
+///
+/// The `where` clause mirrors tonic 0.14's `Router<L>::serve_with_incoming`
+/// bounds — `L: Layer<Routes>` where `L::Service` is a tower `Service` over
+/// `http::Request<tonic::body::Body>`. Callers don't spell the bounds;
+/// inference carries them from the `.layer(...)` call site. If tonic's
+/// bound changes in a minor bump, this compile-fails loudly rather than
+/// silently diverging.
+///
+/// The non-generic [`spawn_grpc_server`] (≈ `L = Identity`) is kept as a
+/// separate fn: Rust's default type parameters on functions are unstable,
+/// and a `L = Identity` blanket would force existing callers to turbofish
+/// or hit inference ambiguity.
+pub async fn spawn_grpc_server_layered<L, ResBody>(
+    router: tonic::transport::server::Router<L>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>)
+where
+    L: tower::Layer<tonic::service::Routes> + Send + 'static,
+    L::Service: tower::Service<http::Request<tonic::body::Body>, Response = http::Response<ResBody>>
+        + Clone
+        + Send
+        + 'static,
+    <L::Service as tower::Service<http::Request<tonic::body::Body>>>::Future: Send,
+    <L::Service as tower::Service<http::Request<tonic::body::Body>>>::Error:
+        Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    ResBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    ResBody::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    let handle = tokio::spawn(async move {
+        router
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("in-process gRPC server");
+    });
+    tokio::task::yield_now().await;
+    (addr, handle)
+}
+
 /// Spawn a MockStore on an ephemeral port. Returns `(store, addr, handle)`.
 pub async fn spawn_mock_store()
 -> anyhow::Result<(MockStore, SocketAddr, tokio::task::JoinHandle<()>)> {

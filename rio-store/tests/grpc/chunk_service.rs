@@ -143,34 +143,13 @@ impl ChunkSession {
         // pattern as production (main.rs:495). StoreService ignores
         // the header (its handlers never read jwt::Claims from
         // extensions). ChunkService's tenant-scoped RPCs read it.
-        //
-        // Inlined server spawn: `rio_test_support::grpc::spawn_grpc_server`
-        // takes `Router<Identity>` (default layer), but `.layer()`
-        // changes the type to `Router<Stack<InterceptorLayer<_>, _>>`.
-        // The helper isn't generic over the layer param (it's used by
-        // ~20 other tests that don't need layers), so we inline the
-        // same bind-ephemeral + serve_with_incoming pattern here.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local_addr");
         let router = Server::builder()
             .layer(tonic::service::InterceptorLayer::new(
                 test_tenant_interceptor,
             ))
             .add_service(StoreServiceServer::new(store_service))
             .add_service(ChunkServiceServer::new(chunk_service));
-        let server = tokio::spawn(async move {
-            router
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .expect("in-process gRPC server");
-        });
-        // yield_now: let the server task reach its accept loop before
-        // we return and the caller tries to connect. Without this,
-        // the first client connect can race the server's listener
-        // being polled — intermittent "connection refused" flake.
-        tokio::task::yield_now().await;
+        let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
 
         let channel = Channel::from_shared(format!("http://{addr}"))?
             .connect()

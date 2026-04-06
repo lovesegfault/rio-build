@@ -180,11 +180,6 @@ async fn test_putpath_sig_covers_references() -> TestResult {
 /// Spawn a store server with a fake interceptor that ALWAYS attaches
 /// `jwt::Claims { sub: tenant_id }` to every request's extensions.
 ///
-/// Can't reuse `spawn_store_server` (via `StoreSession::new_with_signer`):
-/// adding a `.layer()` changes `Router<Identity>` → `Router<Stack<...>>`,
-/// and `spawn_grpc_server` takes the non-generic default. Inlining the
-/// bind/serve avoids adding a type param to the shared helper for one test.
-///
 /// The real P0259 interceptor (`rio_common::jwt_interceptor`) verifies a
 /// signed JWT from the `x-rio-tenant-token` metadata header. Here we skip
 /// all that and inject Claims directly — the handler reads `request
@@ -209,18 +204,10 @@ async fn spawn_store_with_fake_jwt(
         Ok(req)
     };
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .layer(tonic::service::InterceptorLayer::new(fake_interceptor))
-            .add_service(StoreServiceServer::new(service))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("in-process gRPC server");
-    });
-    tokio::task::yield_now().await;
+    let router = Server::builder()
+        .layer(tonic::service::InterceptorLayer::new(fake_interceptor))
+        .add_service(StoreServiceServer::new(service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
 
     let channel = Channel::from_shared(format!("http://{addr}"))?
         .connect()
