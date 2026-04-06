@@ -64,6 +64,17 @@
 #   other test cancels a RUNNING build (recovery kills the scheduler,
 #   build keeps running on the worker).
 #
+# r[verify worker.cgroup.kill-on-teardown]
+# r[verify worker.timeout.no-reassign]
+#   build-timeout submits via gRPC SubmitBuild with buildTimeout=5 against
+#   a 30s sleep. The timeout fires mid-build → run_daemon_build returns
+#   → executor/mod.rs:764 build_cgroup.kill() fires unconditionally →
+#   drain → Drop rmdirs. Asserts cgroup GONE (kernel rejects rmdir on
+#   non-empty, so gone ⇒ builder killed ⇒ kill-on-teardown ran) + a
+#   second build of the SAME drv succeeds (no EEXIST — leak is closed).
+#   Distinct from cancel-cgroup-kill: that tests runtime.rs's explicit
+#   CancelSignal path; this tests the executor's post-daemon teardown.
+#
 # r[verify worker.upload.references-scanned]
 #   refs-end-to-end builds a consumer derivation whose $out embeds a
 #   dep's store path, then asserts PG narinfo."references" contains
@@ -166,6 +177,16 @@ let
   cancelDrv = drvs.mkTrivial {
     marker = "lifecycle-cancel";
     sleepSecs = 60;
+  };
+
+  # build-timeout victim. sleepSecs=30 vs buildTimeout=5 — wide gap so
+  # neither TCG dispatch lag (timeout may fire at 8-12s wall) nor the
+  # scheduler's 10s tick granularity lets the sleep finish first. Same
+  # marker-in-drvname pattern so the cgroup dir is findable from the
+  # VM host (sanitize_build_id: ".drv" → "_drv").
+  timeoutDrv = drvs.mkTrivial {
+    marker = "lifecycle-timeout";
+    sleepSecs = 30;
   };
 
   # Autoscaler queue pressure: 5 leaves, all independent, all Ready
@@ -657,6 +678,227 @@ let
 
           print("cancel-cgroup-kill PASS: cgroup rmdir'd in <30s "
                 "(sleep was 60s ⇒ killed not completed)")
+    '';
+
+    build-timeout = ''
+      # ══════════════════════════════════════════════════════════════════
+      # build-timeout — gRPC buildTimeout < sleep → TimedOut, cgroup cleaned
+      # ══════════════════════════════════════════════════════════════════
+      # Post-P0294: no Build CR. Submit via gRPC SubmitBuild with
+      # buildTimeout=5 directly. The value flows two places:
+      #   (1) scheduler per-build timeout (actor/worker.rs:597) — checked
+      #       on Tick (10s here), fires cancel_build_derivations
+      #   (2) worker per-derivation daemon timeout (executor/mod.rs:567 →
+      #       stderr_loop.rs:126 tokio::time::timeout) — fires TimedOut
+      # Either way run_daemon_build returns (Ok(TimedOut) or Err on
+      # cancel-killed daemon), and the executor FALLS THROUGH to line
+      # 764: build_cgroup.kill() + drain + Drop rmdirs. THAT is the
+      # kill-on-teardown path under test.
+      #
+      # This is DISTINCT from cancel-cgroup-kill above: cancel-cgroup-kill
+      # tests runtime.rs try_cancel_build (explicit CancelBuild RPC).
+      # build-timeout tests executor/mod.rs:764 (post-daemon teardown).
+      # Both write cgroup.kill; different call sites, different r[impl].
+      #
+      # sleepSecs=30 vs buildTimeout=5: wide gap for TCG dispatch lag.
+      # Under TCG the timeout may fire at ~8-12s wall-clock; sleep is
+      # nowhere near done. Narrower gaps flake.
+      with subtest("build-timeout: gRPC buildTimeout < sleep → cgroup cleaned, no EEXIST"):
+          drv_path = client.succeed(
+              "nix-instantiate "
+              "--arg busybox '(builtins.storePath ${common.busybox})' "
+              "${timeoutDrv} 2>/dev/null"
+          ).strip()
+          client.succeed(
+              f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
+          )
+
+          # SubmitBuild via gRPC. buildTimeout is SubmitBuildRequest
+          # field 6 (types.proto:655, camelCase for grpcurl). Same
+          # port-forward + mTLS + protoset pattern as cancel-cgroup-kill.
+          # Port 19098 (distinct from 19099 above, 19001 for sched_grpc)
+          # to sidestep TIME_WAIT contention — port-forward lacks
+          # SO_REUSEADDR, ~60s to rebind.
+          #
+          # `-max-time 3` caps the stream read well under buildTimeout=5
+          # so we always capture the first BuildEvent before timeout races
+          # in. The build is persisted on receipt; stream is observability.
+          leader = leader_pod()
+          submit_payload = json.dumps({
+              "nodes": [{
+                  "drvPath": drv_path,
+                  "drvHash": drv_path,
+                  "system": "${pkgs.stdenv.hostPlatform.system}",
+                  "outputNames": ["out"],
+              }],
+              "edges": [],
+              "buildTimeout": 5,
+          })
+          submit_out = k3s_server.succeed(
+              f"k3s kubectl -n ${ns} port-forward {leader} 19098:9001 "
+              f">/dev/null 2>&1 & pf=$!; "
+              f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+              f"${grpcurl} ${grpcurlTls} -max-time 3 "
+              f"-protoset ${protoset}/rio.protoset "
+              f"-d '{submit_payload}' "
+              f"localhost:19098 rio.scheduler.SchedulerService/SubmitBuild "
+              f"2>&1 || true"
+          )
+          brace = submit_out.find("{")
+          assert brace >= 0, (
+              f"no JSON in SubmitBuild output — submit failed? "
+              f"got: {submit_out[:500]!r}"
+          )
+          first_ev, _ = json.JSONDecoder().raw_decode(submit_out, brace)
+          build_id = first_ev.get("buildId", "")
+          assert build_id, (
+              f"first BuildEvent missing buildId; got: {first_ev!r}"
+          )
+          print(f"build-timeout: submitted, build_id={build_id}")
+
+          # ── Assertion 1: cgroup appeared + non-empty (precondition). ──
+          # Without this, the cgroup-gone assert below proves nothing
+          # (could vanish for any reason). sanitize_build_id: basename
+          # with . → _, so cgroup dir ends "lifecycle-timeout_drv".
+          # Probe from VM host (worker pod is distroless, no `find`).
+          # `| grep .` fails on empty (find exits 0 on no-match) so
+          # wait_until_succeeds retries.
+          worker_node = k3s_server.succeed(
+              "k3s kubectl -n ${ns} get pod default-workers-0 "
+              "-o jsonpath='{.spec.nodeName}'"
+          ).strip()
+          worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
+          cgroup_path = worker_vm.wait_until_succeeds(
+              "find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
+              "-print -quit 2>/dev/null | grep .",
+              timeout=120,
+          ).strip()
+          procs = int(worker_vm.succeed(
+              f"wc -l < {cgroup_path}/cgroup.procs"
+          ).strip())
+          assert procs > 0, (
+              f"cgroup.procs empty ({cgroup_path}) — build not actually "
+              f"running in the cgroup; kill-on-teardown assert vacuous"
+          )
+          print(f"build-timeout: cgroup={cgroup_path}, procs={procs}")
+
+          # ── Assertion 2: cgroup GONE (kill-on-teardown fired). ──────
+          # Kernel rejects rmdir on non-empty cgroup (EBUSY), so gone ⇒
+          # procs drained ⇒ cgroup.kill fired. Without the teardown fix,
+          # this would EBUSY-leak: the sleep-30 builder is a grandchild
+          # (nix-daemon forked it), daemon.kill() doesn't reach it, and
+          # only ~10-20s have elapsed (sleep not done). The explicit
+          # build_cgroup.kill() + drain-poll at executor/mod.rs:764-796
+          # is what makes rmdir succeed.
+          #
+          # timeout=60: buildTimeout=5 + 10s scheduler tick granularity
+          # + daemon-teardown latency + TCG headroom.
+          try:
+              worker_vm.wait_until_succeeds(
+                  f"! test -e {cgroup_path}",
+                  timeout=60,
+              )
+          except Exception:
+              procs_after = worker_vm.succeed(
+                  f"cat {cgroup_path}/cgroup.procs 2>/dev/null | wc -l "
+                  f"|| echo gone"
+              ).strip()
+              k3s_server.execute(
+                  "echo '=== DIAG: worker logs (last 2m, non-DEBUG) ===' >&2; "
+                  "k3s kubectl -n ${ns} logs default-workers-0 --since=2m "
+                  "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
+              )
+              print(f"build-timeout DIAG: procs_after={procs_after} "
+                    f"(was {procs}), build_id={build_id}")
+              raise
+          print(f"build-timeout: cgroup {cgroup_path} removed "
+                f"(builder killed, rmdir succeeded)")
+
+          # ── Assertion 3: timeout observed (no-reassign). ─────────────
+          # Either scheduler's per-build timeout or worker's daemon
+          # timeout won the race — both are terminal-no-reassign. The
+          # scheduler metric rio_scheduler_build_timeouts_total is the
+          # less racy check: it increments when actor/worker.rs:606
+          # fires. With tick=10s and buildTimeout=5, it will fire by
+          # T+~15s (first tick where elapsed > 5) unless the build
+          # already reached a terminal state via the worker path (in
+          # which case the worker reported BuildResultStatus::TimedOut,
+          # which is also permanent-no-reassign per types.proto:278).
+          # We check EITHER incremented — both prove no-reassign.
+          m = sched_metrics()
+          sched_timeouts = metric_value(
+              m, "rio_scheduler_build_timeouts_total"
+          ) or 0.0
+          worker_metrics = k3s_server.succeed(
+              "k3s kubectl -n ${ns} get --raw "
+              "/api/v1/namespaces/${ns}/pods/default-workers-0:9091/proxy/metrics"
+          )
+          timed_out_line = [
+              l for l in worker_metrics.splitlines()
+              if 'rio_worker_builds_total' in l
+              and 'outcome="timed_out"' in l
+              and not l.startswith('#')
+          ]
+          worker_timed_out = (
+              float(timed_out_line[0].rsplit(' ', 1)[1])
+              if timed_out_line else 0.0
+          )
+          assert sched_timeouts >= 1 or worker_timed_out >= 1, (
+              f"neither scheduler_build_timeouts_total "
+              f"({sched_timeouts}) nor worker outcome=timed_out "
+              f"({worker_timed_out}) incremented — timeout didn't fire?"
+          )
+          print(f"build-timeout: sched_timeouts={sched_timeouts}, "
+                f"worker_timed_out={worker_timed_out}")
+
+          # ── Assertion 4: same drv, second build succeeds. ────────────
+          # Proves the leak really is closed, not just "rmdir warned".
+          # Without kill-on-teardown: BuildCgroup::create → mkdir →
+          # EEXIST (leaked cgroup from attempt 1 still has the sleep-30
+          # process). With the fix: clean slate.
+          #
+          # No buildTimeout this time — let the 30s sleep complete.
+          # sched_grpc uses port 19001 (distinct from 19098 above).
+          # SubmitBuild streams events; sched_grpc has -max-time 30 built
+          # in. The 30s sleep + dispatch overhead means the build won't
+          # complete inside 30s, but we don't need completion — just
+          # successful re-dispatch + cgroup recreation (no EEXIST). Same
+          # `|| true` swallow-DeadlineExceeded pattern via a direct call.
+          retry_payload = json.dumps({
+              "nodes": [{
+                  "drvPath": drv_path,
+                  "drvHash": drv_path,
+                  "system": "${pkgs.stdenv.hostPlatform.system}",
+                  "outputNames": ["out"],
+              }],
+              "edges": [],
+          })
+          leader2 = leader_pod()
+          retry_out = k3s_server.succeed(
+              f"k3s kubectl -n ${ns} port-forward {leader2} 19097:9001 "
+              f">/dev/null 2>&1 & pf=$!; "
+              f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+              f"${grpcurl} ${grpcurlTls} -max-time 3 "
+              f"-protoset ${protoset}/rio.protoset "
+              f"-d '{retry_payload}' "
+              f"localhost:19097 rio.scheduler.SchedulerService/SubmitBuild "
+              f"2>&1 || true"
+          )
+          brace2 = retry_out.find("{")
+          assert brace2 >= 0, (
+              f"retry SubmitBuild failed (EEXIST would surface as error "
+              f"before any BuildEvent); got: {retry_out[:500]!r}"
+          )
+          # Cgroup reappeared — concrete proof no EEXIST in
+          # BuildCgroup::create. Same dirname (same drv_path → same
+          # sanitize_build_id). `| grep .` so wait_until_succeeds retries.
+          cgroup_retry = worker_vm.wait_until_succeeds(
+              "find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
+              "-print -quit 2>/dev/null | grep .",
+              timeout=120,
+          ).strip()
+          print(f"build-timeout PASS: same-drv re-dispatched, "
+                f"cgroup recreated at {cgroup_retry} (no EEXIST leak)")
     '';
 
     recovery = ''

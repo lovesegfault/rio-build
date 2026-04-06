@@ -48,6 +48,14 @@
 #   the chunked path.
 #   Asserted end-to-end from /metrics scrapes via assert_metric_*: exact
 #   values (not grep '[1-9]') so CI logs show actual-vs-expected on failure.
+#
+# r[verify worker.shutdown.sigint]
+#   sigint-graceful sends SIGINT (not SIGTERM) to rio-worker on wsmall2
+#   and asserts ExecMainCode=1 + ExecMainStatus=0 → main() RETURNED
+#   (stack unwound, Drop ran) rather than death-by-signal. Also guards
+#   .#coverage-full: main() returning → atexit fires → profraw flushes.
+#   A main.rs refactor that breaks the select! cancellation arm would
+#   silently zero out worker VM coverage.
 {
   pkgs,
   common,
@@ -1079,6 +1087,134 @@ let
 
           print(f"load-50drv PASS: leaf_count=50, "
                 f"assignments delta={a_after - a_before:.0f}")
+    '';
+
+    sigint-graceful = ''
+      # ══════════════════════════════════════════════════════════════════
+      # sigint-graceful — Ctrl+C path: main() returns, FUSE unmounts
+      # ══════════════════════════════════════════════════════════════════
+      # Before remediation 15: worker main.rs watched SIGTERM only.
+      # SIGINT hit the default handler → immediate termination → no
+      # Drop, no atexit. FUSE mount leaked (next start EBUSY), profraw
+      # never flushed (local dev Ctrl+C = zero coverage).
+      #
+      # Three-layered assertion:
+      #   1. ExecMainCode=1 (CLD_EXITED) + ExecMainStatus=0 → main()
+      #      RETURNED Ok(()) via the shutdown.cancelled() select! arm.
+      #      PRIMARY — SIGINT default handler would give Code=2
+      #      (CLD_KILLED) Status=2 (signal number). Code=1 Status=0
+      #      proves main.rs:504 shutdown arm fired, stack unwound.
+      #   2. FUSE mount gone. Belt-and-suspenders: AutoUnmount means
+      #      the kernel unmounts on fd close regardless, so this alone
+      #      doesn't distinguish graceful from crash. But with Code=1
+      #      proven above, this confirms Mount::drop ran in the normal
+      #      unwind (what a human debugging EBUSY would check first).
+      #   3. [coverage mode only] profraw count increased → atexit
+      #      fired → LLVM flush ran. Guards .#coverage-full: a main.rs
+      #      refactor breaking the cancellation arm would silently
+      #      zero worker VM coverage.
+      #
+      # Uses wsmall2: wsmall1 holds FUSE cache state for fuse-direct /
+      # fuse-slowpath (core-test cache-chain coupling). wsmall2 is
+      # disposable here — disrupt split only.
+      #
+      # Standalone fixture only (k3s worker pods are distroless, no
+      # shell, no systemctl). This is the only place we can deliver
+      # SIGINT to a worker PID and inspect aftermath from the host.
+      with subtest("sigint-graceful: SIGINT → main() returns → FUSE unmounts"):
+          # Baseline: mount IS present (worker running, FUSE alive).
+          # If this fails, the fixture is broken — not our bug.
+          wsmall2.succeed("mountpoint -q /var/rio/fuse-store")
+
+          # Coverage-mode baseline. `ls | wc -l` prints 0 on no-match
+          # (wc counts lines from ls's empty stdout); `|| echo 0`
+          # swallows ls's non-zero exit on glob-no-match. COUNT before/
+          # after, not existence: prior fragments (reassign SIGKILL,
+          # or systemd Restart=on-failure churn) may have left stale
+          # profraws. A strict "file exists" check would pass for the
+          # wrong reason.
+          profraw_before = int(wsmall2.succeed(
+              "ls /var/lib/rio/cov/*.profraw 2>/dev/null | wc -l || echo 0"
+          ).strip())
+
+          # SIGINT, not SIGTERM. systemctl kill delivers to MainPID.
+          # `systemctl stop` would send SIGTERM (KillSignal default) —
+          # that path already works (rio-common::signal::shutdown_signal
+          # watched SIGTERM from day one). SIGINT tests the NEW code
+          # at main.rs:503 (r[impl worker.shutdown.sigint]).
+          wsmall2.succeed("systemctl kill -s INT rio-worker.service")
+
+          # Unit reaches inactive when main() returns. NOT
+          # wait_for_unit (that waits for active). 30s: drain is
+          # near-instant with no in-flight builds, but connect_admin
+          # to a still-live scheduler can take a few seconds under TCG.
+          wsmall2.wait_until_succeeds(
+              "systemctl is-active rio-worker.service | grep -qx inactive",
+              timeout=30,
+          )
+
+          # PRIMARY: exit code. main() returning Ok(()) → CLD_EXITED
+          # (Code=1) + Status=0. SIGINT default handler →
+          # CLD_KILLED (Code=2) + Status=2.
+          exit_info = wsmall2.succeed(
+              "systemctl show rio-worker.service "
+              "-p ExecMainCode -p ExecMainStatus"
+          )
+          assert "ExecMainCode=1" in exit_info, (
+              f"worker should exit via return-from-main (CLD_EXITED=1), "
+              f"not death-by-signal. Got: {exit_info!r}. "
+              f"SIGINT handler not installed? Check rio-common::signal."
+          )
+          assert "ExecMainStatus=0" in exit_info, (
+              f"worker main() should return Ok(()) on SIGINT drain. "
+              f"Got: {exit_info!r}"
+          )
+          print(f"sigint-graceful: {exit_info.strip()} (CLD_EXITED, "
+                f"status 0 — main() returned)")
+
+          # SECONDARY: FUSE mount gone. With Code=1 above, this
+          # confirms normal unwind → fuse_session drop → Mount::drop
+          # → fusermount -u. `! mountpoint -q` inverts the exit.
+          wsmall2.succeed("! mountpoint -q /var/rio/fuse-store")
+
+          # TERTIARY [coverage mode only]: fresh profraw appeared.
+          # LLVM registers __llvm_profile_write_file in atexit —
+          # fires iff main() returns (not on signal death).
+          #
+          # Nix interpolates a single Python-boolean token, not a
+          # block: nested indented-string block-interpolation breaks
+          # Python indentation (the inner block strips its OWN common
+          # leading whitespace, so the content lands at col-0 inside
+          # a col-4 `with subtest` context → mypy `Unexpected indent`
+          # on the line after. Observed: test-driver type-check fail
+          # at nixos-test-driver-rio-scheduling-disrupt).
+          _cov_mode = ${if common.coverage then "True" else "False"}
+          if _cov_mode:
+              profraw_after = int(wsmall2.succeed(
+                  "ls /var/lib/rio/cov/*.profraw 2>/dev/null | wc -l"
+              ).strip())
+              assert profraw_after > profraw_before, (
+                  f"graceful SIGINT should flush a fresh profraw via "
+                  f"atexit; before={profraw_before} after={profraw_after}. "
+                  f"main() returned (ExecMainCode=1 above) but atexit "
+                  f"didn't fire? LLVM_PROFILE_FILE unset in unit env?"
+              )
+              print(f"sigint-graceful: profraw {profraw_before} → "
+                    f"{profraw_after} (atexit fired)")
+          else:
+              _ = profraw_before  # silence unused in non-coverage
+
+          # Restart for later fragments + collectCoverage. systemd
+          # Restart=on-failure (worker.nix:191) does NOT fire for
+          # exit 0 (it's on-FAILURE). Must start manually.
+          wsmall2.succeed("systemctl start rio-worker.service")
+          wsmall2.wait_for_unit("rio-worker.service")
+          # Wait for FUSE remount so subsequent fragments (none
+          # currently, but collectCoverage + future additions) see
+          # a consistent state. FUSE mount happens early in main().
+          wsmall2.wait_until_succeeds(
+              "mountpoint -q /var/rio/fuse-store", timeout=30
+          )
     '';
 
   };
