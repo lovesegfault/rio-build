@@ -371,8 +371,22 @@ let
           # bitnami PG's PVC binds against it.
           "--tls-san"
           "k3s-server"
+          # Dual-stack (P0542): the chart defaults to PreferDualStack +
+          # ipFamilies=[IPv6,IPv4] on Services. k3s must have a v6
+          # service CIDR or the apiserver assigns v4-only and the
+          # production EKS path (ip_family=ipv6) goes unexercised. The
+          # NixOS test driver auto-assigns 2001:db8:${vlan}::N/64 to
+          # eth1 and exposes it as primaryIPv6Address; node-ip lists v4
+          # first to keep it the primary family (kubelet/hostNetwork
+          # binds, kube-proxy NodePort) so existing v4-only assertions
+          # in scenarios stay valid.
+          "--cluster-cidr"
+          "10.42.0.0/16,2001:db8:42::/56"
+          "--service-cidr"
+          "10.43.0.0/16,2001:db8:43::/112"
+          "--flannel-ipv6-masq"
           "--node-ip"
-          config.networking.primaryIPAddress
+          "${config.networking.primaryIPAddress},${config.networking.primaryIPv6Address}"
           # Quiet the "Failed to record snapshots: nodes not found"
           # spam during startup. The etcd snapshot reconciler fires
           # on a tight loop before the kubelet registers the node
@@ -412,7 +426,7 @@ let
           "--flannel-iface"
           "eth1"
           "--node-ip"
-          config.networking.primaryIPAddress
+          "${config.networking.primaryIPAddress},${config.networking.primaryIPv6Address}"
         ];
       };
 

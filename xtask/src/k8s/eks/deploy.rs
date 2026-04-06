@@ -157,6 +157,10 @@ pub async fn run(
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "ip",
         "service.beta.kubernetes.io/aws-load-balancer-scheme": "internal",
+        // P0542: dualstack NLB so the gateway has both A and AAAA.
+        // v6-only pods inside the cluster reach it via the Service
+        // ClusterIP anyway; this is for the SSM-tunnel client side.
+        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });

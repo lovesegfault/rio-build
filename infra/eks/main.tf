@@ -96,9 +96,28 @@ module "vpc" {
   private_subnets = ["10.42.1.0/24", "10.42.2.0/24", "10.42.3.0/24"]
   public_subnets  = ["10.42.101.0/24", "10.42.102.0/24", "10.42.103.0/24"]
 
+  # IPv6 (P0542 / I-073): AWS assigns a /56 to the VPC, /64 per subnet.
+  # With cluster_ip_family="ipv6" below, pods get v6 addresses from the
+  # subnet /64 — effectively unlimited. The /24 v4 CIDRs above stay for
+  # node ENIs (primary IP) and the few v4-only AWS endpoints; pods no
+  # longer consume them.
+  enable_ipv6                                    = true
+  private_subnet_ipv6_prefixes                   = [0, 1, 2]
+  public_subnet_ipv6_prefixes                    = [3, 4, 5]
+  private_subnet_assign_ipv6_address_on_creation = true
+  public_subnet_assign_ipv6_address_on_creation  = true
+
   enable_nat_gateway   = true
   single_nat_gateway   = true # dev: one NAT is fine; prod: HA with per-AZ
   enable_dns_hostnames = true
+
+  # DNS64 + NAT64: v6-only pods reaching v4-only upstreams (some source
+  # tarballs, older mirrors) get a synthesized AAAA under 64:ff9b::/96
+  # from Route53 Resolver; the NAT GW translates to v4. The vpc module
+  # adds the ::/0 → egress-only-IGW route and the 64:ff9b::/96 → NAT
+  # route automatically when both this and enable_nat_gateway are set.
+  private_subnet_enable_dns64                                   = true
+  private_subnet_enable_resource_name_dns_aaaa_record_on_launch = true
 
   # EKS requires these tags for subnet auto-discovery by the
   # load-balancer-controller and cluster-autoscaler.
@@ -127,6 +146,13 @@ module "eks" {
 
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
+
+  # Native IPv6 cluster (P0542): pods and Service ClusterIPs are v6.
+  # vpc-cni hands out v6 from the subnet /64 (no v4 per-pod allocation
+  # → I-073 subnet exhaustion is structurally impossible). The chart's
+  # PreferDualStack Services become v6-primary. IMMUTABLE after create.
+  ip_family                  = "ipv6"
+  create_cni_ipv6_iam_policy = true
 
   # IRSA: OIDC provider for pod-to-IAM role assumption. Required
   # for rio-store's S3 access (no static AWS keys in pods).

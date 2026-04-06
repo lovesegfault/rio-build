@@ -64,10 +64,11 @@ resource "aws_security_group" "bastion" {
   vpc_id = module.vpc.vpc_id
 
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
   }
 }
 
@@ -80,6 +81,9 @@ resource "aws_instance" "bastion" {
   vpc_security_group_ids      = [aws_security_group.bastion.id]
   iam_instance_profile        = aws_iam_instance_profile.bastion.name
   associate_public_ip_address = false
+  # P0542: bastion → NLB may resolve AAAA. AL2023 dual-stacks
+  # automatically when the ENI has a v6 address.
+  ipv6_address_count = 1
 
   # IMDSv2 only. Same defense-in-depth as the worker nodes (though
   # the bastion runs nothing interesting — it's just a TCP forward).
