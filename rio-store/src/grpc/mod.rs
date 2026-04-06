@@ -40,7 +40,7 @@ use crate::backend::chunk::ChunkBackend;
 use crate::cas::{self, ChunkCache};
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
-use crate::signing::Signer;
+use crate::signing::TenantSigner;
 use crate::validate::validate_nar_digest;
 
 mod admin;
@@ -118,11 +118,13 @@ pub struct StoreServiceImpl {
     /// `Arc` because the spawned GetPath streaming task needs an owned
     /// handle (the task outlives the `&self` method call).
     chunk_cache: Option<Arc<ChunkCache>>,
-    /// ed25519 signing key for narinfo. `None` = signing disabled (paths
-    /// stored without our signature; still serveable, just unverified).
-    /// Arc because both PutPath branches need it and the inline branch
-    /// doesn't have a good place to hold a reference across the await.
-    signer: Option<Arc<Signer>>,
+    /// Tenant-aware ed25519 signer for narinfo. Wraps the cluster
+    /// `Signer` + PG pool for per-tenant key lookup. `None` = signing
+    /// disabled (paths stored without our signature; still serveable,
+    /// just unverified). Arc because both PutPath branches need it and
+    /// the inline branch doesn't have a good place to hold a reference
+    /// across the await.
+    signer: Option<Arc<TenantSigner>>,
     /// HMAC verifier for assignment tokens on PutPath. When Some, a
     /// PutPath without a valid `x-rio-assignment-token` metadata
     /// header → PERMISSION_DENIED. When Some + valid token: the
@@ -226,21 +228,25 @@ impl StoreServiceImpl {
         self
     }
 
-    /// Enable narinfo signing with the given key.
+    /// Enable narinfo signing with the given tenant-aware signer.
     ///
-    /// Builder-style: `StoreServiceImpl::new(pool).with_signer(key)`.
-    /// Chains after either `new()` or `with_chunk_cache()`.
-    pub fn with_signer(mut self, signer: Signer) -> Self {
+    /// Builder-style: `StoreServiceImpl::new(pool).with_signer(ts)`.
+    /// Chains after either `new()` or `with_chunk_cache()`. The
+    /// `TenantSigner` wraps the cluster key + pool — per-tenant key
+    /// lookup happens at sign time, not construction time.
+    pub fn with_signer(mut self, signer: TenantSigner) -> Self {
         self.signer = Some(Arc::new(signer));
         self
     }
 
     /// Clone the signer Arc for sharing with StoreAdminServiceImpl.
-    /// ResignPaths needs the SAME key as PutPath so re-signed narinfos
-    /// verify against the same `trusted-public-keys` entry. Returning
-    /// an `Option<Arc>` (rather than exposing the field) keeps the
+    /// ResignPaths needs the SAME cluster key as PutPath so re-signed
+    /// narinfos verify against the same `trusted-public-keys` entry.
+    /// Admin re-signing uses `ts.cluster()` directly — backfilled
+    /// historical paths have no per-tenant attribution. Returning an
+    /// `Option<Arc>` (rather than exposing the field) keeps the
     /// Arc-wrapping detail internal.
-    pub fn signer(&self) -> Option<Arc<Signer>> {
+    pub fn signer(&self) -> Option<Arc<TenantSigner>> {
         self.signer.clone()
     }
 
@@ -260,17 +266,30 @@ impl StoreServiceImpl {
         &self.nar_bytes_budget
     }
 
+    // r[impl store.tenant.sign-key]
     /// If a signer is configured, compute the narinfo fingerprint and
-    /// push a signature onto `info.signatures`.
+    /// push a signature onto `info.signatures` using the tenant's key
+    /// (or cluster fallback — see [`TenantSigner::sign_for_tenant`]).
     ///
     /// Called just before complete_manifest_* writes narinfo to PG —
     /// the signature goes into the DB, and the HTTP cache server serves
     /// it as a `Sig:` line without ever touching the privkey.
     ///
-    /// No-op if signer is None. No error path: signing can't fail
-    /// (ed25519 signing is pure math on valid inputs, and we control
-    /// all inputs).
-    fn maybe_sign(&self, info: &mut ValidatedPathInfo) {
+    /// `tenant_id` comes from JWT `Claims.sub` (P0259 interceptor). `None`
+    /// means: no JWT (dual-mode fallback), OR mTLS bypass (gateway cert,
+    /// `nix copy` path — no per-build attribution), OR dev mode (no
+    /// interceptor). All three correctly fall through to cluster key.
+    ///
+    /// Async because `sign_for_tenant` hits PG for `tenant_keys` lookup
+    /// when `tenant_id` is `Some`. The `None` path is sync-in-practice
+    /// (no await point hit), but the signature is uniformly async.
+    ///
+    /// Error handling: `TenantKeyLookup` (the only failing variant — the
+    /// `None` path is infallible) is logged + falls back to cluster key.
+    /// A transient PG hiccup shouldn't fail the upload; the cluster sig
+    /// is still valid, just not tenant-scoped. The caller gets a
+    /// signature either way — `maybe_sign` itself stays infallible.
+    async fn maybe_sign(&self, tenant_id: Option<uuid::Uuid>, info: &mut ValidatedPathInfo) {
         let Some(signer) = &self.signer else {
             return;
         };
@@ -301,8 +320,27 @@ impl StoreServiceImpl {
             &refs,
         );
 
-        let sig = signer.sign(&fp);
-        debug!(key = %signer.key_name(), "signed narinfo fingerprint");
+        let (sig, was_tenant) = match signer.sign_for_tenant(tenant_id, &fp).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Transient PG failure — don't fail the upload. Fall back
+                // to cluster key explicitly (sign_for_tenant(None, ...) is
+                // infallible — it never touches the DB). Log loud so ops
+                // notices: a tenant WITH a configured key is now getting
+                // cluster-signed paths, which `nix store verify
+                // --trusted-public-keys tenant:<pk>` will reject. The
+                // upload succeeds; the tenant's verify chain breaks.
+                warn!(error = %e, ?tenant_id, "tenant-key lookup failed; falling back to cluster key");
+                let (sig, _) = signer
+                    .sign_for_tenant(None, &fp)
+                    .await
+                    .expect("None path is infallible (no DB hit)");
+                (sig, false)
+            }
+        };
+
+        let key_label = if was_tenant { "tenant" } else { "cluster" };
+        debug!(key = key_label, ?tenant_id, "signed narinfo fingerprint");
         info.signatures.push(sig);
     }
 
@@ -627,17 +665,22 @@ mod tests {
     use tracing_test::traced_test;
 
     /// Build a StoreServiceImpl with a test signer but no DB/backend.
-    /// `maybe_sign` only touches the signer, so pool can be dangling —
-    /// we construct one that's never awaited (lazy connect).
+    /// These tests pass `tenant_id: None` to `maybe_sign`, so the pool
+    /// inside `TenantSigner` is never queried — lazy connect stays lazy.
+    /// (The Some-tenant path IS tested by the integration test at
+    /// `tests/grpc/signing.rs`, which has a real PG.)
     fn svc_with_signer() -> StoreServiceImpl {
         // 32-byte seed → Signer::parse accepts `name:base64(seed)` (seed-only
         // form; ed25519 derives pubkey deterministically).
         let seed_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42u8; 32]);
-        let signer = Signer::parse(&format!("test-key-1:{seed_b64}")).expect("valid test signer");
-        // Pool is lazy — never connects since maybe_sign doesn't touch it.
+        let cluster = crate::signing::Signer::parse(&format!("test-key-1:{seed_b64}"))
+            .expect("valid test signer");
+        // Pool is lazy — never connects since these tests pass tenant_id=None
+        // (the cluster-key path in sign_for_tenant skips the DB entirely).
         let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool never connects");
-        StoreServiceImpl::new(pool).with_signer(signer)
+        let ts = TenantSigner::new(cluster, pool.clone());
+        StoreServiceImpl::new(pool).with_signer(ts)
     }
 
     /// r[verify store.signing.empty-refs-warn]
@@ -653,7 +696,7 @@ mod tests {
         assert!(info.references.is_empty());
         assert!(info.content_address.is_none());
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(
             logs_contain("suspicious"),
@@ -677,7 +720,7 @@ mod tests {
         let mut info = make_path_info(&test_store_path("ca-path"), b"nar", [0u8; 32]);
         info.content_address = Some("fixed:r:sha256:abc".into());
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(
             !logs_contain("suspicious"),
@@ -696,7 +739,7 @@ mod tests {
         info.references =
             vec![rio_nix::store_path::StorePath::parse(&test_store_path("dep-a")).unwrap()];
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(
             !logs_contain("suspicious"),
@@ -716,7 +759,7 @@ mod tests {
         let svc = StoreServiceImpl::new(pool); // no .with_signer()
         let mut info = make_path_info(&test_store_path("unsigned"), b"nar", [0u8; 32]);
 
-        svc.maybe_sign(&mut info);
+        svc.maybe_sign(None, &mut info).await;
 
         assert!(!logs_contain("suspicious"));
         assert!(info.signatures.is_empty(), "no signer → no signature");

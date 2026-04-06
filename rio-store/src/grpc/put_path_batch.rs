@@ -59,6 +59,16 @@ impl StoreServiceImpl {
         // every output — each output's path must be in expected_outputs.
         let hmac_claims = self.verify_assignment_token(&request)?;
 
+        // JWT tenant-id extraction — same mechanism as PutPath (see
+        // put_path.rs for the full interceptor/dual-mode commentary).
+        // One JWT per batch; all outputs in the batch get signed with
+        // the same tenant's key. This is correct: a batch is one
+        // derivation's outputs, one build, one tenant.
+        let tenant_id: Option<uuid::Uuid> = request
+            .extensions()
+            .get::<rio_common::jwt::Claims>()
+            .map(|c| c.sub);
+
         let mut stream = request.into_inner();
 
         // BTreeMap for deterministic iteration order (output 0, 1, 2, …).
@@ -313,7 +323,7 @@ impl StoreServiceImpl {
             }
             let mut info = accum.info.take().expect("validated in phase 2");
             info.store_path_hash = std::mem::take(&mut accum.store_path_hash);
-            self.maybe_sign(&mut info);
+            self.maybe_sign(tenant_id, &mut info).await;
 
             let nar_data = Bytes::from(std::mem::take(&mut accum.nar_data));
             if let Err(e) = metadata::complete_manifest_inline_in_tx(&mut tx, &info, nar_data).await

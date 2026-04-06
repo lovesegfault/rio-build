@@ -22,7 +22,7 @@ use crate::backend::chunk::ChunkBackend;
 use crate::cas::ChunkCache;
 use crate::gc;
 use crate::metadata::{self, ManifestKind};
-use crate::signing::Signer;
+use crate::signing::TenantSigner;
 
 /// StoreAdminService gRPC server.
 pub struct StoreAdminServiceImpl {
@@ -40,7 +40,14 @@ pub struct StoreAdminServiceImpl {
     /// signature is appended (old sig won't verify against the new
     /// fingerprint; caller must re-sign out-of-band or accept
     /// unsigned paths).
-    signer: Option<Arc<Signer>>,
+    ///
+    /// `TenantSigner` wrapper, but ResignPaths only ever uses the
+    /// cluster key via `ts.cluster()` — backfilled historical paths
+    /// have no per-tenant attribution (they predate whatever
+    /// tenant_id→path association the build had). Sharing the same
+    /// `Arc<TenantSigner>` as StoreServiceImpl guarantees the cluster
+    /// key is the SAME one PutPath falls back to.
+    signer: Option<Arc<TenantSigner>>,
 }
 
 impl StoreAdminServiceImpl {
@@ -68,7 +75,7 @@ impl StoreAdminServiceImpl {
     /// share one key between StoreServiceImpl (PutPath signing)
     /// and StoreAdminServiceImpl (ResignPaths re-signing) — same
     /// key, same `Sig:` line in the narinfo either way.
-    pub fn with_signer(mut self, signer: Arc<Signer>) -> Self {
+    pub fn with_signer(mut self, signer: Arc<TenantSigner>) -> Self {
         self.signer = Some(signer);
         self
     }
@@ -181,7 +188,10 @@ impl StoreAdminServiceImpl {
             let take = nar_hash.len().min(32);
             nh[..take].copy_from_slice(&nar_hash[..take]);
             let fp = rio_nix::narinfo::fingerprint(store_path, &nh, nar_size as u64, &new_refs);
-            signer.sign(&fp)
+            // Cluster key only — historical paths have no tenant attribution.
+            // Even if the original PutPath used a tenant key, we don't know
+            // which tenant here (backfill reads narinfo rows, not builds).
+            signer.cluster().sign(&fp)
         });
 
         // Single UPDATE: refs + (optional) sig-append + backfilled
@@ -203,7 +213,7 @@ impl StoreAdminServiceImpl {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| crate::grpc::internal_error("ResignPaths: update refs+sig", e))?;
-                debug!(store_path, refs = new_refs.len(), key = %self.signer.as_ref().unwrap().key_name(), "backfilled refs + re-signed");
+                debug!(store_path, refs = new_refs.len(), key = %self.signer.as_ref().unwrap().cluster_key_name(), "backfilled refs + re-signed");
             }
             None => {
                 sqlx::query(
@@ -1328,9 +1338,13 @@ mod tests {
 
         let seed_b64 =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42u8; 32]);
-        let signer =
-            Signer::parse(&format!("test-resign-1:{seed_b64}")).expect("valid test signer");
-        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None).with_signer(Arc::new(signer));
+        let cluster = crate::signing::Signer::parse(&format!("test-resign-1:{seed_b64}"))
+            .expect("valid test signer");
+        // ResignPaths only uses the cluster key — the tenant_keys table
+        // is empty in this test DB, but that's irrelevant since resign_one
+        // calls `signer.cluster().sign()` unconditionally.
+        let ts = TenantSigner::new(cluster, db.pool.clone());
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None).with_signer(Arc::new(ts));
 
         // A: leaf; B references A (blob embeds A's hash).
         let hash_a = "33333333333333333333333333333333";
