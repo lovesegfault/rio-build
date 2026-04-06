@@ -59,6 +59,11 @@ pub(crate) struct Config {
     pub(crate) scheduler_balance_host: Option<String>,
     pub(crate) scheduler_balance_port: u16,
     pub(crate) store_addr: String,
+    /// rio-store headless Service host. Same balance pattern as
+    /// scheduler — but for load distribution across replicas, not
+    /// leader routing (all store pods serve). `None` = single-channel.
+    pub(crate) store_balance_host: Option<String>,
+    pub(crate) store_balance_port: u16,
     /// Systems this builder can build for. Empty after merge →
     /// auto-detect single element via std::env::consts. Multi-
     /// element for qemu-user-static or cross-arch builders.
@@ -178,6 +183,8 @@ impl Default for Config {
             scheduler_balance_host: None,
             scheduler_balance_port: 9001,
             store_addr: String::new(),
+            store_balance_host: None,
+            store_balance_port: 9002,
             systems: Vec::new(),
             features: Vec::new(),
             // Matches nix/modules/builder.nix. NEVER default to /nix/store:

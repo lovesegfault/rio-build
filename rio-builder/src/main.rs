@@ -977,7 +977,13 @@ fn init_cgroup(
 
 type StoreClient = rio_proto::StoreServiceClient<tonic::transport::Channel>;
 type WorkerClient = rio_proto::ExecutorServiceClient<tonic::transport::Channel>;
-type BalanceGuard = Option<rio_proto::client::balance::BalancedChannel>;
+/// Probe-loop guards for both balanced channels. Dropping a
+/// `BalancedChannel` stops its probe loop, so these must outlive the
+/// clients. Either can be `None` (single-channel fallback).
+type BalanceGuards = (
+    Option<rio_proto::client::balance::BalancedChannel>,
+    Option<rio_proto::client::balance::BalancedChannel>,
+);
 
 /// Retry-until-connected store + scheduler clients via
 /// [`connect_with_retry`](rio_proto::client::connect_with_retry)
@@ -1000,12 +1006,30 @@ type BalanceGuard = Option<rio_proto::client::balance::BalancedChannel>;
 async fn connect_upstreams(
     cfg: &Config,
     shutdown: &rio_common::signal::Token,
-) -> Option<(StoreClient, WorkerClient, BalanceGuard)> {
+) -> Option<(StoreClient, WorkerClient, BalanceGuards)> {
     rio_proto::client::connect_with_retry(
         shutdown,
         || async {
-            let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
-            let (sched, guard) = match &cfg.scheduler_balance_host {
+            let (store, store_guard) = match &cfg.store_balance_host {
+                None => {
+                    info!(addr = %cfg.store_addr, "store: single-channel mode");
+                    let c = rio_proto::client::connect_store(&cfg.store_addr).await?;
+                    (c, None)
+                }
+                Some(host) => {
+                    info!(
+                        %host, port = cfg.store_balance_port,
+                        "store: health-aware balanced mode"
+                    );
+                    let (c, bc) = rio_proto::client::balance::connect_store_balanced(
+                        host.clone(),
+                        cfg.store_balance_port,
+                    )
+                    .await?;
+                    (c, Some(bc))
+                }
+            };
+            let (sched, sched_guard) = match &cfg.scheduler_balance_host {
                 None => {
                     info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
                     let c = rio_proto::client::connect_executor(&cfg.scheduler_addr).await?;
@@ -1024,7 +1048,7 @@ async fn connect_upstreams(
                     (c, Some(bc))
                 }
             };
-            anyhow::Ok((store, sched, guard))
+            anyhow::Ok((store, sched, (store_guard, sched_guard)))
         },
         None,
     )

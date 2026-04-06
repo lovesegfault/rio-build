@@ -72,7 +72,7 @@ use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
-use super::builders::{self, SchedulerAddrs};
+use super::builders::{self, SchedulerAddrs, StoreAddrs};
 use super::job_common::{
     SpawnOutcome, is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
     spawn_prerequisites, try_spawn_job,
@@ -188,10 +188,10 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
     if to_spawn > 0 {
-        let (oref, scheduler) = spawn_prerequisites(wp, ctx)?;
+        let (oref, scheduler, store) = spawn_prerequisites(wp, ctx)?;
 
         for _ in 0..to_spawn {
-            let job = build_job(wp, oref.clone(), &scheduler, &ctx.store_addr)?;
+            let job = build_job(wp, oref.clone(), &scheduler, &store)?;
             // build_job() always sets metadata.name, so this can't
             // fail today — but .expect() here violates the crate's
             // "reconciler panic = pod crash-loop" convention
@@ -324,7 +324,7 @@ pub(super) fn build_job(
     wp: &BuilderPool,
     oref: OwnerReference,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &StoreAddrs,
 ) -> Result<Job> {
     let pool = wp.name_any();
     let labels = builders::labels(wp);
@@ -337,7 +337,7 @@ pub(super) fn build_job(
     let cache_gb = builders::parse_quantity_to_gb(&wp.spec.fuse_cache_size)?;
 
     let mut pod_spec =
-        builders::build_pod_spec(wp, scheduler, store_addr, cache_gb, cache_quantity, None);
+        builders::build_pod_spec(wp, scheduler, store, cache_gb, cache_quantity, None);
 
     // Append RIO_EPHEMERAL=1 to the worker container's env. The
     // container is always index 0 (build_pod_spec constructs exactly
@@ -421,7 +421,7 @@ pub(super) fn build_job(
 mod tests {
     use super::*;
     use crate::crds::builderpool::Replicas;
-    use crate::fixtures::test_sched_addrs;
+    use crate::fixtures::{test_sched_addrs, test_store_addrs};
     // `controller_owner_ref` comes from `kube::Resource`. Module-
     // level import moved to job_common with spawn_prerequisites;
     // tests still build Jobs directly, so import here.
@@ -461,7 +461,7 @@ mod tests {
     fn job_spec_load_bearing_fields() {
         let wp = test_wp();
         let oref = wp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
 
         // ownerReference → GC on BuilderPool delete.
         let orefs = job.metadata.owner_references.as_ref().unwrap();
@@ -525,7 +525,7 @@ mod tests {
     fn job_name_format() {
         let wp = test_wp();
         let oref = wp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         let name = job.metadata.name.unwrap();
 
         // Precondition self-assert: test_wp names the pool "eph-pool".
@@ -604,7 +604,7 @@ mod tests {
         let mut wp = test_wp();
         wp.spec.ephemeral_deadline_seconds = Some(7200);
         let oref = wp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
 
         let spec = job.spec.as_ref().unwrap();
         assert_eq!(
@@ -639,7 +639,7 @@ mod tests {
         let mut wp = test_wp();
         wp.spec.tls_secret_name = Some("rio-builder-tls".into());
         let oref = wp.controller_owner_ref(&()).unwrap();
-        let job = build_job(&wp, oref, &test_sched_addrs(), "store:9002").unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
 
         let tls_vol = pod

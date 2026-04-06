@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use super::builders::*;
 use super::*;
 use crate::crds::builderpool::SeccompProfileKind;
-use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios, test_sched_addrs};
+use crate::fixtures::{
+    ApiServerVerifier, Scenario, apply_ok_scenarios, test_sched_addrs, test_store_addrs,
+};
 
 mod apply_tests;
 mod builders_tests;
@@ -45,7 +47,7 @@ pub(crate) fn test_sts(wp: &BuilderPool) -> StatefulSet {
         wp,
         wp.controller_owner_ref(&()).unwrap(),
         &test_sched_addrs(),
-        "store:9002",
+        &test_store_addrs(),
         Some(wp.spec.replicas.min),
     )
     .unwrap()
@@ -76,6 +78,8 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         store_addr: "http://127.0.0.1:1".into(),
         scheduler_balance_host: None,
         scheduler_balance_port: 9001,
+        store_balance_host: None,
+        store_balance_port: 9002,
         recorder,
         error_counts: Default::default(),
         manifest_idle: Default::default(),

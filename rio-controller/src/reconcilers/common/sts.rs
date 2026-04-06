@@ -88,20 +88,27 @@ impl ExecutorRole {
     }
 }
 
-/// Scheduler addresses injected into executor pod env. Bundled as
-/// a struct because threading 3+ `&str` params through the builder
-/// chain is noisy, and these always travel together.
+/// Upstream gRPC addresses injected into executor pod env: a
+/// ClusterIP `addr` for single-channel mode plus an optional
+/// headless-Service `balance_host` for health-aware p2c. Same shape
+/// for scheduler and store; the env-var prefix differs at the
+/// injection site below.
+///
+/// Type aliases (rather than two distinct structs) keep the
+/// `SchedulerAddrs` / `StoreAddrs` names at every call site without
+/// duplicating the field set.
 #[derive(Clone)]
-pub struct SchedulerAddrs {
-    /// ClusterIP Service `host:port` (`RIO_SCHEDULER_ADDR`).
+pub struct UpstreamAddrs {
+    /// ClusterIP Service `host:port` (`RIO_{SCHEDULER,STORE}_ADDR`).
     pub addr: String,
-    /// Headless Service hostname (`RIO_SCHEDULER_BALANCE_HOST`).
-    /// `None` = env var NOT injected → executor falls back to
-    /// single-channel.
+    /// Headless Service hostname. `None` = env var NOT injected →
+    /// executor falls back to single-channel.
     pub balance_host: Option<String>,
-    /// Headless Service port (`RIO_SCHEDULER_BALANCE_PORT`).
     pub balance_port: u16,
 }
+
+pub type SchedulerAddrs = UpstreamAddrs;
+pub type StoreAddrs = UpstreamAddrs;
 
 /// Every spec field the pod-spec builder reads. Both reconcilers
 /// construct this from their respective CRD spec and call
@@ -204,7 +211,7 @@ pub fn build_executor_statefulset(
     p: &ExecutorStsParams,
     oref: OwnerReference,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &StoreAddrs,
     replicas: Option<i32>,
 ) -> StatefulSet {
     let name = sts_name(&p.pool_name, p.role);
@@ -246,7 +253,7 @@ pub fn build_executor_statefulset(
                     labels: Some(labels),
                     ..Default::default()
                 }),
-                spec: Some(build_executor_pod_spec(p, scheduler, store_addr)),
+                spec: Some(build_executor_pod_spec(p, scheduler, store)),
             },
             ..Default::default()
         }),
@@ -260,7 +267,7 @@ pub fn build_executor_statefulset(
 pub fn build_executor_pod_spec(
     p: &ExecutorStsParams,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &StoreAddrs,
 ) -> PodSpec {
     // cgroup handling: we do NOT hostPath-mount /sys/fs/cgroup.
     // See builderpool/builders.rs pre-extraction commentary for the
@@ -285,7 +292,7 @@ pub fn build_executor_pod_spec(
         .and_then(|k| k.localhost_profile.as_deref());
 
     PodSpec {
-        containers: vec![build_executor_container(p, scheduler, store_addr)],
+        containers: vec![build_executor_container(p, scheduler, store)],
 
         // wait-seccomp initContainer: polls the hostPath-mounted
         // kubelet seccomp dir until the Localhost profile lands.
@@ -552,7 +559,7 @@ pub fn build_executor_pod_spec(
 fn build_executor_container(
     p: &ExecutorStsParams,
     scheduler: &SchedulerAddrs,
-    store_addr: &str,
+    store: &StoreAddrs,
 ) -> Container {
     let privileged = p.privileged;
 
@@ -564,7 +571,7 @@ fn build_executor_container(
         env: Some({
             let mut e = vec![
                 env("RIO_SCHEDULER_ADDR", &scheduler.addr),
-                env("RIO_STORE_ADDR", store_addr),
+                env("RIO_STORE_ADDR", &store.addr),
                 env("RIO_FUSE_CACHE_SIZE_GB", &p.fuse_cache_gb.to_string()),
                 env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
                 env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
@@ -588,6 +595,13 @@ fn build_executor_container(
                 e.push(env(
                     "RIO_SCHEDULER_BALANCE_PORT",
                     &scheduler.balance_port.to_string(),
+                ));
+            }
+            if let Some(host) = &store.balance_host {
+                e.push(env("RIO_STORE_BALANCE_HOST", host));
+                e.push(env(
+                    "RIO_STORE_BALANCE_PORT",
+                    &store.balance_port.to_string(),
                 ));
             }
             if let Some(n) = p.fuse_threads {

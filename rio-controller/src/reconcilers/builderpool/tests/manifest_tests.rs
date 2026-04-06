@@ -20,7 +20,7 @@ use kube::api::ObjectMeta;
 use rio_proto::types::{DerivationResourceEstimate, ExecutorInfo};
 
 use crate::crds::builderpool::{Replicas, Sizing};
-use crate::fixtures::test_sched_addrs;
+use crate::fixtures::{test_sched_addrs, test_store_addrs};
 use crate::reconcilers::builderpool::manifest::{
     Bucket, CPU_CLASS_LABEL, CRASH_LOOP_WARN_THRESHOLD, FAILED_SWEEP_MIN, FLOOR_CLASS,
     MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST, SPAWN_FAIL_THRESHOLD, SpawnDirective,
@@ -487,8 +487,14 @@ fn built_job_labels_roundtrip_through_inventory() {
     let oref = wp.controller_owner_ref(&()).unwrap();
     let bucket = (8 * GI, 2000);
 
-    let job = build_manifest_job(&wp, oref, &test_sched_addrs(), "store:9002", Some(bucket))
-        .expect("build_manifest_job");
+    let job = build_manifest_job(
+        &wp,
+        oref,
+        &test_sched_addrs(),
+        &test_store_addrs(),
+        Some(bucket),
+    )
+    .expect("build_manifest_job");
 
     // The Job's own labels.
     let labels = job.metadata.labels.as_ref().unwrap();
@@ -540,8 +546,14 @@ fn built_job_pod_has_bucket_resources() {
     let oref = wp.controller_owner_ref(&()).unwrap();
     let bucket = (32 * GI, 4000);
 
-    let job = build_manifest_job(&wp, oref, &test_sched_addrs(), "store:9002", Some(bucket))
-        .expect("build_manifest_job");
+    let job = build_manifest_job(
+        &wp,
+        oref,
+        &test_sched_addrs(),
+        &test_store_addrs(),
+        Some(bucket),
+    )
+    .expect("build_manifest_job");
 
     let pod_spec = job.spec.unwrap().template.spec.unwrap();
     let resources = pod_spec.containers[0]
@@ -578,7 +590,7 @@ fn cold_start_job_uses_spec_resources_floor() {
     assert!(wp.spec.resources.is_none(), "precondition");
 
     let oref = wp.controller_owner_ref(&()).unwrap();
-    let job = build_manifest_job(&wp, oref, &test_sched_addrs(), "store:9002", None)
+    let job = build_manifest_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None)
         .expect("build_manifest_job");
 
     // Label is the floor sentinel.
@@ -620,7 +632,7 @@ fn job_spec_load_bearing_fields() {
         &wp,
         oref,
         &test_sched_addrs(),
-        "store:9002",
+        &test_store_addrs(),
         Some((8 * GI, 2000)),
     )
     .unwrap();
@@ -674,7 +686,7 @@ fn job_name_format() {
         &wp,
         oref,
         &test_sched_addrs(),
-        "store:9002",
+        &test_store_addrs(),
         Some((8 * GI, 2000)),
     )
     .unwrap();
@@ -706,7 +718,8 @@ fn job_name_format() {
 fn job_name_format_cold_start() {
     let wp = test_manifest_wp();
     let oref = wp.controller_owner_ref(&()).unwrap();
-    let job = build_manifest_job(&wp, oref, &test_sched_addrs(), "store:9002", None).unwrap();
+    let job =
+        build_manifest_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
     let name = job.metadata.name.unwrap();
     assert!(
         name.starts_with("mf-pool-mf-floorg-floorm-"),
