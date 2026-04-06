@@ -390,290 +390,22 @@ pub async fn execute_build(
         );
     }
 
-    // r[impl worker.executor.resolve-input-drvs]
-    // Resolve inputDrv outputs → add to BasicDerivation's inputSrcs.
-    // `drv.to_basic()` only copies the static input_srcs (e.g., busybox);
-    // it does NOT resolve inputDrvs to their output paths. nix-daemon's
-    // sandbox only bind-mounts inputSrcs into the chroot, so without this
-    // the builder can't find its input derivations' outputs.
-    // Each inputDrv's .drv file is already in rio-store (uploaded by the
-    // gateway during SubmitBuild); fetch + parse to get output paths.
-    let mut resolved_input_srcs = drv.input_srcs().clone();
-    // Collect owned (path, names) pairs up-front so the async closures
-    // don't borrow from `drv` (which is not 'static inside spawn_monitored).
-    let input_drv_specs: Vec<(String, std::collections::BTreeSet<String>)> = drv
-        .input_drvs()
-        .iter()
-        .map(|(p, n)| (p.clone(), n.clone()))
-        .collect();
-    let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
-        .map(|(path, names)| {
-            let mut client = store_client.clone();
-            async move {
-                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
-                let matching: Vec<String> = input_drv
-                    .outputs()
-                    .iter()
-                    .filter(|out| names.contains(out.name()))
-                    // Floating-CA outputs have path="" in the .drv
-                    // (computed post-build). Reaching this loop with a
-                    // CA input means the scheduler's resolve failed
-                    // (RealisationMissing, PG blip) and dispatched
-                    // unresolved content. Passing "" to
-                    // fetch_input_metadata → `invalid store path ""` →
-                    // InfrastructureFailure → unbounded retry storm
-                    // (9748 events observed). Filter here so the build
-                    // fails later on the unresolved PLACEHOLDER in
-                    // env/args (a proper BuildFailed, not an infra
-                    // loop). The scheduler-side fix (insert realisation
-                    // at completion) makes this path unreachable in
-                    // normal operation; this is defense-in-depth.
-                    .filter(|out| {
-                        if out.path().is_empty() {
-                            tracing::warn!(
-                                input_drv = %path,
-                                output_name = out.name(),
-                                "floating-CA input unresolved by scheduler; \
-                                 filtering empty path (build will fail on placeholder)"
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    })
-                    .map(|out| out.path().to_string())
-                    .collect();
-                Ok::<_, ExecutorError>(matching)
-            }
-        })
-        .buffer_unordered(MAX_PARALLEL_FETCHES)
-        .try_collect()
-        .await?;
-    // Defense: filter empty paths. A floating-CA input derivation's .drv
-    // file has `out.path() == ""` (the path is unknown until the build
-    // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs
-    // to realized paths (maybe_resolve_ca gate miss, or resolve failed),
-    // we'd pass `""` to nix-daemon's inputSrcs → bind-mount of "" →
-    // build fails with a cryptic ENOENT. Dropping empties here makes the
-    // failure mode clearer (the build still fails — it's missing an
-    // input — but the log shows the actual missing path, not "").
-    //
-    // WARN-log indicates a scheduler bug: the scheduler should have
-    // resolved CA inputDrvs before dispatch. Zero warns expected in
-    // steady-state; any warn here means investigate the scheduler's
-    // `maybe_resolve_ca` path.
-    let mut dropped_empty = 0usize;
-    for paths in fetched {
-        for p in paths {
-            if p.is_empty() {
-                dropped_empty += 1;
-            } else {
-                resolved_input_srcs.insert(p);
-            }
-        }
-    }
-    if dropped_empty > 0 {
-        tracing::warn!(
-            drv_path = %drv_path,
-            dropped = dropped_empty,
-            "dropped empty inputDrv output paths (floating-CA input not resolved by scheduler)"
-        );
-    }
-    let basic_drv = rio_nix::derivation::BasicDerivation::new(
-        drv.outputs().to_vec(),
-        resolved_input_srcs.clone(),
-        drv.platform().to_string(),
-        drv.builder().to_string(),
-        drv.args().to_vec(),
-        drv.env().clone(),
+    // 3. Resolve inputDrvs → BasicDerivation + full input closure.
+    let ResolvedInputs {
+        basic_drv,
+        input_paths,
+    } = resolve_inputs(&*store_client, &drv, drv_path).await?;
+
+    // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
+    prepare_sandbox(
+        &overlay_mount,
+        &*store_client,
+        &drv,
+        drv_path,
+        &input_paths,
+        is_fod,
     )
-    .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
-
-    // 3. Compute input closure for the synthetic DB (ValidPaths table).
-    // Seed with resolved_input_srcs (includes inputDrv outputs, not just
-    // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
-    // compute_input_closure only seeds from drv.input_srcs() (static), so
-    // we merge the resolved set in.
-    //
-    // Worker computes closure via QueryPathInfo BFS. The scheduler ALSO
-    // sends a PrefetchHint (approx_input_closure — DAG children's outputs,
-    // bloom-filtered) before the WorkAssignment, so the FUSE cache starts
-    // warming while we parse the .drv here. That's a HINT, not a
-    // replacement for THIS computation: the synth DB needs the FULL
-    // closure (transitive deps + input_srcs), not just the direct
-    // dependency outputs the scheduler knows about. The hint gets ahead
-    // on the common-case paths; this BFS covers the rest.
-    let mut input_paths: Vec<String> =
-        compute_input_closure(&*store_client, &drv, drv_path).await?;
-    // Add resolved inputDrv outputs (their runtime closure is BFS'd via
-    // fetch_input_metadata's references, but they need to be in the seed
-    // set first). Dedup via set conversion.
-    {
-        let mut set: std::collections::HashSet<String> = input_paths.into_iter().collect();
-        set.extend(resolved_input_srcs.iter().cloned());
-        input_paths = set.into_iter().collect();
-    }
-
-    // 4. Fetch input path metadata and generate synthetic DB.
-    // CRITICAL: populate DerivationOutputs so nix-daemon's
-    // queryPartialDerivationOutputMap(drvPath) returns our output paths.
-    // Without it, initialOutputs[out].known is None → nix-daemon builds at
-    // makeFallbackPath() (hash of "rewrite:<drvPath>:name:out" + zero hash),
-    // but the builder's $out (from BasicDerivation env) is the REAL path →
-    // output path mismatch → "builder failed to produce output path".
-    //
-    // CA floating outputs have an empty path (computed post-build from the
-    // NAR hash). Inserting an empty-string path makes nix-daemon's
-    // queryStaticPartialDerivationOutputMap call parseStorePath("") which
-    // aborts the daemon (core dump). Real Nix never writes DerivationOutputs
-    // rows for floating-CA — the output path is unknown until the build
-    // finishes and the daemon writes a Realisations row instead. Filter them
-    // here; nix-daemon computes scratchPath internally for CA outputs and
-    // doesn't need the DerivationOutputs hint.
-    let synth_paths = fetch_input_metadata(&*store_client, &input_paths).await?;
-    let drv_outputs: Vec<SynthDrvOutput> = drv
-        .outputs()
-        .iter()
-        .filter(|o| !o.path().is_empty())
-        .map(|o| SynthDrvOutput {
-            drv_path: drv_path.clone(),
-            output_name: o.name().to_string(),
-            output_path: o.path().to_string(),
-        })
-        .collect();
-    let db_dir = overlay::prepare_nix_state_dirs(&overlay_mount.upper_synth_db())?;
-    let db_path = db_dir.join("db.sqlite");
-    synth_db::generate_db(&db_path, &synth_paths, &drv_outputs).await?;
-
-    // 4. Set up nix.conf in overlay
-    setup_nix_conf(&overlay_mount.upper_nix_conf())?;
-
-    // 4b. Whiteout declared output paths in the overlay upper layer.
-    //
-    // r[impl worker.fod.verify-hash]
-    //
-    // P0308: FOD BuildResult propagation hang. When a builder exits
-    // nonzero WITHOUT creating `$out` (wget 403 → exit 1, typical FOD
-    // failure), nix-daemon's post-build cleanup — `deletePath(outputPath)`
-    // in LocalDerivationGoal — stats `/nix/store/<output-basename>`.
-    //
-    // The overlay resolves this lookup layer by layer:
-    //   upper ({upper}/nix/store/)  → ENOENT (builder never wrote it)
-    //   lower[0] (host /nix/store)  → ENOENT (never built)
-    //   lower[1] (FUSE)             → lookup() → ensure_cached() → gRPC
-    //
-    // The FUSE gRPC should return ENOENT quickly, but empirically in the
-    // k3s fixture it blocks — the daemon's stat syscall hangs, the daemon
-    // never writes STDERR_LAST, and nix-build waits until `timeout 90`.
-    //
-    // Success path is unaffected: builder wrote `$out` → upper has it →
-    // overlay resolves immediately, FUSE never probed.
-    //
-    // The whiteout fix: mknod a char device 0/0 for each output path
-    // DIRECTLY IN THE UPPER DIR — bypassing overlay semantics entirely.
-    //
-    // Why not create-then-delete via the merged dir? Overlayfs only
-    // writes a whiteout when `ovl_lower_positive()` returns true, i.e.
-    // when at least one lower has the name. Here both lowers ENOENT
-    // (host never built it; FUSE returns NotFound), so unlink via
-    // merged takes the `ovl_remove_upper` path — plain unlink, no
-    // whiteout. Empirically verified on Linux 6.12: create+rm via
-    // merged for a name absent from all lowers leaves upper EMPTY.
-    //
-    // A char device 0/0 placed directly in the upperdir IS the
-    // whiteout format (Documentation/filesystems/overlayfs.rst). The
-    // kernel's merged-view lookup sees it and returns ENOENT without
-    // consulting lowers — regardless of what lowers would say.
-    // Post-whiteout:
-    //
-    //   - Daemon's pre-build deletePath(output): lstat → ENOENT (whiteout)
-    //     → nothing to delete → returns. Whiteout survives.
-    //   - Builder creates $out as FILE: open(O_CREAT)/link()/rename-file via
-    //     merged → overlayfs replaces the whiteout with a real file in upper.
-    //     Success path unchanged. **mkdir() onto a whiteout → EIO** (verified
-    //     Linux 6.12; rename-dir → EXDEV) — the whiteout SURVIVES. Hence the
-    //     is_fod guard below: fod-fetch.nix (the hang's repro) uses
-    //     outputHashMode=flat → `wget -O $out` → file. Non-FOD `mkdir $out`
-    //     callers (lifecycle.nix:171,218,227) skip the whiteout entirely.
-    //     Recursive-mode FODs (NAR-hash dir outputs) are a known gap; not
-    //     the plan's target, and the FUSE-spin hang is FOD-hash-verify-path
-    //     specific — non-FOD failures don't probe $out the same way, so
-    //     they never needed this whiteout.
-    //   - Builder fails, $out never created: whiteout remains → daemon's
-    //     post-fail stat gets ENOENT from upper → FUSE never probed →
-    //     daemon proceeds → STDERR_LAST + BuildResult{PermanentFailure}.
-    //
-    // mknod(S_IFCHR) needs CAP_MKNOD. We hold it: this runs in the
-    // worker's initial namespace before spawn_daemon_in_namespace, with
-    // the same caps that mount the overlay (CAP_SYS_ADMIN ⊇ CAP_MKNOD
-    // in practice; both granted to the worker pod). The syscall goes
-    // straight to the upper's backing fs (local SSD) — the overlay and
-    // FUSE are never consulted, so no spawn_blocking needed.
-    //
-    // `{upper}/nix/store/` is the overlayfs upperdir (overlay.rs:201).
-    // It's a fresh empty dir per-build (mkdir_all at overlay setup),
-    // so EEXIST is impossible here.
-    if is_fod {
-        let upper_store = overlay_mount.upper_store();
-        // drv.is_fixed_output() ⇒ exactly one output named "out"
-        // (derivation/mod.rs:211); loop body runs once.
-        for out in drv.outputs() {
-            // Output paths are always absolute store paths. An empty
-            // path (CA derivations with unknown output paths) can't be
-            // whitedout — skip and let the daemon's own logic handle it.
-            let Some(basename) = out
-                .path()
-                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
-                .filter(|b| !b.is_empty())
-            else {
-                continue;
-            };
-            let whiteout = upper_store.join(basename);
-            nix::sys::stat::mknod(
-                &whiteout,
-                nix::sys::stat::SFlag::S_IFCHR,
-                nix::sys::stat::Mode::empty(),
-                0, // dev_t 0 (major 0, minor 0) — the overlayfs whiteout signature
-            )
-            .map_err(|errno| {
-                // EPERM → missing CAP_MKNOD (pod securityContext regression).
-                // EROFS → upper not writable (overlay misconfigured).
-                // Either way the daemon spawn would fail; fail early with context.
-                ExecutorError::DaemonSetup(format!(
-                    "mknod whiteout for output {basename:?} at {}: {errno}",
-                    whiteout.display()
-                ))
-            })?;
-            // Diagnostic: verify the whiteout is visible as ENOENT through
-            // the MERGED view. The mknod above writes directly to the
-            // upperdir backing fs; this stat goes through overlayfs. If it
-            // doesn't return ENOENT, the char-dev-0/0 whiteout approach
-            // isn't being honored in this environment (nested overlay,
-            // unusual mount options, kernel quirk) — the build will still
-            // proceed but the FOD-failure hang fix won't take effect.
-            // See TODO(P0308-followup) in fod-proxy.nix.
-            let merged_check = overlay_mount.merged_dir().join(basename);
-            match std::fs::symlink_metadata(&merged_check) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::debug!(
-                        output = basename,
-                        upper = %whiteout.display(),
-                        "FOD output whiteout created and visible as ENOENT via merged"
-                    );
-                }
-                other => {
-                    tracing::warn!(
-                        output = basename,
-                        upper = %whiteout.display(),
-                        merged = %merged_check.display(),
-                        result = ?other,
-                        "FOD output whiteout NOT visible as ENOENT via merged — \
-                         daemon post-fail stat may fall through to FUSE and hang"
-                    );
-                }
-            }
-        }
-    }
+    .await?;
 
     // 5. Spawn nix-daemon --stdio in a private mount namespace.
     //
@@ -937,218 +669,21 @@ pub async fn execute_build(
     // NOW propagate any daemon error (after kill).
     let build_result = build_result?;
 
-    // 10. Check build result. output_size_bytes tracked alongside:
-    // sum of uploaded NAR sizes (only set on successful upload path).
-    let mut output_size_bytes = 0u64;
-    let proto_result = if build_result.status.is_success() {
-        // FOD defense-in-depth BEFORE upload: verify_fod_hashes
-        // computes local NAR hashes (via dump_path_streaming +
-        // digest sink) so a bad output is rejected WITHOUT entering
-        // the store. Verifying after upload would mean the bad
-        // output is already content-indexed and manifest-complete
-        // before the mismatch is noticed.
-        //
-        // spawn_blocking: verify_fod_hashes does sync filesystem I/O
-        // (fs::read for flat, dump_path_streaming for recursive) +
-        // hashing. Typical FOD outputs are small (fetchurl), so
-        // this is fast.
-        if is_fod {
-            let drv_for_verify = drv.clone();
-            let upper_store_for_verify = overlay_mount.upper_store();
-            let verify_result = tokio::task::spawn_blocking(move || {
-                verify_fod_hashes(&drv_for_verify, &upper_store_for_verify)
-            })
-            .await
-            .map_err(|e| ExecutorError::BuildFailed(format!("FOD verify task panicked: {e}")))?;
-
-            if let Err(e) = verify_result {
-                tracing::error!(
-                    drv_path = %drv_path,
-                    error = %e,
-                    "FOD output hash verification failed — NOT uploading"
-                );
-                return Ok(ExecutionResult {
-                    drv_path: drv_path.clone(),
-                    result: ProtoBuildResult {
-                        status: BuildResultStatus::OutputRejected.into(),
-                        error_msg: format!("FOD output hash verification failed: {e}"),
-                        ..Default::default()
-                    },
-                    assignment_token: assignment.assignment_token.clone(),
-                    // Build DID run (FOD verification is post-build).
-                    // cgroup was populated → memory+cpu are meaningful
-                    // even though we reject the output.
-                    peak_memory_bytes,
-                    output_size_bytes: 0,
-                    peak_cpu_cores,
-                });
-            }
-        }
-
-        tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
-
-        // Upload outputs.
-        //
-        // Reference-scan candidate set = input_paths ∪ drv.outputs():
-        //   - input_paths: the TRANSITIVE input closure, built above via
-        //     compute_input_closure (BFS over QueryPathInfo.references,
-        //     seeded from input_srcs + inputDrv outputs). This matches
-        //     Nix's computeFSClosure — see derivation-building-goal.cc:444,450
-        //     and derivation-builder.cc:1335-1344 in Nix 2.31.3. A build can
-        //     legitimately embed any path reachable from its inputs: e.g.
-        //     hello-2.12.2 references glibc, which is NOT a direct input
-        //     but comes via closure(stdenv). Scanning only direct inputs
-        //     would drop those references.
-        //   - drv.outputs(): self-references and cross-output references are
-        //     legal (e.g., a -dev output referencing the lib output's rpath,
-        //     or a binary embedding its own store path in an rpath).
-        let mut ref_candidates: Vec<String> = input_paths.clone();
-        ref_candidates.extend(
-            drv.outputs()
-                .iter()
-                .filter(|o| !o.path().is_empty())
-                .map(|o| o.path().to_string()),
-        );
-        // Floating-CA: .drv has path = ""; the real path comes from
-        // the daemon's BuildResult. Needed for self-references.
-        ref_candidates.extend(
-            build_result
-                .built_outputs
-                .iter()
-                .map(|bo| bo.out_path.clone()),
-        );
-
-        match upload::upload_all_outputs(
-            store_client,
-            &overlay_mount.upper_store(),
-            // Pass the assignment token as gRPC metadata on each
-            // PutPath. Store with hmac_verifier checks it. Empty
-            // token (scheduler without hmac_signer, dev mode) →
-            // no header → store with verifier=None accepts.
-            &assignment.assignment_token,
-            drv_path,
-            &ref_candidates,
-        )
-        .await
-        {
-            Ok(upload_results) => {
-                // Sum NAR sizes for the CompletionReport. Feeds
-                // build_history.ema_output_size_bytes — not used for
-                // routing yet but useful for dashboards / capacity.
-                output_size_bytes = upload_results.iter().map(|r| r.nar_size).sum();
-
-                // Map store_path → output_name. Upload results are
-                // unordered (buffer_unordered), and even the prior
-                // sequential scan had undefined order (read_dir).
-                //
-                // Two sources:
-                //  - drv.outputs(): works for IA and fixed-CA, where
-                //    the .drv has the output path baked in.
-                //  - build_result.built_outputs: for floating-CA
-                //    (__contentAddressed = true), the .drv has
-                //    path = "" (computed post-build from NAR hash).
-                //    The daemon's BuildResult carries the realized
-                //    path in its Realisation entries; the output
-                //    name is the suffix of drv_output_id after '!'.
-                //
-                // Without the second source, CA builds fail the
-                // lookup below with "not in derivation outputs" —
-                // the upload scanned the real /nix/store/<hash>-name
-                // but path_to_name only had "" → name.
-                let mut path_to_name: HashMap<&str, &str> = drv
-                    .outputs()
-                    .iter()
-                    .filter(|o| !o.path().is_empty())
-                    .map(|o| (o.path(), o.name()))
-                    .collect();
-                for bo in &build_result.built_outputs {
-                    if let Some(name) = bo.drv_output_id.rsplit('!').next() {
-                        path_to_name.insert(bo.out_path.as_str(), name);
-                    }
-                }
-                // wkr-scan-unfiltered (21-p2-p3-rollup Batch B): if the
-                // lookup misses, scan_new_outputs picked up a stray file
-                // under /nix/store (tempfile leak, .drv, etc.) that is NOT
-                // a declared derivation output. Prior behavior: warn and
-                // upload anyway with basename-as-output-name → phantom
-                // output reported to scheduler. Now: fail the build. The
-                // stray upload has already hit the store (upload_all_outputs
-                // ran first) but it's unreferenced and GC-eligible; the
-                // scheduler won't mark this drv Built so nothing downstream
-                // can depend on the phantom.
-                let built_outputs: Vec<BuiltOutput> = upload_results
-                    .iter()
-                    .map(|result| {
-                        let output_name = path_to_name
-                            .get(result.store_path.as_str())
-                            .map(|s| s.to_string())
-                            .ok_or_else(|| {
-                                tracing::warn!(
-                                    store_path = %result.store_path,
-                                    "uploaded path not in derivation outputs — rejecting build"
-                                );
-                                ExecutorError::BuildFailed(format!(
-                                    "uploaded path {} not in derivation outputs (stray file in overlay upper /nix/store?)",
-                                    result.store_path
-                                ))
-                            })?;
-                        Ok::<_, ExecutorError>(BuiltOutput {
-                            output_name,
-                            output_path: result.store_path.clone(),
-                            output_hash: result.nar_hash.to_vec(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                // start/stop_time: nix-daemon's BuildResult already has
-                // these as Unix epoch seconds (rio-nix/build.rs:118-120).
-                // Scheduler guards update_build_history on BOTH being
-                // Some (completion.rs:182) — without them, EMA duration
-                // can't be computed and the WHOLE build_history write
-                // is skipped (peak_memory_bytes included). VM tests
-                // bypass this via direct psql INSERT — only live
-                // scheduler-worker integration exercises it.
-                //
-                // 0 → None: nix-daemon sends 0 on some error paths.
-                // A real build at 1970-01-01 doesn't exist.
-                let to_proto_ts = |secs: u64| {
-                    (secs > 0).then_some(prost_types::Timestamp {
-                        seconds: secs as i64,
-                        nanos: 0,
-                    })
-                };
-                ProtoBuildResult {
-                    status: BuildResultStatus::Built.into(),
-                    error_msg: String::new(),
-                    times_built: build_result.times_built,
-                    start_time: to_proto_ts(build_result.start_time),
-                    stop_time: to_proto_ts(build_result.stop_time),
-                    built_outputs,
-                }
-            }
-            Err(e) => {
-                tracing::error!(drv_path = %drv_path, error = %e, "output upload failed");
-                ProtoBuildResult {
-                    status: BuildResultStatus::InfrastructureFailure.into(),
-                    error_msg: format!("output upload failed: {e}"),
-                    ..Default::default()
-                }
-            }
-        }
-    } else {
-        tracing::warn!(
-            drv_path = %drv_path,
-            status = ?build_result.status,
-            error = %build_result.error_msg,
-            "build failed"
-        );
-
-        ProtoBuildResult {
-            status: nix_failure_to_proto(build_result.status).into(),
-            error_msg: build_result.error_msg.clone(),
-            ..Default::default()
-        }
-    };
+    // 10. Collect outputs: FOD verify, upload, map to proto BuildResult.
+    let BuildOutputs {
+        proto_result,
+        output_size_bytes,
+    } = collect_outputs(
+        &build_result,
+        store_client,
+        &overlay_mount,
+        &drv,
+        drv_path,
+        is_fod,
+        &input_paths,
+        &assignment.assignment_token,
+    )
+    .await?;
 
     // 11. Tear down overlay (explicit, before Drop).
     // The leak-threshold check happens at ENTRY (above), not here: we don't
@@ -1173,6 +708,587 @@ pub async fn execute_build(
         peak_memory_bytes,
         output_size_bytes,
         peak_cpu_cores,
+    })
+}
+
+/// Resolved build inputs: the BasicDerivation (inputDrvs collapsed into
+/// inputSrcs) and the full transitive input closure for the synth DB.
+struct ResolvedInputs {
+    /// BasicDerivation with inputDrv outputs resolved into inputSrcs.
+    /// Sent to nix-daemon via wopBuildDerivation.
+    basic_drv: rio_nix::derivation::BasicDerivation,
+    /// Full transitive input closure (BFS over QueryPathInfo references,
+    /// seeded from input_srcs + resolved inputDrv outputs). Used for the
+    /// synth DB ValidPaths table and the output reference-scan candidate
+    /// set.
+    input_paths: Vec<String>,
+}
+
+/// Resolve inputDrvs → BasicDerivation + compute full input closure.
+///
+/// r[impl worker.executor.resolve-input-drvs]
+///
+/// `drv.to_basic()` only copies static input_srcs (e.g., busybox); it
+/// does NOT resolve inputDrvs to their output paths. nix-daemon's
+/// sandbox only bind-mounts inputSrcs into the chroot, so without this
+/// the builder can't find its input derivations' outputs. Each
+/// inputDrv's .drv file is already in rio-store (uploaded by the gateway
+/// during SubmitBuild); fetch + parse to get output paths.
+///
+/// Also computes the full transitive input closure (BFS over
+/// QueryPathInfo references) for the synth DB ValidPaths table. The
+/// scheduler sends a PrefetchHint (approx_input_closure) before the
+/// WorkAssignment so the FUSE cache starts warming; that's a HINT, not
+/// a replacement for this computation — the synth DB needs the FULL
+/// closure.
+#[instrument(skip_all, fields(drv_path = %drv_path))]
+async fn resolve_inputs(
+    store_client: &StoreServiceClient<Channel>,
+    drv: &Derivation,
+    drv_path: &str,
+) -> Result<ResolvedInputs, ExecutorError> {
+    let mut resolved_input_srcs = drv.input_srcs().clone();
+    // Collect owned (path, names) pairs up-front so the async closures
+    // don't borrow from `drv` (which is not 'static inside spawn_monitored).
+    let input_drv_specs: Vec<(String, std::collections::BTreeSet<String>)> = drv
+        .input_drvs()
+        .iter()
+        .map(|(p, n)| (p.clone(), n.clone()))
+        .collect();
+    let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
+        .map(|(path, names)| {
+            let mut client = store_client.clone();
+            async move {
+                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
+                let matching: Vec<String> = input_drv
+                    .outputs()
+                    .iter()
+                    .filter(|out| names.contains(out.name()))
+                    // Floating-CA outputs have path="" in the .drv
+                    // (computed post-build). Reaching this loop with a
+                    // CA input means the scheduler's resolve failed
+                    // (RealisationMissing, PG blip) and dispatched
+                    // unresolved content. Passing "" to
+                    // fetch_input_metadata → `invalid store path ""` →
+                    // InfrastructureFailure → unbounded retry storm
+                    // (9748 events observed). Filter here so the build
+                    // fails later on the unresolved PLACEHOLDER in
+                    // env/args (a proper BuildFailed, not an infra
+                    // loop). The scheduler-side fix (insert realisation
+                    // at completion) makes this path unreachable in
+                    // normal operation; this is defense-in-depth.
+                    .filter(|out| {
+                        if out.path().is_empty() {
+                            tracing::warn!(
+                                input_drv = %path,
+                                output_name = out.name(),
+                                "floating-CA input unresolved by scheduler; \
+                                 filtering empty path (build will fail on placeholder)"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .map(|out| out.path().to_string())
+                    .collect();
+                Ok::<_, ExecutorError>(matching)
+            }
+        })
+        .buffer_unordered(MAX_PARALLEL_FETCHES)
+        .try_collect()
+        .await?;
+    // Defense: filter empty paths. A floating-CA input derivation's .drv
+    // file has `out.path() == ""` (the path is unknown until the build
+    // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs
+    // to realized paths (maybe_resolve_ca gate miss, or resolve failed),
+    // we'd pass `""` to nix-daemon's inputSrcs → bind-mount of "" →
+    // build fails with a cryptic ENOENT. Dropping empties here makes the
+    // failure mode clearer (the build still fails — it's missing an
+    // input — but the log shows the actual missing path, not "").
+    //
+    // WARN-log indicates a scheduler bug: the scheduler should have
+    // resolved CA inputDrvs before dispatch. Zero warns expected in
+    // steady-state; any warn here means investigate the scheduler's
+    // `maybe_resolve_ca` path.
+    let mut dropped_empty = 0usize;
+    for paths in fetched {
+        for p in paths {
+            if p.is_empty() {
+                dropped_empty += 1;
+            } else {
+                resolved_input_srcs.insert(p);
+            }
+        }
+    }
+    if dropped_empty > 0 {
+        tracing::warn!(
+            drv_path = %drv_path,
+            dropped = dropped_empty,
+            "dropped empty inputDrv output paths (floating-CA input not resolved by scheduler)"
+        );
+    }
+    let basic_drv = rio_nix::derivation::BasicDerivation::new(
+        drv.outputs().to_vec(),
+        resolved_input_srcs.clone(),
+        drv.platform().to_string(),
+        drv.builder().to_string(),
+        drv.args().to_vec(),
+        drv.env().clone(),
+    )
+    .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
+
+    // Compute input closure for the synthetic DB (ValidPaths table).
+    // Seed with resolved_input_srcs (includes inputDrv outputs, not just
+    // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
+    // compute_input_closure only seeds from drv.input_srcs() (static), so
+    // we merge the resolved set in.
+    let mut input_paths: Vec<String> = compute_input_closure(store_client, drv, drv_path).await?;
+    // Add resolved inputDrv outputs (their runtime closure is BFS'd via
+    // fetch_input_metadata's references, but they need to be in the seed
+    // set first). Dedup via set conversion.
+    {
+        let mut set: std::collections::HashSet<String> = input_paths.into_iter().collect();
+        set.extend(resolved_input_srcs.into_iter());
+        input_paths = set.into_iter().collect();
+    }
+
+    Ok(ResolvedInputs {
+        basic_drv,
+        input_paths,
+    })
+}
+
+/// Populate the sandbox: synthetic SQLite DB, nix.conf, FOD whiteouts.
+///
+/// Runs after overlay mount setup and input resolution. All side-effects
+/// on the overlay's upper layer — no state returned. The overlay_mount
+/// is held by the caller (execute_build) for later daemon spawn + upload
+/// + teardown.
+///
+/// Steps:
+/// 1. Fetch input path metadata → generate synthetic DB (ValidPaths +
+///    DerivationOutputs) so nix-daemon's isValidPath()/queryPartial
+///    DerivationOutputMap() work without a real store.
+/// 2. Write nix.conf (sandbox=true, substitute=false).
+/// 3. For FODs: mknod whiteout char-devs for declared output paths so
+///    daemon post-fail stat gets ENOENT from upper without probing FUSE.
+#[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
+async fn prepare_sandbox(
+    overlay_mount: &overlay::OverlayMount,
+    store_client: &StoreServiceClient<Channel>,
+    drv: &Derivation,
+    drv_path: &str,
+    input_paths: &[String],
+    is_fod: bool,
+) -> Result<(), ExecutorError> {
+    // Fetch input path metadata and generate synthetic DB.
+    // CRITICAL: populate DerivationOutputs so nix-daemon's
+    // queryPartialDerivationOutputMap(drvPath) returns our output paths.
+    // Without it, initialOutputs[out].known is None → nix-daemon builds at
+    // makeFallbackPath() (hash of "rewrite:<drvPath>:name:out" + zero hash),
+    // but the builder's $out (from BasicDerivation env) is the REAL path →
+    // output path mismatch → "builder failed to produce output path".
+    //
+    // CA floating outputs have an empty path (computed post-build from the
+    // NAR hash). Inserting an empty-string path makes nix-daemon's
+    // queryStaticPartialDerivationOutputMap call parseStorePath("") which
+    // aborts the daemon (core dump). Real Nix never writes DerivationOutputs
+    // rows for floating-CA — the output path is unknown until the build
+    // finishes and the daemon writes a Realisations row instead. Filter them
+    // here; nix-daemon computes scratchPath internally for CA outputs and
+    // doesn't need the DerivationOutputs hint.
+    let synth_paths = fetch_input_metadata(store_client, input_paths).await?;
+    let drv_outputs: Vec<SynthDrvOutput> = drv
+        .outputs()
+        .iter()
+        .filter(|o| !o.path().is_empty())
+        .map(|o| SynthDrvOutput {
+            drv_path: drv_path.to_string(),
+            output_name: o.name().to_string(),
+            output_path: o.path().to_string(),
+        })
+        .collect();
+    let db_dir = overlay::prepare_nix_state_dirs(&overlay_mount.upper_synth_db())?;
+    let db_path = db_dir.join("db.sqlite");
+    synth_db::generate_db(&db_path, &synth_paths, &drv_outputs).await?;
+
+    // Set up nix.conf in overlay
+    setup_nix_conf(&overlay_mount.upper_nix_conf())?;
+
+    // Whiteout declared output paths in the overlay upper layer.
+    //
+    // r[impl worker.fod.verify-hash]
+    //
+    // P0308: FOD BuildResult propagation hang. When a builder exits
+    // nonzero WITHOUT creating `$out` (wget 403 → exit 1, typical FOD
+    // failure), nix-daemon's post-build cleanup — `deletePath(outputPath)`
+    // in LocalDerivationGoal — stats `/nix/store/<output-basename>`.
+    //
+    // The overlay resolves this lookup layer by layer:
+    //   upper ({upper}/nix/store/)  → ENOENT (builder never wrote it)
+    //   lower[0] (host /nix/store)  → ENOENT (never built)
+    //   lower[1] (FUSE)             → lookup() → ensure_cached() → gRPC
+    //
+    // The FUSE gRPC should return ENOENT quickly, but empirically in the
+    // k3s fixture it blocks — the daemon's stat syscall hangs, the daemon
+    // never writes STDERR_LAST, and nix-build waits until `timeout 90`.
+    //
+    // Success path is unaffected: builder wrote `$out` → upper has it →
+    // overlay resolves immediately, FUSE never probed.
+    //
+    // The whiteout fix: mknod a char device 0/0 for each output path
+    // DIRECTLY IN THE UPPER DIR — bypassing overlay semantics entirely.
+    //
+    // Why not create-then-delete via the merged dir? Overlayfs only
+    // writes a whiteout when `ovl_lower_positive()` returns true, i.e.
+    // when at least one lower has the name. Here both lowers ENOENT
+    // (host never built it; FUSE returns NotFound), so unlink via
+    // merged takes the `ovl_remove_upper` path — plain unlink, no
+    // whiteout. Empirically verified on Linux 6.12: create+rm via
+    // merged for a name absent from all lowers leaves upper EMPTY.
+    //
+    // A char device 0/0 placed directly in the upperdir IS the
+    // whiteout format (Documentation/filesystems/overlayfs.rst). The
+    // kernel's merged-view lookup sees it and returns ENOENT without
+    // consulting lowers — regardless of what lowers would say.
+    // Post-whiteout:
+    //
+    //   - Daemon's pre-build deletePath(output): lstat → ENOENT (whiteout)
+    //     → nothing to delete → returns. Whiteout survives.
+    //   - Builder creates $out as FILE: open(O_CREAT)/link()/rename-file via
+    //     merged → overlayfs replaces the whiteout with a real file in upper.
+    //     Success path unchanged. **mkdir() onto a whiteout → EIO** (verified
+    //     Linux 6.12; rename-dir → EXDEV) — the whiteout SURVIVES. Hence the
+    //     is_fod guard below: fod-fetch.nix (the hang's repro) uses
+    //     outputHashMode=flat → `wget -O $out` → file. Non-FOD `mkdir $out`
+    //     callers (lifecycle.nix:171,218,227) skip the whiteout entirely.
+    //     Recursive-mode FODs (NAR-hash dir outputs) are a known gap; not
+    //     the plan's target, and the FUSE-spin hang is FOD-hash-verify-path
+    //     specific — non-FOD failures don't probe $out the same way, so
+    //     they never needed this whiteout.
+    //   - Builder fails, $out never created: whiteout remains → daemon's
+    //     post-fail stat gets ENOENT from upper → FUSE never probed →
+    //     daemon proceeds → STDERR_LAST + BuildResult{PermanentFailure}.
+    //
+    // mknod(S_IFCHR) needs CAP_MKNOD. We hold it: this runs in the
+    // worker's initial namespace before spawn_daemon_in_namespace, with
+    // the same caps that mount the overlay (CAP_SYS_ADMIN ⊇ CAP_MKNOD
+    // in practice; both granted to the worker pod). The syscall goes
+    // straight to the upper's backing fs (local SSD) — the overlay and
+    // FUSE are never consulted, so no spawn_blocking needed.
+    //
+    // `{upper}/nix/store/` is the overlayfs upperdir (overlay.rs:201).
+    // It's a fresh empty dir per-build (mkdir_all at overlay setup),
+    // so EEXIST is impossible here.
+    if is_fod {
+        let upper_store = overlay_mount.upper_store();
+        // drv.is_fixed_output() ⇒ exactly one output named "out"
+        // (derivation/mod.rs:211); loop body runs once.
+        for out in drv.outputs() {
+            // Output paths are always absolute store paths. An empty
+            // path (CA derivations with unknown output paths) can't be
+            // whitedout — skip and let the daemon's own logic handle it.
+            let Some(basename) = out
+                .path()
+                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
+                .filter(|b| !b.is_empty())
+            else {
+                continue;
+            };
+            let whiteout = upper_store.join(basename);
+            nix::sys::stat::mknod(
+                &whiteout,
+                nix::sys::stat::SFlag::S_IFCHR,
+                nix::sys::stat::Mode::empty(),
+                0, // dev_t 0 (major 0, minor 0) — the overlayfs whiteout signature
+            )
+            .map_err(|errno| {
+                // EPERM → missing CAP_MKNOD (pod securityContext regression).
+                // EROFS → upper not writable (overlay misconfigured).
+                // Either way the daemon spawn would fail; fail early with context.
+                ExecutorError::DaemonSetup(format!(
+                    "mknod whiteout for output {basename:?} at {}: {errno}",
+                    whiteout.display()
+                ))
+            })?;
+            // Diagnostic: verify the whiteout is visible as ENOENT through
+            // the MERGED view. The mknod above writes directly to the
+            // upperdir backing fs; this stat goes through overlayfs. If it
+            // doesn't return ENOENT, the char-dev-0/0 whiteout approach
+            // isn't being honored in this environment (nested overlay,
+            // unusual mount options, kernel quirk) — the build will still
+            // proceed but the FOD-failure hang fix won't take effect.
+            // See TODO(P0311-T10) in fod-proxy.nix.
+            let merged_check = overlay_mount.merged_dir().join(basename);
+            match std::fs::symlink_metadata(&merged_check) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        output = basename,
+                        upper = %whiteout.display(),
+                        "FOD output whiteout created and visible as ENOENT via merged"
+                    );
+                }
+                other => {
+                    tracing::warn!(
+                        output = basename,
+                        upper = %whiteout.display(),
+                        merged = %merged_check.display(),
+                        result = ?other,
+                        "FOD output whiteout NOT visible as ENOENT via merged — \
+                         daemon post-fail stat may fall through to FUSE and hang"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Collected build outputs: proto BuildResult + total uploaded bytes.
+struct BuildOutputs {
+    /// Proto BuildResult to send to the scheduler in CompletionReport.
+    proto_result: ProtoBuildResult,
+    /// Sum of uploaded NAR sizes. 0 on build failure or output rejection.
+    output_size_bytes: u64,
+}
+
+/// Collect build outputs: FOD verify, upload, map to proto BuildResult.
+///
+/// Runs after daemon teardown. On success: verifies FOD hashes (if
+/// applicable), uploads outputs to the store, maps upload results to
+/// proto BuiltOutput entries. On build failure: maps the nix-daemon
+/// BuildStatus to the proto equivalent.
+///
+/// Reference-scan candidate set = input_paths ∪ drv.outputs() ∪
+/// build_result.built_outputs (the last for floating-CA self-refs).
+#[instrument(skip_all, fields(drv_path = %drv_path, is_fod))]
+#[allow(clippy::too_many_arguments)]
+async fn collect_outputs(
+    build_result: &rio_nix::protocol::build::BuildResult,
+    store_client: &mut StoreServiceClient<Channel>,
+    overlay_mount: &overlay::OverlayMount,
+    drv: &Derivation,
+    drv_path: &str,
+    is_fod: bool,
+    input_paths: &[String],
+    assignment_token: &str,
+) -> Result<BuildOutputs, ExecutorError> {
+    if !build_result.status.is_success() {
+        tracing::warn!(
+            drv_path = %drv_path,
+            status = ?build_result.status,
+            error = %build_result.error_msg,
+            "build failed"
+        );
+        return Ok(BuildOutputs {
+            proto_result: ProtoBuildResult {
+                status: nix_failure_to_proto(build_result.status).into(),
+                error_msg: build_result.error_msg.clone(),
+                ..Default::default()
+            },
+            output_size_bytes: 0,
+        });
+    }
+
+    // FOD defense-in-depth BEFORE upload: verify_fod_hashes
+    // computes local NAR hashes (via dump_path_streaming +
+    // digest sink) so a bad output is rejected WITHOUT entering
+    // the store. Verifying after upload would mean the bad
+    // output is already content-indexed and manifest-complete
+    // before the mismatch is noticed.
+    //
+    // spawn_blocking: verify_fod_hashes does sync filesystem I/O
+    // (fs::read for flat, dump_path_streaming for recursive) +
+    // hashing. Typical FOD outputs are small (fetchurl), so
+    // this is fast.
+    if is_fod {
+        let drv_for_verify = drv.clone();
+        let upper_store_for_verify = overlay_mount.upper_store();
+        let verify_result = tokio::task::spawn_blocking(move || {
+            verify_fod_hashes(&drv_for_verify, &upper_store_for_verify)
+        })
+        .await
+        .map_err(|e| ExecutorError::BuildFailed(format!("FOD verify task panicked: {e}")))?;
+
+        if let Err(e) = verify_result {
+            tracing::error!(
+                drv_path = %drv_path,
+                error = %e,
+                "FOD output hash verification failed — NOT uploading"
+            );
+            // Build DID run (FOD verification is post-build). Caller
+            // already has peak_memory_bytes/peak_cpu_cores from the
+            // cgroup; they're meaningful even though we reject output.
+            return Ok(BuildOutputs {
+                proto_result: ProtoBuildResult {
+                    status: BuildResultStatus::OutputRejected.into(),
+                    error_msg: format!("FOD output hash verification failed: {e}"),
+                    ..Default::default()
+                },
+                output_size_bytes: 0,
+            });
+        }
+    }
+
+    tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
+
+    // Upload outputs.
+    //
+    // Reference-scan candidate set = input_paths ∪ drv.outputs():
+    //   - input_paths: the TRANSITIVE input closure, built above via
+    //     compute_input_closure (BFS over QueryPathInfo.references,
+    //     seeded from input_srcs + inputDrv outputs). This matches
+    //     Nix's computeFSClosure — see derivation-building-goal.cc:444,450
+    //     and derivation-builder.cc:1335-1344 in Nix 2.31.3. A build can
+    //     legitimately embed any path reachable from its inputs: e.g.
+    //     hello-2.12.2 references glibc, which is NOT a direct input
+    //     but comes via closure(stdenv). Scanning only direct inputs
+    //     would drop those references.
+    //   - drv.outputs(): self-references and cross-output references are
+    //     legal (e.g., a -dev output referencing the lib output's rpath,
+    //     or a binary embedding its own store path in an rpath).
+    let mut ref_candidates: Vec<String> = input_paths.to_vec();
+    ref_candidates.extend(
+        drv.outputs()
+            .iter()
+            .filter(|o| !o.path().is_empty())
+            .map(|o| o.path().to_string()),
+    );
+    // Floating-CA: .drv has path = ""; the real path comes from
+    // the daemon's BuildResult. Needed for self-references.
+    ref_candidates.extend(
+        build_result
+            .built_outputs
+            .iter()
+            .map(|bo| bo.out_path.clone()),
+    );
+
+    let proto_result = match upload::upload_all_outputs(
+        store_client,
+        &overlay_mount.upper_store(),
+        // Pass the assignment token as gRPC metadata on each
+        // PutPath. Store with hmac_verifier checks it. Empty
+        // token (scheduler without hmac_signer, dev mode) →
+        // no header → store with verifier=None accepts.
+        assignment_token,
+        drv_path,
+        &ref_candidates,
+    )
+    .await
+    {
+        Ok(upload_results) => {
+            // Sum NAR sizes for the CompletionReport. Feeds
+            // build_history.ema_output_size_bytes — not used for
+            // routing yet but useful for dashboards / capacity.
+            let output_size_bytes: u64 = upload_results.iter().map(|r| r.nar_size).sum();
+
+            // Map store_path → output_name. Upload results are
+            // unordered (buffer_unordered), and even the prior
+            // sequential scan had undefined order (read_dir).
+            //
+            // Two sources:
+            //  - drv.outputs(): works for IA and fixed-CA, where
+            //    the .drv has the output path baked in.
+            //  - build_result.built_outputs: for floating-CA
+            //    (__contentAddressed = true), the .drv has
+            //    path = "" (computed post-build from NAR hash).
+            //    The daemon's BuildResult carries the realized
+            //    path in its Realisation entries; the output
+            //    name is the suffix of drv_output_id after '!'.
+            //
+            // Without the second source, CA builds fail the
+            // lookup below with "not in derivation outputs" —
+            // the upload scanned the real /nix/store/<hash>-name
+            // but path_to_name only had "" → name.
+            let mut path_to_name: HashMap<&str, &str> = drv
+                .outputs()
+                .iter()
+                .filter(|o| !o.path().is_empty())
+                .map(|o| (o.path(), o.name()))
+                .collect();
+            for bo in &build_result.built_outputs {
+                if let Some(name) = bo.drv_output_id.rsplit('!').next() {
+                    path_to_name.insert(bo.out_path.as_str(), name);
+                }
+            }
+            // wkr-scan-unfiltered (21-p2-p3-rollup Batch B): if the
+            // lookup misses, scan_new_outputs picked up a stray file
+            // under /nix/store (tempfile leak, .drv, etc.) that is NOT
+            // a declared derivation output. Prior behavior: warn and
+            // upload anyway with basename-as-output-name → phantom
+            // output reported to scheduler. Now: fail the build. The
+            // stray upload has already hit the store (upload_all_outputs
+            // ran first) but it's unreferenced and GC-eligible; the
+            // scheduler won't mark this drv Built so nothing downstream
+            // can depend on the phantom.
+            let built_outputs: Vec<BuiltOutput> = upload_results
+                .iter()
+                .map(|result| {
+                    let output_name = path_to_name
+                        .get(result.store_path.as_str())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| {
+                            tracing::warn!(
+                                store_path = %result.store_path,
+                                "uploaded path not in derivation outputs — rejecting build"
+                            );
+                            ExecutorError::BuildFailed(format!(
+                                "uploaded path {} not in derivation outputs (stray file in overlay upper /nix/store?)",
+                                result.store_path
+                            ))
+                        })?;
+                    Ok::<_, ExecutorError>(BuiltOutput {
+                        output_name,
+                        output_path: result.store_path.clone(),
+                        output_hash: result.nar_hash.to_vec(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // start/stop_time: nix-daemon's BuildResult already has
+            // these as Unix epoch seconds (rio-nix/build.rs:118-120).
+            // Scheduler guards update_build_history on BOTH being
+            // Some (completion.rs:182) — without them, EMA duration
+            // can't be computed and the WHOLE build_history write
+            // is skipped (peak_memory_bytes included). VM tests
+            // bypass this via direct psql INSERT — only live
+            // scheduler-worker integration exercises it.
+            //
+            // 0 → None: nix-daemon sends 0 on some error paths.
+            // A real build at 1970-01-01 doesn't exist.
+            let to_proto_ts = |secs: u64| {
+                (secs > 0).then_some(prost_types::Timestamp {
+                    seconds: secs as i64,
+                    nanos: 0,
+                })
+            };
+            return Ok(BuildOutputs {
+                proto_result: ProtoBuildResult {
+                    status: BuildResultStatus::Built.into(),
+                    error_msg: String::new(),
+                    times_built: build_result.times_built,
+                    start_time: to_proto_ts(build_result.start_time),
+                    stop_time: to_proto_ts(build_result.stop_time),
+                    built_outputs,
+                },
+                output_size_bytes,
+            });
+        }
+        Err(e) => {
+            tracing::error!(drv_path = %drv_path, error = %e, "output upload failed");
+            ProtoBuildResult {
+                status: BuildResultStatus::InfrastructureFailure.into(),
+                error_msg: format!("output upload failed: {e}"),
+                ..Default::default()
+            }
+        }
+    };
+
+    Ok(BuildOutputs {
+        proto_result,
+        output_size_bytes: 0,
     })
 }
 

@@ -327,6 +327,7 @@ src/
 │   ├── mod.rs         # Filesystem impl + mount_fuse_background
 │   ├── inode.rs       # Inode allocator + path↔ino maps
 │   ├── fetch.rs       # GetPath → NAR extract → cache insert
+│   ├── circuit.rs     # Fetch circuit breaker (std::sync only — no tokio in FUSE callbacks)
 │   ├── ops.rs         # fuser trait impls (getattr, readdir, open)
 │   ├── lookup.rs      # lookup() + ensure_cached (materialize on demand)
 │   ├── read.rs        # read() with passthrough fd
@@ -354,7 +355,7 @@ src/
 │   └── tests.rs
 └── reconcilers/
     ├── mod.rs         # Controller::new() + error_policy + requeue intervals
-    ├── gc_schedule.rs # GCSchedule reconcile: cron → store TriggerGC RPC
+    ├── gc_schedule.rs # GC cron interval loop (not a CRD reconciler) → store TriggerGC RPC
     ├── workerpool/
     │   ├── mod.rs     # WorkerPool reconcile: ensure STS/SVC/CM + drain finalizer
     │   ├── builders.rs # STS/Service/ConfigMap object builders (labels, volumes, envFrom)

@@ -950,7 +950,7 @@
           #   vm-scheduling-{core,disrupt}-standalone — 5 VMs: fanout, size-class, cgroup
           #   vm-security-standalone — 3 VMs: mTLS, HMAC, tenant-resolve
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
-          #   vm-lifecycle-{core,ctrlrestart,recovery,reconnect,autoscale}-k3s
+          #   vm-lifecycle-{core,recovery,autoscale,wps}-k3s
           #   vm-le-{stability,build}-k3s — 2-node k3s fixture (fragment splits)
           #
           # mkVmTests: build the attrset for a given (workspace,
@@ -1020,6 +1020,12 @@
                 vm-scheduling-disrupt-standalone = 5;
                 # 3 VMs: control + worker + client.
                 vm-security-standalone = 3;
+                # 3 VMs: control + worker + client. Single-worker
+                # standalone fixture (ca-cutoff chain is serial anyway).
+                vm-ca-cutoff-standalone = 3;
+                # 3 VMs: control + worker + client. toxiproxy runs as a
+                # systemd unit on control, not a separate VM.
+                vm-chaos-standalone = 3;
                 # 5 VMs: control + worker1/2/3 + client.
                 vm-observability-standalone = 5;
                 # 3 VMs but k3s-server is 8-core 6GB + k3s-agent 8-core 4GB.
@@ -1041,6 +1047,10 @@
                 # Same fixture + rio-dashboard nginx image. curl via
                 # nginx → envoy → scheduler (SPA + proxy_buffering gate).
                 vm-dashboard-k3s = 8;
+                # k3s base fixture. rio-cli AdminService smoke.
+                vm-cli-k3s = 8;
+                # k3s base fixture. Worker egress NetworkPolicy enforce.
+                vm-netpol-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
@@ -1796,7 +1806,7 @@
             # VM coverage targets (manual — NOT in .#ci)
             # ──────────────────────────────────────────────────────────
             #
-            # coverage-full: unit + all 7 VM tests merged. ~25min,
+            # coverage-full: unit + all VM tests merged. ~25min,
             # needs KVM (run via nix-build-remote). Output:
             #   result/lcov.info   — combined, stripped to workspace paths
             #   result/html/       — genhtml report

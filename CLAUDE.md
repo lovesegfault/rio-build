@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-rio-build is an early-stage Rust project. It uses a Nix flake-based development environment with Crane for building Rust packages and protobuf for gRPC code generation.
+rio-build is an early-stage Rust project. It uses a Nix flake-based development environment with crate2nix for building Rust packages and protobuf for gRPC code generation.
 
 ## Quick Start
 
@@ -44,24 +44,24 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 
 ## Build System
 
-- **Nix + Crane**: The flake.nix defines the full build pipeline. Crane handles dependency caching via `buildDepsOnly` and the actual build via `buildPackage`.
+- **Nix + crate2nix**: The flake.nix defines the full build pipeline. crate2nix generates per-crate derivations from `Cargo.lock` (JSON output mode — no `Cargo.nix` checked in), giving per-crate caching via nixpkgs' `buildRustCrate`.
 - **Cargo workspace**: Root Cargo.toml is a workspace; crates live in subdirectories.
-- **Protobuf**: `.proto` files are included in the Crane source filter. `PROTOC` and `LIBCLANG_PATH` are set automatically in the dev shell.
+- **Protobuf**: `.proto` files are picked up by the crate2nix source filter. `PROTOC` and `LIBCLANG_PATH` are set automatically in the dev shell.
 
 ## Key Commands via Nix
 
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `/nixbuild .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×8, all VM tests (Linux+KVM only) |
+| `/nixbuild .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×9, all VM tests (Linux+KVM only) |
 | `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 2min fuzz, VM tests) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
 | `/nixbuild .#coverage-full` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
-| `/nixbuild .#cov-vm-phase1a` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
-| `nix build .#coverage-vm-phase1a` | Per-test lcov from one coverage-mode VM run |
+| `/nixbuild .#cov-vm-protocol-warm-standalone` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
+| `nix build .#coverage-vm-protocol-warm-standalone` | Per-test lcov from one coverage-mode VM run |
 
 ### CI aggregate target
 
@@ -72,7 +72,7 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 Two tiers:
 
 - **Unit-test only** (~5min): `nix build .#checks.x86_64-linux.coverage`. Output: `result/lcov.info`. HTML via `nix build .#coverage-html`.
-- **Combined unit+VM** (~25min, manual, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-phase*.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — invoke on demand.
+- **Combined unit+VM** (~25min, manual, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — invoke on demand.
 
 VM coverage architecture details: see `.claude/rules/coverage.md` (loads when editing `nix/coverage.nix`).
 
@@ -182,7 +182,7 @@ nix build .#checks.x86_64-linux.fuzz-wire_primitives  # 2min, in flake check
 When adding a new parser, also add a fuzz target:
 1. Add a `[[bin]]` entry in the relevant `fuzz/Cargo.toml` + target file in `fuzz_targets/`
 2. Add seed inputs to `fuzz/corpus/<target>/` (must be prefixed `seed-`; NAR seeds: see `gen-nar-corpus.sh`)
-3. Add the target to `fuzzTargets` in `flake.nix` (target name + which `fuzzBuild` + `corpusRoot`)
+3. Add the target to `fuzzTargets` in `nix/fuzz.nix` (target name + which `fuzzBuild` + `corpusRoot`)
 4. If the fuzzed crate's deps changed, run `cd <crate>/fuzz && cargo update -p <crate>` (fuzz lockfile is independent)
 
 ## Design Book

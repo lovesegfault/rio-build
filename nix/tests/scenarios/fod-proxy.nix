@@ -74,7 +74,7 @@ pkgs.testers.runNixOSTest {
 
   # k3s bring-up ~4min + squid ready + origin setup + 3 builds. The
   # denied build currently hangs until `timeout 150` kills it
-  # (TODO(P0308-followup): whiteout fix unvalidated in k3s). Budget:
+  # (TODO(P0311-T10): whiteout fix unvalidated in k3s). Budget:
   # 4min k3s + 150s denied + 2×30s allowed/nonfod ≈ 8min, under 900s.
   globalTimeout = 900 + common.covTimeoutHeadroom;
 
@@ -184,7 +184,7 @@ pkgs.testers.runNixOSTest {
     # are `wget -T 15` inside the FOD (network layer) and `timeout 150`
     # at the shell (via timeout_wrap=150 at call sites).
     #
-    # TODO(P0308-followup): whiteout fix unvalidated in k3s — timing
+    # TODO(P0311-T10): whiteout fix unvalidated in k3s — timing
     #   assertion removed until rio-worker mknod-whiteout proven to work
     #   in emptyDir/tmpfs upperdir.
     #
@@ -288,7 +288,7 @@ pkgs.testers.runNixOSTest {
         # without probing lowers → daemon cleanup stat returns →
         # STDERR_LAST + BuildResult{PermanentFailure} → nix-build exits.
         #
-        # TODO(P0308-followup): the whiteout fix is NOT working in k3s
+        # TODO(P0311-T10): the whiteout fix is NOT working in k3s
         #   (see build() comment). This subtest validates FUNCTIONALITY
         #   only: the builder runs, squid denies, 403 propagates, squid
         #   log shows TCP_DENIED. The build currently hangs until the

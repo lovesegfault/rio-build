@@ -72,9 +72,9 @@
 │                   rio-controller (K8s Operator)                       │
 │                                                                      │
 │  Manages: WorkerPool scaling, Build lifecycle, GC                    │
-│  CRDs: Build, WorkerPool                                             │
+│  CRDs: WorkerPool, WorkerPoolSet                                     │
 │  Watches: K8s API -> reconciles StatefulSets, Services               │
-│  Leader-elected via Kubernetes Lease                                  │
+│  Single-replica by design (not leader-elected)                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

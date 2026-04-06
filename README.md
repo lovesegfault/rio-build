@@ -55,15 +55,15 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
    │  cgroup v2 per-build resource tracking       │
    └──────────────────────────────────────────────┘
 
-   rio-controller (K8s operator): WorkerPool + Build CRDs, StatefulSet
-   reconciliation, autoscaling, drain-aware termination, leader election.
+   rio-controller (K8s operator): WorkerPool/WorkerPoolSet CRDs, StatefulSet
+   reconciliation, autoscaling, drain-aware termination.
 ```
 
 ## Status
 
-**Pre-1.0, under active development.** Phase-gated — see [`docs/src/phases/`](docs/src/phases/) for the roadmap. Currently through Phase 3a (Kubernetes operator, CRDs, cgroup v2 per-build accounting, end-to-end k3s VM test).
+**Pre-1.0, under active development.** Phase-gated — see [`docs/src/phases-archive/`](docs/src/phases-archive/) for the roadmap. Currently through Phase 4a (multi-tenancy: JWT auth, per-tenant quotas, per-tenant signing keys, query-level isolation; CA cutoff-compare; CLI tooling).
 
-> **Multi-tenancy warning:** Multi-tenant deployments with untrusted tenants are **unsafe before Phase 5** (no quota enforcement, no per-tenant signing keys, incomplete query-level isolation). Deploy single-tenant or trusted-tenant until then.
+> **Multi-tenancy warning:** Multi-tenant deployments with untrusted tenants are **unsafe before Phase 5** (incomplete query-level isolation). Deploy single-tenant or trusted-tenant until then.
 
 ## Crates
 
@@ -76,7 +76,10 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
 | `rio-scheduler` | DAG scheduler, critical-path priority, size-class routing |
 | `rio-store` | Chunked CAS, narinfo signing, binary-cache HTTP server |
 | `rio-worker` | Build executor, FUSE store, overlayfs isolation, cgroup metering |
-| `rio-controller` | Kubernetes operator (WorkerPool/Build CRDs, autoscaler) |
+| `rio-controller` | Kubernetes operator (WorkerPool/WorkerPoolSet CRDs, autoscaler) |
+| `rio-crds` | Kubernetes CRD types (kube-derive), shared between controller and CLI |
+| `rio-cli` | Admin CLI (trigger GC, tenant mgmt, backfill, dry-run introspection) |
+| `rio-bench` | Criterion benchmarks (wire parsers, chunker, scheduler hot paths) |
 | `rio-test-support` | Ephemeral PostgreSQL bootstrap, mock gRPC, wire helpers |
 
 ## Development
@@ -130,7 +133,7 @@ Full design docs are in [`docs/src/`](docs/src/) (mdBook). Start with:
 - [**Introduction**](docs/src/introduction.md) — goals, non-goals, landscape
 - [**Architecture**](docs/src/architecture.md) — component diagram, data flows
 - [**Crate Structure**](docs/src/crate-structure.md) — dependency graph, module layout
-- [**Phases**](docs/src/phases/) — implementation roadmap and task tracking
+- [**Phases**](docs/src/phases-archive/) — implementation roadmap and task tracking
 - [**Observability**](docs/src/observability.md) — metric naming, tracing conventions
 
 ## License

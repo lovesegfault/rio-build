@@ -123,7 +123,7 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 
 **Weekly tier, not per-push.** Mutation testing is O(mutations × test-suite-time); for the scoped target set (~320 mutations, scheduler state machine / wire primitives / ATerm parser / HMAC / manifest) it's hours per run. The `.github/workflows/weekly.yml` `mutants` job builds `.#mutants` and surfaces caught/missed counts in the job summary. **Missed-count is a trend metric, not a gate** — the job does not fail on nonzero. Diff week-over-week; an increase means a recent change weakened a test or introduced untested code.
 
-**Scoping** lives in [`.config/mutants.toml`](../.config/mutants.toml): `examine_globs` lists high-signal files where a surviving mutant is a genuine gap (not "you didn't test your tracing span"). `exclude_re` filters out tracing/metric calls — those are already covered by the per-crate `metrics_registered` test. `cap_lints = true` prevents the `--deny warnings` policy from marking mutations unviable before a test can kill them.
+**Scoping** lives in [`.config/mutants.toml`](../../.config/mutants.toml): `examine_globs` lists high-signal files where a surviving mutant is a genuine gap (not "you didn't test your tracing span"). `exclude_re` filters out tracing/metric calls — those are already covered by the per-crate `metrics_registered` test. `cap_lints = true` prevents the `--deny warnings` policy from marking mutations unviable before a test can kill them.
 
 | Invocation | What |
 |---|---|
