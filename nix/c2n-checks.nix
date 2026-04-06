@@ -307,6 +307,16 @@ let
     })).overrideAttrs
       (old: {
         name = "${old.name}-test";
+        # Cargo sets CARGO_BIN_EXE_<bin> for integration tests so they
+        # can `env!("CARGO_BIN_EXE_foo")` the crate's own binary.
+        # buildRustCrate doesn't — the test build (buildTests=true)
+        # produces only test harnesses, not the bin target. Point at
+        # `base` (the non-test build) which DOES have $out/bin/<name>.
+        # Hyphenated attr names become env vars fine (POSIX allows
+        # them; only bash's $VAR syntax rejects hyphens, and rustc
+        # reads env directly). Lib-only crates get a dangling path
+        # here — harmless, nothing reads it.
+        "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
       });
 
   # Clippy check on TEST targets: same driver as clippyMember, but
@@ -323,6 +333,9 @@ let
     })).overrideAttrs
       (old: {
         name = "${old.name}-clippy-test";
+        # See testMember — env!("CARGO_BIN_EXE_<name>") needs this at
+        # compile time. clippy-driver IS rustc, same macro expansion.
+        "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
       });
 
   # Doc build: rustdoc instead of rustc. The wrapper translates
@@ -373,6 +386,9 @@ let
     })).overrideAttrs
       (old: {
         name = "${old.name}-cov-test";
+        # See testMember. `base` here is the instrumented build
+        # (c2nCov tree), so the subprocess emits profraws too.
+        "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
       });
 
   # ──────────────────────────────────────────────────────────────────

@@ -1116,6 +1116,114 @@ mod tests {
         Ok(())
     }
 
+    /// r[verify worker.fod.verify-hash]
+    ///
+    /// P0308 T1: FOD-failure BuildResult propagation — worker-side isolation.
+    ///
+    /// Reproduces the fod-proxy.nix:285 denied-case WIRE SEQUENCE as seen by
+    /// the worker's stderr loop: `STDERR_RESULT{101, "wget: 403..."}` (how
+    /// modern nix-daemon forwards builder output) followed by `STDERR_LAST`
+    /// followed by `BuildResult{PermanentFailure}`. This is the Nix daemon's
+    /// contract for `wopBuildDerivation` — the daemon catches build errors
+    /// INTERNALLY and returns them via BuildResult, not via STDERR_ERROR.
+    ///
+    /// **What this test proves:** IF the daemon writes these bytes to its
+    /// stdout, the worker's stderr loop receives the PermanentFailure
+    /// correctly and promptly. The loop does not branch on BuildResult.status
+    /// for parsing (read_build_result reads the same fields regardless), so
+    /// the success and failure wire shapes are identical.
+    ///
+    /// **What this test localizes:** The fod-proxy.nix:285 hang is NOT in
+    /// the worker's stderr parsing. The daemon is not sending these bytes —
+    /// it is blocked inside `buildDerivation()` before reaching the
+    /// `logger->stopWork()` (STDERR_LAST) call. Root cause: the daemon's
+    /// post-fail cleanup probes the never-created `$out` at
+    /// `/nix/store/<fod-output>`, which falls through the overlay
+    /// (upper → host → FUSE) to a FUSE `lookup()` → `ensure_cached()` →
+    /// gRPC. See P0308 T2 for the whiteout fix that short-circuits this
+    /// overlay fall-through.
+    #[tokio::test]
+    async fn test_fod_failure_buildresult_propagates_promptly() -> anyhow::Result<()> {
+        use rio_nix::protocol::stderr::ResultField;
+
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            // Daemon's pre-build chatter: STDERR_START_ACTIVITY. Discarded
+            // by the loop; included to match the real wire shape.
+            let aid = w
+                .start_activity(
+                    rio_nix::protocol::stderr::ActivityType::Build,
+                    "building '/nix/store/xxx-rio-fod-fetch.drv'",
+                    0,
+                    0,
+                )
+                .await?;
+            // Builder output: wget's 403 line, forwarded as
+            // STDERR_RESULT{101}. This is the line P0243 CONFIRMED
+            // arrives at nix-build — so we know the daemon writes at
+            // least up to here, and the worker forwards it.
+            w.result(
+                aid,
+                101,
+                &[ResultField::String(
+                    "wget: server returned error: HTTP/1.1 403 Forbidden".into(),
+                )],
+            )
+            .await?;
+            // Builder exits 1. Daemon's buildDone() cleanup runs — THIS
+            // is where the real daemon hangs (overlay→FUSE stat of the
+            // never-created $out). In this test the bytes continue:
+            w.stop_activity(aid).await?;
+            // logger->stopWork() → STDERR_LAST. The daemon DOES send
+            // this on both success and failure paths (daemon.cc's
+            // wopBuildDerivation handler runs stopWork unconditionally
+            // before writing BuildResult).
+            w.finish().await?;
+        }
+        // BuildResult with PermanentFailure. Same wire format as
+        // success — read_build_result reads status + errorMsg +
+        // timesBuilt + isNonDet + startTime + stopTime + cpuUser +
+        // cpuSystem + builtOutputs unconditionally. builtOutputs is
+        // empty on failure (output_count=0 → loop body skipped).
+        buf.extend(
+            build_result_bytes(&BuildResult::failure(
+                BuildStatus::PermanentFailure,
+                "builder for '/nix/store/xxx-rio-fod-fetch.drv' failed with exit code 1",
+            ))
+            .await?,
+        );
+
+        // tokio::time::timeout on a Cursor-backed future is just a
+        // safety rail — the loop resolves in microseconds. If THIS
+        // times out, the stderr loop has a parsing bug that only
+        // triggers on the failure shape (which we've argued is
+        // impossible since the parser is status-agnostic, but the
+        // test makes that argument executable).
+        let (result, batches) = tokio::time::timeout(Duration::from_secs(5), run_loop(buf))
+            .await
+            .expect("stderr loop should return promptly on failure BuildResult, not hang");
+
+        let br = result.expect("loop should return Ok(BuildResult), not WireError");
+        assert_eq!(
+            br.status,
+            BuildStatus::PermanentFailure,
+            "failure status should propagate unchanged"
+        );
+        assert!(
+            br.error_msg.contains("exit code 1"),
+            "daemon's error_msg should propagate: {}",
+            br.error_msg
+        );
+        // The wget 403 line was a STDERR_RESULT{101} → captured as a log line.
+        assert_eq!(
+            count_log_lines(&batches),
+            1,
+            "wget 403 line captured (proves the full wire sequence parsed cleanly)"
+        );
+        Ok(())
+    }
+
     /// STDERR_RESULT with result_type=101 (BuildLogLine) is captured as a
     /// log line. This is how modern nix-daemon actually sends builder
     /// output — NOT as raw STDERR_NEXT. Latent phase2a bug caught by

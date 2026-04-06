@@ -5,6 +5,7 @@
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
+    "rio-crds": "rio-crds",
     "rio-gateway": "rio-gateway",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
@@ -14252,6 +14253,10 @@
           "packageId": "serde"
         },
         {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },
@@ -14268,6 +14273,16 @@
       ],
       "authors": [
         "Rio Contributors"
+      ],
+      "devDependencies": [
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        }
       ]
     },
     "rio-common": {
@@ -14419,10 +14434,6 @@
           "packageId": "clap"
         },
         {
-          "name": "dashmap",
-          "packageId": "dashmap"
-        },
-        {
           "name": "futures-util",
           "packageId": "futures-util"
         },
@@ -14443,8 +14454,8 @@
           "packageId": "rio-common"
         },
         {
-          "name": "rio-nix",
-          "packageId": "rio-nix"
+          "name": "rio-crds",
+          "packageId": "rio-crds"
         },
         {
           "name": "rio-proto",
@@ -14457,10 +14468,6 @@
         {
           "name": "schemars",
           "packageId": "schemars"
-        },
-        {
-          "name": "scopeguard",
-          "packageId": "scopeguard"
         },
         {
           "name": "serde",
@@ -14527,6 +14534,49 @@
         {
           "name": "tokio",
           "packageId": "tokio"
+        }
+      ]
+    },
+    "rio-crds": {
+      "crateName": "rio-crds",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-crds"
+      },
+      "dependencies": [
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "schemars",
+          "packageId": "schemars"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ],
+      "devDependencies": [
+        {
+          "name": "serde_yml",
+          "packageId": "serde_yml"
         }
       ]
     },
@@ -14630,8 +14680,16 @@
           "packageId": "metrics"
         },
         {
+          "name": "rio-store",
+          "packageId": "rio-store"
+        },
+        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
+        },
+        {
+          "name": "sqlx",
+          "packageId": "sqlx"
         },
         {
           "name": "tempfile",
@@ -15104,6 +15162,10 @@
         {
           "name": "tracing",
           "packageId": "tracing"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
         },
         {
           "name": "x509-parser",

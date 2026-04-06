@@ -135,6 +135,26 @@ let
     '';
   };
 
+  # rio-controller's workerpool tests include_str! the seccomp profile
+  # from ../../../../infra/helm/rio-build/files/ (4 levels up from
+  # src/reconcilers/workerpool/ = repo root). Same cross-directory
+  # compile-time-read problem as migrations: buildRustCrate's src is
+  # just rio-controller/, so the relative path resolves outside the
+  # unpacked sourceRoot. Symlink the files/ dir at $NIX_BUILD_TOP/infra/
+  # so the include_str! path resolves. Narrow fileset keeps the hash
+  # stable when unrelated helm templates change.
+  helmFilesFileset = pkgs.lib.fileset.toSource {
+    root = ../infra/helm/rio-build/files;
+    fileset = ../infra/helm/rio-build/files;
+  };
+
+  withHelmFiles = _: {
+    postUnpack = ''
+      mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build
+      ln -sf ${helmFilesFileset} $NIX_BUILD_TOP/infra/helm/rio-build/files
+    '';
+  };
+
   # ──────────────────────────────────────────────────────────────────
   # sys-crate policy: system-link over vendored C
   # ──────────────────────────────────────────────────────────────────
@@ -221,9 +241,18 @@ let
     };
 
     # sqlx::migrate!("../migrations") compile-time file read. See
-    # `withMigrations` above.
+    # `withMigrations` above. rio-gateway only uses it in tests/
+    # (integration-test MIGRATOR static), so its non-test build
+    # succeeds without this — but buildTests=true compiles tests/
+    # and needs the symlink.
     rio-scheduler = withMigrations;
     rio-store = withMigrations;
+    rio-gateway = withMigrations;
+
+    # include_str!("../../../../infra/helm/rio-build/files/...") in
+    # workerpool tests — compile-time file read crossing crate boundary.
+    # See `withHelmFiles` above.
+    rio-controller = withHelmFiles;
 
     # tonic-health ships a bundled .proto and its build.rs compiles it.
     # Same PROTOC need as rio-proto.
