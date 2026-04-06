@@ -374,9 +374,11 @@ Relative to A: no fscache, no cachefiles daemon, no device table, no `(cookie,of
 
 r[builder.fs.composefs-stack]
 
+The builder mounts three layers: (1) EROFS metadata image loop-mounted RO; (2) digest-addressed FUSE at the per-build `objects_dir`; (3) `overlay -o ro,userxattr,lowerdir=<erofs>::<objects_dir>` at `/nix/store`. The `::` separator marks the FUSE mount as a **data-only lower** ([`Documentation/filesystems/overlayfs.rst`](https://docs.kernel.org/filesystems/overlayfs.html#data-only-lower-layers)) — overlayfs will not `lookup()` into it for path resolution, only follow absolute redirects.
+
 r[builder.fs.userxattr-mount]
 
-The builder mounts three layers: (1) EROFS metadata image loop-mounted RO; (2) digest-addressed FUSE at `/mnt/objects`; (3) `overlay -o ro,userxattr,lowerdir=<erofs>::<objects>` at `/nix/store`. The `::` separator marks the FUSE mount as a **data-only lower** ([`Documentation/filesystems/overlayfs.rst`](https://docs.kernel.org/filesystems/overlayfs.html#data-only-lower-layers)) — overlayfs will not `lookup()` into it for path resolution, only follow absolute redirects. With `userxattr`, the overlay reads `user.overlay.{redirect,metacopy}` xattrs and is mountable from an **unprivileged userns**; do **not** pass `metacopy=on`/`redirect_dir=on` explicitly — they are rejected under `userxattr`, and the `::` data-only-lower form already implies the redirect/metacopy behavior.
+With `userxattr`, the overlay reads `user.overlay.{redirect,metacopy}` xattrs and is mountable from an **unprivileged userns**; do **not** pass `metacopy=on`/`redirect_dir=on` explicitly (rejected — `params.c:988-1008`). The presence of a `::` data-only lower independently enables following absolute redirects into it regardless of those options ([`namei.c:1241`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/namei.c), commit [`5ef7bcdeecc9`](https://git.kernel.org/linus/5ef7bcdeecc9), v6.16+) — gated on `ofs->numdatalayer > 0`, not `config->metacopy`. The in-tree comment reads: "Don't require redirect=follow and metacopy=on in this case." This is the maintainer-designed userns-safe path; its safety condition ("lower layer is read-only and `user.overlay.redirect` cannot be modified") is structurally satisfied by EROFS.
 
 | Syscall | Resolved by | FUSE upcalls |
 |---|---|---|
@@ -386,7 +388,7 @@ The builder mounts three layers: (1) EROFS metadata image loop-mounted RO; (2) d
 | `read` (cold) | FUSE `read` upcalls, ~128 KiB/req via readahead | O(filesize / 128 KiB) |
 | `read` (warm) | page cache | **0** |
 
-§1's killer constraint — FUSE passthrough binds one backing fd at `open()` so a 200 MB partially-hot `.so` either upcalls every read or blocks open — **is addressed by streaming open (§C.7).** The handler returns from `open()` after the first chunk; uncached `read()` ranges upcall once during the background fill, never after. The FUSE-on-read cost is bounded to `filesize / 128 KiB` upcalls **once per file per node**.
+§1's killer constraint — FUSE passthrough binds one backing fd at `open()` so a 200 MB partially-hot `.so` either upcalls every read or blocks open — **is addressed by streaming open (§C.7).** The handler returns from `open()` after the first chunk; uncached `read()` ranges upcall once during the background fill, then 0 upcalls while pages remain cached. The FUSE-on-read cost is bounded to `filesize / 128 KiB` upcalls **once per file per node** (re-served from the SSD backing file if cgroup pressure evicts pages).
 
 ### C.2 Encoder — `mkcomposefs --from-file`
 
@@ -394,7 +396,7 @@ r[builder.fs.stub-isize]
 
 The metadata image must encode each regular file's **real `i_size`** with zero data blocks. overlayfs metacopy surfaces the metadata layer's `i_size` to `stat()`; a stub encoded with `i_size=0` reports 0 to userspace even though `read()` returns full data — `mmap(len=st_size)` then maps nothing. Bare `mkfs.erofs` over a directory of 0-byte staging files is therefore **insufficient**.
 
-[`mkcomposefs --from-file`](https://github.com/containers/composefs/blob/main/man/composefs-dump.md) takes a `composefs-dump(5)` text manifest (one line per node: escaped path, size, mode, nlink, uid, gid, rdev, mtime, **payload** = redirect target, content, **digest**) and emits the EROFS image directly — no staging dir, no per-file `setxattr`, correct `i_size`. The dump format is line-oriented and trivially generated from a `NarIndex` walk; rio's encoder is a `NarIndex → dump-text` serializer plus either a subprocess call or a port of [`libcomposefs/lcfs-writer-erofs.c`](https://github.com/containers/composefs/blob/main/libcomposefs/lcfs-writer-erofs.c) (~1.2 kLoC C, dual GPL-2.0/Apache-2.0).
+[`mkcomposefs --from-file`](https://github.com/containers/composefs/blob/main/man/composefs-dump.md) takes a `composefs-dump(5)` text manifest (one line per node: escaped path, size, mode, nlink, uid, gid, rdev, mtime, **payload** = redirect target, content, **digest**) and emits the EROFS image directly — no staging dir, no per-file `setxattr`, correct `i_size`. The dump format is line-oriented and trivially generated from a `NarIndex` walk (the per-store-path file index — `{path, kind, size, executable, file_digest}` per entry, computed at PutPath-time); rio's encoder is a `NarIndex → dump-text` serializer plus either a subprocess call or a port of [`libcomposefs/lcfs-writer-erofs.c`](https://github.com/containers/composefs/blob/main/libcomposefs/lcfs-writer-erofs.c) (~2.1 kLoC C, `GPL-2.0-or-later OR Apache-2.0`).
 
 r[builder.fs.metacopy-xattr-shape]
 
@@ -404,19 +406,23 @@ r[builder.fs.metacopy-xattr-shape]
 
 ### C.3 Mount sequence and privilege boundary
 
-r[builder.fs.fd-handoff-ordering]
-
 Privilege is split: a node-level **`rio-mountd`** (~50 LoC, CAP_SYS_ADMIN, DaemonSet) opens `/dev/fuse` + the EROFS superblock and hands both fds to the unprivileged builder over a UDS; the builder does the overlay mount itself inside its own userns. `rio-mountd` per request:
 
-1. `open("/dev/fuse")` → `mount("fuse", objects_dir, …, "fd=N,…")` → `SCM_RIGHTS` the fd to the builder
+1. `open("/dev/fuse")` → `mount("fuse", objects_dir, …, "fd=N,…")` where `objects_dir = /var/rio/objects/{build_id}` → `SCM_RIGHTS` the fd to the builder
 2. `fsopen("erofs")` → `fsconfig(FSCONFIG_SET_FLAG, "ro")` → `fsconfig(FSCONFIG_SET_STRING, "source", meta_image)` → `fsconfig(FSCONFIG_CMD_CREATE)` → `fsmount(…)` → `SCM_RIGHTS` the detached-mount fd
-3. exit (per request; the daemon process persists for the next pod)
+3. return (per request; the daemon process persists for the next pod and tracks the UDS connection for teardown)
 
 The builder, inside its unprivileged userns:
 
 4. `fuser::Session::from_fd(fuse_fd)` → spawn `digest_fuse::serve` (§C.4)
 5. `move_mount(erofs_fd, "", AT_FDCWD, meta_mnt, MOVE_MOUNT_F_EMPTY_PATH)`
 6. `mount("overlay", mount_point, "overlay", MS_RDONLY, "userxattr,lowerdir=<meta_mnt>::<objects_dir>")`
+
+Teardown — builder closes the UDS (or its pod exits):
+
+7. `rio-mountd` does `umount2(objects_dir, MNT_DETACH)` + `rmdir(objects_dir)`; the builder's mount-ns death takes the overlay + erofs mounts with it. Crash-safety: `rio-mountd` start-up scans `/var/rio/objects/*` for orphaned mounts and detaches them.
+
+r[builder.fs.fd-handoff-ordering]
 
 **Ordering is load-bearing:** the `/dev/fuse` fd MUST be received and the digest-FUSE server MUST be answering before step 6. overlayfs probes each lower's root at `mount(2)`; with no one serving `/dev/fuse`, that probe deadlocks. The `fsconfig` `"ro"` flag MUST precede `CMD_CREATE` — `MOUNT_ATTR_RDONLY` on `fsmount` is per-mount, not per-superblock, and erofs otherwise opens the bdev RW → `EACCES` on a read-only loop.
 
@@ -426,19 +432,23 @@ The builder, inside its unprivileged userns:
 
 r[builder.fs.digest-fuse-open]
 
-The data-only lower is a `fuser` filesystem rooted at `objects_dir` exposing exactly two directory levels: 256 prefix dirs (`00`..`ff`) and leaf files named by the remaining 62 hex chars of `blake3(file_content)`. `lookup(prefix, name)` consults a `file_digest → (size, executable)` map populated from the closure's `NarIndex`; unknown digests return `ENOENT`. `open` JIT-fetches the file by digest (see §C.7 for the fetch shape) and returns `FOPEN_KEEP_CACHE`. `read` serves from the materialized buffer/backing-file. The handler reuses [`rio-builder/src/fuse/fetch.rs`](rio-builder/src/fuse/fetch.rs)'s bounded-memory chunk fan-out; the lookup key changes from `store_path` to `file_digest`.
+The data-only lower is a `fuser` filesystem rooted at the per-build `objects_dir` exposing exactly two directory levels: 256 prefix dirs (`00`..`ff`) and leaf files named by the remaining 62 hex chars of `blake3(file_content)`. `lookup(prefix, name)` consults a `file_digest → (size, executable)` map populated from the closure's `NarIndex`; unknown digests return `ENOENT`. `open` JIT-fetches the file by digest (see §C.7 for the fetch shape) and returns `FOPEN_KEEP_CACHE`. `read` serves from the materialized backing file. The handler reuses [`rio-builder/src/fuse/fetch.rs`](rio-builder/src/fuse/fetch.rs)'s bounded-memory chunk fan-out; the lookup key changes from `store_path` to `file_digest`.
+
+r[builder.fs.shared-backing-cache]
+
+The FUSE **mount point** is per-build (`/var/rio/objects/{build_id}/`, §C.3) for cross-pod isolation. The **backing cache** where fetched bytes land is shared node-SSD (`/var/rio/cache/ab/<digest>`). On `open`, the handler first checks the shared cache; on miss it `O_EXCL`-creates `/var/rio/cache/ab/<digest>.partial` — a concurrent fetcher that loses the `O_EXCL` race waits on inotify for the `.partial→<digest>` rename instead of double-fetching. This gives §C.7's node-level dedup ("second build pays 0") without exposing one build's mount to another.
 
 This is **the only FUSE in the stack**, and it is hit only on cold `open()`. Spike-measured cold lookups are exactly 2 regardless of the merged path's depth — overlayfs walks the EROFS dirent chain in-kernel, then the redirect is one absolute jump.
 
 ### C.5 Spike evidence
 
-Core-stack nixosTests on branch `worktree-agent-acf26042` ([`9c162024`](../../nix/tests/scenarios/composefs-spike.nix), [`a1394c0b`](../../nix/tests/scenarios/composefs-spike-scale.nix), `9415f9e2`); chromium-146 closure topology (357 store paths, 23 218 regular files, 8 221 dirs, 3 374 symlinks) with synthetic file content:
+Core-stack nixosTests on `adr-022` ([`composefs-spike.nix`](../../nix/tests/scenarios/composefs-spike.nix), [`composefs-spike-scale.nix`](../../nix/tests/scenarios/composefs-spike-scale.nix), ported in `15a9db79`); chromium-146 closure topology (357 store paths, 23 218 regular files, 8 221 dirs, 3 374 symlinks) with synthetic file content:
 
 | Metric | Measured |
 |---|---|
 | `mount -t overlay` wall-clock | **<10 ms** (below `time(1)` granularity) |
 | FUSE upcalls during mount | lookup=0 getattr=0 open=0 read=0 |
-| EROFS metadata image (mkcomposefs) | **5.3 MiB** (≈228 B/file), encoded in **70 ms** |
+| EROFS metadata image (mkcomposefs) | **5.3 MiB** (≈239 B/file), encoded in **70 ms** |
 | `find -type f` over 23 218 files | 60 ms, **0 FUSE upcalls** |
 | `find -printf %s` sum over 23 218 files | 1 795 354 094 B == manifest, 120 ms, **0 FUSE upcalls** |
 | Cold `lookup` upcalls (any depth) | **2** (prefix + digest) |
@@ -448,20 +458,20 @@ Core-stack nixosTests on branch `worktree-agent-acf26042` ([`9c162024`](../../ni
 
 Against A's targets: mount **<10 ms vs ~70 ms** (357 eager OPENs × ~200 µs); warm-read identical; metadata footprint 5.3 MiB vs ~15 MB boot-blob budget.
 
-Follow-on spikes (separate worktree branches):
+Follow-on spikes (consolidated on `adr-022`):
 
-| Commit | Branch | Finding |
+| Commit | Test | Finding |
 |---|---|---|
-| `1dad4f3c` | `worktree-agent-ae3fc13c` | Streaming-open (§C.7): `FOPEN_KEEP_CACHE` set at `open()` does not suppress cold-page upcalls (2049 reads on first `dd` of 256 MiB), only prevents invalidation — second `dd` 0 upcalls. **No mode-flip needed.** `mmap(MAP_PRIVATE)` page-faults route through FUSE `read`. `open()` 256 MiB with 10 ms/chunk backend → 10.3 ms (vs 2560 ms whole-file). |
-| `da6148cd` | `worktree-agent-a47f4d59` | Access patterns: real consumers touch **0.3-33%** of giant `.so`/`.a` (link-against-libLLVM 2.79% bimodal head+tail; `opt --version` 32.77% scattered/266 ranges; `libicudata` 0.28%). `ld.so` uses no `MAP_POPULATE`/`fadvise`. |
-| `11861a29` | `worktree-agent-aa791c36` | Privilege boundary (§C.3): all 6 questions PASS on kernel 6.18.20 — fd-handoff, stack-survives-mounter-exit, unpriv-userns-inherits, **`userxattr` unpriv overlay**, teardown-under-load (no D-state), `fsopen`/`fsmount` detached-fd handoff. |
-| `65fecde2` | `worktree-agent-a238b66a` | `/dev/kvm` via `extra-sandbox-paths` (§C.8): `ioctl(KVM_GET_API_VERSION)=12` from inside Nix sandbox; smarter-device-manager not required. |
+| `15a9db79` | [`composefs-spike-stream.nix`](../../nix/tests/scenarios/composefs-spike-stream.nix) | Streaming-open (§C.7): `FOPEN_KEEP_CACHE` set at `open()` does not suppress cold-page upcalls (2049 reads on first `dd` of 256 MiB), only prevents invalidation — second `dd` 0 upcalls. **No mode-flip needed.** `mmap(MAP_PRIVATE)` page-faults route through FUSE `read`. `open()` 256 MiB with 10 ms/chunk backend → 10.3 ms (vs 2560 ms whole-file). |
+| `42aa81b2` | [`spike-access-data/RESULTS.md`](../../nix/tests/lib/spike-access-data/RESULTS.md) | Access patterns: real consumers touch **0.3-33%** of giant `.so`/`.a` (link-against-libLLVM 2.79% bimodal head+tail; `opt --version` 32.77% scattered/266 ranges; `libicudata` 0.28%). `ld.so` uses no `MAP_POPULATE`/`fadvise`. |
+| `af8db499` | [`composefs-spike-priv.nix`](../../nix/tests/scenarios/composefs-spike-priv.nix) | Privilege boundary (§C.3): all 6 questions PASS on kernel 6.18.20 — fd-handoff, stack-survives-mounter-exit, unpriv-userns-inherits, **`userxattr` unpriv overlay**, teardown-under-load (no D-state), `fsopen`/`fsmount` detached-fd handoff. |
+| `9492019c` | [`kvm-hostpath-spike.nix`](../../nix/tests/scenarios/kvm-hostpath-spike.nix) | `/dev/kvm` via `extra-sandbox-paths` (§C.8): `ioctl(KVM_GET_API_VERSION)=12` from inside Nix sandbox; smarter-device-manager not required. |
 
 ### C.6 Integrity — fs-verity does not apply; per-file blake3 in handler
 
 r[builder.fs.file-digest-integrity]
 
-composefs's native integrity story embeds an fs-verity digest in the metacopy xattr; the kernel checks it against the backing file's fs-verity measurement at `open()`. **This requires fs-verity enabled on the lower filesystem**, which a FUSE lower cannot provide. Per-file integrity for C therefore lives in the digest-FUSE handler: on `open`, after materializing the file, blake3 the bytes and compare against the requested digest before returning. The digest is the filename — the check is structural. This is the `file_digest` field proposed independently as a `NarIndexEntry` extension; here it is load-bearing.
+composefs's native integrity story embeds an fs-verity digest in the metacopy xattr; the kernel checks it against the backing file's fs-verity measurement at `open()`. **This requires fs-verity enabled on the lower filesystem**, which a FUSE lower cannot provide. Per-file integrity for C therefore lives in the digest-FUSE handler: **verify each chunk's blake3 against its content-address on arrival** (chunks are blake3-addressed in the CAS layer; `rio-store/src/chunker.rs`); never serve a byte from an unverified chunk. For files ≤ the streaming threshold (§C.7), the whole-file blake3 against `file_digest` additionally runs before `open()` returns. For files > threshold, per-chunk verification covers the streaming window and the whole-file `file_digest` check runs at fill-complete, gating the `.partial → /var/rio/cache/ab/<digest>` rename. The digest is the filename — the check is structural. This is the `file_digest` field proposed independently as a `NarIndexEntry` extension; here it is load-bearing. `file_digest` also serves as the per-file content-address for the Directory-merkle layer enabling closure delta-sync (U5); see `components/store.md` §NAR index.
 
 What C **doesn't** have that B does: in-kernel range verification. C trusts the FUSE handler not to lie about the bytes it serves; B's `read_folio` could verify chunk digests kernel-side. For rio's threat model (builder is the FUSE server; builder is already trusted to not corrupt its own build), this is not a regression from A.
 
@@ -472,11 +482,14 @@ What C **doesn't** have that B does: in-kernel range verification. C trusts the 
 | **FUSE handler crash** | overlayfs `open()` on a redirect target → `ENOTCONN`. Existing open files keep their page-cache content (warm reads unaffected). | Supervisor respawns; next `open()` reconnects. **No D-state**, no `restore` dance. Simpler than A. |
 | **FUSE handler hung mid-fetch** | `open()` blocks in `S` (interruptible — FUSE, not folio lock). | Per-spawn `tokio::timeout` returns `EIO` to the open; build fails loudly. Same shape as today's `jit_fetch_timeout`. |
 | **Redirect target ENOENT** | overlayfs `open()` → `ENOENT`. | Handler returns ENOENT only for digests outside the closure's declared-input allowlist — correct (JIT fetch imperative). |
+| **Build completes / pod exits** | Builder mount-ns death drops overlay+erofs; `objects_dir` FUSE mount persists in init-ns. | `rio-mountd` detaches it on UDS close (§C.3 step 7); start-up scan reaps orphans from a prior crash. |
 | **Partial-file hot ranges** | First `open()` of a 200 MB `.so` blocks for the whole file. Subsequent reads of any range are page-cache. | **The trade-off.** See below. |
 
 r[builder.fs.streaming-open-threshold]
 
-**Streaming open (P0575) ships unconditionally.** The 1000 largest files in nixpkgs are *all* >64 MiB (median 179 MiB, 7 files >1 GiB; `top1000.csv`), and access-pattern measurement (`da6148cd`) shows consumers touch 0.3-33% of them — whole-file fetch over-fetches 64-99.7%. The mitigation, spike-proven (`1dad4f3c`): the digest-FUSE handler sets `FOPEN_KEEP_CACHE` **unconditionally** at `open()`. Files ≤ `STREAM_THRESHOLD` (default 8 MiB) fetch-whole-then-return. Files > threshold spawn a background fill task and return after the first chunk (~10 ms); `read(off,len)` upcalls once per uncached page during fill (priority-bumping the requested range), never after. ~80 LoC; **no mode-transition** — `KEEP_CACHE` does not suppress cold-page upcalls, only invalidation, so the kernel page cache *is* the transition. `mmap(MAP_PRIVATE)` page-faults route through the same `read` path, covering linkers. Node-local digest cache (P0571) means the second build to touch `libLLVM.so` on that node pays 0.
+**Streaming open ships unconditionally.** The 1000 largest files in nixpkgs are *all* >64 MiB (median 179 MiB, 7 files >1 GiB; `top1000.csv`), and access-pattern measurement (`42aa81b2`) shows consumers touch 0.3-33% of them — whole-file fetch over-fetches 64-99.7%. The mitigation, spike-proven (`15a9db79`): the digest-FUSE handler sets `FOPEN_KEEP_CACHE` **unconditionally** at `open()`. Files ≤ `STREAM_THRESHOLD` (default 8 MiB) fetch-whole-then-return. Files > threshold spawn a background fill task and return after the first chunk (~10 ms); `read(off,len)` upcalls once per uncached page during fill (priority-bumping the requested range), then 0 upcalls while pages remain cached — under cgroup memory pressure, evicted pages re-upcall and are re-served from the SSD backing file. ~80 LoC; **no mode-transition** — `KEEP_CACHE` does not suppress cold-page upcalls, only invalidation, so the kernel page cache *is* the transition. `mmap(MAP_PRIVATE)` page-faults route through the same `read` path, covering linkers. The shared node-SSD backing cache (§C.4) means the second build to touch `libLLVM.so` on that node pays 0.
+
+**Considered and rejected for the partial-file case:** encoder-side file-splitting into N redirect targets (overlayfs `redirect` is single-path per inode; not expressible); allowlist-bounded prefetch of giants at mount (violates the JIT-fetch imperative — fetches inputs the build may never touch); composefs+fscache hybrid for giants only (resurrects ~70% of Path A's deleted LoC — cachefiles daemon, reverse-map, second encoder — for marginal gain over streaming-open); FSx-Lustre-backed cluster-wide `objects` cache (violates the builder air-gap — shared writable FS between untrusted builders is a cache-poisoning + lateral-movement surface).
 
 ### C.8 Kconfig (NixOS)
 
@@ -493,7 +506,7 @@ boot.kernelPatches = [{
 }];
 ```
 
-All three are stock-on in essentially every distro; the patch block is for `=y` over `=m` only.
+All three are stock-on in essentially every distro; the patch block is for `=y` over `=m` only. Requires kernel **≥6.16** ([`5ef7bcdeecc9`](https://git.kernel.org/linus/5ef7bcdeecc9): data-only-lower redirect honored under `userxattr`) + **≥5.2** (`fsopen`/`fsmount`/`move_mount`); the NixOS-node module asserts this at boot.
 
 **Device exposure:** no smarter-device-manager. `/dev/fuse` reaches the builder via `rio-mountd` fd-handoff (§C.3; builder pod never opens the device). `/dev/kvm` reaches the kvm-pool build via plain `hostPath` CharDevice volume + `nodeSelector: rio.build/kvm` + `nix.settings.extra-sandbox-paths=["/dev/kvm"]` (`65fecde2`).
 
@@ -503,7 +516,7 @@ All three are stock-on in essentially every distro; the patch block is for `=y` 
 
 | Axis | **(A) EROFS + fscache** | **(B) `riofs` kmod** | **(C) composefs-style** |
 |---|---|---|---|
-| **Total LoC owned** | **~2 700** = 0 kernel + ~1 200 daemon (poll loop, reverse-map, cookie idx) + ~950 rio-store (encoder + PutPath + migration) + ~400 builder merge + ~150 nix/helm. Plus ~400 LoC vendored Nydus protocol parsing (Apache-2.0, attributed). | **~3 600** = ~2 800 kernel C + ~500 builder (`/dev/riofs` loop + `.riom` serializer) + **0 rio-store** + ~100 `nix/kmod/` + ~200 VM-test scaffolding. (Rust path: +~1 500 carried rust-vfs — don't.) | **~1 450** = 0 kernel + ~450 digest-FUSE (reuses `fuse/fetch.rs` fan-out) + ~80 streaming-open (§C.7) + ~250 `NarIndex→dump` serializer + ~300 rio-store (`file_digest` in NarIndex, PutPath blake3-per-file) + ~50 `rio-mountd` fd-handoff + ~170 builder mount + ~150 nix/helm. **Smaller privileged surface than today's FUSE setup** (rio-mountd opens 2 fds and exits; builder pod has zero device exposure). Subprocess `mkcomposefs`; porting `lcfs-writer-erofs.c` is +~1 200 if shell-out is unacceptable. |
+| **Total LoC owned** | **~2 700** = 0 kernel + ~1 200 daemon (poll loop, reverse-map, cookie idx) + ~950 rio-store (encoder + PutPath + migration) + ~400 builder merge + ~150 nix/helm. Plus ~400 LoC vendored Nydus protocol parsing (Apache-2.0, attributed). | **~3 600** = ~2 800 kernel C + ~500 builder (`/dev/riofs` loop + `.riom` serializer) + **0 rio-store** + ~100 `nix/kmod/` + ~200 VM-test scaffolding. (Rust path: +~1 500 carried rust-vfs — don't.) | **~1 450** = 0 kernel + ~450 digest-FUSE (reuses `fuse/fetch.rs` fan-out) + ~80 streaming-open (§C.7) + ~250 `NarIndex→dump` serializer + ~300 rio-store (`file_digest` in NarIndex, PutPath blake3-per-file) + ~50 `rio-mountd` fd-handoff + ~170 builder mount + ~150 nix/helm. **Smaller privileged surface than today's FUSE setup** (rio-mountd opens 2 fds and exits; builder pod has zero device exposure). Subprocess `mkcomposefs`; porting `lcfs-writer-erofs.c` is +~2 100 if shell-out is unacceptable. |
 | **Distribution of complexity** | All userspace; 100% `cargo nextest`-able; bugs = wrong bytes (build fails its checksum, loud). The fiddly part (reverse-map) is `proptest`-able. | ~800 LoC genuinely-novel kernel (read_folio + ring + waiters); ~2 000 romfs-shaped boilerplate. Bugs = hung folio lock, UAF on evicted chunk, `copy_from_user` length error. Dev loop = VM rebuild (~2-3 min). | All userspace; **no reverse-map, no merge-splice, no cookie state machine.** The fiddly part is the dump-text escaper (`proptest`-able against `mkcomposefs` round-trip). Digest-FUSE is a subset of today's `fuse/ops.rs`. |
 | **rio-store write-path Δ** | +encoder, +PutPath hook, +migration, +S3 object class, +GC wiring, +backfill job. | **None.** | +`file_digest` per `NarIndexEntry` (one blake3 per regular file during `nar_ls`; bytes already in RAM). No new S3 object class. |
 | **Build-start latency added** | ~15 MB boot-blob batch fetch + in-mem merge of ~300 k inodes (V4: target <200 ms; cache merged result per-closure-hash on STS pods to amortize). | `.riom` serialize from already-in-memory `ManifestHint`s — **~10 ms**. | `NarIndex` rows → dump text → `mkcomposefs` → 5.3 MiB image in **70 ms** measured; + loop-mount + overlay mount **<10 ms**. **No eager OPEN per device-slot.** |
@@ -532,13 +545,13 @@ All three are stock-on in essentially every distro; the patch block is for `=y` 
 
 **B's chunk-native protocol is elegant but cheap to forgo.** A's reverse-map is ~150 LoC of binary search; the over-fetch is <512 KiB against a moka cache that already holds whole chunks. The wall-clock cost of A's impedance mismatch is microseconds per cold miss against millisecond network RTTs.
 
-**C trades range-granular cold-miss for everything else.** A and B can serve a 4 MB hot range of a 200 MB file without fetching the other 196 MB; C fetches the whole 200 MB on first `open()`. In exchange C drops the cachefiles daemon, the device-slot ceiling, the eager-OPEN mount cost, the reverse-map, and the rio-store S3 artifact — and gains structural per-file dedup that A cannot achieve and B only achieves with an optional kernel cache. Whether the trade is favorable depends on workload shape: if builds touch many small-to-medium files fully (compilers reading headers, linkers reading whole `.o`s) C wins outright; if builds seek into large archives, A/B's range granularity matters. The node-local digest cache amortizes C's penalty to one fetch per unique file per node lifetime.
+**C trades nothing once streaming-open is in.** A and B can serve a 4 MB hot range of a 200 MB file without fetching the other 196 MB; C with streaming-open (§C.7) returns `open()` after the first chunk (~10 ms) and demand-fetches only touched ranges thereafter — effectively range-granular above `STREAM_THRESHOLD`. C drops the cachefiles daemon, the device-slot ceiling, the eager-OPEN mount cost, the reverse-map, and the rio-store S3 artifact — and gains structural per-file dedup that A cannot achieve and B only achieves with an optional kernel cache. The node-local digest cache amortizes C's remaining over-fetch (≤8 MiB/file below the threshold) to once per unique file per node lifetime.
 
 ---
 
 ## 5. Recommendation
 
-> **Superseded 2026-04-05.** The original recommendation below chose A over B without evaluating C. Spike evidence (§C.5) shows C dominates A on mount latency (<10 ms vs ~70 ms), matches A on the warm path, achieves kernel-side per-file dedup A structurally cannot, and is ~half the owned LoC with no cachefiles daemon and no rio-store S3 artifact. **New decision: Path C**, with A retained as the documented fallback if overlay-on-FUSE-data-only-lower exhibits an unforeseen production issue. The partial-file trade-off (§C.7) is C's known cost; gate mitigation (i) on a "p99 first-touched-file size" measurement alongside V11.
+> **Superseded 2026-04-05.** The original recommendation below chose A over B without evaluating C. Spike evidence (§C.5) shows C dominates A on mount latency (<10 ms vs ~70 ms), matches A on the warm path, achieves kernel-side per-file dedup A structurally cannot, and is ~half the owned LoC with no cachefiles daemon and no rio-store S3 artifact. **New decision: Path C**, with A retained as the documented fallback if overlay-on-FUSE-data-only-lower exhibits an unforeseen production issue. C's known cost — whole-file cold `open()` of giants — is resolved by streaming-open (§C.7), which ships unconditionally based on `top1000.csv` + access-pattern evidence.
 
 ### 5.0 Original recommendation (retained for the record)
 
@@ -590,13 +603,10 @@ Path C primary (read for §3a):
 - [`containers/composefs`](https://github.com/containers/composefs) — mechanism, `mkcomposefs`, [`composefs-dump(5)`](https://github.com/containers/composefs/blob/main/man/composefs-dump.md), [`lcfs-writer-erofs.c`](https://github.com/containers/composefs/blob/main/libcomposefs/lcfs-writer-erofs.c)
 - [`Documentation/filesystems/overlayfs.rst` §Data-only lower layers, §Metadata only copy up](https://docs.kernel.org/filesystems/overlayfs.html)
 - [`fs/overlayfs/util.c` `ovl_get_redirect_xattr`/`ovl_check_metacopy_xattr`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/util.c) — `struct ovl_metacopy` shape
+- [`fs/overlayfs/namei.c:1237-1247`](https://github.com/torvalds/linux/blob/master/fs/overlayfs/namei.c) + [`5ef7bcdeecc9`](https://git.kernel.org/linus/5ef7bcdeecc9) — data-only-lower redirect gate under `userxattr` (`ofs->numdatalayer > 0`, not `config->metacopy`)
 - [snix castore data model](https://snix.dev/docs/components/castore/data-model/) — the per-file merkle that motivated evaluating C
 - [`libcomposefs/lcfs-internal.h:37-50`](https://github.com/containers/composefs/blob/main/libcomposefs/lcfs-internal.h) — `OVERLAY_XATTR_PREFIX` hardcoded `trusted.`
-- Spike (core stack): [`nix/tests/scenarios/composefs-spike.nix`](../../nix/tests/scenarios/composefs-spike.nix), [`composefs-spike-scale.nix`](../../nix/tests/scenarios/composefs-spike-scale.nix), `spike_digest_fuse.rs`; commits `9c162024`/`a1394c0b`/`9415f9e2` on `worktree-agent-acf26042`
-- Spike (streaming open): `nix/tests/scenarios/composefs-spike-stream.nix`, `spike_stream_fuse.rs`; commit `1dad4f3c` on `worktree-agent-ae3fc13c`
-- Spike (access patterns): `nix/tests/lib/spike_access_probe.sh`, `spike-access-data/RESULTS.md`; commit `da6148cd` on `worktree-agent-a47f4d59`
-- Spike (privilege boundary): `nix/tests/scenarios/composefs-spike-priv.nix`, `spike_mountd.rs`; commit `11861a29` on `worktree-agent-aa791c36`
-- Spike (kvm hostPath): `nix/tests/scenarios/kvm-hostpath-spike.nix`; commit `65fecde2` on `worktree-agent-a238b66a`
+- Spikes (consolidated on `adr-022`): core/scale/stream `15a9db79` ([`composefs-spike.nix`](../../nix/tests/scenarios/composefs-spike.nix), [`-scale.nix`](../../nix/tests/scenarios/composefs-spike-scale.nix), [`-stream.nix`](../../nix/tests/scenarios/composefs-spike-stream.nix), [`spike_digest_fuse.rs`](../../rio-builder/src/bin/spike_digest_fuse.rs), [`spike_stream_fuse.rs`](../../rio-builder/src/bin/spike_stream_fuse.rs)); privilege boundary `af8db499` ([`-priv.nix`](../../nix/tests/scenarios/composefs-spike-priv.nix), [`spike_mountd.rs`](../../rio-builder/src/bin/spike_mountd.rs)); access patterns `42aa81b2` ([`spike-access-data/RESULTS.md`](../../nix/tests/lib/spike-access-data/RESULTS.md)); kvm hostPath `9492019c` ([`kvm-hostpath-spike.nix`](../../nix/tests/scenarios/kvm-hostpath-spike.nix))
 - `~/src/nix-index/main/top1000.csv` — 1000 largest files in nixpkgs (P0575 sizing)
 
 Background:
