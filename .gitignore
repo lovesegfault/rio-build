@@ -65,3 +65,4 @@ mutants.out*/
 # Local dev runtime state (postgres data, gateway keys)
 .data/
 *.qcow2
+.stress-test/

@@ -148,6 +148,24 @@ fn builds_status_and_limit() {
 }
 
 #[test]
+fn derivations_build_id_or_all_active() {
+    // Positional build_id.
+    assert_parsed(&["derivations", "abc-123"]);
+    assert_parsed(&["derivations", "abc-123", "--status", "Ready"]);
+    assert_parsed(&["derivations", "abc-123", "--stuck"]);
+    // --all-active instead of positional.
+    assert_parsed(&["derivations", "--all-active"]);
+    assert_parsed(&["derivations", "--all-active", "--stuck"]);
+    // conflicts_with: can't give both.
+    assert_rejected(&["derivations", "abc-123", "--all-active"]);
+    // Neither is a clap-level accept (Option<String>) — clap does not
+    // reject. The handler's runtime check fires AFTER connect, so this
+    // test only proves clap didn't exit-2 it; smoke.rs covers the
+    // handler-level "BUILD_ID required" message end-to-end.
+    assert_parsed(&["derivations"]);
+}
+
+#[test]
 fn logs_positional_drv_and_optional_build_id() {
     assert_parsed(&["logs", "/nix/store/foo.drv"]);
     assert_parsed(&["logs", "/nix/store/foo.drv", "--build-id", "uuid"]);

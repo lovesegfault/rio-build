@@ -3,6 +3,48 @@
 
 use super::*;
 
+/// I-025 freeze detector: state machine that WARNs when derivations are
+/// queued but zero streams of the matching kind exist for >60s.
+///
+/// The scheduler already surfaces this via metrics (`fod_queue_depth` +
+/// `fetcher_utilization`), but metrics need a port-forward. A WARN lands
+/// in `kubectl logs`. QA I-025: 20-minute freeze with zero ERROR/WARN is
+/// operator-hostile — the scheduler knew, it just didn't say.
+///
+/// Rate-limit: `since` is reset on each WARN so we emit once/minute, not
+/// once/dispatch-pass (~once/tick = every 10s would spam).
+///
+/// Free function (not `&mut self`) so the call site can borrow
+/// `&mut self.fod_freeze_since` while also reading `self.executors`.
+fn check_freeze(
+    since: &mut Option<Instant>,
+    frozen: bool,
+    kind: &str,
+    queue_depth: u64,
+    stream_count: usize,
+) {
+    const WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+    match (frozen, *since) {
+        (true, None) => *since = Some(Instant::now()),
+        (true, Some(start)) if start.elapsed() > WARN_AFTER => {
+            warn!(
+                kind,
+                queue_depth,
+                stream_count,
+                frozen_for_secs = start.elapsed().as_secs(),
+                "derivations queued but zero {kind} streams — dispatch stuck. \
+                 Worker gRPC bidi-streams may have disconnected. \
+                 Run `rio-cli derivations --all-active --stuck` to diagnose. \
+                 Restart workers: `kubectl rollout restart sts -n rio-builders default-builders`"
+            );
+            // Rate-limit: reset so we WARN once/minute, not once/pass.
+            *since = Some(Instant::now());
+        }
+        (false, _) => *since = None,
+        _ => {} // frozen but not yet 60s — keep counting
+    }
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Dispatch
@@ -199,6 +241,9 @@ impl DagActor {
         for sc in self.size_classes.read().iter() {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
         }
+        // Sum before class_deferred is consumed by the gauge loop below.
+        // Feeds the I-025 builder-freeze check at the end of this fn.
+        let class_total: u64 = class_deferred.values().sum();
         // Now overwrite for classes that actually have deferrals.
         for (class, count) in class_deferred {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => class).set(count as f64);
@@ -226,6 +271,28 @@ impl DagActor {
             0.0
         };
         metrics::gauge!("rio_scheduler_fetcher_utilization").set(util);
+
+        // I-025 freeze detector: WARN if queue pressure + zero streams >60s.
+        // `total` is the fetcher-stream count from the fold above.
+        check_freeze(
+            &mut self.fod_freeze_since,
+            fod_deferred > 0 && total == 0,
+            "fetcher",
+            fod_deferred,
+            total as usize,
+        );
+        let builder_stream_count = self
+            .executors
+            .values()
+            .filter(|e| e.kind == rio_proto::types::ExecutorKind::Builder)
+            .count();
+        check_freeze(
+            &mut self.builder_freeze_since,
+            class_total > 0 && builder_stream_count == 0,
+            "builder",
+            class_total,
+            builder_stream_count,
+        );
     }
 
     /// Find a worker for this derivation, starting at `target_class` and
@@ -1075,5 +1142,68 @@ impl DagActor {
             });
         }
         inputs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // check_freeze state machine. `backdate` (from actor/mod.rs) lets us
+    // construct Instants in the past without waiting or mocking the clock.
+
+    #[test]
+    fn check_freeze_starts_timer_on_first_freeze() {
+        let mut since = None;
+        check_freeze(&mut since, true, "fetcher", 41, 0);
+        assert!(since.is_some(), "frozen=true with None → timer started");
+    }
+
+    #[test]
+    fn check_freeze_thaw_resets_to_none() {
+        let mut since = Some(backdate(30));
+        check_freeze(&mut since, false, "fetcher", 0, 5);
+        assert!(since.is_none(), "frozen=false → reset to None");
+
+        // Also resets even if we were past the WARN threshold.
+        let mut since = Some(backdate(120));
+        check_freeze(&mut since, false, "fetcher", 0, 5);
+        assert!(since.is_none(), "thaw wins regardless of elapsed");
+    }
+
+    #[test]
+    fn check_freeze_keeps_counting_before_threshold() {
+        let start = backdate(30);
+        let mut since = Some(start);
+        check_freeze(&mut since, true, "fetcher", 41, 0);
+        assert_eq!(
+            since,
+            Some(start),
+            "frozen but under 60s → unchanged (keep counting)"
+        );
+    }
+
+    #[test]
+    fn check_freeze_resets_timer_after_warn() {
+        // Past the 60s threshold: the WARN fires and `since` is reset
+        // to ~now for rate-limiting (once/minute, not once/pass).
+        let start = backdate(61);
+        let mut since = Some(start);
+        check_freeze(&mut since, true, "fetcher", 41, 0);
+        // Timer was reset: new Instant, strictly after the old one.
+        let new = since.expect("still frozen → still Some");
+        assert!(new > start, "rate-limit reset: new timer > old start");
+        // And the reset is recent (within the last second — the call just happened).
+        assert!(
+            new.elapsed() < std::time::Duration::from_secs(1),
+            "reset to ~now"
+        );
+    }
+
+    #[test]
+    fn check_freeze_noop_when_never_frozen() {
+        let mut since = None;
+        check_freeze(&mut since, false, "fetcher", 0, 5);
+        assert!(since.is_none(), "never frozen → stays None");
     }
 }

@@ -283,6 +283,20 @@ pub struct DagActor {
     /// Default (from `new()`) is a fresh never-cancelled token →
     /// tests and non-production constructors are unchanged.
     shutdown: rio_common::signal::Token,
+    /// I-025 freeze detector: when `fod_deferred > 0 && fetcher_streams == 0`
+    /// first became true. `dispatch_ready` WARNs after 60s elapsed, then
+    /// resets this so the WARN re-fires once/minute (not once/dispatch-pass).
+    /// Reset to None when either side of the AND clears.
+    ///
+    /// The scheduler already surfaces the freeze via the
+    /// `rio_scheduler_fod_queue_depth` + `rio_scheduler_fetcher_utilization`
+    /// gauges — but those require a port-forward to observe. A WARN lands
+    /// in `kubectl logs`. QA I-025: all 4 builds froze at 29/219 for 20min
+    /// with zero ERROR/WARN while fod_queue_depth=41 and fetcher streams=0.
+    fod_freeze_since: Option<Instant>,
+    /// Same pattern for non-FOD derivations stuck with zero builder streams.
+    /// Tracks `class_deferred.values().sum() > 0 && builder_streams == 0`.
+    builder_freeze_since: Option<Instant>,
     /// Test-only: oneshot pair for deterministic interleaving in
     /// `handle_leader_acquired`. When set, the actor sends on `.0`
     /// after `recover_from_pg()` returns, then awaits `.1` before
@@ -337,6 +351,8 @@ impl DagActor {
             event_persist_tx: None,
             hmac_signer: None,
             shutdown: rio_common::signal::Token::new(),
+            fod_freeze_since: None,
+            builder_freeze_since: None,
             #[cfg(test)]
             recovery_toctou_gate: None,
         }
@@ -646,6 +662,9 @@ impl DagActor {
                 ActorCommand::ReconcileAssignments => {
                     self.handle_reconcile_assignments().await;
                 }
+                ActorCommand::InspectBuildDag { build_id, reply } => {
+                    let _ = reply.send(self.handle_inspect_build_dag(build_id));
+                }
                 #[cfg(test)]
                 ActorCommand::DebugQueryWorkers { reply } => {
                     let _ = reply.send(self.handle_debug_query_workers());
@@ -796,6 +815,55 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_reconcile_dropped_total").increment(1);
             }
         });
+    }
+
+    /// Actor in-memory snapshot of a build's derivations cross-referenced
+    /// with the live stream pool. I-025 diagnostic: `executor_has_stream`
+    /// is false when a derivation is Assigned to an executor whose gRPC
+    /// bidi stream is gone from `self.executors` — dispatch can never
+    /// complete. PG (`rio-cli workers`) may still show the executor as
+    /// alive; only the actor's HashMap knows the stream is dead.
+    fn handle_inspect_build_dag(
+        &self,
+        build_id: Uuid,
+    ) -> (Vec<rio_proto::types::DerivationDiagnostic>, Vec<String>) {
+        let now = std::time::Instant::now();
+        let derivations = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| s.interested_builds.contains(&build_id))
+            .map(|(_, s)| {
+                let assigned_executor = s
+                    .assigned_executor
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                // THE I-025 signal.
+                let executor_has_stream = s
+                    .assigned_executor
+                    .as_ref()
+                    .is_some_and(|e| self.executors.contains_key(e));
+                let backoff_remaining_secs = s
+                    .backoff_until
+                    .and_then(|deadline| deadline.checked_duration_since(now))
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                rio_proto::types::DerivationDiagnostic {
+                    drv_path: s.drv_path().to_string(),
+                    drv_hash: s.drv_hash.to_string(),
+                    status: format!("{:?}", s.status()),
+                    is_fod: s.is_fixed_output,
+                    assigned_executor,
+                    executor_has_stream,
+                    retry_count: s.retry_count,
+                    infra_retry_count: s.infra_retry_count,
+                    backoff_remaining_secs,
+                    interested_build_count: s.interested_builds.len() as u32,
+                }
+            })
+            .collect();
+        let live_executor_ids = self.executors.keys().map(|e| e.to_string()).collect();
+        (derivations, live_executor_ids)
     }
 
     // ----- cfg(test) debug handlers ----------------------------------

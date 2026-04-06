@@ -136,6 +136,42 @@ message ListPoisonedResponse {
   repeated PoisonedDerivation derivations = 1;
 }
 
+// Actor-state snapshot for one derivation. Unlike GetBuildGraph (PG-backed),
+// this reads the in-memory DAG + live stream pool. The golden field is
+// executor_has_stream: false for an Assigned/Running derivation = the stream
+// is dead, dispatch can never complete. I-025 diagnostic.
+message DerivationDiagnostic {
+  string drv_path = 1;
+  string drv_hash = 2;
+  // DerivationStatus enum as string: "Ready", "Assigned", "Running", etc.
+  // String not enum so the CLI doesn't need to track every variant.
+  string status = 3;
+  bool is_fod = 4;                      // Routes to fetcher pool vs builder pool
+  // Assignment state (empty unless Assigned/Running).
+  string assigned_executor = 5;
+  // Whether self.executors.contains_key(assigned_executor). THE I-025 signal.
+  // Only meaningful when assigned_executor is non-empty.
+  bool executor_has_stream = 6;
+  // Retry accounting.
+  uint32 retry_count = 7;
+  uint32 infra_retry_count = 8;
+  // Seconds remaining on retry backoff. 0 = no backoff or elapsed.
+  // Answers "why isn't this Ready drv being dispatched".
+  uint64 backoff_remaining_secs = 9;
+  // How many builds need this derivation (>1 = shared across builds, dedup).
+  uint32 interested_build_count = 10;
+}
+
+message InspectBuildDagRequest {
+  string build_id = 1;
+}
+
+message InspectBuildDagResponse {
+  repeated DerivationDiagnostic derivations = 1;
+  // Executors in the live stream pool. For "this executor is in PG but not here" diff.
+  repeated string live_executor_ids = 2;
+}
+
 // Tenant info for ListTenants/CreateTenant.
 message TenantInfo {
   string tenant_id = 1;                  // UUID as string
