@@ -32,7 +32,7 @@ PostgreSQL provides:
 
 The decision to use PostgreSQL for scheduler state stands, but two mechanisms listed in the "PostgreSQL provides" section above were never built:
 
-- **Advisory locks:** Leader election uses a Kubernetes Lease instead (see `rio-scheduler/src/lease.rs`). The original rationale was that coupling leader election to PG availability ensures the leader always has access to its state backend; in practice a K8s Lease is operationally simpler and the generation-fence mechanism (workers reject stale-generation assignments) makes brief dual-leader windows harmless.
+- **Advisory locks:** Leader election uses a Kubernetes Lease instead (see `rio-scheduler/src/lease/`). The original rationale was that coupling leader election to PG availability ensures the leader always has access to its state backend; in practice a K8s Lease is operationally simpler and the generation-fence mechanism (workers reject stale-generation assignments) makes brief dual-leader windows harmless.
 - **LISTEN/NOTIFY:** Scheduling is tick-based (10s dispatch interval). No event-driven pubsub was implemented. The actor model's internal message channel handles intra-process events; PG is polled, not subscribed.
 - **Separate schemas:** All migrations share the default `public` schema. The `migrations/` directory contains both scheduler (`001_scheduler.sql`) and store (`002_store.sql`) tables with no `CREATE SCHEMA` separation.
 

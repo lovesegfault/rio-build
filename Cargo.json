@@ -14881,10 +14881,6 @@
         {
           "name": "tonic",
           "packageId": "tonic"
-        },
-        {
-          "name": "uuid",
-          "packageId": "uuid"
         }
       ],
       "devDependencies": [
@@ -14895,10 +14891,17 @@
         {
           "name": "rio-nix",
           "packageId": "rio-nix"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
         }
       ],
       "libCrateTypes": [
         "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-cli": {
@@ -15176,10 +15179,6 @@
           "packageId": "rio-proto"
         },
         {
-          "name": "rustls",
-          "packageId": "rustls 0.23.37"
-        },
-        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -15344,10 +15343,6 @@
         {
           "name": "russh",
           "packageId": "russh"
-        },
-        {
-          "name": "rustls",
-          "packageId": "rustls 0.23.37"
         },
         {
           "name": "serde",
@@ -15697,10 +15692,6 @@
           "packageId": "rio-proto"
         },
         {
-          "name": "rustls",
-          "packageId": "rustls 0.23.37"
-        },
-        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -15898,10 +15889,6 @@
         {
           "name": "rio-proto",
           "packageId": "rio-proto"
-        },
-        {
-          "name": "rustls",
-          "packageId": "rustls 0.23.37"
         },
         {
           "name": "scopeguard",
@@ -16132,6 +16119,9 @@
       ],
       "libCrateTypes": [
         "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
       ]
     },
     "rio-worker": {
@@ -16194,10 +16184,6 @@
         {
           "name": "rio-proto",
           "packageId": "rio-proto"
-        },
-        {
-          "name": "rustls",
-          "packageId": "rustls 0.23.37"
         },
         {
           "name": "scopeguard",

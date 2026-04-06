@@ -19,8 +19,6 @@ rio-proto = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
-# Direct rustls for CryptoProvider::install_default(). Phase 3b mTLS.
-rustls = { workspace = true }
 # google.protobuf.Timestamp in BuildResult.start_time/stop_time.
 # Scheduler guards update_build_history on these being Some.
 prost-types = { workspace = true }
@@ -44,7 +42,7 @@ futures-util = { workspace = true }
 # (it's a gRPC CLIENT of the scheduler) so tonic-health doesn't fit.
 # axum on a separate port. K8s readinessProbe hits /readyz.
 axum = { workspace = true }
-scopeguard = "1"
+scopeguard = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 
@@ -60,4 +58,4 @@ figment = { workspace = true, features = ["test"] }
 [build-dependencies]
 # build.rs greps metric-emit literals for the emit→describe check.
 # Already transitive in Cargo.lock; zero new lockfile churn.
-regex = "1"
+regex = { workspace = true }

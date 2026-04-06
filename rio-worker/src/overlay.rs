@@ -301,6 +301,19 @@ fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> Result<()
         }
     }
 
+    // Remove the now-empty parent {base}/{build_id}/. Use remove_dir (not
+    // remove_dir_all) — if it's non-empty, one of the child removals above
+    // failed and we want that surfaced, not masked.
+    if let Some(build_dir) = merged.parent()
+        && let Err(e) = fs::remove_dir(build_dir)
+    {
+        tracing::warn!(
+            path = %build_dir.display(),
+            error = %e,
+            "failed to remove overlay build_dir during cleanup"
+        );
+    }
+
     Ok(())
 }
 

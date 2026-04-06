@@ -2,7 +2,9 @@
 name = "rio-test-support"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 description = "Test harness: ephemeral PostgreSQL, wire protocol helpers, mock gRPC services"
 
@@ -52,4 +54,4 @@ serde_json = { workspace = true }
 # metrics_grep self-test compiles the include!()-ed helper as a
 # cfg(test) module to unit-test grep_spec_names. emit_metrics_grep
 # (unused in the test, but compiled) references regex::Regex.
-regex = "1"
+regex = { workspace = true }

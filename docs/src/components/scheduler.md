@@ -651,7 +651,7 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
 - `rio-scheduler/src/db/` — PostgreSQL persistence (derivations, assignments, build_history EMA; split into 9 domain modules per P0411)
 - `rio-scheduler/src/logs/` — LogBuffers ring buffer + S3 LogFlusher
-- `rio-scheduler/src/lease.rs` — Kubernetes Lease leader-election loop (generation counter, is_leader flag, recovery_complete gate)
+- `rio-scheduler/src/lease/` — Kubernetes Lease leader-election loop (generation counter, is_leader flag, recovery_complete gate)
 - `rio-scheduler/src/actor/recovery.rs` — State recovery: reload non-terminal builds/derivations from PG on LeaderAcquired
 - `rio-scheduler/src/event_log.rs` — PostgreSQL-backed build_event_log writes for gateway `since_sequence` replay
 - `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs, TriggerGC)

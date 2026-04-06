@@ -28,9 +28,6 @@ rio-proto = { workspace = true }
 # (0.8 breaks #[derive(CustomResource)]). #[x_kube(validation=...)]
 # for CEL, not schemars extend.
 kube = { workspace = true }
-# Direct dep for CryptoProvider::install_default() in main.rs.
-# See workspace Cargo.toml for the ring-vs-aws-lc-rs rationale.
-rustls = { workspace = true }
 k8s-openapi = { workspace = true }
 
 # --- gRPC client (scheduler AdminService) ---
@@ -66,4 +63,4 @@ figment = { workspace = true, features = ["test"] }
 [build-dependencies]
 # build.rs greps metric-emit literals for the emit→describe check.
 # Already transitive in Cargo.lock; zero new lockfile churn.
-regex = "1"
+regex = { workspace = true }

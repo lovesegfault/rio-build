@@ -29,7 +29,6 @@ tonic-health = { workspace = true }
 # RIO_LEASE_NAME env — unset means non-K8s mode (generation stays
 # at 1, VM tests unaffected).
 kube = { workspace = true }
-rustls = { workspace = true }
 k8s-openapi = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
@@ -71,8 +70,8 @@ parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-store = { workspace = true }
 rio-test-support = { workspace = true }
-tracing-test = "0.2"
-aws-smithy-mocks = "0.2"
+tracing-test = { workspace = true }
+aws-smithy-mocks = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 # grpc/tests.rs trace_id header test: needs the tracing→OTel bridge so
 # #[instrument] spans get a real TraceId. Already transitive via rio-common
@@ -93,4 +92,4 @@ http = { workspace = true }
 # check in tests/metrics_registered.rs. Already transitive in Cargo.lock
 # (via tracing-subscriber etc.); promoting to direct build-dep is zero
 # new lockfile churn.
-regex = "1"
+regex = { workspace = true }
