@@ -51,13 +51,13 @@ const BUILDER_POOL_SETS_JSON: &str = r#"[
   {"name":"x86-64-kvm","systems":["x86_64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
    "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
-     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"96Gi"},
-                  "limits":{"cpu":"128","memory":"256Gi"}}}]},
+     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"62Gi"},
+                  "limits":{"cpu":"128","memory":"256Gi","ephemeral-storage":"96Gi"}}}]},
   {"name":"aarch64-kvm","systems":["aarch64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
    "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
-     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"96Gi"},
-                  "limits":{"cpu":"128","memory":"256Gi"}}}]}
+     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"62Gi"},
+                  "limits":{"cpu":"128","memory":"256Gi","ephemeral-storage":"96Gi"}}}]}
 ]"#;
 
 /// One FetcherPool per arch — `system="builtin"` FODs overflow to
@@ -78,6 +78,7 @@ pub async fn run(
     log_level: &str,
     tenant: Option<&str>,
     skip_preflight: bool,
+    no_hooks: bool,
 ) -> Result<()> {
     let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
         .context("no .rio-image-tag — run `cargo xtask k8s -p eks up --push` first")?;
@@ -168,7 +169,7 @@ pub async fn run(
     let (jwt_seed_b64, jwt_pubkey_b64) = jwt_keypair(&client).await?;
 
     // Subchart symlink (same requirement as dev apply).
-    ui::step("chart deps", || async { crate::k8s::shared::chart_deps() }).await?;
+    ui::step("chart deps", crate::k8s::shared::chart_deps).await?;
 
     // NLB annotations (previously a --set-json one-liner in bash).
     let nlb_ann = json!({
@@ -318,6 +319,13 @@ pub async fn run(
             .set("securityProfilesOperator.enabled", "false")
             .set("controller.seccompPreinstalled", "true")
             .wait(Duration::from_secs(600))
+            // AMI bring-up chicken-and-egg: the chart's post-install
+            // hook smoke-tests through the gateway, which needs working
+            // builder nodes, which need a validated AMI, which is what
+            // we're trying to deploy to test. --deploy-no-hooks skips
+            // the hook so the chart lands; operator runs `k8s smoke`
+            // manually once nodes are up.
+            .no_hooks(no_hooks)
             .run()
     })
     .await?;

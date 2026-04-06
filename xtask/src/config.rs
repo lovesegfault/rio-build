@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::sh;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct XtaskConfig {
     /// Path to the SSH pubkey used for gateway authorized_keys.
     /// Default: `~/.ssh/id_ed25519.pub`.

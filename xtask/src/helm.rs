@@ -124,6 +124,7 @@ pub struct Helm {
     sets: Vec<(String, String)>,
     set_jsons: Vec<(String, String)>,
     wait: Option<Duration>,
+    no_hooks: bool,
 }
 
 impl Helm {
@@ -137,6 +138,7 @@ impl Helm {
             sets: vec![],
             set_jsons: vec![],
             wait: None,
+            no_hooks: false,
         }
     }
 
@@ -170,6 +172,15 @@ impl Helm {
         self
     }
 
+    /// Skip pre/post-install and pre/post-upgrade hooks. Used by
+    /// `up --deploy-no-hooks` to break the AMI-bringup chicken-and-egg:
+    /// the chart's post-install smoke hook needs working nodes, but
+    /// validating a fresh AMI may need a chart deployed first.
+    pub fn no_hooks(mut self, v: bool) -> Self {
+        self.no_hooks = v;
+        self
+    }
+
     pub fn run(self) -> Result<()> {
         let sh = shell()?;
         let mut args = vec![
@@ -199,6 +210,9 @@ impl Helm {
                 "--timeout".into(),
                 format!("{}s", t.as_secs()),
             ]);
+        }
+        if self.no_hooks {
+            args.push("--no-hooks".into());
         }
         sh::run_sync(cmd!(sh, "helm {args...}"))
     }

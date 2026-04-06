@@ -3,12 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::task::JoinSet;
 
 use crate::config::XtaskConfig;
 use crate::{helm, kube, sh, ui};
@@ -180,6 +180,11 @@ pub struct UpOpts {
     /// Skip the pre-deploy cluster health check (eks).
     #[arg(long = "deploy-skip-preflight")]
     deploy_skip_preflight: bool,
+    /// Pass --no-hooks to helm upgrade — skips post-install/upgrade
+    /// hooks (smoke tests). For AMI bring-up where the hook needs
+    /// working nodes that don't exist yet.
+    #[arg(long = "deploy-no-hooks")]
+    deploy_no_hooks: bool,
     /// Cluster node count (kind only: 1 control + N-1 workers).
     #[arg(long = "provision-nodes", value_parser = clap::value_parser!(u8).range(1..))]
     provision_nodes: Option<u8>,
@@ -248,6 +253,7 @@ impl UpOpts {
             "--deploy-skip-preflight",
             Phase::Deploy
         );
+        req!(self.deploy_no_hooks, "--deploy-no-hooks", Phase::Deploy);
         req!(
             !matches!(self.ami_arch, AmiArch::All),
             "--ami-arch",
@@ -379,6 +385,27 @@ pub enum K8sCmd {
     /// `setsid nohup` left zombie session-manager-plugin tunnels.
     #[command(subcommand)]
     Stress(stress::StressCmd),
+    /// NixOS node AMI management (ADR-021). EKS-only — `up --ami`
+    /// builds + registers; this is the maintenance side.
+    #[command(subcommand)]
+    Ami(AmiCmd),
+}
+
+#[derive(Subcommand)]
+pub enum AmiCmd {
+    /// Deregister stale rio AMIs + delete their snapshots. "Stale" =
+    /// tagged `rio.build/ami`, NOT tagged `rio.build/ami-latest=true`,
+    /// older than `--older-than-days`. Dry-run by default.
+    Gc {
+        /// Minimum age in days. AMIs newer than this are kept even if
+        /// not latest (rollback window).
+        #[arg(long, default_value_t = 7)]
+        older_than_days: u64,
+        /// Actually deregister + delete. Without this, prints the
+        /// candidate set and exits.
+        #[arg(long = "no-dry-run")]
+        no_dry_run: bool,
+    },
 }
 
 #[derive(Args)]
@@ -404,7 +431,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
     };
     let p = provider::get(kind);
     match args.cmd {
-        K8sCmd::Up(opts) => run_up(&*p, kind, cfg, opts).await,
+        K8sCmd::Up(opts) => run_up(p, kind, cfg, opts).await,
         K8sCmd::Smoke => p.smoke(cfg).await,
         K8sCmd::Rollback { rev } => {
             let rev = if rev > 0 {
@@ -480,6 +507,17 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             .await
         }
         K8sCmd::Stress(cmd) => stress::run(cmd, &*p, kind, cfg).await,
+        K8sCmd::Ami(cmd) => {
+            if !matches!(kind, ProviderKind::Eks) {
+                bail!("`ami` is EKS-only (NixOS node AMI, ADR-021); pass -p eks");
+            }
+            match cmd {
+                AmiCmd::Gc {
+                    older_than_days,
+                    no_dry_run,
+                } => eks::ami::gc(older_than_days, !no_dry_run).await,
+            }
+        }
     }
 }
 
@@ -491,7 +529,12 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
 /// applicable here). Same distinction lets `validate_phase_opts`
 /// reject `--push --deploy-tenant foo` while accepting
 /// `--deploy-tenant foo` alone.
-async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOpts) -> Result<()> {
+async fn run_up(
+    p: Arc<dyn Provider>,
+    kind: ProviderKind,
+    cfg: &XtaskConfig,
+    o: UpOpts,
+) -> Result<()> {
     let selected = o.phases();
     // Explicit = at least one phase flag set. Passing all 7 flags is
     // intentionally treated as implicit (≡ no flags) — semantically
@@ -508,17 +551,18 @@ async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOp
         bail!("--ami is EKS-only (NixOS node AMI, ADR-021); pass -p eks");
     }
 
-    let log_level = o
-        .deploy_log_level
-        .clone()
-        .unwrap_or_else(|| cfg.log_level.clone());
     let pp = PhaseParams {
         yes: o.yes,
         nodes: o.provision_nodes.unwrap_or(3),
-        log_level: &log_level,
-        tenant: o.deploy_tenant.as_deref(),
+        log_level: o
+            .deploy_log_level
+            .clone()
+            .unwrap_or_else(|| cfg.log_level.clone()),
+        tenant: o.deploy_tenant.clone(),
         skip_preflight: o.deploy_skip_preflight,
+        no_hooks: o.deploy_no_hooks,
     };
+    let cfg = Arc::new(cfg.clone());
 
     // ami_branch is built here (not inside run_up_phases) because the
     // EKS-only gate needs `kind`, which the provider-agnostic core
@@ -540,7 +584,7 @@ async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOp
         }
     };
 
-    ui::step("k8s up", || async {
+    ui::step("k8s up", || async move {
         run_up_phases(p, cfg, &selected, pp, ami_branch, envoy_install()).await?;
         if !explicit {
             info!("all phases done — run `cargo xtask k8s -p {kind} smoke` to verify");
@@ -552,13 +596,16 @@ async fn run_up(p: &dyn Provider, kind: ProviderKind, cfg: &XtaskConfig, o: UpOp
 
 /// Per-phase knobs threaded through [`run_up_phases`]. Bundled so the
 /// concurrent-dispatch core has a stable test surface independent of
-/// `UpOpts` (which is clap-coupled).
-struct PhaseParams<'a> {
+/// `UpOpts` (which is clap-coupled). Owned + `Clone` so each spawned
+/// phase task can hold its own copy (`'static` for `tokio::spawn`).
+#[derive(Clone)]
+struct PhaseParams {
     yes: bool,
     nodes: u8,
-    log_level: &'a str,
-    tenant: Option<&'a str>,
+    log_level: String,
+    tenant: Option<String>,
     skip_preflight: bool,
+    no_hooks: bool,
 }
 
 /// Concurrent core of `up`: a ready-set DAG executor over
@@ -580,24 +627,35 @@ struct PhaseParams<'a> {
 /// without an EKS account or a live cluster. They are only awaited if
 /// their phase is in `selected`.
 ///
+/// **I-198 — per-phase `tokio::spawn`.** Each phase runs on its own
+/// tokio task (`JoinSet`), so a phase that blocks the calling thread
+/// (sync `sh::read`, `std::thread::sleep`, an SDK call that turns out
+/// to be blocking) parks ONE worker thread — siblings on other workers
+/// keep running. The earlier `FuturesUnordered` design polled every
+/// phase from a single task and depended on every phase being purely
+/// cooperative; one stray sync call serialized the whole DAG.
+/// `Provider: Send + Sync` and `Arc`-threaded `cfg`/`pp` give the
+/// `'static` bound `tokio::spawn` needs. Phases should still prefer
+/// `sh::run`/`run_read` (yield) over `sh::read`/`run_sync` (block) —
+/// each blocked phase ties up a runtime worker — but a slip is now a
+/// throughput cost, not a wall-clock-doubling stall.
+///
 /// `ui::step` is concurrency-aware (span-scoped depth, see ui.rs
 /// `DepthLayer`); interleaved ✓/✗ lines from concurrent phases render
 /// with correct indentation. The transient spinner is best-effort
 /// (last-enter-wins) — acceptable, the persistent tree is the record.
 async fn run_up_phases<A, E>(
-    p: &dyn Provider,
-    cfg: &XtaskConfig,
+    p: Arc<dyn Provider>,
+    cfg: Arc<XtaskConfig>,
     selected: &[Phase],
-    pp: PhaseParams<'_>,
+    pp: PhaseParams,
     ami_branch: A,
     envoy_branch: E,
 ) -> Result<()>
 where
-    A: Future<Output = Result<()>>,
-    E: Future<Output = Result<()>>,
+    A: Future<Output = Result<()>> + Send + 'static,
+    E: Future<Output = Result<()>> + Send + 'static,
 {
-    type PhaseFut<'a> = Pin<Box<dyn Future<Output = (Phase, Result<()>)> + 'a>>;
-
     // Per-phase unsatisfied-dep set, restricted to `selected`: a dep
     // the user didn't ask for is treated as already satisfied (so
     // `up --push --deploy` works without `--provision`).
@@ -615,77 +673,97 @@ where
         .collect();
     let mut started: HashSet<Phase> = HashSet::new();
     let mut failed: Vec<(Phase, anyhow::Error)> = Vec::new();
-    let mut running: FuturesUnordered<PhaseFut<'_>> = FuturesUnordered::new();
+    let mut running: JoinSet<(Phase, Result<()>)> = JoinSet::new();
     // Injected futures, taken exactly once when their phase dispatches.
     let mut ami = Some(ami_branch);
     let mut envoy = Some(envoy_branch);
 
     loop {
         // Spawn every selected phase whose pending-dep set is empty.
-        // FuturesUnordered borrows nothing of ours (the boxed futures
-        // borrow `p`/`cfg`/`pp`, all of which outlive `running`), so
-        // pushing here while results are still queued is fine.
+        // Each task owns clones of the Arcs/params it needs (`'static`
+        // for `tokio::spawn`) — nothing borrows from this stack frame.
         for &ph in selected {
             if started.contains(&ph) || !pending[&ph].is_empty() {
                 continue;
             }
             started.insert(ph);
-            let fut: PhaseFut<'_> = match ph {
+            match ph {
                 Phase::Bootstrap => {
-                    Box::pin(async move { (ph, ui::step("bootstrap", || p.bootstrap(cfg)).await) })
+                    let (p, cfg) = (p.clone(), cfg.clone());
+                    running.spawn(async move {
+                        (ph, ui::step("bootstrap", || p.bootstrap(&cfg)).await)
+                    });
                 }
                 Phase::Provision => {
+                    let (p, cfg) = (p.clone(), cfg.clone());
                     let (yes, nodes) = (pp.yes, pp.nodes);
-                    Box::pin(async move {
+                    running.spawn(async move {
                         (
                             ph,
-                            ui::step("provision", || p.provision(cfg, yes, nodes)).await,
+                            ui::step("provision", || p.provision(&cfg, yes, nodes)).await,
                         )
-                    })
+                    });
                 }
                 Phase::Kubeconfig => {
-                    Box::pin(
-                        async move { (ph, ui::step("kubeconfig", || p.kubeconfig(cfg)).await) },
-                    )
+                    let (p, cfg) = (p.clone(), cfg.clone());
+                    running.spawn(async move {
+                        (ph, ui::step("kubeconfig", || p.kubeconfig(&cfg)).await)
+                    });
                 }
                 Phase::Ami => {
                     let a = ami.take().expect("ami dispatched once");
                     // Caller already wraps in ui::step("ami", ..).
-                    Box::pin(async move { (ph, a.await) })
+                    running.spawn(async move { (ph, a.await) });
                 }
-                Phase::Push => Box::pin(async move {
-                    // build+push kept as one phase: build is fast and
-                    // local; not worth a typed-output channel between
-                    // DAG nodes for one edge.
-                    let r = async {
-                        let images = ui::step("build", || p.build(cfg)).await?;
-                        ui::step("push", || p.push(&images, cfg)).await
-                    }
-                    .await;
-                    (ph, r)
-                }),
+                Phase::Push => {
+                    let (p, cfg) = (p.clone(), cfg.clone());
+                    running.spawn(async move {
+                        // build+push kept as one phase: build is fast
+                        // and local; not worth a typed-output channel
+                        // between DAG nodes for one edge.
+                        let r = async {
+                            let images = ui::step("build", || p.build(&cfg)).await?;
+                            ui::step("push", || p.push(&images, &cfg)).await
+                        }
+                        .await;
+                        (ph, r)
+                    });
+                }
                 Phase::Deploy => {
-                    let (lvl, ten, skip) = (pp.log_level, pp.tenant, pp.skip_preflight);
-                    Box::pin(async move {
+                    let (p, cfg, pp) = (p.clone(), cfg.clone(), pp.clone());
+                    running.spawn(async move {
                         (
                             ph,
-                            ui::step("deploy", || p.deploy(cfg, lvl, ten, skip)).await,
+                            ui::step("deploy", || {
+                                p.deploy(
+                                    &cfg,
+                                    &pp.log_level,
+                                    pp.tenant.as_deref(),
+                                    pp.skip_preflight,
+                                    pp.no_hooks,
+                                )
+                            })
+                            .await,
                         )
-                    })
+                    });
                 }
                 Phase::Envoy => {
                     let e = envoy.take().expect("envoy dispatched once");
-                    Box::pin(async move { (ph, ui::step("envoy", || e).await) })
+                    running.spawn(async move { (ph, ui::step("envoy", || e).await) });
                 }
-            };
-            running.push(fut);
+            }
         }
 
-        // Drain one. `next()` never aborts the rest — in-flight phases
-        // run to completion regardless of what we do with the result.
-        let Some((ph, r)) = running.next().await else {
+        // Drain one. `join_next()` never aborts the rest — in-flight
+        // phases run to completion regardless of what we do with the
+        // result. JoinSet's Drop WOULD abort, but we only return after
+        // the loop exits (set empty), so every spawned task has joined.
+        let Some(joined) = running.join_next().await else {
             break; // nothing running, nothing ready ⇒ graph drained
         };
+        // JoinError = panic or cancel. We never cancel; surface a panic
+        // verbatim — the phase task is gone, no in-flight work to save.
+        let (ph, r) = joined.expect("phase task panicked");
         match r {
             // Success: clear this phase from every dependent's pending
             // set; next spawn pass picks up newly-ready phases.
@@ -803,13 +881,19 @@ where
 /// Envoy Gateway operator (dashboard gRPC-Web → gRPC+mTLS translation).
 /// Provider-agnostic — same helm chart, same namespace.
 async fn envoy_install() -> Result<()> {
-    let shell = sh::shell()?;
     let client = kube::client().await?;
 
-    let eg = sh::read(sh::cmd!(
-        shell,
-        "nix build --no-link --print-out-paths .#helm-envoy-gateway"
-    ))?;
+    // I-198: was sync sh::read — `nix build` can be multi-second and
+    // this runs as a DAG phase. run_read yields. Shell scoped tight
+    // (xshell::Shell is !Sync) so it isn't held across await.
+    let eg = {
+        let shell = sh::shell()?;
+        sh::run_read(sh::cmd!(
+            shell,
+            "nix build --no-link --print-out-paths .#helm-envoy-gateway"
+        ))
+    }
+    .await?;
 
     helm::Helm::upgrade_install("envoy-gateway", &eg)
         .namespace("envoy-gateway-system")
@@ -872,7 +956,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl Provider for MockProvider {
         fn context_matches(&self, _: &str) -> bool {
             unimplemented!()
@@ -908,7 +992,14 @@ mod tests {
             self.record("push");
             Ok(())
         }
-        async fn deploy(&self, _: &XtaskConfig, _: &str, _: Option<&str>, _: bool) -> Result<()> {
+        async fn deploy(
+            &self,
+            _: &XtaskConfig,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+            _: bool,
+        ) -> Result<()> {
             self.record("deploy");
             Ok(())
         }
@@ -930,14 +1021,19 @@ mod tests {
         }
     }
 
-    fn pp() -> PhaseParams<'static> {
+    fn pp() -> PhaseParams {
         PhaseParams {
             yes: true,
             nodes: 1,
-            log_level: "info",
+            log_level: "info".into(),
             tenant: None,
             skip_preflight: true,
+            no_hooks: false,
         }
+    }
+
+    fn cfg() -> Arc<XtaskConfig> {
+        Arc::new(XtaskConfig::default())
     }
 
     fn pos(log: &[&str], what: &str) -> usize {
@@ -951,8 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn up_phases_concurrent_ordering() {
         let log: Log = Arc::default();
-        let p = MockProvider::new(log.clone());
-        let cfg = XtaskConfig::default();
+        let p: Arc<dyn Provider> = Arc::new(MockProvider::new(log.clone()));
 
         let ami_log = log.clone();
         let ami = async move {
@@ -966,7 +1061,7 @@ mod tests {
             Ok(())
         };
 
-        run_up_phases(&p, &cfg, &Phase::ALL, pp(), ami, envoy)
+        run_up_phases(p, cfg(), &Phase::ALL, pp(), ami, envoy)
             .await
             .unwrap();
 
@@ -996,7 +1091,7 @@ mod tests {
         let mut p = MockProvider::new(log.clone());
         p.provision_delay = Duration::from_millis(50);
         let provision_done = p.provision_done.clone();
-        let cfg = XtaskConfig::default();
+        let p: Arc<dyn Provider> = Arc::new(p);
 
         // ami fails immediately — well before provision's 50ms sleep
         // completes. With try_join!, provision would be dropped here.
@@ -1004,8 +1099,8 @@ mod tests {
         let envoy = async { Ok(()) };
 
         let r = run_up_phases(
-            &p,
-            &cfg,
+            p,
+            cfg(),
             &[Phase::Bootstrap, Phase::Provision, Phase::Ami],
             pp(),
             ami,
@@ -1030,12 +1125,11 @@ mod tests {
     #[tokio::test]
     async fn up_phases_selection_subset() {
         let log: Log = Arc::default();
-        let p = MockProvider::new(log.clone());
-        let cfg = XtaskConfig::default();
+        let p: Arc<dyn Provider> = Arc::new(MockProvider::new(log.clone()));
 
         run_up_phases(
-            &p,
-            &cfg,
+            p,
+            cfg(),
             &[Phase::Push, Phase::Deploy],
             pp(),
             async { Ok(()) },
@@ -1059,11 +1153,11 @@ mod tests {
         p.provision_delay = Duration::from_millis(5);
         p.kubeconfig_delay = Duration::from_millis(30);
         p.push_delay = Duration::from_millis(30);
-        let cfg = XtaskConfig::default();
+        let p: Arc<dyn Provider> = Arc::new(p);
 
         run_up_phases(
-            &p,
-            &cfg,
+            p,
+            cfg(),
             &[
                 Phase::Bootstrap,
                 Phase::Provision,
@@ -1091,6 +1185,126 @@ mod tests {
         assert!(pos(&log, "provision") < pos(&log, "build"));
     }
 
+    /// I-198 regression. Each phase runs on its own tokio task
+    /// (`JoinSet::spawn`), so a phase that BLOCKS THE THREAD — raw
+    /// `std::thread::sleep`, sync `sh::read`, an SDK call that turns
+    /// out to be blocking — parks one runtime worker; the sibling on
+    /// another worker keeps running. ami parks for 200ms with NO
+    /// `spawn_blocking` / no yield; bootstrap (sibling, no deps,
+    /// instant) must still complete in <100ms.
+    ///
+    /// Under the old single-task `FuturesUnordered` executor this
+    /// would serialize: cooperative concurrency only — one parked
+    /// thread = no sibling polled. Option A (a6a1de7a) papered over it
+    /// by mandating `spawn_blocking` everywhere; this test only passes
+    /// with the structural fix (per-phase spawn).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn up_dag_raw_blocking_does_not_stall_sibling() {
+        let log: Log = Arc::default();
+        let bootstrap_at = Arc::new(Mutex::new(None::<Duration>));
+
+        let ami_log = log.clone();
+        let ami = async move {
+            ami_log.lock().unwrap().push("ami:start");
+            // Raw thread park — NO spawn_blocking, NO .await. Under
+            // FuturesUnordered this stalls every sibling.
+            std::thread::sleep(Duration::from_millis(200));
+            ami_log.lock().unwrap().push("ami");
+            Ok(())
+        };
+
+        let t0 = std::time::Instant::now();
+        // Wrap bootstrap to timestamp its completion. Ami is first in
+        // `selected` so it dispatches (and parks its worker) before
+        // bootstrap is spawned — if both ran on one task, bootstrap_at
+        // would be ≥200ms.
+        let p: Arc<dyn Provider> = Arc::new(TimestampBootstrap {
+            inner: MockProvider::new(log.clone()),
+            t0,
+            at: bootstrap_at.clone(),
+        });
+        run_up_phases(
+            p,
+            cfg(),
+            &[Phase::Ami, Phase::Bootstrap],
+            pp(),
+            ami,
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
+
+        let log = log.lock().unwrap();
+        let b_at = bootstrap_at.lock().unwrap().expect("bootstrap ran");
+        // Bootstrap completed while ami's worker was parked. 100ms
+        // slack for CI jitter; failure mode is ≥200ms.
+        assert!(
+            b_at < Duration::from_millis(100),
+            "bootstrap serialized behind ami's blocking work: {b_at:?} (log: {log:?})"
+        );
+        // bootstrap finished before ami's 200ms sleep returned —
+        // holds regardless of which task the runtime schedules first.
+        assert!(pos(&log, "bootstrap") < pos(&log, "ami"), "log: {log:?}");
+        assert!(log.contains(&"ami:start"), "log: {log:?}");
+    }
+
+    /// Wraps a MockProvider to timestamp bootstrap completion.
+    struct TimestampBootstrap {
+        inner: MockProvider,
+        t0: std::time::Instant,
+        at: Arc<Mutex<Option<Duration>>>,
+    }
+
+    #[async_trait]
+    impl Provider for TimestampBootstrap {
+        fn context_matches(&self, c: &str) -> bool {
+            self.inner.context_matches(c)
+        }
+        async fn bootstrap(&self, c: &XtaskConfig) -> Result<()> {
+            self.inner.bootstrap(c).await?;
+            *self.at.lock().unwrap() = Some(self.t0.elapsed());
+            Ok(())
+        }
+        async fn provision(&self, c: &XtaskConfig, a: bool, n: u8) -> Result<()> {
+            self.inner.provision(c, a, n).await
+        }
+        async fn kubeconfig(&self, c: &XtaskConfig) -> Result<()> {
+            self.inner.kubeconfig(c).await
+        }
+        async fn build(&self, c: &XtaskConfig) -> Result<provider::BuiltImages> {
+            self.inner.build(c).await
+        }
+        async fn push(&self, i: &provider::BuiltImages, c: &XtaskConfig) -> Result<()> {
+            self.inner.push(i, c).await
+        }
+        async fn deploy(
+            &self,
+            c: &XtaskConfig,
+            l: &str,
+            t: Option<&str>,
+            s: bool,
+            h: bool,
+        ) -> Result<()> {
+            self.inner.deploy(c, l, t, s, h).await
+        }
+        async fn smoke(&self, _: &XtaskConfig) -> Result<()> {
+            unimplemented!()
+        }
+        async fn tunnel(&self, _: u16) -> Result<shared::ProcessGuard> {
+            unimplemented!()
+        }
+        async fn tunnel_grpc(
+            &self,
+            _: u16,
+            _: u16,
+        ) -> Result<((u16, shared::ProcessGuard), (u16, shared::ProcessGuard))> {
+            unimplemented!()
+        }
+        async fn destroy(&self, _: &XtaskConfig) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
     /// A failed phase poisons its dependents but NOT its siblings.
     /// push errors immediately; kubeconfig (sibling — same dep,
     /// independent of push) is mid-flight and runs to completion;
@@ -1101,11 +1315,11 @@ mod tests {
         let mut p = MockProvider::new(log.clone());
         p.kubeconfig_delay = Duration::from_millis(20);
         p.push_err = true;
-        let cfg = XtaskConfig::default();
+        let p: Arc<dyn Provider> = Arc::new(p);
 
         let r = run_up_phases(
-            &p,
-            &cfg,
+            p,
+            cfg(),
             // Ami unselected → pre-satisfied, so deploy's only blockers
             // are kubeconfig+push.
             &[

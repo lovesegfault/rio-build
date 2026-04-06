@@ -1,5 +1,7 @@
 //! Provider abstraction: same command surface, different backing cluster.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use tempfile::TempDir;
@@ -33,11 +35,15 @@ impl std::fmt::Display for ProviderKind {
     }
 }
 
-// ?Send: xshell::Shell uses RefCell (not Sync), and providers hold
-// Shell across awaits. We never spawn providers to other threads —
-// everything runs on the main tokio runtime — so Send isn't needed.
-#[async_trait(?Send)]
-pub trait Provider {
+// Send + Sync: `run_up_phases` (I-198) spawns each phase on its own
+// tokio task so a synchronously-blocking phase can't stall siblings.
+// `tokio::spawn` needs `'static + Send`, which means `Arc<dyn Provider
+// + Send + Sync>`. xshell::Shell is `!Sync` (RefCell internals) — impls
+// scope `Shell` so its `&`-borrow never crosses an `.await` (the
+// `sh::run`/`run_read` wrappers convert `Cmd<'_>` → owned `Command`
+// synchronously and return a `Send + use<>` future).
+#[async_trait]
+pub trait Provider: Send + Sync {
     /// True if `ctx` (from `kubectl config current-context`) looks
     /// like it belongs to this provider. Used by `status` to guard
     /// against `-p kind` reading an EKS kubeconfig.
@@ -65,13 +71,17 @@ pub trait Provider {
     /// `tenant` overrides the authorized_keys comment (→ gateway's
     /// `tenant_name`); `None` falls through to RIO_SSH_TENANT then
     /// `ssh::DEFAULT_TENANT`. `skip_preflight` bypasses the pre-deploy
-    /// cluster health check (EKS-only; kind/k3s ignore it).
+    /// cluster health check (EKS-only; kind/k3s ignore it). `no_hooks`
+    /// passes `--no-hooks` to helm — skips post-install/upgrade hooks
+    /// (smoke tests etc.) for AMI bring-up where the hook itself needs
+    /// the thing being brought up.
     async fn deploy(
         &self,
         cfg: &XtaskConfig,
         log_level: &str,
         tenant: Option<&str>,
         skip_preflight: bool,
+        no_hooks: bool,
     ) -> Result<()>;
 
     /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (kind/k3s).
@@ -103,10 +113,10 @@ pub trait Provider {
     async fn destroy(&self, cfg: &XtaskConfig) -> Result<()>;
 }
 
-pub fn get(kind: ProviderKind) -> Box<dyn Provider> {
+pub fn get(kind: ProviderKind) -> Arc<dyn Provider> {
     match kind {
-        ProviderKind::Kind => Box::new(super::kind::Kind),
-        ProviderKind::K3s => Box::new(super::k3s::K3s),
-        ProviderKind::Eks => Box::new(super::eks::Eks),
+        ProviderKind::Kind => Arc::new(super::kind::Kind),
+        ProviderKind::K3s => Arc::new(super::k3s::K3s),
+        ProviderKind::Eks => Arc::new(super::eks::Eks),
     }
 }

@@ -20,7 +20,7 @@ pub const TF_DIR: &str = "infra/eks";
 
 pub struct Eks;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Provider for Eks {
     fn context_matches(&self, ctx: &str) -> bool {
         // `aws eks update-kubeconfig` names the context
@@ -64,8 +64,9 @@ impl Provider for Eks {
         log_level: &str,
         tenant: Option<&str>,
         skip_preflight: bool,
+        no_hooks: bool,
     ) -> Result<()> {
-        deploy::run(cfg, log_level, tenant, skip_preflight).await
+        deploy::run(cfg, log_level, tenant, skip_preflight, no_hooks).await
     }
 
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()> {

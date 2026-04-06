@@ -26,7 +26,7 @@ jobs:
     runs-on: rio-ci
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
       - name: Build golden matrix with bumped unstable inputs
         run: |
@@ -59,7 +59,7 @@ jobs:
     # silently. mutants runs against locked inputs, unaffected by upstream.
     if: always() && !cancelled()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-nix
       - run: nix build .#mutants --print-build-logs
       # Surface the trend metric in the job summary. The

@@ -158,18 +158,39 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
         bail!("{} push(es) failed: {}", failed.len(), failed.join(" "));
     }
 
-    // Manifest lists (OCI image index) per image. Sequential — small
-    // metadata-only PUTs, ~1s each.
+    // Manifest lists (OCI image index) per image. Parallel — each is
+    // an independent metadata-only PUT (~1s); ~6 images well under
+    // ECR's ~10 req/s PutImage limit so no concurrency cap. Same
+    // collect-all-errors discipline as the skopeo JoinSet above.
+    let mut joinset = JoinSet::new();
     for name in &names {
-        ui::step(&format!("manifest rio-{name}:{tag}"), || async {
-            let sh = shell()?;
-            crate::sh::run(cmd!(
-                sh,
-                "manifest-tool --docker-cfg {docker_cfg} push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
-            ))
-            .await
-        })
-        .await?;
+        let (name, tag, ecr, docker_cfg) =
+            (name.clone(), tag.clone(), ecr.clone(), docker_cfg.clone());
+        joinset.spawn(ui::step_owned(
+            format!("manifest rio-{name}:{tag}"),
+            async move {
+                // Shell scoped tight (xshell::Shell is !Sync) so the
+                // spawned future stays Send.
+                let fut = {
+                    let sh = shell()?;
+                    crate::sh::run(cmd!(
+                        sh,
+                        "manifest-tool --docker-cfg {docker_cfg} push from-args --platforms linux/amd64,linux/arm64 --template {ecr}/rio-{name}:{tag}-ARCH --target {ecr}/rio-{name}:{tag}"
+                    ))
+                };
+                fut.await.with_context(|| format!("manifest rio-{name}"))
+            },
+        ));
+    }
+    let mut failed = vec![];
+    while let Some(res) = joinset.join_next().await {
+        if let Err(e) = res? {
+            ui::eprint(format_args!("  {e:#}\n"));
+            failed.push(e);
+        }
+    }
+    if !failed.is_empty() {
+        bail!("{} manifest push(es) failed", failed.len());
     }
 
     info!(
@@ -182,7 +203,6 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
 }
 
 async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
-    let sh = shell()?;
     let attrs: Vec<String> = ARCHES
         .iter()
         .map(|(sys, _)| format!(".#packages.{sys}.dockerImages"))
@@ -208,13 +228,16 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     // `nix path-info` re-eval can disagree with the build's eval under
     // `--eval-store auto --store remote` — ask the build itself.
     let (sa, at) = (&store_args, &attrs);
-    let out_paths = ui::step("nix build (multi-arch)", || {
+    // Shell scoped so `&Shell` (`!Sync`) drops before the await — keeps
+    // this future `Send` for the per-phase `tokio::spawn` (I-198).
+    let build = {
+        let sh = shell()?;
         crate::sh::run_read(cmd!(
             sh,
             "nix build -L --no-link --print-out-paths {sa...} {at...}"
         ))
-    })
-    .await?;
+    };
+    let out_paths = ui::step("nix build (multi-arch)", || build).await?;
     let paths: Vec<&str> = out_paths.lines().collect();
     anyhow::ensure!(
         paths.len() == ARCHES.len(),
@@ -225,10 +248,11 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
 
     if let Some(remote) = &cfg.remote_store {
         let p = &paths;
-        ui::step(&format!("nix copy from {remote}"), || {
+        let copy = {
+            let sh = shell()?;
             crate::sh::run(cmd!(sh, "nix copy --from {remote} --no-check-sigs {p...}"))
-        })
-        .await?;
+        };
+        ui::step(&format!("nix copy from {remote}"), || copy).await?;
     }
 
     for ((_, arch), path) in ARCHES.iter().zip(&paths) {

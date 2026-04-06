@@ -22,7 +22,7 @@ pub const CLUSTER: &str = "rio-dev";
 
 pub struct Kind;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Provider for Kind {
     fn context_matches(&self, ctx: &str) -> bool {
         ctx == format!("kind-{CLUSTER}")
@@ -34,10 +34,11 @@ impl Provider for Kind {
     }
 
     async fn provision(&self, _cfg: &XtaskConfig, _auto: bool, nodes: u8) -> Result<()> {
-        let sh = shell()?;
-
         // Idempotent: skip create if the cluster already exists.
-        let existing = sh::read(cmd!(sh, "kind get clusters"))?;
+        let existing = {
+            let sh = shell()?;
+            sh::read(cmd!(sh, "kind get clusters"))?
+        };
         if existing.lines().any(|l| l.trim() == CLUSTER) {
             ui::step_skip("kind create cluster", "already exists");
         } else {
@@ -46,13 +47,16 @@ impl Provider for Kind {
             std::fs::write(cfg_file.path(), &cfg)?;
             let cfg_path = cfg_file.path().to_str().unwrap();
 
-            ui::step(&format!("kind create cluster ({nodes} nodes)"), || {
+            // Shell scoped so `&Shell` (`!Sync`) drops before the await
+            // — keeps this future `Send` (I-198 per-phase spawn).
+            let create = {
+                let sh = shell()?;
                 sh::run(cmd!(
                     sh,
                     "kind create cluster --name {CLUSTER} --config {cfg_path} --wait 120s"
                 ))
-            })
-            .await?;
+            };
+            ui::step(&format!("kind create cluster ({nodes} nodes)"), || create).await?;
         }
 
         // Docker defaults kind node containers to PidsLimit ~2048. On
@@ -63,6 +67,7 @@ impl Provider for Kind {
         // only controls POD cgroups, not the node container itself.
         // Idempotent: runs on both fresh and existing clusters.
         ui::step("raise node pids limit", || async {
+            let sh = shell()?;
             let containers = sh::read(cmd!(
                 sh,
                 "docker ps --filter label=io.x-k8s.kind.cluster={CLUSTER} -q"
@@ -75,6 +80,7 @@ impl Provider for Kind {
         .await?;
 
         ui::step("kubeconfig", || async {
+            let sh = shell()?;
             let dst = sh::kubeconfig_path();
             std::fs::create_dir_all(dst.parent().unwrap())?;
             let dst_s = dst.to_str().unwrap();
@@ -111,10 +117,11 @@ impl Provider for Kind {
         log_level: &str,
         tenant: Option<&str>,
         _skip_preflight: bool,
+        _no_hooks: bool,
     ) -> Result<()> {
         let client = kube::client().await?;
 
-        ui::step("chart deps", || async { shared::chart_deps() }).await?;
+        ui::step("chart deps", shared::chart_deps).await?;
         ui::step("apply CRDs", || kube::apply_crds(&client)).await?;
 
         ui::step("namespaces + ssh secret", || async {
@@ -181,11 +188,11 @@ impl Provider for Kind {
     }
 
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
-        let sh = shell()?;
-        ui::step("kind delete cluster", || {
+        let delete = {
+            let sh = shell()?;
             sh::run(cmd!(sh, "kind delete cluster --name {CLUSTER}"))
-        })
-        .await
+        };
+        ui::step("kind delete cluster", || delete).await
     }
 }
 

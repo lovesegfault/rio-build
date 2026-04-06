@@ -41,6 +41,7 @@
 let
   inherit (fixture) ns;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
+  jq = "${pkgs.jq}/bin/jq";
 
   # 60s build: long enough to span one full failover cycle (kill +
   # ~15s observed-ttl steal + gateway balanced-channel reprobe ~3s +
@@ -48,6 +49,14 @@ let
   # time; leader failover just churns the control-plane stream.
   failoverDrv = drvs.mkTrivial {
     marker = "leader-failover";
+    sleepSecs = 60;
+  };
+
+  # Distinct marker → distinct drv hash. failoverDrv is already built
+  # by the time sigkill-mid-build runs (subtests order); a reused drv
+  # would cache-hit and complete instantly — no mid-build window.
+  sigkillDrv = drvs.mkTrivial {
+    marker = "leader-sigkill";
     sleepSecs = 60;
   };
 
@@ -474,6 +483,203 @@ let
               f"build returned {bg.get('out')!r}, expected a store path. "
               f"Build succeeded from the worker's perspective but the "
               f"result didn't propagate back through the new leader?"
+          )
+    '';
+
+    sigkill-mid-build = ''
+      # ══════════════════════════════════════════════════════════════════
+      # sigkill-mid-build — TRUE ungraceful death: SIGKILL host PID
+      # ══════════════════════════════════════════════════════════════════
+      # Gap closed: every other subtest goes through kubectl delete.
+      # Even `--grace-period=0 --force` sends SIGTERM before SIGKILL
+      # (kubelet behavior), and post-a5b06ef step_down() wins that race
+      # → holderIdentity cleared → standby acquires via empty-holder
+      # fast path. NOTHING tested the no-FIN, no-step_down path: process
+      # vanishes mid-build (OOM-kill, kernel panic, node hard-reset).
+      #
+      # Mechanism: crictl resolves the leader container's host-namespace
+      # PID; `kill -9` from the node bypasses kubelet entirely. No
+      # SIGTERM, no graceful shutdown hooks, no TCP FIN — sockets go
+      # half-open until peer keepalive/h2-ping fires. Kubelet detects
+      # the container exit and restarts it in-place (Deployment pods
+      # are restartPolicy=Always); pod object survives, restartCount
+      # increments. This is "old leader dies, NEW process in same pod"
+      # — distinct from `kubectl delete` which evicts the pod and
+      # spawns a fresh one (restartCount=0).
+      #
+      # Expected lease behavior (election.rs decide()):
+      #   - Restarted container has same HOSTNAME → same holder_id.
+      #     First tick: GET shows holder == our_id → Decision::Renew
+      #     → replace(steal=false). leaseTransitions UNCHANGED. The
+      #     standby sees rv bump on that renew, resets its observed
+      #     clock, never reaches TTL.
+      #   - UNLESS kubelet restart + scheduler init takes >TTL=15s
+      #     (CrashLoopBackOff, slow image pull): standby's observed-rv
+      #     stays unchanged for TTL → Decision::Steal → tx +1.
+      # Either is correct. Assert tx delta ∈ {0, 1} and the build
+      # completes regardless. The same-pod-resume path (delta=0) is the
+      # production OOM-kill path; the standby-steal path (delta=1) is
+      # the ONLY test of observed-record-expiry steal — `failover`
+      # above doesn't reach it because step_down wins.
+      #
+      # Ordering: runs AFTER build-during-failover in vm-le-build-k3s.
+      # sshKeySetup/seedBusybox already done (ssh-keygen is not
+      # idempotent — don't re-run). `import threading` already loaded.
+      k3s_server.wait_until_succeeds(
+          "test \"$(k3s kubectl -n ${ns} get deploy rio-scheduler "
+          "-o jsonpath='{.status.readyReplicas}')\" = 2",
+          timeout=120,
+      )
+      k3s_server.wait_until_succeeds(
+          "k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+          "-o jsonpath='{.spec.holderIdentity}' | grep -q rio-scheduler",
+          timeout=30,
+      )
+
+      with subtest("sigkill-mid-build: SIGKILL leader host-PID, build survives"):
+          old_leader = leader_pod()
+          tx_before = lease_transitions()
+          rc_before = int(kubectl(
+              f"get pod {old_leader} "
+              f"-o jsonpath='{{.status.containerStatuses[0].restartCount}}'"
+          ).strip() or "0")
+
+          bg = {}
+          def _bg():
+              try:
+                  bg["out"] = client.succeed(
+                      "nix-build --no-out-link "
+                      "--store 'ssh-ng://k3s-server' "
+                      "--arg busybox '(builtins.storePath ${common.busybox})' "
+                      "${sigkillDrv}"
+                  ).strip()
+              except Exception as e:
+                  bg["err"] = e
+          bg_thread = threading.Thread(target=_bg, daemon=True)
+          bg_thread.start()
+
+          # Wait for dispatch — same metric probe as build-during-failover.
+          # leader_pod() inside the shell pipeline (not old_leader): the
+          # prior subtest's failover may have moved leadership; re-read
+          # at probe time.
+          k3s_server.wait_until_succeeds(
+              "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "  -o jsonpath='{.spec.holderIdentity}') && "
+              'test -n "$leader" && '
+              "k3s kubectl get --raw "
+              '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
+              "| grep -E '^rio_scheduler_derivations_running [1-9]'",
+              timeout=30,
+          )
+
+          # Re-read leader AFTER dispatch confirmed (build-during-failover
+          # may have churned it; old_leader above was a best-effort early
+          # snapshot for the diagnostic — refresh tx/rc to match).
+          old_leader = leader_pod()
+          tx_before = lease_transitions()
+          rc_before = int(kubectl(
+              f"get pod {old_leader} "
+              f"-o jsonpath='{{.status.containerStatuses[0].restartCount}}'"
+          ).strip() or "0")
+
+          # ── crictl → host PID → kill -9 (netpol.nix pattern) ──────────
+          # antiAffinity (asserted in vm-le-stability) puts exactly one
+          # scheduler per node, so kill -9 on the leader's node hits ONLY
+          # the leader. Still resolve via crictl for surgical precision —
+          # pkill -f would also match e.g. a kubectl exec shell.
+          node_name = kubectl(
+              f"get pod {old_leader} -o jsonpath='{{.spec.nodeName}}'"
+          ).strip()
+          host_vm = k3s_agent if node_name == "k3s-agent" else k3s_server
+          cid = host_vm.succeed(
+              f"k3s crictl ps -q "
+              f"--label io.kubernetes.pod.name={old_leader} | head -1"
+          ).strip()
+          assert cid, f"no running container for leader {old_leader}"
+          host_pid = host_vm.succeed(
+              f"k3s crictl inspect {cid} | ${jq} -r .info.pid"
+          ).strip()
+          assert host_pid and host_pid != "0", (
+              f"crictl inspect returned bad pid: {host_pid!r}"
+          )
+          print(f"sigkill: leader={old_leader} on {node_name}, "
+                f"host-pid={host_pid}, tx={tx_before}, rc={rc_before}")
+          host_vm.succeed(f"kill -9 {host_pid}")
+
+          # ── kubelet restarted the container in-place ──────────────────
+          # Proves we hit the crash path (pod survives, restartCount+1)
+          # not the pod-evict path (new pod, rc=0). Kubelet container
+          # status sync is ~1s; restart backoff is 0 on first crash.
+          k3s_server.wait_until_succeeds(
+              f"test \"$(k3s kubectl -n ${ns} get pod {old_leader} "
+              f"-o jsonpath='{{.status.containerStatuses[0].restartCount}}')\" "
+              f"-gt {rc_before}",
+              timeout=30,
+          )
+
+          # ── leadership recovered within TTL + slack ───────────────────
+          # holderIdentity is NEVER cleared on this path (no step_down).
+          # It stays = old_leader the whole time; what changes is WHO is
+          # renewing it. renew_age_secs() going fresh again proves a live
+          # process (restarted container OR standby post-steal) is
+          # writing. TTL=15s + 5s poll + init slack → 30s.
+          k3s_server.wait_until_succeeds(
+              "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+              "-o jsonpath='{.spec.holderIdentity}'); "
+              'test -n "$h"',
+              timeout=30,
+          )
+          # And renewing (not just a stale holder string).
+          for _ in range(6):
+              if renew_age_secs() < 10:
+                  break
+              k3s_server.sleep(5)
+          age = renew_age_secs()
+          assert age < 10, (
+              f"renewTime is {age}s old after SIGKILL+restart. "
+              f"No process is renewing the lease — restarted container "
+              f"stuck before first tick, AND standby didn't TTL-steal?"
+          )
+
+          new_leader = leader_pod()
+          tx_after = lease_transitions()
+          delta = tx_after - tx_before
+          # delta=0: same pod resumed via Renew (holder==our_id branch,
+          #   election.rs:119-124). Production OOM-kill path.
+          # delta=1: standby TTL-stole (observed-record expiry,
+          #   election.rs:128-138). Restart took >15s.
+          assert delta in (0, 1), (
+              f"leaseTransitions {tx_before}→{tx_after} (delta={delta}). "
+              f">1 = leadership bounced; <0 = impossible."
+          )
+          path = (
+              "same-pod-resume (Renew, holder==our_id)"
+              if delta == 0 else
+              "standby-steal (observed-rv expiry)"
+          )
+          if delta == 0:
+              assert new_leader == old_leader, (
+                  f"tx unchanged but holder moved {old_leader}→{new_leader}? "
+                  f"Steal without leaseTransitions++ — election.rs:310 broken?"
+              )
+          print(f"sigkill: recovered via {path}, leader={new_leader}")
+
+          # ── build survived ────────────────────────────────────────────
+          # 60s sleep + (0-20s lease recovery) + gateway balanced-channel
+          # reprobe ~3s + worker relay reconnect. Gateway/worker saw the
+          # gRPC stream drop with NO GOAWAY (process vanished) — h2
+          # keepalive (project_heartbeat_zombie I-048) is what detects it.
+          bg_thread.join(timeout=180)
+          assert not bg_thread.is_alive(), (
+              "build thread did not finish within 180s after SIGKILL. "
+              "h2 keepalive never fired? Gateway stuck on half-open "
+              "socket to dead leader? Worker relay buffer lost?"
+          )
+          if "err" in bg:
+              dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")
+              raise bg["err"]
+          assert bg.get("out", "").startswith("/nix/store/"), (
+              f"build returned {bg.get('out')!r}, expected a store path"
           )
     '';
 

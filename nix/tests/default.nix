@@ -723,7 +723,20 @@ in
   vm-le-build-k3s = leMod.mkTest {
     name = "build";
     # r[verify sched.lease.non-blocking-acquire]
-    subtests = [ "build-during-failover" ];
+    subtests = [
+      "build-during-failover"
+      # r[verify sched.lease.k8s-lease]
+      # r[verify sched.lease.generation-fence]
+      #   True ungraceful death: SIGKILL the leader's host PID via
+      #   crictl (no SIGTERM, no step_down, no FIN). Kubelet restarts
+      #   the container in-place; restarted process sees holder==our_id
+      #   → Renew (tx+0), OR standby observed-rv-expiry steals (tx+1)
+      #   if restart >TTL. The `failover` subtest does NOT reach the
+      #   observed-record-expiry branch — step_down wins the SIGTERM
+      #   race post-a5b06ef. Ordered after build-during-failover:
+      #   reuses its sshKeySetup (ssh-keygen is not idempotent).
+      "sigkill-mid-build"
+    ];
   };
 
   # r[verify sched.admin.create-tenant]

@@ -573,7 +573,16 @@ const NIX_CONFIG: &str = "experimental-features = nix-command flakes ca-derivati
 /// — no `nix eval` needed, no writable /nix/var needed. Locally (outside
 /// `nix build .#nextest`), the env var is unset and we fall back to
 /// `nix eval` + `builtins.toFile`.
+///
+/// Cached: called once per daemon spawn (register_fixture_paths) AND once
+/// per test body. Under `cargo test` (single process) the OnceLock saves
+/// N-1 subprocess calls; under nextest (process-per-test) it saves one.
 pub fn build_test_path() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(build_test_path_uncached).clone()
+}
+
+fn build_test_path_uncached() -> String {
     if let Ok(p) = std::env::var("RIO_GOLDEN_TEST_PATH") {
         assert!(
             std::path::Path::new(&p).exists(),
@@ -611,7 +620,14 @@ pub fn build_test_path() -> String {
 /// In hermetic CI, `RIO_GOLDEN_CA_PATH` is set by flake.nix to a
 /// fixed-output derivation path (FODs don't need ca-derivations, so this
 /// builds anywhere). Locally, fall back to building a CA derivation.
+///
+/// Cached for the same reason as [`build_test_path`].
 pub fn build_ca_test_path() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(build_ca_test_path_uncached).clone()
+}
+
+fn build_ca_test_path_uncached() -> String {
     if let Ok(p) = std::env::var("RIO_GOLDEN_CA_PATH") {
         assert!(
             std::path::Path::new(&p).exists(),
@@ -620,10 +636,16 @@ pub fn build_ca_test_path() -> String {
         return p;
     }
 
-    // --no-substitute: remote ssh-ng substituters may not implement
-    // wopQueryRealisation (CA query opcode), failing with "unimplemented
-    // worker op". The fixture derivation is trivial and builds in <1s
-    // locally, so skip substituter queries entirely.
+    // Fixed-output derivation (FOD) — same outputHash as flake.nix's
+    // goldenCaPath so the store path is identical in both environments.
+    // FODs are content-addressed (`ca = "fixed:sha256:..."` in path-info)
+    // WITHOUT needing the ca-derivations experimental feature, so this
+    // builds against any host daemon. The earlier `__contentAddressed =
+    // true` form required ca-derivations on the host daemon, which dev
+    // shells can't assume.
+    //
+    // --no-substitute: the fixture derivation is trivial and builds in
+    // <1s locally; skip substituter queries entirely.
     let output = std::process::Command::new("nix")
         .env("NIX_CONFIG", NIX_CONFIG)
         .args([
@@ -638,9 +660,9 @@ pub fn build_ca_test_path() -> String {
                 builder = "/bin/sh";
                 args = ["-c" "echo -n ca-golden-test-data > $out"];
                 system = builtins.currentSystem;
-                __contentAddressed = true;
                 outputHashMode = "flat";
                 outputHashAlgo = "sha256";
+                outputHash = "sha256-ZofhPTz/XO99Dn3kQMcBaG3vHoMFiD9kHTTtuvf2KNM=";
             }"#,
         ])
         .output()
@@ -664,129 +686,44 @@ pub fn build_ca_test_path() -> String {
 /// Uses `nix-store --dump` (legacy command, no state dir needed — works in
 /// hermetic sandboxes) + in-process SHA-256. Our golden fixture paths have
 /// no deriver, no references, no signatures, so we leave those
-/// empty/default. The `ca` field is computed from the file content for FOD-
-/// style paths, or passed explicitly for paths where we know it.
+/// empty/default. The `ca` field is computed from the file content for the
+/// FOD fixture path.
 ///
-/// If the env var fixtures are unset, falls back to `nix path-info --json`
-/// (needs working Nix state) for non-trivial paths the caller didn't
-/// precompute.
+/// This must agree with what [`register_fixture_paths`] writes into the
+/// daemon's db via `--load-db` (also no deriver/sigs/refs), so that the
+/// MockStore seeded from this entry returns the same fields the daemon
+/// does. The daemon is always given a fresh hermetic db (see
+/// [`start_local_daemon`]), so there is no host-db fallback to reconcile
+/// with — both sides are computed from the NAR.
 pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
     use rio_nix::hash::{HashAlgo, NixHash};
 
-    // In hermetic sandboxes (no /nix/var/nix/db), start_local_daemon()
-    // registers fixture paths via --load-db with NO deriver/sigs/ca —
-    // compute matching metadata here. Outside sandboxes (real db exists),
-    // the daemon symlinks the real db and knows the REAL deriver/sigs,
-    // so we must query via `nix path-info` to match. This condition
-    // mirrors the linked_db check in start_local_daemon().
-    //
-    // RIO_GOLDEN_FORCE_HERMETIC: escape hatch for CI environments where
-    // /nix/var/nix/db exists but is unusable (e.g. ARC runner containers
-    // with sandbox disabled — the db is visible but locked by the host
-    // daemon). flake.nix sets this in the nextest check derivation.
-    let hermetic = std::env::var_os("RIO_GOLDEN_FORCE_HERMETIC").is_some()
-        || !std::path::Path::new("/nix/var/nix/db").exists();
-    let is_fixture = std::env::var("RIO_GOLDEN_TEST_PATH")
-        .map(|p| p == store_path)
-        .unwrap_or(false)
-        || std::env::var("RIO_GOLDEN_CA_PATH")
-            .map(|p| p == store_path)
-            .unwrap_or(false);
+    let nar = dump_nar(store_path);
+    let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar).to_sri();
+    let nar_size = nar.len() as u64;
 
-    if hermetic && is_fixture {
-        let nar = dump_nar(store_path);
-        let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar).to_sri();
-        let nar_size = nar.len() as u64;
-
-        // For FOD-style paths (our goldenCaPath), ca = "fixed:sha256:<nixbase32>"
-        // of the flat file content. For writeText paths (our goldenTestPath),
-        // Nix registers no ca (it's derivation-built, not CA-addressed).
-        let ca = if std::env::var("RIO_GOLDEN_CA_PATH").as_deref() == Ok(store_path) {
-            let content = std::fs::read(store_path).expect("read ca fixture content");
-            let flat_hash = NixHash::compute(HashAlgo::SHA256, &content);
-            Some(format!("fixed:{}", flat_hash.to_colon()))
-        } else {
-            None
-        };
-
-        return StorePathEntry {
-            path: store_path.to_string(),
-            deriver: None,
-            nar_hash,
-            references: vec![],
-            // reg_time is skipped in conformance comparisons anyway.
-            registration_time: 0,
-            nar_size,
-            ultimate: false,
-            sigs: vec![],
-            ca,
-        };
-    }
-
-    // Fallback: local dev path — use `nix path-info`.
-    let output = std::process::Command::new("nix")
-        .env("NIX_CONFIG", NIX_CONFIG)
-        .args(["path-info", "--json", store_path])
-        .output()
-        .expect("nix path-info must succeed");
-    assert!(
-        output.status.success(),
-        "nix path-info failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("valid JSON from nix path-info");
-
-    // nix path-info --json returns { "/nix/store/...": { ... } }
-    let info = json
-        .as_object()
-        .and_then(|m| m.get(store_path))
-        .and_then(|v| v.as_object())
-        .unwrap_or_else(|| panic!("unexpected JSON structure from nix path-info"));
+    // For the FOD fixture (build_ca_test_path), ca = "fixed:sha256:<nixbase32>"
+    // of the flat file content. For the writeText fixture (build_test_path),
+    // Nix registers no ca (it's derivation-built, not CA-addressed).
+    let ca = if store_path == build_ca_test_path() {
+        let content = std::fs::read(store_path).expect("read ca fixture content");
+        let flat_hash = NixHash::compute(HashAlgo::SHA256, &content);
+        Some(format!("fixed:{}", flat_hash.to_colon()))
+    } else {
+        None
+    };
 
     StorePathEntry {
         path: store_path.to_string(),
-        deriver: info
-            .get("deriver")
-            .and_then(|d| d.as_str())
-            .map(String::from),
-        nar_hash: info
-            .get("narHash")
-            .and_then(|h| h.as_str())
-            .expect("narHash field")
-            .to_string(),
-        nar_size: info
-            .get("narSize")
-            .and_then(|n| n.as_u64())
-            .expect("narSize field"),
-        references: info
-            .get("references")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        sigs: info
-            .get("signatures")
-            .and_then(|s| s.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        ca: info.get("ca").and_then(|c| c.as_str()).map(String::from),
-        registration_time: info
-            .get("registrationTime")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0),
-        ultimate: info
-            .get("ultimate")
-            .and_then(|u| u.as_bool())
-            .unwrap_or(false),
+        deriver: None,
+        nar_hash,
+        references: vec![],
+        // reg_time is skipped in conformance comparisons anyway.
+        registration_time: 0,
+        nar_size,
+        ultimate: false,
+        sigs: vec![],
+        ca,
     }
 }
 
@@ -819,43 +756,26 @@ impl Drop for DaemonGuard {
 
 /// Start a local nix-daemon on a temporary Unix socket.
 ///
-/// Outside sandboxes: symlinks `/nix/var/nix/*` into a temp dir so the
-/// daemon sees the real store db. Inside hermetic remote build
-/// sandboxes, `/nix/var/nix` doesn't exist — the symlink step is a
-/// no-op and the daemon starts with an empty db. We then register the
-/// golden fixture paths via `nix-store --register-validity` so queries
-/// find them.
+/// The daemon is given a fresh, hermetic state dir — never the host's
+/// `/nix/var/nix`. An earlier revision symlinked the host db so the
+/// daemon could see real store paths, but on a multi-user nix install
+/// `/nix/var/nix/db/big-lock` is root-owned mode 600 and the
+/// unprivileged daemon process fails with EACCES → connection reset.
+/// That path only ever worked as root or on single-user nix, so it's
+/// gone; instead we register the two fixture paths into the fresh db
+/// via `nix-store --load-db` (see [`register_fixture_paths`]). The
+/// `RIO_GOLDEN_FORCE_HERMETIC` env var that flake.nix sets is now a
+/// no-op (always hermetic).
 ///
 /// Enables `ca-derivations` experimental feature so golden tests can
 /// validate content-addressed workflows.
 pub fn start_local_daemon() -> (String, DaemonGuard) {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
-    // Symlink real store state into the temp dir (skip daemon-socket and gc-socket).
-    // In hermetic sandboxes this loop is a no-op (/nix/var/nix absent).
-    // RIO_GOLDEN_FORCE_HERMETIC skips symlinking — see query_path_info_json.
-    let real_state = std::path::Path::new("/nix/var/nix");
-    let force_hermetic = std::env::var_os("RIO_GOLDEN_FORCE_HERMETIC").is_some();
-    let mut linked_db = false;
-    if !force_hermetic && let Ok(entries) = std::fs::read_dir(real_state) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str != "daemon-socket" && name_str != "gc-socket" {
-                let _ = std::os::unix::fs::symlink(entry.path(), temp_dir.path().join(&name));
-                if name_str == "db" {
-                    linked_db = true;
-                }
-            }
-        }
-    }
-
-    // No real db — hermetic sandbox. Register fixture paths so the daemon
-    // knows about them. Without this the daemon returns not-found for all
-    // queries and conformance comparisons fail.
-    if !linked_db {
-        register_fixture_paths(temp_dir.path());
-    }
+    // Register fixture paths into a fresh db so the daemon knows about
+    // them. Without this the daemon returns not-found for all queries
+    // and conformance comparisons fail.
+    register_fixture_paths(temp_dir.path());
 
     let daemon_sock_dir = temp_dir.path().join("daemon-socket");
     std::fs::create_dir_all(&daemon_sock_dir).expect("create daemon-socket dir");
@@ -914,14 +834,11 @@ fn register_fixture_paths(state_dir: &std::path::Path) {
     use rio_nix::hash::{HashAlgo, NixHash};
     use std::io::Write;
 
-    let fixtures: Vec<String> = ["RIO_GOLDEN_TEST_PATH", "RIO_GOLDEN_CA_PATH"]
-        .iter()
-        .filter_map(|v| std::env::var(v).ok())
-        .filter(|p| std::path::Path::new(p).exists())
-        .collect();
-    if fixtures.is_empty() {
-        return;
-    }
+    // build_*_path() check the RIO_GOLDEN_*_PATH env vars first (set by
+    // flake.nix in the CI sandbox), then fall back to `nix eval` /
+    // `nix build` against the host daemon. Either way the path exists
+    // in /nix/store afterwards, so dump_nar() works.
+    let fixtures = [build_test_path(), build_ca_test_path()];
 
     // nix-store --load-db expects per-path stanzas on stdin
     // (same format as --dump-db output):

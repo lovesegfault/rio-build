@@ -884,48 +884,51 @@ builderPoolSetDefaults:
   #   large→c6a.16xlarge(64), xlarge→c6a.32xlarge(128).
   # Memory limit at 2× request (same blast-radius cap as
   # builderPoolDefaults.resources).
-  # I-196/I-197: 2/8/32/64/128 cores. CPU+memory are HARD LIMITS
-  # (limits = requests, Guaranteed QoS) — a build that needs more
-  # than its class's envelope should be PROMOTED (I-177), not burst
-  # into a neighbor's headroom. Bursting makes EMA duration estimates
-  # unreliable and defeats size-class learning. With limits.cpu set,
-  # cgroup cpu.max = limit → effective_cores() reads it directly →
-  # NIX_BUILD_CORES = -jN matches the class. Memory limit at 2×
-  # request gives OOM headroom while keeping the envelope bounded.
+  # I-196/I-197: 2/8/32/64/128 cores. CPU is HARD LIMIT (limits =
+  # requests) — a build that needs more should be PROMOTED (I-177),
+  # not burst into a neighbor's headroom. Bursting makes EMA duration
+  # estimates unreliable and defeats size-class learning. With
+  # limits.cpu set, cgroup cpu.max = limit → effective_cores() reads
+  # it directly → NIX_BUILD_CORES = -jN matches the class.
+  #
+  # Memory limit = 2× request: OOM headroom while bounded.
+  # Storage limit = class table (2/4/32/64/96 Gi); request = 65% of
+  # limit. Scheduler reserves 65% headroom (better bin-packing); pod
+  # is hard-evicted at the table value. Eviction → disconnect → I-177
+  # promotes → retry on next class.
   # MUST track scheduler.sizeClasses in deploy.rs SIZE_CLASSES_JSON.
   classes:
     - name: tiny
       cutoffSecs: 30
       maxReplicas: 200
       resources:
-        # I-118: 2Gi storage — hello-class builds need <500MB FUSE
-        # cache + overlay. 10Gi was the dominant scheduling blocker.
-        requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "2Gi"}
-        limits: {cpu: "2", memory: "4Gi"}
+        # I-118: hello-class builds need <500MB FUSE cache + overlay.
+        requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "1300Mi"}
+        limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "2Gi"}
     - name: small
       cutoffSecs: 120
       maxReplicas: 200
       resources:
-        requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "4Gi"}
-        limits: {cpu: "8", memory: "16Gi"}
+        requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "2600Mi"}
+        limits: {cpu: "8", memory: "16Gi", ephemeral-storage: "4Gi"}
     - name: medium
       cutoffSecs: 600
       maxReplicas: 100
       resources:
-        requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "32Gi"}
-        limits: {cpu: "32", memory: "64Gi"}
+        requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "21Gi"}
+        limits: {cpu: "32", memory: "64Gi", ephemeral-storage: "32Gi"}
     - name: large
       cutoffSecs: 1800
       maxReplicas: 50
       resources:
-        requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "64Gi"}
-        limits: {cpu: "64", memory: "128Gi"}
+        requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "42Gi"}
+        limits: {cpu: "64", memory: "128Gi", ephemeral-storage: "64Gi"}
     - name: xlarge
       cutoffSecs: 7200
       maxReplicas: 20
       resources:
-        requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "96Gi"}
-        limits: {cpu: "128", memory: "256Gi"}
+        requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "62Gi"}
+        limits: {cpu: "128", memory: "256Gi", ephemeral-storage: "96Gi"}
   # poolTemplate fields layer over builderPoolDefaults (deep-merge), so
   # seccomp/tolerations/nodeSelector/privileged/hostUsers stay single-
   # sourced. Override here only what differs from the flat-pool defaults.

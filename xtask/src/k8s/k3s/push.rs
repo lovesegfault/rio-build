@@ -13,7 +13,6 @@ use crate::ui;
 pub use crate::k8s::shared::build_host_arch as build;
 
 pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
-    let sh = shell()?;
     let link = images.dir.path().join("images");
 
     let mut n = 0;
@@ -26,10 +25,11 @@ pub async fn push(images: &BuiltImages, _cfg: &XtaskConfig) -> Result<()> {
             continue;
         }
         let path_s = path.to_str().context("non-utf8 path")?;
-        ui::step(&format!("ctr import {fname}"), || {
+        let import = {
+            let sh = shell()?;
             sh::run(cmd!(sh, "sudo k3s ctr images import {path_s}"))
-        })
-        .await?;
+        };
+        ui::step(&format!("ctr import {fname}"), || import).await?;
         n += 1;
     }
     if n == 0 {

@@ -41,7 +41,10 @@ runs:
         chmod 0755 "$RUNNER_TEMP/niks3-hook"
 
     # Upstream NixOS action (no telemetry). No tags yet — pin by SHA.
-    - uses: NixOS/nix-installer-action@228d8a956062db04221c97c2794ea443194824aa
+    # 6b8548f includes PR#9 (--enable-flakes; the wrapped installer
+    # stopped enabling flakes by default) and PR#10 (skip udev write
+    # on container runners — what enable-kvm:false below worked around).
+    - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc
       with:
         # Default is true; it writes a udev rule to /etc/udev/rules.d/
         # which doesn't exist in ARC runner containers. We handle KVM
@@ -50,7 +53,13 @@ runs:
         # extra-conf lands verbatim in /etc/nix/nix.conf before the
         # daemon launches. ${{ runner.temp }} is a GHA context expanded
         # at action-evaluation time — the daemon sees a literal path.
+        #
+        # experimental-features is set explicitly even though the action
+        # now passes --enable-flakes (PR#9) — the action's pin is on the
+        # wrapper, not the installer it downloads at runtime, so the
+        # default can shift again. Belt-and-suspenders.
         extra-conf: |
+          experimental-features = nix-command flakes
           substituters = https://rio-nix-cache.s3.us-west-2.amazonaws.com https://cache.nixos.org
           trusted-public-keys = rio-nix-cache:er1fTC0pPR1nSGU+qcYJPle1CW1xtTJul+gA/kUo0KI= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
           max-jobs = auto

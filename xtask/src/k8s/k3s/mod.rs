@@ -17,7 +17,7 @@ pub(super) mod smoke;
 
 pub struct K3s;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Provider for K3s {
     fn context_matches(&self, ctx: &str) -> bool {
         // k3s.yaml's single context is named "default".
@@ -69,10 +69,11 @@ impl Provider for K3s {
         log_level: &str,
         tenant: Option<&str>,
         _skip_preflight: bool,
+        _no_hooks: bool,
     ) -> Result<()> {
         let client = kube::client().await?;
 
-        ui::step("chart deps", || async { shared::chart_deps() }).await?;
+        ui::step("chart deps", shared::chart_deps).await?;
         ui::step("apply CRDs", || kube::apply_crds(&client)).await?;
 
         ui::step("namespaces + ssh secret", || async {

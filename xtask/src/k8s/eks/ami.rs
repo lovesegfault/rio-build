@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use super::TF_DIR;
-use crate::sh::{cmd, read, run_read, shell};
+use crate::sh::{cmd, run_read, shell};
 use crate::{git, tofu, ui};
 
 #[derive(Copy, Clone, Default, PartialEq, Eq, ValueEnum)]
@@ -76,11 +76,23 @@ struct ImageInfo {
 /// closure changes (e.g. arm firmware) that the x86 drvPath alone
 /// would miss. Called by `up --ami` to find/tag; deploy reads the
 /// tag back from EC2 (`resolve_latest_tag`), not by recomputing.
-pub fn ami_tag() -> Result<String> {
-    let sh = shell()?;
+///
+/// I-198: was sync `sh::read` — `nix eval` of a NixOS module is
+/// multi-second per arch (×2). `run_read` spawns via tokio::process
+/// and yields. Per-phase `tokio::spawn` (run_up_phases) means a stray
+/// blocking call here would no longer stall siblings, but it would
+/// still tie up a runtime worker.
+pub async fn ami_tag() -> Result<String> {
     let mut h = Sha256::new();
     for &(attr, _, _) in AmiArch::All.targets() {
-        let drv = read(cmd!(sh, "nix eval --raw .#node-ami-{attr}.drvPath"))
+        // Shell scoped tight so it isn't held across the await
+        // (xshell::Shell is !Sync; keeping the future Send-clean).
+        let fut = {
+            let sh = shell()?;
+            run_read(cmd!(sh, "nix eval --raw .#node-ami-{attr}.drvPath"))
+        };
+        let drv = fut
+            .await
             .with_context(|| format!("evaluating .#node-ami-{attr}.drvPath"))?;
         h.update(drv.trim().as_bytes());
     }
@@ -95,7 +107,7 @@ pub fn ami_tag() -> Result<String> {
 pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let repo = git::open()?;
     let sha = git::short_sha(&repo)?;
-    let ami_tag = ami_tag()?;
+    let ami_tag = ami_tag().await?;
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
     let cluster = tf.get("cluster_name")?;
@@ -158,15 +170,14 @@ async fn build_and_register_one(
         return Ok(());
     }
 
-    let out = ui::step(&format!("nix build .#node-ami-{attr}"), || async {
+    let build = {
         let sh = shell()?;
         run_read(cmd!(
             sh,
             "nix build -L --no-link --print-out-paths .#node-ami-{attr}"
         ))
-        .await
-    })
-    .await?;
+    };
+    let out = ui::step(&format!("nix build .#node-ami-{attr}"), || build).await?;
     let info = read_image_info(Path::new(out.trim()))?;
 
     let snap = ui::step(&format!("coldsnap upload ({k8s_arch})"), || async {
@@ -175,28 +186,40 @@ async fn build_and_register_one(
         // (which DOES) and pass the temp creds explicitly.
         // --wait polls until `completed` (register-image rejects
         // `pending`). stdout is the snapshot ID.
-        let sh = shell()?;
-        let creds: serde_json::Value =
-            serde_json::from_str(&run_read(cmd!(sh, "aws configure export-credentials")).await?)?;
-        let _r = sh.push_env("AWS_REGION", region);
-        let _a = sh.push_env(
-            "AWS_ACCESS_KEY_ID",
-            creds["AccessKeyId"].as_str().unwrap_or_default(),
-        );
-        let _s = sh.push_env(
-            "AWS_SECRET_ACCESS_KEY",
-            creds["SecretAccessKey"].as_str().unwrap_or_default(),
-        );
-        let _t = sh.push_env(
-            "AWS_SESSION_TOKEN",
-            creds["SessionToken"].as_str().unwrap_or_default(),
-        );
+        let creds: serde_json::Value = serde_json::from_str(
+            &{
+                let sh = shell()?;
+                run_read(cmd!(sh, "aws configure export-credentials"))
+            }
+            .await?,
+        )?;
         let file = &info.file;
         let desc = format!("rio-nixos-node {ami_tag} {k8s_arch}");
-        run_read(cmd!(
-            sh,
-            "coldsnap upload --wait --omit-zero-blocks --description {desc} {file}"
-        ))
+        // I-198: was `sh.push_env()` RAII guards (hold `&Shell`, `!Sync`)
+        // across the await — broke per-phase `tokio::spawn`. Per-command
+        // `.env()` keeps the future `Send`.
+        {
+            let sh = shell()?;
+            run_read(
+                cmd!(
+                    sh,
+                    "coldsnap upload --wait --omit-zero-blocks --description {desc} {file}"
+                )
+                .env("AWS_REGION", region)
+                .env(
+                    "AWS_ACCESS_KEY_ID",
+                    creds["AccessKeyId"].as_str().unwrap_or_default(),
+                )
+                .env(
+                    "AWS_SECRET_ACCESS_KEY",
+                    creds["SecretAccessKey"].as_str().unwrap_or_default(),
+                )
+                .env(
+                    "AWS_SESSION_TOKEN",
+                    creds["SessionToken"].as_str().unwrap_or_default(),
+                ),
+            )
+        }
         .await
         .map(|s| s.trim().to_string())
     })
@@ -443,6 +466,118 @@ async fn untag_prior_latest(
     Ok(())
 }
 
+/// `xtask k8s ami gc`: deregister stale rio AMIs + delete their backing
+/// snapshots. "Stale" = tagged `rio.build/ami` (any value), NOT tagged
+/// `rio.build/ami-latest=true`, and `CreationDate` older than
+/// `older_than_days`. The latest tag is what `up --deploy` resolves
+/// (see `resolve_latest_tag`), so anything carrying it is live by
+/// definition and never collected. `dry_run` (the default) prints the
+/// candidate set without touching AWS.
+///
+/// Each `up --ami` that changes the NixOS closure leaves the prior
+/// generation's 2×~4 GB snapshots behind (`untag_prior_latest` only
+/// strips the `ami-latest` tag — it keeps the AMI for rollback). Weekly
+/// gc bounds the accumulation.
+pub async fn gc(older_than_days: u64, dry_run: bool) -> Result<()> {
+    let tf = tofu::outputs(TF_DIR)?;
+    let region = tf.get("region")?;
+    let conf = crate::aws::config(Some(&region)).await;
+    let ec2 = aws_sdk_ec2::Client::new(conf);
+
+    // All self-owned AMIs that carry the rio.build/ami tag (any value).
+    // The ami-latest exclusion + age filter happen client-side in
+    // gc_candidates so the selection logic is unit-testable.
+    let resp = ec2
+        .describe_images()
+        .owners("self")
+        .filters(
+            Filter::builder()
+                .name("tag-key")
+                .values("rio.build/ami")
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let cutoff =
+        jiff::Timestamp::now() - jiff::SignedDuration::from_hours(older_than_days as i64 * 24);
+    let victims = gc_candidates(resp.images(), cutoff);
+
+    if victims.is_empty() {
+        info!(
+            "ami gc: nothing to collect (no rio.build/ami images older than {older_than_days}d \
+             without rio.build/ami-latest)"
+        );
+        return Ok(());
+    }
+
+    for (id, created, snaps) in &victims {
+        info!(
+            "{} {id} (created {created}, {} snapshot(s): {})",
+            if dry_run {
+                "would deregister"
+            } else {
+                "deregister"
+            },
+            snaps.len(),
+            snaps.join(",")
+        );
+    }
+
+    if dry_run {
+        info!(
+            "ami gc: dry-run — {} AMI(s) would be deregistered; \
+             pass --no-dry-run to actually delete",
+            victims.len()
+        );
+        return Ok(());
+    }
+
+    for (id, _, snaps) in &victims {
+        ui::step(&format!("deregister {id}"), || async {
+            ec2.deregister_image().image_id(id).send().await?;
+            for snap in snaps {
+                ec2.delete_snapshot().snapshot_id(snap).send().await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    }
+    info!("ami gc: deregistered {} AMI(s)", victims.len());
+    Ok(())
+}
+
+/// Pure half of [`gc`]: select `(image_id, creation_date, snapshot_ids)`
+/// for every image that (a) is NOT tagged `rio.build/ami-latest=true`
+/// and (b) has a `CreationDate` strictly before `cutoff`. Images
+/// missing an ID or with an unparseable date are skipped (conservative
+/// — never delete what we can't age). Split out for unit testing
+/// without an EC2 client, mirroring `latest_ami_tag_of`.
+fn gc_candidates(images: &[Image], cutoff: jiff::Timestamp) -> Vec<(String, String, Vec<String>)> {
+    images
+        .iter()
+        .filter(|i| {
+            !i.tags()
+                .iter()
+                .any(|t| t.key() == Some("rio.build/ami-latest") && t.value() == Some("true"))
+        })
+        .filter_map(|i| {
+            let id = i.image_id()?.to_string();
+            let created = i.creation_date()?;
+            let ts: jiff::Timestamp = created.parse().ok()?;
+            if ts >= cutoff {
+                return None;
+            }
+            let snaps = i
+                .block_device_mappings()
+                .iter()
+                .filter_map(|b| b.ebs().and_then(|e| e.snapshot_id()).map(str::to_string))
+                .collect();
+            Some((id, created.to_string(), snaps))
+        })
+        .collect()
+}
+
 fn mk_tag(k: &str, v: &str) -> Tag {
     Tag::builder().key(k).value(v).build()
 }
@@ -517,6 +652,45 @@ mod tests {
             .build()];
         let err = latest_ami_tag_of(&broken).unwrap_err().to_string();
         assert!(err.contains("ami-broken"), "{err}");
+    }
+
+    #[test]
+    fn gc_candidates_excludes_latest_and_recent() {
+        let bdm = |snap: &str| {
+            BlockDeviceMapping::builder()
+                .device_name("/dev/xvda")
+                .ebs(EbsBlockDevice::builder().snapshot_id(snap).build())
+                .build()
+        };
+        let img = |id: &str, date: &str, latest: bool, snap: &str| {
+            let mut b = Image::builder()
+                .image_id(id)
+                .creation_date(date)
+                .tags(mk_tag("rio.build/ami", "deadbeef0000"))
+                .block_device_mappings(bdm(snap));
+            if latest {
+                b = b.tags(mk_tag("rio.build/ami-latest", "true"));
+            }
+            b.build()
+        };
+        let images = vec![
+            // old, not latest → collected
+            img("ami-old", "2026-03-01T00:00:00.000Z", false, "snap-old"),
+            // old but latest → kept (live)
+            img("ami-live", "2026-03-01T00:00:00.000Z", true, "snap-live"),
+            // recent, not latest → kept (within retention window)
+            img("ami-new", "2026-04-02T00:00:00.000Z", false, "snap-new"),
+            // unparseable date → skipped (conservative)
+            img("ami-bad", "garbage", false, "snap-bad"),
+        ];
+        let cutoff: jiff::Timestamp = "2026-03-28T00:00:00Z".parse().unwrap();
+        let v = gc_candidates(&images, cutoff);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].0, "ami-old");
+        assert_eq!(v[0].2, vec!["snap-old"]);
+
+        // Empty input → empty output.
+        assert!(gc_candidates(&[], cutoff).is_empty());
     }
 
     #[test]

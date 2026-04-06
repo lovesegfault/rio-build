@@ -80,17 +80,26 @@ async fn run_inner(
 
     if ui::is_verbose() {
         // Inherit stdio; suspend the spinner so output prints cleanly.
-        let out = ui::suspend(|| {
-            if read_stdout {
-                std_cmd.stderr(Stdio::inherit()).output()
-            } else {
-                std_cmd.status().map(|s| std::process::Output {
-                    status: s,
-                    stdout: vec![],
-                    stderr: vec![],
-                })
-            }
-        })?;
+        // I-198: std::process::Command::output()/status() block the
+        // calling thread. run/run_read are awaited inside spawned
+        // phase tasks — blocking here ties up a runtime worker for the
+        // child's lifetime. spawn_blocking offloads to the blocking
+        // pool and yields, same as the non-verbose tokio::process path
+        // below.
+        let out = tokio::task::spawn_blocking(move || {
+            ui::suspend(|| {
+                if read_stdout {
+                    std_cmd.stderr(Stdio::inherit()).output()
+                } else {
+                    std_cmd.status().map(|s| std::process::Output {
+                        status: s,
+                        stdout: vec![],
+                        stderr: vec![],
+                    })
+                }
+            })
+        })
+        .await??;
         if !out.status.success() {
             bail!("{argv}: {}", out.status);
         }

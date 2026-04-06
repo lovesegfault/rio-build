@@ -62,13 +62,20 @@ const SUBCHARTS: &[&str] = &["postgresql", "rustfs"];
 
 /// Symlink all subcharts from their nix-store derivations into
 /// `infra/helm/rio-build/charts/`. Gitignored.
-pub fn chart_deps() -> Result<()> {
-    let sh = shell()?;
+pub async fn chart_deps() -> Result<()> {
     let charts = repo_root().join("infra/helm/rio-build/charts");
     std::fs::create_dir_all(&charts)?;
     for name in SUBCHARTS {
         let attr = format!(".#helm-{name}");
-        let path = sh::read(cmd!(sh, "nix build --no-link --print-out-paths {attr}"))?;
+        // I-198: was sync `sh::read` — `nix build` is multi-second on a
+        // cold cache; this runs inside the deploy phase (a spawned tokio
+        // task). `run_read` yields. Shell scoped per call so `&Shell`
+        // (`!Sync`) isn't held across the await.
+        let path = {
+            let sh = shell()?;
+            sh::run_read(cmd!(sh, "nix build --no-link --print-out-paths {attr}"))
+        }
+        .await?;
         let link = charts.join(name);
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(path.trim(), &link)?;
@@ -80,7 +87,6 @@ pub fn chart_deps() -> Result<()> {
 /// Shared by k3s (`ctr import`) and kind (`kind load image-archive`) —
 /// both run on the local machine so only need the host arch.
 pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
-    let sh = shell()?;
     let repo = git::open()?;
     let tag = git::image_tag(&repo)?;
 
@@ -95,10 +101,13 @@ pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
     let link_s = link.to_str().unwrap();
     let attr = format!(".#packages.{sys}.dockerImages");
 
-    ui::step(&format!("nix build {attr}"), || {
+    // Shell scoped so `&Shell` (`!Sync`) drops before the await — keeps
+    // this future `Send` for the per-phase `tokio::spawn` (I-198).
+    let build = {
+        let sh = shell()?;
         sh::run(cmd!(sh, "nix build {attr} -L --out-link {link_s}"))
-    })
-    .await?;
+    };
+    ui::step(&format!("nix build {attr}"), || build).await?;
     Ok(BuiltImages { dir, tag })
 }
 
