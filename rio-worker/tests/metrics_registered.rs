@@ -15,9 +15,7 @@
 //! register — so `describe_metrics()` alone produces an empty scrape.
 //! The custom recorder below intercepts `describe_*` directly.
 
-use std::sync::{Arc, Mutex};
-
-use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+use rio_test_support::metrics::DescribedNames;
 
 /// Metric names from observability.md's Worker Metrics table.
 /// Keep in sync; the tracey rule `r[obs.metric.worker]` on
@@ -40,33 +38,6 @@ const WORKER_METRICS: &[&str] = &[
     "rio_worker_cpu_fraction",
     "rio_worker_memory_fraction",
 ];
-
-/// Recorder that captures names passed to `describe_*` and ignores
-/// everything else. `register_*` return noop handles — we never
-/// touch a metric, only describe.
-#[derive(Default)]
-struct DescribedNames(Arc<Mutex<Vec<String>>>);
-
-impl Recorder for DescribedNames {
-    fn describe_counter(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
-        self.0.lock().unwrap().push(key.as_str().to_string());
-    }
-    fn describe_gauge(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
-        self.0.lock().unwrap().push(key.as_str().to_string());
-    }
-    fn describe_histogram(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
-        self.0.lock().unwrap().push(key.as_str().to_string());
-    }
-    fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
-        Counter::noop()
-    }
-    fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
-        Gauge::noop()
-    }
-    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
-        Histogram::noop()
-    }
-}
 
 // r[verify obs.metric.worker]
 #[test]

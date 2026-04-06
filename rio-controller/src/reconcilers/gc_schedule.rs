@@ -219,93 +219,10 @@ async fn tick_once(store_addr: &str) -> TickResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Thread-local counter capture. `#[tokio::test]` uses a current-
-    /// thread runtime, so a spawned task sees the same OS thread's
-    /// `set_default_local_recorder` install at `.await` points.
-    /// Mirrors `rio-scheduler/src/actor/tests/helpers.rs`.
-    #[derive(Default)]
-    struct CountingRecorder {
-        // `metrics` provides `impl CounterFn for AtomicU64`, so
-        // `Counter::from_arc(Arc<AtomicU64>)` is a valid handle.
-        counters: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    }
-
-    impl CountingRecorder {
-        fn key(k: &metrics::Key) -> String {
-            let mut labels: Vec<_> = k
-                .labels()
-                .map(|l| format!("{}={}", l.key(), l.value()))
-                .collect();
-            labels.sort();
-            format!("{}{{{}}}", k.name(), labels.join(","))
-        }
-        fn get(&self, rendered: &str) -> u64 {
-            self.counters
-                .lock()
-                .unwrap()
-                .get(rendered)
-                .map(|a| a.load(Ordering::Relaxed))
-                .unwrap_or(0)
-        }
-        fn keys(&self) -> Vec<String> {
-            let mut ks: Vec<_> = self.counters.lock().unwrap().keys().cloned().collect();
-            ks.sort();
-            ks
-        }
-    }
-
-    impl metrics::Recorder for CountingRecorder {
-        fn describe_counter(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        fn describe_gauge(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        fn describe_histogram(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        fn register_counter(
-            &self,
-            key: &metrics::Key,
-            _: &metrics::Metadata<'_>,
-        ) -> metrics::Counter {
-            let rendered = Self::key(key);
-            let atomic = self
-                .counters
-                .lock()
-                .unwrap()
-                .entry(rendered)
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                .clone();
-            metrics::Counter::from_arc(atomic)
-        }
-        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
-            metrics::Gauge::noop()
-        }
-        fn register_histogram(
-            &self,
-            _: &metrics::Key,
-            _: &metrics::Metadata<'_>,
-        ) -> metrics::Histogram {
-            metrics::Histogram::noop()
-        }
-    }
+    use rio_test_support::metrics::CountingRecorder;
 
     /// Drive the loop's next tick. `start_paused` means all futures
     /// auto-advance when idle, but the SPAWNED loop task won't
@@ -347,7 +264,7 @@ mod tests {
             recorder.get("rio_controller_gc_runs_total{result=success}"),
             1,
             "success counter = 1 after first tick; keys={:?}",
-            recorder.keys()
+            recorder.all_keys()
         );
 
         // Advance to t=24h. Second tick.
@@ -415,7 +332,7 @@ mod tests {
             recorder.get("rio_controller_gc_runs_total{result=connect_failure}"),
             1,
             "connect_failure counter = 1; keys={:?}",
-            recorder.keys()
+            recorder.all_keys()
         );
         assert_eq!(
             recorder.get("rio_controller_gc_runs_total{result=success}"),
