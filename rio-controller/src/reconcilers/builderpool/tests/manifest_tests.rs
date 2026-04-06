@@ -26,7 +26,7 @@ use crate::reconcilers::builderpool::manifest::{
     MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST, SpawnDirective, bucket_labels,
     build_manifest_job, compute_spawn_plan, compute_surplus, crash_loop_tier, group_by_bucket,
     inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs, select_failed_jobs,
-    truncate_plan, update_idle_and_reapable,
+    sweep_cap, truncate_plan, update_idle_and_reapable,
 };
 
 use super::*;
@@ -1265,6 +1265,31 @@ fn failed_sweep_cap_tracks_replicas_max() {
     // Same 50 Failed, cap=20 (small-pool floor) → bounded.
     let selected_small = select_failed_jobs(&failed, 20);
     assert_eq!(selected_small.len(), 20);
+}
+
+/// Boundary table for sweep_cap. The `.max(0)` clamp (row 3) guards
+/// i32→usize wrap; the `replicas.max > FAILED_SWEEP_MIN` case (row 5)
+/// is the ceiling-tracks-spawn-rate property that VM tests never hit
+/// (small pools only). Row 4 is the P0511-divergence canary: if
+/// .max() → .min() at the call site, `sweep_cap(4)` → 4 not 20.
+// r[verify ctrl.pool.manifest-failed-sweep+2]
+#[test]
+fn sweep_cap_boundaries() {
+    assert_eq!(FAILED_SWEEP_MIN, 20, "doc-const sync");
+    // (replicas_max, expected, what-it-proves)
+    #[rustfmt::skip]
+    let cases = [
+        (0,        20,                 "zero → floor"),
+        (-1,       20,                 "negative clamped (i32→usize wrap guard)"),
+        (i32::MIN, 20,                 "MIN clamped"),
+        (4,        20,                 "small pool → floor (P0511 canary: .min typo → 4)"),
+        (20,       20,                 "equal to floor"),
+        (100,      100,                "ceiling tracks spawn rate — VM never hits this"),
+        (i32::MAX, i32::MAX as usize,  "MAX passes through"),
+    ];
+    for (replicas_max, want, why) in cases {
+        assert_eq!(sweep_cap(replicas_max), want, "{why}");
+    }
 }
 
 /// T2 regression: sort before truncate. Without this, `list()`-order
