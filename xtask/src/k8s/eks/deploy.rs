@@ -203,7 +203,7 @@ pub async fn run(
             // builderPoolDefaults.
             .set_json(
                 "builderPools",
-                r#"[{"name":"x86-64","systems":["x86_64-linux"]},{"name":"aarch64","systems":["aarch64-linux"],"replicas":{"min":0,"max":100}}]"#,
+                r#"[{"name":"x86-64","systems":["x86_64-linux"]},{"name":"aarch64","systems":["aarch64-linux"],"replicas":{"min":0,"max":500}}]"#,
             )
             // P0452 hard-split: SMOKE_EXPR's builtin:fetchurl FOD routes
             // to FetcherPool only. Without this, the FOD queues forever
