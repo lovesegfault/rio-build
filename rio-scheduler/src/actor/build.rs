@@ -89,15 +89,18 @@ impl DagActor {
             }
             if let Some(worker) = self.workers.get(worker_id)
                 && let Some(tx) = &worker.stream_tx
-            {
-                let _ = tx.try_send(rio_proto::types::SchedulerMessage {
+                && let Err(e) = tx.try_send(rio_proto::types::SchedulerMessage {
                     msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
                         rio_proto::types::CancelSignal {
                             drv_path: drv_path.clone(),
                             reason: signal_reason.to_string(),
                         },
                     )),
-                });
+                })
+            {
+                debug!(worker_id = %worker_id, drv_hash = %drv_hash, error = %e,
+                       "cancel signal dropped (stream full/closed)");
+                metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
             }
             // Remove from worker's running set — it's no longer
             // counted against their capacity. They'll re-report it

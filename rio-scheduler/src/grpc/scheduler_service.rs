@@ -54,7 +54,7 @@ impl SchedulerService for SchedulerGrpc {
         // attested jti to check against the revocation table.
         let jwt_claims = request
             .extensions()
-            .get::<rio_common::jwt::Claims>()
+            .get::<rio_common::jwt::TenantClaims>()
             .cloned();
 
         let req = request.into_inner();

@@ -36,8 +36,13 @@ use uuid::Uuid;
 /// what `jsonwebtoken`'s [`Validation`] expects when checking `exp`.
 /// A renamed field (`#[serde(rename = "exp")] expires: i64`) would
 /// work but obscures the wire format when debugging.
+///
+/// Named `TenantClaims` (not bare `Claims`) to disambiguate from
+/// [`crate::hmac::AssignmentClaims`] — both appear together in PutPath
+/// handlers, and `hmac::Claims` vs `jwt::Claims` was a recurring
+/// source of confusion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Claims {
+pub struct TenantClaims {
     /// Tenant UUID. Server-resolved at mint time — the gateway
     /// matches the SSH key against `authorized_keys`, reads the
     /// tenant name from the comment, and resolves it to a UUID via
@@ -104,7 +109,7 @@ pub enum JwtError {
 /// footgun (`alg: none` downgrade attacks). If a caller passes an
 /// RSA key here, that's a type error at compile time, not a runtime
 /// surprise.
-pub fn sign(claims: &Claims, key: &SigningKey) -> Result<String, JwtError> {
+pub fn sign(claims: &TenantClaims, key: &SigningKey) -> Result<String, JwtError> {
     // PKCS#8 DER is what jsonwebtoken's from_ed_der expects. The
     // pkcs8 feature on ed25519-dalek gives us the EncodePrivateKey
     // trait. SecretDocument zeroizes on drop — the DER bytes don't
@@ -124,7 +129,7 @@ pub fn sign(claims: &Claims, key: &SigningKey) -> Result<String, JwtError> {
 /// default 60s leeway — reasonable for cross-service clock skew).
 /// Does NOT check `jti` against a revocation list — that's the
 /// scheduler's job, needs PG access this crate doesn't have.
-pub fn verify(token: &str, pubkey: &VerifyingKey) -> Result<Claims, JwtError> {
+pub fn verify(token: &str, pubkey: &VerifyingKey) -> Result<TenantClaims, JwtError> {
     // Raw 32-byte compressed Edwards point — NOT the SPKI DER
     // wrapper (`to_public_key_der()`). The name `from_ed_der` is a
     // misnomer (carried over from v9 into v10/rust_crypto): it just
@@ -146,7 +151,7 @@ pub fn verify(token: &str, pubkey: &VerifyingKey) -> Result<Claims, JwtError> {
     // (every tenant UUID is valid; authorization is downstream).
     let validation = Validation::new(Algorithm::EdDSA);
 
-    let token_data = jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation)?;
+    let token_data = jsonwebtoken::decode::<TenantClaims>(token, &decoding_key, &validation)?;
     Ok(token_data.claims)
 }
 
@@ -176,9 +181,9 @@ mod tests {
     }
 
     /// Claims with `exp` offset from now. Negative offset → expired.
-    fn test_claims(exp_offset_secs: i64) -> Claims {
+    fn test_claims(exp_offset_secs: i64) -> TenantClaims {
         let n = now();
-        Claims {
+        TenantClaims {
             sub: Uuid::from_u128(0xdead_beef_cafe_0000_0000_0000_0000_0001),
             iat: n,
             exp: n + exp_offset_secs,
@@ -296,7 +301,7 @@ mod tests {
 
         let parts: Vec<&str> = token.split('.').collect();
         // Swap in a different sub. Keep the original signature.
-        let evil = Claims {
+        let evil = TenantClaims {
             sub: Uuid::from_u128(0xEEEE_EEEE_EEEE_EEEE_EEEE_EEEE_EEEE_EEEE),
             ..claims
         };
@@ -359,7 +364,7 @@ mod tests {
             jti in "[a-zA-Z0-9-]{8,64}",
             key_seed: [u8; 32],
         ) {
-            let claims = Claims {
+            let claims = TenantClaims {
                 sub: Uuid::from_bytes(sub_bytes),
                 iat,
                 // exp is future-relative to NOW, not to iat. iat is

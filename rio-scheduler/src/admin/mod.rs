@@ -2,7 +2,8 @@
 //!
 //! All RPCs are fully implemented as of phase4a: `GetBuildLogs`,
 //! `ClusterStatus`, `DrainWorker`, `TriggerGC`, `ListWorkers`,
-//! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`.
+//! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`,
+//! `GetBuildGraph`, `GetSizeClassStatus`.
 //!
 //! Per-RPC bodies live in submodules (`logs`, `gc`, `tenants`,
 //! `builds`, `workers`, `graph`, `sizeclass`). This file holds only the

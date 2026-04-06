@@ -313,7 +313,13 @@ async fn warn_on_spec_degrades(wp: &WorkerPool, ctx: &Ctx) {
 
 /// Normal reconcile: make the world match spec.
 async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
-    let ns = wp.namespace().expect("checked in reconcile()");
+    // reconcile_inner() already checked namespace is Some, but
+    // re-derive via ok_or rather than .expect() — cross-function
+    // invariants are refactor-fragile, and a panic here is a pod
+    // crash-loop. InvalidSpec surfaces in error_policy instead.
+    let ns = wp
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPool has no namespace".into()))?;
     let name = wp.name_any();
 
     // Surface silent degrades BEFORE branching on ephemeral — both
@@ -346,12 +352,13 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // before removing the parent from etcd.
     //
     // `&()` because our DynamicType is () (statically typed CRD).
-    // `.expect`: returns None only if metadata.uid or name is
-    // missing — impossible for an apiserver-sourced object
-    // (those fields are set on every read).
-    let oref = wp
-        .controller_owner_ref(&())
-        .expect("apiserver-sourced object has uid");
+    // Returns None only if metadata.uid or name is missing —
+    // impossible for an apiserver-sourced object (those fields are
+    // set on every read). Still: error-return, not panic. A
+    // reconciler panic is a pod crash-loop.
+    let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
+        Error::InvalidSpec("WorkerPool has no metadata.uid (not from apiserver?)".into())
+    })?;
 
     // ---- Headless Service ----
     // StatefulSet's serviceName MUST point to a real Service.
@@ -364,7 +371,10 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
     svc_api
         .patch(
-            svc.metadata.name.as_deref().expect("we set it"),
+            svc.metadata
+                .name
+                .as_deref()
+                .ok_or_else(|| Error::InvalidSpec("built Service has no name".into()))?,
             &PatchParams::apply(MANAGER).force(),
             &Patch::Apply(&svc),
         )
@@ -380,7 +390,9 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
     pdb_api
         .patch(
-            pdb.metadata.name.as_deref().expect("we set it"),
+            pdb.metadata.name.as_deref().ok_or_else(|| {
+                Error::InvalidSpec("built PodDisruptionBudget has no name".into())
+            })?,
             &PatchParams::apply(MANAGER).force(),
             &Patch::Apply(&pdb),
         )
@@ -534,7 +546,9 @@ const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 /// logic, doesn't need the scheduler). We just lose the "stop
 /// accepting NEW work early" optimization for pods 0,1.
 async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
-    let ns = wp.namespace().expect("checked in reconcile()");
+    let ns = wp
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPool has no namespace".into()))?;
     let name = wp.name_any();
 
     // Ephemeral mode: no STS to scale to 0, no long-lived workers

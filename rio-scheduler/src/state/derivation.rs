@@ -3,6 +3,13 @@
 //!
 //! State machine: created → queued → ready → assigned → running →
 //! completed|failed|poisoned. Poisoned has a 24h TTL (→ created).
+//!
+//! `Failed` is a **transient intermediate**, not a terminal state:
+//! `handle_transient_failure` transitions Running → Failed → Ready
+//! within a single call (sub-second) to record the retry attempt.
+//! Terminal failure states are `Poisoned` (retry-exhausted) and
+//! `DependencyFailed` (upstream failed). A derivation observed in
+//! `Failed` is mid-retry, not stuck.
 
 use std::collections::HashSet;
 use std::time::Instant;

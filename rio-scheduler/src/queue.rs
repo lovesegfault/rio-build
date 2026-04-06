@@ -158,9 +158,6 @@ impl ReadyQueue {
         }
     }
 
-    /// Number of valid (not-removed) entries.
-    // `is_empty` pair was dead code — `pub(crate) mod queue` revealed it.
-    #[allow(clippy::len_without_is_empty)]
     /// Remove all entries. Used by recover_from_pg() to start
     /// fresh before reloading Ready derivations from PG.
     pub fn clear(&mut self) {
@@ -174,6 +171,9 @@ impl ReadyQueue {
         // with entries re-pushed.
     }
 
+    /// Number of valid (not-removed) entries.
+    // `is_empty` pair was dead code — `pub(crate) mod queue` revealed it.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.members.len()
     }

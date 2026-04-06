@@ -1,7 +1,9 @@
 //! String-backed newtypes for scheduler identifiers.
 //!
-//! Moved to `rio-common` so rio-worker and rio-proto can share the same
-//! types. Re-exported here for `use crate::state::DrvHash` compat — the
-//! scheduler's 80+ import sites don't need to churn.
+//! Definitions live in `rio-common`. Currently the scheduler is the
+//! only consumer — rio-worker and rio-proto use raw strings. Re-
+//! exported here for `use crate::state::DrvHash` compat so the
+//! scheduler's 80+ import sites don't churn if the upstream path
+//! changes.
 
 pub use rio_common::newtype::{DrvHash, WorkerId};

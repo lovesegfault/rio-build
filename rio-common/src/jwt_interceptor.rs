@@ -3,7 +3,7 @@
 //! Sits on the scheduler and store gRPC servers (the two binaries the
 //! gateway dials). Extracts the `x-rio-tenant-token` metadata header,
 //! verifies signature + expiry against the configured ed25519 pubkey,
-//! and attaches the decoded [`Claims`] to the request's extensions for
+//! and attaches the decoded [`TenantClaims`] to the request's extensions for
 //! handlers to read. The scheduler's `SubmitBuild` handler additionally
 //! checks `Claims.jti` against the `jwt_revoked` table — that's a PG
 //! lookup, so it lives in the handler, not here (this crate is PG-free).
@@ -57,7 +57,7 @@ use base64::Engine;
 use ed25519_dalek::VerifyingKey;
 use tonic::{Request, Status};
 
-use crate::jwt::{self, Claims};
+use crate::jwt::{self, TenantClaims};
 use crate::signal::Token as CancellationToken;
 
 /// gRPC metadata key the gateway sets on every outbound call in JWT mode.
@@ -257,7 +257,7 @@ pub fn jwt_interceptor(pubkey: JwtPubkey) -> impl tonic::service::Interceptor + 
             Status::unauthenticated(format!("{TENANT_TOKEN_HEADER} header is not valid ASCII"))
         })?;
 
-        let claims: Claims = {
+        let claims: TenantClaims = {
             // Read-lock scope: held ONLY for verify. `jwt::verify` is
             // pure compute (ed25519 sig check + JSON parse + exp
             // compare); no await, no I/O. The guard drops at scope
@@ -308,9 +308,9 @@ mod tests {
             .as_secs() as i64
     }
 
-    fn claims(exp_offset: i64) -> Claims {
+    fn claims(exp_offset: i64) -> TenantClaims {
         let n = now();
-        Claims {
+        TenantClaims {
             sub: uuid::Uuid::from_u128(0x1234),
             iat: n,
             exp: n + exp_offset,
@@ -346,7 +346,7 @@ mod tests {
         // would brick dev clusters.)
         let out = intercept.call(req_with_token("garbage")).unwrap();
         assert!(
-            out.extensions().get::<Claims>().is_none(),
+            out.extensions().get::<TenantClaims>().is_none(),
             "no-pubkey path must not attach Claims — it didn't verify anything"
         );
     }
@@ -360,7 +360,7 @@ mod tests {
         let mut intercept = jwt_interceptor(pubkey(vk));
         let out = intercept.call(Request::new(())).unwrap();
         assert!(
-            out.extensions().get::<Claims>().is_none(),
+            out.extensions().get::<TenantClaims>().is_none(),
             "absent header → no Claims attached; handler falls back to tenant_name"
         );
     }
@@ -380,8 +380,8 @@ mod tests {
 
         let attached = out
             .extensions()
-            .get::<Claims>()
-            .expect("valid token → Claims attached to extensions");
+            .get::<TenantClaims>()
+            .expect("valid token → TenantClaims attached to extensions");
         // Full struct equality, not just jti — sub is the tenant
         // identity handlers use for authz; it must roundtrip exactly.
         assert_eq!(attached, &original);
@@ -491,7 +491,7 @@ mod tests {
         intercept.call(req_with_token(&tok_old)).unwrap_err();
         let out = intercept.call(req_with_token(&tok_new)).unwrap();
         assert!(
-            out.extensions().get::<Claims>().is_some(),
+            out.extensions().get::<TenantClaims>().is_some(),
             "post-swap: new-key token verifies AND attaches Claims"
         );
     }

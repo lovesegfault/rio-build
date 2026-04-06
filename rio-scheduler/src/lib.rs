@@ -145,7 +145,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_log_flush_failures_total",
-        "Failed S3 log flushes (labeled by phase: s3/pg); alert if rate > 0 sustained"
+        "Failed S3 log flushes (labeled by phase: gzip/s3/pg); alert if rate > 0 sustained"
     );
     describe_counter!(
         "rio_scheduler_log_flush_dropped_total",
@@ -229,6 +229,12 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_cancel_signals_total",
         "CancelSignal messages sent to workers (build cancellation propagation)"
+    );
+    describe_counter!(
+        "rio_scheduler_cancel_signal_dropped_total",
+        "CancelSignal try_send drops (worker stream full/closed under backpressure). \
+         Best-effort: the transition to Cancelled is scheduler-authoritative regardless; \
+         worker disconnect reassign still fires. Alert if rate > 0 sustained."
     );
     describe_counter!(
         "rio_scheduler_lease_acquired_total",

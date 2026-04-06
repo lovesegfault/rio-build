@@ -134,25 +134,31 @@ impl LeaseConfig {
 
 /// Shared leader state. The lease task writes; actor + health read.
 ///
-/// Both atomics, both Relaxed on one and Release/Acquire on the
-/// other. Why the asymmetry:
+/// Three atomics — generation, is_leader, recovery_complete — all
+/// updated together on acquire/lose transitions. **All writes and
+/// reads use SeqCst** to prevent reordering on weak memory models
+/// (ARM). Previously is_leader/recovery_complete used Relaxed, which
+/// allowed a reader on ARM to see `recovery_complete=true` before
+/// `is_leader=true` during an acquire transition (the two stores
+/// reordered). SeqCst gives a single total order across all three
+/// atomics: if a reader sees the last store of a transition, it sees
+/// all prior stores too.
 ///
-/// `generation`: Release on write (lease acquire), Acquire on read
-/// (dispatch, heartbeat). The generation is a FENCE — when
-/// dispatch sees a new generation, it should also see the
-/// `is_leader=true` write that happened-before. Acquire/Release
-/// pairs give that.
+/// Transitions go through [`on_acquire`](Self::on_acquire) /
+/// [`on_lose`](Self::on_lose) rather than raw field stores — these
+/// encapsulate the multi-field update order.
 ///
-/// `is_leader`: Relaxed. It's a standalone flag with no other
-/// state to synchronize against. dispatch_ready checks it at the
-/// top of each dispatch pass; a one-pass lag on a false→true
-/// transition is harmless (next pass dispatches). A true→false
-/// lag means we dispatch once more as a lame duck — also fine
-/// (idempotency, see module doc).
+/// Public fields remain for main.rs compat (it clones out the Arcs
+/// for the health-toggle polling loop and reconstructs the struct
+/// literal for the lease task). Readers holding bare Arc<AtomicBool>
+/// clones should use SeqCst loads; a one-pass lag on a single flag
+/// is still harmless (idempotency, see module doc) but the ordering
+/// between the three flags is now correct.
 pub struct LeaderState {
-    /// Generation counter. Lease task `fetch_add(1, Release)` on
-    /// each acquisition. Same Arc as DagActor.generation (see
-    /// `generation_arc()` — this IS that Arc, cloned).
+    /// Generation counter. Incremented on each acquisition via
+    /// [`on_acquire`](Self::on_acquire). Same Arc as
+    /// DagActor.generation (see `generation_arc()` — this IS that
+    /// Arc, cloned).
     pub generation: Arc<AtomicU64>,
     /// Whether we currently hold the lease. dispatch_ready early-
     /// returns if false (standby schedulers merge DAGs but don't
@@ -160,8 +166,9 @@ pub struct LeaderState {
     pub is_leader: Arc<AtomicBool>,
     /// Whether recovery has completed. dispatch_ready gates on
     /// BOTH is_leader AND this. Set by handle_leader_acquired
-    /// AFTER recover_from_pg finishes. Cleared by the lease loop
-    /// on LOSE transition so re-acquire re-triggers recovery.
+    /// AFTER recover_from_pg finishes. Cleared by
+    /// [`on_lose`](Self::on_lose) so re-acquire re-triggers
+    /// recovery.
     ///
     /// Separate from is_leader because the lease loop sets
     /// is_leader IMMEDIATELY (non-blocking — must keep renewing),
@@ -198,6 +205,31 @@ impl LeaderState {
             is_leader: Arc::new(AtomicBool::new(false)),
             recovery_complete: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Acquire transition: increment generation, set is_leader=true.
+    /// Returns the new generation.
+    ///
+    /// SeqCst on both stores: the generation increment happens-
+    /// before the is_leader write in the total order. A reader
+    /// seeing is_leader=true (SeqCst load) sees the new generation.
+    /// recovery_complete is NOT set here — that's the actor's job
+    /// after recover_from_pg finishes.
+    pub fn on_acquire(&self) -> u64 {
+        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.is_leader.store(true, Ordering::SeqCst);
+        new_gen
+    }
+
+    /// Lose transition: clear is_leader, clear recovery_complete.
+    ///
+    /// SeqCst on both stores: is_leader=false happens-before
+    /// recovery_complete=false in the total order. A reader seeing
+    /// recovery_complete=false (SeqCst) also sees is_leader=false.
+    /// Generation is NOT touched — the NEW leader increments it.
+    pub fn on_lose(&self) {
+        self.is_leader.store(false, Ordering::SeqCst);
+        self.recovery_complete.store(false, Ordering::SeqCst);
     }
 }
 
@@ -305,17 +337,15 @@ pub async fn run_lease_loop(
 
                 if now_leading && !was_leading {
                     // ---- Acquire transition ----
-                    // Increment FIRST, then set is_leader. With
-                    // Release/Acquire on generation, dispatch
-                    // seeing the new gen implies seeing is_leader
-                    // (happened-before). The other order would
-                    // let dispatch run with is_leader=true but
-                    // OLD generation for one pass — harmless
-                    // (workers compare heartbeat gen, not
-                    // assignment gen, for staleness) but
+                    // on_acquire: increment generation FIRST, then
+                    // set is_leader, both SeqCst. A reader seeing
+                    // is_leader=true also sees the new generation.
+                    // The other order would let dispatch run with
+                    // is_leader=true but OLD generation for one
+                    // pass — harmless (workers compare heartbeat
+                    // gen, not assignment gen, for staleness) but
                     // conceptually wrong.
-                    let new_gen = state.generation.fetch_add(1, Ordering::Release) + 1;
-                    state.is_leader.store(true, Ordering::Relaxed);
+                    let new_gen = state.on_acquire();
                     info!(
                         generation = new_gen,
                         holder = %cfg.holder_id,
@@ -380,12 +410,11 @@ pub async fn run_lease_loop(
                     // ---- Lose transition ----
                     // Someone else acquired (we couldn't renew in
                     // time). Stop dispatching. Generation is the
-                    // NEW leader's job to increment.
-                    state.is_leader.store(false, Ordering::Relaxed);
-                    // Clear recovery_complete: if we re-acquire,
-                    // recovery runs again. The other replica's
-                    // actions may have changed PG state.
-                    state.recovery_complete.store(false, Ordering::Relaxed);
+                    // NEW leader's job to increment. on_lose clears
+                    // both is_leader and recovery_complete (SeqCst):
+                    // if we re-acquire, recovery runs again — the
+                    // other replica's actions may have changed PG.
+                    state.on_lose();
                     warn!(
                         holder = %cfg.holder_id,
                         "lost leadership (another replica acquired)"
@@ -481,8 +510,7 @@ fn maybe_self_fence(
             blind_for = ?last_successful_renew.elapsed(),
             "LOCAL SELF-FENCE: no successful renew in > LEASE_TTL, stepping down locally"
         );
-        state.is_leader.store(false, Ordering::Relaxed);
-        state.recovery_complete.store(false, Ordering::Relaxed);
+        state.on_lose();
         metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
         *was_leading = false;
         // No spawn_patch_deletion_cost: can't reach apiserver.

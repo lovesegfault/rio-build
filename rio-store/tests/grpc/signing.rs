@@ -195,7 +195,7 @@ async fn spawn_store_with_fake_jwt(
         // Attach Claims exactly as the real interceptor would on
         // successful verify. Only `sub` is read by put_path — iat/exp/jti
         // are for audit/expiry/revocation, all scheduler-side concerns.
-        req.extensions_mut().insert(rio_common::jwt::Claims {
+        req.extensions_mut().insert(rio_common::jwt::TenantClaims {
             sub: tenant_id,
             iat: 1_700_000_000,
             exp: 9_999_999_999,

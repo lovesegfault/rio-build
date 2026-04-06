@@ -125,7 +125,13 @@ async fn reconcile_inner(wps: Arc<WorkerPoolSet>, ctx: Arc<Ctx>) -> Result<Actio
 /// Normal reconcile: for each size class, SSA-apply its child
 /// WorkerPool. Idempotent — SSA with the same body is a no-op.
 async fn apply(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
-    let ns = wps.namespace().expect("checked in reconcile_inner()");
+    // reconcile_inner() already checked namespace is Some, but
+    // re-derive via ok_or rather than .expect() — cross-function
+    // invariants are refactor-fragile, and a panic here is a pod
+    // crash-loop. InvalidSpec surfaces in error_policy instead.
+    let ns = wps
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPoolSet has no namespace".into()))?;
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
 
     for class in &wps.spec.classes {
@@ -364,16 +370,42 @@ pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
 /// progress). Explicit delete is deterministic and produces clear
 /// `kubectl get events` output.
 ///
+/// Children are discovered by ownerRef UID (same as
+/// `prune_stale_children`), NOT by iterating `spec.classes`. The
+/// spec-iteration approach leaks orphans in this sequence:
+///
+///   1. Operator removes class "large" from `spec.classes`
+///   2. Before the next reconcile runs `prune_stale_children`,
+///      operator deletes the WPS
+///   3. Cleanup iterates the (now-shortened) `spec.classes` →
+///      never sees "large" → orphan survives WPS delete
+///
+/// Listing by ownerRef UID catches every child regardless of
+/// whether it's still in spec.
+///
 /// 404 tolerance: the child might already be gone (GC ran first,
 /// or the operator manually deleted it, or a previous cleanup
 /// succeeded on this child before crashing on the next).
 /// Fine — skip and continue to the next child.
 async fn cleanup(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
-    let ns = wps.namespace().expect("checked in reconcile_inner()");
+    let ns = wps
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPoolSet has no namespace".into()))?;
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
 
-    for class in &wps.spec.classes {
-        let name = child_name(&wps, class);
+    // List all WorkerPools in the namespace, filter by ownerRef
+    // UID. Same pattern as prune_stale_children — a second WPS in
+    // the same namespace owns its own children; UID-match ensures
+    // we only delete ours. Unlike prune, a list failure HERE is
+    // propagated (finalizer stays, cleanup retries) — leaking
+    // children after WPS delete is worse than retrying.
+    let children = wp_api.list(&ListParams::default()).await?;
+
+    for child in &children.items {
+        if !is_wps_owned_by(child, &wps) {
+            continue;
+        }
+        let name = child.name_any();
         match wp_api.delete(&name, &DeleteParams::default()).await {
             Ok(_) => debug!(child = %name, "child WorkerPool deleted"),
             Err(kube::Error::Api(ae)) if ae.code == 404 => {

@@ -131,7 +131,7 @@ impl StoreServiceImpl {
     pub(super) fn verify_assignment_token<T>(
         &self,
         request: &Request<T>,
-    ) -> Result<Option<rio_common::hmac::Claims>, Status> {
+    ) -> Result<Option<rio_common::hmac::AssignmentClaims>, Status> {
         let Some(verifier) = &self.hmac_verifier else {
             // Verifier not configured = dev mode, accept all.
             return Ok(None);
@@ -245,13 +245,13 @@ impl StoreServiceImpl {
         // JWT tenant-id extraction — independent of HMAC claims above.
         //
         // The P0259 interceptor (r[gw.jwt.verify]) runs BEFORE this
-        // handler and attaches `jwt::Claims` to request extensions on
+        // handler and attaches `jwt::TenantClaims` to request extensions on
         // successful verify of the `x-rio-tenant-token` header.
         //
         // Distinct Claims types — don't confuse them:
-        //   - `hmac::Claims` (above): worker_id + drv_hash + expected_outputs.
+        //   - `hmac::AssignmentClaims` (above): worker_id + drv_hash + expected_outputs.
         //     Restricts WHICH paths this worker may upload. Per-assignment.
-        //   - `jwt::Claims` (here): sub (tenant UUID) + iat/exp/jti.
+        //   - `jwt::TenantClaims` (here): sub (tenant UUID) + iat/exp/jti.
         //     Says WHOSE tenant key signs the narinfo. Per-session.
         //
         // `None` here covers three cases, all cluster-key-correct:
@@ -266,7 +266,7 @@ impl StoreServiceImpl {
         // Otherwise None → cluster key, same as pre-P0338.
         let tenant_id: Option<uuid::Uuid> = request
             .extensions()
-            .get::<rio_common::jwt::Claims>()
+            .get::<rio_common::jwt::TenantClaims>()
             .map(|c| c.sub);
 
         let mut stream = request.into_inner();

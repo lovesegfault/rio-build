@@ -8,7 +8,7 @@
 //! Some — in dev mode (None) the check is bypassed entirely.
 
 use super::*;
-use rio_common::hmac::{Claims, HmacSigner};
+use rio_common::hmac::{AssignmentClaims, HmacSigner};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_KEY: &[u8] = b"test-hmac-key-at-least-32-bytes!!!";
@@ -22,7 +22,7 @@ fn now_unix() -> u64 {
 
 /// Build a valid Claims with the given expected_outputs and sign it.
 fn sign_claims(outputs: Vec<String>, expiry_offset_secs: i64) -> String {
-    let claims = Claims {
+    let claims = AssignmentClaims {
         worker_id: "test-worker".into(),
         drv_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         expected_outputs: outputs,
@@ -118,7 +118,7 @@ async fn hmac_wrong_key_signed_rejected() -> TestResult {
 
     // Sign with a DIFFERENT key → MAC mismatch.
     let wrong_key = b"different-key-different-signature!!";
-    let claims = Claims {
+    let claims = AssignmentClaims {
         worker_id: "evil".into(),
         drv_hash: "00".repeat(32),
         expected_outputs: vec![path.clone()],

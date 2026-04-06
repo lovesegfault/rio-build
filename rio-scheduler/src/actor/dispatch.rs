@@ -12,21 +12,25 @@ impl DagActor {
     pub(super) async fn dispatch_ready(&mut self) {
         // Standby scheduler: merge DAGs (state warm for fast
         // takeover) but DON'T dispatch. The lease task flips this
-        // on acquire/lose. Relaxed load: a one-pass lag either way
-        // is harmless (see DagActor.is_leader field doc). In non-
-        // K8s mode this is always true — no-op check.
-        if !self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+        // on acquire/lose via LeaderState::on_acquire/on_lose.
+        // SeqCst load: paired with SeqCst stores in LeaderState so
+        // the three-field transition (generation, is_leader,
+        // recovery_complete) is observably ordered even on ARM.
+        // A one-pass lag on a single flag is still harmless (see
+        // DagActor.is_leader field doc). In non-K8s mode this is
+        // always true — no-op check.
+        if !self.is_leader.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         // Also gate on recovery: don't dispatch until recover_from_
         // pg has rebuilt the DAG. Otherwise we'd dispatch from a
-        // partial/empty DAG mid-recovery. Acquire pairs with
-        // handle_leader_acquired's Release — sees all recovery
+        // partial/empty DAG mid-recovery. SeqCst pairs with
+        // handle_leader_acquired's SeqCst — sees all recovery
         // writes before proceeding (though actor is single-threaded
         // so this is belt-and-suspenders).
         if !self
             .recovery_complete
-            .load(std::sync::atomic::Ordering::Acquire)
+            .load(std::sync::atomic::Ordering::SeqCst)
         {
             return;
         }
@@ -412,7 +416,7 @@ impl DagActor {
                     .map(|d| d.as_secs())
                     .unwrap_or(0)
                     .saturating_add(timeout_secs.saturating_mul(2));
-                signer.sign(&rio_common::hmac::Claims {
+                signer.sign(&rio_common::hmac::AssignmentClaims {
                     worker_id: worker_id.to_string(),
                     drv_hash: drv_hash.to_string(),
                     expected_outputs: state.expected_output_paths.clone(),

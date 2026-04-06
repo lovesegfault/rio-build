@@ -69,7 +69,7 @@ use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crds::workerpool::WorkerPool;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
 use super::MANAGER;
@@ -123,7 +123,9 @@ const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 /// columns either way. `desiredReplicas` is the concurrent-Job
 /// ceiling (`spec.replicas.max`).
 pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Action> {
-    let ns = wp.namespace().expect("checked in reconcile_inner");
+    let ns = wp
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec("WorkerPool has no namespace".into()))?;
     let name = wp.name_any();
     let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
 
@@ -161,21 +163,28 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     // the scheduler would waste pod starts (worker heartbeat would
     // fail → never Ready → Job eventually times out).
     //
+    // We ALSO set a SchedulerUnreachable condition on the WorkerPool
+    // so operators can see WHY nothing is spawning. Without this,
+    // `kubectl get wp` shows queued=0 → "no demand" — indistinguishable
+    // from the scheduler being healthy but idle. The condition
+    // disambiguates. Still fail-open (queued=0, no spawn).
+    //
     // Cloning the admin client: tonic clients are cheap to clone
     // (Arc-internal). The finalizer's cleanup() does the same.
-    let queued: u32 = match ctx.admin.clone().cluster_status(()).await {
-        Ok(resp) => resp.into_inner().queued_derivations,
-        Err(e) => {
-            warn!(
-                pool = %name, error = %e,
-                "ClusterStatus poll failed; treating as queued=0, will retry"
-            );
-            // Still patch status (so `kubectl get wp` shows current
-            // active count even when scheduler is down) before
-            // requeueing. Fall through with queued=0 → no spawn.
-            0
-        }
-    };
+    let (queued, scheduler_err): (u32, Option<String>) =
+        match ctx.admin.clone().cluster_status(()).await {
+            Ok(resp) => (resp.into_inner().queued_derivations, None),
+            Err(e) => {
+                warn!(
+                    pool = %name, error = %e,
+                    "ClusterStatus poll failed; treating as queued=0, will retry"
+                );
+                // Still patch status (so `kubectl get wp` shows current
+                // active count even when scheduler is down) before
+                // requeueing. Fall through with queued=0 → no spawn.
+                (0, Some(e.to_string()))
+            }
+        };
 
     // ---- Spawn decision ----
     // The cast dance: queued is u32 (proto field), active/ceiling
@@ -188,9 +197,9 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
     if to_spawn > 0 {
-        let oref = wp
-            .controller_owner_ref(&())
-            .expect("apiserver-sourced object has uid");
+        let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
+            Error::InvalidSpec("WorkerPool has no metadata.uid (not from apiserver?)".into())
+        })?;
         let scheduler = SchedulerAddrs {
             addr: ctx.scheduler_addr.clone(),
             balance_host: ctx.scheduler_balance_host.clone(),
@@ -239,8 +248,17 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     // `desiredReplicas` = ceiling. The autoscaler skips ephemeral
     // pools (scaling.rs checks spec.ephemeral) so it won't
     // overwrite this.
+    //
+    // `conditions`: SchedulerUnreachable reflects the ClusterStatus
+    // poll above. status="True" when the RPC failed (operators see
+    // WHY nothing is spawning); status="False" when reachable (clears
+    // the condition after recovery — SSA with this field manager owns
+    // the condition, so we must write it every reconcile or a stale
+    // True would persist). The autoscaler's Scaling condition lives
+    // under a different field manager so SSA keeps them separate.
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
     let ar = WorkerPool::api_resource();
+    let cond = scheduler_unreachable_condition(scheduler_err.as_deref());
     let status_patch = serde_json::json!({
         "apiVersion": ar.api_version,
         "kind": ar.kind,
@@ -248,6 +266,7 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
             "replicas": active,
             "readyReplicas": active,
             "desiredReplicas": ceiling,
+            "conditions": [cond],
         },
     });
     wp_api
@@ -296,6 +315,45 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
 /// the next tick self-corrects.
 fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
+}
+
+/// Build a `SchedulerUnreachable` K8s Condition for the ephemeral
+/// reconciler's status patch.
+///
+/// `err = Some(msg)` → status="True", reason="ClusterStatusFailed",
+/// message carries the gRPC error. Operators see `kubectl describe
+/// wp` show why nothing is spawning (otherwise "queued=0" is
+/// indistinguishable from "scheduler idle").
+///
+/// `err = None` → status="False", reason="ClusterStatusOK". We
+/// write this every reconcile (not just on recovery) because SSA
+/// with our field manager owns this condition — omitting it would
+/// leave a stale True after the scheduler comes back.
+///
+/// Same json!-not-struct pattern as `scaling::scaling_condition`:
+/// k8s_openapi's Condition struct requires observedGeneration which
+/// we don't track.
+fn scheduler_unreachable_condition(err: Option<&str>) -> serde_json::Value {
+    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+    let (status, reason, message) = match err {
+        Some(e) => (
+            "True",
+            "ClusterStatusFailed",
+            format!("ClusterStatus RPC failed: {e}; treating as queued=0"),
+        ),
+        None => (
+            "False",
+            "ClusterStatusOK",
+            "scheduler reachable".to_string(),
+        ),
+    };
+    serde_json::json!({
+        "type": "SchedulerUnreachable",
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "lastTransitionTime": now,
+    })
 }
 
 /// Build a K8s Job for one ephemeral worker pod.
@@ -349,16 +407,19 @@ pub(super) fn build_job(
 
     // Append RIO_EPHEMERAL=1 to the worker container's env. The
     // container is always index 0 (build_pod_spec constructs exactly
-    // one). unwrap on env: build_container ALWAYS sets Some(vec![..]).
-    // If that invariant breaks (future refactor), panic here is
-    // correct — an ephemeral pod without RIO_EPHEMERAL would loop
-    // forever waiting for a second assignment that never comes (Job
-    // wouldn't complete → ttlSecondsAfterFinished never fires →
-    // leaked pod).
+    // one). build_container ALWAYS sets env=Some(vec![..]); if a
+    // future refactor breaks that invariant, return InvalidSpec
+    // rather than panic — a reconciler panic means pod crash-loop,
+    // which is worse than a surfaced reconcile error. An ephemeral
+    // pod without RIO_EPHEMERAL would loop forever (Job never
+    // completes → ttlSecondsAfterFinished never fires → leaked pod),
+    // so failing the reconcile is correct.
     pod_spec.containers[0]
         .env
         .as_mut()
-        .expect("build_container always sets env")
+        .ok_or_else(|| {
+            Error::InvalidSpec("build_container produced a container with no env".into())
+        })?
         .push(builders::env("RIO_EPHEMERAL", "1"));
 
     // r[impl ctrl.pool.ephemeral-single-build]
@@ -378,7 +439,9 @@ pub(super) fn build_job(
     for e in pod_spec.containers[0]
         .env
         .as_mut()
-        .expect("build_container always sets env")
+        .ok_or_else(|| {
+            Error::InvalidSpec("build_container produced a container with no env".into())
+        })?
         .iter_mut()
     {
         if e.name == "RIO_MAX_BUILDS" {
@@ -703,6 +766,34 @@ mod tests {
             "Some(7200) must propagate verbatim — NOT clamped to default \
              (the default-branch test already covers None→3600)"
         );
+    }
+
+    /// SchedulerUnreachable condition: status flips True/False based
+    /// on whether the ClusterStatus RPC failed. Operators need this
+    /// to distinguish "scheduler idle (queued=0)" from "scheduler
+    /// down (queued unknown, treated as 0)."
+    #[test]
+    fn scheduler_unreachable_condition_shape() {
+        // RPC failed → status=True, error in message.
+        let c = scheduler_unreachable_condition(Some("connection refused"));
+        assert_eq!(c["type"], "SchedulerUnreachable");
+        assert_eq!(c["status"], "True");
+        assert_eq!(c["reason"], "ClusterStatusFailed");
+        assert!(
+            c["message"]
+                .as_str()
+                .unwrap()
+                .contains("connection refused")
+        );
+        // K8s requires lastTransitionTime (RFC3339).
+        assert!(c["lastTransitionTime"].is_string());
+
+        // RPC succeeded → status=False (clears stale True after
+        // recovery).
+        let c = scheduler_unreachable_condition(None);
+        assert_eq!(c["type"], "SchedulerUnreachable");
+        assert_eq!(c["status"], "False");
+        assert_eq!(c["reason"], "ClusterStatusOK");
     }
 
     /// random_suffix returns valid K8s name chars. DNS-1123 subdomain

@@ -492,8 +492,8 @@ async fn test_submit_build_rejects_too_many_edges() {
 
 /// Build a Claims with the given jti. Other fields don't matter for
 /// the revocation check — it only reads `claims.jti`.
-fn claims_with_jti(jti: &str) -> rio_common::jwt::Claims {
-    rio_common::jwt::Claims {
+fn claims_with_jti(jti: &str) -> rio_common::jwt::TenantClaims {
+    rio_common::jwt::TenantClaims {
         sub: uuid::Uuid::from_u128(0xFEED),
         iat: 1_700_000_000,
         exp: 9_999_999_999, // far future — expiry is interceptor's job, not ours

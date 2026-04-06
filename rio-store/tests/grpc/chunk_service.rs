@@ -61,7 +61,7 @@ fn test_tenant_interceptor(
         // values here; a handler that starts reading exp will make
         // these tests fail loudly (past expiry), which is the right
         // signal to update this interceptor.
-        req.extensions_mut().insert(rio_common::jwt::Claims {
+        req.extensions_mut().insert(rio_common::jwt::TenantClaims {
             sub,
             iat: 0,
             exp: 0,

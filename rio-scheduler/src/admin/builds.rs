@@ -148,8 +148,21 @@ pub(super) async fn list_builds(
 
     Ok(ListBuildsResponse {
         builds: rows.into_iter().map(row_to_proto).collect(),
-        total_count: total as u32,
+        total_count: clamp_u32(total, "total_count"),
         next_cursor,
+    })
+}
+
+/// Clamp an i64 row-count to u32 with a warn! on saturation.
+///
+/// PG COUNT(*) returns i64; proto fields are u32. `as u32` would
+/// truncate (wrapping) on overflow. u32::MAX (~4.3B) is unreachable
+/// in practice for build/derivation counts but the warn! gives a
+/// signal if the assumption ever breaks.
+fn clamp_u32(v: i64, field: &'static str) -> u32 {
+    v.try_into().unwrap_or_else(|_| {
+        tracing::warn!(value = v, field, "i64 row-count overflowed u32, saturating");
+        u32::MAX
     })
 }
 
@@ -168,9 +181,9 @@ fn row_to_proto(r: BuildListRow) -> BuildInfo {
         tenant_id: r.tenant_id.unwrap_or_default(),
         priority_class: r.priority_class,
         state,
-        total_derivations: r.total_derivations as u32,
-        completed_derivations: r.completed_derivations as u32,
-        cached_derivations: r.cached_derivations as u32,
+        total_derivations: clamp_u32(r.total_derivations, "total_derivations"),
+        completed_derivations: clamp_u32(r.completed_derivations, "completed_derivations"),
+        cached_derivations: clamp_u32(r.cached_derivations, "cached_derivations"),
         error_summary: r.error_summary.unwrap_or_default(),
         // Timestamps not populated in 4a — PG ::text format isn't RFC3339
         // and we don't have chrono. Same deferral as TenantInfo.created_at.

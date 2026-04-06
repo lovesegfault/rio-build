@@ -131,7 +131,7 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
 // r[impl sec.boundary.grpc-hmac]
 pub(super) fn validate_put_metadata(
     mut raw_info: rio_proto::types::PathInfo,
-    hmac_claims: Option<&rio_common::hmac::Claims>,
+    hmac_claims: Option<&rio_common::hmac::AssignmentClaims>,
     ctx_label: &str,
 ) -> Result<ValidatedPathInfo, Status> {
     // Step 1: trailer-only enforcement. metadata.nar_hash must be empty;
