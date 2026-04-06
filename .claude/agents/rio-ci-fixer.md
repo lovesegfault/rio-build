@@ -27,9 +27,7 @@ You are the rio-build CI fixer. You run after a merge turned `.#ci` red. Your fi
 
 ## Known flaky tests
 
-See `.claude/known-flakes.jsonl` — a committed JSONL file (coordinator-managed, not hand-edited; survives clone). Each row has a `fix_owner` — these are fixable, the retry is a bridge while the fix is pending. `rio-ci-flake-fixer` step 6 deletes the row when the fix lands. Check via the typed CLI: `python3 .claude/lib/state.py known-flake-exists '<test_name>'`.
-
-If `.#ci` is red ONLY on a test in that file: retry once. Two reds = real (the fix owner may have changed something). One red + one green = flake confirmed, use the green.
+`.claude/bin/onibus flake excusable <log_path>` → `ExcusableVerdict` JSON. `.excusable: true` means single known-flake with `retry` in {Once, Twice} — retry `.#ci` once; two reds = real, one red + one green = flake confirmed. `.excusable: false` → `.reason` says why (multiple failures, unknown test, or `retry=Never` — the fix owner may have changed something).
 
 ## Protocol
 

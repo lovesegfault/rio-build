@@ -16,48 +16,33 @@ You are given:
 - A plan number `<N>`
 - A branch name or worktree path (e.g., `p134` or `/root/src/rio-build/p134`)
 
+Read the integration branch once (the sprint's merge target — not `main`):
+
+```bash
+TGT=$(/root/src/rio-build/main/.claude/bin/onibus integration-branch)  # e.g., "sprint-1"
+```
+
 ## Protocol
 
 ### 0. Precondition: worktree must be current
 
 ```bash
-cd /root/src/rio-build/main && git fetch               # ensure main is current (if remote exists)
-cd <worktree>
-behind=$(git rev-list --count HEAD..main)       # commits main has that we don't
+cd /root/src/rio-build/main && git fetch               # refresh refs (if remote exists)
+/root/src/rio-build/main/.claude/bin/onibus merge behind-check <worktree>
 ```
 
-If `behind > 0`, compute the **file intersection** before returning BEHIND:
+Returns `BehindCheck` JSON: `{behind, file_collision, trivial_rebase}`. The 3-dot file-intersection (what this worktree changed ∩ what `$TGT` added since merge-base) is already computed — the prior 2-dot phantom-collision incidents are guarded against in the implementation.
 
-```bash
-# What did THE WORKTREE change? 3-dot = merge-base to HEAD
-worktree_files=$(git diff main...HEAD --name-only)
-
-# What did MAIN change since merge-base? Explicit range.
-mb=$(git merge-base main HEAD)
-main_files=$(git diff $mb..main --name-only)
-
-# Intersection — THIS is the real collision set
-comm -12 <(echo "$worktree_files" | sort) <(echo "$main_files" | sort)
-```
-
-**File intersection — use 3-dot, not 2-dot:**
-`git diff main..HEAD` (2-dot) shows tree-diff including files MAIN changed
-reflected as deletions — this is NOT the worktree's changes. Use
-`git diff main...HEAD --name-only` (3-dot, merge-base) for worktree files,
-`git diff $(git merge-base main HEAD)..main --name-only` for main files,
-then `comm -12`. Empty intersection → byte-identical source post-rebase.
-(Prior incidents: validators using 2-dot diff reported phantom collisions — files MAIN changed showed as worktree deletions.)
-
-Then return immediately — **do not verify**:
+If `behind > 0`, return immediately — **do not verify**:
 
 ```
 VERDICT: BEHIND
-commits_behind: <N>
+commits_behind: <.behind>
 main_head: <sha>
-file_collision: <empty | list-of-paths>
+file_collision: <.file_collision — empty list or paths>
 ```
 
-Verifying stale code proves the wrong thing — the rebased code that actually merges was never examined. Coordinator must `SendMessage` the impl agent to rebase, then re-launch verifier. **No exception for "small" N** — behind is behind. But `file_collision: empty` tells the coordinator the rebase will be trivial (derivation-identical if all main changes are outside the crane fileset) — no merge-conflict round-trip expected.
+Verifying stale code proves the wrong thing — the rebased code that actually merges was never examined. Coordinator must `SendMessage` the impl agent to rebase, then re-launch verifier. **No exception for "small" N** — behind is behind. But `trivial_rebase: true` tells the coordinator the rebase is conflict-free (derivation-identical if all `$TGT` changes are outside the crane fileset).
 
 ### 1. Read the spec
 
@@ -70,8 +55,8 @@ Read it. Extract every bullet under `## Exit criteria` — these are the claims 
 ### 2. Diff the branch
 
 ```bash
-git diff main..<branch> --stat    # shape: which files, how big
-git diff main..<branch>           # detail: what actually changed
+git diff $TGT..<branch> --stat    # shape: which files, how big
+git diff $TGT..<branch>           # detail: what actually changed
 ```
 
 ### 3. Evidence per exit criterion
@@ -90,30 +75,14 @@ For EACH exit criterion bullet, find **concrete evidence** in the diff or test o
 rio-build tracey markers are **domain-indexed** — `r[gw.*]`, `r[sched.*]`, `r[store.*]`, etc. The plan doc's `## Tracey` section lists which domain markers this plan implements.
 
 ```bash
-# Extract domain markers the plan doc claims to cover (uses centralized TRACEY_DOMAINS)
-python3 .claude/lib/state.py tracey-markers .claude/work/plan-<NNNN>-*.md
-
-# Check the branch adds matching r[impl ...] annotations.
-# Domain validity is checked by `tracey query validate` below — grep here just
-# extracts what was added; cross-reference against the tracey-markers output.
-git diff main..<branch> | grep -oE '^\+.*r\[impl [a-z]+\.[a-z0-9.-]+\]'
-
-# And r[verify ...] annotations
-git diff main..<branch> | grep -oE '^\+.*r\[verify [a-z]+\.[a-z0-9.-]+\]'
+.claude/bin/onibus plan tracey-coverage <branch> .claude/work/plan-<NNNN>-*.md --worktree <worktree>
 ```
 
-Cross-reference: does the branch add `r[impl ...]` markers matching the plan doc's referenced domain markers? Build a table:
+Returns `TraceyCoverage` JSON: `{markers:[{id,impl_loc,verify_loc}], unmatched, covered, total}`. Each marker shows the `file:line` where `r[impl ...]` and `r[verify ...]` were found in the diff (or `null` if absent). **`unmatched` non-empty → FAIL** unless the implementer documented why in their report. Exit code is 0 when `unmatched` is empty, 1 otherwise.
 
-| Doc marker | `r[impl ...]` found? | `r[verify ...]` found? |
-|---|---|---|
-| `gw.opcode.wopFoo` | yes — `rio-gateway/src/opcodes.rs:1203` | yes — `rio-gateway/tests/wire.rs:89` |
-| `sched.actor.bar` | **no** | **no** |
-
-Unmatched doc markers = uncovered requirements. This is a FAIL unless the implementer documented why in their report.
-
-Also run tracey itself for end-to-end confirmation:
+Also run tracey itself for end-to-end confirmation (catches dangling refs — this check catches *missing* refs, the opposite direction):
 ```bash
-nix develop -c tracey query validate  # should show 0 errors (no dangling refs)
+nix develop -c tracey query validate
 ```
 
 ### 5. Commit-shape check (merge-gate preview)
@@ -121,14 +90,10 @@ nix develop -c tracey query validate  # should show 0 errors (no dangling refs)
 Not a smell hunt — just a heads-up that `/merge-impl` step 0b will reject:
 
 ```bash
-grep -c '^### T[0-9]' <plan-doc>          # T-count
-git rev-list --count main..HEAD           # commit-count
+.claude/bin/onibus merge atomicity-check <branch>
 ```
 
-- T-count ≥ 3 and commit-count == 1 → `/merge-impl` will abort `mega-commit`. Note it; don't FAIL on it.
-- `chore:`-labeled commit touching `rio-*/src/*.rs` → `/merge-impl` will abort `chore-touches-src`. Note it; don't FAIL on it.
-
-These are merge-gate concerns, not exit-criteria concerns. Report them so the impl fixes before queuing, but they're not your verdict.
+Returns `AtomicityVerdict` JSON: `{t_count, c_count, mega_commit, chore_violations, abort_reason}`. If `abort_reason` is non-null, `/merge-impl` will reject with that reason. Note it in your report so the impl fixes before queuing — but don't FAIL on it. These are merge-gate concerns, not exit-criteria concerns.
 
 ### 6. Verdict
 
@@ -137,7 +102,7 @@ These are merge-gate concerns, not exit-criteria concerns. Report them so the im
 | **PASS** | All exit criteria met with concrete evidence; all referenced tracey markers covered (impl + verify) |
 | **PARTIAL** | All exit criteria met with evidence, BUT tracey coverage incomplete (markers without matching impl/verify) — ship-blocker is debatable |
 | **FAIL** | One or more exit criteria unmet — list the gaps precisely |
-| **BEHIND** | Worktree is behind main — did not verify at all. Precondition failure, not a judgment. |
+| **BEHIND** | Worktree is behind `$TGT` — did not verify at all. Precondition failure, not a judgment. |
 
 **PARTIAL is preserved.** It means: exit criteria look good but the tracey marker table has gaps. Coordinator decides whether that's a doc-bug (marker in wrong place) or a real coverage hole. `rio-impl-reviewer` runs only after PASS — a PARTIAL skips it until the coordinator resolves.
 

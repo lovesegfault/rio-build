@@ -248,6 +248,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-${name}";
+  skipTypeCheck = true;
   # Cold: builtin:fetchurl is a real network fetch inside the sandbox
   # (FOD). ~60s boot + ~30s fetchurl + build + assertions.
   globalTimeout = (if cold then 600 else 300) + covTimeoutHeadroom;
@@ -257,6 +258,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.assertions}
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${common.sshKeySetup gatewayHost}

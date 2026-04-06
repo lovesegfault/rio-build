@@ -1,28 +1,37 @@
 # Fuzz target build + check pipeline.
 #
-# Extracted from flake.nix for the same reason as nix/docker.nix: ~200
-# lines of self-contained machinery that doesn't belong in the flake root.
-#
 # Fuzz crates are their own workspace roots — excluded from the main
 # workspace, each with its own Cargo.lock, needing nightly for
 # libfuzzer-sys. They depend on in-tree crates by path, so the source
-# must include the full workspace Cargo.toml tree. We vendor from the
-# fuzz-specific lockfile.
+# must include the full workspace Cargo.toml tree.
 #
 # Two fuzz workspaces:
-#   rio-nix/fuzz    — protocol/wire parsers (lean deps)
+#   rio-nix/fuzz    — protocol/wire parsers (lean deps, ~70 crates)
 #   rio-store/fuzz  — manifest parser (pulls full rio-store dep
-#                     tree: tonic, sqlx, aws-sdk-s3, fuse3, protobuf)
+#                     tree: tonic, sqlx, aws-sdk-s3, fuse3, protobuf;
+#                     ~470 crates)
+#
+# Build: stdenv.mkDerivation + rustPlatformNightly.importCargoLock +
+# cargoSetupHook. `cargo fuzz build` sets its own RUSTFLAGS (sancov
+# instrumentation: -Cpasses=sancov-module -Zsanitizer=address etc.),
+# so per-crate caching (crate2nix) wouldn't share rlibs with the main
+# workspace anyway — the sancov-instrumented object files are
+# incompatible. A monolithic cargo-fuzz build is the right shape here.
 {
   pkgs,
-  craneLib,
-  craneLibNightly,
+  rustNightly,
+  rustPlatformNightly,
   unfilteredRoot,
+  # Shared workspace source fileset (Cargo.toml, Cargo.lock, all
+  # workspace crate directories). Fuzz builds compose this with the
+  # fuzz/ subtree since the fuzz crate path-deps its parent crate,
+  # which in turn uses workspace deps.
+  c2nWorkspaceFileset,
 }:
 let
   rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
 
-  # Builder for a fuzz-workspace build derivation + its runner.
+  # Builder for a fuzz-workspace build derivation.
   # `fuzzDir` is relative to the repo root (e.g., "rio-nix/fuzz").
   # `cargoLock` is the Nix path to that workspace's lockfile.
   # `targets` is the list of `[[bin]]` names in its Cargo.toml.
@@ -38,70 +47,83 @@ let
       extraBuildInputs ? [ ],
     }:
     let
+      cargoDeps = rustPlatformNightly.importCargoLock {
+        lockFile = cargoLock;
+      };
+    in
+    pkgs.stdenv.mkDerivation {
+      pname = "rio-fuzz-${builtins.replaceStrings [ "/" ] [ "-" ] fuzzDir}";
+      version = "0.0.0";
+
       src = pkgs.lib.fileset.toSource {
         root = unfilteredRoot;
         fileset = pkgs.lib.fileset.unions [
-          (craneLib.fileset.commonCargoSources unfilteredRoot)
-          cargoLock
-          # rio-store fuzz transitively builds rio-proto — needs
-          # .proto sources for prost codegen.
-          (pkgs.lib.fileset.fileFilter (file: file.hasExt "proto") unfilteredRoot)
+          c2nWorkspaceFileset
+          (unfilteredRoot + "/${fuzzDir}/Cargo.toml")
+          (unfilteredRoot + "/${fuzzDir}/Cargo.lock")
+          (unfilteredRoot + "/${fuzzDir}/fuzz_targets")
         ];
       };
 
-      fuzzArgs = {
-        inherit src;
-        strictDeps = true;
-        pname = "rio-fuzz-${builtins.replaceStrings [ "/" ] [ "-" ] fuzzDir}";
-        version = "0.0.0";
+      inherit cargoDeps;
+      # cargoSetupHook validates $src/$cargoRoot/Cargo.lock against
+      # the vendored lockfile. Without this, it compares the MAIN
+      # workspace's Cargo.lock at source root — which differs (the
+      # fuzz crate is its own workspace with its own lockfile).
+      cargoRoot = fuzzDir;
 
-        cargoVendorDir = craneLibNightly.vendorCargoDeps {
-          inherit cargoLock;
-        };
+      nativeBuildInputs =
+        (with pkgs; [
+          pkg-config
+          cargo-fuzz
+          rustPlatformNightly.cargoSetupHook
+        ])
+        ++ [ rustNightly ]
+        ++ extraNativeBuildInputs;
 
-        nativeBuildInputs =
-          (with pkgs; [
-            pkg-config
-            cargo-fuzz
-          ])
-          ++ extraNativeBuildInputs;
+      buildInputs =
+        (with pkgs; [
+          openssl
+          llvmPackages.libclang.lib
+        ])
+        ++ extraBuildInputs;
 
-        buildInputs =
-          (with pkgs; [
-            openssl
-            llvmPackages.libclang.lib
-          ])
-          ++ extraBuildInputs;
+      LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+      PROTOC = "${pkgs.protobuf}/bin/protoc";
 
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        PROTOC = "${pkgs.protobuf}/bin/protoc";
-      };
-    in
-    # Compile all fuzz target binaries with sancov instrumentation.
-    # Expensive but cached by source hash; shared by all fuzz runs.
-    #
-    # No dep-layer (cargoArtifacts=null): cargo-fuzz's sancov flags
-    # produce incompatible object files with a non-instrumented
-    # buildDepsOnly layer, so dep caching would be a pure miss.
-    craneLibNightly.mkCargoDerivation (
-      fuzzArgs
-      // {
-        cargoArtifacts = null;
+      # cmake is in nativeBuildInputs for aws-lc-sys's build.rs, not
+      # for this derivation's configurePhase. The cmake setup hook
+      # auto-injects a cmake configurePhase that looks for
+      # CMakeLists.txt at source root — there isn't one.
+      dontUseCmakeConfigure = true;
 
-        buildPhaseCargoCommand = ''
-          cd ${fuzzDir}
-          cargo fuzz build --release
-        '';
+      # cargoSetupHook vendors into cargo-vendor-dir/ at top level;
+      # the cd into ${fuzzDir} below means cargo sees the vendored
+      # deps via the .cargo/config.toml that cargoSetupHook writes.
+      # cargo-fuzz itself doesn't read the hook's config — cargo does.
+      #
+      # cargo fuzz build sets RUSTFLAGS internally (sancov module,
+      # -Zsanitizer=address). --release for optimized throughput;
+      # the 2min check runs want coverage, not debug symbols.
+      buildPhase = ''
+        runHook preBuild
+        cd ${fuzzDir}
+        cargo fuzz build --release
+        runHook postBuild
+      '';
 
-        doInstallCargoArtifacts = false;
-        installPhaseCommand = ''
-          mkdir -p $out/bin
-          for t in ${pkgs.lib.concatStringsSep " " targets}; do
-            cp target/${rustTarget}/release/$t $out/bin/
-          done
-        '';
-      }
-    );
+      # cargo-fuzz writes binaries to target/<triple>/release/ (the
+      # --target flag is implicit — cargo-fuzz always cross-compiles
+      # to the host triple so linking libfuzzer works on Linux).
+      installPhase = ''
+        runHook preInstall
+        mkdir -p $out/bin
+        for t in ${pkgs.lib.concatStringsSep " " targets}; do
+          cp target/${rustTarget}/release/$t $out/bin/
+        done
+        runHook postInstall
+      '';
+    };
 
   # rio-nix fuzz target names. Used both as the `targets` list for
   # the build derivation and to generate the per-target

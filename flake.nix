@@ -19,7 +19,7 @@
     };
 
     # Spec-coverage tool (nix/tracey.nix). Flake input (not fetchFromGitHub)
-    # so crane reads Cargo.lock from a pre-fetched path — no IFD.
+    # so importCargoLock reads Cargo.lock from a pre-fetched path — no IFD.
     tracey-src = {
       url = "github:bearcove/tracey/2446b4f7433c6220c18737737970f6eccbe2081d";
       flake = false;
@@ -35,7 +35,13 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    crane.url = "github:ipetkov/crane";
+    # RustSec advisory DB for cargo-deny (hermetic — no network at
+    # build time). Bump via `nix flake update advisory-db` to pick up
+    # new advisories.
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
 
     # Per-crate Nix builds (evaluation PoC — see
     # .claude/notes/crate2nix-migration-assessment.md). Pinned to master
@@ -182,11 +188,18 @@
             }
           );
 
-          # Crane for CI: stable toolchain, reproducible.
-          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustStable;
-
-          # Crane for fuzz builds + default dev shell: nightly.
-          craneLibNightly = (inputs.crane.mkLib pkgs).overrideToolchain rustNightly;
+          # nixpkgs rustPlatform wired to our rust-overlay toolchains.
+          # Stable: used by nix/tracey.nix (external tool, edition-2024
+          # capable toolchain). Nightly: used by nix/fuzz.nix
+          # (libfuzzer-sys needs -Zsanitizer=address).
+          rustPlatformStable = pkgs.makeRustPlatform {
+            rustc = rustStable;
+            cargo = rustStable;
+          };
+          rustPlatformNightly = pkgs.makeRustPlatform {
+            rustc = rustNightly;
+            cargo = rustNightly;
+          };
 
           # Source root for filesets
           unfilteredRoot = ./.;
@@ -220,8 +233,7 @@
           };
 
           # Prefix every key in an attrset. Used to surface per-member
-          # c2n derivations under flake packages without colliding with
-          # crane's.
+          # derivations under flake packages.
           prefixed = p: pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "${p}${n}" v);
 
           # ──────────────────────────────────────────────────────────────
@@ -231,8 +243,7 @@
           # Each sys-crate that system-links instead of vendoring C gets
           # its env-var escape hatch + system lib here. Per-crate shape
           # so crate2nix crateOverrides can reference .crates.<name>
-          # directly (same libs crane links, same env vars devShell
-          # sets). Crane + devShell consume the derived .allEnv/.allLibs
+          # directly; devShell consumes the derived .allEnv/.allLibs
           # aggregates.
           #
           # Adding a sys-crate: add a .crates.<name> entry here, add the
@@ -266,122 +277,32 @@
             in
             {
               inherit crates;
-              # Derived aggregates for crane's monolithic commonArgs.
-              # allLibs order matches the pre-per-crate flat list
-              # [sqlite zstd fuse3] so crane's buildInputs (hence drv
-              # hash) stays stable across this restructure.
+              # Derived aggregates for the dev shell (workspace-wide
+              # buildInputs + env).
               allEnv = pkgs.lib.foldl' (a: c: a // c.env) { } (pkgs.lib.attrValues crates);
-              allLibs = with crates; libsqlite3-sys.libs ++ zstd-sys.libs ++ fuser.libs;
+              allLibs = pkgs.lib.concatMap (c: c.libs) (pkgs.lib.attrValues crates);
             };
 
-          # Common arguments for all crane builds
-          commonArgs = sysCrateEnv.allEnv // {
-            src = pkgs.lib.fileset.toSource {
-              root = unfilteredRoot;
-              fileset = pkgs.lib.fileset.unions [
-                # All standard Cargo sources (Cargo.toml, Cargo.lock, .rs files, etc.)
-                (craneLib.fileset.commonCargoSources unfilteredRoot)
-                # Proto files for gRPC code generation
-                (pkgs.lib.fileset.fileFilter (file: file.hasExt "proto") unfilteredRoot)
-                # SQL migrations (embedded at compile time via sqlx::migrate!)
-                ./migrations
-                # cargo-deny config (license + advisory policy)
-                ./.cargo/deny.toml
-                # nextest config (CI profile with JUnit output, test groups)
-                ./.config/nextest.toml
-              ];
-            };
-            strictDeps = true;
+          # Workspace binaries (crate2nix per-crate build, stripped +
+          # patchelf'd closure-shrink in nix/crate2nix.nix). What
+          # docker images, VM tests, worker-vm, and crdgen consume.
+          rio-workspace = c2n.workspaceBins;
 
-            pname = "rio";
-            inherit version;
+          # Coverage-instrumented workspace. crate2nix parallel tree
+          # with globalExtraRustcOpts=["-Cinstrument-coverage"]. Used
+          # by vmTestsCov + nix/coverage.nix. Closure-scrubbed via
+          # patchelf+remove-references-to but NOT stripped — stripping
+          # removes the __llvm_covfun/__llvm_covmap sections llvm-cov
+          # needs. Previously used raw c2nCov.workspace (2.3GB closure
+          # via dead rust-toolchain RPATH) → k3s containerd tmpfs
+          # ENOSPC. workspaceBinsCov collapses the closure to glibc+
+          # syslibs while keeping the instrumentation sections.
+          rio-workspace-cov = c2nCov.workspaceBinsCov;
 
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              protobuf
-              cmake
-            ];
-
-            buildInputs =
-              with pkgs;
-              [
-                openssl
-                llvmPackages.libclang.lib
-              ]
-              # System libraries for sys-crate pkg-config probes (see
-              # sysCrateEnv above — per-crate single source of truth).
-              ++ sysCrateEnv.allLibs
-              ++ lib.optionals stdenv.isDarwin [
-                darwin.apple_sdk.frameworks.Security
-                libiconv
-              ];
-
-            propagatedBuildInputs = with pkgs; [
-              nix
-            ];
-
-            RUST_BACKTRACE = "1";
-            RUST_SRC_PATH = "${rustStable}/lib/rustlib/src/rust/library";
-            PROTOC = "${pkgs.protobuf}/bin/protoc";
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            # Where rio-test-support finds initdb/postgres (falls back to PATH).
-            PG_BIN = "${pkgs.postgresql_18}/bin";
-            # sys-crate escape-hatch env vars set via the
-            # `sysCrateEnv.allEnv //` merge above (first line of
-            # commonArgs). nix/crate2nix.nix references the per-crate
-            # .crates.<name> entries directly.
-            # nixbuildnet's adaptive scheduler decays Rust builds
-            # (nextest went 24 cores @ 3min → 6 cores @ 8min — optimizes
-            # utilization not throughput). Pin minimums on all crane drvs.
-            # VM tests already do this per-test via withMinCpu (below).
-            NIXBUILDNET_MIN_CPU = "64";
-            NIXBUILDNET_MIN_MEM = "65536"; # 64GB in MB
-          };
-
-          # Build dependencies only (for caching)
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-          # Build the workspace
-          rio-workspace = craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              doCheck = false; # We'll run checks separately
-            }
-          );
-
-          # --------------------------------------------------------------
-          # Coverage-instrumented workspace build
-          # --------------------------------------------------------------
-          #
-          # RUSTFLAGS=-Cinstrument-coverage injects LLVM profile-generate
-          # instrumentation. Binaries write .profraw files (via atexit)
-          # to LLVM_PROFILE_FILE. VM tests run these binaries, stop them
-          # gracefully (SIGTERM → drain → atexit profraw flush), collect profraws,
-          # and nix/coverage.nix merges them with unit-test lcov.
-          #
-          # Distinct pname → distinct store path, builds in parallel
-          # with the non-instrumented workspace. RUSTFLAGS invalidates
-          # cargoArtifacts so a separate deps cache is used.
-          covArgs = commonArgs // {
-            RUSTFLAGS = "-C instrument-coverage";
-            pname = "rio-cov";
-            # Build scripts and proc-macros are ALSO instrumented; when
-            # they run at compile time (tonic-prost-build, sqlx macros),
-            # they try to write profraws to CWD — RO in the sandbox →
-            # "LLVM Profile Error: Read-only file system" noise. Discard
-            # build-time profraws. At RUNTIME, the VM's systemd env sets
-            # LLVM_PROFILE_FILE=/var/lib/rio/cov/... which overrides this.
-            LLVM_PROFILE_FILE = "/dev/null";
-          };
-          cargoArtifactsCov = craneLib.buildDepsOnly covArgs;
-          rio-workspace-cov = craneLib.buildPackage (
-            covArgs
-            // {
-              cargoArtifacts = cargoArtifactsCov;
-              doCheck = false;
-            }
-          );
+          # Source tree for genhtml (nix/coverage.nix cd's here so
+          # genhtml can resolve repo-relative lcov paths to source
+          # lines). c2nWorkspaceSrc has all rio-*/src/.
+          commonSrc = c2nWorkspaceSrc;
 
           # --------------------------------------------------------------
           # Fuzz build pipeline (extracted to nix/fuzz.nix)
@@ -393,16 +314,18 @@
           fuzz = import ./nix/fuzz.nix {
             inherit
               pkgs
-              craneLib
-              craneLibNightly
+              rustNightly
+              rustPlatformNightly
               unfilteredRoot
+              c2nWorkspaceFileset
               ;
           };
 
           # Spec-coverage CLI + web dashboard. The SPA is built via
           # fetchPnpmDeps in nix/tracey.nix and embedded at compile time.
           traceyPkg = import ./nix/tracey.nix {
-            inherit craneLib pkgs;
+            inherit pkgs;
+            rustPlatform = rustPlatformStable;
             inherit (inputs) tracey-src;
           };
 
@@ -434,8 +357,7 @@
           # pre-resolved Cargo.json. See nix/crate2nix.nix and
           # .claude/notes/crate2nix-migration-assessment.md for the
           # rationale and caveats. Exposed below as
-          # packages.c2n-workspace + packages.c2n-rio-<crate> for
-          # side-by-side comparison with crane's rio-workspace.
+          # packages.c2n-workspace + packages.c2n-rio-<crate>.
           mkC2n =
             extra:
             import ./nix/crate2nix.nix (
@@ -556,78 +478,86 @@
           } "echo -n ca-golden-test-data > $out";
 
           # --------------------------------------------------------------
-          # Check derivations (extracted so checks and aggregates share them)
+          # Non-rustc check derivations (shared by checks.* and ci aggregate)
           # --------------------------------------------------------------
-          cargoChecks = {
-            clippy = craneLib.cargoClippy (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-              }
-            );
+          #
+          # Rust checks (clippy/nextest/doc/coverage) are in c2nChecks
+          # (per-crate caching, deps built once). These are the rest:
+          # workspace-level policy checks that don't invoke rustc.
+          miscChecks = {
             # License + advisory audit. Policy: deny GPL-3.0 (project is
-            # MIT/Apache), fail on RustSec advisories with a curated ignore
-            # list in deny.toml. Runs as part of `nix flake check` and all
-            # ci-* aggregates.
+            # MIT/Apache), fail on RustSec advisories with a curated
+            # ignore list in .cargo/deny.toml. The advisory DB is a
+            # flake input (hermetic — no network). Bump via `nix flake
+            # update advisory-db` to pick up new advisories.
             #
-            # craneLib.cargoDeny vendors the advisory DB at build time, so
-            # the check is hermetic (no network). Bump the flake inputs to
-            # pick up new advisories.
-            deny = craneLib.cargoDeny (commonArgs // { inherit cargoArtifacts; });
-            nextest = craneLib.cargoNextest (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                # `--profile ci` enables retries + test-groups (.config/nextest.toml).
-                # `--no-tests=warn`: workspace has leaf bins with no tests.
-                cargoNextestExtraArgs = "--no-tests=warn --profile ci";
-                nativeCheckInputs = with pkgs; [
-                  # nix-cli (not .default / nix-everything): the latter has
-                  # nix-functional-tests as a *buildInput*, which fails on
-                  # non-NixOS builders (sandboxing/overlayfs tests need priv).
-                  # nix-cli has the full bin/ set (nix, nix-daemon, nix-store)
-                  # — everything the golden conformance tests need.
-                  inputs.nix.packages.${system}.nix-cli
-                  openssh
-                  postgresql_18
+            # cargo-deny internally runs `cargo metadata` to resolve
+            # the full dep tree for license/advisory analysis. That
+            # needs vendored sources (cargoSetupHook writes a source-
+            # replacement config so cargo finds crates.io deps in the
+            # vendored dir instead of the registry index).
+            deny = pkgs.stdenv.mkDerivation {
+              pname = "rio-deny";
+              inherit version;
+              src = pkgs.lib.fileset.toSource {
+                root = unfilteredRoot;
+                fileset = pkgs.lib.fileset.unions [
+                  ./.cargo/deny.toml
+                  c2nWorkspaceFileset
                 ];
-                # Golden fixture paths (golden/daemon.rs reads these env vars).
-                RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-                RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-                # Force hermetic golden mode — on builders where the Nix
-                # sandbox is disabled or relaxed (e.g. early ARC runner
-                # config), /nix/var/nix/db can leak into the build. The
-                # test's filesystem-based hermetic-detection then tries
-                # to symlink the host's locked Nix db → spawned daemon
-                # crashes. This env var bypasses detection; tests take
-                # the precompute-metadata path unconditionally.
-                RIO_GOLDEN_FORCE_HERMETIC = "1";
-                # Nix's log prefix wrapper (`rio-nextest> ...`) turns
-                # the progress bar into one-line-per-tick spam. `auto`
-                # should detect non-TTY but nix's stderr pipe confuses
-                # the heuristic. (`show-progress` is user-config-only,
-                # can't set it in .config/nextest.toml.)
-                NEXTEST_HIDE_PROGRESS_BAR = "1";
-              }
-            );
-            doc = craneLib.cargoDoc (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                # Deny rustdoc warnings (private_intra_doc_links, broken_intra_doc_links,
-                # unclosed HTML tags) — catches doc regressions in CI.
-                RUSTDOCFLAGS = "-Dwarnings";
-              }
-            );
-            # Spec-coverage validation: fails on broken r[...] references,
-            # duplicate requirement IDs, or unparseable include files. Does
-            # NOT fail on uncovered/untested — those are informational.
+              };
+              cargoDeps = rustPlatformStable.importCargoLock {
+                lockFile = ./Cargo.lock;
+              };
+              nativeBuildInputs = with pkgs; [
+                cargo-deny
+                rustStable
+                rustPlatformStable.cargoSetupHook
+                git
+              ];
+              # cargoSetupHook writes .cargo/config.toml with vendored
+              # source replacement. cargo metadata reads it; no registry
+              # access needed.
+              buildPhase = ''
+                # HOME defaults to /homeless-shelter (RO). deny.toml's
+                # db-path = "~/.cargo/advisory-db" resolves against
+                # HOME. cargo-deny expects the DB as a GIT REPO (reads
+                # HEAD to determine DB version for the report). The
+                # flake input is a plain dir (flake=false strips .git),
+                # so we init a throwaway repo with the content.
+                export HOME=$TMPDIR
+                db=$HOME/.cargo/advisory-db/advisory-db-3157b0e258782691
+                mkdir -p "$db"
+                cp -r ${inputs.advisory-db}/. "$db"/
+                chmod -R u+w "$db"
+                git -C "$db" init -q
+                git -C "$db" add -A
+                git -C "$db" \
+                  -c user.name=nix -c user.email=nix@localhost \
+                  commit -q -m snapshot
+                cargo deny \
+                  --manifest-path ./Cargo.toml \
+                  --offline \
+                  check \
+                  --config ./.cargo/deny.toml \
+                  --disable-fetch \
+                  advisories licenses bans sources \
+                  2>&1 | tee deny.out
+              '';
+              installPhase = ''
+                cp deny.out $out
+              '';
+            };
+
+            # Spec-coverage validation: fails on broken r[...]
+            # references, duplicate requirement IDs, or unparseable
+            # include files. Does NOT fail on uncovered/untested — those
+            # are informational.
             #
-            # Uses cleanSource (not cleanCargoSource) because tracey needs
-            # docs/**/*.md and .config/tracey/config.styx, which crane's
-            # source filter drops. tracey's daemon writes .tracey/daemon.sock
-            # under the working dir, so we cp to a writable tmpdir first.
+            # Uses cleanSource because tracey needs docs/**/*.md and
+            # .config/tracey/config.styx. tracey's daemon writes
+            # .tracey/daemon.sock under the working dir, so we cp to a
+            # writable tmpdir first.
             tracey-validate =
               pkgs.runCommand "rio-tracey-validate"
                 {
@@ -638,10 +568,6 @@
                   cp -r $src $TMPDIR/work
                   chmod -R +w $TMPDIR/work
                   cd $TMPDIR/work
-                  # Remove any stale .tracey/ state that cleanSource may have
-                  # included (committed .gitignore excludes it, but belt+braces).
-                  # HOME is set so tracey's daemon-state dir (if it writes one
-                  # outside the working dir) goes somewhere writable.
                   rm -rf .tracey/
                   export HOME=$TMPDIR
                   set -o pipefail
@@ -649,15 +575,9 @@
                 '';
 
             # Helm chart lint + template for all value profiles. Catches
-            # Go-template syntax errors, missing required values, bad YAML
-            # in rendered output. Subcharts are NOT vendored — charts/ is
-            # gitignored; the PG chart is symlinked from the nix store (via
-            # nix/helm-charts.nix, nixhelm FOD) because `helm dependency
-            # build` needs network and fails in the sandbox.
-            # kubeconform schema validation is NOT here (it fetches schemas
-            # from raw.githubusercontent.com; nixbuild.net sandbox blocks
-            # that) — it's a pre-commit hook instead (runs on dev laptop
-            # with network).
+            # Go-template syntax errors, missing required values, bad
+            # YAML in rendered output. Subcharts symlinked from nixhelm
+            # (FOD) — `helm dependency build` needs network.
             helm-lint =
               let
                 chart = pkgs.lib.cleanSource ./infra/helm/rio-build;
@@ -670,72 +590,14 @@
                   cp -r ${chart} $TMPDIR/chart
                   chmod -R +w $TMPDIR/chart
                   cd $TMPDIR/chart
-                  # PG subchart from nixhelm (FOD). Rook is NOT a subchart
-                  # (separate release, operator-first lifecycle) so helm-lint
-                  # doesn't need it.
                   mkdir -p charts
                   ln -s ${subcharts.postgresql} charts/postgresql
                   helm lint .
-                  # Default (prod) profile: tag must be set (empty → bad image ref).
                   helm template rio . --set global.image.tag=test > /dev/null
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
                   touch $out
                 '';
-            # Coverage via `cargo llvm-cov nextest` (NOT `cargo llvm-cov test`).
-            #
-            # Root cause of the previous flakiness: `cargo test` runs all
-            # tests in a single process with --test-threads=NCPU. Scheduler
-            # tests share ONE ephemeral PG server via `static PG: OnceLock`
-            # (rio-test-support/src/pg.rs). Under ~56-way parallelism +
-            # llvm-cov instrumentation overhead on nixbuild.net, that PG
-            # server saturates on query execution (not connection count —
-            # max_connections=500 is plenty). `test_scheduler_cache_check_
-            # skips_build` is uniquely vulnerable: it does a gRPC
-            # FindMissingPaths call INSIDE the actor's serial event loop
-            # with a 30s timeout (merge.rs:412). The in-process store's
-            # handler does a PG query → stalls → 30s elapses → timeout →
-            # cache check returns empty → derivation stays Created →
-            # assertion expecting Completed fails at ~35s total.
-            #
-            # nextest's per-test-process model eliminates this structurally:
-            # each test gets its OWN PG server (own `PG` static). This is
-            # why the `nextest` check above never flaked. cargoNextest with
-            # `withLlvmCov = true` runs `cargo llvm-cov nextest` under the
-            # hood — same isolation, plus coverage.
-            coverage = craneLib.cargoNextest (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                withLlvmCov = true;
-                cargoNextestExtraArgs = "--no-tests=warn";
-                # crane's cargoNextest does `mkdir -p $out` in buildPhase, so
-                # $out is a directory. The old cargoLlvmCov wrote lcov to $out
-                # directly (a file). lcov consumers downstream (lcov --summary
-                # in the dev shell) need updating to $out/lcov.info.
-                cargoLlvmCovExtraArgs = "--lcov --output-path $out/lcov.info";
-                # cargoNextest runs tests in checkPhase (vs cargoLlvmCov
-                # which used buildPhase), so nativeCheckInputs is correct
-                # here — matching the plain `nextest` check above.
-                nativeCheckInputs = with pkgs; [
-                  inputs.nix.packages.${system}.nix-cli
-                  openssh
-                  postgresql_18
-                ];
-                # We don't need deps-caching output from this derivation;
-                # the plain nextest check already provides that. llvm-cov's
-                # instrumented artifacts also don't usefully seed non-cov
-                # downstream builds.
-                doInstallCargoArtifacts = false;
-                dontFixup = true;
-                RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-                RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-                # See the nextest check above — same sandbox-detection bypass
-                # and progress-bar suppression.
-                RIO_GOLDEN_FORCE_HERMETIC = "1";
-                NEXTEST_HIDE_PROGRESS_BAR = "1";
-              }
-            );
           };
 
           # Container images (Linux-only — dockerTools uses Linux VM
@@ -788,11 +650,27 @@
           # (vm-phase2a once got 5 CPUs for 4 VMs → 16 vCPUs on 5
           # physical, 2 VMs fell back to TCG, worker1's kernel boot
           # starved at PCI enumeration → Shell disconnected flake).
-          # numVMs × 4 (cores per VM) + 1 for the test driver itself.
+          #
+          # Floor of 64 vCPU / 128GB: prevents KVM contention across
+          # concurrent VM-test builds on the same host. With ~60-190
+          # CPU hosts, 64 vCPU floor caps at ~1-3 concurrent VM-test
+          # builds per host (previously ~9 at old ×4 formula → up to
+          # ~45 concurrent qemu KVM_CREATE_VM → some lose the race,
+          # "failed to initialize kvm: Permission denied" → TCG
+          # fallback or hard fail). 128GB floor ensures the k3s tests
+          # (≈20GB peak) plus qemu+test-driver overhead have headroom.
+          # cpuHints is still consulted for the ×4 formula when it
+          # exceeds the floor (future >16-VM tests).
           withMinCpu =
             numVMs: test:
+            let
+              byVMs = numVMs * 4 + 1;
+              cpuFloor = 64;
+              memFloor = 131072;
+            in
             test.overrideTestDerivation {
-              NIXBUILDNET_MIN_CPU = toString (numVMs * 4 + 1);
+              NIXBUILDNET_MIN_CPU = toString (pkgs.lib.max byVMs cpuFloor);
+              NIXBUILDNET_MIN_MEM = toString memFloor;
             };
 
           mkVmTests =
@@ -868,7 +746,16 @@
           #
           # nix/coverage.nix merges profraws from each coverage-mode VM
           # test with the unit-test lcov, producing combined + per-test
-          # lcov + genhtml report. See that file for the full pipeline.
+          # lcov + genhtml report.
+          #
+          # stripPrefix: buildRustCrate's --remap-path-prefix maps
+          # sandbox → `/`, so profraws reference `/rio-store/src/...`.
+          # Strip the leading slash to get repo-relative paths that
+          # genhtml can resolve against commonSrc.
+          #
+          # Coverage mode uses workspaceBinsCov (not workspaceBins) —
+          # same closure-scrub but skips strip so the __llvm_covfun /
+          # __llvm_covmap sections llvm-cov needs stay intact.
           coverage = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             import ./nix/coverage.nix {
               inherit
@@ -876,9 +763,9 @@
                 rustStable
                 rio-workspace-cov
                 vmTestsCov
+                commonSrc
                 ;
-              commonSrc = commonArgs.src;
-              unitCoverage = cargoChecks.coverage;
+              unitCoverage = c2nChecks.coverage;
             }
           );
 
@@ -891,25 +778,18 @@
           # (inspectable with `ls result/`).
           #
           # All VM tests (including k3s scenarios) + 2min fuzz. On
-          # non-Linux, degrades to cargo checks + pre-commit only (VM
+          # non-Linux, degrades to Rust checks + pre-commit only (VM
           # tests and fuzz are both optionalAttrs isLinux upstream).
-          # Linux+KVM required for the full set — typically via
-          # `nix-build-remote -- .#ci`.
-
-          # Base constituents present in every aggregate.
-          # fuzz-build is NOT listed — it's a transitive dep of every fuzz
-          # derivation and will be built regardless.
+          # Linux+KVM required for the full set.
           ciBaseDrvs = [
             rio-workspace
-            cargoChecks.clippy
-            cargoChecks.nextest
-            cargoChecks.doc
-            cargoChecks.coverage
-            cargoChecks.deny
-            cargoChecks.tracey-validate
-            cargoChecks.helm-lint
-            # pre-commit is auto-generated by git-hooks-nix; referencing
-            # config.checks from packages is acyclic.
+            c2nChecks.clippyCheck
+            c2nChecks.nextest
+            c2nChecks.docCheck
+            c2nChecks.coverage
+            miscChecks.deny
+            miscChecks.tracey-validate
+            miscChecks.helm-lint
             config.checks.pre-commit
           ];
 
@@ -917,111 +797,6 @@
             ciBaseDrvs
             ++ builtins.attrValues fuzz.runs
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTests)
-          );
-
-          # ──────────────────────────────────────────────────────────
-          # crate2nix-backed CI aggregate (parallel to `.#ci`)
-          # ──────────────────────────────────────────────────────────
-          #
-          # Same linkFarmFromDrvs UX (`nix build .#ci-c2n`, ls result/).
-          # Swaps crane's rustc-invoking constituents for crate2nix
-          # equivalents; leaves non-rust checks (tracey, helm-lint,
-          # pre-commit, cargo-deny) and fuzz (nightly craneLibNightly,
-          # separate workspace — no caching win from porting) unchanged.
-          #
-          # VM tests consume c2n.workspace — same `bin/` layout as
-          # crane's rio-workspace (verified: bin/crdgen bin/rio-cli
-          # bin/rio-{controller,gateway,scheduler,store,worker}), so
-          # mkVmTests / mkDockerImages / nix/modules/*.nix all accept
-          # it as a drop-in. See §4 of the migration-assessment doc.
-          #
-          # Additive: `.#ci` (crane) stays the gate until this proves
-          # stable. Keeping both aggregates means the crane pipeline
-          # still exercises end-to-end during the migration window.
-          # c2n.workspaceBins (not c2n.workspace): stripped binary-
-          # only derivation. `allWorkspaceMembers` references the
-          # full rust toolchain via debug info → ~2.3 GB closure,
-          # vs crane's ~300 MB. VM tests and docker images only
-          # need the executables; the strip+patchelf wrapper in
-          # nix/crate2nix.nix drops the toolchain reference
-          # (disallowedReferences = [rustStable] enforces this).
-          dockerImagesC2n = mkDockerImages { rio-workspace = c2n.workspaceBins; };
-          vmTestsC2n = mkVmTests {
-            rio-workspace = c2n.workspaceBins;
-            dockerImages = dockerImagesC2n;
-            coverage = false;
-          };
-
-          # Non-rust checks reused verbatim from the crane pipeline —
-          # none of these invoke rustc, so crate2nix gives zero caching
-          # win. cargo-deny is workspace-level (reads Cargo.lock +
-          # deny.toml); it stays on crane because craneLib.cargoDeny
-          # already vendors the advisory DB hermetically and there's
-          # no crate2nix equivalent.
-          ciC2nBaseDrvs = [
-            c2n.workspaceBins
-            c2nChecks.clippyCheck
-            c2nChecks.nextest
-            c2nChecks.docCheck
-            c2nChecks.coverage
-            cargoChecks.deny
-            cargoChecks.tracey-validate
-            cargoChecks.helm-lint
-            config.checks.pre-commit
-          ];
-
-          ci-c2n = pkgs.linkFarmFromDrvs "rio-ci-c2n" (
-            ciC2nBaseDrvs
-            ++ builtins.attrValues fuzz.runs
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTestsC2n)
-          );
-
-          # ──────────────────────────────────────────────────────────
-          # crate2nix-backed coverage-full (parallel to `.#coverage-full`)
-          # ──────────────────────────────────────────────────────────
-          #
-          # Same nix/coverage.nix merge pipeline, fed with:
-          #   - unitCoverage = c2nChecks.coverage (instrumented nextest
-          #     run → profraw → lcov, already repo-relative paths)
-          #   - rio-workspace-cov = c2nCov.workspace (instrumented
-          #     release binaries, --remap-path-prefix → `/` at compile)
-          #   - vmTestsCov = vmTestsC2nCov (VMs run c2n-instrumented
-          #     binaries, emit profraws with `/rio-*/src/...` paths)
-          #
-          # stripPrefix differs: buildRustCrate remaps to `/` (not
-          # `.../source/`), so the pattern is `s|^/||` — same as
-          # c2n-checks.nix's own lcov normalization.
-          # Coverage mode: CANNOT use workspaceBins — stripping
-          # removes the __llvm_covfun/__llvm_covmap sections that
-          # llvm-cov needs. Use the full unstripped c2nCov.workspace
-          # and accept the 2.3 GB closure. k3s-agent VM disk sizes
-          # may need bumping to accommodate (docker.nix already
-          # uses zstd -19 for coverage images to keep import size
-          # down, but the uncompressed layer size is what matters
-          # for kubelet's ephemeral-storage accounting).
-          vmTestsC2nCov = mkVmTests {
-            rio-workspace = c2nCov.workspace;
-            dockerImages = mkDockerImages {
-              rio-workspace = c2nCov.workspace;
-              coverage = true;
-            };
-            coverage = true;
-          };
-
-          coverageC2n = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-            import ./nix/coverage.nix {
-              inherit pkgs rustStable;
-              rio-workspace-cov = c2nCov.workspace;
-              vmTestsCov = vmTestsC2nCov;
-              commonSrc = commonArgs.src;
-              unitCoverage = c2nChecks.coverage;
-              # buildRustCrate's --remap-path-prefix maps sandbox →
-              # `/`, so profraws reference `/rio-store/src/...` etc.
-              # Strip the leading slash to get repo-relative paths
-              # that genhtml can resolve against commonSrc.
-              stripPrefix = "s|^/||";
-              nameSuffix = "-c2n";
-            }
           );
 
           # ──────────────────────────────────────────────────────────
@@ -1046,17 +821,13 @@
           # too — on Darwin it's {} (harmless).
           githubActions = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             matrix = {
-              # Cargo/static checks. Excludes `coverage` (superseded by
-              # the coverage matrix below — Codecov merges flags).
+              # Rust + static checks. Excludes `coverage` (superseded
+              # by the coverage matrix below — Codecov merges flags).
               checks = {
-                inherit (cargoChecks)
-                  clippy
-                  nextest
-                  doc
-                  deny
-                  tracey-validate
-                  helm-lint
-                  ;
+                clippy = c2nChecks.clippyCheck;
+                doc = c2nChecks.docCheck;
+                inherit (c2nChecks) nextest;
+                inherit (miscChecks) deny tracey-validate helm-lint;
                 inherit (config.checks) pre-commit;
               };
               # 2min fuzz runs, one matrix entry per target. Keys are
@@ -1161,7 +932,7 @@
           # --------------------------------------------------------------
           #
           # Default = nightly so `cargo fuzz run` works out of the box.
-          # CI builds still use stable (see craneLib above), so if you
+          # CI builds use stable (rustStable via crate2nix), so if you
           # write nightly-only code, checks.clippy / checks.nextest will
           # catch it.
           #
@@ -1246,35 +1017,39 @@
                   ps.pytest
                 ]))
               ];
-              # sys-crate escape-hatch env vars (same aggregate
-              # commonArgs uses). craneLib.devShell inherits buildInputs
-              # from `checks`, but env vars need explicit propagation.
-              shellEnv = sysCrateEnv.allEnv // {
-                RUST_BACKTRACE = "1";
-                PROTOC = "${pkgs.protobuf}/bin/protoc";
-                LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-                PG_BIN = "${pkgs.postgresql_18}/bin";
-                shellHook = config.pre-commit.installationScript;
-              };
+              # Shared mkShell builder. Lists build deps explicitly
+              # (openssl, libclang, sys-crate libs for pkg-config
+              # probes, protobuf+cmake for rio-proto's codegen).
+              mkRioShell =
+                rust:
+                pkgs.mkShell (
+                  sysCrateEnv.allEnv
+                  // {
+                    packages = [ rust ] ++ shellPackages;
+                    nativeBuildInputs = with pkgs; [
+                      pkg-config
+                      protobuf
+                      cmake
+                    ];
+                    buildInputs =
+                      with pkgs;
+                      [
+                        openssl
+                        llvmPackages.libclang.lib
+                      ]
+                      ++ sysCrateEnv.allLibs;
+                    RUST_BACKTRACE = "1";
+                    PROTOC = "${pkgs.protobuf}/bin/protoc";
+                    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+                    PG_BIN = "${pkgs.postgresql_18}/bin";
+                    RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
+                    shellHook = config.pre-commit.installationScript;
+                  }
+                );
             in
             {
-              default = craneLibNightly.devShell (
-                shellEnv
-                // {
-                  inherit (config) checks;
-                  packages = shellPackages;
-                  RUST_SRC_PATH = "${rustNightly}/lib/rustlib/src/rust/library";
-                }
-              );
-
-              stable = craneLib.devShell (
-                shellEnv
-                // {
-                  inherit (config) checks;
-                  packages = shellPackages;
-                  RUST_SRC_PATH = "${rustStable}/lib/rustlib/src/rust/library";
-                }
-              );
+              default = mkRioShell rustNightly;
+              stable = mkRioShell rustStable;
             };
 
           # --------------------------------------------------------------
@@ -1369,15 +1144,6 @@
             '';
             # VM-only combined (no unit-test merge). Debugging.
             coverage-vm = coverage.vmLcov;
-
-            # crate2nix-backed coverage-full. Same merge pipeline +
-            # output layout (result/lcov.info, result/html/,
-            # result/per-test/) but instrumented binaries and unit
-            # lcov both come from the c2nCov tree. stripPrefix is
-            # `s|^/||` (buildRustCrate's remap prefix is `/`, not
-            # crane's `.../source/`). See coverageC2n above.
-            coverage-full-c2n = coverageC2n.full;
-            coverage-vm-c2n = coverageC2n.vmLcov;
           }
           # Per-test lcovs: coverage-vm-phase1a etc. Useful for
           # "why is X not covered" — inspect one VM test's
@@ -1389,40 +1155,23 @@
           # Used during smoke debugging.
           // prefixed "cov-" vmTestsCov
           // {
-
-            # HTML coverage report generated from the lcov tracefile.
-            # View: `xdg-open result/index.html`.
-            #
-            # The coverage derivation's $out is a DIRECTORY (crane's
-            # cargoNextest does `mkdir -p $out`), with the tracefile
-            # at $out/lcov.info — see cargoLlvmCovExtraArgs on the
-            # `coverage` check above. The old cargoLlvmCov wrote lcov
-            # to $out itself (a plain file).
-            #
-            # The tracefile embeds absolute sandbox paths like
-            # /build/nix-build-rio-nextest-*.drv-*/source/rio-foo/src/bar.rs
-            # Strip everything up through `source/` so genhtml can resolve
-            # against ${commonArgs.src}. The pattern anchors on `source/`
-            # (not a specific sandbox dir layout) so it survives builder
-            # differences — the old cargoLlvmCov had /nix/var/nix/builds/,
-            # nixbuild.net's, crane's cargoNextest uses /build/. All share
-            # the unpackPhase convention of unpacking into `source/`.
+            # HTML coverage report from the unit-test lcov.
+            # c2nChecks.coverage already emits repo-relative paths
+            # (`rio-*/src/...`) — no strip needed, just genhtml.
             coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
-              ${pkgs.lcov}/bin/lcov \
-                --substitute 's|^/[^[:space:]]*/source/||' \
-                --extract ${cargoChecks.coverage}/lcov.info 'rio-*' \
-                --output-file $TMPDIR/cleaned.lcov
-              cd ${commonArgs.src}
-              ${pkgs.lcov}/bin/genhtml $TMPDIR/cleaned.lcov \
+              cd ${commonSrc}
+              ${pkgs.lcov}/bin/genhtml ${c2nChecks.coverage}/lcov.info \
                 --output-directory $out
             '';
+            inherit ci;
+            # Backward-compat aliases for scripts that target the old
+            # c2n-suffixed names.
+            ci-c2n = ci;
+            coverage-full-c2n = coverage.full;
+            coverage-vm-c2n = coverage.vmLcov;
           }
-          // {
-            inherit ci ci-c2n;
-          }
-          # crate2nix PoC outputs — per-member + symlinkJoin aggregate.
-          # Prefixed c2n- so they sort together in `nix flake show` and
-          # don't collide with the crane rio-workspace. See
+          # Per-member crate2nix derivations. Prefixed c2n- so they
+          # sort together in `nix flake show`. See
           # .claude/notes/crate2nix-migration-assessment.md.
           // prefixed "c2n-" c2n.members
           # Per-member check derivations for targeted runs:
@@ -1468,29 +1217,37 @@
             c2n-rustdoc-rustc = c2nChecks.rustdocRustc;
             # Instrumented workspace (symlinkJoin). Inspection:
             #   objdump -h result/bin/rio-store | grep llvm_prf
-            # Consumed by vmTestsC2nCov + coverageC2n above.
             c2n-workspace-cov = c2nCov.workspace;
           }
-          # crate2nix-backed VM tests and coverage-mode VM tests.
-          # Prefixed c2n- for side-by-side comparison with the crane
-          # vmTests/vmTestsCov. These are the constituents of .#ci-c2n
-          # and .#coverage-full-c2n respectively.
-          #
-          # Linux-only (mkVmTests wraps in optionalAttrs isLinux).
-          #
-          #   nix build .#c2n-vm-protocol-warm-standalone
-          #   nix build .#c2n-cov-vm-lifecycle-core-k3s
-          // prefixed "c2n-" vmTestsC2n
-          // prefixed "c2n-cov-" vmTestsC2nCov
-          // prefixed "c2n-coverage-" (coverageC2n.perTestLcov or { });
+          # Per-test VM packages (Linux-only — mkVmTests wraps in
+          # optionalAttrs isLinux):
+          #   nix build .#vm-protocol-warm-standalone
+          #   nix build .#cov-vm-lifecycle-core-k3s
+          # Plus c2n- prefixed aliases for backward-compat.
+          // vmTests
+          // prefixed "c2n-" vmTests
+          // prefixed "c2n-cov-" vmTestsCov
+          // prefixed "c2n-coverage-" (coverage.perTestLcov or { })
+          # KVM race validation probes (nix/tests/kvm-probe.nix).
+          # Not in .#ci — run manually to compare concurrent vs
+          # staggered VM start. Hypothesis: start_all() races qemu
+          # KVM_init, some VMs fall to TCG.
+          #   nix build -L .#kvm-probe-concurrent .#kvm-probe-staggered
+          #   grep "KVM-PROBE" <log> | sort | uniq -c
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            pkgs.lib.mapAttrs (_: withMinCpu 5) (import ./nix/tests/kvm-probe.nix { inherit pkgs; })
+          );
 
           # --------------------------------------------------------------
           # Checks (run with 'nix flake check')
           # --------------------------------------------------------------
           checks = {
             build = rio-workspace;
+            clippy = c2nChecks.clippyCheck;
+            doc = c2nChecks.docCheck;
+            inherit (c2nChecks) nextest coverage;
           }
-          // cargoChecks
+          // miscChecks
           # 2min fuzz runs (Linux-only). Compiled binaries shared
           # across targets via rio-{nix,store}-fuzz-build.
           // fuzz.runs
@@ -1508,10 +1265,6 @@
             codecov-matrix-sync =
               let
                 expected = builtins.length (builtins.attrNames githubActions.matrix.coverage);
-                # Single-line grep is fine here; if someone rewrites
-                # codecov.yml to split the key across lines, the check
-                # fails closed (no match → head-on-null error) rather
-                # than passing silently.
                 declared = pkgs.lib.toInt (
                   builtins.head (
                     builtins.match ".*after_n_builds: ([0-9]+).*" (builtins.readFile ./.github/codecov.yml)
@@ -1523,24 +1276,6 @@
                 Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
               '';
               pkgs.emptyFile;
-          }
-          # crate2nix-native checks. Parallel to crane's cargoClippy/
-          # cargoNextest/cargoDoc but with per-crate caching — deps
-          # built once, only workspace members rebuilt per-check.
-          # NOT yet the gate (crane checks still are); exposed for
-          # side-by-side comparison and migration validation.
-          // {
-            c2n-clippy = c2nChecks.clippyCheck;
-            # Test RUNNER (not just compilation) — executes harness
-            # binaries and fails if any test fails. Needs postgres
-            # for rio-test-support's ephemeral PG bootstrap.
-            # Currently Linux-only (postgres, FUSE tests).
-            c2n-test = c2nChecks.testCheck;
-            # nextest variant — per-test-process isolation, test
-            # groups, retries. Reuse-build mode against crate2nix
-            # test binaries. Parity with crane's cargoNextest.
-            c2n-nextest = c2nChecks.nextest;
-            c2n-doc = c2nChecks.docCheck;
           };
 
           # Formatter for 'nix fmt'

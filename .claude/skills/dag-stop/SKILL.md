@@ -18,7 +18,7 @@ touch .claude/state/runner-stopped
 ## 3. Snapshot
 
 ```bash
-python3 .claude/skills/dag-stop/dag_stop.py
+.claude/bin/onibus stop
 ```
 
 Output is `StopSnapshot` JSON (`--schema` for the contract). Pure read — no side effects.

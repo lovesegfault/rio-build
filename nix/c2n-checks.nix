@@ -186,7 +186,6 @@ let
     args=()
     skip_next=0
     is_build_script=0
-    saw_out_dir=0
     crate_name=""
     for arg in "$@"; do
       if [[ "$skip_next" == 1 ]]; then skip_next=0; continue; fi
@@ -197,7 +196,7 @@ let
         -C) skip_next=1 ;;
         -C*) ;; # drop -Copt-level=3 form
         --remap-path-prefix=*) ;;
-        --out-dir) skip_next=1; saw_out_dir=1 ;;
+        --out-dir) skip_next=1 ;;
         build_script_build) is_build_script=1; args+=("$arg") ;;
         --crate-name) args+=("$arg"); crate_name="NEXT" ;;
         *)
@@ -438,9 +437,10 @@ let
         // {
           nativeBuildInputs = runtimeTestInputs;
           RUST_BACKTRACE = "1";
-          # nixbuild.net heuristic allocation can under-provision for
-          # test runs (one run got 3.2GB — postgres + 16 tokio test
-          # threads OOM'd). Match crane's commonArgs pin.
+          # nixbuild.net can under-provision (one run got 3.2GB —
+          # postgres + 16 tokio test threads OOM'd). Lower than
+          # crane's 64/65536 workspace-wide pin — per-crate test
+          # runs are lighter.
           NIXBUILDNET_MIN_CPU = "16";
           NIXBUILDNET_MIN_MEM = "16384";
         }
@@ -613,22 +613,12 @@ let
   # per-crate Nix evals.
   testBinDirsJson = builtins.toJSON (lib.mapAttrs (_: drv: "${drv}/tests") testBinDrvs);
 
-  # Per-member target list from cargo metadata — we read Cargo.toml
-  # directly at Nix-eval time via fromTOML rather than running cargo.
-  # This is cheaper and avoids needing cargo in the derivation's
-  # nativeBuildInputs. The schema we extract matches what nextest
-  # wants: [{ name, kind }] per package.
-  #
-  # cargo's auto-discovery rules (src/lib.rs → lib, src/main.rs → bin
-  # with crateName, tests/*.rs → test, tests/*/main.rs → test) are
-  # replicated here because Cargo.toml doesn't list auto-discovered
-  # targets. This must stay in sync with cargo's behavior — if a
-  # member adds an explicit [[test]] with `path = "..."` the auto-
-  # discovery would be wrong (cargo disables autodiscover when any
-  # [[test]] is explicit unless autotests=true). Current workspace
-  # has no explicit [[test]] sections so auto-discovery suffices.
-  # If this breaks: switch to running `cargo metadata --no-deps` at
-  # build time inside the derivation.
+  # Target list from `cargo metadata --no-deps --offline` at build
+  # time. A previous draft tried fromTOML + hand-replicated auto-
+  # discovery (src/lib.rs, tests/*.rs, [[test]] override) — abandoned
+  # because cargo's autodiscover rules are a moving target and
+  # --no-deps --offline costs nothing (zero registry access, zero
+  # lockfile read).
   nextestMeta =
     pkgs.runCommand "c2n-nextest-meta"
       {
@@ -977,10 +967,9 @@ in
   tests = testRunDrvs;
   doc = docDrvs;
 
-  # Coverage (only populated when c2nCov is passed). covTestBins
-  # is the instrumented compile; covProfraw runs them + collects raw
-  # profile data; coverage is the merged lcov.
-  covTestBins = covTestBinDrvs;
+  # Coverage (populated when c2nCov is passed). covProfraw runs
+  # instrumented tests + collects raw profile data; coverage is the
+  # merged lcov.
   covProfraw = covProfrawDrvs;
   coverage = if c2nCov != null then coverageLcov else null;
 

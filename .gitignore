@@ -44,6 +44,8 @@ docs/book/
 # DAG-runner runtime state (agents-running.jsonl, merge-queue.jsonl, etc.)
 .claude/state/
 .claude/lib/.pytest_cache/
+# write_jsonl crash artifact (tmp+rename — crash leaves .tmp sibling)
+.claude/*.jsonl.tmp
 
 # tracey daemon state (unix socket, cache)
 .tracey/

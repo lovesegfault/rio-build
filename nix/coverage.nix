@@ -22,22 +22,21 @@
   vmTestsCov,
   commonSrc,
   unitCoverage,
-  # Source-path normalization pattern. Default = crane (both the
-  # instrumented build and the unit-test coverage build unpack into
-  # `source/`; the sandbox prefix differs — anchor on `source/` to
-  # strip both, same pattern as coverage-html in flake.nix).
-  #
-  # crate2nix (buildRustCrate) uses --remap-path-prefix to map the
-  # sandbox build dir to `/`, so paths are `/rio-common/src/lib.rs`.
-  # The c2n caller passes `stripPrefix = "s|^/||"` instead.
-  stripPrefix ? "s|^/[^[:space:]]*/source/||",
-  # --ignore-filename-regex passed to llvm-cov export on VM-test
-  # profraws. Default = crane layout. For crate2nix, dep paths are
-  # `/tokio-1.50.0/...` (no common prefix filterable here); the lcov
-  # --extract 'rio-*' step at the end handles workspace-only.
-  ignoreRegex ? "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/release/build",
-  # Name suffix for derivations so crane and c2n variants can
-  # coexist in the same store without conflicts.
+  # Source-path normalization pattern. buildRustCrate's
+  # --remap-path-prefix maps the sandbox build dir to `/`, so
+  # profraws reference `/rio-common/src/lib.rs`. Strip the leading
+  # slash to get repo-relative paths genhtml can resolve.
+  stripPrefix ? "s|^/||",
+  # --ignore-filename-regex for llvm-cov export on VM-test profraws.
+  # Dep paths like `/tokio-1.50.0/...` get filtered by the final
+  # `lcov --extract 'rio-*'` step; this regex catches common build
+  # artifacts that --extract misses. `target/.*build` covers both
+  # crane's target/release/build/ and crate2nix's target/build/
+  # (buildRustCrate puts generated proto code at target/build/
+  # <crate>.out/, genhtml can't resolve it against commonSrc).
+  ignoreRegex ? "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build",
+  # Name suffix for derivations. Kept for callers that want
+  # multiple coverage pipelines side by side.
   nameSuffix ? "",
 }:
 let
@@ -179,7 +178,16 @@ in
         fi
         # --extract filters to workspace crates (drops any stray
         # deps that made it through --ignore-filename-regex).
-        lcov --extract $TMPDIR/combined.lcov 'rio-*' -o $out/lcov.info
+        lcov --extract $TMPDIR/combined.lcov 'rio-*' -o $TMPDIR/extracted.lcov
+        # --remove filters out generated build artifacts that
+        # --extract let through (rio-proto/target/build/... matches
+        # 'rio-*' but the generated .rs doesn't exist in commonSrc).
+        # crate2nix puts tonic-prost-build output at target/build/
+        # (crane used target/release/build/); genhtml can't resolve
+        # either against commonSrc. unused: don't error if pattern
+        # doesn't match (clean unit-only runs may not have these).
+        lcov --ignore-errors unused \
+          --remove $TMPDIR/extracted.lcov '*/target/*' -o $out/lcov.info
 
         # HTML report. cd into source so genhtml can find files
         # for the source view. --ignore-errors source: safety net
@@ -187,7 +195,7 @@ in
         # through the regex (genhtml synthesizes a placeholder).
         cd ${commonSrc}
         genhtml $out/lcov.info --output-directory $out/html \
-          --ignore-errors source
+          --ignore-errors source --synthesize-missing
 
         # Summary to build log for quick inspection.
         echo "=== Combined Coverage Summary ==="

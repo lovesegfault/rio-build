@@ -40,6 +40,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-cli";
+  skipTypeCheck = true;
 
   # Bring-up ~3-4min + a few CLI calls. No builds, no recovery.
   globalTimeout = 600 + covTimeoutHeadroom;
@@ -49,6 +50,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.assertions}
 
+    ${common.kvmPreopen}
     start_all()
     ${fixture.waitReady}
     ${fixture.kubectlHelpers}

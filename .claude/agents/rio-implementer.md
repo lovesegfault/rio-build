@@ -17,6 +17,14 @@ cd /root/src/rio-build/p<N>
 
 All subsequent work happens in `/root/src/rio-build/p<N>`. Never touch `/root/src/rio-build/main` or any other `../p*` worktree — other agents are running there.
 
+The integration branch (what you rebase against at the verification gate) is the current sprint branch, not `main`. Read it once:
+
+```bash
+TGT=$(.claude/bin/onibus integration-branch)  # e.g., "sprint-1"
+```
+
+`.claude/integration-branch` is committed, so your worktree sees it. Use `$TGT` wherever the verification gate below says to rebase or diff.
+
 ## Step 1 is ALWAYS: read the plan doc
 
 ```bash
@@ -97,15 +105,15 @@ If T-count is 1 or 0 (single-feature plan — no `### T` structure), one commit 
 
 Before reporting complete, run in this exact order:
 
-0. `git rebase main` — ALWAYS, before any verification. Worktrees share the `.git` refs; `main` as seen from your worktree is the ref the merger just updated (no fetch needed — local-only workflow). Your `.#ci` must run against current main or the verifier's BEHIND precondition bounces it back to you anyway. If conflict, see § Rebase conflicts below.
+0. `git rebase $TGT` — ALWAYS, before any verification. Worktrees share the `.git` refs; `$TGT` as seen from your worktree is the ref the merger just updated (no fetch needed — local-only workflow). Your `.#ci` must run against current `$TGT` or the verifier's BEHIND precondition bounces it back to you anyway. If conflict, see § Rebase conflicts below.
 1. `nix develop -c cargo test -p <touched-crate>` — tests pass on everything you changed (local test is safe — no nix eval)
 2. `nix develop -c cargo clippy --workspace --all-targets -- -D warnings` — zero clippy noise
 3. `git add -A && git commit -m '<conventional message>'` — commit (convco hook fires here)
-4. `python3 .claude/skills/nixbuild/nixbuild.py .#ci --role impl` — the full CI gate. `BuildReport` JSON on stdout: `.rc` 0 green / nonzero red; `.log_tail` has last 80 lines if red.
+4. `.claude/bin/onibus build .#ci --role impl` — the full CI gate. `BuildReport` JSON on stdout: `.rc` 0 green / nonzero red; `.log_tail` has last 80 lines if red.
 
 If `.#ci` fails, investigate and fix. Do NOT report "done but CI red." A red `.#ci` is not done.
 
-**Known-flake exception:** if `.#ci` is red on EXACTLY ONE test and that test is in `.claude/known-flakes.jsonl` (check the `retry` field — some flakes poison state and don't get retry), retry `.#ci` ONCE. Two reds = real. One red + one green = proceed with green, note the flake in your report. Check via the typed CLI (exit 0 = in the bridge table): `python3 .claude/lib/state.py known-flake-exists '<test_name>'`.
+**Known-flake exception:** `.claude/bin/onibus flake excusable <BuildReport.log_path>` → `ExcusableVerdict` JSON. If `.excusable` is true, retry `.#ci` ONCE; two reds = real, one red + one green = proceed with green and note `.matched_flakes` in your report. If `.excusable` is false, `.reason` tells you why (multiple failures, not a known flake, or `retry=Never`).
 
 ### Devshell gotcha
 
@@ -115,13 +123,13 @@ Use `nix develop .#stable` to match CI. If you want nightly ergonomics during th
 
 ### Rebase conflicts
 
-Step 0's `git rebase main` may conflict. Check `.claude/collisions.jsonl` — each row is `{path, plans, count}`. For append-vs-replace semantics:
+Step 0's `git rebase $TGT` may conflict. Check `.claude/bin/onibus collisions top` — each row is `{path, plans, count}`. For append-vs-replace semantics:
 
 | Conflict shape | Resolution |
 |---|---|
 | Dispatch arm — both sides added a `match` arm | Usually keep-both. Arms are orthogonal. |
 | Struct field / enum variant / proto field | **One side wins.** Report to coordinator; don't guess which. |
-| Both sides edited the same line in opposite directions | Your plan doc's `## Files` section is the authority on what YOU intended. Read `git log main -1 -- <file>` for what THEY intended. If still unclear, report. |
+| Both sides edited the same line in opposite directions | Your plan doc's `## Files` section is the authority on what YOU intended. Read `git log $TGT -1 -- <file>` for what THEY intended. If still unclear, report. |
 
 Don't push through a conflict resolution you're not confident about — a bad resolve merges cleanly and breaks at runtime. Report and wait.
 
@@ -143,8 +151,7 @@ When launched via `/fix-impl` with verify FAIL sections instead of a plan doc (t
 When complete, report:
 
 - Commit hash
-- Files changed count (from `git diff main..HEAD --stat`)
-- Any deviations from the plan spec (and why)
+- `## Deviations` section — any deviations from the plan spec (and why); emit the header even if empty so validate-impl's grep finds it
 - Benchmark delta if this is a `perf` plan (before/after numbers)
 - Tracey coverage: which `r[domain.*]` markers you covered with `r[impl ...]` and `r[verify ...]`
 

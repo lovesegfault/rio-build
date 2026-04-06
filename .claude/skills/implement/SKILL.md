@@ -28,15 +28,15 @@ From the plan doc, extract:
 - **Exit criteria** — bullets under `## Exit criteria` (the done-definition)
 - **Tracey markers** — domain markers referenced (NOT `r[plan.*]` — rio-build is domain-indexed):
   ```bash
-  python3 .claude/lib/state.py tracey-markers <plan-doc>
+  .claude/bin/onibus plan tracey-markers <plan-doc>
   ```
 
 ## 3. Live collision check against running worktrees
 
-The static dag.jsonl matrix is computed at regen time and only covers hot files above a threshold. Plans can collide on files the matrix doesn't track.
+Collisions are live-computed. Plans can collide on any file — the check below is ground truth.
 
 ```bash
-python3 .claude/skills/implement/collision_check.py $ARGUMENTS
+.claude/bin/onibus collisions check $ARGUMENTS
 ```
 
 Output is JSON (`CollisionReport` — `--schema` for the contract). Running-worktree side uses `git diff --name-only main..HEAD` (ground truth); this-plan side greps the doc (best-effort).
@@ -44,7 +44,7 @@ Output is JSON (`CollisionReport` — `--schema` for the contract). Running-work
 - `source: "none"` → doc has no fence and grep found nothing; check was a no-op for this plan. Report that — not the same as "no collisions".
 - `collisions: [...]` → each has `branch` + `files`. Include in the prompt.
 
-Also read collisions.jsonl for append-vs-replace semantics — the live check finds collisions, the static matrix tells you how to resolve them at rebase. Include any collision findings in the prompt as a note.
+Also check `onibus collisions top` for append-vs-replace semantics — the live check finds collisions, the top-N matrix tells you how to resolve them at rebase. Include any collision findings in the prompt as a note.
 
 ## 4. Compose the prompt
 
@@ -83,6 +83,7 @@ Agent(
 ## 6. Record
 
 ```bash
-python3 .claude/lib/state.py agent-row \
-  '{"plan":"P'$ARGUMENTS'","role":"impl","agent_id":"p'$ARGUMENTS'","worktree":"/root/src/rio-build/p'$ARGUMENTS'","status":"running","note":"<collision-group-from-step-3>"}'
+.claude/bin/onibus state agent-start impl P$ARGUMENTS --id "p$ARGUMENTS" --note "<collision-group-from-step-3>"
 ```
+
+Worktree path is derived.

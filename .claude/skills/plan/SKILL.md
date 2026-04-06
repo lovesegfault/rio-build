@@ -5,21 +5,21 @@ description: Promote follow-ups into plan docs. Reads followups-pending.jsonl (t
 
 ## 1. Load follow-ups from the sink
 
-**Default mode** (no `$ARGUMENTS`): read `followups-pending.jsonl`. The sink IS canonical — reviewers and cadence agents write to it via `state.py followup`; if a reviewer crashed before writing, coordinator re-runs `/review-impl`.
+**Default mode** (no `$ARGUMENTS`): read `followups-pending.jsonl`. The sink IS canonical — reviewers and cadence agents write to it via `onibus state followup`; if a reviewer crashed before writing, coordinator re-runs `/review-impl`.
 
 ```bash
-python3 .claude/lib/state.py followups-render
+.claude/bin/onibus state followups-render
 ```
 
 **`--inline` mode**: `$ARGUMENTS` is a JSON array of Followup-shaped objects (coordinator ad-hoc — e.g., tooling fixes mid-run). Validated against `state.Followup`:
 
 ```bash
-python3 .claude/lib/state.py followups-render --inline '<json-array>'
+.claude/bin/onibus state followups-render --inline '<json-array>'
 ```
 
 If empty: report "no follow-ups" and stop.
 
-Schema (`state.Followup` — `python3 .claude/lib/state.py schema Followup` for JSON Schema):
+Schema (`state.Followup` — `.claude/bin/onibus schema Followup` for JSON Schema):
 
 | Field | Meaning |
 |---|---|
@@ -42,7 +42,7 @@ Six digits, unique per `/plan` invocation (collides only if two invocations land
 
 ```bash
 # Is the relevant batch doc still UNIMPL/PARTIAL? dag.jsonl is the source of truth.
-python3 .claude/lib/state.py open-batches
+.claude/bin/onibus state open-batches
 ```
 
 If a batch doc has `"status":"DONE"`, the writer creates a fresh batch doc instead of appending. Note this in the prompt.
@@ -78,10 +78,10 @@ Agent(
 
 ## 6. Record + truncate sink
 
-Append a `role=writer` row via `state.py agent-row`. Then truncate the sink (writer has the data now):
+Append a `role=writer` row via `onibus state agent-row`. Then truncate the sink (writer has the data now):
 
 ```bash
-python3 .claude/lib/state.py agent-row \
+.claude/bin/onibus state agent-row \
   '{"plan":"docs-<runid>","role":"writer","agent_id":"<id>","worktree":"/root/src/rio-build/docs-<runid>","status":"running","note":"runid <runid>"}'
 
 : > .claude/state/followups-pending.jsonl  # default mode only — skip for --inline
@@ -95,10 +95,10 @@ The planner commits plan docs to `docs-<runid>`. **Before** ff-merging to main a
 
 ### 7a. Mechanical precondition (skill-layer — don't spawn to abort)
 
-Same pattern as `atomicity_check.py` in `/merge-impl` step 0b. Cheap pydantic validation — no agent spawn.
+Same pattern as `onibus merge atomicity-check` in `/merge-impl` step 0b. Cheap pydantic validation — no agent spawn.
 
 ```bash
-python3 .claude/lib/state.py qa-check /root/src/rio-build/docs-<runid>
+.claude/bin/onibus plan qa-check /root/src/rio-build/docs-<runid>
 ```
 
 `qa_mechanical_check` checks: `json files` fence → `list[PlanFile]`; `json deps` ints exist in dag.jsonl (9-digit placeholders skipped); **NO `r[plan.*]` markers (pollution — rio-build tracey is domain-indexed)**; ≥1 `r[domain.*]` marker ref (WARN only). **FAIL → don't spawn reviewer.** `SendMessage` the planner with the pydantic error; planner fixes in-place, re-commit, re-run 7a.
@@ -115,7 +115,7 @@ Agent(
 )
 ```
 
-Append `role=qa` row via `state.py agent-row`.
+Append `role=qa` row via `onibus state agent-row`.
 
 **Reviewer verdict → action:**
 
