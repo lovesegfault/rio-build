@@ -732,6 +732,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // r[impl builder.ephemeral.exit-aborts-heartbeat]
+    // I-142: stop the heartbeat task FIRST, before run_drain. While
+    // it's alive the scheduler sees `heartbeat-alive but stream_tx
+    // closed` and keeps the executor in its map (undispatchable
+    // zombie). run_drain below has no inherent timeout — if the
+    // scheduler is overloaded, the heartbeat would tick indefinitely.
+    // Abort is fire-and-forget: the task holds only Arcs (no Drop
+    // ordering hazards), and any in-flight HeartbeatRequest is
+    // harmless (scheduler tolerates a final heartbeat after Drain).
+    //
+    // Manual verification (no main-loop test harness): start an
+    // ephemeral builder against a scheduler with admin RPCs blocked
+    // (iptables DROP), trigger a build → completion. Pre-fix: process
+    // logs "drain complete, exiting" never appears; heartbeats keep
+    // landing every 10s. Post-fix: heartbeats stop within one
+    // interval; process exits at the 5s timeout below.
+    heartbeat_handle.abort();
+
     // Exit deregister. By now in_flight=0 (drain_done fired, or
     // ephemeral's single build returned its permit). DrainExecutor
     // here is the explicit "I'm leaving" — heartbeat already told
@@ -739,7 +757,20 @@ async fn main() -> anyhow::Result<()> {
     // 50% chance of standby (I-046), but the stream-close that
     // follows (process exit drops the bidi) triggers
     // ExecutorDisconnected anyway.
-    run_drain(&cfg.scheduler_addr, &build_ctx.executor_id).await;
+    //
+    // I-142: 5s hard timeout. run_drain's connect_admin + RPC have no
+    // built-in timeout; an overloaded scheduler stalls this and the
+    // process never reaches drop(fuse_session) below. Best-effort
+    // means best-effort — log and move on.
+    if tokio::time::timeout(
+        Duration::from_secs(5),
+        run_drain(&cfg.scheduler_addr, &build_ctx.executor_id),
+    )
+    .await
+    .is_err()
+    {
+        tracing::debug!("DrainExecutor timed out (5s); proceeding to exit");
+    }
 
     // Dropping BackgroundSession:
     //   - detaches the FUSE thread (BackgroundSession has NO Drop impl)

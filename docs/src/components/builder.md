@@ -459,6 +459,9 @@ If `cgroup.kill` returns ENOENT (cancel raced cgroup creation), the cancel flag 
 r[builder.shutdown.sigint]
 The builder handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path. Returning from `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit handlers fire (LLVM profraw flush).
 
+r[builder.ephemeral.exit-aborts-heartbeat]
+On exit from the reconnect loop (ephemeral single-shot done, idle timeout, or drain complete), the builder MUST abort the heartbeat task before `run_drain()`. A live heartbeat with a closed BuildExecution stream presents to the scheduler as an undispatchable zombie executor (I-142). `run_drain()` itself MUST be bounded by a hard timeout (5s) --- it is best-effort deregistration, redundant with the stream-close `ExecutorDisconnected` path, and must not block the process from reaching `drop(fuse_session)`.
+
 
 ## Key Files
 
