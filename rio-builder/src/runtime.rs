@@ -13,9 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore, mpsc};
-use tonic::transport::Channel;
 
-use rio_proto::StoreServiceClient;
 use rio_proto::types::{
     CompletionReport, ExecutorMessage, HeartbeatRequest, PrefetchComplete, PrefetchHint,
     ProgressUpdate, ResourceUsage, WorkAssignment, WorkAssignmentAck, executor_message,
@@ -256,7 +254,12 @@ pub async fn build_heartbeat_request(
 /// boilerplate. `spawn_build_task` clones only what each spawned task needs.
 #[derive(Clone)]
 pub struct BuildSpawnContext {
-    pub store_client: StoreServiceClient<Channel>,
+    /// `StoreService` + `ChunkService` over the same balanced channel.
+    /// `.store` goes to `execute_build` (drv fetch, upload, query);
+    /// the bundle goes to `ExecutorEnv.fuse_clients` for the warm/
+    /// prefetch path so the chunk-fanout transport (dataplane2) is
+    /// reachable.
+    pub store_clients: crate::fuse::StoreClients,
     pub executor_id: String,
     pub fuse_mount_point: PathBuf,
     pub overlay_base_dir: PathBuf,
@@ -308,14 +311,14 @@ pub struct BuildSpawnContext {
     /// cancel-only. std::sync is simpler and the critical sections
     /// are short (HashMap insert/remove/get — no await inside).
     pub cancel_registry: Arc<CancelRegistry>,
-    /// Handle to the FUSE local cache. I-110c: threaded into
-    /// `ExecutorEnv` so `prefetch_manifests` can prime the manifest-
-    /// hint map before the warm-stat loop.
+    /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
+    /// the executor can `register_inputs` (JIT allowlist) and
+    /// `prefetch_manifests` (I-110c) before daemon spawn.
     pub fuse_cache: Arc<crate::fuse::cache::Cache>,
-    /// Per-fetch gRPC timeout for `prefetch_path_blocking`. I-165c:
-    /// `warm_inputs_in_fuse` now calls the cache's fetch path directly
-    /// (not stat-through-own-FUSE) and needs the same timeout the FUSE
-    /// layer uses. Same value passed to [`handle_prefetch_hint`].
+    /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
+    /// JIT lookup scales it per path via `jit_fetch_timeout(this,
+    /// nar_size)` (I-178). Same value passed to
+    /// [`handle_prefetch_hint`].
     pub fuse_fetch_timeout: Duration,
 }
 
@@ -363,13 +366,14 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Cgroup doesn't exist — cancel arrived before execute_build
-            // reached BuildCgroup::create. I-165 showed this window can
-            // be tens of minutes (warm_inputs_in_fuse stalled on a
-            // saturated store), not the "narrow race" previously assumed.
+            // reached BuildCgroup::create. Under JIT fetch this window
+            // is overlay → resolve → prepare_sandbox → register +
+            // prefetch (sub-second; the I-165 47-min warm stall is
+            // gone), so the cancel-poll select was removed.
             //
             // r[impl builder.cancel.pre-cgroup-deferred]
-            // LEAVE THE FLAG SET. execute_build polls it before and
-            // during the prefetch+warm phase and aborts with
+            // LEAVE THE FLAG SET. execute_build checks it before the
+            // register+prefetch phase and aborts with
             // `ExecutorError::Cancelled` without spawning the daemon.
             // The misclassification risk (an unrelated Err later
             // reported as Cancelled) is real but is the lesser evil:
@@ -554,7 +558,7 @@ pub async fn spawn_build_task(
         .insert(drv_path.clone(), (cgroup_path, Arc::clone(&cancelled)));
 
     // Clone state needed by spawned tasks ('static lifetime).
-    let mut build_store_client = ctx.store_client.clone();
+    let mut build_store_client = ctx.store_clients.store.clone();
     let build_tx = ctx.stream_tx.clone();
     let build_leaked_mounts = Arc::clone(&ctx.leaked_mounts);
     let build_drv_path = drv_path.clone();
@@ -571,6 +575,7 @@ pub async fn spawn_build_task(
         cgroup_parent: ctx.cgroup_parent.clone(),
         executor_kind: ctx.executor_kind,
         fuse_cache: Some(Arc::clone(&ctx.fuse_cache)),
+        fuse_clients: Some(ctx.store_clients.clone()),
         fuse_fetch_timeout: ctx.fuse_fetch_timeout,
         // Same Arc as the registry entry and `build_cancelled` below.
         // execute_build polls it during the pre-cgroup phase (I-166).
@@ -821,7 +826,7 @@ pub async fn spawn_build_task(
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
     cache: Arc<fuse::cache::Cache>,
-    store_client: StoreServiceClient<Channel>,
+    clients: crate::fuse::StoreClients,
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
@@ -859,7 +864,7 @@ pub fn handle_prefetch_hint(
         // Arc clone, tonic Channel is Arc-internal,
         // tokio Handle is a lightweight token.
         let cache = Arc::clone(&cache);
-        let client = store_client.clone();
+        let clients = clients.clone();
         let rt = rt.clone();
         let sem = Arc::clone(&sem);
 
@@ -888,7 +893,7 @@ pub fn handle_prefetch_hint(
             let result = tokio::task::spawn_blocking(move || {
                 use crate::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
                 let _permit = _permit; // hold through blocking work
-                match prefetch_path_blocking(&cache, &client, &rt, fetch_timeout, &basename) {
+                match prefetch_path_blocking(&cache, &clients, &rt, fetch_timeout, &basename) {
                     Ok(None) => "fetched",
                     Ok(Some(PrefetchSkip::AlreadyCached)) => "already_cached",
                     Ok(Some(PrefetchSkip::AlreadyInFlight)) => "already_in_flight",

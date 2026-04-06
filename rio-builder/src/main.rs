@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     rio_builder::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
 
-    let Some((store_client, mut scheduler_client, _balance_guard)) =
+    let Some((store_clients, mut scheduler_client, _balance_guard)) =
         connect_upstreams(&cfg, &shutdown).await
     else {
         // Shutdown fired during cold-start connect. Clean exit —
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
     // threads). The prefetch handler will call them via
     // spawn_blocking — async → nested-runtime panic.
     let prefetch_cache = Arc::clone(&cache);
-    let prefetch_store = store_client.clone();
+    let prefetch_clients = store_clients.clone();
     let runtime = tokio::runtime::Handle::current();
     let prefetch_runtime = runtime.clone();
     // FUSE fetch timeout (60s default) — NOT GRPC_STREAM_TIMEOUT (300s).
@@ -202,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
     let (fuse_session, fuse_circuit) = fuse::mount_fuse_background(
         &cfg.fuse_mount_point,
         cache,
-        store_client.clone(),
+        store_clients.clone(),
         runtime,
         cfg.fuse_passthrough,
         cfg.fuse_threads,
@@ -332,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
     // Shared context for spawning build tasks (clones done once per assignment
     // inside spawn_build_task, not here).
     let build_ctx = BuildSpawnContext {
-        store_client,
+        store_clients,
         executor_id,
         fuse_mount_point: cfg.fuse_mount_point,
         overlay_base_dir: cfg.overlay_base_dir,
@@ -352,11 +352,11 @@ async fn main() -> anyhow::Result<()> {
         executor_kind: cfg.executor_kind,
         cancel_registry: Arc::clone(&cancel_registry),
         // I-110c: same Arc as prefetch_cache / the FUSE mount —
-        // executor primes manifest hints, FUSE threads consume them.
+        // executor primes manifest hints + JIT allowlist, FUSE threads
+        // consume them.
         fuse_cache: Arc::clone(&prefetch_cache),
-        // I-165c: warm_inputs_in_fuse calls prefetch_path_blocking
-        // directly with the same fetch timeout the FUSE layer and
-        // PrefetchHint handler use.
+        // Base per-path fetch timeout; JIT lookup scales it with
+        // nar_size (I-178). Same value the PrefetchHint handler uses.
         fuse_fetch_timeout,
     };
 
@@ -687,7 +687,7 @@ async fn main() -> anyhow::Result<()> {
                             handle_prefetch_hint(
                                 prefetch,
                                 Arc::clone(&prefetch_cache),
-                                prefetch_store.clone(),
+                                prefetch_clients.clone(),
                                 prefetch_runtime.clone(),
                                 Arc::clone(&prefetch_sem),
                                 fuse_fetch_timeout,
@@ -1120,7 +1120,7 @@ fn init_cgroup(
     Ok((cgroup_parent, resource_snapshot))
 }
 
-type StoreClient = rio_proto::StoreServiceClient<tonic::transport::Channel>;
+type StoreClients = rio_builder::fuse::StoreClients;
 type WorkerClient = rio_proto::ExecutorServiceClient<tonic::transport::Channel>;
 /// Probe-loop guards for both balanced channels. Dropping a
 /// `BalancedChannel` stops its probe loop, so these must outlive the
@@ -1151,27 +1151,31 @@ type BalanceGuards = (
 async fn connect_upstreams(
     cfg: &Config,
     shutdown: &rio_common::signal::Token,
-) -> Option<(StoreClient, WorkerClient, BalanceGuards)> {
+) -> Option<(StoreClients, WorkerClient, BalanceGuards)> {
     rio_proto::client::connect_with_retry(
         shutdown,
         || async {
+            // dataplane2: build StoreService + ChunkService over the SAME
+            // channel so per-chunk GetChunk RPCs p2c-fan across the same
+            // SERVING replicas as GetPath. In single-channel mode (VM
+            // tests, no headless DNS) both wrap one eager channel.
             let (store, store_guard) = match &cfg.store_balance_host {
                 None => {
                     info!(addr = %cfg.store_addr, "store: single-channel mode");
-                    let c = rio_proto::client::connect_store(&cfg.store_addr).await?;
-                    (c, None)
+                    let ch = rio_proto::client::connect_channel(&cfg.store_addr).await?;
+                    (StoreClients::from_channel(ch), None)
                 }
                 Some(host) => {
                     info!(
                         %host, port = cfg.store_balance_port,
                         "store: health-aware balanced mode"
                     );
-                    let (c, bc) = rio_proto::client::balance::connect_store_balanced(
+                    let (_c, bc) = rio_proto::client::balance::connect_store_balanced(
                         host.clone(),
                         cfg.store_balance_port,
                     )
                     .await?;
-                    (c, Some(bc))
+                    (StoreClients::from_channel(bc.channel()), Some(bc))
                 }
             };
             let (sched, sched_guard) = match &cfg.scheduler_balance_host {

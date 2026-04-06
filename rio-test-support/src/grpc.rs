@@ -19,8 +19,8 @@ use tonic::{Request, Response, Status, Streaming};
 use rio_proto::types;
 use rio_proto::validated::ValidatedPathInfo;
 use rio_proto::{
-    AdminService, AdminServiceServer, SchedulerService, SchedulerServiceServer, StoreService,
-    StoreServiceServer,
+    AdminService, AdminServiceServer, ChunkService, ChunkServiceServer, SchedulerService,
+    SchedulerServiceServer, StoreService, StoreServiceServer,
 };
 
 // ============================================================================
@@ -129,6 +129,17 @@ pub struct MockStore {
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
     pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
+    /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
+    /// `ChunkService.GetChunk` impl below. Seed via [`seed_chunked`].
+    pub chunks: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
+    /// Number of `GetChunk` calls received. For dataplane2 tests
+    /// proving the builder uses the parallel chunk path (≥1) and
+    /// fan-out hits this for every chunk in the manifest.
+    pub get_chunk_calls: Arc<AtomicU32>,
+    /// If true, `GetChunk` returns Unimplemented (simulates an old
+    /// store binary). For dataplane2 fallback tests — builder MUST
+    /// fall back to `GetPath`.
+    pub get_chunk_unimplemented: Arc<AtomicBool>,
 }
 
 impl Default for MockStore {
@@ -157,6 +168,9 @@ impl Default for MockStore {
             batch_manifest_unimplemented: Arc::default(),
             batch_manifest_calls: Arc::default(),
             get_path_hints: Arc::default(),
+            chunks: Arc::default(),
+            get_chunk_calls: Arc::default(),
+            get_chunk_unimplemented: Arc::default(),
         }
     }
 }
@@ -191,6 +205,80 @@ impl MockStore {
             nar.clone(),
         );
         (nar, hash)
+    }
+
+    /// Seed a path AND its chunked manifest. Splits `nar` into fixed
+    /// `chunk_size` pieces (the real store uses FastCDC; fixed-size is
+    /// fine for the mock — chunks are addressed by content hash, not
+    /// boundary), populates `self.chunks`, and stores the chunk list
+    /// alongside the inline blob so `batch_get_manifest` can return it.
+    ///
+    /// Returns the `Vec<ChunkRef>` so tests can prime the builder's
+    /// hint cache directly.
+    pub fn seed_chunked(
+        &self,
+        info: ValidatedPathInfo,
+        nar: Vec<u8>,
+        chunk_size: usize,
+    ) -> Vec<types::ChunkRef> {
+        let mut refs = Vec::new();
+        let mut chunks = self.chunks.write().unwrap();
+        for piece in nar.chunks(chunk_size) {
+            let h = blake3::hash(piece);
+            let digest = h.as_bytes().to_vec();
+            chunks.insert(digest.clone(), piece.to_vec());
+            refs.push(types::ChunkRef {
+                hash: digest,
+                size: piece.len() as u32,
+            });
+        }
+        drop(chunks);
+        self.seed(info, nar);
+        refs
+    }
+}
+
+#[tonic::async_trait]
+impl ChunkService for MockStore {
+    type GetChunkStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::GetChunkResponse, Status>>;
+
+    async fn get_chunk(
+        &self,
+        request: Request<types::GetChunkRequest>,
+    ) -> Result<Response<Self::GetChunkStream>, Status> {
+        self.get_chunk_calls.fetch_add(1, Ordering::SeqCst);
+        if self.get_chunk_unimplemented.load(Ordering::SeqCst) {
+            return Err(Status::unimplemented("mock: GetChunk disabled"));
+        }
+        let digest = request.into_inner().digest;
+        let data = self
+            .chunks
+            .read()
+            .unwrap()
+            .get(&digest)
+            .cloned()
+            .ok_or_else(|| Status::not_found("mock: chunk not found"))?;
+        // Single-message "stream" — matches the real store (chunk.rs:315).
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let _ = tx.send(Ok(types::GetChunkResponse { data })).await;
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn put_chunk(
+        &self,
+        _request: Request<Streaming<types::PutChunkRequest>>,
+    ) -> Result<Response<types::PutChunkResponse>, Status> {
+        Err(Status::unimplemented("mock: PutChunk"))
+    }
+
+    async fn find_missing_chunks(
+        &self,
+        _request: Request<types::FindMissingChunksRequest>,
+    ) -> Result<Response<types::FindMissingChunksResponse>, Status> {
+        Err(Status::unimplemented("mock: FindMissingChunks"))
     }
 }
 
@@ -1278,7 +1366,12 @@ where
 pub async fn spawn_mock_store()
 -> anyhow::Result<(MockStore, SocketAddr, tokio::task::JoinHandle<()>)> {
     let store = MockStore::new();
-    let router = Server::builder().add_service(StoreServiceServer::new(store.clone()));
+    let router = Server::builder()
+        .add_service(StoreServiceServer::new(store.clone()))
+        // dataplane2: ChunkService on the same port (mirrors the real
+        // store, which serves both on 9002). Existing callers that
+        // never touch chunk RPCs are unaffected.
+        .add_service(ChunkServiceServer::new(store.clone()));
     let (addr, handle) = spawn_grpc_server(router).await;
     Ok((store, addr, handle))
 }

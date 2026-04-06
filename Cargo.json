@@ -19329,6 +19329,10 @@
           "packageId": "rand 0.9.2"
         },
         {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -20618,6 +20622,10 @@
         {
           "name": "anyhow",
           "packageId": "anyhow"
+        },
+        {
+          "name": "blake3",
+          "packageId": "blake3"
         },
         {
           "name": "hex",

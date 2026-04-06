@@ -40,10 +40,7 @@ mod daemon;
 mod inputs;
 
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
-use inputs::{
-    compute_input_closure, fetch_drv_from_store, prefetch_manifests, verify_fod_hashes,
-    warm_inputs_in_fuse, warm_overall_deadline,
-};
+use inputs::{compute_input_closure, fetch_drv_from_store, prefetch_manifests, verify_fod_hashes};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
@@ -101,21 +98,24 @@ pub struct ExecutorEnv {
     /// `drv.is_fixed_output()` against this BEFORE daemon spawn —
     /// defense-in-depth against scheduler misroutes (ADR-019).
     pub executor_kind: rio_proto::types::ExecutorKind,
-    /// Handle to the FUSE local cache. I-110c: `prefetch_manifests`
-    /// primes its manifest-hint map BEFORE `warm_inputs_in_fuse` so
-    /// each warm-loop `GetPath` carries its manifest and the store
-    /// skips PG. I-165c: `warm_inputs_in_fuse` calls the cache's
-    /// `prefetch_path_blocking` directly instead of stat-through-own-
-    /// FUSE. `None` in tests that don't mount FUSE (prefetch and the
-    /// direct-materialize stage are then skipped; warm degrades to a
-    /// tempdir stat).
+    /// Handle to the FUSE local cache. The executor calls
+    /// `register_inputs` (JIT allowlist, I-043 redesign) and
+    /// `prefetch_manifests` (I-110c PG-skip hints) on it after
+    /// `compute_input_closure` and before daemon spawn. `None` in
+    /// tests that don't mount FUSE — both calls are skipped, FUSE
+    /// `lookup` falls back to legacy `JitClass::NotArmed`.
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
-    /// Per-fetch gRPC timeout for the FUSE cache's `GetPath`. I-165c:
-    /// `warm_inputs_in_fuse` calls `prefetch_path_blocking` directly
-    /// and needs the same timeout the FUSE layer uses (from
-    /// `worker.toml fuse_fetch_timeout_secs`, default 60s). Bounds how
-    /// long a detached warm thread can linger in the blocking pool
-    /// after `WARM_OVERALL_DEADLINE` fires.
+    /// `StoreService`+`ChunkService` over the same balanced channel,
+    /// for `prefetch_path_blocking` (FUSE JIT fetch). `None` in tests
+    /// that don't mount FUSE (same lifecycle as `fuse_cache`).
+    /// dataplane2: the chunk client enables the parallel `GetChunk`
+    /// fan-out transport when `RIO_BUILDER_FETCH_TRANSPORT=getchunk`.
+    pub fuse_clients: Option<crate::fuse::StoreClients>,
+    /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
+    /// (`worker.toml fuse_fetch_timeout_secs`, default 60s). JIT
+    /// `lookup` uses `jit_fetch_timeout(this, nar_size)` per path so
+    /// large inputs get a size-proportional budget (I-178). Same
+    /// value passed to the `PrefetchHint` handler.
     pub fuse_fetch_timeout: Duration,
     /// Cancel flag for THIS build. Set by [`crate::runtime::try_cancel_build`]
     /// before it writes `cgroup.kill`. I-166: threaded into the executor
@@ -457,74 +457,57 @@ pub async fn execute_build(
     // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
     prepare_sandbox(&overlay_mount, &drv, drv_path, input_metadata, is_fod).await?;
 
-    // 4b. Warm every input in the FUSE lower BEFORE the daemon stats
-    // through the overlay (I-043). After prepare_sandbox so we know
-    // every path passed QueryPathInfo (the store has it); a FUSE miss
-    // here is a sub-200ms visibility race that the NotFound re-probe
-    // covers. Before daemon spawn so the overlay's first lookup of
-    // each input finds a positive FUSE-layer dentry — never gets a
-    // chance to negative-cache.
+    // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
+    // closure as the FUSE `lookup()` allowlist. The daemon's first
+    // overlay→FUSE `lstat` of each input now blocks-and-fetches in
+    // FUSE userspace; on fetch failure `lookup()` returns EIO (NEVER
+    // ENOENT — overlay would negative-cache it). Names NOT in the
+    // allowlist (`.lock`, `.chroot`, output-path probes) get fast
+    // ENOENT without contacting the store.
     //
-    // I-110c: prefetch all input manifests in ONE batch RPC first so
-    // each FUSE-driven GetPath carries its manifest and the store
-    // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
-    // Unimplemented (old store) or any error, the per-path GetPath
-    // queries PG as before.
+    // This replaces the pre-daemon `warm_inputs_in_fuse` phase, which
+    // fetched the WHOLE closure (~800–1500 paths) up-front — defeating
+    // lazy fetch for builds that touch a fraction of their closure.
+    // The I-165 47-min hang window is gone with it: register +
+    // prefetch_manifests together are <100 ms (one HashMap extend +
+    // one BatchGetManifest RPC).
     //
     // r[impl builder.cancel.pre-cgroup-deferred]
     // I-166: the cgroup doesn't exist yet (created post-spawn below),
-    // so a Cancel that arrived during overlay/resolve/prepare landed as
-    // ENOENT in `try_cancel_build` — which now LEAVES the flag set.
-    // Check it here (fast path) and poll it during prefetch+warm
-    // (the I-165 hang made this window 47 min). Dropping the warm
-    // future detaches ≤ WARM_FUSE_CONCURRENCY spawn_blocking threads
-    // — I-165c: they're in USERSPACE `block_on(gRPC)` (not kernel
-    // D-state), bounded by `fuse_fetch_timeout` (60s), and die on
-    // SIGKILL. For ephemeral builders the process is about to exit
-    // anyway.
+    // so a Cancel that arrived during overlay/resolve/prepare landed
+    // as ENOENT in `try_cancel_build` — which now LEAVES the flag
+    // set. Check it here. The pre-cgroup window is now overlay →
+    // resolve → prepare_sandbox → register + prefetch (sub-second);
+    // the cancel_poll select that covered the warm hang is no longer
+    // needed.
     if env.cancelled.load(Ordering::Acquire) {
-        tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, before warm)");
+        tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
         return Err(ExecutorError::Cancelled);
     }
-    // I-178: size-aware warm deadline. A 1.9 GB input at the flat 90 s
-    // wall detached the fetch thread mid-stream → daemon ENOENT →
-    // PermanentFailure poison. The 90 s floor stays for small closures
-    // (I-165 thundering-herd bound); large closures get Σnar_size /
-    // (MIN_THROUGHPUT × CONCURRENCY) + slop.
-    let total_nar_bytes: u64 = input_sized.iter().map(|(_, sz)| *sz).sum();
-    let warm_deadline = warm_overall_deadline(total_nar_bytes);
-    let warm = async {
-        if let Some(cache) = &env.fuse_cache {
-            prefetch_manifests(store_client, cache, &input_paths).await;
+    if let Some(cache) = &env.fuse_cache {
+        // r[impl builder.fuse.jit-register]
+        // `RIO_BUILDER_JIT_FETCH=0` disarms (forces `NotArmed` →
+        // legacy gRPC-anything) for one-revert rollback during stress.
+        // Default on. Remove the gate after one stress cycle green.
+        let jit_enabled = std::env::var("RIO_BUILDER_JIT_FETCH")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if jit_enabled {
+            cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
+                Some((
+                    p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?
+                        .to_owned(),
+                    *sz,
+                ))
+            }));
+            metrics::gauge!("rio_builder_jit_inputs_registered")
+                .set(cache.known_inputs_len() as f64);
         }
-        warm_inputs_in_fuse(
-            fuse_mount_point,
-            env.fuse_cache.as_ref(),
-            store_client,
-            env.fuse_fetch_timeout,
-            &input_sized,
-            warm_deadline,
-        )
-        .await;
-    };
-    let cancel_poll = async {
-        // 1s granularity: cancel latency here is bounded by this, not
-        // by warm's 90s deadline. Cheap — one atomic load + sleep per
-        // tick. `loop` not `while !load`: the first iteration must
-        // sleep (we just checked the flag synchronously above).
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if env.cancelled.load(Ordering::Acquire) {
-                break;
-            }
-        }
-    };
-    tokio::select! {
-        () = warm => {}
-        () = cancel_poll => {
-            tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, during warm)");
-            return Err(ExecutorError::Cancelled);
-        }
+        // I-110c: prime manifest hints so each JIT fetch's `GetPath`
+        // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
+        // Unimplemented (old store) or any error, the per-path
+        // `GetPath` queries PG as before.
+        prefetch_manifests(store_client, cache, &input_paths).await;
     }
 
     // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
@@ -981,11 +964,12 @@ async fn resolve_inputs(
     let input_metadata =
         compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
     let input_paths: Vec<String> = input_metadata.iter().map(|m| m.path.clone()).collect();
-    // I-178: project (path, nar_size) for warm_inputs_in_fuse. SynthPathInfo
-    // already has nar_size from BatchQueryPathInfo (authoritative; the
-    // ManifestHint.info.nar_size is best-effort). Two projections from
-    // input_metadata is cheaper than passing &input_metadata around — the
-    // other consumers (prefetch_manifests, ref-scan) want plain &[String].
+    // I-178: project (path, nar_size) for the JIT FUSE allowlist
+    // (`register_inputs`). SynthPathInfo already has nar_size from
+    // BatchQueryPathInfo (authoritative; the ManifestHint.info.nar_size
+    // is best-effort). Two projections from input_metadata is cheaper
+    // than passing &input_metadata around — the other consumers
+    // (prefetch_manifests, ref-scan) want plain &[String].
     let input_sized: Vec<(String, u64)> = input_metadata
         .iter()
         .map(|m| (m.path.clone(), m.nar_size))
@@ -1563,27 +1547,56 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 /// `<p> ∈ input_paths` membership check is the load-bearing guard — a
 /// genuinely-missing path NOT in the closure stays `PermanentFailure`.
 ///
-// r[impl builder.result.input-enoent-is-infra]
+/// I-178b: live cluster output is ANSI-colored AND the path the daemon
+/// reports is the OVERLAY path (`/var/rio/overlays/<build_id>/nix/store/
+/// <hash>-<name>`), not the bare `/nix/store/<hash>-<name>` we have in
+/// `input_paths`. So: strip ANSI escapes first, then match by BASENAME
+/// only — `<hash>-<name>` is unique (the nixbase32 hash makes
+/// collisions practically impossible) and is the trailing path component
+/// in both overlay and store-path forms. The errno suffix is NOT
+/// matched: ENOENT (`No such file or directory`) and EIO (`Input/output
+/// error`, see I-179) are both worker-local materialization failures.
+///
+// r[impl builder.result.input-enoent-is-infra+2]
 pub(crate) fn is_input_materialization_failure(
     nix_status: rio_nix::protocol::build::BuildStatus,
     error_msg: &str,
     input_paths: &[String],
 ) -> bool {
     use rio_nix::protocol::build::BuildStatus;
+    use std::sync::LazyLock;
+
+    // ANSI SGR escapes: ESC [ <params> m. nix-daemon emits 31;1 (bold red)
+    // and 35;1 (bold magenta) around `error:` and the quoted path. Stripping
+    // BEFORE the substring split means the `'...'` extract sees clean text.
+    static ANSI: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;]*m").expect("static regex"));
+
     if nix_status != BuildStatus::MiscFailure {
         return false;
     }
+    let stripped = ANSI.replace_all(error_msg, "");
     // Single substring extract between the first '…' pair after the
     // marker. nix-daemon formats: `getting attributes of path
-    // '/nix/store/…': No such file or directory`. The closure is
-    // ≤ ~2k entries; linear scan is fine on the failure path.
-    let Some(rest) = error_msg.split("getting attributes of path '").nth(1) else {
+    // '<path>': <strerror>`. The closure is ≤ ~2k entries; linear scan
+    // is fine on the failure path.
+    let Some(rest) = stripped.split("getting attributes of path '").nth(1) else {
         return false;
     };
     let Some(path) = rest.split('\'').next() else {
         return false;
     };
-    input_paths.iter().any(|p| p == path)
+    // Basename match: the daemon reports the overlay path (I-178b); the
+    // closure has store paths. Both end in `<hash>-<name>`. An empty
+    // basename (trailing slash — shouldn't happen, but defensive) must
+    // not vacuously match every closure entry.
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    if basename.is_empty() {
+        return false;
+    }
+    input_paths
+        .iter()
+        .any(|p| p.rsplit('/').next().unwrap_or(p) == basename)
 }
 
 /// Map a Nix daemon BuildStatus (failure path only — caller has already
@@ -1751,6 +1764,7 @@ mod tests {
             cgroup_parent: dir.path().to_path_buf(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
             fuse_cache: None,
+            fuse_clients: None,
             fuse_fetch_timeout: Duration::from_secs(60),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -1833,12 +1847,15 @@ mod tests {
     /// materialization failure (warm timeout / FUSE EIO / I-043 race),
     /// not a build defect. The membership check is load-bearing — a
     /// path NOT in the closure stays PermanentFailure.
-    // r[verify builder.result.input-enoent-is-infra]
+    ///
+    /// I-178b: the live cluster message is ANSI-colored and reports the
+    /// OVERLAY path, not the store path. Strip ANSI; match by basename.
+    // r[verify builder.result.input-enoent-is-infra+2]
     #[test]
     fn test_is_input_materialization_failure() {
         use rio_nix::protocol::build::BuildStatus as Nix;
 
-        let input = "/nix/store/54f75pjisgzabcdefghijklmnopqrstu-source".to_string();
+        let input = "/nix/store/54f75pjisgz20ql6azwmck1v779xs0a9-source".to_string();
         let other = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string();
         let closure = vec![input.clone(), other.clone()];
         let enoent = format!(
@@ -1850,6 +1867,31 @@ mod tests {
         assert!(
             is_input_materialization_failure(Nix::MiscFailure, &enoent, &closure),
             "ENOENT on closure input must reclassify"
+        );
+
+        // I-178b regression: literal cluster output. ANSI SGR escapes
+        // around `error:` and the quoted path; the path is the OVERLAY
+        // path (`/var/rio/overlays/<build_id>/nix/store/<basename>`),
+        // not the bare store path. Basename match must catch it.
+        let ansi_overlay = "\u{1b}[31;1merror:\u{1b}[0m\n       \
+             … while setting up the build environment\n\n       \
+             \u{1b}[31;1merror:\u{1b}[0m getting attributes of path \
+             '\u{1b}[35;1m/var/rio/overlays/\
+             vwb2lprckpd4kbg67sczakiqqqd4jxzy-llvm-tblgen-src-21_1_8_drv\
+             /nix/store/54f75pjisgz20ql6azwmck1v779xs0a9-source\u{1b}[0m': \
+             \u{1b}[35;1mNo such file or directory\u{1b}[0m";
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, ansi_overlay, &closure),
+            "I-178b: ANSI-wrapped overlay path must reclassify by basename"
+        );
+
+        // I-179 coupling: EIO suffix (not ENOENT) is also a
+        // materialization failure — the matcher keys on the prefix +
+        // path, not the strerror suffix.
+        let eio = format!("getting attributes of path '{input}': Input/output error");
+        assert!(
+            is_input_materialization_failure(Nix::MiscFailure, &eio, &closure),
+            "EIO on closure input must reclassify (I-179 wait_for_fetcher)"
         );
 
         // MiscFailure + path NOT in closure → false (genuine missing

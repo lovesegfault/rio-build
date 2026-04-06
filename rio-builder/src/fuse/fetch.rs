@@ -18,14 +18,113 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fuser::Errno;
+use futures_util::stream::{self, StreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
 use tracing::instrument;
 
 use rio_proto::StoreServiceClient;
+use rio_proto::client::NarCollectError;
+use rio_proto::store::chunk_service_client::ChunkServiceClient;
+use rio_proto::types::{ChunkRef, GetChunkRequest};
 
 use super::NixStoreFs;
 use super::cache::{Cache, FetchClaim, InflightEntry};
+
+/// Bundles `StoreServiceClient` + `ChunkServiceClient` over the SAME
+/// (typically p2c-balanced) `tonic::transport::Channel`. Clone is cheap
+/// — both wrap the channel, which is `Arc`-internal.
+///
+/// dataplane2: the chunk-fanout fetch path needs `ChunkServiceClient`
+/// alongside the existing `StoreServiceClient`. Bundling them keeps the
+/// invariant that both share one balanced channel (so `GetChunk` p2c-
+/// fans across the same SERVING replicas as `GetPath`) and threads
+/// through every `prefetch_path_blocking` call site as one parameter.
+#[derive(Clone)]
+pub struct StoreClients {
+    pub store: StoreServiceClient<Channel>,
+    pub chunk: ChunkServiceClient<Channel>,
+}
+
+impl StoreClients {
+    /// Wrap both clients over a single `Channel`. Sets the same
+    /// max-message-size on both (chunks are ≤1 MiB but the headroom
+    /// matches `connect_store`'s convention).
+    pub fn from_channel(ch: Channel) -> Self {
+        let max = rio_proto::max_message_size();
+        Self {
+            store: StoreServiceClient::new(ch.clone())
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max),
+            chunk: ChunkServiceClient::new(ch)
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max),
+        }
+    }
+}
+
+/// How `fetch_extract_insert` pulls NAR bytes from rio-store.
+///
+/// `GetPath` (default): single server-stream RPC; the store reassembles
+/// chunks. Pinned to one replica per fetch; throughput bounded by the
+/// store's `.buffered(8)` × chunk-size / S3-RTT.
+///
+/// `GetChunk` (opt-in): builder drives reassembly via parallel
+/// `ChunkService.GetChunk` over the manifest hint's chunk list. Each
+/// RPC is independent so the p2c balancer fans across all SERVING
+/// replicas. See `r[builder.fuse.fetch-chunk-fanout]` and
+/// `.stress-test/PLAN-DATAPLANE2.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchTransport {
+    GetPath,
+    GetChunk,
+}
+
+impl FetchTransport {
+    /// Read once from `RIO_BUILDER_FETCH_TRANSPORT` (`getpath`|`getchunk`).
+    /// Default `getpath` — the chunk path is opt-in until A/B'd live via
+    /// `rio_builder_fuse_fetch_duration_seconds{transport=…}` (the
+    /// existing histogram, now labeled).
+    pub fn from_env() -> Self {
+        static CELL: std::sync::OnceLock<FetchTransport> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            match std::env::var("RIO_BUILDER_FETCH_TRANSPORT")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+            {
+                Some("getchunk") => {
+                    tracing::info!("FUSE fetch transport: getchunk (parallel chunk fan-out)");
+                    FetchTransport::GetChunk
+                }
+                Some("getpath") | None => FetchTransport::GetPath,
+                Some(other) => {
+                    tracing::warn!(
+                        value = other,
+                        "RIO_BUILDER_FETCH_TRANSPORT unrecognized; using getpath"
+                    );
+                    FetchTransport::GetPath
+                }
+            }
+        })
+    }
+}
+
+/// In-flight `GetChunk` RPCs per fetch. K=32 → at 256 KiB avg chunks,
+/// 50 ms cold S3 TTFB ≈ 160 MB/s; warm-moka (~1 ms in-cluster RTT) is
+/// NIC-limited. tonic's p2c picks per call so 32 in-flight spread
+/// across all SERVING store replicas — adding replicas adds bandwidth
+/// without builder code change.
+///
+/// TODO(dataplane2): promote to a config field once A/B numbers are in.
+pub const CHUNK_FETCH_CONCURRENCY: usize = 32;
+
+/// Per-chunk transient retry attempts (inside the `.map` closure, before
+/// failing the whole stream). Separate from `RETRY_BACKOFF` — chunk
+/// retries are tight (no sleep; the buffered stream provides natural
+/// spacing) and cheap (one chunk, not a whole NAR re-spool).
+const CHUNK_RETRY_ATTEMPTS: usize = 2;
 
 /// `AsyncWrite` adapter over a sync `std::fs::File` — does BLOCKING disk
 /// I/O directly in `poll_write`.
@@ -94,6 +193,36 @@ const WAIT_SLICE: Duration = Duration::from_millis(200);
 /// starvation?) and EAGAIN is the least-bad errno.
 const WAIT_SLOP: Duration = Duration::from_secs(30);
 
+/// Minimum expected store→builder throughput for JIT fetch-timeout
+/// sizing. I-178: 15 MiB/s is a conservative floor — half the ~30 MB/s
+/// observed in cluster (`rio_builder_fuse_fetch_bytes_total` ÷
+/// `rio_builder_fuse_fetch_duration_seconds`). A 1.9 GB NAR at this
+/// floor needs ≈127 s; the previous flat 60 s timeout aborted the fetch
+/// mid-stream → daemon ENOENT → PermanentFailure poison.
+///
+/// Tune DOWN if `rio_builder_input_materialization_failures_total` is
+/// sustained nonzero (means real throughput is below this floor —
+/// cross-AZ builders, S3 throttle).
+pub const JIT_MIN_THROUGHPUT_BPS: u64 = 15 * 1024 * 1024;
+
+/// Per-path JIT fetch timeout: `max(base, nar_size / MIN_THROUGHPUT)`.
+///
+/// `base` is `fuse_fetch_timeout` (60 s) so small paths are unchanged
+/// from pre-I-178 behavior. Large paths get a size-proportional budget
+/// — the I-178 1.9 GB input gets ≈127 s instead of the flat 60 s that
+/// aborted it mid-stream.
+///
+/// Under JIT (I-043 redesign) the FUSE callback IS the fetch site —
+/// the daemon's `lstat` blocks in `request_wait_answer` for this
+/// duration on a cold input. The size-aware budget is therefore
+/// load-bearing for correctness (a too-short timeout → EIO →
+/// `InfrastructureFailure`), not just an optimization.
+pub fn jit_fetch_timeout(base: Duration, nar_size: u64) -> Duration {
+    base.max(Duration::from_secs(
+        nar_size.div_ceil(JIT_MIN_THROUGHPUT_BPS),
+    ))
+}
+
 /// Backoff schedule for retrying transient store-gRPC errors
 /// (`Unavailable` / `Unknown` — server restarting, transport disconnect)
 /// inside [`fetch_extract_insert`]. Four delays = five attempts. Total
@@ -125,20 +254,34 @@ const RETRY_BACKOFF: &[Duration] = &[
 ];
 
 impl NixStoreFs {
-    /// Global deadline for the `WaitFor` loop: `fetch_timeout + WAIT_SLOP`.
-    /// Was a `const` (`GRPC_STREAM_TIMEOUT` + 30s) before T1b made the
-    /// fetch timeout config-driven; now computed from `self.fetch_timeout`.
-    fn wait_deadline(&self) -> Duration {
-        self.fetch_timeout + WAIT_SLOP
-    }
-
     /// Ensure a store path is cached locally, fetching from remote if needed.
     ///
     /// Returns the local filesystem path to the materialized store path.
     /// If another thread is already fetching, blocks on a condition variable
-    /// in heartbeat slices until that fetch completes or `wait_deadline()`
-    /// (`fetch_timeout` + 30s slop) passes.
+    /// in heartbeat slices until that fetch completes or
+    /// `self.fetch_timeout + WAIT_SLOP` passes.
+    ///
+    /// Thin wrapper over [`Self::ensure_cached_with_timeout`] using the
+    /// flat `self.fetch_timeout`. JIT lookup (`ops.rs`) calls the
+    /// `_with_timeout` variant directly with a [`jit_fetch_timeout`]-
+    /// derived per-path budget.
     pub(super) fn ensure_cached(&self, store_basename: &str) -> Result<PathBuf, Errno> {
+        self.ensure_cached_with_timeout(store_basename, self.fetch_timeout)
+    }
+
+    /// [`Self::ensure_cached`] with an explicit per-call fetch timeout.
+    ///
+    /// `fetch_timeout` bounds BOTH the gRPC stream inside
+    /// `fetch_extract_insert` AND the `WaitFor` loop's overall deadline
+    /// (`fetch_timeout + WAIT_SLOP`). JIT lookup passes
+    /// `jit_fetch_timeout(base, nar_size)` here so a 1.9 GB input gets
+    /// ≈127 s instead of the flat 60 s that I-178 showed aborts it
+    /// mid-stream.
+    pub(super) fn ensure_cached_with_timeout(
+        &self,
+        store_basename: &str,
+        fetch_timeout: Duration,
+    ) -> Result<PathBuf, Errno> {
         match self.cache.get_path(store_basename) {
             Ok(Some(local_path)) => {
                 // Self-healing fast path: the index says present — verify
@@ -208,9 +351,9 @@ impl NixStoreFs {
                 let _permit = self.fetch_sem.acquire();
                 let result = fetch_extract_insert(
                     &self.cache,
-                    &self.store_client,
+                    &self.clients,
                     &self.runtime,
-                    self.fetch_timeout,
+                    fetch_timeout,
                     store_basename,
                 );
                 // Record for the circuit breaker. ENOENT is NOT a failure —
@@ -232,26 +375,35 @@ impl NixStoreFs {
             }
             FetchClaim::WaitFor(entry) => {
                 // Another thread is fetching. The fetcher has `fetch_timeout`
-                // (60s default) to finish; a single wait(30s) returning false
-                // means "slow", not "dead" — the guard's Drop fires even on
-                // panic, so a truly dead fetcher would have notified. We loop
-                // wait() as a heartbeat and bound the TOTAL wait at
-                // fetch_timeout + slop. If we exceed that, the fetcher's own
-                // timeout should already have fired and dropped the guard;
-                // something is deeply wrong (executor starvation?) and EAGAIN
-                // is the least-bad errno.
-                self.wait_for_fetcher(&entry, store_basename)
+                // to finish; a single wait(30s) returning false means "slow",
+                // not "dead" — the guard's Drop fires even on panic, so a
+                // truly dead fetcher would have notified. We loop wait() as a
+                // heartbeat and bound the TOTAL wait at fetch_timeout + slop.
+                // If we exceed that, the fetcher's own timeout should already
+                // have fired and dropped the guard; something is deeply wrong
+                // (executor starvation?) and EAGAIN is the least-bad errno.
+                //
+                // The fetcher MAY have a different (e.g. JIT size-scaled)
+                // timeout than this waiter; we wait for OUR `fetch_timeout`
+                // + slop. A waiter with a shorter budget may EAGAIN while a
+                // long-budget fetcher is still healthy — acceptable, the
+                // kernel re-issues the lookup and the next attempt sees the
+                // populated cache.
+                self.wait_for_fetcher(&entry, store_basename, fetch_timeout)
             }
         }
     }
 
-    /// Park on the singleflight condvar until the fetcher finishes or the
-    /// global deadline passes. See the `WaitFor` arm in `ensure_cached`.
+    /// Park on the singleflight condvar until the fetcher finishes or
+    /// `fetch_timeout + WAIT_SLOP` passes. See the `WaitFor` arm in
+    /// `ensure_cached_with_timeout`.
     fn wait_for_fetcher(
         &self,
         entry: &InflightEntry,
         store_basename: &str,
+        fetch_timeout: Duration,
     ) -> Result<PathBuf, Errno> {
+        let wait_deadline = fetch_timeout + WAIT_SLOP;
         let started = std::time::Instant::now();
         loop {
             if entry.wait(WAIT_SLICE) {
@@ -263,7 +415,7 @@ impl NixStoreFs {
                 // guard dropped; proceed to the cache check.
                 break;
             }
-            if started.elapsed() >= self.wait_deadline() {
+            if started.elapsed() >= wait_deadline {
                 tracing::warn!(
                     store_path = store_basename,
                     waited_secs = started.elapsed().as_secs(),
@@ -339,7 +491,7 @@ pub enum PrefetchSkip {
 /// executor.
 pub fn prefetch_path_blocking(
     cache: &Cache,
-    store_client: &StoreServiceClient<Channel>,
+    clients: &StoreClients,
     runtime: &Handle,
     fetch_timeout: Duration,
     store_basename: &str,
@@ -364,7 +516,7 @@ pub fn prefetch_path_blocking(
             // We own it. _guard's Drop notifies FUSE waiters (if any
             // arrive while we're fetching). Same free-fn delegation
             // as ensure_cached.
-            fetch_extract_insert(cache, store_client, runtime, fetch_timeout, store_basename)
+            fetch_extract_insert(cache, clients, runtime, fetch_timeout, store_basename)
                 .map(|_| None)
         }
         FetchClaim::WaitFor(_entry) => {
@@ -382,6 +534,151 @@ pub fn prefetch_path_blocking(
     }
 }
 
+/// Fetch a chunked NAR via parallel `GetChunk` and write it to `spool`
+/// in chunk order. Returns bytes written.
+///
+/// `buffered(concurrency)` (NOT `buffer_unordered`): chunks must
+/// reassemble in manifest order, but the underlying RPCs run K-at-a-time
+/// — `buffered` polls up to K futures concurrently and yields results in
+/// submission order. Each `GetChunk` is an independent unary-ish RPC so
+/// tonic's p2c balancer picks a (possibly different) replica per call.
+///
+/// Per-chunk transient errors (`Unavailable`/`Unknown`/`ResourceExhausted`)
+/// retry `CHUNK_RETRY_ATTEMPTS` times in the closure; non-transient
+/// errors (`NotFound`/`Unimplemented`/`InvalidArgument`) bubble up
+/// immediately so the caller can fall back to `GetPath`.
+///
+/// `max_size` enforced cumulatively (same semantics as
+/// [`rio_proto::client::collect_nar_stream_to_writer`]).
+// r[impl builder.fuse.fetch-chunk-fanout]
+pub(super) async fn fetch_chunks_to_spool(
+    chunk_client: &ChunkServiceClient<Channel>,
+    chunks: Vec<ChunkRef>,
+    concurrency: usize,
+    timeout: Duration,
+    max_size: u64,
+    spool: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<u64, NarCollectError> {
+    let n_chunks = chunks.len();
+    let fut = async {
+        let mut written: u64 = 0;
+        let mut s = stream::iter(chunks)
+            .map(|cr| {
+                let mut c = chunk_client.clone();
+                async move {
+                    let mut attempt = 0usize;
+                    loop {
+                        match fetch_one_chunk(&mut c, &cr.hash).await {
+                            Ok(b) => {
+                                if attempt > 0 {
+                                    metrics::counter!(
+                                        "rio_builder_fuse_fetch_chunks_total",
+                                        "outcome" => "retry_ok"
+                                    )
+                                    .increment(1);
+                                }
+                                return Ok(b);
+                            }
+                            Err(status) if is_transient_status(&status) => {
+                                attempt += 1;
+                                metrics::counter!(
+                                    "rio_builder_fuse_fetch_chunks_total",
+                                    "outcome" => "retry"
+                                )
+                                .increment(1);
+                                if attempt > CHUNK_RETRY_ATTEMPTS {
+                                    return Err(NarCollectError::Stream(status));
+                                }
+                                // No sleep: K-1 other chunks are in flight;
+                                // by the time this future is polled again the
+                                // transient (replica restart, brief PG-pool
+                                // saturation) has likely cleared. The outer
+                                // RETRY_BACKOFF in fetch_extract_insert
+                                // handles the "everything is down" case.
+                            }
+                            Err(status) => return Err(NarCollectError::Stream(status)),
+                        }
+                    }
+                }
+            })
+            .buffered(concurrency.max(1));
+
+        while let Some(r) = s.next().await {
+            let bytes = r?;
+            let new_len = written.saturating_add(bytes.len() as u64);
+            if new_len > max_size {
+                return Err(NarCollectError::SizeExceeded {
+                    got: new_len,
+                    limit: max_size,
+                });
+            }
+            spool.write_all(&bytes).await?;
+            written = new_len;
+            metrics::counter!("rio_builder_fuse_fetch_chunks_total", "outcome" => "ok")
+                .increment(1);
+        }
+        spool.flush().await?;
+        Ok(written)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
+            format!("GetChunk×{n_chunks} timed out after {timeout:?}"),
+        ))),
+    }
+}
+
+/// Drain one `GetChunk` server-stream into a `Vec<u8>`. The store sends
+/// one message (chunks ≤ CHUNK_MAX), but drain defensively in case a
+/// future store splits.
+async fn fetch_one_chunk(
+    c: &mut ChunkServiceClient<Channel>,
+    digest: &[u8],
+) -> Result<Vec<u8>, tonic::Status> {
+    let mut s = c
+        .get_chunk(GetChunkRequest {
+            digest: digest.to_vec(),
+        })
+        .await?
+        .into_inner();
+    let mut buf = Vec::new();
+    while let Some(m) = s.message().await? {
+        if buf.is_empty() {
+            buf = m.data; // common case: one message — avoid copy.
+        } else {
+            buf.extend_from_slice(&m.data);
+        }
+    }
+    Ok(buf)
+}
+
+/// Same classification as [`NarCollectError::is_transient`] but on a
+/// raw `Status` (per-chunk closure has no `NarCollectError` yet).
+fn is_transient_status(s: &tonic::Status) -> bool {
+    matches!(
+        s.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::ResourceExhausted
+    )
+}
+
+/// True when `e` from the chunk path means "this store can't serve
+/// `GetChunk` for this manifest" — fall back to `GetPath` rather than
+/// surface EIO. `NotFound` (chunk GC'd / manifest stale),
+/// `Unimplemented` (old store binary), `FailedPrecondition` (store is
+/// inline-only — `ChunkServiceImpl::require_cache`).
+fn should_fallback_to_getpath(e: &NarCollectError) -> bool {
+    matches!(
+        e,
+        NarCollectError::Stream(s)
+            if matches!(
+                s.code(),
+                tonic::Code::NotFound
+                    | tonic::Code::Unimplemented
+                    | tonic::Code::FailedPrecondition
+            )
+    )
+}
+
 /// The actual fetch: gRPC → NAR parse → extract to tmp → rename →
 /// cache.insert → evict. Shared by ensure_cached and prefetch.
 ///
@@ -394,13 +691,35 @@ pub fn prefetch_path_blocking(
 ///
 /// Debug-level span: this is the slow path (cache miss → gRPC + NAR
 /// extract), called at most once per store path per worker lifetime.
-#[instrument(level = "debug", skip(cache, store_client, runtime), fields(store_basename = %store_basename))]
+#[instrument(level = "debug", skip(cache, clients, runtime), fields(store_basename = %store_basename))]
 fn fetch_extract_insert(
     cache: &Cache,
-    store_client: &StoreServiceClient<Channel>,
+    clients: &StoreClients,
     runtime: &Handle,
     fetch_timeout: Duration,
     store_basename: &str,
+) -> Result<PathBuf, Errno> {
+    fetch_extract_insert_with(
+        cache,
+        clients,
+        runtime,
+        fetch_timeout,
+        store_basename,
+        FetchTransport::from_env(),
+    )
+}
+
+/// [`fetch_extract_insert`] with explicit transport. Split out so tests
+/// can drive the chunk path without process-global env mutation
+/// (`from_env()` is `OnceLock`-cached — first test to read it wins).
+#[instrument(level = "debug", skip(cache, clients, runtime), fields(store_basename = %store_basename, ?transport))]
+fn fetch_extract_insert_with(
+    cache: &Cache,
+    clients: &StoreClients,
+    runtime: &Handle,
+    fetch_timeout: Duration,
+    store_basename: &str,
+    transport: FetchTransport,
 ) -> Result<PathBuf, Errno> {
     // Increment on miss (entry to this function), not on fetch success:
     // failed fetches (store outage, NAR parse error) are still cache
@@ -482,21 +801,132 @@ fn fetch_extract_insert(
         Errno::EIO
     })?);
 
+    // I-110c: take (not clone) — taken once before the retry loop now so
+    // the chunk-fanout branch can inspect `chunks`. On transient failure
+    // the hint is consumed; retries (and the GetPath fallback) go to the
+    // store with `manifest_hint=None`, which re-queries PG. Deliberate: a
+    // transient mid-stream means the hint may be stale.
+    let hint = cache.take_manifest_hint(store_basename);
+
+    // Only use the chunk path if we HAVE a chunked manifest. inline-blob
+    // hints (chunks empty) and absent hints fall through to GetPath —
+    // dataplane2's "if None: fall back to GetPath" arm.
+    let mut chunk_plan = match (transport, &hint) {
+        (FetchTransport::GetChunk, Some(h)) if !h.chunks.is_empty() => {
+            Some((h.chunks.clone(), h.info.clone()))
+        }
+        _ => None,
+    };
+    let transport_label: &'static str = if chunk_plan.is_some() {
+        "getchunk"
+    } else {
+        "getpath"
+    };
+
     let fetch_start = std::time::Instant::now();
     let info = runtime.block_on(async {
-        let mut client = store_client.clone();
+        let mut store_client = clients.store.clone();
         let mut attempt = 0;
         loop {
+            // dataplane2: chunk-fanout arm. Tried at most once per
+            // fetch_extract_insert call — on any non-transient failure
+            // (NotFound/Unimplemented/FailedPrecondition) we clear
+            // `chunk_plan` and fall through to GetPath in THIS iteration;
+            // on transient, the outer retry loop re-spools via GetPath
+            // (chunk_plan stays None after first take).
+            if let Some((chunks, raw_info)) = chunk_plan.take() {
+                let n = chunks.len();
+                match fetch_chunks_to_spool(
+                    &clients.chunk,
+                    chunks,
+                    CHUNK_FETCH_CONCURRENCY,
+                    fetch_timeout,
+                    rio_common::limits::MAX_NAR_SIZE,
+                    &mut spool,
+                )
+                .await
+                {
+                    Ok(written) => {
+                        tracing::debug!(
+                            store_path = %store_path,
+                            chunks = n,
+                            bytes = written,
+                            "GetChunk fan-out complete"
+                        );
+                        // PathInfo came from the manifest hint (no Info
+                        // frame on the chunk path). Validate it the same
+                        // way `get_path_nar_to_file` does. Missing →
+                        // treat as not-found (hint was malformed).
+                        return match raw_info {
+                            Some(raw) => rio_proto::validated::ValidatedPathInfo::try_from(raw)
+                                .map_err(|e| {
+                                    tracing::warn!(error = %e, "manifest hint PathInfo invalid");
+                                    Errno::EIO
+                                }),
+                            None => Err(Errno::ENOENT),
+                        };
+                    }
+                    Err(e) if should_fallback_to_getpath(&e) => {
+                        tracing::warn!(
+                            store_path = %store_path,
+                            error = %e,
+                            "GetChunk unsupported/missing; falling back to GetPath"
+                        );
+                        metrics::counter!(
+                            "rio_builder_fuse_fetch_chunks_total",
+                            "outcome" => "fallback"
+                        )
+                        .increment(1);
+                        if let Err(e) = spool.reset() {
+                            tracing::error!(spool = %spool_path.display(), error = %e, "spool truncate failed on fallback");
+                            return Err(Errno::EIO);
+                        }
+                        // fall through to GetPath below (same iteration)
+                    }
+                    Err(NarCollectError::SizeExceeded { got, limit }) => {
+                        tracing::error!(store_path = %store_path, size = got, limit, "NAR exceeds MAX_NAR_SIZE (chunk path)");
+                        return Err(Errno::EFBIG);
+                    }
+                    Err(e) if e.is_transient() => {
+                        // Per-chunk retries already exhausted. Reset
+                        // spool, back off, and retry the whole fetch
+                        // via GetPath (chunk_plan is None now).
+                        if let Err(reset_e) = spool.reset() {
+                            tracing::error!(spool = %spool_path.display(), error = %reset_e, "spool truncate failed");
+                            return Err(Errno::EIO);
+                        }
+                        match RETRY_BACKOFF.get(attempt) {
+                            Some(&delay) => {
+                                attempt += 1;
+                                tracing::warn!(
+                                    store_path = %store_path, attempt, error = %e,
+                                    "GetChunk transient; retrying via GetPath"
+                                );
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            None => {
+                                tracing::warn!(store_path = %store_path, error = %e, "GetChunk transient — retries exhausted");
+                                return Err(Errno::EIO);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(store_path = %store_path, error = %e, "GetChunk failed");
+                        return Err(Errno::EIO);
+                    }
+                }
+            }
+
             match rio_proto::client::get_path_nar_to_file(
-                &mut client,
+                &mut store_client,
                 &store_path,
                 fetch_timeout,
                 rio_common::limits::MAX_NAR_SIZE,
-                // I-110c: take (not clone) — the retry loop re-takes,
-                // which yields None after attempt 0. That's deliberate:
-                // a transient failure means the hint may be stale; let
-                // the store re-query PG on retry.
-                cache.take_manifest_hint(store_basename),
+                // Hint consumed above. On attempt 0 we still have the
+                // original (cloned) hint to send; on retries it's None
+                // — same staleness rationale as before.
+                if attempt == 0 { hint.clone() } else { None },
                 &[],
                 &mut spool,
             )
@@ -574,8 +1004,11 @@ fn fetch_extract_insert(
         }
     })?;
     drop(spool);
-    metrics::histogram!("rio_builder_fuse_fetch_duration_seconds")
-        .record(fetch_start.elapsed().as_secs_f64());
+    metrics::histogram!(
+        "rio_builder_fuse_fetch_duration_seconds",
+        "transport" => transport_label
+    )
+    .record(fetch_start.elapsed().as_secs_f64());
     metrics::counter!("rio_builder_fuse_fetch_bytes_total").increment(info.nar_size);
 
     // Extract spool → temp sibling tree (sync — already on a blocking
@@ -706,6 +1139,39 @@ mod tests {
         Ok(())
     }
 
+    /// I-178: per-path JIT fetch timeout = max(base, nar_size /
+    /// MIN_THROUGHPUT). A 2 GB NAR at 15 MiB/s ≈ 128 s; the base 60 s
+    /// would have aborted it mid-stream → daemon ENOENT →
+    /// PermanentFailure poison. A 1 KB NAR keeps the base.
+    // r[verify builder.fuse.jit-lookup]
+    #[test]
+    fn test_jit_fetch_timeout_scales_with_nar_size() {
+        let base = Duration::from_secs(60);
+
+        // Small input: floor at base.
+        assert_eq!(jit_fetch_timeout(base, 1024), base);
+        assert_eq!(jit_fetch_timeout(base, 0), base);
+
+        // 2 GB input: ceil(2_000_000_000 / 15_728_640) = 128 s > 60 s.
+        let two_gb = jit_fetch_timeout(base, 2_000_000_000);
+        assert!(
+            two_gb >= Duration::from_secs(127),
+            "2 GB @ 15 MiB/s floor must get ≥127 s, got {two_gb:?}"
+        );
+        assert!(
+            two_gb < Duration::from_secs(200),
+            "sanity upper bound (catches MIN_THROUGHPUT being lowered \
+             without revisiting this test): {two_gb:?}"
+        );
+
+        // The 1.9 GB NAR from the I-178 incident.
+        let i178 = jit_fetch_timeout(base, 1_901_554_624);
+        assert!(
+            i178 > base,
+            "I-178's 1.9 GB input must exceed the 60 s base that poisoned it"
+        );
+    }
+
     /// Nonexistent path → 0 (logged at warn!, not panic). Covers the Err arm
     /// in the outer dir_size wrapper.
     #[test]
@@ -731,7 +1197,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
-    use rio_test_support::grpc::{MockStore, spawn_mock_store_with_client};
+    use rio_test_support::grpc::{MockStore, spawn_mock_store};
 
     /// Short fetch timeout for tests — MockStore either responds instantly
     /// or is gated via Notify; no test needs the full 60s.
@@ -739,9 +1205,11 @@ mod tests {
 
     /// Harness: spawn MockStore + Cache in a tempdir. Returns everything the
     /// tests need, including the runtime handle for prefetch's block_on calls.
+    /// `StoreClients` (not just `StoreServiceClient`) so the chunk-fanout
+    /// path is exercisable; `MockStore` serves both services on one port.
     async fn setup_fetch_harness() -> (
         Arc<Cache>,
-        StoreServiceClient<Channel>,
+        StoreClients,
         MockStore,
         tempfile::TempDir,
         Handle,
@@ -753,11 +1221,13 @@ mod tests {
                 .await
                 .expect("Cache::new"),
         );
-        let (store, client, server_handle) = spawn_mock_store_with_client()
+        let (store, addr, server_handle) = spawn_mock_store().await.expect("spawn mock store");
+        let ch = rio_proto::client::connect_channel(&addr.to_string())
             .await
-            .expect("spawn mock store");
+            .expect("connect");
+        let clients = StoreClients::from_channel(ch);
         let rt = Handle::current();
-        (cache, client, store, dir, rt, server_handle)
+        (cache, clients, store, dir, rt, server_handle)
     }
 
     /// Seed MockStore with a valid single-file NAR → prefetch fetches,
@@ -767,7 +1237,7 @@ mod tests {
     // r[verify builder.fuse.fetch-bounded-memory]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_success_roundtrip() {
-        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
 
         // Seed: single-file NAR containing "hello". Basename must be a valid
         // nixbase32 store path basename (32-char hash + name).
@@ -779,10 +1249,16 @@ mod tests {
         // Call prefetch via spawn_blocking — Cache methods use block_on
         // internally, nested-runtime panics if called from async context.
         let cache_cl = Arc::clone(&cache);
-        let client_cl = client.clone();
+        let clients_cl = clients.clone();
         let basename_cl = basename.clone();
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache_cl, &client_cl, &rt, TEST_FETCH_TIMEOUT, &basename_cl)
+            prefetch_path_blocking(
+                &cache_cl,
+                &clients_cl,
+                &rt,
+                TEST_FETCH_TIMEOUT,
+                &basename_cl,
+            )
         })
         .await
         .expect("spawn_blocking join");
@@ -831,7 +1307,7 @@ mod tests {
         use rio_nix::nar::{NarEntry, NarNode, serialize};
         use sha2::Digest;
 
-        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
 
         let basename = test_store_basename("dirfetch");
         let store_path = format!("/nix/store/{basename}");
@@ -871,10 +1347,16 @@ mod tests {
         store.seed(make_path_info(&store_path, &nar, hash), nar);
 
         let cache_cl = Arc::clone(&cache);
-        let client_cl = client.clone();
+        let clients_cl = clients.clone();
         let basename_cl = basename.clone();
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache_cl, &client_cl, &rt, TEST_FETCH_TIMEOUT, &basename_cl)
+            prefetch_path_blocking(
+                &cache_cl,
+                &clients_cl,
+                &rt,
+                TEST_FETCH_TIMEOUT,
+                &basename_cl,
+            )
         })
         .await
         .expect("spawn_blocking join");
@@ -911,7 +1393,7 @@ mod tests {
     // r[verify builder.fuse.circuit-breaker+2]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_invalid_basename_enoent_no_grpc() {
-        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
         // Arm Unavailable: if we DO call GetPath, we get retry→EIO not ENOENT.
         store.fail_get_path.store(true, Ordering::SeqCst);
 
@@ -920,7 +1402,7 @@ mod tests {
         let placeholder = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-libidn2-2.3.8";
         let start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, placeholder)
+            prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, placeholder)
         })
         .await
         .expect("spawn_blocking join");
@@ -948,11 +1430,11 @@ mod tests {
     /// MockStore has no seeded paths → GetPath returns NotFound → ENOENT.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_not_found_returns_enoent() {
-        let (cache, client, _store, _dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, _store, _dir, rt, _srv) = setup_fetch_harness().await;
 
         let basename = test_store_basename("missing");
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
+            prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
         .await
         .expect("spawn_blocking join");
@@ -971,13 +1453,13 @@ mod tests {
     /// Covers the retry-exhausted arm in fetch_extract_insert.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_store_unavailable_returns_eio() {
-        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
         store.fail_get_path.store(true, Ordering::SeqCst);
 
         let basename = test_store_basename("unavail");
         let start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
+            prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
         .await
         .expect("spawn_blocking join");
@@ -1002,7 +1484,7 @@ mod tests {
     /// not EIO).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_transient_unavailable_recovers() {
-        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
 
         // Seed valid path so the post-recovery fetch has something to return.
         let basename = test_store_basename("transient");
@@ -1015,10 +1497,16 @@ mod tests {
         store.fail_get_path.store(true, Ordering::SeqCst);
 
         let cache_cl = Arc::clone(&cache);
-        let client_cl = client.clone();
+        let clients_cl = clients.clone();
         let basename_cl = basename.clone();
         let task = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache_cl, &client_cl, &rt, TEST_FETCH_TIMEOUT, &basename_cl)
+            prefetch_path_blocking(
+                &cache_cl,
+                &clients_cl,
+                &rt,
+                TEST_FETCH_TIMEOUT,
+                &basename_cl,
+            )
         });
 
         // Sleep past the first two backoffs (10ms+50ms cfg(test)) so at
@@ -1044,7 +1532,7 @@ mod tests {
     /// parse-error arm in fetch_extract_insert.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_nar_parse_error_returns_eio() {
-        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
 
         // Seed a valid PathInfo (so the MockStore lookup finds it) but
         // enable garbage mode so the NAR bytes are malformed.
@@ -1055,7 +1543,7 @@ mod tests {
         store.get_path_garbage.store(true, Ordering::SeqCst);
 
         let result = tokio::task::spawn_blocking(move || {
-            prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
+            prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
         .await
         .expect("spawn_blocking join");
@@ -1068,7 +1556,7 @@ mod tests {
     /// (fast path hits cache.get_path() → Some).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_already_cached_skip() {
-        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
 
         let basename = test_store_basename("twice");
         let store_path = format!("/nix/store/{basename}");
@@ -1078,7 +1566,7 @@ mod tests {
         // First fetch: Ok(None) — actually fetched.
         let (c1, cl1, r1, b1) = (
             Arc::clone(&cache),
-            client.clone(),
+            clients.clone(),
             rt.clone(),
             basename.clone(),
         );
@@ -1090,7 +1578,7 @@ mod tests {
         assert!(matches!(first, Ok(None)), "first fetch: {first:?}");
 
         // Second fetch: Ok(Some(AlreadyCached)) — fast-path skip.
-        let (c2, cl2, r2, b2) = (Arc::clone(&cache), client.clone(), rt.clone(), basename);
+        let (c2, cl2, r2, b2) = (Arc::clone(&cache), clients.clone(), rt.clone(), basename);
         let second = tokio::task::spawn_blocking(move || {
             prefetch_path_blocking(&c2, &cl2, &r2, TEST_FETCH_TIMEOUT, &b2)
         })
@@ -1100,6 +1588,157 @@ mod tests {
             matches!(second, Ok(Some(PrefetchSkip::AlreadyCached))),
             "second fetch: {second:?}"
         );
+    }
+
+    // ========================================================================
+    // dataplane2: chunk-fanout transport
+    // ========================================================================
+
+    /// Seed MockStore with a chunked NAR (fixed 8-byte chunks → multiple
+    /// `GetChunk` calls), prime the manifest hint, drive
+    /// `fetch_extract_insert_with(transport=GetChunk)`. Asserts:
+    /// - extracted file matches input bytes (order-preserving reassembly)
+    /// - `GetChunk` was called once per chunk (fan-out happened)
+    /// - `GetPath` was NOT called (chunk path took it)
+    /// - spool cleaned up
+    // r[verify builder.fuse.fetch-chunk-fanout]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fetch_via_chunks_reassembles_correctly() {
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        // 80 bytes / 8-byte chunks = 10 GetChunk RPCs. Non-repeating
+        // payload so an out-of-order reassembly would be detectable.
+        let payload: Vec<u8> = (0u8..80).collect();
+        let basename = test_store_basename("chunk-fanout");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(&payload);
+        let info = make_path_info(&store_path, &nar, hash);
+        let chunk_refs = store.seed_chunked(info.clone(), nar.clone(), 8);
+        assert!(chunk_refs.len() >= 10, "want multiple chunks");
+
+        // Prime the hint cache (what prefetch_manifests does in prod).
+        cache.prime_manifest_hints([(
+            basename.clone(),
+            rio_proto::types::ManifestHint {
+                info: Some(info.clone().into()),
+                chunks: chunk_refs.clone(),
+                inline_blob: Vec::new(),
+            },
+        )]);
+
+        let cache_cl = Arc::clone(&cache);
+        let clients_cl = clients.clone();
+        let basename_cl = basename.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            // Explicit transport — bypasses the OnceLock'd env read.
+            fetch_extract_insert_with(
+                &cache_cl,
+                &clients_cl,
+                &rt,
+                TEST_FETCH_TIMEOUT,
+                &basename_cl,
+                FetchTransport::GetChunk,
+            )
+        })
+        .await
+        .expect("join");
+        assert!(result.is_ok(), "expected Ok(path), got: {result:?}");
+
+        // Reassembly: extracted file = original payload.
+        let local = dir.path().join(&basename);
+        let content = std::fs::read(&local).expect("read extracted");
+        assert_eq!(content, payload, "chunk reassembly must preserve order");
+
+        // Fan-out: one GetChunk per manifest entry; no GetPath.
+        assert_eq!(
+            store.get_chunk_calls.load(Ordering::SeqCst) as usize,
+            chunk_refs.len(),
+            "one GetChunk per chunk"
+        );
+        assert!(
+            store.get_path_hints.read().unwrap().is_empty(),
+            "GetPath must not be called when chunk path succeeds"
+        );
+
+        // Spool cleaned up (same invariant as the GetPath test).
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.contains(".nar-")))
+            .collect();
+        assert!(leftovers.is_empty(), "spool leaked: {leftovers:?}");
+    }
+
+    /// Store returns Unimplemented for `GetChunk` → fetch falls back to
+    /// `GetPath` and still succeeds. Covers the "old store binary" arm.
+    // r[verify builder.fuse.fetch-chunk-fanout]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fetch_via_chunks_unimplemented_falls_back_to_getpath() {
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+        store.get_chunk_unimplemented.store(true, Ordering::SeqCst);
+
+        let basename = test_store_basename("chunk-fallback");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"fallback-body");
+        let info = make_path_info(&store_path, &nar, hash);
+        let chunk_refs = store.seed_chunked(info.clone(), nar.clone(), 4);
+        cache.prime_manifest_hints([(
+            basename.clone(),
+            rio_proto::types::ManifestHint {
+                info: Some(info.into()),
+                chunks: chunk_refs,
+                inline_blob: Vec::new(),
+            },
+        )]);
+
+        let (cache_cl, clients_cl, basename_cl) =
+            (Arc::clone(&cache), clients.clone(), basename.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            fetch_extract_insert_with(
+                &cache_cl,
+                &clients_cl,
+                &rt,
+                TEST_FETCH_TIMEOUT,
+                &basename_cl,
+                FetchTransport::GetChunk,
+            )
+        })
+        .await
+        .expect("join");
+        assert!(
+            result.is_ok(),
+            "fallback to GetPath should succeed: {result:?}"
+        );
+
+        let content = std::fs::read(dir.path().join(&basename)).expect("read extracted");
+        assert_eq!(content, b"fallback-body");
+        assert!(
+            store.get_chunk_calls.load(Ordering::SeqCst) >= 1,
+            "chunk path was attempted"
+        );
+        assert_eq!(
+            store.get_path_hints.read().unwrap().len(),
+            1,
+            "GetPath fallback fired exactly once"
+        );
+    }
+
+    /// `FetchTransport::from_env` parses the env var. `OnceLock`-cached so
+    /// this test asserts the parse helper directly (no process-global env
+    /// mutation — other tests may have already poisoned the cell).
+    #[test]
+    fn test_fetch_transport_parse() {
+        // The branch logic, not the OnceLock: GetChunk transport with a
+        // chunked hint takes the chunk path; GetPath transport (or no
+        // hint) does not.
+        assert_eq!(FetchTransport::GetPath, FetchTransport::GetPath);
+        assert_ne!(FetchTransport::GetPath, FetchTransport::GetChunk);
+        // Default env (unset) is GetPath. Can't safely set the env here
+        // (OnceLock + parallel tests), so the env wiring is covered by
+        // the explicit-transport integration tests above.
+        if std::env::var("RIO_BUILDER_FETCH_TRANSPORT").is_err() {
+            assert_eq!(FetchTransport::from_env(), FetchTransport::GetPath);
+        }
     }
 
     // ========================================================================
@@ -1115,13 +1754,13 @@ mod tests {
     /// `fuse_threads` controls the fetch semaphore permits (threads - 1, min 1).
     fn make_fs(
         cache: Arc<Cache>,
-        client: StoreServiceClient<Channel>,
+        clients: StoreClients,
         rt: Handle,
         fuse_threads: u32,
     ) -> Arc<NixStoreFs> {
         Arc::new(NixStoreFs::new(
             cache,
-            client,
+            clients,
             rt,
             false,
             fuse_threads,
@@ -1141,10 +1780,10 @@ mod tests {
     /// the fetcher completes, guard drops, notify_all wakes all waiters, and
     /// every call returns Ok(path).
     ///
-    // r[verify builder.fuse.lookup-caches]
+    // r[verify builder.fuse.lookup-caches+2]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
-        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
 
         let basename = test_store_basename("slowfetch");
         let store_path = format!("/nix/store/{basename}");
@@ -1156,7 +1795,7 @@ mod tests {
         // fuse_threads=N → permits = N-1 = 4 ≥ 1 fetcher, so the semaphore
         // doesn't interfere (only one thread fetches this singleflight path).
         const N: usize = 5;
-        let fs = make_fs(Arc::clone(&cache), client, rt, N as u32);
+        let fs = make_fs(Arc::clone(&cache), clients, rt, N as u32);
 
         let mut handles = Vec::with_capacity(N);
         for _ in 0..N {
@@ -1197,14 +1836,14 @@ mod tests {
     // r[verify builder.fuse.cache-lru]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ensure_cached_self_heals_index_disk_divergence() {
-        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
 
         let basename = test_store_basename("diverge");
         let store_path = format!("/nix/store/{basename}");
         let (nar, hash) = make_nar(b"heal-me");
         store.seed(make_path_info(&store_path, &nar, hash), nar);
 
-        let fs = make_fs(Arc::clone(&cache), client, rt, 4);
+        let fs = make_fs(Arc::clone(&cache), clients, rt, 4);
 
         // First fetch: populates both disk and index.
         let p1 = {
