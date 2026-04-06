@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -41,8 +41,8 @@ mod inputs;
 
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
 use inputs::{
-    compute_input_closure, fetch_drv_from_store, prefetch_manifests, verify_fod_hashes,
-    warm_inputs_in_fuse,
+    WARM_OVERALL_DEADLINE, compute_input_closure, fetch_drv_from_store, prefetch_manifests,
+    verify_fod_hashes, warm_inputs_in_fuse,
 };
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
@@ -108,6 +108,14 @@ pub struct ExecutorEnv {
     /// is then skipped — a no-op, the warm stat loop on a tmpdir
     /// never reaches `fetch_extract_insert` anyway).
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
+    /// Cancel flag for THIS build. Set by [`crate::runtime::try_cancel_build`]
+    /// before it writes `cgroup.kill`. I-166: threaded into the executor
+    /// so the pre-cgroup phase (overlay → resolve → prefetch → warm) can
+    /// poll it and abort with [`ExecutorError::Cancelled`] instead of
+    /// burning compute until `activeDeadlineSeconds`. Same `Arc` as the
+    /// one in `runtime::CancelRegistry` and the one `spawn_build_task`
+    /// reads to classify the final `Err`.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
@@ -189,6 +197,14 @@ pub enum ExecutorError {
         is_fod: bool,
         executor_kind: rio_proto::types::ExecutorKind,
     },
+    /// Cancel flag observed before the per-build cgroup exists. I-166:
+    /// distinct from the post-cgroup path (cgroup.kill → daemon EOF →
+    /// `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry
+    /// it. `spawn_build_task` maps any `Err` with `cancelled=true` to
+    /// `BuildResultStatus::Cancelled` regardless of variant; this
+    /// variant just makes the pre-cgroup abort explicit in logs.
+    #[error("build cancelled before cgroup creation")]
+    Cancelled,
 }
 
 impl ExecutorError {
@@ -444,10 +460,46 @@ pub async fn execute_build(
     // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
     // Unimplemented (old store) or any error, the per-path GetPath
     // queries PG as before.
-    if let Some(cache) = &env.fuse_cache {
-        prefetch_manifests(store_client, cache, &input_paths).await;
+    //
+    // r[impl builder.cancel.pre-cgroup-deferred]
+    // I-166: the cgroup doesn't exist yet (created post-spawn below),
+    // so a Cancel that arrived during overlay/resolve/prepare landed as
+    // ENOENT in `try_cancel_build` — which now LEAVES the flag set.
+    // Check it here (fast path) and poll it during prefetch+warm
+    // (the I-165 hang made this window 47 min). Dropping the warm
+    // future detaches ≤ WARM_FUSE_CONCURRENCY spawn_blocking threads;
+    // they unpark when their fuser thread's `fetch_timeout` (60s) fires
+    // or when shutdown aborts the FUSE connection. For ephemeral
+    // builders the process is about to exit anyway.
+    if env.cancelled.load(Ordering::Acquire) {
+        tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, before warm)");
+        return Err(ExecutorError::Cancelled);
     }
-    warm_inputs_in_fuse(fuse_mount_point, &input_paths).await;
+    let warm = async {
+        if let Some(cache) = &env.fuse_cache {
+            prefetch_manifests(store_client, cache, &input_paths).await;
+        }
+        warm_inputs_in_fuse(fuse_mount_point, &input_paths, WARM_OVERALL_DEADLINE).await;
+    };
+    let cancel_poll = async {
+        // 1s granularity: cancel latency here is bounded by this, not
+        // by warm's 90s deadline. Cheap — one atomic load + sleep per
+        // tick. `loop` not `while !load`: the first iteration must
+        // sleep (we just checked the flag synchronously above).
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if env.cancelled.load(Ordering::Acquire) {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = warm => {}
+        () = cancel_poll => {
+            tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup, during warm)");
+            return Err(ExecutorError::Cancelled);
+        }
+    }
 
     // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
     //
@@ -502,9 +554,10 @@ pub async fn execute_build(
     // rmdir because it has a stuck process, or daemon died between
     // spawn and now). Both are real errors the operator should see.
     //
-    // build_id = sanitize_build_id(drv_path). nixbase32 hash chars
-    // are valid cgroup names; sanitize replaces '.' (from ".drv")
-    // with '_'. Same name as the overlay directory — easy to
+    // build_id = sanitize_build_id(drv_path). nixbase32 hash chars are
+    // valid cgroup names; sanitize collapses anything outside
+    // [A-Za-z0-9_-] to '_' (drv names can carry `?id=...`, `+`, etc. —
+    // see I-167). Same name as the overlay directory — easy to
     // correlate in debugging.
     let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, &build_id)
         .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
@@ -1395,13 +1448,29 @@ fn setup_nix_conf(upper_nix_conf: &Path) -> Result<(), ExecutorError> {
 /// kill happened, the build proceeds. Harmless race — a cancel
 /// arriving THAT early is extremely rare and the scheduler will
 /// re-send on the next dispatch cycle if the build keeps running).
+// r[impl builder.exec.build-id-sanitized]
 pub fn sanitize_build_id(drv_path: &str) -> String {
-    // /nix/store/abc...-foo.drv -> abc...-foo.drv
+    // /nix/store/abc...-foo.drv -> abc___-foo_drv
+    //
+    // Derivation names from nixpkgs are NOT constrained to filesystem- or
+    // URL-safe characters. fetchpatch against a Gentoo mirror produces e.g.
+    // `opensp-1.5.2-c11-using.patch?id=688d9675...drv` (I-167). The build_id
+    // becomes an overlay directory name, a cgroup v2 name, and a component of
+    // the synth_db sqlite:// URI — so anything outside [A-Za-z0-9_-] is
+    // collapsed to `_`. nixbase32 hash chars (0-9 a-z) are already in-set.
     drv_path
         .rsplit('/')
         .next()
         .unwrap_or(drv_path)
-        .replace('.', "_")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Map a Nix daemon BuildStatus (failure path only — caller has already
@@ -1458,6 +1527,7 @@ pub(crate) fn nix_failure_to_proto(
 mod tests {
     use super::*;
 
+    // r[verify builder.exec.build-id-sanitized]
     #[test]
     fn test_sanitize_build_id() {
         assert_eq!(
@@ -1466,6 +1536,21 @@ mod tests {
         );
         assert_eq!(sanitize_build_id("simple"), "simple");
         assert_eq!(sanitize_build_id("foo.bar.drv"), "foo_bar_drv");
+        // I-167: fetchpatch URLs with query strings leak into drv names.
+        assert_eq!(
+            sanitize_build_id("/nix/store/abc-foo.patch?id=deadbeef.drv"),
+            "abc-foo_patch_id_deadbeef_drv"
+        );
+        // Every URL-ish metacharacter collapses to `_`.
+        assert_eq!(
+            sanitize_build_id("a?b=c&d+e%f#g:h.drv"),
+            "a_b_c_d_e_f_g_h_drv"
+        );
+        // nixbase32 + dash survive untouched.
+        assert_eq!(
+            sanitize_build_id("0123456789abcdfghijklmnpqrsvwxyz-name_drv"),
+            "0123456789abcdfghijklmnpqrsvwxyz-name_drv"
+        );
     }
 
     #[test]
@@ -1553,6 +1638,7 @@ mod tests {
             cgroup_parent: dir.path().to_path_buf(),
             executor_kind: rio_proto::types::ExecutorKind::Builder,
             fuse_cache: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;

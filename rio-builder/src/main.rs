@@ -772,13 +772,21 @@ async fn main() -> anyhow::Result<()> {
         tracing::debug!("DrainExecutor timed out (5s); proceeding to exit");
     }
 
-    // Dropping BackgroundSession:
-    //   - detaches the FUSE thread (BackgroundSession has NO Drop impl)
-    //   - drops the inner Mount, whose Drop DOES call fusermount -u
-    //     → kernel unmounts → sends DESTROY to the FUSE session
-    //     → detached FUSE thread processes DESTROY → Filesystem::destroy()
-    //       runs (flushes passthrough-failure stats, profraw)
-    //     → FUSE thread exits (but we're not joining it)
+    // r[impl builder.shutdown.fuse-abort]
+    // I-165: abort the FUSE connection FIRST. The builder both serves
+    // this mount (fuser threads) and consumes it (spawn_blocking
+    // symlink_metadata from the warm loop). If warm-stat threads are
+    // parked in the kernel's FUSE request queue when the runtime tears
+    // down, they're uninterruptible — exit_group() can't reap them and
+    // the process hangs (observed: main zombie + 4× D-state stat
+    // threads). The fusectl abort makes the kernel return ECONNABORTED
+    // to all pending requests, so the D-state threads wake BEFORE the
+    // session drops and the runtime exits. Then:
+    //   - drop the inner Mount → fusermount -u (lazy MNT_DETACH; with
+    //     no pending requests this completes immediately)
+    //   - detached fuser-bg thread sees ENODEV on /dev/fuse read
+    //     → Session::run() returns → Filesystem::destroy() runs
+    //     (flushes passthrough-failure stats, profraw)
     //
     // The race: main thread can reach libc exit() before the detached
     // FUSE thread processes DESTROY → destroy() never runs → profraw

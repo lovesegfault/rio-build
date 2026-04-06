@@ -85,6 +85,9 @@ pub struct ActorHandle {
     /// gRPC layer reads via `leader_generation()`. See
     /// [`GenerationReader`] for ordering semantics.
     pub(super) generation: GenerationReader,
+    /// Cached [`ClusterSnapshot`], refreshed each `Tick`. See
+    /// [`ActorHandle::cluster_snapshot_cached`].
+    pub(super) snapshot_rx: watch::Receiver<Arc<ClusterSnapshot>>,
 }
 
 impl ActorHandle {
@@ -202,12 +205,14 @@ impl ActorHandle {
 
         let backpressure = actor.backpressure_flag();
         let generation = actor.generation_reader();
+        let snapshot_rx = actor.snapshot_receiver();
         let self_tx = tx.downgrade();
         rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));
         Self {
             tx,
             backpressure,
             generation,
+            snapshot_rx,
         }
     }
     /// Whether the actor task is still alive. Returns false if the actor
@@ -242,6 +247,26 @@ impl ActorHandle {
     /// Check if the actor is under backpressure (hysteresis-aware).
     pub fn is_backpressured(&self) -> bool {
         self.backpressure.is_active()
+    }
+
+    /// Latest [`ClusterSnapshot`] published by the actor's `Tick`,
+    /// without an actor round-trip. Up to one Tick (~1s) stale.
+    ///
+    /// I-163: `query_unchecked(ClusterSnapshot)` queues behind whatever
+    /// is in the mailbox — under medium-mixed-32x load that was 9.5k
+    /// commands × ~5ms avg ≈ 47s for a 37µs handler. The autoscaler
+    /// and `xtask status` need a reading PRECISELY when the actor is
+    /// saturated (I-056 diagnostic-blind-spot lesson). This path is
+    /// O(1) Arc clone regardless of mailbox depth.
+    ///
+    /// Returns the `Default` snapshot (all zeros) until the first Tick
+    /// fires — same observable behavior as a fresh actor with an empty
+    /// DAG. The actor-routed `ActorCommand::ClusterSnapshot` is kept
+    /// for callers that need a synchronous-with-mailbox read (none at
+    /// present; cheap to keep).
+    // r[impl sched.admin.snapshot-cached]
+    pub fn cluster_snapshot_cached(&self) -> Arc<ClusterSnapshot> {
+        self.snapshot_rx.borrow().clone()
     }
 
     /// Current leader generation for `HeartbeatResponse.generation`.

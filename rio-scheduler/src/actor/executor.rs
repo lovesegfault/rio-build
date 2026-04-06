@@ -972,6 +972,24 @@ impl DagActor {
 
         self.tick_sweep_event_log();
         self.tick_publish_gauges();
+
+        // r[impl sched.actor.dispatch-decoupled]
+        // I-163: coalesced dispatch. Heartbeat sets the flag; we drain
+        // it at Tick cadence (≤1/s) instead of per-heartbeat (29/s at
+        // 290 workers). dispatch_ready clears the flag itself (after
+        // its leader/recovery gates) so inline callers (MergeDag,
+        // PrefetchComplete, ProcessCompletion) also satisfy it.
+        if self.dispatch_dirty {
+            self.dispatch_ready().await;
+        }
+
+        // r[impl sched.admin.snapshot-cached]
+        // Publish AFTER dispatch so the snapshot reflects this Tick's
+        // assignments. send_replace: single-slot overwrite, never blocks,
+        // returns the previous Arc (dropped). No-receiver is fine —
+        // watch::Sender holds the value regardless.
+        self.snapshot_tx
+            .send_replace(Arc::new(self.compute_cluster_snapshot()));
     }
 
     // -----------------------------------------------------------------------

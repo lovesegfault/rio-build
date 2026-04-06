@@ -187,13 +187,15 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         self.check_actor_alive()?;
 
-        // send_unchecked: autoscaler MUST get a reading under saturation.
-        // See ActorCommand::ClusterSnapshot doc for rationale.
-        let snap = self
-            .actor
-            .query_unchecked(|reply| ActorCommand::ClusterSnapshot { reply })
-            .await
-            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+        // I-163: read the watch-cached snapshot instead of round-
+        // tripping `ActorCommand::ClusterSnapshot` through the mailbox.
+        // The autoscaler MUST get a reading under saturation —
+        // `send_unchecked` bypassed backpressure but still queued
+        // behind 9.5k commands (~47s wait for a 37µs handler). The
+        // cached value is ≤1 Tick stale; for a 30s autoscaler poll
+        // that's noise.
+        // r[impl sched.admin.snapshot-cached]
+        let snap = self.actor.cluster_snapshot_cached();
 
         // SystemTime::now() - elapsed → "start time in CURRENT wall-clock
         // terms." checked_sub: if elapsed > now (clock jumped way back),
@@ -211,7 +213,7 @@ impl AdminService for AdminServiceImpl {
             queued_derivations: snap.queued_derivations,
             running_derivations: snap.running_derivations,
             queued_fod_derivations: snap.queued_fod_derivations,
-            queued_by_system: snap.queued_by_system,
+            queued_by_system: snap.queued_by_system.clone(),
             store_size_bytes: self
                 .store_size_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),

@@ -887,6 +887,8 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
             running_builds: vec![],
         })
         .await?;
+    // I-163: Heartbeat sets dispatch_dirty; Tick drains it.
+    handle.send_unchecked(ActorCommand::Tick).await?;
 
     // Drain the one assignment the worker receives (serializes with
     // the actor loop so the snapshot below sees the post-dispatch

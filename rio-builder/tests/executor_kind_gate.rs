@@ -6,7 +6,7 @@
 //! cross-kind assignments BEFORE overlay setup or daemon spawn.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use rio_builder::executor::{DEFAULT_DAEMON_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
 use rio_builder::log_stream::LogLimits;
@@ -35,6 +35,7 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         cgroup_parent: dir.to_path_buf(),
         executor_kind: kind,
         fuse_cache: None,
+        cancelled: Arc::new(AtomicBool::new(false)),
     }
 }
 

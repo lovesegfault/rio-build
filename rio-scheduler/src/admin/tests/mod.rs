@@ -165,11 +165,23 @@ async fn admin_rpcs_are_wired() -> anyhow::Result<()> {
 // ClusterStatus
 // -----------------------------------------------------------------------
 
+/// Tick (publish cached snapshot) then call `cluster_status`. I-163:
+/// `cluster_status` reads the watch-cached snapshot, which is Default
+/// until the actor's first Tick. Tests drive Tick explicitly.
+async fn cluster_status_now(
+    svc: &AdminServiceImpl,
+    actor: &crate::actor::ActorHandle,
+) -> anyhow::Result<ClusterStatusResponse> {
+    actor.send_unchecked(ActorCommand::Tick).await?;
+    crate::actor::tests::barrier(actor).await;
+    Ok(svc.cluster_status(Request::new(())).await?.into_inner())
+}
+
 #[tokio::test]
 async fn cluster_status_empty() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc_default().await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
-    let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+    let resp = cluster_status_now(&svc, &actor).await?;
 
     assert_eq!(resp.total_executors, 0);
     assert_eq!(resp.active_executors, 0);
@@ -217,7 +229,7 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
     // Fully registered worker (stream + heartbeat) → active.
     let _rx2 = connect_executor(&actor, "full", "x86_64-linux", 4).await?;
 
-    let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+    let resp = cluster_status_now(&svc, &actor).await?;
 
     assert_eq!(resp.total_executors, 2);
     assert_eq!(
@@ -258,7 +270,7 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
     ));
 
-    let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+    let resp = cluster_status_now(&svc, &actor).await?;
 
     // First derivation is Assigned (worker slot reserved, not yet acked
     // → Running). Second is in ready_queue (no capacity). BOTH builds
@@ -304,7 +316,7 @@ async fn cluster_status_counts_queued_fod_separately() -> anyhow::Result<()> {
     merge_dag(&actor, uuid::Uuid::new_v4(), vec![fod], vec![], false).await?;
     merge_dag(&actor, uuid::Uuid::new_v4(), vec![nonfod], vec![], false).await?;
 
-    let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+    let resp = cluster_status_now(&svc, &actor).await?;
 
     assert_eq!(
         resp.queued_derivations, 2,
@@ -358,7 +370,7 @@ async fn cluster_status_queued_fod_includes_assigned() -> anyhow::Result<()> {
     // Drain one assignment so the actor's running_build is set.
     let _ = recv_assignment(&mut rx).await;
 
-    let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+    let resp = cluster_status_now(&svc, &actor).await?;
     assert_eq!(resp.running_derivations, 1, "one Assigned to f0");
     assert_eq!(resp.queued_derivations, 1, "one still Ready (no capacity)");
     assert_eq!(
@@ -484,7 +496,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
 
     // Can't easily assert "nothing arrived" without a timeout. Instead,
     // check ClusterStatus: the second drv should be queued, not running.
-    let status = svc.cluster_status(Request::new(())).await?.into_inner();
+    let status = cluster_status_now(&svc, &actor).await?;
     assert_eq!(status.queued_derivations, 1, "second drv waiting (drained)");
     assert_eq!(status.running_derivations, 1, "only first drv on worker");
     assert_eq!(status.draining_executors, 1);
@@ -558,35 +570,17 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
 
     // reassign_derivations pushes to ready_queue but dispatch_ready
     // isn't called from handle_drain_executor — it fires on the NEXT
-    // heartbeat/merge/completion. Send a heartbeat to trigger it.
-    actor
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            executor_id: first_worker.into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-            bloom: None,
-            size_class: None,
-        })
-        .await?;
+    // Tick/merge/completion. Heartbeat sets dispatch_dirty, Tick
+    // drains it (I-163).
+    crate::actor::tests::send_heartbeat(&actor, first_worker, "x86_64-linux", 1).await?;
 
     // The OTHER worker should now get the reassigned drv.
-    let msg = other_rx
-        .recv()
-        .await
-        .expect("reassigned drv to other worker");
-    assert!(matches!(
-        msg.msg,
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-    ));
+    let msg = crate::actor::tests::recv_assignment(other_rx).await;
+    let _ = msg; // recv_assignment already asserts variant + 2s timeout
 
     // ClusterStatus: 1 draining, 1 active, 1 running (on the other
     // worker now), 0 queued.
-    let status = svc.cluster_status(Request::new(())).await?.into_inner();
+    let status = cluster_status_now(&svc, &actor).await?;
     assert_eq!(status.draining_executors, 1);
     assert_eq!(status.active_executors, 1);
     assert_eq!(

@@ -14,7 +14,7 @@ use std::time::Instant;
 // Same for BuildOptions/PriorityClass in the state import.
 // mod.rs is the import hub for the actor/* submodule tree.
 #[allow(unused_imports)]
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tonic::transport::Channel;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -322,6 +322,24 @@ pub struct DagActor {
     /// Same pattern for non-FOD derivations stuck with zero builder streams.
     /// Tracks `class_deferred.values().sum() > 0 && builder_streams == 0`.
     builder_freeze_since: Option<Instant>,
+    /// Set by events that change dispatch eligibility (Heartbeat, drain).
+    /// `handle_tick` consumes it: `if dirty { dispatch_ready(); dirty=false; }`.
+    /// I-163: Heartbeat used to call `dispatch_ready` inline — at 290
+    /// workers / 10s × 169ms each that's ~5× actor capacity. Coalescing
+    /// to once-per-Tick drops it to ≤1/s; state-change events
+    /// (PrefetchComplete, ProcessCompletion, MergeDag) still dispatch
+    /// inline because those genuinely unlock new work.
+    // r[impl sched.actor.dispatch-decoupled]
+    dispatch_dirty: bool,
+    /// Last [`ClusterSnapshot`] published by `handle_tick`. The
+    /// AdminService `cluster_status` handler reads `snapshot_tx.
+    /// subscribe().borrow()` via [`ActorHandle::cluster_snapshot_cached`]
+    /// instead of round-tripping `ActorCommand::ClusterSnapshot` through
+    /// the mailbox — so `xtask status` / autoscaler polls stay alive
+    /// regardless of mailbox depth (I-163: 30s timeouts when 9.5k
+    /// commands queued ahead of a 37µs handler). Up to one Tick stale.
+    // r[impl sched.admin.snapshot-cached]
+    snapshot_tx: watch::Sender<Arc<ClusterSnapshot>>,
     /// Test-only: oneshot pair for deterministic interleaving in
     /// `handle_leader_acquired`. When set, the actor sends on `.0`
     /// after `recover_from_pg()` returns, then awaits `.1` before
@@ -379,9 +397,20 @@ impl DagActor {
             shutdown: rio_common::signal::Token::new(),
             fod_freeze_since: None,
             builder_freeze_since: None,
+            dispatch_dirty: false,
+            snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
             recovery_toctou_gate: None,
         }
+    }
+
+    /// Receiver for the cached [`ClusterSnapshot`]. Called once by
+    /// `ActorHandle::spawn_with_leader` (and the test helper) before
+    /// `run_with_self_tx` — same pattern as `backpressure_flag` /
+    /// `generation_reader`. Additional subscribers are fine
+    /// (`watch::Sender::subscribe` is cheap, single-slot).
+    pub fn snapshot_receiver(&self) -> watch::Receiver<Arc<ClusterSnapshot>> {
+        self.snapshot_tx.subscribe()
     }
 
     /// Enable HMAC signing for assignment tokens. Builder-style.
@@ -635,14 +664,20 @@ impl DagActor {
                         draining,
                         kind,
                     );
-                    // I-035: drain phantom assignments BEFORE dispatch
-                    // so the freed slot + re-queued derivation are both
-                    // visible to the same dispatch pass.
+                    // I-035: drain phantom assignments BEFORE the next
+                    // dispatch so the freed slot + re-queued derivation
+                    // are both visible to it.
                     if !phantoms.is_empty() {
                         self.drain_phantoms(phantoms).await;
                     }
-                    // Dispatch on heartbeat: new capacity may be available
-                    self.dispatch_ready().await;
+                    // I-163: mark dirty instead of dispatching inline.
+                    // 290 workers × 10s heartbeat × 169ms dispatch_ready
+                    // = ~5× actor capacity → mailbox_depth=9.5k → admin
+                    // RPC timeouts. handle_tick drains the flag at ≤1/s;
+                    // ProcessCompletion / PrefetchComplete / MergeDag
+                    // still dispatch inline (those unlock new work).
+                    // r[impl sched.actor.dispatch-decoupled]
+                    self.dispatch_dirty = true;
                 }
                 ActorCommand::Tick => {
                     self.handle_tick().await;

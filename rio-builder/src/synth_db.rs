@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 use tracing::instrument;
 
@@ -107,9 +108,15 @@ pub async fn generate_db(
     paths: &[SynthPathInfo],
     drv_outputs: &[SynthDrvOutput],
 ) -> Result<(), sqlx::Error> {
-    // sqlx sqlite URI format: sqlite:///absolute/path or sqlite://relative
-    let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let mut conn = SqliteConnection::connect(&url).await?;
+    // SqliteConnectOptions::filename takes the path verbatim — no URI parsing.
+    // Defense-in-depth for I-167: drv names can contain `?` which a
+    // `sqlite://{path}?mode=rwc` string would mis-parse as a query param.
+    // sanitize_build_id keeps such bytes out of the overlay dir name, but the
+    // db_path is caller-controlled and this layer should not assume that.
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true);
+    let mut conn = SqliteConnection::connect_with(&opts).await?;
 
     // PRAGMAs must be executed separately (sqlx doesn't support multi-statement strings)
     sqlx::query("PRAGMA journal_mode=WAL")
@@ -358,8 +365,29 @@ mod tests {
 
     /// Open a connection to an existing DB file for test assertions.
     async fn open_db(db_path: &Path) -> anyhow::Result<SqliteConnection> {
-        let url = format!("sqlite://{}", db_path.display());
-        Ok(SqliteConnection::connect(&url).await?)
+        let opts = SqliteConnectOptions::new().filename(db_path);
+        Ok(SqliteConnection::connect_with(&opts).await?)
+    }
+
+    /// I-167 regression: a `?` in a parent directory component used to be
+    /// parsed as the start of the sqlite:// query string. With
+    /// SqliteConnectOptions::filename the path is taken verbatim.
+    #[tokio::test]
+    async fn test_generate_db_path_with_query_char() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let weird = dir.path().join("upper?id=deadbeef");
+        std::fs::create_dir_all(&weird)?;
+        let db_path = weird.join("db.sqlite");
+
+        generate_db(&db_path, &sample_paths(), &[]).await?;
+
+        assert!(db_path.exists(), "db file should exist at {db_path:?}");
+        let mut conn = open_db(&db_path).await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
+            .fetch_one(&mut conn)
+            .await?;
+        assert_eq!(count, 2);
+        Ok(())
     }
 
     #[tokio::test]

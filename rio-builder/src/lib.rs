@@ -81,6 +81,14 @@ pub fn describe_metrics() {
          lookup MAY negative-cache → 'build input does not exist'. Sustained \
          nonzero = store or FUSE infrastructure issue, not a transient race."
     );
+    describe_counter!(
+        "rio_builder_input_warm_timeout_total",
+        "Builds whose FUSE input-warm phase hit the overall deadline (I-165). \
+         The build proceeds with a partial warm; un-warmed inputs may hit the \
+         I-043 overlay negative-dentry race. Sustained nonzero = store-side \
+         GetPath saturation (thundering-herd dispatch), not individual missing \
+         paths (that's _failures_total)."
+    );
     describe_gauge!(
         "rio_builder_fuse_cache_size_bytes",
         "FUSE SSD cache usage in bytes"

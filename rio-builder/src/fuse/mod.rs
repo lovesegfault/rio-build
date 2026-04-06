@@ -292,10 +292,114 @@ fn make_fuse_config(n_threads: u32) -> Config {
     config
 }
 
+/// `BackgroundSession` plus the bookkeeping needed to abort the
+/// connection on shutdown. Drop aborts the connection BEFORE the
+/// inner session drops.
+pub struct FuseMount {
+    /// `Option` so `Drop` can `take()` it and control ordering: abort
+    /// write FIRST, then drop session (→ `Mount::Drop` → unmount).
+    /// Never `None` outside `Drop`.
+    session: Option<fuser::BackgroundSession>,
+    /// fusectl `abort` control file for this connection, captured at
+    /// mount time. `None` if `stat(mount_point)` failed (mount not yet
+    /// visible — shouldn't happen post-`spawn_mount2`) or fusectl isn't
+    /// mounted; abort then degrades to the plain session-Drop path.
+    abort_path: Option<PathBuf>,
+}
+
+impl Drop for FuseMount {
+    // r[impl builder.shutdown.fuse-abort]
+    /// Abort the FUSE connection (kernel returns `ECONNABORTED` to all
+    /// pending requests) then drop the session.
+    ///
+    /// I-165: the builder both SERVES this mount (fuser threads) and
+    /// CONSUMES it (`spawn_blocking(symlink_metadata)` from the warm
+    /// loop). If the runtime tears down while warm-stat threads are
+    /// parked in the kernel's FUSE request queue, those threads enter
+    /// uninterruptible D-state — `exit_group()` can't reap them, the
+    /// process hangs with main as a zombie. fuser's `Mount::Drop` (via
+    /// `AutoUnmount` socket close → `fusermount -u` → lazy
+    /// `MNT_DETACH`) does NOT abort pending requests; the fusectl
+    /// `abort` write does (`fs/fuse/control.c` → `fuse_abort_conn`).
+    ///
+    /// `abort_path` was captured at mount time because computing it
+    /// requires `stat(mount_point)` — which is itself a FUSE
+    /// `getattr(ROOT)` that would queue behind the very requests we're
+    /// trying to abort.
+    ///
+    /// In `Drop` (not a consuming method) so the `bail!` unwind path in
+    /// main.rs gets the abort too. Best-effort: if fusectl isn't
+    /// mounted or the write fails, log and fall through. The pod's
+    /// `activeDeadlineSeconds` is the backstop.
+    fn drop(&mut self) {
+        if let Some(abort_path) = &self.abort_path {
+            match std::fs::write(abort_path, "1") {
+                Ok(()) => tracing::debug!(
+                    abort_path = %abort_path.display(),
+                    "FUSE connection aborted; pending requests will see ECONNABORTED"
+                ),
+                Err(e) => tracing::warn!(
+                    abort_path = %abort_path.display(),
+                    error = %e,
+                    "FUSE connection abort failed; D-state warm-stat threads may delay process exit"
+                ),
+            }
+        } else {
+            tracing::debug!("no fusectl abort path captured at mount time; skipping FUSE abort");
+        }
+        // Explicit drop for ordering clarity (would happen anyway as
+        // the last field, but the abort-before-unmount sequence is the
+        // whole point).
+        drop(self.session.take());
+    }
+}
+
+/// Compute the fusectl `abort` control-file path for `mount_point`.
+///
+/// `/sys/fs/fuse/connections/<N>/abort` where `<N>` is the kernel's
+/// `dev_t` for the mount's anonymous superblock. FUSE uses anonymous
+/// block devices (major 0), so kernel `dev_t = MKDEV(0, minor) = minor`;
+/// the directory name as printed by `fs/fuse/control.c`'s
+/// `sprintf("%u", fc->dev)` is therefore the userspace minor number.
+///
+/// `None` if stat fails or fusectl isn't mounted (no
+/// `/sys/fs/fuse/connections`). Called once at mount time, NOT at abort
+/// time — see the `Drop` impl on [`FuseMount`].
+fn fusectl_abort_path(mount_point: &Path) -> Option<PathBuf> {
+    let st_dev = match nix::sys::stat::stat(mount_point) {
+        Ok(s) => s.st_dev,
+        Err(e) => {
+            tracing::warn!(
+                mount_point = %mount_point.display(),
+                error = %e,
+                "stat(mount_point) failed; FUSE abort path unavailable"
+            );
+            return None;
+        }
+    };
+    // glibc-compatible `gnu_dev_minor()`. `nix` 0.31 doesn't expose
+    // major/minor and `libc` isn't a direct dep; the encoding is stable
+    // ABI (sys/sysmacros.h).
+    let minor = (st_dev & 0xff) | ((st_dev >> 12) & 0xff_ff_ff_00);
+    let abort = PathBuf::from(format!("/sys/fs/fuse/connections/{minor}/abort"));
+    // Existence check: fusectl may not be mounted (it's a separate
+    // `mount -t fusectl`). systemd auto-mounts it; bare containers may
+    // not. Degrade gracefully — the abort is best-effort.
+    if abort.exists() {
+        Some(abort)
+    } else {
+        tracing::debug!(
+            path = %abort.display(),
+            "fusectl abort path not present (fusectl not mounted?); FUSE abort unavailable"
+        );
+        None
+    }
+}
+
 /// Mount the FUSE filesystem in a background thread.
 ///
-/// Returns the `BackgroundSession` handle (dropping it unmounts the
-/// filesystem) plus the circuit breaker handle (cloned out BEFORE
+/// Returns the [`FuseMount`] handle (call `.abort_and_drop()` on
+/// shutdown) plus the circuit breaker handle (cloned out BEFORE
 /// `spawn_mount2` consumes the fs — same extract-before-move pattern
 /// as `bloom_handle`). The heartbeat loop polls `is_open()` on the
 /// returned handle; the fuser thread pool writes to the same breaker
@@ -308,7 +412,7 @@ pub fn mount_fuse_background(
     passthrough: bool,
     n_threads: u32,
     fetch_timeout: Duration,
-) -> anyhow::Result<(fuser::BackgroundSession, Arc<CircuitBreaker>)> {
+) -> anyhow::Result<(FuseMount, Arc<CircuitBreaker>)> {
     let fs = NixStoreFs::new(
         cache,
         store_client,
@@ -324,14 +428,25 @@ pub fn mount_fuse_background(
     let config = make_fuse_config(n_threads);
     let session = fuser::spawn_mount2(fs, mount_point, &config)?;
 
+    // Capture the fusectl abort path NOW, while the fuser threads are
+    // healthy. At abort time they may all be parked.
+    let abort_path = fusectl_abort_path(mount_point);
+
     tracing::info!(
         mount_point = %mount_point.display(),
         passthrough,
         n_threads,
+        abort_path = ?abort_path,
         "FUSE store mounted in background"
     );
 
-    Ok((session, circuit))
+    Ok((
+        FuseMount {
+            session: Some(session),
+            abort_path,
+        },
+        circuit,
+    ))
 }
 
 #[cfg(test)]

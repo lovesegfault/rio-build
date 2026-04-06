@@ -1237,3 +1237,173 @@ async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
     );
     Ok(())
 }
+
+/// I-163 Fix 1: Heartbeat sets `dispatch_dirty` instead of dispatching
+/// inline; `Tick` drains the flag. At 290 workers × 169ms/dispatch the
+/// inline path was ~5× actor capacity.
+///
+/// Shape: merge with no worker (Ready, deferred) → connect_no_ack
+/// (Heartbeat sets dirty) → assert no Assignment yet → Tick → assert
+/// Assignment lands.
+// r[verify sched.actor.dispatch-decoupled]
+#[tokio::test]
+async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Merge first: dispatch_ready runs at end-of-merge with zero
+    // workers → deferred. ready_queue holds the node.
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "i163-hb", PriorityClass::Scheduled).await?;
+
+    // Connected + Heartbeat. Heartbeat now sets dispatch_dirty=true
+    // and returns — no inline dispatch_ready.
+    let mut rx = connect_executor_no_ack(&handle, "i163-w", "x86_64-linux", 1).await?;
+    barrier(&handle).await;
+
+    // Drain whatever the actor sent (PrefetchHint from
+    // on_worker_registered) and assert NO Assignment among it. Would
+    // FAIL on the pre-I-163 inline-dispatch path: the cold-fallback
+    // would have placed the node already.
+    while let Ok(m) = rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "Heartbeat must not dispatch inline (I-163); got Assignment before Tick"
+        );
+    }
+
+    // Tick drains dispatch_dirty → dispatch_ready → cold-fallback
+    // places the node on the only registered worker.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    let a = recv_assignment(&mut rx).await;
+    assert!(a.drv_path.contains("i163-hb"));
+    Ok(())
+}
+
+/// I-163 Fix 2: deferred FODs are checked by the batch pre-pass (one
+/// `FindMissingPaths`), and the drain loop SKIPS the per-FOD
+/// `fod_outputs_in_store` for hashes the batch already covered. The
+/// doc-comment on `fod_outputs_in_store` claimed this; the code
+/// didn't honor it (211 deferred FODs × ~0.7ms RTT ≈ 150ms of the
+/// 169ms/Heartbeat I-163 cost).
+///
+/// Shape: merge 5 Ready FODs with no fetcher (all defer); count
+/// `FindMissingPaths` across one dispatch_ready. Want exactly 1 (the
+/// batch). Pre-fix would be 1 + 5 = 6.
+#[tokio::test]
+async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use std::sync::atomic::Ordering;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    // Builder, not fetcher: FODs route to fetchers (ADR-019), so all
+    // 5 defer in the drain loop — that's the I-163 hot path.
+    let _rx = connect_executor(&handle, "i163-builder", "x86_64-linux", 1).await?;
+
+    let nodes: Vec<_> = (0..5)
+        .map(|i| {
+            let mut n = make_test_node(&format!("i163-fod-{i}"), "x86_64-linux");
+            n.is_fixed_output = true;
+            // batch pre-pass filters on !expected_output_paths.is_empty()
+            n.expected_output_paths = vec![test_store_path(&format!("i163-fod-{i}-out"))];
+            n
+        })
+        .collect();
+    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
+
+    // Merge ran check_cached_outputs (1 RPC) + dispatch_ready (1 batch
+    // RPC). Reset the baseline; the assertion is on the NEXT
+    // dispatch_ready in isolation.
+    barrier(&handle).await;
+    store.find_missing_calls.store(0, Ordering::SeqCst);
+
+    // Drive one dispatch_ready: Heartbeat (dirty) + Tick (drain).
+    // send_heartbeat already chains the Tick.
+    send_heartbeat(&handle, "i163-builder", "x86_64-linux", 1).await?;
+    barrier(&handle).await;
+
+    let calls = store.find_missing_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        calls, 1,
+        "one dispatch_ready over 5 deferred FODs must issue exactly the batch \
+         FindMissingPaths (got {calls}); >1 means the per-FOD fallback fired \
+         for batch-checked hashes"
+    );
+    Ok(())
+}
+
+/// I-163 Fix 2, fail-open edge: when the batch RPC fails, the returned
+/// checked-set is empty so the drain loop's per-FOD fallback STILL
+/// fires (same behavior as before). Guards against the batch's
+/// `return HashSet::new()` paths accidentally suppressing the
+/// fallback.
+#[tokio::test]
+async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use std::sync::atomic::Ordering;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let _rx = connect_executor(&handle, "i163-fo-b", "x86_64-linux", 1).await?;
+
+    let mut n = make_test_node("i163-fo-fod", "x86_64-linux");
+    n.is_fixed_output = true;
+    n.expected_output_paths = vec![test_store_path("i163-fo-fod-out")];
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    store.fail_find_missing.store(true, Ordering::SeqCst);
+    store.find_missing_calls.store(0, Ordering::SeqCst);
+
+    send_heartbeat(&handle, "i163-fo-b", "x86_64-linux", 1).await?;
+    barrier(&handle).await;
+
+    // Batch (1, fails) + per-FOD fallback (1). Both count — the
+    // counter increments before the fail-injection bail. Exactly 2
+    // proves the fallback still runs when the batch returns empty.
+    assert_eq!(store.find_missing_calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+/// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
+/// value the actor publishes on `Tick` — no mailbox round-trip. The
+/// `fn` (not `async fn`) signature is the structural proof; this test
+/// verifies the value is wired (Tick → publish → handle reads it) and
+/// is stale-until-Tick (merge alone doesn't update it).
+// r[verify sched.admin.snapshot-cached]
+#[tokio::test]
+async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    let _rx = connect_executor(&handle, "i163-snap-w", "x86_64-linux", 1).await?;
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "i163-snap",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // No Tick yet → watch holds the Default snapshot (all zeros).
+    // connect_executor's PrefetchComplete dispatched the node, but
+    // the cached snapshot doesn't see that until Tick publishes.
+    let pre = handle.cluster_snapshot_cached();
+    assert_eq!(
+        pre.total_executors, 0,
+        "cached snapshot is Tick-published, not live; pre-Tick must be Default"
+    );
+
+    tick(&handle).await?;
+
+    let post = handle.cluster_snapshot_cached();
+    assert_eq!(post.total_executors, 1);
+    assert_eq!(post.active_executors, 1);
+    // Node was assigned by PrefetchComplete's inline dispatch (still
+    // runs inline — only Heartbeat moved to dirty-flag).
+    assert_eq!(post.running_derivations, 1);
+    Ok(())
+}
