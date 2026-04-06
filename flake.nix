@@ -666,6 +666,7 @@
                   nativeBuildInputs = [
                     pkgs.kubernetes-helm
                     pkgs.yq-go
+                    pkgs.jq
                   ];
                 }
                 ''
@@ -938,6 +939,21 @@
                     echo "FAIL: fetcherPool.hostUsers unset but key rendered (spurious key)" >&2
                     exit 1
                   }
+
+                  # ── r[obs.metric.builder-util] dashboard regex ──────────────
+                  # builder-utilization.json's cAdvisor queries select pods by
+                  # regex. The controller's STS naming is format!("{name}-builders")
+                  # (builderpool/mod.rs, scaling/per_class.rs) → pods named
+                  # {pool}-builders-{ordinal}. The pre-P0458 regex
+                  # "rio-builder.*" matched zero pods (panels blank). Assert
+                  # the -builders- infix so a future dashboard or controller
+                  # rename that desyncs the two fails here, not silently at
+                  # "why is this Grafana panel empty".
+                  jq -r '.panels[].targets[]?.expr' \
+                    ${./infra/helm/grafana/builder-utilization.json} \
+                    | grep 'container_cpu_usage\|container_memory' \
+                    | grep -q -- '-builders-' \
+                    || { echo "FAIL: builder-utilization.json pod regex doesn't match controller STS naming ({pool}-builders-{N})" >&2; exit 1; }
 
                   touch $out
                 '';
