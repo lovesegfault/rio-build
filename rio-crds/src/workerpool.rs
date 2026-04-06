@@ -66,7 +66,7 @@ pub struct WorkerPoolSpec {
     /// strip unknowns." `serde_json::Value` emitted `{}` which
     /// the apiserver REJECTS (`type: Required value`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::crds::any_object")]
+    #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<ResourceRequirements>,
 
     /// Maximum concurrent builds per worker pod. Maps to
@@ -157,7 +157,7 @@ pub struct WorkerPoolSpec {
     /// node_selector: tolerate the `rio.build/worker:NoSchedule`
     /// taint so workers (and only workers) land on those nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::crds::any_object_array")]
+    #[schemars(schema_with = "crate::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
     /// Pod terminationGracePeriodSeconds. SIGTERM → worker drain
@@ -390,7 +390,7 @@ pub struct WorkerPoolStatus {
     /// ("ScaledUp" with a message showing from/to; "UnknownMetric"
     /// when spec.autoscaling.metric is unsupported).
     #[serde(default)]
-    #[schemars(schema_with = "crate::crds::any_object_array")]
+    #[schemars(schema_with = "crate::any_object_array")]
     pub conditions: Vec<Condition>,
 }
 

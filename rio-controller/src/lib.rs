@@ -43,7 +43,10 @@
 //! Build submission is via SSH (`nix build --store ssh-ng://`) —
 //! no K8s-native submission CRD.
 
-pub mod crds;
+// CRD types live in rio-crds (extracted so rio-cli can use them
+// without pulling the full reconciler stack). Re-exported as `crds`
+// so existing `crate::crds::workerpool::...` paths still work.
+pub use rio_crds as crds;
 pub mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;

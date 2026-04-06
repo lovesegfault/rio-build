@@ -1,4 +1,4 @@
-//! CustomResourceDefinitions.
+//! CustomResourceDefinition types for rio-build.
 //!
 //! `#[derive(CustomResource)]` generates the full-object struct
 //! (metadata + spec + status) from the annotated Spec struct.
@@ -9,8 +9,13 @@
 //! idiomatic way to inject `x-kubernetes-validations` into the
 //! generated OpenAPI schema. NOT schemars extend (that's the raw
 //! fallback; x_kube is the first-class path).
+//!
+//! Extracted from rio-controller so rio-cli can import CRD types
+//! without the full reconciler dependency graph. rio-controller
+//! re-exports this crate verbatim (`pub use rio_crds as crds;`).
 
 pub mod workerpool;
+pub mod workerpoolset;
 
 // ----- schemars helpers for k8s-openapi passthrough types -----------
 //
@@ -25,8 +30,8 @@ pub mod workerpool;
 // what ResourceRequirements looks like); we just need to tell it
 // "this is an object, don't strip unknown fields."
 //
-// `pub(crate)`: used by workerpool.rs via
-// `#[schemars(schema_with = "crate::crds::any_object")]`.
+// `pub(crate)`: used by CRD modules via
+// `#[schemars(schema_with = "crate::any_object")]`.
 
 /// Schema for `Option<K8sType>` fields where K8sType is a single
 /// object (ResourceRequirements, etc). nullable + object +
