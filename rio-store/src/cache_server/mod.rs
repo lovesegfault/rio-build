@@ -537,6 +537,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        // Test assertion display, not parse-path.
+        #[allow(clippy::disallowed_methods)]
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("StoreDir: /nix/store"));
         assert!(text.contains("WantMassQuery: 1"));
@@ -582,6 +584,8 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
             .await
             .unwrap();
+        // Test assertion display, not parse-path.
+        #[allow(clippy::disallowed_methods)]
         let text = String::from_utf8_lossy(&body);
 
         assert!(text.contains(&format!("StorePath: {store_path}")));
@@ -613,6 +617,8 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
             .await
             .unwrap();
+        // Test assertion display, not parse-path.
+        #[allow(clippy::disallowed_methods)]
         let text = String::from_utf8_lossy(&body);
 
         // Sig: line present with our key name.

@@ -114,6 +114,11 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
         match event.event {
             Some(types::build_event::Event::Log(log_batch)) => {
                 for line in &log_batch.lines {
+                    // Log display, not parse-path. Build log lines are
+                    // arbitrary builder output (may contain invalid UTF-8
+                    // from whatever the build script printed); lossy
+                    // replacement is the correct behavior for display.
+                    #[allow(clippy::disallowed_methods)]
                     let text = String::from_utf8_lossy(line);
                     stderr.log(&text).await?;
                 }

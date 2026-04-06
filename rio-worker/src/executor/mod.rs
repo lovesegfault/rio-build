@@ -312,8 +312,16 @@ pub async fn execute_build(
     let drv = if assignment.drv_content.is_empty() {
         fetch_drv_from_store(store_client, drv_path).await?
     } else {
-        let drv_text = String::from_utf8_lossy(&assignment.drv_content);
-        Derivation::parse(&drv_text)
+        // Strict UTF-8 — matches the else-branch (parse_from_nar uses
+        // strict from_utf8 at derivation/mod.rs:168). Lossy would silently
+        // produce U+FFFD → ATerm parse fails with a confusing "unexpected
+        // character" instead of the real UTF-8 error. P0017's 2f807a4
+        // eliminated this pattern; 395e826f reintroduced it one day after
+        // P0020 closed. Clippy disallowed-methods (P0290) prevents round 3.
+        let drv_text = std::str::from_utf8(&assignment.drv_content).map_err(|e| {
+            ExecutorError::BuildFailed(format!("drv content is not valid UTF-8: {e}"))
+        })?;
+        Derivation::parse(drv_text)
             .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))?
     };
 

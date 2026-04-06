@@ -424,6 +424,23 @@ impl DagActor {
         let edge_rows = edge_rows?;
         crate::db::SchedulerDb::batch_insert_edges(&mut tx, &edge_rows).await?;
 
+        // r[verify sched.db.tx-commit-before-mutate]
+        // In-mem mutation ordering invariant: no newly-inserted node has
+        // db_id set BEFORE commit. If this fires, someone re-introduced
+        // the in-tx write (the P0191 bug). Fires in every existing merge
+        // test's happy path — zero new test scaffolding.
+        // (rem-12 option b, endorsed at 12-pg-transaction-safety.md:1107)
+        #[cfg(debug_assertions)]
+        for hash in newly_inserted {
+            if let Some(state) = self.dag.node(hash) {
+                debug_assert!(
+                    state.db_id.is_none(),
+                    "newly-inserted node {hash} has db_id set before commit — \
+                     in-mem mutation leaked into tx scope"
+                );
+            }
+        }
+
         tx.commit().await?;
 
         // r[impl sched.db.tx-commit-before-mutate]

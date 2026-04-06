@@ -4,6 +4,11 @@
 //! performs interactive protocol exchanges, and captures both
 //! client and server byte streams for comparison against rio-gateway.
 
+// All from_utf8_lossy uses in this file are test-assertion display or
+// error-message formatting of subprocess stderr/stdout — never parse-path.
+// Golden tests inherently deal with arbitrary subprocess output.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

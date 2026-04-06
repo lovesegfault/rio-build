@@ -170,6 +170,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        // Test assertion display, not parse-path.
+        #[allow(clippy::disallowed_methods)]
         let body = String::from_utf8_lossy(&body);
         assert!(
             body.contains("not configured"),
