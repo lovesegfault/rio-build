@@ -68,6 +68,12 @@ impl CliCtx {
     /// Run rio-cli locally with RIO_SCHEDULER_ADDR/RIO_STORE_ADDR/
     /// RIO_TLS__* set, capture combined output. Prefers an installed
     /// `rio-cli` on PATH; falls back to `cargo run -p rio-cli`.
+    ///
+    /// **Exit-code contract:** non-zero exit propagates as `Err` via
+    /// [`sh::try_read`]. Callers that tolerate expected-failure exits
+    /// (e.g., `create-tenant` on `AlreadyExists`) must match the `Err`
+    /// arm and inspect the error text before propagating. See
+    /// [`step_tenant`].
     pub fn run(&self, args: &[&str]) -> Result<String> {
         let sh = shell()?;
         let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{}", self.sched));
@@ -451,6 +457,11 @@ pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
 
 pub async fn step_status(cli: &CliCtx) -> Result<()> {
     info!("checking cluster status");
+    // CliCtx::run ? is correct here: rio-cli status exits 0 on any
+    // reachable state (empty cluster → empty lists, still exit 0).
+    // Non-zero means an RPC failed (tunnel broke, TLS, timeout) —
+    // unrecoverable for a smoke step. No match-on-Err needed; contrast
+    // step_tenant where create-tenant exits non-zero on AlreadyExists.
     let out = cli.run(&["status"])?;
     // suspend bars before dumping multi-line output — raw println!
     // would freeze a copy of the active bars in scrollback.
