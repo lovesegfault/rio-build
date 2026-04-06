@@ -614,7 +614,6 @@ async fn main() -> anyhow::Result<()> {
         store_size_bytes,
         is_leader_for_grpc,
         shutdown.clone(),
-        cfg.headroom_multiplier,
     );
 
     // Start periodic tick task. Actor-dead handling: try_send fails
