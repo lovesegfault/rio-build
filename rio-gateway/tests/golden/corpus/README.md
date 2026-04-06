@@ -1,8 +1,9 @@
-# CA wire-capture corpus
+# CA wire-capture corpus (removed)
 
-Golden wire bytes for `wopRegisterDrvOutput` (42) and `wopQueryRealisation` (43)
-Realisation payloads. Captured for P0247 spike; future conformance tests compare
-rio-gateway output against these.
+The `.bin` fixtures captured for the P0247 spike were never wired into a test
+and have been removed. The wire-format tables below are kept as reference
+documentation for `wopRegisterDrvOutput` (42) and `wopQueryRealisation` (43)
+Realisation payloads. To regenerate the fixtures, see the `cp` commands below.
 
 ## Provenance
 

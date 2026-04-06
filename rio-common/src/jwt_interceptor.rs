@@ -34,7 +34,7 @@
 //!
 //! # Hot-swap via `Arc<RwLock>`
 //!
-//! The pubkey is `Arc<RwLock<VerifyingKey>>` so [`spawn_pubkey_reload`]'s
+//! The pubkey is `Arc<RwLock<VerifyingKey>>` so `spawn_pubkey_reload`'s
 //! SIGHUP handler can swap the key without restarting the server. Read-lock held only
 //! for the `jwt::verify` call (microseconds); annual key rotation means
 //! the write lock is essentially uncontended. `std::sync::RwLock`, not
@@ -46,7 +46,7 @@
 //! `None` → interceptor is a no-op pass-through. Lets `main.rs` wire it
 //! unconditionally (no type divergence between with/without branches).
 //! Scheduler+store main.rs gate on `cfg.jwt.key_path`: `Some` →
-//! [`load_jwt_pubkey`] + [`spawn_pubkey_reload`]; `None` → inert.
+//! [`load_jwt_pubkey`] + `spawn_pubkey_reload`; `None` → inert.
 //! Matches the gateway-side `Option<SigningKey>` pattern — JWT is
 //! opt-in at both ends, gated on deployment config.
 
@@ -83,7 +83,7 @@ pub type JwtPubkey = Option<Arc<RwLock<VerifyingKey>>>;
 ///
 /// Synchronous — called at boot BEFORE the tokio runtime is doing
 /// anything interesting. The reload path (SIGHUP) uses `tokio::fs`
-/// via [`spawn_pubkey_reload`], but the initial load happens in
+/// via `spawn_pubkey_reload`, but the initial load happens in
 /// `main()` before the server spins up, so blocking is fine there.
 pub fn load_jwt_pubkey(path: &Path) -> anyhow::Result<VerifyingKey> {
     let raw = std::fs::read(path)
@@ -128,7 +128,7 @@ fn parse_jwt_pubkey(raw: &[u8]) -> anyhow::Result<VerifyingKey> {
 /// load, `Arc<RwLock>` setup, and this spawn call into one
 /// `cfg.jwt.key_path → JwtPubkey` step. Direct use is only for callers
 /// that need a non-standard initial load (none currently).
-pub fn spawn_pubkey_reload(
+pub(crate) fn spawn_pubkey_reload(
     path: PathBuf,
     key: Arc<RwLock<VerifyingKey>>,
     shutdown: CancellationToken,
@@ -159,7 +159,7 @@ pub fn spawn_pubkey_reload(
 /// The full `cfg.jwt.key_path → JwtPubkey` pipeline in one call.
 /// Consolidates the 21-line `match &cfg.jwt.key_path { None => ..., Some
 /// => load+Arc+spawn+log }` block previously duplicated verbatim in
-/// scheduler/main.rs + store/main.rs. [`spawn_pubkey_reload`] already
+/// scheduler/main.rs + store/main.rs. `spawn_pubkey_reload` already
 /// existed; this wraps the caller boilerplate around it — the 11th
 /// paired-main.rs pattern (prior 10: TLS, health, drain, lease, metrics…).
 ///

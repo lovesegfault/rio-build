@@ -203,6 +203,7 @@ impl Drop for BuildCgroup {
         // directory under /sys/fs/cgroup — harmless but untidy.
         // Pod restart clears the whole subtree.
         if let Err(e) = fs::remove_dir(&self.path) {
+            metrics::counter!("rio_worker_cgroup_leak_total").increment(1);
             tracing::warn!(
                 path = %self.path.display(),
                 error = %e,
@@ -417,7 +418,8 @@ pub fn delegated_root() -> io::Result<PathBuf> {
 ///
 /// `/proc/self/cgroup` on cgroup v2 is a single line `0::/<path>`.
 /// Join with `/sys/fs/cgroup` to get the filesystem path.
-pub fn own_cgroup() -> io::Result<PathBuf> {
+#[cfg_attr(not(test), allow(dead_code))] // superseded by delegated_root; test-only caller
+pub(crate) fn own_cgroup() -> io::Result<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup")?;
     let path = parse_own_cgroup(&content)?;
 
@@ -665,10 +667,11 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 /// cgroup was removed out from under us), the gauge simply stops
 /// updating; no crash.
 // r[impl obs.metric.worker-util]
-pub async fn utilization_reporter_loop(
+pub async fn utilization_reporter_loop_with_shutdown(
     root: PathBuf,
     overlay_base: PathBuf,
     snapshot: ResourceSnapshotHandle,
+    shutdown: rio_common::signal::Token,
 ) {
     // 10s: matches HEARTBEAT_INTERVAL. The heartbeat reads the shared
     // snapshot; a 15s poll would mean every third heartbeat sees stale
@@ -684,7 +687,13 @@ pub async fn utilization_reporter_loop(
     let mut last_instant = std::time::Instant::now();
 
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::debug!("utilization_reporter_loop: shutdown token fired");
+                return;
+            }
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
 
         let now_usage = fs::read_to_string(&cpu_stat_path)
             .ok()
@@ -738,6 +747,31 @@ pub async fn utilization_reporter_loop(
             disk_total_bytes: disk_total,
         };
     }
+}
+
+/// Shim: [`utilization_reporter_loop_with_shutdown`] without a shutdown
+/// token. Preserves the old 3-arg signature so `main.rs` (owned by the
+/// cold-start track this sprint) keeps compiling unchanged.
+///
+/// **DEPRECATED** — the cold-start track will switch the call site to
+/// `utilization_reporter_loop_with_shutdown(..., shutdown_token)` and
+/// remove this shim. Until then, a never-cancelled token = old
+/// infinite-loop behavior. Not using `#[deprecated]` because clippy
+/// `--deny warnings` would break main.rs before the cold-start track
+/// lands.
+// TODO(cold-start-track): remove this shim once main.rs passes shutdown token
+pub async fn utilization_reporter_loop(
+    root: PathBuf,
+    overlay_base: PathBuf,
+    snapshot: ResourceSnapshotHandle,
+) {
+    utilization_reporter_loop_with_shutdown(
+        root,
+        overlay_base,
+        snapshot,
+        rio_common::signal::Token::new(),
+    )
+    .await
 }
 
 // Need libc for EBUSY. Worker already has `nix` dep but libc is lighter.

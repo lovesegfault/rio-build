@@ -271,7 +271,21 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
                 // or systemd-unit root, raised==mask trivially
                 // (already ambient OR mask==0 effective). Only the
                 // nonpriv k8s path can hit a gap.
-                let _ = raised; // silence unused warning if diag disabled
+                //
+                // pre_exec context: no allocation, no tokio, no
+                // format!. libc::write(2, ...) with a static byte
+                // slice is async-signal-safe. Ignoring the write()
+                // return is fine — if stderr is closed, the
+                // diagnostic is lost but the build proceeds (and
+                // fails at pivot_root with the usual opacity).
+                if raised != mask {
+                    const MSG: &[u8] = b"rio-worker: pre_exec: ambient capability raise \
+                        incomplete (raised != mask) -- expect pivot_root EPERM. \
+                        Check pod securityContext capabilities.\n";
+                    // SAFETY: write(2) is async-signal-safe; MSG is a
+                    // static slice with valid pointer+len.
+                    nix::libc::write(2, MSG.as_ptr() as *const _, MSG.len());
+                }
 
                 // New mount namespace for this process tree (daemon + sandbox).
                 unshare(CloneFlags::CLONE_NEWNS).map_err(std::io::Error::from)?;

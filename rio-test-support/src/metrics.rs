@@ -2,7 +2,7 @@
 //!
 //! Two recorders for two assertion shapes:
 //!
-//! - [`DescribedNames`] — captures `describe_*!` macro calls. For
+//! - `DescribedNames` — captures `describe_*!` macro calls. For
 //!   "every spec'd metric has a describe call" checks (the
 //!   `metrics_registered.rs` pattern). `register_*` return noop.
 //!
@@ -44,7 +44,7 @@ use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, Share
 ///
 /// [`names()`]: Self::names
 #[derive(Default)]
-pub struct DescribedNames(pub Arc<Mutex<Vec<String>>>);
+pub(crate) struct DescribedNames(pub Arc<Mutex<Vec<String>>>);
 
 impl DescribedNames {
     /// Snapshot of all names captured so far. Clones out of the lock.
@@ -81,13 +81,13 @@ impl Recorder for DescribedNames {
 /// `(counters, gauges, histograms)` — one vec per `describe_*!` kind.
 type NamesByType = (Vec<String>, Vec<String>, Vec<String>);
 
-/// Like [`DescribedNames`] but keeps the three metric types in separate
+/// Like `DescribedNames` but keeps the three metric types in separate
 /// vecs. For "every describe_histogram! has a bucket config" checks where
 /// you need to distinguish histograms from counters/gauges.
 ///
 /// Inner tuple: `(counters, gauges, histograms)`.
 #[derive(Default)]
-pub struct DescribedByType(pub Arc<Mutex<NamesByType>>);
+pub(crate) struct DescribedByType(pub Arc<Mutex<NamesByType>>);
 
 impl DescribedByType {
     /// Snapshot of all `describe_histogram!` names captured so far.
@@ -95,10 +95,12 @@ impl DescribedByType {
         self.0.lock().unwrap().2.clone()
     }
     /// Snapshot of all `describe_counter!` names captured so far.
+    #[allow(dead_code)] // API symmetry with histograms(); no caller yet
     pub fn counters(&self) -> Vec<String> {
         self.0.lock().unwrap().0.clone()
     }
     /// Snapshot of all `describe_gauge!` names captured so far.
+    #[allow(dead_code)] // API symmetry with histograms(); no caller yet
     pub fn gauges(&self) -> Vec<String> {
         self.0.lock().unwrap().1.clone()
     }

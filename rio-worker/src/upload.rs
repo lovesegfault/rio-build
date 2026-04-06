@@ -174,8 +174,11 @@ async fn upload_output(
     // We can't know refs until the dump finishes. Changing the proto to
     // send refs in the trailer would ripple into store-side put_path.rs,
     // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
-    // Trailer-refs protocol extension deferred — see worker.md § pre-scan
-    // cost. No plan owns it yet; measure first before scheduling (trailer-refs TODO lives in worker.md § pre-scan cost).
+    // TODO(P0181-followup): trailer-refs protocol extension — gated on
+    // measuring pre-scan cost (see worker.md § pre-scan cost). If the
+    // extra disk pass is measurable at scale, move refs into the trailer
+    // so the scan happens inline with the upload tee. Scope-creeps into
+    // store put_path.rs, ValidatedPathInfo, re-sign path.
     let references = {
         let scan_path = output_path.clone();
         let cands = Arc::clone(&candidates);
@@ -338,12 +341,26 @@ async fn do_upload_streaming(
     rio_proto::interceptor::inject_current(req.metadata_mut());
     if !assignment_token.is_empty() {
         // parse() for AsciiMetadataValue — assignment tokens are
-        // base64url.base64url, always ASCII. unwrap_or default
-        // for the impossible case (defensive, no crash on a bad
-        // token format that came from US anyway).
-        if let Ok(v) = assignment_token.parse() {
-            req.metadata_mut()
-                .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
+        // base64url.base64url, always ASCII. If parse fails (non-ASCII
+        // bytes somehow — scheduler bug or memory corruption), the
+        // store WILL reject the upload with PermissionDenied when
+        // hmac_verifier is set. Silently omitting the header here
+        // turned that into a confusing "rejected, no token" error
+        // with no worker-side trace. Fail loud instead.
+        match assignment_token.parse() {
+            Ok(v) => {
+                req.metadata_mut()
+                    .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
+            }
+            Err(_) => {
+                tracing::error!(
+                    token_len = assignment_token.len(),
+                    "assignment token failed MetadataValue parse — upload will be rejected"
+                );
+                return Err(tonic::Status::invalid_argument(
+                    "assignment token is not a valid ASCII metadata value",
+                ));
+            }
         }
     }
     let put_result = rio_common::grpc::with_timeout_status(
@@ -527,10 +544,12 @@ pub async fn upload_all_outputs(
     // behavior change from before this pre-check existed. This is an
     // optimization, not a correctness requirement.
     //
-    // TODO(phase6): manifest-mode bandwidth opt — measure
+    // TODO(P0263-followup): manifest-mode bandwidth opt — measure
     // rio_store_chunk_cache_hits_total ratio first. Worker NOT trusted
     // → store must reconstruct NAR to verify, so the "win" is net
-    // positive only if ChunkCache hit rate is high (>80%).
+    // positive only if ChunkCache hit rate is high (>80%). P0263
+    // scoped down to the zero-proto-change path; this is the deferred
+    // remainder gated on production ChunkCache hit-rate data.
     let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
     let (to_upload, mut skipped_results) =
         partition_by_presence(store_client, &outputs, store_paths).await;

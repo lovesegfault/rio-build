@@ -372,7 +372,7 @@ pub async fn sweep_orphan_chunks(
 }
 
 /// Spawn the periodic orphan-chunk sweeper. Runs
-/// [`sweep_orphan_chunks`] every [`ORPHAN_CHUNK_SWEEP_INTERVAL`]
+/// [`sweep_orphan_chunks`] every `ORPHAN_CHUNK_SWEEP_INTERVAL`
 /// with [`CHUNK_GRACE_SECS`] grace. Errors logged; next iteration
 /// retries. Exits cleanly when `shutdown` is cancelled.
 ///

@@ -161,4 +161,12 @@ pub fn describe_metrics() {
          scheduler leader). Nonzero during leader transitions is expected; \
          sustained = scheduler lease flapping."
     );
+    describe_counter!(
+        "rio_worker_cgroup_leak_total",
+        "Per-build cgroup rmdir failures on Drop (typically EBUSY — \
+         processes still in the tree). Leaked cgroups are harmless empty \
+         pseudo-dirs under /sys/fs/cgroup; pod restart clears them. \
+         Sustained rate = builds not reaping cleanly (investigate \
+         cgroup.kill timing or zombie builders)."
+    );
 }

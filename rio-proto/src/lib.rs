@@ -120,18 +120,6 @@ pub mod build_types {
     };
 }
 
-/// Re-export of admin-domain types from [`types`]. Sourced from
-/// `proto/admin_types.proto`. Same dual-path semantics as [`dag`].
-pub mod admin_types {
-    pub use crate::types::{
-        BuildInfo, BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
-        CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse,
-        GetBuildLogsRequest, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
-        ListBuildsRequest, ListBuildsResponse, ListTenantsResponse, ListWorkersRequest,
-        ListWorkersResponse, SizeClassStatus, TenantInfo, WorkerInfo,
-    };
-}
-
 /// Scheduler service: gateway-facing RPCs (SubmitBuild, WatchBuild, etc.).
 pub mod scheduler {
     tonic::include_proto!("rio.scheduler");

@@ -29,4 +29,3 @@ pub use pg::{TenantSeed, seed_tenant};
 /// Standard return type for `#[test]` / `#[tokio::test]` bodies.
 /// Lets tests use `?` instead of `.unwrap()`.
 pub type TestResult = anyhow::Result<()>;
-pub use anyhow::Context;

@@ -560,6 +560,14 @@ pub async fn execute_build(
         }
     });
 
+    // Abort guard: if run_daemon_build panics (or any `?` between here
+    // and the explicit abort below early-returns), cpu_poll would leak
+    // as a 1Hz polling task reading a dead cgroup path forever. Same
+    // pattern as stderr_loop.rs:285. `.abort()` on a completed task is
+    // a no-op, so the explicit abort below is harmless redundancy.
+    let cpu_poll_abort = cpu_poll.abort_handle();
+    let _cpu_poll_guard = scopeguard::guard((), move |()| cpu_poll_abort.abort());
+
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
     // The cgroup setup above (create/add_process)
     // is NOT inside this helper — its `?` paths rely on the
@@ -583,7 +591,10 @@ pub async fn execute_build(
     // Stop CPU polling. The last sample is up to 1s stale; good
     // enough (peak CPU doesn't change in the last second of a
     // multi-minute build). abort() doesn't wait — the task is
-    // pure read, no cleanup needed.
+    // pure read, no cleanup needed. The scopeguard above also
+    // aborts on scope exit; this explicit call is the happy-path
+    // fast stop (guard fires redundantly after, which is a no-op
+    // on an already-aborted handle).
     cpu_poll.abort();
     let peak_cpu_cores = f64::from_bits(peak_cpu_atomic.load(Ordering::Acquire));
 
