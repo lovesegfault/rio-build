@@ -73,6 +73,32 @@ use super::read::{io_error_to_errno, read_file_range};
 
 impl Filesystem for NixStoreFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
+        // I-080: without FUSE_PARALLEL_DIROPS, fs/fuse/dir.c::fuse_lookup
+        // takes fi->mutex on the PARENT inode (fuse_lock_inode) — every
+        // root-level lookup serializes kernel-side. warm_inputs_in_fuse
+        // fires MAX_PARALLEL_FETCHES (16) concurrent lstat()s of
+        // /var/rio/fuse-store/{hash}-name; 15 spawn_blocking threads sit
+        // uninterruptibly in fuse_lock_inode while the 1 holder waits on
+        // userspace (block_on(gRPC)). n_threads=4 + fetch_sem=3 are
+        // defeated. Our lookup/readdir are already concurrency-safe
+        // (InodeMap RwLock + Cache singleflight + FetchSemaphore), so
+        // letting the kernel issue concurrent dirops just moves the
+        // bound from a kernel mutex to fetch_sem — observable, bounded
+        // at fuse_threads-1, doesn't pile up uninterruptible waiters.
+        //
+        // Unconditional (not gated on passthrough): the serialization is
+        // wrong regardless. It only became a hard stall after 0f54bd21
+        // because that's when the FUSE INIT flag set actually changed —
+        // before, fc->parallel_dirops AND fc->passthrough were both
+        // false; now passthrough=true changes kernel-side request
+        // accounting (fc->num_background tracking on /dev/fuse) enough
+        // that the previously-tolerable serial warm becomes a stall.
+        if let Err(unsupported) = config.add_capabilities(fuser::InitFlags::FUSE_PARALLEL_DIROPS) {
+            tracing::warn!(
+                ?unsupported,
+                "kernel lacks FUSE_PARALLEL_DIROPS; root-level lookups will serialize"
+            );
+        }
         if self.passthrough {
             // BOTH calls required: add_capabilities puts FUSE_PASSTHROUGH
             // in config.requested (the INIT reply flags); set_max_stack_

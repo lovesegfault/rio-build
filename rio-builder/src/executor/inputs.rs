@@ -14,6 +14,11 @@ use crate::synth_db::SynthPathInfo;
 
 use super::{ExecutorError, MAX_PARALLEL_FETCHES};
 
+/// FUSE-warm concurrency. Matches the default `fuse_threads` (4): the
+/// FUSE layer can't service more than that anyway, and excess stat()s
+/// queue kernel-side. See [`warm_inputs_in_fuse`] doc.
+const WARM_FUSE_CONCURRENCY: usize = 4;
+
 /// Hash algorithm for FOD output verification. Maps from Nix's
 /// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
 /// prefixed "r:").
@@ -201,11 +206,14 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// flags a wider problem upstream.
 ///
 /// The stats run on the blocking pool: each one blocks on
-/// `ensure_cached` → `block_on(get_path_nar)`. `buffer_unordered`
-/// fires `MAX_PARALLEL_FETCHES` at once; FUSE's internal `fetch_sem`
-/// (n_threads − 1) is the real concurrency bound, the rest queue on
-/// it cheaply. Order doesn't matter — all must complete before
-/// daemon spawn.
+/// `ensure_cached` → `block_on(get_path_nar)`. Concurrency is
+/// `WARM_FUSE_CONCURRENCY` (matches default `fuse_threads`), NOT
+/// `MAX_PARALLEL_FETCHES`: the FUSE layer is the bound either way
+/// (n_threads readers, fetch_sem = n_threads − 1 fetchers). Firing 16
+/// just parks 12 spawn_blocking threads in the kernel's FUSE request
+/// queue with nothing gained — and pre-I-080 (no FUSE_PARALLEL_DIROPS),
+/// they piled up uninterruptibly in `fuse_lock_inode(root)`. Order
+/// doesn't matter — all must complete before daemon spawn.
 #[instrument(skip_all, fields(input_count = input_paths.len()))]
 pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[String]) {
     let warm_start = std::time::Instant::now();
@@ -251,7 +259,7 @@ pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[
                 }
             }
         })
-        .buffer_unordered(MAX_PARALLEL_FETCHES)
+        .buffer_unordered(WARM_FUSE_CONCURRENCY)
         .collect()
         .await;
 
