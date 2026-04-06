@@ -58,3 +58,21 @@ The controller-generated pod spec (`rio-controller/src/reconcilers/workerpool/bu
 - **Helm chart default is `workerPool.privileged: false`.** The device plugin is enabled by default (`devicePlugin.enabled: true`), digest-pinned to a known-good upstream release (`values.yaml` `devicePlugin.image` — bump via `skopeo inspect docker://<repo>:<new-tag> --format '{{.Digest}}'` on upstream updates; the helm-lint check enforces the pin).
 
 The `WorkerPool` CRD exposes an optional `privileged: bool` field (`rio-crds/src/workerpool.rs`). When unset or `false` (production default), the container gets the granular `SYS_ADMIN` + `SYS_CHROOT` capabilities, `hostUsers: false`, and the FUSE device-plugin resource. When `true`, the container runs fully privileged with the hostPath `/dev/fuse` fallback — an escape hatch for k3s/kind clusters whose default seccomp profiles block `mount(2)` even with `SYS_ADMIN`, or whose containerd lacks idmap-mount support. Production deployments on EKS/GKE with the device plugin deployed should not need this.
+
+### Seccomp Profile Distribution
+
+The custom Localhost profile is the same regardless of cluster (the JSON lives at `infra/helm/rio-build/files/seccomp-rio-{builder,fetcher}.json`; the chart's `localhostProfile` default `operator/rio-builder.json` is the path under `/var/lib/kubelet/seccomp/` where the profile must land on every node). HOW the file gets there is provider-specific:
+
+| Provider | Mechanism | Per-pod cost | Chart values |
+|---|---|---|---|
+| EKS (Bottlerocket) | `rio-seccomp-bootstrap` bootstrap-container in EC2NodeClass userData | none | `seccompBootstrap.enabled=true`, `controller.seccompPreinstalled=true` (set by `xtask k8s eks deploy`) |
+| Any K8s ≥ 1.33 | security-profiles-operator (`SeccompProfile` CR + `spod` DaemonSet) | `wait-seccomp` initContainer polls until the file appears (5–15s on a fresh node) | `securityProfilesOperator.enabled=true` (default `false`) |
+| k3s / kind | n/a — `privileged: true` escape-hatch in use, profile not loaded | none | `controller.privileged=true` |
+
+**Why bootstrap-container over SPO on EKS.** The bootstrap container runs once per node BEFORE kubelet starts, so the profile is in place before any pod can schedule. SPO's `spod` DaemonSet runs concurrently with workload pods; without the `wait-seccomp` init the kubelet would `CreateContainerError` on the pod that races spod onto a fresh Karpenter node. Under ephemeral builders (one Job per derivation, thousands per hour), the init's 5–15s poll dominated cold-start latency, and SPO's controller OOMKilled under sustained node-churn (I-154). Bootstrap eliminates both: zero per-pod overhead, no in-cluster operator competing for memory.
+
+**Profile-update path.** Under SPO a profile change is a `SeccompProfile` CR edit; spod reconciles every node in place. Under bootstrap-container the profile is baked into the `rio-seccomp-bootstrap` image and referenced by digest in EC2NodeClass userData (helm value `seccompBootstrap.image`). A profile change is a new image push + helm-upgrade; Karpenter Drift detects the userData diff and rolls nodes. Same blast radius as a spod DaemonSet rollout (every builder/fetcher node) — but the cost is paid once per node lifetime instead of once per pod.
+
+**`seccompPreinstalled` gate.** When `controller.seccompPreinstalled=true`, the controller (`rio-controller/src/reconcilers/common/sts.rs`) omits the `wait-seccomp` initContainer entirely. The setting is a *promise* from the deploy layer that the profile is already on disk when any pod schedules; setting it `true` without a working bootstrap-container (or equivalent node-init) gets `CreateContainerError` on every builder/fetcher pod.
+
+**History.** I-020 (the original 7-minute init hang) → P0540 (rio-seccomp-installer DS → SPO `SeccompProfile` CRs) → I-154 (SPO operator OOM under ephemeral churn) → P0541 (SPO → Bottlerocket bootstrap-container).
