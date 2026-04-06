@@ -17,6 +17,19 @@ use crate::k8s::{NS, ensure_namespaces, shared, status};
 use crate::sh::repo_root;
 use crate::{helm, kube, tofu, ui};
 
+/// Scheduler `[[size_classes]]` config — names + cutoffs MUST match
+/// `builderPoolSet.classes` in values.yaml. `memLimitBytes` ≈ the
+/// class's `resources.limits.memory` (the bump threshold: a build
+/// whose EMA peak exceeds it routes to the next class up).
+/// `cpuLimitCores` mirrors `requests.cpu` for the same reason.
+const SIZE_CLASSES_JSON: &str = r#"[
+  {"name":"tiny","cutoffSecs":30,"memLimitBytes":1073741824,"cpuLimitCores":0.5},
+  {"name":"small","cutoffSecs":120,"memLimitBytes":4294967296,"cpuLimitCores":1.0},
+  {"name":"medium","cutoffSecs":600,"memLimitBytes":8589934592,"cpuLimitCores":2.0},
+  {"name":"large","cutoffSecs":1800,"memLimitBytes":17179869184,"cpuLimitCores":4.0},
+  {"name":"xlarge","cutoffSecs":7200,"memLimitBytes":34359738368,"cpuLimitCores":8.0}
+]"#;
+
 pub async fn run(
     cfg: &XtaskConfig,
     log_level: &str,
@@ -190,20 +203,36 @@ pub async fn run(
             .set("karpenter.enabled", "true")
             .set("karpenter.clusterName", &cluster)
             .set("karpenter.nodeRoleName", &node_role)
-            .set("builderPoolDefaults.enabled", "true")
-            // Ephemeral builders (one Job per derivation). I-095/097 made
-            // this safe under churn; I-090 makes karpenter bin-pack them.
-            .set("builderPoolDefaults.ephemeral", "true")
-            .set("builderPoolDefaults.replicas.min", "0")
-            // I-108: EKS supports both arches via Karpenter (rio-builder-
-            // preferred is c6a/c7a x86; rio-builder-fallback covers
-            // Graviton). Chart default `builderPools` is x86-64 only;
-            // override to provision both. Per-pool overrides go here
-            // (e.g. lower aarch64 max); everything else inherits from
-            // builderPoolDefaults.
+            // I-117: BuilderPoolSet supersedes the flat builderPools[] —
+            // five size classes (tiny..xlarge, chart default) with
+            // per-class resource requests. The scheduler's classify()
+            // routes each derivation to the smallest covering class by
+            // (est_duration, peak_memory) so a 50MB hello build gets a
+            // 512Mi pod and gcc gets 16Gi. Ephemeral children: one Job
+            // per build, sized by class. Karpenter bin-packs across
+            // c6a.large..c6a.8xlarge.
+            //
+            // builderPoolDefaults stays the poolTemplate base (seccomp,
+            // tolerations, nodeSelector, hostUsers — deep-merged in the
+            // chart). enabled=false stops the flat builderpool.yaml
+            // template from ALSO rendering.
+            .set("builderPoolDefaults.enabled", "false")
+            .set("builderPoolSet.enabled", "true")
+            .set("builderPoolSet.poolTemplate.ephemeral", "true")
+            // scheduler.sizeClasses MUST agree with builderPoolSet.
+            // classes (names + cutoffs). memLimitBytes ≈ the class's
+            // resources.limits.memory — a build whose EMA peak exceeds
+            // it bumps to the next class even if duration fits.
+            .set_json("scheduler.sizeClasses", SIZE_CLASSES_JSON)
+            // I-108: aarch64 via a flat BuilderPool alongside the BPS.
+            // BuilderPoolSet renders one CR (x86-64); a per-arch BPS
+            // would need a second values overlay. For now keep aarch64
+            // on the flat-pool path with the medium-class resources —
+            // TODO(I-117): second BuilderPoolSet for aarch64 once the
+            // chart renders multiple.
             .set_json(
                 "builderPools",
-                r#"[{"name":"x86-64","systems":["x86_64-linux"]},{"name":"aarch64","systems":["aarch64-linux"],"replicas":{"min":0,"max":500}}]"#,
+                r#"[{"name":"aarch64","enabled":true,"ephemeral":true,"systems":["aarch64-linux"],"replicas":{"min":0,"max":500}}]"#,
             )
             // P0452 hard-split: SMOKE_EXPR's builtin:fetchurl FOD routes
             // to FetcherPool only. Without this, the FOD queues forever

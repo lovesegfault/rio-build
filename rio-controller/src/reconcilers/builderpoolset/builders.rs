@@ -129,17 +129,21 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         fuse_cache_size: DEFAULT_FUSE_CACHE_SIZE.into(),
 
         // --- Unset optional (use BuilderPool defaults) ---
-        // Ephemeral mode is WPS-incompatible (per-class long-lived
-        // pools are the point). If a future "ephemeral size class"
-        // use case emerges, add it to SizeClassSpec, not here.
-        ephemeral: false,
+        // Ephemeral mode propagates from PoolTemplate. Shared
+        // across classes — pod lifecycle (Job-per-build vs STS)
+        // is a deploy-wide decision. The ephemeral reconciler
+        // consults per-class queue depth when `size_class` is
+        // set, so each child only spawns for work classified
+        // into its class.
+        ephemeral: template.ephemeral.unwrap_or(false),
         // WPS is inherently size-class-based (ADR-015) — that IS
         // Sizing::Static. A Manifest-mode WPS would be a distinct
         // feature (controller would poll GetCapacityManifest per-WPS).
         // Until then, WPS children are always Static.
         sizing: Sizing::Static,
-        // Deadline only applies to ephemeral Jobs; WPS children
-        // are never ephemeral (see above), so always None.
+        // Deadline only applies to ephemeral Jobs. None →
+        // controller default (3600s). A future SizeClassSpec
+        // field could make this per-class (xlarge wants longer).
         ephemeral_deadline_seconds: None,
         image_pull_policy: None,
         fuse_threads: None,
@@ -229,6 +233,7 @@ mod tests {
                 privileged: None,
                 host_network: None,
                 host_users: None,
+                ephemeral: None,
                 tls_secret_name: None,
             },
             cutoff_learning: None,
@@ -321,6 +326,38 @@ mod tests {
         // max_replicas: 5, 10, 15.
         assert_eq!(children[0].spec.replicas.max, 5);
         assert_eq!(children[2].spec.replicas.max, 15);
+    }
+
+    /// `PoolTemplate.ephemeral` propagates to every child. The
+    /// default (None) yields STS-mode children (`ephemeral: false`,
+    /// preserving pre-I-117 WPS behavior); `Some(true)` yields
+    /// ephemeral children that spawn Jobs sized by their class's
+    /// `resources`. CEL on the child requires `replicas.min == 0`
+    /// for ephemeral — the fixture's `min_replicas: Some(i+1)`
+    /// would violate that, so the ephemeral case clears it.
+    #[test]
+    fn template_ephemeral_propagates() {
+        let mut wps = test_wps_with_classes(&["small", "large"]);
+        // Default (None) → STS children.
+        for class in &wps.spec.classes {
+            let child = build_child_builderpool(&wps, class).unwrap();
+            assert!(!child.spec.ephemeral, "None → ephemeral=false (STS)");
+        }
+        // Some(true) → ephemeral children. Clear min_replicas so the
+        // child's CEL `ephemeral → replicas.min==0` would pass on
+        // apply (not enforced here, but keep the fixture realistic).
+        wps.spec.pool_template.ephemeral = Some(true);
+        for class in wps.spec.classes.iter_mut() {
+            class.min_replicas = None;
+        }
+        for class in &wps.spec.classes {
+            let child = build_child_builderpool(&wps, class).unwrap();
+            assert!(child.spec.ephemeral, "Some(true) → ephemeral=true");
+            assert_eq!(child.spec.replicas.min, 0);
+            // size_class still set — the ephemeral reconciler uses
+            // this to filter queue depth per-class.
+            assert_eq!(child.spec.size_class, class.name);
+        }
     }
 
     /// Empty template.image is an InvalidSpec error, not a

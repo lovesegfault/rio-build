@@ -163,23 +163,19 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     //
     // Cloning the admin client: tonic clients are cheap to clone
     // (Arc-internal). The finalizer's cleanup() does the same.
-    let (queued, scheduler_err): (u32, Option<String>) =
-        match ctx.admin.clone().cluster_status(()).await {
-            Ok(resp) => (
-                crate::scaling::queued_for_systems(&resp.into_inner(), &wp.spec.systems),
-                None,
-            ),
-            Err(e) => {
-                warn!(
-                    pool = %name, error = %e,
-                    "ClusterStatus poll failed; treating as queued=0, will retry"
-                );
-                // Still patch status (so `kubectl get wp` shows current
-                // active count even when scheduler is down) before
-                // requeueing. Fall through with queued=0 → no spawn.
-                (0, Some(e.to_string()))
-            }
-        };
+    let (queued, scheduler_err): (u32, Option<String>) = match queued_for_pool(ctx, wp).await {
+        Ok(q) => (q, None),
+        Err(e) => {
+            warn!(
+                pool = %name, error = %e,
+                "queue-depth poll failed; treating as queued=0, will retry"
+            );
+            // Still patch status (so `kubectl get wp` shows current
+            // active count even when scheduler is down) before
+            // requeueing. Fall through with queued=0 → no spawn.
+            (0, Some(e.to_string()))
+        }
+    };
 
     // ---- Spawn decision ----
     // The cast dance: queued is u32 (proto field), active/ceiling
@@ -285,13 +281,53 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
 /// "isolation > throughput" ephemeral use case, the latency cost is
 /// acceptable; the resource waste is not.
 ///
-/// Global-Q caveat: `queued_derivations` is cluster-wide, not
-/// per-pool. With mixed STS+ephemeral pools, some queued derivations
-/// will go to STS workers. This formula over-counts need in that
-/// case — but headroom caps it, and the STS workers draining Q on
-/// the next tick self-corrects.
+/// Global-Q caveat: for unclassified pools, `queued` is cluster-
+/// wide (per-system filtered). With mixed STS+ephemeral pools,
+/// some queued derivations will go to STS workers. This formula
+/// over-counts need in that case — but headroom caps it, and the
+/// STS workers draining Q on the next tick self-corrects. Pools
+/// with `size_class` set use per-class depth (see
+/// [`queued_for_pool`]) so this caveat doesn't apply to them.
 pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
+}
+
+/// Queue depth relevant to THIS ephemeral pool.
+///
+/// Two cases:
+///   - `size_class` empty (standalone pool) → cluster-wide
+///     `ClusterStatus` filtered by `spec.systems` (I-107 per-arch
+///     filter). Preserves pre-I-117 behavior.
+///   - `size_class` set (typically a WPS child) → per-class
+///     `queued` from `GetSizeClassStatus`. Without this, N
+///     ephemeral child pools each spawn for the FULL backlog →
+///     N× over-provisioning. With it, each pool spawns only for
+///     work that `classify()` would route to its class.
+///
+/// Missing class in the RPC response (scheduler doesn't have
+/// `size_classes` configured for this name, or feature off) →
+/// fall back to the systems-filtered cluster count. Better to
+/// over-spawn than to never spawn — the `activeDeadlineSeconds`
+/// backstop reaps wrong-class Jobs after 1h.
+async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32, tonic::Status> {
+    if !wp.spec.size_class.is_empty() {
+        let resp = ctx
+            .admin
+            .clone()
+            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest {})
+            .await?
+            .into_inner();
+        if let Some(c) = resp.classes.iter().find(|c| c.name == wp.spec.size_class) {
+            // proto field is u64; spawn_count takes u32. Saturate —
+            // a queue > 4 billion derivations is pathological but
+            // shouldn't wrap to 0 (would scale DOWN under extreme
+            // load). Same cast as scaling::per_class::scale_wps_class.
+            return Ok(c.queued.min(u32::MAX as u64) as u32);
+        }
+        // Class not in response → fall through to systems filter.
+    }
+    let resp = ctx.admin.clone().cluster_status(()).await?.into_inner();
+    Ok(crate::scaling::queued_for_systems(&resp, &wp.spec.systems))
 }
 
 /// Build a K8s Job for one ephemeral worker pod.

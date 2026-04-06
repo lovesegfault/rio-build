@@ -1,0 +1,65 @@
+{{- if .Values.builderPoolSet.enabled }}
+{{- $bps := .Values.builderPoolSet -}}
+{{- $tpl := mergeOverwrite (deepCopy .Values.builderPoolDefaults) $bps.poolTemplate -}}
+---
+# BuilderPoolSet: one child BuilderPool per size class. The scheduler's
+# classify() routes each derivation to the smallest covering class by
+# (est_duration, peak_memory, peak_cpu); the controller spawns workers
+# sized by classes[].resources. Supersedes the flat builderPools[] list
+# (set builderPoolDefaults.enabled=false when this is on, or pools
+# double-render).
+#
+# poolTemplate inherits from builderPoolDefaults (deep-merge, same as
+# builderpool.yaml) so seccomp/tolerations/nodeSelector/hostUsers stay
+# single-sourced. Per-BPS overrides go on .Values.builderPoolSet.
+# poolTemplate.
+apiVersion: rio.build/v1alpha1
+kind: BuilderPoolSet
+metadata:
+  name: {{ $bps.name }}
+  namespace: {{ .Values.namespaces.builders.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+    rio.build/role: builder
+spec:
+  classes:
+    {{- range $bps.classes }}
+    - name: {{ .name }}
+      cutoffSecs: {{ .cutoffSecs }}
+      {{- with .minReplicas }}
+      minReplicas: {{ . }}
+      {{- end }}
+      {{- with .maxReplicas }}
+      maxReplicas: {{ . }}
+      {{- end }}
+      {{- with .targetQueuePerReplica }}
+      targetQueuePerReplica: {{ . }}
+      {{- end }}
+      resources:
+        {{- toYaml .resources | nindent 8 }}
+    {{- end }}
+  poolTemplate:
+    image: {{ include "rio.image" (list . $tpl.image) }}
+    systems:
+      {{- toYaml $bps.systems | nindent 6 }}
+    features:
+      {{- toYaml $tpl.features | nindent 6 }}
+    {{- if .Values.tls.enabled }}
+    tlsSecretName: rio-builder-tls
+    {{- end }}
+    {{- include "rio.optBool" (list $tpl "ephemeral" $tpl.ephemeral) | nindent 4 }}
+    {{- include "rio.optBool" (list $tpl "privileged" $tpl.privileged) | nindent 4 }}
+    {{- include "rio.optBool" (list $tpl "hostUsers" $tpl.hostUsers) | nindent 4 }}
+    {{- with $tpl.seccompProfile }}
+    seccompProfile:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $tpl.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $tpl.nodeSelector }}
+    nodeSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}
