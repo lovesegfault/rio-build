@@ -274,6 +274,162 @@ async fn test_auth_publickey_offered_rejects_unknown_key() -> anyhow::Result<()>
 }
 
 // ===========================================================================
+// I-109 — authorized_keys hot-reload
+// ===========================================================================
+
+/// Like `spawn_ssh_server` but the authorized set is loaded from `path`
+/// and a watcher polls it every 50ms. Returns the bound addr + server
+/// handle; caller manages keys via the file.
+async fn spawn_ssh_server_watching(
+    path: std::path::PathBuf,
+) -> anyhow::Result<(
+    SocketAddr,
+    rio_common::signal::Token,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (_store, store_addr, _sh) = spawn_mock_store().await?;
+    let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
+    let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+
+    let initial = rio_gateway::load_authorized_keys(&path)?;
+
+    let host_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let config = Arc::new(build_ssh_config(host_key));
+
+    let socket = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = socket.local_addr()?;
+
+    let mut server = GatewayServer::new(store_client, scheduler_client, initial);
+    let shutdown = rio_common::signal::Token::new();
+    rio_gateway::spawn_authorized_keys_watcher(
+        server.authorized_keys_handle(),
+        path,
+        std::time::Duration::from_millis(50),
+        shutdown.clone(),
+    );
+    let srv_handle = tokio::spawn(async move {
+        if let Err(e) = server.run_on_socket(config, &socket).await {
+            eprintln!("ssh server error: {e}");
+        }
+    });
+
+    Ok((addr, shutdown, srv_handle))
+}
+
+/// Attempt publickey auth against `addr` with `key`; return whether it
+/// succeeded. Fresh connection per call so each attempt sees the
+/// current (possibly reloaded) authorized set.
+async fn try_auth(addr: SocketAddr, key: &PrivateKey) -> anyhow::Result<bool> {
+    let config = Arc::new(client::Config::default());
+    let mut session = client::connect(config, addr, AcceptAllClient).await?;
+    let res = session
+        .authenticate_publickey(
+            "nix",
+            PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None),
+        )
+        .await?;
+    Ok(res.success())
+}
+
+/// Atomic-replace `path` with `content` via rename-from-sibling. Mirrors
+/// the kubelet `..data` symlink swap (new inode, never a half-written
+/// file). Asserts the watcher's mtime poll picks up inode-replacement,
+/// not just in-place edits.
+fn atomic_write(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// I-109: gateway picks up `authorized_keys` changes without restart.
+///
+/// 1. Start with key A authorized → A accepted, B rejected.
+/// 2. Atomically rewrite the file to authorize B only.
+/// 3. After the watcher's poll interval → A rejected, B accepted.
+///
+/// SLEEP JUSTIFICATION: the watcher polls file mtime on a real
+/// `tokio::time::interval`. We can't `pause()` time here — real TCP
+/// (russh client + server) is in the loop, and `start_paused` +
+/// real-socket is the documented auto-advance footgun. 200ms covers
+/// 4× the 50ms test poll interval; bounded and deterministic enough.
+#[tokio::test]
+async fn test_authorized_keys_hot_reload() -> anyhow::Result<()> {
+    common::init_test_logging();
+
+    let key_a = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let key_b = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("authorized_keys");
+    std::fs::write(&path, key_a.public_key().to_openssh()?)?;
+    // mtime granularity on some filesystems is 1s; the watcher seeds
+    // `last_mtime` from this write. Backdate it so the post-swap write
+    // below is guaranteed a distinct mtime even on coarse-grained FS.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    let f = std::fs::File::open(&path)?;
+    f.set_modified(old)?;
+    drop(f);
+
+    let (addr, shutdown, srv) = spawn_ssh_server_watching(path.clone()).await?;
+
+    assert!(try_auth(addr, &key_a).await?, "key A authorized at startup");
+    assert!(!try_auth(addr, &key_b).await?, "key B not yet authorized");
+
+    atomic_write(&path, &key_b.public_key().to_openssh()?)?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert!(
+        !try_auth(addr, &key_a).await?,
+        "key A must be rejected after reload"
+    );
+    assert!(
+        try_auth(addr, &key_b).await?,
+        "key B must be accepted after reload"
+    );
+
+    shutdown.cancel();
+    srv.abort();
+    Ok(())
+}
+
+/// I-109 failure-mode: a reload that yields zero valid keys (operator
+/// botched the Secret) keeps the OLD set live rather than locking
+/// everyone out. The watcher logs WARN and retries next tick.
+#[tokio::test]
+async fn test_authorized_keys_reload_failure_keeps_old_set() -> anyhow::Result<()> {
+    common::init_test_logging();
+
+    let key_a = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("authorized_keys");
+    std::fs::write(&path, key_a.public_key().to_openssh()?)?;
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    let f = std::fs::File::open(&path)?;
+    f.set_modified(old)?;
+    drop(f);
+
+    let (addr, shutdown, srv) = spawn_ssh_server_watching(path.clone()).await?;
+
+    assert!(try_auth(addr, &key_a).await?, "key A authorized at startup");
+
+    // Garbage content → load_authorized_keys bails ("no valid keys").
+    atomic_write(&path, "not-a-key\n")?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert!(
+        try_auth(addr, &key_a).await?,
+        "key A still accepted — bad reload must not swap to empty set"
+    );
+
+    shutdown.cancel();
+    srv.abort();
+    Ok(())
+}
+
+// ===========================================================================
 // T4 — inter-opcode idle timeout
 // ===========================================================================
 

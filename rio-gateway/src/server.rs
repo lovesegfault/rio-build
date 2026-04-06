@@ -4,11 +4,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use ed25519_dalek::SigningKey;
 use rio_common::config::JwtConfig;
 use rio_common::jwt;
@@ -173,11 +175,105 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<PublicKey>> {
     Ok(keys)
 }
 
+/// Shared hot-swappable authorized-key set. `ArcSwap` so the auth path
+/// (`.load()` per offered key — read-heavy) never blocks the watcher's
+/// rare `.store()`. Wrapped in an outer `Arc` so the watcher task,
+/// `GatewayServer`, and every `ConnectionHandler` share one instance.
+pub type AuthorizedKeys = Arc<ArcSwap<Vec<PublicKey>>>;
+
+/// Poll interval for [`spawn_authorized_keys_watcher`]. kubelet refreshes
+/// projected-Secret mounts ~60s after the Secret changes; 10s polling
+/// means the gateway picks the swap up within ~70s of `kubectl apply`.
+/// Coarse on purpose — inotify on the file itself misses the kubelet
+/// `..data` symlink swap, and inotify on the parent dir is more moving
+/// parts than a 10s mtime poll for a file that changes ~never.
+pub const AUTHORIZED_KEYS_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Watch `path` for content changes and hot-swap `keys` when it does.
+///
+/// I-109: previously the gateway loaded `authorized_keys` once at
+/// startup. Rotating a tenant key (operator edits the K8s Secret) had
+/// no effect until pod restart — the in-memory set was a startup
+/// snapshot. Now: poll the file's mtime every `poll_interval`; on
+/// change, re-parse and atomically swap. In-flight SSH handshakes see
+/// the new set on their next `auth_publickey_offered` call (each
+/// `.load()` reads the current `Arc`, not a per-connection snapshot).
+///
+/// **Why mtime polling, not inotify**: kubelet mounts Secrets via a
+/// `..data → ..YYYY_MM_DD_hh_mm_ss.NNN/` symlink and refreshes by
+/// atomically retargeting the symlink. An `IN_MODIFY` watch on the
+/// file path itself is pinned to the OLD inode and never fires.
+/// Watching the parent dir works but adds a dep + event-debounce
+/// logic. `std::fs::metadata` follows symlinks, so the mtime we read
+/// is the target file's — a swap shows up as a changed mtime. 10s
+/// polling is negligible load and bounded latency.
+///
+/// **Reload failures keep the old set**: if the new file is empty,
+/// all-invalid, or transiently unreadable mid-swap, log WARN and
+/// retry next tick. Never swap to an empty set (would lock everyone
+/// out until the next successful reload).
+pub fn spawn_authorized_keys_watcher(
+    keys: AuthorizedKeys,
+    path: PathBuf,
+    poll_interval: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Seed with the current mtime so the first tick doesn't
+        // spuriously reload what `main` just loaded. If the initial
+        // stat fails (file vanished between main's load and here —
+        // vanishingly rare), `None` means the first successful stat
+        // will trigger a reload, which is the safe outcome.
+        let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut ticker = tokio::time::interval(poll_interval);
+        // First tick fires immediately; we've already seeded mtime, so
+        // skip it rather than special-casing the loop body.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+            let mtime: Option<SystemTime> =
+                match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e,
+                            "authorized_keys stat failed; keeping current set");
+                        continue;
+                    }
+                };
+            if mtime == last_mtime {
+                continue;
+            }
+            match load_authorized_keys(&path) {
+                Ok(new_keys) => {
+                    info!(count = new_keys.len(), "reloaded authorized keys");
+                    keys.store(Arc::new(new_keys));
+                    last_mtime = mtime;
+                }
+                Err(e) => {
+                    // Don't advance last_mtime — retry next tick. A
+                    // half-written file (non-k8s deploys without atomic
+                    // rename) will succeed once the writer finishes.
+                    warn!(path = %path.display(), error = %e,
+                        "authorized_keys reload failed; keeping current set");
+                }
+            }
+        }
+    })
+}
+
 /// The SSH server that accepts connections and spawns protocol sessions.
 pub struct GatewayServer {
     store_client: StoreServiceClient<Channel>,
     scheduler_client: SchedulerServiceClient<Channel>,
-    authorized_keys: Arc<Vec<PublicKey>>,
+    /// Hot-swappable key set. [`spawn_authorized_keys_watcher`] holds
+    /// another `Arc` to the same `ArcSwap` and `.store()`s a fresh
+    /// `Vec` when the backing file changes; every `ConnectionHandler`
+    /// `.load()`s the current set per auth attempt (I-109).
+    authorized_keys: AuthorizedKeys,
     /// ed25519 JWT signing key. `None` → JWT issuance disabled (the
     /// `x-rio-tenant-token` header is never set; downstream services
     /// fall back to `SubmitBuildRequest.tenant_name` per
@@ -245,7 +341,7 @@ impl GatewayServer {
         GatewayServer {
             store_client,
             scheduler_client,
-            authorized_keys: Arc::new(authorized_keys),
+            authorized_keys: Arc::new(ArcSwap::from_pointee(authorized_keys)),
             jwt_signing_key: None,
             jwt_config: JwtConfig::default(),
             limiter: TenantLimiter::disabled(),
@@ -262,6 +358,14 @@ impl GatewayServer {
     /// so the caller observes drops that happen post-`run`.
     pub fn active_conns_handle(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.active_conns)
+    }
+
+    /// Clone of the hot-swappable authorized-key set. Hand this to
+    /// [`spawn_authorized_keys_watcher`] (or, in tests, `.store()` on
+    /// it directly) so file changes propagate to running auth checks
+    /// without a restart. Call BEFORE [`Self::run`] (consumes `self`).
+    pub fn authorized_keys_handle(&self) -> AuthorizedKeys {
+        Arc::clone(&self.authorized_keys)
     }
 
     /// Clone of the server-wide session shutdown token. Cancelling it
@@ -571,7 +675,11 @@ pub struct ConnectionHandler {
     peer_addr: Option<SocketAddr>,
     store_client: StoreServiceClient<Channel>,
     scheduler_client: SchedulerServiceClient<Channel>,
-    authorized_keys: Arc<Vec<PublicKey>>,
+    /// Shared with `GatewayServer` + the watcher task. `.load()` per
+    /// auth attempt — NOT snapshotted at connection-accept, so a key
+    /// rotated mid-handshake (between TCP accept and `auth_publickey`)
+    /// is judged against the current set.
+    authorized_keys: AuthorizedKeys,
     /// Active protocol sessions, indexed by channel ID.
     sessions: HashMap<ChannelId, ChannelSession>,
     /// JWT signing key, cloned from `GatewayServer`. `None` → mint
@@ -841,6 +949,7 @@ impl Handler for ConnectionHandler {
     ) -> Result<Auth, Self::Error> {
         let known = self
             .authorized_keys
+            .load()
             .iter()
             .any(|authorized| authorized.key_data() == key.key_data());
         if known {
@@ -866,8 +975,8 @@ impl Handler for ConnectionHandler {
         // the client's key (SSH key auth sends raw key data only). We
         // match the client's key against our loaded entries, then read
         // .comment() from the MATCHED entry.
-        let matched = self
-            .authorized_keys
+        let keys = self.authorized_keys.load();
+        let matched = keys
             .iter()
             .find(|authorized| authorized.key_data() == key.key_data());
 

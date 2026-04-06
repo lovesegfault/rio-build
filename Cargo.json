@@ -19851,6 +19851,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "arc-swap",
+          "packageId": "arc-swap"
+        },
+        {
           "name": "base64",
           "packageId": "base64"
         },

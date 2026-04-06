@@ -13,7 +13,10 @@ pub mod translate;
 
 pub use quota::QuotaCache;
 pub use ratelimit::{RateLimitConfig, TenantLimiter};
-pub use server::{GatewayServer, load_authorized_keys, load_or_generate_host_key};
+pub use server::{
+    AUTHORIZED_KEYS_POLL_INTERVAL, AuthorizedKeys, GatewayServer, load_authorized_keys,
+    load_or_generate_host_key, spawn_authorized_keys_watcher,
+};
 
 /// Register `# HELP` descriptions for all gateway metrics.
 ///
