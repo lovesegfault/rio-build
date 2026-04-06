@@ -169,8 +169,27 @@ _VM_FAIL_RE = re.compile(
 # P0430 iter-1: vm-le-build-k3s was in known-flakes but excusable() returned
 # false — log had a remote-builder crash signature, not a FAIL/Cannot-build
 # line. Implementer blocked on a false-negative.
+# 4 original patterns: nixbuild.net-era (P0447 plan-prescribed; zero corpus
+# hits 2026-03). Retained — nixbuild.net may return.
+# 2 corpus-derived (P0508, 289-file /tmp/rio-dev scan 2026-03-30):
+#   - "failed to start SSH connection" — 8 hits at ^error: level across
+#     p0450-impl-{2,3} + sprint-1-{impl-1,merge-1..5}.log. SSH connect
+#     fails → no FAIL lines → tier-2 false-negative. Same class as P0430.
+#     4 additional hits inside drv> relay (merge-58/59) are correctly
+#     excluded by the ^error: anchor.
+#   - "builder failed with exit code 137" — 2 hits (p501-t4-ci.log:18269,
+#     rio-p0499-impl-1.log:50295). SIGKILL (128+9) on remote builder —
+#     OOM under concurrent CI on keynes. Appears on the ^[ \t]+Reason:
+#     continuation line, NOT ^error: — hence the unified-prefix alternation.
+#     The plan prescribed `Killed\s*$` inside ^error:, but the corpus shows
+#     the drv-relay Killed line ends with `$@` (bash setup-script output)
+#     and the ^error: line carries `Cannot build` — no `Killed` at EOL
+#     anywhere in 289 files. exit code 137 is the corpus-grounded marker.
+#     `[ \t]+` (not `\s+`) so the anchor doesn't eat a \n.
 _INFRA_ERROR_RE = re.compile(
-    r"^error: .*?(Broken pipe|internal_error|resource vanished|Transient build error)",
+    r"^(?:error: .*?|[ \t]+Reason: )(Broken pipe|internal_error|resource vanished"
+    r"|Transient build error|failed to start SSH connection"
+    r"|builder failed with exit code 137)",
     re.MULTILINE,
 )
 
