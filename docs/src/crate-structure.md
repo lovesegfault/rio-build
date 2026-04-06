@@ -17,8 +17,14 @@ rio-build/
 ├── rio-controller/      # Kubernetes operator (reconciler, autoscaler)
 ├── rio-cli/             # Operator CLI (AdminService client)
 ├── rio-bench/           # Criterion benches
-└── rio-dashboard/       # TypeScript/Svelte SPA (not a Rust crate)
+└── rio-dashboard/       # Svelte 5 SPA — NOT a Rust crate; built by nix/dashboard.nix (pnpm+Vite)
 ```
+
+`rio-dashboard/` is a workspace sibling but NOT a Cargo workspace member. It has
+its own `package.json`/`pnpm-lock.yaml` and is built by `nix/dashboard.nix` via
+`fetchPnpmDeps` + Vite. TypeScript stubs are generated in-sandbox from
+`rio-proto/proto/*.proto` via `buf generate` (protobuf-es v2), so the dashboard
+derivation is invalidated on `.proto` changes but not on Rust-only commits.
 
 ## Dependency Graph
 

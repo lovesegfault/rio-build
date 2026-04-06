@@ -105,7 +105,7 @@ Per-tenant narinfo visibility is implemented via `path_tenants` JOIN: authentica
 | **Worker isolation** | Per-build overlayfs, Nix sandbox, NetworkPolicy | Designed |
 | **Metadata service blocking** | NetworkPolicy egress deny `169.254.169.254`; IMDSv2 hop limit=1 | Designed |
 | **Inter-component auth** | mTLS between all gRPC endpoints | Implemented (Phase 3b) — configure via `RIO_TLS__*` env |
-| **Multi-tenant data isolation** | Per-tenant data visibility (Phase 5); shared workers with per-build overlay isolation | Planned |
+| **Multi-tenant data isolation** | Per-tenant narinfo visibility filtering + per-tenant signing keys; shared workers with per-build overlay isolation | Implemented |
 
 ## Derivation Validation
 
@@ -121,7 +121,7 @@ Additional validation checks (below) are enforced at other points in the pipelin
 | Sandbox enforcement | Worker | Implemented | `sandbox = true` in `nix.conf` ensures all builds run inside the Nix sandbox (user/mount/PID/network namespaces). |
 | DAG size limit | Gateway + Scheduler | Implemented | Gateway's `translate::validate_dag` checks `nodes.len() > MAX_DAG_NODES` before SubmitBuild (early reject); scheduler also enforces. |
 | `__noChroot` rejection | Gateway | Implemented | `translate::validate_dag` checks derivation env for `__noChroot=1` via drv_cache lookup. Rejected with "sandbox escape" error. |
-| Per-tenant NAR size limit | Gateway | **Not implemented** | Only the global `MAX_NAR_SIZE` limit exists. Per-tenant `max_nar_upload_size` is Phase 5. |
+| Per-tenant store quota | Gateway | Implemented | `TenantQuota` RPC gates `SubmitBuild` against `gc_max_store_bytes` (30s-TTL cached, eventually-enforcing). Per-upload NAR size uses the global `MAX_NAR_SIZE` limit. |
 | Output path match | Store | Implemented | HMAC assignment tokens: store verifies `x-rio-assignment-token` metadata on PutPath, checks `store_path ∈ claims.expected_outputs`. mTLS bypass for gateway. |
 
 ## Secrets Management
@@ -149,12 +149,12 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 | Authorized SSH keys[^authkeys] | Gateway | Per-tenant lifecycle | Implemented (flat file; no tenant annotation) |
 | NAR signing key (`signing-key`) | Store | Annually or on compromise | Implemented |
 | HMAC signing key (assignment tokens) | Scheduler + Store | Annually or on compromise | Implemented — `RIO_HMAC_KEY_PATH`, same key file both sides |
-| JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | **Phase 5** — no tenant token issuance yet |
+| JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | Implemented — `RIO_JWT_SIGNING_KEY_PATH`, gateway mints per-session JWT on SSH accept |
 | Database credentials (`database_url`) | Scheduler, Store, Controller | Via Vault database engine or External Secrets | Implemented |
 | TLS certificates | All gRPC components | Via cert-manager auto-renewal (90d certs, renew at 30d) | Implemented — see `infra/helm/rio-build/templates/cert-manager.yaml` |
 
-[^authkeys]: Tenant annotation in the `authorized_keys` comment field (e.g., `ssh-ed25519 AAAA... tenant=acme`) is not yet parsed. All authenticated keys currently share a single implicit tenant. SSH key → tenant mapping is Phase 5.
-[^jwt]: There is no JWT issuance or verification code. Tenant identity exists only as a string field in the scheduler's `BuildOptions` with no authentication backing.
+[^authkeys]: The `authorized_keys` comment field carries the tenant name (e.g., `ssh-ed25519 AAAA... acme`). The gateway resolves this to a tenant UUID via `SchedulerService.ResolveTenant` on SSH accept and mints a per-session JWT with `Claims.sub = tenant_id`.
+[^jwt]: The gateway mints a per-session JWT on SSH accept (`mint_session_jwt`, `r[gw.jwt.issue]`). Downstream services verify via `rio_common::jwt_interceptor::JwtLayer` with SIGHUP-reloadable public key. Dual-mode fallback (`r[gw.jwt.dual-mode]`): when JWT is disabled, services fall back to `SubmitBuildRequest.tenant_name`.
 
 ## Additional Threats
 

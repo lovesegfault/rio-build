@@ -144,4 +144,5 @@ For a complete scripted walkthrough against EKS, see `infra/eks/smoke-test.sh`.
 - **RPO:** Determined by PostgreSQL backup frequency. With WAL archiving, RPO can be near-zero. S3 data has effectively zero RPO.
 - **RTO:** Determined by PostgreSQL restore time + component restart time. Typically 5-15 minutes for managed databases.
 
-> **Multi-tenancy warning:** Multi-tenant deployments with untrusted tenants are unsafe before Phase 5. See [Multi-Tenancy](./multi-tenancy.md) for details.
+See [Multi-Tenancy](./multi-tenancy.md) for tenant isolation configuration
+(resource quotas, per-tenant signing keys, narinfo visibility filtering).
