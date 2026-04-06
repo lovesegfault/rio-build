@@ -61,9 +61,7 @@ Store paths can be shared across tenants. Since store paths are content-addresse
 
 ### Signing Keys
 
-> **Scheduled:** per-tenant signing keys → [P0256](../.claude/work/plan-0256-per-tenant-signing-output-hash.md). Until it lands: a single cluster-wide ed25519 key signs all narinfo.
-
-Each tenant can have their own ed25519 signing key for narinfo signatures. This allows tenants to maintain independent trust chains for their binary caches.
+Each tenant can have their own ed25519 signing key for narinfo signatures. This allows tenants to maintain independent trust chains for their binary caches. The cluster-wide key remains the fallback for tenants without a key.
 
 ### GC Policies
 

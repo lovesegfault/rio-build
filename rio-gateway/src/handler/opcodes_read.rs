@@ -494,18 +494,42 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
         })
         .unwrap_or_default();
 
-    // output_hash: the Nix Realisation JSON doesn't include it directly.
-    // We could QueryPathInfo for the outPath and pull nar_hash... but that's
-    // a roundtrip we can defer. Store zeros for now — the store's
-    // RegisterRealisation validates output_hash is 32 bytes but doesn't
-    // check it's the RIGHT hash (it can't, without the NAR). Phase 5's
-    // realisation signing will need the real hash; until then, this is
-    // metadata the store has elsewhere (narinfo.nar_hash for outPath).
+    // output_hash: the Nix Realisation JSON doesn't carry it — fetch from
+    // QueryPathInfo(outPath).nar_hash. This field is NOT on the CA-cutoff
+    // critical path (cutoff compares content_index, not realisations.output_hash);
+    // it's for realisation SIGNING — the signed tuple is
+    // (drv_hash, output_name, output_path, nar_hash) per store.md:206.
+    // Zeros would mean signing attests to nothing about the output content.
     //
-    // TODO(P0253): populate output_hash from QueryPathInfo(outPath).nar_hash
-    // before signing realisations. Zeros are fine for cache-hit purposes —
-    // QueryRealisation only uses (drv_hash, output_name) as the key.
-    let output_hash = [0u8; 32];
+    // outPath should already be in the store: Nix's protocol order is build
+    // → upload outputs (wopAddToStore/wopAddMultipleToStore) → register drv
+    // output (this opcode). If the client sends this BEFORE uploading, or
+    // the upload failed silently: warn + fall back to zeros. The registration
+    // still lands (cache-hit still works — QueryRealisation keys on
+    // (drv_hash, output_name) only); it just won't carry a meaningful hash
+    // for signing. Same soft-fail posture as the malformed-JSON path above.
+    let output_hash: [u8; 32] = match grpc_query_path_info(store_client, &out_path).await {
+        Ok(Some(info)) => info.nar_hash,
+        Ok(None) => {
+            warn!(
+                out_path = %out_path,
+                "wopRegisterDrvOutput: outPath not in store (uploaded out of order?); \
+                 registering with zero output_hash — realisation unsignable"
+            );
+            [0u8; 32]
+        }
+        // Store-unreachable IS a hard fail below (RegisterRealisation will
+        // hit the same dead store); but a transient here isn't worth bouncing
+        // the whole registration when zeros are the prior behavior.
+        Err(e) => {
+            warn!(
+                out_path = %out_path, error = %e,
+                "wopRegisterDrvOutput: QueryPathInfo failed; \
+                 registering with zero output_hash"
+            );
+            [0u8; 32]
+        }
+    };
 
     let req = types::RegisterRealisationRequest {
         realisation: Some(types::Realisation {
