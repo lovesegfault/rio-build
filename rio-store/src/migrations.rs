@@ -22,6 +22,25 @@
 
 #![allow(dead_code)] // doc-only consts; never referenced, only `cargo doc`'d
 
+/// `migrations/008_round4.sql`
+///
+/// FK CASCADE on `build_derivations.build_id` (Z1) and GIN index on
+/// `narinfo."references"` (Z2) for the GC-sweep referrer re-check.
+///
+/// ## The Z2 comment is wrong about `= ANY()`
+///
+/// The frozen `.sql` says the GIN index "makes `WHERE $path =
+/// ANY("references")` index-scannable". It does not — PostgreSQL's
+/// array-GIN opclass only supports `@>` / `<@` / `&&` / `=`, and the
+/// planner does NOT rewrite `scalar = ANY(arrcol)` into a `@>` probe.
+/// I-145 measured ~1.3s/path seqscans at 100k+ rows under the original
+/// `= ANY()` query. The sweep query (`rio-store/src/gc/sweep.rs`) was
+/// rewritten to `n."references" @> ARRAY[$path]`, which EXPLAIN-
+/// verifies as a Bitmap Index Scan on `idx_narinfo_references_gin`.
+/// The index itself was always correct; only the comment and the
+/// caller were wrong.
+pub const M_008: () = ();
+
 /// `migrations/009_phase4.sql`
 ///
 /// Phase 4 rollup: tenants table + FK backfill (Part A) and
