@@ -373,20 +373,33 @@ karpenter:
 # when enabled; they need the Envoy Gateway operator (gateway-helm via
 # nix/helm-charts.nix) installed first or the CRDs don't exist.
 #
-# Disabled by default — phase 5 feature. When enabled, the SPA itself
-# (P0274) is a separate Deployment (nginx + static bundle); this block
-# only covers the gRPC-Web ingress path.
+# Disabled by default — phase 5 feature. Enabling renders BOTH the
+# Gateway API CRDs (dashboard-gateway*.yaml — operator-managed envoy)
+# AND the SPA Deployment (dashboard.yaml — nginx + static bundle).
+# The Envoy Gateway operator (gateway-helm via nix/helm-charts.nix)
+# must be installed first or the Gateway/GRPCRoute CRDs don't exist.
 dashboard:
   enabled: false
+  # nginx pod carrying the Svelte dist/ bundle (nix build .#docker-
+  # dashboard). Stateless — scale for availability, not load (static
+  # SPA + thin proxy).
+  replicas: 1
+  image: rio-dashboard
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 128Mi}
+  # ── Envoy Gateway data-plane tuning ───────────────────────────────────
   # EnvoyProxy.spec.provider.kubernetes.envoyService.name — stable
   # Service name for the operator-managed envoy data-plane. Without
   # this, the operator generates envoy-{gateway-ns}-{gateway-name}-
-  # {hash} which is awkward to target from curl/nginx upstream config.
+  # {hash} which is awkward to target. The nginx image bakes this
+  # DNS name into its upstream config (nix/docker.nix) — changing it
+  # here requires a docker-dashboard rebuild, not just a helm upgrade.
   envoyServiceName: rio-dashboard-envoy
   # EnvoyProxy.spec.provider.kubernetes.envoyService.type — ClusterIP
-  # by default (dashboard's nginx sits in-cluster and proxies /api/*
-  # to this Service). Set to NodePort for VM tests or LoadBalancer for
-  # direct external access.
+  # by default (nginx sits in-cluster and proxies to this Service).
+  # Set to NodePort for VM tests or LoadBalancer for direct external
+  # gRPC-Web access (bypassing the SPA).
   envoyServiceType: ClusterIP
   # Envoy data-plane image. The operator defaults to a compiled-in
   # version (v1.7.1 → envoy:distroless-v1.37.1); pin here so airgapped

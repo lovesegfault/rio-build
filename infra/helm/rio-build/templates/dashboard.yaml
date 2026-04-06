@@ -1,0 +1,103 @@
+{{- if .Values.dashboard.enabled }}
+{{- $d := .Values.dashboard -}}
+{{- $ns := .Values.namespace.name -}}
+# nginx-only pod: serves the Svelte SPA and proxies /rio.* gRPC-Web to
+# the Envoy Gateway Service. NO sidecar — envoy is operator-managed
+# (Gateway API CRDs in dashboard-gateway*.yaml). nginx proxies to the
+# cluster-DNS upstream, not localhost. The Envoy Gateway handles
+# grpc_web→gRPC translation + mTLS client cert to rio-scheduler; nginx
+# is a thin HTTP/1.1 proxy.
+#
+# No Ingress. Access via `kubectl port-forward svc/rio-dashboard
+# 8080:80` (matches Grafana's model — operator-facing tool, not
+# public).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rio-dashboard
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard" "component" "dashboard") | nindent 4 }}
+spec:
+  replicas: {{ $d.replicas }}
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-dashboard" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rio.labels" (dict "root" . "name" "rio-dashboard" "component" "dashboard") | nindent 8 }}
+    spec:
+      # No privileged ops: nginx listens on 8080 (not 80) so we don't
+      # need CAP_NET_BIND_SERVICE. No fsGroup — no writable volumes
+      # that need group-ownership (emptyDir is world-writable /tmp).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534   # nobody
+        runAsGroup: 65534
+      containers:
+        # SPA serve + gRPC-Web proxy to Envoy Gateway Service. Config
+        # is baked into the image (nix/docker.nix dashboardNginxConf)
+        # — no ConfigMap, no runtime templating. A changed upstream
+        # name is a docker-dashboard rebuild, not a helm value.
+        - name: nginx
+          image: {{ include "rio.image" (list . $d.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # nginx.conf points pid + all *_temp_path directives at
+            # /tmp. One emptyDir covers the lot. /var/log/nginx exists
+            # in the image layer (extraCommands) — nginx probes it at
+            # parse-start before our error_log /dev/stderr takes over,
+            # but never writes (error_log redirects immediately).
+            - name: tmp
+              mountPath: /tmp
+          # / (index.html) is served from the baked-in SPA bundle. If
+          # nginx is up, the SPA is servable — no backend dep to
+          # readiness-gate on (envoy-gateway being down means gRPC
+          # calls fail in-browser, but the static app still loads and
+          # shows its own error state).
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml $d.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-dashboard
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard" "component" "dashboard") | nindent 4 }}
+spec:
+  # ClusterIP — port-forward only (no LoadBalancer, no NodePort).
+  # 80→8080: the Service presents the conventional HTTP port; nginx
+  # inside the container listens on 8080 (unprivileged, matches
+  # runAsNonRoot).
+  type: ClusterIP
+  selector:
+    {{- include "rio.selectorLabels" "rio-dashboard" | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}

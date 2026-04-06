@@ -790,6 +790,13 @@
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
               import ./nix/docker.nix {
                 inherit pkgs rio-workspace coverage;
+                # Dashboard only for the non-coverage image set.
+                # nginx+static has no LLVM instrumentation and the
+                # coverage VM fixture doesn't deploy it — passing
+                # null elides the `dashboard` attr (docker.nix
+                # optionalAttrs guard) so the linkFarm doesn't
+                # reference a redundant drv.
+                rioDashboard = if coverage then null else rioDashboard;
               }
             );
           dockerImages = mkDockerImages { inherit rio-workspace; };
@@ -1527,6 +1534,7 @@
             docker-controller = dockerImages.controller;
             docker-fod-proxy = dockerImages.fod-proxy;
             docker-bootstrap = dockerImages.bootstrap;
+            docker-dashboard = dockerImages.dashboard;
             docker-all = dockerImages.all;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
               pkgs.lib.mapAttrsToList (name: drv: {
