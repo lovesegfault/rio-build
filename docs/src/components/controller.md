@@ -193,15 +193,15 @@ Scheduler and gateway PDBs remain static manifests in the Helm chart (`infra/hel
 ## Health Probes
 
 r[ctrl.probe.named-service]
-K8s readiness probes on gRPC components MUST target a named health check service (e.g., `grpc.health.v1.Health/Check` with `service: rio-scheduler`), not the empty-string default. `set_not_serving` only affects named services, not `""` --- readiness would stay green during drain otherwise.
+Health probes against `grpc.health.v1.Health/Check` MUST target a named service (e.g., `rio.scheduler.SchedulerService`), not the empty-string default. `set_not_serving` only affects named services, not `""` --- a probe on `""` stays green through drain and through standby.
 
-> **Note:** This requirement is satisfied by the static Helm templates (`infra/helm/rio-build/templates/scheduler.yaml` and `store.yaml`), which set `readinessProbe.grpc.service` to `rio.scheduler.SchedulerService` and `rio.store.StoreService` respectively. It is not controller-managed (the controller does not deploy scheduler/store). Worker probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
+> **Note:** This requirement applies to the **client-side balancer** (`rio-proto/src/client/balance.rs`), which probes the named service to find the leader. It does NOT apply to K8s probes: `infra/helm/rio-build/templates/scheduler.yaml` intentionally uses `tcpSocket` for both readiness and liveness --- standby replicas report `NOT_SERVING` on the gRPC health endpoint (they haven't won the lease), so gRPC-based K8s probes would crash-loop them. TCP-accept succeeding proves the process is live; leader-election is client-side routing's concern, not K8s'. `store.yaml` does use `grpc.service: rio.store.StoreService` for readiness (store is not leader-elected, so `NOT_SERVING` only means drain or PG/S3 unhealthy --- correct to take out of rotation). Worker probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
 
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|
 | Gateway | TCP check on SSH port | After scheduler gRPC connection established | — |
-| Scheduler | gRPC health check | After leader election won + PostgreSQL connected + recovery_complete | gRPC check. Startup budget sized for state recovery (reload non-terminal builds from PG). |
-| Store | gRPC health check | After PostgreSQL + S3 reachable | — |
+| Scheduler | TCP socket (gRPC health is leader-election-aware, unsuitable for K8s probes on HA standby) | TCP socket — process is live, port is bound. Leader election happens; client-side balancer routes to leader via named-service health. | TCP socket. Startup budget sized for state recovery (reload non-terminal builds from PG). |
+| Store | TCP socket | gRPC health check on named service --- after PostgreSQL + S3 reachable | — |
 | Controller | HTTP `/healthz` | After CRD watches established | — |
 | Worker | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
 

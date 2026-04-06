@@ -414,17 +414,20 @@ async fn main() -> anyhow::Result<()> {
     // In K8s standby mode: stays NOT_SERVING until lease acquire.
     //
     // r[impl ctrl.probe.named-service]
-    // CRITICAL: the K8s readinessProbe MUST specify
-    // `grpc.service: rio.scheduler.SchedulerService` — the named
-    // service, not empty-string. set_not_serving only affects the
-    // named service (see the health_toggle_not_serving test).
-    // Empty-string stays SERVING forever after the first
-    // set_serving, so a standby would pass readiness on "" and
-    // K8s would route to it. The scheduler.yaml manifest MUST have:
-    //   readinessProbe:
-    //     grpc:
-    //       port: 9001
-    //       service: rio.scheduler.SchedulerService
+    // The CLIENT-SIDE balancer (rio-proto/src/client/balance.rs) probes
+    // the NAMED service `rio.scheduler.SchedulerService` to find the
+    // leader — set_not_serving only affects named services, empty-string
+    // stays SERVING forever after first set_serving. A balancer probing
+    // "" would route to standby.
+    //
+    // CRITICAL — K8S PROBES ARE A DIFFERENT LAYER: scheduler.yaml uses
+    // tcpSocket, NOT grpc. DO NOT "fix" the manifest to grpc probes —
+    // that crash-loops the standby (gRPC health reports NOT_SERVING
+    // until lease acquire; if liveness goes grpc, standby gets SIGKILLed
+    // → restart → still standby → loop). TCP-accept succeeding is the
+    // correct readiness/liveness signal for standby: the process is
+    // live, the port is bound, leader-election is the ONLY thing
+    // blocking serve.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
     // Two-stage shutdown: `shutdown` (parent) fires on SIGTERM and
