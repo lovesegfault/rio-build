@@ -74,6 +74,12 @@ struct Config {
     /// [`rio_gateway::server::DEFAULT_MAX_CONNECTIONS`] (1000 —
     /// ≈2 GiB bounded at 4 channels × 2×256 KiB each).
     max_connections: usize,
+    /// DAG-reconstruction cap on transitive input derivations per
+    /// build (DoS guard). Default
+    /// [`rio_gateway::translate::DEFAULT_MAX_TRANSITIVE_INPUTS`]
+    /// (100k — ~8 MB of path strings). Set via
+    /// `RIO_MAX_TRANSITIVE_INPUTS`.
+    max_transitive_inputs: usize,
 }
 
 impl Default for Config {
@@ -102,6 +108,7 @@ impl Default for Config {
             drain_grace_secs: 6,
             rate_limit: None,
             max_connections: rio_gateway::server::DEFAULT_MAX_CONNECTIONS,
+            max_transitive_inputs: rio_gateway::translate::DEFAULT_MAX_TRANSITIVE_INPUTS,
         }
     }
 }
@@ -217,6 +224,12 @@ async fn main() -> anyhow::Result<()> {
 
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
+
+    // Process-global DoS cap. Set ONCE before any SSH session can
+    // call reconstruct_dag. Same OnceLock pattern as init_client_tls
+    // — the alternative (threading through ~18 call sites) is
+    // invasive for a value that IS process-wide.
+    rio_gateway::translate::init_max_transitive_inputs(cfg.max_transitive_inputs);
 
     // Retry-until-connected via connect_with_retry (shutdown-aware,
     // exponential backoff). Cold-start race: all rio-* pods start in
@@ -466,6 +479,7 @@ mod tests {
         "gateway",
         r#"
         max_connections = 555
+        max_transitive_inputs = 250000
 
         [tls]
         cert_path = "/etc/tls/cert.pem"
@@ -480,6 +494,7 @@ mod tests {
         "#,
         |cfg: Config| {
             assert_eq!(cfg.max_connections, 555);
+            assert_eq!(cfg.max_transitive_inputs, 250_000);
             assert_eq!(
                 cfg.tls.cert_path.as_deref(),
                 Some(std::path::Path::new("/etc/tls/cert.pem")),
@@ -512,6 +527,10 @@ mod tests {
         assert_eq!(
             cfg.max_connections,
             rio_gateway::server::DEFAULT_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            cfg.max_transitive_inputs,
+            rio_gateway::translate::DEFAULT_MAX_TRANSITIVE_INPUTS
         );
     });
 

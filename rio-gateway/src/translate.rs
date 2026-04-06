@@ -6,6 +6,7 @@
 // r[impl gw.dag.reconstruct]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 
 use rio_common::tenant::NormalizedName;
 use rio_nix::derivation::{BasicDerivation, Derivation, DerivationLike};
@@ -30,8 +31,34 @@ const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 use crate::handler::{ClientOptions, resolve_derivation};
 
-/// Maximum number of transitive input derivations to resolve (DoS prevention).
-pub(crate) const MAX_TRANSITIVE_INPUTS: usize = 10_000;
+/// Default cap on transitive input derivations resolved per build (DoS guard).
+/// 100k store-path strings × ~80 bytes/path ≈ 8 MB per session — bounds memory
+/// without blocking real workloads (nixpkgs bootstrap alone is ~900; a monorepo
+/// CI build or full nixpkgs-from-scratch easily exceeds the old 10k cap, I-016).
+/// Override via `RIO_MAX_TRANSITIVE_INPUTS`.
+pub const DEFAULT_MAX_TRANSITIVE_INPUTS: usize = 100_000;
+
+/// Process-global limit. Set once via [`init_max_transitive_inputs`] in main()
+/// AFTER config load. Same OnceLock pattern as `rio_proto::client::CLIENT_TLS`
+/// — threading this through `reconstruct_dag` + `resolve_derivation` +
+/// `try_cache_drv` (~18 call sites including tests) is invasive for a value
+/// that IS process-global (one DoS guard, not per-session policy).
+static MAX_TRANSITIVE_INPUTS: OnceLock<usize> = OnceLock::new();
+
+/// Set the process-wide transitive-input cap. Call ONCE in main(), after
+/// loading config but before any SSH session can call `reconstruct_dag`.
+/// Calling twice is a silent no-op (OnceLock semantics — first wins).
+pub fn init_max_transitive_inputs(n: usize) {
+    let _ = MAX_TRANSITIVE_INPUTS.set(n);
+}
+
+/// Current cap. Falls back to [`DEFAULT_MAX_TRANSITIVE_INPUTS`] if main()
+/// never called init (tests, or a future binary that forgot to wire it).
+pub(crate) fn max_transitive_inputs() -> usize {
+    *MAX_TRANSITIVE_INPUTS
+        .get()
+        .unwrap_or(&DEFAULT_MAX_TRANSITIVE_INPUTS)
+}
 
 /// Reconstruct the full derivation DAG starting from a root derivation.
 ///
@@ -62,9 +89,11 @@ pub async fn reconstruct_dag(
 
     while let Some((drv_path, drv)) = queue.pop_front() {
         count += 1;
-        if count > MAX_TRANSITIVE_INPUTS {
+        let cap = max_transitive_inputs();
+        if count > cap {
             return Err(anyhow::anyhow!(
-                "transitive input limit exceeded ({MAX_TRANSITIVE_INPUTS})"
+                "transitive input limit exceeded: {count} derivations \
+                 (max {cap}; raise RIO_MAX_TRANSITIVE_INPUTS to allow larger DAGs)"
             ));
         }
 

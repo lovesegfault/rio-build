@@ -554,28 +554,36 @@ async fn test_rejects_malformed_store_paths() -> TestResult {
     Ok(())
 }
 
-/// FindMissingPaths with > MAX_BATCH_PATHS entries should be rejected.
+/// FindMissingPaths with > max_batch_paths entries should be rejected.
+/// Uses a low cap (.with_max_batch_paths(100)) so the test exercises the
+/// rejection path without allocating DEFAULT_MAX_BATCH_PATHS+1 = 100k+1
+/// path strings.
 #[tokio::test]
 async fn test_find_missing_paths_rejects_oversized_batch() -> TestResult {
-    let mut s = StoreSession::new().await?;
+    const TEST_CAP: usize = 100;
+    let db = TestDb::new(&MIGRATOR).await;
+    let service = StoreServiceImpl::new(db.pool.clone()).with_max_batch_paths(TEST_CAP);
+    let (mut client, _server) = spawn_store_server(service).await?;
 
-    // 10_001 paths (one over the limit).
-    let paths: Vec<String> = (0..10_001)
+    let paths: Vec<String> = (0..TEST_CAP + 1)
         .map(|i| test_store_path(&format!("path-{i}")))
         .collect();
 
-    let result = s
-        .client
+    let result = client
         .find_missing_paths(FindMissingPathsRequest { store_paths: paths })
         .await;
 
     assert!(result.is_err(), "oversized batch should be rejected");
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    let msg = status.message();
     assert!(
-        status.message().contains("too many paths"),
-        "error should mention path limit: {}",
-        status.message()
+        msg.contains("too many paths"),
+        "error should mention path limit: {msg}"
+    );
+    assert!(
+        msg.contains("RIO_MAX_BATCH_PATHS"),
+        "error should name the env var to raise: {msg}"
     );
 
     Ok(())

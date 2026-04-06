@@ -132,6 +132,10 @@ struct Config {
     /// as transient `DispatchFailure` that the sdk's standard retry
     /// policy handles but exhausts at 3. Set via `RIO_S3_MAX_ATTEMPTS`.
     s3_max_attempts: u32,
+    /// Cap on paths in a FindMissingPaths request (DoS guard).
+    /// Default 100k — ~8 MB of path strings per request. Set via
+    /// `RIO_MAX_BATCH_PATHS`.
+    max_batch_paths: usize,
 }
 
 impl Default for Config {
@@ -159,6 +163,7 @@ impl Default for Config {
             drain_grace_secs: 6,
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
+            max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,
         }
     }
 }
@@ -336,8 +341,9 @@ async fn main() -> anyhow::Result<()> {
     // Chunk-upload concurrency bound. Always set (config is the single
     // source of truth, same pattern as hmac_bypass_cns). Default 32 in
     // Config::default() → DEFAULT_CHUNK_UPLOAD_CONCURRENCY.
-    let store_service =
-        store_service.with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent);
+    let store_service = store_service
+        .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
+        .with_max_batch_paths(cfg.max_batch_paths);
     // NAR buffer budget override. None → constructor already set
     // DEFAULT_NAR_BUDGET (32 GiB); Some → replace the semaphore.
     // `as usize`: lossless on 64-bit; on 32-bit (not a supported
@@ -683,6 +689,7 @@ mod tests {
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
         assert!(d.jwt.key_path.is_none());
         assert!(!d.jwt.required);
+        assert_eq!(d.max_batch_paths, rio_store::grpc::DEFAULT_MAX_BATCH_PATHS);
     }
 
     // r[verify store.cas.s3-retry]

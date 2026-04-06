@@ -220,6 +220,11 @@ store:
   # DispatchFailure persists; each retry has exponential backoff so
   # 10 attempts ≈ 30s worst-case per chunk.
   s3MaxAttempts: 10
+  # Cap on paths in a FindMissingPaths request (DoS guard). 100k path
+  # strings ≈ 8 MB per request. Raise if a single `nix copy` of a
+  # very large closure (>100k store paths) is rejected with "too many
+  # paths"; lower on memory-constrained store pods.
+  maxBatchPaths: 100000
   resources:
     # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
     # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.
@@ -272,6 +277,11 @@ gateway:
   # grpc.health.v1 on each, routes to leader.
   schedulerBalanceHost: rio-scheduler-headless
   schedulerBalancePort: 9001
+  # Cap on transitive input derivations resolved per build (DoS guard).
+  # 100k ≈ 8 MB of path strings per session. Raise if a single build's
+  # DAG (e.g. building all of nixpkgs) exceeds this — the rejection
+  # error names this knob. Lower on memory-constrained gateway pods.
+  maxTransitiveInputs: 100000
   service:
     type: LoadBalancer
     # NO AWS LB annotations here — base is cloud-agnostic. Set via
