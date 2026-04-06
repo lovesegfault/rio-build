@@ -177,11 +177,30 @@ module "eks" {
   # the exec provider) would get Forbidden on every API call.
   enable_cluster_creator_admin_permissions = true
 
+  # Core networking addons. Module v21 hardcodes
+  # bootstrap_self_managed_addons=false (and ignore_changes it for
+  # in-place upgrades) — a fresh cluster gets NO vpc-cni/coredns/
+  # kube-proxy unless declared here. Missed on the v20→v21 bump
+  # because the live cluster predated it; first surfaced on full
+  # teardown+recreate (nodes stuck NotReady "cni plugin not
+  # initialized", nodegroup create hung). most_recent tracks the
+  # cluster k8s version's compatible addon build.
+  #
   # eks-pod-identity-agent: required for module.karpenter's Pod
   # Identity association (karpenter.tf). before_compute=true so the
   # agent DaemonSet is running before any nodegroup pods start —
   # otherwise the association doesn't take effect until agent restart.
   addons = {
+    vpc-cni = {
+      most_recent    = true
+      before_compute = true
+    }
+    kube-proxy = {
+      most_recent = true
+    }
+    coredns = {
+      most_recent = true
+    }
     eks-pod-identity-agent = {
       before_compute = true
     }

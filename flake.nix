@@ -53,7 +53,7 @@
     # Spec-coverage tool (nix/tracey.nix). Flake input (not fetchFromGitHub)
     # so importCargoLock reads Cargo.lock from a pre-fetched path — no IFD.
     tracey-src = {
-      url = "github:bearcove/tracey/2446b4f7433c6220c18737737970f6eccbe2081d";
+      url = "github:bearcove/tracey";
       flake = false;
     };
 
