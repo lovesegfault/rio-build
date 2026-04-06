@@ -316,6 +316,7 @@ async fn drain_build_result_tail(stream: &mut tokio::io::DuplexStream) -> anyhow
 }
 
 // r[verify gw.stderr.error-before-return+2]
+// r[verify gw.reject.nochroot]
 /// wopBuildDerivation (36): DAG-validation failure (cached drv has __noChroot)
 /// sends STDERR_LAST + failure BuildResult, NOT STDERR_ERROR.
 ///
@@ -398,6 +399,7 @@ async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<
 }
 
 // r[verify gw.stderr.error-before-return+2]
+// r[verify gw.reject.nochroot]
 /// wopBuildPathsWithResults (46): DAG-validation failure sends STDERR_LAST +
 /// per-path failure results, NOT STDERR_ERROR. Sibling of the opcode-36 test
 /// above, covering the second bug site at build.rs:799-806.
