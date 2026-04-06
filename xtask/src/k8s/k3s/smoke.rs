@@ -84,7 +84,12 @@ pub(crate) fn port_forward(
 /// Lease. Port-forwarding to `svc/rio-scheduler` load-balances across
 /// all replicas; standbys reject writes with "not leader". Targeting
 /// the leader pod directly makes admin ops deterministic.
-async fn scheduler_leader_pod() -> Result<String> {
+///
+/// Also used for the metrics forward (port 9091): the Service spec
+/// only exposes 9001, so `kubectl port-forward svc/rio-scheduler
+/// X:9091` errors with "does not have a service port 9091" — must
+/// target the pod. See I-050.
+pub(crate) async fn scheduler_leader_pod() -> Result<String> {
     let sh = crate::sh::shell()?;
     // xshell cmd! interpolates {var} — pass jsonpath as a var to avoid
     // brace-escaping gymnastics.
