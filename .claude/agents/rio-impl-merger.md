@@ -122,15 +122,17 @@ Only after `.#ci` is green (coverage is backgrounded, not a gate). If cleanup fa
 `.claude/dag.jsonl` is the source of truth; `onibus dag render` emits a display table to stdout. The status flip is a named-field edit — no positional column counting, no subagent spawn. Serialized by the step-0 lockfile — `.claude/state/merger.lock` guarantees only one merger runs at a time.
 
 ```bash
-.claude/bin/onibus merge count-bump
 N=<plan-number-without-P-prefix>   # e.g. 134 for p134
 .claude/bin/onibus dag set-status $N DONE
 .claude/bin/onibus dag unblocked-by $N    # JSON — plans entering frontier because of this merge
-.claude/bin/onibus merge cadence           # CadenceReport — {count, consolidator.due, bughunter.due, ranges}
 .claude/bin/onibus merge queue-consume "P$N"  # remove from merge-queue.jsonl (no accumulation)
 .claude/bin/onibus dag render
 git add .claude/dag.jsonl
 git commit --amend --no-edit
+# count-bump MUST run AFTER amend — it records HEAD in merge-shas.jsonl for
+# the mc→SHA cadence map. Pre-amend HEAD is orphaned (reflog-only) after amend.
+.claude/bin/onibus merge count-bump
+.claude/bin/onibus merge cadence           # CadenceReport — {count, consolidator.due, bughunter.due, ranges}
 ```
 
 Include `unblocked-by` output in `report.unblocked` and `cadence` output in `report.cadence` (the `MergerReport` schema has both). Coordinator reads these instead of re-querying.
