@@ -36,7 +36,7 @@ use crate::reconcilers::builderpool::ephemeral::{EPHEMERAL_REQUEUE, JOB_TTL_SECS
 use crate::reconcilers::builderpool::job_common::{
     SpawnOutcome, is_active_job, random_suffix, scheduler_unreachable_condition, try_spawn_job,
 };
-use crate::reconcilers::common::sts::{self, POOL_LABEL, SchedulerAddrs, env};
+use crate::reconcilers::common::sts::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs, env};
 
 use super::{MANAGER, executor_params};
 
@@ -209,7 +209,7 @@ pub(super) fn build_job(
     pod_spec.affinity = None;
     pod_spec.topology_spread_constraints = None;
 
-    let job_name = format!("{pool}-eph-{}", random_suffix());
+    let job_name = sts::ephemeral_job_name(&pool, ExecutorRole::Fetcher, &random_suffix());
 
     Ok(Job {
         metadata: ObjectMeta {
@@ -314,6 +314,12 @@ mod tests {
         assert!(
             pod.affinity.is_none() && pod.topology_spread_constraints.is_none(),
             "I-090: ephemeral Jobs bin-pack (no anti-affinity/spread)"
+        );
+        assert!(
+            pod.node_selector
+                .as_ref()
+                .is_none_or(|ns| !ns.contains_key("kubernetes.io/arch")),
+            "I-098: fetchers float across arches (builtin runs anywhere)"
         );
         assert_eq!(spec.backoff_limit, Some(0));
         assert_eq!(spec.ttl_seconds_after_finished, Some(JOB_TTL_SECS));

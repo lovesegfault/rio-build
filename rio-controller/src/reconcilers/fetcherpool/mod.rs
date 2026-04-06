@@ -389,10 +389,10 @@ mod tests {
         );
     }
 
-    /// STS name is `{pool}-fetchers` — distinct from builders.
+    /// STS name is `{pool}-{role}` — same prefix as ephemeral Jobs.
     #[test]
     fn sts_name_has_role_suffix() {
-        assert_eq!(sts_name("rio", ExecutorRole::Fetcher), "rio-fetchers");
-        assert_eq!(sts_name("rio", ExecutorRole::Builder), "rio-builders");
+        assert_eq!(sts_name("rio", ExecutorRole::Fetcher), "rio-fetcher");
+        assert_eq!(sts_name("rio", ExecutorRole::Builder), "rio-builder");
     }
 }

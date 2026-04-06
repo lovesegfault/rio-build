@@ -21,6 +21,7 @@ use rio_proto::types::GetSizeClassStatusResponse;
 
 use crate::crds::builderpool::BuilderPool;
 use crate::crds::builderpoolset::BuilderPoolSet;
+use crate::reconcilers::common::sts::{ExecutorRole, sts_name};
 
 use super::standalone::Autoscaler;
 use super::{
@@ -124,7 +125,7 @@ impl Autoscaler {
         );
 
         let key = pool_key(child);
-        let sts_name = format!("{child_name}-builders");
+        let sts_name = sts_name(&child_name, ExecutorRole::Builder);
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &wps_ns);
 
         // Current from STS (same pattern as scale_one — reconciler
@@ -280,7 +281,7 @@ mod tests {
             serde_json::json!({
                 "apiVersion": "apps/v1",
                 "kind": "StatefulSet",
-                "metadata": { "name": "test-wps-small-builders", "namespace": "rio" },
+                "metadata": { "name": "test-wps-small-builder", "namespace": "rio" },
                 "spec": { "replicas": 4 },
             })
             .to_string(),
@@ -293,7 +294,7 @@ mod tests {
         let patch = sts_replicas_patch(4);
         sts_api
             .patch(
-                "test-wps-small-builders",
+                "test-wps-small-builder",
                 &PatchParams::apply(WPS_AUTOSCALER_MANAGER).force(),
                 &Patch::Apply(&patch),
             )

@@ -963,18 +963,17 @@
 
                   # ── r[obs.metric.builder-util] dashboard regex ──────────────
                   # builder-utilization.json's cAdvisor queries select pods by
-                  # regex. The controller's STS naming is format!("{name}-builders")
-                  # (builderpool/mod.rs, scaling/per_class.rs) → pods named
-                  # {pool}-builders-{ordinal}. The pre-P0458 regex
-                  # "rio-builder.*" matched zero pods (panels blank). Assert
-                  # the -builders- infix so a future dashboard or controller
-                  # rename that desyncs the two fails here, not silently at
-                  # "why is this Grafana panel empty".
+                  # regex. STS naming is `sts_name()` = `{pool}-builder` →
+                  # pods `{pool}-builder-{ordinal}`; ephemeral Jobs use
+                  # `{pool}-builder-{6char}` (I-096). Assert the `-builder-`
+                  # infix so a future dashboard or controller rename that
+                  # desyncs the two fails here, not silently at "why is
+                  # this Grafana panel empty".
                   jq -r '.panels[].targets[]?.expr' \
                     ${./infra/helm/grafana/builder-utilization.json} \
                     | grep 'container_cpu_usage\|container_memory' \
-                    | grep -- '-builders-' >/dev/null \
-                    || { echo "FAIL: builder-utilization.json pod regex doesn't match controller STS naming ({pool}-builders-{N})" >&2; exit 1; }
+                    | grep -- '-builder-' >/dev/null \
+                    || { echo "FAIL: builder-utilization.json pod regex doesn't match controller naming ({pool}-builder-{N})" >&2; exit 1; }
 
                   # ── r[sec.psa.control-plane-restricted] bootstrap-job ───────
                   # P0460 missed bootstrap-job.yaml (default-off → CI never

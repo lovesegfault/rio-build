@@ -105,7 +105,7 @@
 #   semantics) end-to-end with completion-hook-produced rows.
 #
 # ctrl.drain.disruption-target — verify marker at default.nix:subtests[disruption-drain]
-#   disruption-drain submits a 120s-sleep build, evicts rio-builders-0
+#   disruption-drain submits a 120s-sleep build, evicts rio-builder-0
 #   via the K8s eviction API (sets status.conditions[DisruptionTarget]=
 #   True), and asserts the controller's watcher fires DrainWorker
 #   {force:true}. The pod self-drain (SIGTERM, force=false) is the
@@ -843,7 +843,7 @@ let
           # timeout=120: dispatch-lag variance (flannel subnet race
           # observed 2026-03-16 delaying worker pod start).
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${nsBuilders} get pod rio-builders-0 "
+              "k3s kubectl -n ${nsBuilders} get pod rio-builder-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -900,7 +900,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (non-DEBUG, last 2m) ===' >&2; "
-                  "k3s kubectl -n ${nsBuilders} logs rio-builders-0 --since=2m "
+                  "k3s kubectl -n ${nsBuilders} logs rio-builder-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true; "
                   "echo '=== DIAG: scheduler leader logs (cancel dispatch) ===' >&2; "
                   "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
@@ -975,7 +975,7 @@ let
           # `| grep .` fails on empty (find exits 0 on no-match) so
           # wait_until_succeeds retries.
           worker_node = k3s_server.succeed(
-              "k3s kubectl -n ${nsBuilders} get pod rio-builders-0 "
+              "k3s kubectl -n ${nsBuilders} get pod rio-builder-0 "
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
@@ -1016,7 +1016,7 @@ let
               ).strip()
               k3s_server.execute(
                   "echo '=== DIAG: worker logs (last 2m, non-DEBUG) ===' >&2; "
-                  "k3s kubectl -n ${nsBuilders} logs rio-builders-0 --since=2m "
+                  "k3s kubectl -n ${nsBuilders} logs rio-builder-0 --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
               )
               print(f"build-timeout DIAG: procs_after={procs_after} "
@@ -1044,7 +1044,7 @@ let
           # 9091 is the SCHEDULER's — original test copy-pasted the wrong port.
           worker_metrics = k3s_server.succeed(
               "k3s kubectl -n ${ns} get --raw "
-              "/api/v1/namespaces/${nsBuilders}/pods/rio-builders-0:9093/proxy/metrics"
+              "/api/v1/namespaces/${nsBuilders}/pods/rio-builder-0:9093/proxy/metrics"
           )
           timed_out_line = [
               l for l in worker_metrics.splitlines()
@@ -2557,7 +2557,7 @@ let
       # fires if running_builds was non-empty, which this test
       # arranges).
       #
-      # Runs LAST in core: the eviction deletes rio-builders-0. The
+      # Runs LAST in core: the eviction deletes rio-builder-0. The
       # STS recreates it (~120s FUSE-mount+warm), but core has no
       # subsequent subtests needing a ready worker.
 
@@ -2572,7 +2572,7 @@ let
       with subtest("disruption-drain: eviction → DisruptionTarget → DrainWorker force=true"):
           # Start a 120s build so running_builds is non-empty when
           # eviction hits. ssh-ng:// → gateway → SubmitBuild → Ready
-          # → dispatch to rio-builders-0 (the only worker). Back-
+          # → dispatch to rio-builder-0 (the only worker). Back-
           # grounded — script proceeds while build runs.
           client.execute(
               "nohup nix-build --no-out-link "
@@ -2591,7 +2591,7 @@ let
           )
           print("disruption-drain: build dispatched, triggering eviction")
 
-          # Evict rio-builders-0 via the K8s eviction subresource.
+          # Evict rio-builder-0 via the K8s eviction subresource.
           # This is what `kubectl drain` calls under the hood — but
           # targeted at ONE pod instead of draining a whole node (which
           # would evict scheduler/store too and destabilize the test).
@@ -2608,9 +2608,9 @@ let
           k3s_server.succeed(
               "printf '%s' "
               "'{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\","
-              "\"metadata\":{\"name\":\"rio-builders-0\",\"namespace\":\"${nsBuilders}\"}}' "
+              "\"metadata\":{\"name\":\"rio-builder-0\",\"namespace\":\"${nsBuilders}\"}}' "
               "| k3s kubectl create --raw "
-              "'/api/v1/namespaces/${nsBuilders}/pods/rio-builders-0/eviction' -f - "
+              "'/api/v1/namespaces/${nsBuilders}/pods/rio-builder-0/eviction' -f - "
               "|| true"
           )
 
@@ -2714,7 +2714,7 @@ let
           # before starting its own termination. v24/v25 showed pod-1
           # Terminating 4m44s with the old 7200s grace.
           k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get pod rio-builders-0 2>/dev/null",
+              "! k3s kubectl -n ${nsBuilders} get pod rio-builder-0 2>/dev/null",
               timeout=300,
           )
 
@@ -3010,7 +3010,7 @@ let
           # ── STS exists, owned by the CR ───────────────────────────────
           # Reconciler SSA-applies on CRD watch event. 30s margin for
           # the apply + k3s admission lag (same as pdb-ownerref above).
-          sts = "test-fp-fetchers"
+          sts = "test-fp-fetcher"
           k3s_server.wait_until_succeeds(
               f"k3s kubectl -n ${nsFetchers} get statefulset {sts}",
               timeout=30,

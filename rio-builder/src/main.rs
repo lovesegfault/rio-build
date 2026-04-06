@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         std::mem::take(&mut cfg.systems),
         std::mem::take(&mut cfg.features),
     )?;
+    validate_host_arch(cfg.executor_kind, &systems, &detect_system())?;
 
     let _root_guard =
         tracing::info_span!("builder", component = "builder", executor_id = %executor_id).entered();
@@ -924,6 +925,38 @@ fn resolve_executor_identity(
     Ok((executor_id, systems, features, ephemeral))
 }
 
+/// I-098: refuse to start when the host arch isn't in `RIO_SYSTEMS`.
+/// A BuilderPool with `systems=[x86_64-linux]` whose pod lands on an
+/// arm64 node would otherwise register as x86_64, accept x86_64 drvs,
+/// and have nix-daemon refuse them at build time. CrashLoopBackOff is
+/// the right shape — visible in `kubectl get pods`, doesn't poison drvs.
+///
+/// Fetchers skip this: FODs are `builtin` (arch-agnostic) so a fetcher
+/// on the "wrong" arch is fine — and intentional (cheaper Gravitons).
+/// `host` is a parameter (not `detect_system()` inline) for testability.
+fn validate_host_arch(
+    kind: rio_proto::types::ExecutorKind,
+    systems: &[String],
+    host: &str,
+) -> anyhow::Result<()> {
+    use rio_proto::types::ExecutorKind;
+    if kind == ExecutorKind::Fetcher {
+        return Ok(());
+    }
+    let mut non_builtin = systems.iter().filter(|s| s.as_str() != "builtin");
+    if non_builtin.clone().next().is_none() {
+        return Ok(());
+    }
+    if non_builtin.any(|s| s == host) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "host system {host:?} not in RIO_SYSTEMS={systems:?} — pod likely \
+         scheduled onto wrong-arch node. Fix the pool's nodeSelector or \
+         systems list."
+    )
+}
+
 /// cgroup v2 setup + background utilization reporter spawn.
 ///
 /// HARD REQUIREMENT — `?` on both delegated_root and
@@ -1176,6 +1209,39 @@ mod tests {
             store_addr: "http://localhost:9001".into(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn validate_host_arch_gates_builders_only() {
+        use rio_proto::types::ExecutorKind::{Builder, Fetcher};
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        // builder: host must be in systems (excluding builtin)
+        assert!(
+            validate_host_arch(Builder, &s(&["x86_64-linux", "builtin"]), "x86_64-linux").is_ok()
+        );
+        assert!(
+            validate_host_arch(Builder, &s(&["x86_64-linux", "builtin"]), "aarch64-linux").is_err(),
+            "I-098: arm64 host with x86_64-only RIO_SYSTEMS must refuse"
+        );
+        assert!(
+            validate_host_arch(
+                Builder,
+                &s(&["x86_64-linux", "aarch64-linux"]),
+                "aarch64-linux"
+            )
+            .is_ok(),
+            "multi-arch pool accepts either"
+        );
+        // builtin-only → no constraint (auto-detect path adds host first
+        // anyway, but defensive)
+        assert!(validate_host_arch(Builder, &s(&["builtin"]), "aarch64-linux").is_ok());
+
+        // fetcher: never validates (FODs are arch-agnostic)
+        assert!(
+            validate_host_arch(Fetcher, &s(&["x86_64-linux", "builtin"]), "aarch64-linux").is_ok(),
+            "fetcher on wrong arch is intentional (cheap Gravitons)"
+        );
     }
 
     #[test]

@@ -54,7 +54,7 @@ async fn apply_uses_server_side_apply() {
         Scenario::ok(
             http::Method::PATCH,
             "fieldManager=rio-controller",
-            serde_json::json!({"metadata":{"name":"test-pool-builders"}}).to_string(),
+            serde_json::json!({"metadata":{"name":"test-pool-builder"}}).to_string(),
         ),
         // PDB PATCH — same fieldManager assertion.
         Scenario::ok(
@@ -66,7 +66,7 @@ async fn apply_uses_server_side_apply() {
         // 404 → first-create → replicas set to min.
         Scenario {
             method: http::Method::GET,
-            path_contains: "/statefulsets/test-pool-builders",
+            path_contains: "/statefulsets/test-pool-builder",
             body_contains: None,
             status: 404,
             body_json: serde_json::json!({
@@ -79,7 +79,7 @@ async fn apply_uses_server_side_apply() {
             http::Method::PATCH,
             "fieldManager=rio-controller",
             serde_json::json!({
-                "metadata":{"name":"test-pool-builders"},
+                "metadata":{"name":"test-pool-builder"},
                 "status":{"replicas":0}
             })
             .to_string(),
@@ -124,13 +124,13 @@ async fn cleanup_tolerates_missing_statefulset() {
         // STS PATCH → 404. K8s 404 body is a Status object.
         Scenario {
             method: http::Method::PATCH,
-            path_contains: "/statefulsets/test-pool-builders",
+            path_contains: "/statefulsets/test-pool-builder",
             body_contains: None,
             status: 404,
             body_json: serde_json::json!({
                 "apiVersion":"v1","kind":"Status","status":"Failure",
                 "reason":"NotFound","code":404,
-                "message":"statefulsets.apps \"test-pool-builders\" not found"
+                "message":"statefulsets.apps \"test-pool-builder\" not found"
             })
             .to_string(),
         },
@@ -168,7 +168,7 @@ async fn cleanup_requeues_while_draining() {
     let sts_with = |replicas: i32| {
         serde_json::json!({
             "apiVersion":"apps/v1","kind":"StatefulSet",
-            "metadata":{"name":"test-pool-builders"},
+            "metadata":{"name":"test-pool-builder"},
             "status":{"replicas": replicas, "readyReplicas": 0}
         })
         .to_string()
@@ -182,7 +182,7 @@ async fn cleanup_requeues_while_draining() {
         ),
         Scenario::ok(
             http::Method::PATCH,
-            "/statefulsets/test-pool-builders",
+            "/statefulsets/test-pool-builder",
             sts_with(1),
         ),
         // Single GET: replicas=1 (pod still terminating).
@@ -191,7 +191,7 @@ async fn cleanup_requeues_while_draining() {
         // instead of looping inline.
         Scenario::ok(
             http::Method::GET,
-            "/statefulsets/test-pool-builders",
+            "/statefulsets/test-pool-builder",
             sts_with(1),
         ),
     ]);
@@ -219,7 +219,7 @@ async fn cleanup_completes_when_replicas_zero() {
     let sts_with = |replicas: i32| {
         serde_json::json!({
             "apiVersion":"apps/v1","kind":"StatefulSet",
-            "metadata":{"name":"test-pool-builders"},
+            "metadata":{"name":"test-pool-builder"},
             "status":{"replicas": replicas, "readyReplicas": 0}
         })
         .to_string()
@@ -233,12 +233,12 @@ async fn cleanup_completes_when_replicas_zero() {
         ),
         Scenario::ok(
             http::Method::PATCH,
-            "/statefulsets/test-pool-builders",
+            "/statefulsets/test-pool-builder",
             sts_with(0),
         ),
         Scenario::ok(
             http::Method::GET,
-            "/statefulsets/test-pool-builders",
+            "/statefulsets/test-pool-builder",
             sts_with(0),
         ),
     ]);
@@ -272,7 +272,7 @@ async fn cleanup_times_out_from_deletion_timestamp() {
     let sts_with = |replicas: i32| {
         serde_json::json!({
             "apiVersion":"apps/v1","kind":"StatefulSet",
-            "metadata":{"name":"test-pool-builders"},
+            "metadata":{"name":"test-pool-builder"},
             "status":{"replicas": replicas, "readyReplicas": 0}
         })
         .to_string()
@@ -286,7 +286,7 @@ async fn cleanup_times_out_from_deletion_timestamp() {
         ),
         Scenario::ok(
             http::Method::PATCH,
-            "/statefulsets/test-pool-builders",
+            "/statefulsets/test-pool-builder",
             sts_with(2),
         ),
         // replicas=2 (stuck pods) but deadline has passed.
@@ -294,7 +294,7 @@ async fn cleanup_times_out_from_deletion_timestamp() {
         // force-delete.
         Scenario::ok(
             http::Method::GET,
-            "/statefulsets/test-pool-builders",
+            "/statefulsets/test-pool-builder",
             sts_with(2),
         ),
     ]);

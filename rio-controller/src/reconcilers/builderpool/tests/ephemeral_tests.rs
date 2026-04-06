@@ -97,7 +97,7 @@ async fn try_spawn_job_classifies_api_error_as_failed() {
 
     let job = Job {
         metadata: kube::api::ObjectMeta {
-            name: Some("eph-pool-eph-abc123".into()),
+            name: Some("eph-pool-builder-abc123".into()),
             ..Default::default()
         },
         ..Default::default()
@@ -141,12 +141,12 @@ async fn try_spawn_job_classifies_409_as_name_collision() {
         "/namespaces/rio/jobs",
         409,
         "AlreadyExists",
-        "jobs.batch \"eph-pool-eph-abc123\" already exists",
+        "jobs.batch \"eph-pool-builder-abc123\" already exists",
     )]);
 
     let job = Job {
         metadata: kube::api::ObjectMeta {
-            name: Some("eph-pool-eph-abc123".into()),
+            name: Some("eph-pool-builder-abc123".into()),
             ..Default::default()
         },
         ..Default::default()
