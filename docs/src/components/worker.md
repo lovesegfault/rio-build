@@ -217,6 +217,10 @@ After build completes:
 
 ### Multi-Output Derivation Upload
 
+r[worker.upload.idempotent-precheck]
+
+Before uploading, the worker batch-checks all scanned outputs via `FindMissingPaths`. Outputs already present in the store (`'complete'` manifest exists) are skipped --- `QueryPathInfo` fetches the existing `nar_hash`/`nar_size` instead of re-reading disk + re-streaming the NAR. The skip is **best-effort**: if `FindMissingPaths` errors (store transient), all outputs fall back to the upload path and `r[store.put.idempotent]` catches duplicates server-side. The skip saves the pre-scan disk read, the NAR-stream disk read, and the gRPC stream setup --- NOT a correctness requirement. Emits `rio_worker_upload_skipped_idempotent_total` per skipped output.
+
 r[worker.upload.multi-output]
 Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a build completes:
 

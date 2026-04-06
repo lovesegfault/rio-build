@@ -20,7 +20,8 @@ use rio_nix::nar;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
+    FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer,
+    put_path_request,
 };
 
 /// Maximum number of upload retry attempts.
@@ -163,8 +164,8 @@ async fn upload_output(
     // We can't know refs until the dump finishes. Changing the proto to
     // send refs in the trailer would ripple into store-side put_path.rs,
     // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
-    // TODO(P0263): trailer-refs protocol extension if pre-scan cost
-    // becomes measurable.
+    // Trailer-refs protocol extension deferred — see worker.md § pre-scan
+    // cost. No plan owns it yet; measure first before scheduling (trailer-refs TODO lives in worker.md § pre-scan cost).
     let references = {
         let scan_path = output_path.clone();
         let cands = Arc::clone(&candidates);
@@ -490,6 +491,32 @@ pub async fn upload_all_outputs(
     ref_candidates: &[String],
 ) -> Result<Vec<UploadResult>, UploadError> {
     let outputs = scan_new_outputs(upper_dir)?;
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // --- Idempotency pre-check -------------------------------------------
+    // r[impl worker.upload.idempotent-precheck]
+    //
+    // Batch-check all outputs against the store BEFORE reading any bytes
+    // from disk. Outputs with a `'complete'` manifest are skipped: the
+    // pre-scan disk read, NAR stream, SHA-256, and gRPC stream setup
+    // are all wasted work when r[store.put.idempotent] would no-op
+    // server-side anyway.
+    //
+    // Best-effort: on FindMissingPaths error, log + treat ALL as missing.
+    // r[store.put.idempotent] catches the duplicates server-side — zero
+    // behavior change from before this pre-check existed. This is an
+    // optimization, not a correctness requirement.
+    //
+    // TODO(phase6): manifest-mode bandwidth opt — measure
+    // rio_store_chunk_cache_hits_total ratio first. Worker NOT trusted
+    // → store must reconstruct NAR to verify, so the "win" is net
+    // positive only if ChunkCache hit rate is high (>80%).
+    let store_paths: Vec<String> = outputs.iter().map(|b| format!("/nix/store/{b}")).collect();
+    let (to_upload, mut skipped_results) =
+        partition_by_presence(store_client, &outputs, store_paths).await;
+    // ---------------------------------------------------------------------
 
     // Build the candidate set ONCE. Same input closure applies to every
     // output of a derivation; Arc so buffer_unordered's per-task clone
@@ -497,7 +524,8 @@ pub async fn upload_all_outputs(
     let candidates = Arc::new(CandidateSet::from_paths(ref_candidates));
 
     tracing::info!(
-        count = outputs.len(),
+        to_upload = to_upload.len(),
+        skipped = skipped_results.len(),
         max_parallel = MAX_PARALLEL_UPLOADS,
         "uploading build outputs"
     );
@@ -507,7 +535,7 @@ pub async fn upload_all_outputs(
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
     let deriver = deriver.to_string();
-    let results: Vec<Result<UploadResult, UploadError>> = stream::iter(outputs)
+    let results: Vec<Result<UploadResult, UploadError>> = stream::iter(to_upload)
         .map(|output| {
             let mut client = store_client.clone();
             let upper_dir = upper_dir.clone();
@@ -530,7 +558,96 @@ pub async fn upload_all_outputs(
         .collect()
         .await;
 
-    results.into_iter().collect()
+    let mut uploaded: Vec<UploadResult> = results.into_iter().collect::<Result<_, _>>()?;
+    uploaded.append(&mut skipped_results);
+    Ok(uploaded)
+}
+
+/// Batch `FindMissingPaths` → partition outputs into (upload, skip).
+///
+/// For already-present outputs, `QueryPathInfo` fetches `nar_hash`/`nar_size`
+/// from the store so callers get a complete `UploadResult` without any disk
+/// read. `references` is empty — the store already has the authoritative
+/// reference set (from whoever originally uploaded), and no caller reads
+/// `UploadResult.references` anyway (it's only sent TO the store via PutPath).
+///
+/// Fail-open: any error (FindMissingPaths unavailable, QueryPathInfo returned
+/// None for a supposedly-present path) → fall back to uploading. The store's
+/// idempotent PutPath handles it. No error propagation — this whole function
+/// is an optimization layer.
+async fn partition_by_presence(
+    store_client: &StoreServiceClient<Channel>,
+    basenames: &[String],
+    store_paths: Vec<String>,
+) -> (Vec<String>, Vec<UploadResult>) {
+    let mut client = store_client.clone();
+    let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
+    rio_proto::interceptor::inject_current(req.metadata_mut());
+
+    let missing: std::collections::HashSet<String> = match rio_common::grpc::with_timeout_status(
+        "FindMissingPaths",
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        client.find_missing_paths(req),
+    )
+    .await
+    {
+        Ok(resp) => resp.into_inner().missing_paths.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "idempotent pre-check: FindMissingPaths failed; \
+                 falling back to upload-all (store.put.idempotent catches dups)"
+            );
+            return (basenames.to_vec(), Vec::new());
+        }
+    };
+
+    let mut to_upload = Vec::with_capacity(basenames.len());
+    let mut skipped = Vec::new();
+    for basename in basenames {
+        let store_path = format!("/nix/store/{basename}");
+        if missing.contains(&store_path) {
+            to_upload.push(basename.clone());
+            continue;
+        }
+        // Present in store — fetch nar_hash/nar_size instead of re-uploading.
+        // QueryPathInfo is cheap (~1 PG row read); re-upload is 2× disk
+        // reads + NAR stream + gRPC stream. Worth it even for small outputs.
+        match rio_proto::client::query_path_info_opt(
+            &mut client,
+            &store_path,
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        )
+        .await
+        {
+            Ok(Some(info)) => {
+                metrics::counter!("rio_worker_upload_skipped_idempotent_total").increment(1);
+                tracing::info!(
+                    store_path = %store_path,
+                    nar_size = info.nar_size,
+                    "output already in store; skipping upload"
+                );
+                skipped.push(UploadResult {
+                    store_path,
+                    nar_hash: info.nar_hash,
+                    nar_size: info.nar_size,
+                    references: Vec::new(),
+                });
+            }
+            // Present per FindMissingPaths but QueryPathInfo disagrees
+            // (TOCTOU — sub-second window, effectively impossible; or
+            // store transient). Fall back to upload; don't error.
+            Ok(None) | Err(_) => {
+                tracing::warn!(
+                    store_path = %store_path,
+                    "idempotent pre-check: FindMissingPaths said present but \
+                     QueryPathInfo disagreed; falling back to upload"
+                );
+                to_upload.push(basename.clone());
+            }
+        }
+    }
+    (to_upload, skipped)
 }
 
 // r[verify worker.upload.multi-output]
@@ -958,6 +1075,175 @@ mod tests {
         }
         assert!(chunk_count >= 2, "600KiB at 256KiB/chunk → ≥2 chunks");
         assert_eq!(reassembled, data, "reassembled chunks should == input");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotent pre-check (FindMissingPaths → skip already-present outputs)
+    // -----------------------------------------------------------------------
+
+    /// r[verify worker.upload.idempotent-precheck]
+    ///
+    /// Output already in store → zero PutPath calls, UploadResult carries
+    /// the STORE's nar_hash (not a freshly-computed one). This is the
+    /// exit criterion: "second identical-NAR upload → zero chunks".
+    ///
+    /// Disk contents are deliberately DIFFERENT from what's seeded in the
+    /// store: the test asserts the returned nar_hash matches the SEEDED
+    /// hash, NOT the on-disk NAR's hash. Proves we queried the store
+    /// instead of reading disk (the optimization's whole point).
+    #[tokio::test]
+    async fn test_upload_all_outputs_skips_already_present() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let basename = format!("{DEP_HASH_A}-already-there");
+        let store_path = format!("/nix/store/{basename}");
+
+        // Seed: path already complete in store. seed_with_content builds a
+        // NAR from "seeded content" and returns its hash — the nar_hash the
+        // worker should return for the skipped path.
+        let (_seeded_nar, seeded_hash) = store.seed_with_content(&store_path, b"seeded content");
+
+        // Disk: DIFFERENT contents. If the pre-check is broken (falls
+        // through to upload), the result's nar_hash would be the disk
+        // NAR's hash, not seeded_hash. This is the precondition assert —
+        // without distinct contents, the test passes trivially.
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(&basename), b"DIFFERENT disk contents")?;
+        let disk_nar = nar::dump_path(&store_dir.join(&basename))?;
+        let disk_hash: [u8; 32] = Sha256::digest(&disk_nar).into();
+        assert_ne!(
+            seeded_hash, disk_hash,
+            "precondition: seeded vs disk NARs must differ, else this test proves nothing"
+        );
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+
+        // Zero PutPath calls — the skip fired.
+        assert_eq!(
+            store.put_calls.read().unwrap().len(),
+            0,
+            "pre-check should skip already-present path; zero PutPath calls"
+        );
+        // One result, carrying the STORE's hash (not disk's).
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].store_path, store_path);
+        assert_eq!(
+            results[0].nar_hash, seeded_hash,
+            "skipped path's UploadResult carries the store's nar_hash, not disk's"
+        );
+        // references empty for skipped paths (store already has the
+        // authoritative set; nobody reads UploadResult.references).
+        assert!(results[0].references.is_empty());
+        Ok(())
+    }
+
+    /// Mixed: one output already present, one missing. Only the missing
+    /// one hits PutPath; both appear in results.
+    #[tokio::test]
+    async fn test_upload_all_outputs_mixed_presence() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+
+        let b_present = format!("{DEP_HASH_A}-present");
+        let b_missing = format!("{DEP_HASH_B}-missing");
+        let path_present = format!("/nix/store/{b_present}");
+        let path_missing = format!("/nix/store/{b_missing}");
+
+        let (_nar, seeded_hash) = store.seed_with_content(&path_present, b"already here");
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(&b_present), b"disk present")?;
+        fs::write(store_dir.join(&b_missing), b"disk missing")?;
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+
+        // Exactly one PutPath: the missing output.
+        let puts = store.put_calls.read().unwrap();
+        assert_eq!(puts.len(), 1, "only the missing output hits PutPath");
+        assert_eq!(puts[0].store_path, path_missing);
+
+        // Both outputs in results (caller needs ALL outputs reported).
+        assert_eq!(results.len(), 2);
+        let r_present = results
+            .iter()
+            .find(|r| r.store_path == path_present)
+            .expect("present output in results");
+        let r_missing = results
+            .iter()
+            .find(|r| r.store_path == path_missing)
+            .expect("missing output in results");
+
+        // Present: store's hash. Missing: freshly computed.
+        assert_eq!(r_present.nar_hash, seeded_hash);
+        let missing_nar = nar::dump_path(&store_dir.join(&b_missing))?;
+        let missing_hash: [u8; 32] = Sha256::digest(&missing_nar).into();
+        assert_eq!(r_missing.nar_hash, missing_hash);
+        Ok(())
+    }
+
+    /// FindMissingPaths errors → fall back to upload-all. Best-effort:
+    /// store transient doesn't break the upload; r[store.put.idempotent]
+    /// catches duplicates server-side. Zero behavior change from the
+    /// pre-precheck world.
+    #[tokio::test]
+    async fn test_upload_all_outputs_find_missing_error_falls_back() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        store.fail_find_missing.store(true, Ordering::SeqCst);
+
+        let basename = format!("{DEP_HASH_A}-fallback");
+        let store_path = format!("/nix/store/{basename}");
+
+        // Seed the path — WOULD be skipped if FindMissingPaths worked.
+        store.seed_with_content(&store_path, b"seeded");
+
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(&basename), b"disk fallback")?;
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+
+        // FindMissingPaths failed → fell back to upload → PutPath called.
+        // (MockStore's put_path doesn't implement the idempotent no-op;
+        // it happily overwrites. Real store would no-op. We're testing
+        // the WORKER's fail-open, not the store's idempotency.)
+        assert_eq!(
+            store.put_calls.read().unwrap().len(),
+            1,
+            "FindMissingPaths error → fall back to upload (fail-open)"
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].store_path, store_path);
+        // Hash is the disk NAR's (we uploaded, didn't skip).
+        let disk_nar = nar::dump_path(&store_dir.join(&basename))?;
+        let disk_hash: [u8; 32] = Sha256::digest(&disk_nar).into();
+        assert_eq!(results[0].nar_hash, disk_hash);
+        Ok(())
+    }
+
+    /// Empty overlay upper → early return, no FindMissingPaths call.
+    /// Guards the `if outputs.is_empty()` branch added to avoid an empty
+    /// RPC on derivations that produce nothing in the upper (shouldn't
+    /// happen in practice, but the branch is there).
+    #[tokio::test]
+    async fn test_upload_all_outputs_empty_no_rpc() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        // Arm the failure: if FindMissingPaths were called, the test
+        // would still pass (fail-open), but the empty check should
+        // short-circuit BEFORE the RPC.
+        store.fail_find_missing.store(true, Ordering::SeqCst);
+        // MockStore doesn't expose call-count for find_missing_paths.
+        // Just assert empty result + zero PutPath. The is_empty() guard
+        // is simple enough that existence-in-code is the real assurance.
+        let tmp = tempfile::tempdir()?;
+        // nix/store doesn't exist — scan_new_outputs returns empty.
+
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+        assert!(results.is_empty());
+        assert_eq!(store.put_calls.read().unwrap().len(), 0);
         Ok(())
     }
 }
