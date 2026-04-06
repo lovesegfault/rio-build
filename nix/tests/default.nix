@@ -64,6 +64,7 @@ let
   leader-election = import ./scenarios/leader-election.nix;
   cli = import ./scenarios/cli.nix;
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
+  dashboard = import ./scenarios/dashboard.nix;
   fod-proxy = import ./scenarios/fod-proxy.nix;
   netpol = import ./scenarios/netpol.nix;
   chaos = import ./scenarios/chaos.nix;
@@ -560,5 +561,28 @@ in
         "networkPolicy.enabled" = "true";
       };
     };
+  };
+}
+# r[verify dash.journey.build-to-logs]
+#   nginx → Envoy Gateway → scheduler chain end-to-end. Four curl
+#   assertions against the rio-dashboard Service (the nginx pod the
+#   browser actually talks to, not the envoy Service directly):
+#     SPA served (id="app") + SPA routing fallback (try_files) +
+#     unary gRPC-Web 0x00 + streaming 0x80 trailer THROUGH nginx's
+#     proxy_buffering-off location block.
+#   vm-dashboard-gateway-k3s proves the envoy half; this proves the
+#   nginx half AND the full chain. ~6min (same fixture cost).
+#
+# optionalAttrs gate: dockerImages.dashboard doesn't exist in
+# coverage mode (mkDockerImages passes rioDashboard=null → docker.nix
+# elides the attr). Gating the scenario registration on `?` keeps
+# vmTestsCov consistent — the coverage pipeline never sees this test,
+# perTestLcov doesn't include it, codecov after_n_builds stays at
+# its current count. (The nginx pod has no LLVM instrumentation
+# anyway — coverage would yield zero profraws.)
+// pkgs.lib.optionalAttrs (dockerImages ? dashboard) {
+  vm-dashboard-k3s = dashboard {
+    inherit pkgs common;
+    fixture = k3sFull { envoyGatewayEnabled = true; };
   };
 }
