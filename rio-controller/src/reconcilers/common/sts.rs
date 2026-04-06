@@ -272,9 +272,11 @@ pub fn build_executor_pod_spec(
     let labels = executor_labels(p);
     let spread_enabled = p.topology_spread.unwrap_or(true);
     let privileged = p.privileged;
-    // Localhost seccomp: profile lives on node disk, delivered by a
-    // DaemonSet initContainer. A wait-seccomp initContainer blocks
-    // until it appears. Gated on !privileged (privileged disables
+    // Localhost seccomp: profile lives on node disk, reconciled there
+    // by security-profiles-operator's spod DaemonSet from the cluster-
+    // scoped SeccompProfile CR. A wait-seccomp initContainer blocks
+    // until it appears (spod may schedule after this pod on a fresh
+    // Karpenter node). Gated on !privileged (privileged disables
     // seccomp at runtime, so the wait would be dead weight).
     let seccomp_localhost = (!privileged)
         .then_some(p.seccomp_profile.as_ref())
@@ -300,12 +302,11 @@ pub fn build_executor_pod_spec(
                     "/bin/sh".into(),
                     "-c".into(),
                     // `test -s` (non-empty), not `test -f` (exists):
-                    // seccomp-installer DS uses atomic cp+mv but a
-                    // killed DS pod could leave a partial. A truncated
-                    // profile loads with a partial ALLOW list →
-                    // cryptic EACCES on syscalls that should be
-                    // allowed, persisting until a new image forces a
-                    // new cgroup path.
+                    // SPO's spod writes via tmp+rename (saveProfileOnDisk
+                    // → atomic.WriteFile) so a partial is unlikely, but
+                    // a truncated profile loads with a partial ALLOW
+                    // list → cryptic EACCES persisting until a new
+                    // cgroup path. -s costs nothing.
                     format!(
                         "until test -s /host-seccomp/{profile}; do \
                          echo 'waiting for seccomp profile {profile}...'; \
@@ -726,7 +727,7 @@ fn build_executor_container(
 /// Translate CRD `SeccompProfileKind` → k8s-openapi `SeccompProfile`.
 /// `None` and unknown types → `RuntimeDefault` (fail-closed — never
 /// fall through to Unconfined on a typo).
-// r[impl builder.seccomp.localhost-profile]
+// r[impl builder.seccomp.localhost-profile+2]
 pub fn build_seccomp_profile(kind: Option<&SeccompProfileKind>) -> SeccompProfile {
     match kind.map(|k| k.type_.as_str()) {
         Some("Localhost") => SeccompProfile {

@@ -23,4 +23,11 @@
   # Karpenter chart (AWS provider, OCI-published). Must stay within
   # the EKS module's karpenter submodule compat range (~> 21.0).
   karpenter_version = "1.10.0";
+
+  # security-profiles-operator. NOT a tofu-managed helm release: SPO
+  # stopped publishing chart tarballs after v0.7.1 (only the in-repo
+  # deploy/helm/ exists). The static deploy/operator.yaml is vendored
+  # at infra/k8s/security-profiles-operator.yaml; bump = re-download
+  # from this tag. Requires cert-manager (above).
+  spo_version = "v0.10.0";
 }

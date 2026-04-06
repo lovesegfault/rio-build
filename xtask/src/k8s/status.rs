@@ -50,9 +50,12 @@ pub struct Report {
     /// I-021/I-022 signal — Karpenter blocked on ResourceNotRegistered,
     /// InsufficientCapacity, etc.
     stuck_nodeclaims: Vec<StuckNodeClaim>,
-    /// Nodes where the seccomp-installer DaemonSet pod is non-Running
-    /// over 2min. The I-020 signal — these are dead weight (typically
-    /// IP-starved); cordon + delete NodeClaim lets Karpenter reprovision.
+    /// Nodes where the SPO spod DaemonSet pod is non-Running over 2min.
+    /// The I-020 signal — these are dead weight (typically IP-starved);
+    /// cordon + delete NodeClaim lets Karpenter reprovision. spod is the
+    /// node-health canary because (a) it schedules on every builder/
+    /// fetcher node and (b) builder pods block in wait-seccomp until it
+    /// reconciles the profile, so a stuck spod = stuck builders.
     stuck_nodes: Vec<StuckNode>,
     /// Scheduler Prometheus scrape via port-forward (leader pod :9091).
     /// The I-025 signal — fod_queue_depth + fetcher_utilization.
@@ -422,20 +425,16 @@ async fn gather_stuck_nodeclaims(client: &k::Client) -> Vec<StuckNodeClaim> {
     out
 }
 
-/// Nodes where the seccomp-installer DS pod is non-Running >2min.
-/// Maps pod.spec.nodeName → NodeClaim by iterating NodeClaims and
-/// matching .status.nodeName (None if the node is managed-NG, not
-/// Karpenter).
+/// Nodes where the SPO spod DS pod is non-Running >2min. Maps
+/// pod.spec.nodeName → NodeClaim by iterating NodeClaims and matching
+/// .status.nodeName (None if the node is managed-NG, not Karpenter).
 async fn gather_stuck_nodes(
     client: &k::Client,
     node_ips: &HashMap<String, (String, bool)>,
 ) -> Vec<StuckNode> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS_BUILDERS);
-    let Ok(pods) = pods
-        .list(&ListParams::default().labels("app.kubernetes.io/name=rio-seccomp-installer"))
-        .await
-    else {
-        debug!("seccomp-installer pod list failed");
+    let pods: Api<Pod> = Api::namespaced(client.clone(), "security-profiles-operator");
+    let Ok(pods) = pods.list(&ListParams::default().labels("name=spod")).await else {
+        debug!("spod pod list failed");
         return Vec::new();
     };
 
@@ -987,7 +986,7 @@ fn render_human(r: &Report) {
 
     if !r.stuck_nodes.is_empty() {
         eprintln!();
-        header("Stuck Nodes (seccomp-installer non-Running >2min)");
+        header("Stuck Nodes (spod non-Running >2min)");
         let w = r
             .stuck_nodes
             .iter()

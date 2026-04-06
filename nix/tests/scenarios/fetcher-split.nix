@@ -6,10 +6,10 @@
 #
 # Fixture gotchas — fetcher pods have NO privileged escape hatch (hard-
 # coded false at reconcilers/fetcherpool/mod.rs:237) AND a hard-coded
-# Localhost seccomp (profiles/rio-fetcher.json, :241). To get a RUNNING
+# Localhost seccomp (operator/rio-fetcher.json, :241). To get a RUNNING
 # fetcher pod in the airgap VM:
 #   - seccomp profile pre-installed on both nodes via testScript mkdir+cp
-#     (seccompInstaller DS's busybox image not in the airgap set)
+#     (security-profiles-operator + cert-manager images not in the airgap set)
 #   - device-plugin path enabled (vmtest-full-nonpriv.yaml overlay +
 #     pulled.smarter-device-manager extraImage) — same as
 #     vm-security-nonpriv-k3s
@@ -52,9 +52,9 @@ let
 
   inherit (fixture) nsBuilders nsFetchers ns;
 
-  # Seccomp profiles from the chart's files/. Same JSON the
-  # seccompInstaller DS would deliver — we cp it directly since the
-  # DS's busybox image isn't in the airgap set.
+  # Seccomp profiles from the chart's files/. Same JSON the SPO
+  # SeccompProfile CRs render from — we cp directly since SPO +
+  # cert-manager images aren't in the airgap set.
   seccompFetcher = ../../../infra/helm/rio-build/files/seccomp-rio-fetcher.json;
   seccompBuilder = ../../../infra/helm/rio-build/files/seccomp-rio-builder.json;
 
@@ -95,16 +95,17 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
 
     # ── Seccomp profiles on both nodes ────────────────────────────────
-    # Fetcher reconciler hard-codes Localhost/rio-fetcher.json
-    # (fetcherpool/mod.rs:241). seccompInstaller DS would deliver it
-    # but its busybox image isn't airgapped. cp directly — same JSON,
-    # same kubelet-relative path. Both profiles: nonpriv overlay flips
-    # builderPool to Localhost/rio-builder.json too.
+    # Fetcher reconciler hard-codes Localhost operator/rio-fetcher.json
+    # (fetcherpool/mod.rs:254). SPO's spod DaemonSet would reconcile it
+    # there but SPO + cert-manager aren't airgapped. cp directly — same
+    # JSON, same kubelet-relative path SPO writes (cluster-scoped CR →
+    # operator/{name}.json, no namespace component). Both profiles:
+    # nonpriv overlay flips builderPool to Localhost too.
     for n in [k3s_server, k3s_agent]:
         n.succeed(
-            "mkdir -p /var/lib/kubelet/seccomp/profiles && "
-            "cp ${seccompFetcher} /var/lib/kubelet/seccomp/profiles/rio-fetcher.json && "
-            "cp ${seccompBuilder} /var/lib/kubelet/seccomp/profiles/rio-builder.json"
+            "mkdir -p /var/lib/kubelet/seccomp/operator && "
+            "cp ${seccompFetcher} /var/lib/kubelet/seccomp/operator/rio-fetcher.json && "
+            "cp ${seccompBuilder} /var/lib/kubelet/seccomp/operator/rio-builder.json"
         )
 
     # ── Label k3s-agent as the dedicated fetcher node ─────────────────

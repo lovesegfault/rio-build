@@ -19,6 +19,9 @@ rio-proto = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+# buffer_unordered for level-batched .drv resolution in translate.rs
+# (P0539 — was ~200ms × N sequential RTTs to rio-store).
+futures-util = { workspace = true }
 tonic = { workspace = true }
 # grpc.health.v1.Health for K8s readiness probes. Gateway's main
 # protocol is SSH (russh, no tonic server), so we spawn a separate

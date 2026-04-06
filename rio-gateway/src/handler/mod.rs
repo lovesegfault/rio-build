@@ -604,6 +604,86 @@ pub(crate) async fn resolve_derivation(
     Ok(drv)
 }
 
+/// Max in-flight `GetPath` calls during BFS .drv resolution. The store's
+/// `inline_blob` reads are tiny (.drv NARs are KB-range) so the bound is
+/// mostly to cap connection-pool fan-out, same rationale as the
+/// scheduler's `DEFAULT_SUBSTITUTE_CONCURRENCY`. 32 matches I-052's
+/// `wopAddMultipleToStore` pipeline depth.
+pub(crate) const BFS_FETCH_CONCURRENCY: usize = 32;
+
+/// Batch counterpart to [`resolve_derivation`] for the BFS in
+/// `translate::reconstruct_dag`. Fires up to [`BFS_FETCH_CONCURRENCY`]
+/// concurrent `GetPath` calls for the cache MISSES in `paths`, parses
+/// each NAR, inserts into `drv_cache`, and returns `(StorePath,
+/// Derivation)` for EVERY requested path (hits and freshly fetched) so
+/// the caller can enqueue the next BFS level without re-probing the
+/// cache. Order is NOT preserved (buffer_unordered) — the BFS only needs
+/// the set.
+///
+/// P0539: the per-child `resolve_derivation().await` in the old BFS was
+/// ~1085 sequential RTTs to rio-store for a hello-shallow closure
+/// (~210s). Level-batching collapses that to roughly DAG-depth ×
+/// ceil(level-width / 32) RTTs.
+///
+/// Same anonymous-lookup semantics as [`resolve_derivation`] (no JWT —
+/// `.drv`s are build inputs).
+pub(crate) async fn resolve_derivations_batch(
+    paths: Vec<StorePath>,
+    store_client: &StoreServiceClient<Channel>,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<Vec<(StorePath, Derivation)>> {
+    use futures_util::{StreamExt, stream};
+
+    let mut resolved = Vec::with_capacity(paths.len());
+    let mut to_fetch = Vec::new();
+    for p in paths {
+        match drv_cache.get(&p) {
+            Some(d) => resolved.push((p, d.clone())),
+            None => to_fetch.push(p),
+        }
+    }
+    if to_fetch.is_empty() {
+        return Ok(resolved);
+    }
+
+    // tonic clients are cheap clones over a shared Channel; each
+    // concurrent task gets its own clone so calls don't serialize on a
+    // &mut. Results stream back unordered.
+    let mut fetched: Vec<(StorePath, Derivation)> = stream::iter(to_fetch)
+        .map(|sp| {
+            let mut client = store_client.clone();
+            async move {
+                let (_info, nar) = grpc_get_path(&mut client, None, sp.as_str())
+                    .await?
+                    .ok_or_else(|| GatewayError::DerivationNotFound(sp.to_string()))?;
+                let drv = Derivation::parse_from_nar(&nar).map_err(|e| {
+                    GatewayError::DerivationParse {
+                        path: sp.to_string(),
+                        msg: e.to_string(),
+                    }
+                })?;
+                Ok::<_, anyhow::Error>((sp, drv))
+            }
+        })
+        .buffer_unordered(BFS_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<anyhow::Result<_>>()?;
+
+    for (sp, drv) in &fetched {
+        if !insert_drv_bounded(drv_cache, sp.clone(), drv.clone()) {
+            return Err(GatewayError::DrvCacheFull {
+                count: drv_cache.len(),
+                cap: crate::translate::max_transitive_inputs(),
+            }
+            .into());
+        }
+    }
+    resolved.append(&mut fetched);
+    Ok(resolved)
+}
+
 // ---------------------------------------------------------------------------
 // Submodules (defined AFTER stderr_err! macro so it is visible to them)
 // ---------------------------------------------------------------------------

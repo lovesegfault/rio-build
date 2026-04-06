@@ -248,10 +248,12 @@ fn executor_params(fp: &FetcherPool) -> Result<ExecutorStsParams> {
         privileged: false,
         // ADR-019 §Sandbox hardening: stricter Localhost profile
         // with extra denies (ptrace/bpf/setns/process_vm_*/keyctl/
-        // add_key).
+        // add_key). The SeccompProfile CR is cluster-scoped (SPO
+        // ≥0.9.0), so the path is operator/{name}.json with no
+        // namespace component.
         seccomp_profile: Some(SeccompProfileKind {
             type_: "Localhost".into(),
-            localhost_profile: Some("profiles/rio-fetcher.json".into()),
+            localhost_profile: Some("operator/rio-fetcher.json".into()),
         }),
         host_network: None,
         host_users: fp.spec.host_users,
@@ -337,7 +339,7 @@ mod tests {
         assert_eq!(sp.type_, "Localhost");
         assert_eq!(
             sp.localhost_profile.as_deref(),
-            Some("profiles/rio-fetcher.json")
+            Some("operator/rio-fetcher.json")
         );
     }
 

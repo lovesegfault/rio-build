@@ -53,17 +53,17 @@ builderPool:
   #   4. seccomp=Unconfined WITH /proc-remount+ambient: PASSES
   #
   # Production (EKS/GKE): Localhost seccomp profile (RuntimeDefault +
-  # pivot_root − ptrace/bpf/setns) delivered by the seccompInstaller DS
-  # — the chart default. Unconfined here is test-only: the busybox
-  # installer image isn't in the airgap set, and wiring a hostPath
-  # profile drop into the VM fixture isn't worth the test-surface for
-  # what the EKS smoke test already covers end-to-end.
+  # pivot_root − ptrace/bpf/setns) distributed via SeccompProfile CR
+  # — the chart default. Unconfined here is test-only: the SPO +
+  # cert-manager images aren't in the airgap set, and wiring those
+  # into the VM fixture isn't worth the test-surface for what the EKS
+  # smoke test already covers end-to-end.
   seccompProfile:
     type: Unconfined
     # null clears the deep-merged default (values.yaml sets
-    # localhostProfile: profiles/rio-builder.json alongside
+    # localhostProfile: operator/rio-builder.json alongside
     # type: Localhost). Without this, Helm merges to {type:
-    # Unconfined, localhostProfile: profiles/...} which the
+    # Unconfined, localhostProfile: operator/...} which the
     # BuilderPool CRD's CEL rule rejects (localhostProfile
     # allowed iff type==Localhost). Same Helm-null-deletes-
     # key semantics as nodeSelector:null below.

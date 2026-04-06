@@ -768,7 +768,7 @@ in
   # Fetcher pod needs the nonpriv path (hard-coded privileged:false +
   # Localhost seccomp at reconcilers/fetcherpool/mod.rs) — same
   # device-plugin overlay as vm-security-nonpriv-k3s. Seccomp profile
-  # delivered at runtime by testScript (seccompInstaller DS busybox
+  # delivered at runtime by testScript (security-profiles-operator
   # not airgapped). fetcherPool enabled via extraValues with name=
   # "default" (matches builderPool naming → pod default-fetchers-0)
   # and image=rio-all (same aggregate image all pods use). Systems

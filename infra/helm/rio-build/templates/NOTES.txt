@@ -25,21 +25,21 @@ Verify:
   — should show {{ .Values.devicePlugin.fuseMaxDevices }} on builder nodes.
 {{- end }}
 
-{{- if and (not .Values.builderPool.privileged) .Values.seccompInstaller.enabled }}
+{{- if and (not .Values.builderPool.privileged) .Values.securityProfilesOperator.enabled }}
 
-── Seccomp Localhost profile ──────────────────────────────────────────
-The rio-seccomp-installer DaemonSet delivers the rio-builder profile to
-/var/lib/kubelet/seccomp/profiles/rio-builder.json on every builder node.
+── Seccomp Localhost profile (security-profiles-operator) ─────────────
+SeccompProfile CRs (rio-builder, rio-fetcher) are reconciled by SPO's
+spod DaemonSet to /var/lib/kubelet/seccomp/operator/{name}.json.
 Builder pods use seccompProfile: Localhost (RuntimeDefault + pivot_root
 − ptrace/bpf/setns/process_vm_*).
 
 Verify:
-  kubectl -n {{ .Values.namespace.name }} get ds rio-seccomp-installer
-  kubectl -n {{ .Values.namespace.name }} get pod -l app.kubernetes.io/name=rio-seccomp-installer
+  kubectl get seccompprofile rio-builder rio-fetcher
+  kubectl -n security-profiles-operator get ds spod
 
-Builder pods may briefly show ContainerCreating on a fresh node until
-the DS initContainer drops the file (seconds). See docs/src/security.md
-r[worker.seccomp.localhost-profile].
+Builder pods on fresh nodes may briefly wait in the wait-seccomp init
+container until spod reconciles the profile (seconds). See
+docs/src/security.md r[worker.seccomp.localhost-profile].
 {{- end }}
 
 {{- if .Values.builderPool.privileged }}

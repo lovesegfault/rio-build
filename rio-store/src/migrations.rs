@@ -300,6 +300,36 @@ pub const M_026: () = ();
 // r[impl store.key.rotation-cluster-history]
 pub const M_027: () = ();
 
+/// `migrations/028_drop_derivations_fks.sql`
+///
+/// Drop the three FKs referencing `derivations(derivation_id)` from
+/// `derivation_edges` (parent_id, child_id) and `build_derivations`
+/// (derivation_id). [P0539] perf — `persist_merge_to_db` for a
+/// 1085-node closure spent ~20s in FK validation.
+///
+/// ## Why drop instead of DEFERRABLE
+///
+/// `DEFERRABLE INITIALLY DEFERRED` moves the per-row trigger to
+/// COMMIT but still does N PK lookups. The DAG actor is the SOLE
+/// writer (`persist_merge_to_db`, `merge.rs:616-674`): one tx that
+/// inserts derivations first (line 619) then edges/build_derivations
+/// referencing the just-returned `id_map`. Referential integrity is
+/// structural in that code path; the FK check is redundant validation
+/// of UUIDs the application just round-tripped from the same tx.
+///
+/// ## What's NOT dropped
+///
+/// `build_derivations.build_id_fkey` (→ `builds`, `ON DELETE CASCADE`
+/// since migration 008) is kept. `delete_build` (`db/builds.rs:178`)
+/// relies on the cascade for `cleanup_failed_merge` rollback.
+///
+/// `assignments.derivation_id_fkey` is also untouched — assignments
+/// are inserted one-at-a-time on dispatch, not in the merge batch hot
+/// path.
+///
+/// [P0539]: ../../../.stress-test/issues/2026-03-31-stress-findings.md
+pub const M_028: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

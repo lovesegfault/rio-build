@@ -455,10 +455,10 @@ pub struct SeccompProfileKind {
 
     /// Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
     /// `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
-    /// rio's profile is `rio-builder.json` — install the file at
-    /// `/var/lib/kubelet/seccomp/rio-builder.json` on every node
-    /// BEFORE applying the BuilderPool, or the pod fails
-    /// CreateContainerError.
+    /// rio's profiles are distributed via cluster-scoped
+    /// `SeccompProfile` CRs (security-profiles-operator) and land at
+    /// `operator/{name}.json`; the chart's default builderPool value
+    /// is `operator/rio-builder.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localhost_profile: Option<String>,
 }

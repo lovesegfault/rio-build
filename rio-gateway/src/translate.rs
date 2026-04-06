@@ -5,7 +5,7 @@
 //! the full derivation graph.
 // r[impl gw.dag.reconstruct]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use rio_common::tenant::NormalizedName;
@@ -29,7 +29,7 @@ const MAX_INLINE_DRV_BYTES: usize = 64 * 1024;
 /// still a huge win over inlining zero.
 const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
-use crate::handler::{ClientOptions, resolve_derivation};
+use crate::handler::{ClientOptions, resolve_derivations_batch};
 
 /// Default cap on transitive input derivations resolved per build (DoS guard).
 /// 100k store-path strings × ~80 bytes/path ≈ 8 MB per session — bounds memory
@@ -80,65 +80,82 @@ pub async fn reconstruct_dag(
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<(StorePath, Derivation)> = VecDeque::new();
 
+    // Level-batched BFS (P0539). The old per-child
+    // `resolve_derivation().await` was N sequential RTTs to rio-store
+    // (~210s for a 1085-node closure). Processing one BFS level at a
+    // time lets us fire all of that level's cache-miss `GetPath` calls
+    // concurrently via [`resolve_derivations_batch`]. Same node/edge set
+    // as the old walk; only fetch latency changes.
     visited.insert(root_path.to_string());
-    queue.push_back((root_path.clone(), root_drv.clone()));
+    let mut current: Vec<(StorePath, Derivation)> = vec![(root_path.clone(), root_drv.clone())];
 
+    let cap = max_transitive_inputs();
     let mut count = 0usize;
+    let mut levels = 0usize;
+    let mut fetched = 0usize;
 
-    while let Some((drv_path, drv)) = queue.pop_front() {
-        count += 1;
-        let cap = max_transitive_inputs();
-        if count > cap {
-            return Err(anyhow::anyhow!(
-                "transitive input limit exceeded: {count} derivations \
-                 (max {cap}; raise RIO_MAX_TRANSITIVE_INPUTS to allow larger DAGs)"
-            ));
-        }
+    while !current.is_empty() {
+        levels += 1;
+        let mut frontier: Vec<StorePath> = Vec::new();
 
-        let node = derivation_to_node(&drv_path, &drv);
-        nodes.push(node);
+        for (drv_path, drv) in current.drain(..) {
+            count += 1;
+            if count > cap {
+                return Err(anyhow::anyhow!(
+                    "transitive input limit exceeded: {count} derivations \
+                     (max {cap}; raise RIO_MAX_TRANSITIVE_INPUTS to allow larger DAGs)"
+                ));
+            }
+            nodes.push(derivation_to_node(&drv_path, &drv));
 
-        for child_path_str in drv.input_drvs().keys() {
-            // Create edge: parent depends on child
-            edges.push(types::DerivationEdge {
-                parent_drv_path: drv_path.to_string(),
-                child_drv_path: child_path_str.clone(),
-            });
-
-            if visited.insert(child_path_str.clone()) {
-                // Resolve this child derivation.
-                // An unparseable store path here means the parent .drv is
-                // corrupt — fail hard rather than silently dropping the edge
-                // (which would leave the DAG incomplete and cause a confusing
-                // "edge references unknown node" error downstream).
-                let child_sp = StorePath::parse(child_path_str).map_err(|e| {
-                    anyhow::anyhow!(
-                        "corrupted derivation '{drv_path}': invalid inputDrv path '{child_path_str}': {e}"
-                    )
-                })?;
-
-                // If the child can't be resolved (store unreachable, .drv
-                // missing from store), the build cannot proceed: a stub leaf
-                // with system="" would never match any worker and hang forever.
-                // Fail now with a clear error.
-                let child_drv = resolve_derivation(&child_sp, store_client, drv_cache)
-                    .await
-                    .map_err(|e| {
+            for child_path_str in drv.input_drvs().keys() {
+                edges.push(types::DerivationEdge {
+                    parent_drv_path: drv_path.to_string(),
+                    child_drv_path: child_path_str.clone(),
+                });
+                if visited.insert(child_path_str.clone()) {
+                    // An unparseable store path here means the parent .drv is
+                    // corrupt — fail hard rather than silently dropping the edge
+                    // (which would leave the DAG incomplete and cause a confusing
+                    // "edge references unknown node" error downstream).
+                    let child_sp = StorePath::parse(child_path_str).map_err(|e| {
                         anyhow::anyhow!(
-                            "cannot resolve dependency '{child_path_str}' of '{drv_path}': {e} \
-                             (store unreachable or .drv missing; build cannot proceed)"
+                            "corrupted derivation '{drv_path}': invalid inputDrv path \
+                             '{child_path_str}': {e}"
                         )
                     })?;
-                queue.push_back((child_sp, child_drv));
+                    frontier.push(child_sp);
+                }
             }
         }
+
+        if frontier.is_empty() {
+            break;
+        }
+        let frontier_len = frontier.len();
+        // If any child can't be resolved (store unreachable, .drv missing
+        // from store), the build cannot proceed: a stub leaf with
+        // system="" would never match any worker and hang forever. Fail
+        // now with a clear error. The level-wide error context loses the
+        // specific parent path the per-child loop reported, but the
+        // failing child path is still in the underlying error.
+        current = resolve_derivations_batch(frontier, store_client, drv_cache)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot resolve {frontier_len} dependencies at BFS level {levels}: {e} \
+                     (store unreachable or .drv missing; build cannot proceed)"
+                )
+            })?;
+        fetched += frontier_len;
     }
 
     debug!(
         nodes = nodes.len(),
         edges = edges.len(),
+        levels,
+        store_fetches = fetched,
         "DAG reconstruction complete"
     );
 
@@ -1099,17 +1116,18 @@ mod tests {
 
         let err = result.expect_err("unresolvable inputDrv must fail reconstruct_dag");
         let msg = err.to_string();
+        // P0539: level-batched BFS reports the level + count instead of
+        // the specific parent path (one batch can have children from
+        // many parents). The failing CHILD path is still surfaced via
+        // the underlying GetPath error — that's the operationally useful
+        // part (which .drv is missing from the store).
         assert!(
-            msg.contains("cannot resolve dependency"),
-            "error should mention unresolvable dependency, got: {msg}"
+            msg.contains("cannot resolve") && msg.contains("dependencies"),
+            "error should mention unresolvable dependency batch, got: {msg}"
         );
         assert!(
             msg.contains(missing_child),
             "error should include the missing child path, got: {msg}"
-        );
-        assert!(
-            msg.contains(&root_path.to_string()),
-            "error should include the parent drv path, got: {msg}"
         );
     }
 
