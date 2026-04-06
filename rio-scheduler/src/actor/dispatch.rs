@@ -255,8 +255,15 @@ impl DagActor {
         // (no FODs queued), emitted explicitly so Prometheus doesn't
         // persist stale nonzero.
         metrics::gauge!("rio_scheduler_fod_queue_depth").set(fod_deferred as f64);
+        // I-048b: count only is_registered() fetchers. A heartbeat-only
+        // zombie (stream_tx: None — race after scheduler restart, fixed
+        // at the create-side in handle_heartbeat) would inflate `total`
+        // here, hiding the freeze: fod_queue>0 + util=0 + total>0 looks
+        // like "fetchers busy on something else" when really nothing
+        // can dispatch. Filtering by is_registered() makes the freeze
+        // detector below fire on genuine no-stream-connected.
         let (busy, total) = self.executors.values().fold((0u32, 0u32), |(b, t), e| {
-            if e.kind == rio_proto::types::ExecutorKind::Fetcher {
+            if e.kind == rio_proto::types::ExecutorKind::Fetcher && e.is_registered() {
                 (b + u32::from(!e.running_builds.is_empty()), t + 1)
             } else {
                 (b, t)
@@ -284,7 +291,7 @@ impl DagActor {
         let builder_stream_count = self
             .executors
             .values()
-            .filter(|e| e.kind == rio_proto::types::ExecutorKind::Builder)
+            .filter(|e| e.kind == rio_proto::types::ExecutorKind::Builder && e.is_registered())
             .count();
         check_freeze(
             &mut self.builder_freeze_since,

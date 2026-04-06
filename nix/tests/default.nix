@@ -828,7 +828,11 @@ in
           fetcherPool:
             enabled: true
             name: default
-            replicas: 1
+            # I-014: replicas is now {min, max} for autoscaling. min=max
+            # pins the replica count — this test exercises fetcher-split
+            # routing, not autoscaling. autoscaling block inherits from
+            # base values.yaml (helm coalesce).
+            replicas: {min: 1, max: 1}
             image: rio-all
             # builtin:fetchurl FOD has system=builtin; hard_filter's
             # can_build check needs the fetcher to advertise it.

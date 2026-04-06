@@ -5,6 +5,52 @@
 
 use super::*;
 
+/// I-048b: a heartbeat arriving before any BuildExecution stream
+/// connects must NOT create an executor entry. Only stream-open
+/// (`handle_worker_connected`) creates. Heartbeat-creates-entry
+/// produces a zombie with `stream_tx: None`: `is_registered()` false,
+/// `has_capacity()` false, dispatch dead-locked until a stream
+/// connects — which after an abrupt scheduler restart can take
+/// minutes (worker's old stream stuck in TCP keepalive timeout while
+/// the unary heartbeat RPC succeeds against the new scheduler
+/// immediately). Live: `fod_queue=3 fetcher_util=0.00` for 5+ minutes
+/// post-deploy; fetcher restart unblocks because the fresh process
+/// opens a stream first.
+#[tokio::test]
+async fn test_heartbeat_before_stream_does_not_create_zombie() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Heartbeat for an executor that never opened a stream. Pre-fix:
+    // `entry().or_insert_with()` created a zombie. Post-fix: WARN +
+    // drop, no entry.
+    send_heartbeat(&handle, "zombie-candidate", "x86_64-linux", 1).await?;
+
+    let workers = handle.debug_query_workers().await?;
+    assert!(
+        !workers.iter().any(|w| w.executor_id == "zombie-candidate"),
+        "heartbeat-before-stream must NOT create an executor entry; \
+         got {:?}",
+        workers.iter().map(|w| &w.executor_id).collect::<Vec<_>>()
+    );
+
+    // Now connect properly: stream first, THEN heartbeat. This is the
+    // normal lifecycle and must still work — proves the fix doesn't
+    // break the happy path. connect_executor sends ExecutorConnected
+    // (creates entry, sets stream_tx) followed by Heartbeat (updates).
+    let _rx = connect_executor(&handle, "zombie-candidate", "x86_64-linux", 1).await?;
+
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "zombie-candidate")
+        .expect("stream-first connect must create entry");
+    assert!(
+        w.is_registered,
+        "stream + heartbeat → fully registered (lifecycle invariant intact)"
+    );
+    Ok(())
+}
+
 /// TOCTOU fix: a stale heartbeat (sent before scheduler assigned a
 /// derivation) must not clobber the scheduler's fresh assignment in
 /// worker.running_builds. The scheduler is authoritative.

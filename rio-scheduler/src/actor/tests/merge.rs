@@ -360,9 +360,10 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
 #[tokio::test]
 async fn test_ca_cache_hit_via_realisations() -> TestResult {
     let test_db = TestDb::new(&MIGRATOR).await;
-    // No store client — the CA path uses the realisations table
-    // directly, not FindMissingPaths. This also proves the CA check
-    // doesn't spuriously depend on store availability.
+    // No store client — exercises the I-048 fail-open: CA realisation
+    // verify can't reach the store, so the realisation is trusted.
+    // With a store client, the realized path would be verified
+    // (test_ca_cache_miss_stale_realisation covers that case).
     let (handle, _task) = setup_actor(test_db.pool.clone());
 
     let modular_hash = [0x42u8; 32];
@@ -408,6 +409,62 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
         cached_paths,
         vec![realized_path],
         "cache-hit must report the REALIZED path, not the \"\" placeholder"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.stale-completed-verify]
+/// I-048: a CA node whose realisation row points to a GC'd output must
+/// NOT cache-hit. The realisations table is scheduler-local; store GC
+/// doesn't touch it. Without the store-existence verify, this node
+/// flips to Completed and ping-pongs against I-047's pre-existing-
+/// completed reset on subsequent merges.
+///
+/// Seed the realisation in PG but NOT the path in MockStore. With a
+/// store client present, FindMissingPaths reports missing → the
+/// realisation is filtered → the node proceeds to Ready.
+#[tokio::test]
+async fn test_ca_cache_miss_stale_realisation() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let modular_hash = [0x55u8; 32];
+    let stale_path = test_store_path("ca-gcd-out");
+
+    // Realisation exists (a prior build registered it), but the path is
+    // NOT in MockStore.paths (GC'd). The CA cache-check should find the
+    // realisation, then the store-existence verify should reject it.
+    crate::ca::insert_realisation(
+        &test_db.pool,
+        &modular_hash,
+        "out",
+        &stale_path,
+        &[0x22u8; 32],
+    )
+    .await?;
+
+    let mut node = make_test_node("ca-stale-real", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.ca_modular_hash = modular_hash.to_vec();
+    node.expected_output_paths = vec![String::new()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // The realisation was filtered → node is NOT cached → build is
+    // Active waiting for it to dispatch.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "stale realisation must NOT cache-hit; node should proceed to Ready"
+    );
+    assert_eq!(
+        status.cached_derivations, 0,
+        "stale realisation must not count as cached"
     );
 
     Ok(())

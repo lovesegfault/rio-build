@@ -502,6 +502,29 @@ impl DagActor {
         store_degraded: bool,
         kind: rio_proto::types::ExecutorKind,
     ) -> Vec<DrvHash> {
+        // I-048b: heartbeat for an executor without a stream entry is
+        // dropped. Only `handle_worker_connected` (BuildExecution
+        // stream open) creates entries. Allowing heartbeat to create
+        // produces a zombie with `stream_tx: None` — `is_registered()`
+        // is false, `has_capacity()` is false, dispatch is dead-locked
+        // until a stream connects (which may not happen for minutes if
+        // the worker's old stream is stuck in TCP keepalive timeout
+        // after an abrupt scheduler restart). Live: `fod_queue=3
+        // fetcher_util=0.00` for 5+ minutes after deploy; fetcher
+        // restart unblocks because the fresh process opens a stream.
+        //
+        // Early-return also skips the reconcile loop below, which
+        // would otherwise spuriously WARN "scheduler did not assign"
+        // for every running build the unknown worker reports.
+        if !self.executors.contains_key(executor_id.as_str()) {
+            warn!(
+                executor_id = %executor_id,
+                "heartbeat for unknown executor; dropping \
+                 (stream not yet connected — scheduler restart race?)"
+            );
+            return Vec::new();
+        }
+
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
         //   - Keep scheduler-known builds that are still Assigned/Running
@@ -577,10 +600,12 @@ impl DagActor {
             reconciled.remove(phantom);
         }
 
+        // Existence asserted at top of function (I-048b early-return).
+        // get_mut not entry().or_insert: this path never creates.
         let worker = self
             .executors
-            .entry(executor_id.clone())
-            .or_insert_with(|| ExecutorState::new(executor_id.clone()));
+            .get_mut(executor_id.as_str())
+            .expect("checked contains_key at top of fn");
 
         let was_registered = worker.is_registered();
 

@@ -777,8 +777,18 @@
                   # typo (or a template guard regression) has fail-OPENED
                   # ClearPoison/DrainWorker/CreateTenant/TriggerGC to any
                   # browser that can reach the gateway.
+                  #
+                  # `grep -x >/dev/null`, NOT `grep -qx`: stdenv runs with
+                  # pipefail. grep -q exits on first match → closes pipe → yq's
+                  # next write SIGPIPEs → yq exit 141 → pipeline fails → false
+                  # FAIL. Go's stdout is unbuffered to a pipe, so each output
+                  # line is a separate write() — grep can race-close between
+                  # them. ~120 bytes fits the 64K pipe buffer normally; under
+                  # 192-core scheduler contention it doesn't. Observed: same
+                  # drv flapped FAIL at different yq sites on consecutive runs.
+                  # Dropping -q makes grep drain the pipe; no SIGPIPE.
                   ! yq 'select(.kind=="GRPCRoute") | .metadata.name' /tmp/dash-on.yaml \
-                    | grep -qx rio-scheduler-mutating || {
+                    | grep -x rio-scheduler-mutating >/dev/null || {
                     echo "FAIL: rio-scheduler-mutating GRPCRoute rendered with default values (enableMutatingMethods should default false)" >&2
                     exit 1
                   }
@@ -788,7 +798,7 @@
                   # on ClusterStatus routing).
                   yq 'select(.kind=="GRPCRoute" and .metadata.name=="rio-scheduler-readonly")
                       | .spec.rules[].matches[].method.method' /tmp/dash-on.yaml \
-                    | grep -qx ClusterStatus || {
+                    | grep -x ClusterStatus >/dev/null || {
                     echo "FAIL: rio-scheduler-readonly missing ClusterStatus match" >&2
                     exit 1
                   }
@@ -796,16 +806,16 @@
                   # one-line yaml indent mistake could silently attach it.
                   ! yq 'select(.kind=="GRPCRoute" and .metadata.name=="rio-scheduler-readonly")
                         | .spec.rules[].matches[].method.method' /tmp/dash-on.yaml \
-                    | grep -qx ClearPoison || {
+                    | grep -x ClearPoison >/dev/null || {
                     echo "FAIL: ClearPoison leaked into readonly GRPCRoute" >&2
                     exit 1
                   }
                   # CORS allowOrigins MUST NOT be wildcard by default. The
                   # earlier MVP had "*" — regression guard. yq-go `select()`
-                  # doesn't short-circuit like jq; pipe to grep -qx instead.
+                  # doesn't short-circuit like jq; pipe to grep -x instead.
                   ! yq 'select(.kind=="SecurityPolicy" and .metadata.name=="rio-dashboard-cors")
                         | .spec.cors.allowOrigins[]' /tmp/dash-on.yaml \
-                    | grep -qx '\*' || {
+                    | grep -x '\*' >/dev/null || {
                     echo "FAIL: SecurityPolicy rio-dashboard-cors allowOrigins contains wildcard" >&2
                     exit 1
                   }
@@ -822,7 +832,7 @@
                     > /tmp/dash-mut.yaml
                   yq 'select(.kind=="GRPCRoute" and .metadata.name=="rio-scheduler-mutating")
                       | .spec.rules[].matches[].method.method' /tmp/dash-mut.yaml \
-                    | grep -qx ClearPoison || {
+                    | grep -x ClearPoison >/dev/null || {
                     echo "FAIL: enableMutatingMethods=true did not render mutating GRPCRoute with ClearPoison" >&2
                     exit 1
                   }
@@ -863,7 +873,7 @@
                         | .spec.template.spec.volumes[]
                         | select(.name==\"jwt-pubkey\")
                         | .configMap.name" $TMPDIR/jwt-on.yaml \
-                      | grep -qx rio-jwt-pubkey || {
+                      | grep -x rio-jwt-pubkey >/dev/null || {
                       echo "FAIL: $dep missing jwt-pubkey configMap volume" >&2
                       exit 1
                     }
@@ -872,7 +882,7 @@
                         | .spec.template.spec.containers[0].volumeMounts[]
                         | select(.name==\"jwt-pubkey\")
                         | .mountPath" $TMPDIR/jwt-on.yaml \
-                      | grep -qx /etc/rio/jwt || {
+                      | grep -x /etc/rio/jwt >/dev/null || {
                       echo "FAIL: $dep missing jwt-pubkey volumeMount at /etc/rio/jwt" >&2
                       exit 1
                     }
@@ -881,7 +891,7 @@
                         | .spec.template.spec.containers[0].env[]
                         | select(.name==\"RIO_JWT__KEY_PATH\")
                         | .value" $TMPDIR/jwt-on.yaml \
-                      | grep -qx /etc/rio/jwt/ed25519_pubkey || {
+                      | grep -x /etc/rio/jwt/ed25519_pubkey >/dev/null || {
                       echo "FAIL: $dep RIO_JWT__KEY_PATH != /etc/rio/jwt/ed25519_pubkey" >&2
                       exit 1
                     }
@@ -892,7 +902,7 @@
                       | .spec.template.spec.volumes[]
                       | select(.name=="jwt-signing")
                       | .secret.secretName' $TMPDIR/jwt-on.yaml \
-                    | grep -qx rio-jwt-signing || {
+                    | grep -x rio-jwt-signing >/dev/null || {
                     echo "FAIL: gateway missing jwt-signing Secret volume" >&2
                     exit 1
                   }
@@ -900,7 +910,7 @@
                       | .spec.template.spec.containers[0].env[]
                       | select(.name=="RIO_JWT__KEY_PATH")
                       | .value' $TMPDIR/jwt-on.yaml \
-                    | grep -qx /etc/rio/jwt/ed25519_seed || {
+                    | grep -x /etc/rio/jwt/ed25519_seed >/dev/null || {
                     echo "FAIL: gateway RIO_JWT__KEY_PATH != /etc/rio/jwt/ed25519_seed" >&2
                     exit 1
                   }
@@ -933,7 +943,7 @@
                     --set postgresql.enabled=false \
                     > $TMPDIR/fp-false.yaml
                   yq 'select(.kind=="FetcherPool") | .spec.hostUsers' $TMPDIR/fp-false.yaml \
-                    | grep -qx false || {
+                    | grep -x false >/dev/null || {
                     echo "FAIL: fetcherPool.hostUsers=false did not render (with-on-bool bug)" >&2
                     exit 1
                   }
@@ -963,7 +973,7 @@
                   jq -r '.panels[].targets[]?.expr' \
                     ${./infra/helm/grafana/builder-utilization.json} \
                     | grep 'container_cpu_usage\|container_memory' \
-                    | grep -q -- '-builders-' \
+                    | grep -- '-builders-' >/dev/null \
                     || { echo "FAIL: builder-utilization.json pod regex doesn't match controller STS naming ({pool}-builders-{N})" >&2; exit 1; }
 
                   # ── r[sec.psa.control-plane-restricted] bootstrap-job ───────
@@ -979,13 +989,13 @@
                     > $TMPDIR/bootstrap-on.yaml
                   yq 'select(.kind=="Job" and .metadata.name=="rio-bootstrap")
                       | .spec.template.spec.securityContext.runAsNonRoot' \
-                    $TMPDIR/bootstrap-on.yaml | grep -qx true || {
+                    $TMPDIR/bootstrap-on.yaml | grep -x true >/dev/null || {
                     echo "FAIL: rio-bootstrap Job pod securityContext.runAsNonRoot != true" >&2
                     exit 1
                   }
                   yq 'select(.kind=="Job" and .metadata.name=="rio-bootstrap")
                       | .spec.template.spec.containers[0].securityContext.capabilities.drop[0]' \
-                    $TMPDIR/bootstrap-on.yaml | grep -qx ALL || {
+                    $TMPDIR/bootstrap-on.yaml | grep -x ALL >/dev/null || {
                     echo "FAIL: rio-bootstrap Job container securityContext.capabilities.drop[0] != ALL" >&2
                     exit 1
                   }

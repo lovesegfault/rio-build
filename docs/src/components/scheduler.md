@@ -378,7 +378,7 @@ r[sched.state.poisoned-ttl]
 The `poisoned → created` transition is gated by a 24h TTL.
 
 r[sched.merge.stale-completed-verify]
-When a build merges and finds a pre-existing `completed` node in the global DAG, the scheduler batches a `FindMissingPaths` against rio-store with that node's `output_paths` before computing initial states for newly-inserted dependents. If any output is missing, the node resets to `ready` (clearing `output_paths`), is pushed to the dispatch queue, and `rio_scheduler_stale_completed_reset_total` increments. Newly-inserted dependents then correctly compute as `queued` rather than `ready`. The check is fail-open: store unreachable → skip verification, treat existing `completed` as valid (the GC race is rare; blocking merge on store availability would be a worse regression).
+When a build merges and finds a pre-existing `completed` node in the global DAG, the scheduler batches a `FindMissingPaths` against rio-store with that node's `output_paths` before computing initial states for newly-inserted dependents. If any output is missing, the node resets to `ready` (clearing `output_paths`), is pushed to the dispatch queue, and `rio_scheduler_stale_completed_reset_total` increments. Newly-inserted dependents then correctly compute as `queued` rather than `ready`. The same store-existence check applies to newly-inserted CA nodes whose `realisations`-table lookup found a hit: the realized path is verified before the node counts as a cache hit (`rio_scheduler_stale_realisation_filtered_total`). Both checks are fail-open: store unreachable → skip verification, treat existing `completed` (or the realisation) as valid (the GC race is rare; blocking merge on store availability would be a worse regression).
 
 ## Build State Machine
 
