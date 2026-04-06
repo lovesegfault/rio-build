@@ -413,11 +413,14 @@ async fn main() -> anyhow::Result<()> {
     info!("controller running");
     // Both controllers run until SIGTERM (graceful_shutdown_on
     // drains in-flight reconciles). tokio::join! polls both
-    // concurrently on THIS task — no separate spawn, so a panic
-    // in either reconciler propagates here (and main() exits)
-    // rather than being swallowed by a JoinHandle. Both futures
-    // complete when the shared shutdown token is cancelled;
-    // `join!` returns only after BOTH have drained.
+    // concurrently on THIS task — no separate spawn. Semantics:
+    //   - Ok(()) from ONE: join! continues polling the OTHER until
+    //     it also completes (graceful-shutdown waits for both drains).
+    //   - Panic in ONE: unwinds through join! immediately — the OTHER
+    //     is NOT polled to completion (process exits via unwind).
+    // This is the intended behavior: panics propagate (no JoinHandle
+    // silent-swallow), Ok-exits wait for sibling (no half-drained
+    // state on shutdown).
     tokio::join!(wp_controller, wps_controller);
 
     info!("controller shutting down");
