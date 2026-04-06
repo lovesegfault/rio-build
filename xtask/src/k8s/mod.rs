@@ -185,7 +185,12 @@ pub enum K8sCmd {
         log: LogLevelArgs,
     },
     /// Tear down rio + backing infra.
-    Destroy,
+    Destroy {
+        /// Skip the interactive confirm. Destroy is irreversible —
+        /// only use this from CI / scripted teardowns.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Open a tunnel to the gateway and run `nix build --store
     /// ssh-ng://rio@localhost:PORT <ARGS>`. Uses your SSH key (the
     /// pair of RIO_SSH_PUBKEY installed by `deploy`).
@@ -312,16 +317,22 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
             }
             .await
         }
-        K8sCmd::Destroy => {
+        K8sCmd::Destroy { yes } => {
             let what = match kind {
                 ProviderKind::Eks => crate::tofu::output(eks::TF_DIR, "cluster_name")
-                    .map(|n| format!("EKS cluster '{n}'"))
-                    .unwrap_or_else(|_| "the EKS cluster".into()),
+                    .map(|n| format!("EKS cluster '{n}' (RDS, S3, ECR, VPC, IAM)"))
+                    .unwrap_or_else(|_| "the EKS cluster (RDS, S3, ECR, VPC, IAM)".into()),
                 ProviderKind::K3s => "the local k3s rio deployment + rook".into(),
                 ProviderKind::Kind => format!("kind cluster '{}'", kind::CLUSTER),
             };
-            if !ui::confirm_destroy(&format!("This will DESTROY {what} and all data. Continue?"))? {
-                bail!("destroy cancelled");
+            // confirm_destroy returns false on non-TTY stdin — `--yes`
+            // is the only way to run this from a script.
+            if !yes
+                && !ui::confirm_destroy(&format!(
+                    "This will DESTROY {what} and all data. Continue?"
+                ))?
+            {
+                bail!("destroy cancelled (use --yes to bypass)");
             }
             p.destroy(cfg).await
         }

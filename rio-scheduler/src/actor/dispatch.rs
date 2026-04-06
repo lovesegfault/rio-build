@@ -35,7 +35,7 @@ fn check_freeze(
                 "derivations queued but zero {kind} streams — dispatch stuck. \
                  Worker gRPC bidi-streams may have disconnected. \
                  Run `rio-cli derivations --all-active --stuck` to diagnose. \
-                 Restart workers: `kubectl rollout restart sts -n rio-builders default-builders`"
+                 Restart workers: `kubectl rollout restart sts -n rio-builders rio-builders`"
             );
             // Rate-limit: reset so we WARN once/minute, not once/pass.
             *since = Some(Instant::now());

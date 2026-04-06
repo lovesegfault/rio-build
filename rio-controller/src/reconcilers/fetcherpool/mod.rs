@@ -392,13 +392,7 @@ mod tests {
     /// STS name is `{pool}-fetchers` — distinct from builders.
     #[test]
     fn sts_name_has_role_suffix() {
-        assert_eq!(
-            sts_name("default", ExecutorRole::Fetcher),
-            "default-fetchers"
-        );
-        assert_eq!(
-            sts_name("default", ExecutorRole::Builder),
-            "default-builders"
-        );
+        assert_eq!(sts_name("rio", ExecutorRole::Fetcher), "rio-fetchers");
+        assert_eq!(sts_name("rio", ExecutorRole::Builder), "rio-builders");
     }
 }

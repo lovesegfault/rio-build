@@ -30,7 +30,7 @@ pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
 const SCHED_PORT: u16 = 19001;
 const STORE_PORT: u16 = 19002;
-const POOL: &str = "default";
+const POOL: &str = "rio";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded
 /// scheduler+store. Holds the tunnel guards and the mTLS cert tempdir
@@ -452,8 +452,8 @@ pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
 
 pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::fetcherpool::FetcherPool;
-    // values.yaml default: fetcherPool.name=rio-fetchers. The deploy
-    // flow enables it via --set fetcherPool.enabled=true (deploy.rs).
+    // values.yaml default: fetcherPool.name=rio. The deploy flow
+    // enables it via --set fetcherPool.enabled=true (deploy.rs).
     // SMOKE_EXPR's builtin:fetchurl FOD queues forever without a
     // reconciled fetcher (P0452 hard-split: FODs never go to builders).
     let api: Api<FetcherPool> = Api::namespaced(client.clone(), NS_FETCHERS);
@@ -461,7 +461,7 @@ pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
         let api = api.clone();
         async move {
             Ok(api
-                .get_opt("rio-fetchers")
+                .get_opt(POOL)
                 .await?
                 .and_then(|fp| fp.status)
                 .map(|_| ()))

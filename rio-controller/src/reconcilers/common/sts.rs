@@ -197,7 +197,7 @@ pub fn executor_labels(p: &ExecutorStsParams) -> BTreeMap<String, String> {
 }
 
 /// STS name for a given pool. `{pool_name}-{role}s` — e.g.
-/// `default-builders`, `default-fetchers`.
+/// `rio-builders`, `rio-fetchers`.
 pub fn sts_name(pool_name: &str, role: ExecutorRole) -> String {
     format!("{pool_name}-{}s", role.as_str())
 }
