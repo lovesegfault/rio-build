@@ -11,6 +11,7 @@
     STATE_META,
   } from '../components/BuildStatePill.svelte';
   import type { BuildInfo } from '../api/types';
+  import { progress, fmtTsRel, fmtDuration } from '../lib/buildInfo';
 
   // svelte-routing hands route params as props. `/builds/:id` populates
   // `id`; `/builds` leaves it undefined. The stub version kept this as
@@ -91,32 +92,6 @@
       });
   });
 
-  function progress(b: BuildInfo): number {
-    if (b.totalDerivations === 0) return 0;
-    const done = b.completedDerivations + b.cachedDerivations;
-    return Math.min(100, Math.round((done / b.totalDerivations) * 100));
-  }
-
-  function relTime(ts: { seconds: bigint; nanos: number } | undefined): string {
-    if (!ts) return '—';
-    const then = Number(ts.seconds) * 1000;
-    const delta = Date.now() - then;
-    if (delta < 60_000) return `${Math.round(delta / 1000)}s ago`;
-    if (delta < 3_600_000) return `${Math.round(delta / 60_000)}m ago`;
-    if (delta < 86_400_000) return `${Math.round(delta / 3_600_000)}h ago`;
-    return `${Math.round(delta / 86_400_000)}d ago`;
-  }
-
-  function duration(b: BuildInfo): string {
-    if (!b.startedAt) return '—';
-    const start = Number(b.startedAt.seconds) * 1000;
-    const end = b.finishedAt ? Number(b.finishedAt.seconds) * 1000 : Date.now();
-    const s = Math.round((end - start) / 1000);
-    if (s < 60) return `${s}s`;
-    if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
-    return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
-  }
-
   // Click-to-copy the full build_id. navigator.clipboard is stubbed in
   // jsdom (undefined), hence the optional chain — in the browser the
   // Permissions API gates it but the promise rejection is harmless.
@@ -187,8 +162,8 @@
               <progress value={progress(b)} max="100"></progress>
               <span class="pct">{progress(b)}%</span>
             </td>
-            <td>{relTime(b.submittedAt)}</td>
-            <td>{duration(b)}</td>
+            <td>{fmtTsRel(b.submittedAt)}</td>
+            <td>{fmtDuration(b)}</td>
           </tr>
         {:else}
           <tr><td colspan="6" class="empty">no builds</td></tr>
