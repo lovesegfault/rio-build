@@ -175,6 +175,11 @@ message FindMissingPathsRequest {
 
 message FindMissingPathsResponse {
   repeated string missing_paths = 1;      // Paths not found in store
+  // Subset of missing_paths available from a configured upstream cache
+  // (tenant_upstreams). P0463 wires these into wopQueryMissing's
+  // willSubstitute set. Additive: pre-P0461 clients ignore this field.
+  // r[store.substitute.upstream] — wire surface
+  repeated string substitutable_paths = 2;
 }
 
 // Content-addressed lookup: find a store path by its content hash.
@@ -348,4 +353,36 @@ message ResignPathsResponse {
   uint32 processed = 2;    // Paths processed this batch (≤ batch_size).
   uint32 refs_changed = 3; // Subset of processed where refs changed (old scanner missed).
   uint32 failed = 4;       // NAR/chunk errors; stay refs_backfilled=FALSE for next pass.
+}
+
+// Per-tenant upstream cache config (tenant_upstreams table, migration
+// 026). r[store.substitute.upstream] — admin CRUD surface.
+message UpstreamInfo {
+  int32 id = 1;                      // SERIAL PK
+  string tenant_id = 2;              // tenants.tenant_id UUID as string
+  string url = 3;                    // e.g. "https://cache.nixos.org"
+  int32 priority = 4;                // lower tried first; default 50
+  repeated string trusted_keys = 5;  // name:base64(pubkey), nix trusted-public-keys shape
+  string sig_mode = 6;               // keep | add | replace (r[store.substitute.sig-mode])
+}
+
+message ListUpstreamsRequest {
+  string tenant_id = 1;
+}
+
+message ListUpstreamsResponse {
+  repeated UpstreamInfo upstreams = 1;  // ORDER BY priority ASC
+}
+
+message AddUpstreamRequest {
+  string tenant_id = 1;
+  string url = 2;
+  int32 priority = 3;
+  repeated string trusted_keys = 4;
+  string sig_mode = 5;               // empty → server default "keep"
+}
+
+message RemoveUpstreamRequest {
+  string tenant_id = 1;
+  string url = 2;                    // matches UNIQUE(tenant_id, url)
 }

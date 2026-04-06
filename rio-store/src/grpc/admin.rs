@@ -16,7 +16,9 @@ use tracing::{debug, info, instrument, warn};
 use rio_common::grpc::StatusExt;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::{
-    GcProgress, GcRequest, PinPathRequest, PinPathResponse, ResignPathsRequest, ResignPathsResponse,
+    AddUpstreamRequest, GcProgress, GcRequest, ListUpstreamsRequest, ListUpstreamsResponse,
+    PinPathRequest, PinPathResponse, RemoveUpstreamRequest, ResignPathsRequest,
+    ResignPathsResponse, UpstreamInfo,
 };
 
 use crate::backend::chunk::ChunkBackend;
@@ -637,6 +639,33 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             refs_changed,
             failed,
         }))
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Upstream CRUD — stubs. Full impl in P0462 (core fetch logic).
+    // r[impl store.substitute.upstream]
+    // TODO(P0462): wire to tenant_upstreams CRUD
+    // ────────────────────────────────────────────────────────────────
+
+    async fn list_upstreams(
+        &self,
+        _request: Request<ListUpstreamsRequest>,
+    ) -> Result<Response<ListUpstreamsResponse>, Status> {
+        Err(Status::unimplemented("ListUpstreams: P0462"))
+    }
+
+    async fn add_upstream(
+        &self,
+        _request: Request<AddUpstreamRequest>,
+    ) -> Result<Response<UpstreamInfo>, Status> {
+        Err(Status::unimplemented("AddUpstream: P0462"))
+    }
+
+    async fn remove_upstream(
+        &self,
+        _request: Request<RemoveUpstreamRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented("RemoveUpstream: P0462"))
     }
 }
 

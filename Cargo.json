@@ -812,7 +812,9 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "lzma",
         "tokio",
+        "xz",
         "zstd"
       ],
       "libCrateTypes": [
@@ -4441,6 +4443,10 @@
           "packageId": "compression-core"
         },
         {
+          "name": "liblzma",
+          "packageId": "liblzma"
+        },
+        {
           "name": "zstd",
           "packageId": "zstd",
           "rename": "libzstd"
@@ -4452,6 +4458,8 @@
       ],
       "resolvedDefaultFeatures": [
         "libzstd",
+        "lzma",
+        "xz",
         "zstd",
         "zstd-safe"
       ],
@@ -14224,6 +14232,68 @@
         "Cryspen"
       ]
     },
+    "liblzma": {
+      "crateName": "liblzma",
+      "version": "0.4.6",
+      "edition": "2021",
+      "sha256": "16gqsypfx0nanl4cb9l5a5vg3gg7zfwlw0g8xbg5c7qxq9vkn0xn",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "liblzma-sys",
+          "packageId": "liblzma-sys"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "bindgen",
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>",
+        "Portable-Network-Archive Developers"
+      ]
+    },
+    "liblzma-sys": {
+      "crateName": "liblzma-sys",
+      "version": "0.4.5",
+      "edition": "2021",
+      "sha256": "11k1bvr1si1fv253rydq95whazbplrnjczq76d87nj3869pvcbcz",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "cc",
+          "packageId": "cc"
+        },
+        {
+          "name": "pkg-config",
+          "packageId": "pkg-config"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "bindgen"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "links": "lzma",
+      "authors": [
+        "Alex Crichton <alex@alexcrichton.com>",
+        "Portable-Network-Archive Developers"
+      ]
+    },
     "libm": {
       "crateName": "libm",
       "version": "0.2.16",
@@ -20160,6 +20230,10 @@
         {
           "name": "base64",
           "packageId": "base64"
+        },
+        {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
         },
         {
           "name": "hex",
@@ -29622,20 +29696,16 @@
           "packageId": "curve25519-dalek"
         },
         {
+          "name": "der",
+          "packageId": "der 0.7.10"
+        },
+        {
           "name": "digest",
           "packageId": "digest 0.10.7"
         },
         {
           "name": "ecdsa",
           "packageId": "ecdsa 0.16.9"
-        },
-        {
-          "name": "ed25519",
-          "packageId": "ed25519"
-        },
-        {
-          "name": "ed25519-dalek",
-          "packageId": "ed25519-dalek"
         },
         {
           "name": "either",
@@ -29840,6 +29910,10 @@
           "packageId": "rand_chacha 0.9.0"
         },
         {
+          "name": "rand_core",
+          "packageId": "rand_core 0.6.4"
+        },
+        {
           "name": "regex",
           "packageId": "regex"
         },
@@ -29902,6 +29976,10 @@
         {
           "name": "spin",
           "packageId": "spin"
+        },
+        {
+          "name": "spki",
+          "packageId": "spki 0.7.3"
         },
         {
           "name": "sqlx-core",
@@ -30165,6 +30243,10 @@
         {
           "name": "prost",
           "packageId": "prost"
+        },
+        {
+          "name": "rand_core",
+          "packageId": "rand_core 0.6.4"
         },
         {
           "name": "regex",

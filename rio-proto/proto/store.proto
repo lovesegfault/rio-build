@@ -1,6 +1,7 @@
 syntax = "proto3";
 package rio.store;
 
+import "google/protobuf/empty.proto";
 import "types.proto";
 
 // Store service for NAR storage and path metadata.
@@ -119,4 +120,19 @@ service StoreAdminService {
   // Cursor-paginated: caller loops until response.cursor is empty.
   // Idempotent per path — safe to re-run on crash.
   rpc ResignPaths(rio.types.ResignPathsRequest) returns (rio.types.ResignPathsResponse);
+
+  // Per-tenant upstream cache CRUD (tenant_upstreams, migration 026).
+  // r[store.substitute.upstream] — the substitution fetch logic itself
+  // lands in P0462; these RPCs configure which upstreams a tenant
+  // trusts and with what sig_mode.
+
+  // List a tenant's configured upstreams, ORDER BY priority ASC.
+  rpc ListUpstreams(rio.types.ListUpstreamsRequest) returns (rio.types.ListUpstreamsResponse);
+
+  // Add an upstream cache for a tenant. ALREADY_EXISTS on duplicate
+  // (tenant_id, url). INVALID_ARGUMENT on bad sig_mode.
+  rpc AddUpstream(rio.types.AddUpstreamRequest) returns (rio.types.UpstreamInfo);
+
+  // Remove an upstream by (tenant_id, url). NOT_FOUND if no match.
+  rpc RemoveUpstream(rio.types.RemoveUpstreamRequest) returns (google.protobuf.Empty);
 }

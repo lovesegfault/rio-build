@@ -581,6 +581,8 @@ impl StoreService for StoreServiceImpl {
 
         Ok(Response::new(FindMissingPathsResponse {
             missing_paths: missing,
+            // TODO(P0462): populate from tenant_upstreams narinfo probes
+            substitutable_paths: Vec::new(),
         }))
     }
 
