@@ -12,8 +12,26 @@
 use super::*;
 use sqlx::PgPool;
 use std::collections::HashSet;
-use tracing::{debug, instrument};
+use std::time::Duration;
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
+
+/// True if `e` is a PostgreSQL deadlock (SQLSTATE 40P01). Used by the
+/// defensive retry in `delete_manifest_chunked_uploading`.
+fn is_deadlock(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("40P01"))
+}
+
+/// Cheap pseudo-jitter for retry backoff: 50–150ms derived from the
+/// low bits of the system clock. Not cryptographic — just enough to
+/// desynchronize two retrying txns so they don't re-collide in lockstep.
+fn jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(50 + (nanos % 100) as u64)
+}
 
 // ---------------------------------------------------------------------------
 // Chunked manifest ops
@@ -108,6 +126,21 @@ pub async fn upgrade_manifest_to_chunked(
     // serializes INSERT vs UPDATE — two concurrent PutPaths with
     // overlapping chunk lists both increment correctly.
     //
+    // r[impl store.chunk.refcount-txn]
+    // Co-sort (hash, size) pairs by hash before UNNEST: same deadlock
+    // prevention as the rollback path (see delete_manifest_chunked_
+    // uploading). ON CONFLICT DO UPDATE acquires row locks on the
+    // conflicted rows in UNNEST input order; two concurrent upgrades
+    // with reversed-order overlapping sets would otherwise deadlock.
+    // The co-sort keeps each hash paired with its size.
+    let mut pairs: Vec<(Vec<u8>, i64)> = chunk_hashes
+        .iter()
+        .cloned()
+        .zip(chunk_sizes.iter().copied())
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let (chunk_hashes, chunk_sizes): (Vec<Vec<u8>>, Vec<i64>) = pairs.into_iter().unzip();
+    //
     // `deleted = false`: resurrects a chunk that GC sweep marked for
     // deletion (refcount hit 0) between sweep and drain. Without
     // this, PutPath would bump refcount but leave `deleted=true` →
@@ -141,9 +174,9 @@ pub async fn upgrade_manifest_to_chunked(
         RETURNING blake3_hash, (refcount = 1) AS inserted
         "#,
     )
-    .bind(chunk_hashes)
+    .bind(&chunk_hashes)
     .bind(vec![1i64; chunk_hashes.len()])
-    .bind(chunk_sizes)
+    .bind(&chunk_sizes)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -215,6 +248,43 @@ pub async fn delete_manifest_chunked_uploading(
     store_path_hash: &[u8],
     chunk_hashes: &[Vec<u8>],
 ) -> Result<()> {
+    // r[impl store.chunk.refcount-txn]
+    // r[impl store.put.wal-manifest]
+    // Sort before UPDATE: consistent lock-acquisition order prevents
+    // deadlock (SQLSTATE 40P01) when concurrent rollbacks have
+    // overlapping chunk sets. PG acquires row locks in ANY() scan
+    // order; without sorting, array A=[h1,h2,h3] and B=[h3,h2,h1] →
+    // txn A locks h1 waits for h3, txn B locks h3 waits for h1 →
+    // circular wait. Sorting makes lock order deterministic across
+    // all callers.
+    let mut hashes = chunk_hashes.to_vec();
+    hashes.sort_unstable();
+
+    // Defensive single-retry on 40P01. The sort above SHOULD make
+    // deadlock impossible, but PG can still deadlock on index-page
+    // splits under extreme contention. One retry is cheap insurance;
+    // unbounded retry would mask real problems. On retry, the entire
+    // transaction is restarted (PG aborts the whole txn on deadlock,
+    // not just the failing statement).
+    for attempt in 0..2 {
+        match delete_manifest_chunked_uploading_inner(pool, store_path_hash, &hashes).await {
+            Err(MetadataError::Other(e)) if is_deadlock(&e) && attempt == 0 => {
+                warn!(error = %e, "40P01 deadlock on rollback txn; retrying once after jitter");
+                tokio::time::sleep(jitter()).await;
+            }
+            r => return r,
+        }
+    }
+    unreachable!("loop either returns or continues exactly once")
+}
+
+/// Transaction body for `delete_manifest_chunked_uploading`. Split out
+/// so the outer function can retry the whole txn on 40P01.
+async fn delete_manifest_chunked_uploading_inner(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    hashes: &[Vec<u8>],
+) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     // Decrement refcounts FIRST. If we deleted manifest_data first and
@@ -235,7 +305,7 @@ pub async fn delete_manifest_chunked_uploading(
         WHERE blake3_hash = ANY($1)
         "#,
     )
-    .bind(chunk_hashes)
+    .bind(hashes)
     .execute(&mut *tx)
     .await?;
 
@@ -692,5 +762,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc, 2, "shared chunk referenced by both manifests");
+    }
+
+    /// Regression: concurrent rollbacks with reverse-ordered overlapping
+    /// chunk sets MUST NOT deadlock.
+    ///
+    /// Before the sort in `delete_manifest_chunked_uploading`, PG acquired
+    /// row locks in the ANY($1) array's scan order. Array A = [h1..h50],
+    /// array B = [h50..h1] → txn A locks h1 waits for h50, txn B locks
+    /// h50 waits for h1 → circular wait → SQLSTATE 40P01.
+    ///
+    /// After the sort, both txns acquire locks in the same canonical
+    /// order — no circular wait possible. The 5s timeout makes a
+    /// regression fail fast rather than hang the suite.
+    // r[verify store.chunk.refcount-txn]
+    // r[verify store.put.wal-manifest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rollback_overlapping_no_deadlock() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // 50 overlapping chunk hashes. Each manifest references all 50
+        // (refcount starts at 2 so both rollbacks can decrement without
+        // hitting the CHECK (refcount >= 0) constraint).
+        let hashes: Vec<Vec<u8>> = (0u8..50).map(|i| vec![i; 32]).collect();
+        let sizes: Vec<i64> = vec![1024; 50];
+
+        // Seed via two upgrade_manifest_to_chunked calls → refcount=2
+        // for every chunk.
+        let sph_a = vec![0xAAu8; 32];
+        let sph_b = vec![0xBBu8; 32];
+        seed_placeholder(&db.pool, &sph_a).await;
+        seed_placeholder(&db.pool, &sph_b).await;
+        upgrade_manifest_to_chunked(&db.pool, &sph_a, b"ml-a", &hashes, &sizes)
+            .await
+            .unwrap();
+        upgrade_manifest_to_chunked(&db.pool, &sph_b, b"ml-b", &hashes, &sizes)
+            .await
+            .unwrap();
+
+        // Forward order for A, reversed for B. Before the fix this is
+        // the pathological lock-order inversion.
+        let hashes_fwd = hashes.clone();
+        let mut hashes_rev = hashes.clone();
+        hashes_rev.reverse();
+
+        let pool_a = db.pool.clone();
+        let pool_b = db.pool.clone();
+
+        let task_a = tokio::spawn(async move {
+            delete_manifest_chunked_uploading(&pool_a, &sph_a, &hashes_fwd).await
+        });
+        let task_b = tokio::spawn(async move {
+            delete_manifest_chunked_uploading(&pool_b, &sph_b, &hashes_rev).await
+        });
+
+        let (ra, rb) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(task_a, task_b).expect("tasks should not panic")
+        })
+        .await
+        .expect("concurrent rollbacks must complete within 5s — deadlock detected");
+
+        ra.expect("rollback A should succeed");
+        rb.expect("rollback B should succeed");
+
+        // All refcounts back to 0.
+        let sum: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(refcount),0) FROM chunks WHERE blake3_hash = ANY($1)",
+        )
+        .bind(&hashes)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(sum, 0, "both rollbacks decremented all 50 chunks to zero");
     }
 }
