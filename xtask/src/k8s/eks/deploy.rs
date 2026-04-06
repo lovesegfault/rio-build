@@ -234,12 +234,16 @@ pub async fn run(
             .set_json("builderPools", "[]")
             .set("builderPoolSetDefaults.enabled", "true")
             .set("builderPoolSetDefaults.poolTemplate.ephemeral", "true")
-            // ADR-012 userns isolation: NixOS AMI's containerd has
-            // cgroup_writable=true (nix/nixos-node/eks-node.nix), so
-            // hostUsers:false works here. values.yaml default stays
-            // true for k3s/kind VM tests (no idmap-mount on /dev/fuse).
-            .set("builderPoolSetDefaults.poolTemplate.hostUsers", "false")
-            .set("fetcherPool.hostUsers", "false")
+            // I-186: hostUsers:false breaks FUSE passthrough
+            // (FUSE_DEV_IOC_BACKING_OPEN needs init-userns
+            // CAP_SYS_ADMIN) and fusectl mount (I-165b). Passthrough
+            // is critical for compile-heavy builds. Stay on
+            // hostUsers:true until P0560 (EROFS+fscache) deletes FUSE
+            // — EROFS warm reads are page-cache-native, no passthrough
+            // dependency. ADR-012 userns isolation deferred to then.
+            // The NixOS AMI's containerd cgroup_writable=true is in
+            // place (nix/nixos-node/eks-node.nix) so the flip is a
+            // one-line revert here when P0560 lands.
             .set_json("builderPoolSets", BUILDER_POOL_SETS_JSON)
             // scheduler.sizeClasses MUST agree with builderPoolSetDefaults.
             // classes (names + cutoffs). memLimitBytes ≈ the class's
