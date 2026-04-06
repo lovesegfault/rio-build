@@ -91,6 +91,11 @@ pub struct Substituter {
     /// handles concurrent `get_with` on the same key by coalescing —
     /// N callers become one `do_substitute` call.
     inflight: Cache<(Uuid, String), Option<Arc<ValidatedPathInfo>>>,
+    /// Max concurrent S3 chunk uploads per `put_chunked` call. Same
+    /// bound as `StoreServiceImpl` — the substitution ingest path
+    /// calls the same `cas::put_chunked` as PutPath. Default
+    /// [`cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY`].
+    chunk_upload_max_concurrent: usize,
 }
 
 impl Substituter {
@@ -127,6 +132,7 @@ impl Substituter {
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(30))
                 .build(),
+            chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
         }
     }
 
@@ -142,6 +148,14 @@ impl Substituter {
     /// Production can use this to configure timeouts/proxies.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = Some(http);
+        self
+    }
+
+    /// Override the per-call chunk-upload concurrency bound.
+    /// Builder-style. main.rs threads `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`
+    /// here (same value as `StoreServiceImpl`).
+    pub fn with_chunk_upload_max_concurrent(mut self, n: usize) -> Self {
+        self.chunk_upload_max_concurrent = n;
         self
     }
 
@@ -474,10 +488,16 @@ impl Substituter {
         let use_chunked = self.chunk_backend.is_some() && nar_bytes.len() >= cas::INLINE_THRESHOLD;
         let result = if use_chunked {
             let backend = self.chunk_backend.as_ref().unwrap();
-            cas::put_chunked(&self.pool, backend, &info, &nar_bytes)
-                .await
-                .map(|_| ())
-                .map_err(|e| SubstituteError::Chunked(e.to_string()))
+            cas::put_chunked(
+                &self.pool,
+                backend,
+                &info,
+                &nar_bytes,
+                self.chunk_upload_max_concurrent,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| SubstituteError::Chunked(e.to_string()))
         } else {
             metadata::complete_manifest_inline(&self.pool, &info, nar_bytes)
                 .await
