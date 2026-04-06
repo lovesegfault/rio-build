@@ -80,8 +80,6 @@ let
       system = builtins.currentSystem;
     }
   '';
-
-  covTimeoutHeadroom = if common.coverage then 300 else 0;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-chaos";
@@ -90,7 +88,7 @@ pkgs.testers.runNixOSTest {
   # backoff) + subtest 3 ~15s (5s toxic-close + build) + subtest 4 ~30s
   # (dd + 16s throttled upload) + margin. 600s is generous; the dominant
   # term is subtest 2's wait_until_succeeds poll loop under VM jitter.
-  globalTimeout = 600 + covTimeoutHeadroom;
+  globalTimeout = 600 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
