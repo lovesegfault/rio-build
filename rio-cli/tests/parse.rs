@@ -76,6 +76,7 @@ fn top_level_help_lists_all_subcommands() {
         "drain-executor",
         "cutoffs",
         "wps",
+        "upstream",
     ] {
         assert!(help.contains(sub), "--help missing {sub}:\n{help}");
     }
@@ -182,6 +183,52 @@ fn wps_nested_subcommands() {
     assert_rejected(&["wps", "describe"]);
     // bare `wps` with no subcommand is a clap error.
     assert_rejected(&["wps"]);
+}
+
+// r[verify store.substitute.upstream]
+#[test]
+fn upstream_nested_subcommands() {
+    // list needs --tenant.
+    assert_parsed(&["upstream", "list", "--tenant", "t1"]);
+    assert_rejected(&["upstream", "list"]);
+    // add needs --tenant + --url; priority/sig-mode have defaults.
+    assert_parsed(&[
+        "upstream",
+        "add",
+        "--tenant",
+        "t1",
+        "--url",
+        "https://cache.nixos.org",
+    ]);
+    assert_parsed(&[
+        "upstream",
+        "add",
+        "--tenant",
+        "t1",
+        "--url",
+        "https://cache.nixos.org",
+        "--priority",
+        "10",
+        "--trusted-key",
+        "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+        "--trusted-key",
+        "other:abc=",
+        "--sig-mode",
+        "add",
+    ]);
+    assert_rejected(&["upstream", "add", "--tenant", "t1"]);
+    // remove needs both.
+    assert_parsed(&[
+        "upstream",
+        "remove",
+        "--tenant",
+        "t1",
+        "--url",
+        "https://cache.nixos.org",
+    ]);
+    assert_rejected(&["upstream", "remove", "--tenant", "t1"]);
+    // bare `upstream` is a clap error.
+    assert_rejected(&["upstream"]);
 }
 
 #[test]

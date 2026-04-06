@@ -289,6 +289,53 @@ spec:
         - ipBlock: {cidr: {{ . }}}
       ports: [{protocol: TCP, port: 443}]
     {{- end }}
+{{- if .Values.store.upstreamCaches }}
+---
+# r[impl store.substitute.upstream]
+#
+# Store egress allowlist for upstream binary caches. Separate policy
+# from `store-egress` above so the base egress (DNS + postgres + S3)
+# stays minimal and the upstream allowlist is visibly conditional —
+# absent `store.upstreamCaches` config, this policy does NOT render
+# and the store cannot reach any public IP on 443.
+#
+# CIDR-based because NetworkPolicy has no native FQDN support. The
+# operator resolves cache.nixos.org etc. to their current CIDRs at
+# deploy time. If CIDR churn is operational pain, the upgrade path is
+# a CNI with FQDN-aware policies (Cilium CiliumNetworkPolicy toFQDNs,
+# Calico GlobalNetworkPolicy domain matchers) — out of scope here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: store-egress-upstream
+  namespace: {{ $ns.store.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-store
+  policyTypes: [Egress]
+  egress:
+    # DNS for upstream hostname resolution. Same kube-system selector
+    # as the base store-egress policy — the two policies OR together
+    # (NetworkPolicy is additive on egress), so this duplicates the
+    # DNS rule for clarity: if an operator reads only THIS policy to
+    # audit upstream access, they see the DNS dependency.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    {{- range .Values.store.upstreamCaches }}
+    # {{ .name | default .cidr }}
+    - to:
+        - ipBlock: {cidr: {{ .cidr | quote }}}
+      ports: [{protocol: TCP, port: 443}]
+    {{- end }}
+{{- end }}
 {{- if .Values.dashboard.enabled }}
 ---
 # Dashboard egress: DNS + Envoy Gateway Service only. nginx proxies

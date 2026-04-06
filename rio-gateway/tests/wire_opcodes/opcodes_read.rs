@@ -409,11 +409,55 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
     assert_eq!(will_build[0], drv_path);
     assert!(
         will_substitute.is_empty(),
-        "no substituter support → willSubstitute empty"
+        "no substitutable seed → willSubstitute empty"
     );
     assert!(unknown.is_empty());
     assert_eq!(download_size, 0);
     assert_eq!(nar_size, 0);
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.opcode.query-missing]
+/// wopQueryMissing: substitutable paths land in willSubstitute, not
+/// willBuild. MockStore seeded with one substitutable + one
+/// build-only .drv → handler partitions by `substitutable_paths`.
+#[tokio::test]
+async fn test_query_missing_reports_will_substitute() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let sub_drv = "/nix/store/22222222222222222222222222222222-sub.drv";
+    let build_drv = "/nix/store/33333333333333333333333333333333-build.drv";
+
+    // Seed MockStore: sub_drv is substitutable (upstream has it),
+    // build_drv is not. Neither is present in `paths` → both missing.
+    h.store
+        .substitutable
+        .write()
+        .unwrap()
+        .push(sub_drv.to_string());
+
+    wire_send!(&mut h.stream;
+        u64: 40,
+        strings: &[format!("{sub_drv}!out"), format!("{build_drv}!out")],
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let will_build = wire::read_strings(&mut h.stream).await?;
+    let will_substitute = wire::read_strings(&mut h.stream).await?;
+    let unknown = wire::read_strings(&mut h.stream).await?;
+    let _download_size = wire::read_u64(&mut h.stream).await?;
+    let _nar_size = wire::read_u64(&mut h.stream).await?;
+
+    // The partition: substitutable-check fires BEFORE the Built
+    // match arm, so sub_drv lands in willSubstitute (not willBuild).
+    // This is what makes `nix build` show "1 path will be fetched"
+    // instead of "2 paths will be built".
+    assert_eq!(will_substitute, vec![sub_drv.to_string()]);
+    assert_eq!(will_build, vec![build_drv.to_string()]);
+    assert!(unknown.is_empty());
 
     h.finish().await;
     Ok(())

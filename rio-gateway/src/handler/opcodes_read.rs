@@ -718,31 +718,45 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         .collect();
 
     let req = types::FindMissingPathsRequest { store_paths };
-    let missing_set: HashSet<String> = match tokio::time::timeout(
-        DEFAULT_GRPC_TIMEOUT,
-        store_client.find_missing_paths(req),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
-        Ok(Err(e)) => stderr_err!(stderr, "gRPC FindMissingPaths: {e}"),
-        Err(_) => stderr_err!(
-            stderr,
-            "gRPC FindMissingPaths timed out after {DEFAULT_GRPC_TIMEOUT:?}"
-        ),
-    };
+    let (missing_set, substitutable_set): (HashSet<String>, HashSet<String>) =
+        match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.find_missing_paths(req)).await
+        {
+            Ok(Ok(r)) => {
+                let resp = r.into_inner();
+                (
+                    resp.missing_paths.into_iter().collect(),
+                    resp.substitutable_paths.into_iter().collect(),
+                )
+            }
+            Ok(Err(e)) => stderr_err!(stderr, "gRPC FindMissingPaths: {e}"),
+            Err(_) => stderr_err!(
+                stderr,
+                "gRPC FindMissingPaths timed out after {DEFAULT_GRPC_TIMEOUT:?}"
+            ),
+        };
 
     // wopQueryMissing response is three StorePathSets (willBuild,
     // willSubstitute, unknown) — plain store paths, NOT DerivedPath
     // wire strings. For Built paths, report the .drv; echoing the raw
     // `...drv!out` string makes the Nix client fail StorePath::parse
     // on '!'.
+    //
+    // Partition: missing ∩ substitutable → willSubstitute (client shows
+    // "N paths will be fetched"); missing ∩ ¬substitutable → willBuild
+    // (Built) or unknown (Opaque). Substitutable-check first so a path
+    // that's both buildable AND substitutable lands in willSubstitute
+    // — the store fetching it is cheaper than the worker building it.
     let mut will_build = Vec::new();
+    let mut will_substitute = Vec::new();
     let mut unknown = Vec::new();
 
     for dp in derived {
         let sp = dp.store_path();
         if !missing_set.contains(sp.as_str()) {
+            continue;
+        }
+        if substitutable_set.contains(sp.as_str()) {
+            will_substitute.push(sp.as_str().to_string());
             continue;
         }
         match dp {
@@ -760,7 +774,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     let w = stderr.inner_mut();
 
     wire::write_strings(w, &will_build).await?;
-    wire::write_strings(w, wire::NO_STRINGS).await?; // willSubstitute: always empty
+    wire::write_strings(w, &will_substitute).await?;
     wire::write_strings(w, &unknown).await?;
     wire::write_u64(w, 0).await?; // downloadSize
     wire::write_u64(w, 0).await?; // narSize
