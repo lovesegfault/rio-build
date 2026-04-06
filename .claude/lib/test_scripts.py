@@ -42,6 +42,7 @@ from onibus.models import (
     KnownFlake,
     MergeQueueRow,
     MergerReport,
+    MergeSha,
     PlanFile,
     PlanRow,
     Worktree,
@@ -145,6 +146,51 @@ def test_jsonl_roundtrip(tmp_path: Path):
     assert got[0].agent_id is None
     assert got[2].role == "verify"
     assert got[2].agent_id == "abc123"
+
+
+def test_mergesha_roundtrip(tmp_path: Path):
+    """MergeSha writes via append_jsonl and reads via read_jsonl. The
+    ts datetime roundtrips through ISO string. Last-row-per-mc-wins
+    is a dict-comp property, not a model property — tested separately
+    in test_cadence_range_last_mc_wins if that exists."""
+    from datetime import datetime, timezone
+
+    p = tmp_path / "merge-shas.jsonl"
+    row = MergeSha(mc=42, sha="deadbeef" * 5, ts=datetime.now(timezone.utc))
+    append_jsonl(p, row)
+    got = read_jsonl(p, MergeSha)
+    assert len(got) == 1
+    assert got[0].mc == 42
+    assert got[0].sha == "deadbeef" * 5
+    # ts roundtrips (pydantic serializes datetime → ISO, parses back)
+    assert abs((got[0].ts - row.ts).total_seconds()) < 1
+
+
+def test_mergesha_sha_pattern_rejects():
+    """The sha Field pattern ^[0-9a-f]{8,40}$ — same as Mitigation.landed_sha.
+    Catches: 7-char git-short (too ambiguous), uppercase (git is lowercase),
+    non-hex, empty. Raw json.dumps didn't validate any of this; a typo'd
+    sha would surface as 'fatal: bad object' in _cadence_range's git diff
+    much later."""
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc)
+    # 7-char: rejected (min 8)
+    with pytest.raises(ValidationError):
+        MergeSha(mc=1, sha="abc1234", ts=ts)
+    # uppercase: rejected
+    with pytest.raises(ValidationError):
+        MergeSha(mc=1, sha="DEADBEEF", ts=ts)
+    # non-hex: rejected
+    with pytest.raises(ValidationError):
+        MergeSha(mc=1, sha="ghijklmn", ts=ts)
+    # 8-char lowercase hex: accepted
+    MergeSha(mc=1, sha="deadbeef", ts=ts)
+    # 40-char full: accepted
+    MergeSha(mc=1, sha="a" * 40, ts=ts)
+    # negative mc: rejected (ge=0)
+    with pytest.raises(ValidationError):
+        MergeSha(mc=-1, sha="deadbeef", ts=ts)
 
 
 def test_read_jsonl_missing_file(tmp_path: Path):

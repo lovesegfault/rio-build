@@ -11,6 +11,7 @@ as display (verifier's ## Follow-ups in its human-read report — never parsed).
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -276,6 +277,25 @@ class CoverageResult(BaseModel):
     exit_code: int
     log_path: str
     merged_at: str = Field(description="main hash at merge time")
+
+
+# ─── MergeSha ────────────────────────────────────────────────────────────────
+
+
+class MergeSha(BaseModel):
+    """One row in state/merge-shas.jsonl — merge-count → integration-branch
+    tip at that merge. Written by count_bump() AFTER the merger's amend
+    (P0319 fix @ 8a1ed8cd — before the fix, pre-amend SHAs dangled).
+    Read by _cadence_range() to compute git ranges for consolidator/
+    bughunter agents. Last-row-per-mc wins (count-bump --set-to can
+    re-record the same mc with a different tip after a reset)."""
+    mc: int = Field(ge=0, description="merge-count — value AFTER this bump")
+    sha: str = Field(
+        pattern=r"^[0-9a-f]{8,40}$",
+        description="git rev-parse <integration-branch> — full 40-hex or "
+        "abbreviated ≥8-hex. Same pattern as Mitigation.landed_sha.",
+    )
+    ts: datetime = Field(description="UTC timestamp of the bump")
 
 
 # ─── PlanRow ─────────────────────────────────────────────────────────────────
