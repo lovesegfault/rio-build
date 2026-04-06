@@ -36,10 +36,16 @@ export const DEGRADE_THRESHOLD = 2000;
 export const WORKER_THRESHOLD = 500;
 
 // DerivationStatus string → CSS class. Mirrors
-// rio-scheduler/src/state/derivation.rs:138-152 (as_str). Completed is
-// green; in-flight (assigned/running) are yellow; every failure flavour
-// is red; pre-dispatch states and cancelled are gray. Unknown defaults
-// to gray so a proto/DB addition doesn't crash the node.
+// rio-scheduler/src/state/derivation.rs DerivationStatus::as_str(). The
+// golden snapshot at rio-test-support/golden/derivation_statuses.json is
+// the cross-language source of truth — both the Rust snapshot test
+// (derivation.rs status_snapshot mod) and the vitest cross-language
+// describe (graphLayout.test.ts) fail if a new variant isn't plumbed
+// here. Completed is green; in-flight (assigned/running) are yellow;
+// every failure flavour is red; pre-dispatch states and cancelled are
+// gray. Unknown defaults to gray so a proto/DB addition doesn't crash
+// the node — but the golden cross-check catches that fall-through at
+// test time, not at runtime.
 const STATUS_CLASS: Record<string, 'green' | 'yellow' | 'red' | 'gray'> = {
   completed: 'green',
   skipped: 'green',
@@ -61,9 +67,13 @@ export function statusClass(status: string): 'green' | 'yellow' | 'red' | 'gray'
 // Terminal states: no further status transitions without external reset.
 // Mirrors rio-scheduler/src/state/derivation.rs DerivationStatus::
 // is_terminal() — note `failed` is NOT terminal (retriable: failed→ready
-// until poison threshold). Graph.svelte uses this to stop polling once
-// every node is settled — a finished build's drawer left open shouldn't
-// keep hitting GetBuildGraph every 5s.
+// until poison threshold). Enforced cross-language via the golden
+// snapshot's per-row `terminal: bool` field (graphLayout.test.ts
+// "TERMINAL matches Rust is_terminal() via golden" — a Rust-side
+// reclassification drifts both the nextest snapshot and that vitest).
+// Graph.svelte uses this to stop polling once every node is settled —
+// a finished build's drawer left open shouldn't keep hitting
+// GetBuildGraph every 5s.
 export const TERMINAL = new Set([
   'completed',
   'skipped',
@@ -73,11 +83,13 @@ export const TERMINAL = new Set([
 ]);
 
 // All status strings the scheduler emits (derivation.rs as_str()). Kept
-// here so the exhaustiveness test in graphLayout.test.ts can iterate the
-// full set against STATUS_CLASS — catches the next Skipped-style
-// addition before it silently falls through to gray. GraphNode.status is
-// a plain string on the wire (dag.proto), not a proto enum, so there's
-// no generated type to derive this from.
+// here so the same-file exhaustiveness test in graphLayout.test.ts can
+// iterate against STATUS_CLASS — catches the next Skipped-style addition
+// before it silently falls through to gray. GraphNode.status is a plain
+// string on the wire (dag.proto), not a proto enum, so there's no
+// generated type to derive this from. The cross-language golden check
+// asserts this hand-list matches what Rust actually emits (so this list
+// staying stale no longer creates a blind spot).
 export const DERIVATION_STATUSES = [
   'created',
   'queued',
@@ -103,8 +115,12 @@ export function hashPrefix(drvPath: string): string {
 
 // Failed/poisoned sorts first (top of the degraded table — "what's
 // broken"), then in-flight, then pre-dispatch, then completed. Within a
-// rank, pname lexically.
-const SORT_RANK: Record<string, number> = {
+// rank, pname lexically. Mirrors the same DerivationStatus string set
+// as STATUS_CLASS above — the golden snapshot cross-check in
+// graphLayout.test.ts asserts `s in SORT_RANK` for every Rust-emitted
+// status (no fall-through to the `?? 5` default rank). Exported for
+// that membership check; sortForTable stays the consuming API.
+export const SORT_RANK: Record<string, number> = {
   failed: 0,
   poisoned: 0,
   dependency_failed: 0,
