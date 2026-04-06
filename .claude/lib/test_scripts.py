@@ -1690,6 +1690,92 @@ def test_by_drv_collapse_picks_most_restrictive(tmp_path: Path, monkeypatch):
         assert "retry=Never" in v.reason
 
 
+def test_check_fail_re_matches_non_vm_drv(tmp_path: Path, monkeypatch):
+    """_CHECK_FAIL_RE gives non-VM checks.* drvs a match surface. P0490's
+    rio-tracey-validate known-flake entry was dead: drv_name:null excluded
+    from by_drv, _VM_FAIL_RE needs -vm-test-run- between hash and name.
+    A rio-tracey-validate Cannot-build line matched neither surface.
+
+    Also proves disjoint-ness from _VM_FAIL_RE: [a-z0-9]+ excludes '-' so
+    the greedy + halts at the first hyphen after the store hash. A
+    vm-test-run-rio-* drv has -vm- there, not -rio-, so it cannot match
+    _CHECK_FAIL_RE. No double-count across the two regexes.
+    """
+    import onibus.build
+    from onibus.build import _CHECK_FAIL_RE, _VM_FAIL_RE, excusable
+
+    kf = tmp_path / "known-flakes.jsonl"
+    log = tmp_path / "ci.log"
+    monkeypatch.setattr(onibus.build, "KNOWN_FLAKES", kf)
+
+    tracey_entry = KnownFlake(
+        test="rio-tracey-validate", drv_name="rio-tracey-validate",
+        symptom="Daemon failed to start within 5s",
+        root_cause="tracey daemon socket startup race", fix_owner="P0490",
+        fix_description="retry-once wrapper in flake.nix", retry="Once",
+    )
+    kf.write_text(tracey_entry.model_dump_json() + "\n")
+
+    # Positive: rio-tracey-validate Cannot-build → _CHECK_FAIL_RE captures it,
+    # drv_name is in by_drv → excusable with retry=Once.
+    log.write_text(
+        "error: Cannot build '/nix/store/abc123xyz-rio-tracey-validate.drv'\n"
+        "       Reason: builder failed with exit code 1.\n"
+    )
+    v = excusable(log)
+    assert v.excusable, (
+        f"rio-tracey-validate check drv with known-flake entry should be "
+        f"excusable; got: {v.reason!r}"
+    )
+    assert v.matched_flakes == ["rio-tracey-validate"]
+    assert v.failing_tests == ["rio-tracey-validate"]
+    assert "retry=Once" in v.reason
+
+    # Negative: vm-test-run-rio-observability drv with a checks-name entry
+    # → no match. Proves disjoint: _CHECK_FAIL_RE does NOT match VM drvs,
+    # and _VM_FAIL_RE captures "rio-observability" (not "rio-tracey-validate").
+    log.write_text(
+        "error: Cannot build '/nix/store/def456abc-vm-test-run-rio-observability.drv'\n"
+    )
+    v = excusable(log)
+    assert not v.excusable, (
+        f"vm-test-run drv must not match a checks-name known-flake entry; "
+        f"got: {v.reason!r}"
+    )
+    assert v.failing_tests == ["rio-observability"]  # caught by _VM_FAIL_RE
+    assert v.matched_flakes == []  # rio-observability ≠ rio-tracey-validate
+    assert "not in known-flakes" in v.reason
+
+    # Regex-level disjoint proof: same vm-test-run drv line against both
+    # regexes. _CHECK_FAIL_RE must return empty — [a-z0-9]+ stops at the
+    # first '-' after the hash, next chars are 'vm-' not 'rio-'. This is
+    # the exit criterion: structurally impossible to double-count.
+    vm_line = "error: Cannot build '/nix/store/def456abc-vm-test-run-rio-foo.drv'"
+    assert _CHECK_FAIL_RE.findall(vm_line) == [], (
+        f"_CHECK_FAIL_RE must NOT match vm-test-run drvs (disjoint from "
+        f"_VM_FAIL_RE); got {_CHECK_FAIL_RE.findall(vm_line)!r}"
+    )
+    assert _VM_FAIL_RE.findall(vm_line) == ["rio-foo"]
+
+    # And the mirror: check drv line against _VM_FAIL_RE → empty.
+    check_line = "error: Cannot build '/nix/store/abc123xyz-rio-tracey-validate.drv'"
+    assert _VM_FAIL_RE.findall(check_line) == []
+    assert _CHECK_FAIL_RE.findall(check_line) == ["rio-tracey-validate"]
+
+    # P0517 aggregate-cascade concern: rio-cov-vm-total WOULD match
+    # _CHECK_FAIL_RE on failure, but the len(failing)>1 gate catches
+    # cascades. Two rio-* Cannot-build lines → not excusable, before
+    # by_drv lookup. No over-count re-introduction.
+    log.write_text(
+        "error: Cannot build '/nix/store/aaa-rio-tracey-validate.drv'\n"
+        "error: Cannot build '/nix/store/bbb-rio-cov-vm-total.drv'\n"
+    )
+    v = excusable(log)
+    assert not v.excusable
+    assert "2 failures" in v.reason
+    assert set(v.failing_tests) == {"rio-tracey-validate", "rio-cov-vm-total"}
+
+
 # ─── unassigned placeholder rename ───────────────────────────────────────────
 
 
