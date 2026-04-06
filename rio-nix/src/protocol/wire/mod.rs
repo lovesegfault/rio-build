@@ -696,14 +696,14 @@ mod tests {
     }
 
     /// MAX_FRAMED_TOTAL / MAX_FRAME_SIZE constant mutations: `*` → `+`
-    /// or `/` at framed.rs:12,15. The clamp in `FramedStreamReader::new`
+    /// or `/` at framed.rs. The clamp in `FramedStreamReader::new`
     /// is `max_total.min(MAX_FRAMED_TOTAL)`; a `*` → `+` mutation drops
-    /// 1 GiB to ~2 KiB (`1024 + 1024 + 1024`), which a 4 KiB single-frame
-    /// stream would then exceed.
+    /// 4 GiB to ~3 KiB (`4 + 1024 + 1024 + 1024`), which a 4 KiB
+    /// single-frame stream would then exceed.
     #[tokio::test]
     async fn max_framed_constants_are_large() -> anyhow::Result<()> {
         // 4 KiB single frame — well under real MAX_FRAME_SIZE (64 MiB)
-        // and MAX_FRAMED_TOTAL (1 GiB). A `*` → `+` or `*` → `/` on
+        // and MAX_FRAMED_TOTAL (4 GiB). A `*` → `+` or `*` → `/` on
         // either constant would clamp to a tiny value and reject this.
         let data = vec![0x55u8; 4096];
         let result = framed_reader_roundtrip(&data, 4096).await?;
@@ -713,7 +713,7 @@ mod tests {
         // still running (at compile time) against the mutated constant.
         const {
             assert!(MAX_FRAME_SIZE == 64 * 1024 * 1024);
-            assert!(MAX_FRAMED_TOTAL == 1024 * 1024 * 1024);
+            assert!(MAX_FRAMED_TOTAL == 4 * 1024 * 1024 * 1024);
             assert!(MAX_FRAME_SIZE > 4096);
             assert!(MAX_FRAMED_TOTAL > MAX_FRAME_SIZE);
         }
