@@ -178,10 +178,11 @@ pkgs.testers.runNixOSTest {
     # combined stdout+stderr so the denied case can assert the wget
     # error message.
     #
-    # `--timeout 60 --max-silent-time 60`: NO-OPS over ssh-ng — the client
-    # never sends wopSetOptions (P0215 empirical). Kept as harmless; the
-    # live bounds are `wget -T 15` inside the FOD (network layer) and
-    # `timeout 150` at the shell.
+    # nix-build per-build-timeout and silence-timeout flags DROPPED:
+    # NO-OPS over ssh-ng — the client never sends wopSetOptions (P0215
+    # source-verified: ssh-store.cc:81-88 empty override). Live bounds
+    # are `wget -T 15` inside the FOD (network layer) and `timeout 150`
+    # at the shell (via timeout_wrap=150 at call sites).
     #
     # TODO(P0308-followup): whiteout fix unvalidated in k3s — timing
     #   assertion removed until rio-worker mknod-whiteout proven to work
@@ -208,21 +209,10 @@ pkgs.testers.runNixOSTest {
     #
     #   Shell timeout 150s admits one fetch_timeout + retry + slop.
     #   Re-tighten to 60s + add `elapsed < 45` once validated.
-    def build(drv_file, extra_args="", expect_fail=False):
-        cmd = (
-            f"timeout 150 "
-            f"nix-build --no-out-link --timeout 60 --max-silent-time 60 "
-            f"--store 'ssh-ng://k3s-server' "
-            f"--arg busybox '(builtins.storePath ${common.busybox})' "
-            f"{extra_args} {drv_file} 2>&1"
-        )
-        try:
-            if expect_fail:
-                return client.fail(cmd)
-            return client.succeed(cmd)
-        except Exception:
-            dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")
-            raise
+    ${common.mkBuildHelperV2 {
+      gatewayHost = "k3s-server";
+      dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")'';
+    }}
 
     # ══════════════════════════════════════════════════════════════════
     # allowed — allowlisted FOD → build succeeds + TCP_MISS
@@ -240,17 +230,17 @@ pkgs.testers.runNixOSTest {
     # the outbound leg, or no log at all which would mean wget bypassed
     # the proxy entirely).
     with subtest("fod-proxy-allowed: allowlisted fetch succeeds via squid"):
-        out = build(
+        # strip_to_store_path (default under 2>&1) skips SSH warnings +
+        # progress. timeout_wrap=60: regression hard bound (see helper
+        # comment above).
+        store_path = build(
             "${drvs.fodFetch}",
             extra_args=(
                 "--argstr url 'http://k3s-server:${toString originPort}/fixture' "
                 "--argstr sha256 '${fodFixtureSha256}'"
             ),
+            timeout_wrap=60,
         )
-        print(f"allowed build output:\n{out}")
-        # Last non-empty line is the store path (earlier lines: SSH
-        # warnings, nix-build progress).
-        store_path = [l for l in out.strip().split("\n") if l.strip()][-1]
         assert store_path.startswith("/nix/store/"), (
             f"allowed FOD build should produce a store path: {store_path!r}"
         )
@@ -306,7 +296,8 @@ pkgs.testers.runNixOSTest {
         #   diagnostic but NOT asserted. Once the whiteout is fixed,
         #   add back `assert elapsed < 45` (~5s builder + dispatch
         #   slop) — that's the regression guard for the overlay→FUSE
-        #   fall-through.
+        #   fall-through. expect_fail returns raw client.fail output
+        #   (no strip) so the 403/error-message asserts see full 2>&1.
         import time
         t0 = time.monotonic()
         out = build(
@@ -316,6 +307,7 @@ pkgs.testers.runNixOSTest {
                 "--argstr sha256 '${bogusSha256}'"
             ),
             expect_fail=True,
+            timeout_wrap=150,
         )
         elapsed = time.monotonic() - t0
         print(f"denied build output (expected failure, {elapsed:.1f}s):\n{out}")
@@ -365,9 +357,7 @@ pkgs.testers.runNixOSTest {
     # stricter than FOD), but "might" is a flake. The gate makes this
     # deterministic regardless of Nix sandbox config.
     with subtest("fod-proxy-nonfod: non-FOD builder env has no http_proxy"):
-        out = build("${drvs.envDump}")
-        print(f"env-dump build output:\n{out}")
-        store_path = [l for l in out.strip().split("\n") if l.strip()][-1]
+        store_path = build("${drvs.envDump}", timeout_wrap=60)
         assert store_path.startswith("/nix/store/"), (
             f"env-dump build should produce a store path: {store_path!r}"
         )

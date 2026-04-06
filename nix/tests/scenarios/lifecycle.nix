@@ -484,19 +484,10 @@ let
     # client's programs.ssh.extraConfig routes `Host k3s-server` →
     # port 32222, user rio (mkClientNode in common.nix:348-356). So
     # `ssh-ng://k3s-server` hits the gateway NodePort.
-    def build(drv_file, capture_stderr=True):
-        cmd = (
-            f"nix-build --no-out-link --store 'ssh-ng://k3s-server' "
-            f"--arg busybox '(builtins.storePath ${common.busybox})' "
-            f"{drv_file}"
-        )
-        if capture_stderr:
-            cmd += " 2>&1"
-        try:
-            return client.succeed(cmd)
-        except Exception:
-            dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")
-            raise
+    ${common.mkBuildHelperV2 {
+      gatewayHost = "k3s-server";
+      dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")'';
+    }}
   '';
 
   # ── Subtest fragments ─────────────────────────────────────────────────
@@ -1682,20 +1673,12 @@ let
 
           # Build tenantDrv via the tenant-key alias. Fresh marker →
           # fresh derivation → fresh build (no DAG-dedup). Completion
-          # sees tenant_id=Some(uuid) → upsert fires. Can't use build()
-          # — it hardcodes 'ssh-ng://k3s-server' (default key).
-          try:
-              out_tenant = client.succeed(
-                  "nix-build --no-out-link "
-                  "--store 'ssh-ng://k3s-server-tenant' "
-                  "--arg busybox '(builtins.storePath ${common.busybox})' "
-                  "${tenantDrv} 2>&1"
-              )
-          except Exception:
-              dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")
-              raise
-          out_tenant = [l.strip() for l in out_tenant.strip().split("\n")
-                        if l.strip()][-1]
+          # sees tenant_id=Some(uuid) → upsert fires. store_url routes
+          # through the k3s-server-tenant ssh_config alias (tenant key
+          # via IdentitiesOnly); strip_to_store_path (the default under
+          # capture_stderr=True) skips SSH known_hosts warnings.
+          out_tenant = build("${tenantDrv}",
+                             store_url="ssh-ng://k3s-server-tenant")
           assert out_tenant.startswith("/nix/store/"), (
               f"tenant-key build should produce store path: {out_tenant!r}"
           )

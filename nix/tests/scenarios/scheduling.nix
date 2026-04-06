@@ -138,21 +138,10 @@ let
     all_workers = [wsmall1, wsmall2, wlarge]
     small_workers = [wsmall1, wsmall2]
 
-    def build(drv_file, attr="", capture_stderr=True):
-        cmd = (
-            f"nix-build --no-out-link --store 'ssh-ng://${gatewayHost}' "
-            f"--arg busybox '(builtins.storePath ${common.busybox})' "
-            f"{drv_file}"
-        )
-        if attr:
-            cmd += f" -A {attr}"
-        if capture_stderr:
-            cmd += " 2>&1"
-        try:
-            return client.succeed(cmd)
-        except Exception:
-            dump_all_logs([${gatewayHost}] + all_workers)
-            raise
+    ${common.mkBuildHelperV2 {
+      inherit gatewayHost;
+      dumpLogsExpr = "dump_all_logs([${gatewayHost}] + all_workers)";
+    }}
 
     def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
         """SubmitBuild via plaintext gRPC direct to :9001. Returns buildId.
@@ -758,13 +747,11 @@ let
               timeout=40,
           )
 
-          # client.fail: TimedOut is a build FAILURE (nix-build exits nonzero).
+          # expect_fail=True: TimedOut is a build FAILURE (nix-build
+          # exits nonzero). The timing wrap stays at the callsite —
+          # measures end-to-end including ssh setup, not just build.
           t0 = _time.monotonic()
-          out = client.fail(
-              "nix-build --no-out-link --store 'ssh-ng://${gatewayHost}' "
-              "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "${silenceDrv} 2>&1"
-          )
+          out = build("${silenceDrv}", expect_fail=True)
           elapsed = _time.monotonic() - t0
 
           # Timing proof. 10s silence + daemon-setup + QEMU/SSH overhead

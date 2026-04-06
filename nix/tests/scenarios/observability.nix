@@ -67,22 +67,12 @@ pkgs.testers.runNixOSTest {
     ${common.sshKeySetup gatewayHost}
     ${common.seedBusybox gatewayHost}
 
-    store_url = "ssh-ng://${gatewayHost}"
     workers = [worker1, worker2, worker3]
 
-    def build_chain():
-        """Build the A→B→C chain. Captures stderr (2>&1) — the
-        PHASE2B-LOG-MARKER lines flow worker→scheduler→gateway→STDERR_NEXT→
-        client stderr. The `rio trace_id: <hex>` line also lands here."""
-        try:
-            return client.succeed(
-                f"nix-build --no-out-link --store '{store_url}' "
-                "--arg busybox '(builtins.storePath ${common.busybox})' "
-                "${drvs.chain} 2>&1"
-            )
-        except Exception:
-            dump_all_logs([${gatewayHost}] + workers)
-            raise
+    ${common.mkBuildHelperV2 {
+      inherit gatewayHost;
+      dumpLogsExpr = "dump_all_logs([${gatewayHost}] + workers)";
+    }}
 
     # ══════════════════════════════════════════════════════════════════
     # metrics-registered: every spec'd rio_{component}_* metric appears
@@ -95,7 +85,12 @@ pkgs.testers.runNixOSTest {
     # Run the chain build FIRST. Counters/histograms only appear after
     # first increment (metrics-rs doesn't pre-register). Gauges appear
     # immediately but better to check everything post-traffic.
-    output = build_chain()
+    #
+    # strip_to_store_path=False: `output` is searched for the
+    # `rio trace_id: <hex>` STDERR_NEXT line (trace-id-propagation
+    # subtest below). The default strip would discard everything but
+    # the store path.
+    output = build("${drvs.chain}", strip_to_store_path=False)
 
     # Port map (nix/modules/*.nix defaults):
     #   gateway=9090  scheduler=9091  store=9092  worker=9093
