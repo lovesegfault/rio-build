@@ -910,3 +910,81 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
 
     Ok(())
 }
+
+/// I-146: a Ready derivation with NO estimator data (cold-start —
+/// pname not in build_history, peak_mem/cpu=None) MUST count in the
+/// smallest size-class's `queued`, never vanish. If it vanishes the
+/// controller sees queued=0 across all pools → scales every pool to 0
+/// → 1870 cold-start drvs sit in ready_queue with no workers and
+/// dispatch deadlocks. Also: FODs are NOT counted in any size-class
+/// (they dispatch to fetchers, not size-class builders — ADR-019).
+#[tokio::test]
+async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        // Classes deliberately UNSORTED so the smallest-class fallback
+        // can't accidentally rely on index 0 being smallest.
+        a.with_size_classes(vec![
+            crate::assignment::SizeClassConfig {
+                name: "large".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            crate::assignment::SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ])
+    });
+
+    // Two non-FOD nodes with pnames the (empty) estimator has never
+    // seen → est_duration falls back to DEFAULT_DURATION_SECS (30s)
+    // → classify() picks smallest covering class = tiny. One FOD
+    // node → must NOT appear in any size-class queued.
+    let mut fod = make_test_node("cold-fod", "x86_64-linux");
+    fod.is_fixed_output = true;
+    let _rx = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![
+            make_test_node("cold-a", "x86_64-linux"),
+            make_test_node("cold-b", "x86_64-linux"),
+            fod,
+        ],
+        vec![],
+        false,
+    )
+    .await?;
+
+    let snap = handle
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
+        .await?;
+    assert_eq!(snap.len(), 2);
+
+    let tiny = snap.iter().find(|s| s.name == "tiny").unwrap();
+    let large = snap.iter().find(|s| s.name == "large").unwrap();
+
+    // Cold-start non-FODs land in the smallest class. FOD excluded.
+    assert_eq!(
+        tiny.queued, 2,
+        "cold-start non-FOD drvs must count in the smallest class \
+         (controller needs non-zero queued to spawn workers)"
+    );
+    assert_eq!(tiny.queued_by_system.get("x86_64-linux"), Some(&2));
+    assert_eq!(large.queued, 0);
+
+    // Invariant: every Ready non-FOD is counted in exactly one class
+    // — sum across classes == Ready non-FOD count (2). The FOD (1) is
+    // NOT in any class's queued.
+    let total_queued: u64 = snap.iter().map(|s| s.queued).sum();
+    assert_eq!(
+        total_queued, 2,
+        "FOD must not be counted in size-class queued (goes to fetchers); \
+         every Ready non-FOD must be counted in exactly one class"
+    );
+
+    Ok(())
+}

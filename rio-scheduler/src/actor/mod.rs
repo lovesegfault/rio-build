@@ -1314,11 +1314,25 @@ impl DagActor {
         // name → index into `snapshots`. classify() and
         // assigned_size_class both return names, not indices.
         let mut index: HashMap<String, usize> = HashMap::with_capacity(classes.len());
+        // I-146: index of the smallest-cutoff class. Fallback bucket
+        // for any Ready non-FOD that classify() somehow doesn't place
+        // — every dispatchable derivation MUST count in some class so
+        // the controller never sees queued=0 across all pools while
+        // ready_queue is non-empty (which would scale every pool to 0
+        // and deadlock dispatch). With the current classify() contract
+        // (always Some when classes non-empty) the fallback is
+        // unreachable; it's defensive against future classify changes
+        // and makes the "sum(queued) == Ready non-FOD count" invariant
+        // structural rather than incidental.
+        let mut smallest_idx = 0usize;
         let mut snapshots: Vec<SizeClassSnapshot> = classes
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 index.insert(c.name.clone(), i);
+                if c.cutoff_secs < classes[smallest_idx].cutoff_secs {
+                    smallest_idx = i;
+                }
                 // configured_cutoffs lookup: linear scan is fine for
                 // ~3-5 classes. Falls back to effective if not found
                 // (shouldn't happen — both populated from the same
@@ -1346,27 +1360,48 @@ impl DagActor {
         for (_, state) in self.dag.iter_nodes() {
             match state.status() {
                 DerivationStatus::Ready => {
+                    // I-146: FODs dispatch to fetchers, NOT size-class
+                    // builders (find_executor_with_overflow skips the
+                    // overflow chain entirely for is_fixed_output —
+                    // ADR-019). Counting them here would inflate
+                    // builder-pool demand for work those builders will
+                    // never receive. The Running arm already excludes
+                    // FODs implicitly (assigned_size_class=None for FOD
+                    // dispatch); this makes Ready symmetric. FOD demand
+                    // is reported via ClusterSnapshot.queued_fod_
+                    // derivations → FetcherPool autoscaler.
+                    if state.is_fixed_output {
+                        continue;
+                    }
                     // Forecast: what class WOULD dispatch pick?
-                    // Same inputs as dispatch.rs:82-92 — est_duration
-                    // stored on the state at merge time; peak_memory
-                    // / peak_cpu from the estimator.
-                    if let Some(class) = crate::assignment::classify(
+                    // Same inputs as dispatch.rs — est_duration stored
+                    // on the state at merge time; peak_memory /
+                    // peak_cpu from the estimator. classify() is
+                    // contractually Some when classes is non-empty
+                    // (checked above), so the .and_then chain resolves;
+                    // .unwrap_or(smallest_idx) is the I-146 belt: if a
+                    // future classify() change introduces a None path,
+                    // the derivation lands in the smallest class
+                    // (matching dispatch's "any worker" semantics for
+                    // target_class=None) rather than vanishing from
+                    // every pool's queued count.
+                    let i = crate::assignment::classify(
                         state.est_duration,
                         self.estimator
                             .peak_memory(state.pname.as_deref(), &state.system),
                         self.estimator
                             .peak_cpu(state.pname.as_deref(), &state.system),
                         &classes,
-                    ) && let Some(&i) = index.get(&class)
-                    {
-                        snapshots[i].queued += 1;
-                        // I-143: per-system breakdown so per-arch
-                        // size-class pools scale on their own backlog.
-                        *snapshots[i]
-                            .queued_by_system
-                            .entry(state.system.clone())
-                            .or_default() += 1;
-                    }
+                    )
+                    .and_then(|c| index.get(&c).copied())
+                    .unwrap_or(smallest_idx);
+                    snapshots[i].queued += 1;
+                    // I-143: per-system breakdown so per-arch
+                    // size-class pools scale on their own backlog.
+                    *snapshots[i]
+                        .queued_by_system
+                        .entry(state.system.clone())
+                        .or_default() += 1;
                 }
                 DerivationStatus::Assigned | DerivationStatus::Running => {
                     // Fact: what class DID we dispatch to?
