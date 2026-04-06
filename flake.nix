@@ -861,6 +861,104 @@
             nextest reuse-build path with per-variant RIO_GOLDEN_DAEMON_BIN.
           '';
 
+          # --------------------------------------------------------------
+          # Mutation testing (weekly tier — NOT in .#ci)
+          # --------------------------------------------------------------
+          #
+          # cargo-mutants mutates source (swap < for <=, delete a
+          # statement, replace a return with Default::default()),
+          # reruns the test suite, flags mutations that SURVIVE —
+          # code paths the tests don't actually constrain. Tracey
+          # answers "is this spec rule covered"; mutants answers
+          # "does the test that covers it actually catch bugs".
+          #
+          # Scoped via .config/mutants.toml to high-signal targets
+          # (scheduler state machine, wire primitives, ATerm parser,
+          # HMAC verify, manifest encoding — ~320 mutations). Weekly
+          # cron invokes `nix build .#mutants`; survived-count is
+          # diffed week-over-week. Exit 2 on survived mutants is
+          # EXPECTED — derivation `|| true`'s it. Findings are a
+          # trend metric, not a gate.
+          #
+          # `packages` not `checks` (same as golden-matrix): hours
+          # per run, not something `nix flake check` should touch.
+          mutants = craneLib.mkCargoDerivation (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pnameSuffix = "-mutants";
+              # No separate src override: .config/mutants.toml is
+              # already in commonArgs.src via commonCargoSources'
+              # `*.toml` match (same as nextest.toml, deny.toml,
+              # book.toml — the explicit fileset entries above are
+              # belt-and-braces, the filter picks them up regardless).
+              # One-time drv rehash when adding a new .toml to the
+              # tree; future scope tweaks rehash too. Scope edits
+              # are rare (weekly-tier adjustment), so the simpler
+              # single-fileset model wins over fileset.difference.
+              # cargo-mutants runs `cargo build` + `cargo nextest run`
+              # per mutation. Needs the same test-time deps as the
+              # nextest check (PG for scheduler/store tests, nix-cli
+              # for golden-conformance, openssh for ssh-ng tests).
+              # Mutations are scoped to specific crates but the baseline
+              # run hits the whole workspace.
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
+                pkgs.cargo-mutants
+                pkgs.cargo-nextest
+                pkgs.jq
+                inputs.nix.packages.${system}.nix-cli
+                pkgs.openssh
+                pkgs.postgresql_18
+              ];
+
+              # `--in-place`: mutate the unpacked source in $PWD (crane
+              # unpacks to a writable tmpdir). Cheaper than the default
+              # copy-per-mutation mode when running inside a throwaway
+              # sandbox anyway.
+              #
+              # `--no-shuffle` is the default in current cargo-mutants
+              # but kept explicit for the week-over-week diff guarantee.
+              #
+              # `--output $out`: cargo-mutants creates mutants.out/
+              # INSIDE the given dir, so result/mutants.out/outcomes.json.
+              #
+              # `|| true`: exit 2 when mutants survive. That's the
+              # EXPECTED outcome — no codebase is 100% mutation-killed.
+              # The derivation succeeds; missed-count is diffed.
+              buildPhaseCargoCommand = ''
+                cargo mutants \
+                  --in-place --no-shuffle \
+                  --config .config/mutants.toml \
+                  --output $out \
+                  --timeout-multiplier 2.0 \
+                  || true
+              '';
+
+              # Crane's default install copies target/ to $out for
+              # downstream-dep-caching. Mutants artifacts aren't useful
+              # downstream; $out already has mutants.out/.
+              doInstallCargoArtifacts = false;
+              installPhaseCommand = ''
+                # Extract caught/missed counts from the JSON outcome
+                # stream for the weekly-diff step. jq is cleaner than
+                # grep-c here — outcomes.json is a JSON array, and the
+                # same outcome string can appear in scenario_name.
+                jq '[.outcomes[] | select(.summary == "CaughtMutant")] | length' \
+                  $out/mutants.out/outcomes.json > $out/caught-count || echo 0 > $out/caught-count
+                jq '[.outcomes[] | select(.summary == "MissedMutant")] | length' \
+                  $out/mutants.out/outcomes.json > $out/missed-count || echo 0 > $out/missed-count
+              '';
+
+              # Golden fixture paths — the baseline run hits
+              # golden_conformance (workspace-wide). Same vars as the
+              # nextest check above; cargo-mutants inherits the env.
+              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+              RIO_GOLDEN_FORCE_HERMETIC = "1";
+              NEXTEST_HIDE_PROGRESS_BAR = "1";
+            }
+          );
+
           # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
           # ──────────────────────────────────────────────────────────
@@ -1007,6 +1105,7 @@
                 cargo-edit
                 cargo-expand
                 cargo-fuzz # works in default (nightly) shell; errors on stable
+                cargo-mutants # weekly tier — see `just mutants` / `.#mutants`
                 cargo-nextest
                 cargo-outdated
                 cargo-watch
@@ -1315,6 +1414,7 @@
           # build the three extra Nix source trees on every push.
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             golden-matrix = goldenMatrix;
+            inherit mutants;
           };
 
           # --------------------------------------------------------------

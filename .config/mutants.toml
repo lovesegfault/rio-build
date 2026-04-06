@@ -1,0 +1,63 @@
+# Mutation testing scope. Start narrow — high-signal targets where
+# surviving mutants are real test gaps. Expand over time as the
+# missed-count baseline is understood.
+#
+# Run via `just mutants` (local, against $PWD) or `nix build .#mutants`
+# (hermetic weekly tier). Exits 2 when any mutant survives — that's
+# expected; we diff missed-count week-over-week.
+
+# Files to mutate. Globs relative to workspace root. Each target here
+# has tight unit-test coverage where a surviving mutant is a genuine
+# gap, not "you didn't write a test for your tracing span".
+examine_globs = [
+  # Scheduler state machine transitions. Off-by-one or wrong-comparison
+  # bugs here compile cleanly and pass "does it return something" tests.
+  "rio-scheduler/src/state/derivation.rs",
+  # best_worker scoring + hard/soft filters. Arithmetic-heavy.
+  "rio-scheduler/src/assignment.rs",
+  # Protocol primitives: u64/string/bytes padding, framed I/O.
+  "rio-nix/src/protocol/wire/mod.rs",
+  "rio-nix/src/protocol/wire/framed.rs",
+  # .drv ATerm parser. Hand-written recursive descent — off-by-one
+  # in the paren/comma bookkeeping is the classic mutation.
+  "rio-nix/src/derivation/aterm.rs",
+  # Assignment-token MAC. The `>` in the expiry check is the
+  # canonical mutation target (> vs >= matters at the second).
+  "rio-common/src/hmac.rs",
+  # Chunk manifest encoding. Length-prefixed binary format.
+  "rio-store/src/manifest.rs",
+]
+
+# Never mutate these — high churn, low signal.
+exclude_globs = [
+  "**/main.rs",
+  # Mostly re-exports + metric registration — the metrics_registered
+  # test already covers "did you call describe_counter".
+  "**/lib.rs",
+  "**/*_test.rs",
+  "**/tests/**",
+]
+
+# Skip mutants in code matching these regexes. Tracing spans and
+# metric emission — mutations here are "did you emit the metric"
+# which the per-crate metrics_registered test (checks/clippy gates
+# on unused describe_*) already covers.
+exclude_re = ["tracing::", "metrics::", "^describe_"]
+
+# Per-mutant timeout: 2× the baseline test time. A mutation that
+# introduces an infinite loop (e.g. `<` → `<=` in a while-guard)
+# gets killed at 2× and counted CAUGHT (timeout is a valid kill).
+timeout_multiplier = 2.0
+
+# Use nextest for the per-mutant test run. Per-test-process model
+# (vs `cargo test`'s one-process-many-threads) gives clean isolation
+# and deterministic PG-fixture setup — see the coverage derivation's
+# comment block in flake.nix for why nextest > cargo-test here.
+test_tool = "nextest"
+
+# Denied-warnings workspaces (clippy `--deny warnings`) would mark
+# many mutants "unviable" because the mutation introduces a warning
+# (unused variable, unreachable code) before the test even runs.
+# cap_lints downgrades those to the default allow/warn — the mutant
+# must be killed by a failing TEST, not a lint.
+cap_lints = true
