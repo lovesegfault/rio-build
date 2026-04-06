@@ -223,6 +223,24 @@ impl NarCollectError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, NarCollectError::Stream(s) if s.code() == tonic::Code::NotFound)
     }
+
+    /// True if this is a transient transport-level failure that might
+    /// succeed on retry — `Unavailable` (server explicitly down: pod
+    /// restarting, follower-reject) or `Unknown` (transport disconnect:
+    /// h2 connection reset, TLS close mid-stream, what tonic surfaces
+    /// when the peer goes away without a gRPC-level status).
+    ///
+    /// `DeadlineExceeded` is NOT transient: that's [`get_path_nar`]'s
+    /// own timeout firing — the store hung past `fetch_timeout`.
+    /// Retrying with the same timeout won't help, and the next retry
+    /// would compound the wait on a FUSE-thread caller.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            NarCollectError::Stream(s)
+                if matches!(s.code(), tonic::Code::Unavailable | tonic::Code::Unknown)
+        )
+    }
 }
 
 /// Drain a `GetPath` response stream into `(Option<PathInfo>, nar_bytes)`.

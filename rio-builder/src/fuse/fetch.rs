@@ -43,6 +43,36 @@ const WAIT_SLICE: Duration = Duration::from_millis(200);
 /// starvation?) and EAGAIN is the least-bad errno.
 const WAIT_SLOP: Duration = Duration::from_secs(30);
 
+/// Backoff schedule for retrying transient store-gRPC errors
+/// (`Unavailable` / `Unknown` — server restarting, transport disconnect)
+/// inside [`fetch_extract_insert`]. Four delays = five attempts. Total
+/// wait ~7.6s, sized to survive a `replicas: 1` store rolling restart
+/// (~10s old-pod-SIGTERM → new-pod-Ready) without surfacing `EIO` to
+/// the build sandbox. I-039: a deploy mid-LLVM-build was killing 40min
+/// of work with an opaque `Input/output error` on `stat()`.
+///
+/// Sits BELOW the circuit breaker: `ensure_cached` checks the breaker
+/// before calling here, so if the store has been down long enough to
+/// trip it we never reach this loop. The retry handles the transition
+/// window (was-up → briefly-down → up-again); the breaker handles
+/// the steady-state (down-for-a-while → fail-fast).
+///
+/// Short in tests so the permanent-failure path stays sub-second.
+#[cfg(not(test))]
+const RETRY_BACKOFF: &[Duration] = &[
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+#[cfg(test)]
+const RETRY_BACKOFF: &[Duration] = &[
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+];
+
 impl NixStoreFs {
     /// Global deadline for the `WaitFor` loop: `fetch_timeout + WAIT_SLOP`.
     /// Was a `const` (`GRPC_STREAM_TIMEOUT` + 30s) before T1b made the
@@ -327,37 +357,79 @@ fn fetch_extract_insert(
     // the FUSE thread pool and freeze the whole mount. Uses `fetch_timeout`
     // (60s default from worker.toml), NOT `GRPC_STREAM_TIMEOUT` (300s) —
     // FUSE is the build-critical path; uploads get the longer deadline.
+    //
+    // Transient errors (Unavailable/Unknown — store pod restarting,
+    // transport disconnect) are retried with backoff: see RETRY_BACKOFF.
+    // Singleflight + fetch_sem mean only one FUSE thread per unique-path
+    // is parked here; the 8s worst-case retry window doesn't starve the
+    // mount. Non-transient errors (NotFound, SizeExceeded, DeadlineExceeded,
+    // InvalidArgument) fail immediately — those won't fix themselves.
     let fetch_start = std::time::Instant::now();
     let nar_data = runtime.block_on(async {
         let mut client = store_client.clone();
-        match rio_proto::client::get_path_nar(
-            &mut client,
-            &store_path,
-            fetch_timeout,
-            rio_common::limits::MAX_NAR_SIZE,
-            &[],
-        )
-        .await
-        {
-            Ok(Some((_info, nar))) => Ok(nar),
-            Ok(None) => {
-                // Path not in remote store. lookup() probes unknown names
-                // (.lock files, tmp paths); ENOENT is normal here.
-                Err(Errno::ENOENT)
-            }
-            Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
-                tracing::error!(
-                    store_path = %store_path,
-                    size = got,
-                    limit,
-                    "NAR exceeds MAX_NAR_SIZE"
-                );
-                Err(Errno::EFBIG)
-            }
-            Err(e) if e.is_not_found() => Err(Errno::ENOENT),
-            Err(e) => {
-                tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
-                Err(Errno::EIO)
+        let mut attempt = 0;
+        loop {
+            match rio_proto::client::get_path_nar(
+                &mut client,
+                &store_path,
+                fetch_timeout,
+                rio_common::limits::MAX_NAR_SIZE,
+                &[],
+            )
+            .await
+            {
+                Ok(Some((_info, nar))) => {
+                    if attempt > 0 {
+                        tracing::debug!(
+                            store_path = %store_path,
+                            attempt,
+                            "GetPath recovered after transient failure"
+                        );
+                    }
+                    return Ok(nar);
+                }
+                Ok(None) => {
+                    // Path not in remote store. lookup() probes unknown
+                    // names (.lock files, tmp paths); ENOENT is normal.
+                    return Err(Errno::ENOENT);
+                }
+                Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
+                    tracing::error!(
+                        store_path = %store_path,
+                        size = got,
+                        limit,
+                        "NAR exceeds MAX_NAR_SIZE"
+                    );
+                    return Err(Errno::EFBIG);
+                }
+                Err(e) if e.is_not_found() => return Err(Errno::ENOENT),
+                Err(e) if e.is_transient() => match RETRY_BACKOFF.get(attempt) {
+                    Some(&delay) => {
+                        attempt += 1;
+                        tracing::warn!(
+                            store_path = %store_path,
+                            attempt,
+                            max = RETRY_BACKOFF.len(),
+                            backoff = ?delay,
+                            error = %e,
+                            "GetPath transient failure; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    None => {
+                        tracing::warn!(
+                            store_path = %store_path,
+                            attempts = attempt + 1,
+                            error = %e,
+                            "GetPath transient failure — retries exhausted, returning EIO (was the store pod restarted?)"
+                        );
+                        return Err(Errno::EIO);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
+                    return Err(Errno::EIO);
+                }
             }
         }
     })?;
@@ -614,15 +686,16 @@ mod tests {
         );
     }
 
-    /// MockStore.fail_get_path = true → GetPath returns Unavailable → EIO.
-    /// Covers the `Err(e) => EIO` arm in fetch_extract_insert (non-NotFound
-    /// gRPC error).
+    /// MockStore.fail_get_path = true → GetPath returns Unavailable →
+    /// retried RETRY_BACKOFF.len() times → still Unavailable → EIO.
+    /// Covers the retry-exhausted arm in fetch_extract_insert.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_store_unavailable_returns_eio() {
         let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
         store.fail_get_path.store(true, Ordering::SeqCst);
 
         let basename = test_store_basename("unavail");
+        let start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
@@ -631,6 +704,59 @@ mod tests {
 
         let err = result.expect_err("expected Err(EIO)");
         assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
+
+        // Total backoff should have been observed (cfg(test): ~760ms).
+        // Lower-bound check — proves retries happened, not just immediate EIO.
+        let elapsed = start.elapsed();
+        let min: Duration = RETRY_BACKOFF.iter().sum();
+        assert!(
+            elapsed >= min,
+            "expected ≥{min:?} total backoff (proves retries fired), got {elapsed:?}"
+        );
+    }
+
+    /// I-039: store pod restarts mid-build → transient Unavailable →
+    /// retry recovers → build survives. MockStore.fail_get_path starts
+    /// true; the test flips it false mid-retry, simulating the new pod
+    /// coming Ready. Prefetch should complete successfully (Ok(None),
+    /// not EIO).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_transient_unavailable_recovers() {
+        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        // Seed valid path so the post-recovery fetch has something to return.
+        let basename = test_store_basename("transient");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"survived");
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+
+        // Store starts "down". The first attempt + RETRY_BACKOFF[0] (10ms)
+        // backoff + second attempt all hit Unavailable.
+        store.fail_get_path.store(true, Ordering::SeqCst);
+
+        let cache_cl = Arc::clone(&cache);
+        let client_cl = client.clone();
+        let basename_cl = basename.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache_cl, &client_cl, &rt, TEST_FETCH_TIMEOUT, &basename_cl)
+        });
+
+        // Sleep past the first two backoffs (10ms+50ms cfg(test)) so at
+        // least two retries land on the failing store, then "restart" it.
+        // The third attempt (after 200ms backoff) sees the recovered store.
+        tokio::time::sleep(RETRY_BACKOFF[0] + RETRY_BACKOFF[1] + Duration::from_millis(20)).await;
+        store.fail_get_path.store(false, Ordering::SeqCst);
+
+        let result = task.await.expect("spawn_blocking join");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) (recovered + fetched), got: {result:?}"
+        );
+
+        // The NAR should be on disk — full roundtrip completed.
+        let local = dir.path().join(&basename);
+        let content = std::fs::read(&local).expect("read extracted file");
+        assert_eq!(content, b"survived");
     }
 
     /// MockStore.get_path_garbage = true → GetPath returns valid PathInfo
