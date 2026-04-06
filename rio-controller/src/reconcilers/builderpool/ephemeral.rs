@@ -63,17 +63,20 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, ListParams, ObjectMeta, PostParams};
+use kube::ResourceExt;
+use kube::api::{ListParams, ObjectMeta, PostParams};
 use kube::runtime::controller::Action;
-use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
-use super::MANAGER;
 use super::builders::{self, SchedulerAddrs};
+use super::job_common::{
+    is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
+    spawn_prerequisites,
+};
 
 /// Requeue interval for ephemeral pools. Shorter than the STS path's
 /// 5min because Job spawning is reactive to queue depth, not just
@@ -123,11 +126,7 @@ const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
 /// columns either way. `desiredReplicas` is the concurrent-Job
 /// ceiling (`spec.replicas.max`).
 pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
-    let ns = wp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
-    let name = wp.name_any();
-    let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
+    let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
 
     // ---- Count active Jobs for this pool ----
     // "Active" = not yet reached Complete/Failed. K8s Job status has
@@ -141,15 +140,7 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     let active: i32 = jobs
         .items
         .iter()
-        .filter(|j| {
-            // Neither succeeded nor failed → still active (running or
-            // pending). unwrap_or(0): status may be None on a fresh
-            // Job before the Job controller populates it. Treat that
-            // as active (don't spawn another until we know).
-            let s = j.status.as_ref();
-            s.and_then(|st| st.succeeded).unwrap_or(0) == 0
-                && s.and_then(|st| st.failed).unwrap_or(0) == 0
-        })
+        .filter(|j| is_active_job(j))
         .count()
         .try_into()
         .unwrap_or(i32::MAX);
@@ -197,14 +188,7 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
     if to_spawn > 0 {
-        let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
-            Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
-        })?;
-        let scheduler = SchedulerAddrs {
-            addr: ctx.scheduler_addr.clone(),
-            balance_host: ctx.scheduler_balance_host.clone(),
-            balance_port: ctx.scheduler_balance_port,
-        };
+        let (oref, scheduler) = spawn_prerequisites(wp, ctx)?;
 
         for _ in 0..to_spawn {
             let job = build_job(wp, oref.clone(), &scheduler, &ctx.store_addr)?;
@@ -251,40 +235,21 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
 
     // ---- Status patch ----
     // Repurpose the STS-oriented fields. `replicas` = active Jobs;
-    // `readyReplicas` = same (a Job pod is "ready" when it's
-    // running; we don't probe individual Job pods from here).
-    // `desiredReplicas` = ceiling. The autoscaler skips ephemeral
-    // pools (scaling.rs checks spec.ephemeral) so it won't
-    // overwrite this.
-    //
-    // `conditions`: SchedulerUnreachable reflects the ClusterStatus
-    // poll above. status="True" when the RPC failed (operators see
-    // WHY nothing is spawning); status="False" when reachable (clears
-    // the condition after recovery — SSA with this field manager owns
-    // the condition, so we must write it every reconcile or a stale
-    // True would persist). The autoscaler's Scaling condition lives
-    // under a different field manager so SSA keeps them separate.
-    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let ar = BuilderPool::api_resource();
-    let prev = crate::scaling::find_condition(wp, "SchedulerUnreachable");
-    let cond = scheduler_unreachable_condition(scheduler_err.as_deref(), prev.as_ref());
-    let status_patch = serde_json::json!({
-        "apiVersion": ar.api_version,
-        "kind": ar.kind,
-        "status": {
-            "replicas": active,
-            "readyReplicas": active,
-            "desiredReplicas": ceiling,
-            "conditions": [cond],
-        },
-    });
-    wp_api
-        .patch_status(
-            &name,
-            &kube::api::PatchParams::apply(MANAGER).force(),
-            &kube::api::Patch::Apply(&status_patch),
-        )
-        .await?;
+    // `readyReplicas` = same (a Job pod is "ready" when it's running;
+    // we don't probe individual Job pods from here). `desiredReplicas`
+    // = ceiling. SchedulerUnreachable condition reflects the poll
+    // above.
+    patch_job_pool_status(
+        ctx,
+        wp,
+        &ns,
+        &name,
+        active,
+        active,
+        ceiling,
+        scheduler_err.as_deref(),
+    )
+    .await?;
 
     Ok(Action::requeue(EPHEMERAL_REQUEUE))
 }
@@ -324,53 +289,6 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
 /// the next tick self-corrects.
 fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
-}
-
-/// Build a `SchedulerUnreachable` K8s Condition for the ephemeral
-/// reconciler's status patch.
-///
-/// `err = Some(msg)` → status="True", reason="ClusterStatusFailed",
-/// message carries the gRPC error. Operators see `kubectl describe
-/// wp` show why nothing is spawning (otherwise "queued=0" is
-/// indistinguishable from "scheduler idle").
-///
-/// `err = None` → status="False", reason="ClusterStatusOK". We
-/// write this every reconcile (not just on recovery) because SSA
-/// with our field manager owns this condition — omitting it would
-/// leave a stale True after the scheduler comes back.
-///
-/// Same json!-not-struct pattern as `scaling::scaling_condition`:
-/// k8s_openapi's Condition struct requires observedGeneration which
-/// we don't track.
-///
-/// `prev`: existing SchedulerUnreachable condition (if any). Its
-/// `lastTransitionTime` is preserved when `status` hasn't changed —
-/// this reconciler writes every 10s tick; without preservation the
-/// timestamp always reads "~10s ago" regardless of when the
-/// scheduler actually went down/recovered.
-pub(super) fn scheduler_unreachable_condition(
-    err: Option<&str>,
-    prev: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let (status, reason, message) = match err {
-        Some(e) => (
-            "True",
-            "ClusterStatusFailed",
-            format!("ClusterStatus RPC failed: {e}; treating as queued=0"),
-        ),
-        None => (
-            "False",
-            "ClusterStatusOK",
-            "scheduler reachable".to_string(),
-        ),
-    };
-    serde_json::json!({
-        "type": "SchedulerUnreachable",
-        "status": status,
-        "reason": reason,
-        "message": message,
-        "lastTransitionTime": crate::scaling::transition_time(status, prev),
-    })
 }
 
 /// Build a K8s Job for one ephemeral worker pod.
@@ -527,30 +445,15 @@ pub(super) fn build_job(
     })
 }
 
-/// 6-char lowercase-alphanumeric random suffix for Job names.
-///
-/// Not `generate_name`: K8s's generateName appends 5 chars AFTER
-/// a create, meaning we don't know the name until the apiserver
-/// returns. We want to log the name in the create-error path
-/// (409, other API errors). Generating our own suffix is the
-/// same collision math with better observability.
-pub(super) fn random_suffix() -> String {
-    use rand::Rng;
-    // 36^6 ≈ 2.18 billion combinations. With ttl=60s and even
-    // 1000 Jobs/sec, steady-state population is ~60k live names
-    // → birthday collision ~0.08%. K8s 409 handles it.
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rng();
-    (0..6)
-        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crds::builderpool::Replicas;
     use crate::fixtures::test_sched_addrs;
+    // `controller_owner_ref` comes from `kube::Resource`. Module-
+    // level import moved to job_common with spawn_prerequisites;
+    // tests still build Jobs directly, so import here.
+    use kube::Resource;
 
     fn test_wp() -> BuilderPool {
         // Start from the shared fixture, then override the fields
@@ -785,48 +688,6 @@ mod tests {
         );
     }
 
-    /// SchedulerUnreachable condition: status flips True/False based
-    /// on whether the ClusterStatus RPC failed. Operators need this
-    /// to distinguish "scheduler idle (queued=0)" from "scheduler
-    /// down (queued unknown, treated as 0)."
-    #[test]
-    fn scheduler_unreachable_condition_shape() {
-        // RPC failed → status=True, error in message.
-        let c = scheduler_unreachable_condition(Some("connection refused"), None);
-        assert_eq!(c["type"], "SchedulerUnreachable");
-        assert_eq!(c["status"], "True");
-        assert_eq!(c["reason"], "ClusterStatusFailed");
-        assert!(
-            c["message"]
-                .as_str()
-                .unwrap()
-                .contains("connection refused")
-        );
-        // K8s requires lastTransitionTime (RFC3339).
-        assert!(c["lastTransitionTime"].is_string());
-
-        // RPC succeeded → status=False (clears stale True after
-        // recovery).
-        let c = scheduler_unreachable_condition(None, None);
-        assert_eq!(c["type"], "SchedulerUnreachable");
-        assert_eq!(c["status"], "False");
-        assert_eq!(c["reason"], "ClusterStatusOK");
-    }
-
-    /// random_suffix returns valid K8s name chars. DNS-1123 subdomain
-    /// rules: lowercase alphanumeric, '-', max 253 chars. Our suffix
-    /// is a tail fragment so '-' is fine contextually, but we use
-    /// only alnum to be safe with any future prefix.
-    #[test]
-    fn random_suffix_valid_dns1123() {
-        for _ in 0..100 {
-            let s = random_suffix();
-            assert_eq!(s.len(), 6);
-            assert!(
-                s.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-                "invalid char in suffix: {s}"
-            );
-        }
-    }
+    // scheduler_unreachable_condition_shape + random_suffix_valid_
+    // dns1123 moved to job_common::tests alongside their functions.
 }
