@@ -73,6 +73,18 @@ let
       wlarge = {
         maxBuilds = 1;
         sizeClass = "large";
+        # maxSilentTime enforcement. Only wlarge: small workers run
+        # reassignDrv (25s silent sleep) which would trip a silence
+        # threshold. bigthing (the only other drv routed to wlarge)
+        # echoes immediately — no silence exposure. The max-silent-time
+        # subtest routes silenceDrv here via build_history seed.
+        #
+        # Worker-side config because the Nix ssh-ng client does NOT
+        # send wopSetOptions (protocol 1.38) — client --max-silent-time
+        # cannot propagate to the gateway.
+        extraServiceEnv = {
+          RIO_MAX_SILENT_TIME_SECS = "10";
+        };
       };
     };
     extraSchedulerConfig = {
@@ -193,6 +205,7 @@ in
         name = "disrupt";
         subtests = [
           "sizeclass"
+          "max-silent-time"
           "reassign"
         ];
       };

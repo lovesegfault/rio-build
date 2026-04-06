@@ -413,6 +413,7 @@ async fn main() -> anyhow::Result<()> {
         },
         max_leaked_mounts: cfg.max_leaked_mounts,
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
+        max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
         cancel_registry: Arc::clone(&cancel_registry),
         fod_proxy_url: cfg.fod_proxy_url,

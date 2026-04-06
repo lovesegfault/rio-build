@@ -78,6 +78,26 @@ impl ClientOptions {
             .and_then(|(_, v)| v.parse::<u64>().ok())
             .unwrap_or(0)
     }
+
+    /// Effective maxSilentTime: override wins, positional is fallback.
+    ///
+    /// `--option max-silent-time N` from the nix client lands in the
+    /// `overrides` string-pair map, NOT the positional wire slot. The
+    /// positional slot is a snapshot of the client's compiled-in default
+    /// (0 for ssh-ng clients). Empirically: `nix-build --option
+    /// max-silent-time 5 --store ssh-ng://...` sends positional=0,
+    /// overrides=[("max-silent-time", "5")]. Without this fallback the
+    /// option is silently dropped.
+    ///
+    /// The positional stays as fallback for clients that DO populate
+    /// it (older nix, direct libstore API use).
+    pub fn max_silent_time(&self) -> u64 {
+        self.overrides
+            .iter()
+            .find(|(k, _)| k == "max-silent-time")
+            .and_then(|(_, v)| v.parse::<u64>().ok())
+            .unwrap_or(self.max_silent_time)
+    }
 }
 
 /// Per-session mutable state, threaded through all opcode handlers.
@@ -384,3 +404,60 @@ use build::*;
 use grpc::*;
 use opcodes_read::*;
 use opcodes_write::*;
+
+#[cfg(test)]
+mod tests {
+    use super::ClientOptions;
+
+    fn opts(positional_max_silent: u64, overrides: Vec<(String, String)>) -> ClientOptions {
+        ClientOptions {
+            keep_failed: false,
+            keep_going: false,
+            try_fallback: false,
+            verbosity: 0,
+            max_build_jobs: 0,
+            max_silent_time: positional_max_silent,
+            verbose_build: false,
+            build_cores: 0,
+            use_substitutes: false,
+            overrides,
+        }
+    }
+
+    /// `--option max-silent-time N` lands in overrides, not the positional
+    /// slot. ssh-ng clients send positional=0, overrides=[("max-silent-time","N")].
+    #[test]
+    fn max_silent_time_reads_from_overrides() {
+        let o = opts(0, vec![("max-silent-time".into(), "5".into())]);
+        assert_eq!(o.max_silent_time(), 5);
+    }
+
+    /// Override wins even when positional is nonzero — explicit user
+    /// `--option` is authoritative.
+    #[test]
+    fn max_silent_time_override_wins_over_positional() {
+        let o = opts(60, vec![("max-silent-time".into(), "5".into())]);
+        assert_eq!(o.max_silent_time(), 5);
+    }
+
+    /// No override → fall back to positional (older clients, direct API).
+    #[test]
+    fn max_silent_time_falls_back_to_positional() {
+        let o = opts(30, vec![("other-key".into(), "x".into())]);
+        assert_eq!(o.max_silent_time(), 30);
+    }
+
+    /// Both zero → 0 (disabled).
+    #[test]
+    fn max_silent_time_zero_when_neither_set() {
+        let o = opts(0, vec![]);
+        assert_eq!(o.max_silent_time(), 0);
+    }
+
+    /// Unparseable override falls back to positional (not panic).
+    #[test]
+    fn max_silent_time_bad_override_falls_back() {
+        let o = opts(30, vec![("max-silent-time".into(), "not-a-number".into())]);
+        assert_eq!(o.max_silent_time(), 30);
+    }
+}

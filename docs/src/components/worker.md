@@ -182,12 +182,15 @@ r[worker.silence.timeout-kill]
 
 `maxSilentTime` (seconds, forwarded from client `--option
 max-silent-time`) is enforced rio-side in the stderr read loop: on
-each STDERR_NEXT/READ/WRITE, reset `last_output`; a `select!` arm
-fires at `last_output + max_silent_time` → `SilenceTimeout` outcome →
-`cgroup.kill()` → `BuildResult { status: TimedOut, error_msg: "no
-output for Ns (maxSilentTime)" }`. The local nix-daemon MAY also
-enforce it (forwarded via `client_set_options`) — rio-side is the
-authoritative backstop ensuring the correct `TimedOut` status.
+each `STDERR_NEXT` and `STDERR_RESULT BuildLogLine` (types 101/107 —
+the output-producing messages), reset `last_output`; a `select!` arm
+fires at `last_output + max_silent_time` → `BuildResult { status:
+TimedOut, error_msg: "no output for Ns (maxSilentTime)" }` → caller's
+unconditional `cgroup.kill()`. Activity/Progress chatter does NOT
+reset the timer — a build spinning progress updates with no stderr
+output is still "silent". The local nix-daemon MAY also enforce it
+(forwarded via `client_set_options`) — rio-side is the authoritative
+backstop ensuring the correct `TimedOut` status regardless.
 
 r[worker.daemon.stderr-result-logs]
 Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, NOT raw `STDERR_NEXT`. The worker's stderr loop MUST handle `STDERR_RESULT` --- otherwise all build logs are silently dropped.
