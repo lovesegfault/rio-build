@@ -758,7 +758,7 @@ def test_lock_status_ff_landed_when_tgt_moved(tmp_repo: Path, monkeypatch):
     monkeypatch.setattr(onibus.merge, "_LOCK_FILE", state / "merger.lock")
     monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", "HEAD")
     # Aged past _LEASE_SECS + stale main_at_acquire
-    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(seconds=onibus.merge._LEASE_SECS + 60)).isoformat()
     (state / "merger.lock").write_text(json.dumps({
         "agent_id": "x", "plan": "P1",
         "main_at_acquire": "0000000", "acquired_at": old,
@@ -776,14 +776,14 @@ def test_lock_stale_after_lease(tmp_path: Path, monkeypatch):
     from datetime import datetime, timedelta, timezone
     import onibus.merge
     monkeypatch.setattr(onibus.merge, "_LOCK_FILE", tmp_path / "merger.lock")
-    old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(seconds=onibus.merge._LEASE_SECS + 60)).isoformat()
     (tmp_path / "merger.lock").write_text(json.dumps({
         "agent_id": "x", "plan": "P1",
         "acquired_at": old, "main_at_acquire": "deadbee",
     }))
     r = onibus.merge.lock_status()
     assert r.held is True
-    assert r.stale is True  # 31min > 30min lease
+    assert r.stale is True  # _LEASE_SECS+1min > _LEASE_SECS
 
 
 def test_lock_fresh(tmp_path: Path, monkeypatch):
@@ -800,7 +800,7 @@ def test_lock_fresh(tmp_path: Path, monkeypatch):
     }))
     r = onibus.merge.lock_status()
     assert r.held is True
-    assert r.stale is False  # 1min << 30min lease
+    assert r.stale is False  # 1min << _LEASE_SECS
     assert r.ff_landed is None  # only computed when stale
 
 
@@ -845,6 +845,32 @@ def test_agent_mark_updates_matching(tmp_path: Path, monkeypatch):
     assert n == 1
     rows = read_jsonl(f, AgentRow)
     assert rows[0].status == "consumed" and rows[1].status == "running"
+
+
+def test_archive_agents_drops_dead_worktree_rows(tmp_path: Path, monkeypatch):
+    """P0306 T7: agents-running.jsonl grew to 966 rows (expected ~50). Rows
+    whose worktree no longer exists are dead by definition — the merger
+    pruned the worktree. Consumed rows with no worktree path are also
+    terminal. Keep live-worktree rows + non-consumed no-worktree rows."""
+    import onibus.merge
+    from onibus.jsonl import append_jsonl, read_jsonl
+    from onibus.models import AgentRow
+    monkeypatch.setattr(onibus.merge, "STATE_DIR", tmp_path)
+    f = tmp_path / "agents-running.jsonl"
+    live = tmp_path / "p100"
+    live.mkdir()
+    # Live worktree — keep regardless of status
+    append_jsonl(f, AgentRow(plan="P0100", role="impl", worktree=str(live), status="consumed"))
+    # Dead worktree — drop regardless of status
+    append_jsonl(f, AgentRow(plan="P0200", role="impl", worktree=str(tmp_path / "gone"), status="running"))
+    append_jsonl(f, AgentRow(plan="P0201", role="verify", worktree=str(tmp_path / "gone2"), status="consumed"))
+    # No worktree path — keep non-consumed, drop consumed
+    append_jsonl(f, AgentRow(plan="docs-123456", role="writer", worktree=None, status="running"))
+    append_jsonl(f, AgentRow(plan="docs-654321", role="qa", worktree=None, status="consumed"))
+    dropped = onibus.merge.archive_agents()
+    assert dropped == 3  # P0200, P0201, docs-654321
+    rows = read_jsonl(f, AgentRow)
+    assert {r.plan for r in rows} == {"P0100", "docs-123456"}
 
 
 def test_queue_consume_removes(tmp_path: Path, monkeypatch):
@@ -1223,3 +1249,27 @@ def test_tracey_coverage_verify_also_counts(tmp_path: Path, monkeypatch):
     assert r.unmatched == []
     assert r.markers[0].verify_loc == "x.rs:1"
     assert r.markers[0].impl_loc is None
+
+
+def test_verify_phase_plans_excluded_from_collision(tmp_path: Path, monkeypatch):
+    """P0306 T8: collisions.py should not count verify-phase worktrees as
+    in-flight impls. At mc~250, P0314/P0410/P0413 sitting in verify blocked
+    10 launchable plans on false file-collisions — impl is done, worktree
+    files won't change."""
+    import onibus.collisions
+    from onibus.jsonl import append_jsonl
+    from onibus.models import AgentRow
+    monkeypatch.setattr(onibus.collisions, "STATE_DIR", tmp_path)
+    f = tmp_path / "agents-running.jsonl"
+    # P0100 impl running — worktree is mutating, counts as in-flight
+    append_jsonl(f, AgentRow(plan="P0100", role="impl", status="running"))
+    # P0200 reached verify — impl done, worktree frozen, exclude
+    append_jsonl(f, AgentRow(plan="P0200", role="impl", status="consumed"))
+    append_jsonl(f, AgentRow(plan="P0200", role="verify", status="running"))
+    # P0300 verify already consumed — not frozen anymore (merged or bounced)
+    append_jsonl(f, AgentRow(plan="P0300", role="verify", status="consumed"))
+    frozen = onibus.collisions._verify_phase_plans()
+    assert frozen == {200}, (
+        f"expected {{200}} (verify-running); got {frozen}. "
+        "100=impl-running (mutating), 300=verify-consumed (not frozen)."
+    )

@@ -11,9 +11,10 @@ import re
 from collections import defaultdict
 from typing import Iterable, Mapping
 
-from onibus import WORK_DIR
+from onibus import STATE_DIR, WORK_DIR
 from onibus.git_ops import diff_src_files, plan_worktrees
-from onibus.models import Collision, CollisionReport, CollisionRow, PlanFile
+from onibus.jsonl import read_jsonl
+from onibus.models import AgentRow, Collision, CollisionReport, CollisionRow, PlanFile
 from onibus.plan_doc import find_plan_doc, plan_doc_files, plan_doc_src_files
 
 _PLAN_RE = re.compile(r"^plan-(\d{4})-")
@@ -98,9 +99,33 @@ class CollisionIndex:
 # ─── check against running worktrees (lifted from collision_check.py) ────────
 
 
+def _verify_phase_plans() -> set[int]:
+    """Plans whose latest in-flight role is verify (or later). Impl is done,
+    worktree files won't change — exclude from collision check. At mc~250,
+    P0314/P0410/P0413 sitting in verify blocked 10 launchable plans on
+    false file-collisions."""
+    # Latest row per plan wins (rows are append-order). A plan that has
+    # reached role=verify has finished impl; a running verify/review/merge
+    # row means the worktree is frozen pending validator/reviewer/merger.
+    latest: dict[str, AgentRow] = {}
+    for r in read_jsonl(STATE_DIR / "agents-running.jsonl", AgentRow):
+        latest[r.plan] = r
+    frozen_roles = {"verify", "review", "merge"}
+    out: set[int] = set()
+    for plan_str, r in latest.items():
+        if r.role in frozen_roles and r.status == "running":
+            m = re.fullmatch(r"P(\d+)", plan_str)
+            if m:
+                out.add(int(m.group(1)))
+    return out
+
+
 def check_vs_running(plan_num: int) -> CollisionReport:
     """Does plan N's declared files intersect any running worktree's ACTUAL diff?
-    Running-side is ground truth (git diff); this-side is the plan doc's fence/grep."""
+    Running-side is ground truth (git diff); this-side is the plan doc's fence/grep.
+
+    Skips worktrees whose plan is in verify/review/merge phase — impl is
+    done, files won't change, so a collision is a false positive."""
     doc = find_plan_doc(plan_num)
     source = "none"
     this_files: list[str] = []
@@ -114,10 +139,13 @@ def check_vs_running(plan_num: int) -> CollisionReport:
             source = "grep" if this_files else "none"
     this_set = set(this_files)
 
+    frozen = _verify_phase_plans()
     collisions = []
     for wt in plan_worktrees():
         if wt.plan_num == plan_num:
             continue  # don't collide with self
+        if wt.plan_num in frozen:
+            continue  # verify-phase worktree — files won't change
         their = set(diff_src_files(wt))
         overlap = sorted(this_set & their)
         if overlap:

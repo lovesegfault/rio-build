@@ -386,6 +386,39 @@ def agent_mark(plan: str, role: str, status: AgentStatus) -> int:
     return n
 
 
+def archive_agents() -> int:
+    """Drop AgentRows whose worktree no longer exists. Returns rows dropped.
+
+    agents-running.jsonl is append-mostly (agent_mark rewrites in place but
+    never prunes). At mc~250 the file hit 966 rows — 50+ stale Pdocs- rows
+    from mc=33-era, range-ID rows, consumed rows from long-gone worktrees.
+    P0418's canonical_plan_id validator exposed them.
+
+    The plan-doc sketch indexed by mc (drop consumed where mc < current-20),
+    but AgentRow has no mc field. Simpler: a row whose worktree directory is
+    gone is dead by definition — the agent that wrote it finished and the
+    merger pruned the worktree. Rows with no worktree path (writer/qa agents
+    use docs-<runid>, stored as plan not worktree) survive unless consumed.
+
+    Run via `onibus state archive-agents` or wire into /dag-tick post-merge."""
+    path = STATE_DIR / "agents-running.jsonl"
+    rows = read_jsonl(path, AgentRow)
+
+    def _keep(r: AgentRow) -> bool:
+        if r.worktree:
+            return Path(r.worktree).is_dir()
+        # No worktree path (docs-<runid> writer/qa rows) — keep unless
+        # consumed. Consumed-no-worktree is terminal state; nothing will
+        # ever read it again.
+        return r.status != "consumed"
+
+    keep = [r for r in rows if _keep(r)]
+    dropped = len(rows) - len(keep)
+    if dropped:
+        write_jsonl(path, keep)
+    return dropped
+
+
 # ─── atomicity (lifted from atomicity_check.py) ──────────────────────────────
 
 
@@ -574,6 +607,19 @@ def _rewrite_t_placeholders(
     # unique within the writer run), so union the mappings.
     all_t: dict[str, int] = {}
     for m in result.values():
+        # Two batch docs sharing a T-placeholder key with DIFFERENT
+        # assignments → cross-doc T-ref in a placeholder doc would get
+        # wrong-rewrite (last .update wins). Per-doc NN-sequencing means
+        # key-sharing is legitimate (both docs start at <runid>01); only
+        # a DISAGREEING collision that a placeholder doc would read is a
+        # bug. Skip the check if placeholder_docs is empty — all_t is
+        # never consumed.
+        if placeholder_docs:
+            dup = {k for k in set(m) & set(all_t) if m[k] != all_t[k]}
+            assert not dup, (
+                f"T-placeholder collision across batch docs (disagreeing "
+                f"assignments, placeholder doc would wrong-rewrite): {dup}"
+            )
         all_t.update(m)
     for rel in placeholder_docs:
         p = worktree / rel
