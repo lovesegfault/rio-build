@@ -72,6 +72,7 @@ fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) ->
         fuse_threads: wp.spec.fuse_threads,
         privileged: wp.spec.privileged == Some(true),
         seccomp_profile: wp.spec.seccomp_profile.clone(),
+        seccomp_preinstalled: sts::seccomp_preinstalled(),
         host_network: wp.spec.host_network,
         host_users: wp.spec.host_users,
         tls_secret_name: wp.spec.tls_secret_name.clone(),
@@ -84,6 +85,15 @@ fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) ->
 /// on the full params. The cache fields don't affect labels anyway.
 fn executor_params_for_labels(wp: &BuilderPool) -> ExecutorStsParams {
     executor_params(wp, 0, Quantity("0".into()))
+}
+
+/// Tests need to construct params directly so they can set fields
+/// `executor_params` reads from the controller's environment
+/// (`seccomp_preinstalled`). Going through `build_statefulset` would
+/// need `set_var`, which is parallel-test-unsafe.
+#[cfg(test)]
+pub(super) fn executor_params_for_test(wp: &BuilderPool) -> ExecutorStsParams {
+    executor_params_for_labels(wp)
 }
 
 /// Headless Service. `clusterIP: None` + no ports (workers don't

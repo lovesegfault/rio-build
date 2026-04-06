@@ -34,9 +34,27 @@ spec:
   # dies with "fork/exec: no space left on device" (ENOSPC on the userns
   # clone, not disk). 65536 is the upstream containerd-recommended
   # ceiling for userns-per-pod clusters.
+  #
+  # P0541: rio-seccomp bootstrap container writes the two Localhost
+  # seccomp profiles to /var/lib/kubelet/seccomp/operator/ BEFORE
+  # kubelet starts. essential=true fails node bootstrap if the write
+  # can't complete — by the time any pod schedules the file is
+  # guaranteed present, eliminating the wait-seccomp initContainer
+  # (5-15s × thousands of ephemeral Jobs/hour). Replaces SPO's spod
+  # DaemonSet for EKS. Profile updates are picked up by Karpenter
+  # Drift detection (userData change → node roll), same blast radius
+  # as a spod DS rollout. mode=once: runs at first boot only.
+  # Bootstrap containers run as root with the host rootfs at
+  # /.bottlerocket/rootfs by default (no `superpowered` field — that's
+  # for HOST containers; bootstrap-containers schema is `source`, `mode`,
+  # `user-data`, `essential`, `command` only).
   userData: |
     [settings.kernel.sysctl]
     "user.max_user_namespaces" = "65536"
+    [settings.bootstrap-containers.rio-seccomp]
+    source = {{ include "rio.image" (list . "rio-seccomp-bootstrap") }}
+    mode = "once"
+    essential = true
   # Bottlerocket has two volumes: /dev/xvda (OS, ~2GB, immutable) and
   # /dev/xvdb (container data — images, emptyDir, logs). The AMI default
   # for xvdb is ~20GB, which Karpenter treats as the allocatable

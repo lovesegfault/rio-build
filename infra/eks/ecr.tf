@@ -9,7 +9,7 @@ locals {
   # does not exist" at push time.
   rio_images = [
     "gateway", "scheduler", "store", "controller", "builder",
-    "fetcher", "bootstrap", "dashboard", "all",
+    "fetcher", "bootstrap", "seccomp-bootstrap", "dashboard", "all",
   ]
 }
 

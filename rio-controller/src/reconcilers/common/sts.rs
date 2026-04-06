@@ -171,6 +171,16 @@ pub struct ExecutorStsParams {
     pub privileged: bool,
     /// CRD seccomp profile. Converted via [`build_seccomp_profile`].
     pub seccomp_profile: Option<SeccompProfileKind>,
+    /// Localhost seccomp profile is on disk before any pod schedules
+    /// (P0541: Bottlerocket bootstrap container, EC2NodeClass userData
+    /// `essential=true`). When `true` and the profile type is
+    /// `Localhost`, skip the wait-seccomp initContainer + host-seccomp
+    /// hostPath volumes — the file is guaranteed present, the wait is
+    /// dead weight (5-15s × thousands of ephemeral Jobs/hour). The
+    /// Localhost ENFORCEMENT (executor container's securityContext)
+    /// stays in place; only the WAIT machinery is elided. See
+    /// [`seccomp_preinstalled`].
+    pub seccomp_preinstalled: bool,
     pub host_network: Option<bool>,
     /// Explicit override. `None` → derived from `!privileged &&
     /// !host_network`.
@@ -223,6 +233,22 @@ pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str
 /// Fixed product prefix for executor resource names (I-104). Pool name
 /// is the disambiguating SUFFIX (typically arch: `x86-64`, `aarch64`).
 const NAME_PREFIX: &str = "rio";
+
+/// Cluster-wide knob: Localhost seccomp profiles are written to
+/// `/var/lib/kubelet/seccomp/operator/` BEFORE kubelet starts (P0541
+/// Bottlerocket bootstrap container, EC2NodeClass userData). Both
+/// reconcilers read this once at params-construction time so the
+/// pod-spec builder stays pure (testable without env mutation).
+///
+/// Not a per-pool field: distribution is per-NODE (one EC2NodeClass),
+/// not per-pool. Exposing it on the CRD would let an operator set
+/// `seccompPreinstalled: true` on a pool whose nodes don't have the
+/// bootstrap container — pods CrashLoopBackOff with "seccomp profile
+/// not found" at sandbox creation. The controller-level env var keeps
+/// the knob aligned with the deploy that wires the bootstrap.
+pub fn seccomp_preinstalled() -> bool {
+    std::env::var("RIO_SECCOMP_PREINSTALLED").is_ok_and(|v| v == "true")
+}
 
 /// STS name for a given pool. `rio-{role}-{pool_name}` — e.g. pool
 /// `x86-64` → `rio-builder-x86-64`, pool `default` →
@@ -315,17 +341,23 @@ pub fn build_executor_pod_spec(
     let labels = executor_labels(p);
     let spread_enabled = p.topology_spread.unwrap_or(true);
     let privileged = p.privileged;
-    // Localhost seccomp: profile lives on node disk, reconciled there
-    // by security-profiles-operator's spod DaemonSet from the cluster-
-    // scoped SeccompProfile CR. A wait-seccomp initContainer blocks
-    // until it appears (spod may schedule after this pod on a fresh
-    // Karpenter node). Gated on !privileged (privileged disables
-    // seccomp at runtime, so the wait would be dead weight).
+    // Localhost seccomp: profile lives on node disk. Either:
+    //   - reconciled by SPO's spod DaemonSet from a SeccompProfile CR
+    //     (legacy path; spod may schedule after this pod on a fresh
+    //     Karpenter node → wait-seccomp initContainer needed), OR
+    //   - written by a Bottlerocket bootstrap container BEFORE kubelet
+    //     starts (P0541; `seccomp_preinstalled=true` → no wait needed).
+    // Gated on !privileged (privileged disables seccomp at runtime).
     let seccomp_localhost = (!privileged)
         .then_some(p.seccomp_profile.as_ref())
         .flatten()
         .filter(|k| k.type_ == "Localhost")
         .and_then(|k| k.localhost_profile.as_deref());
+    // The wait-seccomp init + host-seccomp/host-spo hostPath volumes
+    // are the WAIT machinery — only emitted when the profile path
+    // existence is racy (SPO). The Localhost ENFORCEMENT on the
+    // executor container (below) reads `seccomp_localhost` directly.
+    let seccomp_wait = seccomp_localhost.filter(|_| !p.seccomp_preinstalled);
 
     PodSpec {
         containers: vec![build_executor_container(p, scheduler, store)],
@@ -336,7 +368,7 @@ pub fn build_executor_pod_spec(
         // container-level so the initContainer can start before the
         // profile file lands; the actual Localhost enforcement is on
         // the executor container.
-        init_containers: seccomp_localhost.map(|profile| {
+        init_containers: seccomp_wait.map(|profile| {
             vec![Container {
                 name: "wait-seccomp".into(),
                 image: Some(p.image.clone()),
@@ -522,7 +554,7 @@ pub fn build_executor_pod_spec(
                     ..Default::default()
                 });
             }
-            if seccomp_localhost.is_some() {
+            if seccomp_wait.is_some() {
                 // SPO's non-root-enabler symlinks /var/lib/kubelet/
                 // seccomp/operator → /var/lib/security-profiles-operator
                 // (absolute). wait-seccomp's `test -s` can't follow it

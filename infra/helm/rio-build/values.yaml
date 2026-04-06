@@ -200,6 +200,17 @@ controller:
   # distribution. Empty → single-channel fallback.
   storeBalanceHost: rio-store-headless.rio-store
   storeBalancePort: 9002
+  # P0541: Localhost seccomp profiles are written to /var/lib/kubelet/
+  # seccomp/operator/ BEFORE kubelet starts (Bottlerocket bootstrap
+  # container, EC2NodeClass userData essential=true). When true, the
+  # controller skips the wait-seccomp initContainer + host-seccomp
+  # hostPath volumes — the file is guaranteed present, the wait is
+  # dead weight (5-15s × thousands of ephemeral Jobs/hour).
+  #
+  # Default false: VM-test k3s + non-EKS providers still use SPO (or
+  # privileged:true with no Localhost profile at all). EKS deploy.rs
+  # sets this true alongside disabling securityProfilesOperator.
+  seccompPreinstalled: false
   # Extra env injected after base vars. VM tests use this for autoscaler
   # tuning (RIO_AUTOSCALER_POLL_SECS=3 etc); coverage mode injects
   # LLVM_PROFILE_FILE here.

@@ -238,6 +238,72 @@ fn seccomp_non_localhost_no_init_container() {
 
 // r[verify builder.seccomp.localhost-profile+2]
 #[test]
+fn seccomp_preinstalled_skips_wait_keeps_enforcement() {
+    // P0541: Bottlerocket bootstrap container writes the profile
+    // BEFORE kubelet starts. seccomp_preinstalled=true elides the
+    // WAIT (initContainer + host-seccomp/host-spo hostPath volumes)
+    // but the ENFORCEMENT (container-level Localhost) stays. Tested
+    // via build_executor_pod_spec directly so the env-var read in
+    // executor_params() doesn't need set_var (parallel-test-unsafe).
+    use crate::reconcilers::common::sts::build_executor_pod_spec;
+    let mut wp = test_wp();
+    wp.spec.seccomp_profile = Some(SeccompProfileKind {
+        type_: "Localhost".into(),
+        localhost_profile: Some("operator/rio-builder.json".into()),
+    });
+    let mut params = executor_params_for_test(&wp);
+    params.seccomp_preinstalled = true;
+    let pod = build_executor_pod_spec(&params, &test_sched_addrs(), &test_store_addrs());
+
+    // No wait-seccomp init.
+    assert!(pod.init_containers.is_none(), "preinstalled: no wait init");
+    // No host-seccomp / host-spo hostPath volumes.
+    let vols = pod.volumes.as_ref().unwrap();
+    for forbidden in ["host-seccomp", "host-spo"] {
+        assert!(
+            !vols.iter().any(|v| v.name == forbidden),
+            "preinstalled: no {forbidden} volume"
+        );
+    }
+
+    // Pod-level: still RuntimeDefault (sandbox can start regardless;
+    // no behavior change here — the split between pod-level and
+    // container-level is independent of the wait gate).
+    let pod_prof = pod
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.seccomp_profile.as_ref())
+        .expect("pod seccomp set");
+    assert_eq!(pod_prof.type_, "RuntimeDefault");
+
+    // Worker container: Localhost — the ENFORCEMENT is unchanged.
+    let worker = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "builder")
+        .expect("worker container");
+    let worker_prof = worker
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.seccomp_profile.as_ref())
+        .expect("worker container seccompProfile set");
+    assert_eq!(worker_prof.type_, "Localhost");
+    assert_eq!(
+        worker_prof.localhost_profile,
+        Some("operator/rio-builder.json".into())
+    );
+
+    // Sanity: same params with preinstalled=false DO emit the wait.
+    params.seccomp_preinstalled = false;
+    let pod = build_executor_pod_spec(&params, &test_sched_addrs(), &test_store_addrs());
+    assert!(
+        pod.init_containers.as_ref().is_some_and(|v| v.len() == 1),
+        "preinstalled=false: wait-seccomp init present"
+    );
+}
+
+// r[verify builder.seccomp.localhost-profile+2]
+#[test]
 fn seccomp_privileged_drops_profile() {
     // privileged=true disables seccomp at the runtime level. The
     // builder drops the POD securityContext entirely rather than

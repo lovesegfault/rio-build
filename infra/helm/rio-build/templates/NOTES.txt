@@ -42,6 +42,23 @@ container until spod reconciles the profile (seconds). See
 docs/src/security.md r[worker.seccomp.localhost-profile].
 {{- end }}
 
+{{- if and .Values.controller.seccompPreinstalled .Values.karpenter.enabled }}
+
+── Seccomp Localhost profile (Bottlerocket bootstrap, P0541) ──────────
+Profiles are written to /var/lib/kubelet/seccomp/operator/ by the
+rio-seccomp bootstrap container (EC2NodeClass userData, essential=true)
+BEFORE kubelet starts — no spod DaemonSet, no wait-seccomp init.
+Builder pods use seccompProfile: Localhost (RuntimeDefault + pivot_root
+− ptrace/bpf/setns/process_vm_*).
+
+Verify on a builder node:
+  kubectl debug node/$(kubectl get node -l rio.build/node-role=builder -o name | head -1 | cut -d/ -f2) -it --image=busybox -- ls -l /host/var/lib/kubelet/seccomp/operator/
+
+Profile updates: change files/seccomp-rio-*.json → next deploy bumps
+the EC2NodeClass userData → Karpenter Drift rolls nodes. See
+docs/src/security.md r[worker.seccomp.localhost-profile].
+{{- end }}
+
 {{- if .Values.builderPoolDefaults.privileged }}
 
 ── privileged:true escape hatch ───────────────────────────────────────
