@@ -339,20 +339,18 @@ async fn migrate_finalizer_conflicts_on_stale_resource_version() {
     //      `Error::Conflict` — proving the error path requeues
     //      instead of bubbling as a generic kube error.
     let guard = verifier.run(vec![Scenario {
-        method: http::Method::PATCH,
-        path_contains: "/builderpools/test-pool",
         // serde_json emits compact JSON — no space after colon.
         // Asserting the EXACT rv=42 (not just "resourceVersion")
         // proves we read it from obj.meta(), not a hardcoded value.
         body_contains: Some(r#""resourceVersion":"42""#),
-        status: 409,
-        body_json: serde_json::json!({
-            "kind": "Status", "apiVersion": "v1",
-            "status": "Failure", "reason": "Conflict", "code": 409,
-            "message": "the object has been modified; please apply \
-                        your changes to the latest version and try again",
-        })
-        .to_string(),
+        ..Scenario::k8s_error(
+            http::Method::PATCH,
+            "/builderpools/test-pool",
+            409,
+            "Conflict",
+            "the object has been modified; please apply \
+             your changes to the latest version and try again",
+        )
     }]);
 
     // BuilderPool with OLD_FINALIZER + rv=42. This is the STALE

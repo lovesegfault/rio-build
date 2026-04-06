@@ -87,18 +87,13 @@ async fn try_spawn_job_classifies_api_error_as_failed() {
     let (client, verifier) = ApiServerVerifier::new();
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
-    let guard = verifier.run(vec![Scenario {
-        method: http::Method::POST,
-        path_contains: "/namespaces/rio/jobs",
-        body_contains: None,
-        status: 403,
-        body_json: serde_json::json!({
-            "kind": "Status", "apiVersion": "v1",
-            "status": "Failure", "reason": "Forbidden", "code": 403,
-            "message": "jobs.batch is forbidden: exceeded quota",
-        })
-        .to_string(),
-    }]);
+    let guard = verifier.run(vec![Scenario::k8s_error(
+        http::Method::POST,
+        "/namespaces/rio/jobs",
+        403,
+        "Forbidden",
+        "jobs.batch is forbidden: exceeded quota",
+    )]);
 
     let job = Job {
         metadata: kube::api::ObjectMeta {
@@ -141,18 +136,13 @@ async fn try_spawn_job_classifies_409_as_name_collision() {
     let (client, verifier) = ApiServerVerifier::new();
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
-    let guard = verifier.run(vec![Scenario {
-        method: http::Method::POST,
-        path_contains: "/namespaces/rio/jobs",
-        body_contains: None,
-        status: 409,
-        body_json: serde_json::json!({
-            "kind": "Status", "apiVersion": "v1",
-            "status": "Failure", "reason": "AlreadyExists", "code": 409,
-            "message": "jobs.batch \"eph-pool-eph-abc123\" already exists",
-        })
-        .to_string(),
-    }]);
+    let guard = verifier.run(vec![Scenario::k8s_error(
+        http::Method::POST,
+        "/namespaces/rio/jobs",
+        409,
+        "AlreadyExists",
+        "jobs.batch \"eph-pool-eph-abc123\" already exists",
+    )]);
 
     let job = Job {
         metadata: kube::api::ObjectMeta {

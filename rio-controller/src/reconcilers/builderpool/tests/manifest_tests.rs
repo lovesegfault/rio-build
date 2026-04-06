@@ -1512,18 +1512,13 @@ fn spawn_test_job(i: u32) -> (Job, Option<Bucket>) {
 /// spawn-error scenario P0516 originally fixed. ResourceQuota on
 /// `count/jobs.batch` exhausted → spawn returns 403 on every attempt.
 fn forbidden_scenario() -> Scenario {
-    Scenario {
-        method: http::Method::POST,
-        path_contains: "/namespaces/rio/jobs",
-        body_contains: None,
-        status: 403,
-        body_json: serde_json::json!({
-            "kind": "Status", "apiVersion": "v1",
-            "status": "Failure", "reason": "Forbidden", "code": 403,
-            "message": "jobs.batch is forbidden: exceeded quota",
-        })
-        .to_string(),
-    }
+    Scenario::k8s_error(
+        http::Method::POST,
+        "/namespaces/rio/jobs",
+        403,
+        "Forbidden",
+        "jobs.batch is forbidden: exceeded quota",
+    )
 }
 
 /// 201 Created. kube's `create` deserializes the body as a `Job`;
@@ -1692,18 +1687,13 @@ async fn spawn_name_collision_neither_increments_nor_resets() {
     // Either bug → panic. Both correct → all consumed + Err returned.
     let n = SPAWN_FAIL_THRESHOLD;
     let mut scenarios: Vec<Scenario> = (0..n - 1).map(|_| forbidden_scenario()).collect();
-    scenarios.push(Scenario {
-        method: http::Method::POST,
-        path_contains: "/namespaces/rio/jobs",
-        body_contains: None,
-        status: 409,
-        body_json: serde_json::json!({
-            "kind": "Status", "apiVersion": "v1",
-            "status": "Failure", "reason": "AlreadyExists", "code": 409,
-            "message": "jobs.batch \"mf-pool-mf-test\" already exists",
-        })
-        .to_string(),
-    });
+    scenarios.push(Scenario::k8s_error(
+        http::Method::POST,
+        "/namespaces/rio/jobs",
+        409,
+        "AlreadyExists",
+        "jobs.batch \"mf-pool-mf-test\" already exists",
+    ));
     scenarios.push(forbidden_scenario()); // the Nth fail → bail
 
     let guard = verifier.run(scenarios);
