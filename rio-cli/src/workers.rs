@@ -229,12 +229,21 @@ fn print_actor_worker(w: &DebugExecutorState) {
     // the field breakdown — the I-048b signature is `entry exists +
     // has_stream=false`, so `has_stream=N` here is the only thing an
     // operator needs to see to know dispatch can't reach this worker.
-    let zombie = if !w.has_stream {
-        "  ⚠ ZOMBIE (no stream)"
-    } else {
-        ""
-    };
-    println!("worker {}  [{}]{zombie}", w.executor_id, kind_str(w));
+    // I-056b: draining/store_degraded gate has_capacity() — either true
+    // means dispatch can't reach this worker even if stream/registered/
+    // warm all show Y. Surface BOTH on the header line so they scan
+    // without reading the field breakdown (same rationale as ZOMBIE).
+    let mut markers = String::new();
+    if !w.has_stream {
+        markers.push_str("  ⚠ ZOMBIE (no stream)");
+    }
+    if w.draining {
+        markers.push_str("  ⚠ DRAINING");
+    }
+    if w.store_degraded {
+        markers.push_str("  ⚠ DEGRADED");
+    }
+    println!("worker {}  [{}]{markers}", w.executor_id, kind_str(w));
     println!(
         "  stream={}  registered={}  warm={}  hb={}s ago",
         yn(w.has_stream),
@@ -298,6 +307,8 @@ struct ActorExecutorJson<'a> {
     last_heartbeat_ago_secs: u64,
     running_count: u32,
     running_builds: &'a [String],
+    draining: bool,
+    store_degraded: bool,
 }
 impl<'a> From<&'a DebugExecutorState> for ActorExecutorJson<'a> {
     fn from(w: &'a DebugExecutorState) -> Self {
@@ -311,6 +322,8 @@ impl<'a> From<&'a DebugExecutorState> for ActorExecutorJson<'a> {
             last_heartbeat_ago_secs: w.last_heartbeat_ago_secs,
             running_count: w.running_count,
             running_builds: &w.running_builds,
+            draining: w.draining,
+            store_degraded: w.store_degraded,
         }
     }
 }

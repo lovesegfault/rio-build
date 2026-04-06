@@ -437,6 +437,7 @@ pub struct ExecutorSnapshot {
     pub max_builds: u32,
     pub running_builds: u32,
     pub draining: bool,
+    pub store_degraded: bool,
     pub size_class: Option<String>,
     pub connected_since: std::time::Instant,
     pub last_heartbeat: std::time::Instant,

@@ -7,11 +7,16 @@ use tonic::Status;
 
 use crate::actor::{ActorCommand, ActorHandle, ExecutorSnapshot};
 
-/// 2-bool → 3-state. `systems.is_empty()` = no heartbeat yet = not
+/// 3-bool → 4-state. `systems.is_empty()` = no heartbeat yet = not
 /// fully registered (stream-only or heartbeat-only) → "connecting".
+/// Draining wins over degraded: an operator who drained doesn't care
+/// the worker also reports a sick store. Degraded wins over alive:
+/// `has_capacity()` is false either way, but degraded names the cause.
 fn executor_status(s: &ExecutorSnapshot) -> &'static str {
     if s.draining {
         "draining"
+    } else if s.store_degraded {
+        "degraded"
     } else if s.systems.is_empty() {
         "connecting"
     } else {

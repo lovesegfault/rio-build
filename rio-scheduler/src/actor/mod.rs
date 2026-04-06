@@ -731,6 +731,7 @@ impl DagActor {
                 max_builds: w.max_builds,
                 running_builds: w.running_builds.len() as u32,
                 draining: w.draining,
+                store_degraded: w.store_degraded,
                 size_class: w.size_class.clone(),
                 connected_since: w.connected_since,
                 last_heartbeat: w.last_heartbeat,
@@ -891,6 +892,8 @@ impl DagActor {
                 last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
                 running_count: w.running_builds.len(),
                 running_builds: w.running_builds.iter().map(|h| h.to_string()).collect(),
+                draining: w.draining,
+                store_degraded: w.store_degraded,
             })
             .collect()
     }

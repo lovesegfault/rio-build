@@ -118,10 +118,44 @@ impl DagActor {
     ) {
         info!(executor_id = %executor_id, "worker stream connected");
 
-        let worker = self
-            .executors
-            .entry(executor_id.clone())
-            .or_insert_with(|| ExecutorState::new(executor_id.clone()));
+        let entry = self.executors.entry(executor_id.clone());
+        let is_reconnect = matches!(entry, std::collections::hash_map::Entry::Occupied(_));
+        let worker = entry.or_insert_with(|| ExecutorState::new(executor_id.clone()));
+
+        // I-056a: clear session-scoped flags on reconnect. A worker
+        // opening a fresh BuildExecution stream is starting a fresh
+        // session — the prior session's drain/degraded markers don't
+        // apply. Without this, drain → ungraceful disconnect →
+        // reconnect leaves the worker permanently invisible to dispatch
+        // (`has_capacity()` checks both, neither is in any diagnostic
+        // proto). Live: fetchers stuck 22 min after deploy churn drained
+        // them; only scheduler restart cleared it.
+        //
+        // `handle_executor_disconnected` removes the entry, so a CLEAN
+        // disconnect→reconnect goes through `or_insert_with` →
+        // `ExecutorState::new()` and never hits this. We're here because
+        // the disconnect signal didn't fire (old stream's task still in
+        // TCP/h2 close handshake when the new stream's connect arrived,
+        // or the disconnect was lost entirely).
+        //
+        // `store_degraded` is also cleared by the next heartbeat (line
+        // ~663 overwrites unconditionally), but `draining` is NOT —
+        // `handle_drain_executor` is the only setter and there's no
+        // clearer. Clearing both here bounds the stuck window to one
+        // stream-connect even if heartbeats are also racing.
+        if is_reconnect && (worker.draining || worker.store_degraded) {
+            info!(
+                executor_id = %executor_id,
+                was_draining = worker.draining,
+                was_store_degraded = worker.store_degraded,
+                "worker reconnected; clearing stale session flags"
+            );
+            worker.draining = false;
+            worker.store_degraded = false;
+        }
+        if is_reconnect {
+            worker.connected_since = std::time::Instant::now();
+        }
 
         let was_registered = worker.is_registered();
         worker.stream_tx = Some(stream_tx);

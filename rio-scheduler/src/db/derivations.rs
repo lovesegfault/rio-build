@@ -168,7 +168,7 @@ impl SchedulerDb {
         sqlx::query_as(
             r#"
             SELECT derivation_id, drv_hash, drv_path, pname, system,
-                   failed_builders,
+                   failed_builders, is_fixed_output,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
                        0.0
