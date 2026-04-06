@@ -376,6 +376,8 @@ pub fn single_node_from_basic(
         // fallback path is already the "don't have full info" case.
         // 0 = no-signal, estimator skips to default.
         input_srcs_nar_size: 0,
+        // TODO(P0250): compute from has_ca_floating_outputs() || is_fixed_output().
+        is_content_addressed: false,
     }]
 }
 
@@ -408,6 +410,8 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
         // BFS so we can batch QueryPathInfo across all nodes' srcs.
         // Doing it inline would be one RPC per src per node.
         input_srcs_nar_size: 0,
+        // TODO(P0250): compute from has_ca_floating_outputs() || is_fixed_output().
+        is_content_addressed: false,
     }
 }
 

@@ -49,6 +49,11 @@ message DerivationNode {
   // tarball → probably long build" signal, which is the main case
   // where this fallback helps (fresh (pname,system) with no history).
   uint64 input_srcs_nar_size = 10;
+
+  // Phase 5 CA cutoff: set by gateway translate.rs from
+  // has_ca_floating_outputs() || is_fixed_output(). Scheduler uses
+  // this to gate the hash-compare branch in completion.rs.
+  bool is_content_addressed = 11;
 }
 
 // A dependency edge in the derivation DAG.
