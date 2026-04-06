@@ -871,9 +871,9 @@ Env var: `RIO_PG_MAX_CONNECTIONS` (figment's default `snake_case` → `UPPER_SNA
 
 ---
 
-## 6. `pg-zero-compile-time-checked-queries` — **deferred**
+## 6. `pg-zero-compile-time-checked-queries` — **tooling landed — P0297; incremental conversion ongoing**
 
-### Why deferred
+### Why deferred (historical — tooling now in place)
 
 `sqlx prepare` + `SQLX_OFFLINE=true` in the Nix build would give compile-time SQL checking for all `query!`/`query_as!` macro callsites. Zero currently — 194 unchecked `query(...)` strings.
 

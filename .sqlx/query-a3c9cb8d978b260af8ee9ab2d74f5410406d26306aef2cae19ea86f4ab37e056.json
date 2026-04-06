@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE narinfo\n           SET signatures = array(\n                 SELECT DISTINCT unnest(signatures || $2::text[])\n               )\n         WHERE store_path = $1\n        RETURNING cardinality(signatures) AS \"n!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a3c9cb8d978b260af8ee9ab2d74f5410406d26306aef2cae19ea86f4ab37e056"
+}

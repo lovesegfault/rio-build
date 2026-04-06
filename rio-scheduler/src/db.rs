@@ -5,10 +5,12 @@
 //!
 //! UUIDs are bound natively via the sqlx `uuid` feature — no `::uuid` casts or
 //! `.to_string()` conversions needed.
-//
-// TODO(P0297): convert query("...") → query!(...) for compile-time
-// SQL checking. Blocked on .sqlx/ in Crane source filter + `just
-// sqlx-prepare` target. See remediations/phase4a/12-pg-transaction-safety.md §6.
+//!
+//! `query!(...)` macros (compile-time SQL checking) read from `.sqlx/`
+//! (committed, regenerated via `just sqlx-prepare`). The `TERMINAL_STATUS_SQL`
+//! `format!`-interpolated callsites are permanent exceptions — the macro
+//! requires a string literal, and the planner needs the literal for
+//! partial-index proof. See remediations/phase4a/12-pg-transaction-safety.md §6.
 
 use std::collections::HashMap;
 
@@ -412,8 +414,7 @@ impl SchedulerDb {
     /// for the persist-failed path (where rows exist but the tx rolled
     /// back, so they don't) and for manual admin cleanup.
     pub async fn delete_build(&self, build_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM builds WHERE build_id = $1")
-            .bind(build_id)
+        sqlx::query!("DELETE FROM builds WHERE build_id = $1", build_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -469,16 +470,16 @@ impl SchedulerDb {
         status: DerivationStatus,
         assigned_worker: Option<&WorkerId>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             UPDATE derivations
             SET status = $2, assigned_worker_id = $3, updated_at = now()
             WHERE drv_hash = $1
             "#,
+            drv_hash.as_str(),
+            status.as_str(),
+            assigned_worker.map(WorkerId::as_str),
         )
-        .bind(drv_hash.as_str())
-        .bind(status.as_str())
-        .bind(assigned_worker.map(WorkerId::as_str))
         .execute(&self.pool)
         .await?;
 
@@ -487,10 +488,10 @@ impl SchedulerDb {
 
     /// Increment the retry count for a derivation.
     pub async fn increment_retry_count(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE derivations SET retry_count = retry_count + 1, updated_at = now() WHERE drv_hash = $1",
+            drv_hash.as_str(),
         )
-        .bind(drv_hash.as_str())
         .execute(&self.pool)
         .await?;
 
@@ -515,13 +516,13 @@ impl SchedulerDb {
         drv_hash: &DrvHash,
         worker_id: &WorkerId,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE derivations \
              SET failed_workers = array_append(failed_workers, $2), updated_at = now() \
              WHERE drv_hash = $1 AND NOT ($2 = ANY(failed_workers))",
+            drv_hash.as_str(),
+            worker_id.as_str(),
         )
-        .bind(drv_hash.as_str())
-        .bind(worker_id.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -539,13 +540,13 @@ impl SchedulerDb {
     /// `assigned_worker_id` is NULLed: a poisoned derivation has no
     /// assignment. Matches the in-mem semantics the caller should enforce.
     pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE derivations \
              SET status = 'poisoned', poisoned_at = now(), \
                  assigned_worker_id = NULL, updated_at = now() \
              WHERE drv_hash = $1",
+            drv_hash.as_str(),
         )
-        .bind(drv_hash.as_str())
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -555,13 +556,13 @@ impl SchedulerDb {
     /// zero `retry_count`, status='created'. Used by ClearPoison admin
     /// RPC + TTL expiry in `handle_tick`.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE derivations
              SET poisoned_at = NULL, failed_workers = '{}', retry_count = 0,
                  status = 'created', updated_at = now()
              WHERE drv_hash = $1",
+            drv_hash.as_str(),
         )
-        .bind(drv_hash.as_str())
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -696,10 +697,12 @@ impl SchedulerDb {
     /// Unpin all live inputs for a drv. Called on terminal status.
     /// Idempotent: unpinning a never-pinned drv = 0 rows deleted.
     pub async fn unpin_live_inputs(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM scheduler_live_pins WHERE drv_hash = $1")
-            .bind(drv_hash.as_str())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM scheduler_live_pins WHERE drv_hash = $1",
+            drv_hash.as_str(),
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -931,11 +934,11 @@ impl SchedulerDb {
     /// Only deletes `pending`/`acknowledged` rows — terminal rows
     /// are audit-valuable even for stale derivations.
     pub async fn delete_latest_assignment(&self, derivation_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "DELETE FROM assignments \
              WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')",
+            derivation_id,
         )
-        .bind(derivation_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1248,7 +1251,7 @@ impl SchedulerDb {
         system: &str,
         actual_duration_secs: f64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             UPDATE build_history
             SET ema_duration_secs = $3,
@@ -1256,10 +1259,10 @@ impl SchedulerDb {
                 last_updated = now()
             WHERE pname = $1 AND system = $2
             "#,
+            pname,
+            system,
+            actual_duration_secs,
         )
-        .bind(pname)
-        .bind(system)
-        .bind(actual_duration_secs)
         .execute(&self.pool)
         .await?;
 
@@ -1342,14 +1345,14 @@ impl SchedulerDb {
         duration_secs: f64,
         peak_memory_bytes: i64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO build_samples (pname, system, duration_secs, peak_memory_bytes)
              VALUES ($1, $2, $3, $4)",
+            pname,
+            system,
+            duration_secs,
+            peak_memory_bytes,
         )
-        .bind(pname)
-        .bind(system)
-        .bind(duration_secs)
-        .bind(peak_memory_bytes)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1364,10 +1367,10 @@ impl SchedulerDb {
         // `$1 * interval '1 day'` with an i32 bind — PG interval
         // arithmetic. Avoids the `($1 || ' days')::interval` text-cast
         // detour (which would take a &str bind).
-        let result = sqlx::query(
+        let result = sqlx::query!(
             "DELETE FROM build_samples WHERE completed_at < now() - $1 * interval '1 day'",
+            days as i32,
         )
-        .bind(days as i32)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
