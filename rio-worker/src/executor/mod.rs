@@ -415,6 +415,32 @@ pub async fn execute_build(
                     .outputs()
                     .iter()
                     .filter(|out| names.contains(out.name()))
+                    // Floating-CA outputs have path="" in the .drv
+                    // (computed post-build). Reaching this loop with a
+                    // CA input means the scheduler's resolve failed
+                    // (RealisationMissing, PG blip) and dispatched
+                    // unresolved content. Passing "" to
+                    // fetch_input_metadata → `invalid store path ""` →
+                    // InfrastructureFailure → unbounded retry storm
+                    // (9748 events observed). Filter here so the build
+                    // fails later on the unresolved PLACEHOLDER in
+                    // env/args (a proper BuildFailed, not an infra
+                    // loop). The scheduler-side fix (insert realisation
+                    // at completion) makes this path unreachable in
+                    // normal operation; this is defense-in-depth.
+                    .filter(|out| {
+                        if out.path().is_empty() {
+                            tracing::warn!(
+                                input_drv = %path,
+                                output_name = out.name(),
+                                "floating-CA input unresolved by scheduler; \
+                                 filtering empty path (build will fail on placeholder)"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .map(|out| out.path().to_string())
                     .collect();
                 Ok::<_, ExecutorError>(matching)
@@ -423,8 +449,35 @@ pub async fn execute_build(
         .buffer_unordered(MAX_PARALLEL_FETCHES)
         .try_collect()
         .await?;
+    // Defense: filter empty paths. A floating-CA input derivation's .drv
+    // file has `out.path() == ""` (the path is unknown until the build
+    // runs). If the scheduler dispatched us WITHOUT resolving inputDrvs
+    // to realized paths (maybe_resolve_ca gate miss, or resolve failed),
+    // we'd pass `""` to nix-daemon's inputSrcs → bind-mount of "" →
+    // build fails with a cryptic ENOENT. Dropping empties here makes the
+    // failure mode clearer (the build still fails — it's missing an
+    // input — but the log shows the actual missing path, not "").
+    //
+    // WARN-log indicates a scheduler bug: the scheduler should have
+    // resolved CA inputDrvs before dispatch. Zero warns expected in
+    // steady-state; any warn here means investigate the scheduler's
+    // `maybe_resolve_ca` path.
+    let mut dropped_empty = 0usize;
     for paths in fetched {
-        resolved_input_srcs.extend(paths);
+        for p in paths {
+            if p.is_empty() {
+                dropped_empty += 1;
+            } else {
+                resolved_input_srcs.insert(p);
+            }
+        }
+    }
+    if dropped_empty > 0 {
+        tracing::warn!(
+            drv_path = %drv_path,
+            dropped = dropped_empty,
+            "dropped empty inputDrv output paths (floating-CA input not resolved by scheduler)"
+        );
     }
     let basic_drv = rio_nix::derivation::BasicDerivation::new(
         drv.outputs().to_vec(),

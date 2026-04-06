@@ -241,7 +241,7 @@
           # subtree must be included verbatim (no commonCargoSources
           # filter — that strips proto/, which rio-proto's build.rs
           # needs as ./proto/).
-          c2nWorkspaceFileset = pkgs.lib.fileset.unions [
+          workspaceFileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
             ./rio-bench
@@ -280,9 +280,9 @@
             # the nextest drv hash so drift is caught.
             ./docs/src/observability.md
           ];
-          c2nWorkspaceSrc = pkgs.lib.fileset.toSource {
+          workspaceSrc = pkgs.lib.fileset.toSource {
             root = unfilteredRoot;
-            fileset = c2nWorkspaceFileset;
+            fileset = workspaceFileset;
           };
 
           # Prefix every key in an attrset. Used to surface per-member
@@ -336,26 +336,23 @@
               allLibs = pkgs.lib.concatMap (c: c.libs) (pkgs.lib.attrValues crates);
             };
 
-          # Workspace binaries (crate2nix per-crate build, stripped +
-          # patchelf'd closure-shrink in nix/crate2nix.nix). What
-          # docker images, VM tests, worker-vm, and crdgen consume.
-          rio-workspace = c2n.workspaceBins;
+          # Workspace binaries (crate2nix per-crate build, stripped in
+          # nix/crate2nix.nix). What docker images, VM tests,
+          # worker-vm, and crdgen consume.
+          rio-workspace = crateBuild.workspaceBins;
 
           # Coverage-instrumented workspace. crate2nix parallel tree
           # with globalExtraRustcOpts=["-Cinstrument-coverage"]. Used
-          # by vmTestsCov + nix/coverage.nix. Closure-scrubbed via
-          # patchelf+remove-references-to but NOT stripped — stripping
+          # by vmTestsCov + nix/coverage.nix. NOT stripped (stripping
           # removes the __llvm_covfun/__llvm_covmap sections llvm-cov
-          # needs. Previously used raw c2nCov.workspace (2.3GB closure
-          # via dead rust-toolchain RPATH) → k3s containerd tmpfs
-          # ENOSPC. workspaceBinsCov collapses the closure to glibc+
-          # syslibs while keeping the instrumentation sections.
-          rio-workspace-cov = c2nCov.workspaceBinsCov;
+          # needs). remap-path-prefix at compile time collapses the
+          # closure to glibc+syslibs — fits k3s containerd tmpfs.
+          rio-workspace-cov = crateBuildCov.workspaceBinsCov;
 
           # Source tree for genhtml (nix/coverage.nix cd's here so
           # genhtml can resolve repo-relative lcov paths to source
-          # lines). c2nWorkspaceSrc has all rio-*/src/.
-          commonSrc = c2nWorkspaceSrc;
+          # lines). workspaceSrc has all rio-*/src/.
+          commonSrc = workspaceSrc;
 
           # --------------------------------------------------------------
           # Fuzz build pipeline (extracted to nix/fuzz.nix)
@@ -370,7 +367,7 @@
               rustNightly
               rustPlatformNightly
               unfilteredRoot
-              c2nWorkspaceFileset
+              workspaceFileset
               ;
           };
 
@@ -403,62 +400,63 @@
           crate2nixCli = pkgs.callPackage "${inputs.crate2nix}/crate2nix/default.nix" { };
 
           # ──────────────────────────────────────────────────────────
-          # crate2nix JSON-mode PoC
+          # crate2nix JSON-mode build
           # ──────────────────────────────────────────────────────────
           #
-          # Parallel build pipeline using pkgs.buildRustCrate + a
+          # Per-crate build pipeline using pkgs.buildRustCrate + a
           # pre-resolved Cargo.json. See nix/crate2nix.nix and
           # .claude/notes/crate2nix-migration-assessment.md for the
           # rationale and caveats. Exposed below as
-          # packages.c2n-workspace + packages.c2n-rio-<crate>.
-          mkC2n =
+          # packages.workspace + packages.rio-<crate>.
+          mkCrateBuild =
             extra:
             import ./nix/crate2nix.nix (
               {
-                inherit pkgs rustStable sysCrateEnv;
+                inherit
+                  pkgs
+                  rustStable
+                  sysCrateEnv
+                  workspaceSrc
+                  ;
                 inherit (pkgs) lib;
                 crate2nixSrc = inputs.crate2nix;
-                workspaceSrc = c2nWorkspaceSrc;
               }
               // extra
             );
-          c2n = mkC2n { };
+          crateBuild = mkCrateBuild { };
 
           # Coverage-instrumented tree: re-import with
           # globalExtraRustcOpts=["-Cinstrument-coverage"]. Doubles the
           # derivation count (645 normal + 645 instrumented), but each
           # half caches independently — touching a workspace crate only
           # rebuilds that crate's two variants + dependents.
-          c2nCov = mkC2n { globalExtraRustcOpts = [ "-Cinstrument-coverage" ]; };
+          crateBuildCov = mkCrateBuild { globalExtraRustcOpts = [ "-Cinstrument-coverage" ]; };
 
           # ──────────────────────────────────────────────────────────
           # crate2nix check backends: clippy, tests, doc
           # ──────────────────────────────────────────────────────────
           #
-          # Per-crate checks layered on the c2n build graph. Deps are
-          # built once (regular rustc, 645 cached drvs); workspace
-          # members are rebuilt per-check with the appropriate driver
-          # (clippy-driver, rustc --test, rustdoc). See
-          # nix/c2n-checks.nix for the wrapper mechanics — notably the
+          # Per-crate checks layered on the crate2nix build graph.
+          # Deps are built once (regular rustc, 645 cached drvs);
+          # workspace members are rebuilt per-check with the
+          # appropriate driver (clippy-driver, rustc --test, rustdoc).
+          # See nix/checks.nix for the wrapper mechanics — notably the
           # clippy wrapper strips lib.sh's hardcoded `--cap-lints
           # allow` (which rustc treats as non-overridable) before
           # forwarding to clippy-driver.
           #
-          # These are the crate2nix-native replacements for crane's
-          # cargoClippy/cargoNextest/cargoDoc. Unlike crane's
-          # workspace-wide derivations, each workspace member gets its
-          # own check derivation → touching rio-scheduler only
-          # re-clippy's rio-scheduler + its dependents, not the full
-          # workspace.
+          # Each workspace member gets its own check derivation →
+          # touching rio-scheduler only re-clippy's rio-scheduler +
+          # its dependents, not the full workspace.
           #
-          # Exposed below as checks.c2n-* and packages.c2n-clippy-* /
-          # c2n-test-* / c2n-doc-* for targeted invocation.
-          c2nChecks = import ./nix/c2n-checks.nix {
+          # Exposed below as checks.* and packages.clippy-* / test-* /
+          # doc-* for targeted invocation.
+          crateChecks = import ./nix/checks.nix {
             inherit
               pkgs
               rustStable
-              c2n
-              c2nCov
+              crateBuild
+              crateBuildCov
               ;
             inherit (pkgs) lib;
             # Runtime inputs for test execution. Mirrors crane's
@@ -488,14 +486,14 @@
             # wrapper-level PG bootstrap not needed. `--no-tests=warn`
             # because rio-cli has zero tests (bin-only crate).
             #
-            # Fileset = c2n's workspaceSrc PLUS .config/nextest.toml
+            # Fileset = workspaceSrc PLUS .config/nextest.toml
             # (--workspace-remap needs to find it relative to the
-            # workspace root). c2n's own fileset omits .config/
+            # workspace root). The base fileset omits .config/
             # because buildRustCrate doesn't need it.
             workspaceSrc = pkgs.lib.fileset.toSource {
               root = unfilteredRoot;
               fileset = pkgs.lib.fileset.unions [
-                c2nWorkspaceFileset
+                workspaceFileset
                 ./.config/nextest.toml
               ];
             };
@@ -539,7 +537,7 @@
           # Non-rustc check derivations (shared by checks.* and ci aggregate)
           # --------------------------------------------------------------
           #
-          # Rust checks (clippy/nextest/doc/coverage) are in c2nChecks
+          # Rust checks (clippy/nextest/doc/coverage) are in crateChecks
           # (per-crate caching, deps built once). These are the rest:
           # workspace-level policy checks that don't invoke rustc.
           miscChecks = {
@@ -561,7 +559,7 @@
                 root = unfilteredRoot;
                 fileset = pkgs.lib.fileset.unions [
                   ./.cargo/deny.toml
-                  c2nWorkspaceFileset
+                  workspaceFileset
                 ];
               };
               cargoDeps = rustPlatformStable.importCargoLock {
@@ -1071,7 +1069,7 @@
                 vmTestsCov
                 commonSrc
                 ;
-              unitCoverage = c2nChecks.coverage;
+              unitCoverage = crateChecks.coverage;
             }
           );
 
@@ -1089,10 +1087,10 @@
           # Linux+KVM required for the full set.
           ciBaseDrvs = [
             rio-workspace
-            c2nChecks.clippyCheck
-            c2nChecks.nextest
-            c2nChecks.docCheck
-            c2nChecks.coverage
+            crateChecks.clippyCheck
+            crateChecks.nextest
+            crateChecks.docCheck
+            crateChecks.coverage
             miscChecks.deny
             miscChecks.tracey-validate
             miscChecks.helm-lint
@@ -1119,7 +1117,7 @@
           # layout, and we don't run the matrix on macs anyway).
           goldenMatrix = import ./nix/golden-matrix.nix {
             inherit pkgs inputs system;
-            inherit (c2nChecks) mkNextestRun;
+            inherit (crateChecks) mkNextestRun;
           };
 
           # --------------------------------------------------------------
@@ -1167,7 +1165,7 @@
               src = pkgs.lib.fileset.toSource {
                 root = unfilteredRoot;
                 fileset = pkgs.lib.fileset.unions [
-                  c2nWorkspaceFileset
+                  workspaceFileset
                   ./.config/mutants.toml
                   ./.config/nextest.toml
                 ];
@@ -1187,7 +1185,7 @@
                 protobuf
                 cmake
                 # Test-time deps (baseline run hits the whole workspace).
-                # Same set as c2nChecks' runtimeTestInputs.
+                # Same set as crateChecks' runtimeTestInputs.
                 inputs.nix.packages.${system}.nix-cli
                 openssh
                 postgresql_18
@@ -1212,7 +1210,7 @@
               PG_BIN = "${pkgs.postgresql_18}/bin";
               # Golden fixture paths — the baseline run hits
               # golden_conformance (workspace-wide). Same vars as
-              # c2nChecks' testEnv; cargo-mutants inherits the env.
+              # crateChecks' testEnv; cargo-mutants inherits the env.
               RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
               RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
               RIO_GOLDEN_FORCE_HERMETIC = "1";
@@ -1333,9 +1331,9 @@
               # Rust + static checks. Excludes `coverage` (superseded
               # by the coverage matrix below — Codecov merges flags).
               checks = {
-                clippy = c2nChecks.clippyCheck;
-                doc = c2nChecks.docCheck;
-                inherit (c2nChecks) nextest;
+                clippy = crateChecks.clippyCheck;
+                doc = crateChecks.docCheck;
+                inherit (crateChecks) nextest;
                 inherit (miscChecks) deny tracey-validate helm-lint;
                 inherit (config.checks) pre-commit;
                 dashboard = rioDashboard;
@@ -1748,78 +1746,70 @@
           // prefixed "cov-" vmTestsCov
           // {
             # HTML coverage report from the unit-test lcov.
-            # c2nChecks.coverage already emits repo-relative paths
+            # crateChecks.coverage already emits repo-relative paths
             # (`rio-*/src/...`) — no strip needed, just genhtml.
             coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
               cd ${commonSrc}
-              ${pkgs.lcov}/bin/genhtml ${c2nChecks.coverage}/lcov.info \
+              ${pkgs.lcov}/bin/genhtml ${crateChecks.coverage}/lcov.info \
                 --output-directory $out
             '';
             inherit ci;
-            # Backward-compat aliases for scripts that target the old
-            # c2n-suffixed names.
-            ci-c2n = ci;
-            coverage-full-c2n = coverage.full;
-            coverage-vm-c2n = coverage.vmLcov;
           }
-          # Per-member crate2nix derivations. Prefixed c2n- so they
-          # sort together in `nix flake show`. See
+          # Per-member crate2nix derivations. Keys are the crate
+          # names (rio-scheduler, rio-common, ...). See
           # .claude/notes/crate2nix-migration-assessment.md.
-          // prefixed "c2n-" c2n.members
+          // crateBuild.members
           # Per-member check derivations for targeted runs:
-          #   nix build .#c2n-clippy-rio-scheduler
-          #   nix build .#c2n-test-rio-common
-          #   nix build .#c2n-doc-rio-nix
-          // prefixed "c2n-clippy-" c2nChecks.clippy
-          // prefixed "c2n-clippy-test-" c2nChecks.clippyTest
-          // prefixed "c2n-test-" c2nChecks.tests
-          // prefixed "c2n-test-bin-" c2nChecks.testBins
-          // prefixed "c2n-doc-" c2nChecks.doc
-          // prefixed "c2n-cov-profraw-" c2nChecks.covProfraw
+          #   nix build .#clippy-rio-scheduler
+          #   nix build .#test-rio-common
+          #   nix build .#doc-rio-nix
+          // prefixed "clippy-" crateChecks.clippy
+          // prefixed "clippy-test-" crateChecks.clippyTest
+          // prefixed "test-" crateChecks.tests
+          // prefixed "test-bin-" crateChecks.testBins
+          // prefixed "doc-" crateChecks.doc
+          // prefixed "cov-profraw-" crateChecks.covProfraw
           // {
-            c2n-workspace = c2n.workspace;
+            # Raw symlinkJoin of all built crate outputs. References
+            # the intermediate .rlib tree — use workspace-bins for
+            # docker/VM tests.
+            inherit (crateBuild) workspace;
             # Stripped binary-only variant — what VM tests/docker
-            # consume. ~300MB closure vs c2n-workspace's ~2.3GB
-            # (buildRustCrate's default out references the full
-            # rust toolchain via debug-info strings).
-            c2n-workspace-bins = c2n.workspaceBins;
+            # consume. Closure ~glibc+syslibs.
+            workspace-bins = crateBuild.workspaceBins;
             # crate2nix CLI for the dev shell (`crate2nix generate
             # --format json -o Cargo.json` regenerates after lockfile
             # changes).
             crate2nix-cli = crate2nixCli;
-            # Aggregate check derivations (same as checks.c2n-* but
+            # Aggregate check derivations (same as checks.* but
             # exposed as packages for --print-out-paths convenience).
-            c2n-clippy-all = c2nChecks.clippyCheck;
-            c2n-test-all = c2nChecks.testCheck;
-            c2n-doc-all = c2nChecks.docCheck;
+            clippy-all = crateChecks.clippyCheck;
+            test-all = crateChecks.testCheck;
+            doc-all = crateChecks.docCheck;
             # nextest reuse-build runner — characteristic
             # `PASS [Xs] crate::test` output, test groups, retries.
-            # Binaries synthesized from c2n testBinDrvs, no cargo
-            # invocation. nextest-meta is the cached metadata
+            # Binaries synthesized from crate2nix testBinDrvs, no
+            # cargo invocation. nextest-meta is the cached metadata
             # derivation for debugging / manual `cargo-nextest run
             # --binaries-metadata result/binaries-metadata.json`.
-            c2n-nextest-all = c2nChecks.nextest;
-            c2n-nextest-meta = c2nChecks.nextestMetadata;
+            nextest-all = crateChecks.nextest;
+            nextest-meta = crateChecks.nextestMetadata;
             # Coverage output (lcov.info at $out/lcov.info).
-            c2n-coverage = c2nChecks.coverage;
+            inherit (crateChecks) coverage;
             # Toolchain wrappers for debugging the arg-filtering:
-            #   nix build .#c2n-clippy-rustc
+            #   nix build .#clippy-rustc
             #   ./result/bin/rustc --version   # → clippy version
-            c2n-clippy-rustc = c2nChecks.clippyRustc;
-            c2n-rustdoc-rustc = c2nChecks.rustdocRustc;
+            clippy-rustc = crateChecks.clippyRustc;
+            rustdoc-rustc = crateChecks.rustdocRustc;
             # Instrumented workspace (symlinkJoin). Inspection:
             #   objdump -h result/bin/rio-store | grep llvm_prf
-            c2n-workspace-cov = c2nCov.workspace;
+            workspace-cov = crateBuildCov.workspace;
           }
           # Per-test VM packages (Linux-only — mkVmTests wraps in
           # optionalAttrs isLinux):
           #   nix build .#vm-protocol-warm-standalone
           #   nix build .#cov-vm-lifecycle-core-k3s
-          # Plus c2n- prefixed aliases for backward-compat.
           // vmTests
-          // prefixed "c2n-" vmTests
-          // prefixed "c2n-cov-" vmTestsCov
-          // prefixed "c2n-coverage-" (coverage.perTestLcov or { })
           # Multi-Nix golden matrix (weekly). Exported Linux-only:
           # nix-daemon needs a unix socket; macOS matrix not supported.
           # Under `packages` not `checks` → `nix flake check` won't
@@ -1874,9 +1864,9 @@
           # --------------------------------------------------------------
           checks = {
             build = rio-workspace;
-            clippy = c2nChecks.clippyCheck;
-            doc = c2nChecks.docCheck;
-            inherit (c2nChecks) nextest coverage;
+            clippy = crateChecks.clippyCheck;
+            doc = crateChecks.docCheck;
+            inherit (crateChecks) nextest coverage;
             dashboard = rioDashboard;
           }
           // miscChecks

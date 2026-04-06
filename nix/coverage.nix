@@ -142,7 +142,7 @@ let
 
   # Unit-test lcov, path-normalized the same way. Same `-a` trick.
   # --ignore-errors unused: crate2nix's unit lcov is already
-  # repo-relative (c2n-checks.nix does `lcov --substitute 's|^/||'`)
+  # repo-relative (nix/checks.nix does `lcov --substitute 's|^/||'`)
   # so this pattern may not match — harmless, skip the error.
   unitLcov =
     pkgs.runCommand "rio-cov-unit-clean${nameSuffix}" { nativeBuildInputs = [ pkgs.lcov ]; }

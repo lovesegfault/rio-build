@@ -256,7 +256,8 @@ mod hash_derivation_modulo_tests {
         let hash = hash_derivation_modulo(&drv, "/nix/store/abc.drv", &resolve, &mut cache)?;
         let drv_hash_hex = hex::encode(hash);
 
-        let result = BuildResult::success().with_outputs_from_drv(&drv, &drv_hash_hex);
+        let result =
+            BuildResult::success().with_outputs_from_drv(&drv, &drv_hash_hex, &HashMap::new());
         assert_eq!(result.status, BuildStatus::Built);
         assert_eq!(result.built_outputs.len(), 3);
 
@@ -295,10 +296,23 @@ mod hash_derivation_modulo_tests {
         let resolve = |_: &str| -> Option<&Derivation> { None };
         let hash = hash_derivation_modulo(&ca_drv, "/nix/store/ca.drv", &resolve, &mut cache)?;
 
-        // Verify the hash uses masked ATerm (empty output path)
+        // Verify the hash uses masked ATerm (empty output path AND empty
+        // env value for the `out` key — Nix C++ masks both; missing the
+        // env mask produces a hash that nix-build's wopQueryRealisation
+        // will never match).
         use sha2::{Digest, Sha256};
         let masked_aterm = ca_drv.to_aterm_modulo(&BTreeMap::new(), true)?;
         assert!(masked_aterm.contains(r#"("out","","sha256","")"#));
+        // Env `out` value masked: original fixture has
+        // ("out","/nix/store/placeholder-ca"), masked has ("out","").
+        assert!(
+            masked_aterm.contains(r#"("out","")"#),
+            "env out var should be masked to empty; got: {masked_aterm}"
+        );
+        assert!(
+            !masked_aterm.contains("/nix/store/placeholder-ca"),
+            "placeholder path should not appear anywhere after masking"
+        );
         let expected: [u8; 32] = Sha256::digest(masked_aterm.as_bytes()).into();
         assert_eq!(hash, expected);
         Ok(())
@@ -527,7 +541,8 @@ mod hash_derivation_modulo_tests {
         let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
         let drv_hash_hex = hex::encode(hash);
 
-        let result = BuildResult::success().with_outputs_from_drv(&drv, &drv_hash_hex);
+        let result =
+            BuildResult::success().with_outputs_from_drv(&drv, &drv_hash_hex, &HashMap::new());
 
         assert_eq!(result.status, BuildStatus::Built);
         assert_eq!(result.built_outputs.len(), 1);

@@ -165,8 +165,16 @@ pub(super) fn validate_put_metadata(
         .map_err(|e| Status::invalid_argument(format!("{ctx_label}: {e}")))?;
 
     // Step 6: HMAC path-in-claims check. None = verifier disabled OR
-    // mTLS bypass (gateway) → no check.
-    if let Some(claims) = hmac_claims {
+    // mTLS bypass (gateway) → no check. Floating-CA (claims.is_ca) →
+    // skip the membership check: the output path is computed post-build
+    // from the NAR hash, so expected_outputs is [""] at sign time.
+    // Threat model holds — token is still bound to drv_hash (worker
+    // can't upload for a derivation it wasn't assigned), and
+    // r[store.integrity.verify-on-put] below hashes the NAR stream
+    // independently.
+    if let Some(claims) = hmac_claims
+        && !claims.is_ca
+    {
         let path_str = info.store_path.as_str();
         if !claims.expected_outputs.iter().any(|o| o == path_str) {
             warn!(

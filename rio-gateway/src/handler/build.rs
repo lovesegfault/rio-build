@@ -1160,11 +1160,54 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     &mut hash_cache,
                 )
             {
-                results.push(
-                    build_result
-                        .clone()
-                        .with_outputs_from_drv(drv_obj, &hex::encode(hash)),
-                );
+                // Floating-CA outputs have path="" in the .drv — the real
+                // store path is computed post-build from the NAR hash.
+                // Query the store's Realisations table (scheduler's
+                // insert_realisation wrote it at completion). Without
+                // this, the client receives empty outPath →
+                // maybeOutputPath == nullopt → assert at
+                // nix-build.cc:722.
+                let mut realized: HashMap<String, String> = HashMap::new();
+                for out in drv_obj.outputs() {
+                    if !out.path().is_empty() {
+                        continue; // IA/fixed-CA: path is in the .drv
+                    }
+                    let req = types::QueryRealisationRequest {
+                        drv_hash: hash.to_vec(),
+                        output_name: out.name().to_string(),
+                    };
+                    match rio_common::grpc::with_timeout(
+                        "QueryRealisation",
+                        DEFAULT_GRPC_TIMEOUT,
+                        store_client.query_realisation(req),
+                    )
+                    .await
+                    {
+                        Ok(resp) => {
+                            realized.insert(out.name().to_string(), resp.into_inner().output_path);
+                        }
+                        Err(e) => {
+                            // Scheduler's insert_realisation runs BEFORE
+                            // the Completed event fires, so NotFound here
+                            // means a real gap (store blip, or a CA drv
+                            // that wasn't actually built). Log and pass
+                            // "" through — the client assert surfaces
+                            // the problem rather than masking it.
+                            warn!(
+                                drv_path = %drv_path,
+                                output = %out.name(),
+                                error = %e,
+                                "QueryRealisation failed for CA output; \
+                                 client will receive empty outPath"
+                            );
+                        }
+                    }
+                }
+                results.push(build_result.clone().with_outputs_from_drv(
+                    drv_obj,
+                    &hex::encode(hash),
+                    &realized,
+                ));
             } else {
                 results.push(build_result.clone());
             }

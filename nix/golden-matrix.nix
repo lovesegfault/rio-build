@@ -14,7 +14,7 @@
 # multi-minute eval, and building the non-pinned daemons is 20-30 min each.
 # Weekly cron invokes `nix build .#golden-matrix` directly.
 #
-# crate2nix port: reuses c2nChecks.mkNextestRun (reuse-build mode — the
+# crate2nix port: reuses crateChecks.mkNextestRun (reuse-build mode — the
 # test binaries are already compiled by buildRustCrate, nextest just runs
 # them). nextestMeta is shared across all variants (it only depends on
 # testBinDrvs + workspaceSrc). Per-variant cost = one nextest invocation

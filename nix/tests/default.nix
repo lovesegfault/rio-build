@@ -213,6 +213,14 @@ in
           maxBuilds = 1;
         };
       };
+      # GAP-1 regression guard: floating-CA output paths are computed
+      # post-build, so the scheduler's HMAC token has
+      # expected_outputs=[""]. Without Claims.is_ca, the store's
+      # path-in-claims check rejects the realized path →
+      # PERMISSION_DENIED on every CA upload. withPki=true enables
+      # HMAC on this fixture — build-1 failing here means the is_ca
+      # bypass at rio-store/src/grpc/mod.rs regressed.
+      withPki = true;
     };
   };
 

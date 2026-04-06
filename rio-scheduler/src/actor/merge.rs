@@ -89,8 +89,8 @@ impl DagActor {
         // cascade-delete). If it ran AFTER persist, delete_build would
         // silently fail the FK constraint, leaving orphan build rows
         // that recovery would resurrect.
-        let cached_hashes = match self.check_cached_outputs(newly_inserted, &node_index).await {
-            Ok(hashes) => hashes,
+        let cached_hits = match self.check_cached_outputs(newly_inserted, &node_index).await {
+            Ok(hits) => hits,
             Err(e) => {
                 error!(build_id = %build_id, error = %e, "cache-check circuit breaker open; rolling back merge");
                 self.cleanup_failed_merge(build_id, &merge_result).await;
@@ -138,7 +138,7 @@ impl DagActor {
         let total_derivations = nodes.len() as u32;
         let mut cached_count = 0u32;
 
-        for drv_hash in &cached_hashes {
+        for (drv_hash, output_paths) in &cached_hits {
             let Some(node) = node_index.get(drv_hash.as_str()) else {
                 continue;
             };
@@ -147,7 +147,11 @@ impl DagActor {
                     warn!(drv_hash = %drv_hash, error = %e, "cache-hit Created->Completed transition failed");
                     continue;
                 }
-                state.output_paths = node.expected_output_paths.clone();
+                // GAP-4 fix: for floating-CA nodes this is the REALIZED path
+                // from the realisations table (not the [""] placeholder from
+                // expected_output_paths). For IA nodes it's expected_output_paths
+                // (same as before). check_cached_outputs populates the right one.
+                state.output_paths = output_paths.clone();
                 cached_count += 1;
                 metrics::counter!("rio_scheduler_cache_hits_total", "source" => "scheduler")
                     .increment(1);
@@ -167,7 +171,7 @@ impl DagActor {
                             derivation_path: node.drv_path.clone(),
                             status: Some(rio_proto::dag::derivation_event::Status::Cached(
                                 rio_proto::dag::DerivationCached {
-                                    output_paths: node.expected_output_paths.clone(),
+                                    output_paths: output_paths.clone(),
                                 },
                             )),
                         },
@@ -192,7 +196,7 @@ impl DagActor {
         // dependents will correctly be computed as Ready here.
         let remaining_new: HashSet<DrvHash> = newly_inserted
             .iter()
-            .filter(|h| !cached_hashes.contains(h.as_str()))
+            .filter(|h| !cached_hits.contains_key(h.as_str()))
             .cloned()
             .collect();
         let initial_states = self.dag.compute_initial_states(&remaining_new);
@@ -499,47 +503,111 @@ impl DagActor {
         }
     }
 
-    /// Query the store for newly-inserted derivations' expected outputs and
-    /// return the set of drv_hashes whose outputs are all already present.
+    /// Query for newly-inserted derivations' outputs and return the map of
+    /// `drv_hash → output_paths` for nodes whose outputs are already available.
+    ///
+    /// **IA / fixed-CA nodes:** query the store via `FindMissingPaths` using
+    /// `expected_output_paths`. The returned paths are `expected_output_paths`
+    /// (deterministic — gateway computed them from the `.drv`).
+    ///
+    /// **Floating-CA nodes** (non-empty `ca_modular_hash`): `expected_output_paths`
+    /// is `[""]` — the path isn't known until build time. Instead, query the
+    /// `realisations` table by `(modular_hash, output_name)`. If a prior build
+    /// registered the realisation, return the REALIZED path. This is the GAP-3
+    /// fix: before this, CA nodes were passed to `FindMissingPaths` with `""`,
+    /// which the store treats as missing → CA never cache-hit at merge time.
     ///
     /// # Circuit breaker interaction
     ///
-    /// - Store unreachable + breaker closed + under threshold → `Ok(empty set)`.
-    ///   Build proceeds as 100% cache miss. Slightly wasteful but recoverable.
+    /// - Store unreachable + breaker closed + under threshold → `Ok(ca_hits only)`.
+    ///   IA nodes proceed as cache miss. Slightly wasteful but recoverable.
     /// - Store unreachable + breaker trips open (or was already open) →
     ///   `Err(StoreUnavailable)`. SubmitBuild is rejected entirely.
-    /// - Store reachable → `Ok(cached set)`. Breaker closes (if it was open,
-    ///   this was a successful half-open probe).
-    /// - No store client (tests) → `Ok(empty set)`. Breaker not touched.
-    /// - No expected_output_paths → `Ok(empty set)`. Breaker not touched
-    ///   (we didn't actually probe the store, so no signal either way).
+    /// - Store reachable → `Ok(full hit map)`. Breaker closes.
+    /// - No store client (tests) → `Ok(ca_hits only)`. Breaker not touched.
+    /// - No IA expected_output_paths → `Ok(ca_hits only)`. Breaker not touched.
+    ///
+    /// The CA realisation lookup hits PG directly (same pool as the actor's
+    /// own DB writes) and does NOT interact with the circuit breaker — a PG
+    /// blip here degrades to cache-miss for that node (warn + skip), not a
+    /// full SubmitBuild rejection.
     ///
     /// `&mut self` because the breaker is actor-owned state.
     async fn check_cached_outputs(
         &mut self,
         newly_inserted: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &rio_proto::dag::DerivationNode>,
-    ) -> Result<HashSet<DrvHash>, ActorError> {
+    ) -> Result<HashMap<DrvHash, Vec<String>>, ActorError> {
+        let mut hits: HashMap<DrvHash, Vec<String>> = HashMap::new();
+
+        // --- Floating-CA: realisations-table lookup --------------------
+        // GAP-3 fix: CA nodes can't use FindMissingPaths (expected path is
+        // ""). Query realisations by (modular_hash, output_name) instead —
+        // same lookup resolve_ca_inputs uses at dispatch time. A hit here
+        // means a prior build (via gateway wopRegisterDrvOutput or scheduler
+        // insert_realisation on completion) already produced this output.
+        for h in newly_inserted {
+            let Some(n) = node_index.get(h.as_str()) else {
+                continue;
+            };
+            let Ok(modular_hash): Result<[u8; 32], _> = n.ca_modular_hash.as_slice().try_into()
+            else {
+                continue; // IA or malformed — handled by FindMissingPaths below
+            };
+            // All output_names must resolve for a full cache-hit. Collect
+            // realized paths index-paired with output_names (same layout
+            // as DerivationState.output_paths).
+            let mut realized = Vec::with_capacity(n.output_names.len());
+            let mut all_found = true;
+            for out_name in &n.output_names {
+                match crate::ca::resolve::query_realisation(self.db.pool(), &modular_hash, out_name)
+                    .await
+                {
+                    Ok(Some(path)) => realized.push(path),
+                    Ok(None) => {
+                        all_found = false;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(drv_hash = %h, output = %out_name, error = %e,
+                              "CA realisation lookup failed; treating as cache-miss");
+                        all_found = false;
+                        break;
+                    }
+                }
+            }
+            if all_found && !realized.is_empty() {
+                hits.insert(h.clone(), realized);
+            }
+        }
+
+        // --- IA / fixed-CA: FindMissingPaths by expected path ----------
         let Some(store_client) = &self.store_client else {
-            return Ok(HashSet::new());
+            return Ok(hits);
         };
 
-        // Collect all expected output paths for newly-inserted derivations.
-        // Skip nodes without expected_output_paths (old gateways, unresolvable leaf nodes).
+        // Collect expected output paths for IA newly-inserted derivations.
+        // Skip CA nodes (handled above) and nodes without expected_output_paths.
+        // Also skip empty-string paths defensively (a stray "" would be
+        // reported missing, defeating the cache-hit for that node anyway,
+        // but no reason to send it over the wire).
         let check_paths: Vec<String> = newly_inserted
             .iter()
             .filter_map(|h| node_index.get(h.as_str()))
-            .flat_map(|n| n.expected_output_paths.iter().cloned())
+            .filter(|n| n.ca_modular_hash.len() != 32)
+            .flat_map(|n| n.expected_output_paths.iter())
+            .filter(|p| !p.is_empty())
+            .cloned()
             .collect();
 
         if check_paths.is_empty() {
             // Didn't probe the store — no signal for the breaker. If it's
             // open, it stays open; if closed, stays closed. Returning
             // Ok here (not checking breaker.is_open()) is deliberate: a
-            // submission with no expected_output_paths is unaffected by
-            // store availability (there's nothing to cache-check), so
+            // submission with no IA expected_output_paths is unaffected by
+            // store availability (there's nothing to path-check), so
             // rejecting it with StoreUnavailable would be a false positive.
-            return Ok(HashSet::new());
+            return Ok(hits);
         }
 
         // Wrap in a timeout: this is a synchronous call inside the
@@ -573,10 +641,10 @@ impl DagActor {
                 if self.cache_breaker.record_failure() {
                     return Err(ActorError::StoreUnavailable);
                 }
-                // Under threshold: proceed with empty cache-hit set.
-                // The build runs with 100% miss — wasteful, but N<5 of
+                // Under threshold: proceed with CA-only hit set.
+                // IA nodes run with 100% miss — wasteful, but N<5 of
                 // these is tolerable. The breaker catches sustained outages.
-                return Ok(HashSet::new());
+                return Ok(hits);
             }
             Err(_) => {
                 warn!(
@@ -587,7 +655,7 @@ impl DagActor {
                 if self.cache_breaker.record_failure() {
                     return Err(ActorError::StoreUnavailable);
                 }
-                return Ok(HashSet::new());
+                return Ok(hits);
             }
         };
 
@@ -597,17 +665,22 @@ impl DagActor {
             .filter(|p| !missing.contains(p))
             .collect();
 
-        // A derivation is cached if it has at least one expected output path
-        // AND all of them are present.
-        Ok(newly_inserted
-            .iter()
-            .filter(|h| {
-                node_index.get(h.as_str()).is_some_and(|n| {
-                    !n.expected_output_paths.is_empty()
-                        && n.expected_output_paths.iter().all(|p| present.contains(p))
-                })
-            })
-            .cloned()
-            .collect())
+        // An IA derivation is cached if it has at least one expected output
+        // path AND all of them are present.
+        for h in newly_inserted {
+            let Some(n) = node_index.get(h.as_str()) else {
+                continue;
+            };
+            if n.ca_modular_hash.len() == 32 {
+                continue; // CA — already handled above
+            }
+            if !n.expected_output_paths.is_empty()
+                && n.expected_output_paths.iter().all(|p| present.contains(p))
+            {
+                hits.insert(h.clone(), n.expected_output_paths.clone());
+            }
+        }
+
+        Ok(hits)
     }
 }

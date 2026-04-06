@@ -341,11 +341,11 @@ impl DagActor {
         // works, just fetches on-demand via FUSE.
         self.send_prefetch_hint(worker_id, drv_hash);
 
-        // CA-depends-on-CA resolution: rewrite placeholder paths
-        // in env/args/builder to realized output paths before
-        // dispatch. Only fires when the derivation is CA AND has
-        // CA inputs (ADR-018 Appendix B: is_ca && !is_fixed_output
-        // is the gate — floating-CA always needs resolve).
+        // CA input resolution: rewrite placeholder paths in
+        // env/args/builder to realized output paths before
+        // dispatch. Fires when gateway set needs_resolve (ADR-018
+        // Appendix B: floating-CA self OR ia.deferred — IA drv
+        // with a floating-CA input).
         //
         // `maybe_resolve_ca` returns the (possibly rewritten)
         // drv_content PLUS the realisation lookups performed. On
@@ -416,6 +416,14 @@ impl DagActor {
                     worker_id: worker_id.to_string(),
                     drv_hash: drv_hash.to_string(),
                     expected_outputs: state.expected_output_paths.clone(),
+                    // Floating-CA: output path is computed post-build
+                    // from the NAR hash, so expected_output_paths is
+                    // [""] here. Store skips the path-in-claims check
+                    // when is_ca is set (verify-on-put still hashes
+                    // the NAR independently; threat model holds).
+                    // Fixed-output CA (FOD) has a known path → treat
+                    // as IA for the membership check.
+                    is_ca: state.is_ca && !state.is_fixed_output,
                     expiry_unix,
                 })
             } else {
@@ -650,9 +658,13 @@ impl DagActor {
     /// completion-time `insert_realisation_deps` call (the FK needs
     /// the parent's OWN realisation row to exist first).
     ///
-    /// ADR-018 Appendix B: resolve fires for `is_ca && !is_fixed_output`
-    /// (floating-CA always resolves). Fixed-output CA derivations
-    /// don't need it — their output paths are known at eval time.
+    /// ADR-018 Appendix B: resolve fires when `needs_resolve` is set
+    /// by the gateway — floating-CA self (`has_ca_floating_outputs`)
+    /// OR any inputDrv is floating-CA (`ia.deferred`: an IA drv
+    /// depending on a CA input has the CA placeholder embedded in
+    /// its env/args). Fixed-output CA with no CA inputs doesn't need
+    /// resolve — its output path AND its inputs' paths are all
+    /// eval-time known.
     ///
     /// The resolve step queries the `realisations` table for each CA
     /// input's `(modular_hash, output_name)` → `output_path`, then
@@ -674,11 +686,13 @@ impl DagActor {
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
     ) -> (Vec<u8>, Vec<crate::ca::RealisationLookup>) {
-        // Gate: floating-CA only. ADR-018 Appendix B `shouldResolve`
-        // table. `is_ca && !is_fixed_output` means the output path
-        // is UNKNOWN pre-build — which means the derivation's inputs
-        // may themselves be CA with placeholder-embedded paths.
-        if !state.is_ca || state.is_fixed_output {
+        // Gate: ADR-018 Appendix B `shouldResolve`. Gateway computes
+        // `needs_resolve = has_ca_floating_outputs() || any inputDrv
+        // is floating-CA` at translate time. Covers both floating-CA
+        // self AND ia.deferred (IA with CA inputs — the CA input's
+        // placeholder is embedded in this drv's env/args and needs
+        // rewriting to the realized path).
+        if !state.needs_resolve {
             return (state.drv_content.clone(), Vec::new());
         }
 
@@ -942,10 +956,33 @@ impl DagActor {
                 continue;
             };
             if child.is_ca {
-                // CA — handled by collect_ca_inputs.
-                continue;
+                // CA child with a modular hash — handled by
+                // collect_ca_inputs via realisation lookup. But a CA
+                // child WITHOUT a modular hash (recovered state,
+                // BasicDerivation fallback) that HAS completed can
+                // still contribute its realized output_paths here:
+                // the resolve doesn't need the realisation table when
+                // we already have the concrete path in-memory.
+                if child.ca_modular_hash.is_some() || child.output_paths.is_empty() {
+                    continue;
+                }
+                // Fall through: CA child, no modular hash, but
+                // output_paths is populated (completed). Treat as IA
+                // for the purpose of inputSrcs collection — the
+                // realized path is just as concrete as an IA
+                // expected_output_path.
             }
-            if child.expected_output_paths.is_empty() {
+            // Prefer realized output_paths (filled on completion) over
+            // expected_output_paths (filled at merge). For IA children
+            // the two are equivalent; for the CA-no-hash fallthrough
+            // above, only output_paths is usable (expected is [""]
+            // for floating-CA).
+            let paths = if !child.output_paths.is_empty() {
+                &child.output_paths
+            } else {
+                &child.expected_output_paths
+            };
+            if paths.is_empty() {
                 // Recovered node or proto without the field. Skip;
                 // resolve_ca_inputs logs and skips the inputSrcs add.
                 continue;
@@ -953,7 +990,7 @@ impl DagActor {
             inputs.push(crate::ca::IaResolveInput {
                 drv_path: child.drv_path().to_string(),
                 output_names: child.output_names.clone(),
-                output_paths: child.expected_output_paths.clone(),
+                output_paths: paths.clone(),
             });
         }
         inputs

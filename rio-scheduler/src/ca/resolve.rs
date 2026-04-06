@@ -492,7 +492,7 @@ pub async fn insert_realisation_deps(
 /// directly (both crates share the PG pool and migrations), not via
 /// the store gRPC. ADR-018 §3: "resolution logic belongs in the
 /// scheduler."
-async fn query_realisation(
+pub(crate) async fn query_realisation(
     pool: &PgPool,
     modular_hash: &[u8; 32],
     output_name: &str,
@@ -505,6 +505,185 @@ async fn query_realisation(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(p,)| p))
+}
+
+/// A prior realisation: some OTHER derivation that produced the same
+/// output_path. Used by CA cutoff to detect "this content existed
+/// before this build" — for CA, same content → same path, so finding
+/// a DIFFERENT modular_hash pointing to the same path proves a prior
+/// build landed it.
+#[derive(Debug, Clone)]
+pub struct PriorRealisation {
+    /// Modular hash of the prior derivation (different from current).
+    pub drv_hash: [u8; 32],
+    /// Output name (usually `"out"`).
+    pub output_name: String,
+    /// Realized store path (same as current — CA content-addressing).
+    pub output_path: String,
+    /// NAR hash of the output (same as current — same content).
+    pub output_hash: [u8; 32],
+}
+
+/// Find a prior realisation for `output_path` with a DIFFERENT
+/// modular_hash. The CA cutoff trigger check.
+///
+/// For CA derivations, the output_path is a function of content: two
+/// builds producing identical bytes get identical store paths. If a
+/// PRIOR build (different modular_hash — different drv, same content)
+/// already registered a realisation for this path, the content
+/// existed before → downstream can be skipped.
+///
+/// Contrast with `ContentLookup(nar_hash, exclude=path)` — that was
+/// the previous trigger check, and it's broken for CA: since both
+/// builds produce the SAME path, the self-exclusion filters out the
+/// only matching row. The realisation-based check excludes by
+/// modular_hash instead (different across builds with different drv
+/// envs, even if content matches).
+///
+/// Uses `realisations_output_idx` (migration 002). Returns the FIRST
+/// match — if multiple prior builds exist, any one proves existence.
+// r[impl sched.ca.cutoff-compare]
+#[instrument(skip(pool, exclude_modular_hash))]
+pub async fn query_prior_realisation(
+    pool: &PgPool,
+    output_path: &str,
+    exclude_modular_hash: &[u8; 32],
+) -> Result<Option<PriorRealisation>, sqlx::Error> {
+    let row: Option<(Vec<u8>, String, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT drv_hash, output_name, output_path, output_hash \
+         FROM realisations \
+         WHERE output_path = $1 AND drv_hash != $2 \
+         LIMIT 1",
+    )
+    .bind(output_path)
+    .bind(exclude_modular_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(h, name, path, oh)| {
+        Some(PriorRealisation {
+            drv_hash: h.as_slice().try_into().ok()?,
+            output_name: name,
+            output_path: path,
+            output_hash: oh.as_slice().try_into().ok()?,
+        })
+    }))
+}
+
+/// `(modular_hash, output_name)` composite key — the realisations PK.
+pub type RealisationKey = (Vec<u8>, String);
+
+/// `(output_path, output_hash)` — the realisation's payload.
+pub type RealisationOutput = (String, [u8; 32]);
+
+/// Walk `realisation_deps` transitively from a seed set, collecting
+/// all dependent realisations (the reverse direction: "who was built
+/// using these as inputs?").
+///
+/// The CA cutoff cascade: given a trigger's PRIOR realisation (found
+/// via [`query_prior_realisation`]), walk the dependency graph to
+/// discover what was previously built downstream. Those prior outputs
+/// are the candidate paths for skip-verification.
+///
+/// Uses `realisation_deps_reverse_idx` (migration 015, explicitly
+/// indexed "for cutoff cascade"). Bounded at `max_nodes` to match
+/// the in-mem DAG's `MAX_CASCADE_DEPTH` — a runaway walk on a
+/// pathological dependency graph shouldn't hang the actor loop.
+///
+/// Returns `(drv_hash, output_name) → (output_path, output_hash)`.
+/// The caller matches these against the current DAG's cascade
+/// candidates by name-suffix (output_path ends with `-{pname}`).
+// r[impl sched.ca.cutoff-propagate]
+#[instrument(skip(pool, seeds))]
+pub async fn walk_dependent_realisations(
+    pool: &PgPool,
+    seeds: &[RealisationKey],
+    max_nodes: usize,
+) -> Result<HashMap<RealisationKey, RealisationOutput>, sqlx::Error> {
+    let mut found: HashMap<RealisationKey, RealisationOutput> = HashMap::new();
+    let mut frontier: Vec<RealisationKey> = seeds.to_vec();
+    let mut visited: HashSet<RealisationKey> = seeds.iter().cloned().collect();
+
+    while let Some((dep_hash, dep_name)) = frontier.pop() {
+        if found.len() >= max_nodes {
+            break;
+        }
+        // Join realisation_deps (reverse) → realisations to get
+        // dependent's output_path in one round-trip.
+        let rows: Vec<(Vec<u8>, String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT rd.drv_hash, rd.output_name, r.output_path, r.output_hash \
+             FROM realisation_deps rd \
+             JOIN realisations r \
+               ON r.drv_hash = rd.drv_hash AND r.output_name = rd.output_name \
+             WHERE rd.dep_drv_hash = $1 AND rd.dep_output_name = $2",
+        )
+        .bind(&dep_hash)
+        .bind(&dep_name)
+        .fetch_all(pool)
+        .await?;
+        for (h, n, path, oh) in rows {
+            let key = (h, n);
+            if visited.insert(key.clone()) {
+                if let Ok(oh32) = oh.as_slice().try_into() {
+                    found.insert(key.clone(), (path, oh32));
+                }
+                frontier.push(key);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Insert a realisation row. Idempotent (`ON CONFLICT DO NOTHING`).
+///
+/// Scheduler-side mirror of `rio_store::realisations::insert` — the
+/// scheduler writes directly to PG (both crates share the pool and
+/// migrations; ADR-018 §3 "resolution logic belongs in the scheduler").
+///
+/// Called from `handle_success_completion` when a CA build finishes:
+/// the worker's `CompletionReport.built_outputs` carries
+/// `(output_name, output_path, output_hash)`; the scheduler has
+/// `ca_modular_hash` from the DAG state. Together they form the full
+/// realisation row — no extra RPC needed.
+///
+/// **Why the scheduler inserts** (not the worker): the gateway's
+/// `wopRegisterDrvOutput` handler inserts realisations for the Nix
+/// wire-protocol path (client → gateway → store). But the rio-worker
+/// speaks gRPC, not wire protocol — its upload flow is `PutPath →
+/// CompletionReport`, with no RegisterRealisation call. Without this
+/// insert, a CA-on-CA chain built entirely by rio-workers never lands
+/// a realisation row, so the next dispatch's `query_realisation`
+/// returns `None` → `RealisationMissing` → dispatch-unresolved →
+/// worker crashes on the empty-string output path from the floating-
+/// CA input's `.drv`. Observed: 9748 retry events in ~10min before
+/// this fix (InfrastructureFailure has no backoff).
+///
+/// `signatures` is empty: the scheduler doesn't sign (phase 5
+/// concern). The gateway path populates signatures from the wire
+/// JSON; a rio-worker-built realisation is unsigned until a later
+/// signing pass (or never, for private deployments).
+#[instrument(skip(pool), fields(drv_hash = hex::encode(modular_hash), output = %output_name))]
+pub async fn insert_realisation(
+    pool: &PgPool,
+    modular_hash: &[u8; 32],
+    output_name: &str,
+    output_path: &str,
+    output_hash: &[u8; 32],
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO realisations (drv_hash, output_name, output_path, output_hash, signatures)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (drv_hash, output_name) DO NOTHING
+        "#,
+    )
+    .bind(modular_hash.as_slice())
+    .bind(output_name)
+    .bind(output_path)
+    .bind(output_hash.as_slice())
+    .bind::<&[String]>(&[])
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Serialize a resolved derivation back to ATerm with `inputDrvs`

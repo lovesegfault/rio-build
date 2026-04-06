@@ -338,7 +338,27 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
     dag.get_children(drv_hash)
         .into_iter()
         .filter_map(|child| dag.node(&child))
-        .flat_map(|child| child.expected_output_paths.iter().cloned())
+        .flat_map(|child| {
+            // Prefer REALIZED output_paths (populated at completion time
+            // from the worker's BuildResult.built_outputs) over
+            // expected_output_paths (populated at merge time from the
+            // proto). For a floating-CA child, expected_output_paths is
+            // `[""]` (the path is unknown pre-build) but output_paths
+            // has the actual realized path once the child completes.
+            // For IA children, expected_output_paths is correct and
+            // output_paths is empty until completion — fall through.
+            if child.output_paths.is_empty() {
+                child.expected_output_paths.iter()
+            } else {
+                child.output_paths.iter()
+            }
+        })
+        // Filter empties: a floating-CA child that hasn't completed yet
+        // has expected_output_paths=[""] and output_paths=[]. The ""
+        // would be a no-op bloom lookup and a no-op PrefetchHint entry,
+        // but cleaner to drop it here.
+        .filter(|p| !p.is_empty())
+        .cloned()
         .collect()
 }
 

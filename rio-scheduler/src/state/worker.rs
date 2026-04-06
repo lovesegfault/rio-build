@@ -199,6 +199,14 @@ impl WorkerState {
 pub struct RetryPolicy {
     /// Maximum number of retries for transient failures.
     pub max_retries: u32,
+    /// Maximum number of retries for InfrastructureFailure. Higher
+    /// than `max_retries` because infra failures are worker-local
+    /// (not the build's fault) — but NOT unbounded: a scheduler-side
+    /// bug that misclassifies a deterministic failure as infra
+    /// (e.g., empty CA input path → MetadataFetch error) would
+    /// otherwise hot-loop forever. Observed: 9748 re-dispatches in
+    /// one session before the CA-path-propagation fix landed.
+    pub max_infra_retries: u32,
     /// Base backoff duration in seconds.
     pub backoff_base_secs: f64,
     /// Backoff multiplier.
@@ -213,6 +221,11 @@ impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_retries: 2,
+            // 10× the transient bound: a genuinely flapping worker
+            // gets plenty of attempts before giving up, but a
+            // deterministic misclassified failure poisons within
+            // seconds-to-minutes instead of looping for hours.
+            max_infra_retries: 20,
             backoff_base_secs: 5.0,
             backoff_multiplier: 2.0,
             backoff_max_secs: 300.0,

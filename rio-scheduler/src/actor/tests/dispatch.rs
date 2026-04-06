@@ -1024,12 +1024,14 @@ fn ca_on_ca_fixture() -> (
 
     let mut child = make_test_node("ca-child", "x86_64-linux");
     child.is_content_addressed = true;
+    child.needs_resolve = true;
     child.ca_modular_hash = child_modular.to_vec();
     // expected_output_paths can stay empty — parent's PrefetchHint
     // will be empty and skipped (leaf child → no hint anyway).
 
     let mut parent = make_test_node("ca-parent", "x86_64-linux");
     parent.is_content_addressed = true;
+    parent.needs_resolve = true;
     parent.drv_content = parent_aterm.clone().into_bytes();
 
     (
@@ -1075,19 +1077,6 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
     // at its .drv store path. `seed_with_content` does the NAR wrap.
     store.seed_with_content(&parent.drv_path, parent_aterm.as_bytes());
 
-    // Seed PG realisations: child's (modular_hash, "out") → realized.
-    // This is what `resolve_ca_inputs` queries to map placeholder →
-    // realized path.
-    sqlx::query(
-        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
-         VALUES ($1, 'out', $2, $3)",
-    )
-    .bind(child_modular.as_slice())
-    .bind(&realized_path)
-    .bind([0u8; 32].as_slice())
-    .execute(&test_db.pool)
-    .await?;
-
     let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
 
     // Merge: child + parent, edge parent → child.
@@ -1103,6 +1092,21 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
     // Child dispatches first (leaf → Ready immediately).
     let a1 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a1.drv_path.contains("ca-child"), "child dispatches first");
+
+    // Seed PG realisations: child's (modular_hash, "out") → realized.
+    // This is what `resolve_ca_inputs` queries to map placeholder →
+    // realized path. Seeded AFTER merge so the child doesn't cache-hit
+    // via check_cached_outputs' CA realisation lookup (GAP-3 fix) —
+    // this test needs the child to actually dispatch and complete.
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(&realized_path)
+    .bind([0u8; 32].as_slice())
+    .execute(&test_db.pool)
+    .await?;
 
     // Clear parent's drv_content BEFORE completing child — actor
     // processes serially, so the clear lands before the completion
@@ -1160,19 +1164,6 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
     let (child, parent, _parent_aterm, _placeholder, child_modular, _realized_path) =
         ca_on_ca_fixture();
 
-    // Seed the realisation (so the ONLY failure is the store fetch,
-    // not a missing-realisation — we're testing the fetch fallback
-    // specifically).
-    sqlx::query(
-        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
-         VALUES ($1, 'out', $2, $3)",
-    )
-    .bind(child_modular.as_slice())
-    .bind(test_store_path("irrelevant"))
-    .bind([0u8; 32].as_slice())
-    .execute(&test_db.pool)
-    .await?;
-
     let mut rx = connect_worker(&handle, "ca-w", "x86_64-linux", 2).await?;
 
     let _ev = merge_dag(
@@ -1186,6 +1177,21 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 
     let a1 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a1.drv_path.contains("ca-child"));
+
+    // Seed the realisation AFTER merge (so the ONLY failure is the
+    // store fetch, not a missing-realisation — we're testing the
+    // fetch fallback specifically). Seeded post-merge so the child
+    // doesn't cache-hit via check_cached_outputs' CA realisation
+    // lookup (GAP-3 fix) — this test needs child to dispatch.
+    sqlx::query(
+        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
+         VALUES ($1, 'out', $2, $3)",
+    )
+    .bind(child_modular.as_slice())
+    .bind(test_store_path("irrelevant"))
+    .bind([0u8; 32].as_slice())
+    .execute(&test_db.pool)
+    .await?;
 
     // Clear parent's drv_content AND make GetPath fail. Order matters:
     // actor serializes, so both land before the completion's dispatch.
@@ -1222,10 +1228,10 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 // -----------------------------------------------------------------------------
 
 // r[verify sched.ca.resolve+2]
-/// IA passthrough: `state.is_ca = false` → gate at dispatch.rs:681
-/// fails → `drv_content` returned unchanged. No resolve fires, no
-/// ContentLookup, no PG query. The cheapest path — every non-CA
-/// dispatch takes it.
+/// IA passthrough: `state.needs_resolve = false` → gate at
+/// dispatch.rs:681 fails → `drv_content` returned unchanged. No
+/// resolve fires, no ContentLookup, no PG query. The cheapest path —
+/// every IA-with-IA-inputs dispatch takes it.
 #[tokio::test]
 async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     let (_db, handle, _task, mut rx) = setup_with_worker("ia-w", "x86_64-linux", 2).await?;
@@ -1233,6 +1239,7 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     let original_content = b"dummy-ia-aterm-content".to_vec();
     let mut node = make_test_node("ia-drv", "x86_64-linux");
     node.is_content_addressed = false; // explicit: IA
+    node.needs_resolve = false; // explicit: no CA inputs either
     node.drv_content = original_content.clone();
 
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
@@ -1246,10 +1253,11 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
 }
 
 // r[verify sched.ca.resolve+2]
-/// FOD passthrough: `is_ca = true` BUT `is_fixed_output = true` →
-/// same gate fails (`!state.is_ca || state.is_fixed_output`). FOD
-/// output path is known at eval time (predeclared hash), no resolve
-/// needed. ADR-018 `shouldResolve` table: FOD → false.
+/// FOD passthrough: `is_ca = true` BUT `needs_resolve = false` (FOD
+/// output path is eval-time known; gateway doesn't set needs_resolve
+/// unless an inputDrv is floating-CA). ADR-018 `shouldResolve` table:
+/// FOD → only if ca-derivations feature enabled (optional optimization;
+/// rio doesn't fire it unless inputs are actually CA).
 #[tokio::test]
 async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
     let (_db, handle, _task, mut rx) = setup_with_worker("fod-w", "x86_64-linux", 2).await?;
@@ -1257,7 +1265,8 @@ async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
     let original_content = b"dummy-fod-aterm-content".to_vec();
     let mut node = make_test_node("fod-drv", "x86_64-linux");
     node.is_content_addressed = true;
-    node.is_fixed_output = true; // FOD — gate rejects
+    node.is_fixed_output = true;
+    node.needs_resolve = false; // gateway: FOD with no CA inputs → no resolve
     node.drv_content = original_content.clone();
 
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
@@ -1283,7 +1292,8 @@ async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
     let original_content = b"floating-ca-with-ia-deps".to_vec();
     let mut parent = make_test_node("noca-parent", "x86_64-linux");
     parent.is_content_addressed = true;
-    parent.is_fixed_output = false; // floating-CA — gate 1 passes
+    parent.is_fixed_output = false;
+    parent.needs_resolve = true; // floating-CA self — gate passes
     parent.drv_content = original_content.clone();
 
     // IA child — collect_ca_inputs skips it (is_ca=false).

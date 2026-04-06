@@ -124,6 +124,13 @@ pub async fn reconstruct_dag(
     // worker-fail-on-placeholder + retry).
     populate_ca_modular_hashes(&mut nodes, drv_cache);
 
+    // Populate needs_resolve for the ia.deferred case: an IA (or
+    // fixed-CA) derivation whose inputDrvs include a floating-CA
+    // child has that child's placeholder path embedded in its
+    // env/args — it needs resolve even though it's not floating-CA
+    // itself. AFTER BFS so every child is in drv_cache.
+    populate_needs_resolve(&mut nodes, drv_cache);
+
     Ok((nodes, edges))
 }
 
@@ -289,6 +296,41 @@ fn populate_ca_modular_hashes(
     }
 }
 
+/// Set `needs_resolve` for nodes with floating-CA inputs (`ia.deferred`).
+///
+/// ADR-018 Appendix B: Nix's `shouldResolve` returns true for IA
+/// derivations when they're "deferred" — i.e., they have a floating-CA
+/// input whose output path is a placeholder at eval time. The parent's
+/// env/args reference that placeholder, so dispatch-time resolve must
+/// rewrite it to the realized path.
+///
+/// `build_node` already set `needs_resolve = has_ca_floating_outputs()`
+/// (self-floating always resolves). This pass ORs in the any-child-is-
+/// floating-CA case. AFTER BFS so every child drv is in `drv_cache`.
+///
+/// Missing children (BFS inconsistency) → skip; the node keeps its
+/// self-computed value. Same degrade as `populate_ca_modular_hashes`.
+fn populate_needs_resolve(
+    nodes: &mut [types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+) {
+    let deferred: Vec<usize> = iter_cached_drvs(nodes, drv_cache, "populate_needs_resolve")
+        .filter(|(_, node, _)| !node.needs_resolve)
+        .filter(|(_, _, drv)| {
+            drv.input_drvs().keys().any(|child_path| {
+                StorePath::parse(child_path)
+                    .ok()
+                    .and_then(|sp| drv_cache.get(&sp))
+                    .is_some_and(|child| child.has_ca_floating_outputs())
+            })
+        })
+        .map(|(idx, _, _)| idx)
+        .collect();
+    for idx in deferred {
+        nodes[idx].needs_resolve = true;
+    }
+}
+
 /// Validate a DAG before SubmitBuild. Returns `Err(reason)` if the
 /// DAG should be rejected — caller sends STDERR_ERROR with the
 /// reason. Returns `Ok(())` if valid.
@@ -420,6 +462,11 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
         // inline would be a partial-closure recurse (InputNotFound
         // for inputs the BFS hasn't visited yet).
         ca_modular_hash: Vec::new(),
+        // ADR-018 Appendix B: floating-CA self always resolves.
+        // populate_needs_resolve() ORs in the ia.deferred case
+        // (IA-with-floating-CA-input) AFTER BFS — needs the
+        // drv_cache to look up children's addressing mode.
+        needs_resolve: drv.has_ca_floating_outputs(),
     }
 }
 
@@ -468,37 +515,49 @@ pub async fn filter_and_inline_drv(
     drv_cache: &HashMap<StorePath, Derivation>,
     store_client: &mut StoreServiceClient<Channel>,
 ) {
-    // Collect all expected output paths across the DAG. One batched
-    // FindMissingPaths call instead of N.
+    // Collect all NON-EMPTY expected output paths across the DAG.
+    // One batched FindMissingPaths call instead of N.
+    //
+    // Floating-CA outputs have path="" (computed post-build from NAR
+    // hash — `DerivationOutput::path()` returns empty until built).
+    // The store's `validate_store_path` rejects the WHOLE BATCH on
+    // any empty path, so one CA node poisons inlining for the entire
+    // DAG. Filter them here; CA nodes are handled in the
+    // `will_dispatch` check below (empty path → always inline).
     let all_outputs: Vec<String> = nodes
         .iter()
-        .flat_map(|n| n.expected_output_paths.iter().cloned())
+        .flat_map(|n| n.expected_output_paths.iter())
+        .filter(|p| !p.is_empty())
+        .cloned()
         .collect();
 
-    if all_outputs.is_empty() {
-        // No expected outputs (all BasicDerivation fallbacks, or
-        // unusual derivations). Nothing to gate on; don't inline.
-        return;
-    }
-
-    // Single FindMissingPaths. Timeout matches the other gateway
-    // store calls. On any error: skip inlining (safe degrade).
-    let missing: HashSet<String> = match tokio::time::timeout(
-        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-        store_client.find_missing_paths(types::FindMissingPathsRequest {
-            store_paths: all_outputs,
-        }),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
-        Ok(Err(e)) => {
-            warn!(error = %e, "FindMissingPaths failed; skipping .drv inlining (worker will fetch)");
-            return;
-        }
-        Err(_) => {
-            warn!("FindMissingPaths timed out; skipping .drv inlining (worker will fetch)");
-            return;
+    // FindMissingPaths only if we have IA outputs to check. Pure-CA
+    // DAGs (all floating) skip straight to the inline loop — every
+    // floating-CA node dispatches (output path unknown → can't
+    // cache-hit by path, so there's nothing for the store to gate).
+    //
+    // Timeout matches the other gateway store calls. On any error:
+    // skip inlining (safe degrade — worker fetches from store).
+    let missing: HashSet<String> = if all_outputs.is_empty() {
+        HashSet::new()
+    } else {
+        match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            store_client.find_missing_paths(types::FindMissingPathsRequest {
+                store_paths: all_outputs,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+            Ok(Err(e)) => {
+                warn!(error = %e, "FindMissingPaths failed; skipping .drv inlining (worker will fetch)");
+                return;
+            }
+            Err(_) => {
+                warn!("FindMissingPaths timed out; skipping .drv inlining (worker will fetch)");
+                return;
+            }
         }
     };
 
@@ -509,11 +568,19 @@ pub async fn filter_and_inline_drv(
 
     for node in nodes.iter_mut() {
         // At least one output missing → this node will dispatch.
+        // Empty path = floating-CA (unknown until built) → ALWAYS
+        // dispatches: can't cache-hit by path, and the scheduler's
+        // `maybe_resolve_ca` REQUIRES drv_content to rewrite
+        // placeholder paths. The scheduler's store-fetch fallback
+        // (`fetch_drv_content_from_store`) depends on its
+        // startup-time store connection succeeding — a race we must
+        // not rely on (layer-9 ca-cutoff failure: scheduler boots
+        // before store ready → store_client=None → fallback dead).
         // All outputs present → cache hit → never dispatches → skip.
         let will_dispatch = node
             .expected_output_paths
             .iter()
-            .any(|p| missing.contains(p));
+            .any(|p| p.is_empty() || missing.contains(p));
         if !will_dispatch {
             continue;
         }
@@ -1175,8 +1242,105 @@ mod tests {
 
         filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
 
-        // Early return on empty — doesn't even hit the (dead) store.
+        // Empty Vec → all_outputs empty → skips FindMissingPaths
+        // (doesn't hit the dead store) → will_dispatch=false (no
+        // elements to .any() over) → not inlined.
         assert!(nodes[0].drv_content.is_empty());
+    }
+
+    /// Floating-CA nodes (expected_output_paths = [""]) must ALWAYS
+    /// inline. Their output paths are unknown until built (computed
+    /// post-build from NAR hash), so they can't cache-hit by path
+    /// and the scheduler's maybe_resolve_ca REQUIRES drv_content to
+    /// rewrite placeholders.
+    ///
+    /// Regression (layer-9 ca-cutoff): previously, the empty string
+    /// was sent to FindMissingPaths, which rejected the whole batch
+    /// ("invalid store path"), causing the gateway to skip inlining
+    /// entirely. The scheduler's store-fetch fallback then depended
+    /// on a startup race (scheduler connects to store before store
+    /// ready → store_client=None → fallback dead → dispatch
+    /// unresolved → worker fails on placeholder).
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_floating_ca_always_inlined() {
+        let ca_path = sp("/nix/store/cacacacacacacacacacacacacacacaca-ca.drv");
+        // Floating-CA ATerm: output path empty, hashAlgo set, hash
+        // empty. Mirrors what nix produces for __contentAddressed.
+        let ca_aterm =
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[("out","")])"#;
+        let ca_drv = Derivation::parse(ca_aterm).expect("CA ATerm should parse");
+
+        let mut cache = HashMap::new();
+        cache.insert(ca_path.clone(), ca_drv.clone());
+
+        // derivation_to_node produces expected_output_paths=[""] for
+        // the floating-CA output (DerivationOutput::path() = "").
+        let mut nodes = vec![derivation_to_node(&ca_path, &ca_drv)];
+        assert_eq!(
+            nodes[0].expected_output_paths,
+            vec![String::new()],
+            "floating-CA output path should be empty string"
+        );
+
+        // Dead store — must NOT matter. Empty paths are filtered
+        // before FindMissingPaths, so a pure-CA DAG never hits it.
+        let mut dead_store = unreachable_store();
+        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
+
+        assert!(
+            !nodes[0].drv_content.is_empty(),
+            "floating-CA node must be inlined (empty path → always dispatches)"
+        );
+        // Inlined bytes = the ATerm we parsed.
+        assert_eq!(
+            std::str::from_utf8(&nodes[0].drv_content).unwrap(),
+            ca_drv.to_aterm(),
+        );
+    }
+
+    /// Mixed DAG (IA + CA): CA empty strings must not poison
+    /// FindMissingPaths for IA nodes. Pre-fix, one CA node made the
+    /// store reject the whole batch → no inlining for anyone.
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_ca_does_not_poison_ia() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let (_store, mut store_client, _h) = spawn_mock_store_with_client().await?;
+
+        // IA node: output missing from (empty) mock store → will inline.
+        let ia_path = sp("/nix/store/iaiaiaiaiaiaiaiaiaiaiaiaiaiaiaia-ia.drv");
+        let ia_out = "/nix/store/iaiaiaiaiaiaiaiaiaiaiaiaiaiaiaia-ia-out";
+        let ia_drv = make_test_derivation(ia_out, &[]);
+
+        // CA node: empty output path.
+        let ca_path = sp("/nix/store/cacacacacacacacacacacacacacacaca-ca.drv");
+        let ca_aterm =
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[("out","")])"#;
+        let ca_drv = Derivation::parse(ca_aterm)?;
+
+        let mut cache = HashMap::new();
+        cache.insert(ia_path.clone(), ia_drv.clone());
+        cache.insert(ca_path.clone(), ca_drv.clone());
+
+        let mut nodes = vec![
+            derivation_to_node(&ia_path, &ia_drv),
+            derivation_to_node(&ca_path, &ca_drv),
+        ];
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+
+        // Both inlined: IA because missing, CA because empty-path.
+        // Pre-fix: CA's "" poisoned the batch → store rejected →
+        // gateway bailed → BOTH stayed empty.
+        assert!(
+            !nodes[0].drv_content.is_empty(),
+            "IA node should inline (output missing); CA must not poison the batch"
+        );
+        assert!(
+            !nodes[1].drv_content.is_empty(),
+            "CA node should inline (empty path → always dispatches)"
+        );
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -1339,6 +1503,67 @@ mod tests {
             )
             .is_none(),
             "resolver miss → InputNotFound → None (warn-and-degrade)"
+        );
+    }
+
+    // r[verify sched.ca.detect]
+    /// `populate_needs_resolve`: IA parent depending on a floating-CA
+    /// child gets `needs_resolve = true` (the ia.deferred case from
+    /// ADR-018 Appendix B). IA-on-IA stays false. Floating-CA self
+    /// stays true (set earlier by `build_node`, unchanged here).
+    #[test]
+    fn populate_needs_resolve_ia_deferred() {
+        let ca_child_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ca.drv");
+        let ia_child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-ia.drv");
+        let ia_parent_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-parent.drv");
+        let ia_pure_path = sp("/nix/store/dddddddddddddddddddddddddddddddd-pure.drv");
+
+        // Floating-CA child: hash_algo set, hash empty.
+        let ca_child_aterm =
+            r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let ca_child = Derivation::parse(ca_child_aterm).unwrap();
+
+        // IA child: all-empty output tuple.
+        let ia_child = make_test_derivation("/nix/store/ia-out", &[]);
+
+        // IA parent depending on the floating-CA child.
+        let ia_parent = make_test_derivation(
+            "/nix/store/parent-out",
+            &[(ca_child_path.as_str(), &["out"])],
+        );
+
+        // IA parent depending only on the IA child (pure IA-on-IA).
+        let ia_pure =
+            make_test_derivation("/nix/store/pure-out", &[(ia_child_path.as_str(), &["out"])]);
+
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(ca_child_path.clone(), ca_child.clone());
+        drv_cache.insert(ia_child_path.clone(), ia_child.clone());
+        drv_cache.insert(ia_parent_path.clone(), ia_parent.clone());
+        drv_cache.insert(ia_pure_path.clone(), ia_pure.clone());
+
+        let mut nodes = vec![
+            derivation_to_node(&ca_child_path, &ca_child),
+            derivation_to_node(&ia_child_path, &ia_child),
+            derivation_to_node(&ia_parent_path, &ia_parent),
+            derivation_to_node(&ia_pure_path, &ia_pure),
+        ];
+
+        // build_node already set needs_resolve from self.
+        assert!(nodes[0].needs_resolve, "floating-CA self → true pre-pass");
+        assert!(!nodes[2].needs_resolve, "IA parent → false pre-pass");
+
+        populate_needs_resolve(&mut nodes, &drv_cache);
+
+        assert!(nodes[0].needs_resolve, "floating-CA unchanged");
+        assert!(!nodes[1].needs_resolve, "IA leaf → still false");
+        assert!(
+            nodes[2].needs_resolve,
+            "ia.deferred: IA with floating-CA input → needs_resolve=true"
+        );
+        assert!(
+            !nodes[3].needs_resolve,
+            "IA with only-IA inputs → still false"
         );
     }
 }

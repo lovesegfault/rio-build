@@ -32,12 +32,12 @@
   lib,
   rustStable,
   # Output of nix/crate2nix.nix: { cargoNix, workspace, members }
-  c2n,
+  crateBuild,
   # Coverage-instrumented variant of the crate tree (nix/crate2nix.nix
   # re-imported with globalExtraRustcOpts=["-Cinstrument-coverage"]).
   # Used to produce test binaries that emit .profraw files at runtime.
   # null → coverage targets not exposed.
-  c2nCov ? null,
+  crateBuildCov ? null,
   # Runtime inputs for test execution (PG, nix-cli, openssh). Mirrors
   # crane's cargoNextest nativeCheckInputs.
   runtimeTestInputs ? [ ],
@@ -54,7 +54,7 @@
   nextestExtraArgs ? [ ],
 }:
 let
-  inherit (c2n) cargoNix;
+  inherit (crateBuild) cargoNix;
 
   # ──────────────────────────────────────────────────────────────────
   # Clippy wrapper
@@ -217,13 +217,12 @@ let
       case "$a" in *main.rs|*/bin/*) mkdir -p target/bin; touch "target/bin/$crate_name"; exit 0 ;; esac
     done
     mkdir -p target/doc
-    # -Dwarnings: matches crane's RUSTDOCFLAGS gate (broken intra-doc
-    # links, unclosed HTML tags fail the build). Deps are not affected
-    # — the wrapper only runs on workspace members; dep rlibs are
-    # cached from the base build. No --document-private-items: crane's
-    # cargo doc defaults to public items only, so adding it here would
-    # make c2n stricter (private-fn doc warnings crane's gate never
-    # sees would break .#ci-c2n).
+    # -Dwarnings: broken intra-doc links, unclosed HTML tags fail the
+    # build. Deps are not affected — the wrapper only runs on
+    # workspace members; dep rlibs are cached from the base build.
+    # No --document-private-items: matches cargo doc's public-items-
+    # only default. Enabling it would surface private-fn doc warnings
+    # the existing docs were never written against.
     exec ${rustStable}/bin/rustdoc "''${args[@]}" \
       --out-dir target/doc \
       -Dwarnings
@@ -251,7 +250,7 @@ let
   #
   # Parameterized on the cargoNix attrset so the same lookup logic
   # serves both the normal (cargoNix) and instrumented
-  # (c2nCov.cargoNix) trees. The instrumented tree has different
+  # (crateBuildCov.cargoNix) trees. The instrumented tree has different
   # metadata hashes (extraRustcOpts contributes to -C metadata=), so
   # mixing rlibs from the two trees would fail at link — each
   # devDepsFor dereferences its own tree's builtCrates.
@@ -264,7 +263,7 @@ let
     in
     map (d: cnix.builtCrates.crates.${d.packageId}) devDepRecords;
   devDepsFor = mkDevDepsFor cargoNix;
-  devDepsForCov = mkDevDepsFor c2nCov.cargoNix;
+  devDepsForCov = mkDevDepsFor crateBuildCov.cargoNix;
 
   # Clippy check: rebuild the member with clippy-driver as "rustc".
   # The wrapper strips --cap-lints allow, re-injects --cap-lints warn,
@@ -374,10 +373,11 @@ let
   # Coverage needs INSTRUMENTED DEPS too for accurate line attribution
   # (an inlined function from a dep shows up in the caller's profile;
   # without instrumented dep rlib, llvm-cov can't map it back). The
-  # parallel tree is a second `cargoNix` instantiation (c2nCov) with
-  # globalExtraRustcOpts=["-Cinstrument-coverage"] — see crate2nix.nix.
-  # devDepsForCov (defined alongside devDepsFor above) dereferences
-  # c2nCov's builtCrates so instrumented rlibs link together.
+  # parallel tree is a second `cargoNix` instantiation (crateBuildCov)
+  # with globalExtraRustcOpts=["-Cinstrument-coverage"] — see
+  # crate2nix.nix. devDepsForCov (defined alongside devDepsFor above)
+  # dereferences crateBuildCov's builtCrates so instrumented rlibs
+  # link together.
   covTestMember =
     name: base:
     (base.override (old: {
@@ -387,7 +387,7 @@ let
       (old: {
         name = "${old.name}-cov-test";
         # See testMember. `base` here is the instrumented build
-        # (c2nCov tree), so the subprocess emits profraws too.
+        # (crateBuildCov tree), so the subprocess emits profraws too.
         "CARGO_BIN_EXE_${name}" = "${base}/bin/${name}";
       });
 
@@ -406,17 +406,17 @@ let
   clippyTestDrvs = lib.mapAttrs (name: m: clippyTestMember name m.build) members;
   testBinDrvs = lib.mapAttrs (name: m: testMember name m.build) members;
   docDrvs = lib.mapAttrs (name: m: docMember name m.build) members;
-  covTestBinDrvs = lib.optionalAttrs (c2nCov != null) (
-    lib.mapAttrs (name: m: covTestMember name m.build) c2nCov.cargoNix.workspaceMembers
+  covTestBinDrvs = lib.optionalAttrs (crateBuildCov != null) (
+    lib.mapAttrs (name: m: covTestMember name m.build) crateBuildCov.cargoNix.workspaceMembers
   );
 
   clippyAll = pkgs.symlinkJoin {
-    name = "c2n-clippy-all";
+    name = "rio-clippy-all";
     paths = lib.attrValues clippyDrvs ++ lib.attrValues clippyTestDrvs;
   };
 
   docAll = pkgs.symlinkJoin {
-    name = "c2n-doc-all";
+    name = "rio-doc-all";
     paths = map (d: d.out) (lib.attrValues docDrvs);
   };
 
@@ -446,7 +446,7 @@ let
       preRun ? "",
       postRun ? "",
     }:
-    pkgs.runCommand "c2n-test-run-${name}"
+    pkgs.runCommand "rio-test-run-${name}"
       (
         testEnv
         // extraEnv
@@ -558,7 +558,7 @@ let
   # caches better — a passing crate's runner doesn't re-execute when
   # a sibling's test changes.
   testRunAll = pkgs.symlinkJoin {
-    name = "c2n-test-all";
+    name = "rio-test-all";
     paths = lib.attrValues testRunDrvs;
   };
 
@@ -636,7 +636,7 @@ let
   # --no-deps --offline costs nothing (zero registry access, zero
   # lockfile read).
   nextestMeta =
-    pkgs.runCommand "c2n-nextest-meta"
+    pkgs.runCommand "rio-nextest-meta"
       {
         nativeBuildInputs = [
           rustStable
@@ -809,7 +809,7 @@ let
   # testBinDrvs + workspaceSrc, neither of which change per-variant).
   mkNextestRun =
     {
-      name ? "c2n-nextest-all",
+      name ? "rio-nextest-all",
       # Extra runtime inputs layered on top of runtimeTestInputs.
       # PREPENDED so callers can shadow the module-level nix-cli with
       # a variant daemon — the golden harness shells out to nix-store
@@ -935,7 +935,7 @@ let
   # compile time. Unlike crane's coverage (which reads the main
   # binaries), here we read the TEST binaries directly since they
   # contain both the library code (via --test) and test-only code.
-  coverageLcov = pkgs.runCommand "c2n-coverage-lcov" { } ''
+  coverageLcov = pkgs.runCommand "rio-coverage-lcov" { } ''
     set -euo pipefail
     mkdir -p $TMPDIR/raw $out
     ${lib.concatMapStringsSep "\n" (d: ''
@@ -989,30 +989,30 @@ let
       --extract $TMPDIR/stripped.lcov 'rio-*' \
       -o $out/lcov.info
 
-    echo "=== c2n Coverage Summary ==="
+    echo "=== Coverage Summary ==="
     ${pkgs.lcov}/bin/lcov --summary $out/lcov.info
   '';
 
 in
 {
   # Per-member check derivations. Exposed for targeted runs:
-  #   nix build .#c2n-clippy-rio-scheduler
+  #   nix build .#clippy-rio-scheduler
   clippy = clippyDrvs;
   clippyTest = clippyTestDrvs;
   testBins = testBinDrvs;
   tests = testRunDrvs;
   doc = docDrvs;
 
-  # Coverage (populated when c2nCov is passed). covProfraw runs
-  # instrumented tests + collects raw profile data; coverage is the
-  # merged lcov.
+  # Coverage (populated when crateBuildCov is passed). covProfraw
+  # runs instrumented tests + collects raw profile data; coverage is
+  # the merged lcov.
   covProfraw = covProfrawDrvs;
-  coverage = if c2nCov != null then coverageLcov else null;
+  coverage = if crateBuildCov != null then coverageLcov else null;
 
   # Aggregate checks (CI entry points). All of these go in checks.*:
-  #   checks.c2n-clippy  — fails if any workspace member has clippy warnings
-  #   checks.c2n-test    — fails if any test binary exits nonzero
-  #   checks.c2n-doc     — fails if rustdoc errors on any member
+  #   checks.clippy  — fails if any workspace member has clippy warnings
+  #   checks.nextest — fails if any test binary exits nonzero
+  #   checks.doc     — fails if rustdoc errors on any member
   clippyCheck = clippyAll;
   testCheck = testRunAll;
   docCheck = docAll;
@@ -1027,7 +1027,7 @@ in
   mkNextestRun = if workspaceSrc != null then mkNextestRun else null;
 
   # The toolchain wrappers, exposed for debugging / manual invocation:
-  #   nix build .#packages.x86_64-linux.c2n-clippy-rustc
+  #   nix build .#packages.x86_64-linux.clippy-rustc
   #   ./result/bin/rustc --version   # prints clippy-driver version
   inherit clippyRustc rustdocRustc;
 }

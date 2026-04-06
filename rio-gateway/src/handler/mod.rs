@@ -25,7 +25,7 @@ use rio_proto::StoreServiceClient;
 use rio_proto::types;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tonic::transport::Channel;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
 use rio_common::limits::MAX_NAR_SIZE;

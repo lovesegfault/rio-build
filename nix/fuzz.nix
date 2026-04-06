@@ -26,7 +26,7 @@
   # workspace crate directories). Fuzz builds compose this with the
   # fuzz/ subtree since the fuzz crate path-deps its parent crate,
   # which in turn uses workspace deps.
-  c2nWorkspaceFileset,
+  workspaceFileset,
 }:
 let
   rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
@@ -58,10 +58,10 @@ let
       src = pkgs.lib.fileset.toSource {
         root = unfilteredRoot;
         fileset = pkgs.lib.fileset.unions [
-          # c2nWorkspaceFileset already includes ./.sqlx + ./migrations
+          # workspaceFileset already includes ./.sqlx + ./migrations
           # (rio-store fuzz transitively compiles rio-store which needs
           # the sqlx offline query cache + sqlx::migrate! embeddings).
-          c2nWorkspaceFileset
+          workspaceFileset
           (unfilteredRoot + "/${fuzzDir}/Cargo.toml")
           (unfilteredRoot + "/${fuzzDir}/Cargo.lock")
           (unfilteredRoot + "/${fuzzDir}/fuzz_targets")

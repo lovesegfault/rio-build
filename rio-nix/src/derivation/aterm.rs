@@ -330,7 +330,7 @@ impl Derivation {
         out.push(']');
         out.push(',');
 
-        self.write_aterm_tail(&mut out);
+        self.write_aterm_tail(&mut out, None);
         out
     }
 
@@ -342,7 +342,13 @@ impl Derivation {
     ///   Every key in `self.input_drvs` must be present; missing keys return
     ///   `InputNotFound`.
     /// - `mask_outputs`: if true, output paths are replaced with `""` (for CA
-    ///   floating / impure derivations).
+    ///   floating / impure derivations). **Also** masks env vars whose key
+    ///   matches an output name — Nix C++ `Derivation::unparse` does both
+    ///   (derivations.cc: `maskOutputs ? outputs.find(i.first) : end()`).
+    ///   Without env masking, the hash diverges from what nix-build sends
+    ///   in `wopQueryRealisation` — the CA `out` env var holds a
+    ///   placeholder (`/1rz4g...`) that Nix masks but we didn't, so
+    ///   realisations keyed by our hash were never found.
     ///
     /// The `inputDrvs` section is re-sorted by the *replacement* keys (hex hashes),
     /// matching Nix C++ `Derivation::unparse` with `actualInputs`.
@@ -407,7 +413,15 @@ impl Derivation {
         out.push(']');
         out.push(',');
 
-        self.write_aterm_tail(&mut out);
+        // mask_outputs masks env vars too — see doc comment above.
+        // Collect output names into a small set for the env-key lookup.
+        // &str borrows from self.outputs, valid for write_aterm_tail's scope.
+        let mask_env: Option<std::collections::HashSet<&str>> = if mask_outputs {
+            Some(self.outputs.iter().map(|o| o.name.as_str()).collect())
+        } else {
+            None
+        };
+        self.write_aterm_tail(&mut out, mask_env.as_ref());
         Ok(out)
     }
 }
@@ -415,8 +429,16 @@ impl Derivation {
 impl Derivation {
     /// Write the shared tail of a `Derive(...)` term: inputSrcs, platform,
     /// builder, args, env, and the closing `)`. Used by both [`Self::to_aterm`]
-    /// and [`Self::to_aterm_modulo`] — the tail is byte-identical between them.
-    fn write_aterm_tail(&self, out: &mut String) {
+    /// and [`Self::to_aterm_modulo`].
+    ///
+    /// `mask_env_keys`: if `Some(set)`, env vars whose key is in the set
+    /// get value `""` instead of their real value. Used by `to_aterm_modulo`
+    /// with `mask_outputs=true` to match Nix C++'s output-env masking.
+    fn write_aterm_tail(
+        &self,
+        out: &mut String,
+        mask_env_keys: Option<&std::collections::HashSet<&str>>,
+    ) {
         // inputSrcs
         out.push('[');
         for (i, src) in self.input_srcs.iter().enumerate() {
@@ -445,7 +467,8 @@ impl Derivation {
         out.push(']');
         out.push(',');
 
-        // env
+        // env — optionally mask values whose key matches an output name
+        // (Nix C++ Derivation::unparse does this when maskOutputs=true).
         out.push('[');
         for (i, (key, value)) in self.env.iter().enumerate() {
             if i > 0 {
@@ -454,7 +477,8 @@ impl Derivation {
             out.push('(');
             write_aterm_string(out, key);
             out.push(',');
-            write_aterm_string(out, value);
+            let masked = mask_env_keys.is_some_and(|s| s.contains(key.as_str()));
+            write_aterm_string(out, if masked { "" } else { value });
             out.push(')');
         }
         out.push(']');
