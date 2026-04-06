@@ -18,8 +18,16 @@ metadata:
   namespace: security-profiles-operator
 spec:
   enableBpfRecorder: false
+  # Bottlerocket's SELinux policy doesn't have spc_t (SPO's default).
+  # super_t is Bottlerocket's privileged container type. Without this,
+  # containerd fails the type transition: "cannot start a stopped
+  # process" (no AVC denial logged — runc exits before the audit).
+  selinuxTypeTag: super_t
   tolerations:
-    - key: rio.build/node-role
+    - key: rio.build/builder
+      operator: Exists
+      effect: NoSchedule
+    - key: rio.build/fetcher
       operator: Exists
       effect: NoSchedule
   affinity:
