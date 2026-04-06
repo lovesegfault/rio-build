@@ -1,12 +1,12 @@
-# crate2nix JSON-mode PoC — parallel to the crane pipeline.
+# crate2nix JSON-mode — per-crate derivation graph.
 #
 # See .claude/notes/crate2nix-migration-assessment.md for the full
-# comparison. This file exercises the experimental `--format json`
-# output: feature/platform resolution happens in Rust (crate2nix
-# generate), Nix is a thin consumer that wires pre-resolved crate
-# records to pkgs.buildRustCrate. One derivation per crate → touching
-# rio-scheduler/src/ doesn't rebuild the 400+ transitive deps that
-# crane's buildDepsOnly lumps together with the workspace rebuild.
+# migration history. Uses the experimental `--format json` output:
+# feature/platform resolution happens in Rust (crate2nix generate),
+# Nix is a thin consumer that wires pre-resolved crate records to
+# pkgs.buildRustCrate. One derivation per crate → touching
+# rio-scheduler/src/ rebuilds only rio-scheduler + its dependents,
+# not the 400+ transitive deps.
 #
 # The `Cargo.json` at repo root is produced by:
 #   nix develop -c bash -c \
@@ -14,8 +14,8 @@
 # (crate2nix is in the dev shell once the flake input is added.)
 #
 # It must be regenerated whenever Cargo.lock changes (new deps, version
-# bumps). Unlike crane, there's no IFD-based auto-regen here — the JSON
-# mode explicitly trades that convenience for simpler/faster eval.
+# bumps). No IFD-based auto-regen — the JSON mode explicitly trades
+# that convenience for simpler/faster eval.
 {
   pkgs,
   lib,
@@ -32,8 +32,8 @@
   # Path to the pre-resolved JSON (checked in at repo root).
   resolvedJson ? ../Cargo.json,
   # sys-crate env-var escape hatches + system libs. Passed from
-  # flake.nix's sysCrateEnv — single source of truth so crane,
-  # devShell, and crate2nix all see the same linkage.
+  # flake.nix's sysCrateEnv — single source of truth so devShell
+  # and crate2nix see the same linkage.
   sysCrateEnv,
   # Extra rustc flags injected into EVERY crate in the tree. Used by
   # the coverage variant (c2nCov in flake.nix) to build a parallel
@@ -46,8 +46,7 @@ let
   # ──────────────────────────────────────────────────────────────────
   #
   # buildRustCrate uses pkgs.rustc/pkgs.cargo by default. Override to
-  # the same rust-overlay stable that crane uses, so edition 2024
-  # compiles. `rust` is for the buildRustCrate runtime tooling (lib.rs
+  # rust-overlay stable so edition 2024 compiles. `rust` is for the buildRustCrate runtime tooling (lib.rs
   # path discovery scripts etc.); `rustc`/`cargo` are the actual
   # compilers.
   #
@@ -154,17 +153,41 @@ let
     exit 1
   '';
 
-  # build.rs include!("../rio-test-support/src/metrics_grep.rs") —
-  # shared metrics-spec grep logic extracted to an include!()-only file
-  # so 5 crates' build.rs don't duplicate 30 lines of regex. Same
-  # cross-directory problem: buildRustCrate's src is just the crate dir.
+  # Cross-crate compile-time reads from rio-test-support: build.rs
+  # include!("../rio-test-support/src/metrics_grep.rs") in 5 crates, and
+  # include_str!("../../../rio-test-support/golden/...") in rio-scheduler
+  # src/state/derivation.rs. buildRustCrate's src is just the crate dir,
+  # so ../rio-test-support resolves outside. Narrow filesets per-file so
+  # editing golden/ doesn't invalidate metrics_grep-only crates.
   metricsGrepFileset = pkgs.lib.fileset.toSource {
     root = ../rio-test-support;
     fileset = ../rio-test-support/src/metrics_grep.rs;
   };
+  goldenFileset = pkgs.lib.fileset.toSource {
+    root = ../rio-test-support;
+    fileset = ../rio-test-support/golden;
+  };
+  # build.rs emit_spec_metrics_grep("{manifest}/../docs/src/observability.md")
+  # — greps the per-component metrics tables to derive SPEC_METRICS for
+  # the spec→describe check. Same cross-directory problem; without this
+  # symlink, emit_spec_metrics_grep's ENOENT fallback writes an empty
+  # spec_metrics.txt and the test-side floor check ("has only 0 entries
+  # — build.rs grep broken?") fails. Narrow fileset keeps the hash
+  # stable when unrelated docs change.
+  obsMdFileset = pkgs.lib.fileset.toSource {
+    root = ../docs;
+    fileset = ../docs/src/observability.md;
+  };
+  # Reconstruct the sibling-dir structure that cross-crate compile-time
+  # reads expect. Called from all three override shapes (withMigrations,
+  # withMetricsGrep, withHelmFiles) — the golden/ symlink is only USED
+  # by rio-scheduler but costs nothing in crates that don't reference it.
   linkMetricsGrep = ''
     mkdir -p $NIX_BUILD_TOP/rio-test-support/src
     ln -sf ${metricsGrepFileset}/src/metrics_grep.rs $NIX_BUILD_TOP/rio-test-support/src/metrics_grep.rs
+    ln -sf ${goldenFileset}/golden $NIX_BUILD_TOP/rio-test-support/golden
+    mkdir -p $NIX_BUILD_TOP/docs/src
+    ln -sf ${obsMdFileset}/src/observability.md $NIX_BUILD_TOP/docs/src/observability.md
   '';
 
   withMigrations = _: {

@@ -3,7 +3,7 @@
 
   inputs = {
     nix = {
-      url = "github:NixOS/Nix/2.34.1";
+      url = "github:NixOS/Nix/2.34.2";
       inputs = {
         flake-compat.follows = "flake-compat";
         flake-parts.follows = "flake-parts";
@@ -1117,16 +1117,10 @@
           # Linux-only at the `packages` site (the flake inputs eval fine
           # on Darwin but `nix-daemon` needs a real unix socket + /nix
           # layout, and we don't run the matrix on macs anyway).
-          # TODO(sprint-save): golden-matrix.nix is crane-based
-          # (craneLib.cargoNextest). Needs porting to c2nChecks nextest
-          # infrastructure — the crate2nix nextest runner uses reuse-build
-          # mode with synthesized metadata, not cargo invocation. Weekly-
-          # tier target, not in .#ci, so stubbed until port lands.
-          goldenMatrix = throw ''
-            golden-matrix needs crate2nix port (was craneLib.cargoNextest).
-            See nix/golden-matrix.nix — adapt mkMatrixRun to c2nChecks
-            nextest reuse-build path with per-variant RIO_GOLDEN_DAEMON_BIN.
-          '';
+          goldenMatrix = import ./nix/golden-matrix.nix {
+            inherit pkgs inputs system;
+            inherit (c2nChecks) mkNextestRun;
+          };
 
           # --------------------------------------------------------------
           # Mutation testing (weekly tier — NOT in .#ci)
@@ -1826,15 +1820,6 @@
           // prefixed "c2n-" vmTests
           // prefixed "c2n-cov-" vmTestsCov
           // prefixed "c2n-coverage-" (coverage.perTestLcov or { })
-          # KVM race validation probes (nix/tests/kvm-probe.nix).
-          # Not in .#ci — run manually to compare concurrent vs
-          # staggered VM start. Hypothesis: start_all() races qemu
-          # KVM_init, some VMs fall to TCG.
-          #   nix build -L .#kvm-probe-concurrent .#kvm-probe-staggered
-          #   grep "KVM-PROBE" <log> | sort | uniq -c
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-            pkgs.lib.mapAttrs (_: withMinCpu 5) (import ./nix/tests/kvm-probe.nix { inherit pkgs; })
-          )
           # Multi-Nix golden matrix (weekly). Exported Linux-only:
           # nix-daemon needs a unix socket; macOS matrix not supported.
           # Under `packages` not `checks` → `nix flake check` won't

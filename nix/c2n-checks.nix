@@ -801,15 +801,33 @@ let
   # finds .config/nextest.toml (test groups, profiles, overrides) and
   # resolves relative paths in package manifests.
   #
-  # Wrapped in a `lib.makeOverridable` so callers can flip
-  # `nextestExtraArgs` without re-importing the whole module —
-  # useful for `-P ci` vs default-profile runs.
-  nextestRun =
-    pkgs.runCommand "c2n-nextest-all"
+  # Parameterized as `mkNextestRun` so callers can flip args/env/inputs
+  # without re-importing the whole module — `-P ci` vs default-profile
+  # runs, or golden-matrix's per-daemon-variant runs (same test
+  # binaries, different RIO_GOLDEN_DAEMON_BIN + nix-cli in PATH).
+  # nextestMeta is shared across all variants (it only depends on
+  # testBinDrvs + workspaceSrc, neither of which change per-variant).
+  mkNextestRun =
+    {
+      name ? "c2n-nextest-all",
+      # Extra runtime inputs layered on top of runtimeTestInputs.
+      # PREPENDED so callers can shadow the module-level nix-cli with
+      # a variant daemon — the golden harness shells out to nix-store
+      # for db seeding and needs the SAME binary set as the daemon
+      # under test (schema/format parity).
+      extraRuntimeInputs ? [ ],
+      # Extra env vars layered on top of testEnv.
+      extraEnv ? { },
+      # Appended after the module-level nextestExtraArgs. Use for
+      # filter expressions like `-E 'binary(golden_conformance)'`.
+      extraArgs ? [ ],
+    }:
+    pkgs.runCommand name
       (
         testEnv
+        // extraEnv
         // {
-          nativeBuildInputs = runtimeTestInputs ++ [ pkgs.cargo-nextest ];
+          nativeBuildInputs = extraRuntimeInputs ++ runtimeTestInputs ++ [ pkgs.cargo-nextest ];
           RUST_BACKTRACE = "1";
           # nextest's output is line-oriented and contains ANSI
           # sequences by default; disable for log greppability.
@@ -861,7 +879,7 @@ let
           --binaries-metadata ${nextestMeta}/binaries-metadata.json \
           --workspace-remap $ws \
           --user-config-file none \
-          ${lib.escapeShellArgs nextestExtraArgs} \
+          ${lib.escapeShellArgs (nextestExtraArgs ++ extraArgs)} \
           2>&1 | tee -a $out/log
         # Copy junit.xml if the chosen profile emits one. The junit
         # path in .config/nextest.toml is `target/nextest/<profile>/junit.xml`
@@ -871,6 +889,8 @@ let
         # via nextestExtraArgs — we don't know it at Nix-eval time.
         find $ws -name junit.xml -exec cp {} $out/ \; 2>/dev/null || true
       '';
+
+  nextestRun = mkNextestRun { };
 
   # ──────────────────────────────────────────────────────────────────
   # Coverage: run instrumented tests → profraw → lcov
@@ -999,9 +1019,12 @@ in
 
   # nextest: metadata synthesis (cached) + reuse-build runner. null
   # when workspaceSrc unset (callers that only want clippy/doc can
-  # skip the nextest wiring).
+  # skip the nextest wiring). mkNextestRun is the parameterized form
+  # — golden-matrix uses it to spin one run per daemon variant with
+  # a different nix-cli in PATH and RIO_GOLDEN_DAEMON_BIN env.
   nextest = if workspaceSrc != null then nextestRun else null;
   nextestMetadata = if workspaceSrc != null then nextestMeta else null;
+  mkNextestRun = if workspaceSrc != null then mkNextestRun else null;
 
   # The toolchain wrappers, exposed for debugging / manual invocation:
   #   nix build .#packages.x86_64-linux.c2n-clippy-rustc

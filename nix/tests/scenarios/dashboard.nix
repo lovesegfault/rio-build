@@ -44,7 +44,7 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.kvmPreopen}
+    ${common.kvmCheck}
     ${common.assertions}
 
     start_all()

@@ -29,6 +29,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "rio-ca-cutoff";
+  skipTypeCheck = true;
   # Build-1 ~24s (3×8s serial) + build-2 <15s + VM boot ~30s + slack.
   # 600s matches observability.nix's generous ceiling.
   globalTimeout = 600 + common.covTimeoutHeadroom;
@@ -36,11 +37,11 @@ pkgs.testers.runNixOSTest {
   inherit (fixture) nodes;
 
   testScript = ''
-    ${common.kvmCheck}
     ${common.assertions}
 
     import time
 
+    ${common.kvmCheck}
     start_all()
     ${fixture.waitReady}
     ${common.sshKeySetup gatewayHost}

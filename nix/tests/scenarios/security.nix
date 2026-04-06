@@ -146,7 +146,7 @@ in
       testScript = ''
         ${common.assertions}
 
-        ${common.kvmPreopen}
+        ${common.kvmCheck}
         start_all()
         ${fixture.waitReady}
 
@@ -1080,7 +1080,7 @@ in
       testScript = ''
         ${common.assertions}
 
-        ${common.kvmPreopen}
+        ${common.kvmCheck}
         start_all()
         ${fixture.waitReady}
         ${fixture.kubectlHelpers}

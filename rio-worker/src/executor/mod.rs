@@ -175,6 +175,45 @@ pub enum ExecutorError {
     Cgroup(String),
 }
 
+impl ExecutorError {
+    /// Whether this error indicates a transient daemon-side failure
+    /// worth retrying locally before reporting to the scheduler.
+    ///
+    /// Covers the daemon-crashed-mid-handshake cases:
+    /// - `DaemonSpawn`: nix-daemon failed to exec (transient FS/mount race)
+    /// - `Handshake`: daemon died before protocol negotiation completed
+    /// - `Wire(Io(UnexpectedEof))`: daemon crashed mid-conversation
+    ///   (core dump, OOM-kill, SIGABRT) → pipe closed → "early eof"
+    ///
+    /// Does NOT cover `BuildFailed` (real builder failure — retrying
+    /// won't help), `Upload`/`Grpc`/`MetadataFetch` (network-side,
+    /// scheduler's retry policy handles re-dispatch with backoff), or
+    /// `Overlay`/`SynthDb`/`NixConf` (deterministic setup failures —
+    /// same inputs, same failure).
+    pub fn is_daemon_transient(&self) -> bool {
+        match self {
+            ExecutorError::DaemonSpawn(_) => true,
+            ExecutorError::Handshake(_) => true,
+            ExecutorError::Wire(rio_nix::protocol::wire::WireError::Io(e)) => {
+                e.kind() == std::io::ErrorKind::UnexpectedEof
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Max local retry attempts for transient daemon failures before
+/// reporting InfrastructureFailure to the scheduler. Bounded so a
+/// persistent crash (bad synth DB, broken nix binary) doesn't spin
+/// indefinitely.
+pub const DAEMON_RETRY_MAX: u32 = 3;
+
+/// Base delay for exponential backoff between daemon retry attempts.
+/// Sequence: 500ms, 1s, 2s. Total worst-case retry overhead ~3.5s
+/// — small vs the scheduler round-trip (re-dispatch + re-fetch
+/// closure + re-generate synth DB).
+pub const DAEMON_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 /// Result of executing a single build.
 #[derive(Debug)]
 pub struct ExecutionResult {
@@ -429,10 +468,20 @@ pub async fn execute_build(
     // makeFallbackPath() (hash of "rewrite:<drvPath>:name:out" + zero hash),
     // but the builder's $out (from BasicDerivation env) is the REAL path →
     // output path mismatch → "builder failed to produce output path".
+    //
+    // CA floating outputs have an empty path (computed post-build from the
+    // NAR hash). Inserting an empty-string path makes nix-daemon's
+    // queryStaticPartialDerivationOutputMap call parseStorePath("") which
+    // aborts the daemon (core dump). Real Nix never writes DerivationOutputs
+    // rows for floating-CA — the output path is unknown until the build
+    // finishes and the daemon writes a Realisations row instead. Filter them
+    // here; nix-daemon computes scratchPath internally for CA outputs and
+    // doesn't need the DerivationOutputs hint.
     let synth_paths = fetch_input_metadata(&*store_client, &input_paths).await?;
     let drv_outputs: Vec<SynthDrvOutput> = drv
         .outputs()
         .iter()
+        .filter(|o| !o.path().is_empty())
         .map(|o| SynthDrvOutput {
             drv_path: drv_path.clone(),
             output_name: o.name().to_string(),
@@ -901,7 +950,20 @@ pub async fn execute_build(
         //     legal (e.g., a -dev output referencing the lib output's rpath,
         //     or a binary embedding its own store path in an rpath).
         let mut ref_candidates: Vec<String> = input_paths.clone();
-        ref_candidates.extend(drv.outputs().iter().map(|o| o.path().to_string()));
+        ref_candidates.extend(
+            drv.outputs()
+                .iter()
+                .filter(|o| !o.path().is_empty())
+                .map(|o| o.path().to_string()),
+        );
+        // Floating-CA: .drv has path = ""; the real path comes from
+        // the daemon's BuildResult. Needed for self-references.
+        ref_candidates.extend(
+            build_result
+                .built_outputs
+                .iter()
+                .map(|bo| bo.out_path.clone()),
+        );
 
         match upload::upload_all_outputs(
             store_client,
@@ -922,11 +984,35 @@ pub async fn execute_build(
                 // routing yet but useful for dashboards / capacity.
                 output_size_bytes = upload_results.iter().map(|r| r.nar_size).sum();
 
-                // Map store_path → output_name from the derivation. Upload
-                // results are unordered (buffer_unordered), and even the
-                // prior sequential scan had undefined order (read_dir).
-                let path_to_name: HashMap<&str, &str> =
-                    drv.outputs().iter().map(|o| (o.path(), o.name())).collect();
+                // Map store_path → output_name. Upload results are
+                // unordered (buffer_unordered), and even the prior
+                // sequential scan had undefined order (read_dir).
+                //
+                // Two sources:
+                //  - drv.outputs(): works for IA and fixed-CA, where
+                //    the .drv has the output path baked in.
+                //  - build_result.built_outputs: for floating-CA
+                //    (__contentAddressed = true), the .drv has
+                //    path = "" (computed post-build from NAR hash).
+                //    The daemon's BuildResult carries the realized
+                //    path in its Realisation entries; the output
+                //    name is the suffix of drv_output_id after '!'.
+                //
+                // Without the second source, CA builds fail the
+                // lookup below with "not in derivation outputs" —
+                // the upload scanned the real /nix/store/<hash>-name
+                // but path_to_name only had "" → name.
+                let mut path_to_name: HashMap<&str, &str> = drv
+                    .outputs()
+                    .iter()
+                    .filter(|o| !o.path().is_empty())
+                    .map(|o| (o.path(), o.name()))
+                    .collect();
+                for bo in &build_result.built_outputs {
+                    if let Some(name) = bo.drv_output_id.rsplit('!').next() {
+                        path_to_name.insert(bo.out_path.as_str(), name);
+                    }
+                }
                 // wkr-scan-unfiltered (21-p2-p3-rollup Batch B): if the
                 // lookup misses, scan_new_outputs picked up a stray file
                 // under /nix/store (tempfile leak, .drv, etc.) that is NOT
@@ -1167,6 +1253,32 @@ mod tests {
         );
         assert_eq!(sanitize_build_id("simple"), "simple");
         assert_eq!(sanitize_build_id("foo.bar.drv"), "foo_bar_drv");
+    }
+
+    #[test]
+    fn test_is_daemon_transient() {
+        use rio_nix::protocol::wire::WireError;
+        use std::io::{Error as IoError, ErrorKind};
+
+        // Retryable: daemon spawn/handshake/early-EOF
+        assert!(ExecutorError::DaemonSpawn(IoError::other("spawn failed")).is_daemon_transient());
+        assert!(
+            ExecutorError::Wire(WireError::Io(IoError::new(
+                ErrorKind::UnexpectedEof,
+                "early eof"
+            )))
+            .is_daemon_transient()
+        );
+
+        // NOT retryable: other wire I/O errors (broken pipe ≠ daemon crash)
+        assert!(
+            !ExecutorError::Wire(WireError::Io(IoError::new(ErrorKind::BrokenPipe, "pipe")))
+                .is_daemon_transient()
+        );
+        // NOT retryable: builder failure, deterministic setup
+        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_daemon_transient());
+        assert!(!ExecutorError::Cgroup("EACCES".into()).is_daemon_transient());
+        assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_daemon_transient());
     }
 
     #[test]

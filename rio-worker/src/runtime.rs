@@ -514,19 +514,58 @@ pub async fn spawn_build_task(
         // Proactive-ema wrap: 10s memory.peak samples flow to the
         // scheduler while the build runs. execute_build is the polled
         // future; run_with_resource_tick drives the select! loop.
-        let result = run_with_resource_tick(
-            executor::execute_build(
-                &assignment,
-                &build_env,
-                &mut build_store_client,
+        //
+        // Daemon-transient retry: if nix-daemon crashes mid-handshake
+        // (core dump, OOM-kill) the error surfaces as early-EOF on the
+        // wire. Retrying locally is cheaper than a scheduler round-trip
+        // (re-dispatch + re-fetch closure + re-generate synth DB) and
+        // keeps a hot-loop daemon bug from flooding the scheduler with
+        // InfrastructureFailure reports — without this, a crashing
+        // daemon caused 800+ retries in <10min (scheduler re-dispatches
+        // InfrastructureFailure immediately, no backoff). The retry
+        // budget is small (DAEMON_RETRY_MAX=3, exponential backoff
+        // 0.5/1/2s); after exhaustion the error propagates as
+        // InfrastructureFailure and the scheduler's own retry policy
+        // takes over. Cancelled builds short-circuit the loop — the
+        // cancelled flag is set by try_cancel_build before cgroup.kill,
+        // so checking it here avoids retrying a user-cancelled build.
+        let mut attempt = 0u32;
+        let result = loop {
+            let r = run_with_resource_tick(
+                executor::execute_build(
+                    &assignment,
+                    &build_env,
+                    &mut build_store_client,
+                    &build_tx,
+                    &build_leaked_mounts,
+                ),
+                &build_cgroup_path,
+                &build_drv_path,
                 &build_tx,
-                &build_leaked_mounts,
-            ),
-            &build_cgroup_path,
-            &build_drv_path,
-            &build_tx,
-        )
-        .await;
+            )
+            .await;
+
+            match &r {
+                Err(e)
+                    if e.is_daemon_transient()
+                        && attempt < executor::DAEMON_RETRY_MAX
+                        && !build_cancelled.load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    let delay = executor::DAEMON_RETRY_BASE_DELAY * 2u32.pow(attempt);
+                    attempt += 1;
+                    tracing::warn!(
+                        drv_path = %drv_path,
+                        attempt,
+                        max = executor::DAEMON_RETRY_MAX,
+                        retry_in = ?delay,
+                        error = %e,
+                        "daemon transient failure; retrying locally"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                _ => break r,
+            }
+        };
 
         // Send CompletionReport. Resource fields flow from the executor
         // (cgroup memory.peak + polled cpu.stat).

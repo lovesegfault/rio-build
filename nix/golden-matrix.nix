@@ -1,6 +1,6 @@
 # Multi-Nix golden conformance matrix (weekly tier — NOT in .#ci).
 #
-# Runs `cargo nextest run -E 'binary(golden_conformance)'` once per daemon
+# Runs `cargo-nextest run -E 'binary(golden_conformance)'` once per daemon
 # variant, each pointing at a different nix-daemon binary. Surfaces wire-
 # protocol divergences across Nix 2.20 / Nix pinned / Nix master / Lix
 # before they bite real clients.
@@ -13,15 +13,17 @@
 # check` doesn't build it — evaluating four full Nix source trees is a
 # multi-minute eval, and building the non-pinned daemons is 20-30 min each.
 # Weekly cron invokes `nix build .#golden-matrix` directly.
+#
+# crate2nix port: reuses c2nChecks.mkNextestRun (reuse-build mode — the
+# test binaries are already compiled by buildRustCrate, nextest just runs
+# them). nextestMeta is shared across all variants (it only depends on
+# testBinDrvs + workspaceSrc). Per-variant cost = one nextest invocation
+# with a different nix-cli in PATH + RIO_GOLDEN_DAEMON_BIN env.
 {
   pkgs,
   inputs,
   system,
-  craneLib,
-  commonArgs,
-  cargoArtifacts,
-  goldenTestPath,
-  goldenCaPath,
+  mkNextestRun,
 }:
 let
   # Daemon package per variant. Package attr names differ across Nix
@@ -37,35 +39,32 @@ let
     lix = inputs.lix.packages.${system}.nix-cli or inputs.lix.packages.${system}.default;
   };
 
-  # One nextest run per daemon. The variant's nix package goes first in
-  # nativeCheckInputs so `nix-store --load-db` / `nix-store --dump`
-  # (which the harness shells out to for db seeding and NAR dumping)
-  # use the SAME binary set as the daemon — schema/format parity.
+  # One nextest run per daemon. The variant's nix package is PREPENDED
+  # to nativeBuildInputs (via mkNextestRun's extraRuntimeInputs) so
+  # `nix-store --load-db` / `nix-store --dump` (which the harness
+  # shells out to for db seeding and NAR dumping) use the SAME binary
+  # set as the daemon — schema/format parity. This shadows the
+  # module-level pinned nix-cli.
   mkMatrixRun =
     variant: nixPkg:
-    craneLib.cargoNextest (
-      commonArgs
-      // {
-        inherit cargoArtifacts;
-        pname = "rio-golden-${variant}";
-        # Only run the golden_conformance binary — the rest of the
-        # workspace suite is the per-push nextest check's job.
-        cargoNextestExtraArgs = "--no-tests=warn --profile ci -E 'binary(golden_conformance)'";
-        nativeCheckInputs = with pkgs; [
-          nixPkg
-          openssh
-          postgresql_18
-        ];
+    mkNextestRun {
+      name = "rio-golden-${variant}";
+      extraRuntimeInputs = [ nixPkg ];
+      extraEnv = {
         # Absolute daemon path — the harness prefers this over PATH so
         # log output records exactly which binary was exercised.
         RIO_GOLDEN_DAEMON_BIN = "${nixPkg}/bin/nix-daemon";
         RIO_GOLDEN_DAEMON_VARIANT = variant;
-        RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-        RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-        RIO_GOLDEN_FORCE_HERMETIC = "1";
-        NEXTEST_HIDE_PROGRESS_BAR = "1";
-      }
-    );
+      };
+      # Only run the golden_conformance binary — the rest of the
+      # workspace suite is the per-push nextest check's job. The
+      # module-level nextestExtraArgs already supply `--profile ci
+      # --no-tests=warn`; this appends the filter.
+      extraArgs = [
+        "-E"
+        "binary(golden_conformance)"
+      ];
+    };
 in
 pkgs.linkFarm "rio-golden-matrix" (
   pkgs.lib.mapAttrsToList (variant: nixPkg: {
