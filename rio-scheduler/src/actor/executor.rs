@@ -285,8 +285,12 @@ impl DagActor {
 
         // Reassign whatever was on this worker. The worker is gone;
         // whether it was draining or not doesn't matter now.
+        // I-173: capture size_class from the removed worker — the
+        // reassign path's FOD floor promotion can't look it up via
+        // self.executors anymore.
+        let lost_class = worker.size_class.clone();
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
-        self.reassign_derivations(&to_reassign, Some(executor_id))
+        self.reassign_derivations(&to_reassign, Some(executor_id), lost_class.as_deref())
             .await;
 
         // Dashboard: running count dropped; assigned_executors lost
@@ -332,12 +336,19 @@ impl DagActor {
     /// (assignment lands just before the one-shot Job exits); counting
     /// it would falsely poison drvs that nothing ever tried.
     ///
+    /// `lost_worker_class`: the lost worker's `size_class`, captured
+    /// by the caller before any `self.executors.remove()`. Threaded
+    /// through because `handle_executor_disconnected` removes the
+    /// executor before calling here, so a `self.executors.get()`
+    /// lookup inside would miss (I-173).
+    ///
     /// `None` for callers that don't have a specific lost worker
     /// (none currently, but keeps the signature extensible).
     async fn reassign_derivations(
         &mut self,
         drv_hashes: &[DrvHash],
         lost_worker: Option<&ExecutorId>,
+        lost_worker_class: Option<&str>,
     ) {
         for drv_hash in drv_hashes {
             // I-097: only count toward poison/failed_builders if the
@@ -360,16 +371,37 @@ impl DagActor {
             // threshold BEFORE reset_to_ready — poison_and_cascade
             // expects Assigned/Running, not Ready.
             let should_poison = match lost_worker {
-                Some(executor_id) if was_running => {
-                    self.record_failure_and_check_poison(drv_hash, executor_id)
-                        .await
+                Some(executor_id) => {
+                    // r[impl sched.fod.size-class-reactive]
+                    // I-173: promote FOD floor REGARDLESS of
+                    // was_running. An OOM'd fetcher disconnects with
+                    // the drv often still Assigned (Running ack
+                    // unprocessed); over-promoting is cheap, retry-
+                    // storm on tiny is not. Uses `lost_worker_class`
+                    // captured before executor removal — the
+                    // self.executors lookup inside record_failure_
+                    // and_check_poison misses on the disconnect path.
+                    if self.dag.node(drv_hash).is_some_and(|s| s.is_fixed_output) {
+                        self.promote_fod_size_class_floor(drv_hash, lost_worker_class)
+                            .await;
+                    }
+                    if was_running {
+                        self.record_failure_and_check_poison(drv_hash, executor_id)
+                            .await
+                    } else {
+                        // I-097: Assigned-only — don't record failure
+                        // (scheduling race, drv never attempted). Re-
+                        // read existing poison state so 3 prior REAL
+                        // failures + 1 disconnect still poisons
+                        // instead of dispatching a 4th time.
+                        self.dag
+                            .node(drv_hash)
+                            .map(|s| self.poison_config.is_poisoned(s))
+                            .unwrap_or(false)
+                    }
                 }
-                // Assigned-only disconnect, or no lost_worker: just
-                // re-read existing poison state (no new failure
-                // recorded). Without this check, 3 prior REAL
-                // failures + 1 disconnect would skip the poison
-                // path and dispatch a 4th time.
-                _ => self
+                // No lost_worker: just re-read existing poison state.
+                None => self
                     .dag
                     .node(drv_hash)
                     .map(|s| self.poison_config.is_poisoned(s))
@@ -468,6 +500,7 @@ impl DagActor {
             // know the drv_path (which needs DAG lookup).
             let to_reassign: Vec<DrvHash> = worker.running_build.take().into_iter().collect();
             let stream_tx = worker.stream_tx.clone();
+            let lost_class = worker.size_class.clone();
 
             // Send CancelSignal for each in-flight build BEFORE
             // reassigning. This is the preemption hook: when the
@@ -528,7 +561,7 @@ impl DagActor {
             // finish them — exclude it from retry consideration
             // (moot since it's draining anyway, but consistent with
             // the disconnect path and feeds poison detection).
-            self.reassign_derivations(&to_reassign, Some(executor_id))
+            self.reassign_derivations(&to_reassign, Some(executor_id), lost_class.as_deref())
                 .await;
 
             return DrainResult {
@@ -1135,8 +1168,16 @@ impl DagActor {
             // Reassign (same path as worker disconnect): reset_to_
             // ready + retry++ + failed_builders.insert (in-mem AND
             // PG via append_failed_worker) + PG status + push_ready.
-            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
-                .await;
+            let lost_class = self
+                .executors
+                .get(executor_id)
+                .and_then(|e| e.size_class.clone());
+            self.reassign_derivations(
+                std::slice::from_ref(drv_hash),
+                Some(executor_id),
+                lost_class.as_deref(),
+            )
+            .await;
         }
     }
 

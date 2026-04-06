@@ -881,6 +881,82 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.fod.size-class-reactive]
+/// I-173: a FOD assigned to a tiny fetcher that disconnects while
+/// status==Assigned (Running ack never sent) MUST still get its
+/// `size_class_floor` promoted. Before the fix, promotion lived only
+/// in `record_failure_and_check_poison`, which the I-097 guard skips
+/// for Assigned-only disconnects — so an OOM'd fetcher (which often
+/// dies before the actor processes the Running ack) left floor=NULL
+/// and retry-stormed on tiny. Live: 14 OOMs, retry_count=0,
+/// size_class_floor=NULL.
+///
+/// Also asserts I-097's invariant still holds (no failed_builders
+/// entry, status=Ready) — promotion is decoupled from poison-record.
+#[tokio::test]
+async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
+    use crate::assignment::FetcherSizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_fetcher_size_classes(vec![
+            FetcherSizeClassConfig {
+                name: "tiny".into(),
+            },
+            FetcherSizeClassConfig {
+                name: "small".into(),
+            },
+        ])
+    });
+
+    let mut rx = connect_fetcher_classed(&handle, "f-tiny", "x86_64-linux", "tiny").await?;
+
+    let mut node = make_test_node("oom-fod-173", "x86_64-linux");
+    node.is_fixed_output = true;
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    // Dispatch → Assigned. Do NOT send Running ack.
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("oom-fod-173"));
+    let pre = handle
+        .debug_query_derivation("oom-fod-173")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Assigned,
+        "precondition: status==Assigned at disconnect (the I-173 race)"
+    );
+
+    // Fetcher OOMs → disconnect. Status was Assigned, not Running.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "f-tiny".into(),
+        })
+        .await?;
+    barrier(&handle).await;
+    drop(rx);
+
+    let info = handle
+        .debug_query_derivation("oom-fod-173")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.size_class_floor.as_deref(),
+        Some("small"),
+        "I-173: Assigned-disconnect must promote FOD floor tiny→small"
+    );
+    // I-097 still holds: no failure recorded.
+    assert!(
+        info.failed_builders.is_empty(),
+        "I-097: Assigned-disconnect must not record failure; got {:?}",
+        info.failed_builders
+    );
+    assert_eq!(info.status, DerivationStatus::Ready);
+
+    Ok(())
+}
+
 /// ExecutorDisconnected for a never-connected worker → no-op. The
 /// handler's early-return on `workers.remove(executor_id) == None`
 /// means no gauge decrement (would go negative otherwise) and no
