@@ -131,53 +131,16 @@ impl StoreServiceImpl {
                             "output {idx}: PutPathMetadata missing PathInfo"
                         ))
                     })?;
-                    // Same trailer-only enforcement as PutPath.
-                    if !raw_info.nar_hash.is_empty() {
-                        bail!(Status::invalid_argument(format!(
-                            "output {idx}: metadata.nar_hash must be empty (trailer-only mode)"
-                        )));
-                    }
-                    // Bound repeated fields BEFORE validation.
-                    rio_common::grpc::check_bound(
-                        "references",
-                        raw_info.references.len(),
-                        rio_common::limits::MAX_REFERENCES,
+                    // Shared 6-step validation (trailer-only, bounds,
+                    // placeholder, TryFrom, HMAC path-in-claims) — same
+                    // helper PutPath uses. Phase 1 hasn't inserted any
+                    // placeholders yet, so `?` is safe (the static
+                    // ?-grep test slices from the phase-2 marker below).
+                    let info = validate_put_metadata(
+                        raw_info,
+                        hmac_claims.as_ref(),
+                        &format!("output {idx}"),
                     )?;
-                    rio_common::grpc::check_bound(
-                        "signatures",
-                        raw_info.signatures.len(),
-                        rio_common::limits::MAX_SIGNATURES,
-                    )?;
-                    // Placeholder hash so TryFrom passes; overwritten from trailer.
-                    let mut raw_info = raw_info;
-                    raw_info.nar_hash = vec![0u8; 32];
-                    let info = ValidatedPathInfo::try_from(raw_info)
-                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
-                    // HMAC path-in-claims check. verify_assignment_token
-                    // handles invalid_token / missing_token / non_gateway;
-                    // path_not_in_claims is per-output and checked here
-                    // (put_path.rs:316-331 parity).
-                    if let Some(claims) = &hmac_claims {
-                        let path_str = info.store_path.as_str();
-                        if !claims.expected_outputs.iter().any(|o| o == path_str) {
-                            warn!(
-                                output_index = %idx,
-                                store_path = %path_str,
-                                worker_id = %claims.worker_id,
-                                drv_hash = %claims.drv_hash,
-                                "PutPathBatch: path not in assignment's expected_outputs"
-                            );
-                            metrics::counter!(
-                                "rio_store_hmac_rejected_total",
-                                "reason" => "path_not_in_claims"
-                            )
-                            .increment(1);
-                            bail!(Status::permission_denied(format!(
-                                "output {idx}: path not authorized by assignment token"
-                            )));
-                        }
-                    }
 
                     accum.store_path_hash = info.store_path.sha256_digest().to_vec();
                     accum.info = Some(info);
@@ -241,21 +204,11 @@ impl StoreServiceImpl {
                 )));
             };
 
-            // Trailer → info (same shape as put_path.rs step 5 prelude).
-            let Ok(hash): Result<[u8; 32], _> = t.nar_hash.as_slice().try_into() else {
-                bail!(Status::invalid_argument(format!(
-                    "output {idx}: trailer nar_hash must be 32 bytes, got {}",
-                    t.nar_hash.len()
-                )));
-            };
-            if t.nar_size > MAX_NAR_SIZE {
-                bail!(Status::invalid_argument(format!(
-                    "output {idx}: trailer nar_size {} exceeds MAX_NAR_SIZE",
-                    t.nar_size
-                )));
+            // bail! (not `?`): prior loop iterations may have pushed to
+            // owned_placeholders.
+            if let Err(e) = apply_trailer(info, t, &format!("output {idx}")) {
+                bail!(e);
             }
-            info.nar_hash = hash;
-            info.nar_size = t.nar_size;
 
             // Hash verification — the security check.
             let digest = crate::validate::NarDigest::from_bytes(&accum.nar_data);
