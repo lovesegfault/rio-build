@@ -243,6 +243,13 @@ in
         };
       };
       withPki = true;
+      # cache-auth subtest curls /{hash}.narinfo + /nix-cache-info.
+      # Store's cache_http_addr defaults to None → HTTP server not
+      # spawned. cache_allow_unauthenticated stays at its default
+      # (false) — the Bearer-required path is what we're testing.
+      extraStoreConfig = {
+        cacheHttpAddr = "0.0.0.0:8080";
+      };
       extraPackages = [
         pkgs.grpcurl
         pkgs.grpc-health-probe
