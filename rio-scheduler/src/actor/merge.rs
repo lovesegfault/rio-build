@@ -384,6 +384,7 @@ impl DagActor {
                     expected_output_paths: node.expected_output_paths.clone(),
                     output_names: node.output_names.clone(),
                     is_fixed_output: node.is_fixed_output,
+                    is_ca: node.is_content_addressed,
                 }
             })
             .collect();
