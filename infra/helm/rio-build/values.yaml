@@ -345,7 +345,9 @@ scheduler:
   sizeClasses: []
   resources:
     requests: {cpu: 500m, memory: 512Mi}
-    limits: {memory: 2Gi}
+    # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +
+    # iterative DFS stack); 4Gi headroom for MAX_DAG_NODES=1M (I-137).
+    limits: {memory: 4Gi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # rio-gateway

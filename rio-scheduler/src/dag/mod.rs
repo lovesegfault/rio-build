@@ -331,7 +331,7 @@ impl DerivationDag {
     /// A back-edge to a gray node indicates a cycle.
     ///
     /// Iterative (not recursive) to avoid stack overflow on deep chains:
-    /// MAX_DAG_NODES=100k × ~150B/frame ≈ 15MB >> 2MB default tokio stack.
+    /// MAX_DAG_NODES=1M × ~150B/frame ≈ 150MB >> 2MB default tokio stack.
     fn has_cycle_from(&self, start: &str, color: &mut HashMap<String, u8>) -> bool {
         // Short-circuit if start already visited (color map persists across
         // multiple has_cycle_from calls in merge()).
