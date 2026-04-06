@@ -279,8 +279,19 @@ pub(super) fn build_pod_spec(
         // mounts on device nodes — ADR-012 Phase 1a spike). The
         // device plugin path (resources.limits, not hostPath) makes
         // this work. Also incompatible with privileged — privileged
-        // containers cannot be user-namespaced. So: gate on !privileged.
-        host_users: (!privileged).then_some(false),
+        // containers cannot be user-namespaced.
+        //
+        // Also incompatible with hostNetwork: K8s admission rejects
+        // hostUsers:false + hostNetwork:true (kubelet returns
+        // "hostUsers=false is not allowed when hostNetwork is set").
+        // The CRD CEL rule (see the host-users-network-exclusive
+        // marker in controller.md) catches NEW specs at apply
+        // time; this guard handles
+        // OLD specs that predate the rule (CEL doesn't re-validate
+        // existing CRs on CRD upgrade). When hostNetwork is set, skip
+        // hostUsers — the operator has chosen the escape hatch. apply()
+        // emits a Warning event for visibility (this builder is pure).
+        host_users: (!privileged && wp.spec.host_network != Some(true)).then_some(false),
 
         // seccompProfile at POD level (applies to all containers +
         // init containers). Skipped when privileged — privileged

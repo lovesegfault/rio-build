@@ -31,7 +31,7 @@ spec:
   sizeClass: small                             # maps to RIO_SIZE_CLASS env
   tlsSecretName: rio-worker-tls                # optional — Secret with tls.crt/tls.key/ca.crt for mTLS
   fodProxyUrl: http://fod-proxy.rio.svc:3128   # optional — injected as http(s)_proxy for FOD builds
-  hostNetwork: false                           # optional — true only for VM-test/airgap escapes
+  hostNetwork: false                           # optional — true only for VM-test/airgap escapes; requires privileged:true (hostUsers:false incompatible with host netns)
   topologySpread: true                         # optional — add topologySpreadConstraints across zones
   # securityContext: NOT a CRD field. The controller hardcodes
   # capabilities (SYS_ADMIN + SYS_CHROOT) in build_pod_spec().
@@ -349,6 +349,7 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 - `spec.replicas.min <= spec.replicas.max`
 - `spec.maxConcurrentBuilds >= 1`
 - `spec.systems` must be non-empty
+- `spec.hostNetwork: true` requires `spec.privileged: true` — Kubernetes rejects `hostUsers: false` combined with `hostNetwork: true` at pod admission; the non-privileged path sets `hostUsers: false` per ADR-012
 
 r[ctrl.crd.host-users-network-exclusive]
 The controller MUST reject `WorkerPool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).

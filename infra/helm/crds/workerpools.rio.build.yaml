@@ -172,7 +172,13 @@ spec:
                   \ where pod networking adds unwanted\nlatency (worker \u2192 store\
                   \ is NAR-heavy).\n\nCaveat: hostNetwork pods can't use containerPort-based\n\
                   Services. The worker doesn't serve anything inbound\n(metrics/health\
-                  \ are scraped from the node), so this\ndoesn't break it."
+                  \ are scraped from the node), so this\ndoesn't break it.\n\nConstraint:\
+                  \ `hostNetwork: true` requires `privileged: true`.\nKubernetes rejects\
+                  \ `hostUsers: false` + `hostNetwork: true`\nat admission (user-namespace\
+                  \ remap is incompatible with the\nhost netns). The non-privileged\
+                  \ path sets `hostUsers: false`\n(ADR-012), so hostNetwork implies\
+                  \ the privileged escape\nhatch. CRD CEL validation enforces this\
+                  \ \u2014 see the\n`host-users-network-exclusive` marker in controller.md."
                 nullable: true
                 type: boolean
               image:
@@ -383,6 +389,11 @@ spec:
             x-kubernetes-validations:
             - rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
                 > 0)'
+            - message: "hostNetwork:true requires privileged:true \u2014 Kubernetes\
+                \ rejects hostUsers:false with hostNetwork:true at admission; the\
+                \ non-privileged path sets hostUsers:false (see ADR-012)"
+              rule: '!(has(self.hostNetwork) && self.hostNetwork) || (has(self.privileged)
+                && self.privileged)'
           status:
             description: "WorkerPool status \u2014 reconciler writes, operators read.\n\
               \n`Default` because kube-rs initializes it to `None` \u2192 `Some(default())`\n\
