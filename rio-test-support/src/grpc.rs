@@ -80,6 +80,11 @@ pub struct MockStore {
     /// CA-compare error-path tests (`Err(Status)` arm — counts as
     /// miss, doesn't block completion).
     pub fail_content_lookup: Arc<AtomicBool>,
+    /// Number of `content_lookup` calls received (success, fail, or
+    /// hang — incremented on entry). For scheduler CA-compare
+    /// short-circuit tests: prove the loop broke after N calls
+    /// instead of iterating all outputs.
+    pub content_lookup_calls: Arc<AtomicU32>,
     /// CA realisations: (drv_hash, output_name) -> Realisation.
     /// Used by gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
@@ -103,6 +108,7 @@ impl Default for MockStore {
             get_path_gate_armed: Arc::default(),
             content_lookup_hang: Arc::default(),
             fail_content_lookup: Arc::default(),
+            content_lookup_calls: Arc::default(),
             realisations: Arc::default(),
             tenant_quotas: Arc::default(),
         }
@@ -440,6 +446,7 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::ContentLookupRequest>,
     ) -> Result<Response<types::ContentLookupResponse>, Status> {
+        self.content_lookup_calls.fetch_add(1, Ordering::SeqCst);
         if self.content_lookup_hang.load(Ordering::SeqCst) {
             // Hang forever. Scheduler CA-compare tests use this to
             // prove the DEFAULT_GRPC_TIMEOUT wrapper is load-bearing.

@@ -250,9 +250,10 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_ca_hash_compares_total",
         "CA early-cutoff output-hash lookups against the content index on \
-         successful completion (labeled by outcome=match|miss). High match \
-         ratio → CA derivations rebuilding identical content; cutoff-propagate \
-         will skip downstream work."
+         successful completion (labeled by outcome=match|miss|skipped_after_miss). \
+         High match ratio → CA derivations rebuilding identical content; \
+         cutoff-propagate will skip downstream work. skipped_after_miss counts \
+         outputs short-circuited after an earlier miss in the same derivation."
     );
     describe_counter!(
         "rio_scheduler_ca_cutoff_saves_total",

@@ -326,4 +326,16 @@ impl ActorHandle {
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
+
+    /// Test-only: call `cache_breaker.record_failure()` `n` times.
+    /// Returns `is_open()` after. For breaker-gate tests that need
+    /// the breaker open WITHOUT driving N failing RPCs through the
+    /// full merge/completion path.
+    #[cfg(test)]
+    pub async fn debug_trip_breaker(&self, n: u32) -> Result<bool, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugTripBreaker { n, reply: tx })
+            .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
 }

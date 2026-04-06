@@ -348,6 +348,18 @@ pub enum ActorCommand {
         drv_hash: String,
         reply: oneshot::Sender<bool>,
     },
+
+    /// Test-only: call `cache_breaker.record_failure()` `n` times.
+    /// For CA cutoff-compare breaker-integration tests: trip the
+    /// breaker open without driving N failing SubmitBuild merges
+    /// (slow + lots of boilerplate) or N failing CA completions
+    /// (also slow). `OPEN_THRESHOLD` is 5; callers pass `n=5` to
+    /// trip immediately. Reply is `is_open()` after the calls.
+    #[cfg(test)]
+    DebugTripBreaker {
+        n: u32,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Reply for `ActorCommand::DrainWorker`.
