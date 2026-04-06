@@ -126,10 +126,12 @@ pub async fn run(
         // scheduling override (constrain spod DS to builder/fetcher nodes,
         // disable bpfrecorder) via SSA AFTER the operator has created it.
         // Poll for existence — operator's first reconcile creates it.
-        let jp = "--for=jsonpath={.metadata.name}=spod";
+        // `--for=create` (kubectl 1.31+) actually polls; `--for=jsonpath`
+        // fails immediately with NotFound if the resource is absent (the
+        // previous form raced the operator's ~5s startup on fresh clusters).
         crate::sh::run(xshell::cmd!(
             sh,
-            "kubectl wait {jp} securityprofilesoperatordaemon/spod -n security-profiles-operator --timeout=60s"
+            "kubectl wait --for=create securityprofilesoperatordaemon/spod -n security-profiles-operator --timeout=60s"
         ))
         .await?;
         let spod_cfg = repo_root().join("infra/k8s/spod-config.yaml");
