@@ -483,6 +483,63 @@ pub(super) struct DecrementStats {
     pub bytes_freed: u64,
 }
 
+/// Enqueue S3 keys for zeroed chunks to `pending_s3_deletes` in the
+/// given transaction. Batched via unnest — one RTT per call instead
+/// of per-chunk (a 1000-chunk manifest would otherwise need 1000
+/// INSERTs at ~1ms RTT = ~1s; batched it's ~1ms).
+///
+/// `blake3_hash` is written alongside `s3_key` so the drain task can
+/// re-check `chunks.(deleted AND refcount=0)` before issuing the S3
+/// DELETE — catches the TOCTOU where PutPath resurrected the chunk
+/// after we enqueued it. `ON CONFLICT DO NOTHING`: duplicate enqueues
+/// are idempotent (drain deletes the row after S3 success).
+///
+/// Skips hashes that fail `try_from` to `[u8; 32]` (can't-happen — the
+/// `chunks` PK is BYTEA but every writer inserts exactly 32 bytes;
+/// `warn!` + skip rather than panic so one corrupt row doesn't kill
+/// the sweep). Returns the number of keys actually enqueued.
+///
+/// No-op if `backend` is None (inline-only store has no S3 keys).
+// r[impl store.gc.pending-deletes]
+pub(super) async fn enqueue_chunk_deletes(
+    tx: &mut Transaction<'_, Postgres>,
+    zeroed: &[(Vec<u8>, i64)],
+    backend: Option<&Arc<dyn ChunkBackend>>,
+) -> Result<u64, sqlx::Error> {
+    let Some(backend) = backend else {
+        return Ok(0);
+    };
+    if zeroed.is_empty() {
+        return Ok(0);
+    }
+    let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
+    let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
+    for (hash, _size) in zeroed {
+        let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
+            warn!(
+                len = hash.len(),
+                "GC: chunk hash wrong length, skipping S3 enqueue"
+            );
+            continue;
+        };
+        keys.push(backend.key_for(&arr));
+        hashes.push(hash.clone());
+    }
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    sqlx::query(
+        "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
+         SELECT * FROM unnest($1::text[], $2::bytea[]) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&keys)
+    .bind(&hashes)
+    .execute(&mut **tx)
+    .await?;
+    Ok(keys.len() as u64)
+}
+
 /// Shared helper for [`sweep::sweep`] and [`orphan::scan_once`]:
 /// given a serialized manifest `chunk_list`, decrement refcounts
 /// for its unique chunks, mark any that hit 0 as deleted, and
@@ -548,42 +605,7 @@ pub(super) async fn decrement_and_enqueue(
 
     stats.chunks_zeroed = zeroed.len() as u64;
     stats.bytes_freed = zeroed.iter().map(|(_, s)| *s as u64).sum();
-
-    // Enqueue S3 keys. Only if we have a chunk backend (inline store
-    // has no S3 keys to delete).
-    //
-    // Batched via unnest — one RTT per manifest instead of per-chunk.
-    // A manifest with 1000 chunks would otherwise need 1000 INSERTs
-    // (~1s at 1ms RTT); batched it's ~1ms. Significant for large sweeps.
-    if let Some(backend) = backend {
-        let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
-        let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
-        for (hash, _) in &zeroed {
-            let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
-                warn!("GC: chunk hash wrong length, skipping S3 enqueue");
-                continue;
-            };
-            keys.push(backend.key_for(&arr));
-            hashes.push(hash.clone());
-        }
-        if !keys.is_empty() {
-            // blake3_hash lets drain re-check chunks.(deleted AND
-            // refcount=0) before S3 delete — catches the TOCTOU where
-            // PutPath resurrected the chunk after sweep enqueued it.
-            // ON CONFLICT DO NOTHING: duplicate enqueues are fine
-            // (idempotent — drain deletes the row after S3 success).
-            sqlx::query(
-                "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
-                 SELECT * FROM unnest($1::text[], $2::bytea[]) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(&keys)
-            .bind(&hashes)
-            .execute(&mut **tx)
-            .await?;
-            stats.s3_keys_enqueued = keys.len() as u64;
-        }
-    }
+    stats.s3_keys_enqueued = enqueue_chunk_deletes(tx, &zeroed, backend).await?;
 
     Ok(stats)
 }
@@ -657,6 +679,37 @@ mod tests {
         assert!(!rows[0].2);
         assert_eq!(rows[1].1, 2, "h2 refcount 3→2");
         assert!(!rows[1].2);
+    }
+
+    /// enqueue_chunk_deletes: a hash that isn't 32 bytes is skipped
+    /// with a warn, not a panic. The well-formed siblings in the same
+    /// batch still enqueue. (Can't-happen in practice — chunks PK writers
+    /// all insert 32 bytes — but warn+skip beats killing the sweep.)
+    #[tokio::test]
+    // r[verify store.gc.pending-deletes]
+    async fn enqueue_skips_corrupt_hash() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let mut tx = db.pool.begin().await.unwrap();
+
+        // One well-formed (32 bytes), one corrupt (7 bytes).
+        let good = vec![0xAAu8; 32];
+        let bad = vec![0xBBu8; 7];
+        let zeroed = vec![(good.clone(), 100i64), (bad, 50i64)];
+
+        let enqueued = enqueue_chunk_deletes(&mut tx, &zeroed, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Only the well-formed one enqueued.
+        assert_eq!(enqueued, 1);
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT blake3_hash FROM pending_s3_deletes")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, good);
     }
 
     /// Chunk at refcount=1 → decrement → 0 → deleted=true + enqueued

@@ -332,48 +332,12 @@ pub async fn sweep_orphan_chunks(
         chunks_deleted += zeroed.len() as u64;
         bytes_freed += zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
 
-        // Enqueue S3 keys. Identical to the enqueue block in
-        // `decrement_and_enqueue` (gc/mod.rs:558) — same unnest
-        // batch insert, same `ON CONFLICT DO NOTHING` idempotence,
-        // same `blake3_hash` column for drain's re-check. If
-        // `chunk_backend` is None (inline-only store), there are
-        // no S3 keys to delete — but an inline-only store also
-        // has no PutChunk clients (require_cache() returns
-        // FAILED_PRECONDITION), so `candidates` is empty and we
-        // never reach here. The `if let` is belt-and-suspenders.
-        if let Some(backend) = chunk_backend
-            && !zeroed.is_empty()
-        {
-            let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
-            let mut enqueue_hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
-            for (hash, _) in &zeroed {
-                // 32-byte invariant: the `chunks` table PK is
-                // BYTEA but every writer inserts exactly 32 bytes
-                // (BLAKE3 output). try_into() is a can't-happen
-                // guard — `warn!` + skip rather than panic so one
-                // corrupt row doesn't kill the sweep.
-                let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
-                    tracing::warn!(
-                        len = hash.len(),
-                        "sweep_orphan_chunks: chunk hash wrong length, skipping S3 enqueue"
-                    );
-                    continue;
-                };
-                keys.push(backend.key_for(&arr));
-                enqueue_hashes.push(hash.clone());
-            }
-            if !keys.is_empty() {
-                sqlx::query(
-                    "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
-                     SELECT * FROM unnest($1::text[], $2::bytea[]) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(&keys)
-                .bind(&enqueue_hashes)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
+        // Enqueue S3 keys for zeroed chunks. If chunk_backend is None
+        // (inline-only store), there are no S3 keys to delete — but an
+        // inline-only store also has no PutChunk clients (require_cache()
+        // returns FAILED_PRECONDITION), so `zeroed` is empty and this is
+        // a no-op. The Option-check inside the helper is belt-and-suspenders.
+        super::enqueue_chunk_deletes(&mut tx, &zeroed, chunk_backend).await?;
 
         tx.commit().await?;
     }
