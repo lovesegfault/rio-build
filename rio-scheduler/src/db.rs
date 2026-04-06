@@ -132,14 +132,19 @@ pub struct SchedulerDb {
 /// EMA alpha for duration estimation updates.
 const EMA_ALPHA: f64 = 0.3;
 
-/// Row from `list_builds`. 4-table join (builds / build_derivations /
-/// derivations / assignments). `cached_derivations` heuristic:
-/// "completed with no assignment row" — a cache-hit derivation
-/// transitions directly to Completed at merge time without ever being
-/// dispatched.
+/// Row from `list_builds` / `list_builds_keyset`. 4-table join
+/// (builds / build_derivations / derivations / assignments).
+/// `cached_derivations` heuristic: "completed with no assignment row"
+/// — a cache-hit derivation transitions directly to Completed at merge
+/// time without ever being dispatched.
+///
+/// `submitted_at_micros` + `build_id` together form the keyset cursor
+/// tuple. Micros via `EXTRACT(EPOCH)*1e6::bigint` — avoids chrono dep
+/// (see TenantRow pattern below). Kept as the raw `Uuid` (not `::text`)
+/// so cursor encoding doesn't round-trip through strings.
 #[derive(Debug, sqlx::FromRow)]
 pub struct BuildListRow {
-    pub build_id: String,
+    pub build_id: Uuid,
     pub tenant_id: Option<String>,
     pub priority_class: String,
     pub status: String,
@@ -147,6 +152,7 @@ pub struct BuildListRow {
     pub total_derivations: i64,
     pub completed_derivations: i64,
     pub cached_derivations: i64,
+    pub submitted_at_micros: i64,
 }
 
 /// Row from `list_tenants` / `create_tenant`. `has_cache_token`
@@ -258,6 +264,38 @@ pub struct DerivationRow {
     pub is_ca: bool,
 }
 
+/// Shared SELECT / FROM / JOIN clause for `list_builds` and
+/// `list_builds_keyset`. The two methods differ only in their WHERE
+/// pagination clause and LIMIT/OFFSET tail. Kept as a `&str` const
+/// (not a macro) because the queries are runtime-built via `format!`
+/// — sqlx compile-time checks don't apply to dynamic strings anyway.
+///
+/// `submitted_at_micros`: `EXTRACT(EPOCH)*1e6` gives fractional seconds
+/// with µs precision; `::bigint` truncates to integer microseconds.
+/// Matches PG's native TIMESTAMPTZ resolution, so `to_timestamp(x/1e6)`
+/// in `list_builds_keyset` round-trips exactly — no silent equal-rows-
+/// skipped-by-cursor bug at page boundaries.
+const LIST_BUILDS_SELECT: &str = r#"
+    SELECT
+        b.build_id,
+        b.tenant_id::text,
+        b.priority_class,
+        b.status,
+        b.error_summary,
+        (EXTRACT(EPOCH FROM b.submitted_at) * 1e6)::bigint AS submitted_at_micros,
+        COALESCE(COUNT(bd.derivation_id), 0)::bigint AS total_derivations,
+        COALESCE(COUNT(*) FILTER (WHERE d.status = 'completed'), 0)::bigint
+            AS completed_derivations,
+        COALESCE(COUNT(*) FILTER (
+            WHERE d.status = 'completed'
+              AND NOT EXISTS (SELECT 1 FROM assignments a
+                              WHERE a.derivation_id = d.derivation_id)
+        ), 0)::bigint AS cached_derivations
+    FROM builds b
+    LEFT JOIN build_derivations bd USING (build_id)
+    LEFT JOIN derivations d ON bd.derivation_id = d.derivation_id
+"#;
+
 impl SchedulerDb {
     /// Create a new database handle from a connection pool.
     pub fn new(pool: PgPool) -> Self {
@@ -278,6 +316,11 @@ impl SchedulerDb {
     ///
     /// `status_opt`: `None` = no filter, `Some(s)` = `b.status = s`.
     /// `limit` is taken as-is — caller clamps.
+    ///
+    /// Offset pagination is unstable under concurrent inserts (newly
+    /// submitted builds shift later pages). Kept for dashboard backward
+    /// compat; new callers should prefer
+    /// [`list_builds_keyset`](Self::list_builds_keyset).
     pub async fn list_builds(
         &self,
         status_opt: Option<&str>,
@@ -285,42 +328,15 @@ impl SchedulerDb {
         limit: i64,
         offset: i64,
     ) -> Result<(i64, Vec<BuildListRow>), sqlx::Error> {
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM builds b
-             WHERE ($1::text IS NULL OR b.status = $1)
-               AND ($2::uuid IS NULL OR b.tenant_id = $2)",
-        )
-        .bind(status_opt)
-        .bind(tenant_filter)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let rows: Vec<BuildListRow> = sqlx::query_as(
-            r#"
-            SELECT
-                b.build_id::text,
-                b.tenant_id::text,
-                b.priority_class,
-                b.status,
-                b.error_summary,
-                COALESCE(COUNT(bd.derivation_id), 0)::bigint AS total_derivations,
-                COALESCE(COUNT(*) FILTER (WHERE d.status = 'completed'), 0)::bigint
-                    AS completed_derivations,
-                COALESCE(COUNT(*) FILTER (
-                    WHERE d.status = 'completed'
-                      AND NOT EXISTS (SELECT 1 FROM assignments a
-                                      WHERE a.derivation_id = d.derivation_id)
-                ), 0)::bigint AS cached_derivations
-            FROM builds b
-            LEFT JOIN build_derivations bd USING (build_id)
-            LEFT JOIN derivations d ON bd.derivation_id = d.derivation_id
+        let total = self.count_builds(status_opt, tenant_filter).await?;
+        let rows: Vec<BuildListRow> = sqlx::query_as(&format!(
+            "{LIST_BUILDS_SELECT}
             WHERE ($1::text IS NULL OR b.status = $1)
               AND ($2::uuid IS NULL OR b.tenant_id = $2)
             GROUP BY b.build_id
             ORDER BY b.submitted_at DESC, b.build_id DESC
-            LIMIT $3 OFFSET $4
-            "#,
-        )
+            LIMIT $3 OFFSET $4"
+        ))
         .bind(status_opt)
         .bind(tenant_filter)
         .bind(limit)
@@ -329,6 +345,69 @@ impl SchedulerDb {
         .await?;
 
         Ok((total, rows))
+    }
+
+    /// Keyset-paginated variant of [`list_builds`](Self::list_builds).
+    /// Stable under
+    /// concurrent inserts: the cursor is `(submitted_at_micros, build_id)`
+    /// — a compound key that's monotone-decreasing through pages. A row
+    /// inserted between page N and N+1 never shifts already-seen rows (it
+    /// sorts before the cursor, so it's simply not visible to this walk).
+    ///
+    /// `cursor_micros`/`cursor_id`: strictly-less-than bound. Pass
+    /// `(i64::MAX, Uuid::max())` for the first page (unbounded).
+    ///
+    /// Row-value comparison `(a, b) < (x, y)` is SQL-standard
+    /// lexicographic: `a < x OR (a = x AND b < y)`. PG implements it
+    /// directly on the native TIMESTAMPTZ, which is why we pass the
+    /// micros back through `to_timestamp($3/1e6)` rather than comparing
+    /// on the EXTRACT'd bigint — keeps the comparison on the indexed
+    /// column type so the planner can use the PK-implied btree. The
+    /// `1e6` round-trip (EXTRACT→bigint→to_timestamp) preserves PG's
+    /// native microsecond precision exactly — no lossy cast.
+    pub async fn list_builds_keyset(
+        &self,
+        status_opt: Option<&str>,
+        tenant_filter: Option<Uuid>,
+        limit: i64,
+        cursor_micros: i64,
+        cursor_id: Uuid,
+    ) -> Result<(i64, Vec<BuildListRow>), sqlx::Error> {
+        let total = self.count_builds(status_opt, tenant_filter).await?;
+        let rows: Vec<BuildListRow> = sqlx::query_as(&format!(
+            "{LIST_BUILDS_SELECT}
+            WHERE ($1::text IS NULL OR b.status = $1)
+              AND ($2::uuid IS NULL OR b.tenant_id = $2)
+              AND (b.submitted_at, b.build_id) < (to_timestamp($3::bigint / 1e6), $4::uuid)
+            GROUP BY b.build_id
+            ORDER BY b.submitted_at DESC, b.build_id DESC
+            LIMIT $5"
+        ))
+        .bind(status_opt)
+        .bind(tenant_filter)
+        .bind(cursor_micros)
+        .bind(cursor_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((total, rows))
+    }
+
+    async fn count_builds(
+        &self,
+        status_opt: Option<&str>,
+        tenant_filter: Option<Uuid>,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM builds b
+             WHERE ($1::text IS NULL OR b.status = $1)
+               AND ($2::uuid IS NULL OR b.tenant_id = $2)",
+        )
+        .bind(status_opt)
+        .bind(tenant_filter)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// List all tenants (for AdminService.ListTenants).
