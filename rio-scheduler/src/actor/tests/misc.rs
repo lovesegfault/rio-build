@@ -855,6 +855,11 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
     let small = snap.iter().find(|s| s.name == "small").unwrap();
     assert_eq!(small.queued, 3, "three merged-and-ready derivations");
     assert_eq!(small.running, 0);
+    // I-143: per-system breakdown sums to scalar (all 3 are x86_64
+    // via merge_single_node).
+    assert_eq!(small.queued_by_system.get("x86_64-linux"), Some(&3));
+    assert_eq!(small.queued_by_system.values().sum::<u64>(), small.queued);
+    assert!(small.running_by_system.is_empty());
     let large = snap.iter().find(|s| s.name == "large").unwrap();
     assert_eq!(large.queued, 0);
     assert_eq!(large.running, 0);
@@ -900,6 +905,8 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
         "one dispatched → two still Ready (one build per pod)"
     );
     assert_eq!(small.running, 1, "one Assigned to w-small");
+    assert_eq!(small.running_by_system.get("x86_64-linux"), Some(&1));
+    assert_eq!(small.running_by_system.values().sum::<u64>(), small.running);
 
     Ok(())
 }

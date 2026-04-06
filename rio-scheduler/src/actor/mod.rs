@@ -1327,6 +1327,8 @@ impl DagActor {
                     configured_cutoff_secs: configured,
                     queued: 0,
                     running: 0,
+                    queued_by_system: HashMap::new(),
+                    running_by_system: HashMap::new(),
                 }
             })
             .collect();
@@ -1349,6 +1351,12 @@ impl DagActor {
                     ) && let Some(&i) = index.get(&class)
                     {
                         snapshots[i].queued += 1;
+                        // I-143: per-system breakdown so per-arch
+                        // size-class pools scale on their own backlog.
+                        *snapshots[i]
+                            .queued_by_system
+                            .entry(state.system.clone())
+                            .or_default() += 1;
                     }
                 }
                 DerivationStatus::Assigned | DerivationStatus::Running => {
@@ -1362,6 +1370,10 @@ impl DagActor {
                         && let Some(&i) = index.get(class)
                     {
                         snapshots[i].running += 1;
+                        *snapshots[i]
+                            .running_by_system
+                            .entry(state.system.clone())
+                            .or_default() += 1;
                     }
                 }
                 // Terminal + pre-Ready: neither queued nor running.

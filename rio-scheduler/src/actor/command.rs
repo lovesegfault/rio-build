@@ -545,6 +545,15 @@ pub struct SizeClassSnapshot {
     pub queued: u64,
     /// Assigned/Running derivations with `assigned_size_class == name`.
     pub running: u64,
+    /// Per-system breakdown of `queued` (sum across keys == `queued`).
+    /// I-143: size-class pools are per-arch; without this the
+    /// controller spawns x86 builders at ceiling for aarch64-only
+    /// backlogs. Same shape as `ClusterSnapshot.queued_by_system`
+    /// (I-107) but per-class.
+    pub queued_by_system: std::collections::HashMap<String, u64>,
+    /// Per-system breakdown of `running`. Symmetry with
+    /// `queued_by_system` for operator/dashboard use.
+    pub running_by_system: std::collections::HashMap<String, u64>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.

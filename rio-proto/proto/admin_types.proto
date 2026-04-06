@@ -331,6 +331,17 @@ message SizeClassStatus {
   // cutoff band. Feeds the "is the rebalancer working off enough data
   // for this class?" operator question.
   uint64 sample_count = 6;
+  // Per-system breakdown of `queued` (sum across keys == `queued`).
+  // I-143: size-class pools are per-arch (one BPS per arch). Without
+  // this, an x86-64-tiny pool reads `queued` for the WHOLE class —
+  // including aarch64 derivations it can never build — and spawns at
+  // ceiling for wrong-arch work. Controller intersects this map with
+  // `BuilderPool.spec.systems`. Empty map (old scheduler) → controller
+  // falls back to the scalar.
+  map<string, uint64> queued_by_system = 7;
+  // Per-system breakdown of `running` (sum across keys == `running`).
+  // Symmetry with `queued_by_system` for operator/dashboard use.
+  map<string, uint64> running_by_system = 8;
 }
 
 message GetSizeClassStatusRequest {}
