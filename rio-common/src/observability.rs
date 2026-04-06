@@ -268,6 +268,16 @@ const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
 /// match the suggested buckets at observability.md:119.
 const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
 
+/// Histogram bucket boundaries for `rio_worker_upload_references_count`.
+///
+/// Reference COUNT (not seconds) per output upload — `references.len()`
+/// after NAR scan. Typical leaf derivation: 0–5 refs. glibc-class: ~40.
+/// Toolchains: 100–300. Default Prometheus buckets `[0.005..10.0]` are
+/// useless here — every output with >10 refs lands in `+Inf`. Second
+/// count-type histogram after [`GRAPH_EDGES_BUCKETS`] above; per-path,
+/// so the top bucket is 500, not 20K.
+const REFERENCES_COUNT_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0];
+
 /// Every histogram that needs non-default bucket boundaries.
 ///
 /// The `metrics-exporter-prometheus` default `[0.005..10.0]` only works for
@@ -308,6 +318,10 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
         ASSIGNMENT_LATENCY_BUCKETS,
     ),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
+    (
+        "rio_worker_upload_references_count",
+        REFERENCES_COUNT_BUCKETS,
+    ),
 ];
 
 /// Initialize Prometheus metrics exporter.
