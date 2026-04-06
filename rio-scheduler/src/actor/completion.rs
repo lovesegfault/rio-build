@@ -390,10 +390,42 @@ impl DagActor {
         } else if let Some(h) = self.drv_path_to_hash(drv_key) {
             h
         } else {
-            warn!(key = drv_key, "completion for unknown derivation, ignoring");
+            // Drv not in DAG (reaped after build-terminal, or truly
+            // unknown). running_builds is keyed by drv_hash which we
+            // can't recover from drv_key here — but the heartbeat
+            // reconcile drops entries whose DAG node is gone (executor.rs
+            // still_inflight check). The next heartbeat (~10s) frees
+            // any such phantom. The WARN includes executor_id so the
+            // race is traceable in logs.
+            warn!(
+                executor_id = %executor_id,
+                key = drv_key,
+                "completion for unknown derivation, ignoring \
+                 (running_builds entry, if any, freed by next heartbeat reconcile)"
+            );
             return;
         };
         let drv_hash = &drv_hash;
+
+        // Free worker capacity NOW, before any early-return below. The
+        // early-return guards (already-Completed, already-terminal,
+        // stale-executor) all mean "this completion's per-derivation
+        // work is moot" — but the executor's slot must still free.
+        // I-042: before this hoist, a completion arriving for an
+        // already-Poisoned derivation (parallel-retry race: drv assigned
+        // to executor-B, executor-A's prior completion poisoned it,
+        // executor-B's completion arrives) hit the not-Assigned/Running
+        // early-return and leaked executor-B's slot. The heartbeat
+        // reconcile (executor.rs:608) eventually frees it via the
+        // still_inflight filter, but that's a ~10s delay (one
+        // heartbeat) of dead capacity per leaked slot.
+        //
+        // Idempotent: HashSet::remove on an absent entry is a no-op.
+        // The line-515 remove below is now redundant for the happy
+        // path but kept for clarity (and harmless).
+        if let Some(worker) = self.executors.get_mut(executor_id) {
+            worker.running_builds.remove(drv_hash);
+        }
 
         // Find the derivation in the DAG
         let Some(state) = self.dag.node(drv_hash) else {
@@ -425,6 +457,9 @@ impl DagActor {
         // Stale-report guard: if this completion is from a worker that no
         // longer owns the derivation (reassigned after disconnect/timeout),
         // drop it. The current assigned_executor's report is authoritative.
+        // running_builds was already freed above — for the stale executor
+        // that's correct (it doesn't own the drv); for the current owner
+        // this branch doesn't fire.
         if let Some(assigned) = &state.assigned_executor
             && assigned != executor_id
         {
