@@ -417,6 +417,35 @@ let
             timeout=timeout,
         )
 
+    # Negative-apply a deliberately-invalid BuilderPool spec. CRD CEL
+    # rules (rio-crds/src/builderpool.rs x_kube validations) are
+    # cross-field constraints that fire at kubectl-apply admission.
+    # --dry-run=server sends to the apiserver (CEL evaluates) without
+    # persisting. fail() asserts non-zero exit; the message-assert
+    # proves it failed at the RIGHT rule — not, say, a schema error or
+    # the wrong CEL rule. Quoted heredoc (<<'EOF') prevents shell
+    # expansion inside the spec body.
+    def assert_cel_rejects(name, spec_body, expected_msg):
+        """spec_body is the YAML body UNDER `spec:` (2-space leading
+        indent, no trailing newline on the last line). expected_msg
+        is a substring of the CEL rule's .message() at builderpool.rs."""
+        result = k3s_server.fail(
+            "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: BuilderPool\n"
+            f"metadata:\n  name: {name}\n  namespace: ${nsBuilders}\n"
+            f"spec:\n{spec_body}\n"
+            "EOF"
+        )
+        assert expected_msg in result, (
+            f"CEL should reject {name!r} with {expected_msg!r} in the "
+            f"message, got: {result!r}. If the apply succeeded or "
+            f"failed for a different reason, the CEL rule at "
+            f"rio-crds/src/builderpool.rs isn't in the deployed CRD — "
+            f"check `helm template | grep x-kubernetes-validations`."
+        )
+        print(f"{name}: CEL rejected with {expected_msg!r} ✓")
+
     # grpcurl against the scheduler's gRPC port (9001) and store (9002).
     # mTLS (tls.enabled=true in vmtest-full.yaml) → present the
     # controller client cert from the fixture's PKI. port-forward is a
@@ -2008,51 +2037,25 @@ let
           )
 
           # ── CEL: ephemeral + maxConcurrentBuilds>1 rejected ───────────
-          # The CRD CEL rule enforces maxConcurrentBuilds==1 in
-          # ephemeral mode (one-pod-per-build isolation breaks if a
-          # pod runs N builds — shared FUSE cache + overlayfs upper).
-          # Negative apply via --dry-run=server: admission-webhook
-          # CEL fires without actually creating the resource. fail()
-          # asserts non-zero exit; the message assert proves it
-          # failed at the RIGHT rule (not, say, systems=[] or image
-          # missing).
-          cel_reject = k3s_server.fail(
-              "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: BuilderPool\n"
-              "metadata:\n"
-              "  name: ephemeral-bad-maxbuilds\n"
-              "  namespace: ${nsBuilders}\n"
-              "spec:\n"
+          # ctrl.pool.ephemeral-single-build — one-pod-per-build isolation
+          # breaks if a pod runs N builds (shared FUSE cache + overlayfs upper).
+          assert_cel_rejects(
+              "ephemeral-bad-maxbuilds",
               "  ephemeral: true\n"
               "  replicas: {min: 0, max: 4}\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  maxConcurrentBuilds: 4\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              "  image: rio-all\n"
-              "EOF"
+              "  image: rio-all",
+              "maxConcurrentBuilds==1",
           )
-          assert "maxConcurrentBuilds==1" in cel_reject, (
-              f"CEL should reject ephemeral+maxConcurrentBuilds>1 "
-              f"with the rule's message, got: {cel_reject!r}. If the "
-              f"apply succeeded or failed for a different reason, the "
-              f"CEL rule at builderpool.rs isn't in the deployed CRD."
-          )
-          print("ephemeral-pool CEL: ephemeral + maxConcurrentBuilds>1 "
-                "rejected at admission ✓")
 
           # ── CEL: ephemeralDeadlineSeconds without ephemeral rejected ──
-          # The field only makes sense on Job pods (activeDeadlineSeconds);
-          # STS pools have no Jobs. CEL gates it to ephemeral:true.
-          cel_reject = k3s_server.fail(
-              "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: BuilderPool\n"
-              "metadata:\n"
-              "  name: sts-with-deadline\n"
-              "  namespace: ${nsBuilders}\n"
-              "spec:\n"
+          # ctrl.pool.ephemeral-deadline — field tunes Job's
+          # activeDeadlineSeconds; STS pools have no Jobs.
+          assert_cel_rejects(
+              "sts-with-deadline",
               "  ephemeral: false\n"
               "  ephemeralDeadlineSeconds: 7200\n"
               "  replicas: {min: 1, max: 4}\n"
@@ -2060,15 +2063,25 @@ let
               "  maxConcurrentBuilds: 1\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              "  image: rio-all\n"
-              "EOF"
+              "  image: rio-all",
+              "ephemeralDeadlineSeconds",
           )
-          assert "ephemeralDeadlineSeconds" in cel_reject, (
-              f"CEL should reject ephemeralDeadlineSeconds on non-"
-              f"ephemeral pool, got: {cel_reject!r}"
+
+          # ── CEL: hostNetwork without privileged rejected ──────────────
+          # ctrl.crd.host-users-network-exclusive — K8s rejects
+          # hostUsers:false with hostNetwork:true at admission; the
+          # non-privileged path sets hostUsers:false (ADR-012).
+          assert_cel_rejects(
+              "hostnet-unprivileged",
+              "  hostNetwork: true\n"
+              "  replicas: {min: 0, max: 4}\n"
+              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
+              "  maxConcurrentBuilds: 1\n"
+              "  fuseCacheSize: 5Gi\n"
+              "  systems: [x86_64-linux]\n"
+              "  image: rio-all",
+              "hostNetwork:true requires privileged:true",
           )
-          print("ephemeral-pool CEL: ephemeralDeadlineSeconds without "
-                "ephemeral:true rejected at admission ✓")
 
           # Apply ephemeral BuilderPool. Spec mirrors vmtest-full.yaml's
           # default pool (image, privileged, resources, grace) except:
@@ -2344,37 +2357,19 @@ let
           )
 
           # ── CEL: sizing=Manifest + maxConcurrentBuilds>1 rejected ─────
-          # Manifest mode's placement filter is per-derivation
-          # (worker.memory_total_bytes >= drv.est_memory_bytes). A pod
-          # running 2 builds could accept a second that fits alone but
-          # not alongside the first. CEL-enforced at CRD admission
-          # (rio-crds/src/builderpool.rs:129). --dry-run=server fires
-          # the admission webhook without creating the resource.
-          cel_reject = k3s_server.fail(
-              "k3s kubectl apply --dry-run=server -f - 2>&1 <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: BuilderPool\n"
-              "metadata:\n"
-              "  name: manifest-bad-maxbuilds\n"
-              "  namespace: ${nsBuilders}\n"
-              "spec:\n"
+          # ctrl.pool.manifest-single-build — per-derivation resource
+          # fit breaks with concurrent builds on one pod (ADR-020).
+          assert_cel_rejects(
+              "manifest-bad-maxbuilds",
               "  sizing: Manifest\n"
               "  replicas: {min: 0, max: 3}\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  maxConcurrentBuilds: 4\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              "  image: rio-all\n"
-              "EOF"
+              "  image: rio-all",
+              "sizing:Manifest requires maxConcurrentBuilds==1",
           )
-          assert "sizing:Manifest requires maxConcurrentBuilds==1" in cel_reject, (
-              f"CEL should reject sizing=Manifest+maxConcurrentBuilds>1 "
-              f"with the rule's message, got: {cel_reject!r}. If the "
-              f"apply succeeded or failed differently, the CEL rule at "
-              f"rio-crds/src/builderpool.rs isn't in the deployed CRD."
-          )
-          print("manifest-pool CEL: Manifest + maxConcurrentBuilds>1 "
-                "rejected at admission ✓")
 
           # Apply manifest BuilderPool. Spec mirrors ephemeral-pool's
           # inline YAML (image:dev, tlsSecretName, privileged) except:
