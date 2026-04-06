@@ -38,6 +38,18 @@ use crate::ratelimit::TenantLimiter;
 ///    token, `channel_close → Drop → abort()` could fire before path 1
 ///    or 2 reached the cancel loop — the abort drops the future, no
 ///    cleanup runs, build leaks until `r[sched.backstop.timeout]`.
+/// 4. **Mid-opcode shutdown** — same token as (3), but firing while
+///    `handle_opcode` is awaiting (e.g. inside `process_build_events`
+///    on the scheduler stream). The opcode-read `select!` is past at
+///    that point. I-157: `wait_for_session_drain` (main.rs) fires
+///    `sessions_shutdown` after `session_drain_secs` with NO pipe
+///    break — the handler's next write never fails because it's
+///    blocked on the inbound stream. The handle_opcode-wrapping
+///    `select!` below catches this; dropping the handler future is
+///    safe (build_id is in `active_build_ids` since SubmitBuild
+///    returned, gRPC stream reset is fine — we send `CancelBuild`
+///    explicitly here, and the SSH wire is dying within main.rs's
+///    `CANCEL_GRACE` regardless).
 ///
 /// The `reason` string propagates to `CancelBuildRequest.reason`:
 /// `"client_disconnect"` for paths 1+2 (the client went away),
@@ -267,7 +279,24 @@ where
 
         debug!(opcode = opcode, "received opcode");
 
-        if let Err(e) = handler::handle_opcode(opcode, reader, writer, ctx).await {
+        // I-157: select on shutdown DURING handle_opcode, not just at
+        // opcode-read above. The build handlers block on
+        // `event_stream.message()` for the duration of a build; if the
+        // token fires WITHOUT a pipe break (wait_for_session_drain
+        // timeout — there is no `ChannelSession::Drop` for a half-open
+        // TCP that russh hasn't noticed), nothing wakes the handler.
+        // Dropping the future on token fire is safe: the only state we
+        // need is `active_build_ids`, populated before the long await.
+        let opcode_result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                debug!("shutdown signal during handle_opcode");
+                cancel_active_builds(ctx, "channel_close").await;
+                return Ok(());
+            }
+            r = handler::handle_opcode(opcode, reader, writer, ctx) => r,
+        };
+        if let Err(e) = opcode_result {
             // Mid-opcode disconnect: handler error is typically BrokenPipe
             // on a response write (client dropped during wopBuildDerivation
             // or wopBuildPathsWithResults). The build handler leaves the
