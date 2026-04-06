@@ -1070,3 +1070,139 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
     drop(stream_rx);
     Ok(())
 }
+
+/// Build a DAG with `n_ready` Ready parents, each depending on `paths_each`
+/// children whose `expected_output_paths` they contribute to the closure.
+/// Every child is shared by all parents below it (index-wise) so lower-index
+/// paths get the highest frequency count. Every parent P(i) gets `i+1`
+/// UUIDs inserted into `interested_builds` — so fan-in is P0<P1<...<P(n-1).
+///
+/// Returns the fully-populated DAG. No actor, no PG — a pure unit-test
+/// fixture for `compute_initial_prefetch_paths`.
+fn build_fanned_dag(n_ready: usize, paths_each: usize) -> crate::dag::DerivationDag {
+    let mut dag = crate::dag::DerivationDag::new();
+
+    // Children: each child C(j) has a single expected_output_path.
+    // test_store_path(format!("child-{j:04}")) gives deterministic
+    // lex ordering so the frequency-sort tie-break is predictable.
+    let n_children = n_ready + paths_each - 1;
+    let child_nodes: Vec<_> = (0..n_children)
+        .map(|j| {
+            let mut c = make_test_node(&format!("child-{j:04}"), "x86_64-linux");
+            c.expected_output_paths = vec![test_store_path(&format!("child-{j:04}-out"))];
+            c
+        })
+        .collect();
+
+    // Parents: P(i) depends on children C(i)..C(i+paths_each). The
+    // sliding window means C(paths_each-1) is shared by paths_each
+    // parents, C(0) by 1 parent, C(n_children-1) by 1 parent, etc.
+    // Actually: C(j)'s parent-count = min(j+1, paths_each, n_ready,
+    // n_children-j) — a trapezoidal distribution peaking in the middle.
+    let parent_nodes: Vec<_> = (0..n_ready)
+        .map(|i| make_test_node(&format!("parent-{i:04}"), "x86_64-linux"))
+        .collect();
+    let mut edges = Vec::with_capacity(n_ready * paths_each);
+    for i in 0..n_ready {
+        for j in i..i + paths_each {
+            edges.push(make_test_edge(
+                &format!("parent-{i:04}"),
+                &format!("child-{j:04}"),
+            ));
+        }
+    }
+
+    // Single merge gets all nodes+edges in. build_id is one shared
+    // UUID (every parent gets interested_builds.len()==1 from this);
+    // we'll bump per-parent counts below via node_mut.
+    let all_nodes: Vec<_> = parent_nodes.into_iter().chain(child_nodes).collect();
+    dag.merge(Uuid::new_v4(), &all_nodes, &edges, "").unwrap();
+
+    // Set statuses: parents → Ready, children → Completed.
+    // `approx_input_closure` walks children; Completed children still
+    // have their `expected_output_paths` set (persisted at merge time).
+    for j in 0..n_children {
+        dag.node_mut(&format!("child-{j:04}"))
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Completed);
+    }
+    for i in 0..n_ready {
+        let p = dag.node_mut(&format!("parent-{i:04}")).unwrap();
+        p.set_status_for_test(DerivationStatus::Ready);
+        // Fan-in: P(i) gets i ADDITIONAL UUIDs (merge already inserted
+        // one). So P0.interested_builds.len()==1, P39.len()==40. The
+        // fan-in sort picks P39 first, P0 last.
+        for _ in 0..i {
+            p.interested_builds.insert(Uuid::new_v4());
+        }
+    }
+
+    dag
+}
+
+// r[verify sched.assign.warm-gate]
+/// Determinism: same DAG state → same PrefetchHint contents.
+/// `HashMap` iteration is random; T1+T2's fan-in + frequency sort
+/// makes the hint reproducible. Pre-T1+T2 this test is flaky (passes
+/// ~1/N! of the time for N-element random iteration orderings).
+///
+/// Also asserts the FIRST path is the highest-frequency one — proving
+/// the frequency sort actually fired (proves-nothing guard: a test
+/// that only checks `a == b` would pass if both were empty or both
+/// selected the same arbitrary set by accident).
+#[test]
+fn warm_gate_initial_hint_is_deterministic() {
+    // 40 Ready parents (>MAX_READY_TO_SCAN=32), each with 4 child
+    // paths in a sliding window → 43 unique children. Plus: we want
+    // >100 unique paths so the cap is exercised. Use paths_each=5
+    // and also attach per-parent UNIQUE paths below.
+    //
+    // Actually simpler: 40 parents × 5 children window = 44 unique
+    // child paths. To exceed 100, bump paths_each to 70. That's 109
+    // unique children with the middle-band children shared by up to
+    // 40 parents (the sliding-window trapezoid). The top-fan-in
+    // parents (P32..P39, interested_builds.len() 33..40) select into
+    // the scan; their children are C32..C108 (overlap: C39..C101
+    // appears in multiple). After the MAX_READY_TO_SCAN=32 cap, the
+    // 32 highest-fan-in parents are P8..P39 (len 9..40).
+    let n_ready = 40;
+    let paths_each = 70;
+    let dag_a = build_fanned_dag(n_ready, paths_each);
+    let dag_b = build_fanned_dag(n_ready, paths_each);
+
+    let hint_a = compute_initial_prefetch_paths(&dag_a);
+    let hint_b = compute_initial_prefetch_paths(&dag_b);
+
+    assert_eq!(
+        hint_a, hint_b,
+        "same DAG state must yield identical initial hint"
+    );
+    assert_eq!(hint_a.len(), 100, "cap at MAX_PREFETCH_PATHS");
+
+    // Proves-nothing guard: highest-frequency path is FIRST. The 32
+    // selected parents are P8..P39 (interested_builds.len() 9..40).
+    // Each P(i) references C(i)..C(i+69). The intersection across all
+    // 32 is C39..C77; within that band every child is referenced by
+    // all 32 parents (frequency=32). Tie-break on path string gives
+    // C39 first.
+    //
+    // Check the stronger property: the first path has the expected
+    // maximum frequency, which proves T2's sort fired (not just T1's
+    // ready-sort making the same arbitrary-cap happen twice).
+    let expected_first = test_store_path("child-0039-out");
+    assert_eq!(
+        hint_a[0], expected_first,
+        "highest-frequency path must be first (proves frequency sort fired)"
+    );
+
+    // Also check the fan-in sort fired: scanning only 32 of 40 Ready
+    // nodes means low-fan-in parents (P0..P7) are excluded. P0's only
+    // unique child is C0..C4 (no other parent in the scan references
+    // C0..C7). If C0's path were present, T1's sort DIDN'T exclude P0.
+    let p0_unique = test_store_path("child-0000-out");
+    assert!(
+        !hint_a.contains(&p0_unique),
+        "lowest-fan-in parent P0 must be excluded by the MAX_READY_TO_SCAN \
+         cap (proves fan-in sort fired)"
+    );
+}
