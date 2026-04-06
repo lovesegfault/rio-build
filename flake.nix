@@ -1256,7 +1256,14 @@
           ci = pkgs.linkFarmFromDrvs "rio-ci" (
             ciBaseDrvs
             ++ builtins.attrValues fuzz.runs
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTests)
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
+              builtins.attrValues vmTests
+              # cov-smoke: one coverage-mode VM scenario, asserts
+              # profraw→lcov pipeline works. ~5min. Catches
+              # "coverage infra broken" at merge-gate instead of
+              # 118 commits later via backgrounded coverage-full.
+              ++ [ coverage.smoke ]
+            )
           );
 
           # --------------------------------------------------------------
@@ -1995,6 +2002,10 @@
             #   result/html/       — genhtml report
             #   result/per-test/   — vm-<scenario>.lcov individual breakdowns
             coverage-full = coverage.full;
+            # cov-smoke: fast (~5min) one-scenario coverage-infra
+            # smoke. Also in .#ci (blocking). Manual run for
+            # debugging: `nix build .#cov-smoke && cat result/summary`.
+            cov-smoke = coverage.smoke;
             # Same data as coverage-full, HTML-only output at result/
             # (no lcov.info / per-test subdirs). Mirrors coverage-html's
             # relationship to the unit-test coverage check.

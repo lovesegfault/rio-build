@@ -502,6 +502,63 @@ def clear_halt() -> bool:
         return True
     return False
 
+
+# ─── coverage-full infra-break heuristic (P0484) ─────────────────────────────
+# .#coverage-full is backgrounded (merger step 6) and writes CoverageResult
+# to coverage-pending.jsonl. /dag-tick consumes these as test-gap followups
+# — "write a test", not "undo the merge". That is correct for ONE scenario
+# failing (genuine test regression). But when ≥3 scenarios fail, it is not a
+# test-gap — the coverage pipeline itself is broken (profraw collection,
+# llvm-cov export, lcov merge, or the instrumented build). The PSA break
+# was all-scenarios-red and went 118 commits undetected because each red
+# got filed as an individual test-gap. This heuristic writes queue-halted
+# instead — same sentinel P0479 uses for clause-4 red-test detection.
+
+# Matches both the VM test drv (scenario did not boot / test script failed)
+# and the per-test lcov drv (profraw pipeline broke). nix/coverage.nix
+# names the latter rio-cov-<scenario>. Captures scenario name from either.
+_COV_SCENARIO_FAIL_RE = re.compile(
+    r"^error: Cannot build '/nix/store/[a-z0-9]+-"
+    r"(?:vm-test-run|rio-cov)-([\w-]+)\.drv'",
+    re.MULTILINE,
+)
+
+# ≥3 scenarios red = infrastructure break. 1-2 could be genuine test
+# regressions in specific scenarios; 3+ means the common substrate
+# (instrumented build, profraw tarball machinery, lcov pipeline) is broken.
+_COV_INFRA_THRESHOLD = 3
+
+
+def coverage_full_red(log_path: str) -> tuple[int, list[str]]:
+    """Count distinct scenario failures in a .#coverage-full build log.
+    Returns (count, sorted_scenario_names). Called by build.coverage()
+    post-red to decide between test-gap followup (coverage-pending.jsonl
+    → /dag-tick) and queue-halted (block new /implement dispatch)."""
+    try:
+        log = Path(log_path).read_text()
+    except (FileNotFoundError, OSError):
+        return 0, []
+    scenarios = sorted(set(_COV_SCENARIO_FAIL_RE.findall(log)))
+    return len(scenarios), scenarios
+
+
+def coverage_maybe_halt(log_path: str) -> bool:
+    """Call after a red .#coverage-full build. Writes queue-halted if the
+    failure is infrastructure-class (≥_COV_INFRA_THRESHOLD scenarios).
+    Returns True if halted. The CoverageResult row still goes to
+    coverage-pending.jsonl either way — this is ADDITIVE (halt + followup,
+    not halt instead-of followup)."""
+    n, scenarios = coverage_full_red(log_path)
+    if n >= _COV_INFRA_THRESHOLD:
+        preview = ", ".join(scenarios[:5]) + ("..." if n > 5 else "")
+        halt_queue(
+            f"coverage-full-red: {n} scenarios failed ({preview}) — "
+            f"infrastructure-class break, not test-gap. Fix the coverage "
+            f"pipeline before dispatching more merges."
+        )
+        return True
+    return False
+
 # Files that provably don't affect .#ci derivation hash. .claude/ is
 # excluded via fileset.difference (P0304-T29); docs/ and *.md are
 # docs-only. Anything under rio-*/ or nix/ CAN change the hash.

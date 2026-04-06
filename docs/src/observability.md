@@ -212,6 +212,9 @@ Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop: gateway
 r[obs.metric.builder-util]
 Builder utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled from the builder's parent cgroup every 10s by `utilization_reporter_loop`. The same loop publishes a `ResourceSnapshot` that the heartbeat reads for `HeartbeatRequest.resources` — one sampling site means Prometheus and `ListWorkers` always agree. These capture the whole builder tree (rio-builder + per-build sub-cgroups + all subprocesses). CPU fraction >1.0 on multi-core is expected under full load. Memory fraction stays 0.0 if `memory.max` is unbounded — only meaningful when the pod has a memory limit configured.
 
+r[obs.metric.fetcher-util]
+The `fetcher-utilization.json` Grafana dashboard's cAdvisor pod selectors MUST use the `-fetchers-` infix regex (`pod=~".*-fetchers-.*"`) to match the controller's `format!("{name}-fetchers")` STS naming. A prefix-anchored regex (`rio-fetchers.*`) works only when the FetcherPool is named `rio`; renames or additional pools silently blank the panels.
+
 ### Controller Metrics
 
 r[obs.metric.controller]
