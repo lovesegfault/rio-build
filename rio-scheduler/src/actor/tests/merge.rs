@@ -1149,3 +1149,100 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
 
     Ok(())
 }
+
+// ===========================================================================
+// Large-DAG merge perf bound (I-139)
+// ===========================================================================
+
+/// I-139: end-to-end `handle_merge_dag` perf bound on a 50k-node /
+/// ~250k-edge synthetic DAG against a real (ephemeral) PG.
+///
+/// Before the fix, the initial-states persist phase did one
+/// `update_derivation_status` round-trip PER newly-inserted node. At
+/// ~1.8ms RTT × 50k = ~90s (the 153k-node production case was ~278s).
+/// After batching to three `ANY($1::text[])` updates, this phase is a
+/// handful of round-trips regardless of DAG size — the merge is
+/// dominated by the (already-batched) UNNEST insert + ANALYZE.
+///
+/// 30s bound: ephemeral PG initdb is single-disk, debug build, no
+/// optimizer; the UNNEST insert of 50k rows + ANALYZE alone is several
+/// seconds. The point is "not O(nodes) round-trips", not a microbench.
+///
+/// No store_client (`setup()` passes None) so `check_cached_outputs`
+/// returns empty → all 50k nodes flow through `compute_initial_states`
+/// → exactly the path that regressed.
+///
+/// **Regression guard:** localhost Unix-socket RTT (~35μs) is too fast
+/// for the wall-clock delta to discriminate reliably. Instead assert
+/// on `pg_stat_database.xact_commit`: each pool-level `execute()`
+/// autocommits, so per-node updates show as ~N extra transactions;
+/// batched updates are O(1) regardless of N. Bound: `< N/2` (loose
+/// enough for the dozen legitimate per-build queries + ANALYZE; tight
+/// enough that one-per-node is a hard fail).
+#[tokio::test]
+async fn test_handle_merge_dag_large_perf_bound() -> TestResult {
+    const N: usize = 50_000;
+    const FANOUT: usize = 5;
+
+    let (db, handle, _task) = setup().await;
+
+    async fn xact_commit(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_database")
+    }
+
+    // Same shape as dag/tests.rs make_wide_dag (path helper inlined —
+    // that one is module-private).
+    let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
+    let nodes: Vec<_> = (0..N)
+        .map(|i| rio_proto::dag::DerivationNode {
+            drv_hash: format!("h{i:08}"),
+            drv_path: path(i),
+            ..make_test_node("x", "x86_64-linux")
+        })
+        .collect();
+    let mut edges = Vec::with_capacity(N * FANOUT);
+    for i in FANOUT..N {
+        for j in 1..=FANOUT {
+            edges.push(rio_proto::dag::DerivationEdge {
+                parent_drv_path: path(i),
+                child_drv_path: path(i - j),
+            });
+        }
+    }
+
+    let build_id = Uuid::new_v4();
+    let xact_before = xact_commit(&db.pool).await;
+    let t = std::time::Instant::now();
+    let _rx = merge_dag(&handle, build_id, nodes, edges, false).await?;
+    let elapsed = t.elapsed();
+    barrier(&handle).await;
+    let xact_delta = xact_commit(&db.pool).await - xact_before;
+    eprintln!(
+        "I-139 actor bench: {N} nodes / {} edges — handle_merge_dag {elapsed:?}, \
+         {xact_delta} PG transactions",
+        (N - FANOUT) * FANOUT
+    );
+
+    assert!(
+        xact_delta < (N / 2) as i64,
+        "handle_merge_dag of {N} nodes issued {xact_delta} PG transactions \
+         (~1 per node); per-node DB round-trip regression (I-139). \
+         Expected O(1) batched updates."
+    );
+    assert!(
+        elapsed.as_secs() < 30,
+        "handle_merge_dag of {N} nodes took {elapsed:?} (>30s); \
+         per-node DB round-trip regression in initial-states persist (I-139)"
+    );
+
+    // Sanity: build is Active, all nodes registered.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
+    assert_eq!(status.total_derivations, N as u32);
+    Ok(())
+}

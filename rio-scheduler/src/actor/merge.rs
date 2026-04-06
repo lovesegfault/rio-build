@@ -27,6 +27,18 @@ impl DagActor {
             jti,
             jwt_token,
         } = req;
+        // I-139: per-phase timing. handle_merge_dag was >300s for a
+        // 153k-node / 837k-edge DAG with only ~22s in the batched DB
+        // phase; the rest had no logging. Each phase now self-reports
+        // so future regressions localize immediately.
+        let t_total = Instant::now();
+        let mut t_phase = Instant::now();
+        macro_rules! phase {
+            ($name:literal) => {
+                debug!(elapsed = ?t_phase.elapsed(), phase = $name, "merge phase");
+                t_phase = Instant::now();
+            };
+        }
         // rio_scheduler_builds_total is incremented at terminal transition
         // (complete_build/transition_build_to_failed/handle_cancel_build)
         // with an outcome label, so SLI queries can compute success rate.
@@ -64,6 +76,7 @@ impl DagActor {
             }
             None => (nodes, edges),
         };
+        phase!("0-topdown-roots");
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
@@ -77,6 +90,7 @@ impl DagActor {
                 jti.as_deref(),
             )
             .await?;
+        phase!("1-db-build-row");
 
         // === Step 2: DAG merge (BEFORE in-memory map inserts) ========
         // If merge fails (cycle), nothing is in the actor's maps; only the
@@ -95,6 +109,7 @@ impl DagActor {
             }
         };
         let newly_inserted = &merge_result.newly_inserted;
+        phase!("2-dag-merge-inmem");
 
         // === Step 3: In-memory map inserts ============================
         let (event_tx, event_rx) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
@@ -140,6 +155,7 @@ impl DagActor {
             .cloned()
             .chain(existing_reprobe.iter().cloned())
             .collect();
+        phase!("3-inmem-maps");
 
         // === Step 4: Scheduler-side cache check (BEFORE DB persist) ====
         // Query the store for expected_output_paths of probe_set
@@ -170,6 +186,7 @@ impl DagActor {
                 return Err(e);
             }
         };
+        phase!("4-check-cached-outputs");
 
         // === Step 5: DB persistence with rollback on error ============
         // If any of these fail, roll back the merge AND the map inserts
@@ -183,6 +200,7 @@ impl DagActor {
             self.cleanup_failed_merge(build_id, &merge_result).await;
             return Err(e);
         }
+        phase!("5-persist-merge-db");
 
         // Transition build to active. If DB write fails, roll back everything.
         // Pending→Active is always a valid transition for a fresh build; we
@@ -212,6 +230,12 @@ impl DagActor {
         let mut cached_count = 0u32;
 
         let mut reprobe_unlocked: Vec<DrvHash> = Vec::new();
+        // I-139: collect for one batched Completed update after the
+        // loop instead of N sequential round-trips. clear_poison and
+        // upsert_path_tenants_for stay per-hit — both are gated
+        // (Poisoned-only / tenant_id-present-only) and rare relative
+        // to cached_hits.len().
+        let mut completed_batch: Vec<DrvHash> = Vec::with_capacity(cached_hits.len());
         for (drv_hash, output_paths) in &cached_hits {
             let Some(node) = node_index.get(drv_hash.as_str()) else {
                 continue;
@@ -261,13 +285,7 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, error = %e,
                       "failed to clear poison in PG after re-probe cache hit");
             }
-            if let Err(e) = self
-                .db
-                .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
-                .await
-            {
-                warn!(drv_hash = %drv_hash, error = %e, "failed to persist cache-hit status");
-            }
+            completed_batch.push(drv_hash.clone());
 
             if is_reprobe {
                 info!(drv_hash = %drv_hash, from = ?from_status,
@@ -296,6 +314,17 @@ impl DagActor {
             // policy. output_paths were just set above.
             self.upsert_path_tenants_for(drv_hash).await;
         }
+        if !completed_batch.is_empty() {
+            let hashes: Vec<&str> = completed_batch.iter().map(DrvHash::as_str).collect();
+            if let Err(e) = self
+                .db
+                .update_derivation_status_batch(&hashes, DerivationStatus::Completed)
+                .await
+            {
+                warn!(count = hashes.len(), error = %e,
+                      "failed to persist cache-hit Completed status batch");
+            }
+        }
         // I-099: advance pre-existing Queued dependents of re-probe
         // hits. Newly-inserted dependents are handled by
         // compute_initial_states; this is the pre-existing-DAG side.
@@ -314,6 +343,7 @@ impl DagActor {
                 self.push_ready(ready_hash);
             }
         }
+        phase!("6a-cached-hits-loop");
 
         // Compute critical-path priorities for newly-inserted nodes.
         // Done AFTER cache-hit transitions so completed derivations
@@ -325,6 +355,7 @@ impl DagActor {
         // subgraph raises their priority. The ready queue reads these
         // for BinaryHeap ordering.
         crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
+        phase!("6b-critical-path");
 
         // I-047: pre-existing Completed nodes may have stale output_paths
         // (GC deleted the output between the node's original completion and
@@ -336,6 +367,7 @@ impl DagActor {
         let stale_reset = self
             .verify_preexisting_completed(&nodes, newly_inserted, &cached_hits)
             .await;
+        phase!("6c-verify-preexisting");
 
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
@@ -346,72 +378,90 @@ impl DagActor {
             .cloned()
             .collect();
         let initial_states = self.dag.compute_initial_states(&remaining_new);
+        phase!("6d-compute-initial-states");
 
         // Track whether any newly inserted node was immediately marked
         // DependencyFailed (because a dep is already poisoned). If so, the
         // build may need to fail (!keepGoing) or terminate early (keepGoing).
         let mut first_dep_failed: Option<DrvHash> = None;
 
+        // I-139: this loop previously did one update_derivation_status
+        // round-trip PER NODE. For a 153k-node fresh DAG that's 153k
+        // sequential PG awaits inside the single-threaded actor — ~278s
+        // at ~1.8ms RTT. Split into an in-memory transition pass +
+        // three batched ANY($1::text[]) updates (one per target status).
+        // Same log-and-continue semantics as before: persist failures
+        // don't abort (build is already Active).
+        let mut by_status: [Vec<DrvHash>; 3] = Default::default();
+        let bucket = |s: DerivationStatus| match s {
+            DerivationStatus::Ready => 0,
+            DerivationStatus::Queued => 1,
+            DerivationStatus::DependencyFailed => 2,
+            _ => unreachable!("compute_initial_states only emits Ready/Queued/DependencyFailed"),
+        };
+
         for (drv_hash, target_status) in &initial_states {
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                match target_status {
-                    DerivationStatus::Ready => {
-                        // Transition created -> queued -> ready
-                        if let Err(e) = state.transition(DerivationStatus::Queued) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
-                        }
-                        if let Err(e) = state.transition(DerivationStatus::Ready) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Queued->Ready transition failed");
-                        }
-                        if let Err(e) = self
-                            .db
-                            .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
-                            .await
-                        {
-                            error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status (build is Active; continuing)");
-                        }
-                        // push_ready computes critical-path priority +
-                        // interactive boost. Old push_front/push_back
-                        // split is now a number, not a position.
-                        self.push_ready(drv_hash.clone());
+            let Some(state) = self.dag.node_mut(drv_hash) else {
+                continue;
+            };
+            match target_status {
+                DerivationStatus::Ready => {
+                    // Transition created -> queued -> ready
+                    if let Err(e) = state.transition(DerivationStatus::Queued) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
                     }
-                    DerivationStatus::Queued => {
-                        if let Err(e) = state.transition(DerivationStatus::Queued) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
-                        }
-                        if let Err(e) = self
-                            .db
-                            .update_derivation_status(drv_hash, DerivationStatus::Queued, None)
-                            .await
-                        {
-                            error!(drv_hash = %drv_hash, error = %e, "failed to persist Queued status (build is Active; continuing)");
-                        }
+                    if let Err(e) = state.transition(DerivationStatus::Ready) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Queued->Ready transition failed");
                     }
-                    DerivationStatus::DependencyFailed => {
-                        if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
-                            warn!(drv_hash = %drv_hash, error = %e, "Created->DependencyFailed transition failed");
-                        }
-                        if let Err(e) = self
-                            .db
-                            .update_derivation_status(
-                                drv_hash,
-                                DerivationStatus::DependencyFailed,
-                                None,
-                            )
-                            .await
-                        {
-                            error!(drv_hash = %drv_hash, error = %e, "failed to persist DependencyFailed status (build is Active; continuing)");
-                        }
-                        first_dep_failed.get_or_insert_with(|| drv_hash.clone());
-                        debug!(
-                            drv_hash = %drv_hash,
-                            "dep already poisoned at merge; marking DependencyFailed"
-                        );
-                    }
-                    _ => {}
+                    // push_ready computes critical-path priority +
+                    // interactive boost. Old push_front/push_back
+                    // split is now a number, not a position.
+                    self.push_ready(drv_hash.clone());
                 }
+                DerivationStatus::Queued => {
+                    if let Err(e) = state.transition(DerivationStatus::Queued) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
+                    }
+                }
+                DerivationStatus::DependencyFailed => {
+                    if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
+                        warn!(drv_hash = %drv_hash, error = %e, "Created->DependencyFailed transition failed");
+                    }
+                    first_dep_failed.get_or_insert_with(|| drv_hash.clone());
+                    debug!(
+                        drv_hash = %drv_hash,
+                        "dep already poisoned at merge; marking DependencyFailed"
+                    );
+                }
+                _ => continue,
+            }
+            by_status[bucket(*target_status)].push(drv_hash.clone());
+        }
+        for (i, status) in [
+            DerivationStatus::Ready,
+            DerivationStatus::Queued,
+            DerivationStatus::DependencyFailed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hashes: Vec<&str> = by_status[i].iter().map(DrvHash::as_str).collect();
+            if hashes.is_empty() {
+                continue;
+            }
+            if let Err(e) = self
+                .db
+                .update_derivation_status_batch(&hashes, status)
+                .await
+            {
+                error!(
+                    status = ?status, count = hashes.len(), error = %e,
+                    "failed to persist initial-state status batch \
+                     (build is Active; continuing)"
+                );
             }
         }
+        phase!("6e-initial-states-persist");
 
         // Also handle nodes that already existed. A pre-existing Completed
         // node counts as cached; a pre-existing Poisoned/DependencyFailed
@@ -467,6 +517,7 @@ impl DagActor {
                 _ => {}
             }
         }
+        phase!("6f-preexisting-nodes-loop");
 
         // Update build's cached count + persist initial denorm columns.
         if let Some(build) = self.builds.get_mut(&build_id) {
@@ -521,6 +572,15 @@ impl DagActor {
             // Dispatch ready derivations to workers
             self.dispatch_ready().await;
         }
+        phase!("7-dispatch");
+        let _ = &mut t_phase; // last write is intentionally unread
+        debug!(
+            elapsed = ?t_total.elapsed(),
+            nodes = nodes.len(),
+            edges = edges.len(),
+            newly_inserted = newly_inserted.len(),
+            "handle_merge_dag total"
+        );
 
         Ok(event_rx)
     }

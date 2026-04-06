@@ -737,6 +737,75 @@ fn test_canonical_returns_none_for_unknown() {
     assert!(dag.canonical("never-inserted").is_none());
 }
 
+// ---------------------------------------------------------------------------
+// Large-DAG perf bound (I-139)
+// ---------------------------------------------------------------------------
+
+/// Build a synthetic wide DAG: `n` nodes, each node `i` (for `i >= fanout`)
+/// depends on `fanout` earlier nodes `i-1..i-fanout`. ~`n*fanout` edges.
+fn make_wide_dag(n: usize, fanout: usize) -> (Vec<DerivationNode>, Vec<DerivationEdge>) {
+    let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
+    let nodes: Vec<_> = (0..n)
+        .map(|i| make_node_with_path(&format!("h{i:08}"), &path(i), "x86_64-linux"))
+        .collect();
+    let mut edges = Vec::with_capacity(n * fanout);
+    for i in fanout..n {
+        for j in 1..=fanout {
+            edges.push(make_edge_with_paths(&path(i), &path(i - j)));
+        }
+    }
+    (nodes, edges)
+}
+
+/// I-139: in-memory `merge()` + `compute_initial_states()` must stay
+/// sub-linear-ish on a 100k-node / ~500k-edge DAG. The original report
+/// was 153k nodes / 837k edges → >300s end-to-end; this asserts the
+/// in-memory phase isn't the bottleneck (it should be well under 10s
+/// even in debug). If THIS test fails, the bug is in `dag/mod.rs`. If
+/// it passes but `handle_merge_dag` is still slow, the bug is in the
+/// actor wrapper (per-node DB round-trips).
+///
+/// Release-mode `cargo test -p rio-scheduler --release merge_large_dag`
+/// to get a representative number; debug is ~5-10× slower but the
+/// 10s bound has plenty of headroom either way.
+#[test]
+fn test_merge_large_dag_perf_bound() -> anyhow::Result<()> {
+    const N: usize = 100_000;
+    const FANOUT: usize = 5;
+    let (nodes, edges) = make_wide_dag(N, FANOUT);
+    assert_eq!(edges.len(), (N - FANOUT) * FANOUT);
+
+    let mut dag = DerivationDag::new();
+    let build_id = Uuid::new_v4();
+
+    let t = std::time::Instant::now();
+    let result = dag.merge(build_id, &nodes, &edges, "")?;
+    let merge_elapsed = t.elapsed();
+
+    let t = std::time::Instant::now();
+    let states = dag.compute_initial_states(&result.newly_inserted);
+    let cis_elapsed = t.elapsed();
+
+    eprintln!(
+        "I-139 bench: {N} nodes / {} edges — merge {merge_elapsed:?}, \
+         compute_initial_states {cis_elapsed:?}",
+        edges.len()
+    );
+
+    assert_eq!(result.newly_inserted.len(), N);
+    assert_eq!(states.len(), N);
+    assert!(
+        merge_elapsed.as_secs() < 10,
+        "in-memory merge of {N} nodes took {merge_elapsed:?} (>10s); \
+         O(n²) regression in dag::merge"
+    );
+    assert!(
+        cis_elapsed.as_secs() < 10,
+        "compute_initial_states on {N} nodes took {cis_elapsed:?} (>10s)"
+    );
+    Ok(())
+}
+
 /// The interning INVARIANT: all DrvHash clones flowing out of DAG accessors
 /// are ptr-equal to the canonical key in `nodes`. This holds because
 /// `merge()` inserts clones of the SAME local Arc into `nodes`,
