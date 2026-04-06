@@ -263,6 +263,16 @@ pub struct RetryPolicy {
     /// otherwise hot-loop forever. Observed: 9748 re-dispatches in
     /// one session before the CA-path-propagation fix landed.
     pub max_infra_retries: u32,
+    /// Seconds since the LAST infra failure after which the
+    /// `infra_retry_count` is reset to 0. Infra failures are by
+    /// definition transient — N quick failures suggests a
+    /// misclassified permanent error, but N failures spread over
+    /// hours are independent incidents and shouldn't accumulate
+    /// toward poison. I-127: a leaked PutPath lock caused 4 builders
+    /// in a row to hit "concurrent PutPath"; the drv was poisoned at
+    /// 99.7% despite being fine. With a window, the counter resets
+    /// once the cluster self-heals (lock released, store recovered).
+    pub infra_retry_window_secs: f64,
     /// Base backoff duration in seconds.
     pub backoff_base_secs: f64,
     /// Backoff multiplier.
@@ -280,14 +290,26 @@ impl Default for RetryPolicy {
             // InfrastructureFailure has NO backoff (re-dispatch is
             // immediate) so a misclassified permanent failure hot-loops.
             // Observed: 12 derivations cycled 146 times in 6 minutes
-            // when an S3 auth failure was reported as infra. Each cycle
-            // re-ran the full build. At 20 (the old default), that's
-            // ~240 wasted builds before the batch poisons. At 5, a
-            // genuinely flapping worker still gets a fair shot (5
-            // immediate retries finishes in seconds for a fast build)
-            // but a permanent failure surfaces as poison in under a
-            // minute instead of chewing through the cluster.
-            max_infra_retries: 5,
+            // when an S3 auth failure was reported as infra. The cap
+            // converts that into a visible poison.
+            //
+            // I-127 raised 5→10 + added the time-window reset below.
+            // 5 was too tight under shallow-1024x: a leaked PutPath
+            // lock made 4 builders in a row report infra → poison at
+            // 99.7% on a perfectly buildable drv. 10 attempts (no
+            // backoff, so still seconds-to-low-minutes for fast
+            // builds) gives the cluster room to self-heal, and the
+            // 5-min window means slow-drip failures don't accumulate.
+            // A true misclassified permanent failure still poisons in
+            // 10 immediate cycles — well under a minute.
+            max_infra_retries: 10,
+            // 5min: long enough that a stuck lock (I-125a's leaked
+            // PutPath, ~tens of seconds to recover) or a store
+            // restart doesn't compound across attempts; short enough
+            // that the 9748-dispatch hot-loop scenario above
+            // (146 cycles / 6min ≈ 2.5s/cycle) still hits the cap
+            // before the window resets it.
+            infra_retry_window_secs: 300.0,
             backoff_base_secs: 5.0,
             backoff_multiplier: 2.0,
             backoff_max_secs: 300.0,

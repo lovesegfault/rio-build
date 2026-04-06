@@ -404,6 +404,15 @@ pub struct DerivationState {
     /// recovery resets to 0 (conservative — won't spuriously poison
     /// after restart).
     pub infra_retry_count: u32,
+    /// Timestamp of the most recent InfrastructureFailure that
+    /// incremented `infra_retry_count`. Drives the time-window reset
+    /// (I-127): if the last infra failure was longer ago than
+    /// `RetryPolicy::infra_retry_window_secs`, `infra_retry_count`
+    /// resets to 0 before the cap check — sparse failures over a
+    /// long build don't accumulate toward poison. In-memory only;
+    /// recovery resets to None (same conservative direction as
+    /// `infra_retry_count: 0` above).
+    pub last_infra_failure_at: Option<Instant>,
     /// Workers that have failed building this derivation. Drives
     /// `best_executor()` exclusion + poison threshold in distinct mode.
     pub failed_builders: HashSet<ExecutorId>,
@@ -519,6 +528,7 @@ impl DerivationState {
             drv_content: node.drv_content.clone(),
             retry_count: 0,
             infra_retry_count: 0,
+            last_infra_failure_at: None,
             failed_builders: HashSet::new(),
             failure_count: 0,
             poisoned_at: None,
@@ -600,6 +610,7 @@ impl DerivationState {
             retry_count: row.retry_count.max(0) as u32,
             // In-memory only — recovery resets to 0 (conservative).
             infra_retry_count: 0,
+            last_infra_failure_at: None,
             // failure_count: initialize from failed_builders.len() —
             // same-worker repeats are lost (in-mem only), conservative.
             failure_count: row.failed_builders.len() as u32,
@@ -677,6 +688,7 @@ impl DerivationState {
             drv_content: Vec::new(),
             retry_count: 0,
             infra_retry_count: 0,
+            last_infra_failure_at: None,
             failure_count: row.failed_builders.len() as u32,
             failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
             poisoned_at: Some(poisoned_at),
@@ -778,6 +790,7 @@ impl DerivationState {
     pub fn clear_failure_history(&mut self) {
         self.retry_count = 0;
         self.infra_retry_count = 0;
+        self.last_infra_failure_at = None;
         self.failed_builders.clear();
         self.failure_count = 0;
         self.poisoned_at = None;

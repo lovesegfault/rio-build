@@ -496,7 +496,7 @@ impl DagActor {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
                 // WITHOUT inserting into failed_builders.
-                self.handle_infrastructure_failure(drv_hash, executor_id)
+                self.handle_infrastructure_failure(drv_hash, executor_id, &result.error_msg)
                     .await;
             }
             rio_proto::build_types::BuildResultStatus::PermanentFailure
@@ -1476,10 +1476,46 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
+        error_msg: &str,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
+
+        // I-127: "concurrent PutPath" is NEVER counted toward the
+        // infra cap. It means another builder is uploading the SAME
+        // output — the drv almost certainly succeeded elsewhere; this
+        // worker just lost the upload race. I-125b makes the builder
+        // wait-then-adopt on this error, so reaching here means the
+        // wait timed out (other uploader stuck/slow). Re-dispatch
+        // freely: either the path appears (next attempt → AlreadyValid)
+        // or the lock clears and the upload retries. Poisoning on this
+        // is exactly the wrong outcome — observed under shallow-1024x
+        // when a leaked lock (I-125a) made 4 builders hit this in a
+        // row → poison at 99.7%.
+        //
+        // Substring match mirrors `is_concurrent_put_path` in
+        // rio-builder/src/upload.rs (the store emits this exact
+        // phrase in its Aborted status).
+        let exempt_from_cap = error_msg.contains("concurrent PutPath");
+
+        // I-127 time-window reset: if the last counted infra failure
+        // was longer ago than `infra_retry_window_secs`, treat this as
+        // a fresh incident — reset the counter before the cap check.
+        // Sparse failures over a long build (4 fails over an hour)
+        // are independent; only a tight burst (4 fails in 2min)
+        // suggests a misclassified permanent error.
+        if let Some(last) = state.last_infra_failure_at
+            && last.elapsed().as_secs_f64() > self.retry_policy.infra_retry_window_secs
+        {
+            debug!(
+                drv_hash = %drv_hash,
+                prev_count = state.infra_retry_count,
+                window_secs = self.retry_policy.infra_retry_window_secs,
+                "infra-retry window elapsed — resetting counter"
+            );
+            state.infra_retry_count = 0;
+        }
 
         // Bound check BEFORE reset_to_ready: if we've already exhausted
         // the infra budget, poison instead. The derivation is likely
@@ -1487,7 +1523,8 @@ impl DagActor {
         // infra — more retries won't help, and the operator needs the
         // poison signal to investigate. ensure_running() first:
         // poison_and_cascade expects Running (not Assigned).
-        if state.infra_retry_count >= self.retry_policy.max_infra_retries {
+        // Exempt errors skip the cap entirely (see above).
+        if !exempt_from_cap && state.infra_retry_count >= self.retry_policy.max_infra_retries {
             state.ensure_running();
             warn!(
                 drv_hash = %drv_hash,
@@ -1510,11 +1547,18 @@ impl DagActor {
         // budget). NO backoff (re-dispatch immediately; P0211's
         // store_degraded check excludes still-broken workers). But DO
         // count against the SEPARATE infra bound — livelock prevention.
-        state.infra_retry_count += 1;
+        // Exempt errors (concurrent PutPath) don't increment — they
+        // can't indicate a misclassified permanent failure, so the
+        // hot-loop guard isn't needed for them.
+        if !exempt_from_cap {
+            state.infra_retry_count += 1;
+            state.last_infra_failure_at = Some(Instant::now());
+        }
         info!(
             drv_hash = %drv_hash,
             executor_id = %executor_id,
             infra_retry_count = state.infra_retry_count,
+            exempt_from_cap,
             "infrastructure failure — retry without poison count"
         );
         self.persist_status(drv_hash, DerivationStatus::Ready, None)

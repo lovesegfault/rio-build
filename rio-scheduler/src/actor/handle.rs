@@ -59,6 +59,9 @@ pub struct DebugDerivationInfo {
     /// Flat failure counter (non-distinct mode). For asserting
     /// same-worker failures count under `require_distinct_workers=false`.
     pub failure_count: u32,
+    /// InfrastructureFailure re-dispatch count. For asserting the
+    /// I-127 cap behavior + concurrent-PutPath exemption.
+    pub infra_retry_count: u32,
     /// Whether this derivation is content-addressed. For precondition
     /// asserts in CA cutoff-compare tests.
     pub is_ca: bool,

@@ -1231,14 +1231,15 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // Default max_infra_retries = 5. Fail 5 times: infra_retry_count
-    // 0→1, 1→2, 2→3, 3→4, 4→5. On the 6th failure the cap check
-    // (`>= max_infra_retries`) fires BEFORE reset_to_ready → poison.
+    // Default max_infra_retries = 10 (I-127). Fail 10 times:
+    // infra_retry_count 0→1..9→10. On the 11th failure the cap
+    // check (`>= max_infra_retries`) fires BEFORE reset_to_ready →
+    // poison.
     //
-    // Boundary: at attempt 4 (5th failure, infra_retry_count=4 going
-    // in) the drv is still Ready post-handling. At attempt 5 (6th)
-    // it poisons. Assert both sides of the boundary.
-    for attempt in 0..5 {
+    // Boundary: at attempt 9 (10th failure, infra_retry_count=9
+    // going in) the drv is still Ready post-handling. At attempt 10
+    // (11th) it poisons. Assert both sides of the boundary.
+    for attempt in 0..10 {
         let ok = handle.debug_force_assign(drv_hash, "infra-cap-w").await?;
         assert!(ok, "force-assign should succeed at attempt {attempt}");
         complete_failure(
@@ -1251,9 +1252,9 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
         .await?;
     }
 
-    // After 5 failures: infra_retry_count=5 but the drv is still
-    // alive (cap check is >=, checked BEFORE increment — 4 < 5 on
-    // the 5th entry, increment to 5, return Ready).
+    // After 10 failures: infra_retry_count=10 but the drv is still
+    // alive (cap check is >=, checked BEFORE increment — 9 < 10 on
+    // the 10th entry, increment to 10, return Ready).
     let before = handle
         .debug_query_derivation(drv_hash)
         .await?
@@ -1263,12 +1264,13 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
             before.status,
             DerivationStatus::Ready | DerivationStatus::Assigned
         ),
-        "5 infra failures (infra_retry_count=5, cap=5) → still alive \
+        "10 infra failures (infra_retry_count=10, cap=10) → still alive \
          (boundary: cap check is pre-increment), got {:?}",
         before.status
     );
+    assert_eq!(before.infra_retry_count, 10);
 
-    // 6th failure: infra_retry_count=5 >= max_infra_retries=5 → poison.
+    // 11th failure: infra_retry_count=10 >= max_infra_retries=10 → poison.
     let ok = handle.debug_force_assign(drv_hash, "infra-cap-w").await?;
     assert!(ok);
     complete_failure(
@@ -1276,7 +1278,7 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
         "infra-cap-w",
         &drv_path,
         rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
-        "infra attempt 5 (cap hit)",
+        "infra attempt 10 (cap hit)",
     )
     .await?;
 
@@ -1287,13 +1289,91 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
     assert_eq!(
         after.status,
         DerivationStatus::Poisoned,
-        "6th infra failure (infra_retry_count=5 >= max_infra_retries=5) → poison"
+        "11th infra failure (infra_retry_count=10 >= max_infra_retries=10) → poison"
     );
     // Confirm the infra path never touched the transient-failure
     // accounting (these stay at 0 the whole way through).
     assert!(after.failed_builders.is_empty());
     assert_eq!(after.retry_count, 0);
     assert_eq!(after.failure_count, 0);
+
+    Ok(())
+}
+
+/// I-127: "concurrent PutPath" InfrastructureFailure is exempt from
+/// the `max_infra_retries` cap. It means another builder is uploading
+/// the SAME output — the drv succeeded; this worker lost the upload
+/// race. Under shallow-1024x a leaked PutPath lock (I-125a) made 4
+/// builders hit this in a row → poison at 99.7% on a fine drv.
+///
+/// Exemption is by error_msg substring (mirrors `is_concurrent_put_path`
+/// in rio-builder/src/upload.rs). The drv stays Ready and
+/// `infra_retry_count` does NOT increment, no matter how many times.
+#[tokio::test]
+async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
+    let (_db, handle, _task, _rx) = setup_with_worker("putpath-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "putpath-drv";
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // Drive WELL past the cap (default 10) — 15 concurrent-PutPath
+    // failures. None should count; the drv stays Ready throughout.
+    for attempt in 0..15 {
+        let ok = handle.debug_force_assign(drv_hash, "putpath-w").await?;
+        assert!(ok, "force-assign should succeed at attempt {attempt}");
+        complete_failure(
+            &handle,
+            "putpath-w",
+            &drv_path,
+            rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+            "upload failed: concurrent PutPath in progress for this path; retry",
+        )
+        .await?;
+    }
+
+    let after = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert!(
+        matches!(
+            after.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "15× concurrent-PutPath infra failures → still alive (exempt from cap), got {:?}",
+        after.status
+    );
+    assert_eq!(
+        after.infra_retry_count, 0,
+        "concurrent-PutPath must NOT increment infra_retry_count"
+    );
+    assert!(after.failed_builders.is_empty());
+    assert_eq!(after.retry_count, 0);
+    assert_eq!(after.failure_count, 0);
+
+    // A NON-exempt infra failure after that DOES count — proves the
+    // exemption is keyed on error_msg, not a blanket disable.
+    let ok = handle.debug_force_assign(drv_hash, "putpath-w").await?;
+    assert!(ok);
+    complete_failure(
+        &handle,
+        "putpath-w",
+        &drv_path,
+        rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+        "FUSE EIO",
+    )
+    .await?;
+    let after2 = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        after2.infra_retry_count, 1,
+        "non-exempt infra failure after exempt ones → counter increments normally"
+    );
 
     Ok(())
 }
