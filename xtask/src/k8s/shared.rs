@@ -267,13 +267,48 @@ pub fn kill_port_listeners(port: u16) {
     }
 }
 
-/// Guard that kills a child process on drop. Used for port-forward
-/// and SSM tunnel processes in smoke tests.
-pub struct ProcessGuard(pub tokio::process::Child);
+/// Guard that kills a child *process group* on drop. Used for
+/// port-forward and SSM tunnel processes in smoke tests.
+///
+/// I-158: `aws ssm start-session` spawns `session-manager-plugin` as a
+/// grandchild. The previous `start_kill()` only SIGTERM'd the direct
+/// `aws` child; the python wrapper doesn't reliably propagate, so the
+/// plugin orphaned (ppid→1) and kept the local port bound. Next run
+/// either fails to bind or — worse — the stale listener forwards to
+/// the OLD NLB ("unexpected packet type 80"). [`spawn`](Self::spawn)
+/// puts the child in its own group; Drop kills the whole group.
+pub struct ProcessGuard {
+    pub child: tokio::process::Child,
+    /// pgid == child's pid (process_group(0) makes the child a group
+    /// leader). Captured at spawn — `Child::id()` returns `None` after
+    /// the child is reaped, so reading it in Drop would be too late.
+    pgid: ::nix::unistd::Pid,
+}
+
+impl ProcessGuard {
+    /// Spawn `cmd` in a fresh process group and wrap it. The ONLY way
+    /// to construct a guard — direct construction would let Drop's
+    /// killpg target whatever group the child inherited (xtask's own).
+    pub fn spawn(mut cmd: tokio::process::Command) -> std::io::Result<Self> {
+        // Linux-only: process_group(0) → setpgid(0,0) post-fork pre-exec.
+        // Child's pgid becomes its own pid; descendants inherit it.
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        let pgid = ::nix::unistd::Pid::from_raw(
+            child
+                .id()
+                .expect("just spawned; not yet waited")
+                .try_into()
+                .expect("pid_t fits i32"),
+        );
+        Ok(Self { child, pgid })
+    }
+}
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
-        let _ = self.0.start_kill();
+        use ::nix::sys::signal::{Signal, killpg};
+        let _ = killpg(self.pgid, Signal::SIGTERM);
     }
 }
 
@@ -313,5 +348,52 @@ mod tests {
         // Matches what operators pass via `openssl rand -base64 32`.
         let seed = B64.encode([0u8; 32]);
         assert_eq!(seed.len(), 44);
+    }
+
+    /// I-158 regression: ProcessGuard must kill GRANDCHILDREN. The
+    /// `aws ssm start-session` → `session-manager-plugin` shape: we
+    /// model it as `bash -c '... & wait'` → `sleep`. Pre-fix (single-
+    /// pid kill) the sleep orphaned; post-fix (killpg) it dies with
+    /// the group.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn process_guard_kills_grandchildren() {
+        use ::nix::sys::signal::kill;
+        use ::nix::unistd::Pid;
+        use std::process::Stdio;
+        use tokio::io::AsyncBufReadExt;
+
+        // Shell prints the grandchild's pid then waits — same parent-
+        // stays-alive-until-child-exits shape as the aws wrapper.
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(Stdio::piped());
+        let mut guard = ProcessGuard::spawn(cmd).expect("spawn bash");
+        let stdout = guard.child.stdout.take().expect("piped");
+        let line = tokio::io::BufReader::new(stdout)
+            .lines()
+            .next_line()
+            .await
+            .expect("read line")
+            .expect("got pid line");
+        let grandchild = Pid::from_raw(line.trim().parse::<i32>().expect("parse pid"));
+
+        // Signal-0 probe: alive before drop.
+        assert!(
+            kill(grandchild, None).is_ok(),
+            "grandchild should be alive pre-drop"
+        );
+
+        drop(guard);
+
+        // SIGTERM delivery + reap isn't synchronous with killpg(). Poll
+        // for ESRCH; same shape as stress.rs::kill_graceful's reap-wait.
+        for _ in 0..20 {
+            if kill(grandchild, None).is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("grandchild {grandchild} still alive 2s after ProcessGuard drop");
     }
 }

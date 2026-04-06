@@ -88,11 +88,12 @@ pub(crate) async fn port_forward(
         .arg(format!("{local}:{remote}"))
         .stderr(std::process::Stdio::null());
     if local != 0 {
-        let child = cmd.stdout(std::process::Stdio::null()).spawn()?;
-        return Ok((local, ProcessGuard(child)));
+        cmd.stdout(std::process::Stdio::null());
+        return Ok((local, ProcessGuard::spawn(cmd)?));
     }
-    let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-    let stdout = child.stdout.take().expect("piped above");
+    cmd.stdout(std::process::Stdio::piped());
+    let mut guard = ProcessGuard::spawn(cmd)?;
+    let stdout = guard.child.stdout.take().expect("piped above");
     let mut lines = BufReader::new(stdout).lines();
     let bound = loop {
         let Some(line) = lines.next_line().await? else {
@@ -110,7 +111,7 @@ pub(crate) async fn port_forward(
     };
     // Drain the rest so kubectl never blocks on a full pipe.
     tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
-    Ok((bound, ProcessGuard(child)))
+    Ok((bound, guard))
 }
 
 /// Look up the scheduler leader pod from the `rio-scheduler-leader`

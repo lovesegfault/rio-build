@@ -252,10 +252,18 @@ fn pid_alive(_pid: u32) -> bool {
 /// gone after the sequence.
 #[cfg(target_os = "linux")]
 fn kill_graceful(pid: u32) -> bool {
-    use nix::sys::signal::{Signal, kill};
+    use nix::sys::signal::{Signal, kill, killpg};
     use nix::unistd::Pid;
     let p = Pid::from_raw(pid as i32);
-    let _ = kill(p, Some(Signal::SIGTERM));
+    // I-158: tunnel pids are group leaders (ProcessGuard::spawn sets
+    // process_group(0)). killpg catches session-manager-plugin
+    // grandchildren that single-pid kill would orphan. Build pids are
+    // session leaders too (setsid below), so killpg is correct for
+    // both. Falls back to single-pid kill if killpg ESRCHs (pid was
+    // recorded before process_group(0) was added — old session dirs).
+    if killpg(p, Signal::SIGTERM).is_err() {
+        let _ = kill(p, Some(Signal::SIGTERM));
+    }
     // Poll for death: 20 × 100ms = 2s.
     for _ in 0..20 {
         if !pid_alive(pid) {
@@ -263,7 +271,9 @@ fn kill_graceful(pid: u32) -> bool {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = kill(p, Some(Signal::SIGKILL));
+    if killpg(p, Signal::SIGKILL).is_err() {
+        let _ = kill(p, Some(Signal::SIGKILL));
+    }
     // SIGKILL is unblockable, but reaping isn't synchronous with
     // kill(2). These are session-leader procs (setsid) with no
     // waiting parent — init auto-reaps, fast but not instant. A
@@ -331,9 +341,12 @@ async fn cmd_run(
         info!("tunnel[{port}]: establishing");
         let guard = p.tunnel(port).await?;
         let tunnel_pid = guard
-            .0
+            .child
             .id()
             .context("tunnel child has no PID (already reaped?)")?;
+        // I-158: ProcessGuard::spawn puts the child in its own process
+        // group (pgid == this pid). cleanup's kill_graceful targets the
+        // group, so the recorded pid catches session-manager-plugin too.
         pids.tunnels.push(PidEntry {
             port,
             pid: tunnel_pid,

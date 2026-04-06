@@ -463,35 +463,40 @@ pub async fn ssm_tunnel(local_port: u16) -> Result<ProcessGuard> {
     })
     .await?;
 
+    // I-158: a SIGKILL'd or panicked prior run leaks the
+    // session-manager-plugin (ProcessGuard::drop never fired). Reap
+    // any stale listener before binding — same pre-start cleanup
+    // with_remote_store does (P0539e).
+    crate::k8s::shared::kill_port_listeners(local_port);
+
     info!("starting SSM tunnel {bastion} → {nlb}:22 → localhost:{local_port}");
-    let mut child = tokio::process::Command::new("aws")
-        .args([
-            "ssm",
-            "start-session",
-            "--region",
-            &region,
-            "--target",
-            &bastion,
-        ])
-        .args([
-            "--document-name",
-            "AWS-StartPortForwardingSessionToRemoteHost",
-        ])
-        .args([
-            "--parameters",
-            &format!("host={nlb},portNumber=22,localPortNumber={local_port}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let mut stderr = child.stderr.take().context("no stderr")?;
-    let mut guard = ProcessGuard(child);
+    let mut cmd = tokio::process::Command::new("aws");
+    cmd.args([
+        "ssm",
+        "start-session",
+        "--region",
+        &region,
+        "--target",
+        &bastion,
+    ])
+    .args([
+        "--document-name",
+        "AWS-StartPortForwardingSessionToRemoteHost",
+    ])
+    .args([
+        "--parameters",
+        &format!("host={nlb},portNumber=22,localPortNumber={local_port}"),
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped());
+    let mut guard = ProcessGuard::spawn(cmd)?;
+    let mut stderr = guard.child.stderr.take().context("no stderr")?;
 
     // aws ssm fails fast on plugin-missing / IAM-denied / bad-target.
     // Give it 2s; if it died, surface the stderr instead of timing out
     // the banner poll 30s later with no clue why.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    if let Some(status) = guard.0.try_wait()? {
+    if let Some(status) = guard.child.try_wait()? {
         let mut err = String::new();
         stderr.read_to_string(&mut err).await?;
         bail!("aws ssm exited ({status}): {}", err.trim());
