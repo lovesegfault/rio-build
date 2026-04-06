@@ -2,7 +2,7 @@
 //!
 //! Starts the gRPC server, connects to PostgreSQL, and spawns the DAG actor.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,14 @@ struct Config {
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
     hmac_key_path: Option<std::path::PathBuf>,
+    /// JWT verification. `key_path` → ConfigMap mount at
+    /// `/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).
+    /// The gateway signs with the matching seed; scheduler verifies.
+    /// Unset = interceptor inert (dev mode / pre-key-rotation-infra).
+    /// SIGHUP reloads from the same path — kubelet remounts the
+    /// ConfigMap on rotation, operator SIGHUPs the pod. Set via
+    /// `RIO_JWT__KEY_PATH` (nested figment key — double underscore).
+    jwt: rio_common::config::JwtConfig,
     /// Seconds to wait after SIGTERM between set_not_serving()
     /// and serve_with_shutdown returning. Gives the BalancedChannel
     /// probe loop (DEFAULT_PROBE_INTERVAL=3s) time to observe
@@ -82,6 +90,7 @@ impl Default for Config {
             health_addr: "0.0.0.0:9101".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
+            jwt: rio_common::config::JwtConfig::default(),
             // periodSeconds: 5 (helm) + 1s propagation. Uniform across
             // all three binaries even though scheduler's actual client
             // probe is 3s — 6s out of 30s termGrace is cheap.
@@ -638,12 +647,52 @@ async fn main() -> anyhow::Result<()> {
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
+    // r[impl gw.jwt.verify]
+    // r[impl gw.jwt.dual-mode]
+    // Load JWT pubkey from ConfigMap mount (if configured) + spawn the
+    // SIGHUP reload loop. kubelet remounts the ConfigMap on rotation;
+    // operator SIGHUPs the pod; spawn_pubkey_reload re-reads + swaps
+    // the Arc<RwLock> the interceptor closure captured below.
+    //
+    // key_path=None → jwt_pubkey=None → interceptor is inert (every
+    // call passes through, Claims never attached). That's the dual-mode
+    // "key-absent" half — dev clusters and pre-JWT-rotation deployments
+    // keep working. key_path=Some → load at boot (fail-fast if the file
+    // is missing/corrupt — better than silently running inert when the
+    // operator meant to enable verification).
+    //
+    // shutdown token (parent, not serve_shutdown): the reload loop is a
+    // background task like lease-loop/tick-loop — stops the instant
+    // SIGTERM fires, not after the drain window.
+    let jwt_pubkey: rio_common::jwt_interceptor::JwtPubkey = match &cfg.jwt.key_path {
+        None => {
+            tracing::warn!(
+                "jwt.key_path unset — JWT interceptor inert \
+                 (all RPCs pass through, Claims extension never attached)"
+            );
+            None
+        }
+        Some(path) => {
+            let initial = rio_common::jwt_interceptor::load_jwt_pubkey(path)
+                .map_err(|e| anyhow::anyhow!("JWT pubkey initial load: {e}"))?;
+            let shared = Arc::new(RwLock::new(initial));
+            rio_common::jwt_interceptor::spawn_pubkey_reload(
+                path.clone(),
+                Arc::clone(&shared),
+                shutdown.clone(),
+            );
+            info!(path = %path.display(), "JWT pubkey loaded; SIGHUP reloads");
+            Some(shared)
+        }
+    };
+
     info!(
         listen_addr = %listen_addr,
         store_addr = %cfg.store_addr,
         max_message_size,
         log_s3_bucket = ?cfg.log_s3_bucket,
         tls = server_tls.is_some(),
+        jwt = jwt_pubkey.is_some(),
         "starting gRPC server"
     );
 
@@ -652,24 +701,20 @@ async fn main() -> anyhow::Result<()> {
         builder = builder.tls_config(tls)?;
     }
     builder
-        // r[impl gw.jwt.verify] — JWT tenant-token verify layer.
+        // JWT tenant-token verify layer. jwt_pubkey computed above —
+        // None (dev/unset) → inert pass-through; Some → verify every
+        // x-rio-tenant-token header the gateway sets.
         //
-        // `None` → interceptor is inert (pass-through on every call).
-        // Installed unconditionally so the builder type stays stable
-        // across the None/Some branch — no `InterceptedService<_, F>`
-        // vs plain server type divergence.
+        // Installed unconditionally (not `if jwt_pubkey.is_some()`) so
+        // the builder type stays stable across the None/Some branch —
+        // no `InterceptedService<_, F>` vs plain server type divergence.
         //
-        // Permissive-on-absent: health/worker/admin callers don't set
-        // x-rio-tenant-token → pass-through. Only the gateway sets it;
-        // only gateway-originated calls get verified. See the module
-        // docs in rio-common for the coexistence table.
-        //
-        // TODO(P0260): load VerifyingKey from ConfigMap mount, wrap in
-        // Arc<RwLock>, wire SIGHUP handler to hot-swap. Until then JWT
-        // verify is dormant — gateway's x-rio-tenant-token header (if
-        // sent) passes through unverified, Claims never attached.
+        // Permissive-on-absent-header: health/worker/admin callers don't
+        // set x-rio-tenant-token → pass-through. Only the gateway sets
+        // it; only gateway-originated calls get verified. See the
+        // module docs in rio-common for the coexistence table.
         .layer(tonic::service::InterceptorLayer::new(
-            rio_common::jwt_interceptor::jwt_interceptor(None),
+            rio_common::jwt_interceptor::jwt_interceptor(jwt_pubkey),
         ))
         .add_service(health_service)
         .add_service(
@@ -730,6 +775,10 @@ mod tests {
         assert_eq!(d.lease_namespace, None);
         // Phase3b: TLS off by default (dev mode, VM tests).
         assert!(!d.tls.is_configured());
+        // JWT verification off by default (interceptor inert until
+        // ConfigMap mount configured via RIO_JWT__KEY_PATH).
+        assert!(d.jwt.key_path.is_none());
+        assert!(!d.jwt.required);
     }
 
     #[test]
