@@ -1,0 +1,34 @@
+# TS proto codegen for rio-dashboard.
+#
+# ONE PLUGIN, NOT TWO: the plan doc assumed protoc-gen-es + protoc-gen-connect-es
+# (the connect-es v1 layout). In v2, protoc-gen-connect-es was deprecated and
+# folded into protoc-gen-es — a single plugin emits both message types and the
+# GenService<...> descriptor that @connectrpc/connect consumes directly. See
+# https://github.com/connectrpc/connect-es/blob/main/MIGRATING.md (v1→v2).
+#
+# Both packages land from nixpkgs:
+#   - pkgs.buf (1.64.0) — the CLI, no network needed for `generate`
+#   - pkgs.protoc-gen-es (2.11.0) — Node-wrapped, nixpkgs already handles the
+#     postinstall-binary trap that would break under fetchPnpmDeps --ignore-scripts
+#
+# Version lock-step: protoc-gen-es 2.11.0 expects @bufbuild/protobuf 2.11.0 at
+# runtime for codegenv2 imports. pnpm-lock.yaml already resolved ^2.2.3 → 2.11.0,
+# so the sandbox's generator and the SPA's runtime agree. If nixpkgs bumps
+# protoc-gen-es past what the lockfile carries, the svelte-check step in
+# nix/dashboard.nix will catch the type mismatch — bump package.json + lockfile
+# to match.
+#
+# LOCAL DEV: `nix develop` puts both on PATH. From rio-dashboard/:
+#   buf generate --template buf.gen.yaml ../rio-proto/proto
+# (src/gen/ is gitignored — regenerate when .proto files change)
+#
+# SANDBOX: nix/dashboard.nix runs the same command in preBuild against a
+# cleanSource'd copy of rio-proto/proto. The proto dir is passed as a separate
+# derivation input so Rust-crate edits don't invalidate the dashboard drv —
+# only .proto changes do, which is exactly when regen is needed.
+version: v2
+plugins:
+  - local: protoc-gen-es
+    out: src/gen
+    opt:
+      - target=ts

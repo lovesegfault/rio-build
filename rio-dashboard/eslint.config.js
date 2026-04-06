@@ -6,7 +6,11 @@ import globals from 'globals';
 import ts from 'typescript-eslint';
 
 export default ts.config(
-  { ignores: ['dist/', 'node_modules/'] },
+  // src/gen/ ships `/* eslint-disable */` at top of file so lint would pass
+  // anyway — but ignoring means eslint doesn't parse 100KB of types_pb.ts on
+  // every run. Pre-commit never sees these (gitignored); this is for local
+  // `pnpm run lint` and the sandbox buildPhase.
+  { ignores: ['dist/', 'node_modules/', 'src/gen/'] },
   js.configs.recommended,
   ...ts.configs.recommended,
   ...svelte.configs['flat/recommended'],

@@ -988,9 +988,13 @@
                 crate2nixCli
 
                 # Dashboard dev: `pnpm install --lockfile-only` (hash bumps),
-                # `pnpm run dev` (vite dev server with Envoy proxy).
+                # `pnpm run dev` (vite dev server with Envoy proxy). Proto
+                # stubs regen: `cd rio-dashboard && buf generate --template
+                # buf.gen.yaml ../rio-proto/proto` (src/gen/ is gitignored).
                 nodejs
                 pnpm_10
+                buf
+                protoc-gen-es
 
                 # Deploy tooling for infra/eks/. Large closures (awscli2
                 # pulls python3 + botocore) but the user asked for
