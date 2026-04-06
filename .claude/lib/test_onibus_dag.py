@@ -906,6 +906,97 @@ def test_ff_try_rejects_diverged(tmp_repo: Path, monkeypatch):
     assert r.pre_merge == r.post_merge
 
 
+# ─── rename-unassigned (P0325: post-ff-merge rewrite skip) ───────────────────
+
+
+def test_rewrite_and_rename_derives_from_mapping_not_diff(tmp_repo: Path):
+    """P0325 T1 regression: _rewrite_and_rename must derive the
+    rewrite set from mapping[].placeholder, not from git diff.
+
+    The bug: touched = git diff --name-only INTEGRATION_BRANCH...HEAD.
+    Post-ff-merge, docs-tip == sprint-1-tip → three-dot range EMPTY →
+    touched = ['.claude/dag.jsonl'] only → plan .md rewrite SKIPPED.
+    But git-mv (mapping-driven) still ran. Result: plan-0318-foo.md
+    exists, content says P992687001. Manifested docs-926870 @ 55f1d050,
+    docs-928654 @ 8cb27862.
+
+    This test doesn't simulate the ff-merge directly — it calls
+    _rewrite_and_rename with an empty-diff-equivalent state and asserts
+    the .md content got rewritten anyway. The discriminator is: does
+    the function READ the diff, or does it READ the mapping?"""
+    import onibus.merge
+    from onibus import INTEGRATION_BRANCH
+    from onibus.models import Rename
+
+    # Seed: plan doc with placeholder in content, on INTEGRATION_BRANCH
+    # (simulating post-ff state: git diff INTEGRATION_BRANCH...HEAD is empty).
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    plan_doc = work / "plan-912345601-test-slug.md"
+    plan_doc.write_text(
+        "# Plan 912345601: test\n\n"
+        "See [P912345601](plan-912345601-test-slug.md).\n"
+    )
+    dag = tmp_repo / ".claude" / "dag.jsonl"
+    dag.write_text('{"plan": 912345601, "title": "t", "deps": []}\n')
+
+    # Commit it — we're on INTEGRATION_BRANCH, so after this commit,
+    # diff INTEGRATION_BRANCH...HEAD is STILL empty (HEAD == branch tip).
+    # The old diff-based code would see zero .md files in touched.
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: add placeholder", "--no-verify")
+
+    # Precondition: three-dot diff is empty. This is the bug's trigger
+    # condition. If this assert fails, the test fixture is wrong and
+    # the test proves nothing — it would pass against the OLD code when
+    # the fixture happens to produce a non-empty diff.
+    diff = _git(tmp_repo, "diff", "--name-only", f"{INTEGRATION_BRANCH}...HEAD")
+    assert diff == "", f"precondition: three-dot diff must be empty, got {diff!r}"
+
+    mapping = [Rename(placeholder="912345601", assigned=318, slug="test-slug")]
+    onibus.merge._rewrite_and_rename(tmp_repo, mapping)
+
+    # The file was renamed (git mv ran — mapping-driven, always worked).
+    assert not plan_doc.exists()
+    renamed = work / "plan-0318-test-slug.md"
+    assert renamed.exists(), "git mv should have renamed the file"
+
+    # THE BUG: content must be rewritten too. Old code left P912345601
+    # in the content because the rewrite loop never saw this file.
+    content = renamed.read_text()
+    assert "912345601" not in content, (
+        f"placeholder must be rewritten in content — found in:\n{content}"
+    )
+    assert "P0318" in content, "assigned number must appear in content"
+    assert "[P0318](plan-0318-test-slug.md)" in content, (
+        "self-link must be fully rewritten (both label and href)"
+    )
+
+    # dag.jsonl also rewritten (integer form, not zero-padded).
+    dag_content = dag.read_text()
+    assert '"plan": 318' in dag_content
+    assert "912345601" not in dag_content
+
+
+def test_rename_unassigned_rejects_post_ff_branch(tmp_repo: Path, monkeypatch):
+    """P0325 T2: rename_unassigned fails loud if the branch is
+    already an ancestor of INTEGRATION_BRANCH. Secondary guard — T1
+    makes the rewrite correct anyway, but this catches a caller about
+    to diverge the branch with a post-ff rename commit.
+
+    _worktree_for would normally raise SystemExit("no worktree for
+    branch") — shadowing the guard's SystemExit. Monkeypatch it to
+    return tmp_repo directly; the guard only needs a cwd where HEAD
+    resolves. tmp_repo's HEAD == INTEGRATION_BRANCH tip → is-ancestor
+    fires."""
+    import onibus.merge
+
+    monkeypatch.setattr(onibus.merge, "_worktree_for", lambda branch: tmp_repo)
+
+    with pytest.raises(SystemExit, match="already an ancestor"):
+        onibus.merge.rename_unassigned("docs-test")
+
+
 # ─── excusable ───────────────────────────────────────────────────────────────
 
 
