@@ -256,8 +256,14 @@ const RECONCILE_DURATION_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.
 /// Histogram bucket boundaries for scheduler assignment latency (seconds).
 ///
 /// Time from a derivation becoming Ready to being assigned to a worker.
-/// Healthy system: sub-millisecond to low-tens-of-ms. Seconds = backlog.
-const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+/// With a warm static fleet this is sub-second. With ephemeral builders the
+/// latency is dominated by node-provision (~60–180s on EKS), so the original
+/// `[0.001..5.0]` set put every sample in `+Inf` (I-124). These span
+/// 100ms..10min: low buckets catch the warm-fleet path, the 30s..600s range
+/// gives resolution across cold-node provision.
+const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[
+    0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0,
+];
 
 /// Histogram bucket boundaries for `rio_scheduler_build_graph_edges`.
 ///

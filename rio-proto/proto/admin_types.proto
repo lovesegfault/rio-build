@@ -377,3 +377,39 @@ message GetCapacityManifestResponse {
   // computation treats absent as "use floor." Not sorted.
   repeated DerivationResourceEstimate estimates = 1;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Estimator stats (GetEstimatorStats) — I-124
+// ───────────────────────────────────────────────────────────────────────────
+// Dump of the in-memory build_history snapshot the scheduler classifies
+// from. `rio-cli estimator` — operator answer to "why is this drv routed
+// to large?" / "is the EMA for X plausible?". Unlike GetSizeClassStatus
+// (per-class aggregate) this is per-(pname,system) detail.
+
+message EstimatorEntry {
+  // Derivation pname (build_history key, not full drv path).
+  string drv_name = 1;
+  // build_history.sample_count — how many completions have fed this EMA.
+  // Low (1-2) = the EMA is mostly the first sample; treat with suspicion.
+  uint64 sample_count = 2;
+  double ema_duration_secs = 3;
+  // 0 = no memory signal yet (pre-cgroup-memory.peak builds, or all
+  // samples failed before cgroup populated).
+  double ema_peak_memory_bytes = 4;
+  // What classify() returns for this entry under the CURRENT effective
+  // (post-rebalancer) cutoffs. Empty = size-classes unconfigured.
+  string size_class = 5;
+  // build_history is keyed (pname, system); same pname on x86_64 vs
+  // aarch64 are separate rows with separate EMAs.
+  string system = 6;
+}
+
+message GetEstimatorStatsRequest {
+  // Substring match on drv_name (pname). Empty = all entries.
+  optional string drv_name_filter = 1;
+}
+
+message GetEstimatorStatsResponse {
+  // Sorted by sample_count desc (most-observed first).
+  repeated EstimatorEntry entries = 1;
+}

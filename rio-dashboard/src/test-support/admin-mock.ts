@@ -62,6 +62,7 @@ export const adminMock = {
     .mockResolvedValue({ nodes: [], edges: [], truncated: false, totalNodes: 0 }),
   getSizeClassStatus: vi.fn(),
   getCapacityManifest: vi.fn(),
+  getEstimatorStats: vi.fn(),
   // Extend as AdminService grows — one site, not N test files.
 } satisfies Record<string, Mock>;
 

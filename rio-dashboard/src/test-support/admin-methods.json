@@ -13,5 +13,6 @@
   "createTenant",
   "getBuildGraph",
   "getSizeClassStatus",
-  "getCapacityManifest"
+  "getCapacityManifest",
+  "getEstimatorStats"
 ]
