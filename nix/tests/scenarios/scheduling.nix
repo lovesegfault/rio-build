@@ -800,17 +800,40 @@ let
           out = build("${silenceDrv}", expect_fail=True)
           elapsed = _time.monotonic() - t0
 
+          # I-200: TimedOut now resets to Ready and retries up to
+          # RetryPolicy.max_timeout_retries (default 4) before going
+          # terminal. The drv runs 1+max_timeout_retries times; each
+          # echoes start-silence-marker. Per-attempt timing proves the
+          # silence arm fired EVERY time — if any attempt ran the full
+          # 60s sleep, elapsed/attempts >> 25.
+          attempts = out.count("start-silence-marker")
+          assert attempts >= 1, (
+              f"no start-silence-marker in output — drv never ran (eval "
+              f"error or wrong-worker routing).\nBuild output:\n{out}"
+          )
+          per_attempt = elapsed / attempts
           # Timing proof. 10s silence + daemon-setup + QEMU/SSH overhead
-          # → expect ~12-25s. 45s upper bound is <<60s (the key constraint).
-          # Lower bound 8s: the silence arm can't fire before the 10s
-          # deadline; if elapsed<8s the failure was something else (eval
-          # error, wrong-worker routing, immediate daemon crash).
-          assert 8 < elapsed < 45, (
-              f"expected silence kill at ~10s (wall-clock ~12-25s), "
-              f"got {elapsed:.1f}s. If ~60s: silence arm never fired, "
-              f"sleep ran to completion (routed to a worker without "
-              f"RIO_MAX_SILENT_TIME_SECS?). If <8s: failed before silence "
-              f"deadline.\nBuild output:\n{out}"
+          # → expect ~12-25s/attempt. 30s/attempt upper bound is <<60s
+          # (the key constraint: silence arm fired, sleep didn't run to
+          # completion). Lower bound 8s: the silence arm can't fire
+          # before the 10s deadline; if per_attempt<8s the failure was
+          # something else (immediate daemon crash, wrong status code).
+          assert 8 < per_attempt < 30, (
+              f"expected silence kill at ~10s/attempt (per-attempt "
+              f"~12-25s), got {per_attempt:.1f}s over {attempts} attempts "
+              f"(total {elapsed:.1f}s). If ~60s/attempt: silence arm "
+              f"never fired, sleep ran to completion (routed to a worker "
+              f"without RIO_MAX_SILENT_TIME_SECS?). If <8s: failed "
+              f"before silence deadline.\nBuild output:\n{out}"
+          )
+          # I-200 retry loop sanity: with default max_timeout_retries=4
+          # this is 5. Asserting >=2 (not ==5) keeps the test green if
+          # the fixture overrides max_timeout_retries while still
+          # verifying the retry path fired at least once.
+          assert attempts >= 2, (
+              f"expected TimedOut→retry (I-200) but only {attempts} "
+              f"attempt(s). max_timeout_retries=0 in fixture?\n"
+              f"Build output:\n{out}"
           )
 
           # wlarge must have logged the silence warn. journalctl grep is
@@ -837,7 +860,7 @@ let
                   "grep 'rio-sched-silence'"
               )
 
-          print(f"max-silent-time PASS: killed at {elapsed:.1f}s wall-clock (drv sleep was 60s)")
+          print(f"max-silent-time PASS: {attempts} attempts, {per_attempt:.1f}s/attempt (drv sleep was 60s)")
     '';
 
     # gw.opcode.set-options.propagation — verify marker at default.nix:subtests[setoptions-unreachable]

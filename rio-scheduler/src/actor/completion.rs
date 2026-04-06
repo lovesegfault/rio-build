@@ -647,12 +647,11 @@ impl DagActor {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, executor_id)
                     .await;
             }
-            // TimedOut: same inputs → same timeout. Auto-reassigning is
-            // a storm — DON'T retry automatically. But an EXPLICIT
-            // resubmit (operator raised timeoutSeconds, or conditions
-            // changed) SHOULD re-dispatch. Route to Cancelled (not
-            // Poisoned): terminal, no auto-retry, but retriable-on-
-            // resubmit via DerivationStatus::is_retriable_on_resubmit.
+            // TimedOut: I-200 promotes size_class_floor and retries on
+            // a larger class (longer activeDeadlineSeconds), bounded by
+            // max_timeout_retries. After the cap → Cancelled (terminal,
+            // retriable-on-resubmit) — same inputs on the LARGEST class
+            // → same timeout, so further auto-retry is a storm.
             // Poisoned's 24h TTL is way too aggressive for a timeout.
             rio_proto::build_types::BuildResultStatus::TimedOut => {
                 self.handle_timeout_failure(drv_hash, &result.error_msg, executor_id)
@@ -1807,24 +1806,94 @@ impl DagActor {
         }
     }
 
-    /// Worker-side timeout (`BuildResultStatus::TimedOut`): terminal, no
-    /// auto-retry (same inputs → same timeout → storm), but retriable on
-    /// EXPLICIT resubmit — the operator presumably raised timeoutSeconds.
+    /// Worker-side timeout (`BuildResultStatus::TimedOut`): promote
+    /// `size_class_floor` and reset to Ready for re-dispatch on a
+    /// larger class — bounded by `max_timeout_retries`, after which
+    /// terminal `Cancelled` (retriable on EXPLICIT resubmit only).
     ///
-    /// Transitions to `Cancelled` (not `Poisoned`): `Cancelled` is in
-    /// `is_retriable_on_resubmit`, `Poisoned` has a 24h TTL that's way
-    /// too aggressive for "ran out of time". Same cascade/events/build-fail
-    /// side-effects as `handle_permanent_failure` — the build still fails
-    /// THIS time, just without the 24h resubmit lockout.
+    /// I-200: with per-class `activeDeadlineSeconds = cutoff×5`
+    /// (`r[ctrl.ephemeral.per-class-deadline]`) the next dispatch
+    /// lands on a larger class with a proportionally longer deadline,
+    /// so "same inputs → same timeout → storm" no longer holds for
+    /// the first N retries. The cap (default 4: tiny→xlarge) ensures
+    /// a genuinely-infinite build still goes terminal.
+    ///
+    /// Separate `timeout_retry_count` (NOT `retry_count` /
+    /// `infra_retry_count`): timeouts neither consume the transient
+    /// budget nor get the infra time-window reset (sparse timeouts
+    /// over hours are still the same hung build).
+    ///
+    /// Terminal path transitions to `Cancelled` (not `Poisoned`):
+    /// `Cancelled` is in `is_retriable_on_resubmit`, `Poisoned` has a
+    /// 24h TTL that's way too aggressive for "ran out of time". Same
+    /// cascade/events/build-fail side-effects as
+    /// `handle_permanent_failure` — the build still fails THIS time,
+    /// just without the 24h resubmit lockout.
+    // r[impl sched.timeout.promote-on-exceed]
     pub(super) async fn handle_timeout_failure(
         &mut self,
         drv_hash: &DrvHash,
         error_msg: &str,
-        _executor_id: &ExecutorId,
+        executor_id: &ExecutorId,
     ) {
+        // Promote BEFORE the cap check / state transition: even the
+        // terminal-path attempt should record that this class was
+        // inadequate, so an explicit resubmit starts on the next-
+        // larger class instead of replaying the timeout. Same shape
+        // as I-199's handle_infrastructure_failure prologue.
+        let failed_class = self
+            .executors
+            .get(executor_id)
+            .and_then(|e| e.size_class.clone());
+        self.promote_size_class_floor(drv_hash, failed_class.as_deref())
+            .await;
+
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
+
+        // Cap check BEFORE reset_to_ready. At the cap, fall through
+        // to terminal Cancelled — a build that timed out on every
+        // class (or on a class where promote_size_class_floor
+        // returned None: already at largest) is genuinely stuck.
+        if state.timeout_retry_count < self.retry_policy.max_timeout_retries {
+            state.ensure_running();
+            if let Err(e) = state.reset_to_ready() {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "timeout failure: reset_to_ready failed, skipping");
+                return;
+            }
+            // NO insert into failed_builders (timeout is not a per-
+            // worker problem — the SAME worker on a larger class
+            // would succeed). NO retry_count++ (separate counter).
+            // NO backoff (next class has a longer deadline; that IS
+            // the backoff).
+            state.timeout_retry_count += 1;
+            info!(
+                drv_hash = %drv_hash,
+                executor_id = %executor_id,
+                timeout_retry_count = state.timeout_retry_count,
+                max = self.retry_policy.max_timeout_retries,
+                failed_class = ?failed_class,
+                "timeout — promoted size_class_floor, retrying on larger class"
+            );
+            self.persist_status(drv_hash, DerivationStatus::Ready, None)
+                .await;
+            self.push_ready(drv_hash.clone());
+            for build_id in self.get_interested_builds(drv_hash) {
+                self.emit_progress(build_id);
+            }
+            return;
+        }
+
+        // ── Terminal path (cap exhausted) ───────────────────────────
+        warn!(
+            drv_hash = %drv_hash,
+            executor_id = %executor_id,
+            timeout_retry_count = state.timeout_retry_count,
+            max = self.retry_policy.max_timeout_retries,
+            "timeout: max_timeout_retries exhausted, transitioning to Cancelled"
+        );
         state.ensure_running();
         if let Err(e) = state.transition(DerivationStatus::Cancelled) {
             warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),

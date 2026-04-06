@@ -45,6 +45,7 @@ pub fn test_workerpool_spec() -> BuilderPoolSpec {
         ephemeral: false,
         sizing: Sizing::Static,
         ephemeral_deadline_seconds: None,
+        size_class_cutoff_secs: None,
         autoscaling: Autoscaling {
             metric: "queueDepth".into(),
             target_value: 5,

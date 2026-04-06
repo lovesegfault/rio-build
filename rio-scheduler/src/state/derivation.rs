@@ -428,6 +428,17 @@ pub struct DerivationState {
     /// recovery resets to 0 (conservative — won't spuriously poison
     /// after restart).
     pub infra_retry_count: u32,
+    /// Number of `TimedOut` re-dispatches so far (I-200). Separate
+    /// from `retry_count` (timeouts don't eat the transient budget)
+    /// and from `infra_retry_count` (no time-window reset — a build
+    /// that times out, gets promoted, and times out again an hour
+    /// later on the larger class is still the same hung build).
+    /// Bounded by `RetryPolicy::max_timeout_retries`; at the cap,
+    /// `handle_timeout_failure` falls through to terminal Cancelled.
+    /// In-memory only: recovery resets to 0 (conservative — won't
+    /// spuriously terminal-cancel after restart; a recovered build
+    /// gets a fresh promotion ladder, bounded again by the cap).
+    pub timeout_retry_count: u32,
     /// Timestamp of the most recent InfrastructureFailure that
     /// incremented `infra_retry_count`. Drives the time-window reset
     /// (I-127): if the last infra failure was longer ago than
@@ -553,6 +564,7 @@ impl DerivationState {
             drv_content: node.drv_content.clone(),
             retry_count: 0,
             infra_retry_count: 0,
+            timeout_retry_count: 0,
             last_infra_failure_at: None,
             failed_builders: HashSet::new(),
             failure_count: 0,
@@ -636,6 +648,7 @@ impl DerivationState {
             retry_count: row.retry_count.max(0) as u32,
             // In-memory only — recovery resets to 0 (conservative).
             infra_retry_count: 0,
+            timeout_retry_count: 0,
             last_infra_failure_at: None,
             // failure_count: initialize from failed_builders.len() —
             // same-worker repeats are lost (in-mem only), conservative.
@@ -715,6 +728,7 @@ impl DerivationState {
             drv_content: Vec::new(),
             retry_count: 0,
             infra_retry_count: 0,
+            timeout_retry_count: 0,
             last_infra_failure_at: None,
             failure_count: row.failed_builders.len() as u32,
             failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
@@ -838,6 +852,7 @@ impl DerivationState {
     pub fn clear_failure_history(&mut self) {
         self.retry_count = 0;
         self.infra_retry_count = 0;
+        self.timeout_retry_count = 0;
         self.last_infra_failure_at = None;
         self.failed_builders.clear();
         self.failure_count = 0;

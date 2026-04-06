@@ -363,6 +363,32 @@ spec:
                   \ pool name = size class name. Not enforced\n(you might have `small-x86`\
                   \ and `small-arm` pools both\nsize_class=\"small\")."
                 type: string
+              sizeClassCutoffSecs:
+                description: 'The class''s `cutoffSecs` (upper-bound predicted build
+                  duration).
+
+                  Stamped onto BuilderPoolSet children from `SizeClassSpec.cutoff_
+
+                  secs`; standalone BuilderPools may set it directly. When set and
+
+                  `ephemeral_deadline_seconds` is unset, ephemeral Jobs derive
+
+                  `activeDeadlineSeconds = cutoff * DEADLINE_MULTIPLIER` instead of
+
+                  the flat 3600 default --- per-class hung-build detection (I-200,
+
+                  `r[ctrl.ephemeral.per-class-deadline]`). f64 to match
+
+                  `SizeClassSpec.cutoff_secs` (EMA-smoothed cutoffs are
+
+                  fractional); the controller `ceil`s before casting. NOT CEL-gated
+
+                  to `ephemeral: true`: it''s a no-op in STS mode but harmless to
+
+                  carry, and BuilderPoolSet stamps it unconditionally.'
+                format: double
+                nullable: true
+                type: number
               sizing:
                 default: Static
                 description: 'Pod sizing mode (ADR-020). `Static` = operator-set

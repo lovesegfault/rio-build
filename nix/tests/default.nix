@@ -387,6 +387,7 @@ in
         subtests = [
           "sizeclass"
           # r[verify builder.silence.timeout-kill]
+          # r[verify sched.timeout.promote-on-exceed]
           "max-silent-time"
           # r[verify gw.opcode.set-options.propagation+2]
           # setoptions-unreachable greps ALL gateway journal history —

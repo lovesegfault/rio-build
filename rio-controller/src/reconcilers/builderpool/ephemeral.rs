@@ -104,14 +104,52 @@ pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 /// sticking around.
 pub(crate) const JOB_TTL_SECS: i32 = 600;
 
-/// Default `activeDeadlineSeconds` when `BuilderPoolSpec.ephemeral_
-/// deadline_seconds` is unset. 3600 (1h): long enough that a matched
-/// dispatch + build completes in the common case; short enough that
-/// a wrong-pool spawn (worker heartbeats but never matches dispatch
-/// — queue depth was for a different pool's system/size_class)
-/// doesn't leak for the life of the cluster. Operators with known-
-/// long builds (LLVM, chromium) should raise this via the CRD.
+/// Fallback `activeDeadlineSeconds` when neither `ephemeral_deadline_
+/// seconds` nor `size_class_cutoff_secs` is set (standalone unclassed
+/// BuilderPool). 3600 (1h): long enough that a matched dispatch +
+/// build completes in the common case; short enough that a wrong-pool
+/// spawn (worker heartbeats but never matches dispatch — queue depth
+/// was for a different pool's system/size_class) doesn't leak for the
+/// life of the cluster. BuilderPoolSet children always carry
+/// `size_class_cutoff_secs`, so this fires only for hand-authored
+/// unclassed pools.
 const DEFAULT_EPHEMERAL_DEADLINE_SECS: i64 = 3600;
+
+/// I-200: `activeDeadlineSeconds = class.cutoffSecs × DEADLINE_
+/// MULTIPLIER`. 5×: a build that's still going at 5× its class's
+/// upper-bound prediction is either hung or grossly misclassified —
+/// either way, K8s kills the pod → ExecutorDisconnected →
+/// `r[sched.reassign.no-promote-on-ephemeral-disconnect+2]` promotes
+/// `size_class_floor` and the next dispatch lands on the next-larger
+/// class (with a 5× longer deadline). tiny (cutoff 30s) → 150s,
+/// small (120s) → 600s, medium (600s) → 3000s, large (1800s) →
+/// 9000s, xlarge (7200s) → 36000s. NOT 2× (the misclassification-
+/// detector threshold): that would race the worker-side completion
+/// for a borderline-slow-but-legit build; 5× leaves room for cold-
+/// FUSE warmup + pod-scheduling overhead on top of the build itself.
+pub(crate) const DEADLINE_MULTIPLIER: i64 = 5;
+
+/// `activeDeadlineSeconds` for an ephemeral Job. Precedence:
+///   1. `ephemeral_deadline_seconds` — explicit override, verbatim.
+///   2. `size_class_cutoff_secs × DEADLINE_MULTIPLIER` — per-class
+///      (I-200, `r[ctrl.ephemeral.per-class-deadline]`).
+///   3. `DEFAULT_EPHEMERAL_DEADLINE_SECS` — flat 1h fallback.
+///
+/// `ceil` so a fractional cutoff (EMA-derived) rounds UP — never
+/// shorten below the integer-second boundary. `max(1)`: a zero/
+/// negative cutoff (misconfigured spec) would set deadline=0 and K8s
+/// kills the pod immediately; clamp to 1s so the misconfiguration is
+/// at least observable (pod starts, then dies) rather than a silent
+/// no-op spawn loop.
+fn ephemeral_deadline(spec: &crate::crds::builderpool::BuilderPoolSpec) -> i64 {
+    if let Some(explicit) = spec.ephemeral_deadline_seconds {
+        return i64::from(explicit);
+    }
+    if let Some(cutoff) = spec.size_class_cutoff_secs {
+        return ((cutoff * DEADLINE_MULTIPLIER as f64).ceil() as i64).max(1);
+    }
+    DEFAULT_EPHEMERAL_DEADLINE_SECS
+}
 
 // r[impl ctrl.pool.ephemeral]
 /// Reconcile an ephemeral BuilderPool: count active Jobs, poll queue
@@ -502,16 +540,13 @@ pub(super) fn build_job(
             backoff_limit: Some(0),
             ttl_seconds_after_finished: Some(JOB_TTL_SECS),
             // r[impl ctrl.pool.ephemeral-deadline]
-            // Wrong-pool-spawn backstop: K8s kills the pod at
-            // deadline → Job Failed → TTL reaps. i64::from because
-            // the CRD field is u32 (negative deadline is
-            // meaningless, keeps the YAML author from a footgun).
-            active_deadline_seconds: Some(
-                wp.spec
-                    .ephemeral_deadline_seconds
-                    .map(i64::from)
-                    .unwrap_or(DEFAULT_EPHEMERAL_DEADLINE_SECS),
-            ),
+            // r[impl ctrl.ephemeral.per-class-deadline]
+            // Wrong-pool-spawn backstop + per-class hung-build
+            // detector (I-200): K8s kills the pod at deadline →
+            // Job Failed → TTL reaps; scheduler-side the disconnect
+            // promotes size_class_floor. Precedence: explicit
+            // override > cutoff×5 > flat 3600.
+            active_deadline_seconds: Some(ephemeral_deadline(&wp.spec)),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
@@ -604,7 +639,9 @@ mod tests {
         );
         // r[verify ctrl.pool.ephemeral-deadline]
         // Wrong-pool-spawn backstop present, defaults to 3600 when
-        // the CRD field is unset (test_wp doesn't set it).
+        // BOTH ephemeral_deadline_seconds and size_class_cutoff_secs
+        // are unset (test_wp sets neither). The per-class branch is
+        // covered by `per_class_deadline_from_cutoff_secs`.
         assert_eq!(
             spec.active_deadline_seconds,
             Some(DEFAULT_EPHEMERAL_DEADLINE_SECS),
@@ -736,18 +773,23 @@ mod tests {
 
     // r[verify ctrl.pool.ephemeral-deadline]
     /// Non-default `ephemeral_deadline_seconds` propagates to the Job
-    /// spec. Complements `job_spec_load_bearing_fields` (which covers
-    /// the `None → DEFAULT_EPHEMERAL_DEADLINE_SECS` branch) with the
-    /// `Some(N) → Some(N)` branch.
+    /// spec verbatim AND wins over `size_class_cutoff_secs`.
+    /// Complements `job_spec_load_bearing_fields` (which covers the
+    /// `None → DEFAULT_EPHEMERAL_DEADLINE_SECS` branch) and
+    /// `per_class_deadline_from_cutoff_secs` (cutoff×5 branch) with
+    /// the explicit-override branch.
     ///
     /// Without this: a refactor that always used the default (or
-    /// swapped the `.unwrap_or` args, or dropped the `.map(i64::from)`
-    /// and wired the wrong field) would pass the default-case test
-    /// and silently ignore user-configured deadlines.
+    /// swapped the precedence, or dropped the `i64::from` and wired
+    /// the wrong field) would pass the other two tests and silently
+    /// ignore user-configured deadlines.
     #[test]
     fn ephemeral_deadline_some_propagates_to_job_spec() {
         let mut wp = test_wp();
         wp.spec.ephemeral_deadline_seconds = Some(7200);
+        // Cutoff also set → would compute 30×5=150 if precedence
+        // were wrong. 7200 must win.
+        wp.spec.size_class_cutoff_secs = Some(30.0);
         let oref = wp.controller_owner_ref(&()).unwrap();
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
 
@@ -755,9 +797,61 @@ mod tests {
         assert_eq!(
             spec.active_deadline_seconds,
             Some(7200),
-            "Some(7200) must propagate verbatim — NOT clamped to default \
-             (the default-branch test already covers None→3600)"
+            "explicit ephemeral_deadline_seconds=7200 must override \
+             cutoff×5 (=150) AND default (=3600)"
         );
+    }
+
+    // r[verify ctrl.ephemeral.per-class-deadline]
+    /// I-200: with `size_class_cutoff_secs` set and no explicit
+    /// override, `activeDeadlineSeconds = cutoff × DEADLINE_MULTIPLIER`.
+    /// tiny (cutoff=30s) → 150s, NOT the flat 3600. The deadline
+    /// becomes a per-class hung-build detector: K8s kills the pod →
+    /// disconnect → I-197 promotes `size_class_floor`.
+    ///
+    /// Mutation check: revert `ephemeral_deadline()` to ignore cutoff
+    /// → this fails (expects 150, gets 3600). Drop the `.ceil()` →
+    /// the fractional case fails (expects 601, gets 600).
+    #[test]
+    fn per_class_deadline_from_cutoff_secs() {
+        let mut wp = test_wp();
+        wp.spec.size_class_cutoff_secs = Some(30.0);
+        let oref = wp.controller_owner_ref(&()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        assert_eq!(
+            job.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(30 * DEADLINE_MULTIPLIER),
+            "cutoff=30 × DEADLINE_MULTIPLIER({DEADLINE_MULTIPLIER}) → 150, \
+             not flat DEFAULT_EPHEMERAL_DEADLINE_SECS"
+        );
+
+        // xlarge: cutoff=7200 → 36000. Proves the multiplier scales
+        // (not a clamped-to-default refactor).
+        wp.spec.size_class_cutoff_secs = Some(7200.0);
+        let oref = wp.controller_owner_ref(&()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        assert_eq!(
+            job.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(36000)
+        );
+
+        // Fractional cutoff (EMA-derived) rounds UP. 120.1 × 5 =
+        // 600.5 → 601. Floor would give 600 and shave a second off
+        // the bound — wrong direction.
+        wp.spec.size_class_cutoff_secs = Some(120.1);
+        let oref = wp.controller_owner_ref(&()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        assert_eq!(
+            job.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(601)
+        );
+
+        // Degenerate cutoff=0 clamps to 1s (not 0, which K8s treats
+        // as "kill immediately" → silent spawn loop).
+        wp.spec.size_class_cutoff_secs = Some(0.0);
+        let oref = wp.controller_owner_ref(&()).unwrap();
+        let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
+        assert_eq!(job.spec.as_ref().unwrap().active_deadline_seconds, Some(1));
     }
 
     /// I-045: ephemeral Job pods stuck `READY 0/1`, "no SERVING

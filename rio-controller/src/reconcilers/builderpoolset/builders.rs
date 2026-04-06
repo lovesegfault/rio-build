@@ -142,9 +142,18 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         // Until then, WPS children are always Static.
         sizing: Sizing::Static,
         // Deadline only applies to ephemeral Jobs. None →
-        // controller default (3600s). A future SizeClassSpec
-        // field could make this per-class (xlarge wants longer).
+        // build_job derives `cutoff × DEADLINE_MULTIPLIER` from
+        // `size_class_cutoff_secs` below (I-200, `r[ctrl.ephemeral.
+        // per-class-deadline]`). No PoolTemplate override knob — the
+        // WPS author controls cutoff_secs which controls the deadline.
         ephemeral_deadline_seconds: None,
+        // I-200: stamp the class cutoff so build_job can derive a
+        // per-class activeDeadlineSeconds. The static spec value, NOT
+        // `effective_cutoff_secs` (status-side EMA-smoothed) — the
+        // deadline should be a stable upper bound, not chase the
+        // rebalancer's drift (a learned cutoff that briefly dips would
+        // tighten the deadline and false-positive kill in-flight pods).
+        size_class_cutoff_secs: Some(class.cutoff_secs),
         image_pull_policy: None,
         fuse_threads: None,
         // bloom_expected_items (P0375): NOT in PoolTemplate — same
@@ -285,6 +294,15 @@ pub(super) mod tests {
             // size_class drives scheduler routing — must match
             // class.name.
             assert_eq!(child.spec.size_class, class.name);
+            // I-200: cutoff stamped onto child for build_job's
+            // per-class activeDeadlineSeconds derivation.
+            // test_wps_with_classes sets cutoff = (i+1)*60.
+            assert_eq!(
+                child.spec.size_class_cutoff_secs,
+                Some(class.cutoff_secs),
+                "size_class_cutoff_secs must propagate (I-200 \
+                 r[ctrl.ephemeral.per-class-deadline])"
+            );
             // Namespace propagates (namespaced CRD).
             assert_eq!(
                 child.metadata.namespace.as_deref(),

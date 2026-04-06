@@ -1210,6 +1210,172 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     Ok(())
 }
 
+// r[verify sched.timeout.promote-on-exceed]
+/// I-200: `TimedOut` promotes `size_class_floor` AND resets to Ready
+/// (bounded by `max_timeout_retries`), then goes terminal `Cancelled`.
+///
+/// Before I-200, `TimedOut` went straight to Cancelled without
+/// promoting — so a worker-side `daemon_timeout_secs` hit on tiny
+/// gave up immediately instead of retrying on a larger class with a
+/// longer deadline. Mutation check: revert `handle_timeout_failure`
+/// to the pre-I-200 terminal-only path → first `assert_eq!(status,
+/// Ready)` fails (gets Cancelled).
+///
+/// Shape mirrors `test_infrastructure_failure_max_infra_retries_
+/// poisons` (cap behavior) + `builder_size_class_floor_skips_smaller`
+/// (size-class setup): `max_timeout_retries=2` so the test walks
+/// tiny→small→medium then terminals.
+#[tokio::test]
+async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 120.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            SizeClassConfig {
+                name: "medium".into(),
+                cutoff_secs: 600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ])
+        .with_retry_policy(crate::RetryPolicy {
+            // 2 retries → walks tiny→small, small→medium, then
+            // terminal on the 3rd TimedOut.
+            max_timeout_retries: 2,
+            ..Default::default()
+        })
+    });
+
+    // Three classed builders. promote_size_class_floor reads the
+    // FAILED executor's `size_class` to compute next_builder_class,
+    // so each completion must come from the class the drv is on.
+    let _t = connect_builder_classed(&handle, "to-tiny", "x86_64-linux", "tiny").await?;
+    let _s = connect_builder_classed(&handle, "to-small", "x86_64-linux", "small").await?;
+    let _m = connect_builder_classed(&handle, "to-medium", "x86_64-linux", "medium").await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "i200-timeout";
+    let drv_path = test_drv_path(drv_hash);
+    let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // ── Retry 1: TimedOut on tiny → floor=small, status=Ready ──────
+    let ok = handle.debug_force_assign(drv_hash, "to-tiny").await?;
+    assert!(ok, "force-assign tiny should succeed");
+    complete_failure(
+        &handle,
+        "to-tiny",
+        &drv_path,
+        rio_proto::build_types::BuildResultStatus::TimedOut,
+        "build exceeded daemon_timeout_secs",
+    )
+    .await?;
+
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.size_class_floor.as_deref(),
+        Some("small"),
+        "I-200: TimedOut on tiny → floor promoted to small"
+    );
+    assert!(
+        matches!(
+            info.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "I-200: TimedOut under cap → reset to Ready (NOT terminal Cancelled), got {:?}",
+        info.status
+    );
+    assert_eq!(
+        info.timeout_retry_count, 1,
+        "timeout_retry_count incremented"
+    );
+    // Timeout MUST NOT eat other budgets.
+    assert_eq!(
+        info.retry_count, 0,
+        "TimedOut must not consume transient budget"
+    );
+    assert_eq!(
+        info.infra_retry_count, 0,
+        "TimedOut must not consume infra budget"
+    );
+    assert!(
+        info.failed_builders.is_empty(),
+        "TimedOut is not per-worker — failed_builders stays empty"
+    );
+
+    // ── Retry 2: TimedOut on small → floor=medium, status=Ready ────
+    let ok = handle.debug_force_assign(drv_hash, "to-small").await?;
+    assert!(ok, "force-assign small should succeed");
+    complete_failure(
+        &handle,
+        "to-small",
+        &drv_path,
+        rio_proto::build_types::BuildResultStatus::TimedOut,
+        "build exceeded daemon_timeout_secs",
+    )
+    .await?;
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(info.size_class_floor.as_deref(), Some("medium"));
+    assert!(
+        matches!(
+            info.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "2nd TimedOut still under cap=2 → Ready, got {:?}",
+        info.status
+    );
+    assert_eq!(info.timeout_retry_count, 2);
+
+    // ── Cap exhausted: 3rd TimedOut on medium → terminal Cancelled ──
+    // Floor still promoted (promote happens before cap check) so an
+    // explicit resubmit would start at the next class — but there IS
+    // no next class (medium is largest), so floor stays at medium.
+    let ok = handle.debug_force_assign(drv_hash, "to-medium").await?;
+    assert!(ok, "force-assign medium should succeed");
+    complete_failure(
+        &handle,
+        "to-medium",
+        &drv_path,
+        rio_proto::build_types::BuildResultStatus::TimedOut,
+        "build exceeded daemon_timeout_secs",
+    )
+    .await?;
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Cancelled,
+        "3rd TimedOut at max_timeout_retries=2 → terminal Cancelled, got {:?}",
+        info.status
+    );
+    assert_eq!(
+        info.size_class_floor.as_deref(),
+        Some("medium"),
+        "promote ran but clamped at largest class (no demote)"
+    );
+    Ok(())
+}
+
 /// InfrastructureFailure hits `max_infra_retries` → poison. The cap
 /// exists to convert a misclassified permanent failure (e.g. S3 auth
 /// error reported as infra) into a visible poison instead of a hot

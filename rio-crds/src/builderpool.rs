@@ -172,6 +172,20 @@ pub struct BuilderPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_deadline_seconds: Option<u32>,
 
+    /// The class's `cutoffSecs` (upper-bound predicted build duration).
+    /// Stamped onto BuilderPoolSet children from `SizeClassSpec.cutoff_
+    /// secs`; standalone BuilderPools may set it directly. When set and
+    /// `ephemeral_deadline_seconds` is unset, ephemeral Jobs derive
+    /// `activeDeadlineSeconds = cutoff * DEADLINE_MULTIPLIER` instead of
+    /// the flat 3600 default --- per-class hung-build detection (I-200,
+    /// `r[ctrl.ephemeral.per-class-deadline]`). f64 to match
+    /// `SizeClassSpec.cutoff_secs` (EMA-smoothed cutoffs are
+    /// fractional); the controller `ceil`s before casting. NOT CEL-gated
+    /// to `ephemeral: true`: it's a no-op in STS mode but harmless to
+    /// carry, and BuilderPoolSet stamps it unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_class_cutoff_secs: Option<f64>,
+
     /// Autoscaling policy. `target_value` is queued-derivations-per-
     /// worker: scale up when `queued / active_executors > target`.
     pub autoscaling: Autoscaling,

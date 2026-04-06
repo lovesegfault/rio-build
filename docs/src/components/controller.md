@@ -165,6 +165,23 @@ phase5's ClusterStatus proto extension. CEL validation rejects
 `ephemeralDeadlineSeconds` set on non-ephemeral pools (field only makes
 sense in Job mode).
 
+r[ctrl.ephemeral.per-class-deadline]
+When `BuilderPoolSpec.sizeClassCutoffSecs` is set (stamped onto every
+BuilderPoolSet child from `SizeClassSpec.cutoffSecs`), the ephemeral
+Job's `activeDeadlineSeconds` MUST be `cutoffSecs * DEADLINE_MULTIPLIER`
+(5) instead of the flat 3600 default --- so a `tiny` (cutoff 30s) pod
+gets 150s, `xlarge` (cutoff 7200s) gets 36000s. An explicit
+`ephemeralDeadlineSeconds` on the pool overrides the computed value
+verbatim. Rationale (I-200): with a flat 1h deadline, a tiny-class build
+that hangs holds a node for 3600s before the K8s deadline kills it ->
+`ExecutorDisconnected` -> `r[sched.reassign.no-promote-on-ephemeral-
+disconnect+2]` promotes; tying the deadline to the class cutoff makes
+the deadline a per-class hung-build detector. K8s killing the pod at
+deadline routes through the same disconnect-promotes path as an OOMKill,
+so the next dispatch lands on a larger class. `FetcherSizeClass` has no
+`cutoffSecs` (FODs route by reactive floor only) so fetcher Jobs keep
+the flat 300s default.
+
 r[ctrl.pool.per-system-class-depth]
 For pools with `spec.sizeClass` set, the spawn/scale decision MUST
 intersect the class's `SizeClassStatus.queued_by_system` with

@@ -602,62 +602,106 @@ pub(super) async fn fetch_chunks_to_spool(
     spool: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<u64, NarCollectError> {
     let n_chunks = chunks.len();
+    let concurrency = concurrency.max(1);
     let fut = async {
-        let mut written: u64 = 0;
-        let mut s = stream::iter(chunks)
-            .map(|cr| {
-                let mut c = chunk_client.clone();
-                async move {
-                    let mut attempt = 0usize;
-                    loop {
-                        match fetch_one_chunk(&mut c, &cr.hash).await {
-                            Ok(b) => {
-                                if attempt > 0 {
-                                    metrics::counter!(
-                                        "rio_builder_fuse_fetch_chunks_total",
-                                        "outcome" => "retry_ok"
-                                    )
-                                    .increment(1);
-                                }
-                                return Ok(b);
-                            }
-                            Err(status) if is_transient_status(&status) => {
-                                attempt += 1;
+        // Per-chunk fetch (with transient retry) as a closure so the
+        // priming loop and the refill below produce the same future type
+        // for `FuturesOrdered`.
+        let fetch = |cr: ChunkRef| {
+            let mut c = chunk_client.clone();
+            async move {
+                let mut attempt = 0usize;
+                loop {
+                    match fetch_one_chunk(&mut c, &cr.hash).await {
+                        Ok(b) => {
+                            if attempt > 0 {
                                 metrics::counter!(
                                     "rio_builder_fuse_fetch_chunks_total",
-                                    "outcome" => "retry"
+                                    "outcome" => "retry_ok"
                                 )
                                 .increment(1);
-                                if attempt > CHUNK_RETRY_ATTEMPTS {
-                                    return Err(NarCollectError::Stream(status));
-                                }
-                                // No sleep: K-1 other chunks are in flight;
-                                // by the time this future is polled again the
-                                // transient (replica restart, brief PG-pool
-                                // saturation) has likely cleared. The outer
-                                // RETRY_BACKOFF in fetch_extract_insert
-                                // handles the "everything is down" case.
                             }
-                            Err(status) => return Err(NarCollectError::Stream(status)),
+                            return Ok::<_, NarCollectError>(b);
                         }
+                        Err(status) if is_transient_status(&status) => {
+                            attempt += 1;
+                            metrics::counter!(
+                                "rio_builder_fuse_fetch_chunks_total",
+                                "outcome" => "retry"
+                            )
+                            .increment(1);
+                            if attempt > CHUNK_RETRY_ATTEMPTS {
+                                return Err(NarCollectError::Stream(status));
+                            }
+                            // No sleep: K-1 other chunks are in flight;
+                            // by the time this future is polled again the
+                            // transient (replica restart, brief PG-pool
+                            // saturation) has likely cleared. The outer
+                            // RETRY_BACKOFF in fetch_extract_insert
+                            // handles the "everything is down" case.
+                        }
+                        Err(status) => return Err(NarCollectError::Stream(status)),
                     }
                 }
-            })
-            .buffered(concurrency.max(1));
-
-        while let Some(r) = s.next().await {
-            let bytes = r?;
-            let new_len = written.saturating_add(bytes.len() as u64);
-            if new_len > max_size {
-                return Err(NarCollectError::SizeExceeded {
-                    got: new_len,
-                    limit: max_size,
-                });
             }
-            spool.write_all(&bytes).await?;
-            written = new_len;
-            metrics::counter!("rio_builder_fuse_fetch_chunks_total", "outcome" => "ok")
-                .increment(1);
+        };
+
+        // Manual `FuturesOrdered` window (semantically `.buffered(K)`)
+        // so that on the first error we can STOP refilling but DRAIN
+        // the ≤K-1 already-in-flight RPCs to completion instead of
+        // dropping them. Dropping a `buffered` stream sends one
+        // RST_STREAM per in-flight h2 stream; with K=CHUNK_FETCH_
+        // CONCURRENCY=32 that exceeds h2's `max_pending_accept_reset_
+        // streams` guard (default 20) → server replies GOAWAY(PROTOCOL_
+        // ERROR) → the SHARED channel (StoreClients::from_channel) is
+        // torn down → the immediately-following GetPath fallback fails
+        // Internal/Cancelled → EIO. Draining costs at most K-1 already-
+        // started RPCs (the iterator below is not advanced past the
+        // error), so an Unimplemented store wastes ≤31 cheap error
+        // round-trips, not the whole manifest.
+        let mut chunks = chunks.into_iter();
+        let mut in_flight = stream::FuturesOrdered::new();
+        for cr in chunks.by_ref().take(concurrency) {
+            in_flight.push_back(fetch(cr));
+        }
+
+        let mut written: u64 = 0;
+        let mut first_err: Option<NarCollectError> = None;
+        while let Some(r) = in_flight.next().await {
+            match r {
+                Ok(bytes) if first_err.is_none() => {
+                    let new_len = written.saturating_add(bytes.len() as u64);
+                    if new_len > max_size {
+                        first_err = Some(NarCollectError::SizeExceeded {
+                            got: new_len,
+                            limit: max_size,
+                        });
+                        continue; // drain in-flight, don't refill
+                    }
+                    spool.write_all(&bytes).await?;
+                    written = new_len;
+                    metrics::counter!(
+                        "rio_builder_fuse_fetch_chunks_total",
+                        "outcome" => "ok"
+                    )
+                    .increment(1);
+                    if let Some(cr) = chunks.next() {
+                        in_flight.push_back(fetch(cr));
+                    }
+                }
+                // Already errored: discard late-arriving Ok bytes (the
+                // spool will be reset by the caller anyway). Don't refill.
+                Ok(_) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    // Don't refill — let remaining in-flight complete.
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         spool.flush().await?;
         Ok(written)
@@ -1787,6 +1831,18 @@ mod tests {
 
     /// Store returns Unimplemented for `GetChunk` → fetch falls back to
     /// `GetPath` and still succeeds. Covers the "old store binary" arm.
+    ///
+    /// Flake-fix strategy (structural, prod bug): `chunk_size=4` over
+    /// the ~128-byte NAR yields ~30 chunks → all CHUNK_FETCH_CONCURRENCY
+    /// =32 slots fire at once. With the old `.buffered()`+`?` fan-out,
+    /// the first Unimplemented dropped the stream → ~29 RST_STREAMs →
+    /// h2's rapid-reset guard (`max_pending_accept_reset_streams`=20)
+    /// sent GOAWAY(PROTOCOL_ERROR) on the shared channel → the GetPath
+    /// fallback hit Internal/Cancelled → EIO ~15-20% of runs. Fixed in
+    /// `fetch_chunks_to_spool` by draining in-flight on error instead of
+    /// dropping. Retry/widen rejected: this was a real prod fallback-path
+    /// bug (StoreClients shares one Channel — main.rs), not test noise;
+    /// the small chunk size is kept deliberately as the regression guard.
     // r[verify builder.fuse.fetch-chunk-fanout]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fetch_via_chunks_unimplemented_falls_back_to_getpath() {
@@ -1797,7 +1853,13 @@ mod tests {
         let store_path = format!("/nix/store/{basename}");
         let (nar, hash) = make_nar(b"fallback-body");
         let info = make_path_info(&store_path, &nar, hash);
+        // chunk_size=4 ⇒ ~30 chunks ⇒ fan-out saturates concurrency.
+        // Do NOT raise this — see doc comment above.
         let chunk_refs = store.seed_chunked(info.clone(), nar.clone(), 4);
+        assert!(
+            chunk_refs.len() > CHUNK_FETCH_CONCURRENCY.min(20),
+            "want enough chunks to saturate the fan-out window"
+        );
         cache.prime_manifest_hints([(
             basename.clone(),
             rio_proto::types::ManifestHint {

@@ -65,6 +65,9 @@ pub struct DebugDerivationInfo {
     /// InfrastructureFailure re-dispatch count. For asserting the
     /// I-127 cap behavior + concurrent-PutPath exemption.
     pub infra_retry_count: u32,
+    /// `TimedOut` re-dispatch count (I-200). For asserting
+    /// `r[sched.timeout.promote-on-exceed]` cap behavior.
+    pub timeout_retry_count: u32,
     /// Whether this derivation is content-addressed. For precondition
     /// asserts in CA cutoff-compare tests.
     pub is_ca: bool,

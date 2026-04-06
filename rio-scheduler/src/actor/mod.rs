@@ -1093,6 +1093,7 @@ impl DagActor {
             failed_builders: s.failed_builders.iter().map(|w| w.to_string()).collect(),
             failure_count: s.failure_count,
             infra_retry_count: s.infra_retry_count,
+            timeout_retry_count: s.timeout_retry_count,
             is_ca: s.is_ca,
             ca_output_unchanged: s.ca_output_unchanged,
         })

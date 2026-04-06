@@ -288,6 +288,18 @@ pub struct RetryPolicy {
     /// otherwise hot-loop forever. Observed: 9748 re-dispatches in
     /// one session before the CA-path-propagation fix landed.
     pub max_infra_retries: u32,
+    /// Maximum number of `TimedOut` re-dispatches before the
+    /// derivation goes terminal (`Cancelled`). Each `TimedOut` retry
+    /// promotes `size_class_floor` (I-200, `r[sched.timeout.promote-
+    /// on-exceed]`), so this caps how many size-class steps a build
+    /// can climb on timeout before the operator gets a visible
+    /// failure. Default 4: tiny→small→medium→large→xlarge is 4
+    /// promotions; a build that times out on xlarge is genuinely
+    /// stuck. Separate counter from `max_retries` (timeouts don't
+    /// eat the transient budget) and from `max_infra_retries` (no
+    /// time-window reset — sparse timeouts over hours are still the
+    /// same hung build).
+    pub max_timeout_retries: u32,
     /// Seconds since the LAST infra failure after which the
     /// `infra_retry_count` is reset to 0. Infra failures are by
     /// definition transient — N quick failures suggests a
@@ -328,6 +340,13 @@ impl Default for RetryPolicy {
             // A true misclassified permanent failure still poisons in
             // 10 immediate cycles — well under a minute.
             max_infra_retries: 10,
+            // I-200: 4 = number of promotions to walk a 5-class
+            // ladder (tiny→xlarge). After that, terminal Cancelled.
+            // Each retry goes to a larger class with a 5× longer
+            // activeDeadlineSeconds, so the wall-clock cost is
+            // bounded by Σ(cutoff_i × 5) ≈ 5× the largest class
+            // cutoff — not unbounded.
+            max_timeout_retries: 4,
             // 5min: long enough that a stuck lock (I-125a's leaked
             // PutPath, ~tens of seconds to recover) or a store
             // restart doesn't compound across attempts; short enough
