@@ -24,6 +24,7 @@ pub mod migrations;
 // update both sites.
 pub(crate) mod realisations;
 pub mod signing;
+pub mod substitute;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 pub(crate) mod validate;
@@ -133,6 +134,19 @@ pub fn describe_metrics() {
         "SignPath requests for non-CA paths with zero references. Suspicious \
          for non-leaf derivations — GC cannot protect deps without the ref \
          graph. Check worker ref-scanner if sustained."
+    );
+    describe_counter!(
+        "rio_store_substitute_total",
+        "Upstream substitution attempts (labeled by result: hit/miss/error, \
+         upstream: URL). Hit means ingested; miss means no upstream had it."
+    );
+    describe_counter!(
+        "rio_store_substitute_bytes_total",
+        "Bytes ingested via upstream substitution (nar_size on hit)"
+    );
+    describe_histogram!(
+        "rio_store_substitute_duration_seconds",
+        "Upstream substitution latency (narinfo fetch + NAR download + ingest)"
     );
 
     // Pre-register drain gauges at 0. metrics-rs only materializes a gauge

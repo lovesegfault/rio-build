@@ -19210,6 +19210,10 @@
           "packageId": "futures-core"
         },
         {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
           "name": "http",
           "packageId": "http 1.4.0"
         },
@@ -19301,6 +19305,11 @@
           "target": "cfg(not(target_arch = \"wasm32\"))"
         },
         {
+          "name": "tokio-util",
+          "packageId": "tokio-util",
+          "target": "cfg(not(target_arch = \"wasm32\"))"
+        },
+        {
           "name": "tower",
           "packageId": "tower",
           "target": "cfg(not(target_arch = \"wasm32\"))"
@@ -19330,6 +19339,11 @@
           "target": "cfg(target_arch = \"wasm32\")"
         },
         {
+          "name": "wasm-streams",
+          "packageId": "wasm-streams",
+          "target": "cfg(target_arch = \"wasm32\")"
+        },
+        {
           "name": "web-sys",
           "packageId": "web-sys",
           "target": "cfg(target_arch = \"wasm32\")"
@@ -19341,7 +19355,8 @@
         "__tls",
         "json",
         "rustls",
-        "rustls-native-certs"
+        "rustls-native-certs",
+        "stream"
       ],
       "libCrateTypes": [
         "lib"
@@ -20677,6 +20692,10 @@
         {
           "name": "moka",
           "packageId": "moka"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest 0.13.1"
         },
         {
           "name": "rio-common",
@@ -27583,6 +27602,44 @@
         "lib"
       ]
     },
+    "wasm-streams": {
+      "crateName": "wasm-streams",
+      "version": "0.4.2",
+      "edition": "2021",
+      "sha256": "0rddn007hp6k2cm91mm9y33n79b0jxv0c3znzszcvv67hn6ks18m",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "js-sys",
+          "packageId": "js-sys"
+        },
+        {
+          "name": "wasm-bindgen",
+          "packageId": "wasm-bindgen"
+        },
+        {
+          "name": "wasm-bindgen-futures",
+          "packageId": "wasm-bindgen-futures"
+        },
+        {
+          "name": "web-sys",
+          "packageId": "web-sys"
+        }
+      ],
+      "libCrateTypes": [
+        "cdylib",
+        "rlib"
+      ],
+      "authors": [
+        "Mattias Buelens <mattias@buelens.com>"
+      ]
+    },
     "wasmparser": {
       "crateName": "wasmparser",
       "version": "0.244.0",
@@ -27662,7 +27719,18 @@
         "MessageEvent",
         "Node",
         "Performance",
+        "QueuingStrategy",
+        "ReadableByteStreamController",
         "ReadableStream",
+        "ReadableStreamByobReader",
+        "ReadableStreamByobRequest",
+        "ReadableStreamDefaultController",
+        "ReadableStreamDefaultReader",
+        "ReadableStreamGetReaderOptions",
+        "ReadableStreamReadResult",
+        "ReadableStreamReaderMode",
+        "ReadableStreamType",
+        "ReadableWritablePair",
         "Request",
         "RequestCache",
         "RequestCredentials",
@@ -27670,9 +27738,18 @@
         "RequestMode",
         "Response",
         "ServiceWorkerGlobalScope",
+        "StreamPipeOptions",
+        "TransformStream",
+        "TransformStreamDefaultController",
+        "Transformer",
+        "UnderlyingSink",
+        "UnderlyingSource",
         "Window",
         "Worker",
         "WorkerGlobalScope",
+        "WritableStream",
+        "WritableStreamDefaultController",
+        "WritableStreamDefaultWriter",
         "default",
         "std"
       ],
@@ -29924,6 +30001,10 @@
         {
           "name": "regex-syntax",
           "packageId": "regex-syntax"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest 0.13.1"
         },
         {
           "name": "rustls",

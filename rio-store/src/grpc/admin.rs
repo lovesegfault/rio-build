@@ -642,30 +642,131 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     }
 
     // ────────────────────────────────────────────────────────────────
-    // Upstream CRUD — stubs. Full impl in P0462 (core fetch logic).
+    // Upstream CRUD — per-tenant binary-cache substitution config.
     // r[impl store.substitute.upstream]
-    // TODO(P0462): wire to tenant_upstreams CRUD
     // ────────────────────────────────────────────────────────────────
 
+    #[instrument(skip(self, request), fields(rpc = "ListUpstreams"))]
     async fn list_upstreams(
         &self,
-        _request: Request<ListUpstreamsRequest>,
+        request: Request<ListUpstreamsRequest>,
     ) -> Result<Response<ListUpstreamsResponse>, Status> {
-        Err(Status::unimplemented("ListUpstreams: P0462"))
+        let req = request.into_inner();
+        let tenant_id = parse_tenant_id(&req.tenant_id)?;
+        let ups = metadata::upstreams::list_for_tenant(&self.pool, tenant_id)
+            .await
+            .map_err(|e| super::metadata_status("ListUpstreams", e))?;
+        Ok(Response::new(ListUpstreamsResponse {
+            upstreams: ups.into_iter().map(upstream_to_proto).collect(),
+        }))
     }
 
+    #[instrument(skip(self, request), fields(rpc = "AddUpstream"))]
     async fn add_upstream(
         &self,
-        _request: Request<AddUpstreamRequest>,
+        request: Request<AddUpstreamRequest>,
     ) -> Result<Response<UpstreamInfo>, Status> {
-        Err(Status::unimplemented("AddUpstream: P0462"))
+        let req = request.into_inner();
+        let tenant_id = parse_tenant_id(&req.tenant_id)?;
+
+        // Validate url: must be http(s). Anything else (file://, ssh)
+        // is not a binary-cache URL we know how to fetch.
+        if !req.url.starts_with("https://") && !req.url.starts_with("http://") {
+            return Err(Status::invalid_argument(
+                "url must start with https:// or http://",
+            ));
+        }
+
+        // Validate sig_mode. Empty → keep (the proto default maps to
+        // the migration's DEFAULT 'keep').
+        let sig_mode = metadata::SigMode::parse(&req.sig_mode).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "sig_mode must be keep|add|replace, got {:?}",
+                req.sig_mode
+            ))
+        })?;
+
+        // Validate trusted_keys format: `name:base64(32-byte-pubkey)`.
+        // Same format Nix's `trusted-public-keys` uses.
+        for k in &req.trusted_keys {
+            validate_trusted_key(k)?;
+        }
+
+        let priority = if req.priority == 0 { 50 } else { req.priority };
+
+        let up = metadata::upstreams::insert(
+            &self.pool,
+            tenant_id,
+            &req.url,
+            priority,
+            &req.trusted_keys,
+            sig_mode,
+        )
+        .await
+        .map_err(|e| super::metadata_status("AddUpstream: insert", e))?;
+
+        Ok(Response::new(upstream_to_proto(up)))
     }
 
+    #[instrument(skip(self, request), fields(rpc = "RemoveUpstream"))]
     async fn remove_upstream(
         &self,
-        _request: Request<RemoveUpstreamRequest>,
+        request: Request<RemoveUpstreamRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("RemoveUpstream: P0462"))
+        let req = request.into_inner();
+        let tenant_id = parse_tenant_id(&req.tenant_id)?;
+        let n = metadata::upstreams::delete(&self.pool, tenant_id, &req.url)
+            .await
+            .map_err(|e| super::metadata_status("RemoveUpstream: delete", e))?;
+        if n == 0 {
+            return Err(Status::not_found(format!(
+                "upstream {} not found for tenant {tenant_id}",
+                req.url
+            )));
+        }
+        Ok(Response::new(()))
+    }
+}
+
+/// Parse the proto's string tenant_id into a Uuid. Proto uses string
+/// (not bytes) for UUIDs; this is the one conversion point.
+fn parse_tenant_id(s: &str) -> Result<uuid::Uuid, Status> {
+    uuid::Uuid::parse_str(s)
+        .map_err(|e| Status::invalid_argument(format!("invalid tenant_id {s:?}: {e}")))
+}
+
+/// Validate a `name:base64(pubkey)` trusted-key entry. Rejects
+/// unparseable base64 and wrong-length pubkeys (ed25519 is 32 bytes).
+fn validate_trusted_key(k: &str) -> Result<(), Status> {
+    let (name, b64) = k.split_once(':').ok_or_else(|| {
+        Status::invalid_argument(format!("trusted_key {k:?}: missing ':' separator"))
+    })?;
+    if name.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "trusted_key {k:?}: empty key name"
+        )));
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| Status::invalid_argument(format!("trusted_key {k:?}: bad base64: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(Status::invalid_argument(format!(
+            "trusted_key {k:?}: pubkey must be 32 bytes (ed25519), got {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+fn upstream_to_proto(u: metadata::Upstream) -> UpstreamInfo {
+    UpstreamInfo {
+        id: u.id,
+        tenant_id: u.tenant_id.to_string(),
+        url: u.url,
+        priority: u.priority,
+        trusted_keys: u.trusted_keys,
+        sig_mode: u.sig_mode.as_str().to_string(),
     }
 }
 
@@ -1566,5 +1667,154 @@ mod tests {
             .await
             .expect_err("bad cursor");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Upstream CRUD
+    // ────────────────────────────────────────────────────────────────
+
+    fn valid_trusted_key() -> String {
+        use base64::Engine;
+        format!(
+            "test-key:{}",
+            base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+        )
+    }
+
+    #[tokio::test]
+    async fn add_list_remove_upstream_roundtrip() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        let tid = rio_test_support::seed_tenant(&db.pool, "ups-rpc").await;
+
+        // Add.
+        let added = svc
+            .add_upstream(Request::new(AddUpstreamRequest {
+                tenant_id: tid.to_string(),
+                url: "https://cache.example".into(),
+                priority: 30,
+                trusted_keys: vec![valid_trusted_key()],
+                sig_mode: "add".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(added.id > 0);
+        assert_eq!(added.sig_mode, "add");
+        assert_eq!(added.priority, 30);
+
+        // List.
+        let listed = svc
+            .list_upstreams(Request::new(ListUpstreamsRequest {
+                tenant_id: tid.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.upstreams.len(), 1);
+        assert_eq!(listed.upstreams[0].url, "https://cache.example");
+
+        // Remove.
+        svc.remove_upstream(Request::new(RemoveUpstreamRequest {
+            tenant_id: tid.to_string(),
+            url: "https://cache.example".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Remove again → NotFound.
+        let err = svc
+            .remove_upstream(Request::new(RemoveUpstreamRequest {
+                tenant_id: tid.to_string(),
+                url: "https://cache.example".into(),
+            }))
+            .await
+            .expect_err("already deleted");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_validates_inputs() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        let tid = rio_test_support::seed_tenant(&db.pool, "ups-val").await;
+
+        // Bad sig_mode.
+        let err = svc
+            .add_upstream(Request::new(AddUpstreamRequest {
+                tenant_id: tid.to_string(),
+                url: "https://x.example".into(),
+                priority: 50,
+                trusted_keys: vec![],
+                sig_mode: "junk".into(),
+            }))
+            .await
+            .expect_err("bad sig_mode");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Bad url scheme.
+        let err = svc
+            .add_upstream(Request::new(AddUpstreamRequest {
+                tenant_id: tid.to_string(),
+                url: "ftp://x.example".into(),
+                priority: 50,
+                trusted_keys: vec![],
+                sig_mode: "keep".into(),
+            }))
+            .await
+            .expect_err("bad url");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Bad trusted_key (wrong pubkey length).
+        let short_key = format!(
+            "k:{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 16])
+        );
+        let err = svc
+            .add_upstream(Request::new(AddUpstreamRequest {
+                tenant_id: tid.to_string(),
+                url: "https://x.example".into(),
+                priority: 50,
+                trusted_keys: vec![short_key],
+                sig_mode: "keep".into(),
+            }))
+            .await
+            .expect_err("bad key length");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Bad tenant_id.
+        let err = svc
+            .add_upstream(Request::new(AddUpstreamRequest {
+                tenant_id: "not-a-uuid".into(),
+                url: "https://x.example".into(),
+                priority: 50,
+                trusted_keys: vec![],
+                sig_mode: "keep".into(),
+            }))
+            .await
+            .expect_err("bad tenant_id");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_defaults() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+        let tid = rio_test_support::seed_tenant(&db.pool, "ups-def").await;
+
+        // Empty sig_mode + priority=0 → keep + 50.
+        let added = svc
+            .add_upstream(Request::new(AddUpstreamRequest {
+                tenant_id: tid.to_string(),
+                url: "https://x.example".into(),
+                priority: 0,
+                trusted_keys: vec![],
+                sig_mode: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(added.sig_mode, "keep");
+        assert_eq!(added.priority, 50);
     }
 }

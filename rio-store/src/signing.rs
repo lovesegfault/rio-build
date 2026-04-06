@@ -24,7 +24,72 @@
 //! 64-byte format for compatibility.
 
 use base64::Engine;
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+
+// r[impl store.substitute.tenant-sig-visibility]
+/// Check if any of `sigs` (narinfo `Sig:` format: `name:base64(sig)`)
+/// verifies against any of `trusted_keys` (`name:base64(pubkey)`) for
+/// the given `fingerprint`. Returns the matching key name or `None`.
+///
+/// This is the cross-tenant visibility gate: when tenant B queries a
+/// path that tenant A substituted, B sees it IFF one of the stored
+/// `narinfo.signatures` verifies against a key in B's trust-set
+/// (`metadata::upstreams::tenant_trusted_keys(B)`). Called from
+/// `query_path_info` with the REQUESTING tenant's keys — not the
+/// substituting tenant's.
+///
+/// Thin wrapper over the same ed25519-verify loop as
+/// [`rio_nix::narinfo::NarInfo::verify_sig`]. That method works on a
+/// parsed `NarInfo` (it reconstructs the fingerprint from fields); this
+/// one takes the fingerprint directly (the caller has the
+/// `ValidatedPathInfo` and can call [`rio_nix::narinfo::fingerprint`]).
+///
+/// Malformed entries (bad base64, wrong key length) are skipped, not
+/// errors — an attacker who can inject garbage sigs shouldn't be able
+/// to DoS the gate.
+pub fn any_sig_trusted(
+    sigs: &[String],
+    trusted_keys: &[String],
+    fingerprint: &str,
+) -> Option<String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // Parse trusted_keys up front. O(keys) not O(keys×sigs) for the
+    // base64-decode + VerifyingKey construction.
+    let keys: Vec<(&str, VerifyingKey)> = trusted_keys
+        .iter()
+        .filter_map(|k| {
+            let (name, pk_b64) = k.split_once(':')?;
+            let pk: [u8; 32] = b64.decode(pk_b64).ok()?.try_into().ok()?;
+            Some((name, VerifyingKey::from_bytes(&pk).ok()?))
+        })
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+
+    for sig in sigs {
+        let Some((sig_name, sig_b64)) = sig.split_once(':') else {
+            continue;
+        };
+        let Some((_, vk)) = keys.iter().find(|(n, _)| *n == sig_name) else {
+            continue;
+        };
+        let Ok(sig_bytes) = b64.decode(sig_b64) else {
+            continue;
+        };
+        let Ok(sig_arr): Result<[u8; 64], _> = sig_bytes.try_into() else {
+            continue;
+        };
+        if vk
+            .verify(fingerprint.as_bytes(), &Signature::from_bytes(&sig_arr))
+            .is_ok()
+        {
+            return Some(sig_name.to_string());
+        }
+    }
+    None
+}
 
 /// A loaded signing key.
 ///
@@ -674,5 +739,99 @@ mod tests {
         cluster_pk
             .verify(b"fp", &parse_sig(&signer_none.sign("fp")))
             .expect("cluster clone signs cluster-verifiable sigs");
+    }
+
+    // ------------------------------------------------------------------------
+    // any_sig_trusted — cross-tenant sig-visibility gate
+    // ------------------------------------------------------------------------
+
+    fn make_trusted_key(name: &str, seed: &[u8; 32]) -> String {
+        let pk = SigningKey::from_bytes(seed).verifying_key();
+        format!(
+            "{name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(pk.as_bytes())
+        )
+    }
+
+    // r[verify store.substitute.tenant-sig-visibility]
+    #[test]
+    fn any_sig_trusted_accepts_matching() {
+        let seed = [0x11u8; 32];
+        let signer = Signer::from_seed("key-a", &seed);
+        let fp = "1;/nix/store/x;sha256:y;1;";
+        let sig = signer.sign(fp);
+        let trusted = make_trusted_key("key-a", &seed);
+
+        assert_eq!(
+            any_sig_trusted(&[sig], &[trusted], fp).as_deref(),
+            Some("key-a")
+        );
+    }
+
+    #[test]
+    fn any_sig_trusted_rejects_untrusted() {
+        let signer = Signer::from_seed("key-a", &[0x11u8; 32]);
+        let fp = "1;/nix/store/x;sha256:y;1;";
+        let sig = signer.sign(fp);
+        // Different key in trust set — key-b, not key-a.
+        let trusted = make_trusted_key("key-b", &[0x22u8; 32]);
+
+        assert_eq!(any_sig_trusted(&[sig], &[trusted], fp), None);
+    }
+
+    #[test]
+    fn any_sig_trusted_rejects_tampered_fingerprint() {
+        let seed = [0x11u8; 32];
+        let signer = Signer::from_seed("key-a", &seed);
+        let sig = signer.sign("1;/nix/store/REAL;sha256:y;1;");
+        let trusted = make_trusted_key("key-a", &seed);
+
+        // Sig was over REAL; verify against TAMPERED → None.
+        assert_eq!(
+            any_sig_trusted(&[sig], &[trusted], "1;/nix/store/TAMPERED;sha256:y;1;"),
+            None
+        );
+    }
+
+    #[test]
+    fn any_sig_trusted_multi_sig_multi_key() {
+        // Two sigs: one by key-a (trusted), one by key-c (untrusted).
+        // trusted_keys has key-a and key-b. Expect match on key-a.
+        let seed_a = [0x11u8; 32];
+        let fp = "1;/nix/store/x;sha256:y;1;";
+        let sig_a = Signer::from_seed("key-a", &seed_a).sign(fp);
+        let sig_c = Signer::from_seed("key-c", &[0x33u8; 32]).sign(fp);
+
+        let trusted = vec![
+            make_trusted_key("key-a", &seed_a),
+            make_trusted_key("key-b", &[0x22u8; 32]),
+        ];
+
+        assert_eq!(
+            any_sig_trusted(&[sig_c, sig_a], &trusted, fp).as_deref(),
+            Some("key-a"),
+            "first matching key name returned"
+        );
+    }
+
+    #[test]
+    fn any_sig_trusted_empty_inputs() {
+        let fp = "1;/nix/store/x;sha256:y;1;";
+        assert_eq!(any_sig_trusted(&[], &["k:abc".into()], fp), None);
+        assert_eq!(any_sig_trusted(&["k:abc".into()], &[], fp), None);
+    }
+
+    #[test]
+    fn any_sig_trusted_skips_malformed() {
+        let seed = [0x11u8; 32];
+        let fp = "1;/nix/store/x;sha256:y;1;";
+        let good_sig = Signer::from_seed("good", &seed).sign(fp);
+        let good_key = make_trusted_key("good", &seed);
+
+        // Garbage entries mixed in — shouldn't break the valid match.
+        let sigs = vec!["no-colon".into(), "bad:!!not-base64!!".into(), good_sig];
+        let keys = vec!["malformed-key-no-colon".into(), good_key];
+
+        assert_eq!(any_sig_trusted(&sigs, &keys, fp).as_deref(), Some("good"));
     }
 }

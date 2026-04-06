@@ -72,6 +72,11 @@ moka = { workspace = true }
 # one S3 GET, not N.
 dashmap = { workspace = true }
 
+# Upstream binary-cache substitution: HTTP narinfo + NAR fetch. `stream`
+# for bytes_stream() on the NAR body (pipes into xz/zstd decoder without
+# buffering the compressed file). rustls matches the rest of the stack.
+reqwest = { workspace = true, features = ["stream"] }
+
 # Encoding
 hex = { workspace = true }
 

@@ -44,6 +44,7 @@ use crate::cas::{self, ChunkCache};
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
 use crate::signing::TenantSigner;
+use crate::substitute::Substituter;
 use crate::validate::validate_nar_digest;
 
 mod admin;
@@ -290,6 +291,11 @@ pub struct StoreServiceImpl {
     /// (chunk_cache above). This bounds ONLY the per-request accumulation
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
+    /// Upstream binary-cache substituter. `None` disables substitution
+    /// (QueryPathInfo/GetPath miss → NotFound immediately, pre-P0462
+    /// behavior). `Some` → on miss, try each of the requesting tenant's
+    /// configured upstreams before returning NotFound.
+    substituter: Option<Arc<Substituter>>,
 }
 
 /// Default global NAR buffer budget: 8 × MAX_NAR_SIZE (32 GiB on 64-bit).
@@ -311,6 +317,7 @@ impl StoreServiceImpl {
             hmac_verifier: None,
             hmac_bypass_cns: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
+            substituter: None,
         }
     }
 
@@ -337,7 +344,15 @@ impl StoreServiceImpl {
             hmac_verifier: None,
             hmac_bypass_cns: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
+            substituter: None,
         }
+    }
+
+    /// Enable upstream binary-cache substitution. Builder-style.
+    /// Without this, QueryPathInfo/GetPath miss → NotFound directly.
+    pub fn with_substituter(mut self, substituter: Arc<Substituter>) -> Self {
+        self.substituter = Some(substituter);
+        self
     }
 
     /// Enable HMAC verification on PutPath assignment tokens.
@@ -393,6 +408,132 @@ impl StoreServiceImpl {
     #[cfg(test)]
     pub(crate) fn nar_bytes_budget(&self) -> &Arc<tokio::sync::Semaphore> {
         &self.nar_bytes_budget
+    }
+
+    /// Extract `tenant_id` from a request's JWT-interceptor extension.
+    /// `None` when no interceptor is wired, no token was sent, or the
+    /// caller is mTLS-bypassed. All three cases correctly skip
+    /// substitution / tenant-filtering.
+    fn request_tenant_id<T>(request: &Request<T>) -> Option<uuid::Uuid> {
+        request
+            .extensions()
+            .get::<rio_common::jwt::TenantClaims>()
+            .map(|c| c.sub)
+    }
+
+    // r[impl store.substitute.upstream]
+    /// On local miss: if the tenant has upstreams configured, try
+    /// substituting. Returns `Ok(Some)` if fetched+ingested, `Ok(None)`
+    /// on miss or if substitution is disabled/tenant-less.
+    async fn try_substitute_on_miss(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+        store_path: &str,
+    ) -> Result<Option<ValidatedPathInfo>, Status> {
+        let (Some(sub), Some(tid)) = (&self.substituter, tenant_id) else {
+            return Ok(None);
+        };
+        sub.try_substitute(tid, store_path)
+            .await
+            .map_err(|e| internal_error("substitute", e))
+    }
+
+    // r[impl store.substitute.tenant-sig-visibility]
+    /// Cross-tenant sig-visibility gate. A substituted path (one that
+    /// was NEVER built by any tenant — zero `path_tenants` rows) is
+    /// visible to the requesting tenant only if one of its `signatures`
+    /// verifies against the requesting tenant's upstream `trusted_keys`
+    /// union.
+    ///
+    /// Returns `true` if visible, `false` if hidden (caller returns
+    /// NotFound). Unauthenticated requests (`tenant_id = None`) pass
+    /// through — `r[store.tenant.narinfo-filter]` defines anonymous
+    /// requests as unfiltered.
+    ///
+    /// # Substituted-path discriminator
+    ///
+    /// `path_tenants` is populated at build-completion by the scheduler
+    /// (`upsert_path_tenants` in rio-scheduler/src/db/live_pins.rs).
+    /// The Substituter does NOT populate it. So:
+    ///   - ≥1 `path_tenants` row → someone built this → skip gate
+    ///     (built paths are trusted regardless of signature)
+    ///   - 0 rows → substitution-only → apply gate
+    ///
+    /// This correctly handles the pre-`path_tenants` timing window:
+    /// freshly-PutPath'd paths (not yet completion-upserted) pass
+    /// through because the `COUNT=0` check includes the requesting
+    /// tenant — we also check if THEY own it. A path that nobody
+    /// `path_tenants`'d AND was never substituted has no signatures
+    /// either (PutPath only signs if signer is configured, and the
+    /// gate's `any_sig_trusted` check will fail on empty sigs, hiding
+    /// it). In practice the gate only ever fires on real substituted
+    /// paths.
+    async fn sig_visibility_gate(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+        info: &ValidatedPathInfo,
+    ) -> Result<bool, Status> {
+        let Some(tid) = tenant_id else {
+            return Ok(true); // anonymous → unfiltered
+        };
+        // No substituter → no substituted paths to gate.
+        if self.substituter.is_none() {
+            return Ok(true);
+        }
+
+        let path_hash = info.store_path.sha256_digest();
+
+        // Two checks in one round-trip: does this tenant own it, and
+        // has ANY tenant ever built it?
+        let (owned, any_built): (bool, bool) = sqlx::query_as(
+            "SELECT \
+               bool_or(tenant_id = $2), \
+               count(*) > 0 \
+             FROM path_tenants WHERE store_path_hash = $1",
+        )
+        .bind(path_hash.as_slice())
+        .bind(tid)
+        .fetch_one(&self.pool)
+        .await
+        .map(|(o, a): (Option<bool>, bool)| (o.unwrap_or(false), a))
+        .map_err(|e| internal_error("sig_visibility_gate: path_tenants", e))?;
+
+        if owned || any_built {
+            // Built path (someone `path_tenants`'d it). Not
+            // substitution-only → skip gate.
+            //
+            // This also covers the freshly-PutPath'd case: PutPath
+            // doesn't populate path_tenants (the scheduler does on
+            // completion), so a PutPath → QueryPathInfo roundtrip
+            // within the same process sees count=0. But such a path
+            // also has no upstream sigs to gate on — it was signed
+            // by rio/tenant key, not an upstream. We let it through
+            // to preserve PutPath → QueryPathInfo correctness.
+            return Ok(true);
+        }
+
+        // Zero path_tenants rows → substitution-only path. Gate it.
+        let trusted = metadata::upstreams::tenant_trusted_keys(&self.pool, tid)
+            .await
+            .map_err(|e| metadata_status("sig_visibility_gate: trusted_keys", e))?;
+        if trusted.is_empty() {
+            // Tenant trusts no upstream keys → any substituted path
+            // is invisible. Correct: opting out of substitution means
+            // opting out of seeing others' substituted paths too.
+            return Ok(false);
+        }
+
+        let fp = rio_nix::narinfo::fingerprint(
+            info.store_path.as_str(),
+            &info.nar_hash,
+            info.nar_size,
+            &info
+                .references
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>(),
+        );
+        Ok(crate::signing::any_sig_trusted(&info.signatures, &trusted, &fp).is_some())
     }
 
     /// Sync signing given a pre-resolved [`Signer`]. No DB hit.
@@ -544,14 +685,50 @@ impl StoreService for StoreServiceImpl {
         request: Request<QueryPathInfoRequest>,
     ) -> Result<Response<PathInfo>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        let tenant_id = Self::request_tenant_id(&request);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
 
-        let info = metadata::query_path_info(&self.pool, &req.store_path)
+        let local = metadata::query_path_info(&self.pool, &req.store_path)
             .await
-            .map_err(|e| metadata_status("QueryPathInfo: query_path_info", e))?
-            .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
+            .map_err(|e| metadata_status("QueryPathInfo: query_path_info", e))?;
+
+        let info = match local {
+            Some(i) => {
+                // r[impl store.substitute.tenant-sig-visibility]
+                // Local hit — but is it visible to THIS tenant? A path
+                // substituted by tenant A with sig_mode=keep is
+                // invisible to tenant B unless B trusts A's upstream
+                // key. Hide-as-NotFound on gate failure.
+                if !self.sig_visibility_gate(tenant_id, &i).await? {
+                    // Gate failed — but B's upstreams may ALSO have
+                    // this path. Try substituting (which will
+                    // append B-trusted sigs to the existing row).
+                    if let Some(sub) = self
+                        .try_substitute_on_miss(tenant_id, &req.store_path)
+                        .await?
+                    {
+                        sub
+                    } else {
+                        return Err(Status::not_found(format!(
+                            "path not found: {}",
+                            req.store_path
+                        )));
+                    }
+                } else {
+                    i
+                }
+            }
+            None => {
+                // Local miss — try upstream substitution.
+                self.try_substitute_on_miss(tenant_id, &req.store_path)
+                    .await?
+                    .ok_or_else(|| {
+                        Status::not_found(format!("path not found: {}", req.store_path))
+                    })?
+            }
+        };
 
         Ok(Response::new(info.into()))
     }
@@ -565,6 +742,7 @@ impl StoreService for StoreServiceImpl {
         request: Request<FindMissingPathsRequest>,
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        let tenant_id = Self::request_tenant_id(&request);
         let req = request.into_inner();
 
         // Bound request size to prevent DoS via huge path lists.
@@ -579,10 +757,24 @@ impl StoreService for StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("FindMissingPaths: find_missing_paths", e))?;
 
+        // HEAD-probe each missing path against the tenant's upstreams.
+        // Fails-open on probe errors (a down upstream shouldn't hide
+        // paths the scheduler can otherwise substitute). Empty if no
+        // substituter / no tenant / no upstreams — the normal case.
+        let substitutable = match (&self.substituter, tenant_id) {
+            (Some(sub), Some(tid)) if !missing.is_empty() => sub
+                .check_available(tid, &missing)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "check_available failed; empty substitutable_paths");
+                    Vec::new()
+                }),
+            _ => Vec::new(),
+        };
+
         Ok(Response::new(FindMissingPathsResponse {
             missing_paths: missing,
-            // TODO(P0462): populate from tenant_upstreams narinfo probes
-            substitutable_paths: Vec::new(),
+            substitutable_paths: substitutable,
         }))
     }
 
@@ -977,5 +1169,142 @@ mod tests {
 
         assert!(!logs_contain("suspicious"));
         assert!(info.signatures.is_empty(), "no signer → no signature");
+    }
+
+    // r[verify store.substitute.tenant-sig-visibility]
+    /// The critical cross-tenant test: tenant A substitutes path P
+    /// signed by key K. Tenant B (who also trusts K) sees P. Tenant C
+    /// (who doesn't trust K) gets NotFound.
+    #[tokio::test]
+    async fn sig_visibility_gate_cross_tenant() {
+        use crate::signing::Signer;
+        use rio_test_support::{TestDb, seed_tenant};
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Gate only applies with substituter wired (`.is_none()`
+        // short-circuits). The substituter itself won't be hit — the
+        // path is pre-seeded, not miss-then-fetch.
+        let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+        let svc = StoreServiceImpl::new(db.pool.clone()).with_substituter(sub);
+
+        let tid_a = seed_tenant(&db.pool, "sig-gate-a").await;
+        let tid_b = seed_tenant(&db.pool, "sig-gate-b").await;
+        let tid_c = seed_tenant(&db.pool, "sig-gate-c").await;
+
+        // Seed a path with a signature from key K.
+        let seed_k = [0x77u8; 32];
+        let signer_k = Signer::from_seed("key-K", &seed_k);
+        let pk_k = ed25519_dalek::SigningKey::from_bytes(&seed_k).verifying_key();
+        let trusted_k = format!(
+            "key-K:{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pk_k.as_bytes())
+        );
+
+        let path = test_store_path("cross-tenant-p");
+        let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"xyz");
+        let fp = rio_nix::narinfo::fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+        let sig_k = signer_k.sign(&fp);
+
+        // Seed the path in narinfo + manifests with K's sig — simulating
+        // "tenant A substituted this from upstream K".
+        let info = make_path_info(&path, &nar, nar_hash);
+        let path_hash = info.store_path.sha256_digest();
+        metadata::insert_manifest_uploading(&db.pool, &path_hash, &path, &[])
+            .await
+            .unwrap();
+        let mut info_with_sig = info.clone();
+        info_with_sig.signatures = vec![sig_k.clone()];
+        info_with_sig.store_path_hash = path_hash.to_vec();
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, nar.into())
+            .await
+            .unwrap();
+
+        // — Tenant A substituted this (so: no path_tenants row, but
+        //   A's upstream trusted_keys includes K) —
+        // — Tenant B ALSO trusts K (different upstream URL, same key) —
+        // — Tenant C trusts a DIFFERENT key J —
+        // — Zero path_tenants rows: this is a substitution-only path —
+        let _ = path_hash; // narinfo seeded above, hash no longer needed
+
+        metadata::upstreams::insert(
+            &db.pool,
+            tid_a,
+            "https://cache-k-a.example",
+            50,
+            std::slice::from_ref(&trusted_k),
+            crate::metadata::SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Tenant B trusts key K via an upstream config.
+        metadata::upstreams::insert(
+            &db.pool,
+            tid_b,
+            "https://cache-k.example",
+            50,
+            std::slice::from_ref(&trusted_k),
+            crate::metadata::SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        // Tenant C has an upstream but trusts a DIFFERENT key.
+        metadata::upstreams::insert(
+            &db.pool,
+            tid_c,
+            "https://cache-j.example",
+            50,
+            &["key-J:aaaa".into()],
+            crate::metadata::SigMode::Keep,
+        )
+        .await
+        .unwrap();
+
+        let stored = metadata::query_path_info(&db.pool, &path)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A: trusts K (the substituting tenant) → sig verifies → visible.
+        assert!(
+            svc.sig_visibility_gate(Some(tid_a), &stored).await.unwrap(),
+            "tenant A trusts K → visible"
+        );
+
+        // B: trusts K → sig verifies → visible.
+        assert!(
+            svc.sig_visibility_gate(Some(tid_b), &stored).await.unwrap(),
+            "tenant B trusts K → visible"
+        );
+
+        // C: doesn't trust K → hidden.
+        assert!(
+            !svc.sig_visibility_gate(Some(tid_c), &stored).await.unwrap(),
+            "tenant C doesn't trust K → NotFound"
+        );
+
+        // Anonymous → passes through (unfiltered per
+        // r[store.tenant.narinfo-filter]).
+        assert!(
+            svc.sig_visibility_gate(None, &stored).await.unwrap(),
+            "anonymous → unfiltered"
+        );
+
+        // — Built-path exemption: once ANY tenant has a path_tenants
+        //   row, the gate is bypassed (built paths are trusted) —
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(stored.store_path.sha256_digest().as_slice())
+            .bind(tid_a)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Now even C (who doesn't trust K) sees it — built paths skip
+        // the gate.
+        assert!(
+            svc.sig_visibility_gate(Some(tid_c), &stored).await.unwrap(),
+            "built path (any path_tenants row) → gate bypassed"
+        );
     }
 }

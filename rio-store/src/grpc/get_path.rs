@@ -49,15 +49,27 @@ impl StoreServiceImpl {
         request: Request<GetPathRequest>,
     ) -> Result<Response<GetPathStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        let tenant_id = Self::request_tenant_id(&request);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
 
         // Step 1: narinfo + manifest.
-        let info = metadata::query_path_info(&self.pool, &req.store_path)
+        // r[impl store.substitute.upstream]
+        // On miss: try upstream substitution before NotFound. The
+        // substituter ingests via the same write-ahead path as PutPath,
+        // so the `get_manifest` below picks up the freshly-ingested
+        // NAR with no extra plumbing.
+        let local = metadata::query_path_info(&self.pool, &req.store_path)
             .await
-            .map_err(|e| metadata_status("GetPath: query_path_info", e))?
-            .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
+            .map_err(|e| metadata_status("GetPath: query_path_info", e))?;
+        let info = match local {
+            Some(i) => i,
+            None => self
+                .try_substitute_on_miss(tenant_id, &req.store_path)
+                .await?
+                .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?,
+        };
 
         // `None` here is defense-in-depth for a race where query_path_info
         // found the narinfo but get_manifest doesn't. Both filter on

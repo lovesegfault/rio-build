@@ -15,6 +15,7 @@ use rio_store::cache_server::{self, CacheServerState};
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};
 use rio_store::signing::{Signer, TenantSigner};
+use rio_store::substitute::Substituter;
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
 
@@ -306,6 +307,21 @@ async fn main() -> anyhow::Result<()> {
         }
         None => store_service,
     };
+
+    // Substituter: upstream binary-cache fetch-on-miss. Shares the same
+    // chunk backend as PutPath (NAR chunks go to the same S3 bucket)
+    // and the same TenantSigner (for sig_mode=add|replace). Always
+    // enabled — a tenant with zero `tenant_upstreams` rows makes
+    // `list_for_tenant` return [], which is a fast no-op.
+    let chunk_backend: Option<Arc<dyn ChunkBackend>> = chunk_cache.as_ref().map(|c| c.backend());
+    let substituter = {
+        let mut s = Substituter::new(pool.clone(), chunk_backend);
+        if let Some(signer) = store_service.signer() {
+            s = s.with_signer(signer);
+        }
+        Arc::new(s)
+    };
+    let store_service = store_service.with_substituter(substituter);
 
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there
