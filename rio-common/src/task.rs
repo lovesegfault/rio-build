@@ -1,10 +1,13 @@
 //! Task spawning utilities with panic logging.
 
 use std::future::Future;
+use std::time::Duration;
 
 use futures_util::FutureExt as _;
 use tokio::task::JoinHandle;
 use tracing::Instrument as _;
+
+use crate::signal::Token;
 
 /// Spawn a task that logs any panic at `error!` level before unwinding.
 ///
@@ -58,6 +61,86 @@ where
     )
 }
 
+/// Spawn a periodic background task: run `body` every `interval` until
+/// `shutdown` fires. The `select!` is `biased;` — shutdown wins over a
+/// ready tick deterministically (tokio's `select!` defaults to RANDOM
+/// branch choice, which can delay shutdown by up to one interval; see
+/// `r[common.task.periodic-biased]`).
+///
+/// `MissedTickBehavior::Skip` by default: if one `body` call overruns
+/// its interval, the next tick fires immediately once, then the
+/// interval resynchronizes (no catch-up burst). Override via
+/// [`spawn_periodic_with`] if `Burst` or `Delay` is needed.
+///
+/// The first tick fires immediately (tokio's default). If the caller
+/// needs to skip the startup tick, use [`spawn_periodic_with`] with a
+/// pre-consumed first tick.
+///
+/// Panic inside `body` is caught and logged by the [`spawn_monitored`]
+/// wrapper (task name in the error). The periodic loop does NOT restart
+/// — panic ends the task. If restart-on-panic is wanted, wrap the body
+/// in `catch_unwind` at the call site.
+///
+/// # Closure state
+///
+/// `body` is `FnMut() -> impl Future`; the returned future cannot
+/// borrow from `body`'s captured state across `.await` (the future
+/// must be `'static`). For stateless loops the usual pattern is
+/// `move || { let x = x.clone(); async move { x.do_thing().await } }`.
+/// Stateful loops (cross-tick mutable state like edge-detection
+/// `prev: Option<bool>`) should stay inline as `spawn_monitored` with
+/// a manual `biased;` `select!` — see the `health-toggle-loop` in
+/// `rio-scheduler/src/main.rs` for an example.
+// r[impl common.task.periodic-biased]
+pub fn spawn_periodic<F, Fut>(
+    name: &'static str,
+    interval: Duration,
+    shutdown: Token,
+    body: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    spawn_periodic_with(name, ticker, shutdown, body)
+}
+
+/// Like [`spawn_periodic`] but the caller constructs the [`Interval`]
+/// (to set a non-default `MissedTickBehavior`, or pre-consume the
+/// first tick before the loop starts).
+///
+/// [`Interval`]: tokio::time::Interval
+pub fn spawn_periodic_with<F, Fut>(
+    name: &'static str,
+    mut ticker: tokio::time::Interval,
+    shutdown: Token,
+    mut body: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    spawn_monitored(name, async move {
+        loop {
+            tokio::select! {
+                // Deterministic shutdown-wins. Without `biased;`,
+                // tokio::select! RANDOMIZES branch choice when multiple
+                // arms are ready — a ready tick could beat a ready
+                // cancellation, delaying shutdown by one interval.
+                biased;
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(task = name, "periodic task shutting down");
+                    break;
+                }
+                _ = ticker.tick() => {}
+            }
+            body().await;
+        }
+    })
+}
+
 /// Extract a human-readable message from a panic payload.
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = panic.downcast_ref::<&str>() {
@@ -71,9 +154,155 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    /// `biased;` means shutdown wins over a ready tick. Without it,
+    /// `tokio::select!` picks randomly — under load, shutdown could
+    /// lose to tick indefinitely (unlikely but possible).
+    ///
+    /// Mutation check: drop `biased;` from `spawn_periodic_with` →
+    /// this test FAILS (50/50 chance per round that the loop ticks
+    /// once more before breaking; across 24 rounds the probability
+    /// of NO extra ticks is 2^-24 ≈ 6e-8).
+    ///
+    /// Mechanics: the body holds a gate (`Notify`) open until the
+    /// test has BOTH armed the next interval AND cancelled the
+    /// shutdown token. When the gate releases, the loop re-enters
+    /// `select!` with BOTH arms ready — biased; picks shutdown;
+    /// random picks either.
+    // r[verify common.task.periodic-biased]
+    #[tokio::test(start_paused = true)]
+    async fn spawn_periodic_biased_shutdown_wins() {
+        use tokio::sync::Notify;
+
+        const ROUNDS: u32 = 24;
+        let mut extra_ticks = 0u32;
+
+        for _round in 0..ROUNDS {
+            let shutdown = Token::new();
+            let ticks = Arc::new(AtomicU32::new(0));
+            let t = Arc::clone(&ticks);
+            // Gate the body: it increments tick then awaits. While
+            // blocked, we prime both the interval and the cancellation.
+            // When released, body returns → loop re-enters select!
+            // with BOTH arms ready.
+            let gate = Arc::new(Notify::new());
+            let g = Arc::clone(&gate);
+
+            let handle = spawn_periodic(
+                "test-biased",
+                Duration::from_millis(10),
+                shutdown.clone(),
+                move || {
+                    let t = Arc::clone(&t);
+                    let g = Arc::clone(&g);
+                    async move {
+                        t.fetch_add(1, Ordering::Relaxed);
+                        g.notified().await;
+                    }
+                },
+            );
+
+            // Drive first tick (immediate) — body blocks on gate.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(ticks.load(Ordering::Relaxed), 1);
+
+            // Prime BOTH arms while body is parked on the gate:
+            //   interval: advance past 10ms (next tick ready)
+            //   shutdown: cancel (cancelled() ready)
+            tokio::time::advance(Duration::from_millis(15)).await;
+            shutdown.cancel();
+
+            // Release the gate. body() returns → loop re-enters
+            // select! with both arms ready. biased; → shutdown
+            // arm wins, break, tick stays at 1. random → ~50%
+            // chance tick arm wins → body runs again (tick=2),
+            // re-blocks on gate.
+            gate.notify_one();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+
+            // If tick went to 2, the body is blocked on gate
+            // again — release it so the task can observe shutdown
+            // on the NEXT select pass and exit cleanly. Loop:
+            // without biased;, each re-entry to select has ~50%
+            // chance of choosing tick again.
+            let mut safety = 0;
+            while !handle.is_finished() {
+                gate.notify_one();
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                safety += 1;
+                assert!(safety < 100, "task stuck (neither arm chosen?)");
+            }
+
+            let final_ticks = ticks.load(Ordering::Relaxed);
+            assert!(
+                final_ticks >= 1,
+                "at least the first immediate tick must have fired"
+            );
+            extra_ticks += final_ticks - 1;
+
+            handle.await.expect("clean shutdown");
+        }
+
+        // With biased; → shutdown ALWAYS wins → extra_ticks == 0.
+        // Without biased; → P(extra_ticks == 0) = 2^-ROUNDS ≈ 6e-8.
+        assert_eq!(
+            extra_ticks, 0,
+            "biased; should make shutdown win over ready tick every time; \
+             observed {extra_ticks} extra ticks across {ROUNDS} rounds"
+        );
+    }
+
+    /// Panic inside body is caught by spawn_monitored — logged,
+    /// task ends. JoinHandle reports the panic. The periodic loop
+    /// does NOT restart.
+    #[tokio::test(start_paused = true)]
+    async fn spawn_periodic_panic_ends_task() {
+        let shutdown = Token::new();
+        let ticks = Arc::new(AtomicU32::new(0));
+        let t = Arc::clone(&ticks);
+
+        let handle = spawn_periodic(
+            "test-panic",
+            Duration::from_millis(10),
+            shutdown,
+            move || {
+                let t = Arc::clone(&t);
+                async move {
+                    if t.fetch_add(1, Ordering::Relaxed) == 2 {
+                        panic!("third tick panics");
+                    }
+                }
+            },
+        );
+
+        // Drive 5 intervals. The third tick (fetch_add returns 2)
+        // panics; subsequent advances don't run the body (task dead).
+        for _ in 0..5 {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_millis(11)).await;
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let err = handle.await.unwrap_err();
+        assert!(err.is_panic());
+        // Exactly 3 ticks ran (0, 1, 2 — panic on 2). Loop did not
+        // restart after panic.
+        assert_eq!(ticks.load(Ordering::Relaxed), 3);
+    }
 
     /// `MakeWriter` into a shared buffer. `tracing_subscriber::fmt::TestWriter`
     /// goes to stdout — no good for asserting on the bytes.

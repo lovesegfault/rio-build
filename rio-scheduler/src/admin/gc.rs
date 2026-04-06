@@ -23,31 +23,30 @@ pub fn spawn_store_size_refresh(
 ) -> Arc<std::sync::atomic::AtomicU64> {
     let size = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let size_clone = Arc::clone(&size);
-    rio_common::task::spawn_monitored("store-size-refresh", async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    tracing::debug!("store-size-refresh shutting down");
-                    break;
+    rio_common::task::spawn_periodic(
+        "store-size-refresh",
+        std::time::Duration::from_secs(60),
+        shutdown,
+        move || {
+            let pool = pool.clone();
+            let size_clone = Arc::clone(&size_clone);
+            async move {
+                match sqlx::query_scalar::<_, i64>(
+                    "SELECT COALESCE(SUM(nar_size), 0)::bigint FROM narinfo",
+                )
+                .fetch_one(&pool)
+                .await
+                {
+                    Ok(bytes) => {
+                        size_clone.store(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "store_size refresh failed");
+                    }
                 }
-                _ = interval.tick() => {}
             }
-            match sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(SUM(nar_size), 0)::bigint FROM narinfo",
-            )
-            .fetch_one(&pool)
-            .await
-            {
-                Ok(bytes) => {
-                    size_clone.store(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "store_size refresh failed");
-                }
-            }
-        }
-    });
+        },
+    );
     size
 }
 

@@ -640,6 +640,10 @@ async fn main() -> anyhow::Result<()> {
         // subscribers — not expensive, but calling it 1Hz for
         // no reason wakes any grpc Health.Watch clients (K8s
         // probes don't use Watch, but other tooling might).
+        //
+        // Stateful: `prev` is cross-tick mutable state, so not
+        // spawn_periodic (FnMut can't lend &mut across .await).
+        // biased; inlined per r[common.task.periodic-biased].
         let reporter = health_reporter.clone();
         let is_leader = is_leader_for_health;
         let health_shutdown = shutdown.clone();
@@ -654,6 +658,7 @@ async fn main() -> anyhow::Result<()> {
             let mut prev: Option<bool> = None;
             loop {
                 tokio::select! {
+                    biased;
                     _ = health_shutdown.cancelled() => {
                         tracing::debug!("health-toggle-loop shutting down");
                         break;
@@ -706,21 +711,21 @@ async fn main() -> anyhow::Result<()> {
     // terminally moves `pool`.
     {
         let db = SchedulerDb::new(pool.clone());
-        let shutdown = shutdown.clone();
-        rio_common::task::spawn_monitored("build-samples-retention", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = interval.tick() => {}
+        rio_common::task::spawn_periodic(
+            "build-samples-retention",
+            std::time::Duration::from_secs(3600),
+            shutdown.clone(),
+            move || {
+                let db = db.clone();
+                async move {
+                    match db.delete_samples_older_than(30).await {
+                        Ok(0) => {}
+                        Ok(n) => info!(rows_deleted = n, "build_samples retention sweep"),
+                        Err(e) => tracing::warn!(?e, "build_samples retention failed"),
+                    }
                 }
-                match db.delete_samples_older_than(30).await {
-                    Ok(0) => {}
-                    Ok(n) => info!(rows_deleted = n, "build_samples retention sweep"),
-                    Err(e) => tracing::warn!(?e, "build_samples retention failed"),
-                }
-            }
-        });
+            },
+        );
     }
 
     let admin_service = AdminServiceImpl::new(
@@ -734,28 +739,21 @@ async fn main() -> anyhow::Result<()> {
         shutdown.clone(),
     );
 
-    // Start periodic tick task
+    // Start periodic tick task. Actor-dead handling: try_send fails
+    // silently once the channel closes; the shutdown token (cancelled
+    // by the actor's drop path) stops the loop shortly after. No
+    // early-break needed — spawn_periodic's biased; shutdown wins.
     let tick_actor = actor.clone();
     let tick_interval = std::time::Duration::from_secs(cfg.tick_interval_secs);
-    let tick_shutdown = shutdown.clone();
-    rio_common::task::spawn_monitored("tick-loop", async move {
-        let mut interval = tokio::time::interval(tick_interval);
-        loop {
-            tokio::select! {
-                _ = tick_shutdown.cancelled() => {
-                    tracing::debug!("tick-loop shutting down");
-                    break;
-                }
-                _ = interval.tick() => {}
-            }
-            // If the actor is dead (channel closed), stop ticking.
+    rio_common::task::spawn_periodic("tick-loop", tick_interval, shutdown.clone(), move || {
+        let tick_actor = tick_actor.clone();
+        async move {
             if tick_actor
                 .try_send(rio_scheduler::actor::ActorCommand::Tick)
                 .is_err()
                 && !tick_actor.is_alive()
             {
-                tracing::warn!("actor channel closed, stopping tick loop");
-                break;
+                tracing::warn!("actor channel closed; tick dropped");
             }
         }
     });

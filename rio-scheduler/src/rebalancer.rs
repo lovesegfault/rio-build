@@ -343,6 +343,9 @@ pub fn spawn_task(
         return;
     }
 
+    // Not spawn_periodic: skip-first-tick + post-pass gauge emit (using
+    // captured class_names snapshot) makes the body non-trivial; the
+    // biased; select below already satisfies r[common.task.periodic-biased].
     rio_common::task::spawn_monitored("rebalancer", async move {
         let cfg = RebalancerConfig::default();
         let mut interval = tokio::time::interval(REBALANCE_INTERVAL);

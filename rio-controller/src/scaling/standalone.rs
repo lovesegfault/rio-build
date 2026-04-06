@@ -95,6 +95,10 @@ impl Autoscaler {
     /// Returns on cancellation (SIGTERM/SIGINT) or panic (logged
     /// by spawn_monitored; controller keeps reconciling without
     /// autoscale).
+    ///
+    /// Stateful: `self.states: HashMap` is cross-tick mutable, so
+    /// not spawn_periodic (FnMut can't lend &mut self across
+    /// .await). biased; inlined per r[common.task.periodic-biased].
     pub async fn run(mut self, shutdown: rio_common::signal::Token) {
         let mut interval = tokio::time::interval(self.timing.poll_interval);
         // MissedTickBehavior::Skip: if one iteration takes >30s

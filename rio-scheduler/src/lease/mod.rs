@@ -277,8 +277,12 @@ pub async fn run_lease_loop(
     // twice immediately. The lease TTL is 15s; we have slack.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Stateful loop (was_leading, last_successful_renew are
+    // cross-tick): not spawn_periodic. biased; inlined per
+    // r[common.task.periodic-biased].
     loop {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }
