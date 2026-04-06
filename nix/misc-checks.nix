@@ -670,7 +670,7 @@
         ../docs/src
         # _no_dag skipif at test_scripts.py:3415 reads this directly.
         # Absent → test_dag_deps_cli etc. skip instead of run.
-        ../.claude/dag.jsonl
+        (pkgs.lib.fileset.maybeMissing ../.claude/dag.jsonl)
         # onibus/__init__.py reads this at import time.
         ../.claude/integration-branch
       ];
