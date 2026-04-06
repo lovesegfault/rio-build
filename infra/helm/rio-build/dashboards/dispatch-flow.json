@@ -1,0 +1,157 @@
+{
+  "uid": "rio-dispatch-flow",
+  "title": "rio-build: Dispatch Flow",
+  "tags": ["rio-build", "scheduler"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Queue / running / workers",
+      "description": "Derivations queued vs running, overlaid with active workers. Queued > workers with running < workers = dispatch stall.",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_derivations_queued",
+          "legendFormat": "queued",
+          "refId": "A"
+        },
+        {
+          "expr": "rio_scheduler_derivations_running",
+          "legendFormat": "running",
+          "refId": "B"
+        },
+        {
+          "expr": "rio_scheduler_workers_active",
+          "legendFormat": "workers active",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "workers active"},
+            "properties": [
+              {"id": "custom.drawStyle", "value": "line"},
+              {"id": "custom.lineStyle", "value": {"dash": [10, 10], "fill": "dash"}},
+              {"id": "custom.fillOpacity", "value": 0}
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Dispatch wait p50/p99",
+      "description": "rio_scheduler_dispatch_wait_seconds — time a Ready derivation waits for a worker slot. (Metric lands in P0539c; shows No Data until then.)",
+      "gridPos": {"x": 0, "y": 9, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rio_scheduler_dispatch_wait_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rio_scheduler_dispatch_wait_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      }
+    },
+    {
+      "id": 3,
+      "type": "heatmap",
+      "title": "Dispatch wait heatmap",
+      "description": "rio_scheduler_dispatch_wait_seconds bucket distribution. (Metric lands in P0539c.)",
+      "gridPos": {"x": 12, "y": 9, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (le) (increase(rio_scheduler_dispatch_wait_seconds_bucket[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}},
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "s", "axisPlacement": "left"},
+        "color": {"mode": "scheme", "scheme": "Spectral", "steps": 128},
+        "cellGap": 1,
+        "tooltip": {"show": true, "yHistogram": false},
+        "legend": {"show": true}
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Per-class queue depth",
+      "description": "rio_scheduler_class_queue_depth — Ready derivations broken down by size class. One class starving while others drain = rebalancer cutoff misconfigured.",
+      "gridPos": {"x": 0, "y": 17, "w": 24, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "rio_scheduler_class_queue_depth",
+          "legendFormat": "{{class}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false, "stacking": {"mode": "normal", "group": "A"}}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    }
+  ]
+}

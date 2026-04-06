@@ -1,0 +1,30 @@
+{{- /*
+Grafana dashboard ConfigMaps — one CM per JSON in dashboards/*.json.
+Loaded by the kube-prometheus-stack grafana sidecar (watches for the
+`grafana_dashboard: "1"` label across all namespaces).
+
+Gated on .Values.monitoring.enabled. Nil-safe accessor: P0539a adds the
+`monitoring:` block to values.yaml, P0539b adds these dashboards. They
+are file-disjoint and merge in any order — until A lands, the parens
+form evaluates `(nil).enabled` → false, so this renders nothing.
+
+One CM per file (not one CM with N keys) so a single oversized
+dashboard can't push the whole bundle over the 1MiB ConfigMap limit.
+*/ -}}
+{{- if (.Values.monitoring).enabled }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+{{- $name := base $path | trimSuffix ".json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-dashboard-{{ $name }}
+  namespace: {{ $.Values.namespace.name }}
+  labels:
+    grafana_dashboard: "1"
+    {{- include "rio.labels" (dict "root" $ "name" "rio-dashboards" "component" "monitoring") | nindent 4 }}
+data:
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+{{- end }}
+{{- end }}

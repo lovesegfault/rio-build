@@ -68,7 +68,10 @@ pub async fn scan_once(
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<u64, sqlx::Error> {
     // Find stale uploading manifests. SELECT hash only — chunk_list
-    // is re-read INSIDE the tx (see TOCTOU handling below).
+    // is re-read INSIDE the tx (see TOCTOU handling below). I-148:
+    // covered by the partial index from migration 031 (predicate
+    // matches `WHERE status = 'uploading'` exactly); without it this
+    // was a ~4s seq-scan over ~1.5M rows per replica per interval.
     let threshold_secs = STALE_THRESHOLD.as_secs() as i64;
     let stale: Vec<(Vec<u8>,)> = sqlx::query_as(
         r#"
@@ -774,5 +777,77 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(dead_count.0, 0, "non-heartbeated upload reaped");
+    }
+
+    /// I-148 dev-only sanity: the `scan_once` SELECT must use the
+    /// partial index from migration 031, not seq-scan manifests.
+    ///
+    /// `#[ignore]` because EXPLAIN output depends on PG's cost model;
+    /// in practice the partial index is tiny enough (predicate matches
+    /// <100 rows at steady state) that PG picks it even on a small
+    /// test DB, but this isn't a CI gate. Run locally with
+    /// `cargo test -p rio-store -- --ignored scan_query_uses`.
+    #[ignore = "EXPLAIN plan depends on PG cost model; dev-only sanity"]
+    #[tokio::test]
+    async fn scan_query_uses_uploading_partial_idx() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed enough rows that PG's cost model wouldn't pick the
+        // index for a generic scan — proves the PARTIAL predicate is
+        // what makes it cheap. All 'complete' (don't match the index
+        // predicate) bar a handful 'uploading'. narinfo first to
+        // satisfy the manifests FK.
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size)
+             SELECT sha256(i::text::bytea),
+                    '/nix/store/' || lpad(to_hex(i), 32, '0') || '-seed',
+                    sha256(i::text::bytea), 0
+             FROM generate_series(1, 2000) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, updated_at)
+             SELECT sha256(i::text::bytea),
+                    CASE WHEN i <= 5 THEN 'uploading' ELSE 'complete' END,
+                    now() - i * interval '1 second'
+             FROM generate_series(1, 2000) AS i",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE manifests")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Mirror scan_once's query exactly (predicate must match the
+        // partial index's WHERE for PG to use it).
+        let plan: Vec<(String,)> = sqlx::query_as(
+            "EXPLAIN (FORMAT TEXT)
+             SELECT m.store_path_hash
+               FROM manifests m
+              WHERE m.status = 'uploading'
+                AND m.updated_at < now() - make_interval(secs => $1)",
+        )
+        .bind(STALE_THRESHOLD.as_secs() as i64)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+        let joined: String = plan
+            .into_iter()
+            .map(|(l,)| l)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("idx_manifests_uploading_updated_at"),
+            "EXPLAIN plan should reference idx_manifests_uploading_updated_at; got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("Seq Scan on manifests"),
+            "EXPLAIN plan should NOT seq-scan manifests; got:\n{joined}"
+        );
     }
 }
