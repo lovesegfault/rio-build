@@ -367,6 +367,12 @@ in
       # r[verify worker.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
+      # r[verify ctrl.drain.disruption-target]
+      #   LAST: evicts default-workers-0 (STS recreates it ~120s later,
+      #   but core has no subsequent subtests needing a ready worker).
+      #   Proves the watcher (disruption.rs) fires DrainWorker{force=
+      #   true} — before P0285, force=true had ZERO prod callers.
+      "disruption-drain"
     ];
   };
 

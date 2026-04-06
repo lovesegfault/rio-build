@@ -344,6 +344,7 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
 /// build + result.running_builds=N. The preemption hook: controller sees
 /// DisruptionTarget on a pod, calls this so the worker cgroup.kills its
 /// builds NOW instead of running the full 2h terminationGracePeriod.
+/// (wired: P0285 rio-controller disruption.rs watcher)
 ///
 /// Counterpart to test_force_drain_idle_worker_no_cancel_signals — that
 /// one proves the CancelSignal loop does 0 iterations on idle; this one

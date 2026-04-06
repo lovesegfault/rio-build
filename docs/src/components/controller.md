@@ -278,6 +278,9 @@ r[ctrl.drain.sigterm]
 
 A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The StatefulSet does NOT define a preStop.
 
+r[ctrl.drain.disruption-target]
+**Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt, PDB-mediated disruption), the watcher calls `AdminService.DrainWorker{force:true}` — the scheduler iterates `running_builds`, sends `CancelSignal` per build → worker `cgroup.kill()`s → builds reassign to healthy workers within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for in-flight builds to complete naturally before SIGKILL loses them anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.
+
 r[ctrl.autoscale.direct-patch]
 **Autoscaling:** The controller queries the scheduler's `AdminService.ClusterStatus` gRPC RPC to obtain current queue depth and worker utilization. It directly patches StatefulSet replicas based on this data. This is an internal mechanism, not HPA. The scaling logic requires stabilization windows and anti-flapping thresholds to avoid oscillation:
 

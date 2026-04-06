@@ -223,6 +223,7 @@ impl DagActor {
             // cgroup.kill) instead of letting them run for the
             // full terminationGracePeriodSeconds (2h — wasted if
             // the pod is evicting anyway).
+            // (wired: P0285 rio-controller disruption.rs watcher)
             //
             // try_send: best-effort. If the stream is full/closed,
             // the worker is about to disconnect anyway. reassign_
