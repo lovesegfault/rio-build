@@ -56,7 +56,10 @@ const DEFAULT_THRESHOLD: u32 = 5;
 /// Half-open this long after opening (let one probe through).
 const DEFAULT_AUTO_CLOSE: Duration = Duration::from_secs(30);
 /// Open if no successful fetch for this long (degraded-store trip).
-const DEFAULT_WALL_CLOCK_TRIP: Duration = Duration::from_secs(90);
+/// I-123: MUST be > fetch_timeout (default 600s). At 90s, a single
+/// slow gcc-NAR download (130s under 555-builder S3 contention)
+/// tripped the circuit BEFORE the fetch would have succeeded.
+const DEFAULT_WALL_CLOCK_TRIP: Duration = Duration::from_secs(720);
 
 /// Three-state circuit breaker for the FUSE fetch path.
 ///
@@ -400,11 +403,11 @@ mod tests {
         let b = breaker();
         b.record(true); // last_success = now
         b.record(false); // arm the wall-clock: ≥1 failure since success
-        b.clock.advance(Duration::from_secs(89));
-        assert!(b.check().is_ok(), "89s: under wall_clock_trip");
+        b.clock.advance(Duration::from_secs(719));
+        assert!(b.check().is_ok(), "719s: under wall_clock_trip");
 
-        b.clock.advance(Duration::from_secs(2)); // 91s
-        let err = b.check().expect_err("91s > 90s: wall-clock trip");
+        b.clock.advance(Duration::from_secs(2)); // 721s
+        let err = b.check().expect_err("721s > 720s: wall-clock trip");
         assert_eq!(err.code(), Errno::EIO.code());
         assert!(b.is_open(), "wall-clock trip sets open_since");
     }
@@ -418,7 +421,7 @@ mod tests {
         let b = breaker();
         b.record(true); // last_success = now
         // No failures recorded — the build is sleeping, not fetching.
-        b.clock.advance(Duration::from_secs(180));
+        b.clock.advance(Duration::from_secs(800));
         assert!(
             b.check().is_ok(),
             "180s idle with 0 failures: store is idle, not degraded"
@@ -439,7 +442,7 @@ mod tests {
         b.record(true);
         b.record(false); // arms
         b.record(true); // disarms (resets consecutive_failures)
-        b.clock.advance(Duration::from_secs(91));
+        b.clock.advance(Duration::from_secs(721));
         assert!(
             b.check().is_ok(),
             "failure→success disarms the gate; idle 91s is still idle"
@@ -451,7 +454,7 @@ mod tests {
         let b = breaker();
         b.record(true);
         b.record(false); // arm the wall-clock gate
-        b.clock.advance(Duration::from_secs(91));
+        b.clock.advance(Duration::from_secs(721));
         assert!(b.check().is_err(), "wall-clock trip");
 
         // Half-open after 30s. The half-open override in check() means
