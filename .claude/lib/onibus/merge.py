@@ -722,6 +722,10 @@ _REAL_RE = re.compile(r"^plan-(\d{1,4})-")
 _T_PLACEHOLDER_RE = re.compile(r"\bT(9\d{8,10})\b")
 # Real T-header: ### T<N> — where N is ≤4 digits. Cap excludes placeholders.
 _T_HEADER_RE = re.compile(r"^### T(\d{1,4}) —", re.M)
+# docs-NNNNNN branch name — 6-digit runid convention from rio-planner Step 1.
+# Used by pre_ff_rename (step 3.5) to catch docs branches that carry ONLY
+# T-placeholders (no plan-9ddddddNN-*.md files → _find_placeholders empty).
+_DOCS_BRANCH_RE = re.compile(r"^docs-\d{6}$")
 
 
 def _worktree_for(branch: str) -> Path:
@@ -1045,3 +1049,48 @@ def rename_unassigned(branch: str) -> RenameReport:
         branch=branch, mapping=mapping,
         commit=git("rev-parse", "--short", "HEAD", cwd=worktree),
     )
+
+
+def pre_ff_rename(branch: str) -> RenameReport:
+    """Merger step 3.5 — run rename_unassigned after rebase, before ff-try.
+
+    Precedent 4e755ae0 (SECOND TIME coordinator manual-fixup required),
+    then c05ec902, then 45daa5a8 — three manual post-ff renames before
+    P0523 wired this in. rename_unassigned's is-ancestor guard REFUSES
+    post-ff (HEAD already ancestor of INTEGRATION_BRANCH → rename commit
+    would DIVERGE the branch). The pNNN merger protocol had no pre-ff
+    rename step — docs-batch-specific. By the time anyone noticed
+    placeholders were still 9ddddddNN, HEAD was an ancestor and the
+    check bailed; coordinator had to manual-sed on sprint-1 post-merge.
+
+    Detection: either predicate suffices —
+      - branch name matches docs-NNNNNN (6-digit runid convention)
+      - _find_placeholders nonempty (plan-9ddddddNN-*.md present)
+    The second catches ad-hoc docs branches with nonstandard names.
+    The first catches docs branches with ONLY T-placeholders: all rows
+    were batch-appends to existing docs, no new P-docs, so
+    _find_placeholders is empty — but _touched_batch_docs is nonempty
+    and T-tokens need renaming. rename_unassigned already scans for both.
+
+    Placement (after rebase, before ff): post-rebase the three-dot diff
+    in _touched_batch_docs is clean. Pre-ff the is-ancestor guard passes.
+    SKILL.md step 0a runs rename-unassigned PRE-rebase at the skill
+    layer; this step-3.5 is the defensive re-check inside the merger
+    agent so a skipped/bypassed step-0a can't strand placeholders.
+
+    No-op on impl branches (pNNN): neither predicate fires, returns
+    empty without calling rename_unassigned (cheap fast-path — this
+    runs every merge). Idempotent: if step 0a already ran,
+    rename_unassigned returns empty mapping (nothing left to rename)."""
+    worktree = _worktree_for(branch)
+    is_docs_branch = _DOCS_BRANCH_RE.match(branch) is not None
+    has_placeholder_docs = bool(_find_placeholders(worktree))
+
+    if not (is_docs_branch or has_placeholder_docs):
+        return RenameReport(branch=branch, mapping=[], commit=None)
+
+    print(
+        f"docs-branch detected ({branch}): running rename-unassigned pre-ff",
+        file=sys.stderr,
+    )
+    return rename_unassigned(branch)

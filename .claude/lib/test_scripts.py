@@ -1795,6 +1795,128 @@ def test_rename_idempotent(docs_branch):
     assert second.commit is None
 
 
+def test_docs_merger_renames_placeholders_pre_ff(docs_branch):
+    """Regression: 4e755ae0 + c05ec902 + 45daa5a8 (three coordinator
+    manual-fixups). docs-NNNNNN branch with plan-9ddddddNN-*.md
+    placeholder files must have rename-unassigned run BEFORE ff —
+    post-ff, merge-base --is-ancestor fires and rename refuses.
+
+    P0523 wired pre_ff_rename as merger step 3.5 (between rebase-anchored
+    and ff-try). This test proves step 3.5 fires on the docs-branch
+    detection predicate and leaves NO stranded 9-digit tokens anywhere.
+
+    Assertions:
+      - plan-924999901-alpha.md RENAMED to plan-0101-alpha.md
+      - dag.jsonl's 924999901 row REWRITTEN to 101 (unpadded)
+      - NO stranded 9-digit tokens in the merged tree
+      - commit created (rename committed pre-ff → ff picks it up)
+    """
+    from onibus.merge import pre_ff_rename
+
+    tmp_repo, impl = docs_branch
+    # Add dag.jsonl with placeholder rows — the writer's typical output.
+    (tmp_repo / ".claude" / "dag.jsonl").write_text(
+        '{"plan":100,"title":"real","deps":[],"status":"DONE"}\n'
+        '{"plan":924999901,"title":"alpha","deps":[924999902],"status":"UNIMPL"}\n'
+        '{"plan":924999902,"title":"beta","deps":[],"status":"UNIMPL"}\n'
+    )
+    _git(tmp_repo, "add", ".claude/dag.jsonl")
+    _git(tmp_repo, "commit", "-m", "docs: add dag.jsonl", "--no-verify")
+
+    # Step 3.5 fires: branch name "docs-249999" matches _DOCS_BRANCH_RE
+    # AND _find_placeholders is nonempty (plan-924999901-alpha.md +
+    # plan-924999902-beta.md from the docs_branch fixture).
+    report = pre_ff_rename("docs-249999")
+
+    # Rename committed — ff-try at step 4 would pick this up.
+    assert report.commit is not None
+    assert len(report.mapping) == 2
+    assert report.mapping[0].placeholder == "924999901"
+    assert report.mapping[0].assigned == 101
+
+    # Placeholder file gone, real-number file present.
+    assert not (impl / "plan-924999901-alpha.md").exists()
+    assert not (impl / "plan-924999902-beta.md").exists()
+    assert (impl / "plan-0101-alpha.md").exists()
+    assert (impl / "plan-0102-beta.md").exists()
+
+    # No stranded 9-digit tokens anywhere in the tree.
+    dag = (tmp_repo / ".claude" / "dag.jsonl").read_text()
+    assert "924999901" not in dag
+    assert "924999902" not in dag
+    assert '"plan":101' in dag  # unpadded in JSON
+    for p in impl.glob("plan-*.md"):
+        assert "924999901" not in p.read_text(), f"stranded token in {p.name}"
+        assert "924999902" not in p.read_text(), f"stranded token in {p.name}"
+
+
+def test_pre_ff_rename_noop_on_impl_branch(tmp_repo: Path, monkeypatch):
+    """pre_ff_rename's fast-path: impl branch (pNNN name, no placeholder
+    files) → neither detection predicate fires → returns empty without
+    touching rename_unassigned. This runs every merge; must be cheap."""
+    from onibus import merge as merge_mod
+    from onibus.merge import pre_ff_rename
+
+    impl = tmp_repo / ".claude" / "work"
+    impl.mkdir(parents=True)
+    (impl / "plan-0100-x.md").write_text("real\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
+    _git(tmp_repo, "checkout", "-b", "p100")
+    (tmp_repo / "src.rs").write_text("impl work\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "feat(x): work", "--no-verify")
+    monkeypatch.setattr(merge_mod, "_worktree_for", lambda _: tmp_repo)
+
+    # Prove rename_unassigned is NOT called: sentinel raises.
+    def _sentinel(_):
+        raise AssertionError("pre_ff_rename called rename_unassigned on impl branch")
+    monkeypatch.setattr(merge_mod, "rename_unassigned", _sentinel)
+
+    report = pre_ff_rename("p100")
+    assert report.mapping == []
+    assert report.commit is None
+    assert report.branch == "p100"
+
+
+def test_pre_ff_rename_fires_on_branch_name_alone(tmp_repo: Path, monkeypatch):
+    """Edge case from P0523 T1: docs branch with ZERO P-placeholders (all
+    rows were batch-appends to existing docs, no new plan-9ddddddNN-*.md).
+    _find_placeholders returns [], but the branch-name predicate fires
+    and rename_unassigned runs anyway to catch T-placeholders."""
+    from onibus import merge as merge_mod
+    from onibus.merge import pre_ff_rename
+
+    impl = tmp_repo / ".claude" / "work"
+    impl.mkdir(parents=True)
+    # Real batch doc with a T-placeholder append (no P-placeholder files).
+    (impl / "plan-0304-batch.md").write_text(
+        "# batch\n\n### T1 — old\n\nold.\n"
+    )
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
+    _git(tmp_repo, "checkout", "-b", "docs-654321")
+    (impl / "plan-0304-batch.md").write_text(
+        "# batch\n\n### T1 — old\n\nold.\n\n### T965432101 — new\n\nnew.\n"
+    )
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: append T", "--no-verify")
+
+    monkeypatch.setattr(merge_mod, "_worktree_for", lambda _: tmp_repo)
+    monkeypatch.setattr(merge_mod, "DOCS_DIR", impl)
+
+    # _find_placeholders is empty (no plan-9ddddddNN-*.md files) but
+    # _DOCS_BRANCH_RE matches "docs-654321" → rename_unassigned fires.
+    report = pre_ff_rename("docs-654321")
+
+    # T-placeholder rewritten; no P-mapping (no P-placeholders existed).
+    assert report.mapping == []  # P-mapping empty
+    assert report.commit is not None  # but T-rewrite committed
+    text = (impl / "plan-0304-batch.md").read_text()
+    assert "T965432101" not in text
+    assert "### T2 —" in text  # assigned next-T after T1
+
+
 # ─── T-placeholder rewrite (lazy T-number assignment, P0401) ──────────────────
 
 

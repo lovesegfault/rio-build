@@ -368,6 +368,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             _schema_exit(_MODELS["RenameReport"])
         _emit(merge.rename_unassigned(args.branch))
         return 0
+    if c == "pre-ff-rename":
+        if args.schema:
+            _schema_exit(_MODELS["RenameReport"])
+        _emit(merge.pre_ff_rename(args.branch))
+        return 0
     if c == "preflight":
         if args.schema:
             _schema_exit(_MODELS["Preflight"])
@@ -586,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_parser("clear-halt")
     sp = g.add_parser("clause4-check"); sp.add_argument("base"); sp.add_argument("--schema", action="store_true")
     g.add_parser("record-green")
-    for name in ("atomicity-check", "rename-unassigned", "preflight", "rebase-anchored", "ff-try"):
+    for name in ("atomicity-check", "rename-unassigned", "pre-ff-rename", "preflight", "rebase-anchored", "ff-try"):
         sp = g.add_parser(name); sp.add_argument("branch"); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("convco-check"); sp.add_argument("range"); sp.add_argument("--schema", action="store_true")
     sp = g.add_parser("behind-report"); sp.add_argument("--schema", action="store_true")

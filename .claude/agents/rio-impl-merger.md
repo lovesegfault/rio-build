@@ -70,6 +70,16 @@ Returns `RebaseResult` JSON: `{status: "ok"|"conflict"|"no-op", pre_rebase, move
 
 **Stale-verify signal.** `moved` is the `rev-list --count` of how far the branch advanced during rebase. If `moved > 3`: the verify likely ran on code `moved` commits behind what's now merging. The verifier's BEHIND precondition (step 0) should have caught this, but if the verify ran *before* those commits landed on `$TGT`, the window existed. **Don't abort** — `.#ci` in step 5 catches most regressions. But include `stale_verify_commits_moved: <moved>` in the report. Coordinator decides whether to trust the PASS or re-verify post-merge.
 
+### 3.5 docs-branch pre-ff rename
+
+```bash
+.claude/bin/onibus merge pre-ff-rename <branch>
+```
+
+Returns `RenameReport` JSON: `{branch, mapping: [...], commit}`. Runs `rename_unassigned` **only** if the branch name matches `docs-NNNNNN` OR `plan-9ddddddNN-*.md` placeholder files exist. On impl branches (`pNNN` — the common case) neither predicate fires → fast-path no-op, `mapping: []`. On docs branches: 9-digit P-placeholders → real plan numbers, T-placeholders → next-T per batch doc, commits `docs: assign …`. ff-try at step 4 picks up the rename commit.
+
+**Why here and not earlier.** `rename_unassigned` refuses if HEAD is already an ancestor of `$TGT` (post-ff, the rename commit would diverge). SKILL step 0a runs it pre-rebase at the skill layer; this step-3.5 is the defensive re-check inside the merger — three manual post-ff fixups (4e755ae0, c05ec902, 45daa5a8) before P0523 wired it in. Post-rebase placement means the three-dot diff in `_touched_batch_docs` is clean; pre-ff means the is-ancestor guard passes. Idempotent: if step 0a already ran, `mapping: []` and no commit.
+
 ### 4. ff-only merge into `$TGT`
 
 ```bash

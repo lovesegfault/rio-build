@@ -38,7 +38,7 @@ If you create zero new docs (all rows are `P-batch-*` appends to open batches), 
 
 When appending tasks to an existing batch doc (P0304/P0311/P0295 etc.), use placeholder T-numbers `T9<runid><NN>` where `<runid>` is the same 6-digit Run ID from your prompt, `<NN>` is YOUR local sequence **per-batch-doc** (01, 02, …). E.g., first append to P0304 gets `T9<runid>01`, second gets `T9<runid>02`. First append to P0311 ALSO starts at `T9<runid>01` (sequences are per-doc, not global).
 
-The merger's `rename_unassigned` assigns real sequential T-numbers at merge time based on each doc's current max-T on the integration branch — you never see the final numbers, and concurrent writers can't collide.
+The merger's `rename_unassigned` runs automatically at step 3.5 (post-rebase, pre-ff) and assigns real sequential T-numbers at merge time based on each doc's current max-T on the integration branch — you never see the final numbers, and concurrent writers can't collide.
 
 **Cross-references:** when T-item A references T-item B in the SAME batch-append run, use the placeholder `T9<runid>NN` form. When referencing a PRE-EXISTING T-item (from TGT, not your append), use its real number (`T157`). The merger rewrites only `T9\d{8}` tokens.
 
