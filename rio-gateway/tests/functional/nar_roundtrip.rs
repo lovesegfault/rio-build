@@ -28,7 +28,8 @@ use super::*;
 /// survive chunk → manifest → backend → reassembly byte-for-byte.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
-    let mut stack = RioStack::new_chunked_ready().await?;
+    let (builder, chunk_backend) = RioStackBuilder::new().with_chunked();
+    let mut stack = builder.ready().await?;
 
     // 3 paths at 512 KiB each — well over INLINE_THRESHOLD (256 KiB),
     // chunks into ~8 pieces at FastCDC's 64 KiB normal-size. Different
@@ -77,10 +78,6 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
     // the store took the inline-blob shortcut (narinfo.inline_blob NOT
     // NULL) and this test is NOT exercising reassembly. The exit
     // criterion demands real chunking.
-    let chunk_backend = stack
-        .chunk_backend
-        .as_ref()
-        .expect("new_chunked provides it");
     let chunk_count = chunk_backend.len();
     assert!(
         chunk_count > 0,
@@ -135,17 +132,14 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
 /// the other write opcode. Smaller NAR (still over threshold).
 #[tokio::test(flavor = "multi_thread")]
 async fn add_single_then_nar_from_path_chunked() -> TestResult {
-    let mut stack = RioStack::new_chunked_ready().await?;
+    let (builder, chunk_backend) = RioStackBuilder::new().with_chunked();
+    let mut stack = builder.ready().await?;
     let path = test_store_path("func-nar-single");
     // 300 KiB — just over INLINE_THRESHOLD. Minimum viable chunking.
     let (nar, hash) = make_large_nar(99, 300 * 1024);
 
     add_to_store_nar(&mut stack.stream, &path, &nar, hash, &[]).await?;
 
-    let chunk_backend = stack
-        .chunk_backend
-        .as_ref()
-        .expect("new_chunked provides it");
     assert!(
         !chunk_backend.is_empty(),
         "300 KiB NAR > INLINE_THRESHOLD — must chunk"

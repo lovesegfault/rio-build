@@ -44,6 +44,9 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 
 > **TLS SNI:** `load_client_tls` does **not** set a fixed `domain_name` on the `ClientTlsConfig`. tonic derives the SNI server name from the connect URL's host per-connection. A global `domain_name` override would break multi-service clients (gateway/worker connect to both scheduler and store, each with a different cert SAN).
 
+r[sec.jwt.pubkey-mount]
+When `jwt.enabled=true`, scheduler and store pods MUST have the `rio-jwt-pubkey` ConfigMap mounted at `/etc/rio/jwt/ed25519_pubkey` and `RIO_JWT__KEY_PATH` set to that path. Without the mount, `cfg.jwt.key_path` remains `None` and the interceptor falls through to inert mode (every RPC passes, no `Claims` attached) --- a silent fail-open. The gateway correspondingly mounts the `rio-jwt-signing` Secret at `/etc/rio/jwt/ed25519_seed`. Helm `_helpers.tpl` provides `rio.jwtVerifyEnv`/`VolumeMount`/`Volume` and `rio.jwtSignEnv`/`VolumeMount`/`Volume` triplets, self-guarded on `.Values.jwt.enabled`.
+
 ### Boundary 3: Worker → Nix Sandbox
 
 - **Auth**: None (sandbox is a purity mechanism, NOT a security boundary)

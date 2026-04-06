@@ -26,7 +26,7 @@
 #[path = "mod.rs"]
 mod fixture;
 
-use fixture::{RioStack, add_to_store_nar, make_large_nar};
+use fixture::{RioStackBuilder, add_to_store_nar, make_large_nar};
 use rio_nix::protocol::wire;
 use rio_test_support::TestResult;
 use rio_test_support::fixtures::{make_nar, test_store_path};
