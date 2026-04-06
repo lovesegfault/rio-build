@@ -909,6 +909,36 @@
                     exit 1
                   }
 
+                  # ── rio.optBool: with-on-bool footgun guard ─────────────────
+                  # Explicit `false` MUST render. Helm's `with` is falsy-skip —
+                  # `hostUsers: false` in values produced NO key (controller
+                  # default applied instead of the explicit override). hasKey
+                  # renders the key whenever it's SET, regardless of value.
+                  helm template rio . \
+                    --set fetcherPool.enabled=true \
+                    --set fetcherPool.hostUsers=false \
+                    --set global.image.tag=test \
+                    --set postgresql.enabled=false \
+                    > $TMPDIR/fp-false.yaml
+                  yq 'select(.kind=="FetcherPool") | .spec.hostUsers' $TMPDIR/fp-false.yaml \
+                    | grep -qx false || {
+                    echo "FAIL: fetcherPool.hostUsers=false did not render (with-on-bool bug)" >&2
+                    exit 1
+                  }
+                  # Unset stays unset — no spurious key. --set key=null deletes
+                  # the key from the values map (Helm deep-merge semantics), so
+                  # hasKey sees it as absent and the template renders nothing.
+                  helm template rio . \
+                    --set fetcherPool.enabled=true \
+                    --set fetcherPool.hostUsers=null \
+                    --set global.image.tag=test \
+                    --set postgresql.enabled=false \
+                    > $TMPDIR/fp-unset.yaml
+                  test "$(yq 'select(.kind=="FetcherPool") | .spec | has("hostUsers")' $TMPDIR/fp-unset.yaml)" = false || {
+                    echo "FAIL: fetcherPool.hostUsers unset but key rendered (spurious key)" >&2
+                    exit 1
+                  }
+
                   touch $out
                 '';
 
