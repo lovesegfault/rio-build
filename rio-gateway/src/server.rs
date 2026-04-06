@@ -12,7 +12,7 @@ use ed25519_dalek::SigningKey;
 use rio_common::config::JwtConfig;
 use rio_common::jwt;
 use rio_common::signal::Token as CancellationToken;
-use rio_common::tenant::NormalizedName;
+use rio_common::tenant::{NameError, NormalizedName};
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
@@ -621,6 +621,55 @@ impl Drop for ConnectionHandler {
     }
 }
 
+/// Normalize an `authorized_keys` comment into a tenant name.
+///
+/// Three outcomes per `NormalizedName::new`:
+///
+/// - `Ok(name)` → multi-tenant mode with a valid tenant identifier.
+/// - `Err(Empty)` → single-tenant mode. Intentional — the operator
+///   left the comment blank. `None`, no noise.
+/// - `Err(InteriorWhitespace)` → MISCONFIGURED. The operator typo'd
+///   `team a` instead of `team-a` in `authorized_keys`. Degrade to
+///   single-tenant (the comment isn't a usable identifier — same
+///   outcome as Empty) but SURFACE the misconfig: `warn!` makes it
+///   visible in logs, `rio_gateway_auth_degraded_total{reason=
+///   interior_whitespace}` makes it alertable. Without this, builds
+///   succeed in single-tenant mode and the operator never learns
+///   their tenant isolation is silently off.
+///
+/// Extracted as a free function so tests can assert the counter fires
+/// without constructing a full `ConnectionHandler` (which needs live
+/// gRPC clients). Takes `key_fingerprint` as `impl Display` — the call
+/// site passes `matched.fingerprint(Default::default())`; tests pass
+/// a string literal.
+// r[impl gw.auth.tenant-from-key-comment]
+fn normalize_key_comment(
+    comment: &str,
+    key_fingerprint: &dyn std::fmt::Display,
+) -> Option<NormalizedName> {
+    match NormalizedName::new(comment) {
+        Ok(name) => Some(name),
+        // Intentional single-tenant: empty comment. No noise.
+        Err(NameError::Empty) => None,
+        // Misconfigured: interior whitespace. Degrade + warn.
+        Err(NameError::InteriorWhitespace(raw)) => {
+            warn!(
+                comment = %raw,
+                key_fingerprint = %key_fingerprint,
+                "authorized_keys comment has interior whitespace — \
+                 degrading to single-tenant mode; fix the comment \
+                 (e.g. `team a` → `team-a`)"
+            );
+            metrics::counter!(
+                "rio_gateway_auth_degraded_total",
+                "reason" => "interior_whitespace"
+            )
+            .increment(1);
+            None
+        }
+    }
+}
+
 impl Handler for ConnectionHandler {
     type Error = anyhow::Error;
 
@@ -692,15 +741,23 @@ impl Handler for ConnectionHandler {
         if let Some(matched) = matched {
             // Normalize via the shared newtype so every tenant-name
             // consumer (scheduler, store, quota cache) sees the exact
-            // same bytes. Empty or malformed comment (interior
-            // whitespace — `"team a"`) → None (single-tenant mode);
-            // the `Option<NormalizedName>` type IS the mode flag,
-            // threaded all the way through `run_protocol` /
+            // same bytes. The `Option<NormalizedName>` type IS the
+            // mode flag, threaded all the way through `run_protocol` /
             // `SessionContext` / `translate::build_submit_request`.
             // No downstream `.trim()` or `.is_empty()` checks needed
             // — the type guarantees the `Some` case is trimmed,
             // non-empty, and whitespace-free.
-            self.tenant_name = NormalizedName::from_maybe_empty(matched.comment());
+            //
+            // Interior whitespace (`"team a"`) is a MISCONFIGURED
+            // authorized_keys entry — degrade to single-tenant (same
+            // as Empty; the comment isn't a usable identifier) but
+            // WARN + bump `rio_gateway_auth_degraded_total` so the
+            // operator notices their tenant isolation is off. The
+            // helper is extracted for direct unit-testability (no
+            // full `ConnectionHandler` needed to assert the counter
+            // fires).
+            self.tenant_name =
+                normalize_key_comment(matched.comment(), &matched.fingerprint(Default::default()));
 
             // r[impl gw.jwt.dual-mode]
             //
@@ -1247,6 +1304,95 @@ mod tests {
             "comment field should be preserved from the authorized_keys line"
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_key_comment — the extracted tenant-name normalization
+    // helper. Tests all three NameError branches + the counter emit.
+    // -----------------------------------------------------------------------
+
+    // r[verify gw.auth.tenant-from-key-comment]
+    /// T4 regression for P0367-T1: interior-whitespace comment (e.g.,
+    /// `team a` typo'd from `team-a`) degrades to single-tenant (None)
+    /// but BUMPS `rio_gateway_auth_degraded_total{reason=
+    /// interior_whitespace}`. Before the fix, `from_maybe_empty`
+    /// silently returned None — the operator never learned their
+    /// tenant isolation was off.
+    ///
+    /// Mutation-checked: replacing the `InteriorWhitespace` arm with
+    /// a bare `=> None` (no warn, no counter) fails the counter
+    /// assertion below.
+    #[test]
+    fn interior_whitespace_comment_warns_and_degrades() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let recorder = CountingRecorder::default();
+        let result = metrics::with_local_recorder(&recorder, || {
+            normalize_key_comment("team a", &"SHA256:test-fingerprint")
+        });
+
+        // Degrades to single-tenant:
+        assert_eq!(result, None, "interior-ws must degrade to single-tenant");
+        // But counter bumped — the misconfig is alertable:
+        assert_eq!(
+            recorder.get("rio_gateway_auth_degraded_total{reason=interior_whitespace}"),
+            1,
+            "interior-ws must bump auth_degraded counter; saw keys: {:?}",
+            recorder.all_keys()
+        );
+    }
+
+    /// Positive control for the above: a valid comment produces
+    /// `Some(name)` and does NOT bump the counter. Without this, the
+    /// interior-whitespace test above could pass while the helper
+    /// unconditionally returns None (e.g., if the match was written
+    /// with the Ok arm unreachable).
+    #[test]
+    fn valid_comment_returns_some_no_counter() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let recorder = CountingRecorder::default();
+        let result =
+            metrics::with_local_recorder(&recorder, || normalize_key_comment("  team-a  ", &"fp"));
+
+        assert_eq!(
+            result.as_deref(),
+            Some("team-a"),
+            "valid comment should be trimmed+Some"
+        );
+        assert_eq!(
+            recorder.get("rio_gateway_auth_degraded_total{reason=interior_whitespace}"),
+            0,
+            "valid comment must NOT bump the degrade counter"
+        );
+    }
+
+    /// Empty comment → None, no counter. Intentional single-tenant
+    /// mode — the operator left the comment blank on purpose. Distinct
+    /// from interior-whitespace (misconfig): empty is quiet, interior-
+    /// ws is loud. Proves the two Err variants are branched separately.
+    #[test]
+    fn empty_comment_returns_none_no_counter() {
+        use rio_test_support::metrics::CountingRecorder;
+
+        let recorder = CountingRecorder::default();
+        let result = metrics::with_local_recorder(&recorder, || normalize_key_comment("", &"fp"));
+
+        assert_eq!(result, None, "empty comment → single-tenant (None)");
+        assert_eq!(
+            recorder.get("rio_gateway_auth_degraded_total{reason=interior_whitespace}"),
+            0,
+            "empty comment is INTENTIONAL single-tenant — no counter"
+        );
+        // Also whitespace-only (trims to empty → Empty variant):
+        let ws_result =
+            metrics::with_local_recorder(&recorder, || normalize_key_comment("   ", &"fp"));
+        assert_eq!(ws_result, None);
+        assert_eq!(
+            recorder.get("rio_gateway_auth_degraded_total{reason=interior_whitespace}"),
+            0,
+            "whitespace-only → Empty (not InteriorWhitespace) → no counter"
+        );
     }
 
     /// Key with NO comment → empty comment string. This is the

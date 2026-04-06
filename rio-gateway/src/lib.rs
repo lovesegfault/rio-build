@@ -67,6 +67,12 @@ pub fn describe_metrics() {
         "JWT mint failed but jwt.required=false, degraded to tenant_name fallback"
     );
     describe_counter!(
+        "rio_gateway_auth_degraded_total",
+        "SSH auth accepted but tenant identity degraded to single-tenant mode \
+         (labeled by reason: interior_whitespace = authorized_keys comment has \
+         a space where a dash was intended)"
+    );
+    describe_counter!(
         "rio_gateway_quota_rejections_total",
         "SubmitBuild rejected because tenant is over store quota (labeled by tenant)"
     );
