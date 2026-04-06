@@ -19,8 +19,11 @@ use super::*;
 // ChunkService
 // ===========================================================================
 
-use rio_proto::ChunkServiceClient;
 use rio_proto::ChunkServiceServer;
+// ChunkServiceClient is not re-exported at crate root (P0430 — no
+// production callers; client-side chunking descoped). Tests reach it
+// via the deep codegen path.
+use rio_proto::store::chunk_service_client::ChunkServiceClient;
 use rio_proto::types::{
     FindMissingChunksRequest, GetChunkRequest, PutChunkMetadata, PutChunkRequest, put_chunk_request,
 };

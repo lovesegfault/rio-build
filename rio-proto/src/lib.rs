@@ -133,32 +133,18 @@ pub mod worker {
 /// Store service: NAR storage and path metadata RPCs.
 ///
 /// Also includes `ChunkService` (`GetChunk`/`FindMissingChunks`/
-/// `PutChunk`). Server-side chunking is the primary path — `PutPath`
-/// chunks internally — but `PutChunk` is implemented for direct chunk
-/// upload.
+/// `PutChunk`). Chunking is **server-side only** — workers stream
+/// full NARs via `StoreService::PutPath`; rio-store does the FastCDC
+/// cut internally. `GetChunk`/`FindMissingChunks` exist so the store
+/// can dedupe across tenants without clients knowing chunk
+/// boundaries. `PutChunk` is stubbed `UNIMPLEMENTED`.
 ///
-/// ## ChunkService client is forward-scaffolding
-///
-/// [`ChunkServiceClient`] has **zero
-/// production callers** — it's exercised only by
-/// `rio-store/tests/grpc/chunk_service.rs`. This is intentional:
-///
-/// - Today, chunking is **server-side only**: workers stream full
-///   NARs via `StoreService::PutPath`; rio-store does the FastCDC
-///   cut internally. `GetChunk`/`FindMissingChunks` exist so the
-///   store can dedupe across tenants without clients knowing chunk
-///   boundaries.
-/// - The client stub is kept as forward-scaffolding for a future
-///   **client-side chunking** worker: upload only missing chunks
-///   instead of whole NARs. See
-///   [ADR-006](../../../docs/src/decisions/006-custom-chunked-cas.md)
-///   for the CAS design this would slot into.
-///
-/// Keeping the proto service definition is cheap; deleting and
-/// re-adding it later would churn `store.proto` and every generated
-/// snapshot. If client-side chunking is descoped permanently, remove
-/// the `ChunkServiceClient` re-export (and this note) rather than
-/// the service definition.
+/// `ChunkServiceClient` is **not** re-exported at crate root (P0430):
+/// client-side chunking was descoped in favor of P0434's
+/// manifest-mode (`StoreService::PutPathManifest`), where the worker
+/// sends a manifest and the store resolves chunks server-side. The
+/// store's own tests reach the client stub via the deep codegen path
+/// `store::chunk_service_client::ChunkServiceClient`.
 pub mod store {
     tonic::include_proto!("rio.store");
 }
@@ -181,10 +167,6 @@ pub use admin::admin_service_client::AdminServiceClient;
 pub use admin::admin_service_server::{AdminService, AdminServiceServer};
 pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
-// TODO(P0430): ChunkServiceClient still has zero production callers
-// post-P0263. Decide whether client-side chunking is still planned; if
-// descoped, remove this re-export per the doc-comment above.
-pub use store::chunk_service_client::ChunkServiceClient;
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
 pub use store::store_admin_service_client::StoreAdminServiceClient;
 pub use store::store_admin_service_server::{StoreAdminService, StoreAdminServiceServer};
