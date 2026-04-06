@@ -39,6 +39,9 @@ pub struct HistoryEntry {
     /// pre-seeded via psql with only duration, or an old build
     /// from before cgroup memory.peak was wired).
     pub ema_peak_memory_bytes: Option<f64>,
+    /// EMA of peak CPU cores. `None` if no samples yet. Feeds
+    /// size-class cpu-bump (assignment::classify).
+    pub ema_peak_cpu_cores: Option<f64>,
 }
 
 /// Duration estimator. Owned by the actor (single-threaded; no lock).
@@ -153,6 +156,20 @@ impl Estimator {
             .and_then(|e| e.ema_peak_memory_bytes)
     }
 
+    /// Look up peak CPU for size-class cpu-bump. Mirrors [`peak_memory`].
+    ///
+    /// `None` means no history OR no cpu data. No cross-system fallback —
+    /// same rationale as [`peak_memory`]: resource ceilings are
+    /// architecture-dependent, better to say "unknown" than guess.
+    ///
+    /// [`peak_memory`]: Self::peak_memory
+    pub fn peak_cpu(&self, pname: Option<&str>, system: &str) -> Option<f64> {
+        let pname = pname?;
+        self.history
+            .get(&(pname.to_string(), system.to_string()))
+            .and_then(|e| e.ema_peak_cpu_cores)
+    }
+
     /// Rebuild from a fresh `build_history` read.
     ///
     /// Called by the actor on Tick (every ~60s). Replaces the whole
@@ -162,12 +179,6 @@ impl Estimator {
     ///
     /// The input shape matches `SchedulerDb::read_build_history`
     /// exactly — callers just pipe the query result through.
-    ///
-    /// `_ema_cpu` is accepted but not stored — `HistoryEntry` doesn't
-    /// have a cpu field yet. size-class routing currently bumps on
-    /// MEMORY only (not cpu). When cpu-bump lands, adding the
-    /// `HistoryEntry` field is a pure-estimator change; the DB
-    /// roundtrip is already done.
     pub fn refresh(&mut self, rows: Vec<crate::db::BuildHistoryRow>) {
         let mut history = HashMap::with_capacity(rows.len());
         // pname → (sum, count) for mean calculation. Mean not median:
@@ -175,7 +186,7 @@ impl Estimator {
         // a fallback estimate, mean is plenty.
         let mut pname_acc: HashMap<String, (f64, u32)> = HashMap::new();
 
-        for (pname, system, ema_duration, ema_mem, _ema_cpu) in rows {
+        for (pname, system, ema_duration, ema_mem, ema_cpu) in rows {
             let (sum, count) = pname_acc.entry(pname.clone()).or_insert((0.0, 0));
             *sum += ema_duration;
             *count += 1;
@@ -185,6 +196,7 @@ impl Estimator {
                 HistoryEntry {
                     ema_duration_secs: ema_duration,
                     ema_peak_memory_bytes: ema_mem,
+                    ema_peak_cpu_cores: ema_cpu,
                 },
             );
         }
@@ -342,6 +354,28 @@ mod tests {
 
         // x86_64 lookup: no exact match → None (NOT the aarch64 value).
         assert_eq!(est.peak_memory(Some("firefox"), "x86_64-linux"), None);
+    }
+
+    #[test]
+    fn peak_cpu_lookup() {
+        let mut est = Estimator::default();
+        est.refresh(vec![
+            (
+                "chromium".into(),
+                "x86_64-linux".into(),
+                7200.0,
+                None,
+                Some(12.0),
+            ),
+            ("hello".into(), "x86_64-linux".into(), 5.0, None, None),
+        ]);
+
+        assert_eq!(est.peak_cpu(Some("chromium"), "x86_64-linux"), Some(12.0));
+        assert_eq!(est.peak_cpu(Some("hello"), "x86_64-linux"), None);
+        assert_eq!(est.peak_cpu(Some("missing"), "x86_64-linux"), None);
+        assert_eq!(est.peak_cpu(None, "x86_64-linux"), None);
+        // No cross-system fallback (same rationale as peak_memory).
+        assert_eq!(est.peak_cpu(Some("chromium"), "aarch64-linux"), None);
     }
 
     #[test]

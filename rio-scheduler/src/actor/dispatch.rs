@@ -70,15 +70,26 @@ impl DagActor {
                     continue;
                 }
 
-                // Classify by estimated duration + memory. None if
-                // size_classes unconfigured (optional feature off —
+                // Classify by estimated duration + memory + CPU. None
+                // if size_classes unconfigured (optional feature off —
                 // no filter, all workers candidates).
-                let target_class = crate::assignment::classify(
-                    state.est_duration,
-                    self.estimator
-                        .peak_memory(state.pname.as_deref(), &state.system),
-                    &self.size_classes,
-                );
+                //
+                // Read guard is dropped at the end of this block —
+                // BEFORE `assign_to_worker().await`. parking_lot
+                // guards aren't `Send`; the await point would be a
+                // compile error anyway, but keeping the scope tight
+                // is defensive.
+                let target_class = {
+                    let classes = self.size_classes.read();
+                    crate::assignment::classify(
+                        state.est_duration,
+                        self.estimator
+                            .peak_memory(state.pname.as_deref(), &state.system),
+                        self.estimator
+                            .peak_cpu(state.pname.as_deref(), &state.system),
+                        &classes,
+                    )
+                };
 
                 // Try target class first, then overflow to larger
                 // classes if no worker in target has capacity. A
@@ -146,7 +157,7 @@ impl DagActor {
         // (gauge=50) then cleared (no entries in class_deferred this
         // pass) would STAY at 50 forever without this zeroing.
         // Operators would see a phantom bottleneck.
-        for sc in &self.size_classes {
+        for sc in self.size_classes.read().iter() {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
         }
         // Now overwrite for classes that actually have deferrals.
@@ -187,9 +198,12 @@ impl DagActor {
         // We don't cache this chain because classify() is called fresh
         // per-dispatch anyway (est_duration can change between ticks
         // via estimator refresh) and the sort is 2-4 elements.
-        let target_cutoff = crate::assignment::cutoff_for(target, &self.size_classes);
-        let mut chain: Vec<&str> = self
-            .size_classes
+        //
+        // Read guard lives through the chain walk — no `.await` in
+        // this fn, so it's safe. best_worker is sync.
+        let classes = self.size_classes.read();
+        let target_cutoff = crate::assignment::cutoff_for(target, &classes);
+        let mut chain: Vec<(&str, f64)> = classes
             .iter()
             .filter(|c| {
                 // Target itself (== cutoff) or larger.
@@ -198,16 +212,12 @@ impl DagActor {
                 // defensive: if None, include everything.
                 target_cutoff.is_none_or(|t| c.cutoff_secs >= t)
             })
-            .map(|c| c.name.as_str())
+            .map(|c| (c.name.as_str(), c.cutoff_secs))
             .collect();
-        chain.sort_by(|a, b| {
-            let ca = crate::assignment::cutoff_for(a, &self.size_classes).unwrap_or(f64::MAX);
-            let cb = crate::assignment::cutoff_for(b, &self.size_classes).unwrap_or(f64::MAX);
-            ca.total_cmp(&cb)
-        });
+        chain.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         // Walk the chain: first class with an available worker wins.
-        for class in chain {
+        for (class, _) in chain {
             if let Some(w) =
                 crate::assignment::best_worker(&self.workers, drv_state, &self.dag, Some(class))
             {

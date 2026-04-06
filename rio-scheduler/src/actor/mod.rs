@@ -146,9 +146,21 @@ pub struct DagActor {
     /// `None` if spawned via bare `run()` (no delayed scheduling).
     self_tx: Option<mpsc::WeakSender<ActorCommand>>,
     /// Size-class cutoff config. Empty = feature off (no classification).
-    /// dispatch.rs calls classify() with this; completion.rs looks up
-    /// cutoff_for() for misclassification detection.
-    size_classes: Vec<crate::assignment::SizeClassConfig>,
+    /// dispatch.rs calls classify() with a read guard; completion.rs
+    /// reads cutoff_for() for misclassification detection.
+    ///
+    /// `Arc<parking_lot::RwLock<...>>` — shared with the rebalancer
+    /// task (spawned in `run_inner`) which writes new cutoffs hourly.
+    /// parking_lot not tokio::sync: writes are rare (1/hour) so
+    /// contention is near-zero, and a sync lock keeps `classify()`
+    /// sync — no `.await` inside dispatch's hot read path.
+    ///
+    /// R10 CHECK: callers MUST NOT hold a read/write guard across
+    /// `.await`. parking_lot guards are not `Send` so the borrow
+    /// checker catches some misuse, but a `.read()` followed by
+    /// `.await` on the same task blocks the executor thread. See
+    /// dispatch.rs: guards are dropped before any await boundary.
+    size_classes: Arc<parking_lot::RwLock<Vec<crate::assignment::SizeClassConfig>>>,
     /// Channel to the LogFlusher task. Completion handlers `try_send` a
     /// FlushRequest here so the S3 upload is ordered AFTER the state
     /// transition (hybrid model: buffer outside actor, flush triggered by
@@ -259,7 +271,7 @@ impl DagActor {
             // unset" (old scheduler); gen=1 is the real first generation.
             generation: Arc::new(AtomicU64::new(1)),
             self_tx: None,
-            size_classes: Vec::new(),
+            size_classes: Arc::new(parking_lot::RwLock::new(Vec::new())),
             log_flush_tx: None,
             // Default true: non-K8s mode, always leader.
             // with_leader_flag() overrides for K8s deployments.
@@ -311,7 +323,7 @@ impl DagActor {
     /// tests don't need it, and deployments without size-class routing
     /// (VM tests phase1a/1b/2a/2b) leave size_classes unconfigured.
     pub fn with_size_classes(mut self, classes: Vec<crate::assignment::SizeClassConfig>) -> Self {
-        self.size_classes = classes;
+        self.size_classes = Arc::new(parking_lot::RwLock::new(classes));
         self
     }
 
@@ -337,6 +349,16 @@ impl DagActor {
 
     async fn run_inner(&mut self, rx: &mut mpsc::Receiver<ActorCommand>) {
         info!("DAG actor started");
+
+        // Rebalancer: hourly recompute of size-class cutoffs.
+        // Shares the `size_classes` Arc — writes new `cutoff_secs`
+        // via write lock; dispatch/completion read via `.read()`.
+        // No-op if size_classes empty (feature off).
+        crate::rebalancer::spawn_task(
+            self.db.clone(),
+            Arc::clone(&self.size_classes),
+            self.shutdown.clone(),
+        );
 
         loop {
             let cmd = tokio::select! {

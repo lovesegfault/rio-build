@@ -237,6 +237,11 @@ rand = "0.9"
 tokio-stream = "0.1"
 futures-util = "0.3"
 
+# Sync primitives. parking_lot::RwLock for shared hot-path state where
+# writes are rare (rebalancer → size_classes at 1/hour, reads per-dispatch).
+# Sync (no .await across guard) keeps classify() sync.
+parking_lot = "0.12"
+
 # Testing
 proptest = "1"
 tempfile = "3"

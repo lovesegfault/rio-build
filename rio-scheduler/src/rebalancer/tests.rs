@@ -216,3 +216,88 @@ fn ema_smoothing_blends_toward_raw() {
     let instant = compute_cutoffs(&samples, 2, &[0.0], &cfg_instant).unwrap();
     assert!((instant.new_cutoffs[0] - 100.0).abs() < 1e-9);
 }
+
+/// Integration: seed bimodal samples in PG, call apply_pass, verify
+/// the shared RwLock's cutoff changed from the initial value.
+///
+/// Exercises the full wire: db.query_build_samples_last_days →
+/// compute_cutoffs → guard.write() → zip-assign. This is the path
+/// the spawned rebalancer task takes every hour.
+#[tokio::test]
+async fn apply_pass_writes_cutoffs_through_rwlock() {
+    use crate::assignment::SizeClassConfig;
+    use rio_test_support::TestDb;
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Seed bimodal samples: 100 @ 10s + 100 @ 300s. Same shape as
+    // bimodal_converges_to_midpoint_in_3_iters above — raw SITA-E
+    // boundary sits ~48 samples into the 300s cluster (~307s).
+    for i in 0..100 {
+        db.insert_build_sample("small-thing", "x86_64-linux", 10.0 + jitter(i, 1.0), 0)
+            .await
+            .unwrap();
+    }
+    for i in 0..100 {
+        db.insert_build_sample("big-thing", "x86_64-linux", 300.0 + jitter(i, 15.0), 0)
+            .await
+            .unwrap();
+    }
+
+    // Initial config: cutoff FAR from either cluster. If apply_pass
+    // works, one pass with α=1.0 lands us near the raw ~307 target.
+    let initial_cutoff = 60.0;
+    let size_classes = Arc::new(RwLock::new(vec![SizeClassConfig {
+        name: "default".into(),
+        cutoff_secs: initial_cutoff,
+        mem_limit_bytes: u64::MAX,
+        cpu_limit_cores: None,
+    }]));
+
+    let cfg = RebalancerConfig {
+        min_samples: 50,
+        ema_alpha: 1.0, // no smoothing — one pass lands at raw target
+        lookback_days: 7,
+    };
+
+    let result = apply_pass(&db, &size_classes, &cfg)
+        .await
+        .expect("apply_pass should return Some with 200 samples > min_samples=50");
+
+    assert_eq!(result.sample_count, 200);
+    assert_eq!(
+        result.new_cutoffs.len(),
+        1,
+        "1 class → n+1=2 passed to compute_cutoffs → 1 cutoff returned"
+    );
+
+    // Read through the SAME RwLock — proves the write landed.
+    let new_cutoff = size_classes.read()[0].cutoff_secs;
+    assert!(
+        (new_cutoff - initial_cutoff).abs() > 50.0,
+        "cutoff unchanged after apply_pass: initial={initial_cutoff} new={new_cutoff}"
+    );
+    assert!(
+        new_cutoff > 200.0 && new_cutoff < 320.0,
+        "cutoff {new_cutoff} not near the raw SITA-E target (~307)"
+    );
+}
+
+/// apply_pass with empty size_classes is a no-op (returns None).
+/// The spawned task short-circuits before the spawn (spawn_task
+/// returns early on empty) but apply_pass itself is also defensive.
+#[tokio::test]
+async fn apply_pass_empty_config_is_noop() {
+    use rio_test_support::TestDb;
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let empty = Arc::new(RwLock::new(Vec::new()));
+
+    let result = apply_pass(&db, &empty, &RebalancerConfig::default()).await;
+    assert!(
+        result.is_none(),
+        "empty size_classes → rebalancer no-op → None"
+    );
+}

@@ -30,11 +30,13 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
                 name: "small".into(),
                 cutoff_secs: 30.0,
                 mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
             },
             SizeClassConfig {
                 name: "large".into(),
                 cutoff_secs: 3600.0,
                 mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
             },
         ])
     });
