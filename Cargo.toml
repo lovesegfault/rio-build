@@ -108,6 +108,8 @@ nix = { version = "0.31", features = [
   "hostname",
   "process",
   "signal",
+  "socket",
+  "uio",
 ] }
 # raw_os_error()/raise()/errno constants where the `nix` crate is
 # overkill. Used as a normal dep in rio-gateway (EMFILE/ENFILE accept

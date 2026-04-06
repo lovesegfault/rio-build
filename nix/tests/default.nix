@@ -239,6 +239,8 @@ let
     inherit pkgs common;
     fixture = k3sProdParity { };
   };
+
+  composefs-spike-priv = import ./scenarios/composefs-spike-priv.nix;
 in
 {
   # ── nixos-node AMI bootstrap (mocked IMDS, no AWS) ────────────────────
@@ -252,6 +254,9 @@ in
   #   `-d kubelet` short-flag collision that only surfaced on live EC2.
   #   Gates Phase-2 boot-path changes (initrd-networkd, UKI, perlless).
   vm-nixos-node = import ./nixos-node.nix { inherit pkgs; };
+
+  # ── Spikes (single-VM, no rio fixture) ──────────────────────────────
+  vm-composefs-spike-priv = composefs-spike-priv { inherit pkgs rio-workspace; };
 
   # r[verify gw.conn.exit-status]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +
