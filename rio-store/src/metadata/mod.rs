@@ -40,6 +40,7 @@ use rio_proto::validated::{PathInfoValidationError, ValidatedPathInfo};
 use tracing::warn;
 
 mod chunked;
+mod cluster_key_history;
 mod inline;
 mod queries;
 mod tenant_keys;
@@ -48,6 +49,7 @@ pub mod upstreams;
 // Public API — re-exports so all external callers in grpc/, cas.rs,
 // cache_server.rs, content_index.rs keep their `metadata::foo` paths.
 pub use chunked::*;
+pub use cluster_key_history::*;
 pub use inline::*;
 pub use queries::*;
 pub use tenant_keys::*;

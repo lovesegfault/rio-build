@@ -255,6 +255,51 @@ pub const M_025: () = ();
 // r[impl store.substitute.sig-mode]
 pub const M_026: () = ();
 
+/// `migrations/027_cluster_key_history.sql`
+///
+/// Prior cluster signing keys for `sig_visibility_gate` verification
+/// after rotation. Route I of [P0521] — history-row pattern instead of
+/// GC re-sign.
+///
+/// ## Why this exists
+///
+/// The sig-visibility gate (grpc/mod.rs `sig_visibility_gate`) pushes
+/// the cluster key into the trusted set so a freshly-built path
+/// (rio-signed, `path_tenants` not yet populated) isn't rejected as
+/// "untrusted substitution" during the PutPath→scheduler window. But
+/// it pushed ONLY the current `Signer`'s pubkey.
+///
+/// After rotation: paths signed under the old cluster key, whose
+/// `path_tenants` rows get CASCADE-deleted (tenant deletion), become
+/// invisible — old sig doesn't verify against the new key, no
+/// `path_tenants` row to bypass the gate.
+///
+/// ## Why not GC re-sign (Route II)
+///
+/// The spec previously prescribed GC-mark re-signing reachable paths
+/// with the new key. Never implemented (zero `Signer` refs in
+/// `gc/mark.rs`). Would change GC's write profile: mark is currently a
+/// ~1s read-only CTE; re-sign = N SIGNATURE + N UPDATE per cycle.
+/// Route I is readpath-only — matches the `tenant_keys` precedent.
+///
+/// ## `pubkey` column format
+///
+/// Full `name:base64(pubkey)` string (what `Signer::trusted_key_entry`
+/// returns), NOT raw pubkey bytes. `any_sig_trusted` matches
+/// signatures by name first (`keys.iter().find(|(n, _)| *n ==
+/// sig_name)`), so the name is load-bearing. Storing the entry-format
+/// string means zero parsing at gate time — just `Vec::extend`.
+///
+/// ## `retired_at` semantics
+///
+/// NULL = old key still within grace period, gate trusts it.
+/// Non-NULL = grace expired; row retained for audit only. The loader
+/// query filters `WHERE retired_at IS NULL`.
+///
+/// [P0521]: ../../../.claude/work/plan-0521-cluster-key-rotation-contradiction.md
+// r[impl store.key.rotation-cluster-history]
+pub const M_027: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

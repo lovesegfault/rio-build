@@ -212,8 +212,8 @@ Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = 
 1. Generate a new ed25519 signing key
 2. Add the new public key to all clients' `trusted-public-keys` configuration
 3. New paths are signed with the new key immediately
-4. Existing active paths are re-signed during GC (mark phase signs reachable paths with the new key)
-5. After a grace period (default: 30 days), remove the old key from `trusted-public-keys`
+4. Prior cluster public keys stay in the trusted set via `cluster_key_history`; no re-sign needed while the history row exists (see `r[store.key.rotation-cluster-history]`)
+5. After a grace period (default: 30 days), remove the old key from `trusted-public-keys` and delete its `cluster_key_history` row
 
 r[store.key.rotation-cluster-history]
 The cluster signing key MAY be rotated. Prior cluster public keys MUST remain in the trusted set for `sig_visibility_gate` verification until the grace period expires — otherwise paths signed under the old key become invisible to cross-tenant reads when `path_tenants` row count hits zero (CASCADE on tenant deletion). Prior keys are loaded from `cluster_key_history` alongside the active `Signer`.
