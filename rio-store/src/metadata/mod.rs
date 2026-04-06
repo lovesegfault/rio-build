@@ -33,8 +33,11 @@
 //! `query_path_info()` and `find_missing_paths()` filter on
 //! `manifests.status = 'complete'`, so placeholders are never exposed.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use rio_proto::validated::{PathInfoValidationError, ValidatedPathInfo};
+use tracing::warn;
 
 mod chunked;
 mod inline;
@@ -78,6 +81,14 @@ pub enum MetadataError {
     /// Maps to `aborted`.
     #[error("serialization failure (retry)")]
     Serialization,
+
+    /// Deadlock detected (PG code 40P01). Two transactions have a
+    /// circular lock-wait on overlapping row sets. Retriable — PG
+    /// aborted one txn; retry will likely succeed. Prevention: sort
+    /// batch-UPDATE input so all writers acquire locks in the same
+    /// order (see [`with_sorted_retry`]). Maps to `aborted`.
+    #[error("deadlock detected (retry)")]
+    Deadlock(#[source] sqlx::Error),
 
     /// The write-ahead placeholder from `insert_manifest_uploading` is
     /// gone — `delete_manifest_uploading` raced us and won, or a crashed
@@ -152,6 +163,7 @@ impl From<sqlx::Error> for MetadataError {
                     MetadataError::Conflict(db_err.message().to_string())
                 }
                 Some("40001") => MetadataError::Serialization,
+                Some("40P01") => MetadataError::Deadlock(e),
                 _ => MetadataError::Other(e),
             },
             // PoolTimedOut: all connections checked out, waited
@@ -170,6 +182,57 @@ impl From<sqlx::Error> for MetadataError {
 }
 
 pub type Result<T> = std::result::Result<T, MetadataError>;
+
+/// Cheap pseudo-jitter for PG-retry backoff: 50–150ms derived from the
+/// low bits of the system clock. Not cryptographic — just enough to
+/// desynchronize two retrying txns so they don't re-collide in lockstep.
+///
+/// NOT the same as rio-scheduler's configurable-fraction backoff jitter
+/// (`state/executor.rs`) — that's scheduling backoff with different
+/// semantics. This is fixed-range PG-retry jitter; unifying across
+/// crates would add a dep for 4 lines.
+pub(crate) fn jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(50 + (nanos % 100) as u64)
+}
+
+/// Execute a batch `UPDATE ... WHERE <key> = ANY($1)` with deadlock-safe
+/// lock ordering. Sorts the input before binding so all callers acquire
+/// PG row locks in the same deterministic order (prevents circular wait
+/// → SQLSTATE 40P01). Wraps in a single retry-on-40P01: the sort SHOULD
+/// prevent deadlock, but PG can still hit it on index-page splits under
+/// extreme contention; one retry is cheap, unbounded retry masks real
+/// problems.
+///
+/// The `body` closure receives the SORTED keys (owned, cloned once per
+/// attempt) and must perform the full transaction (begin→UPDATE→commit).
+/// On 40P01, the closure is re-invoked after jitter — PG aborts the
+/// whole txn on deadlock, not just the failing statement.
+///
+/// Owned `Vec<Vec<u8>>` (not `&[Vec<u8>]`): the closure returns a
+/// `Future` that must own its captures across `.await` points; a slice
+/// borrow into the helper's stack would need higher-ranked trait bounds.
+/// The one-clone cost (~KB for typical chunk batches) is negligible
+/// versus PG roundtrips.
+// r[impl store.chunk.lock-order]
+pub async fn with_sorted_retry<T, F, Fut>(mut keys: Vec<Vec<u8>>, body: F) -> Result<T>
+where
+    F: Fn(Vec<Vec<u8>>) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    keys.sort_unstable();
+    match body(keys.clone()).await {
+        Err(MetadataError::Deadlock(e)) => {
+            warn!(error = %e, "40P01 on batch UPDATE; retrying once after jitter");
+            tokio::time::sleep(jitter()).await;
+            body(keys).await
+        }
+        r => r,
+    }
+}
 
 /// How a NAR's content is stored. Returned by [`get_manifest`].
 ///
@@ -456,6 +519,10 @@ mod tests {
             ),
             (MetadataError::Serialization, Code::Aborted),
             (
+                MetadataError::Deadlock(sqlx::Error::PoolClosed),
+                Code::Aborted,
+            ),
+            (
                 MetadataError::PlaceholderMissing {
                     store_path: "/nix/store/x".into(),
                 },
@@ -568,6 +635,7 @@ mod tests {
             MetadataError::Conflict(s) => MetadataError::Conflict(s.clone()),
             MetadataError::Connection(_) => MetadataError::Connection(sqlx::Error::PoolClosed),
             MetadataError::Serialization => MetadataError::Serialization,
+            MetadataError::Deadlock(_) => MetadataError::Deadlock(sqlx::Error::PoolClosed),
             MetadataError::PlaceholderMissing { store_path } => MetadataError::PlaceholderMissing {
                 store_path: store_path.clone(),
             },

@@ -95,6 +95,7 @@ pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Stat
         M::Conflict(_) => Status::already_exists("conflict: path already exists"),
         M::Connection(_) => Status::unavailable("database connection failed; retry"),
         M::Serialization => Status::aborted("transaction serialization failure; retry"),
+        M::Deadlock(_) => Status::aborted("transaction deadlock detected; retry"),
         M::PlaceholderMissing { .. } => {
             Status::aborted("upload placeholder concurrently deleted; retry")
         }

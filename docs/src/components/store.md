@@ -87,6 +87,9 @@ Chunk refcounts track how many manifests reference each chunk. The `chunks` tabl
 r[store.chunk.refcount-txn]
 **Refcount increment:** In the same PostgreSQL transaction that writes `manifest_data` (step 2 of PutPath). Uses `INSERT ... ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1` — a single UPSERT over the full chunk list via `UNNEST`. PostgreSQL's conflict resolution serializes INSERT vs UPDATE per-row, so concurrent `PutPath` calls with overlapping chunk lists both increment correctly without explicit locking.
 
+r[store.chunk.lock-order]
+All batch row-locking statements keyed on `blake3_hash` (`UPDATE chunks ... WHERE blake3_hash = ANY($1)`, `DELETE FROM chunk_tenants WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash arrays) MUST bind a sorted input array. PostgreSQL acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets across concurrent transactions create circular lock-wait → SQLSTATE 40P01. Sorting makes lock-acquisition order deterministic across all writers. Note: a RETURNING set is NOT in input-array order — re-sort before passing to downstream ANY() statements. A single defensive retry on 40P01 is permitted (index-page splits can still deadlock under extreme contention); unbounded retry is NOT permitted (masks real lock-order bugs).
+
 r[store.chunk.put-standalone]
 The `PutChunk` RPC MUST accept chunks independent of any NAR manifest. A chunk with no manifest reference is held for the grace-TTL before GC eligibility. (Sibling to `r[store.chunk.refcount-txn]`.)
 

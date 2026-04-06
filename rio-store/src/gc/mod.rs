@@ -530,9 +530,20 @@ pub(super) async fn enqueue_chunk_deletes(
     if zeroed.is_empty() {
         return Ok(0);
     }
+    // r[impl store.chunk.lock-order]
+    // Sort by hash before building the parallel keys/hashes vecs: the
+    // input is a RETURNING set (PG internal order, NOT input-array
+    // order). Both the chunk_tenants DELETE and pending_s3_deletes
+    // INSERT below bind ANY()/UNNEST() — unsorted → circular-wait
+    // against a concurrent enqueue_chunk_deletes or rollback. One sort
+    // here covers both statements AND all callers (decrement_and_enqueue,
+    // sweep_orphan_batch). The .to_vec() clone is cheap (~KB) relative
+    // to the two PG roundtrips this function makes.
+    let mut zeroed: Vec<_> = zeroed.to_vec();
+    zeroed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
     let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
-    for (hash, _size) in zeroed {
+    for (hash, _size) in &zeroed {
         let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
             warn!(
                 len = hash.len(),
@@ -593,6 +604,15 @@ pub(super) async fn enqueue_chunk_deletes(
 /// and yields zero stats — the narinfo DELETE (caller's step 2) has
 /// already CASCADEd the manifest away, so the worst case is leaked
 /// refcounts (chunks survive until a future GC sees them at actual 0).
+///
+/// # Deadlock safety
+///
+/// Runs inside a caller-provided `&mut Transaction`, so this CANNOT
+/// use [`crate::metadata::with_sorted_retry`] — retry would need to
+/// replay the whole outer txn. The `unique_hashes.sort_unstable()`
+/// below is the primary defense (deterministic lock-acquisition
+/// order across all `ANY($1)` writers). If the caller owns the txn
+/// and wants defensive retry, wrap the outer txn in the helper.
 pub(super) async fn decrement_and_enqueue(
     tx: &mut Transaction<'_, Postgres>,
     chunk_list: &[u8],
@@ -610,7 +630,7 @@ pub(super) async fn decrement_and_enqueue(
 
     // Dedup chunk hashes: a manifest CAN repeat chunks if the NAR has
     // duplicate content blocks; decrement once per unique hash.
-    let unique_hashes: Vec<Vec<u8>> = {
+    let mut unique_hashes: Vec<Vec<u8>> = {
         let mut seen = std::collections::HashSet::<[u8; 32]>::new();
         manifest
             .entries
@@ -619,6 +639,14 @@ pub(super) async fn decrement_and_enqueue(
             .map(|e| e.hash.to_vec())
             .collect()
     };
+    // r[impl store.chunk.lock-order]
+    // HashSet iteration order is nondeterministic across runs. Sort
+    // before binding to ANY($1) so both UPDATEs below acquire row
+    // locks in the same canonical order as every other chunk-hash
+    // writer (rollback path, sweep path). Without this, a concurrent
+    // decrement_refcounts_for_manifest on an overlapping manifest
+    // could lock h1→h3 while we lock h3→h1 → circular wait → 40P01.
+    unique_hashes.sort_unstable();
     if unique_hashes.is_empty() {
         return Ok(stats);
     }
