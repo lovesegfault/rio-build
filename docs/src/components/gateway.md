@@ -497,6 +497,9 @@ JWT claims: `sub` = tenant_id UUID (server-resolved at mint time), `iat`, `exp` 
 r[gw.jwt.issue]
 On successful SSH authentication, the gateway MUST mint a JWT with `sub` set to the resolved tenant UUID and store it on the session context. The scheduler reads `jti` from the interceptor-attached `Claims` extension (per `r[gw.jwt.verify]` below) — NO proto body field. For audit, the `SubmitBuild` handler INSERTs `jti` into `builds.jwt_jti` (column added in migration 016). Zero wire redundancy: `jti` lives once in the JWT, parsed once by the interceptor, read once by the handler.
 
+r[gw.jwt.refresh-on-expiry]
+The gateway MUST re-mint the session JWT before injecting it on a new channel if the cached token is within 5 minutes of `exp`. SSH `ControlMaster` keeps a single TCP connection alive indefinitely, so a token minted once at `auth_publickey` would expire under any mux'd session lasting longer than `JWT_SESSION_TTL_SECS`. Re-mint is local (`sub` and the signing key are already on the connection handler) — no `ResolveTenant` round-trip. The refreshed token gets a fresh `jti`; the old `jti` is NOT revoked (it expires naturally).
+
 r[gw.jwt.verify]
 The tonic interceptor on scheduler and store MUST extract `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request extensions, and reject invalid tokens with `Status::unauthenticated`. (Controller has no gRPC ingress — kube reconcile loop + raw-TCP /healthz only.) The scheduler ADDITIONALLY checks `jti NOT IN jwt_revoked` (PG lookup — gateway stays PG-free).
 
