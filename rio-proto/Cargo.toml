@@ -31,6 +31,7 @@ tracing = { workspace = true }
 # phase2b: W3C traceparent inject/extract via tonic interceptor
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 # Interceptor roundtrip test needs a real (non-noop) tracer to get

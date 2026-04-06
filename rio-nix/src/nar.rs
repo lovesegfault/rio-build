@@ -1002,12 +1002,13 @@ mod tests {
 
     /// Compare our NAR output against `nix-store --dump` for a single file.
     #[test]
+    #[tracing_test::traced_test]
     fn golden_single_file() -> anyhow::Result<()> {
         let drv_path = "/nix/store/3543bymzsssf34hrlchksl28apr3gfyc-simple-test.drv";
 
         // Check if path exists (test may run without this specific path)
         if !std::path::Path::new(drv_path).exists() {
-            eprintln!("skipping golden_single_file: {drv_path} not found");
+            tracing::info!("skipping: {drv_path} not found");
             return Ok(());
         }
 
@@ -1020,7 +1021,7 @@ mod tests {
         let nix_output = match nix_output {
             Ok(o) if o.status.success() => o,
             _ => {
-                eprintln!("skipping golden_single_file: nix-store not available");
+                tracing::info!("skipping: nix-store not available");
                 return Ok(());
             }
         };
@@ -1034,6 +1035,7 @@ mod tests {
 
     /// Compare our NAR output against `nix-store --dump` for a directory.
     #[test]
+    #[tracing_test::traced_test]
     fn golden_directory() -> anyhow::Result<()> {
         let tmpdir = tempfile::TempDir::new()?;
         let root = tmpdir.path();
@@ -1062,7 +1064,7 @@ mod tests {
         let nix_output = match nix_output {
             Ok(o) if o.status.success() => o,
             _ => {
-                eprintln!("skipping golden_directory: nix-store not available");
+                tracing::info!("skipping: nix-store not available");
                 return Ok(());
             }
         };

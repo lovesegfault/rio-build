@@ -12,6 +12,8 @@ members = [
   "rio-worker",
   "rio-crds",
   "rio-bench",
+  "workspace-hack",
+  "xtask",
 ]
 exclude = ["rio-nix/fuzz", "rio-store/fuzz"]
 resolver = "2"
@@ -257,6 +259,53 @@ aws-smithy-mocks = "0.2"
 # Utility
 regex = "1"
 scopeguard = "1"
+
+# --- xtask (dev tooling) ---
+xshell = "0.2"
+# Pure-Rust git (no libgit2 C dep). xtask needs rev-parse + dirty-tree
+# detection for the ECR image tag. status/dirwalk covers both tracked
+# changes and untracked files (the push script hashes `git diff HEAD` +
+# `git status --porcelain`).
+gix = { version = "0.81", default-features = false, features = [
+  "basic",
+  "dirwalk",
+  "revision",
+  "status",
+  "blob-diff",
+  "sha1",
+  "parallel",
+] }
+aws-sdk-ecr = "1"
+aws-sdk-elasticloadbalancingv2 = "1"
+aws-sdk-sts = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "rustls-native-certs",
+  "json",
+] }
+dotenvy = "0.15"
+indicatif = "0.18"
+tracing-indicatif = "0.3"
+human-panic = "2"
+# Interactive prompts (TTY fallbacks when flags are missing). console
+# backend matches indicatif's terminal library — no second redraw loop.
+inquire = { version = "0.9", default-features = false, features = [
+  "console",
+  "fuzzy",
+] }
+# Timestamp parsing + friendly duration display (rollback picker).
+# Already transitive via kube 3.0; direct for jiff::fmt::friendly.
+jiff = "0.2"
+# Don't hand-roll "1.5 GB" — use this for size display.
+bytesize = "2.3"
+# Parse workspace Cargo.toml (fuzz-lock auto-discovery). Already
+# transitive; direct for toml::from_str.
+toml = "0.9"
+clap-verbosity-flag = { version = "3", default-features = false, features = [
+  "tracing",
+] }
+console = "0.16"
+filetime = "0.2"
 
 [profile.release]
 lto = "thin"

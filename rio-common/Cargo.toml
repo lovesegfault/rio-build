@@ -61,6 +61,7 @@ serde_json = { workspace = true }
 jsonwebtoken = { workspace = true }
 ed25519-dalek = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies.proptest]
 workspace = true

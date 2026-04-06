@@ -775,6 +775,7 @@ mod tests {
 
     /// Parse a real `.drv` file from the local Nix store.
     #[test]
+    #[tracing_test::traced_test]
     fn parse_real_drv_file() -> anyhow::Result<()> {
         // Generate a simple derivation and parse it
         let output = std::process::Command::new("nix-instantiate")
@@ -784,7 +785,7 @@ mod tests {
         let output = match output {
             Ok(o) if o.status.success() => o,
             _ => {
-                eprintln!("skipping parse_real_drv_file: nix-instantiate not available");
+                tracing::info!("skipping: nix-instantiate not available");
                 return Ok(());
             }
         };
@@ -810,6 +811,7 @@ mod tests {
 
     /// Parse the real hello .drv (complex, many deps).
     #[test]
+    #[tracing_test::traced_test]
     fn parse_hello_drv() -> anyhow::Result<()> {
         let output = std::process::Command::new("nix-instantiate")
             .args(["<nixpkgs>", "-A", "hello"])
@@ -818,9 +820,7 @@ mod tests {
         let output = match output {
             Ok(o) if o.status.success() => o,
             _ => {
-                eprintln!(
-                    "skipping parse_hello_drv: nix-instantiate not available or nixpkgs not found"
-                );
+                tracing::info!("skipping: nix-instantiate not available or nixpkgs not found");
                 return Ok(());
             }
         };

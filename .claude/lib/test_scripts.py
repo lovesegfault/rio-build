@@ -8,7 +8,7 @@ rio-build deltas:
     per plan; rio-build tracey is domain-indexed. r[plan.*] in a plan doc
     is POLLUTION → FAIL. Zero r[domain.*] refs → WARN (not FAIL — refactor
     plans legitimately cite zero).
-  - PlanFile validator: +migrations/ +infra/ +scripts/ +codecov.yml,
+  - PlanFile validator: +migrations/ +infra/ +xtask/ +codecov.yml,
     -systemd/ -tests/ -benches/
   - rename_unassigned fixtures: no r[plan.*] markers (use plain P<N> refs);
     the string-replace logic is format-agnostic
@@ -933,13 +933,13 @@ def test_plan_file_validates_path_prefix():
     PlanFile(path=".claude/lib/onibus/cli.py")
     PlanFile(path="Cargo.toml")
     PlanFile(path="docs/src/components/gateway.md")
-    PlanFile(path="justfile")
     PlanFile(path=".config/tracey/config.styx")
     PlanFile(path="codecov.yml")
-    # rio-build additions: migrations/ + infra/ + scripts/
+    # rio-build additions: migrations/ + infra/ + xtask/
     PlanFile(path="migrations/009_tenants.sql")
     PlanFile(path="infra/helm/rio-build/values.yaml")
-    PlanFile(path="scripts/split-crds.sh")
+    PlanFile(path="xtask/src/regen/crds.rs")
+    PlanFile(path=".cargo/config.toml")
     # Root-level additions (P0304-T1): .github/, deny.toml, flake.lock,
     # .envrc, ALL-CAPS.md
     PlanFile(path=".github/workflows/ci.yml")

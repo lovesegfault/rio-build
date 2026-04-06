@@ -13,6 +13,7 @@ anyhow = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
+tracing = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 tonic = { workspace = true }
@@ -42,6 +43,7 @@ metrics = { workspace = true }
 # benches need unique drv_hash across iterations (scheduler DAG
 # dedupes, collisions skew latency low).
 rand = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal"] }

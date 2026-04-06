@@ -1,0 +1,120 @@
+//! OpenTofu wrappers. All paths are relative to repo root.
+
+use anyhow::{Context, Result, bail};
+use tracing::info;
+
+use crate::sh::{self, cmd, shell};
+use crate::ui;
+
+pub struct Backend {
+    pub bucket: String,
+    pub region: String,
+}
+
+/// `tofu init -reconfigure` with dynamic backend config.
+///
+/// `-reconfigure`: tofu can't tell the dynamic -backend-config is the
+/// same as last time, prompts "migrate?" even though nothing changed.
+pub fn init(dir: &str, backend: &Backend) -> Result<()> {
+    let sh = shell()?;
+    let (b, r) = (&backend.bucket, &backend.region);
+    sh::run_sync(cmd!(
+        sh,
+        "tofu -chdir={dir} init -reconfigure -backend-config=bucket={b} -backend-config=region={r}"
+    ))
+}
+
+/// `tofu init -backend=false` — local state, used for first-time bootstrap.
+pub fn init_local(dir: &str) -> Result<()> {
+    let sh = shell()?;
+    sh::run_sync(cmd!(
+        sh,
+        "tofu -chdir={dir} init -backend=false -reconfigure"
+    ))
+}
+
+/// `tofu init -migrate-state` — move local state into S3 after bootstrap.
+pub fn init_migrate(dir: &str, backend: &Backend) -> Result<()> {
+    let sh = shell()?;
+    let (b, r) = (&backend.bucket, &backend.region);
+    sh::run_sync(cmd!(
+        sh,
+        "tofu -chdir={dir} init -migrate-state -force-copy -backend-config=bucket={b} -backend-config=region={r}"
+    ))
+}
+
+/// Plan then apply. Skips apply (and its noisy output) if the plan
+/// shows no changes. `-detailed-exitcode` makes `tofu plan` exit 0 for
+/// no-diff, 2 for diff, 1 for error.
+pub fn apply(dir: &str, auto: bool, vars: &[(&str, &str)]) -> Result<()> {
+    let sh = shell()?;
+    let varflags: Vec<String> = vars.iter().map(|(k, v)| format!("-var={k}={v}")).collect();
+
+    let plan = tempfile::NamedTempFile::new()?;
+    let plan_path = plan.path().to_str().unwrap();
+
+    // Captured (non-interactive): plan doesn't prompt. At default
+    // verbosity sh::run_sync hides output; -v shows the full diff.
+    let out = cmd!(
+        sh,
+        "tofu -chdir={dir} plan -detailed-exitcode -out={plan_path} {varflags...}"
+    )
+    .quiet()
+    .ignore_status()
+    .output()?;
+
+    match out.status.code() {
+        Some(0) => {
+            info!("tofu: no changes");
+            Ok(())
+        }
+        Some(2) => {
+            if !auto {
+                // Show the plan (suspend bars so tofu's colored diff
+                // renders cleanly) then confirm ourselves. Applying a
+                // plan file skips tofu's own prompt — it treats the
+                // file as pre-approved.
+                ui::suspend(|| cmd!(sh, "tofu -chdir={dir} show {plan_path}").run())?;
+                if !ui::confirm("Apply these changes?")? {
+                    bail!("tofu apply cancelled");
+                }
+            }
+            sh::run_sync(cmd!(sh, "tofu -chdir={dir} apply {plan_path}"))
+        }
+        _ => {
+            // Plan error — dump captured output so it's visible.
+            #[allow(clippy::disallowed_methods)]
+            let err = String::from_utf8_lossy(&out.stderr);
+            bail!("tofu plan failed:\n{err}")
+        }
+    }
+}
+
+/// Destroy without prompting — the caller (`k8s destroy`) gates with
+/// `ui::confirm_destroy` before reaching here.
+pub fn destroy(dir: &str) -> Result<()> {
+    let sh = shell()?;
+    sh::run_sync(cmd!(sh, "tofu -chdir={dir} destroy -auto-approve"))
+}
+
+/// `tofu output -raw NAME` with a friendly error.
+pub fn output(dir: &str, name: &str) -> Result<String> {
+    let sh = shell()?;
+    sh::read(cmd!(sh, "tofu -chdir={dir} output -raw {name}")).with_context(|| {
+        format!("tofu output '{name}' missing — run `cargo xtask k8s provision -p eks` first?")
+    })
+}
+
+/// Resolve the tfstate bucket: RIO_TFSTATE_BUCKET or rio-tfstate-${account_id}.
+pub async fn state_bucket(
+    cfg: &crate::config::XtaskConfig,
+    aws: &aws_config::SdkConfig,
+) -> Result<String> {
+    if let Some(b) = &cfg.tfstate_bucket {
+        return Ok(b.clone());
+    }
+    let sts = aws_sdk_sts::Client::new(aws);
+    let ident = sts.get_caller_identity().send().await?;
+    let account = ident.account().context("no AWS account ID")?;
+    Ok(format!("rio-tfstate-{account}"))
+}

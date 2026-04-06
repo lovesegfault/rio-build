@@ -183,7 +183,7 @@ When adding a new parser, also add a fuzz target:
 1. Add a `[[bin]]` entry in the relevant `fuzz/Cargo.toml` + target file in `fuzz_targets/`
 2. Add seed inputs to `fuzz/corpus/<target>/` (must be prefixed `seed-`; NAR seeds: see `gen-nar-corpus.sh`)
 3. Add the target to `fuzzTargets` in `nix/fuzz.nix` (target name + which `fuzzBuild` + `corpusRoot`)
-4. If the fuzzed crate's deps changed, run `cd <crate>/fuzz && cargo update -p <crate>` (fuzz lockfile is independent)
+4. If the fuzzed crate's deps changed, run `cargo xtask regen fuzz-lock` (fuzz lockfiles are independent of the main workspace)
 
 ## Design Book
 

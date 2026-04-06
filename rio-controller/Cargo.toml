@@ -51,6 +51,7 @@ futures-util = { workspace = true }
 clap = { workspace = true }
 # Ephemeral Job name suffixes (ephemeral.rs random_suffix).
 rand = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 # ApiServerVerifier + Scenario (tower-test mock apiserver).
