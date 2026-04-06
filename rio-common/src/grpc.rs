@@ -12,6 +12,13 @@ use std::time::Duration;
 ///
 /// Should be long enough for a round trip under load, short enough that a
 /// stuck server doesn't hang callers indefinitely.
+///
+/// Tests that arm a hung MockStore to prove a timeout-wrapper exists
+/// override this to ~3s via per-component plumbing (e.g.
+/// `DagActor::with_grpc_timeout`) — NOT `cfg(test)` on this constant.
+/// `cfg(test)` is per-crate; a cross-crate caller's test build still
+/// links against rio-common built without `cfg(test)`, so a test-gated
+/// constant here would be invisible to it.
 pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for NAR streaming calls (GetPath, PutPath).

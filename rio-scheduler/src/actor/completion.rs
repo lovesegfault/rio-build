@@ -119,7 +119,7 @@ impl DagActor {
         });
         rio_proto::interceptor::inject_current(req.metadata_mut());
         let missing: HashSet<String> = match tokio::time::timeout(
-            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            self.grpc_timeout,
             store_client.clone().find_missing_paths(req),
         )
         .await
@@ -416,7 +416,7 @@ impl DagActor {
                 });
                 rio_proto::interceptor::inject_current(req.metadata_mut());
                 let matched = match tokio::time::timeout(
-                    rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    self.grpc_timeout,
                     store_client.clone().content_lookup(req),
                 )
                 .await

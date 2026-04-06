@@ -105,6 +105,17 @@ pub struct DagActor {
     /// Store service client for scheduler-side cache checks. `None` in tests
     /// that don't need the store (cache check is then skipped).
     store_client: Option<StoreServiceClient<Channel>>,
+    /// Timeout for metadata gRPC calls to the store (FindMissingPaths,
+    /// ContentLookup). Defaults to [`rio_common::grpc::DEFAULT_GRPC_TIMEOUT`]
+    /// (30s). Tests that arm `MockStore.content_lookup_hang` to prove the
+    /// timeout wrapper exists (e.g.
+    /// `ca_cutoff_compare_slow_store_doesnt_block_completion`) override to
+    /// 3s via [`with_grpc_timeout`](Self::with_grpc_timeout) — same
+    /// wrapper-exists proof at 10× less wall-clock. Plumbed as a field
+    /// (not `cfg(test)` on the const) because `cfg(test)` is per-crate:
+    /// rio-scheduler's test build links against rio-common built WITHOUT
+    /// `cfg(test)`, so a test-gated constant there is invisible here.
+    grpc_timeout: std::time::Duration,
     /// Circuit breaker for the cache-check FindMissingPaths call. Owned by
     /// the actor (single-threaded, no lock needed). Checked/updated in
     /// `merge.rs::check_cached_outputs`.
@@ -272,6 +283,7 @@ impl DagActor {
             poison_config: PoisonConfig::default(),
             db,
             store_client,
+            grpc_timeout: rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
             cache_breaker: CacheCheckBreaker::default(),
             estimator: Estimator::default(),
             tick_count: 0,
@@ -359,6 +371,16 @@ impl DagActor {
     /// and threads them through `spawn_with_leader`.
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
+        self
+    }
+
+    /// Override the store-RPC timeout. Production leaves the default
+    /// (30s); slow-store regression tests set 3s so the wrapper-exists
+    /// proof costs ~3s wall-clock instead of ~30s. See the
+    /// [`grpc_timeout`](Self#structfield.grpc_timeout) field doc for why
+    /// this is plumbed rather than `cfg(test)`-gated.
+    pub fn with_grpc_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.grpc_timeout = timeout;
         self
     }
 
