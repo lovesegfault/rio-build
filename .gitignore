@@ -39,6 +39,7 @@ __pycache__/
 docs/book/
 
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # DAG-runner runtime state (agents-running.jsonl, merge-queue.jsonl, etc.)
 .claude/state/

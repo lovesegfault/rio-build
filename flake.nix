@@ -37,6 +37,34 @@
 
     crane.url = "github:ipetkov/crane";
 
+    # Per-crate Nix builds (evaluation PoC — see
+    # .claude/notes/crate2nix-migration-assessment.md). Pinned to master
+    # for the experimental JSON output (Cargo.json + lib/build-from-json.nix:
+    # feature resolution in Rust, no 6k+ line Cargo.nix checked in).
+    #
+    # We consume two surfaces:
+    #   - `lib/build-from-json.nix` as a source file (no inputs needed)
+    #   - The CLI binary for `crate2nix generate --format json`
+    #
+    # Everything else in crate2nix's flake (devshell, cachix,
+    # pre-commit-hooks, nix-test-runner, crate2nix_stable bootstrap)
+    # is upstream dev tooling. Their flake-parts wiring imports
+    # `inputs.devshell.flakeModule` unconditionally at the top level —
+    # eager module eval means `follows = ""` on devshell breaks
+    # `packages.default` even though the CLI build itself doesn't
+    # touch devshell.
+    #
+    # `flake = false` sidesteps the whole thing: zero transitive
+    # inputs in flake.lock. The CLI is built via the callPackage-
+    # compatible `crate2nix/default.nix` entrypoint (checked-in
+    # Cargo.nix + nixpkgs' buildRustCrate; same machinery as
+    # crate2nix's own bootstrap). See `crate2nixCli` in the
+    # perSystem let-block.
+    crate2nix = {
+      url = "github:nix-community/crate2nix";
+      flake = false;
+    };
+
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -163,8 +191,91 @@
           # Source root for filesets
           unfilteredRoot = ./.;
 
+          # Shared fileset for the crate2nix workspaceSrc. buildRustCrate
+          # works on per-crate directories, so each workspace member's
+          # subtree must be included verbatim (no commonCargoSources
+          # filter — that strips proto/, which rio-proto's build.rs
+          # needs as ./proto/).
+          c2nWorkspaceFileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./rio-cli
+            ./rio-common
+            ./rio-controller
+            ./rio-gateway
+            ./rio-nix/src
+            ./rio-nix/Cargo.toml
+            ./rio-proto
+            ./rio-scheduler
+            ./rio-store/src
+            ./rio-store/tests
+            ./rio-store/Cargo.toml
+            ./rio-test-support
+            ./rio-worker
+            ./migrations
+          ];
+          c2nWorkspaceSrc = pkgs.lib.fileset.toSource {
+            root = unfilteredRoot;
+            fileset = c2nWorkspaceFileset;
+          };
+
+          # Prefix every key in an attrset. Used to surface per-member
+          # c2n derivations under flake packages without colliding with
+          # crane's.
+          prefixed = p: pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "${p}${n}" v);
+
+          # ──────────────────────────────────────────────────────────────
+          # sys-crate linkage: per-crate single source of truth
+          # ──────────────────────────────────────────────────────────────
+          #
+          # Each sys-crate that system-links instead of vendoring C gets
+          # its env-var escape hatch + system lib here. Per-crate shape
+          # so crate2nix crateOverrides can reference .crates.<name>
+          # directly (same libs crane links, same env vars devShell
+          # sets). Crane + devShell consume the derived .allEnv/.allLibs
+          # aggregates.
+          #
+          # Adding a sys-crate: add a .crates.<name> entry here, add the
+          # override in nix/crate2nix.nix referencing it, done.
+          sysCrateEnv =
+            let
+              crates = {
+                # build.rs:49-53 escape hatch: routes build_linked →
+                # pkg-config probe instead of compiling the bundled
+                # amalgamation (sqlx's `sqlite` → sqlx-sqlite/bundled
+                # feature chain otherwise forces vendoring).
+                # bundled_bindings stays — precompiled Rust bindings,
+                # no bindgen; SQLite 3.x ABI stability makes them work
+                # against any 3.x system lib.
+                libsqlite3-sys = {
+                  env.LIBSQLITE3_SYS_USE_PKG_CONFIG = "1";
+                  libs = [ pkgs.sqlite ];
+                };
+                # build.rs:30 escape hatch: probe → system libzstd.
+                zstd-sys = {
+                  env.ZSTD_SYS_USE_PKG_CONFIG = "1";
+                  libs = [ pkgs.zstd ];
+                };
+                # No escape-hatch env var — fuser's build.rs already
+                # defaults to pkg-config (never bundles).
+                fuser = {
+                  env = { };
+                  libs = [ pkgs.fuse3 ];
+                };
+              };
+            in
+            {
+              inherit crates;
+              # Derived aggregates for crane's monolithic commonArgs.
+              # allLibs order matches the pre-per-crate flat list
+              # [sqlite zstd fuse3] so crane's buildInputs (hence drv
+              # hash) stays stable across this restructure.
+              allEnv = pkgs.lib.foldl' (a: c: a // c.env) { } (pkgs.lib.attrValues crates);
+              allLibs = with crates; libsqlite3-sys.libs ++ zstd-sys.libs ++ fuser.libs;
+            };
+
           # Common arguments for all crane builds
-          commonArgs = {
+          commonArgs = sysCrateEnv.allEnv // {
             src = pkgs.lib.fileset.toSource {
               root = unfilteredRoot;
               fileset = pkgs.lib.fileset.unions [
@@ -196,8 +307,10 @@
               [
                 openssl
                 llvmPackages.libclang.lib
-                fuse3
               ]
+              # System libraries for sys-crate pkg-config probes (see
+              # sysCrateEnv above — per-crate single source of truth).
+              ++ sysCrateEnv.allLibs
               ++ lib.optionals stdenv.isDarwin [
                 darwin.apple_sdk.frameworks.Security
                 libiconv
@@ -213,6 +326,10 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             # Where rio-test-support finds initdb/postgres (falls back to PATH).
             PG_BIN = "${pkgs.postgresql_18}/bin";
+            # sys-crate escape-hatch env vars set via the
+            # `sysCrateEnv.allEnv //` merge above (first line of
+            # commonArgs). nix/crate2nix.nix references the per-crate
+            # .crates.<name> entries directly.
             # nixbuildnet's adaptive scheduler decays Rust builds
             # (nextest went 24 cores @ 3min → 6 cores @ 8min — optimizes
             # utilization not throughput). Pin minimums on all crane drvs.
@@ -287,6 +404,131 @@
           traceyPkg = import ./nix/tracey.nix {
             inherit craneLib pkgs;
             inherit (inputs) tracey-src;
+          };
+
+          # crate2nix CLI built from source against OUR nixpkgs.
+          # inputs.crate2nix is `flake = false` (bare source tree) so
+          # its 8 transitive flake inputs (devshell, cachix,
+          # pre-commit-hooks, nix-test-runner, crate2nix_stable, …)
+          # don't bloat flake.lock. `crate2nix/default.nix` is the
+          # callPackage-compatible entrypoint — same one upstream's
+          # bootstrap uses — reads the checked-in Cargo.nix and
+          # builds via pkgs.buildRustCrate.
+          #
+          # The only nixpkgs-version risk here is `callPackage
+          # Cargo.nix` — if upstream's Cargo.nix template references
+          # a buildRustCrate attr our nixpkgs lacks, the CLI build
+          # fails. In practice the template surface is stable (the
+          # template itself is what crate2nix generates for every
+          # user, so it's tested against a wide nixpkgs range). If
+          # this does break on a nixpkgs bump: pin
+          # `inputs.crate2nix-nixpkgs` separately and pass that
+          # through as `pkgs` here.
+          crate2nixCli = pkgs.callPackage "${inputs.crate2nix}/crate2nix/default.nix" { };
+
+          # ──────────────────────────────────────────────────────────
+          # crate2nix JSON-mode PoC
+          # ──────────────────────────────────────────────────────────
+          #
+          # Parallel build pipeline using pkgs.buildRustCrate + a
+          # pre-resolved Cargo.json. See nix/crate2nix.nix and
+          # .claude/notes/crate2nix-migration-assessment.md for the
+          # rationale and caveats. Exposed below as
+          # packages.c2n-workspace + packages.c2n-rio-<crate> for
+          # side-by-side comparison with crane's rio-workspace.
+          mkC2n =
+            extra:
+            import ./nix/crate2nix.nix (
+              {
+                inherit pkgs rustStable sysCrateEnv;
+                inherit (pkgs) lib;
+                crate2nixSrc = inputs.crate2nix;
+                workspaceSrc = c2nWorkspaceSrc;
+              }
+              // extra
+            );
+          c2n = mkC2n { };
+
+          # Coverage-instrumented tree: re-import with
+          # globalExtraRustcOpts=["-Cinstrument-coverage"]. Doubles the
+          # derivation count (645 normal + 645 instrumented), but each
+          # half caches independently — touching a workspace crate only
+          # rebuilds that crate's two variants + dependents.
+          c2nCov = mkC2n { globalExtraRustcOpts = [ "-Cinstrument-coverage" ]; };
+
+          # ──────────────────────────────────────────────────────────
+          # crate2nix check backends: clippy, tests, doc
+          # ──────────────────────────────────────────────────────────
+          #
+          # Per-crate checks layered on the c2n build graph. Deps are
+          # built once (regular rustc, 645 cached drvs); workspace
+          # members are rebuilt per-check with the appropriate driver
+          # (clippy-driver, rustc --test, rustdoc). See
+          # nix/c2n-checks.nix for the wrapper mechanics — notably the
+          # clippy wrapper strips lib.sh's hardcoded `--cap-lints
+          # allow` (which rustc treats as non-overridable) before
+          # forwarding to clippy-driver.
+          #
+          # These are the crate2nix-native replacements for crane's
+          # cargoClippy/cargoNextest/cargoDoc. Unlike crane's
+          # workspace-wide derivations, each workspace member gets its
+          # own check derivation → touching rio-scheduler only
+          # re-clippy's rio-scheduler + its dependents, not the full
+          # workspace.
+          #
+          # Exposed below as checks.c2n-* and packages.c2n-clippy-* /
+          # c2n-test-* / c2n-doc-* for targeted invocation.
+          c2nChecks = import ./nix/c2n-checks.nix {
+            inherit
+              pkgs
+              rustStable
+              c2n
+              c2nCov
+              ;
+            inherit (pkgs) lib;
+            # Runtime inputs for test execution. Mirrors crane's
+            # cargoNextest nativeCheckInputs — postgres for ephemeral
+            # PG bootstrap (rio-test-support), nix-cli for golden
+            # conformance tests (nix-store --dump, nix-instantiate),
+            # openssh for rio-gateway SSH accept tests.
+            runtimeTestInputs = with pkgs; [
+              inputs.nix.packages.${system}.nix-cli
+              openssh
+              postgresql_18
+            ];
+            # Env vars for test runners. PG_BIN so rio-test-support
+            # finds initdb/postgres; RIO_GOLDEN_* so golden tests
+            # don't try to `nix build` their fixture in-sandbox.
+            testEnv = {
+              PG_BIN = "${pkgs.postgresql_18}/bin";
+              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+              RIO_GOLDEN_FORCE_HERMETIC = "1";
+            };
+            # nextest reuse-build runner. Synthesizes --cargo-metadata
+            # and --binaries-metadata JSON from the crate2nix test
+            # binaries; runs with the `ci` profile (retries, test
+            # groups from .config/nextest.toml). Per-test-process
+            # isolation — no PDEATHSIG/libtest thread race, so
+            # wrapper-level PG bootstrap not needed. `--no-tests=warn`
+            # because rio-cli has zero tests (bin-only crate).
+            #
+            # Fileset = c2n's workspaceSrc PLUS .config/nextest.toml
+            # (--workspace-remap needs to find it relative to the
+            # workspace root). c2n's own fileset omits .config/
+            # because buildRustCrate doesn't need it.
+            workspaceSrc = pkgs.lib.fileset.toSource {
+              root = unfilteredRoot;
+              fileset = pkgs.lib.fileset.unions [
+                c2nWorkspaceFileset
+                ./.config/nextest.toml
+              ];
+            };
+            nextestExtraArgs = [
+              "--profile"
+              "ci"
+              "--no-tests=warn"
+            ];
           };
 
           # --------------------------------------------------------------
@@ -678,6 +920,111 @@
           );
 
           # ──────────────────────────────────────────────────────────
+          # crate2nix-backed CI aggregate (parallel to `.#ci`)
+          # ──────────────────────────────────────────────────────────
+          #
+          # Same linkFarmFromDrvs UX (`nix build .#ci-c2n`, ls result/).
+          # Swaps crane's rustc-invoking constituents for crate2nix
+          # equivalents; leaves non-rust checks (tracey, helm-lint,
+          # pre-commit, cargo-deny) and fuzz (nightly craneLibNightly,
+          # separate workspace — no caching win from porting) unchanged.
+          #
+          # VM tests consume c2n.workspace — same `bin/` layout as
+          # crane's rio-workspace (verified: bin/crdgen bin/rio-cli
+          # bin/rio-{controller,gateway,scheduler,store,worker}), so
+          # mkVmTests / mkDockerImages / nix/modules/*.nix all accept
+          # it as a drop-in. See §4 of the migration-assessment doc.
+          #
+          # Additive: `.#ci` (crane) stays the gate until this proves
+          # stable. Keeping both aggregates means the crane pipeline
+          # still exercises end-to-end during the migration window.
+          # c2n.workspaceBins (not c2n.workspace): stripped binary-
+          # only derivation. `allWorkspaceMembers` references the
+          # full rust toolchain via debug info → ~2.3 GB closure,
+          # vs crane's ~300 MB. VM tests and docker images only
+          # need the executables; the strip+patchelf wrapper in
+          # nix/crate2nix.nix drops the toolchain reference
+          # (disallowedReferences = [rustStable] enforces this).
+          dockerImagesC2n = mkDockerImages { rio-workspace = c2n.workspaceBins; };
+          vmTestsC2n = mkVmTests {
+            rio-workspace = c2n.workspaceBins;
+            dockerImages = dockerImagesC2n;
+            coverage = false;
+          };
+
+          # Non-rust checks reused verbatim from the crane pipeline —
+          # none of these invoke rustc, so crate2nix gives zero caching
+          # win. cargo-deny is workspace-level (reads Cargo.lock +
+          # deny.toml); it stays on crane because craneLib.cargoDeny
+          # already vendors the advisory DB hermetically and there's
+          # no crate2nix equivalent.
+          ciC2nBaseDrvs = [
+            c2n.workspaceBins
+            c2nChecks.clippyCheck
+            c2nChecks.nextest
+            c2nChecks.docCheck
+            c2nChecks.coverage
+            cargoChecks.deny
+            cargoChecks.tracey-validate
+            cargoChecks.helm-lint
+            config.checks.pre-commit
+          ];
+
+          ci-c2n = pkgs.linkFarmFromDrvs "rio-ci-c2n" (
+            ciC2nBaseDrvs
+            ++ builtins.attrValues fuzz.runs
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTestsC2n)
+          );
+
+          # ──────────────────────────────────────────────────────────
+          # crate2nix-backed coverage-full (parallel to `.#coverage-full`)
+          # ──────────────────────────────────────────────────────────
+          #
+          # Same nix/coverage.nix merge pipeline, fed with:
+          #   - unitCoverage = c2nChecks.coverage (instrumented nextest
+          #     run → profraw → lcov, already repo-relative paths)
+          #   - rio-workspace-cov = c2nCov.workspace (instrumented
+          #     release binaries, --remap-path-prefix → `/` at compile)
+          #   - vmTestsCov = vmTestsC2nCov (VMs run c2n-instrumented
+          #     binaries, emit profraws with `/rio-*/src/...` paths)
+          #
+          # stripPrefix differs: buildRustCrate remaps to `/` (not
+          # `.../source/`), so the pattern is `s|^/||` — same as
+          # c2n-checks.nix's own lcov normalization.
+          # Coverage mode: CANNOT use workspaceBins — stripping
+          # removes the __llvm_covfun/__llvm_covmap sections that
+          # llvm-cov needs. Use the full unstripped c2nCov.workspace
+          # and accept the 2.3 GB closure. k3s-agent VM disk sizes
+          # may need bumping to accommodate (docker.nix already
+          # uses zstd -19 for coverage images to keep import size
+          # down, but the uncompressed layer size is what matters
+          # for kubelet's ephemeral-storage accounting).
+          vmTestsC2nCov = mkVmTests {
+            rio-workspace = c2nCov.workspace;
+            dockerImages = mkDockerImages {
+              rio-workspace = c2nCov.workspace;
+              coverage = true;
+            };
+            coverage = true;
+          };
+
+          coverageC2n = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            import ./nix/coverage.nix {
+              inherit pkgs rustStable;
+              rio-workspace-cov = c2nCov.workspace;
+              vmTestsCov = vmTestsC2nCov;
+              commonSrc = commonArgs.src;
+              unitCoverage = c2nChecks.coverage;
+              # buildRustCrate's --remap-path-prefix maps sandbox →
+              # `/`, so profraws reference `/rio-store/src/...` etc.
+              # Strip the leading slash to get repo-relative paths
+              # that genhtml can resolve against commonSrc.
+              stripPrefix = "s|^/||";
+              nameSuffix = "-c2n";
+            }
+          );
+
+          # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
           # ──────────────────────────────────────────────────────────
           #
@@ -783,7 +1130,14 @@
               treefmt.enable = true;
               convco.enable = true;
               ripsecrets.enable = true;
-              check-added-large-files.enable = true;
+              check-added-large-files = {
+                enable = true;
+                # Cargo.json is the crate2nix pre-resolved dependency
+                # graph (~500 KB, grows with dep count). Treated like
+                # Cargo.lock: generated + checked in, reviewed on
+                # regeneration. See nix/crate2nix.nix.
+                excludes = [ "^Cargo\\.json$" ];
+              };
               check-merge-conflicts.enable = true;
               end-of-file-fixer.enable = true;
               trim-trailing-whitespace.enable = true;
@@ -845,6 +1199,11 @@
                 # Spec-coverage: `tracey query validate`, `tracey web`
                 traceyPkg
 
+                # crate2nix CLI for regenerating Cargo.json after
+                # Cargo.lock changes. PoC — see
+                # .claude/notes/crate2nix-migration-assessment.md.
+                crate2nixCli
+
                 # Deploy tooling for infra/eks/. Large closures (awscli2
                 # pulls python3 + botocore) but the user asked for
                 # everything-in-one-shell over a separate .#deploy.
@@ -887,7 +1246,10 @@
                   ps.pytest
                 ]))
               ];
-              shellEnv = {
+              # sys-crate escape-hatch env vars (same aggregate
+              # commonArgs uses). craneLib.devShell inherits buildInputs
+              # from `checks`, but env vars need explicit propagation.
+              shellEnv = sysCrateEnv.allEnv // {
                 RUST_BACKTRACE = "1";
                 PROTOC = "${pkgs.protobuf}/bin/protoc";
                 LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
@@ -1007,16 +1369,25 @@
             '';
             # VM-only combined (no unit-test merge). Debugging.
             coverage-vm = coverage.vmLcov;
+
+            # crate2nix-backed coverage-full. Same merge pipeline +
+            # output layout (result/lcov.info, result/html/,
+            # result/per-test/) but instrumented binaries and unit
+            # lcov both come from the c2nCov tree. stripPrefix is
+            # `s|^/||` (buildRustCrate's remap prefix is `/`, not
+            # crane's `.../source/`). See coverageC2n above.
+            coverage-full-c2n = coverageC2n.full;
+            coverage-vm-c2n = coverageC2n.vmLcov;
           }
           # Per-test lcovs: coverage-vm-phase1a etc. Useful for
           # "why is X not covered" — inspect one VM test's
           # contribution in isolation. `or {}`: coverage is
           # optionalAttrs isLinux → empty on Darwin → no attr error.
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "coverage-${n}" v) (coverage.perTestLcov or { })
+          // prefixed "coverage-" (coverage.perTestLcov or { })
           # Coverage-mode VM test runs: cov-vm-phase1a etc. Build
           # one to get the raw profraws at result/coverage/<node>/.
           # Used during smoke debugging.
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "cov-${n}" v) vmTestsCov
+          // prefixed "cov-" vmTestsCov
           // {
 
             # HTML coverage report generated from the lcov tracefile.
@@ -1047,8 +1418,71 @@
             '';
           }
           // {
-            inherit ci;
-          };
+            inherit ci ci-c2n;
+          }
+          # crate2nix PoC outputs — per-member + symlinkJoin aggregate.
+          # Prefixed c2n- so they sort together in `nix flake show` and
+          # don't collide with the crane rio-workspace. See
+          # .claude/notes/crate2nix-migration-assessment.md.
+          // prefixed "c2n-" c2n.members
+          # Per-member check derivations for targeted runs:
+          #   nix build .#c2n-clippy-rio-scheduler
+          #   nix build .#c2n-test-rio-common
+          #   nix build .#c2n-doc-rio-nix
+          // prefixed "c2n-clippy-" c2nChecks.clippy
+          // prefixed "c2n-clippy-test-" c2nChecks.clippyTest
+          // prefixed "c2n-test-" c2nChecks.tests
+          // prefixed "c2n-test-bin-" c2nChecks.testBins
+          // prefixed "c2n-doc-" c2nChecks.doc
+          // prefixed "c2n-cov-profraw-" c2nChecks.covProfraw
+          // {
+            c2n-workspace = c2n.workspace;
+            # Stripped binary-only variant — what VM tests/docker
+            # consume. ~300MB closure vs c2n-workspace's ~2.3GB
+            # (buildRustCrate's default out references the full
+            # rust toolchain via debug-info strings).
+            c2n-workspace-bins = c2n.workspaceBins;
+            # crate2nix CLI for the dev shell (`crate2nix generate
+            # --format json -o Cargo.json` regenerates after lockfile
+            # changes).
+            crate2nix-cli = crate2nixCli;
+            # Aggregate check derivations (same as checks.c2n-* but
+            # exposed as packages for --print-out-paths convenience).
+            c2n-clippy-all = c2nChecks.clippyCheck;
+            c2n-test-all = c2nChecks.testCheck;
+            c2n-doc-all = c2nChecks.docCheck;
+            # nextest reuse-build runner — characteristic
+            # `PASS [Xs] crate::test` output, test groups, retries.
+            # Binaries synthesized from c2n testBinDrvs, no cargo
+            # invocation. nextest-meta is the cached metadata
+            # derivation for debugging / manual `cargo-nextest run
+            # --binaries-metadata result/binaries-metadata.json`.
+            c2n-nextest-all = c2nChecks.nextest;
+            c2n-nextest-meta = c2nChecks.nextestMetadata;
+            # Coverage output (lcov.info at $out/lcov.info).
+            c2n-coverage = c2nChecks.coverage;
+            # Toolchain wrappers for debugging the arg-filtering:
+            #   nix build .#c2n-clippy-rustc
+            #   ./result/bin/rustc --version   # → clippy version
+            c2n-clippy-rustc = c2nChecks.clippyRustc;
+            c2n-rustdoc-rustc = c2nChecks.rustdocRustc;
+            # Instrumented workspace (symlinkJoin). Inspection:
+            #   objdump -h result/bin/rio-store | grep llvm_prf
+            # Consumed by vmTestsC2nCov + coverageC2n above.
+            c2n-workspace-cov = c2nCov.workspace;
+          }
+          # crate2nix-backed VM tests and coverage-mode VM tests.
+          # Prefixed c2n- for side-by-side comparison with the crane
+          # vmTests/vmTestsCov. These are the constituents of .#ci-c2n
+          # and .#coverage-full-c2n respectively.
+          #
+          # Linux-only (mkVmTests wraps in optionalAttrs isLinux).
+          #
+          #   nix build .#c2n-vm-protocol-warm-standalone
+          #   nix build .#c2n-cov-vm-lifecycle-core-k3s
+          // prefixed "c2n-" vmTestsC2n
+          // prefixed "c2n-cov-" vmTestsC2nCov
+          // prefixed "c2n-coverage-" (coverageC2n.perTestLcov or { });
 
           # --------------------------------------------------------------
           # Checks (run with 'nix flake check')
@@ -1089,6 +1523,24 @@
                 Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
               '';
               pkgs.emptyFile;
+          }
+          # crate2nix-native checks. Parallel to crane's cargoClippy/
+          # cargoNextest/cargoDoc but with per-crate caching — deps
+          # built once, only workspace members rebuilt per-check.
+          # NOT yet the gate (crane checks still are); exposed for
+          # side-by-side comparison and migration validation.
+          // {
+            c2n-clippy = c2nChecks.clippyCheck;
+            # Test RUNNER (not just compilation) — executes harness
+            # binaries and fails if any test fails. Needs postgres
+            # for rio-test-support's ephemeral PG bootstrap.
+            # Currently Linux-only (postgres, FUSE tests).
+            c2n-test = c2nChecks.testCheck;
+            # nextest variant — per-test-process isolation, test
+            # groups, retries. Reuse-build mode against crate2nix
+            # test binaries. Parity with crane's cargoNextest.
+            c2n-nextest = c2nChecks.nextest;
+            c2n-doc = c2nChecks.docCheck;
           };
 
           # Formatter for 'nix fmt'
