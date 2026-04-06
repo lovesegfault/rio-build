@@ -1,6 +1,6 @@
 //! Generate CRD YAML for the Helm chart.
 //!
-//! `nix build .#crds && ./scripts/split-crds.sh result`
+//! `cargo xtask regen crds`
 //!
 //! serde_yml is the maintained serde_yaml fork (RUSTSEC-2024-0320).
 //! Write-only here — serializes our own structs.
