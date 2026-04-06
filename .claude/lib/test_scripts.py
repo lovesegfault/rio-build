@@ -1508,6 +1508,98 @@ def test_worktree_phase_num():
     assert Worktree(path=Path("/x"), branch="xp142", head="abc").plan_num is None
 
 
+# ─── behind_check phantom-amend detection ────────────────────────────────────
+
+
+def test_behind_check_phantom_amend_detection(tmp_repo: Path):
+    """phantom_amend fires when the worktree's base is the merger's
+    orphaned pre-amend SHA.
+
+    Scenario (merger step-7.5): integration branch gets a feature commit
+    ff'd, then `git commit --amend --no-edit` to flip dag.jsonl. Any
+    worktree that rebased onto the pre-amend SHA during the ff→amend
+    window sees behind=1 with a collision on the feature files (NOT
+    dag.jsonl — the collision is the ff'd commit's tree, which appears
+    on both sides of the merge-base). `git rebase` auto-drops the
+    patch-already-upstream commit; the phantom_amend bit makes that
+    mechanical instead of a ~30s hand-diagnosis."""
+    from onibus import INTEGRATION_BRANCH
+    from onibus.git_ops import behind_check
+
+    repo = tmp_repo
+    # tmp_repo starts on INTEGRATION_BRANCH with an init commit.
+    # Seed dag.jsonl so the amend has a target.
+    (repo / ".claude" / "dag.jsonl").write_text('{"plan":1,"status":"UNIMPL"}\n')
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "chore: seed dag", "--no-verify")
+
+    # Feature commit — simulates a plan's ff'd work.
+    (repo / "feature.txt").write_text("prev plan work\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: prev plan change", "--no-verify")
+    pre_amend = _git(repo, "rev-parse", "HEAD")
+    # The amend — flips dag status, rewrites HEAD SHA, keeps message.
+    (repo / ".claude" / "dag.jsonl").write_text('{"plan":1,"status":"DONE"}\n')
+    _git(repo, "add", ".claude/dag.jsonl")
+    _git(repo, "commit", "--amend", "--no-edit", "--no-verify")
+    post_amend = _git(repo, "rev-parse", "HEAD")
+    assert pre_amend != post_amend, "amend must rewrite SHA"
+    assert _git(repo, "log", "-1", "--format=%s") == "feat: prev plan change"
+
+    # Worktree branched from pre_amend (orphaned). Simulates an impl that
+    # rebased onto sprint-1 during the ff→amend window.
+    wt = repo.parent / "wt-p999"
+    _git(repo, "worktree", "add", "-b", "p999", str(wt), pre_amend)
+    (wt / "own-work.txt").write_text("p999 work\n")
+    _git(wt, "add", "own-work.txt")
+    _git(wt, "commit", "-m", "feat: p999 work", "--no-verify")
+
+    bc = behind_check(wt)
+    assert bc.behind == 1
+    # Collision includes the ff'd commit's files — both sides have
+    # feature.txt since both pre_amend and post_amend share that tree.
+    # (This is WHY trivial_rebase reads false despite the rebase being
+    # mechanically safe — phantom_amend is the signal that cuts through.)
+    assert "feature.txt" in bc.file_collision
+    assert bc.trivial_rebase is False
+    assert bc.phantom_amend is True, (
+        f"expected phantom_amend=True: pre_amend={pre_amend[:8]} in our "
+        f"ancestry differs from {INTEGRATION_BRANCH}@{post_amend[:8]} only "
+        f"in dag.jsonl; collision={bc.file_collision}"
+    )
+
+    # Negative A: worktree from post_amend → behind=0, no phantom.
+    wt2 = repo.parent / "wt-p998"
+    _git(repo, "worktree", "add", "-b", "p998", str(wt2), post_amend)
+    bc2 = behind_check(wt2)
+    assert bc2.behind == 0
+    assert bc2.phantom_amend is False
+
+    # Negative B: forked from BEFORE the feature commit (did NOT rebase
+    # onto pre-amend). behind=1, collision may include dag.jsonl if the
+    # worktree also touches it — but there's no pre-amend SHA in its
+    # ancestry, so phantom_amend must NOT fire. Guards against a naive
+    # `collision ⊆ {dag.jsonl}` check false-positiving here.
+    seed_sha = _git(repo, "rev-parse", f"{INTEGRATION_BRANCH}~1")
+    wt3 = repo.parent / "wt-p997"
+    _git(repo, "worktree", "add", "-b", "p997", str(wt3), seed_sha)
+    (wt3 / ".claude" / "dag.jsonl").write_text(
+        '{"plan":1,"status":"UNIMPL"}\n{"plan":2,"status":"UNIMPL"}\n'
+    )
+    _git(wt3, "add", ".claude/dag.jsonl")
+    _git(wt3, "commit", "-m", "docs: add plan-2 row", "--no-verify")
+    bc3 = behind_check(wt3)
+    assert bc3.behind == 1
+    assert ".claude/dag.jsonl" in bc3.file_collision
+    # The oldest ours-only commit is our OWN docs commit (not pre_amend);
+    # diff vs sprint-1 tip = {feature.txt, dag.jsonl} ⊄ amend-files.
+    assert bc3.phantom_amend is False, (
+        "forked-from-earlier should NOT be phantom — no pre-amend SHA "
+        "in ancestry; a naive collision⊆{dag.jsonl} check would have "
+        "false-positived here"
+    )
+
+
 # ─── atomicity_check (synthetic fixture; decoupled from live branches) ───────
 
 

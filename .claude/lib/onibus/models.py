@@ -474,6 +474,16 @@ class BehindCheck(BaseModel):
         "added since merge-base. Empty → rebase will be trivial (no conflicts)."
     )
     trivial_rebase: bool = Field(description="behind > 0 and file_collision empty")
+    phantom_amend: bool = Field(
+        default=False,
+        description="behind==1 AND the oldest commit exclusive to our side "
+        "differs from $TGT's tip only in dag.jsonl/merge-shas.jsonl (the "
+        "merger's step-7.5 amend-files) AND carries the same commit message "
+        "(amend --no-edit preserves it). This worktree rebased onto the "
+        "pre-amend SHA during the ff→amend window; `git rebase $TGT` will "
+        "auto-drop the patch-already-upstream commit. NOT a real collision "
+        "despite trivial_rebase=false."
+    )
 
 
 # ─── CadenceReport ───────────────────────────────────────────────────────────
