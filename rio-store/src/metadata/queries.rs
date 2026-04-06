@@ -210,6 +210,45 @@ pub async fn query_by_hash_part(
     validate_row(row)
 }
 
+/// Tenant-scoped variant of [`query_by_hash_part`]: only returns the
+/// path if `path_tenants` has a row linking it to `tenant_id`.
+///
+/// Same LIKE prefix match, plus an inner JOIN on `path_tenants` keyed
+/// by `store_path_hash` + `tenant_id = $2`. If the tenant never built
+/// (or was never attributed) the path, the JOIN eliminates the row →
+/// `None` → caller returns 404 (indistinguishable from "path doesn't
+/// exist at all" — no existence oracle).
+///
+/// Caller validates `hash_part` (LIKE-injection guard, same as the
+/// unfiltered variant).
+#[instrument(skip(pool))]
+pub async fn query_by_hash_part_for_tenant(
+    pool: &PgPool,
+    hash_part: &str,
+    tenant_id: uuid::Uuid,
+) -> Result<Option<ValidatedPathInfo>> {
+    let pattern = format!("/nix/store/{hash_part}-%");
+
+    // JOIN on path_tenants (composite PK (store_path_hash, tenant_id)
+    // — migration 012). The equality on $2 filters to this tenant's
+    // rows only; the PK index makes this a point lookup after the
+    // narinfo LIKE resolves.
+    let row: Option<NarinfoRow> = sqlx::query_as(concat!(
+        "SELECT ",
+        narinfo_cols!(),
+        " FROM narinfo n \
+         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+         INNER JOIN path_tenants pt ON pt.store_path_hash = n.store_path_hash \
+         WHERE n.store_path LIKE $1 AND m.status = 'complete' AND pt.tenant_id = $2"
+    ))
+    .bind(&pattern)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    validate_row(row)
+}
+
 /// Append signatures to an existing narinfo, deduplicating.
 ///
 /// Deduplicates server-side via `array(SELECT DISTINCT unnest(old || new))`.
@@ -320,6 +359,61 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let result = find_missing_paths(&db.pool, &[]).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    /// `query_by_hash_part_for_tenant`: the JOIN on path_tenants
+    /// scopes to one tenant. Same hash-part, three outcomes depending
+    /// on which tenant asks.
+    #[tokio::test]
+    async fn query_by_hash_part_tenant_scoped() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // seed_complete's hash-part is the 32 'a's after /nix/store/.
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-tenant-scoped";
+        let (ph, _) = seed_complete(&db.pool, path, Some(b"blob")).await;
+
+        let tenant_a: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name) VALUES ('a') RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let tenant_b: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO tenants (tenant_name) VALUES ('b') RETURNING tenant_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        // Attribute only to tenant A.
+        sqlx::query("INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2)")
+            .bind(&ph)
+            .bind(tenant_a)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let hash_part = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Tenant A → found.
+        let got = query_by_hash_part_for_tenant(&db.pool, hash_part, tenant_a)
+            .await
+            .unwrap();
+        assert!(
+            got.as_ref().is_some_and(|i| i.store_path.as_str() == path),
+            "tenant A owns the path"
+        );
+
+        // Tenant B → None (path exists in narinfo but not attributed).
+        let got = query_by_hash_part_for_tenant(&db.pool, hash_part, tenant_b)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "tenant B does NOT own the path → None");
+
+        // Unfiltered variant → found (control: proves the path IS
+        // there, so the None above is the JOIN filtering, not a typo
+        // in the hash-part).
+        let got = query_by_hash_part(&db.pool, hash_part).await.unwrap();
+        assert!(got.is_some(), "unfiltered sees the path");
     }
 
     /// `path_by_nar_hash` — only caller is the HTTP cache server's

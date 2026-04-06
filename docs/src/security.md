@@ -66,7 +66,7 @@ Worker pods MAY be configured with a Localhost seccomp profile (`WorkerPoolSpec.
   - NetworkPolicy: restrict access to the HTTP port from trusted CIDR ranges or ingress controller only.
 - **Note**: The binary cache HTTP server runs in the same process as the gRPC StoreService. Consider separate NetworkPolicy rules for the HTTP port vs the gRPC port.
 
-> **Scheduled:** per-tenant narinfo visibility + bearer auth → [P0272](../.claude/work/plan-0272-per-tenant-narinfo-filter.md). Until it lands: narinfo/NAR endpoints serve any valid store path; only `NetworkPolicy` CIDR restriction gates the HTTP port. See [Multi-Tenancy](multi-tenancy.md).
+Per-tenant narinfo visibility is implemented via `path_tenants` JOIN: authenticated requests only see paths attributed to their `tenant_id` (404 for anything else — no existence oracle). Anonymous access (when `cache_allow_unauthenticated=true`) is unfiltered for single-tenant/public-cache backward compat. The `/nar/` endpoint relies on narinfo 404 for protection — a tenant who can't see a narinfo never learns the 256-bit nar_hash needed to construct the NAR URL. See [Multi-Tenancy](multi-tenancy.md).
 
 ## Key Security Properties
 
