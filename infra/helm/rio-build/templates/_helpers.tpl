@@ -64,6 +64,76 @@ spec; the caller must also append the matching volumes: entry.
 {{- end -}}
 
 {{/*
+JWT pubkey mount — SCHEDULER + STORE. Self-guarded on .Values.jwt.enabled
+(renders nothing when disabled, so callers include unconditionally with
+`| nindent 12`). ConfigMap is PUBLIC (ed25519 verifying key) — mounted
+read-only, no Secret perms needed. key_path matches what the main.rs
+wiring reads (rio-common JwtConfig.key_path → RIO_JWT__KEY_PATH env).
+
+File-key-mapping: ConfigMap data key `ed25519_pubkey` → file
+`/etc/rio/jwt/ed25519_pubkey`. scheduler/main.rs doc-comment already
+references this path — this mount makes it real.
+
+Without the mount, cfg.jwt.key_path stays None and the interceptor
+falls through to inert mode (every RPC passes, no Claims attached) —
+a silent fail-open when the operator thought jwt.enabled=true meant
+enforcement. See r[sec.jwt.pubkey-mount].
+*/}}
+{{- define "rio.jwtVerifyEnv" -}}
+{{- if .Values.jwt.enabled }}
+- name: RIO_JWT__KEY_PATH
+  value: /etc/rio/jwt/ed25519_pubkey
+{{- end }}
+{{- end -}}
+
+{{- define "rio.jwtVerifyVolumeMount" -}}
+{{- if .Values.jwt.enabled }}
+- name: jwt-pubkey
+  mountPath: /etc/rio/jwt
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "rio.jwtVerifyVolume" -}}
+{{- if .Values.jwt.enabled }}
+- name: jwt-pubkey
+  configMap:
+    name: rio-jwt-pubkey
+{{- end }}
+{{- end -}}
+
+{{/*
+JWT signing seed mount — GATEWAY ONLY. Secret (private ed25519 seed).
+Same self-guard pattern; gateway main.rs reads RIO_JWT__KEY_PATH for
+the SIGNING seed path (JwtConfig is shared type, both sides use
+key_path — gateway loads it as a SigningKey seed, scheduler/store
+load it as a VerifyingKey). Gateway decodes the Secret's base64 layer
+→ 32 raw bytes → SigningKey::from_bytes.
+*/}}
+{{- define "rio.jwtSignEnv" -}}
+{{- if .Values.jwt.enabled }}
+- name: RIO_JWT__KEY_PATH
+  value: /etc/rio/jwt/ed25519_seed
+{{- end }}
+{{- end -}}
+
+{{- define "rio.jwtSignVolumeMount" -}}
+{{- if .Values.jwt.enabled }}
+- name: jwt-signing
+  mountPath: /etc/rio/jwt
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "rio.jwtSignVolume" -}}
+{{- if .Values.jwt.enabled }}
+- name: jwt-signing
+  secret:
+    secretName: rio-jwt-signing
+{{- end }}
+{{- end -}}
+
+{{/*
 RUST_LOG env var. Self-guarded — empty global.logLevel renders nothing
 (binary falls back to "info"). Include unconditionally with `| nindent 12`.
 */}}
