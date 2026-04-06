@@ -66,6 +66,18 @@ service StoreService {
   // a normal cache miss, not an error. The gateway translates NOT_FOUND
   // into an empty-set wire response (u64 count = 0).
   rpc QueryRealisation(rio.types.QueryRealisationRequest) returns (rio.types.Realisation);
+
+  // Per-tenant store usage + quota. Gateway calls this before
+  // SubmitBuild (r[store.gc.tenant-quota-enforce]) to reject over-quota
+  // tenants with STDERR_ERROR. Takes tenant_name (not UUID) so the
+  // gateway can call in dual-mode (no JWT → no tenant_id resolved).
+  // The store joins tenants on tenant_name to get tenant_id +
+  // gc_max_store_bytes, then sums narinfo.nar_size via path_tenants.
+  //
+  // Cached 30s gateway-side — quota is soft, a few MB of race-window
+  // overflow is acceptable. NOT_FOUND on unknown tenant_name (gateway
+  // treats as no-quota, passes through).
+  rpc TenantQuota(rio.types.TenantQuotaRequest) returns (rio.types.TenantQuotaResponse);
 }
 
 // Chunk-level storage service for content-defined chunking.

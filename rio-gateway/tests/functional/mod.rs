@@ -178,6 +178,7 @@ impl RioStack {
                 String::new(),
                 None,
                 rio_gateway::TenantLimiter::disabled(),
+                rio_gateway::QuotaCache::new(),
                 shutdown,
             )
             .await

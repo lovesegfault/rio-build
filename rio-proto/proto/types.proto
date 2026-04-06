@@ -836,6 +836,24 @@ message PinPathResponse {
   string message = 2;                    // Error detail on failure (path not found etc)
 }
 
+// Per-tenant quota check (gateway → store, pre-SubmitBuild gate).
+// tenant_name not tenant_id: the gateway is PG-free and may not have
+// resolved the UUID (dual-mode fallback, signing_key=None). The store
+// joins tenants on tenant_name internally.
+message TenantQuotaRequest {
+  string tenant_name = 1;
+}
+
+message TenantQuotaResponse {
+  // SUM(narinfo.nar_size) over all paths the tenant references.
+  // i64 on the wire: matches PG bigint, and tenant_store_bytes()
+  // returns i64. Negative is impossible (SUM of non-negative sizes).
+  uint64 used_bytes = 1;
+  // tenants.gc_max_store_bytes. NULL in PG → absent here → no limit.
+  // The gateway checks `used > limit` only when limit is present.
+  optional uint64 limit_bytes = 2;
+}
+
 // ResignPaths backfill job: re-scan NAR references + re-sign for paths
 // uploaded before the worker's reference-scanner fix. Driven off
 // narinfo.refs_backfilled = FALSE (migration 010). Cursor-paginated:

@@ -1655,3 +1655,155 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ===========================================================================
+// Quota gate (pre-SubmitBuild, store.gc.tenant-quota-enforce)
+// ===========================================================================
+
+// r[verify store.gc.tenant-quota-enforce]
+/// Over-quota tenant → STDERR_ERROR before SubmitBuild. Same
+/// pre-SubmitBuild gate shape as the rate-limit check: the scheduler
+/// never sees the request, the connection stays open, and the user
+/// gets a human-readable error with used/limit bytes.
+///
+/// Drives the RPC fetch path end-to-end: `QuotaCache::check` misses,
+/// calls `MockStore::tenant_quota`, classifies as `Over`, the
+/// handler sends STDERR_ERROR + early-returns. The scheduler's
+/// `submit_calls` stays empty.
+#[tokio::test]
+async fn over_quota_sends_stderr_error() -> anyhow::Result<()> {
+    // Non-empty tenant_name so the quota check runs (empty name
+    // short-circuits to Unlimited — single-tenant mode).
+    let mut h = GatewaySession::new_with_tenant_handshake("team-quota").await?;
+
+    // Seed MockStore: 200 MiB used, 100 MiB limit → Over. The mock's
+    // TenantQuota RPC reads this map directly.
+    h.store.tenant_quotas.write().unwrap().insert(
+        "team-quota".to_string(),
+        (200 * 1024 * 1024, Some(100 * 1024 * 1024)),
+    );
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-quota.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("over store quota"),
+        "error should say 'over store quota': {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("team-quota"),
+        "error should name the tenant (proves the limiter keyed on \
+         tenant_name, not a generic gate): {:?}",
+        err.message
+    );
+    // Human-readable bytes (200.0 MiB / 100.0 MiB). Don't assert the
+    // exact string — just that both MiB values appear.
+    assert!(
+        err.message.contains("MiB"),
+        "error should format bytes human-readably: {:?}",
+        err.message
+    );
+
+    // Pre-SubmitBuild rejection: scheduler never saw it. This is the
+    // load-bearing half — STDERR_ERROR alone can't distinguish
+    // "rejected at gateway" from "scheduler rejected it too".
+    let submits = h.scheduler.submit_calls.read().unwrap().clone();
+    assert!(
+        submits.is_empty(),
+        "over-quota rejection must be pre-SubmitBuild; scheduler got {} calls",
+        submits.len()
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Under-quota / no-limit / unknown-tenant → quota gate passes. This
+/// is the positive control for `over_quota_sends_stderr_error` — a
+/// gate that always rejects would pass that test too.
+#[tokio::test]
+async fn under_quota_passes_through() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_tenant_handshake("team-under").await?;
+
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        send_completed: true,
+        ..Default::default()
+    });
+
+    // 50 used, 100 limit → Under.
+    h.store
+        .tenant_quotas
+        .write()
+        .unwrap()
+        .insert("team-under".to_string(), (50, Some(100)));
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-under.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "under-quota build should succeed (u64(1))");
+
+    let submits = h.scheduler.submit_calls.read().unwrap().clone();
+    assert_eq!(
+        submits.len(),
+        1,
+        "under-quota → SubmitBuild reaches the scheduler"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Unknown tenant (no `tenant_quotas` entry) → NOT_FOUND from mock
+/// → gateway fails-open (Unlimited). Single-tenant mode and
+/// operator-forgot-to-seed both flow here; the scheduler's own
+/// tenant resolution rejects unknown names independently.
+#[tokio::test]
+async fn unknown_tenant_fails_open() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_tenant_handshake("team-unseeded").await?;
+
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        send_completed: true,
+        ..Default::default()
+    });
+
+    // NO tenant_quotas entry → MockStore returns NOT_FOUND →
+    // QuotaCache caches the negative → classify → Unlimited.
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-unseeded.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        result, 1,
+        "unknown-tenant should pass through (fail-open on NOT_FOUND)"
+    );
+
+    h.finish().await;
+    Ok(())
+}

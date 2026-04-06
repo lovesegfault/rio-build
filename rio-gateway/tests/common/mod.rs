@@ -40,6 +40,16 @@ impl GatewaySession {
     ///
     /// [`new_with_handshake`]: Self::new_with_handshake
     pub async fn new() -> anyhow::Result<Self> {
+        Self::new_with_tenant("").await
+    }
+
+    /// Like [`new`] but with an explicit `tenant_name`. Empty string =
+    /// single-tenant mode (same as [`new`]). Non-empty enables the
+    /// per-tenant rate-limit and quota checks in the build handlers —
+    /// tests seed [`MockStore::tenant_quotas`] to drive the quota gate.
+    ///
+    /// [`new`]: Self::new
+    pub async fn new_with_tenant(tenant_name: &str) -> anyhow::Result<Self> {
         let (store, store_addr, store_handle) = spawn_mock_store().await?;
         let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
@@ -50,6 +60,7 @@ impl GatewaySession {
         let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
         let mut sc = store_client.clone();
         let mut scc = scheduler_client.clone();
+        let tenant = tenant_name.to_string();
         let shutdown = CancellationToken::new();
         let shutdown_child = shutdown.child_token();
         // Fire-and-forget: aborted in Drop or awaited in finish()/join_server().
@@ -66,9 +77,10 @@ impl GatewaySession {
                 &mut w,
                 &mut sc,
                 &mut scc,
-                String::new(),
+                tenant,
                 None,
                 rio_gateway::TenantLimiter::disabled(),
+                rio_gateway::QuotaCache::new(),
                 shutdown_child,
             )
             .await
@@ -104,6 +116,16 @@ impl GatewaySession {
     /// [`new`]: Self::new
     pub async fn new_with_handshake() -> anyhow::Result<Self> {
         let mut sess = Self::new().await?;
+        do_handshake(&mut sess.stream).await?;
+        send_set_options(&mut sess.stream).await?;
+        Ok(sess)
+    }
+
+    /// Handshake + wopSetOptions with an explicit `tenant_name`. Used
+    /// by quota/rate-limit tests that need a non-empty tenant to
+    /// trigger the per-tenant gates.
+    pub async fn new_with_tenant_handshake(tenant_name: &str) -> anyhow::Result<Self> {
+        let mut sess = Self::new_with_tenant(tenant_name).await?;
         do_handshake(&mut sess.stream).await?;
         send_set_options(&mut sess.stream).await?;
         Ok(sess)

@@ -34,6 +34,11 @@ type StoredPath = (types::PathInfo, Vec<u8>);
 /// Alias silences clippy::type_complexity on the nested generic field.
 type RealisationKey = (Vec<u8>, String);
 
+/// `(used_bytes, limit_bytes)` — value type for
+/// [`MockStore::tenant_quotas`]. Alias silences clippy::type_complexity
+/// on the nested `Arc<RwLock<HashMap<_, _>>>`.
+type TenantQuotaEntry = (u64, Option<u64>);
+
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
 ///
 /// Records PutPath calls and supports prefix-match QueryPathInfo (for
@@ -68,6 +73,10 @@ pub struct MockStore {
     /// CA realisations: (drv_hash, output_name) -> Realisation.
     /// Used by gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
+    /// Per-tenant quota: tenant_name -> (used_bytes, limit_bytes).
+    /// Tests seed this directly; TenantQuota reads it verbatim.
+    /// Absent key → NOT_FOUND (gateway treats as no-quota).
+    pub tenant_quotas: Arc<RwLock<HashMap<String, TenantQuotaEntry>>>,
 }
 
 impl Default for MockStore {
@@ -83,6 +92,7 @@ impl Default for MockStore {
             get_path_gate: Arc::new(tokio::sync::Notify::new()),
             get_path_gate_armed: Arc::default(),
             realisations: Arc::default(),
+            tenant_quotas: Arc::default(),
         }
     }
 }
@@ -503,6 +513,25 @@ impl StoreService for MockStore {
                 "no realisation for {}",
                 req.output_name
             ))),
+        }
+    }
+
+    async fn tenant_quota(
+        &self,
+        request: Request<types::TenantQuotaRequest>,
+    ) -> Result<Response<types::TenantQuotaResponse>, Status> {
+        let name = request.into_inner().tenant_name;
+        // Mirror the real store's empty-name guard so dual-mode tests
+        // that accidentally pass "" get the same InvalidArgument.
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("mock: tenant_name is empty"));
+        }
+        match self.tenant_quotas.read().unwrap().get(name.trim()) {
+            Some(&(used, limit)) => Ok(Response::new(types::TenantQuotaResponse {
+                used_bytes: used,
+                limit_bytes: limit,
+            })),
+            None => Err(Status::not_found(format!("mock: unknown tenant: {name}"))),
         }
     }
 }

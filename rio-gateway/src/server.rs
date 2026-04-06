@@ -24,6 +24,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, error, info, trace, warn};
 
+use crate::quota::QuotaCache;
 use crate::ratelimit::TenantLimiter;
 use crate::session::run_protocol;
 
@@ -192,6 +193,12 @@ pub struct GatewayServer {
     /// all their concurrent SSH connections, not per-connection.
     /// See `r[gw.rate.per-tenant]`.
     limiter: TenantLimiter,
+    /// Per-tenant store-quota cache (30s TTL). Clones share state
+    /// — a quota reading fetched by one connection is warm for all.
+    /// Always enabled: single-tenant mode (empty `tenant_name`)
+    /// skips the check inside the cache, so there's no disabled
+    /// variant. See `r[store.gc.tenant-quota-enforce]`.
+    quota_cache: QuotaCache,
     // r[impl gw.conn.cap]
     /// Global connection cap. `try_acquire_owned()` in `new_client`;
     /// the permit is moved into the `ConnectionHandler` and dropped
@@ -222,6 +229,7 @@ impl GatewayServer {
             jwt_signing_key: None,
             jwt_config: JwtConfig::default(),
             limiter: TenantLimiter::disabled(),
+            quota_cache: QuotaCache::new(),
             conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
         }
     }
@@ -371,6 +379,7 @@ impl russh::server::Server for GatewayServer {
             jwt_signing_key: self.jwt_signing_key.clone(),
             jwt_config: self.jwt_config.clone(),
             limiter: self.limiter.clone(),
+            quota_cache: self.quota_cache.clone(),
             sessions: HashMap::new(),
             tenant_name: String::new(),
             jwt_token: None,
@@ -453,6 +462,9 @@ pub struct ConnectionHandler {
     /// the same `dashmap` entry regardless of which SSH connection
     /// submits.
     limiter: TenantLimiter,
+    /// Per-tenant quota cache, cloned from `GatewayServer`. Shared
+    /// state — a quota fetched by one channel is warm for all.
+    quota_cache: QuotaCache,
     /// Tenant name from the matched `authorized_keys` entry's comment
     /// field. Set in `auth_publickey` when a key matches. Passed to
     /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
@@ -847,6 +859,7 @@ impl Handler for ConnectionHandler {
         // Shared-state clone: all channels on all connections drain
         // the same per-tenant bucket.
         let limiter = self.limiter.clone();
+        let quota_cache = self.quota_cache.clone();
         // Graceful-shutdown link: Drop fires this, run_protocol selects
         // on it. One token per channel (not per-connection) — each
         // channel's cancel loop is independent. child_token() so a
@@ -867,6 +880,7 @@ impl Handler for ConnectionHandler {
                     tenant_name,
                     jwt_token,
                     limiter,
+                    quota_cache,
                     shutdown_child,
                 )
                 .await
