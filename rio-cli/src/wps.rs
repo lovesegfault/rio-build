@@ -140,15 +140,57 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
     // ~2-4 classes in practice (small/medium/large + maybe huge);
     // concurrent fetch would save milliseconds at the cost of error
     // interleaving. Each class's child is fetched separately so a
-    // missing/not-yet-reconciled child (`get` → 404) degrades that
-    // ONE class's row to "-/-" rather than failing the whole describe.
+    // missing/not-yet-reconciled child (`get_opt` → Ok(None)) degrades
+    // that ONE class's row to "-/-" rather than failing the whole
+    // describe.
     let mut rows = Vec::with_capacity(wps.spec.classes.len());
     for class in &wps.spec.classes {
         let child_name = format!("{}-{}", wps.name_any(), class.name);
-        // `.ok()` — child may not exist yet (reconciler lag, or the
-        // child create failed — check the WPS .status.conditions for
-        // the latter). A missing child renders as "-/-" replicas.
-        let child_status = wp_api.get(&child_name).await.ok().and_then(|wp| wp.status);
+        // `get_opt` — child may not exist yet (Ok(None) → -/-);
+        // 403 → warn to stderr but still render the row (RBAC
+        // misconfig is per-verb, the WPS get above already worked);
+        // 500/network → bail (apiserver degraded means all remaining
+        // rows would be equally misleading).
+        //
+        // Previously a Result-to-Option coercion here swallowed 403
+        // and 500 into the same silent `-/-` as a genuine 404 — an
+        // operator diagnosing a misbehaving autoscaler couldn't tell
+        // "child not reconciled yet" from "my ServiceAccount can't
+        // `get workerpools`."
+        let child_status = match wp_api.get_opt(&child_name).await {
+            Ok(Some(wp)) => wp.status,
+            Ok(None) => {
+                // Child not created yet — reconciler lag, or the
+                // child create failed (check WPS .status.conditions
+                // for the latter). Render as -/-.
+                None
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 403 => {
+                // RBAC denied. Warn but don't bail — the operator
+                // might still want the spec-side of the describe
+                // (class names, cutoffs, derived child names) even
+                // if the child status is unavailable. 403 on a
+                // per-resource get is common post-deploy when the
+                // helm chart's RBAC covers `get workerpoolsets` but
+                // forgot `get workerpools`.
+                eprintln!(
+                    "warning: RBAC denied `get workerpools/{child_name}` ({}). \
+                     Child status unavailable — check service account permissions.",
+                    ae.message
+                );
+                None
+            }
+            Err(e) => {
+                // 500, network blip, transport error — surface it.
+                // Continuing with `-/-` for this class would be
+                // misleading: if the apiserver is degraded for one
+                // child it's degraded for the rest, and the operator
+                // would see a table of `-/-` that looks like "nothing
+                // reconciled yet" when the real signal is "apiserver
+                // is down."
+                anyhow::bail!("get WorkerPool {ns}/{child_name}: {e}");
+            }
+        };
         rows.push(ClassRow {
             class,
             child_name,
@@ -309,5 +351,173 @@ impl<'a> From<&'a ClassStatus> for StatusClassJson<'a> {
             replicas: s.replicas,
             ready_replicas: s.ready_replicas,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `describe()` error-branching tests — prove the child WorkerPool
+    //! lookup distinguishes 404 (→ Ok with -/-) from 403 (→ Ok with
+    //! warning + -/-) from 500 (→ Err). Prior to the `get_opt` switch,
+    //! all three collapsed into a silent -/-.
+    //!
+    //! Unit tests here rather than in `tests/smoke.rs`: smoke.rs
+    //! invokes rio-cli as a subprocess via CARGO_BIN_EXE, and the
+    //! `wps` subcommand constructs its kube::Client from kubeconfig/
+    //! in-cluster. There's no way to inject a mock apiserver into a
+    //! subprocess binary without standing up an actual HTTPS listener
+    //! that mimics the K8s API surface. Calling `describe()` directly
+    //! with `ApiServerVerifier`'s mock client is both simpler and
+    //! tighter — it tests exactly the branch under question.
+
+    use super::*;
+    use http::Method;
+    use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
+
+    /// Minimal WorkerPoolSet JSON with one `small` class. Just enough
+    /// that `describe()`'s `wps_api.get(name)` succeeds and the
+    /// per-class loop iterates once (one child WP fetch). `resources:
+    /// {}` is fine — `ResourceRequirements` has all-Option fields.
+    fn wps_body() -> String {
+        serde_json::json!({
+            "apiVersion": "rio.build/v1alpha1",
+            "kind": "WorkerPoolSet",
+            "metadata": { "name": "test-wps", "namespace": "default" },
+            "spec": {
+                "classes": [
+                    { "name": "small", "cutoffSecs": 60.0, "resources": {} }
+                ],
+                "poolTemplate": { "image": "x", "systems": ["x86_64-linux"] }
+            }
+        })
+        .to_string()
+    }
+
+    /// K8s apimachinery `Status` object — what the apiserver returns
+    /// on non-2xx. kube-rs parses this into `kube::Error::Api(ae)`
+    /// with `ae.code` = the HTTP status. A bare body (or a
+    /// non-Status-shaped one) deserializes with `ae.code == 0` and
+    /// the 403 branch misses — the test would pass for the wrong
+    /// reason (falling through to the generic `Err(e)` arm).
+    fn status_body(code: u16, message: &str, reason: &str) -> String {
+        serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "message": message,
+            "reason": reason,
+            "code": code,
+        })
+        .to_string()
+    }
+
+    /// 404 on the child WorkerPool → `Ok(None)` → `describe()` returns
+    /// Ok with a `-/-` row. This is the benign "reconciler hasn't
+    /// created the child yet" case — the whole point of `get_opt` over
+    /// `get` (which would turn 404 into `Err`).
+    #[tokio::test]
+    async fn wps_describe_404_renders_ok() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let guard = verifier.run(vec![
+            Scenario::ok(Method::GET, "/workerpoolsets/test-wps", wps_body()),
+            Scenario {
+                method: Method::GET,
+                path_contains: "/workerpools/test-wps-small",
+                body_contains: None,
+                status: 404,
+                body_json: status_body(404, "not found", "NotFound"),
+            },
+        ]);
+
+        // as_json=false exercises the human-output path. The println!
+        // output goes to the test harness's captured stdout — we
+        // don't assert on it; the Ok/Err return value is the signal
+        // under test.
+        let r = describe(false, client, "default", "test-wps").await;
+        assert!(r.is_ok(), "404 should render -/-, not bail: {r:?}");
+
+        guard.verified().await;
+    }
+
+    /// 403 on the child WorkerPool → RBAC denied. The branch warns
+    /// to stderr but returns Ok — the operator still gets the spec
+    /// side of the describe (class names, cutoffs) even if child
+    /// status is unavailable. Bailing here would hide the half of
+    /// the picture that IS visible.
+    #[tokio::test]
+    async fn wps_describe_403_warns_not_swallows() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let guard = verifier.run(vec![
+            Scenario::ok(Method::GET, "/workerpoolsets/test-wps", wps_body()),
+            Scenario {
+                method: Method::GET,
+                path_contains: "/workerpools/test-wps-small",
+                body_contains: None,
+                status: 403,
+                body_json: status_body(
+                    403,
+                    r#"workerpools.rio.build "test-wps-small" is forbidden"#,
+                    "Forbidden",
+                ),
+            },
+        ]);
+
+        let r = describe(false, client, "default", "test-wps").await;
+        // Ok — 403 warns, doesn't bail. The stderr text isn't
+        // captured here (eprintln! goes to the test's stderr, which
+        // nextest suppresses on pass); the Ok return proves the
+        // branch doesn't propagate the error like the generic arm
+        // would. Before the get_opt switch this also returned Ok
+        // (the Result-to-Option coercion swallowed it) — the
+        // BEHAVIOURAL difference is the stderr warning, which is
+        // observable interactively but not in-process. What this
+        // test proves: the `ae.code == 403` guard matches (i.e., the
+        // Status body is parsed correctly AND the code check is
+        // right) rather than falling through to the generic `Err(e)`
+        // arm, which would make THIS test fail with a bail.
+        assert!(
+            r.is_ok(),
+            "403 should warn + continue, not bail (if this failed, \
+             the 403 branch fell through to the generic Err arm): {r:?}"
+        );
+
+        guard.verified().await;
+    }
+
+    /// 500 on the child WorkerPool → generic `Err(e)` arm → bail.
+    /// This is the case that the Result-to-Option coercion silently
+    /// swallowed into `-/-`: an operator would see the same "child
+    /// not reconciled yet" presentation for a degraded apiserver.
+    /// Post-fix, describe() surfaces the error — the operator sees
+    /// "get WorkerPool default/test-wps-small: ..." and knows to
+    /// check apiserver health, not wait for a reconcile that isn't
+    /// the problem.
+    #[tokio::test]
+    async fn wps_describe_500_bails() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let guard = verifier.run(vec![
+            Scenario::ok(Method::GET, "/workerpoolsets/test-wps", wps_body()),
+            Scenario {
+                method: Method::GET,
+                path_contains: "/workerpools/test-wps-small",
+                body_contains: None,
+                status: 500,
+                body_json: status_body(500, "etcd unreachable", "InternalError"),
+            },
+        ]);
+
+        let r = describe(false, client, "default", "test-wps").await;
+        // Err — 500 bails. This is the regression guard: the
+        // pre-fix Result-to-Option coercion made this Ok (with a
+        // silent -/- row). Any future refactor that re-introduces
+        // blanket error swallowing fails this test.
+        let err = r.expect_err("500 should bail, not render -/-");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("get WorkerPool") && msg.contains("test-wps-small"),
+            "error should name the failing child lookup: {msg}"
+        );
+
+        guard.verified().await;
     }
 }
