@@ -435,9 +435,9 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def test_convco_check(tmp_repo: Path, monkeypatch):
+def test_convco_check(tmp_repo_patched: tuple[Path, Path]):
     import onibus.git_ops
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     _git(tmp_repo, "checkout", "-b", "pX")
     (tmp_repo / "a").write_text("1")
     _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(x): good", "--no-verify")
@@ -449,9 +449,9 @@ def test_convco_check(tmp_repo: Path, monkeypatch):
     assert r.violations == ["bad commit msg"]
 
 
-def test_preflight_clean(tmp_repo: Path, monkeypatch):
+def test_preflight_clean(tmp_repo_patched: tuple[Path, Path]):
     import onibus.git_ops
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     # tmp_repo is its own "worktree parent" sibling — mock the worktree check.
     wt = tmp_repo.parent / "pX"
     wt.mkdir()
@@ -463,18 +463,18 @@ def test_preflight_clean(tmp_repo: Path, monkeypatch):
     assert r.commits_ahead == 1
 
 
-def test_preflight_rejects_missing_branch(tmp_repo: Path, monkeypatch):
+def test_preflight_rejects_missing_branch(tmp_repo_patched: tuple[Path, Path]):
     import onibus.git_ops
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     r = onibus.git_ops.preflight("does-not-exist", repo=tmp_repo)
     assert not r.clean
     assert "branch" in r.reason or "worktree" in r.reason
 
 
-def test_ff_try_advances(tmp_repo: Path, monkeypatch):
+def test_ff_try_advances(tmp_repo_patched: tuple[Path, Path]):
     import onibus.git_ops
     from onibus import INTEGRATION_BRANCH
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     _git(tmp_repo, "checkout", "-b", "pX")
     (tmp_repo / "x").write_text("1")
     _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(x): a", "--no-verify")
@@ -484,11 +484,11 @@ def test_ff_try_advances(tmp_repo: Path, monkeypatch):
     assert r.pre_merge != r.post_merge
 
 
-def test_behind_check_trivial_when_no_overlap(tmp_repo: Path, monkeypatch):
+def test_behind_check_trivial_when_no_overlap(tmp_repo_patched: tuple[Path, Path]):
     """Validator's compound query: behind but no file-collision → trivial_rebase."""
     import onibus.git_ops
     from onibus import INTEGRATION_BRANCH
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     # Branch pX touches a.rs; $TGT advances with b.rs. No overlap.
     _git(tmp_repo, "checkout", "-b", "pX")
     (tmp_repo / "a.rs").write_text("1")
@@ -503,10 +503,10 @@ def test_behind_check_trivial_when_no_overlap(tmp_repo: Path, monkeypatch):
     assert r.trivial_rebase is True
 
 
-def test_behind_check_collision_when_same_file(tmp_repo: Path, monkeypatch):
+def test_behind_check_collision_when_same_file(tmp_repo_patched: tuple[Path, Path]):
     import onibus.git_ops
     from onibus import INTEGRATION_BRANCH
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     _git(tmp_repo, "checkout", "-b", "pX")
     (tmp_repo / "shared.rs").write_text("mine")
     _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(x): a", "--no-verify")
@@ -520,15 +520,15 @@ def test_behind_check_collision_when_same_file(tmp_repo: Path, monkeypatch):
     assert r.trivial_rebase is False
 
 
-def test_behind_check_zero_when_current(tmp_repo: Path, monkeypatch):
+def test_behind_check_zero_when_current(tmp_repo_patched: tuple[Path, Path]):
     import onibus.git_ops
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     r = onibus.git_ops.behind_check(tmp_repo)
     assert r.behind == 0
     assert r.trivial_rebase is False  # not behind → not a trivial REBASE, just current
 
 
-def test_behind_check_no_phantom_self_collision(tmp_repo: Path, monkeypatch):
+def test_behind_check_no_phantom_self_collision(tmp_repo_patched: tuple[Path, Path]):
     """P0306 T1 regression: 2-dot `diff HEAD..TGT` is tree-vs-tree — includes
     OUR changes as 'undo', so `mine & theirs` always contains `mine`. 3-dot
     `diff HEAD...TGT` (merge-base→TGT) is what TGT actually changed.
@@ -539,7 +539,7 @@ def test_behind_check_no_phantom_self_collision(tmp_repo: Path, monkeypatch):
     file_b have DIFFERENT content — no rename heuristic — proves the 3-dot fix."""
     import onibus.git_ops
     from onibus import INTEGRATION_BRANCH
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     # pX touches file_a (unique content); TGT advances with file_b (different unique
     # content). No genuine overlap; no rename possibility.
     _git(tmp_repo, "checkout", "-b", "pX")
@@ -592,18 +592,14 @@ def test_cadence_zero_count_not_due(tmp_path: Path, monkeypatch):
     assert not r.consolidator.due  # 0 is not a cadence trigger
 
 
-def test_count_bump_records_merge_sha(tmp_repo: Path, monkeypatch):
+def test_count_bump_records_merge_sha(tmp_repo_patched: tuple[Path, Path]):
     """P0306 T5: count_bump() appends {mc, sha, ts} to merge-shas.jsonl.
     This is the mc→SHA map _cadence_range indexes against. One row per merge;
     append-only; last-row-wins for a given mc (handles set_to re-writes)."""
     import json as _json
     import onibus.merge
     from onibus import INTEGRATION_BRANCH
-    state = tmp_repo / ".claude" / "state"
-    state.mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(tmp_repo)
-    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
-    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    tmp_repo, state = tmp_repo_patched
     n = onibus.merge.count_bump()
     assert n == 1
     sha_file = state / "merge-shas.jsonl"
@@ -615,7 +611,7 @@ def test_count_bump_records_merge_sha(tmp_repo: Path, monkeypatch):
     assert "ts" in rows[0]
 
 
-def test_count_bump_after_amend_records_stable_sha(tmp_repo: Path, monkeypatch):
+def test_count_bump_after_amend_records_stable_sha(tmp_repo_patched: tuple[Path, Path]):
     """P0319: merger flow is ff-merge → dag-flip amend → count-bump.
     count-bump MUST come AFTER the amend or the recorded SHA dangles
     (amend rewrites HEAD; the pre-amend commit is reflog-only).
@@ -635,11 +631,7 @@ def test_count_bump_after_amend_records_stable_sha(tmp_repo: Path, monkeypatch):
     import json as _json
     import onibus.merge
     from onibus import INTEGRATION_BRANCH
-    state = tmp_repo / ".claude" / "state"
-    state.mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(tmp_repo)
-    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
-    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    tmp_repo, state = tmp_repo_patched
 
     # Simulate merger §7.5: ff-merge lands (tmp_repo's init commit stands
     # in for the ff'd plan tip), then dag-flip amend rewrites HEAD. The
@@ -679,7 +671,7 @@ def test_count_bump_after_amend_records_stable_sha(tmp_repo: Path, monkeypatch):
     )
 
 
-def test_cadence_range_indexes_by_merge_count(tmp_repo: Path, monkeypatch):
+def test_cadence_range_indexes_by_merge_count(tmp_repo_patched: tuple[Path, Path]):
     """P0306 T5: _cadence_range counts MERGES, not COMMITS. Merges are ff
     (no merge commit) so each plan lands as N first-parent commits. At mc=14
     this sprint: 7 plans since mc=7 spanned 33 commits, but commit-indexed
@@ -691,11 +683,7 @@ def test_cadence_range_indexes_by_merge_count(tmp_repo: Path, monkeypatch):
     would miss most of plan B)."""
     import onibus.merge
     from onibus import INTEGRATION_BRANCH
-    state = tmp_repo / ".claude" / "state"
-    state.mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(tmp_repo)
-    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
-    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    tmp_repo, state = tmp_repo_patched
 
     # Simulate 3 plan merges with 1, 5, 2 commits each. count_bump AFTER each
     # batch (as merger does post-ff). Plan B is the bug trigger: multi-commit.
@@ -725,16 +713,11 @@ def test_cadence_range_indexes_by_merge_count(tmp_repo: Path, monkeypatch):
     assert _git(tmp_repo, "rev-list", "--count", rng) == "7"
 
 
-def test_cadence_range_none_when_insufficient_history(tmp_repo: Path, monkeypatch):
+def test_cadence_range_none_when_insufficient_history(tmp_repo_patched: tuple[Path, Path]):
     """Returns None until `window` merges accumulate post-fix. merge-shas.jsonl
     has no rows for pre-P0306 history — one cadence cycle lost (bootstrap cost)."""
     import onibus.merge
-    from onibus import INTEGRATION_BRANCH
-    state = tmp_repo / ".claude" / "state"
-    state.mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(tmp_repo)
-    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
-    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    tmp_repo, state = tmp_repo_patched
     # No sha file yet.
     assert onibus.merge._cadence_range(5) is None
     # Only 2 merges recorded; window=5 needs mc=current-5 which doesn't exist.
@@ -745,16 +728,12 @@ def test_cadence_range_none_when_insufficient_history(tmp_repo: Path, monkeypatc
     assert onibus.merge._cadence_range(1) is not None
 
 
-def test_cadence_range_last_row_wins_for_same_mc(tmp_repo: Path, monkeypatch):
+def test_cadence_range_last_row_wins_for_same_mc(tmp_repo_patched: tuple[Path, Path]):
     """set_to re-writes can record the same mc twice (e.g., count-bump --set-to N
     after a reset). Last row wins — the map is a dict rebuilt from jsonl order."""
     import onibus.merge
     from onibus import INTEGRATION_BRANCH
-    state = tmp_repo / ".claude" / "state"
-    state.mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(tmp_repo)
-    monkeypatch.setattr(onibus.merge, "STATE_DIR", state)
-    monkeypatch.setattr(onibus.merge, "INTEGRATION_BRANCH", INTEGRATION_BRANCH)
+    tmp_repo, state = tmp_repo_patched
     onibus.merge.count_bump()  # mc=1, tip=initial
     # Advance branch, then re-record mc=1 via set_to.
     (tmp_repo / "x").write_text("x")
@@ -891,10 +870,10 @@ def test_merger_report_unblocked_field():
     assert r2.unblocked == []
 
 
-def test_ff_try_rejects_diverged(tmp_repo: Path, monkeypatch):
+def test_ff_try_rejects_diverged(tmp_repo_patched: tuple[Path, Path]):
     import onibus.git_ops
     from onibus import INTEGRATION_BRANCH
-    monkeypatch.setattr(onibus.git_ops, "REPO_ROOT", tmp_repo)
+    tmp_repo, _ = tmp_repo_patched
     _git(tmp_repo, "checkout", "-b", "pX")
     (tmp_repo / "x").write_text("1")
     _git(tmp_repo, "add", "-A"); _git(tmp_repo, "commit", "-m", "feat(x): a", "--no-verify")
