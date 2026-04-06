@@ -78,9 +78,11 @@ pub enum UploadError {
 ///
 /// Returns basenames of paths under `/nix/store/` in the upper layer
 /// that represent build outputs.
-pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
-    let store_dir = upper_dir.join("nix/store");
-    let read_dir = match std::fs::read_dir(&store_dir) {
+///
+/// `upper_store` is `{overlay_upper}/nix/store` — callers pass
+/// `OverlayMount::upper_store()`.
+pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
+    let read_dir = match std::fs::read_dir(upper_store) {
         Ok(iter) => iter,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -125,13 +127,13 @@ pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
 #[instrument(skip_all, fields(store_path = %format!("/nix/store/{output_basename}")))]
 async fn upload_output(
     store_client: &mut StoreServiceClient<Channel>,
-    upper_dir: &Path,
+    upper_store: &Path,
     output_basename: &str,
     assignment_token: &str,
     deriver: &str,
     candidates: Arc<CandidateSet>,
 ) -> Result<UploadResult, UploadError> {
-    let output_path = upper_dir.join("nix/store").join(output_basename);
+    let output_path = upper_store.join(output_basename);
     let store_path = format!("/nix/store/{output_basename}");
 
     // Validate the store path ONCE, before the retry loop. A malformed
@@ -492,12 +494,12 @@ impl Write for HashingChannelWriter {
 #[instrument(skip_all)]
 pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
-    upper_dir: &Path,
+    upper_store: &Path,
     assignment_token: &str,
     deriver: &str,
     ref_candidates: &[String],
 ) -> Result<Vec<UploadResult>, UploadError> {
-    let outputs = scan_new_outputs(upper_dir)?;
+    let outputs = scan_new_outputs(upper_store)?;
     if outputs.is_empty() {
         return Ok(Vec::new());
     }
@@ -543,7 +545,7 @@ pub async fn upload_all_outputs(
         );
         match upload_outputs_batch(
             store_client,
-            upper_dir,
+            upper_store,
             &to_upload,
             assignment_token,
             deriver,
@@ -579,7 +581,7 @@ pub async fn upload_all_outputs(
         "uploading build outputs (independent PutPath)"
     );
 
-    let upper_dir = upper_dir.to_path_buf();
+    let upper_store = upper_store.to_path_buf();
     // Clone the token into each task (it's a String in each async
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
@@ -587,14 +589,14 @@ pub async fn upload_all_outputs(
     let results: Vec<Result<UploadResult, UploadError>> = stream::iter(to_upload)
         .map(|output| {
             let mut client = store_client.clone();
-            let upper_dir = upper_dir.clone();
+            let upper_store = upper_store.clone();
             let token = token.clone();
             let deriver = deriver.clone();
             let candidates = Arc::clone(&candidates);
             async move {
                 upload_output(
                     &mut client,
-                    &upper_dir,
+                    &upper_store,
                     &output,
                     &token,
                     &deriver,
@@ -716,7 +718,7 @@ async fn partition_by_presence(
 #[instrument(skip_all, fields(outputs = outputs.len()))]
 async fn upload_outputs_batch(
     store_client: &StoreServiceClient<Channel>,
-    upper_dir: &Path,
+    upper_store: &Path,
     outputs: &[String],
     assignment_token: &str,
     deriver: &str,
@@ -730,7 +732,7 @@ async fn upload_outputs_batch(
     //
     // Cloned inputs for the `spawn`ed task (it needs 'static). The outputs
     // list is cloned once (basenames, small).
-    let upper_dir = upper_dir.to_path_buf();
+    let upper_store = upper_store.to_path_buf();
     let outputs_owned: Vec<String> = outputs.to_vec();
     let deriver_owned = deriver.to_string();
     let candidates = Arc::clone(candidates);
@@ -738,7 +740,7 @@ async fn upload_outputs_batch(
     let producer = tokio::spawn(async move {
         let mut results: Vec<UploadResult> = Vec::with_capacity(outputs_owned.len());
         for (idx, basename) in outputs_owned.iter().enumerate() {
-            let output_path = upper_dir.join("nix/store").join(basename);
+            let output_path = upper_store.join(basename);
             let store_path = format!("/nix/store/{basename}");
             let idx = idx as u32;
 
@@ -881,7 +883,8 @@ mod tests {
     #[test]
     fn test_scan_new_outputs_empty() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let outputs = scan_new_outputs(dir.path())?;
+        // upper_store doesn't exist → ENOENT → empty Vec.
+        let outputs = scan_new_outputs(&dir.path().join("nonexistent"))?;
         assert!(outputs.is_empty());
         Ok(())
     }
@@ -899,7 +902,7 @@ mod tests {
         fs::write(store_dir.join(".links"), "")?;
 
         // scan_new_outputs sorts internally for deterministic output.
-        let outputs = scan_new_outputs(dir.path())?;
+        let outputs = scan_new_outputs(&store_dir)?;
         assert_eq!(outputs, vec!["abc-hello", "def-world"]);
         Ok(())
     }
@@ -918,13 +921,17 @@ mod tests {
     use rio_test_support::grpc::{spawn_mock_store_inproc, spawn_mock_store_with_client};
     use std::sync::atomic::Ordering;
 
-    /// Write a file at `{tmp}/nix/store/{basename}` and return the tempdir.
-    fn make_output_file(basename: &str, contents: &[u8]) -> anyhow::Result<tempfile::TempDir> {
+    /// Write a file at `{tmp}/nix/store/{basename}` and return the tempdir
+    /// plus the store dir. Hold the TempDir to keep it alive.
+    fn make_output_file(
+        basename: &str,
+        contents: &[u8],
+    ) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf)> {
         let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
         fs::create_dir_all(&store_dir)?;
         fs::write(store_dir.join(basename), contents)?;
-        Ok(tmp)
+        Ok((tmp, store_dir))
     }
 
     /// Empty candidate set — for tests that don't care about ref scanning.
@@ -936,15 +943,15 @@ mod tests {
     async fn test_upload_output_success() -> anyhow::Result<()> {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("hello");
-        let tmp = make_output_file(&basename, b"hello world")?;
+        let (_tmp, store_dir) = make_output_file(&basename, b"hello world")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
+        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
             .await
             .expect("upload should succeed");
 
         assert_eq!(result.store_path, format!("/nix/store/{basename}"));
         // Hash must match SHA-256 of the NAR serialization.
-        let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename))?;
+        let expected_nar = nar::dump_path(&store_dir.join(&basename))?;
         let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
         assert_eq!(result.nar_hash, expected_hash);
         assert_eq!(result.nar_size, expected_nar.len() as u64);
@@ -964,9 +971,9 @@ mod tests {
         let (store, mut client) = spawn_mock_store_inproc().await?;
         store.fail_next_puts.store(2, Ordering::SeqCst);
         let basename = test_store_basename("retry");
-        let tmp = make_output_file(&basename, b"retry me")?;
+        let (_tmp, store_dir) = make_output_file(&basename, b"retry me")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
+        let result = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
             .await
             .expect("upload should succeed on 3rd attempt");
 
@@ -986,9 +993,9 @@ mod tests {
             .fail_next_puts
             .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
         let basename = test_store_basename("exhaust");
-        let tmp = make_output_file(&basename, b"never uploads")?;
+        let (_tmp, store_dir) = make_output_file(&basename, b"never uploads")?;
 
-        let err = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
+        let err = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
             .await
             .expect_err("upload should exhaust retries");
 
@@ -1017,7 +1024,7 @@ mod tests {
         fs::write(store_dir.join(&b2), b"two")?;
         fs::write(store_dir.join(&b3), b"three")?;
 
-        let results = upload_all_outputs(&client, tmp.path(), "", "", &[])
+        let results = upload_all_outputs(&client, &store_dir, "", "", &[])
             .await
             .expect("all uploads succeed");
 
@@ -1041,12 +1048,13 @@ mod tests {
         let (_store, mut client) = spawn_mock_store_inproc().await?;
         let tmp = tempfile::tempdir()?;
         // Create nix/store/ dir but NOT the output file.
-        fs::create_dir_all(tmp.path().join("nix/store"))?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
 
         // Use a VALID basename (32-char hash) so we get past the path
         // validation and into the dump that actually ENOENTs.
         let basename = test_store_basename("nonexistent");
-        let err = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
+        let err = upload_output(&mut client, &store_dir, &basename, "", "", no_candidates())
             .await
             .expect_err("should fail NAR serialization");
 
@@ -1103,14 +1111,14 @@ mod tests {
     async fn test_upload_streaming_mockstore_has_trailer_hash() -> anyhow::Result<()> {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("tee-hash");
-        let tmp = make_output_file(&basename, b"tee upload test data")?;
+        let (_tmp, store_dir) = make_output_file(&basename, b"tee upload test data")?;
 
         let result =
-            upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates()).await?;
+            upload_output(&mut client, &store_dir, &basename, "", "", no_candidates()).await?;
 
         // The hash returned by upload_output == the hash MockStore recorded
         // == SHA-256 of dump_path(). Three-way consistency.
-        let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename))?;
+        let expected_nar = nar::dump_path(&store_dir.join(&basename))?;
         let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
         assert_eq!(result.nar_hash, expected_hash, "worker's hash");
 
@@ -1154,14 +1162,14 @@ mod tests {
         let dep_b = format!("/nix/store/{DEP_HASH_B}-unused");
         let self_path = format!("/nix/store/{basename}");
         let contents = format!("RPATH={dep_a}/lib\nself={self_path}\n");
-        let tmp = make_output_file(&basename, contents.as_bytes())?;
+        let (_tmp, store_dir) = make_output_file(&basename, contents.as_bytes())?;
 
         // Candidate set: both deps + the output itself (self-references are
         // legal — binaries embed their own store path in rpaths).
         let candidates = Arc::new(CandidateSet::from_paths([&dep_a, &dep_b, &self_path]));
 
         let result =
-            upload_output(&mut client, tmp.path(), &basename, "", &deriver, candidates).await?;
+            upload_output(&mut client, &store_dir, &basename, "", &deriver, candidates).await?;
 
         // UploadResult carries the scanned refs. Sorted: /nix/store/7rjj...
         // < /nix/store/aaaa... (self). dep-B absent.
@@ -1194,13 +1202,13 @@ mod tests {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("noref");
         let deriver = test_drv_path("noref");
-        let tmp = make_output_file(&basename, b"plain text, no store paths here")?;
+        let (_tmp, store_dir) = make_output_file(&basename, b"plain text, no store paths here")?;
 
         let dep = format!("/nix/store/{DEP_HASH_A}-dep");
         let candidates = Arc::new(CandidateSet::from_paths([&dep]));
 
         let result =
-            upload_output(&mut client, tmp.path(), &basename, "", &deriver, candidates).await?;
+            upload_output(&mut client, &store_dir, &basename, "", &deriver, candidates).await?;
 
         assert!(result.references.is_empty(), "no refs in output contents");
         let puts = store.put_calls.read().unwrap();
@@ -1234,7 +1242,7 @@ mod tests {
         let deriver = test_drv_path("multi");
         let results = upload_all_outputs(
             &client,
-            tmp.path(),
+            &store_dir,
             "",
             &deriver,
             &[dep_a.clone(), dep_b.clone()],
@@ -1340,7 +1348,7 @@ mod tests {
             "precondition: seeded vs disk NARs must differ, else this test proves nothing"
         );
 
-        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
 
         // Zero PutPath calls — the skip fired.
         assert_eq!(
@@ -1380,7 +1388,7 @@ mod tests {
         fs::write(store_dir.join(&b_present), b"disk present")?;
         fs::write(store_dir.join(&b_missing), b"disk missing")?;
 
-        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
 
         // Exactly one PutPath: the missing output.
         let puts = store.put_calls.read().unwrap();
@@ -1426,7 +1434,7 @@ mod tests {
         fs::create_dir_all(&store_dir)?;
         fs::write(store_dir.join(&basename), b"disk fallback")?;
 
-        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+        let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
 
         // FindMissingPaths failed → fell back to upload → PutPath called.
         // (MockStore's put_path doesn't implement the idempotent no-op;
@@ -1461,9 +1469,10 @@ mod tests {
         // Just assert empty result + zero PutPath. The is_empty() guard
         // is simple enough that existence-in-code is the real assurance.
         let tmp = tempfile::tempdir()?;
-        // nix/store doesn't exist — scan_new_outputs returns empty.
+        // upper_store doesn't exist — scan_new_outputs returns empty.
 
-        let results = upload_all_outputs(&client, tmp.path(), "", "", &[]).await?;
+        let results =
+            upload_all_outputs(&client, &tmp.path().join("nonexistent"), "", "", &[]).await?;
         assert!(results.is_empty());
         assert_eq!(store.put_calls.read().unwrap().len(), 0);
         Ok(())

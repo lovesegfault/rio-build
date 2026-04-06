@@ -444,7 +444,7 @@ pub async fn execute_build(
     synth_db::generate_db(&db_path, &synth_paths, &drv_outputs).await?;
 
     // 4. Set up nix.conf in overlay
-    setup_nix_conf(overlay_mount.upper_dir())?;
+    setup_nix_conf(&overlay_mount.upper_nix_conf())?;
 
     // 4b. Whiteout declared output paths in the overlay upper layer.
     //
@@ -512,7 +512,7 @@ pub async fn execute_build(
     // It's a fresh empty dir per-build (mkdir_all at overlay setup),
     // so EEXIST is impossible here.
     if is_fod {
-        let upper_store = overlay_mount.upper_dir().join("nix/store");
+        let upper_store = overlay_mount.upper_store();
         // drv.is_fixed_output() ⇒ exactly one output named "out"
         // (derivation/mod.rs:211); loop body runs once.
         for out in drv.outputs() {
@@ -824,9 +824,9 @@ pub async fn execute_build(
         // this is fast.
         if is_fod {
             let drv_for_verify = drv.clone();
-            let upper_for_verify = overlay_mount.upper_dir().to_path_buf();
+            let upper_store_for_verify = overlay_mount.upper_store();
             let verify_result = tokio::task::spawn_blocking(move || {
-                verify_fod_hashes(&drv_for_verify, &upper_for_verify)
+                verify_fod_hashes(&drv_for_verify, &upper_store_for_verify)
             })
             .await
             .map_err(|e| ExecutorError::BuildFailed(format!("FOD verify task panicked: {e}")))?;
@@ -877,7 +877,7 @@ pub async fn execute_build(
 
         match upload::upload_all_outputs(
             store_client,
-            overlay_mount.upper_dir(),
+            &overlay_mount.upper_store(),
             // Pass the assignment token as gRPC metadata on each
             // PutPath. Store with hmac_verifier checks it. Empty
             // token (scheduler without hmac_signer, dev mode) →
@@ -1018,9 +1018,8 @@ pub async fn execute_build(
 /// Override use case: operator wants to add e.g. `extra-sandbox-
 /// paths = /some/secret` or tweak `sandbox-build-dir`. ConfigMap
 /// edit + pod restart, no image rebuild.
-fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
-    let conf_dir = upper_dir.join("etc/nix");
-    std::fs::create_dir_all(&conf_dir).map_err(ExecutorError::NixConf)?;
+fn setup_nix_conf(upper_nix_conf: &Path) -> Result<(), ExecutorError> {
+    std::fs::create_dir_all(upper_nix_conf).map_err(ExecutorError::NixConf)?;
 
     // Try the override first. `read` (not `read_to_string`) —
     // nix.conf is ASCII but we're just copying bytes, no reason
@@ -1050,7 +1049,7 @@ fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
         Err(e) => return Err(ExecutorError::NixConf(e)),
     };
 
-    std::fs::write(conf_dir.join("nix.conf"), content).map_err(ExecutorError::NixConf)?;
+    std::fs::write(upper_nix_conf.join("nix.conf"), content).map_err(ExecutorError::NixConf)?;
     Ok(())
 }
 
@@ -1153,9 +1152,10 @@ mod tests {
     #[test]
     fn test_setup_nix_conf() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        setup_nix_conf(dir.path())?;
+        let conf_dir = dir.path().join("etc/nix");
+        setup_nix_conf(&conf_dir)?;
 
-        let conf_path = dir.path().join("etc/nix/nix.conf");
+        let conf_path = conf_dir.join("nix.conf");
         assert!(conf_path.exists());
         let content = std::fs::read_to_string(&conf_path)?;
         assert!(content.contains("sandbox = true"));

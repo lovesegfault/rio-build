@@ -107,12 +107,30 @@ impl OverlayMount {
     /// The upper root path under which outputs, synth DB, and nix.conf live.
     ///
     /// Note: the overlayfs `upperdir` is `{upper}/nix/store/`, not `{upper}/`.
-    /// Callers use `upper_dir().join("nix/store")` to scan outputs,
-    /// `upper_dir().join("nix/var/nix/db")` for the synth DB, and
-    /// `upper_dir().join("etc/nix")` for nix.conf. The latter two are
-    /// bind-mounted separately (not visible through the overlay).
+    /// See the three `upper_*` accessors below for the subpaths callers need.
     pub fn upper_dir(&self) -> &Path {
         &self.upper
+    }
+
+    /// `{upper}/nix/store` — the overlayfs upperdir itself. Build outputs
+    /// materialize here. scan_new_outputs + upload_output read this;
+    /// executor's FOD-whiteout (mknod) writes here.
+    pub fn upper_store(&self) -> PathBuf {
+        self.upper.join("nix/store")
+    }
+
+    /// `{upper}/nix/var/nix/db` — synth-db bind-mount target. Populated by
+    /// synth_db before the daemon starts. NOT visible through the overlay
+    /// (separate bind mount in spawn.rs).
+    pub fn upper_synth_db(&self) -> PathBuf {
+        self.upper.join("nix/var/nix/db")
+    }
+
+    /// `{upper}/etc/nix` — nix.conf bind-mount target. setup_nix_conf
+    /// populates it from WORKER_NIX_CONF or the rio-nix-conf ConfigMap
+    /// override. NOT visible through the overlay.
+    pub fn upper_nix_conf(&self) -> PathBuf {
+        self.upper.join("etc/nix")
     }
 
     /// The merged view path where the overlay is mounted.
@@ -449,7 +467,7 @@ mod tests {
 
         // Overlayfs upperdir should have been created at upper/nix/store/,
         // NOT just upper/. This is critical for upload.rs which scans
-        // `upper_dir().join("nix/store")` for build outputs.
+        // `upper_store()` for build outputs.
         let store_upper = base.join("test-build/upper/nix/store");
         assert!(
             store_upper.exists(),
