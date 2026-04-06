@@ -305,6 +305,31 @@ pub(super) fn build_job(
         .expect("build_container always sets env")
         .push(builders::env("RIO_EPHEMERAL", "1"));
 
+    // r[impl ctrl.pool.ephemeral-single-build]
+    // Force RIO_MAX_BUILDS=1 regardless of spec.max_concurrent_builds.
+    // build_pod_spec set it from spec (builders.rs build_container env
+    // vec); ephemeral mode needs exactly one build per pod — a pod
+    // running N builds shares FUSE cache + overlayfs upper across
+    // those N, breaking the one-pod-per-build isolation guarantee.
+    //
+    // The CEL at workerpool.rs rejects ephemeral+maxConcurrentBuilds>1
+    // at apply time; this override is DEFENSIVE for existing CRs
+    // applied before the CEL landed, or future CEL drift.
+    //
+    // Find-and-replace, not push: build_pod_spec already set it. A
+    // second env var with the same name is last-wins in K8s but
+    // depending on that is fragile — explicit replace.
+    for e in pod_spec.containers[0]
+        .env
+        .as_mut()
+        .expect("build_container always sets env")
+        .iter_mut()
+    {
+        if e.name == "RIO_MAX_BUILDS" {
+            e.value = Some("1".into());
+        }
+    }
+
     // restartPolicy: Never is REQUIRED by K8s for Jobs with
     // backoffLimit=0. "Always" (the PodSpec default) is rejected.
     // build_pod_spec doesn't set it (STS pods default to Always
@@ -512,6 +537,50 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
             "suffix must be lowercase alnum (K8s DNS-1123): {suffix}"
+        );
+    }
+
+    /// Regression: ephemeral with maxConcurrentBuilds=4 still gets
+    /// RIO_MAX_BUILDS=1 in the Job pod. The CEL at workerpool.rs
+    /// rejects this combo at apply time; this test proves the
+    /// DEFENSIVE env-override fires regardless (existing bad CRs
+    /// applied before the CEL landed, future CEL drift).
+    ///
+    /// Mutation check: comment out the find-and-replace loop in
+    /// build_job → this fails with "spec had 4" (RIO_MAX_BUILDS
+    /// stays at spec.max_concurrent_builds, build_pod_spec's value).
+    ///
+    /// Also asserts there's exactly ONE RIO_MAX_BUILDS env entry —
+    /// the override is find-and-replace, not push-duplicate. K8s
+    /// env is last-wins on duplicate names, but depending on that
+    /// is fragile and surprising in `kubectl describe pod` output.
+    // r[verify ctrl.pool.ephemeral-single-build]
+    #[test]
+    fn build_job_forces_max_builds_1_ignoring_spec() {
+        let mut wp = test_wp();
+        // CEL rejects this combo at apply time; the fixture sidesteps
+        // the apiserver so we can prove the defensive override
+        // independently. A real cluster would never let this spec
+        // through — the point is belt-and-suspenders.
+        wp.spec.max_concurrent_builds = 4;
+        let oref = wp.controller_owner_ref(&()).unwrap();
+        let job = build_job(&wp, oref, &test_sched(), "store:9002").unwrap();
+
+        let pod_spec = job.spec.unwrap().template.spec.unwrap();
+        let env = pod_spec.containers[0].env.as_ref().unwrap();
+
+        let max_builds: Vec<_> = env.iter().filter(|e| e.name == "RIO_MAX_BUILDS").collect();
+        assert_eq!(
+            max_builds.len(),
+            1,
+            "exactly one RIO_MAX_BUILDS entry — override is \
+             find-and-replace, not push-duplicate"
+        );
+        assert_eq!(
+            max_builds[0].value.as_deref(),
+            Some("1"),
+            "ephemeral Job must force RIO_MAX_BUILDS=1 — spec had {}",
+            wp.spec.max_concurrent_builds
         );
     }
 

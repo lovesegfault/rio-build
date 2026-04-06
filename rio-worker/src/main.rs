@@ -332,6 +332,15 @@ async fn main() -> anyhow::Result<()> {
     // fire it once in ephemeral mode; in STS mode it's never
     // notified (the select arm is conditionally added).
     let ephemeral_done = Arc::new(tokio::sync::Notify::new());
+    // Spawn the ephemeral-done watcher task exactly ONCE (on the
+    // first assignment), not per-assignment. Per-assignment spawning
+    // is wasteful (N watchers all blocked on acquire_many) and only
+    // happened to work when max_builds=1. AtomicBool swap(true)
+    // returns the previous value — only the first caller sees false.
+    // Lives outside the reconnect loop: a scheduler failover mid-
+    // build must NOT spawn a second watcher (the build task keeps
+    // running and returns its permit regardless of stream state).
+    let ephemeral_watcher_spawned = std::sync::atomic::AtomicBool::new(false);
 
     // Track running builds (drv_path set) for heartbeat reporting
     let running_builds: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -655,7 +664,22 @@ async fn main() -> anyhow::Result<()> {
                             // in a Job pod is wasted compute). The
                             // watcher runs concurrently; select still
                             // processes Cancel.
-                            if ephemeral {
+                            //
+                            // swap(true) gates to ONCE: the first
+                            // assignment sees false and spawns; any
+                            // subsequent assignment (shouldn't happen
+                            // in ephemeral mode once T1/T2 enforce
+                            // max_builds=1, but belt-and-suspenders)
+                            // sees true and skips. Previously this
+                            // spawned a fresh watcher per assignment —
+                            // with max>1, N watchers all blocked on
+                            // acquire_many(N), all fire at once when
+                            // the Nth build completes. Wasteful and
+                            // only accidentally correct for max=1.
+                            if ephemeral
+                                && !ephemeral_watcher_spawned
+                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
                                 let sem = Arc::clone(&build_semaphore);
                                 let max = cfg.max_builds;
                                 let done = Arc::clone(&ephemeral_done);

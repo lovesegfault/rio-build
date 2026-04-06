@@ -39,6 +39,7 @@ specs (
           rio-store/src/**/*.rs
           rio-worker/src/**/*.rs
           rio-controller/src/**/*.rs
+          rio-crds/src/**/*.rs
           rio-nix/src/**/*.rs
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs

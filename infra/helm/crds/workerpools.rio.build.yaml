@@ -387,8 +387,12 @@ spec:
             - systems
             type: object
             x-kubernetes-validations:
-            - rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
-                > 0)'
+            - message: "ephemeral:true requires replicas.min==0, replicas.max>0, and\
+                \ maxConcurrentBuilds==1 \u2014 ephemeral's one-pod-per-build isolation\
+                \ guarantee breaks if a pod runs multiple builds (shared FUSE cache\
+                \ + overlayfs upper); see security.md \xA7 Ephemeral Builders"
+              rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
+                > 0 && self.maxConcurrentBuilds == 1)'
             - message: "hostNetwork:true requires privileged:true \u2014 Kubernetes\
                 \ rejects hostUsers:false with hostNetwork:true at admission; the\
                 \ non-privileged path sets hostUsers:false (see ADR-012)"
