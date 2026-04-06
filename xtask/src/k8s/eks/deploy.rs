@@ -4,7 +4,6 @@
 //! (written by `eks push`). No git roundtrip — chart changes on a dirty
 //! tree deploy directly.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -14,9 +13,9 @@ use tracing::info;
 use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::provider::ProviderKind;
-use crate::k8s::{NS, ensure_namespaces, status};
+use crate::k8s::{NS, ensure_namespaces, shared, status};
 use crate::sh::repo_root;
-use crate::{helm, kube, ssh, tofu, ui};
+use crate::{helm, kube, tofu, ui};
 
 pub async fn run(
     cfg: &XtaskConfig,
@@ -78,14 +77,7 @@ pub async fn run(
     // for FUSE).
     ui::step("namespaces + ssh secret", || async {
         ensure_namespaces(&client).await?;
-        let authorized = ssh::authorized_keys(cfg, tenant)?;
-        kube::apply_secret(
-            &client,
-            NS,
-            "rio-gateway-ssh",
-            BTreeMap::from([("authorized_keys".into(), authorized)]),
-        )
-        .await
+        shared::ensure_gateway_ssh_secret(&client, cfg, tenant).await
     })
     .await?;
 

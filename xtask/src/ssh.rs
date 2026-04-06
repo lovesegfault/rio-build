@@ -50,6 +50,17 @@ pub fn authorized_keys(cfg: &XtaskConfig, tenant: Option<&str>) -> Result<String
     Ok(key.to_openssh().map(|s| s + "\n")?)
 }
 
+/// Extract the tenant name (comment field) from an authorized_keys
+/// line. First non-empty line wins; empty/absent comment → `None`.
+pub fn parse_tenant_comment(authorized_keys: &str) -> Option<String> {
+    authorized_keys
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|l| PublicKey::from_openssh(l).ok())
+        .map(|k| k.comment().to_owned())
+        .filter(|c| !c.is_empty())
+}
+
 /// Resolve RIO_SSH_PUBKEY with tilde-expansion. dotenv loaders
 /// (direnv, dotenvy) don't expand `~` — `RIO_SSH_PUBKEY=~/.ssh/foo.pub`
 /// arrives as a literal `~`. Default: `~/.ssh/id_ed25519.pub`.
@@ -147,5 +158,23 @@ mod tests {
         // cfg overrides default
         let out = authorized_keys(&cfg, None).unwrap();
         assert_eq!(out.split_whitespace().nth(2), Some("from-env"));
+    }
+
+    #[test]
+    fn parse_tenant_comment_roundtrip() {
+        let (_d, cfg) = cfg_with_key(None);
+        let ak = authorized_keys(&cfg, Some("smoke-test")).unwrap();
+        assert_eq!(parse_tenant_comment(&ak).as_deref(), Some("smoke-test"));
+        // leading blank lines / trailing newline tolerated
+        assert_eq!(
+            parse_tenant_comment(&format!("\n\n{ak}\n")).as_deref(),
+            Some("smoke-test")
+        );
+        // empty comment → None (don't preserve "")
+        let (_, no_comment) = generate("").unwrap();
+        assert_eq!(parse_tenant_comment(&no_comment), None);
+        // garbage → None
+        assert_eq!(parse_tenant_comment("not a key"), None);
+        assert_eq!(parse_tenant_comment(""), None);
     }
 }

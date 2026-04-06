@@ -4,7 +4,6 @@
 //! RustFS standalone (~10s) vs Rook (~2-5min). Multi-node by default
 //! so worker-kill chaos can observe cross-node reassignment.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -15,7 +14,7 @@ use crate::config::XtaskConfig;
 use crate::k8s::provider::{BuiltImages, Provider, StepCounts};
 use crate::k8s::{NS, ensure_namespaces, shared};
 use crate::sh::{self, cmd, shell};
-use crate::{helm, kube, ssh, ui};
+use crate::{helm, kube, ui};
 
 mod push;
 
@@ -134,14 +133,7 @@ impl Provider for Kind {
 
         ui::step("namespaces + ssh secret", || async {
             ensure_namespaces(&client).await?;
-            let authorized = ssh::authorized_keys(cfg, tenant)?;
-            kube::apply_secret(
-                &client,
-                NS,
-                "rio-gateway-ssh",
-                BTreeMap::from([("authorized_keys".into(), authorized)]),
-            )
-            .await
+            shared::ensure_gateway_ssh_secret(&client, cfg, tenant).await
         })
         .await?;
 
