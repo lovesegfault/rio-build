@@ -30,15 +30,33 @@ from onibus.models import (
 # ─── low-level git ───────────────────────────────────────────────────────────
 
 
+class GitError(subprocess.CalledProcessError):
+    """CalledProcessError with stderr in __str__. P0504 merger hit exit-128
+    on git commit --amend; CalledProcessError.__str__ includes returncode
+    and cmd but NOT stderr, so the traceback showed only "returned non-zero
+    exit status 128" — the actual git error was invisible. This subclass
+    surfaces it. git_try() still catches this via the base class."""
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        if self.stderr:
+            return f"{base}\n{self.stderr.rstrip()}"
+        return base
+
+
 def git(*args: str, cwd: Path | None = None) -> str:
-    """Run git, return stdout stripped. Non-zero → CalledProcessError."""
-    out = subprocess.run(
-        ["git", *args],
-        cwd=cwd or REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    """Run git, return stdout stripped. Non-zero → GitError (a
+    CalledProcessError subclass with stderr surfaced in __str__)."""
+    try:
+        out = subprocess.run(
+            ["git", *args],
+            cwd=cwd or REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise GitError(e.returncode, e.cmd, e.output, e.stderr) from None
     return out.stdout.strip()
 
 

@@ -2580,6 +2580,39 @@ def test_behind_check_phantom_amend_identical_tree(tmp_repo: Path):
     )
 
 
+# ─── git() error surfacing (P0514) ───────────────────────────────────────────
+
+
+def test_git_error_surfaces_stderr_in_str(tmp_repo: Path):
+    """GitError puts git's stderr in __str__ so tracebacks name the cause.
+    P0504 merger hit exit-128 on commit --amend; CalledProcessError.__str__
+    shows only returncode + cmd, so the actual git error was invisible —
+    manual recovery was needed just to learn WHY it failed."""
+    from onibus.git_ops import GitError, git
+
+    with pytest.raises(GitError) as exc_info:
+        git("rev-parse", "this-ref-does-not-exist", cwd=tmp_repo)
+    msg = str(exc_info.value)
+    # Exit code in the base message (CalledProcessError.__str__).
+    assert "128" in msg
+    # Git's actual stderr surfaced — this is the delta over the base class.
+    # rev-parse on a bad ref prints "fatal: ..." to stderr; without GitError
+    # the traceback would end at "returned non-zero exit status 128." and
+    # the diagnostic is a manual re-run.
+    assert "fatal" in msg.lower(), f"expected git stderr in str, got: {msg!r}"
+
+
+def test_git_error_caught_by_calledprocesserror(tmp_repo: Path):
+    """git_try() and any existing `except CalledProcessError` stay intact."""
+    from onibus.git_ops import GitError, git, git_try
+
+    assert issubclass(GitError, subprocess.CalledProcessError)
+    # git_try swallows via `except CalledProcessError` — must catch GitError.
+    assert git_try("rev-parse", "this-ref-does-not-exist", cwd=tmp_repo) is None
+    # And it doesn't accidentally convert success to None.
+    assert git_try("rev-parse", "HEAD", cwd=tmp_repo) is not None
+
+
 # ─── atomicity_check (synthetic fixture; decoupled from live branches) ───────
 
 
