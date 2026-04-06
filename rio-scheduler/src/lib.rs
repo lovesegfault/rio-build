@@ -103,6 +103,19 @@ pub fn describe_metrics() {
          paths-per-hint. High avg = workers cold (poor locality) or bloom stale."
     );
     describe_counter!(
+        "rio_scheduler_warm_gate_fallback_total",
+        "best_worker() fell back to cold workers because NO warm worker \
+         passed the hard filter. Single-worker clusters and mass scale-up \
+         expect nonzero; sustained high rate = workers never warming \
+         (PrefetchComplete not arriving — check worker logs)."
+    );
+    describe_histogram!(
+        "rio_scheduler_warm_prefetch_paths",
+        "Paths fetched per initial warm-gate PrefetchHint (from the worker's \
+         PrefetchComplete ACK). 0 = worker was already warm (cache hit on \
+         everything); high = fresh worker cold-fetched everything."
+    );
+    describe_counter!(
         "rio_scheduler_cleanup_dropped_total",
         "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
     );

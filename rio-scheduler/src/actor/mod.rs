@@ -458,6 +458,17 @@ impl DagActor {
                 ActorCommand::WorkerDisconnected { worker_id } => {
                     self.handle_worker_disconnected(&worker_id).await;
                 }
+                ActorCommand::PrefetchComplete {
+                    worker_id,
+                    paths_fetched,
+                } => {
+                    self.handle_prefetch_complete(&worker_id, paths_fetched);
+                    // Dispatch: a newly-warm worker may now be the
+                    // best candidate for queued derivations that were
+                    // previously deferred (no warm worker passed the
+                    // hard filter).
+                    self.dispatch_ready().await;
+                }
                 ActorCommand::Heartbeat {
                     worker_id,
                     systems,

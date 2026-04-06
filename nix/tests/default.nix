@@ -261,6 +261,11 @@ in
           # r[verify obs.metric.worker]
           # r[verify obs.metric.store]
           "load-50drv"
+          # r[verify sched.assign.warm-gate]
+          #   Placed AFTER load-50drv so the per-assignment PrefetchHint
+          #   → worker-ACK → rio_scheduler_warm_prefetch_paths histogram
+          #   has had many opportunities to fire. Passive check (~0s).
+          "warm-gate"
           # r[verify worker.shutdown.sigint]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the

@@ -278,6 +278,15 @@ const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 200
 /// so the top bucket is 500, not 20K.
 const REFERENCES_COUNT_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0];
 
+/// Histogram bucket boundaries for `rio_scheduler_warm_prefetch_paths`.
+///
+/// Path COUNT (not seconds) per `PrefetchComplete` ACK — how many paths
+/// the worker actually fetched for a warm-gate hint. Hard-capped at 100
+/// (scheduler-side `MAX_PREFETCH_PATHS`). 0 = already warm (all cache
+/// hits). Small-leaf closures: 1–10. Fat stdenv closures: 30–80.
+/// Third count-type histogram; sub-100 range since hint is capped.
+const WARM_PREFETCH_PATHS_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0];
+
 /// Every histogram that needs non-default bucket boundaries.
 ///
 /// The `metrics-exporter-prometheus` default `[0.005..10.0]` only works for
@@ -321,6 +330,10 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
     (
         "rio_worker_upload_references_count",
         REFERENCES_COUNT_BUCKETS,
+    ),
+    (
+        "rio_scheduler_warm_prefetch_paths",
+        WARM_PREFETCH_PATHS_BUCKETS,
     ),
 ];
 

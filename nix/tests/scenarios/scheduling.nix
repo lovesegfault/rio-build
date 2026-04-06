@@ -1252,6 +1252,62 @@ let
           )
     '';
 
+    warm-gate = ''
+      # ══════════════════════════════════════════════════════════════════
+      # warm-gate — PrefetchHint ACK opens the warm-gate; fallback unused
+      # ══════════════════════════════════════════════════════════════════
+      # All 3 workers register at boot with an EMPTY ready queue (no
+      # build submitted yet) → on_worker_registered short-circuits, flips
+      # warm=true immediately. Every best_worker() call during later
+      # fragments finds warm candidates → fallback never fires.
+      #
+      # The per-assignment PrefetchHint (dispatch.rs:342) still fires on
+      # every non-leaf assignment. The worker fetches + ACKs
+      # PrefetchComplete → scheduler records rio_scheduler_warm_prefetch_
+      # paths. By this fragment (placed AFTER fanout/chunks/load-50drv),
+      # at least one parent-with-children has dispatched → histogram
+      # populated.
+      #
+      # This is a post-hoc observability check — doesn't submit its own
+      # build. Cheap (~0s), lives in the disrupt split after load-50drv.
+      with subtest("warm-gate: no fallback; PrefetchComplete recorded"):
+          # fallback counter: 0 (or absent — absent = never emitted =
+          # never fell back). A nonzero value here means best_worker
+          # saw no warm workers at some point, which would indicate a
+          # registration-hook bug (queue-empty → warm-true short-
+          # circuit didn't fire).
+          fallback = ${gatewayHost}.succeed(
+              "curl -sf http://localhost:9091/metrics | "
+              "grep '^rio_scheduler_warm_gate_fallback_total ' | "
+              "awk '{print $2}' || echo 0"
+          ).strip()
+          assert fallback in ("", "0"), (
+              f"warm-gate fallback fired (expected 0): {fallback}. "
+              f"All workers register with empty queue at boot — "
+              f"on_worker_registered should have flipped warm=true "
+              f"immediately. Check scheduler journal for "
+              f"'warm-gate fallback' debug logs."
+          )
+
+          # PrefetchComplete histogram: the count suffix exists and is
+          # ≥1. At least one per-assignment hint went out (fanout's
+          # collector depends on 4 leaves → approx_input_closure non-
+          # empty → hint sent → worker ACKs). If 0 or absent, the
+          # worker→scheduler PrefetchComplete plumbing is broken.
+          hist_count = ${gatewayHost}.succeed(
+              "curl -sf http://localhost:9091/metrics | "
+              "grep '^rio_scheduler_warm_prefetch_paths_count ' | "
+              "awk '{print $2}' || echo 0"
+          ).strip()
+          assert hist_count and float(hist_count) >= 1, (
+              f"expected ≥1 PrefetchComplete recorded, got "
+              f"rio_scheduler_warm_prefetch_paths_count={hist_count!r}. "
+              f"Worker handle_prefetch_hint → PrefetchComplete → "
+              f"scheduler handle_prefetch_complete chain broken?"
+          )
+          print(f"warm-gate: fallback=0, prefetch_complete_count={hist_count}")
+    '';
+
   };
 
   mkTest = common.mkFragmentTest {

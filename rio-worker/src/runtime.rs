@@ -17,8 +17,8 @@ use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    CompletionReport, HeartbeatRequest, PrefetchHint, ProgressUpdate, ResourceUsage,
-    WorkAssignment, WorkAssignmentAck, WorkerMessage, worker_message,
+    CompletionReport, HeartbeatRequest, PrefetchComplete, PrefetchHint, ProgressUpdate,
+    ResourceUsage, WorkAssignment, WorkAssignmentAck, WorkerMessage, worker_message,
 };
 
 use tracing::{Instrument, instrument};
@@ -667,16 +667,25 @@ pub async fn spawn_build_task(
 }
 
 /// Handle a PrefetchHint from the scheduler: spawn one fire-and-forget
-/// task per path to warm the FUSE cache.
+/// task per path to warm the FUSE cache, then send `PrefetchComplete`
+/// once all paths have finished (succeeded, cached, or errored).
 ///
-/// Called from main.rs's event loop. Does NOT block the caller: each path is spawned
-/// as an independent tokio task that acquires a permit from `sem`
-/// before entering the blocking pool.
+/// Called from main.rs's event loop. Does NOT block the caller: each
+/// path is spawned as an independent tokio task that acquires a permit
+/// from `sem` before entering the blocking pool. A joiner task awaits
+/// all handles and sends the warm-gate ACK.
 ///
-/// No JoinHandle tracking: prefetch is fire-and-forget. If the worker
-/// SIGTERMs mid-prefetch, the tasks abort with the runtime — the
-/// partial fetch is in a .tmp-XXXX sibling dir (see fetch_extract_insert)
-/// which cache init cleans up on next start.
+/// Warm-gate protocol (`r[sched.assign.warm-gate]`): the scheduler
+/// gates dispatch on `WorkerState.warm = true`, flipped on receipt of
+/// `PrefetchComplete`. We send the ACK AFTER every path's fetch task
+/// has returned — the scheduler's first assignment then arrives with a
+/// warm cache. An empty hint (paths=[]) sends the ACK immediately.
+///
+/// No JoinHandle leak: if the worker SIGTERMs mid-prefetch, the tasks
+/// abort with the runtime — the partial fetch is in a .tmp-XXXX sibling
+/// dir (see fetch_extract_insert) which cache init cleans up on next
+/// start. The joiner task also aborts; no ACK is sent — that's fine,
+/// we're shutting down.
 #[instrument(skip_all, fields(count = prefetch.store_paths.len()))]
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
@@ -685,7 +694,14 @@ pub fn handle_prefetch_hint(
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
+    stream_tx: mpsc::Sender<WorkerMessage>,
 ) {
+    // Collect JoinHandles for the ACK-joiner task. A typical hint
+    // is ≤100 paths (scheduler caps at MAX_PREFETCH_PATHS=100) →
+    // ≤100 handles. Cheap (JoinHandle is a small struct).
+    let mut handles: Vec<tokio::task::JoinHandle<&'static str>> =
+        Vec::with_capacity(prefetch.store_paths.len());
+
     // Spawn one task per path. Don't await — the
     // whole point is to NOT block the stream loop
     // on prefetch. The semaphore bounds concurrent
@@ -716,7 +732,7 @@ pub fn handle_prefetch_hint(
         let rt = rt.clone();
         let sem = Arc::clone(&sem);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Permit BEFORE spawn_blocking: if the
             // semaphore is saturated, this task
             // waits here (cheap async wait) not
@@ -729,7 +745,7 @@ pub fn handle_prefetch_hint(
             // worker shutting down. Drop the
             // prefetch silently — it was a hint.
             let Ok(_permit) = sem.acquire_owned().await else {
-                return;
+                return "shutdown";
             };
 
             // spawn_blocking: Cache methods use
@@ -755,8 +771,74 @@ pub fn handle_prefetch_hint(
             // — we're fire-and-forget.
             let label = result.unwrap_or("panic");
             metrics::counter!("rio_worker_prefetch_total", "result" => label).increment(1);
+            label
         });
+        handles.push(handle);
     }
+
+    // r[impl sched.assign.warm-gate]
+    // Joiner: wait for ALL path-fetch tasks to return, then send the
+    // PrefetchComplete ACK. spawn_monitored so a panic in the joiner
+    // logs with task=prefetch-complete instead of vanishing. Does NOT
+    // block the caller (main.rs event loop).
+    //
+    // Serialization: all per-path tasks were spawned above. They run
+    // concurrently (bounded by `sem`). The joiner awaits each handle
+    // in order — order doesn't matter for semantics (we only care
+    // about "all done"), it's just the simplest join-all. A slow path
+    // delays the ACK for the whole batch, which is CORRECT: the
+    // scheduler should wait until the cache is actually warm.
+    rio_common::task::spawn_monitored("prefetch-complete", async move {
+        let mut fetched: u32 = 0;
+        let mut cached: u32 = 0;
+        for handle in handles {
+            // JoinError (task aborted or panicked) → count as neither
+            // fetched nor cached. The label was already recorded in
+            // the metric above; for the ACK we just skip it.
+            if let Ok(label) = handle.await {
+                match label {
+                    "fetched" => fetched += 1,
+                    "already_cached" | "already_in_flight" => cached += 1,
+                    // "error", "malformed", "shutdown", "panic" → noise.
+                    // Scheduler gates on receipt, not on counts.
+                    _ => {}
+                }
+            }
+        }
+
+        // Test hook: RIO_TEST_PREFETCH_DELAY_MS injects an extra delay
+        // AFTER all fetches complete but BEFORE the ACK. The VM warm-
+        // gate scenario uses this to prove the scheduler waits for the
+        // ACK (assert assigned_at - registered_at >= delay). Parse
+        // failure → 0 → no delay. Only read once per hint (not hot).
+        if let Ok(ms) = std::env::var("RIO_TEST_PREFETCH_DELAY_MS")
+            && let Ok(ms) = ms.parse::<u64>()
+            && ms > 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+
+        // send().await not try_send(): the ACK MUST land. If the
+        // permanent-sink relay is backpressured (256 cap filled by
+        // log batches during a chatty build), we block here until a
+        // slot frees. That delays the NEXT prefetch hint's ACK by
+        // one stream-roundtrip — acceptable. Dropping the ACK would
+        // leave the worker cold in the scheduler's view forever.
+        let ack = WorkerMessage {
+            msg: Some(worker_message::Msg::PrefetchComplete(PrefetchComplete {
+                paths_fetched: fetched,
+                paths_cached: cached,
+            })),
+        };
+        if let Err(e) = stream_tx.send(ack).await {
+            // Sink closed → worker is shutting down. Fine — no point
+            // ACKing to a scheduler we're disconnecting from.
+            tracing::debug!(error = %e,
+                            "PrefetchComplete send failed (sink closed; shutting down?)");
+        } else {
+            tracing::debug!(fetched, cached, "sent PrefetchComplete (warm-gate ACK)");
+        }
+    });
 }
 
 #[cfg(test)]

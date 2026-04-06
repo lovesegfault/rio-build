@@ -432,7 +432,6 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
 4. Scheduler begins sending `WorkAssignment` messages on the stream.
 
 r[sched.assign.warm-gate]
-
 A newly-registered worker (step 3 above --- first heartbeat with open stream) receives an initial `PrefetchHint` before any `WorkAssignment`. The worker fetches the hinted paths into its FUSE cache and replies with `PrefetchComplete` on the `BuildExecution` stream. The scheduler's `WorkerState.warm` flag starts `false` and flips `true` on receipt. `best_worker()` filters out `warm=false` workers from its candidate set --- but falls back to cold workers if no warm worker passes the hard filter (single-worker clusters and mass-scale-up must not deadlock). Empty scheduler queue at registration time → `warm` flips `true` immediately (nothing to prefetch for). The warm-gate is per-worker: a second worker registering while the first is still warming does not delay builds that the second (already warm) worker can take.
 
 r[sched.worker.deregister-reassign]

@@ -118,6 +118,27 @@ impl WorkerService for SchedulerGrpc {
                                 "worker acknowledged assignment"
                             );
                         }
+                        rio_proto::types::worker_message::Msg::PrefetchComplete(pc) => {
+                            // r[sched.assign.warm-gate]: worker ACKed
+                            // the initial PrefetchHint. Forward to
+                            // the actor which flips WorkerState.warm.
+                            // send_unchecked (not try_send): dropping
+                            // this under backpressure would leave a
+                            // warmed worker permanently cold in the
+                            // scheduler's view — idle capacity right
+                            // when the scheduler is saturated.
+                            if actor_for_recv
+                                .send_unchecked(ActorCommand::PrefetchComplete {
+                                    worker_id: worker_id_for_recv.clone().into(),
+                                    paths_fetched: pc.paths_fetched,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                warn!("actor channel closed while sending PrefetchComplete");
+                                break;
+                            }
+                        }
                         rio_proto::types::worker_message::Msg::Completion(mut report) => {
                             let drv_path = std::mem::take(&mut report.drv_path);
                             // A CompletionReport with result: None is malformed, but

@@ -50,6 +50,117 @@ impl DagActor {
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (stream + heartbeat)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
+            self.on_worker_registered(worker_id);
+        }
+    }
+
+    /// Flip `warm=true` on PrefetchComplete ACK. See
+    /// `r[sched.assign.warm-gate]`. No-op if the worker is unknown
+    /// (disconnected between hint and ACK — rare race).
+    pub(super) fn handle_prefetch_complete(&mut self, worker_id: &WorkerId, paths_fetched: u32) {
+        let Some(w) = self.workers.get_mut(worker_id) else {
+            debug!(worker_id = %worker_id,
+                   "PrefetchComplete for unknown worker (disconnected?)");
+            return;
+        };
+        // Idempotent: a worker sending two ACKs (e.g., pre-dispatch
+        // hint + first per-assignment hint both getting ACKed) just
+        // re-sets an already-true flag. No warn — this is expected
+        // for the per-assignment PrefetchHint path (dispatch.rs:342)
+        // which also triggers worker-side PrefetchComplete.
+        let was_warm = w.warm;
+        w.warm = true;
+        if !was_warm {
+            info!(worker_id = %worker_id, paths_fetched,
+                  "warm-gate open: worker ACKed initial prefetch");
+        }
+        // Record unconditionally: every PrefetchComplete is a data
+        // point about hint effectiveness (fetched vs cached). The
+        // histogram serves observability, not gating — the gate is
+        // the warm flag flip above, which is idempotent.
+        metrics::histogram!("rio_scheduler_warm_prefetch_paths").record(f64::from(paths_fetched));
+    }
+
+    /// Hook fired exactly once per worker when it transitions
+    /// not-registered → registered (both stream AND heartbeat present).
+    ///
+    /// r[impl sched.assign.warm-gate]
+    /// Sends the INITIAL PrefetchHint so the worker can warm its FUSE
+    /// cache before receiving any WorkAssignment. If the ready queue
+    /// is empty (nothing to prefetch for), the gate flips open
+    /// immediately — spec: "Empty scheduler queue at registration
+    /// time → warm flips true immediately."
+    ///
+    /// Hint contents: union of Ready derivations' input closures
+    /// (same `approx_input_closure` as best_worker scoring and the
+    /// per-assignment hint at dispatch.rs:520). Capped at 100 paths
+    /// — an initial hint covering a broad common-set (glibc, stdenv,
+    /// etc.) is the intent, not the entire queue's closure.
+    fn on_worker_registered(&mut self, worker_id: &WorkerId) {
+        // Collect input closures for Ready derivations. Dedup — same
+        // glibc/stdenv path will appear in most closures. Cap the
+        // DAG scan as well as the hint: don't walk 10k Ready nodes
+        // just to send 100 paths. 32 derivations × ~40 paths covers
+        // the MAX_PREFETCH_PATHS budget with typical closure sizes.
+        const MAX_PREFETCH_PATHS: usize = 100;
+        const MAX_READY_TO_SCAN: usize = 32;
+        let ready_hashes: Vec<DrvHash> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| s.status() == DerivationStatus::Ready)
+            .take(MAX_READY_TO_SCAN)
+            .map(|(h, _)| DrvHash::from(h))
+            .collect();
+        let paths: Vec<String> = ready_hashes
+            .iter()
+            .flat_map(|h| crate::assignment::approx_input_closure(&self.dag, h))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .take(MAX_PREFETCH_PATHS)
+            .collect();
+
+        let Some(worker) = self.workers.get_mut(worker_id) else {
+            return; // can't happen (caller just looked it up) but be defensive
+        };
+
+        if paths.is_empty() {
+            // Nothing queued → nothing to prefetch → gate open now.
+            // Same flip as handle_prefetch_complete, just short-
+            // circuited. Tests that register workers BEFORE merging
+            // a DAG land here — keeps their dispatch assumptions
+            // valid without a synthetic ACK.
+            worker.warm = true;
+            debug!(worker_id = %worker_id,
+                   "warm-gate open on registration: ready queue empty");
+            return;
+        }
+
+        // Send the hint. try_send: if the freshly-opened stream is
+        // somehow already full (256 cap) something is very wrong; log
+        // and flip warm anyway (gate is optimization, not correctness).
+        let hint_len = paths.len();
+        let msg = rio_proto::types::SchedulerMessage {
+            msg: Some(rio_proto::types::scheduler_message::Msg::Prefetch(
+                rio_proto::types::PrefetchHint { store_paths: paths },
+            )),
+        };
+        let sent = worker
+            .stream_tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send(msg).is_ok());
+        if sent {
+            debug!(worker_id = %worker_id, paths = hint_len,
+                   "warm-gate: sent initial PrefetchHint on registration");
+            metrics::counter!("rio_scheduler_prefetch_hints_sent_total").increment(1);
+            metrics::counter!("rio_scheduler_prefetch_paths_sent_total").increment(hint_len as u64);
+            // warm stays false until PrefetchComplete arrives.
+        } else {
+            // stream_tx None or channel full — neither should happen
+            // for a just-registered worker. Flip warm so dispatch
+            // isn't permanently wedged for this worker.
+            warn!(worker_id = %worker_id,
+                  "warm-gate: initial hint send failed; flipping warm anyway");
+            worker.warm = true;
         }
     }
 
@@ -396,6 +507,10 @@ impl DagActor {
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (heartbeat + stream)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
+            // Same hook as handle_worker_connected: whichever of
+            // (stream, heartbeat) arrives SECOND triggers the warm-
+            // gate initial prefetch. dual-register step 3.
+            self.on_worker_registered(worker_id);
         }
     }
 

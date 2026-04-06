@@ -114,6 +114,7 @@ message WorkerMessage {
     // blocker applied to preemption, not to advisory ema.
     ProgressUpdate progress = 4;
     WorkerRegister register = 5;            // First message: identifies the worker
+    PrefetchComplete prefetch_complete = 6; // Warm-gate ACK: FUSE cache warmed the hinted paths
   }
 }
 
@@ -270,6 +271,15 @@ message CancelSignal {
 // Hint to pre-warm FUSE cache for upcoming builds.
 message PrefetchHint {
   repeated string store_paths = 1;        // Paths to pre-fetch from store
+}
+
+// Worker signals its FUSE cache has warmed the hinted paths. Scheduler
+// flips WorkerState.warm = true on receipt (r[sched.assign.warm-gate]).
+// paths_fetched/paths_cached are for observability — the scheduler gates
+// on receipt of the message, not on the counts.
+message PrefetchComplete {
+  uint32 paths_fetched = 1;              // How many hint paths were actually fetched
+  uint32 paths_cached = 2;               // How many were already in FUSE cache (0 for fresh worker)
 }
 
 // Worker progress update (resource usage, current build phase).

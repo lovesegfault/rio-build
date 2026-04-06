@@ -729,6 +729,14 @@ async fn main() -> anyhow::Result<()> {
                                 prefetch_runtime.clone(),
                                 Arc::clone(&prefetch_sem),
                                 fuse_fetch_timeout,
+                                // Warm-gate ACK goes through the
+                                // permanent sink (same as completions
+                                // and log batches) — survives stream
+                                // reconnect. A worker that warms then
+                                // briefly loses its stream still
+                                // delivers PrefetchComplete to the new
+                                // leader once the relay reconnects.
+                                build_ctx.stream_tx.clone(),
                             );
                         }
                         None => {
