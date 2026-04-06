@@ -127,13 +127,25 @@ pub struct StoreServiceImpl {
     /// uploaded path must be in `claims.expected_outputs`.
     ///
     /// mTLS bypass: if `request.peer_certs()` is present AND the
-    /// cert CN matches "rio-gateway" → skip HMAC (gateway uploads
-    /// don't have assignment tokens — `nix copy` just sends paths).
-    /// This ties HMAC to mTLS: you can only bypass if you have a
-    /// CA-signed gateway cert.
+    /// cert CN or any SAN DNSName is in `hmac_bypass_cns` → skip
+    /// HMAC (gateway uploads don't have assignment tokens — `nix
+    /// copy` just sends paths). This ties HMAC to mTLS: you can
+    /// only bypass if you have a CA-signed cert whose identity is
+    /// explicitly allowlisted.
     ///
     /// None = accept all callers (dev mode, same as pre-Phase-3b).
     hmac_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
+    /// Client-cert identities (CN or SAN DNSName) that bypass the
+    /// HMAC check above. Default `["rio-gateway"]`. The bypass check
+    /// reads peer_certs()[0], parses CN + SAN DNSNames, returns true
+    /// if ANY of them appears in this list. Empty Vec = no bypass at
+    /// all (every PutPath needs a token, including the gateway —
+    /// not a supported deployment shape but the config allows it).
+    ///
+    /// Not `Arc<>` — `Vec<String>` is small (typically 1-3 entries)
+    /// and `StoreServiceImpl` isn't cloned per-request (tonic shares
+    /// one instance across all handlers via `&self`).
+    hmac_bypass_cns: Vec<String>,
     /// Global budget for in-flight NAR bytes across ALL concurrent PutPath
     /// handlers. Each handler acquires `chunk.len()` permits before extending
     /// its `nar_data: Vec<u8>`; permits release on handler drop. Default
@@ -164,6 +176,7 @@ impl StoreServiceImpl {
             chunk_cache: None,
             signer: None,
             hmac_verifier: None,
+            hmac_bypass_cns: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
         }
     }
@@ -189,6 +202,7 @@ impl StoreServiceImpl {
             chunk_cache: Some(cache),
             signer: None,
             hmac_verifier: None,
+            hmac_bypass_cns: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
         }
     }
@@ -197,6 +211,16 @@ impl StoreServiceImpl {
     /// Builder-style — chains after `new()` or `with_chunk_cache()`.
     pub fn with_hmac_verifier(mut self, verifier: rio_common::hmac::HmacVerifier) -> Self {
         self.hmac_verifier = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Set the CN/SAN-DNSName allowlist for HMAC bypass on PutPath.
+    /// Replaces the constructor default (`["rio-gateway"]`). main.rs
+    /// always calls this with the loaded config — config is the
+    /// single source of truth. Tests can pass `vec![]` to disable
+    /// bypass entirely or custom CNs to exercise the allowlist.
+    pub fn with_hmac_bypass_cns(mut self, cns: Vec<String>) -> Self {
+        self.hmac_bypass_cns = cns;
         self
     }
 
