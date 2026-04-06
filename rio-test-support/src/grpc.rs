@@ -520,13 +520,16 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::TenantQuotaRequest>,
     ) -> Result<Response<types::TenantQuotaResponse>, Status> {
-        let name = request.into_inner().tenant_name;
-        // Mirror the real store's empty-name guard so dual-mode tests
-        // that accidentally pass "" get the same InvalidArgument.
-        if name.trim().is_empty() {
+        // Mirror the real store's NormalizedName normalization (trim +
+        // empty-reject) so dual-mode tests that accidentally pass ""
+        // get the same InvalidArgument. The mock doesn't depend on
+        // rio-common, so inline the same semantics.
+        let raw = request.into_inner().tenant_name;
+        let name = raw.trim();
+        if name.is_empty() {
             return Err(Status::invalid_argument("mock: tenant_name is empty"));
         }
-        match self.tenant_quotas.read().unwrap().get(name.trim()) {
+        match self.tenant_quotas.read().unwrap().get(name) {
             Some(&(used, limit)) => Ok(Response::new(types::TenantQuotaResponse {
                 used_bytes: used,
                 limit_bytes: limit,

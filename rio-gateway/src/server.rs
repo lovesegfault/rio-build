@@ -12,6 +12,7 @@ use ed25519_dalek::SigningKey;
 use rio_common::config::JwtConfig;
 use rio_common::jwt;
 use rio_common::signal::Token as CancellationToken;
+use rio_common::tenant::NormalizedName;
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
@@ -682,7 +683,19 @@ impl Handler for ConnectionHandler {
             .find(|authorized| authorized.key_data() == key.key_data());
 
         if let Some(matched) = matched {
-            self.tenant_name = matched.comment().trim().to_string();
+            // Normalize via the shared newtype so every tenant-name
+            // consumer (scheduler, store, quota cache) sees the exact
+            // same bytes. Empty comment → empty String (single-tenant
+            // mode); downstream sites gate on `.is_empty()` already.
+            // Stored as `String` (not the newtype) because the field
+            // plumbs through `run_protocol` / `SessionContext` /
+            // `SubmitBuildRequest.tenant_name` which are all String —
+            // changing the whole chain's type is P0298 scope, not this
+            // refactor. The normalization BEHAVIOR is centralized even
+            // if the TYPE isn't (yet).
+            self.tenant_name = NormalizedName::from_maybe_empty(matched.comment())
+                .map(String::from)
+                .unwrap_or_default();
 
             // r[impl gw.jwt.dual-mode]
             //

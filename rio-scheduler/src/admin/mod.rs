@@ -29,6 +29,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, instrument};
 
+use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
@@ -487,8 +488,13 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         let req = request.into_inner();
-        let tenant_filter =
-            crate::grpc::resolve_tenant_name(&self.pool, &req.tenant_filter).await?;
+        // Empty filter → no tenant filter (list all). Non-empty →
+        // resolve to UUID. Unknown name → InvalidArgument (the CLI
+        // tool surfaces it verbatim).
+        let tenant_filter = match NormalizedName::from_maybe_empty(&req.tenant_filter) {
+            None => None,
+            Some(name) => Some(crate::grpc::resolve_tenant_name(&self.pool, &name).await?),
+        };
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = builds::list_builds(
             &db,
@@ -711,14 +717,14 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         let req = request.into_inner();
-        // Trim once, use for BOTH validation and storage. Read paths
-        // trim (gateway server.rs:223, cache auth.rs:51) so storing
-        // untrimmed " team-a " makes WHERE tenant_name = 'team-a'
-        // never match — invisible-whitespace debugging session.
-        let tenant_name = req.tenant_name.trim();
-        if tenant_name.is_empty() {
-            return Err(Status::invalid_argument("tenant_name is required"));
-        }
+        // NormalizedName trims + rejects empty in one step. The same
+        // normalization runs at every read path (gateway server.rs,
+        // cache auth.rs, SubmitBuild) — storing the normalized form
+        // here means every `WHERE tenant_name = $1` lookup matches.
+        // Without it, " team-a " never matches 'team-a' and the
+        // operator spends an afternoon staring at invisible whitespace.
+        let tenant_name = NormalizedName::try_from(req.tenant_name.as_str())
+            .map_err(|_| Status::invalid_argument("tenant_name is required"))?;
         let cache_token = req.cache_token.as_deref().map(str::trim);
         if cache_token.is_some_and(str::is_empty) {
             return Err(Status::invalid_argument(
@@ -747,7 +753,7 @@ impl AdminService for AdminServiceImpl {
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let row = db
             .create_tenant(
-                tenant_name,
+                &tenant_name,
                 gc_retention_hours,
                 gc_max_store_bytes,
                 cache_token,

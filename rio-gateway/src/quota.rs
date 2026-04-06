@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rio_common::tenant::NormalizedName;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::TenantQuotaRequest;
 use tonic::transport::Channel;
@@ -92,12 +93,15 @@ impl QuotaCache {
         store_client: &mut StoreServiceClient<Channel>,
         tenant_name: &str,
     ) -> QuotaVerdict {
-        let tenant_name = tenant_name.trim();
-        if tenant_name.is_empty() {
+        // Single-tenant mode (empty name from authorized_keys comment)
+        // → no quota row to gate on. `from_maybe_empty` is the same
+        // normalization the scheduler/store use — one place defines
+        // what "empty tenant" means.
+        let Some(tenant_name) = NormalizedName::from_maybe_empty(tenant_name) else {
             return QuotaVerdict::Unlimited;
-        }
+        };
 
-        if let Some(v) = self.lookup_fresh(tenant_name) {
+        if let Some(v) = self.lookup_fresh(&tenant_name) {
             return Self::classify(v);
         }
 
