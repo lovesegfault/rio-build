@@ -47,7 +47,18 @@ resource "helm_release" "cert_manager" {
   # before the cluster exists (rare — usually the plan graph gets
   # it right via the provider's `host = module.eks.cluster_endpoint`
   # reference — but explicit is safer).
-  depends_on = [module.eks]
+  #
+  # aws_lbc dep: not semantic — aws-lbc's mservice.elbv2.k8s.aws
+  # mutating webhook intercepts ALL Service creates cluster-wide
+  # with failurePolicy=Fail (it's the only one of its six webhooks
+  # with an empty namespaceSelector). On a fresh apply, the chart
+  # lands the MutatingWebhookConfiguration before its pod is Ready
+  # → cert-manager's Service create gets "no endpoints available
+  # for service aws-load-balancer-webhook-service". Serializing
+  # behind aws_lbc (wait=true default → Deployment Ready → endpoints
+  # populated) closes the race. Same dep on karpenter_crd and
+  # external_secrets for the same reason.
+  depends_on = [module.eks, helm_release.aws_lbc]
 }
 
 # ============================================================

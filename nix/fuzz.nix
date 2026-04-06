@@ -212,15 +212,19 @@ let
 
       mkdir -p artifacts
 
-      # -fork=N spawns N libFuzzer workers that share corpus.
-      # Workers write to fuzz-*.log; dump those on failure so
-      # crash stacks land in the Nix build log.
+      # -fork=N spawns N libFuzzer workers that share corpus. Cap at
+      # 16: wall time is fixed (-max_total_time), so more workers =
+      # more inputs covered but also more CPU stolen from the rest of
+      # `.#ci` (10 targets × 192 cores = 1920 procs on the big box).
+      # Workers write to fuzz-*.log; dump those on failure so crash
+      # stacks land in the Nix build log.
+      cores=''${NIX_BUILD_CORES:-1}
       ${fuzzBuild}/bin/${target} "$workCorpus" \
         -max_total_time=120 \
         -timeout=30 \
         -print_final_stats=1 \
         -artifact_prefix=artifacts/ \
-        -fork=''${NIX_BUILD_CORES:-1} || {
+        -fork=$(( cores <= 16 ? cores : 16 )) || {
           echo "--- worker logs ---"
           cat fuzz-*.log 2>/dev/null || true
           exit 1

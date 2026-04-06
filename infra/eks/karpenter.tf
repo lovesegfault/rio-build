@@ -55,7 +55,8 @@ resource "helm_release" "karpenter_crd" {
   chart      = "karpenter-crd"
   version    = local.karpenter_version
 
-  depends_on = [module.eks]
+  # aws_lbc dep: webhook-ordering only — see addons.tf cert_manager.
+  depends_on = [module.eks, helm_release.aws_lbc]
 }
 
 resource "helm_release" "karpenter" {

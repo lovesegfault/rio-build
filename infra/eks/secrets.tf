@@ -80,7 +80,8 @@ resource "helm_release" "external_secrets" {
     }
   ]
 
-  depends_on = [module.eks]
+  # aws_lbc dep: webhook-ordering only — see addons.tf cert_manager.
+  depends_on = [module.eks, helm_release.aws_lbc]
 }
 
 # ────────────────────────────────────────────────────────────────────────
