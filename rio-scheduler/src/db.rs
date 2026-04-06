@@ -1266,6 +1266,69 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Proactive mid-build memory EMA update: a running build's cgroup
+    /// `memory.peak` already exceeds what the EMA predicted. Overwrite
+    /// the EMA NOW so the NEXT submit of this (pname, system) is
+    /// right-sized BEFORE the current build finishes (or OOMs).
+    ///
+    /// Same penalty-overwrite semantics as
+    /// [`Self::update_build_history_misclassified`] (not a blend — a blend
+    /// would need multiple mid-build samples to converge, defeating the
+    /// point of "proactive"). Self-correcting: if the peak was a spike,
+    /// the completion's normal EMA blend pulls it back down.
+    ///
+    /// Single-statement: joins `derivations` by `drv_path` (what
+    /// `ProgressUpdate` carries — workers don't know their drv_hash),
+    /// then updates `build_history` by the resolved `(pname, system)`.
+    /// The `WHERE` clause's NULL/less-than guard makes the whole thing
+    /// atomic — no read-compare-write race with concurrent completions.
+    ///
+    /// Filters to non-terminal status so the partial index applies
+    /// (see `TERMINAL_STATUS_SQL`). A progress update for a terminal
+    /// derivation is a late-arriving sample post-completion; harmless
+    /// to drop.
+    ///
+    /// Returns `true` if a row was updated (observed > current EMA, or
+    /// EMA was NULL). `false` covers: derivation not found / terminal /
+    /// pname NULL / no build_history row / observed ≤ current EMA. All
+    /// correct no-ops — the caller increments a counter on `true` only.
+    ///
+    /// `drv_path` is NOT indexed. This fires every 10s per running
+    /// build — ~10 qps at 100 concurrent builds, scanning the
+    /// non-terminal subset (small, via partial index). If this becomes
+    /// hot, add an index on `(drv_path) WHERE status NOT IN (...)`.
+    pub async fn update_ema_peak_memory_proactive(
+        &self,
+        drv_path: &str,
+        observed_peak_bytes: u64,
+    ) -> Result<bool, sqlx::Error> {
+        // u64 → f64 for DOUBLE PRECISION. Precision loss at 2^53 bytes
+        // (~9 PB) — not a concern for memory.peak.
+        let observed = observed_peak_bytes as f64;
+
+        let result = sqlx::query(&format!(
+            r#"
+            UPDATE build_history bh
+            SET ema_peak_memory_bytes = $2,
+                last_updated = now()
+            FROM derivations d
+            WHERE d.drv_path = $1
+              AND d.status NOT IN {TERMINAL_STATUS_SQL}
+              AND d.pname IS NOT NULL
+              AND bh.pname = d.pname
+              AND bh.system = d.system
+              AND (bh.ema_peak_memory_bytes IS NULL
+                   OR bh.ema_peak_memory_bytes < $2)
+            "#
+        ))
+        .bind(drv_path)
+        .bind(observed)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Insert one raw build sample. Called from completion.rs success path
     /// alongside the EMA update (P0228). Best-effort: caller warns on Err.
     ///
@@ -1844,6 +1907,152 @@ mod tests {
         .await?;
         assert!((ema2 - 180.0).abs() < 0.001);
         assert_eq!(miscount2, 2);
+
+        Ok(())
+    }
+
+    /// Proactive mid-build ema: a running build's cgroup memory.peak
+    /// (via ProgressUpdate) already exceeds the EMA. The overwrite
+    /// happens BEFORE the build completes — next submit of this
+    /// (pname, system) is right-sized without waiting for an OOM→retry.
+    ///
+    /// Walks the conditional-update guard: observed>ema → overwrite;
+    /// observed≤ema → no-op (common case: worker emits every 10s,
+    /// most samples are under the EMA). Also: NULL ema initializes;
+    /// terminal derivation → no-op (late-arriving sample, completion
+    /// already wrote the authoritative value).
+    #[tokio::test]
+    async fn test_mid_build_resource_sample_updates_ema() -> anyhow::Result<()> {
+        const GB: u64 = 1 << 30;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        // Derivation: running (non-terminal), pname="test-pkg" via
+        // insert_test_derivation's default. drv_path is what
+        // ProgressUpdate carries.
+        let drv_path = rio_test_support::fixtures::test_drv_path("proactive");
+        insert_test_derivation(&db, "proactive").await?;
+        sqlx::query("UPDATE derivations SET status = 'running' WHERE drv_path = $1")
+            .bind(&drv_path)
+            .execute(&test_db.pool)
+            .await?;
+
+        let fetch_ema = || async {
+            sqlx::query_scalar::<_, Option<f64>>(
+                "SELECT ema_peak_memory_bytes FROM build_history \
+                 WHERE pname = 'test-pkg' AND system = 'x86_64-linux'",
+            )
+            .fetch_one(&test_db.pool)
+            .await
+        };
+
+        // --- No build_history row yet (first-ever build) → no-op.
+        // The join finds nothing to update. First-run has no EMA to
+        // proactively correct.
+        let updated = db
+            .update_ema_peak_memory_proactive(&drv_path, 2 * GB)
+            .await?;
+        assert!(!updated, "no build_history row → no-op");
+
+        // --- Seed build_history: prior completion left EMA at 1 GB.
+        db.update_build_history("test-pkg", "x86_64-linux", 60.0, Some(GB), None, None)
+            .await?;
+        let seed = fetch_ema().await?;
+        assert!(
+            seed.is_some_and(|m| (m - GB as f64).abs() < 1.0),
+            "precondition: EMA must actually be ~1 GB before the proactive \
+             update, else the 'updated to 2 GB' assertion proves nothing; \
+             got {seed:?}"
+        );
+
+        // --- observed (2 GB) > ema (1 GB) → overwrite. The mid-build
+        // sample exceeds the estimate; next submit sees 2 GB.
+        let updated = db
+            .update_ema_peak_memory_proactive(&drv_path, 2 * GB)
+            .await?;
+        assert!(updated, "observed > ema → should update");
+        let ema = fetch_ema().await?;
+        assert!(
+            ema.is_some_and(|m| (m - (2 * GB) as f64).abs() < 1.0),
+            "overwrite (not blend): expected 2 GB, got {ema:?}. \
+             A blend (1*0.7 + 2*0.3 = 1.3 GB) would take multiple \
+             samples to converge — defeats 'proactive'."
+        );
+
+        // --- observed (1.5 GB) ≤ ema (2 GB) → no-op. Monotone:
+        // memory.peak never decreases, but the EMA might exceed the
+        // CURRENT peak if a prior build of this pname was bigger.
+        let updated = db
+            .update_ema_peak_memory_proactive(&drv_path, 3 * GB / 2)
+            .await?;
+        assert!(!updated, "observed ≤ ema → no-op");
+        let ema = fetch_ema().await?;
+        assert!(
+            ema.is_some_and(|m| (m - (2 * GB) as f64).abs() < 1.0),
+            "observed ≤ ema: unchanged at 2 GB, got {ema:?}"
+        );
+
+        // --- Terminal derivation → no-op. Completion already wrote the
+        // authoritative value; a late-arriving Progress (race with
+        // completion on the wire) must not clobber it.
+        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_path = $1")
+            .bind(&drv_path)
+            .execute(&test_db.pool)
+            .await?;
+        let updated = db
+            .update_ema_peak_memory_proactive(&drv_path, 4 * GB)
+            .await?;
+        assert!(
+            !updated,
+            "terminal status → filtered by partial-index WHERE"
+        );
+        let ema = fetch_ema().await?;
+        assert!(
+            ema.is_some_and(|m| (m - (2 * GB) as f64).abs() < 1.0),
+            "terminal: still 2 GB (4 GB sample rejected), got {ema:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Proactive ema when the existing EMA is NULL: a build_history
+    /// row exists (duration seeded) but no memory signal yet (prior
+    /// completion had peak_memory_bytes=0 → None). The `IS NULL OR <`
+    /// guard initializes rather than blocking on `NULL < $2` (which is
+    /// NULL, not false, in PG — but NULL fails WHERE, so without the
+    /// `IS NULL OR` disjunct this case would silently no-op forever).
+    #[tokio::test]
+    async fn test_mid_build_sample_initializes_null_ema() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        let drv_path = rio_test_support::fixtures::test_drv_path("nullmem");
+        insert_test_derivation(&db, "nullmem").await?;
+
+        // Seed: duration EMA exists, memory EMA is NULL (None in the
+        // update_build_history call).
+        db.update_build_history("test-pkg", "x86_64-linux", 30.0, None, None, None)
+            .await?;
+        let before: Option<f64> = sqlx::query_scalar(
+            "SELECT ema_peak_memory_bytes FROM build_history WHERE pname = 'test-pkg'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(before, None, "precondition: mem EMA must be NULL");
+
+        let updated = db
+            .update_ema_peak_memory_proactive(&drv_path, 500_000_000)
+            .await?;
+        assert!(updated, "NULL < observed → initializes");
+        let after: Option<f64> = sqlx::query_scalar(
+            "SELECT ema_peak_memory_bytes FROM build_history WHERE pname = 'test-pkg'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert!(
+            after.is_some_and(|m| (m - 500_000_000.0).abs() < 1.0),
+            "NULL → initialized to observed, got {after:?}"
+        );
 
         Ok(())
     }

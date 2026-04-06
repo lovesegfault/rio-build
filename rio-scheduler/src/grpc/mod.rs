@@ -738,6 +738,10 @@ impl WorkerService for SchedulerGrpc {
         let actor_for_recv = self.actor.clone();
         let log_buffers = Arc::clone(&self.log_buffers);
         let worker_id_for_recv = worker_id.clone();
+        // For the Progress arm's proactive ema. None in bare-actor
+        // tests (new_for_tests) — Progress becomes a no-op there,
+        // which is what those tests want anyway.
+        let pool_for_recv = self.pool.clone();
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
             loop {
@@ -806,14 +810,72 @@ impl WorkerService for SchedulerGrpc {
                                 break;
                             }
                         }
-                        rio_proto::types::worker_message::Msg::Progress(_progress) => {
-                            // TODO(P0266): proactive ema — update
-                            // ema_peak_memory_bytes mid-build so the
-                            // next submit is right-sized before the
-                            // current build finishes (or OOMs). No-op
-                            // until P0266 lands the actor command.
+                        rio_proto::types::worker_message::Msg::Progress(progress) => {
+                            // Proactive ema: if a running build's
+                            // cgroup memory.peak already exceeds what
+                            // the EMA predicted, overwrite the EMA NOW
+                            // — the next submit of this drv gets
+                            // right-sized before this build even
+                            // finishes. Same penalty-overwrite
+                            // semantics as completion.rs:363's
+                            // r[sched.classify.penalty-overwrite],
+                            // just triggered earlier (mid-build
+                            // instead of post-completion).
+                            //
                             // r[sched.preempt.never-running] holds:
                             // advisory only, never kills/migrates.
+                            // No CancelBuild, no reassignment — the
+                            // only side effect is a db write.
+                            //
+                            // Worker populates ONLY
+                            // resources.memory_used_bytes with cgroup
+                            // memory.peak (see rio-worker runtime.rs);
+                            // 0 = "couldn't read memory.peak" (ENOENT
+                            // during daemon-spawn), same no-signal
+                            // sentinel as completion's peak_mem filter.
+                            //
+                            // `tokio::spawn`: the db write is
+                            // fire-and-forget. `.await`ing inline
+                            // would stall the stream loop on PG
+                            // latency — a slow PG roundtrip would
+                            // backpressure the worker's log batches
+                            // and completion reports. Progress is
+                            // advisory; a dropped or failed update is
+                            // caught by the next 10s tick (memory.peak
+                            // is monotone — no info lost).
+                            if let (Some(pool), Some(res)) = (&pool_for_recv, &progress.resources)
+                                && res.memory_used_bytes > 0
+                            {
+                                let db = crate::db::SchedulerDb::new(pool.clone());
+                                let drv_path = progress.drv_path;
+                                let observed = res.memory_used_bytes;
+                                tokio::spawn(async move {
+                                    match db
+                                        .update_ema_peak_memory_proactive(&drv_path, observed)
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            metrics::counter!(
+                                                "rio_scheduler_ema_proactive_updates_total"
+                                            )
+                                            .increment(1);
+                                        }
+                                        Ok(false) => {
+                                            // observed ≤ ema, or no
+                                            // build_history row yet
+                                            // (first ever build of this
+                                            // pname). Expected path.
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                drv_path = %drv_path,
+                                                error = %e,
+                                                "proactive ema update failed"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
                         }
                         rio_proto::types::worker_message::Msg::LogBatch(log) => {
                             // Two-step: buffer (never blocks on actor), then forward.
