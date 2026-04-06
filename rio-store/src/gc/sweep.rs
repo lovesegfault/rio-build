@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use tracing::{info, instrument, warn};
 
 use crate::backend::chunk::ChunkBackend;
@@ -113,6 +113,41 @@ pub async fn sweep(
 ) -> Result<GcStats, SweepAbort> {
     let mut stats = GcStats::default();
 
+    if unreachable.is_empty() {
+        // Skip connection acquire + temp-table setup for no-op sweeps.
+        return Ok(stats);
+    }
+
+    // Dedicated connection: the sweep_unreachable temp table below is
+    // session-scoped and must survive across the batch-transaction
+    // boundaries in the loop. pool.begin() would acquire a FRESH
+    // connection each time — temp table invisible. Acquiring once
+    // and begin()-ing on this conn keeps the session (and temp table)
+    // alive for the whole sweep. Temp table drops automatically when
+    // conn returns to the pool and PG eventually recycles it; the
+    // defensive DROP IF EXISTS handles the case where a prior sweep
+    // crashed mid-run and this call happens to reacquire that same
+    // pooled connection with stale state.
+    let mut conn = pool.acquire().await?;
+
+    // Temp-table anti-join for the reference re-check. Before P0449
+    // the re-check bound the WHOLE `unreachable` Vec<bytea> as $2
+    // inside the per-path loop: N paths × N-element bytea[] = O(N²)
+    // wire bytes. A 10k-path sweep sent ~3GB of $2 traffic, and
+    // `<> ALL(array_param)` is an unindexed linear scan PG-side.
+    // Populating once here is O(N) wire; NOT EXISTS against the
+    // PRIMARY KEY is an index probe per-row.
+    sqlx::query("DROP TABLE IF EXISTS sweep_unreachable")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("CREATE TEMP TABLE sweep_unreachable (path_hash bytea PRIMARY KEY)")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("INSERT INTO sweep_unreachable (path_hash) SELECT unnest($1::bytea[])")
+        .bind(&unreachable)
+        .execute(&mut *conn)
+        .await?;
+
     for batch in unreachable.chunks(SWEEP_BATCH_SIZE) {
         // Shutdown check at batch boundary — safe point (no tx
         // open). A large sweep (thousands of batches × ~100ms each)
@@ -129,7 +164,7 @@ pub async fn sweep(
             );
             return Err(SweepAbort::Shutdown);
         }
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
 
         for store_path_hash in batch {
             // Step 1: SELECT chunk_list FOR UPDATE. NULL for
@@ -173,27 +208,29 @@ pub async fn sweep(
             // is TEXT[] (store_path strings, not hashes). The GIN index
             // (migration 008) makes `= ANY("references")` index-scannable.
             //
-            // `store_path_hash <> ALL($2)` excludes referrers that are
-            // themselves in the current unreachable batch. Without this,
-            // mutual-reference cycles (A→B, B→A) and self-references
-            // (A→A) are never swept: the re-check sees an intra-batch
-            // referrer and skips both paths forever. Bound against the
-            // WHOLE `unreachable` set (not `batch`) — a cycle may span
-            // SWEEP_BATCH_SIZE boundaries.
+            // The NOT EXISTS anti-join against sweep_unreachable
+            // excludes referrers that are themselves in the unreachable
+            // set. Without this, mutual-reference cycles (A→B, B→A) and
+            // self-references (A→A) are never swept: the re-check sees
+            // an intra-set referrer and skips both paths forever. The
+            // temp table holds the WHOLE `unreachable` set (not just
+            // `batch`) — a cycle may span SWEEP_BATCH_SIZE boundaries.
             // r[impl store.gc.sweep-cycle-reclaim]
             let has_referrer: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS (
-                  SELECT 1 FROM narinfo
+                  SELECT 1 FROM narinfo n
                    WHERE (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
-                         = ANY("references")
-                     AND store_path_hash <> ALL($2)
+                         = ANY(n."references")
+                     AND NOT EXISTS (
+                       SELECT 1 FROM sweep_unreachable su
+                        WHERE su.path_hash = n.store_path_hash
+                     )
                    LIMIT 1
                 )
                 "#,
             )
             .bind(store_path_hash)
-            .bind(&unreachable)
             .fetch_one(&mut *tx)
             .await?;
             if has_referrer {
@@ -672,8 +709,8 @@ mod tests {
 
     /// Mutual-reference cycles (A→B, B→A) and self-references (A→A)
     /// must be swept when both sides are in the unreachable set.
-    /// Without `store_path_hash <> ALL($batch)` in the re-check, the
-    /// re-check sees an intra-batch referrer and skips both forever.
+    /// Without the sweep_unreachable anti-join in the re-check, the
+    /// re-check sees an intra-set referrer and skips both forever.
     // r[verify store.gc.sweep-cycle-reclaim]
     #[tokio::test]
     async fn sweep_reclaims_two_cycle() {

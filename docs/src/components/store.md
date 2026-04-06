@@ -255,7 +255,9 @@ The sweep-phase reference re-check MUST exclude referrers that are
 themselves in the current unreachable batch. Without this exclusion,
 mutual-reference cycles (A→B, B→A) and self-references (A→A) are never
 swept: the re-check sees an intra-batch referrer and skips both paths
-forever. The exclusion is `AND store_path_hash <> ALL($batch_hashes)`.
+forever. The exclusion is a `NOT EXISTS` anti-join against a temp table
+populated once at sweep start with the full unreachable set — O(N) wire
+bytes and an index probe per row, vs. O(N²) for a per-path array bind.
 
 r[store.gc.tenant-retention]
 A store path survives GC if *any* tenant that has referenced it still
