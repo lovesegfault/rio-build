@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
 use human_panic::setup_panic;
 
+mod aws;
 mod config;
 mod fuzz;
 mod git;

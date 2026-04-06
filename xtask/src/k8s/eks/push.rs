@@ -238,11 +238,8 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
 }
 
 async fn ecr_login(registry: &str, region: &str, authfile: &str) -> Result<()> {
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region.to_string()))
-        .load()
-        .await;
-    let ecr = aws_sdk_ecr::Client::new(&conf);
+    let conf = crate::aws::config(Some(region)).await;
+    let ecr = aws_sdk_ecr::Client::new(conf);
     let resp = ecr.get_authorization_token().send().await?;
     let token = resp
         .authorization_data()

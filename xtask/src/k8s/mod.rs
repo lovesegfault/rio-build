@@ -1,11 +1,14 @@
 //! Unified k8s deploy. One command surface, provider flag selects
 //! k3s (local) vs eks (AWS).
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::config::XtaskConfig;
 use crate::{helm, kube, sh, ui};
@@ -66,7 +69,7 @@ pub async fn ensure_namespaces(client: &kube::Client) -> anyhow::Result<()> {
 
 /// Ordered bring-up phases for `k8s up`. `up` with no phase flags runs
 /// the full sequence; flags select a subset (still in this order).
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Phase {
     Bootstrap,
     Provision,
@@ -78,11 +81,11 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Canonical order for selection/validation. Execution is NOT
-    /// strictly this order: ami runs concurrently with the
-    /// bootstrap→provision→kubeconfig→push chain (see
-    /// [`run_up_phases`]). deploy reads both `.rio-ami-tag` and the
-    /// image tag, so it waits on the join of both branches.
+    /// Canonical order for selection/validation. Execution order is the
+    /// DAG induced by [`Phase::deps`] — [`run_up_phases`] runs every
+    /// phase whose dependencies are satisfied concurrently (ami ∥
+    /// bootstrap→provision; kubeconfig ∥ push after provision; deploy
+    /// waits on the join of all three).
     pub const ALL: [Phase; 7] = [
         Phase::Bootstrap,
         Phase::Provision,
@@ -102,6 +105,31 @@ impl Phase {
             Phase::Push => "push",
             Phase::Deploy => "deploy",
             Phase::Envoy => "envoy",
+        }
+    }
+
+    /// Declarative dependency table for the [`run_up_phases`] DAG
+    /// executor. A phase is ready when every dep listed here is done
+    /// (or wasn't selected — unselected deps are treated as
+    /// pre-satisfied so `up --push --deploy` works without
+    /// `--provision`).
+    ///
+    /// Adding an edge: extend the match arm. The `phase_deps_acyclic`
+    /// test catches cycles.
+    pub const fn deps(self) -> &'static [Phase] {
+        match self {
+            Phase::Bootstrap | Phase::Ami => &[],
+            Phase::Provision => &[Phase::Bootstrap],
+            Phase::Kubeconfig => &[Phase::Provision],
+            // ECR repo URL is a tofu output → push can't start before
+            // provision. build (the nix-build half) is folded into the
+            // push phase rather than threaded as a separate output —
+            // it's fast and local, not worth a typed-output channel.
+            Phase::Push => &[Phase::Provision],
+            // deploy reads `.rio-ami-tag` (ami) + image tag (push) +
+            // talks to the cluster (kubeconfig).
+            Phase::Deploy => &[Phase::Kubeconfig, Phase::Push, Phase::Ami],
+            Phase::Envoy => &[Phase::Deploy],
         }
     }
 }
@@ -532,29 +560,27 @@ struct PhaseParams<'a> {
     skip_preflight: bool,
 }
 
-/// Concurrent core of `up`: the AMI build runs in parallel with the
-/// bootstrap → provision → kubeconfig → push chain; deploy and envoy
-/// run sequentially after both complete.
+/// Concurrent core of `up`: a ready-set DAG executor over
+/// [`Phase::deps`]. A phase spawns the moment all its (selected)
+/// dependencies have completed; independent chains run concurrently
+/// (ami ∥ bootstrap→provision; kubeconfig ∥ push after provision).
 ///
-/// **`join!`, not `try_join!`**: provision is `terraform apply` —
-/// real cloud resources mid-creation. An AMI build failure (nix eval
-/// error, S3 throttle) MUST NOT drop the infra future on the floor;
+/// **No cancellation on error.** provision is `terraform apply` — real
+/// cloud resources mid-creation. An AMI build failure (nix eval error,
+/// S3 throttle) MUST NOT drop an in-flight provision on the floor;
 /// that would abandon a half-applied tofu plan with state drift the
-/// operator then has to untangle by hand. Both branches always run to
-/// completion; errors are collected and surfaced together afterward.
-///
-/// `push` stays in the infra chain (not a third concurrent branch):
-/// the ECR repo URL is a tofu output, so push can't start until
-/// provision has finished.
+/// operator then has to untangle by hand. In-flight phases always run
+/// to completion. A failed phase's *dependents* are never spawned
+/// (their dep is never marked done); *siblings* on independent dep
+/// chains continue. Errors are collected and surfaced together after
+/// the graph drains.
 ///
 /// `ami_branch` / `envoy_branch` are injected so tests can mock them
-/// without an EKS account or a live cluster. Phase selection still
-/// applies: a phase not in `selected` is a no-op even if its branch
-/// future would do work — callers pass `async { Ok(()) }` for an
-/// unselected ami.
+/// without an EKS account or a live cluster. They are only awaited if
+/// their phase is in `selected`.
 ///
 /// `ui::step` is concurrency-aware (span-scoped depth, see ui.rs
-/// `DepthLayer`); interleaved ✓/✗ lines from the two branches render
+/// `DepthLayer`); interleaved ✓/✗ lines from concurrent phases render
 /// with correct indentation. The transient spinner is best-effort
 /// (last-enter-wins) — acceptable, the persistent tree is the record.
 async fn run_up_phases<A, E>(
@@ -569,48 +595,142 @@ where
     A: Future<Output = Result<()>>,
     E: Future<Output = Result<()>>,
 {
-    let sel = |ph| selected.contains(&ph);
+    type PhaseFut<'a> = Pin<Box<dyn Future<Output = (Phase, Result<()>)> + 'a>>;
 
-    let infra_branch = async {
-        if sel(Phase::Bootstrap) {
-            ui::step("bootstrap", || p.bootstrap(cfg)).await?;
-        }
-        if sel(Phase::Provision) {
-            ui::step("provision", || p.provision(cfg, pp.yes, pp.nodes)).await?;
-        }
-        if sel(Phase::Kubeconfig) {
-            ui::step("kubeconfig", || p.kubeconfig(cfg)).await?;
-        }
-        if sel(Phase::Push) {
-            let images = ui::step("build", || p.build(cfg)).await?;
-            ui::step("push", || p.push(&images, cfg)).await?;
-        }
-        anyhow::Ok(())
-    };
-
-    // Both run to completion regardless of the other erroring — see
-    // doc comment. ui::step already printed per-branch ✗ lines; the
-    // bail here is the combined summary for the outer `k8s up` ✗.
-    let (ami_r, infra_r) = tokio::join!(ami_branch, infra_branch);
-    match (ami_r, infra_r) {
-        (Ok(()), Ok(())) => {}
-        (Err(e), Ok(())) => return Err(e.context("ami branch failed")),
-        (Ok(()), Err(e)) => return Err(e.context("infra branch failed")),
-        (Err(ea), Err(ei)) => {
-            bail!("both concurrent branches failed:\n  ami:   {ea:#}\n  infra: {ei:#}")
-        }
-    }
-
-    if sel(Phase::Deploy) {
-        ui::step("deploy", || {
-            p.deploy(cfg, pp.log_level, pp.tenant, pp.skip_preflight)
+    // Per-phase unsatisfied-dep set, restricted to `selected`: a dep
+    // the user didn't ask for is treated as already satisfied (so
+    // `up --push --deploy` works without `--provision`).
+    let mut pending: HashMap<Phase, HashSet<Phase>> = selected
+        .iter()
+        .map(|&ph| {
+            let deps = ph
+                .deps()
+                .iter()
+                .copied()
+                .filter(|d| selected.contains(d))
+                .collect();
+            (ph, deps)
         })
-        .await?;
+        .collect();
+    let mut started: HashSet<Phase> = HashSet::new();
+    let mut failed: Vec<(Phase, anyhow::Error)> = Vec::new();
+    let mut running: FuturesUnordered<PhaseFut<'_>> = FuturesUnordered::new();
+    // Injected futures, taken exactly once when their phase dispatches.
+    let mut ami = Some(ami_branch);
+    let mut envoy = Some(envoy_branch);
+
+    loop {
+        // Spawn every selected phase whose pending-dep set is empty.
+        // FuturesUnordered borrows nothing of ours (the boxed futures
+        // borrow `p`/`cfg`/`pp`, all of which outlive `running`), so
+        // pushing here while results are still queued is fine.
+        for &ph in selected {
+            if started.contains(&ph) || !pending[&ph].is_empty() {
+                continue;
+            }
+            started.insert(ph);
+            let fut: PhaseFut<'_> = match ph {
+                Phase::Bootstrap => {
+                    Box::pin(async move { (ph, ui::step("bootstrap", || p.bootstrap(cfg)).await) })
+                }
+                Phase::Provision => {
+                    let (yes, nodes) = (pp.yes, pp.nodes);
+                    Box::pin(async move {
+                        (
+                            ph,
+                            ui::step("provision", || p.provision(cfg, yes, nodes)).await,
+                        )
+                    })
+                }
+                Phase::Kubeconfig => {
+                    Box::pin(
+                        async move { (ph, ui::step("kubeconfig", || p.kubeconfig(cfg)).await) },
+                    )
+                }
+                Phase::Ami => {
+                    let a = ami.take().expect("ami dispatched once");
+                    // Caller already wraps in ui::step("ami", ..).
+                    Box::pin(async move { (ph, a.await) })
+                }
+                Phase::Push => Box::pin(async move {
+                    // build+push kept as one phase: build is fast and
+                    // local; not worth a typed-output channel between
+                    // DAG nodes for one edge.
+                    let r = async {
+                        let images = ui::step("build", || p.build(cfg)).await?;
+                        ui::step("push", || p.push(&images, cfg)).await
+                    }
+                    .await;
+                    (ph, r)
+                }),
+                Phase::Deploy => {
+                    let (lvl, ten, skip) = (pp.log_level, pp.tenant, pp.skip_preflight);
+                    Box::pin(async move {
+                        (
+                            ph,
+                            ui::step("deploy", || p.deploy(cfg, lvl, ten, skip)).await,
+                        )
+                    })
+                }
+                Phase::Envoy => {
+                    let e = envoy.take().expect("envoy dispatched once");
+                    Box::pin(async move { (ph, ui::step("envoy", || e).await) })
+                }
+            };
+            running.push(fut);
+        }
+
+        // Drain one. `next()` never aborts the rest — in-flight phases
+        // run to completion regardless of what we do with the result.
+        let Some((ph, r)) = running.next().await else {
+            break; // nothing running, nothing ready ⇒ graph drained
+        };
+        match r {
+            // Success: clear this phase from every dependent's pending
+            // set; next spawn pass picks up newly-ready phases.
+            Ok(()) => {
+                for deps in pending.values_mut() {
+                    deps.remove(&ph);
+                }
+            }
+            // Failure: record but DON'T remove from dependents' pending
+            // sets — they stay non-empty forever, so dependents never
+            // spawn. Siblings (independent pending sets) are unaffected.
+            Err(e) => failed.push((ph, e)),
+        }
     }
-    if sel(Phase::Envoy) {
-        ui::step("envoy", || envoy_branch).await?;
+
+    if failed.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let skipped: Vec<_> = selected
+        .iter()
+        .filter(|ph| !started.contains(ph))
+        .map(|ph| ph.name())
+        .collect();
+    for ph in &skipped {
+        ui::step_skip(ph, "dependency failed");
+    }
+    let skipped_ctx = if skipped.is_empty() {
+        String::new()
+    } else {
+        format!(" (skipped: {})", skipped.join(", "))
+    };
+    match failed.len() {
+        // Single failure: hoist the real anyhow::Error so the
+        // backtrace/context chain survives.
+        1 => {
+            let (ph, e) = failed.pop().unwrap();
+            Err(e.context(format!("{} failed{skipped_ctx}", ph.name())))
+        }
+        n => {
+            let mut msg = format!("{n} phases failed{skipped_ctx}:");
+            for (ph, e) in &failed {
+                msg.push_str(&format!("\n  {}: {e:#}", ph.name()));
+            }
+            bail!(msg)
+        }
+    }
 }
 
 /// Open a tunnel to the gateway, resolve the ssh-ng:// store URL,
@@ -723,12 +843,15 @@ mod tests {
 
     type Log = Arc<Mutex<Vec<&'static str>>>;
 
-    /// Records call order; per-method delays make `tokio::join!`
+    /// Records call order; per-method delays make ready-set
     /// interleaving observable. `provision_done` is the witness for
     /// the "ami error must not cancel provision" test.
     struct MockProvider {
         log: Log,
         provision_delay: Duration,
+        kubeconfig_delay: Duration,
+        push_delay: Duration,
+        push_err: bool,
         provision_done: Arc<AtomicBool>,
     }
 
@@ -737,6 +860,9 @@ mod tests {
             Self {
                 log,
                 provision_delay: Duration::ZERO,
+                kubeconfig_delay: Duration::ZERO,
+                push_delay: Duration::ZERO,
+                push_err: false,
                 provision_done: Arc::new(AtomicBool::new(false)),
             }
         }
@@ -761,6 +887,8 @@ mod tests {
             Ok(())
         }
         async fn kubeconfig(&self, _: &XtaskConfig) -> Result<()> {
+            self.record("kubeconfig:start");
+            tokio::time::sleep(self.kubeconfig_delay).await;
             self.record("kubeconfig");
             Ok(())
         }
@@ -772,6 +900,10 @@ mod tests {
             })
         }
         async fn push(&self, _: &BuiltImages, _: &XtaskConfig) -> Result<()> {
+            tokio::time::sleep(self.push_delay).await;
+            if self.push_err {
+                bail!("mock push failed");
+            }
             self.record("push");
             Ok(())
         }
@@ -888,7 +1020,7 @@ mod tests {
         assert!(log.lock().unwrap().contains(&"provision"));
         // overall result is still Err, with the ami context
         let e = r.unwrap_err().to_string();
-        assert!(e.contains("ami branch failed"), "err: {e}");
+        assert!(e.contains("ami failed"), "err: {e}");
     }
 
     /// Phase selection still gates: `up --push --deploy` runs only
@@ -912,6 +1044,133 @@ mod tests {
         .unwrap();
 
         assert_eq!(&*log.lock().unwrap(), &["build", "push", "deploy"]);
+    }
+
+    /// True ready-set (not layer-barrier, not serial chain): kubeconfig
+    /// and push both depend ONLY on provision, so once provision
+    /// finishes both must spawn in the same tick. Each one's start
+    /// marker must land before the OTHER's finish marker — proves
+    /// overlap regardless of which finishes first.
+    #[tokio::test]
+    async fn up_dag_kubeconfig_push_concurrent() {
+        let log: Log = Arc::default();
+        let mut p = MockProvider::new(log.clone());
+        p.provision_delay = Duration::from_millis(5);
+        p.kubeconfig_delay = Duration::from_millis(30);
+        p.push_delay = Duration::from_millis(30);
+        let cfg = XtaskConfig::default();
+
+        run_up_phases(
+            &p,
+            &cfg,
+            &[
+                Phase::Bootstrap,
+                Phase::Provision,
+                Phase::Kubeconfig,
+                Phase::Push,
+            ],
+            pp(),
+            async { Ok(()) },
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
+
+        let log = log.lock().unwrap();
+        // kubeconfig started before push finished
+        assert!(
+            pos(&log, "kubeconfig:start") < pos(&log, "push"),
+            "log: {log:?}"
+        );
+        // push started (build is its first sub-step) before kubeconfig
+        // finished
+        assert!(pos(&log, "build") < pos(&log, "kubeconfig"), "log: {log:?}");
+        // and both honored the provision dep
+        assert!(pos(&log, "provision") < pos(&log, "kubeconfig:start"));
+        assert!(pos(&log, "provision") < pos(&log, "build"));
+    }
+
+    /// A failed phase poisons its dependents but NOT its siblings.
+    /// push errors immediately; kubeconfig (sibling — same dep,
+    /// independent of push) is mid-flight and runs to completion;
+    /// deploy (depends on push) is never spawned.
+    #[tokio::test]
+    async fn up_dag_failed_dep_skips_dependents_not_siblings() {
+        let log: Log = Arc::default();
+        let mut p = MockProvider::new(log.clone());
+        p.kubeconfig_delay = Duration::from_millis(20);
+        p.push_err = true;
+        let cfg = XtaskConfig::default();
+
+        let r = run_up_phases(
+            &p,
+            &cfg,
+            // Ami unselected → pre-satisfied, so deploy's only blockers
+            // are kubeconfig+push.
+            &[
+                Phase::Provision,
+                Phase::Kubeconfig,
+                Phase::Push,
+                Phase::Deploy,
+            ],
+            pp(),
+            async { Ok(()) },
+            async { Ok(()) },
+        )
+        .await;
+
+        let log = log.lock().unwrap();
+        // sibling completed despite push having already failed
+        assert!(log.contains(&"kubeconfig"), "log: {log:?}");
+        // dependent never spawned
+        assert!(!log.contains(&"deploy"), "log: {log:?}");
+        // error names the failed phase and the skipped dependent
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("push failed"), "err: {e}");
+        assert!(e.contains("skipped: deploy"), "err: {e}");
+    }
+
+    /// Kahn's-algorithm cycle check over [`Phase::deps`]. Runs as a
+    /// test (not `debug_assert!` in `deps()`) because `deps()` is
+    /// `const fn` and the table is static — one check at test time is
+    /// enough to catch a bad edge added in review.
+    #[test]
+    fn phase_deps_acyclic() {
+        let mut indeg: HashMap<Phase, usize> =
+            Phase::ALL.iter().map(|&p| (p, p.deps().len())).collect();
+        // self-edges would otherwise pass Kahn (indeg never hits 0 →
+        // caught as "cycle"), but flag them explicitly for the message.
+        for &p in &Phase::ALL {
+            assert!(!p.deps().contains(&p), "{p:?} depends on itself");
+        }
+        let mut ready: Vec<Phase> = indeg
+            .iter()
+            .filter(|&(_, &d)| d == 0)
+            .map(|(&p, _)| p)
+            .collect();
+        let mut visited = 0;
+        while let Some(p) = ready.pop() {
+            visited += 1;
+            for &succ in &Phase::ALL {
+                if succ.deps().contains(&p) {
+                    let d = indeg.get_mut(&succ).unwrap();
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.push(succ);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            visited,
+            Phase::ALL.len(),
+            "Phase::deps() has a cycle: unresolved = {:?}",
+            indeg
+                .iter()
+                .filter(|&(_, &d)| d > 0)
+                .map(|(p, _)| p)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

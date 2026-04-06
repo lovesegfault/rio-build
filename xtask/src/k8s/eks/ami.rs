@@ -97,11 +97,8 @@ pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let region = tf.get("region")?;
     let cluster = tf.get("cluster_name")?;
 
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region.clone()))
-        .load()
-        .await;
-    let ec2 = aws_sdk_ec2::Client::new(&conf);
+    let conf = crate::aws::config(Some(&region)).await;
+    let ec2 = aws_sdk_ec2::Client::new(conf);
 
     // I-182 fast path: every requested arch already registered for
     // this content tag → write the handoff file and stop. No build,
@@ -122,81 +119,107 @@ pub async fn run_phase(arch: AmiArch) -> Result<()> {
         return Ok(());
     }
 
-    for &(attr, ref ec2_arch, k8s_arch) in arch.targets() {
-        // Per-arch idempotency: a prior partial push (e.g. x86 done,
-        // aarch64 interrupted) skips the done arch.
-        if let Some(existing) = find_existing(&ec2, &ami_tag, k8s_arch).await? {
-            info!(
-                "AMI {existing} already tagged rio.build/ami={ami_tag} ({k8s_arch}) — skipping upload"
-            );
-            tag(&ec2, &existing, &ami_tag, &sha, k8s_arch, &cluster).await?;
-            continue;
-        }
-
-        let out = ui::step(&format!("nix build .#node-ami-{attr}"), || async {
-            let sh = shell()?;
-            run_read(cmd!(
-                sh,
-                "nix build -L --no-link --print-out-paths .#node-ami-{attr}"
-            ))
-            .await
-        })
-        .await?;
-        let info = read_image_info(Path::new(out.trim()))?;
-
-        let snap = ui::step(&format!("coldsnap upload ({k8s_arch})"), || async {
-            // coldsnap's Rust SDK doesn't pick up SSO creds from
-            // ~/.aws/sso/cache the way awscli does. Resolve via awscli
-            // (which DOES) and pass the temp creds explicitly.
-            // --wait polls until `completed` (register-image rejects
-            // `pending`). stdout is the snapshot ID.
-            let sh = shell()?;
-            let creds: serde_json::Value = serde_json::from_str(
-                &run_read(cmd!(sh, "aws configure export-credentials")).await?,
-            )?;
-            let _r = sh.push_env("AWS_REGION", &region);
-            let _a = sh.push_env(
-                "AWS_ACCESS_KEY_ID",
-                creds["AccessKeyId"].as_str().unwrap_or_default(),
-            );
-            let _s = sh.push_env(
-                "AWS_SECRET_ACCESS_KEY",
-                creds["SecretAccessKey"].as_str().unwrap_or_default(),
-            );
-            let _t = sh.push_env(
-                "AWS_SESSION_TOKEN",
-                creds["SessionToken"].as_str().unwrap_or_default(),
-            );
-            let file = &info.file;
-            let desc = format!("rio-nixos-node {ami_tag} {k8s_arch}");
-            run_read(cmd!(
-                sh,
-                "coldsnap upload --wait --omit-zero-blocks --description {desc} {file}"
-            ))
-            .await
-            .map(|s| s.trim().to_string())
-        })
-        .await?;
-
-        let ami = ui::step(&format!("register-image ({k8s_arch})"), || {
-            register(&ec2, &info, &snap, ec2_arch.clone(), &ami_tag, k8s_arch)
-        })
-        .await?;
-
-        ui::step(&format!("tag {ami}"), || {
-            tag(&ec2, &ami, &ami_tag, &sha, k8s_arch, &cluster)
-        })
-        .await?;
-
-        info!(
-            "registered {ami} (snapshot {snap}) — rio.build/ami={ami_tag} kubernetes.io/arch={k8s_arch}"
-        );
+    // join_all (not try_join_all): both arches run to completion even
+    // if one fails — don't cancel a ~4 GB coldsnap upload mid-flight
+    // because the other arch errored. Same "let in-flight work finish"
+    // principle as run_up_phases. The nix build + upload are ~10–15 min
+    // each and fully independent, so AmiArch::All halves wall time.
+    // `nix build -L` stderr from both interleaves; ui::step is
+    // concurrency-safe (f8db656d).
+    let results = futures_util::future::join_all(
+        arch.targets()
+            .iter()
+            .map(|t| build_and_register_one(&ec2, &ami_tag, &sha, &region, &cluster, t)),
+    )
+    .await;
+    for r in results {
+        r?;
     }
     // Handoff to deploy: same shape as .rio-image-tag (push.rs).
     std::fs::write(
         crate::sh::repo_root().join(".rio-ami-tag"),
         format!("{ami_tag}\n"),
     )?;
+    Ok(())
+}
+
+/// One arch's build → coldsnap upload → register-image → tag pipeline.
+/// Extracted from `run_phase` so `AmiArch::All` runs both concurrently.
+async fn build_and_register_one(
+    ec2: &aws_sdk_ec2::Client,
+    ami_tag: &str,
+    sha: &str,
+    region: &str,
+    cluster: &str,
+    &(attr, ref ec2_arch, k8s_arch): &(&'static str, ArchitectureValues, &'static str),
+) -> Result<()> {
+    // Per-arch idempotency: a prior partial push (e.g. x86 done,
+    // aarch64 interrupted) skips the done arch.
+    if let Some(existing) = find_existing(ec2, ami_tag, k8s_arch).await? {
+        info!(
+            "AMI {existing} already tagged rio.build/ami={ami_tag} ({k8s_arch}) — skipping upload"
+        );
+        tag(ec2, &existing, ami_tag, sha, k8s_arch, cluster).await?;
+        return Ok(());
+    }
+
+    let out = ui::step(&format!("nix build .#node-ami-{attr}"), || async {
+        let sh = shell()?;
+        run_read(cmd!(
+            sh,
+            "nix build -L --no-link --print-out-paths .#node-ami-{attr}"
+        ))
+        .await
+    })
+    .await?;
+    let info = read_image_info(Path::new(out.trim()))?;
+
+    let snap = ui::step(&format!("coldsnap upload ({k8s_arch})"), || async {
+        // coldsnap's Rust SDK doesn't pick up SSO creds from
+        // ~/.aws/sso/cache the way awscli does. Resolve via awscli
+        // (which DOES) and pass the temp creds explicitly.
+        // --wait polls until `completed` (register-image rejects
+        // `pending`). stdout is the snapshot ID.
+        let sh = shell()?;
+        let creds: serde_json::Value =
+            serde_json::from_str(&run_read(cmd!(sh, "aws configure export-credentials")).await?)?;
+        let _r = sh.push_env("AWS_REGION", region);
+        let _a = sh.push_env(
+            "AWS_ACCESS_KEY_ID",
+            creds["AccessKeyId"].as_str().unwrap_or_default(),
+        );
+        let _s = sh.push_env(
+            "AWS_SECRET_ACCESS_KEY",
+            creds["SecretAccessKey"].as_str().unwrap_or_default(),
+        );
+        let _t = sh.push_env(
+            "AWS_SESSION_TOKEN",
+            creds["SessionToken"].as_str().unwrap_or_default(),
+        );
+        let file = &info.file;
+        let desc = format!("rio-nixos-node {ami_tag} {k8s_arch}");
+        run_read(cmd!(
+            sh,
+            "coldsnap upload --wait --omit-zero-blocks --description {desc} {file}"
+        ))
+        .await
+        .map(|s| s.trim().to_string())
+    })
+    .await?;
+
+    let ami = ui::step(&format!("register-image ({k8s_arch})"), || {
+        register(ec2, &info, &snap, ec2_arch.clone(), ami_tag, k8s_arch)
+    })
+    .await?;
+
+    ui::step(&format!("tag {ami}"), || {
+        tag(ec2, &ami, ami_tag, sha, k8s_arch, cluster)
+    })
+    .await?;
+
+    info!(
+        "registered {ami} (snapshot {snap}) — rio.build/ami={ami_tag} kubernetes.io/arch={k8s_arch}"
+    );
     Ok(())
 }
 
@@ -238,11 +261,8 @@ async fn find_existing(
 /// drifted from the last-pushed AMI (I-182 fallback recomputed a tag
 /// that didn't exist).
 pub async fn assert_registered(ami_tag: &str, region: &str) -> Result<()> {
-    let conf = aws_config::from_env()
-        .region(aws_config::Region::new(region.to_string()))
-        .load()
-        .await;
-    let ec2 = aws_sdk_ec2::Client::new(&conf);
+    let conf = crate::aws::config(Some(region)).await;
+    let ec2 = aws_sdk_ec2::Client::new(conf);
     for &(_, _, k8s_arch) in AmiArch::All.targets() {
         if find_existing(&ec2, ami_tag, k8s_arch).await?.is_none() {
             anyhow::bail!(

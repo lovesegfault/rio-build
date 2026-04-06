@@ -392,11 +392,8 @@ async fn tofu_destroy() -> Result<()> {
                 .as_ref()
                 .and_then(|t| t.get("region").ok())
                 .unwrap_or_else(|| "us-east-2".into());
-            let conf = aws_config::from_env()
-                .region(aws_config::Region::new(region))
-                .load()
-                .await;
-            let ec2 = aws_sdk_ec2::Client::new(&conf);
+            let conf = crate::aws::config(Some(&region)).await;
+            let ec2 = aws_sdk_ec2::Client::new(conf);
             let vpc_filter = aws_sdk_ec2::types::Filter::builder()
                 .name("vpc-id")
                 .values(&vpc)
