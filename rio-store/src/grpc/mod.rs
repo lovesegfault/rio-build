@@ -808,12 +808,16 @@ impl StoreService for StoreServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
-        // Empty name is a gateway bug here — the quota gate short-circuits
-        // single-tenant mode BEFORE hitting this RPC. Reject explicitly.
-        let name = NormalizedName::try_from(req.tenant_name.as_str()).map_err(|_| {
-            Status::invalid_argument(
-                "tenant_name is empty (gateway should gate single-tenant mode before calling)",
-            )
+        // Invalid name is a gateway bug here — the quota gate
+        // short-circuits single-tenant mode BEFORE hitting this RPC.
+        // Reject explicitly. `NameError::InteriorWhitespace` catches
+        // the `"team a"` case that an ad-hoc `.trim()` would miss —
+        // a rejected InvalidArgument with the specific error beats a
+        // NOT_FOUND from the PG lookup downstream.
+        let name = NormalizedName::new(&req.tenant_name).map_err(|e| {
+            Status::invalid_argument(format!(
+                "tenant_name invalid: {e} (gateway should gate single-tenant mode before calling)"
+            ))
         })?;
 
         let quota = crate::gc::tenant::tenant_quota_by_name(&self.pool, &name)

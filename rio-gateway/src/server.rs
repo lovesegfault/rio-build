@@ -382,7 +382,7 @@ impl russh::server::Server for GatewayServer {
             limiter: self.limiter.clone(),
             quota_cache: self.quota_cache.clone(),
             sessions: HashMap::new(),
-            tenant_name: String::new(),
+            tenant_name: None,
             jwt_token: None,
             auth_attempted: false,
             conn_permit,
@@ -469,8 +469,12 @@ pub struct ConnectionHandler {
     /// Tenant name from the matched `authorized_keys` entry's comment
     /// field. Set in `auth_publickey` when a key matches. Passed to
     /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
-    /// it to a UUID via the `tenants` table. Empty = single-tenant mode.
-    tenant_name: String,
+    /// it to a UUID via the `tenants` table. `None` = single-tenant
+    /// mode (empty comment) OR malformed comment (interior whitespace
+    /// — logged at warn in `auth_publickey`). The [`NormalizedName`]
+    /// type guarantees the `Some` case is trimmed and whitespace-free
+    /// — no downstream `.trim()` needed anywhere in the request chain.
+    tenant_name: Option<NormalizedName>,
     /// Minted JWT, set in `auth_publickey` IFF `jwt_signing_key` is
     /// `Some` and minting succeeds. Cloned into every
     /// `SessionContext` spawned from this connection (multiple SSH
@@ -507,7 +511,9 @@ impl ConnectionHandler {
 
     /// ResolveTenant round-trip + JWT mint. Called from
     /// `auth_publickey` when `jwt_signing_key` is `Some` and
-    /// `tenant_name` is non-empty.
+    /// `tenant_name` is `Some` — the caller pattern-matches and
+    /// passes the [`NormalizedName`] directly, so this function
+    /// never sees single-tenant mode.
     ///
     /// Returns `(token, jti)` on success. Error covers: RPC timeout,
     /// scheduler unavailable, unknown tenant (InvalidArgument), UUID
@@ -530,12 +536,13 @@ impl ConnectionHandler {
     async fn resolve_and_mint(
         &mut self,
         signing_key: &SigningKey,
+        tenant_name: &NormalizedName,
     ) -> anyhow::Result<(String, String)> {
         use rio_proto::scheduler::ResolveTenantRequest;
 
         let timeout = std::time::Duration::from_millis(self.jwt_config.resolve_timeout_ms);
         let req = tonic::Request::new(ResolveTenantRequest {
-            tenant_name: self.tenant_name.clone(),
+            tenant_name: tenant_name.to_string(),
         });
 
         // `scheduler_client` is `SchedulerServiceClient<Channel>`.
@@ -685,17 +692,15 @@ impl Handler for ConnectionHandler {
         if let Some(matched) = matched {
             // Normalize via the shared newtype so every tenant-name
             // consumer (scheduler, store, quota cache) sees the exact
-            // same bytes. Empty comment → empty String (single-tenant
-            // mode); downstream sites gate on `.is_empty()` already.
-            // Stored as `String` (not the newtype) because the field
-            // plumbs through `run_protocol` / `SessionContext` /
-            // `SubmitBuildRequest.tenant_name` which are all String —
-            // changing the whole chain's type is P0298 scope, not this
-            // refactor. The normalization BEHAVIOR is centralized even
-            // if the TYPE isn't (yet).
-            self.tenant_name = NormalizedName::from_maybe_empty(matched.comment())
-                .map(String::from)
-                .unwrap_or_default();
+            // same bytes. Empty or malformed comment (interior
+            // whitespace — `"team a"`) → None (single-tenant mode);
+            // the `Option<NormalizedName>` type IS the mode flag,
+            // threaded all the way through `run_protocol` /
+            // `SessionContext` / `translate::build_submit_request`.
+            // No downstream `.trim()` or `.is_empty()` checks needed
+            // — the type guarantees the `Some` case is trimmed,
+            // non-empty, and whitespace-free.
+            self.tenant_name = NormalizedName::from_maybe_empty(matched.comment());
 
             // r[impl gw.jwt.dual-mode]
             //
@@ -732,11 +737,11 @@ impl Handler for ConnectionHandler {
             // SigningKey itself isn't cloned (zeroize-on-drop still
             // fires exactly once, on the original Arc's last drop).
             if let Some(signing_key) = self.jwt_signing_key.clone()
-                && !self.tenant_name.is_empty()
+                && let Some(tenant_name) = self.tenant_name.clone()
             {
-                match self.resolve_and_mint(&signing_key).await {
+                match self.resolve_and_mint(&signing_key, &tenant_name).await {
                     Ok((token, jti)) => {
-                        debug!(jti = %jti, tenant = %self.tenant_name, "minted session JWT");
+                        debug!(jti = %jti, tenant = %tenant_name, "minted session JWT");
                         self.jwt_token = Some(token);
                     }
                     Err(e) if self.jwt_config.required => {
@@ -747,7 +752,7 @@ impl Handler for ConnectionHandler {
                         // auth failed and disconnect cleanly).
                         warn!(
                             error = %e,
-                            tenant = %self.tenant_name,
+                            tenant = %tenant_name,
                             peer = ?self.peer_addr,
                             "JWT mint failed and jwt.required=true; rejecting SSH auth"
                         );
@@ -765,7 +770,7 @@ impl Handler for ConnectionHandler {
                         // Same behavior as key=None / pre-JWT.
                         warn!(
                             error = %e,
-                            tenant = %self.tenant_name,
+                            tenant = %tenant_name,
                             "JWT mint failed; degrading to tenant_name fallback"
                         );
                         metrics::counter!("rio_gateway_jwt_mint_degraded_total").increment(1);
@@ -777,7 +782,7 @@ impl Handler for ConnectionHandler {
             info!(
                 user = user,
                 peer = ?self.peer_addr,
-                tenant = %self.tenant_name,
+                tenant = self.tenant_name.as_deref().unwrap_or("-"),
                 "SSH public key authentication accepted"
             );
             Ok(Auth::Accept)

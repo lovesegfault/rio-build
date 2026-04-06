@@ -85,23 +85,23 @@ impl QuotaCache {
     /// — quota is a soft limit, not a security gate). The error is
     /// logged so ops sees repeated misses.
     ///
-    /// `tenant_name` empty → no RPC, `Unlimited`. Empty name =
+    /// `tenant_name` `None` → no RPC, `Unlimited`. `None` =
     /// single-tenant mode per `r[gw.auth.tenant-from-key-comment]`;
-    /// there's no tenant row to quota against.
+    /// there's no tenant row to quota against. The caller has already
+    /// normalized via [`NormalizedName::from_maybe_empty`] at the SSH
+    /// auth boundary — this function doesn't re-normalize.
     pub async fn check(
         &self,
         store_client: &mut StoreServiceClient<Channel>,
-        tenant_name: &str,
+        tenant_name: Option<&NormalizedName>,
     ) -> QuotaVerdict {
-        // Single-tenant mode (empty name from authorized_keys comment)
-        // → no quota row to gate on. `from_maybe_empty` is the same
-        // normalization the scheduler/store use — one place defines
-        // what "empty tenant" means.
-        let Some(tenant_name) = NormalizedName::from_maybe_empty(tenant_name) else {
+        // Single-tenant mode → no quota row to gate on. The type
+        // carries the normalization guarantee; None IS the mode flag.
+        let Some(tenant_name) = tenant_name else {
             return QuotaVerdict::Unlimited;
         };
 
-        if let Some(v) = self.lookup_fresh(&tenant_name) {
+        if let Some(v) = self.lookup_fresh(tenant_name) {
             return Self::classify(v);
         }
 

@@ -60,7 +60,11 @@ impl GatewaySession {
         let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
         let mut sc = store_client.clone();
         let mut scc = scheduler_client.clone();
-        let tenant = tenant_name.to_string();
+        // Normalize at the test boundary — same path as production
+        // (auth_publickey does the same from_maybe_empty on the
+        // authorized_keys comment). Empty string → None (single-
+        // tenant mode); non-empty → Some(NormalizedName).
+        let tenant = rio_common::tenant::NormalizedName::from_maybe_empty(tenant_name);
         let shutdown = CancellationToken::new();
         let shutdown_child = shutdown.child_token();
         // Fire-and-forget: aborted in Drop or awaited in finish()/join_server().

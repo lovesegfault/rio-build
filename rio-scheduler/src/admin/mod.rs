@@ -717,14 +717,18 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         let req = request.into_inner();
-        // NormalizedName trims + rejects empty in one step. The same
-        // normalization runs at every read path (gateway server.rs,
-        // cache auth.rs, SubmitBuild) — storing the normalized form
-        // here means every `WHERE tenant_name = $1` lookup matches.
-        // Without it, " team-a " never matches 'team-a' and the
-        // operator spends an afternoon staring at invisible whitespace.
-        let tenant_name = NormalizedName::try_from(req.tenant_name.as_str())
-            .map_err(|_| Status::invalid_argument("tenant_name is required"))?;
+        // NormalizedName trims + rejects empty AND interior whitespace.
+        // The same normalization runs at every read path (gateway
+        // server.rs, cache auth.rs, SubmitBuild) — storing the
+        // normalized form here means every `WHERE tenant_name = $1`
+        // lookup matches. Without it, " team-a " never matches
+        // 'team-a' and the operator spends an afternoon staring at
+        // invisible whitespace. Interior-whitespace rejection
+        // (`"team a"` → `InteriorWhitespace`) catches the typo class
+        // where an authorized_keys comment has a space instead of a
+        // dash — the tenant would be unreachable otherwise.
+        let tenant_name = NormalizedName::new(&req.tenant_name)
+            .map_err(|e| Status::invalid_argument(format!("invalid tenant_name: {e}")))?;
         let cache_token = req.cache_token.as_deref().map(str::trim);
         if cache_token.is_some_and(str::is_empty) {
             return Err(Status::invalid_argument(

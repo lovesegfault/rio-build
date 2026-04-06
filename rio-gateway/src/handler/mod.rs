@@ -29,6 +29,7 @@ use tracing::{debug, error, instrument, warn};
 
 use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
 use rio_common::limits::MAX_NAR_SIZE;
+use rio_common::tenant::NormalizedName;
 
 use crate::quota::{QuotaCache, QuotaVerdict, human_bytes};
 use crate::ratelimit::TenantLimiter;
@@ -158,8 +159,10 @@ pub struct SessionContext {
     pub active_build_ids: HashMap<String, u64>,
     /// Tenant name from the matched `authorized_keys` entry's comment.
     /// Sent in `SubmitBuildRequest.tenant_name`; scheduler resolves to UUID.
-    /// Empty = single-tenant mode.
-    pub tenant_name: String,
+    /// `None` = single-tenant mode (empty or malformed comment). The
+    /// [`NormalizedName`] type guarantees the `Some` case is trimmed
+    /// and whitespace-free — no downstream `.trim()` needed.
+    pub tenant_name: Option<NormalizedName>,
     /// Per-session JWT minted at SSH auth time. Injected as
     /// `x-rio-tenant-token` on outbound gRPC calls. `None` when
     /// the gateway's signing key is unconfigured → dual-mode
@@ -183,7 +186,7 @@ impl SessionContext {
     pub fn new(
         store_client: StoreServiceClient<Channel>,
         scheduler_client: SchedulerServiceClient<Channel>,
-        tenant_name: String,
+        tenant_name: Option<NormalizedName>,
         jwt_token: Option<String>,
         limiter: TenantLimiter,
         quota_cache: QuotaCache,

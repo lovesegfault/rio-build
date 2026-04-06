@@ -812,6 +812,25 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
         .await;
     assert_eq!(ws_name.unwrap_err().code(), tonic::Code::InvalidArgument);
 
+    // Interior whitespace ("team a") → InvalidArgument. Almost
+    // certainly a misconfigured authorized_keys comment (space where a
+    // dash was intended). If this stored successfully, no read path
+    // would ever find it — they all look up the dashed form.
+    let interior_ws = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team a".into(),
+            ..Default::default()
+        }))
+        .await;
+    let err = interior_ws.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("interior whitespace"),
+        "error should name the InteriorWhitespace reason so the \
+         operator knows it's a space-vs-dash typo, not an empty name: {}",
+        err.message()
+    );
+
     // Empty cache_token → InvalidArgument (round-3 fix; this test was
     // missing — the validation existed but was never exercised).
     let empty_tok = svc

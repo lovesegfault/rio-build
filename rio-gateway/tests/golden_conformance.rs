@@ -63,7 +63,7 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
             &mut writer,
             &mut store_client,
             &mut scheduler_client,
-            String::new(),
+            None, // golden conformance is tenant-agnostic
             None,
             rio_gateway::TenantLimiter::disabled(),
             rio_gateway::QuotaCache::new(),
@@ -167,7 +167,7 @@ async fn test_golden_live_handshake() -> anyhow::Result<()> {
             &mut writer,
             &mut store_client,
             &mut scheduler_client,
-            String::new(),
+            None, // golden conformance is tenant-agnostic
             None,
             rio_gateway::TenantLimiter::disabled(),
             rio_gateway::QuotaCache::new(),

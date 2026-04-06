@@ -18,6 +18,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use rio_common::tenant::NormalizedName;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -38,13 +39,18 @@ pub struct CacheAuth {
 ///
 /// Both fields move together: either both `Some` (token matched a
 /// tenant row) or both `None` (anonymous). Not an `Option<(Uuid,
-/// String)>` because the two fields are read independently —
+/// NormalizedName)>` because the two fields are read independently —
 /// `tenant_id` for the narinfo handler's `path_tenants` JOIN filter
 /// (`query_by_hash_part_for_tenant`), `tenant_name` for logging.
+///
+/// `tenant_name` is [`NormalizedName`] — PG stores already-normalized
+/// values (the write path is `CreateTenant` which validates via
+/// `NormalizedName::new`), so wrapping on read is an invariant check,
+/// not a transformation.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedTenant {
     pub tenant_id: Option<Uuid>,
-    pub tenant_name: Option<String>,
+    pub tenant_name: Option<NormalizedName>,
 }
 
 // r[impl store.cache.auth-bearer]
@@ -80,9 +86,24 @@ pub async fn auth_middleware(
             .await
             {
                 Ok(Some((id, name))) => {
+                    // PG stores already-normalized names (CreateTenant
+                    // validates via NormalizedName::new before INSERT).
+                    // Wrapping here is an invariant check: if `new`
+                    // ever rejected a PG-stored name, it would mean a
+                    // write-path bypass (manual INSERT, migration, or
+                    // a CreateTenant bug). `.ok()` degrades to None
+                    // (same as anonymous) rather than failing the
+                    // request — auth still succeeded, just without a
+                    // trustworthy display name.
+                    let tenant_name = NormalizedName::new(&name).ok();
+                    debug_assert!(
+                        tenant_name.is_some(),
+                        "PG-stored tenant_name failed normalization — \
+                         write-path bypass? name={name:?}"
+                    );
                     request.extensions_mut().insert(AuthenticatedTenant {
                         tenant_id: Some(id),
-                        tenant_name: Some(name),
+                        tenant_name,
                     });
                     next.run(request).await
                 }
