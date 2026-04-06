@@ -101,8 +101,10 @@ pub(super) fn build_headless_service(wp: &BuilderPool, oref: OwnerReference) -> 
         },
         spec: Some(ServiceSpec {
             cluster_ip: Some("None".into()),
+            // I-085: omit ip_families — explicit lists are validated even
+            // under PreferDualStack and rejected on single-stack clusters
+            // (EKS ipFamily=ipv6). Mirrors chart default (46b3c590).
             ip_family_policy: Some("PreferDualStack".into()),
-            ip_families: Some(vec!["IPv6".into(), "IPv4".into()]),
             selector: Some(labels),
             ports: Some(vec![ServicePort {
                 name: Some("metrics".into()),
