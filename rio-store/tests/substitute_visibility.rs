@@ -19,7 +19,7 @@ use rio_proto::{
     StoreAdminServiceClient, StoreAdminServiceServer, StoreServiceClient, StoreServiceServer,
 };
 use rio_store::grpc::{StoreAdminServiceImpl, StoreServiceImpl};
-use rio_store::signing::Signer;
+use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
 use rio_test_support::fixtures::{make_nar, test_store_path};
 use rio_test_support::{TestDb, TestResult, seed_tenant};
@@ -239,6 +239,163 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     switch.set(Some(tid_a));
     let resp = client.query_path_info(req()).await?.into_inner();
     assert_eq!(resp.store_path, path, "tenant A sees own path");
+
+    server.abort();
+    Ok(())
+}
+
+// r[verify store.substitute.tenant-sig-visibility]
+/// PutPath→scheduler timing-window regression: a freshly-built,
+/// rio-signed path with zero `path_tenants` rows must be visible to
+/// its owning tenant via the cluster-key union.
+///
+/// `path_tenants` is populated by the scheduler at build-completion
+/// (`upsert_path_tenants` in rio-scheduler), NOT by PutPath. During
+/// the intervening window the gate sees count=0 and fires. Without
+/// the cluster key in the trusted set, the rio signature fails to
+/// verify against the tenant's upstream-only `trusted_keys` and the
+/// path returns `NotFound` to its own tenant.
+///
+/// Sequence:
+///   1. Seed a path signed by the CLUSTER key (not any upstream key).
+///   2. Do NOT populate path_tenants (scheduler not yet caught up).
+///   3. Tenant has upstream trusted_keys that do NOT include the
+///      cluster key (normal config — tenants don't list the cluster
+///      key in their upstream config).
+///   4. QueryPathInfo from that tenant → path visible (cluster sig
+///      verifies against the unioned cluster key).
+///
+/// Before the fix, step 4 returns NotFound. After, it returns the
+/// path.
+#[tokio::test]
+async fn sig_visibility_gate_cluster_key_timing_window() -> TestResult {
+    use base64::Engine;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let tid = seed_tenant(&db.pool, "timing-window").await;
+
+    // ── Cluster key (what rio signs freshly-built paths with) ──────────
+    let cluster_seed = [0x55u8; 32];
+    let cluster_signer = Signer::from_seed("rio-cluster", &cluster_seed);
+    let cluster_trusted_entry = cluster_signer.trusted_key_entry();
+
+    // ── Unrelated upstream key (tenant trusts this, NOT cluster) ───────
+    // The bug: gate checked ONLY upstream keys. A cluster-signed path
+    // with no upstream-key match → NotFound.
+    let upstream_seed = [0x66u8; 32];
+    let pk_upstream = ed25519_dalek::SigningKey::from_bytes(&upstream_seed).verifying_key();
+    let trusted_upstream = format!(
+        "key-upstream:{}",
+        base64::engine::general_purpose::STANDARD.encode(pk_upstream.as_bytes())
+    );
+
+    // ── Service WITH signer (cluster key available for the union) ──────
+    // Substituter must be present or the gate short-circuits early.
+    let sub = Arc::new(Substituter::new(db.pool.clone(), None));
+    let ts = TenantSigner::new(cluster_signer.clone(), db.pool.clone());
+    let store_svc = StoreServiceImpl::new(db.pool.clone())
+        .with_substituter(sub)
+        .with_signer(ts);
+    let admin_svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+    let switch = SwitchableTenant::new();
+    let router = Server::builder()
+        .layer(tonic::service::InterceptorLayer::new(switch.interceptor()))
+        .add_service(StoreServiceServer::new(store_svc))
+        .add_service(StoreAdminServiceServer::new(admin_svc));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
+    let channel = Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut client = StoreServiceClient::new(channel.clone());
+    let mut admin = StoreAdminServiceClient::new(channel);
+
+    // ── Tenant trusts ONLY the upstream key, NOT cluster ───────────────
+    // This is the normal config: tenants configure upstream cache
+    // pubkeys. The cluster key is rio-internal; tenants never list it.
+    admin
+        .add_upstream(AddUpstreamRequest {
+            tenant_id: tid.to_string(),
+            url: "https://cache-timing.example".into(),
+            priority: 50,
+            trusted_keys: vec![trusted_upstream],
+            sig_mode: "keep".into(),
+        })
+        .await?;
+
+    // Confirm cluster key is NOT in the DB-side trusted set. The gate's
+    // union adds it at query-time, not here.
+    let db_trusted: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT unnest(trusted_keys) FROM tenant_upstreams WHERE tenant_id = $1",
+    )
+    .bind(tid)
+    .fetch_all(&db.pool)
+    .await?;
+    assert!(
+        !db_trusted.contains(&cluster_trusted_entry),
+        "precondition: tenant's DB-side trusted_keys must NOT include cluster key \
+         (union happens at query-time in the gate)"
+    );
+
+    // ── Seed path signed by CLUSTER key ────────────────────────────────
+    // Simulates: PutPath completed (rio-signed the path), scheduler
+    // hasn't yet run upsert_path_tenants.
+    let path = test_store_path("timing-window-p");
+    let (nar, nar_hash) = make_nar(b"timing-window-payload");
+    let fp = rio_nix::narinfo::fingerprint(&path, &nar_hash, nar.len() as u64, &[]);
+    let sig_cluster = cluster_signer.sign(&fp);
+
+    let path_hash = sha256(&path);
+    sqlx::query(
+        "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, signatures) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&path_hash[..])
+    .bind(&path)
+    .bind(&nar_hash[..])
+    .bind(nar.len() as i64)
+    .bind(&[sig_cluster][..])
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+         VALUES ($1, 'complete', $2)",
+    )
+    .bind(&path_hash[..])
+    .bind(&nar[..])
+    .execute(&db.pool)
+    .await?;
+
+    // ── Precondition: path_tenants count = 0 ───────────────────────────
+    // Proves we're testing the timing window, not the post-scheduler
+    // path (where count ≥ 1 bypasses the gate entirely). If this fails,
+    // every assertion below is vacuous.
+    let pt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&path_hash[..])
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pt_count, 0,
+        "precondition: zero path_tenants rows (scheduler not yet caught up)"
+    );
+
+    // ── THE assertion: cluster-signed path visible during the window ───
+    // Before the fix: gate checks only upstream keys → cluster sig
+    // fails → NotFound. After: cluster key is in the trusted set →
+    // cluster sig verifies → path returned.
+    switch.set(Some(tid));
+    let resp = client
+        .query_path_info(QueryPathInfoRequest {
+            store_path: path.clone(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.store_path, path,
+        "cluster-signed path must be visible during PutPath→scheduler window \
+         (cluster key unioned into trusted set)"
+    );
 
     server.abort();
     Ok(())

@@ -459,8 +459,8 @@ impl StoreServiceImpl {
     /// Cross-tenant sig-visibility gate. A substituted path (one that
     /// was NEVER built by any tenant — zero `path_tenants` rows) is
     /// visible to the requesting tenant only if one of its `signatures`
-    /// verifies against the requesting tenant's upstream `trusted_keys`
-    /// union.
+    /// verifies against the requesting tenant's trusted set: upstream
+    /// `trusted_keys` ∪ the rio cluster key.
     ///
     /// Returns `true` if visible, `false` if hidden (caller returns
     /// NotFound). Unauthenticated requests (`tenant_id = None`) pass
@@ -476,15 +476,12 @@ impl StoreServiceImpl {
     ///     (built paths are trusted regardless of signature)
     ///   - 0 rows → substitution-only → apply gate
     ///
-    /// This correctly handles the pre-`path_tenants` timing window:
-    /// freshly-PutPath'd paths (not yet completion-upserted) pass
-    /// through because the `COUNT=0` check includes the requesting
-    /// tenant — we also check if THEY own it. A path that nobody
-    /// `path_tenants`'d AND was never substituted has no signatures
-    /// either (PutPath only signs if signer is configured, and the
-    /// gate's `any_sig_trusted` check will fail on empty sigs, hiding
-    /// it). In practice the gate only ever fires on real substituted
-    /// paths.
+    /// The PutPath→scheduler timing window (path IS built, count=0
+    /// because the scheduler hasn't yet run `upsert_path_tenants`) is
+    /// handled by the cluster-key union below: a rio-signed path
+    /// always verifies against the cluster key, so it passes the gate
+    /// regardless of the tenant's upstream config. Only paths signed
+    /// ONLY by upstream keys the tenant doesn't trust are gated out.
     async fn sig_visibility_gate(
         &self,
         tenant_id: Option<uuid::Uuid>,
@@ -517,26 +514,30 @@ impl StoreServiceImpl {
 
         if owned || any_built {
             // Built path (someone `path_tenants`'d it). Not
-            // substitution-only → skip gate.
-            //
-            // This also covers the freshly-PutPath'd case: PutPath
-            // doesn't populate path_tenants (the scheduler does on
-            // completion), so a PutPath → QueryPathInfo roundtrip
-            // within the same process sees count=0. But such a path
-            // also has no upstream sigs to gate on — it was signed
-            // by rio/tenant key, not an upstream. We let it through
-            // to preserve PutPath → QueryPathInfo correctness.
+            // substitution-only → skip gate. The freshly-PutPath'd
+            // case (count=0) falls through to the cluster-key union
+            // below — NOT this branch.
             return Ok(true);
         }
 
         // Zero path_tenants rows → substitution-only path. Gate it.
-        let trusted = metadata::upstreams::tenant_trusted_keys(&self.pool, tid)
+        // r[impl store.substitute.tenant-sig-visibility]
+        // Trusted = tenant's upstream pubkeys ∪ rio cluster key.
+        // Without the cluster key, a freshly-built path (rio-signed,
+        // path_tenants not yet populated by the scheduler) would be
+        // gated as "untrusted substitution" and return NotFound to
+        // its own tenant during the PutPath→scheduler window.
+        let mut trusted = metadata::upstreams::tenant_trusted_keys(&self.pool, tid)
             .await
             .map_err(|e| metadata_status("sig_visibility_gate: trusted_keys", e))?;
+        if let Some(ts) = &self.signer {
+            trusted.push(ts.cluster().trusted_key_entry());
+        }
         if trusted.is_empty() {
-            // Tenant trusts no upstream keys → any substituted path
-            // is invisible. Correct: opting out of substitution means
-            // opting out of seeing others' substituted paths too.
+            // Tenant trusts no upstream keys AND no signer configured
+            // → any substituted path is invisible. With a signer the
+            // cluster key was pushed above, so this is the no-signer
+            // edge only.
             return Ok(false);
         }
 
