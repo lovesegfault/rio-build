@@ -207,6 +207,31 @@ fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&s
             (Some(_), None) => false,   // misconfigured worker: reject
             (Some(t), Some(wc)) => t == wc,
         }
+        // r[impl sched.assign.resource-fit]
+        // Resource fit (ADR-020 §5): worker's memory ceiling must
+        // cover the derivation's bucketed estimate. Overflow routing
+        // falls out naturally — a 16Gi drv fits a 64Gi worker.
+        //
+        // Three unknown-ceiling cases all treated as always-fits:
+        //  - est=None: cold start, no history — any worker ok
+        //  - last_resources=None: no heartbeat resources yet
+        //  - memory_total_bytes==0: cgroup memory.max=max (no k8s
+        //    limit) → builder's cgroup.rs:667 sends 0 for the
+        //    None-to-0 unwrap. Per that comment, 0 ONLY means
+        //    "unknown ceiling"; no code path sets it to mean
+        //    "zero memory".
+        //
+        // The size-class match above STAYS — it's gated on
+        // target_class.is_some() (Static mode). Manifest-mode pods
+        // carry no size_class so the match passes through; this
+        // filter does the work.
+        && match drv.est_memory_bytes {
+            None => true,
+            Some(est) => match w.last_resources.as_ref().map(|r| r.memory_total_bytes) {
+                None | Some(0) => true,
+                Some(ceiling) => ceiling >= est,
+            },
+        }
 }
 
 /// Select the best worker for a derivation.
@@ -709,6 +734,131 @@ mod tests {
         // Sanity: same worker IS accepted when scheduler not classifying.
         let result = best_executor(&workers, &make_drv(), &dag, None);
         assert_eq!(result.as_deref(), Some("misconfigured"));
+    }
+
+    // r[verify sched.assign.resource-fit]
+    // ADR-020 §5: worker.memory_total_bytes >= drv.est_memory_bytes
+    // as a hard filter. Uses `hard_filter` directly (not
+    // `best_executor`) to isolate the resource-fit arm from warm-
+    // gate/scoring — the filter's pass/fail is what's under test.
+    #[test]
+    fn resource_fit_filter() {
+        const GIB: u64 = 1 << 30;
+
+        // Plan T3 case matrix. Worker memory via last_resources;
+        // drv estimate via est_memory_bytes.
+        let mk_worker = |mem_total: u64| {
+            let mut w = make_worker("w", 4, 0);
+            w.last_resources = Some(rio_proto::types::ResourceUsage {
+                memory_total_bytes: mem_total,
+                ..Default::default()
+            });
+            w
+        };
+        let mk_drv = |est: Option<u64>| {
+            let mut d = make_drv();
+            d.est_memory_bytes = est;
+            d
+        };
+
+        // Worker 8Gi, drv est 6Gi → fits (6 ≤ 8).
+        assert!(
+            hard_filter(&mk_worker(8 * GIB), &mk_drv(Some(6 * GIB)), None),
+            "8Gi worker must fit 6Gi drv"
+        );
+
+        // Worker 8Gi, drv est 12Gi → doesn't fit.
+        assert!(
+            !hard_filter(&mk_worker(8 * GIB), &mk_drv(Some(12 * GIB)), None),
+            "8Gi worker must REJECT 12Gi drv"
+        );
+
+        // Worker 64Gi, drv est 6Gi → fits (overflow routing: a small
+        // drv CAN go to a big pod if that's what's idle).
+        assert!(
+            hard_filter(&mk_worker(64 * GIB), &mk_drv(Some(6 * GIB)), None),
+            "64Gi worker must fit 6Gi drv (overflow routing)"
+        );
+
+        // Worker 0 (cgroup memory.max=max → unlimited), drv 128Gi
+        // → fits. rio-builder cgroup.rs:667 unwrap_or(0) → 0 means
+        // "unknown ceiling", never "zero memory".
+        assert!(
+            hard_filter(&mk_worker(0), &mk_drv(Some(128 * GIB)), None),
+            "memory_total_bytes=0 (unlimited cgroup) must fit any drv"
+        );
+
+        // Drv est=None (cold start: no history) → any worker fits,
+        // even an 8Gi one. The manifest omits cold-start drvs too
+        // (controller uses operator floor) — consistent with "no
+        // estimate means no constraint".
+        assert!(
+            hard_filter(&mk_worker(8 * GIB), &mk_drv(None), None),
+            "est=None (cold start) must fit any worker"
+        );
+    }
+
+    // r[verify sched.assign.resource-fit]
+    // Worker with last_resources=None (no heartbeat resources yet)
+    // → unknown ceiling → fits. Separate from the 0-ceiling case:
+    // this is "heartbeat didn't carry resources" (proto field
+    // absent), not "heartbeat said unlimited". Both mean
+    // always-fits, but via different match arms.
+    #[test]
+    fn resource_fit_no_heartbeat_resources_fits() {
+        let w = make_worker("fresh", 4, 0); // last_resources defaults to None
+        assert!(w.last_resources.is_none(), "precondition: no resources");
+        let mut d = make_drv();
+        d.est_memory_bytes = Some(128 << 30); // 128Gi
+
+        assert!(
+            hard_filter(&w, &d, None),
+            "worker with no heartbeat resources must be treated as unknown-fits"
+        );
+    }
+
+    // r[verify sched.assign.resource-fit]
+    // Resource-fit is AND-ed with size-class, not replacing it. A
+    // worker that passes size-class but fails resource-fit → reject.
+    // A worker that passes resource-fit but fails size-class → reject.
+    // Proves the filter slots in the same position as has_capacity
+    // (hard filter preceding scoring) without disrupting Static mode.
+    #[test]
+    fn resource_fit_composes_with_size_class() {
+        const GIB: u64 = 1 << 30;
+
+        let mut small_8gi = make_worker("small-8gi", 4, 0);
+        small_8gi.size_class = Some("small".into());
+        small_8gi.last_resources = Some(rio_proto::types::ResourceUsage {
+            memory_total_bytes: 8 * GIB,
+            ..Default::default()
+        });
+
+        let mut drv_12gi = make_drv();
+        drv_12gi.est_memory_bytes = Some(12 * GIB);
+
+        // target=small matches size_class, but 8Gi < 12Gi → reject.
+        // Proves resource-fit runs AFTER size-class passes.
+        assert!(
+            !hard_filter(&small_8gi, &drv_12gi, Some("small")),
+            "size-class match must not bypass resource-fit"
+        );
+
+        // target=large fails size_class (worker is "small"), even
+        // though 8Gi > 6Gi would pass resource-fit → reject.
+        // Proves size-class still works (exit criterion).
+        let mut drv_6gi = make_drv();
+        drv_6gi.est_memory_bytes = Some(6 * GIB);
+        assert!(
+            !hard_filter(&small_8gi, &drv_6gi, Some("large")),
+            "resource-fit match must not bypass size-class"
+        );
+
+        // Both pass → accept.
+        assert!(
+            hard_filter(&small_8gi, &drv_6gi, Some("small")),
+            "both filters passing must accept"
+        );
     }
 
     #[test]

@@ -102,7 +102,7 @@ fn default_substitute_concurrency() -> usize {
 }
 
 fn default_headroom_multiplier() -> f64 {
-    1.25
+    rio_scheduler::DEFAULT_HEADROOM_MULTIPLIER
 }
 
 impl Default for Config {
@@ -466,6 +466,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.poison,
         cfg.retry,
         cfg.substitute_max_concurrent,
+        cfg.headroom_multiplier,
         Some(leader),
         Some(event_persist_tx),
         hmac_signer,

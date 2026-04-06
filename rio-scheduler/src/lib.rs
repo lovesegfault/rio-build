@@ -44,6 +44,10 @@ pub use assignment::SizeClassConfig;
 pub use state::{PoisonConfig, RetryPolicy};
 // Default for main.rs Config's `#[serde(default = ...)]` fn.
 pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
+// ADR-020 headroom default. main.rs's `default_headroom_multiplier()`
+// and `DagActor::new` both read this so the dispatch-time resource-fit
+// filter and the manifest RPC agree on the baked-in default.
+pub use estimator::DEFAULT_HEADROOM_MULTIPLIER;
 
 /// Shared sqlx migrator for the `migrations/` directory. See
 /// rio-store's MIGRATOR for rationale — same pattern.

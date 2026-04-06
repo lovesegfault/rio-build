@@ -76,6 +76,7 @@ impl ActorHandle {
             PoisonConfig::default(),
             RetryPolicy::default(),
             super::DEFAULT_SUBSTITUTE_CONCURRENCY,
+            crate::estimator::DEFAULT_HEADROOM_MULTIPLIER,
             None,
             None,
             None,
@@ -105,6 +106,7 @@ impl ActorHandle {
         poison_config: PoisonConfig,
         retry_policy: RetryPolicy,
         substitute_max_concurrent: usize,
+        headroom_mult: f64,
         leader: Option<crate::lease::LeaderState>,
         event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
         hmac_signer: Option<rio_common::hmac::HmacSigner>,
@@ -114,6 +116,7 @@ impl ActorHandle {
         let mut actor = DagActor::new(db, store_client)
             .with_size_classes(size_classes)
             .with_substitute_concurrency(substitute_max_concurrent)
+            .with_headroom_mult(headroom_mult)
             // r[impl sched.retry.per-worker-budget]
             // scheduler.md:110 — "Both knobs are configurable via
             // scheduler.toml". P0219 shipped the structs + builders;

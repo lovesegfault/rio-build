@@ -344,6 +344,22 @@ pub struct DerivationState {
     /// duration > 2× the class cutoff). `None` = size-classes not
     /// configured, or never assigned.
     pub assigned_size_class: Option<String>,
+    /// Bucketed memory estimate for the resource-fit placement filter
+    /// (ADR-020 §5). `hard_filter` checks `worker.memory_total_bytes
+    /// >= est` as a hard filter preceding transfer-cost scoring.
+    ///
+    /// Populated at DISPATCH time (`dispatch_ready`, same block as
+    /// `classify()`), not merge time — the estimator refreshes on Tick,
+    /// so a long-queued derivation picks up fresh history. `None` =
+    /// cold start (no `build_history` row, no `pname`, or no memory
+    /// sample); filter treats `None` as "any worker fits".
+    ///
+    /// Same `Estimator::bucketed_estimate()` + headroom as the
+    /// capacity manifest RPC → the controller's pod sizing and the
+    /// scheduler's placement filter agree on what "fits".
+    ///
+    /// NOT persisted (lossy on recovery; recomputed next dispatch).
+    pub est_memory_bytes: Option<u64>,
     /// ATerm-serialized .drv content, inlined by the gateway for
     /// nodes that will actually dispatch (outputs missing from store).
     /// Empty = worker fetches from store via GetPath (fallback
@@ -471,6 +487,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             assigned_size_class: None,
+            est_memory_bytes: None, // set at dispatch time
             drv_content: node.drv_content.clone(),
             retry_count: 0,
             infra_retry_count: 0,
@@ -550,6 +567,7 @@ impl DerivationState {
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
             assigned_size_class: None, // lossy; misclassification detector skips None
+            est_memory_bytes: None,    // lossy; recomputed at next dispatch
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
             // In-memory only — recovery resets to 0 (conservative).
@@ -627,6 +645,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_executor: None,
             assigned_size_class: None,
+            est_memory_bytes: None,
             drv_content: Vec::new(),
             retry_count: 0,
             infra_retry_count: 0,

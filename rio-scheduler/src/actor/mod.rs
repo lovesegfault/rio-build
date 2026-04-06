@@ -192,6 +192,16 @@ pub struct DagActor {
     /// `.await` on the same task blocks the executor thread. See
     /// dispatch.rs: guards are dropped before any await boundary.
     size_classes: Arc<parking_lot::RwLock<Vec<crate::assignment::SizeClassConfig>>>,
+    /// ADR-020 headroom multiplier for the resource-fit placement
+    /// filter. Applied in `dispatch_ready` when computing
+    /// `est_memory_bytes` via `Estimator::bucketed_estimate()`. Must
+    /// match the manifest RPC's headroom (both come from
+    /// `cfg.headroom_multiplier`) so the controller's pod sizing and
+    /// the dispatch filter agree on what fits.
+    ///
+    /// f64 not Arc: config-static, never mutated after
+    /// `with_headroom_mult()`. No runtime override.
+    headroom_mult: f64,
     /// Static TOML cutoffs, captured once in `with_size_classes()`
     /// BEFORE the rebalancer's first write. The rebalancer mutates
     /// `size_classes[i].cutoff_secs` in-place hourly; without this
@@ -314,6 +324,7 @@ impl DagActor {
             generation: Arc::new(AtomicU64::new(1)),
             self_tx: None,
             size_classes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            headroom_mult: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER,
             configured_cutoffs: Vec::new(),
             log_flush_tx: None,
             // Default true: non-K8s mode, always leader.
@@ -402,6 +413,18 @@ impl DagActor {
     /// this is plumbed rather than `cfg(test)`-gated.
     pub fn with_grpc_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.grpc_timeout = timeout;
+        self
+    }
+
+    /// Inject the ADR-020 headroom multiplier. main.rs threads
+    /// `cfg.headroom_multiplier` through so dispatch-time resource-fit
+    /// and the manifest RPC both see the same operator-configured
+    /// value. Default [`DEFAULT_HEADROOM_MULTIPLIER`] (1.25). Same
+    /// builder-style optionality as `with_size_classes`.
+    ///
+    /// [`DEFAULT_HEADROOM_MULTIPLIER`]: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER
+    pub fn with_headroom_mult(mut self, mult: f64) -> Self {
+        self.headroom_mult = mult;
         self
     }
 
