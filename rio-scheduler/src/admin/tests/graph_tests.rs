@@ -18,7 +18,7 @@ async fn seed_drv(
     worker: Option<&str>,
 ) -> anyhow::Result<uuid::Uuid> {
     let id: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status, assigned_worker_id)
+        "INSERT INTO derivations (drv_hash, drv_path, pname, system, status, assigned_builder_id)
          VALUES ($1, $2, 'pkg', 'x86_64-linux', $3, $4)
          RETURNING derivation_id",
     )

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE derivations\n             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,\n                 status = 'created', updated_at = now()\n             WHERE drv_hash = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0737389d7131111c2ff2af5a68b0fb903c0e5c3ab6bc08d7ce295d3a98e05229"
+}

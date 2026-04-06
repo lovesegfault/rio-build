@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE derivations SET failed_builders = array_append(failed_builders, $2), updated_at = now() WHERE drv_hash = $1 AND NOT ($2 = ANY(failed_builders))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "167cf9b8b76d0fb2ca968caff08f7612753111da5af871b2891fe0be88977a77"
+}

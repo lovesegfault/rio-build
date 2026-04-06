@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE derivations\n            SET status = $2, assigned_builder_id = $3, updated_at = now()\n            WHERE drv_hash = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "da0cfacd67a5379f4e8b9ec1594fa53ec5406e08aeb8e5156257c503eadc6f96"
+}

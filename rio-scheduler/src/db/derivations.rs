@@ -14,7 +14,7 @@ impl SchedulerDb {
         sqlx::query!(
             r#"
             UPDATE derivations
-            SET status = $2, assigned_worker_id = $3, updated_at = now()
+            SET status = $2, assigned_builder_id = $3, updated_at = now()
             WHERE drv_hash = $1
             "#,
             drv_hash.as_str(),
@@ -53,7 +53,7 @@ impl SchedulerDb {
         let result = sqlx::query!(
             r#"
             UPDATE derivations
-            SET status = $2, assigned_worker_id = NULL, updated_at = now()
+            SET status = $2, assigned_builder_id = NULL, updated_at = now()
             WHERE drv_hash = ANY($1::text[])
             "#,
             drv_hashes as &[&str],
@@ -96,8 +96,8 @@ impl SchedulerDb {
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations \
-             SET failed_workers = array_append(failed_workers, $2), updated_at = now() \
-             WHERE drv_hash = $1 AND NOT ($2 = ANY(failed_workers))",
+             SET failed_builders = array_append(failed_builders, $2), updated_at = now() \
+             WHERE drv_hash = $1 AND NOT ($2 = ANY(failed_builders))",
             drv_hash.as_str(),
             worker_id.as_str(),
         )
@@ -121,7 +121,7 @@ impl SchedulerDb {
         sqlx::query!(
             "UPDATE derivations \
              SET status = 'poisoned', poisoned_at = now(), \
-                 assigned_worker_id = NULL, updated_at = now() \
+                 assigned_builder_id = NULL, updated_at = now() \
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -136,7 +136,7 @@ impl SchedulerDb {
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, failed_workers = '{}', retry_count = 0,
+             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
                  status = 'created', updated_at = now()
              WHERE drv_hash = $1",
             drv_hash.as_str(),
@@ -168,7 +168,7 @@ impl SchedulerDb {
         sqlx::query_as(
             r#"
             SELECT derivation_id, drv_hash, drv_path, pname, system,
-                   failed_workers,
+                   failed_builders AS failed_workers,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
                        0.0
