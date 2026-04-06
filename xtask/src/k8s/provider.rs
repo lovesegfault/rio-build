@@ -92,6 +92,19 @@ pub trait Provider {
     /// Drop the guard to tear down.
     async fn tunnel(&self, local_port: u16) -> Result<super::shared::ProcessGuard>;
 
+    /// Open port-forwards to scheduler:9001 and store:9002, waiting
+    /// until both accept TCP. Drop the guards to tear down. Unlike
+    /// [`Provider::tunnel`], readiness is bare TCP accept — gRPC has
+    /// no greeting banner. Always `kubectl port-forward` (eks too: the
+    /// scheduler/store aren't behind the NLB; kubectl reaches them via
+    /// the apiserver proxy, which `aws eks update-kubeconfig` already
+    /// set up).
+    async fn tunnel_grpc(
+        &self,
+        sched_port: u16,
+        store_port: u16,
+    ) -> Result<(super::shared::ProcessGuard, super::shared::ProcessGuard)>;
+
     /// helm uninstall + tofu destroy (eks) | rook teardown (k3s) | kind delete.
     async fn destroy(&self, cfg: &XtaskConfig) -> Result<()>;
 }

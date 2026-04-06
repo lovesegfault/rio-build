@@ -1,6 +1,7 @@
 //! kube-rs helpers. Replaces the kubectl invocations in the deploy recipes.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,6 +13,7 @@ use kube::ResourceExt;
 use kube::api::{Api, AttachParams, ListParams, Patch, PatchParams};
 use serde::Serialize;
 use serde_json::json;
+use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 
 use crate::sh::repo_root;
@@ -139,6 +141,50 @@ pub async fn get_secret_key(
         .and_then(|v| String::from_utf8(v.0).ok()))
 }
 
+/// Fetch `tls.crt`, `tls.key`, `ca.crt` from a cert-manager Secret
+/// into a tempdir. Returns `(TempDir, cert, key, ca)` — hold the
+/// [`TempDir`] for the lifetime of whatever consumes the paths
+/// (dropping it removes the files).
+///
+/// cert-manager Secrets always populate all three keys once the
+/// Certificate reaches Ready; any missing key means issuance hasn't
+/// completed. Key file is written 0600 — tonic doesn't check, but it
+/// lands on the operator's laptop.
+pub async fn fetch_tls_to_tempdir(
+    client: &Client,
+    ns: &str,
+    secret: &str,
+) -> Result<(TempDir, PathBuf, PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let api: Api<Secret> = Api::namespaced(client.clone(), ns);
+    let data = api
+        .get_opt(secret)
+        .await?
+        .and_then(|s| s.data)
+        .with_context(|| {
+            format!("Secret {ns}/{secret} not found — wait for Certificate {secret} Ready")
+        })?;
+    let get = |k: &str| -> Result<Vec<u8>> {
+        data.get(k).map(|v| v.0.clone()).with_context(|| {
+            format!(
+                "Secret {ns}/{secret} missing key '{k}' — \
+                 cert-manager hasn't issued yet (wait for Certificate {secret} Ready)"
+            )
+        })
+    };
+
+    let dir = TempDir::new()?;
+    let cert = dir.path().join("tls.crt");
+    let key = dir.path().join("tls.key");
+    let ca = dir.path().join("ca.crt");
+    std::fs::write(&cert, get("tls.crt")?)?;
+    std::fs::write(&key, get("tls.key")?)?;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(&ca, get("ca.crt")?)?;
+    Ok((dir, cert, key, ca))
+}
+
 /// Find the scheduler leader pod from the Lease.
 pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
     let api: Api<Lease> = Api::namespaced(client.clone(), ns);
@@ -150,8 +196,14 @@ pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
 }
 
 /// Run a command in the scheduler leader pod and return combined
-/// stdout+stderr. Used by smoke (`rio-cli create-tenant`) and status
-/// (`rio-cli status`). Fails if no leader or pod attachment denied.
+/// stdout+stderr. Fails if no leader or pod attachment denied.
+///
+/// **For rio-cli, use [`crate::k8s::with_cli_tunnel`] or
+/// [`crate::k8s::eks::smoke::CliCtx`] instead** — running rio-cli
+/// in-pod forces the scheduler image to bundle it (and jq, column,
+/// whatever pipes through), widening the control-plane attack surface.
+/// This helper stays for non-rio-cli debugging (`ps`, `ls /proc`, …).
+#[allow(dead_code)] // intentionally kept — see doc-comment
 pub async fn run_in_scheduler(client: &Client, ns: &str, cmd: &[&str]) -> Result<String> {
     let leader = scheduler_leader(client, ns).await?;
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);

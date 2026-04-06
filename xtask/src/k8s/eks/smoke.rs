@@ -21,14 +21,68 @@ use super::TF_DIR;
 use crate::config::XtaskConfig;
 use crate::k8s::shared::ProcessGuard;
 use crate::k8s::{NS, NS_BUILDERS, NS_FETCHERS};
-use crate::kube::run_in_scheduler;
-use crate::sh::{cmd, shell};
+use crate::sh::{self, cmd, shell};
 use crate::{kube, ssh, tofu, ui};
 
 const TENANT: &str = "smoke-test";
 pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
 const LOCAL_PORT: u16 = 2222;
+const SCHED_PORT: u16 = 19001;
+const STORE_PORT: u16 = 19002;
 const POOL: &str = "default";
+
+/// Context for running rio-cli LOCALLY against a port-forwarded
+/// scheduler+store. Holds the tunnel guards and the mTLS cert tempdir
+/// — dropping this tears everything down. Fetched once at the top of
+/// the phase and threaded through to each step that needs rio-cli
+/// (cheaper than re-opening tunnels per step, and keeps `step_tenant`/
+/// `step_status` provider-agnostic).
+pub struct CliCtx {
+    _guards: (ProcessGuard, ProcessGuard),
+    _dir: tempfile::TempDir,
+    sched: u16,
+    store: u16,
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    ca: std::path::PathBuf,
+}
+
+impl CliCtx {
+    /// Open scheduler+store tunnels and fetch the mTLS cert. Cheap:
+    /// two `kubectl port-forward` children + one Secret GET.
+    pub async fn open(client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
+        let guards = crate::k8s::k3s::smoke::tunnel_grpc(sched, store).await?;
+        let (dir, cert, key, ca) =
+            kube::fetch_tls_to_tempdir(client, NS, "rio-scheduler-tls").await?;
+        Ok(Self {
+            _guards: guards,
+            _dir: dir,
+            sched,
+            store,
+            cert,
+            key,
+            ca,
+        })
+    }
+
+    /// Run rio-cli locally with RIO_SCHEDULER_ADDR/RIO_STORE_ADDR/
+    /// RIO_TLS__* set, capture combined output. Prefers an installed
+    /// `rio-cli` on PATH; falls back to `cargo run -p rio-cli`.
+    pub fn run(&self, args: &[&str]) -> Result<String> {
+        let sh = shell()?;
+        let _e1 = sh.push_env("RIO_SCHEDULER_ADDR", format!("localhost:{}", self.sched));
+        let _e2 = sh.push_env("RIO_STORE_ADDR", format!("localhost:{}", self.store));
+        let _e3 = sh.push_env("RIO_TLS__CERT_PATH", &self.cert);
+        let _e4 = sh.push_env("RIO_TLS__KEY_PATH", &self.key);
+        let _e5 = sh.push_env("RIO_TLS__CA_PATH", &self.ca);
+        let on_path = sh::read(cmd!(sh, "command -v rio-cli")).is_ok();
+        if on_path {
+            sh::read(cmd!(sh, "rio-cli {args...}"))
+        } else {
+            sh::read(cmd!(sh, "cargo run -q -p rio-cli -- {args...}"))
+        }
+    }
+}
 
 /// Minimal self-contained derivation (busybox FOD + raw derivation).
 /// `@TAG@` and `@SECS@` are replaced at use time.
@@ -59,7 +113,9 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
     ui::phase! { "smoke":
-        "bootstrap tenant"                            => step_tenant(&client);
+        let cli =
+        "open cli tunnel"   [+ui::POLL_STEPS]         => CliCtx::open(&client, SCHED_PORT, STORE_PORT);
+        "bootstrap tenant"                            => step_tenant(&cli);
         "install ssh key"                             => step_install_key(&client);
         "restart gateway"   [+RESTART_GATEWAY_STEPS]  => step_restart_gateway(&client);
         // NLB target registration + health-check cycle is separate
@@ -76,7 +132,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         "fetcherpool reconcile"                        => step_fetcherpool_reconciled(&client);
         "trivial build (cold-start ~2-3min)"
                             [+SMOKE_BUILD_STEPS]      => smoke_build("fast", 5, &store_url);
-        "rio-cli status"                              => step_status(&client);
+        "rio-cli status"                              => step_status(&cli);
         "worker-kill chaos" [+WORKER_KILL_STEPS]      => step_worker_kill(&client, &store_url);
     }
     .await?;
@@ -84,9 +140,9 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-pub async fn step_tenant(client: &kube::Client) -> Result<()> {
+pub async fn step_tenant(cli: &CliCtx) -> Result<()> {
     info!("bootstrapping tenant '{TENANT}'");
-    let out = run_in_scheduler(client, NS, &["rio-cli", "create-tenant", TENANT]).await?;
+    let out = cli.run(&["create-tenant", TENANT])?;
     // print_tenant format: "tenant <name> (<uuid>)  gc_retention=..."
     // AlreadyExists is printed on re-run (idempotent).
     if !out.contains(&format!("tenant {TENANT}")) && !out.to_lowercase().contains("already exists")
@@ -382,9 +438,9 @@ pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
     .await
 }
 
-pub async fn step_status(client: &kube::Client) -> Result<()> {
+pub async fn step_status(cli: &CliCtx) -> Result<()> {
     info!("checking cluster status");
-    let out = run_in_scheduler(client, NS, &["rio-cli", "status"]).await?;
+    let out = cli.run(&["status"])?;
     // suspend bars before dumping multi-line output — raw println!
     // would freeze a copy of the active bars in scrollback.
     #[allow(clippy::print_stdout)]

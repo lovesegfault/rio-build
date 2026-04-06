@@ -96,11 +96,12 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 After deployment:
 
 ```bash
-# 1. Tenant bootstrap + cluster status. rio-cli is bundled in the
-#    scheduler image (/bin/rio-cli); the pod's RIO_TLS__* env gives
-#    it mTLS to localhost:9001 automatically.
-kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli create-tenant my-team
-kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli status
+# 1. Tenant bootstrap + cluster status. `xtask k8s cli` port-forwards
+#    scheduler:9001 + store:9002, fetches the mTLS client cert from
+#    the rio-scheduler-tls Secret, and runs rio-cli LOCALLY. No need
+#    for rio-cli (or jq, column, …) inside the scheduler image.
+cargo xtask k8s cli -p kind -- create-tenant my-team
+cargo xtask k8s cli -p kind -- status
 
 # 2. SSH key with tenant-name comment. The gateway maps the
 #    authorized_keys comment field to tenant_name (server-side
@@ -119,6 +120,21 @@ curl -s https://rio-cache.example.com/nix-cache-info
 ```
 
 For a complete scripted walkthrough against EKS, run `cargo xtask k8s smoke -p eks`.
+
+<details>
+<summary>Without xtask (kubectl exec fallback)</summary>
+
+If rio-cli is bundled in the scheduler image (legacy — discouraged per
+`r[sec.image.control-plane-minimal]`):
+
+```bash
+kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli create-tenant my-team
+kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli status
+```
+
+The pod's `RIO_TLS__*` env gives rio-cli mTLS to `localhost:9001` automatically.
+
+</details>
 
 ## Production Considerations
 

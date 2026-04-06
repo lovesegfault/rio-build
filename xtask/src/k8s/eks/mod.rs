@@ -91,6 +91,20 @@ impl Provider for Eks {
         smoke::ssm_tunnel(local_port).await
     }
 
+    async fn tunnel_grpc(
+        &self,
+        sched_port: u16,
+        store_port: u16,
+    ) -> Result<(
+        crate::k8s::shared::ProcessGuard,
+        crate::k8s::shared::ProcessGuard,
+    )> {
+        // NOT SSM — scheduler/store aren't behind the NLB. kubectl
+        // reaches them via the apiserver proxy, which `aws eks
+        // update-kubeconfig` (provision step) already set up.
+        crate::k8s::k3s::smoke::tunnel_grpc(sched_port, store_port).await
+    }
+
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {
         destroy::run().await
     }
