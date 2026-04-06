@@ -959,6 +959,121 @@ def test_fast_path_verdict_model_roundtrips():
         FastPathVerdict(decision="PASS", reason="not a valid decision")
 
 
+def _clause4_fixture(tmp_path, monkeypatch, *, ci_hash, last_green,
+                     diff_files="", diff_unified="", nextest_rc=0):
+    """Shared monkeypatch setup for clause4 CLI tests — redirects state,
+    mocks nix eval / git diff / nextest so the dispatch runs hermetically."""
+    import onibus.merge as m
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(m, "_QUEUE_HALTED", state / "queue-halted")
+    monkeypatch.setattr(m, "_LAST_GREEN_HASH", state / "last-green-ci-hash")
+    if last_green:
+        (state / "last-green-ci-hash").write_text(last_green)
+    monkeypatch.setattr(m, "_ci_drv_hash", lambda: ci_hash)
+    def fake_git(*a, **kw):
+        if a[0] == "diff" and "--name-only" in a:
+            return diff_files
+        if a[0] == "diff" and "--unified=3" in a:
+            return diff_unified
+        return ""
+    monkeypatch.setattr(m, "git", fake_git)
+    monkeypatch.setattr(m, "_run_new_tests",
+                        lambda names: (nextest_rc, f"rc={nextest_rc}"))
+    return state
+
+
+def _clause4_dispatch(base: str, capsys) -> tuple[int, dict]:
+    """Drive `onibus merge clause4-check` through the cli dispatch (not
+    subprocess — monkeypatch doesn't cross process boundaries). Returns
+    (exit_code, parsed_json_stdout)."""
+    import argparse
+    from onibus.cli import _cmd_merge
+    ns = argparse.Namespace(merge_cmd="clause4-check", base=base, schema=False)
+    rc = _cmd_merge(ns)
+    out = json.loads(capsys.readouterr().out)
+    return rc, out
+
+
+def test_clause4_cli_skip_on_hash_identity(tmp_path, monkeypatch, capsys):
+    """P0488: docs-only diff + matching last-green-hash → SKIP, exit 0.
+    The merger skips .#ci entirely when drv-hash is provably unchanged."""
+    _clause4_fixture(
+        tmp_path, monkeypatch,
+        ci_hash="/nix/store/SAME-ci.drv",
+        last_green="/nix/store/SAME-ci.drv",
+        diff_files="docs/src/architecture.md\n.claude/work/plan-0999.md",
+    )
+    rc, out = _clause4_dispatch("HEAD~1", capsys)
+    assert rc == 0
+    assert out["decision"] == "SKIP"
+    assert out["ci_hash"] == out["last_green_hash"]
+
+
+def test_clause4_cli_run_full_on_src_change(tmp_path, monkeypatch, capsys):
+    """P0488: rio-*/src change → hash differs → RUN_FULL, exit 0.
+    No new tests in the diff so no HALT risk; merger runs .#ci as normal."""
+    _clause4_fixture(
+        tmp_path, monkeypatch,
+        ci_hash="/nix/store/NEW-ci.drv",
+        last_green="/nix/store/OLD-ci.drv",
+        diff_files="rio-store/src/manifest.rs",
+        diff_unified="+    let x = 1;\n",  # no #[test] attr
+    )
+    rc, out = _clause4_dispatch("HEAD~1", capsys)
+    assert rc == 0
+    assert out["decision"] == "RUN_FULL"
+    assert out["new_tests"] == []
+
+
+def test_clause4_cli_halt_on_red_new_test(tmp_path, monkeypatch, capsys):
+    """P0488: new #[test] attr that fails → HALT, exit 1, sentinel written.
+    The cli exit code is what the merger's `|| exit` hooks on — must be
+    nonzero so bash catches HALT without jq-parsing."""
+    state = _clause4_fixture(
+        tmp_path, monkeypatch,
+        ci_hash="/nix/store/NEW-ci.drv",
+        last_green="/nix/store/OLD-ci.drv",
+        diff_files="rio-store/tests/manifest.rs",
+        diff_unified="+#[test]\n+fn broken() { panic!() }\n",
+        nextest_rc=1,
+    )
+    rc, out = _clause4_dispatch("HEAD~1", capsys)
+    assert rc == 1, "HALT must exit nonzero for merger bash to catch it"
+    assert out["decision"] == "HALT"
+    assert "broken" in out["new_tests"]
+    import onibus.merge as m
+    assert m.queue_halted() is not None, "sentinel not written on HALT"
+    assert "broken" in (state / "queue-halted").read_text()
+
+
+def test_clause4_cli_record_green_writes_hash(tmp_path, monkeypatch, capsys):
+    """P0488: `onibus merge record-green` writes _LAST_GREEN_HASH file.
+    Merger calls this post-green-.#ci so the NEXT clause4-check has a
+    baseline to compare against."""
+    import argparse
+    import onibus.merge as m
+    from onibus.cli import _cmd_merge
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(m, "_LAST_GREEN_HASH", state / "last-green-ci-hash")
+    monkeypatch.setattr(m, "_ci_drv_hash", lambda: "/nix/store/GREEN-ci.drv")
+
+    ns = argparse.Namespace(merge_cmd="record-green")
+    rc = _cmd_merge(ns)
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "/nix/store/GREEN-ci.drv"
+    assert (state / "last-green-ci-hash").read_text() == "/nix/store/GREEN-ci.drv"
+
+    # eval-failed path: prints sentinel, doesn't write file.
+    (state / "last-green-ci-hash").unlink()
+    monkeypatch.setattr(m, "_ci_drv_hash", lambda: None)
+    rc = _cmd_merge(ns)
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "eval-failed"
+    assert not (state / "last-green-ci-hash").exists()
+
+
 def test_gate_manual_never_auto_clears():
     gate = Gate(kind="manual", reason="waiting on upstream nixpkgs bump")
     # Regardless of DAG state — manual gates need coordinator to remove the row.

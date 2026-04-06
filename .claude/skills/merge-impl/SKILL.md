@@ -51,6 +51,8 @@ The merger emits a fenced ```json `MergerReport` block (`state.MergerReport` —
 
 **`report.cov_log`** — coverage is backgrounded (non-gating). Merger step 6 writes a `CoverageResult` row to `coverage-pending.jsonl` via onibus; `/dag-tick` consumes it (surfaces in `TickReport.coverage_regressions`) and appends a follow-up if `exit_code != 0`.
 
+**clause4 fast-path** — if `report.failure_detail` contains `"clause-4 SKIP"`, the merger skipped `.#ci` entirely (drv-hash identical to last-green — nothing observable changed). This is expected for docs-only / `.claude/`-only merges post-P0304-T29 `fileset.difference`. The merger still calls `onibus merge record-green` to refresh the baseline.
+
 **`report.behind_worktrees`** — informational. Impls self-rebase at their verification-gate step 0; you don't broadcast.
 
 **`report.stale_verify_commits_moved > 3`** — branch rebased >3 commits at merge time, verify PASS examined older code. `.#ci` passed so syntactic/test regressions are ruled out. Your judgment: accept (most merges), or re-verify on the integration branch retroactively if the rebase magnitude worries you.
@@ -59,6 +61,7 @@ The merger emits a fenced ```json `MergerReport` block (`state.MergerReport` —
 
 | `abort_reason` | Action |
 |---|---|
+| `"clause4-halt"` | `onibus merge clause4-check` found new `#[test]` attrs that are RED. Merge rolled back; `queue-halted` sentinel written. **Do NOT relaunch** — the queue is halted. Root-cause (the new test is either a real regression the impl missed, or a broken test) then `onibus merge clear-halt`. `report.failure_detail` has the test names + nextest tail. |
 | `"ci-failed"` | Merge rolled back; integration branch at pre-merge hash. `report.failure_detail` is a log tail — `rio-ci-fixer`'s expected input. Either launch ci-fixer against a throwaway worktree, or send the branch back to impl with the log tail. |
 | `"rebase-conflict"` | `report.failure_detail` has the conflicting files. Send back to impl: resolve in the worktree, commit, re-run `/merge-impl`. |
 | `"non-convco-commits"` | `.pre-commit-config.yaml` symlink was missing; commits bypassed convco. Impl agent needs `git rebase -i $(.claude/bin/onibus integration-branch)` to reword. |
