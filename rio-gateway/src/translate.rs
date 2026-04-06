@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rio_common::tenant::NormalizedName;
-use rio_nix::derivation::{BasicDerivation, Derivation};
+use rio_nix::derivation::{BasicDerivation, Derivation, DerivationLike};
 use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types;
@@ -365,7 +365,13 @@ pub fn single_node_from_basic(
         system: f.system,
         required_features: f.required_features,
         output_names: f.output_names,
-        is_fixed_output: basic_drv.outputs().iter().any(|o| o.is_fixed_output()),
+        // Strict predicate — same as derivation_to_node below. The loose
+        // per-output `any(DerivationOutput::is_fixed_output)` form evaluated
+        // TRUE for floating-CA (hash_algo set, hash empty), diverging from
+        // the worker's strict recompute at executor/mod.rs:344 → spurious
+        // warn!. DerivationLike::is_fixed_output is the strict FOD predicate
+        // (single `out` with both hash_algo AND hash set).
+        is_fixed_output: basic_drv.is_fixed_output(),
         expected_output_paths: f.expected_output_paths,
         // Single-node fallback: BasicDerivation has no inputDrvs. We
         // COULD serialize it, but this path is the "full drv not
@@ -644,6 +650,43 @@ mod tests {
             nodes[0].is_content_addressed,
             "fixed-output (hash_algo + hash both set) → true"
         );
+        Ok(())
+    }
+
+    // r[verify sched.ca.detect]
+    /// Floating-CA via single-node fallback: is_fixed_output MUST be
+    /// false (strict predicate — hash_algo set but hash empty doesn't
+    /// qualify), is_content_addressed MUST be true (either-kind disjunct).
+    ///
+    /// Pre-fix the loose per-output predicate made is_fixed_output=true
+    /// here, diverging from the full-DAG path (derivation_to_node) which
+    /// already uses the strict form. Worker's strict recompute at
+    /// executor/mod.rs:344 saw false → warn! at :346 fired spuriously.
+    #[test]
+    fn single_node_floating_ca_strict_fod_false() -> anyhow::Result<()> {
+        // Floating-CA: hash_algo set, hash empty.
+        let floating = make_basic_drv_with_output("sha256", "")?;
+        let nodes = single_node_from_basic("/nix/store/abc-floating.drv", &floating);
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            !nodes[0].is_fixed_output,
+            "floating-CA via fallback: strict FOD predicate → false (hash is empty)"
+        );
+        assert!(
+            nodes[0].is_content_addressed,
+            "floating-CA via fallback: is_ca true via has_ca_floating_outputs()"
+        );
+
+        // True FOD: both set → strict predicate true, consistency with
+        // derivation_to_node on the same drv shape.
+        let fod = make_basic_drv_with_output("sha256", "deadbeef")?;
+        let nodes = single_node_from_basic("/nix/store/abc-fod.drv", &fod);
+        assert!(nodes[0].is_fixed_output, "true FOD → true on both paths");
+
+        // Input-addressed: both empty → false (sanity).
+        let ia = make_basic_drv_with_output("", "")?;
+        let nodes = single_node_from_basic("/nix/store/abc-ia.drv", &ia);
+        assert!(!nodes[0].is_fixed_output, "input-addressed → false");
         Ok(())
     }
 

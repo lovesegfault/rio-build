@@ -8,6 +8,8 @@
 
 pub mod derivation;
 pub mod hash;
+
+pub use derivation::DerivationLike;
 pub mod nar;
 pub mod narinfo;
 pub mod protocol;

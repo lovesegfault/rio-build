@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
-use super::{Derivation, DerivationError, MAX_HASH_RECURSION_DEPTH};
+use super::{Derivation, DerivationError, DerivationLike, MAX_HASH_RECURSION_DEPTH};
 
 // ---------------------------------------------------------------------------
 // hashDerivationModulo
