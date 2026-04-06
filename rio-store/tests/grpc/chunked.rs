@@ -205,22 +205,16 @@ async fn test_chunked_hash_mismatch_no_leaked_state() -> TestResult {
     Ok(())
 }
 
-/// GT13 verify — multi-output atomicity gap. SCOPE-GATING for P0267.
+/// GT13 verify — the gap independent PutPath calls have (by design).
 ///
-/// Simulates a 2-output derivation where output-1's PutPath succeeds
-/// and output-2's fails. Proves the architectural gap:
+/// Two independent `put_path()` calls → output-1 commits, output-2 fails,
+/// output-1 stays 'complete'. This is ARCHITECTURAL: separate RPCs pull
+/// separate pool connections; there's no shared tx. This test documents
+/// the gap; `gt13_batch_rpc_atomic` below proves `PutPathBatch` closes it.
 ///
-///   worker upload_all_outputs() → buffer_unordered(4) independent RPCs
-///   → each PutPath is per-path transactional (put_chunked correct)
-///   → NO cross-output transaction exists
-///   → output-1 row stays 'complete' after output-2 fails
-///
-/// This test PASSES by asserting the gap (one row survives). P0267
-/// adds cross-output atomicity and inverts this assertion.
-///
-/// No proto-level batch-put RPC exists (`rg PutPathBatch rio-proto/` = 0).
-///
-/// TODO(P0267): invert assertion once atomic multi-output lands.
+/// Kept (not inverted) because independent PutPath is still the fallback
+/// when an output is too large for the v1 batch handler's inline-only
+/// limit — the gap persists in that case and this test documents it.
 #[tokio::test]
 async fn gt13_multi_output_not_atomic() -> TestResult {
     let mut s = StoreSession::new().await?;
@@ -259,8 +253,9 @@ async fn gt13_multi_output_not_atomic() -> TestResult {
     .await?;
     assert_eq!(
         complete, 1,
-        "GT13-OUTCOME: real — output-1 survives output-2 failure. \
-         P0267 scope: full sqlx::Transaction wrap, NOT tracey-annotate-only."
+        "independent PutPath: output-1 survives output-2 failure \
+         (architectural — separate RPCs, separate transactions). \
+         Use PutPathBatch for cross-output atomicity."
     );
 
     // Output-2 correctly rolled back (per-path rollback DOES work).
@@ -275,4 +270,155 @@ async fn gt13_multi_output_not_atomic() -> TestResult {
     assert_eq!(out2_rows, 0, "output-2 per-path rollback works correctly");
 
     Ok(())
+}
+
+// r[verify store.atomic.multi-output]
+/// `PutPathBatch`: all outputs commit in one transaction. Mid-batch
+/// failure → ZERO rows committed (not even the outputs that validated
+/// cleanly before the bad one).
+///
+/// This is the inverse of `gt13_multi_output_not_atomic`: same 2-output
+/// shape (output-1 valid, output-2 corrupt), but sent via the batch RPC.
+/// Assert zero `'complete'` rows — the WHOLE batch rolled back.
+///
+/// Then: retry with BOTH valid → both commit. Proves the rollback was
+/// clean (no stale placeholders blocking the retry).
+#[tokio::test]
+async fn gt13_batch_rpc_atomic() -> TestResult {
+    let s = StoreSession::new().await?;
+
+    // Output 0: valid content + matching trailer.
+    let out0_path = test_store_path("batch-out0");
+    let (out0_nar, _) = make_nar(b"output zero content");
+    let out0_info = make_path_info_for_nar(&out0_path, &out0_nar);
+
+    // Output 1: trailer declares out1_good's hash but we send out1_bad's bytes.
+    // Same fault as gt13_multi_output_not_atomic (hash mismatch mid-batch).
+    let out1_path = test_store_path("batch-out1");
+    let (out1_good_nar, _) = make_nar(b"output one content");
+    let out1_info = make_path_info_for_nar(&out1_path, &out1_good_nar);
+    let (out1_bad_nar, _) = make_nar(b"CORRUPTED BYTES");
+
+    // --- Attempt 1: mid-batch failure → zero rows ---
+    let (tx, rx) = mpsc::channel(16);
+    // Send output-0 FULLY first (metadata → chunk → trailer), then
+    // output-1. Serial — matches the worker's batch streaming shape.
+    send_batch_output(&tx, 0, out0_info.clone().into(), out0_nar.clone()).await;
+    send_batch_output(&tx, 1, out1_info.clone().into(), out1_bad_nar).await;
+    drop(tx);
+
+    let mut client = s.client.clone();
+    let r = client.put_path_batch(ReceiverStream::new(rx)).await;
+    assert!(r.is_err(), "batch with corrupt output-1 must fail: {r:?}");
+    let status = r.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("output 1"),
+        "error should name the failing output: {}",
+        status.message()
+    );
+
+    // THE ATOMICITY ASSERTION: zero 'complete' rows. Output-0 validated
+    // fine, but was NEVER committed (phase-3 tx rolled back when
+    // output-1 failed validation in phase-2 — actually phase-2 bails
+    // BEFORE phase-3's tx even opens).
+    let complete: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'complete'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(
+        complete, 0,
+        "store.atomic.multi-output: mid-batch failure → ZERO commits \
+         (contrast gt13_multi_output_not_atomic where output-0 survives)"
+    );
+
+    // Placeholders cleaned up too (abort_batch). No stale 'uploading' rows
+    // blocking the retry.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manifests")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(total, 0, "placeholders must be cleaned up (clean retry)");
+
+    // --- Attempt 2: both valid → both commit (clean retry) ---
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, out0_info.into(), out0_nar).await;
+    send_batch_output(&tx, 1, out1_info.into(), out1_good_nar).await;
+    drop(tx);
+
+    let resp = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await
+        .context("retry with valid inputs should succeed")?
+        .into_inner();
+    assert_eq!(resp.created, vec![true, true], "both outputs newly created");
+
+    // Both complete. 2 rows — that's the precondition-shaped assert from
+    // plan-review-preferences ("proves nothing" guard): we checked the
+    // test STARTED from zero rows above, so 2 here proves BOTH this batch
+    // committed AND the first batch truly rolled back.
+    let complete: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'complete'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(complete, 2, "both outputs committed atomically");
+
+    // QueryPathInfo works for both (full visibility).
+    for p in [&out0_path, &out1_path] {
+        let info = client
+            .query_path_info(QueryPathInfoRequest {
+                store_path: p.clone(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(&info.store_path, p);
+    }
+
+    Ok(())
+}
+
+/// Send one output's full message sequence (metadata → chunk → trailer)
+/// tagged with `output_index`. Mirrors `put_path_raw` but wraps each
+/// inner message in `PutPathBatchRequest`.
+async fn send_batch_output(
+    tx: &mpsc::Sender<rio_proto::types::PutPathBatchRequest>,
+    output_index: u32,
+    mut info: PathInfo,
+    nar: Vec<u8>,
+) {
+    use rio_proto::types::{PutPathBatchRequest, PutPathRequest, put_path_request};
+
+    // Extract hash/size for trailer, zero them in metadata (trailer-only mode).
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+
+    tx.send(PutPathBatchRequest {
+        output_index,
+        inner: Some(PutPathRequest {
+            msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+                info: Some(info),
+            })),
+        }),
+    })
+    .await
+    .expect("fresh channel");
+
+    tx.send(PutPathBatchRequest {
+        output_index,
+        inner: Some(PutPathRequest {
+            msg: Some(put_path_request::Msg::NarChunk(nar)),
+        }),
+    })
+    .await
+    .expect("fresh channel");
+
+    tx.send(PutPathBatchRequest {
+        output_index,
+        inner: Some(PutPathRequest {
+            msg: Some(put_path_request::Msg::Trailer(trailer)),
+        }),
+    })
+    .await
+    .expect("fresh channel");
 }

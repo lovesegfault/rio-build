@@ -240,9 +240,9 @@ r[worker.upload.deriver-populated]
 
 > **Pre-scan cost:** the scan is a separate disk read before the first upload attempt. Retries do NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan over the restricted nixbase32 alphabet does ~memcpy speed on binary sections (skips ~31/32 bytes); a 4 GiB output adds ~4s wall time on NVMe. If this becomes measurable, the escape hatch is a trailer-refs protocol extension (send refs in `PutPathTrailer` instead of the first `PathInfo` message) --- deferred to a later phase.
 
-Outputs are uploaded **concurrently and independently** via `buffer_unordered(MAX_PARALLEL_UPLOADS)` --- each output is its own `PutPath` stream. There is no cross-output atomicity: if one output's upload fails, the other outputs may already be registered. Partial registration is possible.
+For **multi-output derivations (≥2 outputs)**, the worker uses `PutPathBatch`: all outputs stream serially on one RPC, the store commits them in ONE database transaction. If any output fails validation, zero outputs are registered --- atomic per `r[store.atomic.multi-output]`. The v1 batch handler is inline-only; if any output is ≥ `INLINE_THRESHOLD` (256 KiB NAR) it returns `FailedPrecondition` and the worker falls back to independent `PutPath` calls (pre-P0267 behavior: `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity).
 
-> **Scheduled:** atomic multi-output registration → [P0267](../../.claude/work/plan-0267-atomic-multi-output-tx.md). Until it lands: partial registration possible on upload failure.
+For **single-output derivations**, the worker uses independent `PutPath` directly (atomicity is vacuous for one output).
 
 **Upload failure handling:** If the upload to rio-store fails (S3 unavailable, network timeout), the worker retries the upload with exponential backoff (up to 3 attempts). If all upload retries are exhausted, the worker reports an `InfrastructureFailure` to the scheduler. The scheduler may reassign the derivation to a different worker, which must rebuild from scratch --- there is no mechanism to transfer the completed output from the original worker's local overlay. This is a known limitation; the completed output on the original worker is lost when the overlay is discarded.
 

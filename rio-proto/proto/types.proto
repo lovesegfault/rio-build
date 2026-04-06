@@ -534,6 +534,28 @@ message PutPathResponse {
   bool created = 1;                       // true if newly stored, false if already existed
 }
 
+// Batch variant for atomic multi-output derivation upload. A single stream
+// carries ALL outputs; the server commits them in ONE database transaction.
+//
+// Each message is tagged with the output it belongs to. The client streams
+// output 0 (metadata → chunks → trailer), then output 1, etc. — serial
+// per-output, but interleaving is permitted (server routes by output_index).
+//
+// If ANY output fails validation, NO output is committed (atomic — the
+// point of this RPC vs. N independent PutPath calls).
+message PutPathBatchRequest {
+  // Which output (0-indexed) this message belongs to.
+  uint32 output_index = 1;
+  // The per-output message. Same Metadata/NarChunk/Trailer shape as PutPath.
+  PutPathRequest inner = 2;
+}
+
+message PutPathBatchResponse {
+  // Per-output created flag, indexed by output_index. true = newly stored,
+  // false = already existed (idempotency hit for that output).
+  repeated bool created = 1;
+}
+
 // Request to download a store path's NAR data.
 message GetPathRequest {
   string store_path = 1;

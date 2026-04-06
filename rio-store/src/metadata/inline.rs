@@ -111,8 +111,29 @@ pub async fn complete_manifest_inline(
     nar_data: Bytes,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
+    complete_manifest_inline_in_tx(&mut tx, info, nar_data).await?;
+    tx.commit().await?;
+    debug!(store_path = %info.store_path.as_str(), "inline upload completed");
+    Ok(())
+}
 
-    if update_narinfo_complete(&mut tx, info).await? == 0 {
+/// Transaction-body variant of [`complete_manifest_inline`]: runs the
+/// narinfo UPDATE + manifests UPDATE inside a caller-owned transaction.
+///
+/// `PutPathBatch` calls this N times inside ONE `pool.begin()` to achieve
+/// cross-output atomicity (all outputs flip to 'complete' or none do).
+/// [`complete_manifest_inline`] is a thin wrapper that begins/commits
+/// around one call.
+///
+/// Takes `&mut PgConnection` (not `&mut Transaction`) to match
+/// [`update_narinfo_complete`]'s signature — `&mut *tx` deref-coerces
+/// a `Transaction` to `PgConnection`.
+pub async fn complete_manifest_inline_in_tx(
+    conn: &mut sqlx::PgConnection,
+    info: &ValidatedPathInfo,
+    nar_data: Bytes,
+) -> Result<()> {
+    if update_narinfo_complete(conn, info).await? == 0 {
         // insert_manifest_uploading MUST have run first. If rows_affected
         // is 0, delete_manifest_uploading raced us and won. The caller's
         // placeholder is gone; bailing here prevents a half-complete write.
@@ -134,7 +155,7 @@ pub async fn complete_manifest_inline(
     )
     .bind(&info.store_path_hash)
     .bind(nar_data.as_ref())
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
     if manifest_result.rows_affected() == 0 {
@@ -143,9 +164,6 @@ pub async fn complete_manifest_inline(
         });
     }
 
-    tx.commit().await?;
-
-    debug!(store_path = %info.store_path.as_str(), "inline upload completed");
     Ok(())
 }
 
