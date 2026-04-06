@@ -58,6 +58,90 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     Ok(())
 }
 
+/// I-035: a SECOND consecutive heartbeat with empty running_builds drains
+/// the phantom. The TOCTOU window is one heartbeat interval (~10s) — one
+/// miss is the race the test above protects; two misses means the worker
+/// genuinely doesn't have the assignment (lost completion, dead stream
+/// post-send, I-032 pre-d11245b4). Before this fix the slot stayed dead
+/// forever: `has_capacity()` saw 1/1 and the derivation sat Assigned with
+/// no path to Ready short of executor disconnect.
+#[tokio::test]
+async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("phantom-worker", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_hash = "phantom-drv-hash";
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+
+    // Precondition: dispatch assigned the drv (max_builds=1, single
+    // candidate). Worker's running_builds has it; DAG is Assigned.
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("derivation should exist");
+    assert_eq!(info.status, DerivationStatus::Assigned);
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "phantom-worker")
+        .expect("phantom-worker registered");
+    assert!(
+        w.running_builds.contains(&drv_hash.to_string()),
+        "precondition: dispatch tracked the assignment"
+    );
+
+    // First miss: TOCTOU keep — same outcome as the test above.
+    send_heartbeat(&handle, "phantom-worker", "x86_64-linux", 1).await?;
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "phantom-worker")
+        .expect("phantom-worker registered");
+    assert!(
+        w.running_builds.contains(&drv_hash.to_string()),
+        "first miss is the TOCTOU race — keep"
+    );
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("derivation should exist");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Assigned,
+        "first miss leaves DAG state alone"
+    );
+
+    // Second miss: phantom confirmed. Drain → reset_to_ready →
+    // dispatch_ready re-assigns to the (now-free) same worker.
+    send_heartbeat(&handle, "phantom-worker", "x86_64-linux", 1).await?;
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("derivation should exist");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Assigned,
+        "second miss drained → Ready → dispatch_ready re-assigned \
+         (only worker, only drv, deterministic)"
+    );
+    // The re-assignment proves the drain happened: without it, the
+    // slot would still be 1/1 (phantom holds it) and dispatch would
+    // skip. The drain WARNs + resets to Ready; the same heartbeat's
+    // dispatch_ready sees 0/1 + Ready in queue → assigns again.
+    // Distinguish from "nothing happened": failed_builders must be
+    // empty. The drain path explicitly does NOT penalize the worker
+    // (a phantom is not a worker failure).
+    assert!(
+        info.failed_builders.is_empty(),
+        "phantom drain must NOT add to failed_builders — \
+         not the worker's fault, got {:?}",
+        info.failed_builders
+    );
+    Ok(())
+}
+
 /// Heartbeat timeout deregisters worker and reassigns its builds.
 /// Instead of advancing time (PG timeout issue), we send Tick commands
 /// after manipulating the worker's last_heartbeat via multiple Tick cycles

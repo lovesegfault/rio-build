@@ -233,6 +233,13 @@ pub fn describe_metrics() {
         "Derivations reset to Ready after running-since exceeded backstop (worker went silent)"
     );
     describe_counter!(
+        "rio_scheduler_phantom_assignments_drained_total",
+        "running_builds entries drained after two consecutive heartbeats reported \
+         empty (lost completion / dead-stream-post-send). The slot was dead capacity \
+         until drained. Nonzero is the signal to look for I-032-class bugs upstream — \
+         the drain is the safety net, not the fix."
+    );
+    describe_counter!(
         "rio_scheduler_build_timeouts_total",
         "Builds failed by per-build wall-clock timeout (BuildOptions.build_timeout \
          seconds since submission). Distinct from backstop_timeouts_total \

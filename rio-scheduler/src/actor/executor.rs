@@ -483,6 +483,11 @@ impl DagActor {
 
     // 10 args — all independent heartbeat fields. A struct would add
     // boilerplate at every call site for an internal-only method.
+    /// Returns confirmed-phantom drv hashes for the caller to reassign.
+    /// Kept sync — the async PG write for the reassign lives in the
+    /// caller (mod.rs Heartbeat arm) which already `.await`s
+    /// `dispatch_ready`. See the phantom-detection block below for
+    /// what "confirmed" means.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_heartbeat(
         &mut self,
@@ -496,7 +501,7 @@ impl DagActor {
         resources: Option<rio_proto::types::ResourceUsage>,
         store_degraded: bool,
         kind: rio_proto::types::ExecutorKind,
-    ) {
+    ) -> Vec<DrvHash> {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
         //   - Keep scheduler-known builds that are still Assigned/Running
@@ -546,12 +551,54 @@ impl DagActor {
             }
         }
 
+        // Phantom detection (I-035): entries the prior reconcile kept
+        // (TOCTOU keep-logic) but the worker still doesn't report. Two
+        // consecutive misses = past the ~10s race window = phantom slot
+        // (lost completion à la I-032, or assignment sent into a stream
+        // that died right after). Compute against PRIOR phantom_suspects
+        // before the entry().or_insert below borrows worker mutably.
+        let suspects: HashSet<DrvHash> = reconciled.difference(&heartbeat_set).cloned().collect();
+        let prior_suspects: HashSet<DrvHash> = self
+            .executors
+            .get(executor_id.as_str())
+            .map(|w| w.phantom_suspects.clone())
+            .unwrap_or_default();
+        let confirmed_phantoms: Vec<DrvHash> =
+            suspects.intersection(&prior_suspects).cloned().collect();
+        for phantom in &confirmed_phantoms {
+            warn!(
+                executor_id = %executor_id,
+                drv_hash = %phantom,
+                "phantom running_builds entry: scheduler tracked this assignment \
+                 across two heartbeats but worker reports nothing — draining \
+                 (lost completion?)"
+            );
+            metrics::counter!("rio_scheduler_phantom_assignments_drained_total").increment(1);
+            reconciled.remove(phantom);
+        }
+
         let worker = self
             .executors
             .entry(executor_id.clone())
             .or_insert_with(|| ExecutorState::new(executor_id.clone()));
 
         let was_registered = worker.is_registered();
+
+        // Observability: heartbeat-alive but stream channel closed.
+        // The bridge task (executor_service.rs build-exec-bridge) exits
+        // when the gRPC ReceiverStream is dropped — but worker-stream-
+        // reader keeps running until the inbound half breaks. In the
+        // gap, dispatch's try_send Errs with the rollback path. This
+        // WARN surfaces the half-dead state in logs before dispatch
+        // hits it. Doesn't change `is_registered()` — the rollback path
+        // already handles it; this is operator signal.
+        if worker.stream_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
+            warn!(
+                executor_id = %executor_id,
+                "heartbeat-alive but stream_tx closed (bridge task exited); \
+                 executor unreachable for dispatch until reconnect"
+            );
+        }
 
         worker.systems = systems;
         worker.supported_features = supported_features;
@@ -595,6 +642,13 @@ impl DagActor {
             info!(executor_id = %executor_id, "store-degraded cleared; returning to assignment pool");
         }
 
+        // Missed-once → carry to next heartbeat. Missed-twice
+        // (confirmed) → already removed from `reconciled` above so
+        // they're gone from `running_builds`; drop from suspects too
+        // (re-detection would need a fresh dispatch insert first).
+        let confirmed_set: HashSet<DrvHash> = confirmed_phantoms.iter().cloned().collect();
+        worker.phantom_suspects = suspects.difference(&confirmed_set).cloned().collect();
+
         if !was_registered && worker.is_registered() {
             info!(executor_id = %executor_id, "worker fully registered (heartbeat + stream)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
@@ -602,6 +656,39 @@ impl DagActor {
             // (stream, heartbeat) arrives SECOND triggers the warm-
             // gate initial prefetch. dual-register step 3.
             self.on_worker_registered(executor_id);
+        }
+
+        confirmed_phantoms
+    }
+
+    /// Reset confirmed-phantom derivations to Ready and re-queue.
+    /// Called from the Heartbeat arm in mod.rs after `handle_heartbeat`
+    /// returns — split out because the PG write is async and
+    /// `handle_heartbeat` stays sync.
+    ///
+    /// NOT via `reassign_derivations`: that path adds to
+    /// `failed_builders` + checks poison, but a phantom is NOT a worker
+    /// failure. The worker may have completed successfully and we just
+    /// never heard about it (I-032). Penalizing the executor_id would
+    /// recreate the very dead-capacity problem this drain exists to
+    /// fix — `failed_builders` is keyed by executor_id (StatefulSet
+    /// pod name), stable across restarts.
+    pub(super) async fn drain_phantoms(&mut self, phantoms: Vec<DrvHash>) {
+        for phantom in phantoms {
+            let Some(state) = self.dag.node_mut(&phantom) else {
+                continue;
+            };
+            if let Err(e) = state.reset_to_ready() {
+                // State changed under us (completion arrived between
+                // heartbeat and here, or another build cancelled it).
+                // The phantom is moot — skip.
+                debug!(drv_hash = %phantom, error = %e,
+                       "phantom drain: reset_to_ready rejected (state moved)");
+                continue;
+            }
+            self.persist_status(&phantom, DerivationStatus::Ready, None)
+                .await;
+            self.push_ready(phantom);
         }
     }
 
