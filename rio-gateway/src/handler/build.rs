@@ -1151,36 +1151,20 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         for (idx, _raw) in raw_paths.iter().enumerate() {
             if let Some(opaque) = opaque_results.remove(&idx) {
                 results.push(opaque);
-            } else if build_result.status.is_success() {
-                if let Some((drv_path, drv_obj)) = drv_for_idx.get(&idx) {
-                    let resolve =
-                        |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
-                    match rio_nix::derivation::hash_derivation_modulo(
-                        drv_obj,
-                        drv_path,
-                        &resolve,
-                        &mut hash_cache,
-                    ) {
-                        Ok(hash) => {
-                            let hash_hex = hex::encode(hash);
-                            results.push(
-                                build_result
-                                    .clone()
-                                    .with_outputs_from_drv(drv_obj, &hash_hex),
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                drv_path = %drv_path,
-                                error = %e,
-                                "hash_derivation_modulo failed; builtOutputs will be empty"
-                            );
-                            results.push(build_result.clone());
-                        }
-                    }
-                } else {
-                    results.push(build_result.clone());
-                }
+            } else if build_result.status.is_success()
+                && let Some((drv_path, drv_obj)) = drv_for_idx.get(&idx)
+                && let Some(hash) = translate::compute_modular_hash_cached(
+                    drv_obj,
+                    drv_path,
+                    drv_cache,
+                    &mut hash_cache,
+                )
+            {
+                results.push(
+                    build_result
+                        .clone()
+                        .with_outputs_from_drv(drv_obj, &hex::encode(hash)),
+                );
             } else {
                 results.push(build_result.clone());
             }

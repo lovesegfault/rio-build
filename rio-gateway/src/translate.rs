@@ -127,6 +127,65 @@ pub async fn reconstruct_dag(
     Ok((nodes, edges))
 }
 
+/// Yield `(node_idx, &node, &Derivation)` for every node whose
+/// `drv_path` is in `drv_cache`. Logs BFS-inconsistency at debug
+/// for misses (the cache was populated BY the BFS — a miss means
+/// the BFS and this walk disagree about what nodes exist; our bug,
+/// not the operator's). Shared scaffold for every post-BFS
+/// `populate_*` pass.
+///
+/// Index-based because callers need to write `nodes[idx].field`
+/// AFTER the lookup. Yielding `&mut Node` would alias the iterator's
+/// own immutable borrow of `nodes` (it reads `node.drv_path`). The
+/// collect-then-apply pattern at each call-site sidesteps the split.
+fn iter_cached_drvs<'a>(
+    nodes: &'a [types::DerivationNode],
+    drv_cache: &'a HashMap<StorePath, Derivation>,
+    walker_name: &'static str,
+) -> impl Iterator<Item = (usize, &'a types::DerivationNode, &'a Derivation)> + 'a {
+    nodes.iter().enumerate().filter_map(move |(idx, node)| {
+        let sp = StorePath::parse(&node.drv_path).ok()?;
+        match drv_cache.get(&sp) {
+            Some(drv) => Some((idx, node, drv)),
+            None => {
+                debug!(
+                    drv_path = %node.drv_path,
+                    walker = walker_name,
+                    "drv not in cache (BFS inconsistency)"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// Compute [`hash_derivation_modulo`] via a `drv_cache`-backed
+/// resolver. Pass the same `hash_cache` across calls to reuse
+/// sub-hashes. Errors warn-and-return-`None` — both callers
+/// (translate's populate + handler's builtOutputs) treat "no hash"
+/// as log + degrade-gracefully.
+///
+/// [`hash_derivation_modulo`]: rio_nix::derivation::hash_derivation_modulo
+pub(crate) fn compute_modular_hash_cached(
+    drv: &Derivation,
+    drv_path: &str,
+    drv_cache: &HashMap<StorePath, Derivation>,
+    hash_cache: &mut HashMap<String, [u8; 32]>,
+) -> Option<[u8; 32]> {
+    let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+    match rio_nix::derivation::hash_derivation_modulo(drv, drv_path, &resolve, hash_cache) {
+        Ok(hash) => Some(hash),
+        Err(e) => {
+            warn!(
+                drv_path = %drv_path,
+                error = %e,
+                "hash_derivation_modulo failed; caller will degrade"
+            );
+            None
+        }
+    }
+}
+
 /// Fill `input_srcs_nar_size` on each node via batched QueryPathInfo.
 ///
 /// The estimator's closure-size-as-proxy fallback: a derivation with
@@ -135,23 +194,11 @@ pub async fn reconstruct_dag(
 /// fresh `(pname, system)`).
 ///
 /// Best-effort and ORTHOGONAL to the build actually working:
-/// - Store error → `warn!` once, leave all nodes at 0, return. The
-///   DAG is already built; the build proceeds. This is estimation
-///   metadata, not a dependency.
-/// - Path not in store (NotFound) → that src contributes 0. Can
-///   happen for .drv files that reference paths the client hasn't
-///   uploaded yet — the build will fail at execution time anyway
-///   if the path is truly missing, and if it IS uploaded between
-///   now and dispatch, great, we just under-estimate slightly.
+/// - Store error → `warn!` once, leave all nodes at 0, return.
+/// - Path not in store → that src contributes 0.
 ///
-/// Batching: union all `input_srcs` across all nodes, dedup, query
-/// once each. Typical DAG has ~50 nodes sharing ~30 unique srcs
-/// (everything pulls in stdenv/bash/coreutils). Without dedup it'd
-/// be 50×30=1500 RPCs; with dedup, 30. Worth the HashMap.
-///
-/// `drv_cache` re-lookup because `nodes` is the proto type (doesn't
-/// carry `input_srcs`) and `Derivation` does. We populated the cache
-/// during BFS so this is a pure hashmap lookup, no store round-trip.
+/// Batching: union `input_srcs` across all nodes, dedup, query once
+/// each. ~50 nodes × ~30 shared srcs → 30 RPCs not 1500.
 async fn populate_input_srcs_sizes(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
@@ -159,46 +206,19 @@ async fn populate_input_srcs_sizes(
 ) {
     use rio_proto::client::query_path_info_opt;
 
-    // ---- Collect unique srcs across all nodes ----
-    // HashSet not Vec: the dedup IS the point. BTreeSet would give
-    // stable iteration but we don't care about order — each src is
-    // queried independently and results land in a HashMap.
+    // HashSet not Vec: the dedup IS the point.
     let mut all_srcs: HashSet<String> = HashSet::new();
-    for node in nodes.iter() {
-        // drv_path → StorePath → cache lookup. The cache was
-        // populated during BFS with every node we visited, so a
-        // miss here means the BFS and this function disagree
-        // about what nodes exist — a bug. debug! not warn!:
-        // it's OUR bug, not the operator's.
-        let Ok(sp) = StorePath::parse(&node.drv_path) else {
-            continue; // already failed BFS if truly bad
-        };
-        let Some(drv) = drv_cache.get(&sp) else {
-            debug!(drv_path = %node.drv_path, "populate_input_srcs: drv not in cache (BFS inconsistency)");
-            continue;
-        };
+    for (_, _, drv) in iter_cached_drvs(nodes, drv_cache, "populate_input_srcs_sizes") {
         all_srcs.extend(drv.input_srcs().iter().cloned());
     }
 
     if all_srcs.is_empty() {
-        // Pure inputDrv DAG (everything built from other
-        // derivations, no static srcs). Common for higher-level
-        // packages. Nothing to do.
+        // Pure inputDrv DAG. Nothing to do.
         return;
     }
 
-    // ---- Batch query: src → nar_size ----
-    // Sequential, not concurrent. Could `buffer_unordered(8)` like
-    // GetPath does, but this is a one-shot per SubmitBuild (not
-    // hot path) and 30 sequential RPCs at ~1ms each is 30ms —
-    // negligible next to the build itself. Concurrent would need
-    // a cloned client per future; not worth the complexity here.
-    //
-    // Single store error → bail the whole batch. If the store is
-    // flaky RIGHT NOW, retrying per-src won't help. Better to
-    // leave all nodes at 0 (honest "no signal") than a partial
-    // fill (some nodes have data, some don't — confusing for
-    // dashboards comparing sizes).
+    // Single store error → bail whole batch. Partial fill is
+    // confusing for dashboards; prefer honest "no signal".
     let mut sizes: HashMap<String, u64> = HashMap::with_capacity(all_srcs.len());
     for src in &all_srcs {
         match query_path_info_opt(store_client, src, rio_common::grpc::DEFAULT_GRPC_TIMEOUT).await {
@@ -206,11 +226,10 @@ async fn populate_input_srcs_sizes(
                 sizes.insert(src.clone(), info.nar_size);
             }
             Ok(None) => {
-                // NotFound — src contributes 0. See fn doc.
                 sizes.insert(src.clone(), 0);
             }
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     error = %e,
                     queried = sizes.len(),
                     total = all_srcs.len(),
@@ -221,98 +240,52 @@ async fn populate_input_srcs_sizes(
         }
     }
 
-    // ---- Sum per node ----
-    for node in nodes.iter_mut() {
-        let Ok(sp) = StorePath::parse(&node.drv_path) else {
-            continue;
-        };
-        let Some(drv) = drv_cache.get(&sp) else {
-            continue;
-        };
-        // saturating_add: if someone has >u64::MAX bytes of srcs
-        // they have bigger problems, but don't panic on it.
-        node.input_srcs_nar_size = drv
-            .input_srcs()
-            .iter()
-            .map(|s| sizes.get(s).copied().unwrap_or(0))
-            .fold(0u64, |acc, x| acc.saturating_add(x));
+    // saturating_add: if someone has >u64::MAX bytes of srcs they
+    // have bigger problems, but don't panic on it.
+    let sums: Vec<(usize, u64)> = iter_cached_drvs(nodes, drv_cache, "populate_input_srcs_sizes")
+        .map(|(idx, _, drv)| {
+            let sum = drv
+                .input_srcs()
+                .iter()
+                .map(|s| sizes.get(s).copied().unwrap_or(0))
+                .fold(0u64, |acc, x| acc.saturating_add(x));
+            (idx, sum)
+        })
+        .collect();
+    for (idx, sum) in sums {
+        nodes[idx].input_srcs_nar_size = sum;
     }
 }
 
 /// Fill `ca_modular_hash` on each CA node via `hash_derivation_modulo`.
 ///
-/// The scheduler's CA-on-CA resolve queries the `realisations` table
-/// keyed on `(modular_hash, output_name)`. The modular hash needs the
-/// full transitive closure of parsed derivations to recurse over
-/// (`inputDrvs` paths → `Derivation` → their `inputDrvs` → …). The
-/// BFS in `reconstruct_dag` populates exactly that closure into
-/// `drv_cache`, so computing here (post-BFS) gives the resolve what
-/// it needs without the scheduler having to hold and re-parse the
-/// full closure itself.
+/// The scheduler's CA-on-CA resolve queries `realisations` keyed on
+/// `(modular_hash, output_name)`. The modular hash needs the full
+/// transitive closure of parsed derivations (what BFS put in
+/// `drv_cache`). Memoised via one shared `hash_cache` — for N CA
+/// nodes sharing a common CA input, the common sub-hash is computed
+/// once.
 ///
-/// Memoised: one `hash_cache` shared across all nodes. For a DAG
-/// with N CA nodes that share a common CA input (the typical
-/// stdenv-as-CA case), the common input's sub-hash is computed once.
-/// Without memoisation it'd be N× the closure walk.
-///
-/// Best-effort: `InputNotFound` (drv referenced by `inputDrvs` but
-/// missing from the cache — shouldn't happen post-BFS since BFS
-/// fails hard on unresolved inputs) or cycle/depth errors → warn,
-/// leave that node's `ca_modular_hash` empty. The scheduler's
-/// `collect_ca_inputs` skips empty-hash children; resolve is
-/// incomplete for parents depending on them, worker fails on the
-/// placeholder path, retry-with-backoff gives the input time to
-/// land (if it's a race) or surfaces the hard error (if it's a
-/// structural bug).
+/// Best-effort: hash failure → warn, leave empty. Scheduler's
+/// `collect_ca_inputs` skips empty; resolve degrades to worker-fail
+/// + retry-with-backoff.
 fn populate_ca_modular_hashes(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
 ) {
     let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-    let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
-
-    for node in nodes.iter_mut() {
-        // IA nodes: ca_modular_hash stays empty. The scheduler's
-        // realisations-table lookup is CA-only (the compare/resolve
-        // gates on is_ca). Computing and carrying it for IA would
-        // just be dead bytes on the wire.
-        if !node.is_content_addressed {
-            continue;
-        }
-        let Ok(sp) = StorePath::parse(&node.drv_path) else {
-            continue; // BFS would have failed already if truly bad
-        };
-        let Some(drv) = drv_cache.get(&sp) else {
-            // Our own BFS inconsistency (same as
-            // populate_input_srcs_sizes). debug, not warn — our bug.
-            debug!(
-                drv_path = %node.drv_path,
-                "populate_ca_modular_hashes: drv not in cache (BFS inconsistency)"
-            );
-            continue;
-        };
-        match rio_nix::derivation::hash_derivation_modulo(
-            drv,
-            &node.drv_path,
-            &resolve,
-            &mut hash_cache,
-        ) {
-            Ok(hash) => node.ca_modular_hash = hash.to_vec(),
-            Err(e) => {
-                // InputNotFound shouldn't fire — BFS fails hard on
-                // unresolved inputDrvs. Cycle/depth: same .drv that
-                // would have failed the build anyway; leave empty
-                // so the scheduler's resolve skip + worker-fail
-                // surfaces the structural error with a clearer
-                // message than "placeholder path not found."
-                warn!(
-                    drv_path = %node.drv_path,
-                    error = %e,
-                    "hash_derivation_modulo failed; ca_modular_hash left empty \
-                     (scheduler resolve will skip this node as CA input)"
-                );
-            }
-        }
+    // IA nodes: ca_modular_hash stays empty — dead bytes on the
+    // wire (scheduler's resolve gates on is_ca).
+    let hashes: Vec<(usize, Vec<u8>)> =
+        iter_cached_drvs(nodes, drv_cache, "populate_ca_modular_hashes")
+            .filter(|(_, node, _)| node.is_content_addressed)
+            .filter_map(|(idx, node, drv)| {
+                compute_modular_hash_cached(drv, &node.drv_path, drv_cache, &mut hash_cache)
+                    .map(|h| (idx, h.to_vec()))
+            })
+            .collect();
+    for (idx, h) in hashes {
+        nodes[idx].ca_modular_hash = h;
     }
 }
 
@@ -1312,5 +1285,60 @@ mod tests {
             "no srcs → 0, no RPC (unreachable store didn't error)"
         );
         Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // iter_cached_drvs + compute_modular_hash_cached (P0413 walker dedup)
+    // -------------------------------------------------------------------
+
+    /// 3 nodes, 2 in drv_cache, 1 miss. Helper yields exactly the
+    /// 2 cached indices; the miss is debug-logged and skipped.
+    /// Mutation-anchor: returning `None` unconditionally → `hits` is
+    /// empty → assert fires.
+    #[test]
+    fn cached_drv_walker_skips_cache_miss() {
+        let a = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
+        let b = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        let c = sp("/nix/store/cccccccccccccccccccccccccccccccc-c.drv");
+        let mk_node = |p: &StorePath| types::DerivationNode {
+            drv_path: p.to_string(),
+            ..Default::default()
+        };
+        let nodes = vec![mk_node(&a), mk_node(&b), mk_node(&c)];
+
+        // Only a + c in the cache; b is the miss (BFS-inconsistency).
+        let mut drv_cache = HashMap::new();
+        drv_cache.insert(a, make_test_derivation("/nix/store/aaa-out", &[]));
+        drv_cache.insert(c, make_test_derivation("/nix/store/ccc-out", &[]));
+
+        let hits: Vec<usize> = iter_cached_drvs(&nodes, &drv_cache, "test")
+            .map(|(i, _, _)| i)
+            .collect();
+        assert_eq!(hits, vec![0, 2], "indices 0+2 cached; 1 skipped");
+    }
+
+    /// inputDrv not in cache → `hash_derivation_modulo` returns
+    /// `InputNotFound` → wrapper returns `None` (no panic, no garbage).
+    #[test]
+    fn modular_hash_wrapper_none_on_resolver_miss() {
+        let drv = make_test_derivation(
+            "/nix/store/oooooooooooooooooooooooooooooooo-out",
+            &[(
+                "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-missing.drv",
+                &["out"],
+            )],
+        );
+        let drv_cache = HashMap::new(); // empty — guaranteed miss
+        let mut hash_cache = HashMap::new();
+        assert!(
+            compute_modular_hash_cached(
+                &drv,
+                "/nix/store/pppppppppppppppppppppppppppppppp-parent.drv",
+                &drv_cache,
+                &mut hash_cache
+            )
+            .is_none(),
+            "resolver miss → InputNotFound → None (warn-and-degrade)"
+        );
     }
 }
