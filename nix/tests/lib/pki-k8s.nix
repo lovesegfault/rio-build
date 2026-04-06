@@ -116,6 +116,12 @@ let
           -out $out/rio-builder/tls.crt -days 3650 \
           -extfile <(printf 'subjectAltName=${workerSans}')
         cp $out/ca.crt $out/rio-builder/ca.crt
+
+        # ── Fetcher cert ────────────────────────────────────────────
+        # Same binary, same mTLS client role as builder — reuse the
+        # cert. Separate directory so secretTargets can emit a
+        # rio-fetcher-tls Secret matching fetcherpool.yaml:24.
+        cp -r $out/rio-builder $out/rio-fetcher
       '';
 
   # Secret-name → target-namespace pairs. ADR-019: store/builder
@@ -130,13 +136,14 @@ let
         name = "rio-builder";
         namespace = nsBuilders;
       }
-      # ADR-019: fetcher pods live in rio-fetchers. Same cert (same
-      # binary, same mTLS client role), different namespace. Cross-ns
-      # Secret mounts aren't supported — the Secret must exist where
-      # the pod mounts it. fetcherpool.yaml sets tlsSecretName:
-      # rio-builder-tls pointing at THIS copy.
+      # ADR-019: fetcher pods live in rio-fetchers. Same cert material
+      # as builder (same binary, same mTLS client role), different
+      # Secret name + namespace. Cross-ns Secret mounts aren't
+      # supported — the Secret must exist where the pod mounts it.
+      # fetcherpool.yaml:24 sets tlsSecretName: rio-fetcher-tls;
+      # cert-manager.yaml:135 creates rio-fetcher-tls in production.
       {
-        name = "rio-builder";
+        name = "rio-fetcher";
         namespace = nsFetchers;
       }
     ];

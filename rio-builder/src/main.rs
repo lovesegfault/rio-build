@@ -145,6 +145,33 @@ async fn main() -> anyhow::Result<()> {
     // thread. See config.rs fuse_fetch_timeout_secs for the full rationale.
     let fuse_fetch_timeout = Duration::from_secs(cfg.fuse_fetch_timeout_secs);
 
+    // ─── Startup rootfs writes (readOnlyRootFilesystem audit) ─────
+    //
+    // FetcherPool forces readOnlyRootFilesystem:true (ADR-019
+    // §Sandbox hardening — reconcilers/fetcherpool/mod.rs:212).
+    // Every write below MUST land on an emptyDir mount from
+    // reconcilers/common/sts.rs, or the pod CrashLoops with EROFS.
+    //
+    //   path                        | covering mount (sts.rs)
+    //   ──────────────────────────────────────────────────────────
+    //   cfg.fuse_mount_point        | `fuse-store` emptyDir
+    //     (/var/rio/fuse-store)     |   (readOnlyRoot only)
+    //   cfg.overlay_base_dir        | `overlays` emptyDir
+    //     (/var/rio/overlays)       |   (always)
+    //   /nix/var/{nix,log}/**       | `nix-var` emptyDir
+    //                               |   (readOnlyRoot only)
+    //   /tmp (tempfile crate)       | `tmp` emptyDir, 64Mi tmpfs
+    //                               |   (readOnlyRoot only)
+    //   cfg.fuse_cache_dir          | `fuse-cache` emptyDir
+    //     (/var/rio/cache —         |   (always)
+    //      Cache::new above)        |
+    //   /sys/fs/cgroup/**           | cgroupfs, not rootfs —
+    //     (cgroup.rs)               |   remounted rw at cgroup.rs
+    //                               |   ns-root-remount
+    //
+    // Adding a new startup write? Extend BOTH this table AND the
+    // `if p.read_only_root_fs` blocks in common/sts.rs (Volume +
+    // VolumeMount pair). vm-fetcher-split-k3s catches misses.
     std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
 
