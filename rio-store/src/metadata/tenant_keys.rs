@@ -155,6 +155,68 @@ mod tests {
         );
     }
 
+    /// Deleting a tenant CASCADEs to tenant_keys — including revoked
+    /// keys. Migration 014 shipped with no ON DELETE clause (PG default
+    /// NO ACTION), which made a tenant with only-revoked keys
+    /// undeletable. Migration 017 fixed it (DROP + ADD CASCADE).
+    ///
+    /// Precondition self-check: we assert the tenant_keys rows EXIST
+    /// before the delete. A broken test setup that never inserts would
+    /// pass the post-delete "zero rows" check vacuously.
+    #[tokio::test]
+    async fn tenant_delete_cascades_keys_including_revoked() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tid = seed_tenant(&db.pool, "tk-cascade-doomed").await;
+
+        // One active key, one revoked. Pre-017 the revoked row alone
+        // was enough to block DELETE FROM tenants (NO ACTION doesn't
+        // care about revoked_at — it's a plain FK check).
+        seed_key(&db.pool, tid, "cascade-active", &[0xAAu8; 32]).await;
+        seed_key(&db.pool, tid, "cascade-revoked", &[0xBBu8; 32]).await;
+        sqlx::query(
+            "UPDATE tenant_keys SET revoked_at = now() \
+             WHERE tenant_id = $1 AND key_name = 'cascade-revoked'",
+        )
+        .bind(tid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Precondition: both rows exist. Not a "proves nothing" assert
+        // — if this fails, the INSERTs above are broken and the
+        // post-delete count=0 below would pass on an empty table.
+        let pre: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_keys WHERE tenant_id = $1")
+            .bind(tid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pre, 2,
+            "precondition: both keys inserted (active + revoked)"
+        );
+
+        // THE ACTION: delete the tenant. Pre-017 this FAILED here with
+        //   ERROR: update or delete on table "tenants" violates foreign
+        //   key constraint "tenant_keys_tenant_id_fkey"
+        // Post-017 it cascades.
+        sqlx::query("DELETE FROM tenants WHERE tenant_id = $1")
+            .bind(tid)
+            .execute(&db.pool)
+            .await
+            .expect("017 CASCADE: delete should succeed even with revoked keys present");
+
+        // Post-condition: both keys gone.
+        let post: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_keys WHERE tenant_id = $1")
+            .bind(tid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            post, 0,
+            "CASCADE should delete both keys (including revoked)"
+        );
+    }
+
     /// Corruption: wrong-length seed → InvariantViolation, NOT a
     /// panic from ed25519-dalek or a silently-dropped key.
     #[tokio::test]
