@@ -308,6 +308,10 @@ pub struct BuildSpawnContext {
     /// cancel-only. std::sync is simpler and the critical sections
     /// are short (HashMap insert/remove/get — no await inside).
     pub cancel_registry: Arc<CancelRegistry>,
+    /// Handle to the FUSE local cache. I-110c: threaded into
+    /// `ExecutorEnv` so `prefetch_manifests` can prime the manifest-
+    /// hint map before the warm-stat loop.
+    pub fuse_cache: Arc<crate::fuse::cache::Cache>,
 }
 
 /// Attempt to cancel a build by drv_path. Looks up the cgroup
@@ -561,6 +565,7 @@ pub async fn spawn_build_task(
         max_silent_time: ctx.max_silent_time,
         cgroup_parent: ctx.cgroup_parent.clone(),
         executor_kind: ctx.executor_kind,
+        fuse_cache: Some(Arc::clone(&ctx.fuse_cache)),
     };
 
     // Clone for the panic handler before moving into the task.

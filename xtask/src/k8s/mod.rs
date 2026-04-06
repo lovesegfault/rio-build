@@ -23,7 +23,7 @@ use tracing::info;
 
 /// Log level for the deployed rio pods (sets RUST_LOG via helm
 /// `global.logLevel`). Precedence: --trace > --debug > --log-level >
-/// RIO_LOG_LEVEL env > [`config::RIO_DEBUG`] default.
+/// RIO_LOG_LEVEL env > `config::RIO_DEBUG` default.
 ///
 /// `--debug` and the default both use a targeted directive (info
 /// baseline, rio crates at debug) — bare `"debug"` floods with h2/

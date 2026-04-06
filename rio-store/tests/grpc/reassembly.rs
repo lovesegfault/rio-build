@@ -26,6 +26,7 @@ async fn test_chunked_roundtrip() -> TestResult {
         .client
         .get_path(GetPathRequest {
             store_path: store_path.clone(),
+            manifest_hint: None,
         })
         .await?
         .into_inner();
@@ -83,7 +84,10 @@ async fn test_chunked_getpath_missing_chunk_data_loss() -> TestResult {
     // GetPath: should produce DATA_LOSS mid-stream.
     let mut stream = s
         .client
-        .get_path(GetPathRequest { store_path })
+        .get_path(GetPathRequest {
+            store_path,
+            manifest_hint: None,
+        })
         .await?
         .into_inner();
 
@@ -142,7 +146,12 @@ async fn test_chunked_manifest_no_cache_preflight_fails() -> TestResult {
     let (mut cli, server) = spawn_store_server(service).await?;
     let store_path = test_store_path("large-nar-44");
 
-    let result = cli.get_path(GetPathRequest { store_path }).await;
+    let result = cli
+        .get_path(GetPathRequest {
+            store_path,
+            manifest_hint: None,
+        })
+        .await;
     let status = result.expect_err("should fail at pre-flight");
     assert_eq!(
         status.code(),

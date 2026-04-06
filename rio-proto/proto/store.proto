@@ -36,6 +36,16 @@ service StoreService {
   // round-trips. Callers that need those semantics use QueryPathInfo.
   rpc BatchQueryPathInfo(rio.types.BatchQueryPathInfoRequest) returns (rio.types.BatchQueryPathInfoResponse);
 
+  // Batch (PathInfo, manifest) lookup. I-110c: the builder's FUSE-warm
+  // stat loop is a SECOND ~800-GetPath/builder burst (each FUSE
+  // lookup() → GetPath → store-side PG narinfo+manifest lookup). One
+  // BatchGetManifest BEFORE the loop primes the builder's hint cache
+  // so each GetPath carries its manifest and the store skips PG.
+  //
+  // Local-only: same caveats as BatchQueryPathInfo (no substitution,
+  // no sig-visibility gate). Returns hint=None for not-found.
+  rpc BatchGetManifest(rio.types.BatchGetManifestRequest) returns (rio.types.BatchGetManifestResponse);
+
   // Batch check which paths are missing from the store.
   rpc FindMissingPaths(rio.types.FindMissingPathsRequest) returns (rio.types.FindMissingPathsResponse);
 

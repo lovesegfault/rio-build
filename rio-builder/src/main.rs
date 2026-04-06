@@ -325,6 +325,9 @@ async fn main() -> anyhow::Result<()> {
         cgroup_parent,
         executor_kind: cfg.executor_kind,
         cancel_registry: Arc::clone(&cancel_registry),
+        // I-110c: same Arc as prefetch_cache / the FUSE mount —
+        // executor primes manifest hints, FUSE threads consume them.
+        fuse_cache: Arc::clone(&prefetch_cache),
     };
 
     // Process incoming scheduler messages + shutdown signal for graceful drain.

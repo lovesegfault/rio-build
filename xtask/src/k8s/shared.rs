@@ -83,7 +83,7 @@ pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
 /// `RIO_SSH_TENANT` is unset, preserves the existing Secret's comment
 /// instead of clobbering to `default` (I-100: a bare `xtask deploy`
 /// after smoke wrote `smoke-test` would otherwise break tenant routing
-/// — `unknown tenant: default`). Falls through to [`ssh::DEFAULT_TENANT`]
+/// — `unknown tenant: default`). Falls through to [`crate::ssh::DEFAULT_TENANT`]
 /// only on first deploy (Secret absent).
 pub async fn ensure_gateway_ssh_secret(
     client: &kube::Client,

@@ -153,6 +153,13 @@ message PutPathBatchResponse {
 // Request to download a store path's NAR data.
 message GetPathRequest {
   string store_path = 1;
+  // I-110c: pre-fetched (PathInfo, manifest) so the store can skip its
+  // two PG lookups and go straight to S3 chunk reassembly. Populated by
+  // BatchGetManifest. The store still SHA-256-verifies the reassembled
+  // NAR against hint.info.nar_hash, so a stale/forged hint surfaces as
+  // DATA_LOSS — same as a corrupt manifest_data row would. Unset → the
+  // store queries PG as before.
+  optional ManifestHint manifest_hint = 2;
 }
 
 // Response containing NAR data chunks. First message may include metadata.
@@ -184,6 +191,47 @@ message PathInfoEntry {
 
 message BatchQueryPathInfoResponse {
   repeated PathInfoEntry entries = 1;
+}
+
+// One entry in a chunked NAR's manifest: (BLAKE3 digest, chunk size).
+// Mirrors the store's `ManifestKind::Chunked` tuple.
+message ChunkRef {
+  bytes hash = 1;   // 32-byte BLAKE3
+  uint32 size = 2;
+}
+
+// Pre-fetched (PathInfo, manifest) sufficient for GetPath to skip PG
+// entirely. `chunks` empty + `inline_blob` set = inline NAR; `chunks`
+// non-empty = chunked (inline_blob ignored). Exactly one of the two is
+// populated for a found path.
+message ManifestHint {
+  PathInfo info = 1;
+  repeated ChunkRef chunks = 2;
+  bytes inline_blob = 3;
+}
+
+// I-110c: batch (PathInfo, manifest) lookup. The builder's
+// warm_inputs_in_fuse stat loop was the SECOND ~800-GetPath/builder PG
+// burst (kernel→FUSE-callback driven, can't batch the syscalls). One
+// BatchGetManifest before the loop primes a builder-side hint cache;
+// each GetPath then carries its hint and the store skips PG. The S3
+// chunk fetch stays per-path (it's content; can't avoid).
+//
+// Same local-only caveat as BatchQueryPathInfo: no upstream
+// substitution, no sig-visibility gate.
+message BatchGetManifestRequest {
+  repeated string store_paths = 1;
+}
+
+// One entry per requested path, request order preserved. `hint` absent
+// = path has no complete manifest.
+message ManifestEntry {
+  string store_path = 1;
+  optional ManifestHint hint = 2;
+}
+
+message BatchGetManifestResponse {
+  repeated ManifestEntry entries = 1;
 }
 
 // Batch check which paths are missing from the store.

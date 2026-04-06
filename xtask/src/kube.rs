@@ -199,7 +199,7 @@ pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
 /// stdout+stderr. Fails if no leader or pod attachment denied.
 ///
 /// **For rio-cli, use [`crate::k8s::with_cli_tunnel`] or
-/// [`crate::k8s::eks::smoke::CliCtx`] instead** — running rio-cli
+/// `CliCtx` instead** — running rio-cli
 /// in-pod forces the scheduler image to bundle it (and jq, column,
 /// whatever pipes through), widening the control-plane attack surface.
 /// This helper stays for non-rio-cli debugging (`ps`, `ls /proc`, …).
