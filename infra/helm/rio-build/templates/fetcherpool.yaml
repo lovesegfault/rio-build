@@ -1,12 +1,21 @@
-{{- if .Values.fetcherPool.enabled }}
-{{- $fp := .Values.fetcherPool -}}
+{{- if hasKey .Values "fetcherPool" -}}
+{{- fail "values key `fetcherPool` (singular) was renamed to `fetcherPools` (list) + `fetcherPoolDefaults` — update your --set/values overrides" -}}
+{{- end -}}
+{{- $root := . -}}
+{{- range .Values.fetcherPools }}
+{{- /* One FetcherPool per entry, deep-merged over
+       fetcherPoolDefaults (same pattern as I-117b builderpoolset.yaml).
+       mergeOverwrite mutates its first arg, so deepCopy the defaults
+       each iteration. */ -}}
+{{- $fp := mergeOverwrite (deepCopy $root.Values.fetcherPoolDefaults) . -}}
+{{- if $fp.enabled }}
 ---
 # FetcherPool: FOD-only executors with open internet egress. See ADR-019.
 apiVersion: rio.build/v1alpha1
 kind: FetcherPool
 metadata:
   name: {{ $fp.name }}
-  namespace: {{ .Values.namespaces.fetchers.name }}
+  namespace: {{ $root.Values.namespaces.fetchers.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: fetcher
@@ -23,8 +32,8 @@ spec:
     targetValue: {{ $fp.autoscaling.targetValue }}
   systems:
     {{- toYaml $fp.systems | nindent 4 }}
-  image: {{ include "rio.image" (list . $fp.image) }}
-  {{- if .Values.tls.enabled }}
+  image: {{ include "rio.image" (list $root $fp.image) }}
+  {{- if $root.Values.tls.enabled }}
   # Secret must exist in rio-fetchers namespace (cross-ns Secret mount
   # not supported). cert-manager.yaml creates rio-fetcher-tls here;
   # pki-k8s.nix creates it for VM tests.
@@ -50,4 +59,5 @@ spec:
   nodeSelector:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+{{- end }}
 {{- end }}

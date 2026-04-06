@@ -558,6 +558,42 @@ mod tests {
         );
     }
 
+    // r[verify sched.dispatch.fod-builtin-any-arch]
+    /// `system="builtin"` FOD matches a fetcher of EITHER arch
+    /// (every executor appends `"builtin"` to its advertised
+    /// `systems` at startup). An arch-specific FOD (`system=
+    /// "x86_64-linux"`, e.g. `pkgs.fetchgit` inheriting stdenv's
+    /// system) matches only fetchers advertising that arch.
+    #[test]
+    fn hard_filter_builtin_matches_any_fetcher() {
+        let mk_fetcher = |systems: &[&str]| {
+            let mut w = make_worker("f", 4, 0);
+            w.kind = ExecutorKind::Fetcher;
+            w.systems = systems.iter().map(|s| s.to_string()).collect();
+            w
+        };
+        let mk_fod = |system: &str| {
+            let mut d =
+                DerivationState::try_from_node(&make_derivation_node("fod", system)).unwrap();
+            d.is_fixed_output = true;
+            d
+        };
+
+        let arm = mk_fetcher(&["aarch64-linux", "builtin"]);
+        let x86 = mk_fetcher(&["x86_64-linux", "builtin"]);
+
+        // builtin FOD: both arches eligible (overflow to either).
+        assert!(hard_filter(&arm, &mk_fod("builtin"), None));
+        assert!(hard_filter(&x86, &mk_fod("builtin"), None));
+        // x86_64-linux FOD: only x86 fetcher; arm rejects.
+        assert!(hard_filter(&x86, &mk_fod("x86_64-linux"), None));
+        assert!(!hard_filter(&arm, &mk_fod("x86_64-linux"), None));
+        assert_eq!(
+            rejection_reason(&arm, &mk_fod("x86_64-linux"), None),
+            Some("system-mismatch")
+        );
+    }
+
     /// Kind check runs BEFORE capacity — a full builder still rejects
     /// FODs for the right reason (wrong kind), not by accident (no
     /// capacity). Pins the ordering so a refactor that puts kind LAST

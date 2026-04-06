@@ -295,16 +295,28 @@ pub(crate) fn queued_for_systems(
 /// fall back to the class scalar. Same posture as I-107: a controller
 /// upgrade ahead of the scheduler still scales (over-spawns rather
 /// than never spawning).
+///
+/// `"builtin"` is always summed regardless of `systems` — every
+/// executor advertises it unconditionally (rio-builder/main.rs), so
+/// a `system="builtin"` FOD can land on any pool. Omitting it
+/// from the spawn signal stalls cold-store bootstrap (bootstrap-tools
+/// FODs queue with no fetcher spawned). Harmless for builder pools:
+/// FODs never reach builders (kind-mismatch in `hard_filter`), so
+/// `queued_by_system["builtin"]` is always 0 for builder classes.
 // r[impl ctrl.pool.per-system-class-depth]
+// r[impl ctrl.fetcherpool.spawn-builtin]
 pub(crate) fn class_queued_for_systems(
     class: &rio_proto::types::SizeClassStatus,
     systems: &[String],
 ) -> u64 {
+    const BUILTIN: &str = "builtin";
     if class.queued_by_system.is_empty() || systems.is_empty() {
         return class.queued;
     }
     systems
         .iter()
+        .map(String::as_str)
+        .chain((!systems.iter().any(|s| s == BUILTIN)).then_some(BUILTIN))
         .map(|s| class.queued_by_system.get(s).copied().unwrap_or(0))
         .sum()
 }

@@ -277,9 +277,9 @@ pub fn seccomp_preinstalled() -> bool {
 }
 
 /// STS name for a given pool. `rio-{role}-{pool_name}` — e.g. pool
-/// `x86-64` → `rio-builder-x86-64`, fetcher class `tiny` →
-/// `rio-fetcher-tiny`. Ephemeral Jobs use the same prefix with a
-/// random suffix.
+/// `x86-64` → `rio-builder-x86-64`, fetcher pool `x86-64` class
+/// `tiny` → `rio-fetcher-x86-64-tiny`. Ephemeral Jobs use the same
+/// prefix with a random suffix.
 pub fn sts_name(pool_name: &str, role: ExecutorRole) -> String {
     format!("{NAME_PREFIX}-{}-{pool_name}", role.as_str())
 }

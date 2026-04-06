@@ -802,9 +802,9 @@ in
   # Localhost seccomp at reconcilers/fetcherpool/mod.rs) — same
   # device-plugin overlay as vm-security-nonpriv-k3s. Seccomp profile
   # delivered at runtime by testScript (security-profiles-operator
-  # not airgapped). fetcherPool enabled via extraValues with name=
-  # "default" + classes=[tiny,small] (I-170/P0556 → pod
-  # rio-fetcher-tiny-0) and image=rio-fetcher (per-component ref
+  # not airgapped). fetcherPools[] enabled via extraValues with name=
+  # "x86-64" + classes=[tiny] (I-170 + multiarch naming → pod
+  # rio-fetcher-x86-64-tiny-0) and image=rio-fetcher (per-component ref
   # from the vmTestSeed preload). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
   # the hard_filter can_build check. nodeSelector/tolerations left
@@ -829,6 +829,12 @@ in
   #   actually scheduled on the labeled k3s-agent node. Karpenter
   #   NodePool enforcement is EKS-only; this proves the params→
   #   podspec chain.
+  # r[verify ctrl.fetcherpool.multiarch]
+  #   fetcherPools[] list-shape renders one FetcherPool per entry;
+  #   STS named `rio-fetcher-{pool}-{class}` (the test's fetcherPod
+  #   = rio-fetcher-x86-64-tiny-0). Per-arch dispatch covered by
+  #   the assignment.rs hard_filter unit test; second-pool e2e via
+  #   EKS smoke (FETCHER_POOLS_JSON has both arches).
   vm-fetcher-split-k3s = fetcher-split {
     inherit pkgs common drvs;
     fixture = k3sFull {
@@ -836,15 +842,19 @@ in
         "networkPolicy.enabled" = "true";
         "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
       };
-      # fetcherPool via values file (not --set-string) so hostUsers
+      # fetcherPools via values file (not --set-string) so hostUsers
       # stays bool true. --set-string would coerce to the STRING
       # "true" which the CRD Option<bool> field rejects.
       extraValuesFiles = [
         ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
         (pkgs.writeText "fetcherpool-vm.yaml" ''
-          fetcherPool:
+          fetcherPools:
+            - name: x86-64
+              # builtin:fetchurl FOD has system=builtin; hard_filter's
+              # can_build check needs the fetcher to advertise it.
+              systems: [x86_64-linux, builtin]
+          fetcherPoolDefaults:
             enabled: true
-            name: default
             # P0541: ephemeral defaults true at CRD level. This test
             # exercises fetcher-split routing via the STS path (stable
             # pod name for the kubectl-exec assertions below).
@@ -855,15 +865,12 @@ in
             # base values.yaml (helm coalesce).
             replicas: {min: 1, max: 1}
             image: rio-fetcher
-            # builtin:fetchurl FOD has system=builtin; hard_filter's
-            # can_build check needs the fetcher to advertise it.
-            systems: [x86_64-linux, builtin]
             # k3s containerd doesn't chown the pod cgroup under
             # hostUsers:false → rio-builder's mkdir /sys/fs/cgroup/
             # leaf EACCES → CrashLoop. Same escape hatch builderPool
             # uses (via privileged:true which implies hostUsers:true).
             hostUsers: true
-            # I-170/P0556: values.yaml defaults classes=[tiny(1Gi req),
+            # I-170: values.yaml defaults classes=[tiny(1Gi req),
             # small(4Gi req)]. k3s-agent VM can't fit 1Gi alongside the
             # builder pod. Override tiny to 128Mi — this test exercises
             # routing/netpol, not memory sizing.

@@ -41,6 +41,9 @@ The ADR-019–defined markers for this component live in [ADR-019](../decisions/
 - `r[fetcher.node.dedicated]` — dedicated Karpenter NodePool with `rio.build/fetcher` taint
 - `r[ctrl.fetcherpool.reconcile]` — FetcherPool CRD reconciler
 - `r[ctrl.fetcherpool.classes]` — per-class StatefulSet stamping (I-170)
+- `r[ctrl.fetcherpool.multiarch]` — multiple FetcherPools coexist (one per arch); `{fp.name}-{class}` naming
+- `r[ctrl.fetcherpool.spawn-builtin]` — spawn signal counts `builtin` FODs for every pool
 - `r[sched.dispatch.fod-to-fetcher]` — scheduler hard-filter routes FODs here
+- `r[sched.dispatch.fod-builtin-any-arch]` — `system="builtin"` FOD eligible on any fetcher
 - `r[sched.dispatch.no-fod-fallback]` — FODs queue rather than fall back to builders
 - `r[sched.fod.size-class-reactive]` — FOD size-class floor promoted on transient failure

@@ -41,7 +41,7 @@ const STORE_PORT: u16 = 19002;
 // {name:"aarch64",...}]). The set fans out to {name}-{class} child
 // BuilderPools — there is no BuilderPool literally named "x86-64".
 const BUILDER_POOL_SET: &str = "x86-64";
-const FETCHER_POOL: &str = "default";
+const FETCHER_POOL: &str = "x86-64";
 
 /// Context for running rio-cli LOCALLY against a port-forwarded
 /// scheduler+store. Holds the tunnel guards and the mTLS cert tempdir
@@ -555,8 +555,8 @@ pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
 
 pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::fetcherpool::FetcherPool;
-    // values.yaml default: fetcherPool.name=default. The deploy flow
-    // enables it via --set fetcherPool.enabled=true (deploy.rs).
+    // deploy.rs FETCHER_POOLS_JSON renders one FetcherPool per arch;
+    // poll the x86-64 one (smoke runs from x86 host).
     // SMOKE_EXPR's builtin:fetchurl FOD queues forever without a
     // reconciled fetcher (P0452 hard-split: FODs never go to builders).
     let api: Api<FetcherPool> = Api::namespaced(client.clone(), NS_FETCHERS);

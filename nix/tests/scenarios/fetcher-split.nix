@@ -65,10 +65,10 @@ let
   originIP = "203.0.113.1";
 
   builderPod = "rio-builder-x86-64-0";
-  # I-170/P0556: per-class STS naming → rio-fetcher-{class}-{ordinal}
-  # (pool-name segment dropped — fetchers are a single pool). values.yaml
-  # defaults classes=[tiny,small]; smallest (tiny) hosts the test's FOD.
-  fetcherPod = "rio-fetcher-tiny-0";
+  # I-170 + multi-arch: per-class STS naming → rio-fetcher-{pool}-
+  # {class}-{ordinal}. fetcherPools[] entry name is "x86-64";
+  # smallest class (tiny) hosts the test's FOD.
+  fetcherPod = "rio-fetcher-x86-64-tiny-0";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-fetcher-split";
@@ -157,7 +157,13 @@ pkgs.testers.runNixOSTest {
     if rc != 0:
         print("=== fetcher-Ready TIMEOUT: diagnostic dump ===")
         print(k3s_server.execute(
+            "k3s kubectl -n ${nsFetchers} get fetcherpool,sts,pod -o wide 2>&1; "
+            "k3s kubectl -n ${nsFetchers} describe fetcherpool 2>&1; "
             "k3s kubectl -n ${nsFetchers} describe pod ${fetcherPod} 2>&1"
+        )[1])
+        print("--- controller logs (reconcile errors) ---")
+        print(k3s_server.execute(
+            "k3s kubectl -n rio-system logs deploy/rio-controller --tail=80 2>&1"
         )[1])
         print("--- kubectl logs --previous (the crash stderr) ---")
         print(k3s_server.execute(

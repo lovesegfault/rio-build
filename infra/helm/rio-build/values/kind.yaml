@@ -60,7 +60,7 @@ postgresql:
 
 # I-108: kind uses chart-default builderPools (single x86-64 entry) but
 # adds `builtin` to its systems so the smoke FOD's system=builtin passes
-# hard_filter when fetcherPool is also enabled.
+# hard_filter when a FetcherPool is also enabled.
 builderPools:
   - name: x86-64
     systems: [x86_64-linux, builtin]
@@ -77,10 +77,13 @@ builderPoolDefaults:
   # plugin path cleanly; privileged:true is the escape hatch.
   privileged: true
 
-fetcherPool:
-  enabled: true
+fetcherPools:
   # Matches values.yaml default — smoke.rs expects this name.
-  name: default
+  - name: x86-64
+    systems: [x86_64-linux, builtin]
+
+fetcherPoolDefaults:
+  enabled: true
   # kind is single-node STS; ephemeral Job-mode would need RBAC for
   # batch/v1 in the rio-fetchers namespace and the smoke test asserts
   # on a stable pod name.
@@ -90,7 +93,6 @@ fetcherPool:
   replicas: {min: 1, max: 1}
   autoscaling: {metric: fodQueueDepth, targetValue: 5}
   image: rio-fetcher
-  systems: [x86_64-linux, builtin]
   hostUsers: true
 
 rustfs:

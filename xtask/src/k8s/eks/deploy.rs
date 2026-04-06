@@ -60,6 +60,19 @@ const BUILDER_POOL_SETS_JSON: &str = r#"[
                   "limits":{"memory":"32Gi"}}}]}
 ]"#;
 
+/// One FetcherPool per arch — `system="builtin"` FODs overflow to
+/// either (every executor advertises `builtin`; `best_executor` scores
+/// across the union). nodeSelector REPLACES the reconciler default, so
+/// `rio.build/node-role: fetcher` is repeated. Image stays the ECR ref
+/// from `fetcherPoolDefaults.image` (PLAN-PREBAKE: layer-cache-warm,
+/// not digest-pin).
+const FETCHER_POOLS_JSON: &str = r#"[
+  {"name":"x86-64","systems":["x86_64-linux","builtin"],
+   "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"amd64"}},
+  {"name":"aarch64","systems":["aarch64-linux","builtin"],
+   "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"arm64"}}
+]"#;
+
 pub async fn run(
     cfg: &XtaskConfig,
     log_level: &str,
@@ -253,13 +266,16 @@ pub async fn run(
             // P0452 hard-split: SMOKE_EXPR's builtin:fetchurl FOD routes
             // to FetcherPool only. Without this, the FOD queues forever
             // (scheduler never sends a FOD to a builder per ADR-019).
-            .set("fetcherPool.enabled", "true")
+            // One pool per arch; builtin FODs overflow to whichever
+            // has capacity.
+            .set_json("fetcherPools", FETCHER_POOLS_JSON)
+            .set("fetcherPoolDefaults.enabled", "true")
             // P0541: ephemeral fetchers (one Job per FOD). Chart default
             // is false (preserves existing STS pools); EKS opts in. The
             // CRD's CEL requires replicas.min==0 for ephemeral (no
             // standing set).
-            .set("fetcherPool.ephemeral", "true")
-            .set("fetcherPool.replicas.min", "0")
+            .set("fetcherPoolDefaults.ephemeral", "true")
+            .set("fetcherPoolDefaults.replicas.min", "0")
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             // I-128: store.replicas was a fixed "8" here (I-105

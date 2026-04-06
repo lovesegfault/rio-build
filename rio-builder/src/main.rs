@@ -1009,10 +1009,14 @@ fn resolve_executor_identity(
     } else {
         systems
     };
+    // r[impl sched.dispatch.fod-builtin-any-arch]
     // Every nix-daemon supports builtin:fetchurl — it's handled
     // internally, no real process forked. Bootstrap derivations
     // (busybox, bootstrap-tools) have system="builtin"; without
     // this, a cold store permanently stalls at the DAG leaves.
+    // With per-arch FetcherPools, this is what makes a `builtin`
+    // FOD eligible on either arch's fetchers (hard_filter matches
+    // on the union; best_executor scores across both).
     if !systems.iter().any(|s| s == "builtin") {
         systems.push("builtin".to_string());
     }

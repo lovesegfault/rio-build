@@ -100,12 +100,14 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
         fp.spec.classes.iter().map(Some).collect()
     };
     for (idx, class) in class_iter.into_iter().enumerate() {
+        // r[impl ctrl.fetcherpool.multiarch]
         // pool_name doubles as the `rio.build/pool` label value
-        // (executor_labels via executor_params) — per-class active-Job
-        // selector. P0556 dropped the fp-name segment for classed
-        // pools, so this is just `{class.name}`.
+        // (executor_labels via executor_params) — per-class active-
+        // Job selector. `{fp.name}-{class.name}` so two FetcherPools
+        // (per-arch) with the same class don't count each other's
+        // Jobs. MUST match executor_params' pool_name derivation.
         let pool_name = class
-            .map(|c| c.name.clone())
+            .map(|c| format!("{name}-{}", c.name))
             .unwrap_or_else(|| name.clone());
         let ceiling = class
             .and_then(|c| c.max_replicas)
@@ -549,10 +551,10 @@ mod tests {
     }
 
     // r[verify ctrl.fetcherpool.ephemeral-per-class]
-    /// P0556: per-class Job stamping. `class=Some(small)` →
+    /// Per-class Job stamping. `class=Some(small)` →
     /// `RIO_SIZE_CLASS=small` env, per-class resources, `rio.build/
-    /// pool=small` label (NOT `eph-fp-small` — pool-name segment
-    /// dropped), Job name prefix `rio-fetcher-small-`.
+    /// pool={fp.name}-small` label (per-arch collision-safe), Job
+    /// name prefix `rio-fetcher-{fp.name}-small-`.
     #[test]
     fn build_job_per_class_stamps_class() {
         use k8s_openapi::api::core::v1::ResourceRequirements;
@@ -583,16 +585,16 @@ mod tests {
         let labels = job.metadata.labels.as_ref().unwrap();
         assert_eq!(
             labels.get(POOL_LABEL).map(String::as_str),
-            Some("small"),
-            "P0556: classed pool label is class name (no fp-name segment)"
+            Some("eph-fp-small"),
+            "classed pool label is `{{fp.name}}-{{class}}` (per-arch collision-safe)"
         );
         assert!(
             job.metadata
                 .name
                 .as_deref()
                 .unwrap()
-                .starts_with("rio-fetcher-small-"),
-            "Job name prefix matches class: {:?}",
+                .starts_with("rio-fetcher-eph-fp-small-"),
+            "Job name prefix `rio-fetcher-{{fp}}-{{class}}-`: {:?}",
             job.metadata.name
         );
 
@@ -614,6 +616,47 @@ mod tests {
                 .and_then(|l| l.get("memory")),
             Some(&Quantity("8Gi".into())),
             "per-class resources applied"
+        );
+    }
+
+    // r[verify ctrl.fetcherpool.multiarch]
+    /// Per-arch active-Job selector: `fp{name=aarch64}, class=tiny` →
+    /// `rio.build/pool=aarch64-tiny`. The per-class spawn loop lists
+    /// Jobs by this label; without the fp-name segment, an x86-64
+    /// pool's `active` count would include aarch64 Jobs (over-counts
+    /// → under-spawns) and `reap_excess_pending` could delete the
+    /// other pool's Jobs.
+    #[test]
+    fn ephemeral_job_label_includes_pool() {
+        let mut fp = test_fp();
+        fp.metadata.name = Some("aarch64".into());
+        let class = FetcherSizeClass {
+            name: "tiny".into(),
+            resources: Default::default(),
+            min_replicas: None,
+            max_replicas: None,
+        };
+        let oref = fp.controller_owner_ref(&()).unwrap();
+        let job = build_job(
+            &fp,
+            Some(&class),
+            oref,
+            &test_sched_addrs(),
+            &crate::fixtures::test_store_addrs(),
+        )
+        .unwrap();
+        assert_eq!(
+            job.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(POOL_LABEL))
+                .map(String::as_str),
+            Some("aarch64-tiny"),
+        );
+        // The selector string the spawn loop uses to list active Jobs:
+        assert_eq!(
+            format!("{POOL_LABEL}=aarch64-tiny"),
+            "rio.build/pool=aarch64-tiny"
         );
     }
 

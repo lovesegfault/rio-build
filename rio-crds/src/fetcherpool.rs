@@ -175,8 +175,10 @@ pub struct FetcherPoolSpec {
     /// indirection exists for per-class autoscaling targets keyed on
     /// per-class queue depth. Fetcher classes are expected to be
     /// `[tiny, small]` with `small` rarely used — flat `classes[]`
-    /// on the existing CRD is simpler. Promote to a *Set CRD later
-    /// if per-class autoscaling matters.
+    /// on the existing CRD is simpler. Per-arch is handled by
+    /// rendering multiple `FetcherPool` CRs (helm `fetcherPools[]`),
+    /// not by a *Set CRD. Promote to a *Set CRD later if per-class-
+    /// per-arch autoscaling targets diverge.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub classes: Vec<FetcherSizeClass>,
 

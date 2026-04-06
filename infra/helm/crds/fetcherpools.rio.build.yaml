@@ -87,8 +87,10 @@ spec:
                   child\nindirection exists for per-class autoscaling targets keyed\
                   \ on\nper-class queue depth. Fetcher classes are expected to be\n\
                   `[tiny, small]` with `small` rarely used \u2014 flat `classes[]`\n\
-                  on the existing CRD is simpler. Promote to a *Set CRD later\nif\
-                  \ per-class autoscaling matters."
+                  on the existing CRD is simpler. Per-arch is handled by\nrendering\
+                  \ multiple `FetcherPool` CRs (helm `fetcherPools[]`),\nnot by a\
+                  \ *Set CRD. Promote to a *Set CRD later if per-class-\nper-arch\
+                  \ autoscaling targets diverge."
                 items:
                   description: "One fetcher size class. Mirrors `SizeClassSpec` minus\n\
                     `cutoff_secs` \u2014 fetchers route by reactive floor only, not\n\

@@ -267,6 +267,59 @@ fn class_queued_for_systems_ignores_other_arch() {
     assert_eq!(class_queued_for_systems(&mixed, &[]), 105);
 }
 
+// r[verify ctrl.fetcherpool.spawn-builtin]
+/// Latent cold-store stall: `compute_fod_size_class_snapshot` keys by
+/// `drv.system`; bootstrap-tools FODs have `system="builtin"`. A pool
+/// with `spec.systems=[x86_64-linux]` (the pre-multiarch default)
+/// would see `class_queued_for_systems → 0` and never spawn — the FOD
+/// queues forever. Unobserved in production because bootstrap FODs are
+/// warm-cached after first run, but a fresh store would deadlock.
+///
+/// Fix: `"builtin"` is summed regardless of `spec.systems`. With
+/// per-arch pools both listing `[<arch>, builtin]` this means ≤2×
+/// spawn for `builtin` work — cheap (`tiny` = 500m/1Gi, 300s TTL) and
+/// `reap_excess_pending` reclaims the surplus.
+#[test]
+fn class_queued_counts_builtin() {
+    use rio_proto::types::SizeClassStatus;
+    let class = SizeClassStatus {
+        name: "tiny".into(),
+        queued: 8,
+        queued_by_system: [("builtin".into(), 5), ("x86_64-linux".into(), 3)].into(),
+        ..Default::default()
+    };
+
+    // The latent bug: pool didn't list `builtin` → must still count it.
+    assert_eq!(
+        class_queued_for_systems(&class, &["x86_64-linux".into()]),
+        8,
+        "builtin FODs counted even when spec.systems omits it"
+    );
+    // Pool that DOES list it (chart default) → no double-count.
+    assert_eq!(
+        class_queued_for_systems(&class, &["x86_64-linux".into(), "builtin".into()]),
+        8,
+        "explicit builtin in spec.systems doesn't double-count"
+    );
+    // Per-arch overflow: aarch64 pool sees builtin work (5), not x86 (3).
+    assert_eq!(
+        class_queued_for_systems(&class, &["aarch64-linux".into(), "builtin".into()]),
+        5,
+        "aarch64 pool sees builtin (overflow) but not x86_64-linux FODs"
+    );
+    // builtin-only backlog, arm-only pool, builtin omitted from spec
+    // → still spawns (the safety-net path).
+    let bonly = SizeClassStatus {
+        queued: 5,
+        queued_by_system: [("builtin".into(), 5)].into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        class_queued_for_systems(&bonly, &["aarch64-linux".into()]),
+        5
+    );
+}
+
 // ---- class_queued_for_pool: I-176 per-feature × per-class filter ----
 
 /// I-176: a kvm derivation classified as `tiny` (trivial runCommand

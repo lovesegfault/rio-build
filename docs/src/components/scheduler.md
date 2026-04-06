@@ -490,6 +490,9 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
 r[sched.dispatch.fod-to-fetcher]
 Per [ADR-019](../decisions/019-builder-fetcher-split.md), `hard_filter()` rejects any derivation-executor pairing where `drv.is_fixed_output != (executor.kind == Fetcher)`. Fixed-output derivations route ONLY to fetcher-kind executors; non-FODs route ONLY to builder-kind executors. The `ExecutorKind` is reported via `HeartbeatRequest.kind` and stored on `ExecutorState`.
 
+r[sched.dispatch.fod-builtin-any-arch]
+A FOD with `system="builtin"` is eligible on any registered fetcher regardless of arch. Every executor appends `"builtin"` to its advertised `systems` unconditionally at startup (before the first heartbeat), so `hard_filter()`'s `system-mismatch` clause matches on the union. `best_executor()` scores across the flat `workers` map (keyed by `ExecutorId`, not pool), so a `builtin` FOD overflows to whichever arch's fetchers have capacity. Arch-specific FODs (`system="x86_64-linux"` inherited from stdenv) match only fetchers advertising that system.
+
 r[sched.dispatch.no-fod-fallback]
 `find_executor_with_overflow()` for `drv.is_fixed_output` walks the configured fetcher size classes only (`[[fetcher_size_classes]]`, smallest→largest, starting at `size_class_floor`); it never enters the builder `[[size_classes]]` overflow chain. If no fetcher of any class is available the FOD queues; the scheduler NEVER sends a FOD to a builder under pressure. A queued FOD is preferable to a builder with internet access. The `rio_scheduler_fod_queue_depth` gauge tracks queued FODs.
 

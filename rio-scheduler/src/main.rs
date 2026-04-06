@@ -45,9 +45,10 @@ struct Config {
     /// ordered smallest→largest — the scheduler needs the ORDER to
     /// compute "next larger" for reactive promotion; per-class
     /// resources live on the controller side (`FetcherPool.spec.
-    /// classes[]`). MUST match `fetcherPool.classes[].name` in the
-    /// helm chart (single source of truth: scheduler.yaml renders
-    /// both from `.Values.fetcherPool.classes`). TOML:
+    /// classes[]`). MUST match `fetcherPoolDefaults.classes[].name`
+    /// in the helm chart (single source of truth: scheduler.yaml
+    /// renders both from `.Values.fetcherPoolDefaults.classes`;
+    /// class names are arch-agnostic). TOML:
     ///   [[fetcher_size_classes]]
     ///   name = "tiny"
     ///   [[fetcher_size_classes]]

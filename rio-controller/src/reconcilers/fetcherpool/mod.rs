@@ -104,17 +104,12 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
     let mut total_ready = 0i32;
     let mut total_desired = 0i32;
     if fp.spec.classes.is_empty() {
-        let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, &name, None).await?;
+        let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, None).await?;
         total_ready += ready;
         total_desired += desired;
     } else {
         for class in &fp.spec.classes {
-            // P0556: pool_name = class.name (fp-name segment dropped —
-            // fetchers are a single pool by convention). Matches
-            // executor_params() so STS name and `rio.build/pool` label
-            // agree.
-            let (ready, desired) =
-                apply_one(&fp, ctx, &ns, &oref, &class.name, Some(class)).await?;
+            let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, Some(class)).await?;
             total_ready += ready;
             total_desired += desired;
         }
@@ -148,17 +143,20 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
 /// Apply one STS+Service for a single size-class (or the unclassed
 /// pool when `class` is `None`). Returns `(ready, desired)` from
 /// the resulting STS for status aggregation.
+///
+/// `pool_name` (and thus the STS/Service name + `rio.build/pool`
+/// label) is derived once via [`executor_params`] — single source of
+/// truth so the SSA-apply URL and body cannot disagree.
 async fn apply_one(
     fp: &FetcherPool,
     ctx: &Ctx,
     ns: &str,
     oref: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
-    pool_name: &str,
     class: Option<&FetcherSizeClass>,
 ) -> Result<(i32, i32)> {
     let params = executor_params(fp, class)?;
     let labels = sts::executor_labels(&params);
-    let sts_name = sts_name(pool_name, ExecutorRole::Fetcher);
+    let sts_name = sts_name(&params.pool_name, ExecutorRole::Fetcher);
 
     // ── Headless Service ────────────────────────────────────────
     let svc = Service {
@@ -295,16 +293,20 @@ fn executor_params(
         extra_env: class
             .map(|c| vec![sts::env("RIO_SIZE_CLASS", &c.name)])
             .unwrap_or_default(),
-        // Per-class pool_name → STS name `rio-fetcher-{class}`.
-        // P0556: drop the FetcherPool name segment — fetchers are a
-        // single pool by convention (unlike per-arch BuilderPools), so
-        // `rio-fetcher-default-tiny` was carrying a vestigial
-        // `default`. executor_labels reads this for `rio.build/pool`
-        // so the per-class headless Service selector and ephemeral
-        // active-Job count match. Unclassed (`class=None`) keeps
-        // `fp.name_any()` for back-compat with pre-I-170 deployments.
+        // r[impl ctrl.fetcherpool.multiarch]
+        // Per-class pool_name → STS name `rio-fetcher-{fp}-{class}`.
+        // P0556 had dropped the fp-name segment ("fetchers are a
+        // single pool by convention"); multi-arch FetcherPools break
+        // that — two pools `x86-64` and `aarch64` with the same
+        // `classes=[tiny]` would both stamp `rio-fetcher-tiny` in
+        // the same namespace. Restoring `{fp.name}-{class.name}`
+        // matches builder naming (`rio-builder-x86-64-tiny`).
+        // executor_labels reads this for `rio.build/pool` so the
+        // per-class headless Service selector and ephemeral
+        // active-Job count stay per-pool. Unclassed (`class=None`)
+        // keeps bare `fp.name_any()` for pre-I-170 back-compat.
         pool_name: match class {
-            Some(c) => c.name.clone(),
+            Some(c) => format!("{}-{}", fp.name_any(), c.name),
             None => fp.name_any(),
         },
         namespace: fp
@@ -499,12 +501,12 @@ mod tests {
             .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
             .collect();
         assert_eq!(env.get("RIO_SIZE_CLASS"), Some(&"small"));
-        // P0556: pool_name is just the class name (fp-name segment
-        // dropped — fetchers are a single pool by convention).
-        assert_eq!(params.pool_name, "small");
+        // pool_name = `{fp.name}-{class.name}` so per-arch pools
+        // don't collide (multiarch_pools_distinct_sts_names below).
+        assert_eq!(params.pool_name, "test-small");
         assert_eq!(
             sts_name(&params.pool_name, ExecutorRole::Fetcher),
-            "rio-fetcher-small"
+            "rio-fetcher-test-small"
         );
         // Per-class resources, NOT spec.resources (which is None).
         assert_eq!(
@@ -554,7 +556,42 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(names, vec!["rio-fetcher-tiny", "rio-fetcher-small"]);
+        assert_eq!(
+            names,
+            vec!["rio-fetcher-test-tiny", "rio-fetcher-test-small"]
+        );
+    }
+
+    // r[verify ctrl.fetcherpool.multiarch]
+    /// Two FetcherPools (one per arch) with the same `classes=[tiny]`
+    /// produce DISTINCT STS names. P0556's `pool_name = class.name`
+    /// would collide both at `rio-fetcher-tiny`; the `{fp}-{class}`
+    /// form keeps them separate. Mirrors `rio-builder-{arch}-{class}`.
+    #[test]
+    fn multiarch_pools_distinct_sts_names() {
+        let class = FetcherSizeClass {
+            name: "tiny".into(),
+            resources: ResourceRequirements::default(),
+            min_replicas: None,
+            max_replicas: None,
+        };
+        let mut x86 = mk(2, 8);
+        x86.metadata.name = Some("x86-64".into());
+        let mut arm = mk(2, 8);
+        arm.metadata.name = Some("aarch64".into());
+
+        let n = |fp: &FetcherPool| {
+            sts_name(
+                &executor_params(fp, Some(&class)).unwrap().pool_name,
+                ExecutorRole::Fetcher,
+            )
+        };
+        assert_eq!(n(&x86), "rio-fetcher-x86-64-tiny");
+        assert_eq!(n(&arm), "rio-fetcher-aarch64-tiny");
+        assert_ne!(n(&x86), n(&arm), "per-arch pools must not collide");
+        // Max length headroom: `rio-fetcher-aarch64-small-abcdef`
+        // = 32 chars; RFC 1123 limit is 63.
+        assert!(n(&arm).len() < 63 - 7);
     }
 
     /// Unclassed path: `class=None` → no RIO_SIZE_CLASS env, bare

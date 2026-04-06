@@ -4,7 +4,7 @@
        classes are configured. The scheduler's classify() reads
        [[size_classes]]; the FOD floor walk reads [[fetcher_size_classes]].
        Both array-of-tables (can't env-encode). */ -}}
-{{- $hasClasses := or $s.sizeClasses .Values.fetcherPool.classes -}}
+{{- $hasClasses := or $s.sizeClasses .Values.fetcherPoolDefaults.classes -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -38,7 +38,7 @@ spec:
       annotations:
         # Scheduler reads /etc/rio/scheduler.toml once at boot; kubelet
         # CM-remount alone doesn't trigger reload. Roll on class change.
-        checksum/size-classes: {{ list (toJson $s.sizeClasses) (toJson .Values.fetcherPool.classes) | join "" | sha256sum }}
+        checksum/size-classes: {{ list (toJson $s.sizeClasses) (toJson .Values.fetcherPoolDefaults.classes) | join "" | sha256sum }}
       {{- end }}
     spec:
       serviceAccountName: rio-scheduler
@@ -243,9 +243,10 @@ data:
     {{- end }}
     {{- end }}
     {{- /* I-170: ordered fetcher class names for reactive promotion.
-           Single source of truth — same .Values.fetcherPool.classes
-           that fetcherpool.yaml renders into the CRD. */ -}}
-    {{- range .Values.fetcherPool.classes }}
+           Single source of truth — same .Values.fetcherPoolDefaults.
+           classes that fetcherpool.yaml renders into every FetcherPool
+           CR (class names are arch-agnostic). */ -}}
+    {{- range .Values.fetcherPoolDefaults.classes }}
     [[fetcher_size_classes]]
     name = {{ .name | quote }}
     {{- end }}

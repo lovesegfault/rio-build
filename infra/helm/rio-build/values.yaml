@@ -604,7 +604,15 @@ karpenter:
       requirements:
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: [t3a.medium, t3a.large]
+          # t3a (amd64) + t4g (arm64 Graviton). Per-FetcherPool
+          # nodeSelector.kubernetes.io/arch picks which arch a given
+          # Job lands on; Karpenter provisions accordingly. Single
+          # NodePool keeps the rio.build/node-role:fetcher taint+label
+          # model intact (NetworkPolicy keys on that, not arch).
+          values: [t3a.medium, t3a.large, t4g.medium, t4g.large]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64, arm64]
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
@@ -1035,38 +1043,61 @@ builderPoolDefaults:
     rio.build/node-role: builder
 
 # ──────────────────────────────────────────────────────────────────────────
-# Default FetcherPool (SKELETON — reconciler wiring is a follow-on plan)
+# FetcherPools (one per arch) — FOD-only executors. See ADR-019.
 # ──────────────────────────────────────────────────────────────────────────
-# FOD-only executors with open internet egress. See ADR-019.
-fetcherPool:
+# r[impl ctrl.fetcherpool.multiarch]
+#
+# Same list/defaults split as I-117b's builderPoolSets[] — one
+# FetcherPool per arch. Each entry needs at minimum `name` + `systems`
+# + `nodeSelector.kubernetes.io/arch`; everything else deep-merges
+# from `fetcherPoolDefaults`. Per-entry overrides go on the list item
+# (e.g. PLAN-PREBAKE adds per-arch digest-pinned `image`). Overlays
+# that want to change a property for ALL pools (classes, ephemeral)
+# set it on `fetcherPoolDefaults`. Overlays that want a different POOL
+# LIST replace `fetcherPools` (lists are replaced wholesale).
+#
+# `systems` MUST include `builtin` so the spawn-signal intent is
+# self-describing in `kubectl get fp -o yaml` (the controller
+# includes it regardless as a safety net). nodeSelector REPLACES the
+# reconciler default — include `rio.build/node-role: fetcher` too.
+fetcherPools:
+  - name: x86-64
+    systems: [x86_64-linux, builtin]
+    nodeSelector:
+      rio.build/node-role: fetcher
+      kubernetes.io/arch: amd64
+  # Multi-arch: add a second entry (EKS deploy.rs does this via
+  # --set-json):
+  #   - name: aarch64
+  #     systems: [aarch64-linux, builtin]
+  #     nodeSelector:
+  #       rio.build/node-role: fetcher
+  #       kubernetes.io/arch: arm64
+
+fetcherPoolDefaults:
   enabled: false
-  # I-104: pool name is the suffix in `rio-fetcher-<name>`. Fetchers are
-  # arch-agnostic (FODs are `builtin`) — single pool named `default`.
-  name: default
   # P0541: ephemeral defaults true at the CRD level. The chart's
-  # default pool sets it explicitly here so flipping the chart
-  # default is a one-line diff (and so `helm get values` shows the
-  # mode without consulting the CRD schema). false → STS path,
-  # min=2 standing set; true → Job-per-FOD, requires min=0.
+  # default sets it explicitly here so flipping the chart default
+  # is a one-line diff (and so `helm get values` shows the mode
+  # without consulting the CRD schema). false → STS path, min=2
+  # standing set; true → Job-per-FOD, requires min=0.
   ephemeral: false
   # ephemeralDeadlineSeconds: ~  # only with ephemeral:true; default 300
   replicas:
     # min=2: matches the smoke test's parallel-FOD coverage. Same
-    # rationale as builderPoolDefaults.replicas.min — there's always a warm
-    # fetcher so the first FOD doesn't wait for cold-start.
+    # rationale as builderPoolDefaults.replicas.min — there's always
+    # a warm fetcher so the first FOD doesn't wait for cold-start.
     min: 2
     # max paired with karpenter rio-fetcher cpu=128. FODs spike at
     # build start (40+ ready when chains hit FOD-phase together) but
-    # are short (~seconds) — the 30s scale-up window is enough to
-    # catch the spike, the 10m scale-down is plenty to ride out the
-    # tail.
+    # are short (~seconds).
     max: 32
   autoscaling:
     metric: fodQueueDepth
     targetValue: 5   # scale up when queued_fod / fetchers > 5
-  systems: [x86_64-linux]
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
+  # PLAN-PREBAKE: per-entry override with `localhost/…@sha256:<digest>`.
   image: rio-fetcher
   # Same default-true-EKS-overrides-false as builderPoolDefaults above.
   hostUsers: true
@@ -1077,9 +1108,10 @@ fetcherPool:
   # fails on tiny → retry on small). `tiny` matches the pre-I-170
   # single pool; `small` handles the chromium-source tier.
   #
-  # MUST agree with scheduler.toml `[[fetcher_size_classes]]` (rendered
-  # from this list in templates/scheduler.yaml — single source of truth).
-  # Set to `[]` for a single-size pool at the legacy `resources:` field.
+  # MUST agree with scheduler.toml `[[fetcher_size_classes]]`
+  # (rendered from this list in templates/scheduler.yaml — single
+  # source of truth, arch-agnostic floor-walk ordering). Set to `[]`
+  # for a single-size pool at the legacy `resources:` field.
   classes:
     - name: tiny
       resources:
@@ -1098,8 +1130,6 @@ fetcherPool:
       operator: Equal
       value: "true"
       effect: NoSchedule
-  nodeSelector:
-    rio.build/node-role: fetcher
 
 # ──────────────────────────────────────────────────────────────────────────
 # Conditional subchart: PG (dev only). From nixhelm (FOD), not vendored.
