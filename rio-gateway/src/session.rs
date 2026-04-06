@@ -15,6 +15,7 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 use crate::handler::{self, SessionContext};
+use crate::ratelimit::TenantLimiter;
 
 /// Best-effort cancel of all builds tracked in `active_build_ids`.
 ///
@@ -89,6 +90,12 @@ const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
+// 8 args is one over clippy's default of 7. The alternatives
+// (grouping into a struct, or building SessionContext at the call
+// site) both add more noise than the extra arg costs. The session
+// entry point is the natural narrowing-point: everything before is
+// SSH plumbing, everything after is protocol handling.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "session", skip_all, fields(tenant = %tenant_name))]
 pub async fn run_protocol<R, W>(
     reader: &mut R,
@@ -97,6 +104,10 @@ pub async fn run_protocol<R, W>(
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: String,
     jwt_token: Option<String>,
+    // Per-tenant rate limiter, shared across all sessions via
+    // `Arc`-inside-`TenantLimiter`. Checked in the build handlers
+    // before `SubmitBuild`. Disabled limiter (default) is a no-op.
+    limiter: TenantLimiter,
     // Fired by `ChannelSession::Drop` (server.rs) when russh signals
     // `channel_close`. The opcode-read select picks this up and runs
     // the cancel loop — same outcome as the UnexpectedEof arm, but
@@ -114,6 +125,7 @@ where
         scheduler_client.clone(),
         tenant_name,
         jwt_token,
+        limiter,
     );
 
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));

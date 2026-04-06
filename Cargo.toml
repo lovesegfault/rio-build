@@ -113,6 +113,11 @@ flate2 = "1"
 # BuildExecution recv tasks outside the actor loop)
 dashmap = "6"
 
+# Per-tenant rate limiting (phase4b gateway). DefaultKeyedRateLimiter
+# keyed on tenant_name (bounded keyspace — authorized_keys comment is
+# operator-controlled, not client-forgeable). No eviction needed.
+governor = "0.6"
+
 # --- phase2c: chunked CAS ---
 # Content-defined chunking. v2020 algorithm — Chunker::new(data, min, avg, max)
 # slices at statistically-stable boundaries so small edits only perturb the

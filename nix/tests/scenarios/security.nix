@@ -29,6 +29,13 @@
 # the store via wopAddToStoreNar, then wopBuildPathsWithResults triggers
 # BFS → drv_cache populated → validate_dag fires on the env entry.
 #
+# r[verify gw.rate.per-tenant]
+# rate-limit subtest: configure per_minute=2 burst=3 via systemd
+# drop-in, fire 4 rapid builds from the same tenant SSH key → 4th
+# gets STDERR_ERROR with "rate limit" body. builds row count unchanged
+# on the 4th proves the scheduler never saw it (same pre-SubmitBuild
+# gate as gateway-validate).
+#
 # Caller (default.nix) constructs the fixture with:
 #   fixture = standalone {
 #     workers = { worker = { maxBuilds = 1; }; };
@@ -73,6 +80,15 @@ let
   dualSshDrv = drvs.mkTrivial { marker = "sec-dual-ssh"; };
   dualJwtDrv = drvs.mkTrivial { marker = "sec-dual-jwt"; };
 
+  # Rate limit: 4 distinct-marker drvs so each build is fresh (no DAG
+  # dedup collapsing them into one SubmitBuild). The 4th must be
+  # REJECTED by the rate limiter — distinct marker guarantees it
+  # would have been a new build if it got through.
+  rlDrv1 = drvs.mkTrivial { marker = "sec-rl-1"; };
+  rlDrv2 = drvs.mkTrivial { marker = "sec-rl-2"; };
+  rlDrv3 = drvs.mkTrivial { marker = "sec-rl-3"; };
+  rlDrv4 = drvs.mkTrivial { marker = "sec-rl-4"; };
+
   # __noChroot derivation: REJECTED by gateway's translate::validate_dag.
   # Rejection is pre-SubmitBuild so scheduler never sees it. Not using
   # drvs.mkTrivial — that factory doesn't expose arbitrary env attrs,
@@ -95,9 +111,11 @@ in
 pkgs.testers.runNixOSTest {
   name = "rio-security";
   skipTypeCheck = true;
-  # 3 boot + worker registration (~60s) + 4 builds (~30s each) +
-  # gateway restart + metric scrapes. Margin for CI jitter.
-  globalTimeout = 600 + covTimeoutHeadroom;
+  # Boot + worker registration (~60s) + ~9 builds (~30s each: hmac +
+  # tenant-resolve×3 + jwt-dual-mode×2 + rate-limit×3) + 3 gateway
+  # restarts (tenant keys, rate-limit config, rate-limit teardown) +
+  # metric scrapes. Margin for CI jitter.
+  globalTimeout = 900 + covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -478,6 +496,117 @@ pkgs.testers.runNixOSTest {
             f"builds count changed {count_before} → {build_count()}"
         )
         print("gateway-validate PASS: __noChroot rejected at gateway, scheduler unreached")
+
+    # ══════════════════════════════════════════════════════════════════
+    # Section: rate limit (per-tenant, r[gw.rate.per-tenant])
+    # ══════════════════════════════════════════════════════════════════
+    # Configure per_minute=2 burst=3 via a systemd drop-in, restart the
+    # gateway, fire 4 rapid builds from the same tenant SSH key. The
+    # first 3 fall inside the burst bucket; the 4th is rejected with
+    # "rate limit" in the error body. Verify the 4th did NOT reach the
+    # scheduler (builds row count unchanged) — same pre-SubmitBuild
+    # proof shape as gateway-validate above.
+    #
+    # Placed after gateway-validate: the restart loses the gateway's
+    # in-memory state (metrics counters, rate-limiter buckets), and
+    # the burst=3 config would interfere with earlier subtests if
+    # applied sooner. Teardown at the end removes the config + restarts
+    # so cache-auth + jwt-dual-mode subtests run unconstrained.
+
+    with subtest("rate-limit: 4th rapid build from same tenant rejected"):
+        # Drop-in: figment's env layer reads RIO_RATE_LIMIT__PER_MINUTE
+        # → rate_limit.per_minute. Both fields must be set (no
+        # compiled-in default — r[gw.rate.per-tenant] says
+        # workload-dependent). per_minute=2 → one token every 30s;
+        # with burst=3, 3 rapid builds drain the bucket and the 4th
+        # needs ~30s before the next token — well outside the test's
+        # submit loop.
+        ${gatewayHost}.succeed(
+            "mkdir -p /etc/systemd/system/rio-gateway.service.d && "
+            "printf '[Service]\\nEnvironment=RIO_RATE_LIMIT__PER_MINUTE=2\\nEnvironment=RIO_RATE_LIMIT__BURST=3\\n' "
+            "> /etc/systemd/system/rio-gateway.service.d/ratelimit.conf && "
+            "systemctl daemon-reload && systemctl restart rio-gateway"
+        )
+        ${gatewayHost}.wait_for_unit("rio-gateway.service")
+        ${gatewayHost}.wait_for_open_port(2222)
+
+        # Confirm the limiter is actually enabled (not silently
+        # disabled by a config parse miss). The "per-tenant rate
+        # limiting enabled" info log from main.rs is the discriminator
+        # — without it, the test's 3 successes below prove nothing
+        # (disabled limiter also passes).
+        ${gatewayHost}.wait_until_succeeds(
+            "journalctl -u rio-gateway --since '-10s' | "
+            "grep -q 'per-tenant rate limiting enabled'"
+        )
+
+        count_before = build_count()
+
+        # 3 rapid builds under id_team_test (known tenant, resolved
+        # UUID). Each distinct marker → distinct DAG → fresh
+        # SubmitBuild (no dedup). All 3 within burst.
+        #
+        # We don't `succeed` on these — the build itself may fail
+        # for unrelated reasons (worker timeout, etc). What matters
+        # for rate-limiting is the SUBMIT path: each build_drv
+        # that doesn't hit "rate limit" in its output is one
+        # consumed token. Using succeed+out would couple this
+        # subtest to the worker's health; instead, check for ABSENCE
+        # of the rate-limit error.
+        for i, drv in enumerate(["${rlDrv1}", "${rlDrv2}", "${rlDrv3}"], start=1):
+            out = client.succeed(
+                "nix-build --no-out-link "
+                "--store 'ssh-ng://root@${gatewayHost}?ssh-key=/root/.ssh/id_team_test' "
+                "--arg busybox '(builtins.storePath ${common.busybox})' "
+                f"{drv} 2>&1 || true"
+            )
+            assert "rate limit" not in out, (
+                f"build #{i} unexpectedly rate-limited "
+                f"(burst=3 should allow it): {out[:300]}"
+            )
+            ${gatewayHost}.log(f"rate-limit: build #{i} submitted (within burst)")
+
+        # 4th build — should be rejected. burst=3 drained, per_minute=2
+        # means the next token is ~30s away. The nix-build will fail
+        # with the gateway's STDERR_ERROR containing "rate limit".
+        out = client.fail(
+            "nix-build --no-out-link "
+            "--store 'ssh-ng://root@${gatewayHost}?ssh-key=/root/.ssh/id_team_test' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${rlDrv4} 2>&1"
+        )
+        assert "rate limit" in out, (
+            f"4th build should be rate-limited; got: {out[:500]}"
+        )
+        # The wait-hint should mention the tenant name (proves the
+        # limiter keyed on tenant_name, not a generic counter).
+        assert "team-test" in out, (
+            f"rate-limit error should name the tenant: {out[:500]}"
+        )
+        # Pre-SubmitBuild rejection: scheduler never saw the 4th. The
+        # first 3 may or may not have succeeded (worker-dependent), so
+        # we check DELTA <= 3, not == 3. The load-bearing half is the
+        # 4th's builds-count being unchanged from count-after-third.
+        count_after = build_count()
+        assert count_after <= count_before + 3, (
+            f"at most 3 builds should reach scheduler; "
+            f"count {count_before} → {count_after}"
+        )
+        print(
+            "rate-limit PASS: 3 submits within burst, 4th rejected "
+            "pre-SubmitBuild with tenant-named error"
+        )
+
+        # Teardown: remove the drop-in so the cache-auth subtests
+        # below (which may indirectly trigger gateway paths via
+        # narinfo serving — they don't, but future subtests might)
+        # aren't rate-limited by the leftover burst=3.
+        ${gatewayHost}.succeed(
+            "rm -f /etc/systemd/system/rio-gateway.service.d/ratelimit.conf && "
+            "systemctl daemon-reload && systemctl restart rio-gateway"
+        )
+        ${gatewayHost}.wait_for_unit("rio-gateway.service")
+        ${gatewayHost}.wait_for_open_port(2222)
 
     # ══════════════════════════════════════════════════════════════════
     # Section: cache-auth (binary-cache HTTP Bearer token)

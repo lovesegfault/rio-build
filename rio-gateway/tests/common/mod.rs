@@ -68,6 +68,7 @@ impl GatewaySession {
                 &mut scc,
                 String::new(),
                 None,
+                rio_gateway::TenantLimiter::disabled(),
                 shutdown_child,
             )
             .await

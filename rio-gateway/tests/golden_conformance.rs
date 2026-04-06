@@ -65,6 +65,7 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
             &mut scheduler_client,
             String::new(),
             None,
+            rio_gateway::TenantLimiter::disabled(),
             rio_common::signal::Token::new(),
         )
         .await;
@@ -167,6 +168,7 @@ async fn test_golden_live_handshake() -> anyhow::Result<()> {
             &mut scheduler_client,
             String::new(),
             None,
+            rio_gateway::TenantLimiter::disabled(),
             rio_common::signal::Token::new(),
         )
         .await;
