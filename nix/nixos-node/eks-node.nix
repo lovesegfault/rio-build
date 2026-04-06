@@ -124,9 +124,13 @@ in
       type = lib.types.listOf lib.types.package;
       default = [ ];
       description = ''
-        OCI tarballs to `ctr image import` before kubelet starts, so
-        static pods don't round-trip a registry. Pattern cribbed from
-        nixpkgs `services.kubernetes.kubelet.seedDockerImages`.
+        OCI-archive tarballs to `ctr -n k8s.io image import --local`
+        before kubelet starts. Layer blobs land in containerd's content
+        store; the seed.local/…:prebaked refs are pinned so kubelet
+        image-GC and containerd content-GC can't reclaim the blobs
+        before any pod has referenced them via its real ECR ref. The
+        seed refs themselves are never pulled — they're GC roots only.
+        See r[infra.node.prebake-layer-warm].
       '';
     };
   };
@@ -334,22 +338,49 @@ in
           ];
           # AL2023 sets `iptables -P FORWARD ACCEPT` so pod↔pod traffic
           # via the vpc-cni veth pairs isn't dropped by the kernel default
-          # FORWARD=DROP. Then seed images: pause MUST land before kubelet
-          # creates its first sandbox (nodeadm pins sandbox=localhost/
-          # kubernetes/pause — there is no registry to fall back to).
-          preStart = ''
-            ${lib.getExe' pkgs.iptables "iptables"} -P FORWARD ACCEPT -w 5
-            ${lib.concatMapStringsSep "\n" (
-              img:
-              "${pkgs.containerd}/bin/ctr -n k8s.io image import --label io.cri-containerd.pinned=pinned ${img} || true"
-            ) ([ pauseImage ] ++ cfg.seedImages)}
-          ''
-          + lib.optionalString (cfg.staticPods != { }) ''
-            mkdir -p /etc/kubernetes/manifests
-            ${lib.concatMapStringsSep "\n" (
-              name: "ln -sf ${cfg.staticPods.${name}} /etc/kubernetes/manifests/${name}.json"
-            ) (lib.attrNames cfg.staticPods)}
-          '';
+          # FORWARD=DROP. Then seed images into containerd's content store
+          # before kubelet starts.
+          # r[impl infra.node.prebake-layer-warm]
+          preStart =
+            let
+              ctr = "${pkgs.containerd}/bin/ctr -n k8s.io";
+            in
+            ''
+              ${lib.getExe' pkgs.iptables "iptables"} -P FORWARD ACCEPT -w 5
+              # pause: docker-archive, MUST land before kubelet creates its
+              # first sandbox (nodeadm pins sandbox=localhost/kubernetes/
+              # pause — there is no registry to fall back to). --label on
+              # import works for docker-archive on the legacy path.
+              ${ctr} image import --label io.cri-containerd.pinned=pinned \
+                ${pauseImage} || true
+              ${lib.concatMapStringsSep "\n" (seed: ''
+                # Layer-cache warm: import the OCI archive. --local: the
+                # containerd 2.x transfer-API path drops --label and handles
+                # multi-manifest ref.name annotations differently; --local
+                # forces the legacy client-side path which honours both
+                # (PLAN-PREBAKE Q1/Q6). Seed-import failure is degraded-but-
+                # functional (first-pod pull fetches every layer from ECR),
+                # so log-warn rather than fail-hard — a corrupt seed
+                # shouldn't take the node out of the pool.
+                ${ctr} image import --local ${seed} \
+                  || echo "rio: seed import ${seed} failed; first-pod pull will be cold" >&2
+                # Pin both seed.local/…:prebaked refs. The label stops
+                # kubelet's CRI image-GC from deleting the IMAGE RECORD;
+                # the record's mere existence stops containerd's content-GC
+                # from deleting the LAYER BLOBS (Q8 — gc.Scheduler walks
+                # image-store refs, not labels). No content-label or lease
+                # needed.
+                for ref in seed.local/rio-builder:prebaked seed.local/rio-fetcher:prebaked; do
+                  ${ctr} image label "$ref" io.cri-containerd.pinned=pinned || true
+                done
+              '') cfg.seedImages}
+            ''
+            + lib.optionalString (cfg.staticPods != { }) ''
+              mkdir -p /etc/kubernetes/manifests
+              ${lib.concatMapStringsSep "\n" (
+                name: "ln -sf ${cfg.staticPods.${name}} /etc/kubernetes/manifests/${name}.json"
+              ) (lib.attrNames cfg.staticPods)}
+            '';
           serviceConfig = {
             Slice = "runtime.slice";
             EnvironmentFile = "/etc/eks/kubelet/environment";

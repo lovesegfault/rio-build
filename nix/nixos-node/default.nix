@@ -9,7 +9,16 @@
 # r[impl infra.node.nixos-ami]
 #
 # Design: docs/src/decisions/021-nixos-node-ami.md (ADR-021).
-{ lib, ... }:
+{
+  lib,
+  # OCI archive(s) to import into containerd's content store before
+  # kubelet starts (layer-cache warm — r[infra.node.prebake-layer-warm]).
+  # Threaded via specialArgs from flake.nix's nodeAmi rather than
+  # imported directly so this module tree stays evaluable without the
+  # full flake context (the P0-nixos-vm-test composition won't pass it).
+  rioSeedImages ? [ ],
+  ...
+}:
 {
   imports = [
     ./minimal.nix
@@ -18,6 +27,7 @@
   ];
 
   services.rio.eksNode.enable = true;
+  services.rio.eksNode.seedImages = rioSeedImages;
 
   # nixpkgs amazon-image.nix pulls in amazon-init.service, which fetches
   # userData and pipes it to `nixos-rebuild switch`. We want the node
