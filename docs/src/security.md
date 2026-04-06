@@ -169,6 +169,42 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 - **Threat**: `FindMissingChunks` can reveal whether another tenant has built a specific package.
 - **Mitigation**: Per-tenant chunk scoping (at the cost of dedup) or accept the risk. See [Multi-Tenancy](multi-tenancy.md#findmissingchunks-scoping).
 
+## Ephemeral Builders
+
+For untrusted multi-tenant deployments where **isolation > throughput**,
+`WorkerPoolSpec.ephemeral: true` (see `r[ctrl.pool.ephemeral]` in
+[components/controller.md](components/controller.md#ephemeral-workerpools))
+provides the strongest cross-build isolation rio offers: one pod per
+build, zero shared state. Each build gets a fresh emptyDir for the FUSE
+cache and overlayfs upper — an untrusted tenant cannot leave behind
+poisoned cache entries, doctored overlays, or stale mount points for the
+next build, because there is no "next build" on that pod. The pod
+terminates after one `CompletionReport`; K8s reaps the Job via
+`ttlSecondsAfterFinished`.
+
+**What ephemeral mode does NOT provide** (limitations #1–3 below still
+apply): the Nix sandbox is still a purity boundary, not a security
+boundary. A malicious derivation can still attempt sandbox escape and
+gain `CAP_SYS_ADMIN` within the pod. Ephemeral mode limits the BLAST
+RADIUS of such an escape — the attacker is confined to one pod with no
+persistent state to poison and no cached inputs from other tenants to
+exfiltrate.
+
+**Recommended combination** for untrusted multi-tenant:
+
+| Layer | Mechanism | What it provides |
+|---|---|---|
+| Pod lifetime | `WorkerPoolSpec.ephemeral: true` | Zero cross-build state; no cache/overlay poisoning |
+| User namespace | `hostUsers: false` (K8s 1.33+) | `CAP_SYS_ADMIN` scoped to unprivileged host UIDs (see limitation #2) |
+| Seccomp | `WorkerPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[worker.seccomp.localhost-profile]`) |
+| Node isolation | Dedicated tainted node pool | Sandbox escape confined to worker nodes |
+| Network | NetworkPolicy egress deny + FOD proxy allowlist | No exfil to arbitrary endpoints |
+
+The cost is per-build cold start (~10–30s pod scheduling + FUSE mount +
+heartbeat) plus one reconciler tick (~10s). For trusted-tenant CI
+workloads, prefer the default StatefulSet mode (warm cache, ~ms
+dispatch latency).
+
 ## Known Limitations
 
 1. **The Nix sandbox is NOT a security boundary.** It prevents builds from accessing undeclared inputs (purity) but does not prevent a determined attacker from escaping. For multi-tenant deployments, the security boundary is the worker pod + node isolation.

@@ -15,6 +15,7 @@ use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios};
 fn test_wp() -> WorkerPool {
     let spec = WorkerPoolSpec {
         replicas: Replicas { min: 2, max: 10 },
+        ephemeral: false,
         autoscaling: Autoscaling {
             metric: "queueDepth".into(),
             target_value: 5,

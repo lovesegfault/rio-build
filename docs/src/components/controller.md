@@ -57,6 +57,57 @@ status:
       message: "scaled from 5 to 8"
 ```
 
+### Ephemeral WorkerPools
+
+r[ctrl.pool.ephemeral]
+
+When `WorkerPoolSpec.ephemeral: true`, the controller does NOT create a
+StatefulSet, headless Service, or PodDisruptionBudget. Instead,
+`reconcile_ephemeral` polls `AdminService.ClusterStatus` each requeue tick
+(10s, vs 5min for STS pools) and spawns K8s Jobs when
+`queued_derivations > 0` and active Jobs < `spec.replicas.max`. Each Job
+runs one rio-worker pod with `RIO_EPHEMERAL=1` → worker's main loop exits
+after one `CompletionReport` (no second event-loop iteration) → pod
+terminates → Job goes Complete → `ttlSecondsAfterFinished: 60` reaps. Job
+settings: `backoffLimit: 0` (scheduler owns retry), `restartPolicy:
+Never`, `parallelism: 1`. `spec.replicas.min` MUST be 0 (CEL-enforced);
+`spec.replicas.max` is the concurrent-Job ceiling, not a standing set.
+
+**Isolation guarantee:** zero cross-build state. Fresh pod means fresh
+emptyDir for FUSE cache and overlayfs upper, fresh filesystem. Untrusted
+tenants cannot leave poisoned cache entries for subsequent builds — there
+is no "subsequent build" on that pod. Strongest isolation when combined
+with `hostUsers: false` + non-privileged (see `docs/src/security.md`
+§ Ephemeral Builders).
+
+**Cost:** per-build cold start (pod scheduling + container pull + FUSE
+mount + scheduler registration — typically 10–30s) plus one reconcile
+tick (~10s) before the Job is spawned. `W_LOCALITY` is meaningless
+(every ephemeral worker has an empty cache; `count_missing` returns
+full closure for every candidate); scheduler scoring reduces to
+`W_LOAD` which becomes "under the `replicas.max` concurrent-Job
+ceiling?". Pod churn may require Karpenter tuning (consolidation
+policy). Not recommended for high-throughput trusted-tenant workloads;
+intended for untrusted multi-tenant where isolation > throughput.
+
+**Dispatch path unchanged:** from the scheduler's perspective, an
+ephemeral Job pod is indistinguishable from an STS pod — it heartbeats
+in, gets dispatched, sends CompletionReport, disconnects. The
+"ephemeral" property is purely worker-side (`RIO_EPHEMERAL` → exit
+after one build) and controller-side (Job lifecycle). The proto
+`ControllerService.CreateEphemeralWorker` RPC exists for a future
+sub-second dispatch path (scheduler calls controller directly at
+dispatch time); the active mechanism is ClusterStatus polling.
+
+**RBAC:** the controller's ClusterRole grants `batch/jobs` verbs
+`[get, list, watch, create]`. `delete` not needed —
+`ttlSecondsAfterFinished` reaps; ownerRef GC handles WorkerPool-delete
+cleanup.
+
+**Cleanup:** the finalizer's `cleanup()` branches on `spec.ephemeral` and
+returns immediately (no STS to scale to 0, no long-lived workers to
+DrainWorker). In-flight Jobs finish their one build naturally.
+
 ### WorkerPoolSet
 
 > **Scheduled:** [P0232](../../.claude/work/plan-0232-wps-crd-struct-crdgen.md) (CRD types) + [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md) (reconciler) + [P0229](../../.claude/work/plan-0229-cutoff-rebalancer-gauge-convergence.md) (CutoffRebalancer). Until those land: size-class routing via multiple independent `WorkerPool` CRs, cutoffs static in `scheduler.toml`.
@@ -153,6 +204,7 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 | `""` (core) | pods | get, list, watch |
 | `""` (core) | services | get, list, watch, create, update, patch, delete |
 | `""` (core) | events | create, patch |
+| `batch` | jobs | get, list, watch, create |
 
 Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).
 

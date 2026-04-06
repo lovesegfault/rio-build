@@ -53,6 +53,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
 clap = { workspace = true }
+# Ephemeral Job name suffixes (ephemeral.rs random_suffix).
+rand = { workspace = true }
 
 [dev-dependencies]
 # ApiServerVerifier + Scenario (tower-test mock apiserver).

@@ -37,6 +37,7 @@ use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::Ctx;
 
 mod builders;
+mod ephemeral;
 use builders::*;
 
 #[cfg(test)]
@@ -112,6 +113,23 @@ async fn reconcile_inner(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
 async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let ns = wp.namespace().expect("checked in reconcile()");
     let name = wp.name_any();
+
+    // r[impl ctrl.pool.ephemeral]
+    // Ephemeral mode: NO StatefulSet / headless Service / PDB. Jobs
+    // are spawned on demand (reconcile_ephemeral polls ClusterStatus
+    // for queued derivations). Each Job pod runs one build then
+    // exits. See ephemeral.rs module doc for the full architecture.
+    //
+    // The branch is HERE (not deeper) because everything below is
+    // STS-mode: Service for STS identity, PDB for STS eviction, the
+    // STS itself. None of it applies to per-assignment Jobs.
+    //
+    // cleanup() also branches on ephemeral — no STS to scale to 0,
+    // just wait for in-flight Jobs to finish (or let the finalizer
+    // timeout → ownerRef GC deletes them).
+    if wp.spec.ephemeral {
+        return ephemeral::reconcile_ephemeral(&wp, ctx).await;
+    }
 
     // ownerReference: ties children to this CRD. Delete the
     // WorkerPool → K8s GC deletes the StatefulSet + Service.
@@ -309,6 +327,24 @@ const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let ns = wp.namespace().expect("checked in reconcile()");
     let name = wp.name_any();
+
+    // Ephemeral mode: no STS to scale to 0, no long-lived workers
+    // to DrainWorker. Jobs complete on their own (one build each);
+    // in-flight Jobs finish naturally. ownerRef GC deletes them
+    // once the finalizer is removed. We return immediately —
+    // the finalizer is removed, K8s GC handles the rest.
+    //
+    // NOT waiting for in-flight Jobs: a running ephemeral build
+    // will complete regardless (worker doesn't know the WorkerPool
+    // is being deleted; it finishes its one build and exits).
+    // Waiting would just delay the CR deletion. If an operator
+    // wants to interrupt in-flight ephemeral builds, they can
+    // `kubectl delete jobs -l rio.build/pool=X` separately.
+    if wp.spec.ephemeral {
+        info!(workerpool = %name, "cleanup: ephemeral pool; ownerRef GC handles Jobs");
+        return Ok(Action::await_change());
+    }
+
     let sts_name = format!("{name}-workers");
     info!(workerpool = %name, "cleanup: starting drain");
 

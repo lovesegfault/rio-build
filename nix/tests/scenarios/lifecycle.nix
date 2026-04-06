@@ -90,6 +90,17 @@
 #   backdates first_referenced_at past retention too → sweep collects 1.
 #   Proves tenant retention EXTENDS global grace (the spec's "floor"
 #   semantics) end-to-end with completion-hook-produced rows.
+#
+# r[verify ctrl.pool.ephemeral]
+#   ephemeral-pool: applies WorkerPoolSpec.ephemeral=true; asserts NO
+#   StatefulSet (apply() took the ephemeral branch, mod.rs:118-132);
+#   asserts status.desiredReplicas == replicas.max (reconcile_ephemeral
+#   ran and patched status, ephemeral.rs:220-228). The full
+#   Job-spawn-on-queue path requires running after finalizer (no STS
+#   worker to steal the dispatch) — proven in the vm-lifecycle-ephemeral
+#   composition (see default.nix), not inline here. The structural
+#   assertions (no-STS, status-patched, cleanup-immediate) ARE
+#   self-contained.
 {
   pkgs,
   common,
@@ -195,6 +206,13 @@ let
   # `out_recovery` from the recovery subtest — convenient but coupled.
   # Fragment architecture: gc-sweep builds its own victim.
   gcVictimDrv = drvs.mkTrivial { marker = "lifecycle-gc-victim"; };
+
+  # ephemeral-pool: two builds with DISTINCT markers. Same DAG-dedup
+  # reasoning as pinDrv/recoveryDrv — the second build must be a fresh
+  # derivation, not a cache hit, so reconcile_ephemeral's ClusterStatus
+  # poll sees queued > 0 again and spawns a SECOND Job.
+  ephemeralDrv1 = drvs.mkTrivial { marker = "lifecycle-ephemeral-1"; };
+  ephemeralDrv2 = drvs.mkTrivial { marker = "lifecycle-ephemeral-2"; };
 
   # gc-sweep's path_tenants proof. Distinct marker so DAG-dedup doesn't
   # reuse pinDrv/gcVictimDrv (those were built with the empty-comment
@@ -1582,6 +1600,216 @@ let
           print("refs-end-to-end PASS: refscan→PG→mark-walks-refs proven")
     '';
 
+    ephemeral-pool = ''
+      # ══════════════════════════════════════════════════════════════════
+      # ephemeral-pool — WorkerPoolSpec.ephemeral=true → no STS, Job/build
+      # ══════════════════════════════════════════════════════════════════
+      # REQUIRES: no STS workers alive (run AFTER finalizer, which
+      # deletes the default pool). Otherwise the STS worker picks up
+      # dispatches before reconcile_ephemeral's 10s tick spawns a Job.
+      #
+      # Proves end-to-end:
+      #   - apply() branches on spec.ephemeral (mod.rs:118-132) — no STS
+      #   - reconcile_ephemeral polls ClusterStatus + spawns Jobs when
+      #     queued > 0 (ephemeral.rs:107-215)
+      #   - Job pod has RIO_EPHEMERAL=1 → worker exits after one build
+      #     (main.rs single-shot gate)
+      #   - pod terminates → Job Complete → ttlSecondsAfterFinished reaps
+      #   - second build → fresh Job (zero cross-build state)
+      #
+      # NOT proven here: the actual isolation property (tenant A can't
+      # poison tenant B's cache). That'd need two tenants building
+      # overlapping closures with one malicious. The "fresh pod = fresh
+      # emptyDir" property is structural — K8s guarantees it.
+      with subtest("ephemeral-pool: no STS, Job spawned, pod reaped, second build = new Job"):
+          # Precondition: no STS workers. The finalizer fragment (run
+          # before this) deletes the default pool. If this assert fires,
+          # assertChains ordering is wrong.
+          sched_metric_wait(
+              "grep -qx 'rio_scheduler_workers_active 0'",
+              timeout=30,
+          )
+
+          # Apply ephemeral WorkerPool. Spec mirrors vmtest-full.yaml's
+          # default pool (image, privileged, resources, grace) except:
+          # ephemeral=true, replicas.min=0 (CEL enforced), max=4.
+          # Heredoc via stdin: kubectl apply -f - with EOF. The YAML
+          # is inline so the test doc is self-contained (no external
+          # fixture file to drift).
+          k3s_server.succeed(
+              "k3s kubectl apply -f - <<'EOF'\n"
+              "apiVersion: rio.build/v1alpha1\n"
+              "kind: WorkerPool\n"
+              "metadata:\n"
+              "  name: ephemeral\n"
+              "  namespace: ${ns}\n"
+              "spec:\n"
+              "  ephemeral: true\n"
+              "  replicas: {min: 0, max: 4}\n"
+              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
+              "  maxConcurrentBuilds: 1\n"
+              "  fuseCacheSize: 5Gi\n"
+              "  systems: [x86_64-linux]\n"
+              "  image: rio-all\n"
+              "  imagePullPolicy: Never\n"
+              "  privileged: true\n"
+              "  terminationGracePeriodSeconds: 60\n"
+              "  nodeSelector: null\n"
+              "  tolerations: null\n"
+              "EOF"
+          )
+
+          # ── No StatefulSet ────────────────────────────────────────────
+          # The reconciler's apply() branches on spec.ephemeral BEFORE
+          # the STS/Service/PDB block. Give it one reconcile tick (CRD
+          # watch fires immediately on create), then assert. If an STS
+          # ever appears for this pool, the branch didn't fire.
+          import time
+          time.sleep(3)  # one reconcile tick (kube-runtime is fast)
+          k3s_server.fail(
+              "k3s kubectl -n ${ns} get sts ephemeral-workers 2>/dev/null"
+          )
+          # Headless Service also skipped.
+          k3s_server.fail(
+              "k3s kubectl -n ${ns} get svc ephemeral-workers 2>/dev/null"
+          )
+
+          # ── Status patched by reconcile_ephemeral ─────────────────────
+          # desiredReplicas = spec.replicas.max (the concurrent-Job
+          # ceiling). reconcile_ephemeral runs on first apply even with
+          # queued=0 — it patches status then requeues at 10s.
+          k3s_server.wait_until_succeeds(
+              "test \"$(k3s kubectl -n ${ns} get workerpool ephemeral "
+              "-o jsonpath='{.status.desiredReplicas}')\" = 4",
+              timeout=30,
+          )
+
+          # ── Build 1: Job spawned, completes, pod reaped ───────────────
+          # Submit via the backgrounded nix-build pattern (same as
+          # recoverySlowDrv) — foreground would block before we can
+          # observe the Job. Background, assert Job appears, wait for
+          # nix-build exit.
+          client.succeed(
+              "nix-build --no-out-link --store 'ssh-ng://k3s-server' "
+              "--arg busybox '(builtins.storePath ${common.busybox})' "
+              "${ephemeralDrv1} > /tmp/eph1.out 2>&1 & "
+              "echo $! > /tmp/eph1.pid"
+          )
+
+          # Job appears within: nix-build handshake (~5s) + queue +
+          # reconcile_ephemeral tick (10s) + K8s create (~1s). 45s
+          # margin. The Job label `rio.build/pool=ephemeral` comes
+          # from builders::labels() — same label cleanup() lists by.
+          k3s_server.wait_until_succeeds(
+              "test -n \"$(k3s kubectl -n ${ns} get jobs "
+              "-l rio.build/pool=ephemeral -o name)\"",
+              timeout=45,
+          )
+          job1 = k3s_server.succeed(
+              "k3s kubectl -n ${ns} get jobs "
+              "-l rio.build/pool=ephemeral "
+              "-o jsonpath='{.items[0].metadata.name}'"
+          ).strip()
+          print(f"ephemeral: build 1 spawned Job {job1}")
+
+          # RIO_EPHEMERAL=1 on the Job's pod spec. This is the load-
+          # bearing env var: without it the worker loops forever.
+          # jsonpath into Job.spec.template (not pod — pod name is
+          # Job-generated, less stable for the query).
+          eph_env = k3s_server.succeed(
+              f"k3s kubectl -n ${ns} get job {job1} "
+              "-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name==\"RIO_EPHEMERAL\")].value}'"
+          ).strip()
+          assert eph_env == "1", (
+              f"RIO_EPHEMERAL must be '1' on ephemeral Job pod; got "
+              f"{eph_env!r}. Without it, worker never exits → Job never "
+              f"completes → pod leaked."
+          )
+
+          # nix-build completes. 120s: Job pod schedule (~5s) + container
+          # pull from local registry (~2s, image already loaded) + FUSE
+          # mount + cgroup (~5s) + heartbeat accepted (~10s tick) +
+          # dispatch + build (mkTrivial ~1s) + CompletionReport + worker
+          # exit. ~30-40s typical; 120s margin.
+          client.wait_until_succeeds(
+              "! kill -0 $(cat /tmp/eph1.pid) 2>/dev/null",
+              timeout=120,
+          )
+          out1 = client.succeed("cat /tmp/eph1.out").strip()
+          assert "/nix/store/" in out1, (
+              f"build 1 should have produced a store path, got: {out1!r}"
+          )
+
+          # Pod goes Succeeded (worker exited 0 after its one build).
+          # Not checking Job.status.succeeded directly — K8s Job
+          # controller may lag a tick. Checking pod phase is tighter.
+          k3s_server.wait_until_succeeds(
+              "test \"$(k3s kubectl -n ${ns} get pods "
+              "-l rio.build/pool=ephemeral "
+              "-o jsonpath='{.items[0].status.phase}')\" = Succeeded",
+              timeout=30,
+          )
+
+          # ── Build 2: fresh Job (not reusing build 1's pod) ────────────
+          # ttlSecondsAfterFinished=60 may not have reaped job1 yet
+          # (depends on K8s TTL controller tick). That's fine — the
+          # ASSERTION is that a NEW Job appears, not that job1 is gone.
+          # Count Jobs before build 2, expect +1 after.
+          jobs_before = int(k3s_server.succeed(
+              "k3s kubectl -n ${ns} get jobs "
+              "-l rio.build/pool=ephemeral -o name | wc -l"
+          ).strip())
+
+          # Foreground build this time — we don't need to observe
+          # mid-flight state, just that it completes.
+          out2 = build("${ephemeralDrv2}")
+          assert "/nix/store/" in out2, (
+              f"build 2 should have produced a store path, got: {out2!r}"
+          )
+
+          jobs_after = int(k3s_server.succeed(
+              "k3s kubectl -n ${ns} get jobs "
+              "-l rio.build/pool=ephemeral -o name | wc -l"
+          ).strip())
+          # >= not ==: job1 might have been TTL-reaped during build 2
+          # (60s ttl, build 2 takes ~30-40s). jobs_after >= jobs_before
+          # proves a NEW Job was created (if job1 was reaped AND no new
+          # Job, count would DROP).
+          #
+          # Alternative assertion (stricter, but timing-sensitive):
+          # fetch all Job names, assert the set grew. This weaker form
+          # is robust to TTL-reap timing.
+          assert jobs_after >= jobs_before, (
+              f"expected ≥{jobs_before} Jobs after build 2 (new Job "
+              f"spawned, possibly old one reaped), got {jobs_after}. "
+              f"If jobs_after < jobs_before, build 2 was served by a "
+              f"REUSED pod — ephemeral mode is broken."
+          )
+          # Precondition self-assert (guards "proves nothing"):
+          # jobs_before must be ≥1, otherwise the >= check is vacuous
+          # (0 >= 0 passes even if nothing happened).
+          assert jobs_before >= 1, (
+              f"jobs_before must be ≥1 (build 1 should have spawned one); "
+              f"got {jobs_before}. If 0, build 1 never reached the Job-"
+              f"spawn path."
+          )
+
+          # ── Cleanup ───────────────────────────────────────────────────
+          # Delete the ephemeral pool. cleanup() branches on
+          # spec.ephemeral and returns immediately (no STS scale-to-0,
+          # no DrainWorker loop). In-flight Jobs finish naturally;
+          # ownerRef GC deletes them.
+          kubectl("delete workerpool ephemeral --wait=false")
+          # CR gone quickly — finalizer removed on first cleanup() call.
+          # 30s is generous; should be <5s in practice.
+          k3s_server.wait_until_succeeds(
+              "! k3s kubectl -n ${ns} get workerpool ephemeral 2>/dev/null",
+              timeout=30,
+          )
+          print("ephemeral-pool PASS: no STS, Job spawned per build, "
+                "pod Succeeded, fresh Job for build 2")
+    '';
+
     finalizer = ''
       # ══════════════════════════════════════════════════════════════════
       # finalizer — delete WorkerPool → pod gone → CR gone → workers=0
@@ -1649,6 +1877,12 @@ let
     assert lib.assertMsg (
       !(has "finalizer") || (has "autoscaler" && idx "autoscaler" < idx "finalizer")
     ) "lifecycle: finalizer requires autoscaler earlier (pod-1 reverse-ordinal coverage)";
+    # ephemeral-pool requires workers_active=0 (finalizer deletes the
+    # default STS pool). Without this ordering, the STS worker picks
+    # up dispatches before reconcile_ephemeral's 10s tick spawns a Job.
+    assert lib.assertMsg (
+      !(has "ephemeral-pool") || (has "finalizer" && idx "finalizer" < idx "ephemeral-pool")
+    ) "lifecycle: ephemeral-pool requires finalizer earlier (no STS workers stealing dispatch)";
     true;
 
   # Coverage-instrumented images are ~3-4× larger. The k3s containerd

@@ -103,9 +103,25 @@ async fn main() -> anyhow::Result<()> {
     // to reserve it for other work).
     let features = cfg.features;
 
+    // r[impl ctrl.pool.ephemeral]
+    // Ephemeral mode: controller's build_job (ephemeral.rs) sets
+    // RIO_EPHEMERAL=1 on Job pods. Worker exits after one build
+    // completes → pod terminates → Job goes Complete →
+    // ttlSecondsAfterFinished reaps it. Fresh pod per build = zero
+    // cross-build state (FUSE cache, overlayfs upper, filesystem
+    // are all emptyDir, wiped on pod termination).
+    //
+    // is_ok() not == "1": the controller sets "1" but any non-empty
+    // value is a clear intent signal. Matches the pattern at
+    // builders.rs:554 for LLVM_PROFILE_FILE (var_os.is_some).
+    let ephemeral = std::env::var("RIO_EPHEMERAL").is_ok();
+
     let _root_guard =
         tracing::info_span!("worker", component = "worker", worker_id = %worker_id).entered();
-    info!(version = env!("CARGO_PKG_VERSION"), "starting rio-worker");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        ephemeral, "starting rio-worker"
+    );
 
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_worker::describe_metrics();
@@ -304,6 +320,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Concurrent build semaphore
     let build_semaphore = Arc::new(Semaphore::new(cfg.max_builds as usize));
+
+    // Ephemeral-done signal. Notified by the select loop after a
+    // build is spawned AND its permit returns (CompletionReport was
+    // sent — spawn_build_task's scopeguard drops the permit after
+    // build_tx.send(completion).await). The select loop has an arm
+    // that awaits this; in ephemeral mode, one notification = exit.
+    //
+    // Notify not oneshot: Notify is cheaper (no channel allocation)
+    // and `notified()` is cancel-safe for select!. We only ever
+    // fire it once in ephemeral mode; in STS mode it's never
+    // notified (the select arm is conditionally added).
+    let ephemeral_done = Arc::new(tokio::sync::Notify::new());
 
     // Track running builds (drv_path set) for heartbeat reporting
     let running_builds: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -505,6 +533,22 @@ async fn main() -> anyhow::Result<()> {
                     break StreamEnd::Shutdown;
                 }
 
+                // Ephemeral single-shot exit. Guarded on `ephemeral`
+                // so STS-mode workers don't pay the Notify poll cost
+                // (select! with an always-pending arm is cheap, but
+                // why bother). The watcher task spawned after
+                // spawn_build_task fires this once the build's
+                // permit returns.
+                //
+                // biased; ordering: this comes AFTER shutdown (SIGTERM
+                // always wins) but BEFORE the stream arm. If a Cancel
+                // arrives at the same instant the build completes, we
+                // prefer to exit (the build is done; Cancel is moot).
+                _ = ephemeral_done.notified(), if ephemeral => {
+                    info!("ephemeral build complete; exiting single-shot mode");
+                    break StreamEnd::EphemeralDone;
+                }
+
                 msg_result = tokio_stream::StreamExt::next(&mut build_stream) => {
                     let Some(msg_result) = msg_result else {
                         break StreamEnd::Closed;
@@ -570,6 +614,61 @@ async fn main() -> anyhow::Result<()> {
                             };
 
                             spawn_build_task(assignment, permit, &build_ctx).await;
+
+                            // r[impl ctrl.pool.ephemeral]
+                            // Ephemeral mode: after spawning the ONE
+                            // build, wait for its permit to return
+                            // (build complete + CompletionReport sent
+                            // — spawn_build_task's scopeguard drops
+                            // the permit after the send), then exit.
+                            //
+                            // This is the single-shot gate. The select
+                            // arm below on `ephemeral_done.notified()`
+                            // breaks the inner loop with
+                            // StreamEnd::EphemeralDone → outer loop
+                            // breaks → run_drain (which is a no-op
+                            // here: acquire_many succeeds immediately,
+                            // DrainWorker deregisters us) → FUSE drop
+                            // → exit 0 → pod terminates → Job complete.
+                            //
+                            // Why not break immediately here: the build
+                            // is still RUNNING (spawn_build_task
+                            // returned, but the spawned task is live).
+                            // We need to wait for it to finish AND for
+                            // the CompletionReport to land in the
+                            // scheduler. The permit-return is the
+                            // synchronization point — same mechanism
+                            // run_drain uses.
+                            //
+                            // Why spawn a watcher task (not inline
+                            // acquire_many here): inlining would block
+                            // the select loop, which means Cancel
+                            // messages wouldn't be processed while the
+                            // build runs. An ephemeral build MUST
+                            // still be cancellable (a stuck 2h build
+                            // in a Job pod is wasted compute). The
+                            // watcher runs concurrently; select still
+                            // processes Cancel.
+                            if ephemeral {
+                                let sem = Arc::clone(&build_semaphore);
+                                let max = cfg.max_builds;
+                                let done = Arc::clone(&ephemeral_done);
+                                tokio::spawn(async move {
+                                    // acquire_many(max) succeeds when
+                                    // ALL permits are back — i.e., the
+                                    // one build's OwnedPermit dropped.
+                                    // Same synchronization point as
+                                    // run_drain (see its step-2 comment
+                                    // about NOT close()'ing first).
+                                    if sem.acquire_many(max).await.is_ok() {
+                                        done.notify_one();
+                                    }
+                                    // Err = semaphore closed (can't
+                                    // happen — close is never called).
+                                    // Silently return; the heartbeat
+                                    // loop dying is a separate bail.
+                                });
+                            }
                         }
                         Some(scheduler_message::Msg::Cancel(cancel)) => {
                             info!(
@@ -605,7 +704,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         match stream_end {
-            StreamEnd::Shutdown => break 'reconnect,
+            StreamEnd::Shutdown | StreamEnd::EphemeralDone => break 'reconnect,
             StreamEnd::Closed | StreamEnd::Error => {
                 // Swap relay target to None — relay buffers until
                 // we open the next stream. Running builds' send()s
@@ -742,12 +841,16 @@ async fn run_drain(semaphore: &Semaphore, max_builds: u32, scheduler_addr: &str,
     info!("drain complete, exiting");
 }
 
-/// Why the inner select loop exited. Shutdown breaks the outer
-/// reconnect loop; Closed/Error trigger a reconnect.
+/// Why the inner select loop exited. Shutdown and EphemeralDone
+/// break the outer reconnect loop; Closed/Error trigger a reconnect.
 enum StreamEnd {
     Shutdown,
     Closed,
     Error,
+    /// Ephemeral mode: one build completed. Exit the process so
+    /// the pod terminates → Job completes → ttlSecondsAfterFinished
+    /// reaps it. See `RIO_EPHEMERAL` handling in main().
+    EphemeralDone,
 }
 
 /// Pump the permanent sink channel into the current gRPC outbound

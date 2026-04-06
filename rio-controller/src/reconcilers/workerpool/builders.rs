@@ -42,12 +42,12 @@ pub(super) struct SchedulerAddrs {
 ///
 /// `rio.build/pool`: the WorkerPool name. The finalizer's
 /// cleanup() lists pods by this label to DrainWorker each one.
-/// The autoscaler could use it too but patches the StatefulSet
-/// directly instead.
+/// Ephemeral mode's `reconcile_ephemeral` lists Jobs by this
+/// same label to count active-vs-ceiling.
 ///
 /// `app.kubernetes.io/*`: standard K8s recommended labels.
 /// Dashboards and `kubectl get pods -l` queries expect these.
-fn labels(wp: &WorkerPool) -> BTreeMap<String, String> {
+pub(super) fn labels(wp: &WorkerPool) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("rio.build/pool".into(), wp.name_any()),
         ("app.kubernetes.io/name".into(), "rio-worker".into()),
@@ -197,7 +197,13 @@ pub(super) fn build_pdb(wp: &WorkerPool, oref: OwnerReference) -> PodDisruptionB
 
 /// The pod spec. Separate fn because it's the bulk of the
 /// StatefulSet complexity and it's useful to test in isolation.
-fn build_pod_spec(
+///
+/// `pub(super)` (not module-private) so `ephemeral::build_job`
+/// can reuse it — the ephemeral Job pod is the same worker
+/// container with one extra env var (`RIO_EPHEMERAL=1`). Better
+/// to reuse and append than duplicate the volume/security/env
+/// block.
+pub(super) fn build_pod_spec(
     wp: &WorkerPool,
     scheduler: &SchedulerAddrs,
     store_addr: &str,
@@ -721,7 +727,7 @@ fn build_seccomp_profile(kind: Option<&SeccompProfileKind>) -> SeccompProfile {
     }
 }
 
-fn env(name: &str, value: &str) -> EnvVar {
+pub(super) fn env(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.into(),
         value: Some(value.into()),

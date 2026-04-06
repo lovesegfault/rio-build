@@ -377,6 +377,15 @@ where
 /// Returns after spawning — does NOT block on build completion. The build runs
 /// in its own tokio task holding `permit`; it reports completion via
 /// `ctx.stream_tx` and drops the permit on exit (success, failure, or panic).
+///
+/// Ephemeral mode (`RIO_EPHEMERAL` env, set by the controller's
+/// `ephemeral::build_job` on Job pods — see `r[ctrl.pool.ephemeral]`):
+/// main.rs's event loop spawns a watcher AFTER calling this that waits
+/// for the permit to return, then signals exit. This function is
+/// unchanged — the permit-drop on completion IS the signal. The
+/// single-shot gate is in main.rs's select! loop, not here; putting it
+/// here would mean every `spawn_build_task` caller (including tests)
+/// would need to handle the ephemeral branch.
 #[instrument(skip_all, fields(drv_path = %assignment.drv_path))]
 pub async fn spawn_build_task(
     assignment: WorkAssignment,

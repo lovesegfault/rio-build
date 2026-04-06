@@ -228,6 +228,14 @@ impl Autoscaler {
                 debug!(pool = %pool_key(pool), "skipping: pool is being deleted");
                 continue;
             }
+            // Ephemeral pools have no STS to patch. Job spawning is
+            // driven by the reconciler (ephemeral.rs), not this
+            // autoscaler. Without this skip, scale_one would log
+            // a spurious "STS not found" every poll.
+            if pool.spec.ephemeral {
+                debug!(pool = %pool_key(pool), "skipping: ephemeral pool (Job mode, no STS)");
+                continue;
+            }
             if let Some(err) = self.scale_one(pool, &status).await {
                 self.patch_error_condition(pool, &err).await;
             }
