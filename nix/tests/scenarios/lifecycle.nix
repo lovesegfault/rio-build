@@ -576,7 +576,7 @@ let
       # fail-open when the operator thought jwt.enabled=true meant
       # enforcement.
       #
-      # kubectl-get-jsonpath, NOT kubectl-exec. The rio-all image has
+      # kubectl-get-jsonpath, NOT kubectl-exec. The rio-* images have
       # no coreutils (docker.nix baseContents = cacert+tzdata only —
       # minimal by design). `printenv`/`cat` aren't there. The Pod
       # spec (env + volumeMounts + volumes) IS the proof the Helm
@@ -2047,7 +2047,7 @@ let
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              "  image: rio-all",
+              "  image: rio-builder",
               "ephemeralDeadlineSeconds",
           )
 
@@ -2062,7 +2062,7 @@ let
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              "  image: rio-all",
+              "  image: rio-builder",
               "hostNetwork:true requires privileged:true",
           )
 
@@ -2085,13 +2085,13 @@ let
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              # rio-all:dev — MUST match the tag from nix/docker.nix
-              # (tag = "dev"). Bare "rio-all" normalizes to :latest which
-              # the airgap import doesn't have → ErrImageNeverPull. The
-              # Helm-rendered default pool gets this via the rio.image
-              # helper (global.image.tag); inline YAML here must spell it
-              # out.
-              "  image: rio-all:dev\n"
+              # rio-builder:dev — MUST match the ref from nix/docker.nix
+              # vmTestSeed (tag = "dev"). Bare "rio-builder" normalizes
+              # to :latest which the airgap import doesn't have →
+              # ErrImageNeverPull. The Helm-rendered default pool gets
+              # this via the rio.image helper (global.image.tag); inline
+              # YAML here must spell it out.
+              "  image: rio-builder:dev\n"
               "  imagePullPolicy: Never\n"
               # tlsSecretName: vmtest-full.yaml sets tls.enabled=true, so
               # the scheduler requires mTLS on its gRPC port. The Helm-
@@ -2377,9 +2377,9 @@ let
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
-              # Same rio-all:dev tag + tlsSecretName rationale as
+              # Same rio-builder:dev tag + tlsSecretName rationale as
               # ephemeral-pool (see that fragment's comments).
-              "  image: rio-all:dev\n"
+              "  image: rio-builder:dev\n"
               "  imagePullPolicy: Never\n"
               "  tlsSecretName: rio-builder-tls\n"
               "  privileged: true\n"
@@ -2901,7 +2901,7 @@ let
       # reconcile→child-create→cleanup wiring.
       with subtest("wps-lifecycle: apply WPS → 3 children → delete → children gone"):
           # ── Apply 3-class WPS ─────────────────────────────────────────
-          # poolTemplate.image=rio-all + imagePullPolicy not-in-template
+          # poolTemplate.image=rio-builder + imagePullPolicy not-in-template
           # (builders.rs:137 hardcodes None). systems=[x86_64-linux]
           # (required by child WP CEL). resources are dummy — replicas.
           # min defaults to 0 (DEFAULT_MIN_REPLICAS in builders.rs:18)
@@ -2933,7 +2933,7 @@ let
               "      resources:\n"
               "        requests: {cpu: '4', memory: 8Gi}\n"
               "  poolTemplate:\n"
-              "    image: rio-all\n"
+              "    image: rio-builder\n"
               "    systems: [x86_64-linux]\n"
               "    privileged: true\n"
               "EOF"
@@ -3057,7 +3057,7 @@ let
               # securityContext, not autoscaling.
               "  replicas: {min: 1, max: 1}\n"
               "  autoscaling: {metric: fodQueueDepth, targetValue: 5}\n"
-              "  image: rio-all:dev\n"
+              "  image: rio-fetcher:dev\n"
               "  systems: [x86_64-linux]\n"
               "EOF"
           )
