@@ -73,8 +73,8 @@ pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
 /// Both are `.to_vec()`'d into the proto — a heartbeat every 10s
 /// means ~100 allocs/min for typically 1-3 elements; not worth the
 /// lifetime-threading to avoid.
-// 8 args: all distinct worker-identity/state fields. A struct would
-// just move the same 8 lines to the call site.
+// 9 args: all distinct worker-identity/state fields. A struct would
+// just move the same 9 lines to the call site.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_heartbeat_request(
     worker_id: &str,
@@ -85,6 +85,7 @@ pub async fn build_heartbeat_request(
     running: &RwLock<HashSet<String>>,
     bloom: Option<&BloomHandle>,
     resources: &ResourceSnapshotHandle,
+    store_degraded: bool,
 ) -> HeartbeatRequest {
     let current: Vec<String> = running.read().await.iter().cloned().collect();
 
@@ -135,10 +136,14 @@ pub async fn build_heartbeat_request(
         // pass through verbatim — the worker doesn't interpret it,
         // just declares what the operator configured.
         size_class: size_class.to_string(),
-        // TODO(P0210): replace with circuit.is_open() once the FUSE
-        // circuit breaker lands. Explicit `false` (not ..Default::default())
-        // so P0210 has a clean one-line rebase target.
-        store_degraded: false,
+        // r[impl worker.heartbeat.store-degraded]
+        // Reflects CircuitBreaker::is_open() — main.rs reads the
+        // breaker each heartbeat tick and passes it here. Scheduler
+        // treats this like `draining`: has_capacity() returns false
+        // while the FUSE fetch circuit is open (store unreachable
+        // or degraded). Half-open counts as NOT degraded (the probe
+        // is in flight, let it decide).
+        store_degraded,
     }
 }
 
@@ -837,6 +842,7 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
         )
         .await;
         assert_eq!(req.running_builds.len(), 2);
@@ -867,6 +873,7 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
         )
         .await;
         assert!(req.running_builds.is_empty());
@@ -885,6 +892,7 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
         )
         .await;
         assert_eq!(req.size_class, "large");
@@ -898,9 +906,58 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
         )
         .await;
         assert_eq!(req.size_class, "", "empty = unclassified");
+    }
+
+    /// `store_degraded` passes through to the proto field. main.rs
+    /// reads `CircuitBreaker::is_open()` each heartbeat tick and
+    /// passes it here — this test is the contract between the two:
+    /// whatever bool main.rs observes, the scheduler sees.
+    ///
+    /// No mock circuit: `build_heartbeat_request` takes the bool
+    /// directly (the circuit lives in main.rs's FUSE setup, which
+    /// has no unit-test harness). The scheduler-side consumption
+    /// is `r[verify]`'d separately (P0211, has_capacity excludes
+    /// degraded workers).
+    #[tokio::test]
+    async fn test_heartbeat_store_degraded_passthrough() {
+        let running = Arc::new(RwLock::new(HashSet::new()));
+
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into()],
+            &[],
+            1,
+            "",
+            &running,
+            None,
+            &ResourceSnapshotHandle::default(),
+            true,
+        )
+        .await;
+        assert!(
+            req.store_degraded,
+            "circuit open → proto field set → scheduler excludes via has_capacity()"
+        );
+
+        // Control: default path is NOT degraded. Guards against an
+        // accidental hardcode-true in the struct literal.
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into()],
+            &[],
+            1,
+            "",
+            &running,
+            None,
+            &ResourceSnapshotHandle::default(),
+            false,
+        )
+        .await;
+        assert!(!req.store_degraded);
     }
 
     /// Regression: supported_features must reflect the config — if
@@ -918,6 +975,7 @@ mod tests {
             &running,
             None,
             &ResourceSnapshotHandle::default(),
+            false,
         )
         .await;
         assert_eq!(req.systems, vec!["x86_64-linux", "aarch64-linux"]);
@@ -964,6 +1022,7 @@ mod tests {
             &running,
             Some(&bloom),
             &ResourceSnapshotHandle::default(),
+            false,
         )
         .await;
 

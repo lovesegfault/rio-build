@@ -257,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
 
-    let fuse_session = fuse::mount_fuse_background(
+    let (fuse_session, fuse_circuit) = fuse::mount_fuse_background(
         &cfg.fuse_mount_point,
         cache,
         store_client.clone(),
@@ -351,6 +351,11 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_running = Arc::clone(&running_builds);
     let heartbeat_ready = Arc::clone(&ready);
     let heartbeat_resources = Arc::clone(&resource_snapshot);
+    // FUSE circuit breaker: the heartbeat loop polls is_open() each
+    // tick (std::sync Mutex load — cheap, no contention on the happy
+    // path since fuser threads only write on fetch outcome). move
+    // into the task: main() has no other use for the handle.
+    let heartbeat_circuit = fuse_circuit;
     // Latest generation observed in an accepted HeartbeatResponse.
     // Starts at 0 — scheduler generation is always ≥1 (lease/mod.rs
     // non-K8s path starts at 1; k8s Lease increments from 1 on first
@@ -374,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
                 &heartbeat_running,
                 Some(&heartbeat_bloom),
                 &heartbeat_resources,
+                heartbeat_circuit.is_open(),
             )
             .await;
 
