@@ -352,10 +352,13 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::SubmitBuildRequest>,
     ) -> Result<Response<Self::SubmitBuildStream>, Status> {
-        // Link into the gateway's trace BEFORE doing anything else. The
+        // Link to the gateway's trace BEFORE doing anything else. The
         // #[instrument] span is already entered by the time we're here;
-        // link_parent stitches it to the client's trace_id. Everything
-        // below (actor calls, DB writes, store RPCs) inherits this span.
+        // link_parent adds an OTel span LINK to the client's traceparent
+        // — NOT a parent. This span keeps its own trace_id; Jaeger shows
+        // two traces connected by the link. Everything below (actor calls,
+        // DB writes, store RPCs) inherits THIS span's trace_id.
+        // See TODO(phase4b) at nix/tests/scenarios/observability.nix:269.
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
         self.check_actor_alive()?;
