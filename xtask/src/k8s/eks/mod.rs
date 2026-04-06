@@ -120,8 +120,9 @@ fn kubeconfig() -> Result<()> {
     let path = sh::kubeconfig_path();
     std::fs::create_dir_all(path.parent().unwrap())?;
     let path_s = path.to_str().unwrap();
-    let region = tofu::output(TF_DIR, "region")?;
-    let cluster = tofu::output(TF_DIR, "cluster_name")?;
+    let tf = tofu::outputs(TF_DIR)?;
+    let region = tf.get("region")?;
+    let cluster = tf.get("cluster_name")?;
     let shell = sh::shell()?;
     sh::run_sync(sh::cmd!(
         shell,
