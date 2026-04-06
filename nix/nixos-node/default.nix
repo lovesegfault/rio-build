@@ -13,13 +13,18 @@
   lib,
   # OCI archive(s) to import into containerd's content store before
   # kubelet starts (layer-cache warm — r[infra.node.prebake-layer-warm]).
-  # Threaded via specialArgs from flake.nix's nodeAmi rather than
-  # imported directly so this module tree stays evaluable without the
-  # full flake context (the P0-nixos-vm-test composition won't pass it).
-  rioSeedImages ? [ ],
+  # Threaded via specialArgs from flake.nix's nodeAmi.
+  rioSeedImages,
   ...
 }:
 {
+  # `rioSeedImages` MUST be passed via specialArgs (the `? []` formal
+  # default is dead code in NixOS module context — the module system
+  # always passes a `_module.args` lookup-thunk, so the default never
+  # fires). This mkDefault makes the [] fallback actually work for any
+  # composition that doesn't pass it (e.g., a future VM-test fixture).
+  _module.args.rioSeedImages = lib.mkDefault [ ];
+
   imports = [
     ./minimal.nix
     ./eks-node.nix
