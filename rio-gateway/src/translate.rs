@@ -229,50 +229,6 @@ async fn populate_input_srcs_sizes(
     }
 }
 
-/// Fields of `DerivationNode` that are extracted identically from both
-/// `BasicDerivation` and `Derivation`. Both types have `.outputs()`,
-/// `.env()`, `.platform()`; the iterator chains are structurally the
-/// same, just called on different receiver types.
-struct NodeCommonFields {
-    output_names: Vec<String>,
-    expected_output_paths: Vec<String>,
-    pname: String,
-    system: String,
-    required_features: Vec<String>,
-}
-
-/// Extract the fields that are computed identically for both derivation
-/// kinds. The `outputs` iterator yields `(name, path)` pairs — callers
-/// adapt their output type's accessors into that shape.
-fn node_common_fields(
-    outputs: impl Iterator<Item = (String, String)>,
-    env: &std::collections::BTreeMap<String, String>,
-    platform: &str,
-) -> NodeCommonFields {
-    let (output_names, expected_output_paths) = outputs.unzip();
-    NodeCommonFields {
-        output_names,
-        expected_output_paths,
-        // pname → name fallback: stdenv's mkDerivation sets both;
-        // raw derivation{} calls typically only set name. Without
-        // the fallback, raw derivations get pname="" → never match
-        // build_history (keyed on pname,system) → 30s default →
-        // wrong size-class routing. name includes version suffix so
-        // it's a LESS stable key (hello-2.12 vs hello-2.13 are
-        // different rows), but some history beats none.
-        pname: env
-            .get("pname")
-            .or_else(|| env.get("name"))
-            .cloned()
-            .unwrap_or_default(),
-        system: platform.to_string(),
-        required_features: env
-            .get("requiredSystemFeatures")
-            .map(|s| s.split_whitespace().map(String::from).collect())
-            .unwrap_or_default(),
-    }
-}
-
 /// Validate a DAG before SubmitBuild. Returns `Err(reason)` if the
 /// DAG should be rejected — caller sends STDERR_ERROR with the
 /// reason. Returns `Ok(())` if valid.
@@ -341,92 +297,87 @@ pub fn validate_dag(
     Ok(())
 }
 
-/// Create a single-node DAG from a BasicDerivation (no inputDrvs).
-/// Used as fallback when the full Derivation is not available.
-pub fn single_node_from_basic(
-    drv_path: &str,
-    basic_drv: &BasicDerivation,
-) -> Vec<types::DerivationNode> {
-    let f = node_common_fields(
-        basic_drv
-            .outputs()
-            .iter()
-            .map(|o| (o.name().to_string(), o.path().to_string())),
-        basic_drv.env(),
-        basic_drv.platform(),
-    );
-
-    vec![types::DerivationNode {
-        drv_path: drv_path.to_string(),
-        // Use drv_path as drv_hash fallback (input-addressed derivations
-        // already use the store path as the hash; this is consistent)
-        drv_hash: drv_path.to_string(),
-        pname: f.pname,
-        system: f.system,
-        required_features: f.required_features,
-        output_names: f.output_names,
-        // Strict predicate — same as derivation_to_node below. The loose
-        // per-output `any(DerivationOutput::is_fixed_output)` form evaluated
-        // TRUE for floating-CA (hash_algo set, hash empty), diverging from
-        // the worker's strict recompute at executor/mod.rs:344 → spurious
-        // warn!. DerivationLike::is_fixed_output is the strict FOD predicate
-        // (single `out` with both hash_algo AND hash set).
-        is_fixed_output: basic_drv.is_fixed_output(),
-        expected_output_paths: f.expected_output_paths,
-        // Single-node fallback: BasicDerivation has no inputDrvs. We
-        // COULD serialize it, but this path is the "full drv not
-        // available" fallback — if we don't have the full thing, the
-        // worker will fetch it from store. Keep the fallback simple.
-        drv_content: Vec::new(),
-        // BasicDerivation's input_srcs could be looked up, but this
-        // fallback path is already the "don't have full info" case.
-        // 0 = no-signal, estimator skips to default.
-        input_srcs_nar_size: 0,
-        // r[impl sched.ca.detect]
-        // Both CA kinds: floating (hash_algo set, hash empty) and
-        // fixed-output (hash also set). Cutoff applies to either —
-        // the output's nar_hash is what gets compared, not the
-        // input addressing.
-        is_content_addressed: basic_drv.is_fixed_output() || basic_drv.has_ca_floating_outputs(),
-    }]
-}
-
-/// Convert a Derivation into a proto DerivationNode.
-fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
-    let f = node_common_fields(
-        drv.outputs()
-            .iter()
-            .map(|o| (o.name().to_string(), o.path().to_string())),
-        drv.env(),
-        drv.platform(),
-    );
-
+/// Build the proto `DerivationNode` for any [`DerivationLike`].
+///
+/// Both [`Derivation`] (full BFS path) and [`BasicDerivation`]
+/// (single-node fallback) route through here — the
+/// [`DerivationLike`] trait (P0384) unifies the accessor surface so
+/// the struct-literal is written once. Before the trait existed the
+/// two paths were hand-rolled separately and drifted on every
+/// `DerivationNode` field-add (the `is_fixed_output` divergence P0384
+/// fixed; the dual `is_content_addressed` annotations P0250 added).
+///
+/// `drv_content`/`input_srcs_nar_size` are left zeroed —
+/// [`filter_and_inline_drv`] and [`populate_input_srcs_sizes`] fill
+/// them AFTER FindMissingPaths/BFS batching (see call-site comments
+/// on the wrappers).
+///
+/// `is_fixed_output` is the strict [`DerivationLike::is_fixed_output`]
+/// predicate (single `out` with both `hash_algo` AND `hash` set) —
+/// matches the worker's strict recompute at executor/mod.rs:344.
+// r[impl sched.ca.detect]
+// Both CA kinds: floating (hash_algo set, hash empty) and
+// fixed-output (hash also set). Cutoff applies to either — the
+// output's nar_hash is what gets compared, not the input addressing.
+fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNode {
+    let (output_names, expected_output_paths): (Vec<_>, Vec<_>) = drv
+        .outputs()
+        .iter()
+        .map(|o| (o.name().to_string(), o.path().to_string()))
+        .unzip();
+    let env = drv.env();
     types::DerivationNode {
         drv_path: drv_path.to_string(),
         // Input-addressed derivations use the store path as the drv_hash.
         // This ensures every node has a unique, non-empty key in the DAG.
         drv_hash: drv_path.to_string(),
-        pname: f.pname,
-        system: f.system,
-        required_features: f.required_features,
-        output_names: f.output_names,
+        // pname → name fallback: stdenv's mkDerivation sets both;
+        // raw derivation{} calls typically only set name. Without
+        // the fallback, raw derivations get pname="" → never match
+        // build_history (keyed on pname,system) → 30s default →
+        // wrong size-class routing. name includes version suffix so
+        // it's a LESS stable key (hello-2.12 vs hello-2.13 are
+        // different rows), but some history beats none.
+        pname: env
+            .get("pname")
+            .or_else(|| env.get("name"))
+            .cloned()
+            .unwrap_or_default(),
+        system: drv.platform().to_string(),
+        required_features: env
+            .get("requiredSystemFeatures")
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default(),
+        output_names,
         is_fixed_output: drv.is_fixed_output(),
-        expected_output_paths: f.expected_output_paths,
-        // Empty here — filter_and_inline_drv() populates AFTER the
-        // FindMissingPaths check. Inlining now would waste bytes on
-        // cache-hit nodes that never dispatch.
+        expected_output_paths,
         drv_content: Vec::new(),
-        // 0 here — populate_input_srcs_sizes() fills AFTER the full
-        // BFS so we can batch QueryPathInfo across all nodes' srcs.
-        // Doing it inline would be one RPC per src per node.
         input_srcs_nar_size: 0,
-        // r[impl sched.ca.detect]
-        // Both CA kinds: floating (hash_algo set, hash empty) and
-        // fixed-output (hash also set). Cutoff applies to either —
-        // the output's nar_hash is what gets compared, not the
-        // input addressing.
         is_content_addressed: drv.is_fixed_output() || drv.has_ca_floating_outputs(),
     }
+}
+
+/// Create a single-node DAG from a [`BasicDerivation`] (no inputDrvs).
+/// Used as fallback when the full [`Derivation`] is not available.
+///
+/// Wraps the generic `build_node`. `drv_content`/`input_srcs_nar_size`
+/// stay zeroed — this is the "full drv not available" fallback; the
+/// worker fetches from store.
+pub fn single_node_from_basic(
+    drv_path: &str,
+    basic_drv: &BasicDerivation,
+) -> Vec<types::DerivationNode> {
+    vec![build_node(drv_path, basic_drv)]
+}
+
+/// Convert a full [`Derivation`] into a proto `DerivationNode`.
+///
+/// Wraps [`build_node`]. `drv_content`/`input_srcs_nar_size` are
+/// populated AFTER by [`filter_and_inline_drv`] (batched
+/// FindMissingPaths) and [`populate_input_srcs_sizes`] (batched
+/// QueryPathInfo across the whole DAG).
+fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
+    build_node(drv_path.as_str(), drv)
 }
 
 /// Inline .drv content into nodes whose outputs are missing from the
@@ -622,6 +573,12 @@ mod tests {
     }
 
     // r[verify sched.ca.detect]
+    // Both Derivation and BasicDerivation route through build_node<D> —
+    // the three tests below prove the trait dispatch is correct for
+    // each DerivationLike impl (not that the builder logic differs; it
+    // doesn't). Regression guard for the pre-P0388 divergence shape:
+    // same proto field, two hand-rolled struct literals, drift on
+    // every DerivationNode field-add.
     /// is_content_addressed on the BasicDerivation path (single_node_from_basic).
     /// Three cases: input-addressed (both empty), floating-CA (algo set,
     /// hash empty), fixed-output (both set).
