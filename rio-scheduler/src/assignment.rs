@@ -441,7 +441,7 @@ mod tests {
 
         // Build a DAG: drv depends on child, child has the input paths.
         let mut dag = DerivationDag::new();
-        let child_proto = rio_proto::types::DerivationNode {
+        let child_proto = rio_proto::dag::DerivationNode {
             expected_output_paths: vec!["/nix/store/input-a".into(), "/nix/store/input-b".into()],
             ..make_derivation_node("child", "x86_64-linux")
         };
@@ -478,7 +478,7 @@ mod tests {
 
         // DAG with one input path that only A has.
         let mut dag = DerivationDag::new();
-        let child_proto = rio_proto::types::DerivationNode {
+        let child_proto = rio_proto::dag::DerivationNode {
             expected_output_paths: vec!["/nix/store/big-input".into()],
             ..make_derivation_node("child", "x86_64-linux")
         };

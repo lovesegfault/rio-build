@@ -475,16 +475,14 @@ impl DagActor {
         for build_id in &interested_builds {
             self.emit_build_event(
                 *build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
-                        status: Some(rio_proto::types::derivation_event::Status::Started(
-                            rio_proto::types::DerivationStarted {
-                                worker_id: worker_id.to_string(),
-                            },
-                        )),
-                    },
-                ),
+                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
+                    derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                    status: Some(rio_proto::dag::derivation_event::Status::Started(
+                        rio_proto::dag::DerivationStarted {
+                            worker_id: worker_id.to_string(),
+                        },
+                    )),
+                }),
             );
             // Progress snapshot: running count +1, worker set changed.
             // Critpath unchanged on dispatch (no completion, no

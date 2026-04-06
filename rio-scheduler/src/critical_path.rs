@@ -265,8 +265,8 @@ mod tests {
     /// `pname` is set to `tag` (not the fixture's `"test-pkg"` default)
     /// because the test estimator keys on (pname, system) — the test
     /// assertions below depend on `node("a")` having `pname == "a"`.
-    fn node(tag: &str) -> rio_proto::types::DerivationNode {
-        rio_proto::types::DerivationNode {
+    fn node(tag: &str) -> rio_proto::dag::DerivationNode {
+        rio_proto::dag::DerivationNode {
             pname: tag.to_string(),
             ..make_derivation_node(tag, "x86_64-linux")
         }

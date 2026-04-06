@@ -68,8 +68,44 @@ pub mod interceptor;
 pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.
+///
+/// P0376 domain split: the underlying `.proto` definitions are spread across
+/// `types.proto` (shared primitives: store, chunk, GC, bloom, ResourceUsage,
+/// BuildResultStatus), `dag.proto` (DAG + derivation events + GraphNode/Edge),
+/// `build_types.proto` (build lifecycle, worker stream, heartbeat), and
+/// `admin_types.proto` (admin RPC data types). All four share
+/// `package rio.types;`, so prost merges them into ONE module here. The
+/// file-level split is for plan-DAG collision tracking; this Rust module is
+/// the single flattened namespace.
 pub mod types {
     tonic::include_proto!("rio.types");
+}
+
+/// Re-export of DAG-domain types from [`types`]. Sourced from
+/// `proto/dag.proto`. Callers MAY use either `rio_proto::dag::DerivationNode`
+/// or `rio_proto::dag::DerivationNode` — both resolve to the same struct.
+/// The domain-scoped path is encouraged for new code (makes file-level
+/// collision tracking in plan docs meaningful).
+pub mod dag {
+    pub use crate::types::{
+        DerivationCached, DerivationCompleted, DerivationEdge, DerivationEvent, DerivationFailed,
+        DerivationNode, DerivationQueued, DerivationStarted, GetBuildGraphRequest,
+        GetBuildGraphResponse, GraphEdge, GraphNode, derivation_event,
+    };
+}
+
+/// Re-export of build-lifecycle-domain types from [`types`]. Sourced from
+/// `proto/build_types.proto`. Same dual-path semantics as [`dag`].
+pub mod build_types {
+    pub use crate::types::{
+        BuildCancelled, BuildCompleted, BuildEvent, BuildFailed, BuildInputsResolved,
+        BuildLogBatch, BuildOptions, BuildProgress, BuildResult, BuildResultStatus, BuildStarted,
+        BuildState, BuildStatus, BuiltOutput, CancelBuildRequest, CancelBuildResponse,
+        CancelSignal, CompletionReport, HeartbeatRequest, HeartbeatResponse, PrefetchHint,
+        ProgressUpdate, QueryBuildRequest, SchedulerMessage, SubmitBuildRequest, WatchBuildRequest,
+        WorkAssignment, WorkAssignmentAck, WorkerMessage, WorkerRegister, build_event,
+        scheduler_message, worker_message,
+    };
 }
 
 /// Scheduler service: gateway-facing RPCs (SubmitBuild, WatchBuild, etc.).

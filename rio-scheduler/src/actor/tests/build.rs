@@ -402,7 +402,7 @@ async fn test_watch_build_after_failure_replays_failed() -> TestResult {
         &handle,
         "fail-watch-w",
         &test_drv_path("fail-watch"),
-        rio_proto::types::BuildResultStatus::PermanentFailure,
+        rio_proto::build_types::BuildResultStatus::PermanentFailure,
         "test permanent failure",
     )
     .await?;
@@ -465,7 +465,7 @@ async fn test_inputs_resolved_fires_between_started_and_dispatch() -> TestResult
             Some(Event::Started(_)) => "Started",
             Some(Event::InputsResolved(_)) => "InputsResolved",
             Some(Event::Derivation(d)) => match &d.status {
-                Some(rio_proto::types::derivation_event::Status::Started(_)) => "DrvStarted",
+                Some(rio_proto::dag::derivation_event::Status::Started(_)) => "DrvStarted",
                 other => panic!("unexpected DerivationEvent status: {other:?}"),
             },
             other => panic!("unexpected event in merge sequence: {other:?}"),
@@ -633,7 +633,7 @@ async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
                 // dispatch.rs). Assert we see it first.
                 assert!(matches!(
                     d.status,
-                    Some(rio_proto::types::derivation_event::Status::Started(_))
+                    Some(rio_proto::dag::derivation_event::Status::Started(_))
                 ));
                 saw_drv_started = true;
             }

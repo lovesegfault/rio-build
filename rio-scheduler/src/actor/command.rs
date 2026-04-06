@@ -20,8 +20,8 @@ pub struct MergeDagRequest {
     pub build_id: Uuid,
     pub tenant_id: Option<Uuid>,
     pub priority_class: PriorityClass,
-    pub nodes: Vec<rio_proto::types::DerivationNode>,
-    pub edges: Vec<rio_proto::types::DerivationEdge>,
+    pub nodes: Vec<rio_proto::dag::DerivationNode>,
+    pub edges: Vec<rio_proto::dag::DerivationEdge>,
     pub options: BuildOptions,
     pub keep_going: bool,
     /// W3C traceparent of the submitting gRPC handler's span. Span
@@ -47,7 +47,7 @@ pub enum ActorCommand {
         /// Either a drv_hash OR a full drv_path — handle_completion resolves both.
         /// Workers send drv_path; tests sometimes send drv_hash directly.
         drv_key: String,
-        result: rio_proto::types::BuildResult,
+        result: rio_proto::build_types::BuildResult,
         /// Peak memory from cgroup `memory.peak`, bytes. 0 = no signal
         /// (build failed before cgroup populated). Feeds
         /// `build_history.ema_peak_memory_bytes` for size-class

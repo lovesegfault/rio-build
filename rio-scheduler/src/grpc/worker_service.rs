@@ -129,9 +129,9 @@ impl WorkerService for SchedulerGrpc {
                                     drv_path = %drv_path,
                                     "completion with None result, synthesizing InfrastructureFailure"
                                 );
-                                rio_proto::types::BuildResult {
+                                rio_proto::build_types::BuildResult {
                                     status:
-                                        rio_proto::types::BuildResultStatus::InfrastructureFailure
+                                        rio_proto::build_types::BuildResultStatus::InfrastructureFailure
                                             .into(),
                                     error_msg: "worker sent CompletionReport with no result"
                                         .into(),

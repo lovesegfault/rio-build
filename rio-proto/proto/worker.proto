@@ -1,7 +1,7 @@
 syntax = "proto3";
 package rio.worker;
 
-import "types.proto";
+import "build_types.proto";
 
 // Worker-facing RPCs served by the rio-scheduler process.
 // Separated from SchedulerService for distinct auth/rate-limiting interceptors
