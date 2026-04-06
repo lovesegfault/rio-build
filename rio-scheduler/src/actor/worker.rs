@@ -453,8 +453,32 @@ impl DagActor {
     pub(super) async fn handle_tick(&mut self) {
         self.maybe_refresh_estimator().await;
 
-        // Check for heartbeat timeouts
         let now = Instant::now();
+        self.tick_check_heartbeats(now).await;
+
+        // Ordering is load-bearing: backstop-process runs before the
+        // per-build-timeout check, poison-expire runs last — matches
+        // the pre-refactor code sequence. Backstop reassigns stuck
+        // derivations (transient retry); per-build-timeout cancels
+        // whole builds (permanent failure); poison-expire removes
+        // DAG nodes after both have had their say.
+        let (expired_poisons, backstop_timeouts) = self.tick_scan_dag(now);
+        self.tick_process_backstop_timeouts(&backstop_timeouts)
+            .await;
+        self.tick_check_build_timeouts().await;
+        self.tick_process_expired_poisons(expired_poisons).await;
+
+        self.tick_sweep_event_log();
+        self.tick_publish_gauges();
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_tick helpers — one per periodic check
+    // -----------------------------------------------------------------------
+
+    /// Scan workers for heartbeat timeouts; disconnect any that have
+    /// missed MAX_MISSED_HEARTBEATS consecutive checks.
+    async fn tick_check_heartbeats(&mut self, now: Instant) {
         let timeout = std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
         let mut timed_out_workers = Vec::new();
 
@@ -471,10 +495,17 @@ impl DagActor {
             warn!(worker_id = %worker_id, "worker timed out (missed heartbeats)");
             self.handle_worker_disconnected(&worker_id).await;
         }
+    }
 
-        // Check for poisoned derivations that should expire (24h TTL)
-        // + backstop timeout for stuck-Running derivations.
-        // r[impl sched.backstop.timeout]
+    /// Single DAG pass collecting both poison-TTL expiries and backstop-
+    /// timeout candidates. Coupled because the two checks share the
+    /// per-node iteration; splitting would double `iter_nodes()` passes
+    /// for no behavioral gain.
+    ///
+    /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
+    /// `(drv_hash, drv_path, worker_id)`.
+    // r[impl sched.backstop.timeout]
+    fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, WorkerId)>) {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
         // (drv_hash, drv_path, worker_id) for backstop-timed-out builds
         let mut backstop_timeouts: Vec<(DrvHash, String, WorkerId)> = Vec::new();
@@ -531,11 +562,15 @@ impl DagActor {
             }
         }
 
-        // Process backstop timeouts: send CancelSignal, reset to
-        // Ready for retry. This is a TRANSIENT failure (the build
-        // may work fine on another worker or even the same worker
-        // after a restart) so we go through retry not poison.
-        for (drv_hash, drv_path, worker_id) in &backstop_timeouts {
+        (expired_poisons, backstop_timeouts)
+    }
+
+    /// Process backstop timeouts: send CancelSignal, reset to
+    /// Ready for retry. This is a TRANSIENT failure (the build
+    /// may work fine on another worker or even the same worker
+    /// after a restart) so we go through retry not poison.
+    async fn tick_process_backstop_timeouts(&mut self, timeouts: &[(DrvHash, String, WorkerId)]) {
+        for (drv_hash, drv_path, worker_id) in timeouts {
             warn!(
                 drv_hash = %drv_hash,
                 worker_id = %worker_id,
@@ -579,18 +614,20 @@ impl DagActor {
             self.reassign_derivations(std::slice::from_ref(drv_hash), Some(worker_id))
                 .await;
         }
+    }
 
-        // r[impl sched.timeout.per-build]
-        //
-        // Wall-clock limit on the ENTIRE build from submission. Distinct from:
-        //   - r[sched.backstop.timeout] above (per-derivation heuristic: est×3)
-        //   - worker-side daemon floor at actor/build.rs build_options_for_
-        //     derivation (also receives build_timeout as min_nonzero per-
-        //     derivation — defense-in-depth, NOT the primary semantics)
-        //
-        // Zero = no overall timeout. Only Active builds are checked: Pending
-        // hasn't started dispatching (validate_transition rejects Pending →
-        // Failed anyway); terminal builds are already done.
+    /// Wall-clock limit on the ENTIRE build from submission. Distinct from:
+    ///   - `r[sched.backstop.timeout]` in [`Self::tick_scan_dag`] (per-derivation
+    ///     heuristic: est×3)
+    ///   - worker-side daemon floor at `actor/build.rs` `build_options_for_derivation`
+    ///     (also receives `build_timeout` as `min_nonzero` per-derivation —
+    ///     defense-in-depth, NOT the primary semantics)
+    ///
+    /// Zero = no overall timeout. Only Active builds are checked: Pending
+    /// hasn't started dispatching (`validate_transition` rejects Pending →
+    /// Failed anyway); terminal builds are already done.
+    // r[impl sched.timeout.per-build]
+    async fn tick_check_build_timeouts(&mut self) {
         let mut timed_out_builds: Vec<(Uuid, u64)> = Vec::new();
         for (build_id, build) in &self.builds {
             if build.state() == BuildState::Active
@@ -620,14 +657,16 @@ impl DagActor {
                 error!(build_id = %build_id, error = %e, "failed to persist per-build-timeout failure");
             }
         }
+    }
 
+    /// Clear expired poison entries (PG first, in-mem second — same
+    /// ordering as `handle_clear_poison`: a PG blip here leaves in-mem
+    /// still Poisoned, so the next tick's scan retries. Previous order
+    /// meant a blip left in-mem gone → scan never finds it again →
+    /// PG clear deferred to next scheduler restart).
+    async fn tick_process_expired_poisons(&mut self, expired_poisons: Vec<DrvHash>) {
         for drv_hash in expired_poisons {
             info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
-            // PG first, in-mem second (same ordering as handle_clear_poison):
-            // a PG blip here leaves in-mem still Poisoned, so the next
-            // tick's expired_poisons scan retries. Previous order meant
-            // a blip left in-mem gone → scan never finds it again
-            // → PG clear deferred to next scheduler restart.
             if let Err(e) = self.db.clear_poison(&drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
                 continue;
@@ -635,18 +674,20 @@ impl DagActor {
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
         }
+    }
 
-        // build_event_log time-based sweep. Every 360 ticks (~1h at
-        // 10s interval). Safety net for terminal-cleanup delete —
-        // if that failed (PG blip), rows would leak. Also catches
-        // rows from builds that never hit terminal-cleanup (actor
-        // restart mid-build, PG restored before recovery).
-        //
-        // spawn_monitored (not bare spawn): a PG panic in the sweep
-        // logs with task=event-log-sweep + component=scheduler instead
-        // of vanishing. Still fire-and-forget — handle_tick doesn't block.
-        // 24h retention is plenty for WatchBuild replay (gateway
-        // reconnects are within minutes of disconnect).
+    /// `build_event_log` time-based sweep. Every 360 ticks (~1h at
+    /// 10s interval). Safety net for terminal-cleanup delete —
+    /// if that failed (PG blip), rows would leak. Also catches
+    /// rows from builds that never hit terminal-cleanup (actor
+    /// restart mid-build, PG restored before recovery).
+    ///
+    /// `spawn_monitored` (not bare spawn): a PG panic in the sweep
+    /// logs with task=event-log-sweep + component=scheduler instead
+    /// of vanishing. Still fire-and-forget — `handle_tick` doesn't block.
+    /// 24h retention is plenty for WatchBuild replay (gateway
+    /// reconnects are within minutes of disconnect).
+    fn tick_sweep_event_log(&self) {
         const EVENT_LOG_SWEEP_EVERY: u64 = 360;
         if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.event_persist_tx.is_some()
         {
@@ -672,20 +713,21 @@ impl DagActor {
                 }
             });
         }
+    }
 
-        // Update metrics. All gauges are set from ground-truth state on each
-        // Tick — this is self-healing against any counting bugs elsewhere.
-        // The inc/dec calls at connect/disconnect/heartbeat (worker.rs:52/
-        // :76/:384) stay — they give sub-tick responsiveness. This block
-        // corrects any drift every tick.
-        //
-        // r[impl obs.metric.scheduler-leader-gate]
-        // Leader-only: standby's actor is warm (DAGs merge for takeover) but
-        // workers don't connect to it (leader-guarded gRPC), so its counts are
-        // stale-or-zero. With replicas:2, Prometheus scrapes both; a naked
-        // gauge query returns two series. Stat-panel lastNotNull picks one
-        // nondeterministically. Gate here so the standby simply doesn't export
-        // the series — queries see one series, no max() wrapper needed.
+    /// Update metrics. All gauges are set from ground-truth state on each
+    /// Tick — this is self-healing against any counting bugs elsewhere.
+    /// The inc/dec calls at connect/disconnect/heartbeat stay — they give
+    /// sub-tick responsiveness. This block corrects any drift every tick.
+    ///
+    /// Leader-only: standby's actor is warm (DAGs merge for takeover) but
+    /// workers don't connect to it (leader-guarded gRPC), so its counts are
+    /// stale-or-zero. With replicas:2, Prometheus scrapes both; a naked
+    /// gauge query returns two series. Stat-panel lastNotNull picks one
+    /// nondeterministically. Gate here so the standby simply doesn't export
+    /// the series — queries see one series, no max() wrapper needed.
+    // r[impl obs.metric.scheduler-leader-gate]
+    fn tick_publish_gauges(&self) {
         if self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
             metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
             metrics::gauge!("rio_scheduler_workers_active")
