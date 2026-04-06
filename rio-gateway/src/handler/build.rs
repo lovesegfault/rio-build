@@ -162,6 +162,9 @@ async fn quota_check<W: AsyncWrite + Unpin>(
 ///
 /// Delete when the legacy peek path is removed (after fleet-wide
 /// scheduler upgrade; see phase4a remediation 20).
+// TODO(P0199): delete legacy peek path after fleet-wide scheduler
+// upgrade. P0199 (Rem-20) landed build_id-in-gRPC-initial-metadata;
+// this fallback stays until all schedulers serve the new path.
 fn handle_peeked_first_event(first: &types::BuildEvent) -> Option<BuildResult> {
     match &first.event {
         Some(types::build_event::Event::Started(started)) => {
@@ -685,7 +688,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 ///
 /// Receives an inline BasicDerivation (no inputDrvs). Recovers the full
 /// Derivation from drv_cache to reconstruct the DAG.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -705,6 +708,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         ..
     } = ctx;
     let drv_path_str = wire::read_string(reader).await?;
+    tracing::Span::current().record("path", drv_path_str.as_str());
     let Ok(basic_drv) = read_basic_derivation(reader).await else {
         stderr_err!(stderr, "wopBuildDerivation: failed to read BasicDerivation");
     };
@@ -852,7 +856,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
 // r[impl gw.opcode.build-paths]
 /// wopBuildPaths (9): Build a set of derivations.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(count = tracing::field::Empty))]
 pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -879,6 +883,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         );
     };
 
+    tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopBuildPaths");
 
     // Collect all derivation paths and reconstruct a combined DAG
@@ -991,7 +996,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 // r[impl gw.opcode.build-paths-with-results]
 // r[impl gw.stderr.error-before-return+2]
 /// wopBuildPathsWithResults (46): Build paths and return per-path BuildResult.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(count = tracing::field::Empty))]
 pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -1018,6 +1023,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         );
     };
 
+    tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopBuildPathsWithResults");
 
     let mut results = Vec::new();

@@ -4,13 +4,14 @@ use super::*;
 
 // r[impl gw.opcode.is-valid-path]
 /// wopIsValidPath (1): Check if a store path exists.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
+    tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopIsValidPath");
 
     let valid = match StorePath::parse(&path_str) {
@@ -31,13 +32,14 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
 
 // r[impl gw.opcode.mandatory-set]
 /// wopEnsurePath (10): Ensure a store path is valid/available.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
+    tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopEnsurePath");
 
     if let Ok(path) = StorePath::parse(&path_str).inspect_err(|e| {
@@ -67,13 +69,14 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 // r[impl gw.opcode.query-path-info]
 // r[impl gw.wire.narhash-hex]
 /// wopQueryPathInfo (26): Return full path metadata.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
+    tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopQueryPathInfo");
 
     let path = match StorePath::parse(&path_str) {
@@ -120,7 +123,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
 
 // r[impl gw.opcode.query-valid-paths]
 /// wopQueryValidPaths (31): Batch validity check.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(count = tracing::field::Empty))]
 pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -128,6 +131,7 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
 ) -> anyhow::Result<()> {
     let path_strs = wire::read_strings(reader).await?;
     let _substitute = wire::read_bool(reader).await?;
+    tracing::Span::current().record("count", path_strs.len());
 
     debug!(count = path_strs.len(), "wopQueryValidPaths");
 
@@ -175,12 +179,13 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
 ///
 /// Previously this inserted into a `HashSet<StorePath>` that nothing
 /// read — unbounded growth on `nix copy` of large closures.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
+    tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopAddTempRoot");
 
     // Still validate — a malformed path is a client bug worth logging,
@@ -261,13 +266,14 @@ pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 ///
 /// Nix client: `processStderr(ex)` (no sink) → `copyNAR(from, sink)`.
 /// The stderr loop exits on STDERR_LAST; the NAR is read as raw bytes after.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
+    tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, "wopNarFromPath");
 
     let path = match StorePath::parse(&path_str) {
@@ -322,7 +328,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
 /// Nix sends just the 32-char nixbase32 hash (no /nix/store/ prefix, no
 /// name) and expects the full path back. Wire response: one string —
 /// the full path if found, empty string if not.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(hash_part = tracing::field::Empty))]
 pub(super) async fn handle_query_path_from_hash_part<
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -332,6 +338,7 @@ pub(super) async fn handle_query_path_from_hash_part<
     store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let hash_part = wire::read_string(reader).await?;
+    tracing::Span::current().record("hash_part", hash_part.as_str());
     debug!(hash_part = %hash_part, "wopQueryPathFromHashPart");
 
     // The store validates hash_part (32 chars, nixbase32 charset) and
@@ -368,7 +375,7 @@ pub(super) async fn handle_query_path_from_hash_part<
 ///
 /// Wire: path string + strings list. Response: u64(1) on success.
 /// The real daemon returns STDERR_ERROR on unknown path; we do the same.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -376,6 +383,7 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     let sigs = wire::read_strings(reader).await?;
+    tracing::Span::current().record("path", path_str.as_str());
     debug!(path = %path_str, count = sigs.len(), "wopAddSignatures");
 
     // The store appends to narinfo.signatures TEXT[]. NOT_FOUND →
@@ -434,7 +442,7 @@ fn parse_drv_output_id(id: &str) -> Option<([u8; 32], String)> {
 /// here would break buggy clients; a bad registration just means the
 /// cache-hit doesn't happen — degraded, not broken.
 // r[impl gw.opcode.mandatory-set]
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(id = tracing::field::Empty))]
 pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -469,6 +477,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
         warn!(field = "id", "RegisterDrvOutput missing required field");
     }
     let id = id_field.unwrap_or_default();
+    tracing::Span::current().record("id", id);
 
     // Wire outPath is a BASENAME ("<hashpart>-<name>") per CppNix
     // StorePath::to_string(). Our gRPC/PG repr uses full paths. Prepend
@@ -577,13 +586,14 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
 /// practice the store returns at most one — the (drv_hash, output_name) PK
 /// is unique.
 // r[impl gw.opcode.mandatory-set]
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(id = tracing::field::Empty))]
 pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let id = wire::read_string(reader).await?;
+    tracing::Span::current().record("id", id.as_str());
 
     // Malformed id → empty set (same soft-fail rationale as Register).
     let Some((drv_hash, output_name)) = parse_drv_output_id(&id) else {
@@ -680,7 +690,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
 
 // r[impl gw.opcode.query-missing]
 /// wopQueryMissing (40): Report what needs building.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(count = tracing::field::Empty))]
 pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -688,6 +698,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
+    tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopQueryMissing");
 
     let derived: Vec<DerivedPath> = raw_paths
@@ -769,7 +780,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
 /// Writing "" → client reads `std::nullopt` → `assert(maybeOutputPath)`
 /// fires at nix-build.cc:722. Mirror CppNix's `queryPartialDerivationOutputMap`
 /// (store-api.cc:442-466): query the Realisations table for CA outputs.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_query_derivation_output_map<
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -780,6 +791,7 @@ pub(super) async fn handle_query_derivation_output_map<
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
     let drv_path_str = wire::read_string(reader).await?;
+    tracing::Span::current().record("path", drv_path_str.as_str());
     info!(path = %drv_path_str, "wopQueryDerivationOutputMap");
 
     let drv_path = match StorePath::parse(&drv_path_str) {

@@ -27,7 +27,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LogFormat {
+pub(crate) enum LogFormat {
     /// JSON structured logs (production default).
     #[default]
     Json,

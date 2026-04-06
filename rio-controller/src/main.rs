@@ -289,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         scheduler_balance_port: cfg.scheduler_balance_port,
         store_addr: cfg.store_addr.clone(),
         recorder: recorder.clone(),
+        error_counts: Default::default(),
     });
 
     // ---- WorkerPool controller ----

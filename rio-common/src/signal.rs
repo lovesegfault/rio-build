@@ -118,7 +118,7 @@ pub fn shutdown_signal() -> CancellationToken {
 /// Panics if SIGHUP handler installation fails — same as
 /// [`shutdown_signal`], same rationale (Unix-only binaries, signal
 /// handling is a hard requirement).
-pub fn sighup_reload<F, Fut>(
+pub(crate) fn sighup_reload<F, Fut>(
     shutdown: CancellationToken,
     mut reload: F,
 ) -> tokio::task::JoinHandle<()>

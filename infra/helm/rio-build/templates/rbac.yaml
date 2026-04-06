@@ -91,6 +91,16 @@ rules:
   - apiGroups: [rio.build]
     resources: [workerpools/status]
     verbs: [get, patch]
+  # /finalizers subresource: OwnerReferencesPermissionEnforcement
+  # admission plugin checks `update` on `<owner>/finalizers` when
+  # creating a child with `blockOwnerDeletion: true` (which
+  # controller_owner_ref sets on StatefulSet/Service/PDB/Job).
+  # Without this verb, child creates fail with "cannot set
+  # blockOwnerDeletion ... not permitted to update the owner
+  # resource." Mirrors the workerpoolsets/finalizers rule below.
+  - apiGroups: [rio.build]
+    resources: [workerpools/finalizers]
+    verbs: [update]
   # WorkerPoolSet: aggregating CRD — one WPS spawns one child WorkerPool
   # per size class. Reconciler watches WPS, SSA-applies child WPs, refreshes
   # per-class status. No `create`/`delete` — operators `kubectl apply` the

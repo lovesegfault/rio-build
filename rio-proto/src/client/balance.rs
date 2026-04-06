@@ -307,16 +307,16 @@ impl BalancedChannel {
 /// DIFFERENT health entry and always reports SERVING (tonic-health
 /// default) --- probing that would make both pods look healthy.
 // r[impl ctrl.probe.named-service]
-pub const SCHEDULER_HEALTH_SERVICE: &str = "rio.scheduler.SchedulerService";
+pub(crate) const SCHEDULER_HEALTH_SERVICE: &str = "rio.scheduler.SchedulerService";
 
 /// Default TLS domain for scheduler connections. Matches the
 /// first SAN in `infra/helm/rio-build/templates/cert-manager.yaml`.
-pub const SCHEDULER_TLS_DOMAIN: &str = "rio-scheduler";
+pub(crate) const SCHEDULER_TLS_DOMAIN: &str = "rio-scheduler";
 
 /// Default probe interval. CoreDNS headless-Service TTL is 5s
 /// by default; 3s means we catch a leadership flip within one
 /// missed heartbeat window.
-pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+pub(crate) const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Connect to the scheduler via a health-aware balanced channel.
 ///

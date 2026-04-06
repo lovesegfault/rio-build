@@ -144,6 +144,7 @@ let
     "narinfo_parsing"
     "build_result_parsing"
     "refscan"
+    "stderr_message_parsing"
   ];
 
   # rio-nix fuzz: wire/protocol parsers. Lean — rio-nix has few deps.

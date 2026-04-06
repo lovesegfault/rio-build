@@ -57,7 +57,7 @@ use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 use crate::crds::workerpool::WorkerPool;
 use crate::crds::workerpoolset::{ClassStatus, WorkerPoolSet};
 use crate::error::{Error, Result, error_kind};
-use crate::reconcilers::Ctx;
+use crate::reconcilers::{Ctx, error_key};
 use crate::scaling::is_wps_owned_by;
 
 pub(crate) mod builders;
@@ -99,7 +99,11 @@ const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 )]
 pub async fn reconcile(wps: Arc<WorkerPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
     let start = std::time::Instant::now();
-    let result = reconcile_inner(wps, ctx).await;
+    let key = error_key(wps.as_ref());
+    let result = reconcile_inner(wps, ctx.clone()).await;
+    if result.is_ok() {
+        ctx.reset_error_count(&key);
+    }
     metrics::histogram!("rio_controller_reconcile_duration_seconds",
         "reconciler" => "workerpoolset")
     .record(start.elapsed().as_secs_f64());
@@ -429,7 +433,7 @@ async fn cleanup(wps: Arc<WorkerPoolSet>, ctx: &Ctx) -> Result<Action> {
 /// `error_policy` — InvalidSpec (operator needs to fix the CRD)
 /// gets a long backoff; transient Kube/Finalizer errors retry
 /// sooner.
-pub fn error_policy(_wps: Arc<WorkerPoolSet>, err: &Error, _ctx: Arc<Ctx>) -> Action {
+pub fn error_policy(wps: Arc<WorkerPoolSet>, err: &Error, ctx: Arc<Ctx>) -> Action {
     metrics::counter!("rio_controller_reconcile_errors_total",
         "reconciler" => "workerpoolset", "error_kind" => error_kind(err))
     .increment(1);
@@ -440,8 +444,11 @@ pub fn error_policy(_wps: Arc<WorkerPoolSet>, err: &Error, _ctx: Arc<Ctx>) -> Ac
             Action::requeue(Duration::from_secs(300))
         }
         _ => {
-            warn!(error = %err, "reconcile failed; retrying");
-            Action::requeue(Duration::from_secs(30))
+            // Exponential backoff: 5s → 300s cap. Same pattern
+            // as workerpool::error_policy.
+            let delay = ctx.error_backoff(&error_key(wps.as_ref()));
+            warn!(error = %err, backoff = ?delay, "reconcile failed; retrying");
+            Action::requeue(delay)
         }
     }
 }

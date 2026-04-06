@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 use crate::crds::workerpool::WorkerPool;
 use crate::error::{Error, Result, error_kind};
-use crate::reconcilers::Ctx;
+use crate::reconcilers::{Ctx, error_key};
 
 mod builders;
 pub mod disruption;
@@ -90,7 +90,14 @@ pub(crate) const POOL_LABEL: &str = "rio.build/pool";
 )]
 pub async fn reconcile(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
     let start = std::time::Instant::now();
-    let result = reconcile_inner(wp, ctx).await;
+    let key = error_key(wp.as_ref());
+    let result = reconcile_inner(wp, ctx.clone()).await;
+    // Reset the error-backoff counter on success so the NEXT
+    // failure starts the curve from 5s, not from wherever the
+    // last streak left off.
+    if result.is_ok() {
+        ctx.reset_error_count(&key);
+    }
     // Record duration regardless of success/error — error-path
     // duration is a useful signal (slow apiserver timeouts show
     // as long durations + error).
@@ -641,13 +648,17 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
         Err(e) => return Err(e.into()),
     }
 
-    // ---- Phase 3: wait for replicas=0 ----
-    // Bounded poll. NOT a watch: a watch stream on StatefulSet
-    // here would fight with the Controller's `.owns()` watch
-    // (kube-runtime dedupes watches by Api<T>, two watches on the
-    // same type from the same client can interfere). Polling is
-    // simpler and the event rate is low (one transition per pod
-    // termination, 5s poll is fine).
+    // ---- Phase 3: check replicas=0 (requeue if not) ----
+    // Single-shot check, NOT an inline poll loop. kube-rs
+    // Controller has no `.with_concurrency()` — an inline sleep
+    // loop here monopolizes the reconcile slot for up to
+    // `terminationGracePeriodSeconds + 60s` (2h+ default). With
+    // multiple deleting pools, ALL other reconciliation stops.
+    // Instead: one GET, if still draining return
+    // `Action::requeue(DRAIN_POLL_INTERVAL)`. The finalizer
+    // stays (we haven't returned Ok from a path that removes
+    // it); next tick re-enters cleanup() via Event::Cleanup and
+    // re-checks. Other pools reconcile in between.
     //
     // `replicas` field, not `ready_replicas`: replicas counts
     // pods that exist (any state); ready_replicas counts pods
@@ -657,52 +668,73 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // ready" — otherwise we'd remove the finalizer while pods
     // are still running builds.
     //
-    // Derived from the spec's grace period (+ 60s slop) instead of
-    // a hardcoded 2h: a cluster with 90s builds and
-    // terminationGracePeriodSeconds=180 shouldn't block WorkerPool
-    // delete for 2h on a stuck/never-Ready pod (vm-lifecycle-autoscale-k3s
-    // v24/v25: autoscaler-spawned pod-1 never went Ready; STS
-    // sequential termination stalls on it).
+    // Deadline derived from `metadata.deletionTimestamp` (wall
+    // clock, set once by the apiserver at delete time) instead
+    // of a stored Instant — each requeue re-enters cleanup()
+    // fresh, so a monotonic Instant would reset every tick and
+    // the deadline would never trip. `deletionTimestamp + grace
+    // + slop` is stable across requeues.
+    //
+    // Grace period from the spec (+ 60s slop) instead of a
+    // hardcoded 2h: a cluster with 90s builds and
+    // terminationGracePeriodSeconds=180 shouldn't block
+    // WorkerPool delete for 2h on a stuck/never-Ready pod
+    // (vm-lifecycle-autoscale-k3s v24/v25: autoscaler-spawned
+    // pod-1 never went Ready; STS sequential termination stalls
+    // on it).
     let grace = wp
         .spec
         .termination_grace_period_seconds
         .unwrap_or(DEFAULT_TERMINATION_GRACE);
     let drain_max_wait = Duration::from_secs(grace.max(0) as u64) + DRAIN_WAIT_SLOP;
-    let deadline = tokio::time::Instant::now() + drain_max_wait;
-    loop {
-        match sts_api.get_opt(&sts_name).await? {
-            Some(sts) => {
-                let replicas = sts.status.map(|s| s.replicas).unwrap_or(0);
-                if replicas == 0 {
-                    info!(workerpool = %name, "drain complete (replicas=0)");
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    // Grace expired. Pods are STILL running —
-                    // either a build is stuck or the kubelet is
-                    // dead. We can't do anything more from here.
-                    // Remove the finalizer; ownerRef GC will
-                    // SIGKILL (kubelet's `deletion_grace_period`
-                    // handling) eventually. Operator sees the
-                    // stuck pods in `kubectl get pods`.
-                    warn!(
-                        workerpool = %name,
-                        remaining = replicas,
-                        timeout = ?drain_max_wait,
-                        "drain timeout; proceeding (ownerRef GC will force-delete)"
-                    );
-                    break;
-                }
-                debug!(workerpool = %name, remaining = replicas, "waiting for drain");
-                tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    // deletionTimestamp is set by the apiserver when the delete
+    // was accepted. Absent only if something called cleanup()
+    // outside the finalizer() wrapper (shouldn't happen — treat
+    // as "just started," deadline far in the future).
+    let deletion_ts = wp
+        .metadata
+        .deletion_timestamp
+        .as_ref()
+        .map(|t| t.0)
+        .unwrap_or_else(k8s_openapi::jiff::Timestamp::now);
+    let elapsed = k8s_openapi::jiff::Timestamp::now()
+        .as_second()
+        .saturating_sub(deletion_ts.as_second())
+        .max(0) as u64;
+    let timed_out = elapsed >= drain_max_wait.as_secs();
+
+    match sts_api.get_opt(&sts_name).await? {
+        Some(sts) => {
+            let replicas = sts.status.map(|s| s.replicas).unwrap_or(0);
+            if replicas == 0 {
+                info!(workerpool = %name, "drain complete (replicas=0)");
+            } else if timed_out {
+                // Grace expired. Pods are STILL running —
+                // either a build is stuck or the kubelet is
+                // dead. We can't do anything more from here.
+                // Remove the finalizer; ownerRef GC will
+                // SIGKILL (kubelet's `deletion_grace_period`
+                // handling) eventually. Operator sees the
+                // stuck pods in `kubectl get pods`.
+                warn!(
+                    workerpool = %name,
+                    remaining = replicas,
+                    timeout = ?drain_max_wait,
+                    "drain timeout; proceeding (ownerRef GC will force-delete)"
+                );
+            } else {
+                // Still draining. Requeue — finalizer stays,
+                // next cleanup() tick re-checks. Other pools
+                // reconcile in the meantime.
+                debug!(workerpool = %name, remaining = replicas, "waiting for drain; requeuing");
+                return Ok(Action::requeue(DRAIN_POLL_INTERVAL));
             }
-            None => {
-                // STS deleted out from under us. Unusual (we
-                // own it via ownerRef; GC shouldn't run until
-                // the finalizer is removed) but handle it.
-                info!(workerpool = %name, "STS disappeared mid-wait; done");
-                break;
-            }
+        }
+        None => {
+            // STS deleted out from under us. Unusual (we
+            // own it via ownerRef; GC shouldn't run until
+            // the finalizer is removed) but handle it.
+            info!(workerpool = %name, "STS disappeared mid-wait; done");
         }
     }
 
@@ -712,10 +744,10 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     Ok(Action::await_change())
 }
 
-/// Requeue policy on error. Transient (Kube, Scheduler) → short
-/// backoff. InvalidSpec → longer (operator needs to fix it;
-/// retrying fast is noise).
-pub fn error_policy(_wp: Arc<WorkerPool>, err: &Error, _ctx: Arc<Ctx>) -> Action {
+/// Requeue policy on error. Transient (Kube, Scheduler) →
+/// exponential backoff (5s → 300s). InvalidSpec → fixed 5min
+/// (operator needs to fix it; retrying fast is noise).
+pub fn error_policy(wp: Arc<WorkerPool>, err: &Error, ctx: Arc<Ctx>) -> Action {
     metrics::counter!("rio_controller_reconcile_errors_total",
         "reconciler" => "workerpool", "error_kind" => error_kind(err))
     .increment(1);
@@ -729,11 +761,16 @@ pub fn error_policy(_wp: Arc<WorkerPool>, err: &Error, _ctx: Arc<Ctx>) -> Action
         }
         _ => {
             // Transient (apiserver hiccup, scheduler restarting).
-            // Short backoff, retry. warn! not debug! — a 30s
-            // silent retry loop is invisible at INFO and cost
-            // us ~10min of VM debugging once.
-            warn!(error = %err, "reconcile failed; retrying");
-            Action::requeue(Duration::from_secs(30))
+            // Exponential backoff: 5s → 10s → … → 300s cap.
+            // A persistent 5xx backs off to 5min after ~6
+            // failures instead of retrying every 30s indefinitely.
+            // Reset on the next successful reconcile.
+            //
+            // warn! not debug! — a silent retry loop is invisible
+            // at INFO and cost us ~10min of VM debugging once.
+            let delay = ctx.error_backoff(&error_key(wp.as_ref()));
+            warn!(error = %err, backoff = ?delay, "reconcile failed; retrying");
+            Action::requeue(delay)
         }
     }
 }

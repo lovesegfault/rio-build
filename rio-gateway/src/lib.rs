@@ -32,7 +32,7 @@ pub fn describe_metrics() {
 
     describe_counter!(
         "rio_gateway_connections_total",
-        "Total SSH connections (labeled by result: new/accepted/rejected)"
+        "Total SSH connections (labeled by result: new/accepted/rejected/rejected_jwt)"
     );
     describe_gauge!(
         "rio_gateway_connections_active",

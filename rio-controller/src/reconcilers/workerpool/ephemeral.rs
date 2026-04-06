@@ -208,7 +208,15 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
 
         for _ in 0..to_spawn {
             let job = build_job(wp, oref.clone(), &scheduler, &ctx.store_addr)?;
-            let job_name = job.metadata.name.clone().expect("we set it");
+            // build_job() always sets metadata.name, so this can't
+            // fail today — but .expect() here violates the crate's
+            // "reconciler panic = pod crash-loop" convention
+            // (cf. workerpool/mod.rs:317-319). Error path instead.
+            let job_name = job
+                .metadata
+                .name
+                .clone()
+                .ok_or_else(|| Error::InvalidSpec("job name missing".into()))?;
             // PostParams::default (not SSA): Jobs are create-once.
             // SSA's patch-merge semantics don't fit — there's no
             // "update existing Job to match spec," the Job is
@@ -258,7 +266,8 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     // under a different field manager so SSA keeps them separate.
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
     let ar = WorkerPool::api_resource();
-    let cond = scheduler_unreachable_condition(scheduler_err.as_deref());
+    let prev = crate::scaling::find_condition(wp, "SchedulerUnreachable");
+    let cond = scheduler_unreachable_condition(scheduler_err.as_deref(), prev.as_ref());
     let status_patch = serde_json::json!({
         "apiVersion": ar.api_version,
         "kind": ar.kind,
@@ -333,8 +342,16 @@ fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
 /// Same json!-not-struct pattern as `scaling::scaling_condition`:
 /// k8s_openapi's Condition struct requires observedGeneration which
 /// we don't track.
-fn scheduler_unreachable_condition(err: Option<&str>) -> serde_json::Value {
-    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+///
+/// `prev`: existing SchedulerUnreachable condition (if any). Its
+/// `lastTransitionTime` is preserved when `status` hasn't changed —
+/// this reconciler writes every 10s tick; without preservation the
+/// timestamp always reads "~10s ago" regardless of when the
+/// scheduler actually went down/recovered.
+fn scheduler_unreachable_condition(
+    err: Option<&str>,
+    prev: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let (status, reason, message) = match err {
         Some(e) => (
             "True",
@@ -352,7 +369,7 @@ fn scheduler_unreachable_condition(err: Option<&str>) -> serde_json::Value {
         "status": status,
         "reason": reason,
         "message": message,
-        "lastTransitionTime": now,
+        "lastTransitionTime": crate::scaling::transition_time(status, prev),
     })
 }
 
@@ -775,7 +792,7 @@ mod tests {
     #[test]
     fn scheduler_unreachable_condition_shape() {
         // RPC failed → status=True, error in message.
-        let c = scheduler_unreachable_condition(Some("connection refused"));
+        let c = scheduler_unreachable_condition(Some("connection refused"), None);
         assert_eq!(c["type"], "SchedulerUnreachable");
         assert_eq!(c["status"], "True");
         assert_eq!(c["reason"], "ClusterStatusFailed");
@@ -790,7 +807,7 @@ mod tests {
 
         // RPC succeeded → status=False (clears stale True after
         // recovery).
-        let c = scheduler_unreachable_condition(None);
+        let c = scheduler_unreachable_condition(None, None);
         assert_eq!(c["type"], "SchedulerUnreachable");
         assert_eq!(c["status"], "False");
         assert_eq!(c["reason"], "ClusterStatusOK");

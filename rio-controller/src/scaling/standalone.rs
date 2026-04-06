@@ -51,8 +51,8 @@ use crate::crds::workerpoolset::WorkerPoolSet;
 
 use super::{
     Decision, Direction, STATUS_MANAGER, ScaleError, ScaleState, ScalingTiming,
-    check_stabilization, compute_desired, is_wps_owned, pool_key, scaling_condition,
-    sts_replicas_patch, wp_status_patch,
+    check_stabilization, compute_desired, find_condition, is_wps_owned, pool_key,
+    scaling_condition, sts_replicas_patch, wp_status_patch,
 };
 
 /// Autoscaler. Constructed once in main.rs, `run()` loops forever.
@@ -434,7 +434,8 @@ impl Autoscaler {
             Direction::Down => "ScaledDown",
         };
         let msg = format!("scaled from {from} to {to}");
-        let cond = scaling_condition("True", reason, &msg);
+        let prev = find_condition(pool, "Scaling");
+        let cond = scaling_condition("True", reason, &msg, prev.as_ref());
         self.patch_status_partial(pool, Some(cond)).await;
     }
 
@@ -448,7 +449,8 @@ impl Autoscaler {
                 format!("autoscaling.metric '{m}' is not supported (only 'queueDepth')"),
             ),
         };
-        let cond = scaling_condition("False", reason, &msg);
+        let prev = find_condition(pool, "Scaling");
+        let cond = scaling_condition("False", reason, &msg, prev.as_ref());
         self.patch_status_partial(pool, Some(cond)).await;
     }
 

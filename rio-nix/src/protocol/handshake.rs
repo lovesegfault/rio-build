@@ -65,9 +65,25 @@ pub enum HandshakeError {
     },
 }
 
-/// Perform the server-side handshake over an async stream.
+/// Test-only convenience wrapper: server-side handshake over a single
+/// bidirectional stream. Splits via `tokio::io::split` then delegates
+/// to [`server_handshake_split`]. Production code (rio-gateway) uses
+/// [`server_handshake_split`] directly with separate SSH channel halves.
+#[cfg(test)]
+pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    version_string: &str,
+) -> Result<HandshakeResult, HandshakeError> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    server_handshake_split(&mut reader, &mut writer, version_string).await
+}
+
+/// Perform the server-side handshake with separate reader and writer.
 ///
-/// All values are u64 LE on the wire (including magic bytes).
+/// This is the production entrypoint — rio-gateway calls it with split
+/// read/write halves of an SSH channel (two independent pipe ends, not
+/// one bidirectional stream). All values are u64 LE on the wire
+/// (including magic bytes).
 ///
 /// Phase 1 — Magic + version exchange:
 /// 1. Read `WORKER_MAGIC_1` (u64) from client
@@ -87,20 +103,6 @@ pub enum HandshakeError {
 /// 9. Write STDERR_LAST (u64); flush
 ///
 /// On error, the caller should send `STDERR_ERROR` and close the connection.
-#[cfg(test)]
-pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    version_string: &str,
-) -> Result<HandshakeResult, HandshakeError> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    server_handshake_split(&mut reader, &mut writer, version_string).await
-}
-
-/// Server-side handshake with separate reader and writer streams.
-///
-/// Same as `server_handshake` but takes split read/write halves. This is
-/// needed when the reader and writer are independent streams (e.g., two
-/// ends of separate pipes bridging SSH channel I/O).
 // r[impl gw.handshake.phases]
 // r[impl gw.handshake.magic]
 // r[impl gw.handshake.version-negotiation]
