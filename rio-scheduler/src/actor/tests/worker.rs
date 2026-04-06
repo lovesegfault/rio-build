@@ -807,3 +807,266 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
 
     Ok(())
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// on_worker_registered / warm-gate initial-hint coverage
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Connect a worker WITHOUT the automatic `PrefetchComplete` ACK
+/// that [`connect_worker`] sends. For warm-gate tests that need to
+/// observe the initial `PrefetchHint` arrival and/or prove dispatch
+/// blocks until the ACK.
+async fn connect_worker_no_ack(
+    handle: &ActorHandle,
+    worker_id: &str,
+    system: &str,
+    max_builds: u32,
+) -> anyhow::Result<tokio::sync::mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: worker_id.into(),
+            stream_tx,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            worker_id: worker_id.into(),
+            systems: vec![system.into()],
+            supported_features: vec![],
+            max_builds,
+            running_builds: vec![],
+        })
+        .await?;
+    Ok(stream_rx)
+}
+
+// r[verify sched.assign.warm-gate]
+/// Merge-then-connect: a worker registering AFTER a DAG is merged
+/// receives an initial `PrefetchHint` on its stream BEFORE any
+/// `WorkAssignment`. The hint carries the Ready derivation's input
+/// closure (its children's `expected_output_paths`). Proves
+/// `on_worker_registered` sends the hint when the ready queue is
+/// non-empty AND the closure is non-empty.
+///
+/// Setup: A→B chain. B completes (pre-seeded via a throwaway worker)
+/// → A goes Ready with B as its completed child → A's input
+/// closure = B's output. THEN register the real worker without ACK
+/// → it sees PrefetchHint before Assignment.
+#[tokio::test]
+async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResult {
+    use rio_proto::types::scheduler_message::Msg;
+
+    let (_db, handle, _task) = setup().await;
+
+    // Merge A→B. B has expected_output_paths so A's input closure
+    // (approx_input_closure(A) = children's expected_output_paths)
+    // is non-empty. B is leaf → Ready immediately; A Queued.
+    let build_id = Uuid::new_v4();
+    let mut node_b = make_test_node("warm-b", "x86_64-linux");
+    node_b.expected_output_paths = vec![test_store_path("warm-b-out")];
+    let node_a = make_test_node("warm-a", "x86_64-linux");
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![node_a, node_b],
+        vec![make_test_edge("warm-a", "warm-b")],
+        false,
+    )
+    .await?;
+
+    // Bootstrap: connect a throwaway worker to complete B so A
+    // becomes Ready. Use the auto-ACK connect_worker helper
+    // (we're not testing THIS worker's warm-gate).
+    let mut boot_rx = connect_worker(&handle, "boot-w", "x86_64-linux", 1).await?;
+    let boot_asgn = recv_assignment(&mut boot_rx).await;
+    assert_eq!(boot_asgn.drv_path, test_drv_path("warm-b"));
+    complete_success_empty(&handle, "boot-w", &test_drv_path("warm-b")).await?;
+    barrier(&handle).await;
+
+    // Precondition: A is now Ready (all deps Completed).
+    // The bootstrap worker has max_builds=1 and is now holding A's
+    // assignment — drain it so A stays Ready for the real worker.
+    // Actually, A might've been dispatched to boot-w already.
+    // Disconnect boot-w to reset A to Ready.
+    handle
+        .send_unchecked(ActorCommand::WorkerDisconnected {
+            worker_id: "boot-w".into(),
+        })
+        .await?;
+    barrier(&handle).await;
+    drop(boot_rx);
+
+    let info_a = handle
+        .debug_query_derivation("warm-a")
+        .await?
+        .expect("warm-a exists");
+    assert_eq!(
+        info_a.status,
+        DerivationStatus::Ready,
+        "precondition: A Ready with completed child B"
+    );
+
+    // THEN connect the REAL worker — WITHOUT auto-ACK. Registration
+    // hook sees Ready queue non-empty, A's closure = B's output →
+    // sends PrefetchHint.
+    let mut rx = connect_worker_no_ack(&handle, "warm-worker", "x86_64-linux", 4).await?;
+    barrier(&handle).await;
+
+    // First message: PrefetchHint (NOT Assignment). The hint arrives
+    // FIRST on the stream — proving on_worker_registered sends it.
+    // (With only one cold worker, the warm-gate fallback ALSO fires
+    // dispatch for the same heartbeat — the Assignment may arrive
+    // SECOND via the no-warm-workers fallback. That's correct: the
+    // hint-send ordering is what we're proving, not dispatch-hold.)
+    let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for first message")
+        .expect("channel open");
+    match first.msg {
+        Some(Msg::Prefetch(hint)) => {
+            assert!(
+                hint.store_paths.contains(&test_store_path("warm-b-out")),
+                "initial hint should carry the Ready node's child output paths; \
+                 got {:?}",
+                hint.store_paths
+            );
+        }
+        other => panic!("expected PrefetchHint as FIRST message, got {other:?}"),
+    }
+
+    // Drain any fallback-dispatched Assignment (single-worker cluster
+    // triggers the no-warm-fallback). The point is the PrefetchHint
+    // arrived FIRST — P0299 EC: "Fresh worker receives PrefetchHint
+    // within one tick of registration."
+    Ok(())
+}
+
+// r[verify sched.assign.warm-gate]
+/// Connect-then-empty-queue: a worker registering with an EMPTY
+/// ready queue flips `warm=true` immediately (the short-circuit at
+/// worker.rs:126-136 — "nothing queued → nothing to prefetch → gate
+/// open now"). Proves: merge AFTER connect → Assignment arrives
+/// WITHOUT a PrefetchComplete ACK round-trip.
+#[tokio::test]
+async fn on_worker_registered_empty_queue_flips_warm_immediately() -> TestResult {
+    use rio_proto::types::scheduler_message::Msg;
+
+    let (_db, handle, _task) = setup().await;
+
+    // Connect FIRST — ready queue is empty. on_worker_registered's
+    // short-circuit flips warm=true without sending a hint.
+    let mut rx = connect_worker_no_ack(&handle, "empty-worker", "x86_64-linux", 4).await?;
+    barrier(&handle).await;
+
+    // No PrefetchHint on the stream (nothing to hint for).
+    assert!(
+        rx.try_recv().is_err(),
+        "empty queue at registration → no PrefetchHint sent"
+    );
+
+    // THEN merge. The worker is already warm (short-circuit) so
+    // dispatch proceeds immediately — no ACK round-trip needed.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "empty-drv", PriorityClass::Scheduled).await?;
+
+    // Assignment arrives WITHOUT any PrefetchComplete send. This is
+    // the core assertion: if the short-circuit DIDN'T flip warm,
+    // the derivation would stay Ready (warm-gate holds) and this
+    // recv would timeout.
+    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout — short-circuit didn't flip warm (dispatch blocked)")
+        .expect("channel open");
+    match msg.msg {
+        Some(Msg::Assignment(a)) => {
+            assert_eq!(a.drv_path, test_drv_path("empty-drv"));
+        }
+        Some(Msg::Prefetch(_)) => {
+            panic!("unexpected PrefetchHint — short-circuit should skip the hint for empty queue")
+        }
+        other => panic!("expected Assignment, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+// r[verify sched.assign.warm-gate]
+/// Hint-send-fails: if the initial hint's `try_send` fails (channel
+/// full or closed), `on_worker_registered` flips `warm=true` anyway
+/// (defensive path at worker.rs:158-163 — "gate is optimization, not
+/// correctness"). The scheduler doesn't wedge.
+///
+/// Inducing the fail: use a 1-slot channel pre-filled with a dummy
+/// message. The actor's `try_send(PrefetchHint)` → `Err(Full)` →
+/// warn + flip warm.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Merge A→B so A's closure is non-empty → the hint SEND is
+    // attempted (not the empty-closure short-circuit). B completes
+    // via a throwaway worker → A goes Ready.
+    let build_id = Uuid::new_v4();
+    let mut node_b = make_test_node("fail-b", "x86_64-linux");
+    node_b.expected_output_paths = vec![test_store_path("fail-b-out")];
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![make_test_node("fail-a", "x86_64-linux"), node_b],
+        vec![make_test_edge("fail-a", "fail-b")],
+        false,
+    )
+    .await?;
+    let mut boot_rx = connect_worker(&handle, "boot-f", "x86_64-linux", 1).await?;
+    let _ = recv_assignment(&mut boot_rx).await;
+    complete_success_empty(&handle, "boot-f", &test_drv_path("fail-b")).await?;
+    handle
+        .send_unchecked(ActorCommand::WorkerDisconnected {
+            worker_id: "boot-f".into(),
+        })
+        .await?;
+    barrier(&handle).await;
+    drop(boot_rx);
+
+    // Connect with a 1-slot channel, IMMEDIATELY fill it so the
+    // actor's try_send for the PrefetchHint fails with Full.
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+    stream_tx
+        .send(rio_proto::types::SchedulerMessage { msg: None })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "fail-worker".into(),
+            stream_tx,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            worker_id: "fail-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // The defensive path fired: warn + flip warm.
+    assert!(
+        logs_contain("warm-gate: initial hint send failed; flipping warm anyway"),
+        "send-fail defensive path should warn and flip warm"
+    );
+
+    drop(stream_rx);
+    Ok(())
+}

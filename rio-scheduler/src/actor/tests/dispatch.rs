@@ -1216,3 +1216,101 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 
     Ok(())
 }
+
+// -----------------------------------------------------------------------------
+// maybe_resolve_ca gate-path passthrough coverage
+// -----------------------------------------------------------------------------
+
+// r[verify sched.ca.resolve+2]
+/// IA passthrough: `state.is_ca = false` → gate at dispatch.rs:681
+/// fails → `drv_content` returned unchanged. No resolve fires, no
+/// ContentLookup, no PG query. The cheapest path — every non-CA
+/// dispatch takes it.
+#[tokio::test]
+async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("ia-w", "x86_64-linux", 2).await?;
+
+    let original_content = b"dummy-ia-aterm-content".to_vec();
+    let mut node = make_test_node("ia-drv", "x86_64-linux");
+    node.is_content_addressed = false; // explicit: IA
+    node.drv_content = original_content.clone();
+
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let asgn = recv_assignment(&mut rx).await;
+
+    assert_eq!(
+        asgn.drv_content, original_content,
+        "IA derivation → maybe_resolve_ca passthrough; drv_content unchanged"
+    );
+    Ok(())
+}
+
+// r[verify sched.ca.resolve+2]
+/// FOD passthrough: `is_ca = true` BUT `is_fixed_output = true` →
+/// same gate fails (`!state.is_ca || state.is_fixed_output`). FOD
+/// output path is known at eval time (predeclared hash), no resolve
+/// needed. ADR-018 `shouldResolve` table: FOD → false.
+#[tokio::test]
+async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("fod-w", "x86_64-linux", 2).await?;
+
+    let original_content = b"dummy-fod-aterm-content".to_vec();
+    let mut node = make_test_node("fod-drv", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.is_fixed_output = true; // FOD — gate rejects
+    node.drv_content = original_content.clone();
+
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+    let asgn = recv_assignment(&mut rx).await;
+
+    assert_eq!(
+        asgn.drv_content, original_content,
+        "FOD (is_ca && is_fixed_output) → passthrough; output path known at eval"
+    );
+    Ok(())
+}
+
+// r[verify sched.ca.resolve+2]
+/// No-CA-inputs passthrough: floating-CA derivation whose children
+/// are all IA → `collect_ca_inputs` returns `[]` → gate at
+/// dispatch.rs:694 fails → passthrough. The common case: a CA
+/// `mkDerivation` on IA stdenv. No resolve needed — no placeholder
+/// in the ATerm because all input paths were known at eval time.
+#[tokio::test]
+async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("noca-w", "x86_64-linux", 2).await?;
+
+    let original_content = b"floating-ca-with-ia-deps".to_vec();
+    let mut parent = make_test_node("noca-parent", "x86_64-linux");
+    parent.is_content_addressed = true;
+    parent.is_fixed_output = false; // floating-CA — gate 1 passes
+    parent.drv_content = original_content.clone();
+
+    // IA child — collect_ca_inputs skips it (is_ca=false).
+    let child = make_test_node("noca-child", "x86_64-linux");
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![parent, child],
+        vec![make_test_edge("noca-parent", "noca-child")],
+        false,
+    )
+    .await?;
+
+    // Child dispatches first (leaf).
+    let a1 = recv_assignment(&mut rx).await;
+    assert!(a1.drv_path.contains("noca-child"));
+    complete_success_empty(&handle, "noca-w", &test_drv_path("noca-child")).await?;
+
+    // Parent dispatches. collect_ca_inputs(parent) = [] (child is IA)
+    // → ca_inputs.is_empty() gate → passthrough.
+    let a2 = recv_assignment_skip_prefetch(&mut rx).await;
+    assert!(a2.drv_path.contains("noca-parent"));
+    assert_eq!(
+        a2.drv_content, original_content,
+        "floating-CA with only IA children → collect_ca_inputs=[] → \
+         passthrough (no resolve, drv_content unchanged)"
+    );
+    Ok(())
+}

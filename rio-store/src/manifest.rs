@@ -237,6 +237,85 @@ mod tests {
         ));
     }
 
+    /// Boundary arithmetic: the `body.len() % ENTRY_SIZE` divisibility
+    /// check, `/ ENTRY_SIZE` count computation, and `> MAX_CHUNKS`
+    /// comparison have 13 candidate cargo-mutants mutations: `%` → `/`
+    /// or `*`, `/` → `%` or `*`, `>` → `>=` or `<` or `==`. Each row
+    /// below targets a distinct boundary where one of those mutations
+    /// would flip the outcome.
+    ///
+    /// Pattern follows P0373-T2's MAX_FRAME_SIZE boundary: exact, ±1,
+    /// and far-from-boundary cases so any single-operator flip breaks
+    /// at least one row.
+    #[test]
+    fn manifest_chunk_boundary_arithmetic() {
+        // (body_len, expected). body_len is what follows the version
+        // byte. Ok(n) = parsed with n entries; Err variant per the
+        // arithmetic path that rejects it.
+        #[derive(Debug)]
+        enum Expected {
+            Ok(usize),
+            BadLength,
+            TooMany,
+        }
+        use Expected::*;
+
+        let cases = [
+            // Divisibility boundary: `% ENTRY_SIZE != 0`.
+            // ENTRY_SIZE - 1 → BadLength (% catches non-multiple)
+            (ENTRY_SIZE - 1, BadLength),
+            // ENTRY_SIZE → 1 entry (% == 0, / == 1)
+            (ENTRY_SIZE, Ok(1)),
+            // ENTRY_SIZE + 1 → BadLength (catches `%` → `/` mutant:
+            //   37/36=1, 37%36=1; if % became / the check is `1 != 0`
+            //   still BadLength — but the `/` count becomes 1 not 0,
+            //   so this row ALSO guards the count computation)
+            (ENTRY_SIZE + 1, BadLength),
+            // 2*ENTRY_SIZE → 2 entries (proves `/` not `%` in count:
+            //   72/36=2, 72%36=0; if `/` became `%`, count=0, wrong)
+            (2 * ENTRY_SIZE, Ok(2)),
+            // 2*ENTRY_SIZE - 1 → BadLength (71%36=35, not 0)
+            (2 * ENTRY_SIZE - 1, BadLength),
+            // MAX_CHUNKS boundary: `count > MAX_CHUNKS`.
+            // MAX_CHUNKS entries → Ok (at the limit, `>` not `>=`)
+            (MAX_CHUNKS * ENTRY_SIZE, Ok(MAX_CHUNKS)),
+            // MAX_CHUNKS + 1 → TooMany (1 past the limit; the `>`
+            //   vs `>=` mutant is caught by the prior row, this one
+            //   catches `>` → `<` or `==`)
+            ((MAX_CHUNKS + 1) * ENTRY_SIZE, TooMany),
+        ];
+
+        for (body_len, expected) in cases {
+            let mut data = vec![0u8; 1 + body_len];
+            data[0] = VERSION;
+            let got = Manifest::deserialize(&data);
+            match expected {
+                Ok(n) => {
+                    let m = got.unwrap_or_else(|e| {
+                        panic!("body_len={body_len} expected Ok({n}), got Err({e:?})")
+                    });
+                    assert_eq!(
+                        m.entries.len(),
+                        n,
+                        "body_len={body_len} → expected {n} entries"
+                    );
+                    // Round-trip: serialize(deserialize(x)).len() ==
+                    // 1 + n * ENTRY_SIZE (locks the count ↔ length
+                    // bidirectional arithmetic).
+                    assert_eq!(m.serialize().len(), 1 + n * ENTRY_SIZE);
+                }
+                BadLength => assert!(
+                    matches!(got, Err(ManifestError::BadLength(l)) if l == body_len),
+                    "body_len={body_len} expected BadLength, got {got:?}"
+                ),
+                TooMany => assert!(
+                    matches!(got, Err(ManifestError::TooManyChunks(_))),
+                    "body_len={body_len} expected TooManyChunks, got {got:?}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn deserialize_rejects_too_many_chunks() {
         // MAX_CHUNKS + 1 entries. Don't actually allocate 7.2 MB for the
