@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ─── AgentRow ────────────────────────────────────────────────────────────────
@@ -135,8 +135,32 @@ Retry = Literal["Once", "Never", "Twice"]
 _OWNER_RE = re.compile(r"^P\d+( T\d+)?$")
 
 
+class Mitigation(BaseModel):
+    """One entry in a KnownFlake's fix-history. Was: [PXXX LANDED sha: note]
+    bracket-appends in fix_description (grew to 1584 chars on
+    known-flakes.jsonl:11 after 4 same-shape appends; 5c68733e did
+    string-surgery to fix a premature append — structured list avoids that
+    failure mode)."""
+    plan: int = Field(description="P<N> → N")
+    landed_sha: str = Field(pattern=r"^[0-9a-f]{8,40}$")
+    note: str = Field(description="What the mitigation does + any new symptom string")
+
+
 class KnownFlake(BaseModel):
-    test: str
+    test: str = Field(
+        description="Flake-attr name (vm-lifecycle-recovery-k3s) for VM tests, "
+        "crate::module::test_name for nextest. Human-identifier."
+    )
+    drv_name: str | None = Field(
+        default=None,
+        description="nixosTest name attr — the <N> in vm-test-run-<N>.drv as it "
+        "appears in `error: Cannot build` CI log lines. VM tests ONLY (nextest "
+        "entries leave this None). Match key for excusable() _VM_FAIL_RE. Set "
+        "from nix/tests/scenarios/*.nix `name = \"rio-...\"` composition, NOT "
+        "the default.nix attrset key. e.g., vm-lifecycle-recovery-k3s → "
+        "rio-lifecycle-recovery (lifecycle.nix name=\"rio-lifecycle-${name}\" "
+        "+ default.nix name=\"recovery\")."
+    )
     symptom: str
     root_cause: str
     fix_owner: str = Field(
@@ -146,6 +170,12 @@ class KnownFlake(BaseModel):
         description="What the fix does (was prose after fix_owner)"
     )
     retry: Retry
+    mitigations: list[Mitigation] = Field(
+        default_factory=list,
+        description="Ordered fix-history. Replaces [PXXX LANDED sha: note] "
+        "bracket-appends in fix_description. Appended via `onibus flake "
+        "mitigation <test> <plan> <sha> <note>`.",
+    )
 
     @field_validator("fix_owner")
     @classmethod
@@ -157,6 +187,23 @@ class KnownFlake(BaseModel):
                 "Create the plan via /plan --inline first."
             )
         return v
+
+    @model_validator(mode="after")
+    def _match_surface_defined(self) -> "KnownFlake":
+        # Sentinel entries (<tcg-builder-allocation> etc.) are intentionally
+        # unmatchable by name — provenance-only rows that P0304 T10's
+        # _TCG_MARKERS handles via log-grep. They need neither surface.
+        if self.test.startswith("<"):
+            return self
+        # VM-test entries (vm-*-k3s, vm-*-standalone) need drv_name for
+        # _VM_FAIL_RE matching. Nextest entries (crate::path) match via test.
+        if self.test.startswith("vm-") and self.drv_name is None:
+            raise ValueError(
+                f"VM-test known-flake {self.test!r} missing drv_name — "
+                f"_VM_FAIL_RE matches against drv_name, not test. Set drv_name "
+                f"to the nixosTest name attr (see nix/tests/scenarios/*.nix)."
+            )
+        return self
 
     @property
     def owner_plan(self) -> int:

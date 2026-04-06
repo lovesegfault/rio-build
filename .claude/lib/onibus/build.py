@@ -131,26 +131,56 @@ def coverage(branch: str, merged_at: str, *, loud: bool = False) -> None:
 # nextest FAIL line: "        FAIL [   1.234s] crate::module::test_name"
 _NEXTEST_FAIL_RE = re.compile(r"^\s*FAIL\s+\[\s*[\d.]+s\]\s+(\S+)", re.MULTILINE)
 
+# VM test drv failure: "error: Cannot build '/nix/store/<hash>-vm-test-run-<name>.drv'."
+# <name> is the nixosTest `name` attr (e.g., rio-lifecycle-recovery), NOT the
+# flake attr (vm-lifecycle-recovery-k3s). known-flakes.jsonl stores flake-attr
+# names in `test`; drv names in `drv_name`. Match is against drv_name.
+# Verified against /tmp/rio-dev/rio-p0209-impl-2.log:15780 — this is the
+# top-level nix error line; the `Reason: builder failed with exit code N` is a
+# SEPARATE line with no drv path.
+#
+# The `^error:` anchor is load-bearing: one line above in the same log is a
+# debug dump `BuildResultV3 {..., errorMsg = "Cannot build '/nix/...'..."}`
+# prefixed by `vm-test-run-...> [debug]` — the anchor excludes it. Without the
+# anchor we'd double-count the same failure.
+_VM_FAIL_RE = re.compile(
+    r"^error: Cannot build '/nix/store/[a-z0-9]+-vm-test-run-([\w-]+)\.drv'",
+    re.MULTILINE,
+)
+
 
 def excusable(log_path: Path) -> ExcusableVerdict:
     """If .#ci is red on exactly one test AND that test is a known-flake with
     retry != Never, retry is permitted. Typed replacement for the
     grep-then-compare prose at implementer.md:116 / ci-fixer.md:30."""
     text = log_path.read_text()
-    failing = sorted(set(_NEXTEST_FAIL_RE.findall(text)))
-    flakes = {f.test: f for f in read_jsonl(KNOWN_FLAKES, KnownFlake)}
-    matched = sorted(set(failing) & flakes.keys())
+    nextest_fails = sorted(set(_NEXTEST_FAIL_RE.findall(text)))
+    vm_fails = sorted(set(_VM_FAIL_RE.findall(text)))  # drv names
+    failing = nextest_fails + vm_fails  # order: nextest first, VM second (for reason clarity)
+
+    flake_rows = read_jsonl(KNOWN_FLAKES, KnownFlake)
+    # Two match surfaces: nextest fails match against `test` (crate::path form);
+    # VM fails match against `drv_name` (rio-lifecycle-* form).
+    by_test = {f.test: f for f in flake_rows}
+    by_drv = {f.drv_name: f for f in flake_rows if f.drv_name}
+
+    matched = sorted(
+        set(t for t in nextest_fails if t in by_test)
+        | set(d for d in vm_fails if d in by_drv)
+    )
+    # For reason-string: the KnownFlake object, not just the key
+    matched_row = (by_test.get(matched[0]) or by_drv.get(matched[0])) if matched else None
 
     if not failing:
-        reason, ok = "no FAIL lines in log (not a test failure?)", False
+        reason, ok = "no FAIL lines (nextest) or Cannot-build lines (VM) in log", False
     elif len(failing) > 1:
         reason, ok = f"{len(failing)} failures — excusable requires exactly 1", False
     elif not matched:
-        reason, ok = f"{failing[0]!r} not in known-flakes.jsonl", False
-    elif flakes[matched[0]].retry == "Never":
+        reason, ok = f"{failing[0]!r} not in known-flakes.jsonl (neither test nor drv_name)", False
+    elif matched_row.retry == "Never":
         reason, ok = f"{matched[0]!r} is known-flake but retry=Never — investigate, don't retry", False
     else:
-        reason, ok = f"single failure {matched[0]!r} is known-flake retry={flakes[matched[0]].retry}", True
+        reason, ok = f"single failure {matched[0]!r} is known-flake retry={matched_row.retry}", True
     return ExcusableVerdict(
         excusable=ok, failing_tests=failing, matched_flakes=matched, reason=reason,
     )

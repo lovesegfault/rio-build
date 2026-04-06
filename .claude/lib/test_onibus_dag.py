@@ -902,6 +902,116 @@ def test_excusable_rejects_retry_never(tmp_path: Path, monkeypatch):
     assert v.matched_flakes == ["crate::mod::never_retry"]
 
 
+def test_excusable_single_vm_known_flake(tmp_path: Path, monkeypatch):
+    """P0317 T1: _VM_FAIL_RE extracts drv name from Cannot-build line;
+    matches against drv_name, not test. Shape verified against
+    /tmp/rio-dev/rio-p0209-impl-2.log:15780."""
+    from onibus import build
+    log = tmp_path / "ci.log"
+    log.write_text(
+        "error: Cannot build '/nix/store/"
+        "lbb1v37c1dm9dmx0ghcy3zzjwk6kzywd-vm-test-run-rio-lifecycle-recovery.drv'.\n"
+        "       Reason: builder failed with exit code 143.\n"
+    )
+    flakes = tmp_path / "known-flakes.jsonl"
+    flakes.write_text(KnownFlake(
+        test="vm-lifecycle-recovery-k3s",  # flake attr — NOT what the regex extracts
+        drv_name="rio-lifecycle-recovery",  # nixosTest name — IS what the regex extracts
+        symptom="s", root_cause="r", fix_owner="P0999", fix_description="d",
+        retry="Once",
+    ).model_dump_json() + "\n")
+    monkeypatch.setattr(build, "KNOWN_FLAKES", flakes)
+    v = build.excusable(log)
+    assert v.excusable
+    assert v.failing_tests == ["rio-lifecycle-recovery"]
+    assert v.matched_flakes == ["rio-lifecycle-recovery"]
+
+
+def test_excusable_vm_drv_name_none_not_matched(tmp_path: Path, monkeypatch):
+    """P0317 T2: by_drv filter excludes drv_name=None. A sentinel row
+    (<tcg-builder-allocation>) validly has drv_name=None — it should NOT
+    appear in by_drv, so a VM failure against it reports not-in-flakes.
+    (The model_validator rejects vm-* rows with drv_name=None at LOAD
+    time — read_jsonl validates — so an unmigrated vm-* row raises before
+    excusable() even runs. Sentinels are the only None-drv_name case that
+    survives load.)"""
+    from onibus import build
+    log = tmp_path / "ci.log"
+    log.write_text(
+        "error: Cannot build '/nix/store/abc123-vm-test-run-rio-cli.drv'.\n"
+    )
+    flakes = tmp_path / "known-flakes.jsonl"
+    # Sentinel: bypasses the vm-*-requires-drv_name validator.
+    flakes.write_text(KnownFlake(
+        test="<tcg-builder-allocation>", drv_name=None,
+        symptom="s", root_cause="r", fix_owner="P0179", fix_description="d",
+        retry="Once",
+    ).model_dump_json() + "\n")
+    monkeypatch.setattr(build, "KNOWN_FLAKES", flakes)
+    v = build.excusable(log)
+    assert not v.excusable
+    assert "not in known-flakes" in v.reason
+    assert v.failing_tests == ["rio-cli"]
+
+
+def test_excusable_mixed_nextest_and_vm_rejects(tmp_path: Path, monkeypatch):
+    """P0317 T1: nextest FAIL + VM Cannot-build in same log → 2 failures,
+    not excusable. This is the masking risk P0304 T10's early-return design
+    would miss without _VM_FAIL_RE."""
+    from onibus import build
+    log = tmp_path / "ci.log"
+    log.write_text(
+        "        FAIL [  1.0s] crate::a::real_bug\n"
+        "error: Cannot build '/nix/store/abc123-vm-test-run-rio-lifecycle-recovery.drv'.\n"
+    )
+    monkeypatch.setattr(build, "KNOWN_FLAKES", tmp_path / "empty.jsonl")
+    v = build.excusable(log)
+    assert not v.excusable
+    assert "2 failures" in v.reason
+    assert v.failing_tests == ["crate::a::real_bug", "rio-lifecycle-recovery"]
+
+
+def test_excusable_vm_fail_re_anchor_excludes_debug_dump(tmp_path: Path, monkeypatch):
+    """P0317 T1: `^error:` anchor is load-bearing. One line above the
+    real error in rio-p0209-impl-2.log is a debug dump:
+      vm-test-run-...> [debug] ... BuildResultV3 {..., errorMsg = "Cannot build '/nix/...'..."}
+    Without the anchor we would count the same failure twice."""
+    from onibus import build
+    log = tmp_path / "ci.log"
+    log.write_text(
+        'vm-test-run-rio-lifecycle-recovery> [debug] component=build_derivation '
+        'build result: BuildResultV3 {status = PermanentFailure, errorMsg = '
+        '"Cannot build \'/nix/store/lbb1v37c1dm9dmx0ghcy3zzjwk6kzywd-vm-test-run-'
+        'rio-lifecycle-recovery.drv\'.\\nReason: ...", timesBuilt = 1}\n'
+        "error: Cannot build '/nix/store/"
+        "lbb1v37c1dm9dmx0ghcy3zzjwk6kzywd-vm-test-run-rio-lifecycle-recovery.drv'.\n"
+    )
+    monkeypatch.setattr(build, "KNOWN_FLAKES", tmp_path / "empty.jsonl")
+    v = build.excusable(log)
+    # Exactly 1 failure — the anchor excluded the debug-dump line.
+    assert v.failing_tests == ["rio-lifecycle-recovery"]
+    assert "not in known-flakes" in v.reason  # (not excusable, but exactly-1)
+
+
+def test_knownflake_validator_vm_requires_drv_name():
+    """P0317 T3: model_validator rejects vm-* test without drv_name."""
+    with pytest.raises(ValueError, match="missing drv_name"):
+        KnownFlake(
+            test="vm-lifecycle-core-k3s", symptom="s", root_cause="r",
+            fix_owner="P0999", fix_description="d", retry="Once",
+        )
+    # Sentinel bypasses:
+    KnownFlake(
+        test="<tcg-builder-allocation>", symptom="s", root_cause="r",
+        fix_owner="P0179", fix_description="d", retry="Once",
+    )
+    # Nextest entries (no vm- prefix) don't need it:
+    KnownFlake(
+        test="crate::mod::test", symptom="s", root_cause="r",
+        fix_owner="P0999", fix_description="d", retry="Once",
+    )
+
+
 # ─── MergerReport cadence typing (panel #7) ──────────────────────────────────
 
 

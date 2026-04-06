@@ -28,7 +28,7 @@ from onibus import build as build_mod
 from onibus import collisions as coll_mod
 from onibus import git_ops, merge, reconcile, tick, tracey
 from onibus.dag import Dag, gate_is_clear, set_priority, set_status
-from onibus.jsonl import append_jsonl, read_jsonl, remove_jsonl
+from onibus.jsonl import append_jsonl, read_jsonl, remove_jsonl, write_jsonl
 from onibus.models import (
     FOLLOWUP_ORIGINS,
     AgentRow,
@@ -366,6 +366,21 @@ def _cmd_flake(args: argparse.Namespace) -> int:
     if args.flake_cmd == "exists":
         rows = read_jsonl(KNOWN_FLAKES, KnownFlake)
         return 0 if any(f.test == args.test for f in rows) else 1
+    if args.flake_cmd == "mitigation":
+        from onibus.models import Mitigation
+        rows = read_jsonl(KNOWN_FLAKES, KnownFlake)
+        target = next((r for r in rows if r.test == args.test), None)
+        if target is None:
+            print(f"no known-flake with test={args.test!r}", file=sys.stderr)
+            return 1
+        target.mitigations.append(
+            Mitigation(plan=args.plan, landed_sha=args.sha, note=args.note)
+        )
+        # Preserve header comments — atomic rewrite via write_jsonl.
+        header = [ln for ln in KNOWN_FLAKES.read_text().splitlines() if ln.startswith("#")]
+        write_jsonl(KNOWN_FLAKES, rows, header=header)
+        print(f"appended mitigation P{args.plan:04d} @ {args.sha} to {args.test!r}")
+        return 0
     if args.flake_cmd == "excusable":
         if args.schema:
             _schema_exit(_MODELS["ExcusableVerdict"])
@@ -504,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = g.add_parser("remove"); sp.add_argument("test")
     sp = g.add_parser("exists"); sp.add_argument("test")
     sp = g.add_parser("excusable"); sp.add_argument("log_path"); sp.add_argument("--schema", action="store_true")
+    sp = g.add_parser("mitigation"); sp.add_argument("test"); sp.add_argument("plan", type=int); sp.add_argument("sha"); sp.add_argument("note")
 
     # collisions
     g = sub.add_parser("collisions").add_subparsers(dest="coll_cmd", required=True)
