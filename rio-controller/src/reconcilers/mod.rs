@@ -10,19 +10,15 @@
 //! scratch, reads current state, computes desired, applies the
 //! diff via server-side apply. Reconciling twice is a no-op.
 
-pub mod build;
 pub mod workerpool;
 
-use std::sync::Arc;
-
-use dashmap::DashMap;
 use kube::Client;
 
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
 ///
-/// `scheduler` + `admin` are live clients, not addresses. When
-/// `scheduler_balance_host` is set (production), they share the same
+/// `admin` is a live client, not an address. When
+/// `scheduler_balance_host` is set (production), it uses a
 /// health-aware balanced Channel that routes only to the leader ---
 /// no ClusterIP round-robin lottery (which fails ~50% with standby's
 /// `UNAVAILABLE: "not leader"`). The startup retry loop in main()
@@ -33,25 +29,21 @@ pub struct Ctx {
     /// K8s client. Shared (clone per `Api<T>` call --- cheap, it's
     /// an Arc internally).
     pub client: Client,
-    /// Balanced SchedulerServiceClient (SubmitBuild/WatchBuild/
-    /// CancelBuild). Routes to leader only when balance is set.
-    /// Clone per call (tonic clients are Arc-backed).
-    pub scheduler: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
     /// Balanced AdminServiceClient (DrainWorker in workerpool
-    /// finalizer). Same channel as `scheduler` --- one probe loop.
+    /// finalizer).
     pub admin: rio_proto::AdminServiceClient<tonic::transport::Channel>,
     /// rio-scheduler ClusterIP address (e.g., "rio-scheduler:9001").
     /// For worker pod env injection ONLY --- reconcilers use
-    /// `scheduler`/`admin` above.
+    /// `admin` above.
     pub scheduler_addr: String,
     /// Headless Service host. Injected as `RIO_SCHEDULER_BALANCE_HOST`
     /// into worker pods. `None` = env var NOT injected --> workers
     /// fall back to single-channel (VM tests, single-replica).
     pub scheduler_balance_host: Option<String>,
     pub scheduler_balance_port: u16,
-    /// rio-store gRPC address (e.g., "rio-store:9002"). The Build
-    /// reconciler fetches .drv content from here to construct the
-    /// DerivationNode. Same lazy-connect rationale as scheduler.
+    /// rio-store gRPC address (e.g., "rio-store:9002"). Injected
+    /// as `RIO_STORE_ADDR` into worker pod containers (workers
+    /// connect to the store directly for PutPath/GetPath).
     pub store_addr: String,
     /// Recorder for K8s Events. Reconcilers call `ctx.publish_
     /// event(obj, ev)` to emit; events show in `kubectl describe`
@@ -62,26 +54,6 @@ pub struct Ctx {
     /// reporter); `publish` takes the object_ref per-call. So we
     /// hold one Recorder and pass the ref at publish time.
     pub recorder: kube::runtime::events::Recorder,
-    // r[impl ctrl.build.watch-by-uid]
-    /// Tracks in-flight Build watch tasks, keyed by Build **uid**
-    /// (NOT {ns}/{name}). uid is unique per K8s object lifetime:
-    /// delete+recreate with the same name gets a FRESH uid. Keying
-    /// by name would let an old drain_stream's scopeguard remove
-    /// the NEW Build's entry after a delete+recreate → next
-    /// reconcile spawns a duplicate watch (the very problem this
-    /// map exists to prevent).
-    ///
-    /// Dedupes spawns across reconciles: drain_stream patches
-    /// Build.status on each BuildEvent → K8s API server emits a
-    /// watch event → controller re-enqueues → apply() runs again.
-    /// Without this gate, each reconcile spawns ANOTHER
-    /// drain_stream — linear growth (N transitions = N tasks).
-    ///
-    /// drain_stream holds a scopeguard that removes the entry on
-    /// exit (success, error, panic, cancel — any path). apply()
-    /// checks contains_key() before spawning; if the watch is
-    /// already running, returns await_change() without spawning.
-    pub watching: Arc<DashMap<String, ()>>,
 }
 
 impl Ctx {

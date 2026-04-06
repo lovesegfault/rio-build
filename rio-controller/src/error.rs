@@ -31,8 +31,8 @@ pub enum Error {
     InvalidSpec(String),
 
     /// Scheduler gRPC unreachable. Autoscaler can't read
-    /// ClusterStatus; Build reconciler can't SubmitBuild. Requeue
-    /// with backoff — the scheduler may come back.
+    /// ClusterStatus; workerpool finalizer can't DrainWorker.
+    /// Requeue with backoff — the scheduler may come back.
     #[error("scheduler unavailable: {0}")]
     SchedulerUnavailable(#[from] tonic::Status),
 }

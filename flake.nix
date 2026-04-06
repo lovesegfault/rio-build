@@ -711,9 +711,7 @@
                 # All lifecycle + leader-election splits boot the same
                 # 2-node k3s fixture.
                 vm-lifecycle-core-k3s = 8;
-                vm-lifecycle-ctrlrestart-k3s = 8;
                 vm-lifecycle-recovery-k3s = 8;
-                vm-lifecycle-reconnect-k3s = 8;
                 vm-lifecycle-autoscale-k3s = 8;
                 vm-le-stability-k3s = 8;
                 vm-le-build-k3s = 8;

@@ -10,7 +10,6 @@
 //! generated OpenAPI schema. NOT schemars extend (that's the raw
 //! fallback; x_kube is the first-class path).
 
-pub mod build;
 pub mod workerpool;
 
 // ----- schemars helpers for k8s-openapi passthrough types -----------
@@ -26,7 +25,7 @@ pub mod workerpool;
 // what ResourceRequirements looks like); we just need to tell it
 // "this is an object, don't strip unknown fields."
 //
-// `pub(crate)`: used across build.rs and workerpool.rs via
+// `pub(crate)`: used by workerpool.rs via
 // `#[schemars(schema_with = "crate::crds::any_object")]`.
 
 /// Schema for `Option<K8sType>` fields where K8sType is a single

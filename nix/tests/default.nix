@@ -232,18 +232,19 @@ in
     };
   };
 
-  # ── lifecycle splits (5 tests, k3s-full fixture) ─────────────────────
+  # ── lifecycle splits (3 tests, k3s-full fixture) ─────────────────────
   # Monolith was ~14min (13 subtests serially after ~4min bootstrap).
   # Split critical path ~8min (autoscale: 238s subtests + 4min boot).
   # The `initial` subtest was dropped — it only existed to seed out_pin
   # early for gc-sweep; gc-sweep now builds its own paths.
+  #
+  # P0294: ctrlrestart + reconnect splits removed (Build CRD rip).
+  # build-crd-flow + build-crd-errors dropped from core.
   vm-lifecycle-core-k3s = lifecycleMod.mkTest {
     name = "core";
     subtests = [
       "health-shared"
-      "build-crd-flow"
       "cancel-cgroup-kill"
-      "build-crd-errors"
       "gc-dry-run"
       "reconciler-replicas"
       "gc-sweep"
@@ -251,19 +252,9 @@ in
     ];
   };
 
-  vm-lifecycle-ctrlrestart-k3s = lifecycleMod.mkTest {
-    name = "ctrlrestart";
-    subtests = [ "controller-restart" ];
-  };
-
   vm-lifecycle-recovery-k3s = lifecycleMod.mkTest {
     name = "recovery";
     subtests = [ "recovery" ];
-  };
-
-  vm-lifecycle-reconnect-k3s = lifecycleMod.mkTest {
-    name = "reconnect";
-    subtests = [ "build-crd-reconnect" ];
   };
 
   vm-lifecycle-autoscale-k3s = lifecycleAutoscaleMod.mkTest {

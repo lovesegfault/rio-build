@@ -2,11 +2,8 @@
 //!
 //! Two concurrent things: the WorkerPool Controller::run (event-
 //! driven reconcile) and the Autoscaler::run (30s poll loop).
-//! Merged via `futures::select` — either can make progress.
-//!
-//! Build reconciler runs as a second Controller::run, merged
-//! with the WorkerPool controller via futures::join. Both
-//! terminate on SIGTERM via graceful_shutdown_on(token).
+//! The Controller terminates on SIGTERM via graceful_shutdown_on;
+//! the Autoscaler is spawn_monitored with its own shutdown token.
 
 use std::sync::Arc;
 
@@ -18,9 +15,8 @@ use kube::{Api, Client};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use rio_controller::crds::build::Build;
 use rio_controller::crds::workerpool::WorkerPool;
-use rio_controller::reconcilers::{Ctx, build, workerpool};
+use rio_controller::reconcilers::{Ctx, workerpool};
 use rio_controller::scaling::Autoscaler;
 
 // ----- config (figment two-struct) --------------------------------------------
@@ -41,10 +37,9 @@ struct Config {
     /// In K8s: set to `rio-scheduler-headless` via env.
     scheduler_balance_host: Option<String>,
     scheduler_balance_port: u16,
-    /// rio-store gRPC address. Build reconciler fetches .drv
-    /// content from here. Required for Build CRDs; WorkerPool-
-    /// only deployments can leave it empty (Build reconciler
-    /// errors on first apply, operator sees it in logs).
+    /// rio-store gRPC address. Injected as `RIO_STORE_ADDR` into
+    /// worker pod containers by the WorkerPool reconciler (workers
+    /// connect to the store directly for PutPath/GetPath).
     store_addr: String,
     /// Prometheus metrics listen address.
     metrics_addr: std::net::SocketAddr,
@@ -167,15 +162,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.autoscaler_poll_secs > 0,
         "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
     );
-    // WorkerPool-only deployments legitimately leave store_addr
-    // empty (doc comment on Config.store_addr). Build CRDs fail
-    // their first reconcile with a tonic malformed-URI error —
-    // deep inside error_policy backoff, easy to miss. Warn loudly
-    // at startup so the operator sees it in `kubectl logs` tail.
+    // store_addr is injected into worker pod containers as
+    // RIO_STORE_ADDR. Workers with an empty store addr fail their
+    // first PutPath with a tonic malformed-URI error — deep inside
+    // a spawned task, easy to miss. Warn loudly at startup.
     if cfg.store_addr.is_empty() {
         warn!(
-            "RIO_STORE_ADDR not set; Build CRDs will fail (connect_store \
-             gets empty URI). Fine for WorkerPool-only deployments."
+            "RIO_STORE_ADDR not set; worker pods will get empty RIO_STORE_ADDR \
+             env (PutPath will fail with malformed URI)."
         );
     }
 
@@ -213,22 +207,20 @@ async fn main() -> anyhow::Result<()> {
     // when scheduler_balance_host is set --- the standby returns
     // UNAVAILABLE on all RPCs, so ClusterIP round-robin fails ~50% of
     // ticks; balanced channel health-probes pod IPs and routes only
-    // to the leader. BOTH AdminServiceClient (autoscaler ClusterStatus
-    // polls) AND SchedulerServiceClient (Build reconciler SubmitBuild/
-    // WatchBuild/CancelBuild) wrap the SAME channel --- one probe
-    // loop, one endpoint set. Guard held in _balance_guard (dropping
-    // it stops the probe loop).
+    // to the leader. AdminServiceClient (autoscaler ClusterStatus
+    // polls + workerpool finalizer DrainWorker) wraps the balanced
+    // channel. Guard held in _balance_guard (dropping it stops the
+    // probe loop).
     //
-    // Single-channel mode: two separate connects (two TCP conns).
-    // Dev/test only (single replica, no standby to round-robin to).
-    let (admin, sched_client, _balance_guard) = loop {
+    // Single-channel mode: dev/test only (single replica, no standby
+    // to round-robin to).
+    let (admin, _balance_guard) = loop {
         let result: anyhow::Result<_> = match &cfg.scheduler_balance_host {
             None => {
                 info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
                 async {
                     let admin = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
-                    let sched = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
-                    Ok((admin, sched, None))
+                    Ok((admin, None))
                 }
                 .await
             }
@@ -243,19 +235,13 @@ async fn main() -> anyhow::Result<()> {
                         cfg.scheduler_balance_port,
                     )
                     .await?;
-                    // Reuse the same balanced Channel for the
-                    // SchedulerServiceClient --- ONE probe loop,
-                    // BOTH clients route only to the leader.
-                    let sched = rio_proto::SchedulerServiceClient::new(bc.channel())
-                        .max_decoding_message_size(rio_proto::max_message_size())
-                        .max_encoding_message_size(rio_proto::max_message_size());
-                    Ok((admin, sched, Some(bc)))
+                    Ok((admin, Some(bc)))
                 }
                 .await
             }
         };
         match result {
-            Ok(triple) => break triple,
+            Ok(pair) => break pair,
             Err(e) => {
                 warn!(error = %e, "scheduler connect failed; retrying in 2s (pod stays not-Ready)");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -290,14 +276,12 @@ async fn main() -> anyhow::Result<()> {
     // ---- Context ----
     let ctx = Arc::new(Ctx {
         client: client.clone(),
-        scheduler: sched_client,
         admin: admin.clone(),
         scheduler_addr: cfg.scheduler_addr.clone(),
         scheduler_balance_host: cfg.scheduler_balance_host.clone(),
         scheduler_balance_port: cfg.scheduler_balance_port,
         store_addr: cfg.store_addr.clone(),
         recorder: recorder.clone(),
-        watching: Arc::new(dashmap::DashMap::new()),
     });
 
     // ---- WorkerPool controller ----
@@ -315,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
     let wp_controller = Controller::new(pools, watcher::Config::default())
         .owns(stses, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(workerpool::reconcile, workerpool::error_policy, ctx.clone())
+        .run(workerpool::reconcile, workerpool::error_policy, ctx)
         .for_each(|res| async move {
             match res {
                 Ok((obj, _action)) => {
@@ -342,29 +326,13 @@ async fn main() -> anyhow::Result<()> {
         min_scale_interval: std::time::Duration::from_secs(cfg.autoscaler_min_interval_secs),
     };
     info!(?timing, "autoscaler timing");
-    let autoscaler = Autoscaler::new(client.clone(), admin, timing, recorder);
+    let autoscaler = Autoscaler::new(client, admin, timing, recorder);
     rio_common::task::spawn_monitored("autoscaler", autoscaler.run(shutdown.clone()));
 
-    // ---- Build controller ----
-    // No `.owns()` — Builds don't own K8s children. The watch
-    // task patches status directly; no need for child-triggered
-    // re-reconcile.
-    let builds: Api<Build> = Api::all(client);
-    let build_controller = Controller::new(builds, watcher::Config::default())
-        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(build::reconcile, build::error_policy, ctx)
-        .for_each(|res| async move {
-            match res {
-                Ok((obj, _)) => tracing::debug!(build = %obj.name, "reconciled"),
-                Err(e) => tracing::debug!(error = %e, "Build reconcile loop error"),
-            }
-        });
-
     info!("controller running");
-    // Both controllers run until SIGTERM. `join!` not `select!`:
-    // both should drain in-flight reconciles on shutdown, not
-    // whichever finishes first kills the other.
-    futures_util::future::join(wp_controller, build_controller).await;
+    // WorkerPool controller runs until SIGTERM (graceful_shutdown_on
+    // drains in-flight reconciles).
+    wp_controller.await;
 
     info!("controller shutting down");
     Ok(())

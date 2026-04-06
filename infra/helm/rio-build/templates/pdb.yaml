@@ -29,8 +29,7 @@ spec:
 {{- if and .Values.gateway.enabled (gt (int .Values.gateway.replicas) 1) }}
 ---
 # minAvailable (not maxUnavailable): SSH ingress must stay up. Killing both
-# gateways = no way to submit builds (Build CRD path still works, but most
-# clients use SSH).
+# gateways = no way to submit builds (SSH is the only submission path).
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

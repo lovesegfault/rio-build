@@ -620,14 +620,12 @@ fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     let dead_ch = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
     Arc::new(Ctx {
         client,
-        scheduler: rio_proto::SchedulerServiceClient::new(dead_ch.clone()),
         admin: rio_proto::AdminServiceClient::new(dead_ch),
         scheduler_addr: "http://127.0.0.1:1".into(),
         store_addr: "http://127.0.0.1:1".into(),
         scheduler_balance_host: None,
         scheduler_balance_port: 9001,
         recorder,
-        watching: Arc::new(dashmap::DashMap::new()),
     })
 }
 

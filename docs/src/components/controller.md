@@ -4,44 +4,6 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 
 ## CRDs
 
-### Build
-
-r[ctrl.crd.build]
-```yaml
-apiVersion: rio.build/v1alpha1
-kind: Build
-metadata:
-  name: my-build-001
-spec:
-  derivation: /nix/store/abc...-hello.drv   # must be a store path (evaluation is external)
-  priority: 100                               # inter-build priority
-  timeoutSeconds: 3600                        # 0 = no timeout
-  tenant: team-infra
-status:
-  phase: Building                             # Pending/Building/Succeeded/Failed/Cancelled
-                                               # Evaluating is an optional phase set by external eval
-                                               # orchestrators; the controller does not set this phase itself
-  progress: "31/47"                            # completed/total derivations (printcolumn)
-  lastSequence: 142                            # last BuildEvent sequence seen by the watch task
-  totalDerivations: 47
-  completedDerivations: 31
-  cachedDerivations: 12
-  startedAt: 2026-02-13T06:00:00Z
-  # Phase 4 deferral: criticalPathRemaining + workers not yet
-  # surfaced in BuildStatus. Scheduler has the data (critical_path.rs
-  # + assignments table); requires a BuildEvent extension.
-  conditions:
-    - type: Scheduled                          # also: InputsResolved, Building, Succeeded, Failed
-      status: "True"
-      lastTransitionTime: 2026-02-13T06:00:00Z
-      reason: WorkerAssigned
-      message: "Build scheduled on worker-0"
-```
-
-Condition types: `Scheduled`, `InputsResolved`, `Building`, `Succeeded`, `Failed`. Each carries `lastTransitionTime`, `reason`, and `message`. `Succeeded` and `Failed` are terminal and mutually exclusive.
-
-> **Phase 4 deferral:** Currently only `Failed` and `Cancelled` conditions are set by the Build reconciler; `phase` is the coarse signal for progress (`Pending` → `Building` → `Succeeded`/`Failed`/`Cancelled`). The finer-grained `Scheduled`/`InputsResolved`/`Building` conditions require per-event condition updates from the watch task.
-
 ### WorkerPool
 
 r[ctrl.crd.workerpool]
@@ -174,10 +136,9 @@ The existing `WorkerPool` CRD remains valid for single-pool deployments without 
 r[ctrl.reconcile.owner-refs]
 - **WorkerPool reconciler**: scale worker StatefulSet based on scheduler queue depth. Create/delete pods. Manage per-worker ephemeral storage for the FUSE cache. All resources created by this reconciler carry `ownerReferences` to the WorkerPool CRD with `controller: true`, ensuring garbage collection on WorkerPool deletion.
 - **WorkerPoolSet reconciler**: manages multiple `WorkerPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `WorkerPoolSet` status. Autoscales each class independently based on per-class queue depth from the scheduler.
-- **Build reconciler**: create Build CRDs from API/webhook triggers, track status, update conditions.
-- **GC reconciler**: trigger store garbage collection on schedule, clean up completed Build resources.
+- **GC reconciler**: trigger store garbage collection on schedule.
 
-> **Scheduled:** WorkerPoolSet reconciler → [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md); scheduled GC → [P0212](../../.claude/work/plan-0212-gc-automation-cron.md). Until those land: GC is manual via `AdminService.TriggerGC`. (Build reconciler is being removed — [P0294](../../.claude/work/plan-0294-build-crd-full-rip.md).)
+> **Scheduled:** WorkerPoolSet reconciler → [P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md); scheduled GC → [P0212](../../.claude/work/plan-0212-gc-automation-cron.md). Until those land: GC is manual via `AdminService.TriggerGC`.
 
 ## RBAC
 
@@ -185,8 +146,8 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 
 | API Group | Resources | Verbs |
 |---|---|---|
-| `rio.build` | workerpools, builds | get, list, watch, create, update, patch, delete |
-| `rio.build` | workerpools/status, builds/status | get, patch |
+| `rio.build` | workerpools | get, list, watch, create, update, patch, delete |
+| `rio.build` | workerpools/status | get, patch |
 | `apps` | statefulsets | get, list, watch, create, update, patch, delete |
 | `policy` | poddisruptionbudgets | get, list, watch, create, update, patch, delete |
 | `""` (core) | pods | get, list, watch |
@@ -284,30 +245,22 @@ connect failure, `warn!` + increment
 timeout and a stale IP hangs on SYN). On success: `TriggerGC`, drain
 the `GcProgress` stream, increment `{result="success"}`.
 
-## Build CRD Lifecycle
+## Build CRD (removed)
 
-Build CRDs are created by:
-1. **The gateway** (for SSH-initiated builds, optional) --- the gateway can create a Build CRD for visibility/tracking, but SSH-initiated builds always go through the scheduler's PostgreSQL directly.
-2. **External systems** via `kubectl` or the Kubernetes API --- for K8s-native workflows that want to submit builds programmatically.
+The `Build` CRD (`rio.build/v1alpha1 Build`) was removed in P0294. It was an
+alternative K8s-native build submission path that duplicated the SSH
+(`ssh-ng://`) flow. No known production users.
 
-SSH-initiated builds do NOT require Build CRDs; Build CRDs are an alternative submission path for Kubernetes-native workflows.
-
-r[ctrl.build.sentinel]
-**Double-submit guard:** The reconciler MUST set `status.build_id` to the literal sentinel string `"submitted"` **immediately** on first reconcile, before the finalizer-add re-reconcile fires. Otherwise the second reconcile sees an empty `build_id` and re-submits to the scheduler. The watch task later overwrites the sentinel with the real scheduler-assigned UUID.
-
-r[ctrl.build.watch-by-uid]
-**Watch deduplication:** The reconciler spawns a background `WatchBuild` task to stream `BuildEvent`s from the scheduler. To prevent duplicate watches on re-reconcile, a `DashMap` in the reconciler context tracks active watches **keyed by Build UID** (`b.uid()`), not `{namespace}/{name}`. UID-keying guards against a delete+recreate race where a new Build with the same name would collide with an old-Build's still-running watch guard; the old scopeguard (on exit) would then remove the NEW Build's entry. A scopeguard removes the `watching` entry on any watch-task exit (terminal, error, or cancel).
-
-r[ctrl.build.reconnect]
-**Stream reconnect on non-terminal EOF:** When the watch task's `BuildEvent` stream returns `Ok(None)` (clean EOF) and the Build's phase is NOT terminal (`Succeeded`/`Failed`/`Cancelled`), the task MUST treat this as a reconnect trigger, not a clean exit. Kubernetes pod termination (SIGTERM → graceful drain → TCP FIN) surfaces as `Ok(None)` in tonic, not `Err(Transport)` --- a scheduler pod kill mid-build otherwise freezes the Build's status. The task reconnects via `WatchBuild` with the last observed sequence, same backoff as the transport-error path. Each reconnect increments `rio_controller_build_watch_reconnects_total`.
-
-**Finalizer:** All Build CRDs carry a `rio.build/build-cleanup` finalizer. Before a Build CRD is deleted, the controller sends `CancelBuild` to the scheduler to ensure in-flight work is properly handled.
+**Cluster upgrade:** existing `Build` CRs on running clusters are orphans
+after controller upgrade (the reconciler no longer watches them). They can be
+safely deleted: `kubectl delete builds.rio.build --all -A`. The CRD itself
+remains installed (helm `crds/` directory is install-only, not upgrade-managed);
+delete it manually: `kubectl delete crd builds.rio.build`.
 
 ## Component Deployment Model
 
 The controller manages:
 - **WorkerPool** CRD → reconciles worker StatefulSet (replicas, resources, security context)
-- **Build** CRD → tracks lifecycle, updates status conditions
 
 The controller does **NOT** manage:
 - Scheduler or store Deployments --- these are deployed via Helm/kustomize as standard Deployments
@@ -330,7 +283,6 @@ CRDs follow a `v1alpha1` → `v1beta1` → `v1` progression. The initial impleme
 CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constraints:
 
 - `spec.replicas.min <= spec.replicas.max`
-- `spec.timeoutSeconds >= 0` (Build CRD; 0 means unbounded)
 - `spec.maxConcurrentBuilds >= 1`
 - `spec.systems` must be non-empty
 
