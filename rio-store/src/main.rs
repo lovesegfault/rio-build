@@ -669,7 +669,7 @@ mod tests {
     /// `./store.toml` in there is picked up by load()'s `{component}.toml`
     /// layer.
     ///
-    /// The "value reaches StoreServer" half of this roundtrip is the
+    /// The "value reaches StoreServiceImpl" half of this roundtrip is the
     /// `with_nar_budget` builder test at grpc/put_path.rs —
     /// `with_nar_budget(N)` → `available_permits() == N`. This test
     /// covers the config-parse side; main()'s match at startup glues

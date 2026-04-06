@@ -26,7 +26,7 @@ Known Lix divergences:
 - Version string format (`"Lix N.N.N"` vs `"nix (Nix) N.N.N"`) — handled by the existing `SKIP_FIELDS` mechanism at field level
 - Daemon feature set advertised during handshake — `test_golden_live_handshake` skipped for Lix until the comparator tolerates feature-set supersets
 
-`nix build .#golden-matrix` produces a linkfarm keyed by variant; `ls result/` shows one dir per daemon.
+`nix build .#golden-matrix` produces a linkfarm keyed by variant; `ls result/` shows one dir per daemon. Cold-cache build time ~60-90min (three full Nix source-tree builds); subsequent warm runs are minutes.
 
 ## Fuzzing
 

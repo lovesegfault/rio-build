@@ -60,7 +60,6 @@ status:
 ### Ephemeral WorkerPools
 
 r[ctrl.pool.ephemeral]
-
 When `WorkerPoolSpec.ephemeral: true`, the controller does NOT create a
 StatefulSet, headless Service, or PodDisruptionBudget. Instead,
 `reconcile_ephemeral` polls `AdminService.ClusterStatus` each requeue tick
@@ -106,6 +105,8 @@ cleanup.
 **Cleanup:** the finalizer's `cleanup()` branches on `spec.ephemeral` and
 returns immediately (no STS to scale to 0, no long-lived workers to
 DrainWorker). In-flight Jobs finish their one build naturally.
+
+> **Marker granularity:** This marker spans 5+ `r[impl]` sites across 3 files (controller branch / Job builder / worker single-shot gate). For finer traceability, use the sub-markers `ctrl.pool.ephemeral-deadline` and `ctrl.pool.ephemeral-single-build` — these cover specific cross-cutting behaviors under the ephemeral umbrella.
 
 r[ctrl.pool.ephemeral-deadline]
 Ephemeral Jobs MUST set `spec.activeDeadlineSeconds` from
@@ -153,9 +154,6 @@ Per-class autoscaling: for each WPS child WorkerPool, compute `desired = clamp(q
 
 r[ctrl.wps.prune-stale]
 The WPS reconciler prunes child WorkerPools whose `size_class` no longer appears in `spec.classes`. Prune matches by ownerRef UID (not name-prefix — robust to WPS renames); deletes are best-effort (404-tolerant, logged on other errors, non-fatal so a stuck child doesn't wedge the whole reconcile). Without prune, a removed-class child is orphaned: the standalone autoscaler skips it (has ownerRef), the per-class autoscaler skips it (not in `spec.classes` iteration) — neither scales it.
-
-r[ctrl.pool.bloom-knob]
-`WorkerPoolSpec.bloomExpectedItems` (optional) injects `RIO_BLOOM_EXPECTED_ITEMS` into the worker container env. Unset → worker uses its compile-time default (50k). Same only-inject-when-set semantics as `fuseThreads` and `daemonTimeoutSecs`: injecting the default would pin it at controller-build time, not worker-build time.
 
 For deployments with heavy-tailed build workloads, `WorkerPoolSet` defines multiple size-class worker pools with different resource allocations. The scheduler routes derivations to the appropriate pool based on estimated duration. See [ADR-015](../decisions/015-size-class-routing.md) for the design rationale.
 

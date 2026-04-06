@@ -124,7 +124,7 @@ print(json.dumps(row))
 
 `plan` is your 9-digit placeholder. `deps` are integer dep-numbers from your `json deps` fence. Exit-crit-count = `## Exit criteria` bullets. Marker-ref-count = domain markers in `## Tracey`. Crates = comma-separated `rio-*` stems from `## Files`.
 
-Validate from inside the worktree — relative `.claude/bin/onibus` resolves correctly there because you're reading, not writing:
+Validate from inside the worktree — the `cd` picks up the WORKTREE copy of onibus (its REPO_ROOT resolves to the worktree, so `dag validate` reads the worktree's dag.jsonl). The direct-append above is belt-and-suspenders: agent docs are session-cached, so onibus path-resolution fixes (P0306 T3) don't reach this planner instance until a fresh spawn:
 
 ```bash
 cd /root/src/rio-build/docs-<runid> && .claude/bin/onibus dag validate

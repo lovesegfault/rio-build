@@ -209,14 +209,21 @@ Nix builds are non-preemptible --- a running build cannot be checkpointed or mig
 2. Applies a **penalty** to the EMA: sets `ema_duration_secs = actual_duration` (replaces the smoothed estimate with the observed value, ignoring the usual alpha blending)
 3. Increments `misclassification_count` for the `(pname, system)` key
 
-Detection happens post-completion, not mid-run --- by the time the check fires, the build has already finished on its original worker.
+Penalty-overwrite detection happens post-completion; proactive EMA updates (`r[sched.classify.proactive-ema]`) may fire mid-run from worker Progress reports.
 
 Future instances of the same `(pname, system)` are routed to a larger class by virtue of the penalty-overwritten EMA: the next `classify()` call reads the updated `ema_duration_secs` and selects the appropriate cutoff. The `misclassification_count` column is incremented but not read by the classifier --- it is input to the `CutoffRebalancer` for detecting systematically-wrong cutoffs. Penalty-overwrite alone drives per-derivation routing correction; the rebalancer handles aggregate drift.
+
+r[sched.classify.proactive-ema]
+When a worker reports `memory_used_bytes > 0` in a `Progress` update, the scheduler proactively updates `ema_peak_memory` for the running derivation's `(pname, system)` key. This gives the classifier fresher data for subsequent submissions of the same package even before the current build completes --- useful for long-running builds where waiting for completion (or OOM) delays class-correction by hours. The proactive update uses penalty-overwrite semantics (not blending --- a blend would need multiple mid-build samples to converge, defeating "proactive"). Self-correcting: if the peak was a spike, the completion's normal EMA blend pulls it back down. Recorded via `rio_scheduler_ema_proactive_updates_total`.
 
 ### Adaptive Cutoff Learning (SITA-E)
 
 r[sched.rebalancer.sita-e]
-The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters are config-driven via `scheduler.toml [rebalancer]` — workload-dependent, operator tunes. Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
+The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters default to `min_samples=500, ema_alpha=0.3, lookback_days=7`.
+
+> **Scheduled:** [P0304-T95](../../.claude/work/plan-0304-trivial-batch-p0222-harness.md) — config-load wiring via `scheduler.toml [rebalancer]`.
+
+ Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
 
 A background task (`CutoffRebalancer`) periodically recomputes class cutoffs to equalize load across pools:
 

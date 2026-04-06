@@ -47,9 +47,11 @@
 # ctrl.probe.named-service — verify marker at default.nix:subtests[health-shared]
 #   health-shared probes with `-service rio.scheduler.SchedulerService`
 #   (the named service, NOT empty-string) and asserts NOT_SERVING on
-#   standby. scheduler/main.rs:380-392: set_not_serving only affects
-#   the named service; if the K8s readinessProbe probed "" instead,
-#   standby would pass readiness.
+#   standby. scheduler/main.rs (r[impl ctrl.probe.named-service]):
+#   set_not_serving only affects the named service. This proves the
+#   CLIENT-SIDE BALANCER constraint via grpc-health-probe CLI — NOT
+#   the K8s readinessProbe (which is tcpSocket, doesn't probe gRPC
+#   health at all).
 #
 # ctrl.autoscale.skip-deleting — verify marker at default.nix:subtests[finalizer]
 #   finalizer subtest deletes the WorkerPool and waits ~300s for pod
@@ -661,12 +663,14 @@ let
           # grpc-health-probe exits 1 for NOT_SERVING (phase3b.nix:348).
           # .fail() expects non-zero exit AND returns stdout+stderr.
           # Probe the NAMED service (rio.scheduler.SchedulerService), NOT
-          # the empty-string default. scheduler/main.rs:380-392 comment:
-          # set_not_serving only affects the named service; empty-string
-          # stays SERVING forever after the first set_serving. If the K8s
-          # readinessProbe probed "" instead, standby would pass readiness
-          # and K8s would route to it. This probe with `-service ...` AND
-          # the NOT_SERVING result together prove the named-service gate.
+          # the empty-string default. scheduler/main.rs at
+          # r[impl ctrl.probe.named-service]: set_not_serving only
+          # affects the named service; empty-string stays SERVING forever
+          # after the first set_serving. This proves the CLIENT-SIDE
+          # BALANCER constraint (the K8s readinessProbe is tcpSocket —
+          # it doesn't probe gRPC health). This probe with `-service ...`
+          # AND the NOT_SERVING result together prove the named-service
+          # gate.
           k3s_server.succeed(
               f"k3s kubectl -n ${ns} port-forward {standby} 19101:9101 "
               f">/dev/null 2>&1 & echo $! > /tmp/pf-health.pid; sleep 2"

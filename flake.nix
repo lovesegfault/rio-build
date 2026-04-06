@@ -25,6 +25,9 @@
     nix-stable = {
       url = "github:NixOS/nix/2.20-maintenance";
       # 2.20's flake predates the flake-parts split — minimal follows.
+      # Branch-deletion is survivable: the lockfile pins the rev, so
+      # only explicit `nix flake update nix-stable` breaks if upstream
+      # deletes the branch (and nixpkgs caches tarballs).
       inputs.flake-compat.follows = "flake-compat";
     };
     nix-unstable = {
