@@ -73,28 +73,125 @@ fn seccomp_default_is_runtime_default() {
 // r[verify worker.seccomp.localhost-profile]
 #[test]
 fn seccomp_localhost_emits_correct_security_context() {
-    // spec.seccompProfile={type: Localhost, localhostProfile: rio-
-    // worker.json} → pod securityContext carries exactly that.
-    // The path is relative to /var/lib/kubelet/seccomp/ on the
-    // node — the kubelet resolves it, not us.
+    // spec.seccompProfile={type: Localhost, localhostProfile: ...}
+    // splits across three places:
+    //   - pod-level: RuntimeDefault (sandbox + initContainer can
+    //     start before the profile file lands on the node)
+    //   - wait-seccomp initContainer: polls hostPath for the file
+    //   - worker container: Localhost (the actual enforcement)
+    // See the seccomp-installer DS race comment in builders.rs.
     let mut wp = test_wp();
     wp.spec.seccomp_profile = Some(SeccompProfileKind {
         type_: "Localhost".into(),
-        localhost_profile: Some("rio-worker.json".into()),
+        localhost_profile: Some("profiles/rio-worker.json".into()),
     });
     let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
 
-    let pod_sc = sts
-        .spec
-        .unwrap()
-        .template
-        .spec
-        .unwrap()
+    // Pod-level: RuntimeDefault floor (NOT Localhost — sandbox
+    // would fail CreateContainerConfigError if file missing).
+    let pod_prof = pod
         .security_context
-        .expect("pod security_context set");
-    let prof = pod_sc.seccomp_profile.expect("seccompProfile set");
-    assert_eq!(prof.type_, "Localhost");
-    assert_eq!(prof.localhost_profile, Some("rio-worker.json".into()));
+        .as_ref()
+        .expect("pod security_context set")
+        .seccomp_profile
+        .as_ref()
+        .expect("pod seccompProfile set");
+    assert_eq!(pod_prof.type_, "RuntimeDefault");
+    assert_eq!(pod_prof.localhost_profile, None);
+
+    // wait-seccomp initContainer: present, mounts host-seccomp,
+    // polls for the profile path.
+    let inits = pod.init_containers.as_ref().expect("initContainers set");
+    assert_eq!(inits.len(), 1);
+    let wait = &inits[0];
+    assert_eq!(wait.name, "wait-seccomp");
+    assert_eq!(wait.image, Some(wp.spec.image.clone()));
+    let cmd = wait.command.as_ref().expect("wait command");
+    assert!(
+        cmd.last().unwrap().contains("profiles/rio-worker.json"),
+        "wait loop references the requested profile path"
+    );
+    let wait_prof = wait
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.seccomp_profile.as_ref())
+        .expect("wait initContainer seccomp set");
+    assert_eq!(wait_prof.type_, "RuntimeDefault");
+    assert!(
+        wait.volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.name == "host-seccomp" && m.read_only == Some(true))
+    );
+
+    // host-seccomp hostPath volume present.
+    assert!(pod.volumes.as_ref().unwrap().iter().any(|v| {
+        v.name == "host-seccomp"
+            && v.host_path
+                .as_ref()
+                .is_some_and(|h| h.path == "/var/lib/kubelet/seccomp")
+    }));
+
+    // Worker container: Localhost (the actual security boundary).
+    let worker = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "worker")
+        .expect("worker container");
+    let worker_prof = worker
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.seccomp_profile.as_ref())
+        .expect("worker container seccompProfile set");
+    assert_eq!(worker_prof.type_, "Localhost");
+    assert_eq!(
+        worker_prof.localhost_profile,
+        Some("profiles/rio-worker.json".into())
+    );
+}
+
+#[test]
+fn seccomp_non_localhost_no_init_container() {
+    // RuntimeDefault/Unconfined: no wait-seccomp initContainer,
+    // no host-seccomp volume. Pod-level carries the profile
+    // directly (original behavior — no file dependency).
+    for ty in ["RuntimeDefault", "Unconfined"] {
+        let mut wp = test_wp();
+        wp.spec.seccomp_profile = Some(SeccompProfileKind {
+            type_: ty.into(),
+            localhost_profile: None,
+        });
+        let sts = test_sts(&wp);
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+
+        assert!(pod.init_containers.is_none(), "{ty}: no initContainer");
+        assert!(
+            !pod.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "host-seccomp"),
+            "{ty}: no host-seccomp volume"
+        );
+        let pod_prof = pod
+            .security_context
+            .unwrap()
+            .seccomp_profile
+            .expect("pod seccomp set");
+        assert_eq!(pod_prof.type_, ty);
+        // Worker container: no container-level override.
+        let worker = pod.containers.iter().find(|c| c.name == "worker").unwrap();
+        assert!(
+            worker
+                .security_context
+                .as_ref()
+                .and_then(|sc| sc.seccomp_profile.as_ref())
+                .is_none(),
+            "{ty}: no container-level seccomp override"
+        );
+    }
 }
 
 // r[verify worker.seccomp.localhost-profile]

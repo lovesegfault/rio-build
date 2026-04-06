@@ -64,7 +64,12 @@ resource "helm_release" "external_secrets" {
   create_namespace = true
   repository       = "https://charts.external-secrets.io"
   chart            = "external-secrets"
-  version          = "0.18.0"
+  # Chart renumbered 0.x→1.x→2.x to align with app version. Main breaking
+  # change in this range was v1beta1 API removal at v0.17 — our CRDs'
+  # storedVersions are already ["v1"] only and the rio chart's
+  # ExternalSecret/ClusterSecretStore manifests use external-secrets.io/v1,
+  # so no migration needed. installCRDs defaults true (helm-managed).
+  version = "2.2.0"
 
   # IRSA annotation on the chart's SA. The chart creates the SA; we just
   # annotate it (unlike aws-lbc where we created the SA ourselves).

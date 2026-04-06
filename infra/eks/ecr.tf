@@ -33,10 +33,12 @@ resource "aws_ecr_repository" "rio" {
   }
 }
 
-# Lifecycle: keep last 10 images per repo. git-SHA tags accumulate
-# forever otherwise. 10 is plenty for "roll back to last week" and
-# keeps ECR storage costs bounded (each rio image is ~50-150MB;
-# 5 repos × 10 images × 150MB ≈ 7.5GB worst case).
+# Lifecycle: keep last 30 images per repo. git-SHA tags accumulate
+# forever otherwise. Multi-arch pushes produce 3 tags per logical
+# version (`-amd64`, `-arm64`, and the manifest index), so 30
+# images ≈ 10 versions — enough for "roll back to last week"
+# while keeping ECR storage bounded (each rio image is ~50-150MB;
+# 9 repos × 30 images × 150MB ≈ 40GB worst case).
 #
 # Rule matches all tags (tagStatus: any). ECR lifecycle rules
 # can't filter by tag prefix within a single rule — if you want
@@ -49,11 +51,11 @@ resource "aws_ecr_lifecycle_policy" "rio" {
   policy = jsonencode({
     rules = [{
       rulePriority = 1
-      description  = "Keep last 10 images"
+      description  = "Keep last 30 images (10 multi-arch versions × 3 tags)"
       selection = {
         tagStatus   = "any"
         countType   = "imageCountMoreThan"
-        countNumber = 10
+        countNumber = 30
       }
       action = { type = "expire" }
     }]

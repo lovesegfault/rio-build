@@ -120,6 +120,12 @@ deploy:
     # client-side apply bloats last-applied-configuration).
     kubectl apply --server-side -f infra/helm/crds/
 
+    # NodeOverlay CRD comes from the Karpenter chart (terraform-managed,
+    # wait=false), not infra/helm/crds/. The rio-build chart renders a
+    # NodeOverlay CR — helm install fails with "no matches for kind" if
+    # the CRD hasn't established yet. Block here until it's ready.
+    kubectl wait --for=condition=Established crd/nodeoverlays.karpenter.sh --timeout=120s
+
     # Namespace + SSH authorized_keys Secret (operator-provided, not in
     # Secrets Manager). Capture rio_authorized_keys into a variable FIRST
     # so a missing/bad pubkey aborts under set -e BEFORE kubectl runs —

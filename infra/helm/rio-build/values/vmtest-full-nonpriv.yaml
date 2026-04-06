@@ -52,10 +52,12 @@ workerPool:
   #      from may_mount()
   #   4. seccomp=Unconfined WITH /proc-remount+ambient: PASSES
   #
-  # Production (EKS/GKE): use a Localhost seccomp profile derived from
-  # RuntimeDefault + pivot_root allowlisted (the security.md
-  # worker.seccomp.localhost-profile already ships one; it needs
-  # pivot_root added). Unconfined is test-only.
+  # Production (EKS/GKE): Localhost seccomp profile (RuntimeDefault +
+  # pivot_root − ptrace/bpf/setns) delivered by the seccompInstaller DS
+  # — the chart default. Unconfined here is test-only: the busybox
+  # installer image isn't in the airgap set, and wiring a hostPath
+  # profile drop into the VM fixture isn't worth the test-surface for
+  # what the EKS smoke test already covers end-to-end.
   seccompProfile:
     type: Unconfined
 

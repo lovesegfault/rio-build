@@ -41,9 +41,12 @@ max-threads = 16
 [test-groups.integration]
 max-threads = 8
 
-# PostgreSQL-backed integration tests. One shared postgres per test
-# binary; each test creates its own database. The first test in each
-# binary pays the initdb cost (~1s).
+# PostgreSQL-backed integration tests. Under nextest each test is its
+# own process, so each test bootstraps its own ephemeral postgres
+# (initdb ~56MB + postgres instance). This group bounds concurrent PG
+# spawns — without it, a high-core box fires 100+ initdb/postgres at
+# once and exhausts /tmp, SysV semaphores, or shared memory. Filters
+# below MUST cover every test that calls TestDb::new.
 [test-groups.postgres]
 max-threads = 8
 
@@ -79,7 +82,22 @@ test-group = 'postgres'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'package(rio-store) and binary(grpc)'
+# binary(grpc) alone missed ~109 lib unit tests (gc::, metadata::,
+# cache_server::, signing::, content_index::, realisations::,
+# grpc::put_path::, grpc::admin::) that also use TestDb. Those ran in
+# the default pool at $NCPU parallelism — on a 192-core box that's
+# 100+ concurrent initdb+postgres spawns. The test(/tests::/)
+# substring match mirrors the rio-scheduler filter: over-captures a
+# handful of non-PG unit tests, but they're fast and it's robust
+# against new PG tests in new modules.
+filter = 'package(rio-store) and (binary(grpc) or test(/tests::/))'
+test-group = 'postgres'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# RioStack in functional/mod.rs wraps TestDb — same ephemeral-PG
+# bootstrap, same concurrency bound needed.
+filter = 'package(rio-gateway) and binary(functional)'
 test-group = 'postgres'
 slow-timeout = { period = "60s", terminate-after = 2 }
 

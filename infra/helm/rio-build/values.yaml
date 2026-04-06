@@ -331,13 +331,11 @@ karpenter:
           value: "true"
           effect: NoSchedule
       requirements:
-        # amd64 only: rio images are x86_64-only. Without this, m6g/m7g/
-        # r6g/r7g (ARM Graviton) are eligible → pod lands → exec format
-        # error → CrashLoopBackOff. rio-worker-preferred doesn't need it
-        # (c6a/c7a are AMD EPYC by family); this pool and rio-general do.
-        - key: kubernetes.io/arch
-          operator: In
-          values: [amd64]
+        # No arch constraint: rio images are multi-arch (x86_64 + aarch64
+        # via OCI manifest list, see infra/eks/push-images.sh). m6g/m7g/
+        # r6g/r7g Graviton nodes are now eligible — containerd pulls the
+        # arm64 image, pod runs natively. Re-add `kubernetes.io/arch In
+        # [amd64]` only if an arch-specific regression surfaces.
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: [m, r]
@@ -360,12 +358,9 @@ karpenter:
         rio.build/node-role: general
       taints: []
       requirements:
-        # amd64 only: same rationale as rio-worker-fallback. Observed:
-        # gateway pod scheduled on m6g.medium → exec format error on
-        # smoke-test rollout restart.
-        - key: kubernetes.io/arch
-          operator: In
-          values: [amd64]
+        # No arch constraint: multi-arch images (see rio-worker-fallback
+        # comment). Gateway/scheduler/store/controller all have arm64
+        # builds; m6g/m7g Graviton is now a valid target.
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: [m]
@@ -494,6 +489,34 @@ devicePlugin:
       effect: NoSchedule
 
 # ──────────────────────────────────────────────────────────────────────────
+# Seccomp profile installer (DaemonSet)
+# ──────────────────────────────────────────────────────────────────────────
+# Delivers files/seccomp-rio-worker.json to /var/lib/kubelet/seccomp/
+# profiles/ on worker nodes so workerPool.seccompProfile.type=Localhost
+# works. Karpenter-provisioned Bottlerocket nodes have no node-prep hook
+# — the DS initContainer is the delivery mechanism.
+#
+# Disable on clusters where the profile is baked into the node image or
+# where workerPool.seccompProfile.type != Localhost (RuntimeDefault,
+# Unconfined, or privileged:true escape hatch).
+seccompInstaller:
+  enabled: true
+  # busybox: cp + sleep. Digest-pinned — bump via `skopeo inspect
+  # docker://busybox:<tag> --format '{{.Digest}}'`. Same pin-policy
+  # as devicePlugin.image above (helm-lint enforces it).
+  image: public.ecr.aws/docker/library/busybox:1.36.1@sha256:b9598f8c98e24d0ad42c1742c32516772c3aa2151011ebaf639089bd18c605b8
+  # Same nodeSelector/tolerations as devicePlugin + workerPool: worker
+  # nodes only. Control-plane + general nodes don't run worker pods,
+  # don't need the profile.
+  nodeSelector:
+    rio.build/node-role: worker
+  tolerations:
+    - key: rio.build/worker
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+# ──────────────────────────────────────────────────────────────────────────
 # Default WorkerPool
 # ──────────────────────────────────────────────────────────────────────────
 # One-size-fits-all baseline for phase 4b — phase 4c WorkerPoolSet
@@ -539,17 +562,39 @@ workerPool:
   # is unacceptable for multi-tenant (ADR-012:18). Production on
   # EKS/GKE with the device plugin deployed should NOT need this.
   #
-  # EKS + Karpenter: currently MUST use privileged:true. The device-
-  # plugin path requests `smarter-devices/fuse` as a schedulable
-  # resource, but Karpenter doesn't know any EC2 instance type
-  # provides it (it's only advertised AFTER the device-plugin
-  # DaemonSet registers on a running node) — chicken-and-egg that
-  # deadlocks cold-start provisioning. startupTaints don't help
-  # (Karpenter still checks extended-resource capacity). Until
-  # Karpenter gains custom extended-resource declarations or a
-  # warm-pool floor is maintained, privileged is the working path.
-  # Tracked in followups-pending.jsonl (P-new, correctness).
-  privileged: true
+  # EKS + Karpenter cold-start: a NodeOverlay (templates/karpenter.yaml)
+  # declares smarter-devices/fuse capacity synthetically so Karpenter
+  # can bin-pack from zero nodes. Requires Karpenter ≥1.7 with the
+  # nodeOverlay feature gate (infra/eks/karpenter.tf).
+  #
+  # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
+  # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist (not
+  # Bottlerocket-specific — same gap on AL2023). The Localhost profile
+  # (files/seccomp-rio-worker.json, delivered by seccompInstaller DS) is
+  # RuntimeDefault + pivot_root − {ptrace, bpf, setns, process_vm_*}.
+  # Keeps granular caps, container_t SELinux confinement, and the
+  # device-plugin /dev/fuse path while denying the syscalls a
+  # sandbox escapee with CAP_SYS_ADMIN would otherwise have.
+  #
+  # hostUsers=true override: runc only chowns the pod cgroup to the userns
+  # root when the OCI spec mounts /sys/fs/cgroup rw. containerd passes ro
+  # unless cgroup_writable=true is set on the runc runtime (containerd
+  # #11131, v2.1+), and Bottlerocket's settings API does not expose that
+  # flag (bottlerocket-os/bottlerocket#2408 — no arbitrary containerd TOML).
+  # Without the chown, /sys/fs/cgroup/ is nobody:nobody inside the userns;
+  # the worker's mkdir /sys/fs/cgroup/leaf fails EACCES even after its rw
+  # remount (CAP_DAC_OVERRIDE can't touch unmapped UIDs) → CrashLoopBackOff.
+  # The builder's default hostUsers:false (ADR-012 userns isolation) is
+  # overridden here. Still vastly better than privileged:true — keeps
+  # granular caps + SELinux + device-plugin. Revisit once Bottlerocket
+  # exposes cgroup_writable or KEP-5474 (writable cgroups in pod spec) lands.
+  privileged: false
+  hostUsers: true
+  seccompProfile:
+    type: Localhost
+    # Relative to /var/lib/kubelet/seccomp/. seccompInstaller DS drops
+    # the file at profiles/rio-worker.json on every worker node.
+    localhostProfile: profiles/rio-worker.json
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
   tolerations:

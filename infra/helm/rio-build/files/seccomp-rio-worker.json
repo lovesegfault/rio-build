@@ -9,7 +9,7 @@
     "process_vm_readv": "cross-process memory read without ptrace — same attack class as ptrace",
     "process_vm_writev": "cross-process memory write without ptrace"
   },
-  "//kept-from-cap-sys-admin": "mount/umount/umount2/unshare/clone/clone3/fsconfig/fsmount/fsopen/fspick/mount_setattr/move_mount/open_tree — worker needs these for overlayfs per-build isolation + Nix sandbox namespace setup. fanotify_init/lookup_dcookie/perf_event_open/quotactl/quotactl_fd/setdomainname/sethostname/syslog kept for RuntimeDefault parity (low risk, removing them is a behavior change vs RuntimeDefault beyond the plan scope).",
+  "//kept-from-cap-sys-admin": "mount/umount/umount2/unshare/clone/clone3/fsconfig/fsmount/fsopen/fspick/mount_setattr/move_mount/open_tree/pivot_root — worker needs these for overlayfs per-build isolation + Nix sandbox namespace setup. pivot_root is NOT in containerd's RuntimeDefault CAP_SYS_ADMIN block (upstream gap) but nix-daemon's build sandbox requires it; added here so the Localhost profile works where RuntimeDefault doesn't. fanotify_init/lookup_dcookie/perf_event_open/quotactl/quotactl_fd/setdomainname/sethostname/syslog kept for RuntimeDefault parity (low risk, removing them is a behavior change vs RuntimeDefault beyond the plan scope).",
   "defaultAction": "SCMP_ACT_ERRNO",
   "defaultErrnoRet": 1,
   "architectures": [
@@ -456,7 +456,7 @@
       ]
     },
     {
-      "//": "CAP_SYS_ADMIN block from RuntimeDefault, MINUS bpf + setns. Worker has CAP_SYS_ADMIN so under RuntimeDefault these are all allowed; here we drop the two that grant lateral movement.",
+      "//": "CAP_SYS_ADMIN block from RuntimeDefault, MINUS bpf + setns, PLUS pivot_root (containerd omits it from the CAP_SYS_ADMIN allowlist but nix-daemon's sandbox requires it). Worker has CAP_SYS_ADMIN so under RuntimeDefault these are all allowed except pivot_root; here we drop the two that grant lateral movement and add the one RuntimeDefault forgot.",
       "names": [
         "clone",
         "clone3",
@@ -471,6 +471,7 @@
         "move_mount",
         "open_tree",
         "perf_event_open",
+        "pivot_root",
         "quotactl",
         "quotactl_fd",
         "setdomainname",

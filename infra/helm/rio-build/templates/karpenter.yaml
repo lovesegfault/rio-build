@@ -28,6 +28,15 @@ spec:
     httpEndpoint: enabled
     httpTokens: required
     httpPutResponseHopLimit: 1
+  # Bottlerocket defaults user.max_user_namespaces=0 (hardening). Worker
+  # pods set hostUsers:false (userns-mapped root — ADR-012), which needs
+  # a userns to idmap-mount /dev/fuse. Without this, pod sandbox creation
+  # dies with "fork/exec: no space left on device" (ENOSPC on the userns
+  # clone, not disk). 65536 is the upstream containerd-recommended
+  # ceiling for userns-per-pod clusters.
+  userData: |
+    [settings.kernel.sysctl]
+    "user.max_user_namespaces" = "65536"
   # Bottlerocket has two volumes: /dev/xvda (OS, ~2GB, immutable) and
   # /dev/xvdb (container data — images, emptyDir, logs). The AMI default
   # for xvdb is ~20GB, which Karpenter treats as the allocatable
@@ -42,6 +51,35 @@ spec:
         encrypted: true
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
+---
+# NodeOverlay: tells Karpenter that worker-role instances provide
+# smarter-devices/fuse capacity BEFORE the node exists. Solves the
+# cold-start deadlock: worker pods request smarter-devices/fuse:1, but
+# the device-plugin DaemonSet only advertises that resource AFTER a
+# node boots and the DaemonSet registers — so from zero nodes Karpenter
+# can't bin-pack and never provisions. The overlay declares the capacity
+# synthetically; once the node is up, the device-plugin registers the
+# real capacity (same value, devicePlugin.fuseMaxDevices).
+#
+# Alpha feature — requires settings.featureGates.nodeOverlay=true on the
+# Karpenter controller (set in infra/eks/karpenter.tf).
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: rio-worker-fuse
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  # Match both rio-worker-preferred and rio-worker-fallback via the
+  # node-role label they carry. NOT rio-general (no worker pods there,
+  # no device-plugin DaemonSet there — advertising a resource that
+  # never materializes would wedge scheduling).
+  requirements:
+    - key: rio.build/node-role
+      operator: In
+      values: [worker]
+  capacity:
+    smarter-devices/fuse: {{ .Values.devicePlugin.fuseMaxDevices | quote }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1
