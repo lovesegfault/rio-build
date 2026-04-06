@@ -697,6 +697,28 @@ impl DagActor {
                     };
                     let _ = reply.send(ok);
                 }
+                #[cfg(test)]
+                ActorCommand::DebugBackdateSubmitted {
+                    build_id,
+                    secs_ago,
+                    reply,
+                } => {
+                    // Backdate submitted_at for per-build-timeout tests.
+                    // handle_tick's r[sched.timeout.per-build] check uses
+                    // submitted_at.elapsed() — a std::time::Instant, which
+                    // tokio paused time cannot mock (and paused time breaks
+                    // PG pool timeouts anyway). Same checked_sub defensive
+                    // clamp as DebugBackdateRunning above.
+                    let ok = if let Some(build) = self.builds.get_mut(&build_id) {
+                        build.submitted_at = Instant::now()
+                            .checked_sub(std::time::Duration::from_secs(secs_ago))
+                            .unwrap_or_else(Instant::now);
+                        true
+                    } else {
+                        false
+                    };
+                    let _ = reply.send(ok);
+                }
             }
         }
 

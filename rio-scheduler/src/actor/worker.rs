@@ -567,6 +567,47 @@ impl DagActor {
                 .await;
         }
 
+        // r[impl sched.timeout.per-build]
+        //
+        // Wall-clock limit on the ENTIRE build from submission. Distinct from:
+        //   - r[sched.backstop.timeout] above (per-derivation heuristic: est×3)
+        //   - worker-side daemon floor at actor/build.rs build_options_for_
+        //     derivation (also receives build_timeout as min_nonzero per-
+        //     derivation — defense-in-depth, NOT the primary semantics)
+        //
+        // Zero = no overall timeout. Only Active builds are checked: Pending
+        // hasn't started dispatching (validate_transition rejects Pending →
+        // Failed anyway); terminal builds are already done.
+        let mut timed_out_builds: Vec<(Uuid, u64)> = Vec::new();
+        for (build_id, build) in &self.builds {
+            if build.state() == BuildState::Active
+                && build.options.build_timeout > 0
+                && build.submitted_at.elapsed().as_secs() > build.options.build_timeout
+            {
+                timed_out_builds.push((*build_id, build.options.build_timeout));
+            }
+        }
+        for (build_id, timeout) in timed_out_builds {
+            let reason = format!("build_timeout {timeout}s exceeded (wall-clock since submission)");
+            warn!(build_id = %build_id, timeout_secs = timeout, "per-build timeout exceeded; cancelling derivations and failing build");
+            metrics::counter!("rio_scheduler_build_timeouts_total").increment(1);
+
+            // Set error_summary FIRST so transition_build_to_failed picks it
+            // up for the BuildFailed event + DB error_summary column.
+            if let Some(build) = self.builds.get_mut(&build_id) {
+                build.error_summary = Some(reason.clone());
+            }
+            // Reuse the CancelBuild derivation-cancellation path (sends
+            // CancelSignal, transitions drvs to Cancelled, removes build
+            // interest, prunes ready queue). Then fail the BUILD instead
+            // of cancelling it — TimedOut is semantically "permanent-no-
+            // reassign" (types.proto:278), same as a build failure.
+            self.cancel_build_derivations(build_id, &reason).await;
+            if let Err(e) = self.transition_build_to_failed(build_id).await {
+                error!(build_id = %build_id, error = %e, "failed to persist per-build-timeout failure");
+            }
+        }
+
         for drv_hash in expired_poisons {
             info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
             // PG first, in-mem second (same ordering as handle_clear_poison):

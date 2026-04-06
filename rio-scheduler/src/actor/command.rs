@@ -284,6 +284,19 @@ pub enum ActorCommand {
         secs_ago: u64,
         reply: oneshot::Sender<bool>,
     },
+
+    /// Test-only: backdate a build's `submitted_at` timestamp. For
+    /// per-build-timeout tests (r[sched.timeout.per-build]): handle_tick
+    /// checks `submitted_at.elapsed() > build_timeout`. `submitted_at`
+    /// is `std::time::Instant` — tokio paused time cannot mock it, and
+    /// paused time breaks PG pool timeouts anyway (see tests/worker.rs
+    /// comment). Returns `false` if the build isn't in `self.builds`.
+    #[cfg(test)]
+    DebugBackdateSubmitted {
+        build_id: Uuid,
+        secs_ago: u64,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Reply for `ActorCommand::DrainWorker`.

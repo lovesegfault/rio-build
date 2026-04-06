@@ -269,4 +269,22 @@ impl ActorHandle {
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
+
+    /// Test-only: backdate a build's `submitted_at`. For per-build-
+    /// timeout tests. Returns `false` if build not found.
+    #[cfg(test)]
+    pub async fn debug_backdate_submitted(
+        &self,
+        build_id: Uuid,
+        secs_ago: u64,
+    ) -> Result<bool, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugBackdateSubmitted {
+            build_id,
+            secs_ago,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
 }

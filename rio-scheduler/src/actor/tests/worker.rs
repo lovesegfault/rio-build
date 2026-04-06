@@ -571,3 +571,130 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
 
     Ok(())
 }
+
+// r[verify sched.timeout.per-build]
+/// Per-build overall timeout: a build with `build_timeout=60` whose
+/// `submitted_at` is 61s ago transitions to Failed on Tick. Same build
+/// at 59s elapsed does NOT fail (boundary check).
+///
+/// Uses DebugBackdateSubmitted (same pattern as DebugBackdateRunning
+/// above): `submitted_at` is `std::time::Instant`, which tokio paused
+/// time cannot mock. And paused time breaks PG pool timeouts anyway
+/// (see comment at test_heartbeat_timeout_via_tick_deregisters_worker).
+///
+/// No worker connected — derivation stays Ready, never Assigned. This
+/// isolates the per-build-timeout from the backstop-timeout above: the
+/// backstop only fires for status==Running, so a Ready derivation with
+/// a stale BUILD proves the per-build check fires independently. The
+/// plan's exit criterion "existing backstop test still passes unchanged
+/// — proves independence" is satisfied by the backstop test above not
+/// being touched; this test adds the converse (per-build fires without
+/// backstop).
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+    // No worker — derivation stays Ready. Keeps the backstop check
+    // (status==Running only) out of the picture.
+
+    let build_id = Uuid::new_v4();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node("pbt-drv", "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions {
+                    max_silent_time: 0,
+                    build_timeout: 60,
+                    build_cores: 0,
+                },
+                keep_going: false,
+                traceparent: String::new(),
+            },
+            reply: reply_tx,
+        })
+        .await?;
+    let _ev = reply_rx.await??;
+
+    // ── Boundary: 59s elapsed — NOT timed out ────────────────────────
+    // 59 < 60 → elapsed.as_secs() > build_timeout is false. The check
+    // uses strict > (worker.rs), so 60s elapsed would also NOT fire
+    // (elapsed().as_secs() truncates to 60, and 60 > 60 is false).
+    // 59 gives a comfortable margin below; 61 is unambiguously past.
+    let ok = handle.debug_backdate_submitted(build_id, 59).await?;
+    assert!(ok, "debug_backdate_submitted should find the build");
+
+    handle.send_unchecked(ActorCommand::Tick).await?;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build should still be Active at 59s < 60s timeout"
+    );
+    assert!(
+        status.error_summary.is_empty(),
+        "error_summary should be empty before timeout; got {:?}",
+        status.error_summary
+    );
+
+    // ── Timeout: 61s elapsed — Failed with timeout reason ────────────
+    let ok = handle.debug_backdate_submitted(build_id, 61).await?;
+    assert!(ok);
+
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    assert!(
+        logs_contain("per-build timeout exceeded"),
+        "handle_tick should warn on per-build timeout"
+    );
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "build should be Failed after per-build timeout; got state={}",
+        status.state
+    );
+    assert!(
+        status.error_summary.contains("build_timeout 60s exceeded"),
+        "error_summary should contain the timeout reason; got {:?}",
+        status.error_summary
+    );
+
+    Ok(())
+}
+
+/// Zero build_timeout = no overall timeout. Even with a wildly stale
+/// submitted_at, Tick does NOT fail the build. Guards against an
+/// accidental `>= 0` instead of `> 0` in the zero-check.
+#[tokio::test]
+async fn test_per_build_timeout_zero_means_unlimited() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    // merge_single_node uses BuildOptions::default() → build_timeout=0.
+    let _ev = merge_single_node(&handle, build_id, "pbt0-drv", PriorityClass::Scheduled).await?;
+
+    // Backdate far past any reasonable timeout. If the zero-check is
+    // wrong (>=0 instead of >0), this would fire immediately.
+    let ok = handle.debug_backdate_submitted(build_id, 100_000).await?;
+    assert!(ok);
+
+    handle.send_unchecked(ActorCommand::Tick).await?;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build with build_timeout=0 should never time out; got state={}",
+        status.state
+    );
+
+    Ok(())
+}
