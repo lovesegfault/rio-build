@@ -42,6 +42,7 @@ mod inputs;
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
 use inputs::{
     compute_input_closure, fetch_drv_from_store, fetch_input_metadata, verify_fod_hashes,
+    warm_inputs_in_fuse,
 };
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
@@ -433,6 +434,15 @@ pub async fn execute_build(
         is_fod,
     )
     .await?;
+
+    // 4b. Warm every input in the FUSE lower BEFORE the daemon stats
+    // through the overlay (I-043). After prepare_sandbox so we know
+    // every path passed QueryPathInfo (the store has it); a FUSE miss
+    // here is a sub-200ms visibility race that the NotFound re-probe
+    // covers. Before daemon spawn so the overlay's first lookup of
+    // each input finds a positive FUSE-layer dentry — never gets a
+    // chance to negative-cache.
+    warm_inputs_in_fuse(fuse_mount_point, &input_paths).await;
 
     // 5. Spawn nix-daemon --stdio in a private mount namespace.
     //
@@ -873,20 +883,16 @@ async fn resolve_inputs(
     )
     .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
 
-    // Compute input closure for the synthetic DB (ValidPaths table).
-    // Seed with resolved_input_srcs (includes inputDrv outputs, not just
-    // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
-    // compute_input_closure only seeds from drv.input_srcs() (static), so
-    // we merge the resolved set in.
-    let mut input_paths: Vec<String> = compute_input_closure(store_client, drv, drv_path).await?;
-    // Add resolved inputDrv outputs (their runtime closure is BFS'd via
-    // fetch_input_metadata's references, but they need to be in the seed
-    // set first). Dedup via set conversion.
-    {
-        let mut set: std::collections::HashSet<String> = input_paths.into_iter().collect();
-        set.extend(resolved_input_srcs.into_iter());
-        input_paths = set.into_iter().collect();
-    }
+    // Compute input closure for the synthetic DB (ValidPaths table)
+    // and the FUSE warm. The BFS seeds with resolved_input_srcs so
+    // it walks the runtime references of inputDrv OUTPUTS — a .drv
+    // file's narinfo references don't include its outputs (those are
+    // in the ATerm structure, not the NAR content), so seeding only
+    // input_drvs().keys() would miss them. I-043: warm count=8 with
+    // the post-BFS merge — autotools-hook (a transitive runtime dep
+    // via stdenv-the-output) never reached.
+    let input_paths: Vec<String> =
+        compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
 
     Ok(ResolvedInputs {
         basic_drv,

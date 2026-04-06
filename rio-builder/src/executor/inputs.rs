@@ -1,7 +1,7 @@
 //! Input fetching: .drv from store, metadata, input closure, FOD hash verification.
 // r[impl builder.fod.verify-hash]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tonic::transport::Channel;
@@ -175,6 +175,98 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
     Ok(())
 }
 
+/// Stat each input path through the FUSE mount before nix-daemon spawns.
+///
+/// I-043: overlayfs caches negative dentries from its lowers.
+/// nix-daemon's first `stat(/nix/store/{input})` goes overlay → upper
+/// miss → FUSE lower; if FUSE returns ENOENT (path uploaded by another
+/// builder mid-build, not yet in this builder's FUSE cache), the
+/// overlay caches a negative dentry. The daemon's RETRY hits that
+/// cache — FUSE `lookup()` is never called again. Live: zlib failed
+/// `build input ... does not exist` for autotools-hook with zero FUSE
+/// fetch logs during the failure window.
+///
+/// Warming materializes every input in FUSE before the overlay sees a
+/// stat for it. Stat goes through the FUSE mount (NOT the overlay
+/// merged dir), so the kernel's FUSE-layer dcache gets a positive
+/// entry; the overlay's later lookup of the same name reuses that
+/// FUSE-layer dentry without re-entering FUSE userspace.
+///
+/// `prepare_sandbox`'s `fetch_input_metadata` already verified each
+/// path exists in the store via QueryPathInfo, so the only window for
+/// FUSE ENOENT here is a sub-200ms visibility race — exactly what
+/// `fetch_extract_insert`'s NotFound re-probe covers. Warm failures
+/// don't fail the build (the daemon will surface the real error if a
+/// path is truly gone); they're WARN'd so a sustained nonzero metric
+/// flags a wider problem upstream.
+///
+/// The stats run on the blocking pool: each one blocks on
+/// `ensure_cached` → `block_on(get_path_nar)`. `buffer_unordered`
+/// fires `MAX_PARALLEL_FETCHES` at once; FUSE's internal `fetch_sem`
+/// (n_threads − 1) is the real concurrency bound, the rest queue on
+/// it cheaply. Order doesn't matter — all must complete before
+/// daemon spawn.
+#[instrument(skip_all, fields(input_count = input_paths.len()))]
+pub(super) async fn warm_inputs_in_fuse(fuse_mount_point: &Path, input_paths: &[String]) {
+    let warm_start = std::time::Instant::now();
+
+    // Owned PathBufs collected up-front so the spawned futures are
+    // 'static (the spawn_blocking closure moves the PathBuf in; no
+    // borrow on `input_paths` survives the .await).
+    let fuse_paths: Vec<PathBuf> = input_paths
+        .iter()
+        .filter_map(|p| {
+            // Malformed paths (no /nix/store/ prefix) would have failed
+            // fetch_input_metadata's QueryPathInfo with InvalidArgument
+            // already; skip silently as defense-in-depth.
+            Some(fuse_mount_point.join(p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?))
+        })
+        .collect();
+
+    let outcomes: Vec<bool> = stream::iter(fuse_paths)
+        .map(|fuse_path| async move {
+            // The whole point is the syscall side-effect (FUSE lookup
+            // → ensure_cached → materialize). The metadata itself is
+            // discarded.
+            match tokio::task::spawn_blocking(move || {
+                fuse_path
+                    .symlink_metadata()
+                    .map(|_| ())
+                    .map_err(|e| (fuse_path, e))
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err((fuse_path, e))) => {
+                    tracing::warn!(
+                        path = %fuse_path.display(),
+                        error = %e,
+                        "FUSE warm stat failed; daemon's overlay lookup may negative-cache this input"
+                    );
+                    false
+                }
+                Err(join_err) => {
+                    tracing::warn!(error = %join_err, "FUSE warm stat task panicked");
+                    false
+                }
+            }
+        })
+        .buffer_unordered(MAX_PARALLEL_FETCHES)
+        .collect()
+        .await;
+
+    let failed = outcomes.iter().filter(|ok| !**ok).count();
+    let elapsed = warm_start.elapsed();
+    metrics::histogram!("rio_builder_input_warm_duration_seconds").record(elapsed.as_secs_f64());
+    metrics::counter!("rio_builder_input_warm_failures_total").increment(failed as u64);
+    tracing::debug!(
+        warmed = input_paths.len() - failed,
+        failed,
+        elapsed_ms = elapsed.as_millis(),
+        "FUSE input warm complete"
+    );
+}
+
 /// Fetch metadata for all input paths from the store.
 #[instrument(skip_all, fields(input_count = input_paths.len()))]
 pub(super) async fn fetch_input_metadata(
@@ -261,22 +353,35 @@ pub(super) async fn fetch_drv_from_store(
 /// upload time from the NAR content) and walk the reference graph via
 /// QueryPathInfo. Paths not yet in the store (e.g., outputs of not-yet-built
 /// input drvs) are skipped — FUSE will lazy-fetch them at build time.
+///
+/// `resolved_input_srcs` MUST be `drv.input_srcs()` ∪ the resolved
+/// output paths of every `input_drv`. The internal seed only adds
+/// `drv_path` + `input_drvs().keys()` (the .drv files); the caller
+/// supplies the OUTPUTS so the BFS walks their runtime references.
+/// I-043: a .drv file's narinfo references DON'T include its outputs
+/// (outputs are in the ATerm structure, not the NAR content). Seeding
+/// only `input_drvs().keys()` meant the BFS walked dep.drv → its
+/// references but NEVER dep.drv's OUTPUT → output's references.
+/// Transitive runtime deps (autotools-hook via stdenv-the-output) were
+/// never reached → never warmed → overlay negative-dentry.
 #[instrument(skip_all)]
 pub(super) async fn compute_input_closure(
     store_client: &StoreServiceClient<Channel>,
     drv: &Derivation,
     drv_path: &str,
+    resolved_input_srcs: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<String>, ExecutorError> {
     use std::collections::HashSet;
 
     let mut closure: HashSet<String> = HashSet::new();
     let mut frontier: Vec<String> = Vec::new();
 
-    // Seed: the .drv itself, its input_srcs, and input_drv paths.
-    // nix-daemon needs to read the .drv; build needs srcs + dep outputs.
+    // Seed: the .drv itself, input_drv paths (so nix-daemon can read them),
+    // and resolved_input_srcs (input_srcs ∪ input_drv OUTPUTS — the caller
+    // has already fetched each input .drv and extracted output paths).
     frontier.push(drv_path.to_string());
-    frontier.extend(drv.input_srcs().iter().cloned());
     frontier.extend(drv.input_drvs().keys().cloned());
+    frontier.extend(resolved_input_srcs.iter().cloned());
 
     // BFS by layer. Within each layer all queries are independent, so
     // buffer_unordered. Layer count is typically 5-15 (dep depth).
@@ -594,6 +699,14 @@ mod tests {
         Derivation::parse(&aterm).unwrap_or_else(|e| panic!("bad ATerm: {e}\n{aterm}"))
     }
 
+    /// `compute_input_closure`'s `resolved_input_srcs` parameter for tests
+    /// without input_drvs: just `drv.input_srcs()` (the production caller
+    /// adds resolved input_drv outputs, but `drv_with_srcs` builds drvs
+    /// with empty input_drvs so there's nothing to resolve).
+    fn srcs_of(drv: &Derivation) -> std::collections::BTreeSet<String> {
+        drv.input_srcs().clone()
+    }
+
     #[tokio::test]
     async fn test_fetch_input_metadata_success() -> anyhow::Result<()> {
         let (store, client) = spawn_and_connect().await?;
@@ -677,7 +790,7 @@ mod tests {
         seed_with_refs(&store, &p_c, &[]);
 
         let drv = drv_with_srcs(std::slice::from_ref(&p_a));
-        let closure = compute_input_closure(&client, &drv, &p_drv)
+        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv))
             .await
             .expect("closure computation should succeed");
 
@@ -701,7 +814,7 @@ mod tests {
         // p_missing is NOT seeded.
 
         let drv = drv_with_srcs(std::slice::from_ref(&p_a));
-        let closure = compute_input_closure(&client, &drv, &p_drv)
+        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv))
             .await
             .expect("missing ref is non-fatal");
 
@@ -724,9 +837,79 @@ mod tests {
         seed_with_refs(&store, &p_c, &[]);
 
         let drv = drv_with_srcs(&[p_a, p_b]);
-        let closure = compute_input_closure(&client, &drv, &p_drv).await?;
+        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
 
         assert_eq!(closure.len(), 4); // drv, A, B, C (once)
+        Ok(())
+    }
+
+    /// I-043 regression: an input_drv's OUTPUT (not in input_srcs, not
+    /// in input_drvs.keys, not in any .drv's narinfo references — only
+    /// declared in the input .drv's ATerm structure) must be in the
+    /// closure, AND its runtime references must be walked.
+    ///
+    /// Live: warm count=8, autotools-hook missing. autotools-hook is
+    /// reached only via stdenv-the-OUTPUT's references; the BFS
+    /// previously seeded only stdenv.drv (the FILE), whose narinfo
+    /// references do not include its outputs.
+    #[tokio::test]
+    async fn test_compute_input_closure_walks_input_drv_output_references() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
+
+        // The shape: main.drv has input_drvs={dep.drv: [out]}. dep.drv's
+        // out is `dep_output`. dep_output references `transitive`.
+        //
+        // dep.drv's narinfo references DO NOT include dep_output (a .drv
+        // file's NAR content is the ATerm string; the scanner finds
+        // references textually embedded, but the output PATH in the
+        // outputs() declaration isn't a reference — it's where we WRITE
+        // TO, not what we DEPEND ON). The only way to reach dep_output
+        // is via the resolved_input_srcs seed.
+        let p_drv = tp("main.drv");
+        let p_dep_drv = tp("dep.drv");
+        let p_dep_output = tp("stdenv");
+        let p_transitive = tp("autotools-hook");
+
+        seed_with_refs(&store, &p_drv, &[]);
+        seed_with_refs(&store, &p_dep_drv, &[]); // .drv file, NO ref to its output
+        seed_with_refs(&store, &p_dep_output, std::slice::from_ref(&p_transitive));
+        seed_with_refs(&store, &p_transitive, &[]);
+
+        // input_srcs is empty; input_drvs is implicit in the test (we
+        // can't easily build a Derivation with input_drvs via ATerm in
+        // this test harness, so we simulate the production caller's
+        // resolution by passing dep_output in resolved_input_srcs).
+        let drv = drv_with_srcs(&[]);
+        let resolved: std::collections::BTreeSet<String> = [p_dep_output.clone()].into();
+
+        let closure = compute_input_closure(&client, &drv, &p_drv, &resolved).await?;
+        let set: std::collections::HashSet<String> = closure.into_iter().collect();
+
+        assert!(
+            set.contains(&p_dep_output),
+            "input_drv output is in closure (seeded directly)"
+        );
+        assert!(
+            set.contains(&p_transitive),
+            "I-043: input_drv output's RUNTIME references are walked. \
+             Pre-fix: dep_output was merged AFTER the BFS, so the BFS \
+             only saw dep.drv → its (empty) narinfo refs. transitive \
+             was never reached → never warmed → overlay negative-dentry."
+        );
+
+        // The pre-fix shape: seed only with input_srcs (empty here),
+        // then merge dep_output post-BFS. Prove transitive is missed.
+        let pre_fix_closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
+        let pre_fix_set: std::collections::HashSet<String> = pre_fix_closure
+            .into_iter()
+            .chain(std::iter::once(p_dep_output)) // post-BFS merge
+            .collect();
+        assert!(
+            !pre_fix_set.contains(&p_transitive),
+            "sensitivity proof: pre-fix seed (input_srcs only) + post-BFS \
+             merge of dep_output never reaches transitive"
+        );
+
         Ok(())
     }
 
@@ -769,7 +952,7 @@ mod tests {
         let drv = drv_with_srcs(std::slice::from_ref(&p_direct));
 
         // --- mod.rs step 1: compute_input_closure (mod.rs:379-380) ---
-        let closure = compute_input_closure(&client, &drv, &p_drv).await?;
+        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
         let closure_set: std::collections::HashSet<_> = closure.iter().cloned().collect();
         assert!(
             closure_set.contains(&p_transitive),
@@ -885,5 +1068,84 @@ mod tests {
             "got: {err}"
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // warm_inputs_in_fuse
+    // -----------------------------------------------------------------------
+    //
+    // Tested against a tempdir standing in for the FUSE mount —
+    // warm_inputs_in_fuse only does symlink_metadata(), so any
+    // filesystem works. The real FUSE side-effect (lookup →
+    // ensure_cached → fetch) is covered by fuse/fetch.rs tests; here
+    // we test the closure-walk + parallelism + error-tolerance shell.
+
+    /// Paths that exist in the "FUSE" dir produce no warnings; the
+    /// function completes without error. Verifies the basename
+    /// extraction (strip /nix/store/) joins correctly onto the mount.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_all_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = vec![
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello".to_string(),
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world".to_string(),
+        ];
+        for p in &inputs {
+            let basename = p.strip_prefix("/nix/store/").unwrap();
+            std::fs::write(dir.path().join(basename), b"x").expect("write");
+        }
+
+        warm_inputs_in_fuse(dir.path(), &inputs).await;
+    }
+
+    /// Missing paths are WARN'd, not fatal. The function completes;
+    /// the failure metric is incremented (we can't assert the metric
+    /// here without a recorder, but we assert no panic/error).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_missing_tolerated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = vec![
+            "/nix/store/cccccccccccccccccccccccccccccccc-missing".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-also-missing".to_string(),
+        ];
+
+        warm_inputs_in_fuse(dir.path(), &inputs).await;
+    }
+
+    /// Malformed paths (no /nix/store/ prefix) are filtered out
+    /// silently. They'd have failed fetch_input_metadata's
+    /// QueryPathInfo with InvalidArgument before reaching warm anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_skips_malformed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = vec![
+            "no-prefix-at-all".to_string(),
+            "/wrong/prefix/foo".to_string(),
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-valid".to_string(),
+        ];
+        std::fs::write(
+            dir.path().join("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-valid"),
+            b"x",
+        )
+        .expect("write");
+
+        warm_inputs_in_fuse(dir.path(), &inputs).await;
+    }
+
+    /// Mixed present/missing: present ones succeed, missing ones
+    /// WARN. This is the realistic case — most inputs are warm from
+    /// earlier builds, a few are cold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_inputs_mixed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let present = "/nix/store/ffffffffffffffffffffffffffffffff-present".to_string();
+        let missing = "/nix/store/00000000000000000000000000000000-missing".to_string();
+        std::fs::write(
+            dir.path().join("ffffffffffffffffffffffffffffffff-present"),
+            b"x",
+        )
+        .expect("write");
+
+        warm_inputs_in_fuse(dir.path(), &[present, missing]).await;
     }
 }

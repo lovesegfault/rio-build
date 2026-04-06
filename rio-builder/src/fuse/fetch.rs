@@ -73,6 +73,26 @@ const RETRY_BACKOFF: &[Duration] = &[
     Duration::from_millis(500),
 ];
 
+/// Single-shot NotFound retry delay inside [`fetch_extract_insert`].
+///
+/// I-043: Builder X uploads a path, scheduler unlocks the dependent
+/// derivation, dispatches it to Builder Y; Y's FUSE queries the store
+/// before the upload commit is visible (PG replica lag, pooler stale
+/// snapshot, or just sub-ms race-the-dispatch). Live evidence: zlib
+/// failed with `build input ... does not exist` for a path PG showed
+/// `manifests.status='complete'` seconds before.
+///
+/// Unlike `RETRY_BACKOFF` (transient transport — store DOWN, retry
+/// schedule) this is one short re-probe (store UP, just hadn't seen
+/// the row yet). 200ms covers PG replica lag in healthy clusters;
+/// the path was about to fail with ENOENT anyway so the cost is borne
+/// only on real misses (.lock probes etc.). Shorter in tests so the
+/// double-miss path stays fast.
+#[cfg(not(test))]
+const NOTFOUND_RETRY_DELAY: Duration = Duration::from_millis(200);
+#[cfg(test)]
+const NOTFOUND_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 impl NixStoreFs {
     /// Global deadline for the `WaitFor` loop: `fetch_timeout + WAIT_SLOP`.
     /// Was a `const` (`GRPC_STREAM_TIMEOUT` + 30s) before T1b made the
@@ -368,6 +388,25 @@ fn fetch_extract_insert(
     let nar_data = runtime.block_on(async {
         let mut client = store_client.clone();
         let mut attempt = 0;
+        let mut notfound_retried = false;
+        // I-043: one re-probe after the first NotFound. Separate from
+        // `attempt` (the transient-transport counter) — they're
+        // orthogonal failure modes. A flag, not a counter: this is a
+        // visibility race, not a retry schedule.
+        macro_rules! retry_notfound_once {
+            () => {
+                if !notfound_retried {
+                    notfound_retried = true;
+                    tracing::debug!(
+                        store_path = %store_path,
+                        delay = ?NOTFOUND_RETRY_DELAY,
+                        "GetPath NotFound; re-probing once (upload-visibility race?)"
+                    );
+                    tokio::time::sleep(NOTFOUND_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+        }
         loop {
             match rio_proto::client::get_path_nar(
                 &mut client,
@@ -386,11 +425,20 @@ fn fetch_extract_insert(
                             "GetPath recovered after transient failure"
                         );
                     }
+                    if notfound_retried {
+                        tracing::debug!(
+                            store_path = %store_path,
+                            "GetPath recovered after NotFound — upload-visibility race resolved"
+                        );
+                        metrics::counter!("rio_builder_fuse_notfound_race_resolved_total")
+                            .increment(1);
+                    }
                     return Ok(nar);
                 }
                 Ok(None) => {
                     // Path not in remote store. lookup() probes unknown
                     // names (.lock files, tmp paths); ENOENT is normal.
+                    retry_notfound_once!();
                     return Err(Errno::ENOENT);
                 }
                 Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
@@ -402,7 +450,10 @@ fn fetch_extract_insert(
                     );
                     return Err(Errno::EFBIG);
                 }
-                Err(e) if e.is_not_found() => return Err(Errno::ENOENT),
+                Err(e) if e.is_not_found() => {
+                    retry_notfound_once!();
+                    return Err(Errno::ENOENT);
+                }
                 Err(e) if e.is_transient() => match RETRY_BACKOFF.get(attempt) {
                     Some(&delay) => {
                         attempt += 1;
@@ -665,12 +716,16 @@ mod tests {
         assert!(contains, "cache index should record the path");
     }
 
-    /// MockStore has no seeded paths → GetPath returns NotFound → ENOENT.
+    /// MockStore has no seeded paths → GetPath returns NotFound on both
+    /// the initial probe AND the I-043 re-probe → ENOENT. The elapsed-time
+    /// check proves the re-probe actually fired (rather than the flag being
+    /// dead code).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_not_found_returns_enoent() {
         let (cache, client, _store, _dir, rt, _srv) = setup_fetch_harness().await;
 
         let basename = test_store_basename("missing");
+        let start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             prefetch_path_blocking(&cache, &client, &rt, TEST_FETCH_TIMEOUT, &basename)
         })
@@ -684,6 +739,52 @@ mod tests {
             Errno::ENOENT.code(),
             "expected ENOENT, got: {err:?}"
         );
+        // Lower-bound: NOTFOUND_RETRY_DELAY (50ms cfg(test)) was observed
+        // between the two NotFound responses.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= NOTFOUND_RETRY_DELAY,
+            "expected ≥{NOTFOUND_RETRY_DELAY:?} (proves re-probe fired), got {elapsed:?}"
+        );
+    }
+
+    /// I-043: store says NotFound on first probe, path appears mid-retry
+    /// (another worker's upload commit becomes visible), second probe
+    /// succeeds. Live: zlib failed `build input ... does not exist` for
+    /// a path PG showed `manifests.status='complete'` seconds before.
+    /// The test seeds MockStore mid-retry-sleep — simulates the upload
+    /// commit landing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_notfound_then_seeded_recovers() {
+        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        let basename = test_store_basename("racewin");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"appeared");
+
+        // NOT seeded yet — first GetPath sees NotFound.
+        let cache_cl = Arc::clone(&cache);
+        let client_cl = client.clone();
+        let basename_cl = basename.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache_cl, &client_cl, &rt, TEST_FETCH_TIMEOUT, &basename_cl)
+        });
+
+        // Sleep into the NOTFOUND_RETRY_DELAY window (50ms cfg(test)),
+        // then seed. The re-probe sees the path. Halfway gives the first
+        // NotFound time to land while staying inside the delay window.
+        tokio::time::sleep(NOTFOUND_RETRY_DELAY / 2).await;
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+
+        let result = task.await.expect("spawn_blocking join");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) (recovered + fetched), got: {result:?}"
+        );
+
+        let local = dir.path().join(&basename);
+        let content = std::fs::read(&local).expect("read extracted file");
+        assert_eq!(content, b"appeared");
     }
 
     /// MockStore.fail_get_path = true → GetPath returns Unavailable →
