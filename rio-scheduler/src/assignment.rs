@@ -204,6 +204,18 @@ pub fn rejection_reason(
         // ready to dispatch to".
         return Some("not-registered");
     }
+    // I-095: stream_tx is Some but the receiver was dropped (gRPC
+    // stream gone). ExecutorDisconnected is queued in the mailbox
+    // but dispatch_ready may run first — without this gate, every
+    // ready drv in the pass picks this executor, try_send fails
+    // "channel closed", drv resets to Ready, next drv picks it
+    // again. Observed: 100+ WARN/tick, actor saturated, RPCs time
+    // out. Distinct from not-registered so the gauge accounting in
+    // handle_executor_disconnected (which keys on is_registered())
+    // stays correct.
+    if w.stream_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
+        return Some("stream-closed");
+    }
     if w.running_build.is_some() {
         return Some("at-capacity");
     }
@@ -428,8 +440,26 @@ mod tests {
         // Tests default to warm — warm-gate coverage lives in the
         // dedicated tests below that flip `warm=false` explicitly.
         w.warm = true;
-        // has_capacity needs stream_tx. Fake it.
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // has_capacity needs an OPEN stream_tx (I-095: is_closed()
+        // is now part of the gate). forget(rx) keeps the channel
+        // open for the test's lifetime — a few dozen tiny receivers
+        // leaked per test process; nextest runs each test in its own
+        // process so they don't accumulate.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        std::mem::forget(rx);
+        w.stream_tx = Some(tx);
+        w
+    }
+
+    /// Like `make_worker` but with a CLOSED stream_tx — the receiver
+    /// is dropped, so `tx.is_closed()` is true. Models the window
+    /// between gRPC stream drop and ExecutorDisconnected processing.
+    fn make_worker_closed_stream(id: &str) -> ExecutorState {
+        let mut w = ExecutorState::new(id.into());
+        w.systems = vec!["x86_64-linux".into()];
+        w.warm = true;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
         w.stream_tx = Some(tx);
         w
     }
@@ -551,6 +581,15 @@ mod tests {
             rejection_reason(&no_stream, &drv, None),
             Some("not-registered")
         );
+
+        // stream-closed (I-095): stream_tx Some but receiver dropped.
+        // Distinct from not-registered — is_registered() stays true
+        // (gauge accounting), but dispatch must skip.
+        let closed = make_worker_closed_stream("w");
+        assert!(closed.is_registered(), "is_registered ignores is_closed()");
+        assert!(!closed.has_capacity(), "has_capacity gates on is_closed()");
+        assert_eq!(rejection_reason(&closed, &drv, None), Some("stream-closed"));
+        assert!(!hard_filter(&closed, &drv, None));
 
         // at-capacity
         let busy = make_worker("w", 1, 1);
@@ -1188,6 +1227,34 @@ mod tests {
         // 10s must go to small (SMALLEST covering class), not large
         // (first in config). If we didn't sort, this would pick large.
         assert_eq!(classify(10.0, None, None, &c).as_deref(), Some("small"));
+    }
+
+    /// I-095 regression: a closed-channel executor must NOT be picked.
+    /// Before the fix, dispatch_ready would pick it for every ready
+    /// drv in the pass (try_send fails → reset_to_ready → next drv
+    /// picks it again), saturating the actor. With the fix, hard_filter
+    /// rejects it so best_executor returns the live one (or None).
+    #[test]
+    fn best_executor_skips_closed_stream() {
+        let drv = make_drv();
+        let dag = DerivationDag::new();
+
+        // Only candidate has a closed channel → no executor.
+        let dead = make_worker_closed_stream("dead");
+        let map = workers_map(vec![dead]);
+        assert_eq!(best_executor(&map, &drv, &dag, None), None);
+
+        // Closed + live → live is picked. Loop to guard against
+        // accidental ordering-dependence (HashMap iteration).
+        for _ in 0..10 {
+            let dead = make_worker_closed_stream("dead");
+            let live = make_worker("live", 1, 0);
+            let map = workers_map(vec![dead, live]);
+            assert_eq!(
+                best_executor(&map, &drv, &dag, None).as_deref(),
+                Some("live")
+            );
+        }
     }
 
     #[test]

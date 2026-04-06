@@ -203,6 +203,10 @@ impl ExecutorState {
         !self.is_draining()
             && !self.store_degraded
             && self.is_registered()
+            // I-095: is_registered() only checks is_some(), not
+            // is_closed() (gauge accounting needs the distinction).
+            // Kept in sync with rejection_reason()'s stream-closed.
+            && !self.stream_tx.as_ref().is_some_and(|tx| tx.is_closed())
             && self.running_build.is_none()
     }
 
@@ -330,8 +334,12 @@ mod tests {
         let mut w = ExecutorState::new("test".into());
         w.systems = systems.into_iter().map(Into::into).collect();
         w.supported_features = features.into_iter().map(Into::into).collect();
-        // is_registered() checks stream_tx.is_some() — fake it.
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // is_registered() checks stream_tx.is_some(); has_capacity()
+        // additionally checks !is_closed() (I-095). forget(rx) keeps
+        // the channel open — see assignment.rs make_worker for the
+        // same pattern + rationale.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        std::mem::forget(rx);
         w.stream_tx = Some(tx);
         w
     }
