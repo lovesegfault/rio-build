@@ -49,6 +49,8 @@ spec:
               value: "6"  # readinessProbe.periodSeconds (5) + 1
             - name: RIO_CHUNK_UPLOAD_MAX_CONCURRENT
               value: {{ $s.chunkUploadMaxConcurrent | quote }}
+            - name: RIO_S3_MAX_ATTEMPTS
+              value: {{ $s.s3MaxAttempts | quote }}
             - name: RIO_DATABASE_URL
               valueFrom:
                 secretKeyRef:

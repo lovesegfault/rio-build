@@ -571,3 +571,208 @@ async fn test_missing_non_substitutable_stays_missing() -> TestResult {
 
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown]
+/// Top-down short-circuit: when the root is substitutable, deps are
+/// pruned from the merge — only the root's NAR is fetched, build
+/// completes immediately.
+///
+/// Scenario mirrors `rsb -L p#hello`: root=hello, deps=glibc,gcc,
+/// stdenv. hello's output is in cache.nixos.org. Before this fix:
+/// scheduler would FindMissingPaths for all 4, eager-fetch all 4
+/// NARs. After: FindMissingPaths for just the root, eager-fetch
+/// just the root NAR, prune deps from the DAG.
+#[tokio::test]
+async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    // Seed: root output substitutable. Dep outputs NOT seeded (not
+    // needed — top-down should never check them).
+    let root_out = test_store_path("hello-2.12.3");
+    store.substitutable.write().unwrap().push(root_out.clone());
+
+    // DAG: hello (root) → glibc, gcc, stdenv (deps).
+    let mut root = make_test_node("hello", "x86_64-linux");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut glibc = make_test_node("glibc", "x86_64-linux");
+    glibc.expected_output_paths = vec![test_store_path("glibc-out")];
+    let mut gcc = make_test_node("gcc", "x86_64-linux");
+    gcc.expected_output_paths = vec![test_store_path("gcc-out")];
+    let mut stdenv = make_test_node("stdenv", "x86_64-linux");
+    stdenv.expected_output_paths = vec![test_store_path("stdenv-out")];
+
+    let nodes = vec![root, glibc, gcc, stdenv];
+    let edges = vec![
+        make_test_edge("hello", "glibc"),
+        make_test_edge("hello", "gcc"),
+        make_test_edge("hello", "stdenv"),
+    ];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    // Build Succeeded: root cached via top-down, deps pruned.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "root substitutable → build completes immediately; got state={}",
+        status.state
+    );
+
+    // ONLY the root fetched. Deps never queried.
+    let qpi = store.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&root_out),
+        "root NAR should be eager-fetched; qpi_calls={qpi:?}"
+    );
+    for dep in ["glibc-out", "gcc-out", "stdenv-out"] {
+        let dep_path = test_store_path(dep);
+        assert!(
+            !qpi.contains(&dep_path),
+            "dep {dep} should NOT be fetched when root is cached; qpi_calls={qpi:?}"
+        );
+    }
+
+    // Total derivations reported = 1 (root only), not 4.
+    assert_eq!(
+        status.total_derivations, 1,
+        "pruned DAG should report root count, not original submission size"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown]
+/// Top-down negative: root NOT substitutable → fall through to
+/// full bottom-up check. All nodes merged, deps processed normally.
+#[tokio::test]
+async fn test_topdown_root_missing_falls_through() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    // Seed: dep output substitutable, root NOT. Top-down sees root
+    // missing → falls through → bottom-up finds glibc substitutable.
+    let glibc_out = test_store_path("glibc-fallthru");
+    store.substitutable.write().unwrap().push(glibc_out.clone());
+
+    let mut root = make_test_node("app", "x86_64-linux");
+    root.expected_output_paths = vec![test_store_path("app-out")];
+    let mut glibc = make_test_node("glibc-ft", "x86_64-linux");
+    glibc.expected_output_paths = vec![glibc_out.clone()];
+
+    let nodes = vec![root, glibc];
+    let edges = vec![make_test_edge("app", "glibc-ft")];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    // Build Active (not Succeeded): root not cached, must build.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "root not substitutable → fall through to full merge"
+    );
+
+    // Full DAG merged — 2 derivations, not pruned to 1.
+    assert_eq!(
+        status.total_derivations, 2,
+        "fall-through should merge the full DAG"
+    );
+
+    // Bottom-up still fires: glibc fetched via check_cached_outputs.
+    let qpi = store.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&glibc_out),
+        "bottom-up should fetch substitutable dep on fall-through; qpi_calls={qpi:?}"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown]
+/// Top-down: deps pruned from this build are NOT in the global DAG,
+/// so a later build that needs them triggers its own cache-check.
+///
+/// Guards against the shared-DAG correctness bug where marking
+/// deps as Completed without fetching would poison later builds
+/// that actually need the dep NAR.
+#[tokio::test]
+async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let hello_out = test_store_path("hello-shared");
+    let glibc_out = test_store_path("glibc-shared");
+    store.substitutable.write().unwrap().push(hello_out.clone());
+    store.substitutable.write().unwrap().push(glibc_out.clone());
+
+    // Build A: hello → glibc. hello substitutable → glibc pruned.
+    let mut hello = make_test_node("hello-a", "x86_64-linux");
+    hello.expected_output_paths = vec![hello_out.clone()];
+    let mut glibc_a = make_test_node("glibc-a", "x86_64-linux");
+    glibc_a.expected_output_paths = vec![glibc_out.clone()];
+
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![hello, glibc_a],
+        vec![make_test_edge("hello-a", "glibc-a")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let status_a = query_status(&handle, build_a).await?;
+    assert_eq!(
+        status_a.state,
+        rio_proto::types::BuildState::Succeeded as i32
+    );
+
+    // Clear QPI tracking between builds.
+    store.qpi_calls.write().unwrap().clear();
+
+    // Build B: app → glibc. app NOT substitutable → falls through
+    // → full merge → glibc is newly_inserted (NOT pre-existing from
+    // A, because A pruned it) → check_cached_outputs fetches glibc.
+    let mut app = make_test_node("app-b", "x86_64-linux");
+    app.expected_output_paths = vec![test_store_path("app-b-out")];
+    let mut glibc_b = make_test_node("glibc-a", "x86_64-linux");
+    glibc_b.expected_output_paths = vec![glibc_out.clone()];
+
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![app, glibc_b],
+        vec![make_test_edge("app-b", "glibc-a")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // glibc fetched by Build B's bottom-up — proves it wasn't
+    // stuck as phantom-Completed from Build A's prune.
+    let qpi = store.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&glibc_out),
+        "Build B should fetch glibc (pruned from A, newly-inserted in B); \
+         qpi_calls={qpi:?}"
+    );
+
+    Ok(())
+}

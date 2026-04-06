@@ -31,6 +31,40 @@ impl DagActor {
         // (complete_build/transition_build_to_failed/handle_cancel_build)
         // with an outcome label, so SLI queries can compute success rate.
 
+        // === Step 0: Top-down root substitution check ===============
+        // r[impl sched.merge.substitute-topdown]
+        // Before merging the full DAG, check if the ROOT derivations'
+        // outputs are already available. If ALL roots are cached, the
+        // deps are transitively unnecessary — prune the submission to
+        // roots-only before merge.
+        //
+        // This short-circuits the common case `rsb -L p#hello` where
+        // hello is in cache.nixos.org: instead of eager-fetching ~700
+        // dependency NARs (stdenv bootstrap chain), fetch just hello
+        // and complete. Deps never enter the global DAG, so a later
+        // build that needs them triggers its own cache-check.
+        //
+        // Falls through to the full DAG on any uncertainty (store
+        // unreachable, partial root cache, CA roots, fetch failure).
+        // The existing check_cached_outputs at step 4 handles those
+        // correctly — this is a fast-path, not a replacement.
+        let (nodes, edges) = match self
+            .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
+            .await
+        {
+            Some(roots_only) => {
+                debug!(
+                    original_nodes = nodes.len(),
+                    root_nodes = roots_only.len(),
+                    pruned = nodes.len() - roots_only.len(),
+                    "top-down: all roots substitutable; pruning deps from submission"
+                );
+                metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
+                (roots_only, Vec::new())
+            }
+            None => (nodes, edges),
+        };
+
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
         self.db
@@ -830,5 +864,224 @@ impl DagActor {
         }
 
         Ok(hits)
+    }
+
+    // r[impl sched.merge.substitute-topdown]
+    /// Top-down root substitution pre-check (step 0 of `handle_merge_dag`).
+    ///
+    /// Returns `Some(roots)` if ALL root derivations' IA outputs are
+    /// available (present in store or upstream-substitutable AND
+    /// successfully eager-fetched). The caller prunes the submission
+    /// to roots-only, dropping the dep subgraph before merge.
+    ///
+    /// Returns `None` to fall through to the full bottom-up
+    /// `check_cached_outputs`. Reasons: no store client, any root
+    /// is floating-CA (no expected path), any root output missing
+    /// and not substitutable, any eager-fetch fails, store error.
+    ///
+    /// Roots are nodes with no parent edge IN THIS SUBMISSION.
+    /// Local computation — doesn't consult the global DAG (parents
+    /// from other builds are irrelevant to what THIS build needs).
+    ///
+    /// # Circuit breaker interaction
+    ///
+    /// Success closes the breaker; error records a failure (but
+    /// returns `None`, not `Err` — step 4's check will reject if
+    /// the breaker tripped). This probe is advisory; the
+    /// authoritative gate is at step 4.
+    async fn check_roots_topdown(
+        &mut self,
+        nodes: &[rio_proto::dag::DerivationNode],
+        edges: &[rio_proto::dag::DerivationEdge],
+        jwt_token: Option<&str>,
+    ) -> Option<Vec<rio_proto::dag::DerivationNode>> {
+        let store_client = self.store_client.as_ref()?;
+
+        // Skip if there's nothing to prune. Single-node and roots-only
+        // submissions get no benefit from the pre-check (step 4 handles
+        // them with the same RPC count). The threshold also avoids a
+        // redundant FindMissingPaths round-trip on tiny DAGs where
+        // step 4's single batch call is already optimal.
+        if edges.is_empty() || nodes.len() <= 1 {
+            return None;
+        }
+
+        // --- Compute roots from submission edges -------------------
+        // A root is a node that appears as no edge's child. Edges key
+        // by drv_path (proto-level), so collect child paths and filter.
+        let children: HashSet<&str> = edges.iter().map(|e| e.child_drv_path.as_str()).collect();
+        let roots: Vec<&rio_proto::dag::DerivationNode> = nodes
+            .iter()
+            .filter(|n| !children.contains(n.drv_path.as_str()))
+            .collect();
+
+        if roots.is_empty() || roots.len() == nodes.len() {
+            // No roots (malformed — cycle?) or all roots (no deps to
+            // prune). Either way, nothing to short-circuit.
+            return None;
+        }
+
+        // --- Bail on floating-CA roots ------------------------------
+        // CA roots have no expected_output_paths (path isn't known
+        // until build time). The realisations-table lookup in
+        // check_cached_outputs handles them; we can't pre-check here.
+        // Conservative: ANY CA root → fall through entirely.
+        if roots.iter().any(|n| n.ca_modular_hash.len() == 32) {
+            return None;
+        }
+
+        // --- Collect root output paths ------------------------------
+        let root_paths: Vec<String> = roots
+            .iter()
+            .flat_map(|n| n.expected_output_paths.iter())
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect();
+
+        if root_paths.is_empty() {
+            // Roots have no expected outputs — nothing to check.
+            return None;
+        }
+
+        // --- FindMissingPaths for roots only ------------------------
+        let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths: root_paths.clone(),
+        });
+        rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
+        // JWT propagation — same as r[sched.merge.substitute-probe].
+        if let Some(t) = jwt_token
+            && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
+        {
+            fmp_req
+                .metadata_mut()
+                .insert(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, v);
+        }
+        let grpc_timeout = self.grpc_timeout;
+        let resp = match tokio::time::timeout(
+            grpc_timeout,
+            store_client.clone().find_missing_paths(fmp_req),
+        )
+        .await
+        {
+            Ok(Ok(r)) => {
+                self.cache_breaker.record_success();
+                r.into_inner()
+            }
+            Ok(Err(e)) => {
+                debug!(error = %e, "top-down FindMissingPaths failed; falling through");
+                self.cache_breaker.record_failure();
+                return None;
+            }
+            Err(_) => {
+                debug!(timeout = ?grpc_timeout, "top-down FindMissingPaths timed out; falling through");
+                self.cache_breaker.record_failure();
+                return None;
+            }
+        };
+
+        debug!(
+            roots = root_paths.len(),
+            missing = resp.missing_paths.len(),
+            substitutable = resp.substitutable_paths.len(),
+            "top-down: FindMissingPaths response"
+        );
+
+        // --- All-or-nothing: every root output available? -----------
+        // "Available" = present in store (NOT in missing_paths) OR
+        // substitutable upstream. A single unavailable root → fall
+        // through to the full merge.
+        let substitutable: HashSet<&str> = resp
+            .substitutable_paths
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let truly_missing: HashSet<&str> = resp
+            .missing_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !substitutable.contains(p))
+            .collect();
+        if root_paths
+            .iter()
+            .any(|p| truly_missing.contains(p.as_str()))
+        {
+            debug!(
+                missing = truly_missing.len(),
+                "top-down: root output(s) unavailable; falling through to full merge"
+            );
+            return None;
+        }
+
+        // --- Eager-fetch substitutable root NARs --------------------
+        // Same pattern as r[sched.merge.substitute-fetch]: QPI with
+        // JWT triggers the store's NAR fetch. Bounded concurrency;
+        // root count is small (usually 1) so this is fast.
+        //
+        // Reborrow store_client: the breaker calls above took &mut
+        // self, invalidating the earlier shared borrow.
+        let store_client = self.store_client.as_ref()?;
+        if !resp.substitutable_paths.is_empty() {
+            use futures_util::stream::{self, StreamExt};
+            let jwt_pair;
+            let jwt_meta: &[(&'static str, &str)] = match jwt_token {
+                Some(t) => {
+                    jwt_pair = [(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, t)];
+                    &jwt_pair
+                }
+                None => &[],
+            };
+            let mut fetches = stream::iter(resp.substitutable_paths)
+                .map(|p| {
+                    let mut c = store_client.clone();
+                    async move {
+                        let res = rio_proto::client::query_path_info_opt(
+                            &mut c,
+                            &p,
+                            grpc_timeout,
+                            jwt_meta,
+                        )
+                        .await;
+                        (p, res)
+                    }
+                })
+                .buffer_unordered(self.substitute_max_concurrent);
+            while let Some((p, res)) = fetches.next().await {
+                // Fetch failure aborts the short-circuit. The full
+                // merge + check_cached_outputs will retry and demote
+                // to cache-miss if it fails again. Split Ok(None) vs
+                // Err so the log shows WHICH failure mode fired — a
+                // sub-20ms NotFound suggests the store's upstream
+                // probe never actually fetched (JWT/metadata issue),
+                // vs a transport error which is a different bug.
+                match res {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        debug!(
+                            path = %p,
+                            "top-down: root NotFound on QPI; falling through"
+                        );
+                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                            .increment(1);
+                        return None;
+                    }
+                    Err(e) => {
+                        debug!(
+                            path = %p,
+                            error = %e,
+                            "top-down: root QPI error; falling through"
+                        );
+                        metrics::counter!("rio_scheduler_substitute_fetch_failures_total")
+                            .increment(1);
+                        return None;
+                    }
+                }
+            }
+            metrics::counter!("rio_scheduler_cache_hits_total", "source" => "substitute")
+                .increment(root_paths.len() as u64);
+        }
+
+        // All roots available and fetched. Return owned root nodes
+        // for the pruned merge.
+        Some(roots.into_iter().cloned().collect())
     }
 }

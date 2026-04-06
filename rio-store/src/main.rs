@@ -125,6 +125,13 @@ struct Config {
     /// `DispatchFailure` in store logs during large-NAR ingest.
     /// Set via `RIO_CHUNK_UPLOAD_MAX_CONCURRENT`.
     chunk_upload_max_concurrent: usize,
+    /// Max aws-sdk retry attempts per S3 operation (PutObject,
+    /// GetObject, HeadObject). Default 10 — raised from the aws-sdk
+    /// default of 3 because S3-compatible backends (rustfs, MinIO)
+    /// recycle connections more aggressively than AWS S3, surfacing
+    /// as transient `DispatchFailure` that the sdk's standard retry
+    /// policy handles but exhausts at 3. Set via `RIO_S3_MAX_ATTEMPTS`.
+    s3_max_attempts: u32,
 }
 
 impl Default for Config {
@@ -151,9 +158,15 @@ impl Default for Config {
             cache_allow_unauthenticated: false,
             drain_grace_secs: 6,
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+            s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
         }
     }
 }
+
+/// Default aws-sdk retry ceiling. aws-sdk's out-of-box default is 3;
+/// 10 gives headroom for S3-compatible backends that close idle
+/// connections aggressively (each reconnect is one attempt).
+const DEFAULT_S3_MAX_ATTEMPTS: u32 = 10;
 
 #[derive(Parser, Serialize, Default)]
 #[command(
@@ -256,8 +269,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let chunk_cache =
-        init_chunk_backend(&cfg.chunk_backend, cfg.chunk_cache_capacity_bytes).await?;
+    let chunk_cache = init_chunk_backend(
+        &cfg.chunk_backend,
+        cfg.chunk_cache_capacity_bytes,
+        cfg.s3_max_attempts,
+    )
+    .await?;
 
     // Load the narinfo signing key. `None` path → `None` signer (not
     // an error — signing is optional). Bad path / bad format → `?`
@@ -510,6 +527,7 @@ async fn init_db_pool(database_url: &str) -> anyhow::Result<sqlx::PgPool> {
 async fn init_chunk_backend(
     kind: &ChunkBackendKind,
     cache_capacity_bytes: u64,
+    s3_max_attempts: u32,
 ) -> anyhow::Result<Option<Arc<ChunkCache>>> {
     Ok(match kind {
         ChunkBackendKind::Inline => {
@@ -529,7 +547,7 @@ async fn init_chunk_backend(
             )))
         }
         ChunkBackendKind::S3 { bucket, prefix } => {
-            info!(%bucket, %prefix, "chunk backend: S3");
+            info!(%bucket, %prefix, s3_max_attempts, "chunk backend: S3");
             // Credentials from the aws-sdk default chain (env vars,
             // IMDS, etc). NOT in our config — we don't want secrets
             // in TOML. If credentials are missing, the first PutPath
@@ -538,7 +556,38 @@ async fn init_chunk_backend(
             // credentials might not be available YET if IMDS is
             // slow — better to start serving and fail the first
             // chunk op than to race IMDS).
-            let aws_cfg = aws_config::load_from_env().await;
+            //
+            // r[impl store.cas.s3-retry]
+            // Two departures from aws-sdk defaults:
+            //
+            // 1. `max_attempts` raised from 3 → `s3_max_attempts`
+            //    (default 10). S3-compatible backends (rustfs, MinIO)
+            //    recycle idle connections more aggressively than AWS
+            //    S3; a pooled connection that was closed server-side
+            //    surfaces as `DispatchFailure` on the next request.
+            //    The sdk's standard retry DOES classify this as
+            //    transient and retries, but at 3 attempts a burst of
+            //    connection churn (e.g. rustfs restart, or its idle
+            //    timeout firing mid-ingest) can exhaust retries
+            //    before the pool reconnects. Observed on kind: 134
+            //    dispatch failures at only 8 concurrent puts.
+            //
+            // 2. Stalled-stream protection OFF. The sdk's default
+            //    grace period can trip on small chunks (≤256 KiB)
+            //    against local S3-compatible servers where the
+            //    upload completes faster than the throughput monitor
+            //    can establish a baseline. A false-positive stall
+            //    aborts the request → `DispatchFailure`. We have no
+            //    untrusted-server streaming here (all chunks are
+            //    tiny, pre-buffered), so the protection is pure
+            //    downside.
+            use aws_config::retry::RetryConfig;
+            use aws_config::stalled_stream_protection::StalledStreamProtectionConfig;
+            let aws_cfg = aws_config::from_env()
+                .retry_config(RetryConfig::standard().with_max_attempts(s3_max_attempts))
+                .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+                .load()
+                .await;
             let client = aws_sdk_s3::Client::new(&aws_cfg);
             let backend: Arc<dyn ChunkBackend> =
                 Arc::new(S3ChunkBackend::new(client, bucket.clone(), prefix.clone()));
@@ -620,6 +669,17 @@ mod tests {
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
         assert!(d.jwt.key_path.is_none());
         assert!(!d.jwt.required);
+    }
+
+    // r[verify store.cas.s3-retry]
+    /// The spec pins `RIO_S3_MAX_ATTEMPTS` default at 10. aws-sdk's
+    /// out-of-box is 3 — insufficient for S3-compatible backends that
+    /// recycle idle connections aggressively. If someone changes
+    /// DEFAULT_S3_MAX_ATTEMPTS without reading the spec, this fails.
+    #[test]
+    fn s3_retry_default_matches_spec() {
+        assert_eq!(DEFAULT_S3_MAX_ATTEMPTS, 10);
+        assert_eq!(Config::default().s3_max_attempts, 10);
     }
 
     /// TOML parsing for the tagged enum via figment (what main.rs
@@ -805,6 +865,7 @@ mod tests {
         hmac_bypass_cns = ["rio-gateway", "rio-admin"]
         chunk_cache_capacity_bytes = 123456
         chunk_upload_max_concurrent = 64
+        s3_max_attempts = 5
 
         [chunk_backend]
         kind = "filesystem"
@@ -820,6 +881,7 @@ mod tests {
             assert_eq!(cfg.nar_buffer_budget_bytes, Some(99999));
             assert_eq!(cfg.chunk_cache_capacity_bytes, 123456);
             assert_eq!(cfg.chunk_upload_max_concurrent, 64);
+            assert_eq!(cfg.s3_max_attempts, 5);
             assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway", "rio-admin"]);
             assert!(
                 matches!(cfg.chunk_backend, ChunkBackendKind::Filesystem { .. }),
@@ -854,6 +916,7 @@ mod tests {
             cfg.chunk_upload_max_concurrent,
             rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
         );
+        assert_eq!(cfg.s3_max_attempts, DEFAULT_S3_MAX_ATTEMPTS);
     });
 
     // -----------------------------------------------------------------------

@@ -295,8 +295,9 @@ Figment env-vars (`RIO_<FIELD>`) that bound fan-out at known saturation points. 
 |---------|-----------|---------|-------------|
 | `RIO_SUBSTITUTE_MAX_CONCURRENT` | scheduler | 16 | Max concurrent `QueryPathInfo` eager-fetch calls at DAG-merge time. Bounds scheduler→store fan-out. |
 | `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` | store | 32 | Max concurrent S3 `PutObject` calls per `put_chunked`. Bounds store→S3 fan-out within a single large-NAR ingest. |
+| `RIO_S3_MAX_ATTEMPTS` | store | 10 | aws-sdk retry ceiling per S3 operation. Raised from the sdk default (3) to absorb connection churn from S3-compatible backends that recycle idle connections aggressively. |
 
-The product (16 × 32 = 512) is the peak in-flight S3 puts under a full substitution burst — kept under the aws-sdk's ~1024 default connection pool with headroom for other store traffic. Raise `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` if the store runs with a larger aws-sdk pool; lower it if `DispatchFailure` appears in store logs during large-NAR ingest.
+The product (16 × 32 = 512) is the peak in-flight S3 puts under a full substitution burst — kept under the aws-sdk's ~1024 default connection pool with headroom for other store traffic. If `DispatchFailure` appears in store logs during large-NAR ingest, raise `RIO_S3_MAX_ATTEMPTS` first (cheap, retries absorb transient connection churn); lower `RIO_CHUNK_UPLOAD_MAX_CONCURRENT` only if retries don't clear it (reduces throughput).
 
 ### Trace Propagation
 

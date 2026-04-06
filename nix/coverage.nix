@@ -57,7 +57,7 @@ let
     "store"
     "scheduler"
     "gateway"
-    "worker"
+    "builder"
     "controller"
     "cli"
   ];

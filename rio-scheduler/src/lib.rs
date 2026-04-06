@@ -92,6 +92,10 @@ pub fn describe_metrics() {
         "Substitutable-path eager fetches (QueryPathInfo) that failed; path demoted to cache-miss"
     );
     describe_counter!(
+        "rio_scheduler_topdown_prune_total",
+        "Submissions pruned to roots-only by the top-down substitution pre-check"
+    );
+    describe_counter!(
         "rio_scheduler_queue_backpressure",
         "Backpressure activations (queue reached 80% capacity)"
     );
