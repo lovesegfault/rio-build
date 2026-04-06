@@ -650,7 +650,18 @@
                   rm -rf .tracey/
                   export HOME=$TMPDIR
                   set -o pipefail
-                  tracey query validate 2>&1 | tee $out
+                  # Retry once: `tracey query validate` auto-starts a daemon
+                  # and waits 5s for the socket. Under sandbox parallel-build
+                  # load the socket-wait races ("Daemon failed to start within
+                  # 5s" / "Error getting status: Cancelled"). tracey 1.3.0 has
+                  # no --no-daemon mode and no TRACEY_DAEMON_TIMEOUT knob, so
+                  # retry-once is the minimal fix. P0490.
+                  tracey query validate 2>&1 | tee $out || {
+                    echo "retry: first tracey attempt failed, retrying once" >&2
+                    rm -rf .tracey/  # clear partial daemon state
+                    sleep 2
+                    tracey query validate 2>&1 | tee $out
+                  }
                 '';
 
             # Helm chart lint + template for all value profiles. Catches
