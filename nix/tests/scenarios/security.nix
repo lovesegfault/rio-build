@@ -12,6 +12,14 @@
 # tenant B → 200 on own. The 200 control guards against JOIN-matches-
 # nothing (the 404 alone proves nothing if the filter always misses).
 #
+# r[verify gw.reject.nochroot]
+# gateway-validate subtest: nix-build a .drv with __noChroot=true via
+# ssh-ng://. Gateway rejects with "sandbox escape" pre-SubmitBuild;
+# builds row count unchanged proves scheduler never saw it. Exercises
+# the validate_dag path (translate.rs:301) — client uploads the .drv to
+# the store via wopAddToStoreNar, then wopBuildPathsWithResults triggers
+# BFS → drv_cache populated → validate_dag fires on the env entry.
+#
 # Caller (default.nix) constructs the fixture with:
 #   fixture = standalone {
 #     workers = { worker = { maxBuilds = 1; }; };
@@ -427,6 +435,12 @@ pkgs.testers.runNixOSTest {
         # BEFORE SubmitBuild. The scheduler never sees it, so no TLS
         # on the scheduler path is exercised here — but that's fine,
         # this section is about gateway-side validation not scheduling.
+        #
+        # Capture builds count BEFORE the attempt. validate_dag is
+        # gateway-only (DerivationNode doesn't carry env — the scheduler
+        # couldn't check __noChroot even if it wanted to). If the count
+        # bumps, the gateway let it through.
+        count_before = build_count()
         result = client.fail(
             "nix-build --no-out-link "
             f"--store '{store_url}' "
@@ -436,7 +450,15 @@ pkgs.testers.runNixOSTest {
         assert ("sandbox escape" in result or "noChroot" in result), (
             f"expected __noChroot rejection, got: {result[:500]}"
         )
-        print("gateway-validate PASS: __noChroot rejected at gateway")
+        # Pre-SubmitBuild rejection: builds table untouched. This is the
+        # load-bearing half — client.fail() + error-message check alone
+        # can't distinguish "rejected at gateway" from "scheduler rejected
+        # it too" (if the check ever moved post-SubmitBuild).
+        assert build_count() == count_before, (
+            f"__noChroot rejection must be pre-SubmitBuild; "
+            f"builds count changed {count_before} → {build_count()}"
+        )
+        print("gateway-validate PASS: __noChroot rejected at gateway, scheduler unreached")
 
     # ══════════════════════════════════════════════════════════════════
     # Section: cache-auth (binary-cache HTTP Bearer token)
