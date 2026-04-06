@@ -203,6 +203,16 @@ let
     root = ../docs;
     fileset = ../docs/src/observability.md;
   };
+
+  # rio-test-support/build.rs runs protoc on ../rio-proto/proto/admin.proto
+  # to emit a FileDescriptorSet for MockAdmin codegen. Same cross-directory
+  # problem as migrations: buildRustCrate src is just rio-test-support/.
+  # Include all .proto files — admin.proto imports types/dag/admin_types,
+  # which transitively import build_types. protoc needs the full graph.
+  protoFileset = pkgs.lib.fileset.toSource {
+    root = ../rio-proto;
+    fileset = pkgs.lib.fileset.fileFilter (f: f.hasExt "proto") ../rio-proto/proto;
+  };
   # Reconstruct the sibling-dir structure that cross-crate compile-time
   # reads expect. Called from all three override shapes (withMigrations,
   # withMetricsGrep, withHelmFiles) — the golden/ symlink is only USED
@@ -345,6 +355,18 @@ let
     rio-proto = _: {
       nativeBuildInputs = [ pkgs.protobuf ];
       PROTOC = "${pkgs.protobuf}/bin/protoc";
+    };
+
+    # rio-test-support: build.rs runs protoc --descriptor_set_out on
+    # ../rio-proto/proto/admin.proto (MockAdmin codegen). Needs PROTOC
+    # same as rio-proto, plus the proto files symlinked into place.
+    rio-test-support = _: {
+      nativeBuildInputs = [ pkgs.protobuf ];
+      PROTOC = "${pkgs.protobuf}/bin/protoc";
+      postUnpack = ''
+        mkdir -p $NIX_BUILD_TOP/rio-proto
+        ln -sf ${protoFileset}/proto $NIX_BUILD_TOP/rio-proto/proto
+      '';
     };
 
     # sqlx::migrate!("../migrations") compile-time file read. See

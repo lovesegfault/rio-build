@@ -92,11 +92,11 @@ impl CliCtx {
 }
 
 /// Minimal self-contained derivation (busybox FOD + raw derivation).
-/// `@TAG@`, `@SECS@`, and `@KB@` are replaced at use time.
+/// `@TAG@`, `@SECS@`, and `@KB_ITER@` are replaced at use time.
 ///
-/// `@KB@` controls output size — `@KB@` KiB of zeros via busybox `dd`
-/// (`$builder` is the busybox binary itself, invoked as a multi-call).
-/// `@KB@` ≥ 256 makes the resulting NAR exceed `cas::INLINE_THRESHOLD`
+/// `out_kb` controls output size — `@KB@` KiB of spaces via sh for+echo (word list + chunk from Rust)
+/// (stdenv bootstrap busybox lacks dd, $((arith)), AND printf — CONFIG_SH_MATH=n).
+/// `out_kb` ≥ 256 makes the resulting NAR exceed `cas::INLINE_THRESHOLD`
 /// (rio-store/src/cas.rs) and take the chunked-S3 path, exercising the
 /// store's IRSA credentials. The trivial-build step had a ~3-byte output
 /// and silently rode the inline-in-postgres path — an IRSA namespace
@@ -118,7 +118,7 @@ in builtins.derivation {
   name = "rio-smoke-@TAG@-${toString builtins.currentTime}";
   system = "x86_64-linux";
   builder = "${busybox}";
-  args = ["sh" "-c" "echo @TAG@; read -t @SECS@ x < /dev/zero || true; $builder dd if=/dev/zero of=$out bs=1024 count=@KB@"];
+  args = ["sh" "-c" "echo @TAG@; read -t @SECS@ x < /dev/zero || true; for _ in @KB_ITER@; do echo @CHUNK@; done > $out"];
 }"#;
 
 pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
@@ -605,7 +605,10 @@ pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> 
     let expr = SMOKE_EXPR
         .replace("@TAG@", tag)
         .replace("@SECS@", &secs.to_string())
-        .replace("@KB@", &out_kb.to_string());
+        .replace("@KB_ITER@", &"x ".repeat(out_kb as usize))
+        // 1023 chars + echo's newline = 1024 bytes/iter. No quoting
+        // needed (alphanumeric). This busybox lacks printf too.
+        .replace("@CHUNK@", &"x".repeat(1023));
     // IdentitiesOnly=yes: the user's deploy key (comment "default") is in
     // authorized_keys too. Without this, ssh-agent offers that key first →
     // gateway sees tenant "default" → scheduler rejects "unknown tenant".

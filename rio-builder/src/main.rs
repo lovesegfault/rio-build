@@ -830,20 +830,41 @@ async fn relay_loop(
             continue;
         }
 
-        // Pump until this gRPC target dies.
+        // Pump until this gRPC target dies OR the reconnect loop
+        // swaps the watch. `target.changed()` is the load-bearing
+        // exit: `grpc_tx.send()` may keep succeeding into a zombie
+        // channel (tonic's ReceiverStream can outlive the network
+        // stream during graceful close), so send() alone won't
+        // detect a stale target. Observed on EKS: completions
+        // silently lost after scheduler failover — relay pumped
+        // into the dead stream for ~20min until pod restart.
+        //
+        // biased; with changed() first: a pending target swap wins
+        // over a pending sink message. The message stays in sink_rx
+        // and goes to the NEW target on the next outer iteration.
         loop {
-            let Some(msg) = sink_rx.recv().await else {
-                // Permanent sink closed — all sink_tx clones
-                // dropped. BuildSpawnContext holds one for process
-                // lifetime, so this is shutdown (main returning).
-                return;
-            };
-            if let Err(e) = grpc_tx.send(msg).await {
-                // gRPC channel died (reconnect loop is about to
-                // or already did swap the target to None). Buffer
-                // this one message and go back to the top.
-                buffered = Some(e.0);
-                break;
+            tokio::select! {
+                biased;
+                r = target.changed() => {
+                    if r.is_err() {
+                        return; // watch sender dropped — shutdown
+                    }
+                    break; // reconnect loop swapped; re-read target
+                }
+                msg = sink_rx.recv() => {
+                    let Some(msg) = msg else {
+                        // Permanent sink closed — all sink_tx clones
+                        // dropped. BuildSpawnContext holds one for
+                        // process lifetime, so this is shutdown.
+                        return;
+                    };
+                    if let Err(e) = grpc_tx.send(msg).await {
+                        // gRPC channel died. Buffer this one message
+                        // and go back to the top to re-read target.
+                        buffered = Some(e.0);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1262,6 +1283,79 @@ mod tests {
         ));
 
         // Cleanup: drop sink → relay exits.
+        drop(sink_tx);
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Relay swaps to new target on `watch.changed()` even when the
+    /// OLD target's receiver is still alive. Regression for I-032:
+    /// tonic's ReceiverStream can outlive the network stream during
+    /// graceful close, so `grpc_tx.send()` keeps succeeding into a
+    /// zombie. Before the fix, relay only broke the pump loop on
+    /// SendError — completions pumped into the dead stream after
+    /// scheduler failover. Observed on EKS: 4 fetchers each did ONE
+    /// build then stalled forever (`running_builds` never freed).
+    ///
+    /// Key difference from `relay_survives_target_swap`: grpc1_rx
+    /// is NOT dropped before the swap. The relay must notice via
+    /// `target.changed()`, not via send-failure.
+    #[tokio::test]
+    async fn relay_swaps_on_watch_change_with_live_old_target() {
+        let (sink_tx, sink_rx) = mpsc::channel(8);
+        let (target_tx, target_rx) = watch::channel(None);
+        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+
+        let (grpc1_tx, mut grpc1_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(grpc1_tx));
+        sink_tx.send(msg("a")).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(1), grpc1_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            r.msg,
+            Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "a"
+        ));
+
+        // Swap to target #2. CRITICAL: grpc1_rx is still in scope
+        // and alive. Pre-fix: relay's pump loop doesn't watch the
+        // target — grpc1_tx.send() succeeds, message lands in
+        // grpc1_rx, grpc2 never sees it.
+        let (grpc2_tx, mut grpc2_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(grpc2_tx));
+
+        // Give relay a chance to observe target.changed() and break
+        // the pump loop. yield_now is too tight (single scheduler
+        // quantum); 10ms is generous without slowing the suite.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        sink_tx.send(msg("b")).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(1), grpc2_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                r.msg,
+                Some(executor_message::Msg::Register(ExecutorRegister { executor_id })) if executor_id == "b"
+            ),
+            "message must route to new target after watch swap"
+        );
+
+        // grpc1 must have no message. Disconnected is expected: once
+        // relay re-reads the watch, its clone of grpc1_tx drops (the
+        // outer let binding goes out of scope on the next iteration);
+        // send_replace already dropped the original. So grpc1 is fully
+        // closed — which is exactly right: the stale target is dead.
+        // Empty would also be fine (relay hasn't re-read yet) but is
+        // a less complete state. Ok(_) is the bug — message misrouted.
+        assert!(
+            grpc1_rx.try_recv().is_err(),
+            "stale target must not receive messages after watch swap"
+        );
         drop(sink_tx);
         tokio::time::timeout(Duration::from_secs(1), relay)
             .await
