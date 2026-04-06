@@ -1,11 +1,17 @@
 //! ChunkService gRPC implementation.
 //!
-//! These RPCs are infrastructure — not used by the current PutPath flow
-//! (which calls `metadata::find_missing_chunks` directly and uploads via
-//! `ChunkBackend` inside `cas::put_chunked`). They exist so future clients
-//! (a hypothetical worker-side chunker, or a store-to-store replication
-//! tool) can interact at the chunk level without going through PutPath's
+//! These RPCs are infrastructure — not used by the server-side PutPath
+//! flow (which chunks inside `cas::put_chunked` and dedups via the
+//! `refcount==1` RETURNING clause, no separate probe). They exist so
+//! future clients (a worker-side chunker, store-to-store replication)
+//! can interact at the chunk level without going through PutPath's
 //! NAR-shaped API.
+//!
+//! Tenant-scoped: FindMissingChunks and PutChunk both require a JWT
+//! `Claims` in request extensions (attached by `jwt_interceptor` in
+//! main.rs). Dedup is per-tenant — tenant A cannot infer what B has
+//! uploaded by probing chunk hashes. GetChunk is unscoped: knowing a
+//! BLAKE3 hash already proves you have (or had) the bytes.
 
 use super::*;
 
@@ -43,6 +49,32 @@ impl ChunkServiceImpl {
             )
         })
     }
+}
+
+/// Extract tenant UUID from JWT Claims; FAIL-CLOSED if absent.
+///
+/// Free function (not a method on `ChunkServiceImpl`) so it borrows
+/// only the request — no `&self` entanglement with `require_cache`'s
+/// borrow. Called before `request.into_inner()` which drops extensions.
+///
+/// The `jwt_interceptor` in main.rs attaches `Claims` only when
+/// (a) a pubkey is configured AND (b) the `x-rio-tenant-token` header
+/// is present and valid. `None` here means one of those is false. For
+/// FindMissingChunks and PutChunk — the two RPCs that read/write the
+/// tenant junction — there is no safe unscoped fallback: unscoped
+/// FindMissing leaks cross-tenant, unscoped PutChunk writes a chunk
+/// the tenant can never dedup against (no junction row). Refuse.
+fn require_tenant<T>(request: &Request<T>, rpc: &str) -> Result<uuid::Uuid, Status> {
+    request
+        .extensions()
+        .get::<rio_common::jwt::Claims>()
+        .map(|c| c.sub)
+        .ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "{rpc} is tenant-scoped; no JWT Claims in request \
+                 (x-rio-tenant-token absent or jwt_interceptor pubkey unconfigured)"
+            ))
+        })
 }
 
 #[tonic::async_trait]
@@ -90,6 +122,13 @@ impl ChunkService for ChunkServiceImpl {
     ) -> Result<Response<PutChunkResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let cache = self.require_cache()?;
+        // Tenant BEFORE into_inner() — same ordering as
+        // find_missing_chunks below. PutChunk without a tenant would
+        // write a `chunks` row with no junction, which the tenant's
+        // next FindMissingChunks would report as still-missing →
+        // infinite re-upload loop. Fail-closed surfaces the config
+        // gap immediately instead of after the third identical upload.
+        let tenant_id = require_tenant(&request, "PutChunk")?;
         let mut stream = request.into_inner();
 
         // --- Frame 1: Metadata ---
@@ -214,6 +253,30 @@ impl ChunkService for ChunkServiceImpl {
         .await
         .map_err(|e| internal_error("PutChunk chunks insert", e))?;
 
+        // Junction row. AFTER the chunks row — chunk_tenants FK
+        // references chunks(blake3_hash). The chunks insert above
+        // DO-NOTHINGs on conflict, so the row exists either way
+        // (freshly inserted by us OR previously by another tenant);
+        // the FK is satisfied in both cases.
+        //
+        // Not in a single transaction with the chunks insert: the
+        // chunks row has already committed (autocommit). If THIS
+        // insert fails, we're left with a chunk attributed to nobody
+        // — same state as a pre-migration-018 chunk. The tenant's
+        // next FindMissingChunks says "missing", they retry PutChunk,
+        // the chunks insert no-ops (already there), this insert runs
+        // again. Self-healing on retry; no need for txn overhead on
+        // the happy path.
+        //
+        // ON CONFLICT DO NOTHING on (blake3_hash, tenant_id): same
+        // tenant re-uploading same bytes is a pure no-op. DIFFERENT
+        // tenant, same bytes → fresh junction row. That's the point:
+        // glibc uploaded by both A and B gets two rows here, one
+        // chunks row, both tenants see "present" on probe.
+        metadata::record_chunk_tenant(&self.pool, digest.as_slice(), tenant_id)
+            .await
+            .map_err(|e| metadata_status("PutChunk chunk_tenants insert", e))?;
+
         Ok(Response::new(PutChunkResponse {
             digest: digest.to_vec(),
         }))
@@ -279,15 +342,33 @@ impl ChunkService for ChunkServiceImpl {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    /// FindMissingChunks: batch check which chunks the store has.
+    /// FindMissingChunks: batch check which chunks THIS TENANT has uploaded.
     ///
-    /// Returns the subset of input digests that are NOT in the `chunks`
-    /// table. The client calls this before PutChunk (or before deciding
-    /// which chunks to send alongside a manifest) to skip re-uploading.
+    /// Returns the subset of input digests that are NOT attributed to the
+    /// caller's tenant in `chunk_tenants`. The client calls this before
+    /// PutChunk to skip re-uploading chunks IT has already contributed.
     ///
-    /// Checks PG, not S3 — same reasoning as `metadata::find_missing_chunks`:
-    /// PG is the source of truth for "chunks we know about", one
-    /// roundtrip beats N S3 HeadObject calls.
+    /// # Tenant scoping (fail-closed)
+    ///
+    /// Unscoped dedup leaks: if tenant A probes for a hash and gets
+    /// "already present", A learns that SOMEONE (maybe B) has uploaded
+    /// bytes with that hash. Probing for known-package chunk hashes
+    /// reveals B's closure. The `chunk_tenants` junction scopes dedup
+    /// to "have I uploaded this before?" — no cross-tenant signal.
+    ///
+    /// `Claims` absent → `UNAUTHENTICATED`. This is FAIL-CLOSED: the
+    /// interceptor layer at `main.rs:496` is unconditionally wired,
+    /// so a missing `Claims` means either (a) no JWT pubkey configured
+    /// yet (dev mode — ChunkService has no prod callers today; the
+    /// server-side PutPath flow dedups inside `cas::put_chunked` via
+    /// the upsert RETURNING, bypassing this RPC entirely), or (b) caller
+    /// didn't send `x-rio-tenant-token` (worker bug — the worker-side
+    /// chunker, when it lands, must propagate the tenant JWT). Either
+    /// way: no tenant identity → no scoped answer → refuse rather than
+    /// leak.
+    ///
+    /// Checks PG (`chunk_tenants`), not S3 — one roundtrip for the whole
+    /// batch, covered by the (tenant_id, blake3_hash) index.
     ///
     /// Also updates `rio_store_chunks_total` as a side effect. This is
     /// an infrequent RPC (once per PutPath-equivalent), so the count
@@ -304,6 +385,12 @@ impl ChunkService for ChunkServiceImpl {
         // disabled, and "find missing chunks" is meaningless.
         let _ = self.require_cache()?;
 
+        // Extract tenant BEFORE into_inner() consumes the request. Same
+        // read-extensions-first pattern as scheduler/grpc/mod.rs:374 —
+        // extensions are dropped by into_inner(). `sub` is `Copy` (Uuid),
+        // no clone needed; just lift it out of the borrow.
+        let tenant_id = require_tenant(&request, "FindMissingChunks")?;
+
         let req = request.into_inner();
         rio_common::grpc::check_bound("digests", req.digests.len(), MAX_CHUNK_DIGESTS)?;
 
@@ -318,11 +405,13 @@ impl ChunkService for ChunkServiceImpl {
             }
         }
 
-        // find_missing_chunks returns Vec<bool> (parallel missing-flags).
-        // We need the actual missing DIGESTS. Zip + filter.
-        let missing_flags = metadata::find_missing_chunks(&self.pool, &req.digests)
-            .await
-            .map_err(|e| metadata_status("FindMissingChunks", e))?;
+        // Scoped variant: checks chunk_tenants junction, not chunks.
+        // Same Vec<bool> (parallel missing-flags) shape as the unscoped
+        // variant — the zip + filter below is unchanged.
+        let missing_flags =
+            metadata::find_missing_chunks_for_tenant(&self.pool, &req.digests, tenant_id)
+                .await
+                .map_err(|e| metadata_status("FindMissingChunks", e))?;
 
         let missing_digests: Vec<Vec<u8>> = req
             .digests

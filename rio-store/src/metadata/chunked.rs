@@ -13,6 +13,7 @@ use super::*;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use tracing::{debug, instrument};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Chunked manifest ops
@@ -288,48 +289,93 @@ pub async fn count_chunks(pool: &PgPool) -> Result<i64> {
     Ok(count)
 }
 
-/// Find which chunks are NOT yet in the `chunks` table.
+/// Find chunks NOT attributed to `tenant_id` in the `chunk_tenants` junction.
 ///
-/// This is the dedup pre-check: PutPath calls this BEFORE uploading to
-/// skip chunks that already exist. Returns a `Vec<bool>` parallel to the
-/// input: `result[i] == true` means `hashes[i]` is missing (upload it).
+/// Returns a `Vec<bool>` parallel to the input: `result[i] == true`
+/// means `hashes[i]` is missing FOR THIS TENANT (upload it).
 ///
-/// Checks PG, not S3. The `chunks` table is the source of truth for
-/// "which chunks do we know about" — it's populated at
-/// insert_manifest_chunked_uploading time (step 1), BEFORE S3 upload.
-/// So a chunk can be in PG but not yet in S3 (in-progress upload). That's
-/// fine for the dedup check: another uploader is handling it, we can
-/// skip. If their upload fails, they decrement and we'll see it missing
-/// on the next attempt.
+/// # Tenant-scoped, not chunks-table-scoped
 ///
-/// One PG roundtrip for N chunks. Beats N S3 HeadObject calls by ~10×
-/// on latency alone.
-#[instrument(skip(pool, hashes), fields(count = hashes.len()))]
-pub async fn find_missing_chunks(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<Vec<bool>> {
+/// An unscoped "is there a `chunks` row?" query would leak cross-tenant: Tenant A's worker probes for glibc's chunk;
+/// if only tenant B has uploaded glibc, A sees it as missing and must
+/// upload it themselves. The upload (PutChunk) then adds A's junction
+/// row, so subsequent probes by A hit.
+///
+/// The security property: A can only learn "I have uploaded this hash
+/// before", never "someone else has uploaded this hash." The latter
+/// would leak one bit per probe — enough to fingerprint what B is
+/// building (probe for known-package chunk hashes → infer B's closure).
+///
+/// # Legacy chunks (pre-migration-018)
+///
+/// A chunk in `chunks` with zero `chunk_tenants` rows is reported as
+/// MISSING here. First tenant to PutChunk it gets a junction row and
+/// subsequently sees it as present — self-healing on first touch. No
+/// special "shared legacy" carve-out: simpler query, and the one-time
+/// re-upload cost is bounded (content-addressed, idempotent).
+#[instrument(skip(pool, hashes), fields(count = hashes.len(), tenant = %tenant_id))]
+pub async fn find_missing_chunks_for_tenant(
+    pool: &PgPool,
+    hashes: &[Vec<u8>],
+    tenant_id: Uuid,
+) -> Result<Vec<bool>> {
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
 
-    // ANY($1) with a bytea[] — returns the hashes that DO exist.
+    // chunk_tenants, NOT chunks. The junction is the source of truth
+    // for "tenant X can dedup against this hash". The (tenant_id,
+    // blake3_hash) index covers this — equality on tenant_id + ANY
+    // probe on blake3_hash is an index-only scan.
+    //
+    // PG-not-S3: the `chunks` row (and thus its junction row) is
+    // populated BEFORE S3 upload, so a hash can be "present" here
+    // while the upload is in flight. Fine — another of THIS TENANT'S
+    // workers is handling it; if their upload fails, they decrement
+    // and we see it missing on retry. One roundtrip for N hashes.
     let present: Vec<(Vec<u8>,)> = sqlx::query_as(
         r#"
-        SELECT blake3_hash FROM chunks
-        WHERE blake3_hash = ANY($1)
+        SELECT blake3_hash FROM chunk_tenants
+        WHERE tenant_id = $1 AND blake3_hash = ANY($2)
         "#,
     )
+    .bind(tenant_id)
     .bind(hashes)
     .fetch_all(pool)
     .await?;
 
-    // Invert: present → missing. HashSet for O(1) membership instead of
-    // O(N) scan per input hash (N² total without the set).
-    let present_set: std::collections::HashSet<&[u8]> =
-        present.iter().map(|(h,)| h.as_slice()).collect();
+    // Invert: present → missing. HashSet for O(1) membership instead
+    // of O(N) scan per input hash (N² total without the set).
+    let present_set: HashSet<&[u8]> = present.iter().map(|(h,)| h.as_slice()).collect();
 
     Ok(hashes
         .iter()
         .map(|h| !present_set.contains(h.as_slice()))
         .collect())
+}
+
+/// Record tenant attribution for a chunk. Called after PutChunk has
+/// written the `chunks` row (FK requires it).
+///
+/// `ON CONFLICT DO NOTHING`: composite PK is (blake3_hash, tenant_id).
+/// Same tenant re-uploading same bytes → idempotent no-op. DIFFERENT
+/// tenant, same bytes → new row (the many-to-many case the junction
+/// exists for). No race: two concurrent PutChunks by the same tenant
+/// both hit the PK, second one no-ops cleanly.
+#[instrument(skip(pool, blake3_hash), fields(hash = hex::encode(blake3_hash), tenant = %tenant_id))]
+pub async fn record_chunk_tenant(pool: &PgPool, blake3_hash: &[u8], tenant_id: Uuid) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO chunk_tenants (blake3_hash, tenant_id)
+        VALUES ($1, $2)
+        ON CONFLICT (blake3_hash, tenant_id) DO NOTHING
+        "#,
+    )
+    .bind(blake3_hash)
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
