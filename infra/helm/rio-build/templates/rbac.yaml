@@ -85,6 +85,25 @@ rules:
   - apiGroups: [rio.build]
     resources: [workerpools/status]
     verbs: [get, patch]
+  # WorkerPoolSet: aggregating CRD — one WPS spawns one child WorkerPool
+  # per size class. Reconciler watches WPS, SSA-applies child WPs, refreshes
+  # per-class status. No `create`/`delete` — operators `kubectl apply` the
+  # WPS; reconciler only reads it + patches metadata.finalizers (`update`)
+  # and status (below). Child WorkerPool lifecycle is covered by the rule
+  # above.
+  - apiGroups: [rio.build]
+    resources: [workerpoolsets]
+    verbs: [get, list, watch, patch, update]
+  # Per-class status (effective_cutoff_secs + queued from scheduler's
+  # GetSizeClassStatus, joined with observed child WP replicas).
+  - apiGroups: [rio.build]
+    resources: [workerpoolsets/status]
+    verbs: [get, patch, update]
+  # finalizer() in the WPS reconciler patches metadata.finalizers via
+  # the /finalizers subresource on delete.
+  - apiGroups: [rio.build]
+    resources: [workerpoolsets/finalizers]
+    verbs: [update]
   # Owned children. `create` because SSA PATCH creates if missing but some
   # clusters still check `create` perm.
   - apiGroups: [apps]

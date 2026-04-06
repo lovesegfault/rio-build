@@ -61,7 +61,7 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 - Large pool (2 workers, 2 concurrent each): handles 10% of builds (GCC, LLVM, Firefox)
 - Better utilization: small workers aren't blocked by multi-hour builds
 
-> **Scheduled:** `WorkerPoolSet` CRD → [P0232](../.claude/work/plan-0232-wps-crd-struct-crdgen.md) + [P0233](../.claude/work/plan-0233-wps-child-builder-reconciler.md). Until those land: deploy multiple independent `WorkerPool` CRs, configure cutoffs in `scheduler.toml`.
+The `WorkerPoolSet` CRD wraps this: one WPS defines all size classes declaratively, spawns one child `WorkerPool` per class (ownerReference → cascade delete), and surfaces per-class `effective_cutoff_secs` + `queued` in `.status.classes[]`. See [controller component spec](components/controller.md) for the reconciler flow.
 
 ## Gateway and Scheduler
 
