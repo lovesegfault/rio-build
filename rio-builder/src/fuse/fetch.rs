@@ -456,12 +456,27 @@ impl NixStoreFs {
                 "waiting on concurrent fetch (fetcher still working)"
             );
         }
-        // Fetcher finished — check cache. Fetcher-failure ⇒ Ok(None) ⇒ ENOENT
-        // (kernel will re-lookup; ATTR_TTL won't cache a negative here because
-        // we never reply.entry'd). Index error ⇒ EIO (loud, not silent retry).
+        // Fetcher finished — check cache. Fetcher-failure ⇒ cache empty ⇒
+        // EIO. I-179: it MUST NOT be ENOENT — FUSE itself wouldn't
+        // negative-cache (we never reply.entry'd), but overlayfs above us
+        // DOES: `ovl_lookup` caches a lower's ENOENT as a negative dentry,
+        // so the daemon's retry never reaches FUSE again → permanent
+        // "input does not exist" until remount. A non-ENOENT error is
+        // propagated to the caller WITHOUT a negative dentry. EIO matches
+        // the Fetch arm's own failure errno and the spec's "fetch failure
+        // is EIO, never ENOENT" rule. Index error ⇒ also EIO.
+        // r[impl builder.fuse.jit-lookup]
         match self.cache.get_path(store_basename) {
             Ok(Some(p)) => Ok(p),
-            Ok(None) => Err(Errno::ENOENT),
+            Ok(None) => {
+                tracing::warn!(
+                    store_path = store_basename,
+                    "fetcher guard dropped with cache empty (fetcher \
+                     errored or panicked); returning EIO so overlayfs \
+                     does not negative-cache (I-179)"
+                );
+                Err(Errno::EIO)
+            }
             Err(e) => {
                 tracing::error!(
                     store_path = store_basename,
@@ -1927,6 +1942,74 @@ mod tests {
         assert!(paths[0].exists(), "fetched path on disk: {:?}", paths[0]);
         assert_eq!(std::fs::read(&paths[0]).expect("read"), b"slow-payload");
         drop(dir); // keep tempdir alive to here
+    }
+
+    /// I-179: when the singleflight guard drops with the cache STILL empty
+    /// (fetcher errored or panicked), `wait_for_fetcher` MUST return EIO,
+    /// not ENOENT. ENOENT would be negative-cached by overlayfs above the
+    /// FUSE mount → daemon's retry never reaches FUSE again → permanent
+    /// "input does not exist" until remount. EIO propagates without a
+    /// negative dentry, so the daemon's retry re-asks FUSE.
+    ///
+    /// Mechanism: take the Fetch claim manually (so we control guard
+    /// lifetime), spawn a `wait_for_fetcher` waiter, drop the guard
+    /// without ever inserting into the cache → waiter wakes, finds
+    /// `cache.get_path == Ok(None)`, returns EIO.
+    ///
+    // r[verify builder.fuse.jit-lookup]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_wait_for_fetcher_guard_drop_cache_empty_is_eio() {
+        let (cache, clients, _store, dir, rt, _srv) = setup_fetch_harness().await;
+        let fs = make_fs(Arc::clone(&cache), clients, rt, 4);
+
+        let basename = test_store_basename("guard-drop-eio");
+
+        // Take the Fetch claim ourselves; we will NOT populate the cache.
+        let FetchClaim::Fetch(guard) = cache.try_start_fetch(&basename) else {
+            panic!("first claim must be Fetch");
+        };
+        // Second claim is the waiter's InflightEntry.
+        let FetchClaim::WaitFor(entry) = cache.try_start_fetch(&basename) else {
+            panic!("second claim must be WaitFor");
+        };
+
+        // Park a waiter on the condvar via spawn_blocking (wait_for_fetcher
+        // is sync). fetch_timeout is irrelevant to the path under test —
+        // the guard drop wakes the waiter long before the deadline.
+        let waiter = {
+            let fs = Arc::clone(&fs);
+            let bn = basename.clone();
+            tokio::task::spawn_blocking(move || {
+                fs.wait_for_fetcher(&entry, &bn, TEST_FETCH_TIMEOUT)
+            })
+        };
+
+        // Let the waiter reach the condvar (one WAIT_SLICE tick is plenty).
+        tokio::time::sleep(WAIT_SLICE / 2).await;
+
+        // Simulate fetcher failure: drop the guard WITHOUT inserting into
+        // the cache. FetchGuard::drop flips `done` and notify_all()s.
+        drop(guard);
+
+        let result = waiter.await.expect("join");
+        let err = result.expect_err("guard dropped with cache empty ⇒ Err");
+        assert_eq!(
+            err.code(),
+            Errno::EIO.code(),
+            "I-179: must be EIO (overlay-safe), NOT ENOENT \
+             (overlay would negative-cache); got {err:?}"
+        );
+        // And specifically NOT the old behavior:
+        assert_ne!(err.code(), Errno::ENOENT.code());
+
+        // Sanity: cache really is empty for this basename.
+        let bn = basename.clone();
+        let cached = tokio::task::spawn_blocking(move || cache.get_path(&bn))
+            .await
+            .expect("join")
+            .expect("get_path");
+        assert!(cached.is_none(), "cache must be empty: {cached:?}");
+        drop(dir);
     }
 
     /// `ensure_cached` with a stale index row (file rm'd, SQLite row intact)

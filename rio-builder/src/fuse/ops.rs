@@ -273,9 +273,10 @@ impl Filesystem for NixStoreFs {
                             // retry would never re-ask FUSE → "build input
                             // does not exist" → MiscFailure → poison.
                             //
-                            // This also fixes I-179: `wait_for_fetcher`'s
-                            // ENOENT-on-fetcher-failure (cache empty after
-                            // guard drop) is remapped here. The legacy
+                            // I-179: `wait_for_fetcher` now returns EIO
+                            // directly on guard-drop-with-cache-empty; this
+                            // remap is defense-in-depth (catches any future
+                            // ENOENT leak from `ensure_cached`). The legacy
                             // `NotArmed` arm preserves its ENOENT semantics
                             // unchanged.
                             // I-189: log errno symbolically (`EIO`/`ENOENT`/

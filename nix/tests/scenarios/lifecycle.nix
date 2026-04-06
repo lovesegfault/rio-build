@@ -400,6 +400,29 @@ let
         )
         return parse_prometheus(raw)
 
+    # Coverage-mode timeout multiplier for waits that bound the
+    # SCHEDULER's view catching up to k8s ground-truth (e.g. the
+    # workers_active==0 chain in autoscale). 69fc4ae0 closed the
+    # producer side (each subtest waits its-own-pool-pods-gone), but
+    # the scheduler-side disconnect lag is unbounded by that: SIGTERM
+    # → builder `continue 'reconnect` (main.rs:388) re-registers →
+    # `break 'reconnect` → atexit __llvm_profile_write_file → process
+    # exit → FIN. Under coverage the profraw write is large (full
+    # counter table), and the heartbeat task keeps refreshing
+    # last_heartbeat during it, so neither stream-EOF nor heartbeat-
+    # timeout (30s + 3×10s tick = ~60s) fires until the write
+    # completes. GHA 24018216226: ephemeral-pool's workers_active==0
+    # precondition 80.00s, manifest-pool's blew 90s — vs 0.20s in
+    # 69fc4ae0's regular-mode 3/3 validation. covTimeoutHeadroom only
+    # pads globalTimeout; per-wait budgets need their own factor.
+    #
+    # 3×: observed 80-90s ≈ 9× the ~10s typical; 90×3=270s clears it
+    # with margin and stays under the 300s pods-gone budget. Regular
+    # mode keeps 1× so a real disconnect-detection regression still
+    # trips the 90s gate there. Nix interpolates a single int token
+    # (no nested-block indent breakage — see scheduling.nix:1246).
+    cov_factor = ${if common.coverage then "3" else "1"}
+
     # Shell-inline version for wait_until_succeeds (condition must be
     # shell-evaluable). Single kubectl call per retry — no background
     # process, no cleanup, no port. Retry rate is now limited only by
@@ -2030,10 +2053,12 @@ let
           # Precondition: no STS workers. The finalizer fragment (run
           # before this) deletes the default pool. 90s: finalizer drain
           # + scheduler disconnect-detect + metric-update can lag under
-          # KVM-speed test ordering or TCG slowness.
+          # KVM-speed test ordering or TCG slowness. ×cov_factor: GHA
+          # 24018216226 hit 80.00s here under coverage (profraw atexit
+          # delays SIGTERM-reconnect exit — see cov_factor comment).
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=90,
+              timeout=90 * cov_factor,
           )
 
           # ── CEL: ephemeralDeadlineSeconds without ephemeral rejected ──
@@ -2353,10 +2378,14 @@ let
           # 24012511360), and finalizer earlier waited pool=x86-64
           # pods gone. So this is just h2 stream-close propagation +
           # one tick_publish_gauges (~10s typical). 90s: shared budget
-          # for the chain's three workers_active==0 waits.
+          # for the chain's three workers_active==0 waits. ×cov_factor:
+          # GHA 24018216226 blew 90s here despite pods-gone holding
+          # (1.24s) — the producer-side fix bounds k8s state, NOT the
+          # scheduler's disconnect-detection lag (profraw atexit write
+          # delays the SIGTERM-reconnect exit; see cov_factor comment).
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=90,
+              timeout=90 * cov_factor,
           )
 
           # Apply manifest BuilderPool. Spec mirrors ephemeral-pool's
@@ -2781,9 +2810,11 @@ let
           # check above, now closed. Kept at 90s as the shared budget
           # for the three identical workers_active==0 waits in this
           # fragment chain (ephemeral-pool/manifest-pool preconditions).
+          # ×cov_factor: under coverage, profraw atexit write delays
+          # the SIGTERM-reconnect exit (see cov_factor comment).
           sched_metric_wait(
               "grep -qx 'rio_scheduler_workers_active 0'",
-              timeout=90,
+              timeout=90 * cov_factor,
           )
           print("finalizer PASS: BuilderPool deleted, pod drained, scheduler saw disconnect")
     '';
