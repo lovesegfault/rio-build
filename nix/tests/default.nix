@@ -256,20 +256,28 @@ in
           "setoptions-unreachable"
           "cancel-timing"
           "reassign"
+          # r[verify obs.metric.scheduler]
+          # r[verify obs.metric.worker]
+          # r[verify obs.metric.store]
+          "load-50drv"
           # r[verify worker.shutdown.sigint]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
           # gentler sibling. Uses wsmall2 only — no cache-chain coupling.
           # ~35s: SIGINT + 30s inactive-wait + restart + FUSE remount.
+          #
+          # sigint-graceful LAST: restarts wsmall2 (systemctl start) but
+          # doesn't wait for scheduler re-registration (HEARTBEAT_INTERVAL
+          # = 10s at rio-common/src/limits.rs:51). If load-50drv ran AFTER
+          # it'd see 2 slots not 4 → ~26 waves instead of ~13 → ~2×
+          # walltime. Placing sigint last makes the re-registration
+          # window non-load-bearing (collectCoverage reads profraw from
+          # the host fs, doesn't need wsmall2 registered with scheduler).
           "sigint-graceful"
-          # r[verify obs.metric.scheduler]
-          # r[verify obs.metric.worker]
-          # r[verify obs.metric.store]
-          "load-50drv"
         ];
         # Default 600s is tight now: sizeclass ~30s + max-silent-time
-        # ~25s + cancel-timing ~40s + reassign ~60s + sigint ~35s +
-        # load-50drv ~60s ≈ 250s subtests + ~120s boot. load-50drv under
+        # ~25s + cancel-timing ~40s + reassign ~60s + load-50drv ~60s +
+        # sigint ~35s ≈ 250s subtests + ~120s boot. load-50drv under
         # TCG could stretch to 150s (13 waves × tick=2s × TCG overhead).
         # 900s is comfortable without being an open-ended escape hatch.
         globalTimeout = 900;

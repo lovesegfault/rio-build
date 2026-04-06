@@ -1218,6 +1218,17 @@ let
           wsmall2.wait_until_succeeds(
               "mountpoint -q /var/rio/fuse-store", timeout=30
           )
+          # Wait for scheduler re-registration. Worker heartbeats every
+          # HEARTBEAT_INTERVAL_SECS=10 (rio-common/src/limits.rs:51).
+          # Without this, any fragment inserted after sigint-graceful
+          # sees 2 slots (wsmall1 only) until wsmall2's first heartbeat.
+          # Timeout 30s: 1 heartbeat interval + TCG slop.
+          ${gatewayHost}.wait_until_succeeds(
+              "curl -sf http://localhost:9091/metrics | "
+              "grep '^rio_scheduler_workers_active ' | "
+              "awk '{exit !($2 >= 3)}'",
+              timeout=30,
+          )
     '';
 
   };
