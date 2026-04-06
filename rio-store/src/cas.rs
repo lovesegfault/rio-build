@@ -553,16 +553,20 @@ impl ChunkCache {
         // remove is tiny, and a caller in that window awaits an
         // already-complete Shared (instant return).
         //
-        // Cancellation edge case: if THIS awaiter is cancelled between
-        // `shared.await` and here, the inflight entry isn't removed.
-        // This is SELF-HEALING: the Shared future already completed,
-        // so the next caller to hit `entry().or_insert_with()` gets
-        // the completed Shared and awaits it instantly, then THAT
-        // caller's remove() fires. Worst case: ~100-byte map entry
-        // leaks until the next get for this hash. Acceptable; a
-        // scopeguard here would need careful Drop ordering with the
-        // Shared clone. TODO(P0225): scopeguard if leak becomes
-        // measurable under sustained cancellation.
+        // Cancellation edge case: if THIS awaiter is cancelled during
+        // `shared.await` (the only await point above), remove() never
+        // runs and the entry persists. SELF-HEALING (proven by
+        // `inflight_leak_self_heals_on_next_get`): the spawned task
+        // runs to completion regardless (it's detached), so the next
+        // caller's `entry().or_insert_with()` finds the completed
+        // Shared, awaits it instantly (no I/O — output is cached), and
+        // THAT caller's remove() fires. Bound: ~100-byte DashMap entry
+        // per cancelled awaiter, cleared on next get for the same hash.
+        //
+        // NO scopeguard: a `defer!` here would hold a reference across
+        // `shared.await`, changing when the last Shared clone drops.
+        // Drop-ordering with the DashMap entry is subtle; the
+        // self-heal is simpler and proven correct.
         self.inflight.remove(hash);
 
         Ok(result)
@@ -737,6 +741,88 @@ mod cache_tests {
         assert!(
             cache.inflight.is_empty(),
             "inflight map should be empty after fetch completes"
+        );
+    }
+
+    /// A stale inflight entry SELF-HEALS on the next `get_verified()`.
+    ///
+    /// The scenario (from the comment at `self.inflight.remove(hash)`):
+    /// an awaiter is cancelled during `shared.await`, so its `remove()`
+    /// never ran. The spawned backend task completed anyway (it's
+    /// detached), leaving a completed Shared in the inflight map.
+    ///
+    /// Rather than race the scheduler to trigger real cancellation
+    /// (which proved fragile across tokio's yield-draining semantics),
+    /// we insert the leaked state directly: a completed Shared under
+    /// `hash`. Then we verify the next `get_verified()` for that hash:
+    ///   1. Finds the existing entry via `entry().or_insert_with()`
+    ///   2. Awaits the (already-complete) Shared instantly — no I/O
+    ///   3. Runs `self.inflight.remove(hash)` — the self-heal
+    ///
+    /// The backend is EMPTY for this hash. If `or_insert_with` had
+    /// somehow NOT found the entry (spawned a fresh fetch), the get
+    /// would return `NotFound` — so getting the data proves the stale
+    /// Shared was reused.
+    #[tokio::test]
+    async fn inflight_leak_self_heals_on_next_get() {
+        let (_backend, cache) = make_cache();
+        let (hash, data) = sample_chunk();
+
+        // Directly construct the leaked state: a completed Shared
+        // holding the chunk bytes. This is exactly what inflight looks
+        // like after a cancelled awaiter's inner spawned task ran to
+        // completion — the Shared caches the task's output, the map
+        // entry was never removed.
+        let stale: InflightFetch = {
+            let d = data.clone();
+            async move { Some(d) }.boxed().shared()
+        };
+        cache.inflight.insert(hash, stale);
+
+        // PRECONDITION: the leak is seeded. If InflightFetch's type
+        // changes and the manual insert stops compiling, this test
+        // breaks loudly at the right spot.
+        assert_eq!(cache.inflight.len(), 1, "precondition: stale entry seeded");
+
+        // SELF-HEAL: get_verified → LRU miss → singleflight_fetch →
+        // `entry().or_insert_with()` finds the existing Shared (does
+        // NOT spawn a fresh fetch) → awaits it (instant — already
+        // complete) → THIS get's remove() fires.
+        let got = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(
+            got, data,
+            "data came from the stale Shared (backend is empty — \
+             a fresh fetch would have returned NotFound)"
+        );
+
+        assert!(
+            cache.inflight.is_empty(),
+            "self-heal: get_verified's remove() cleared the stale entry"
+        );
+    }
+
+    /// Same self-heal, but for the other leak shape: the inner task
+    /// found nothing (backend miss) → stale Shared holds `None`.
+    /// The next get must still clear the entry AND propagate NotFound
+    /// cleanly (not hang, not panic).
+    #[tokio::test]
+    async fn inflight_leak_self_heals_on_none() {
+        let (_backend, cache) = make_cache();
+        let (hash, _) = sample_chunk();
+
+        // Stale entry with None — the spawned task ran, backend said
+        // "not found", awaiter was cancelled before remove().
+        let stale: InflightFetch = async { None }.boxed().shared();
+        cache.inflight.insert(hash, stale);
+        assert_eq!(cache.inflight.len(), 1, "precondition: stale None seeded");
+
+        // get_verified → stale Shared → None → NotFound. Entry cleared
+        // BEFORE the error propagates (remove is unconditional).
+        let result = cache.get_verified(&hash).await;
+        assert!(matches!(result, Err(ChunkError::NotFound(_))));
+        assert!(
+            cache.inflight.is_empty(),
+            "self-heal runs even when the stale Shared held None"
         );
     }
 

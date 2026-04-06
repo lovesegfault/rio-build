@@ -74,12 +74,11 @@ pub fn router(state: Arc<CacheServerState>) -> Router {
         pool: state.pool.clone(),
         allow_unauthenticated: state.allow_unauthenticated,
     };
-    // TODO(P0225): /nix-cache-info is behind the auth layer. Real Nix
-    // clients probe this endpoint first (before authenticating) to discover
-    // cache metadata. Verify in Section I VM test that 401+retry works, OR
-    // move this route above the auth layer (it's static, leaks nothing).
-    Router::new()
-        .route("/nix-cache-info", get(nix_cache_info))
+
+    // narinfo + NAR content require Bearer auth (tenants.cache_token).
+    // .layer() applied here scopes to THESE routes only — the merge
+    // below keeps /nix-cache-info outside the auth layer.
+    let authed = Router::new()
         // {hash}.narinfo — the hash is 32 nixbase32 chars (store-path
         // hash-part). Axum's path param captures up to the next `/`;
         // we strip the `.narinfo` suffix in the handler.
@@ -88,7 +87,16 @@ pub fn router(state: Arc<CacheServerState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             auth,
             auth::auth_middleware,
-        ))
+        ));
+
+    // /nix-cache-info is PUBLIC: Nix clients probe it FIRST (before
+    // authenticating) to discover StoreDir + Priority — they can't know
+    // which token to present until they know it's a Nix cache at all.
+    // 401 here breaks `nix build --substituters=…` at discovery time.
+    // The response is static (no state, no DB); it leaks nothing.
+    Router::new()
+        .route("/nix-cache-info", get(nix_cache_info))
+        .merge(authed)
         .with_state(state)
 }
 
@@ -543,6 +551,78 @@ mod tests {
         assert!(text.contains("StoreDir: /nix/store"));
         assert!(text.contains("WantMassQuery: 1"));
         assert!(text.contains("Priority:"));
+    }
+
+    /// /nix-cache-info must be reachable WITHOUT auth, even when
+    /// `allow_unauthenticated=false` and a tenant token is configured.
+    /// Nix clients probe this endpoint before they know which token to
+    /// present; 401 here breaks substituter discovery.
+    ///
+    /// Same request to a narinfo route MUST 401 — proves the auth
+    /// layer still gates everything else (we didn't accidentally
+    /// disable it globally).
+    #[tokio::test]
+    async fn nix_cache_info_public_when_auth_required() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Seed a tenant with a token so unauthed requests to authed
+        // routes get 401 (not the 503 "misconfigured" fallback — we
+        // want to prove /nix-cache-info bypasses a LIVE auth layer).
+        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let backend = Arc::new(MemoryChunkBackend::new());
+        let cache = Arc::new(ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
+        let state = Arc::new(CacheServerState {
+            pool: db.pool.clone(),
+            chunk_cache: Some(cache),
+            // Auth REQUIRED. The standard setup() uses true; we can't
+            // reuse it.
+            allow_unauthenticated: false,
+        });
+        let app = router(state);
+
+        // No Authorization header on either request.
+
+        // /nix-cache-info → 200. Public route; auth layer never sees it.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/nix-cache-info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/nix-cache-info must be public even when auth is required"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        // Test assertion display, not parse-path.
+        #[allow(clippy::disallowed_methods)]
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("StoreDir: /nix/store"),
+            "public route should return the real body, not just a 200: {text}"
+        );
+
+        // narinfo → 401. Auth layer fires. (Valid hash-part format
+        // so we're testing auth, not the 404-on-bad-hash path.)
+        let resp = app
+            .oneshot(
+                Request::get("/00000000000000000000000000000000.narinfo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "narinfo must still require auth — the public merge must \
+             not have disabled the auth layer on other routes"
+        );
     }
 
     // ------------------------------------------------------------------------
