@@ -90,9 +90,8 @@ let
       # uses, with the unified feature set, from the lock. Stub it to
       # zero deps so per-crate targets don't drag in the whole workspace
       # closure: `.#rio-builder` 491→344 rust drvs, `.#rio-nix` 429→87.
-      # (docker images currently bundle `workspaceBins` = all members so
-      # they don't shrink yet — the win surfaces there once images go
-      # per-binary, and immediately on the AMI per-arch build path.)
+      # docker images consume `memberBins` per-component, so the win
+      # carries through to `.#docker-builder` etc.
       #
       # NOTE: this must intercept `crate_` here, not via
       # `defaultCrateOverrides` below — buildRustCrate threads
@@ -476,6 +475,26 @@ let
     mkdir -p $out/bin
     cp -L ${workspace}/bin/* $out/bin/
   '';
+
+  # Per-member binary-only derivations — same closure-scrub treatment as
+  # workspaceBins/workspaceBinsCov but one derivation per crate, so each
+  # docker image can include only the binary it ships instead of the full
+  # workspace bundle. lib-only members (rio-common, rio-nix, …) have no
+  # bin/ and will fail at build if referenced here — correct, only bin
+  # crates belong in image contents.
+  mkMemberBins =
+    strip:
+    lib.mapAttrs (
+      name: m:
+      pkgs.runCommand "${name}-bin" { disallowedReferences = [ rustStable ]; } ''
+        mkdir -p $out/bin
+        cp -L ${m.build}/bin/* $out/bin/
+        ${lib.optionalString strip ''
+          chmod -R u+w $out/bin
+          ${pkgs.binutils}/bin/strip $out/bin/*
+        ''}
+      ''
+    ) cargoNix.workspaceMembers;
 in
 {
   inherit cargoNix;
@@ -500,4 +519,12 @@ in
   # Each is a single buildRustCrate derivation — the whole point of
   # per-crate caching.
   members = lib.mapAttrs (_: m: m.build) cargoNix.workspaceMembers;
+
+  # Per-member stripped bins (docker.nix consumer). Same shape as
+  # `members` but each is a scrubbed bin/ only — closure ~glibc+syslibs.
+  memberBins = mkMemberBins true;
+
+  # Unstripped variant for coverage-mode docker images (see
+  # workspaceBinsCov).
+  memberBinsCov = mkMemberBins false;
 }
