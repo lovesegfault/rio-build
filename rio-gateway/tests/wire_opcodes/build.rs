@@ -739,7 +739,9 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
     // Expected sequence (PLAN-NOM):
     //   StartActivity{actBuilds=104} (root, from BuildStarted)
     //   Result{SetExpected=106} on root
-    //   StartActivity{actBuild=105, fields=[drv,"w1",1,1], parent=root}
+    //   StartActivity{actBuild=105, fields=[drv,"",1,1], parent=root}
+    //     (machineName "" — RIO_GATEWAY_MACHINE_NAME unset in test;
+    //      executor_id "w1" is intentionally NOT leaked to the client)
     //   StopActivity{drv}
     //   StopActivity{root} (on Completed)
     assert_eq!(frames.len(), 5, "frames: {frames:?}");
@@ -783,12 +785,16 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
             assert_eq!(*level, 3, "lvlInfo");
             assert_eq!(*parent_id, root_id, "parent = actBuilds root");
             assert!(text.contains("aaa-activity-test.drv"));
-            // [drvPath, machineName, curRound, nrRounds]
+            // [drvPath, machineName, curRound, nrRounds].
+            // machineName is the cluster-stable RIO_GATEWAY_MACHINE_NAME
+            // (empty in tests), NOT the per-pod executor_id "w1" — the
+            // pod identity is an implementation detail invisible to the
+            // ssh-ng client.
             assert_eq!(
                 fields,
                 &[
                     rio_nix::protocol::stderr::ResultField::String(target.clone()),
-                    rio_nix::protocol::stderr::ResultField::String("w1".into()),
+                    rio_nix::protocol::stderr::ResultField::String(String::new()),
                     rio_nix::protocol::stderr::ResultField::Int(1),
                     rio_nix::protocol::stderr::ResultField::Int(1),
                 ]

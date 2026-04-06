@@ -198,7 +198,6 @@ fn handle_peeked_first_event(first: &types::BuildEvent) -> Option<BuildResult> {
 /// otherwise the gateway can't `stop_activity` derivations whose
 /// `Started` arrived on the previous stream, and nom shows them as
 /// stuck forever.
-#[derive(Default)]
 struct BuildActivityState {
     /// Per-derivation activity IDs (for `actBuild` start/stop and for
     /// attaching `BuildLogLine`/`SetPhase` results to the right build).
@@ -206,6 +205,20 @@ struct BuildActivityState {
     /// Top-level `actBuilds` activity ID. `None` until `BuildStarted`
     /// arrives. `Progress`/`SetExpected` results attach here.
     builds_root: Option<u64>,
+    /// Stable cluster identifier emitted as `actBuild` field 1
+    /// (`machineName`). NOT per-pod — see the comment at the
+    /// `Status::Started` arm. Read once from `RIO_GATEWAY_MACHINE_NAME`.
+    machine_name: String,
+}
+
+impl Default for BuildActivityState {
+    fn default() -> Self {
+        Self {
+            drv: HashMap::default(),
+            builds_root: None,
+            machine_name: std::env::var("RIO_GATEWAY_MACHINE_NAME").unwrap_or_default(),
+        }
+    }
 }
 
 /// Process a BuildEvent stream from the scheduler and translate events
@@ -298,6 +311,16 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                         // nom reads fields[0] for the drv name and
                         // fields[1] for the "on <machine>" suffix;
                         // rounds are fixed (1,1) — rio doesn't repeat.
+                        //
+                        // machineName: NOT the executor pod ID — that
+                        // leaks ephemeral pod names to the client and
+                        // breaks the "cluster is one machine" abstraction
+                        // (a build with 200 pods would show 200 machine
+                        // names cycling). Use a stable cluster identifier
+                        // from RIO_GATEWAY_MACHINE_NAME (helm sets it to
+                        // the cluster name); empty default = upstream's
+                        // local-build semantics (nom shows no suffix).
+                        let _ = &started.executor_id; // intentionally unused — see above
                         let aid = stderr
                             .start_activity(
                                 ActivityType::Build,
@@ -306,7 +329,7 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                                 act.builds_root.unwrap_or(0),
                                 &[
                                     ResultField::String(drv_event.derivation_path.clone()),
-                                    ResultField::String(started.executor_id.clone()),
+                                    ResultField::String(act.machine_name.clone()),
                                     ResultField::Int(1),
                                     ResultField::Int(1),
                                 ],
