@@ -6,7 +6,7 @@
   // the browser → Envoy → scheduler round-trip works for a unary RPC.
   import { navigate } from 'svelte-routing';
   import { admin } from '../api/admin';
-  import type { ClusterStatusResponse } from '../gen/admin_types_pb';
+  import type { ClusterStatusResponse } from '../api/types';
 
   let status = $state<ClusterStatusResponse | null>(null);
   let error = $state<string | null>(null);

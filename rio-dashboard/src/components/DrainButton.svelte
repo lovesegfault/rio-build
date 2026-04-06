@@ -10,7 +10,7 @@
   // optimistic overwrite would clobber a potential `dead` transition
   // observed by the next poll.
   import { admin } from '../api/admin';
-  import type { WorkerInfo } from '../gen/admin_types_pb';
+  import type { WorkerInfo } from '../api/types';
   import { toast } from '../lib/toast';
 
   let {

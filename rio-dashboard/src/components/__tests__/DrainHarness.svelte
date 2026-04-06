@@ -5,7 +5,7 @@
   // seed, so we side-step the whole class of warning by stashing the
   // fixture in module scope before mount and reading it there instead
   // of from the reactive props proxy.
-  import type { WorkerInfo } from '../../gen/admin_types_pb';
+  import type { WorkerInfo } from '../../api/types';
 
   let seed: WorkerInfo[] = [];
   // After mount, `live` holds the same $state proxy that DrainButton

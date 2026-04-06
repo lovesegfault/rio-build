@@ -8,7 +8,7 @@
 // createClient() returns. That's exactly the key-set adminMock must
 // cover.
 import { describe, expect, it } from 'vitest';
-import { AdminService } from '../gen/admin_pb';
+import { AdminService } from '../api/types';
 import { adminMock } from './admin-mock';
 
 describe('adminMock surface parity', () => {
