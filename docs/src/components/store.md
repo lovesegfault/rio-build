@@ -217,12 +217,15 @@ r[store.gc.two-phase]
 r[store.gc.tenant-retention]
 
 A store path survives GC if *any* tenant that has referenced it still
-has the path inside its retention window. The mark phase CTE joins
-`path_tenants` against `tenants.gc_retention_hours`: `WHERE
-pt.first_referenced_at > now() - make_interval(hours =>
-t.gc_retention_hours)`. This is union-of-retention semantics — the
-most generous tenant wins. The global grace period (`narinfo.created_at`
-window) is a floor; tenant retention extends it but never shortens it.
+has the path inside its retention window. This is the 6th UNION arm in
+the mark phase CTE (after roots, uploading-manifests, global grace,
+extra-roots, and scheduler-live-pins): it joins `path_tenants` against
+`tenants.gc_retention_hours` — `WHERE pt.first_referenced_at > now() -
+make_interval(hours => t.gc_retention_hours)`. Union-of-retention
+semantics: the most generous tenant wins. The global grace period
+(`narinfo.created_at` window) is a floor; tenant retention extends it
+but never shortens it. An empty `path_tenants` table makes this arm a
+no-op (0 rows contributed).
 
 r[store.gc.tenant-quota]
 

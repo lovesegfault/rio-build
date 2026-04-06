@@ -4751,6 +4751,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-test",
+ "uuid",
  "x509-parser",
  "zstd",
 ]

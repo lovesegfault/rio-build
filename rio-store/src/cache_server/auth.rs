@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Configuration for the auth middleware.
 #[derive(Clone)]
@@ -32,10 +33,21 @@ pub struct CacheAuth {
 
 /// Attached as an axum `Extension` on authenticated requests. Handlers
 /// can `Extension<AuthenticatedTenant>` to see which tenant made the
-/// request (or `None` for anonymous when `allow_unauthenticated=true`).
-// TODO(P0272): per-tenant narinfo scoping reads this. Currently write-only.
+/// request (both fields `None` for anonymous when
+/// `allow_unauthenticated=true`).
+///
+/// Both fields move together: either both `Some` (token matched a
+/// tenant row) or both `None` (anonymous). Not an `Option<(Uuid,
+/// String)>` because the two fields are read independently —
+/// `tenant_id` for path_tenants JOINs, `tenant_name` for logging.
+// TODO(P0272): per-tenant narinfo filtering reads tenant_id via
+//   JOIN path_tenants WHERE tenant_id = $auth.tenant_id
+// Currently write-only — the middleware populates it, nothing reads it.
 #[derive(Clone, Debug)]
-pub struct AuthenticatedTenant(pub Option<String>);
+pub struct AuthenticatedTenant {
+    pub tenant_id: Option<Uuid>,
+    pub tenant_name: Option<String>,
+}
 
 // r[impl store.cache.auth-bearer]
 pub async fn auth_middleware(
@@ -62,17 +74,18 @@ pub async fn auth_middleware(
             // PG's text comparison timing is not an exploitable side-
             // channel at network RTT resolution. If stricter timing-
             // safety is needed, Phase 5 hashes tokens before storage.
-            match sqlx::query_scalar::<_, String>(
-                "SELECT tenant_name FROM tenants WHERE cache_token = $1",
+            match sqlx::query_as::<_, (Uuid, String)>(
+                "SELECT tenant_id, tenant_name FROM tenants WHERE cache_token = $1",
             )
             .bind(t)
             .fetch_optional(&auth.pool)
             .await
             {
-                Ok(Some(name)) => {
-                    request
-                        .extensions_mut()
-                        .insert(AuthenticatedTenant(Some(name)));
+                Ok(Some((id, name))) => {
+                    request.extensions_mut().insert(AuthenticatedTenant {
+                        tenant_id: Some(id),
+                        tenant_name: Some(name),
+                    });
                     next.run(request).await
                 }
                 Ok(None) => unauthorized("invalid token"),
@@ -83,7 +96,10 @@ pub async fn auth_middleware(
             }
         }
         None if auth.allow_unauthenticated => {
-            request.extensions_mut().insert(AuthenticatedTenant(None));
+            request.extensions_mut().insert(AuthenticatedTenant {
+                tenant_id: None,
+                tenant_name: None,
+            });
             next.run(request).await
         }
         None => {

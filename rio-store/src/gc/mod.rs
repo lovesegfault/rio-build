@@ -41,6 +41,7 @@ pub mod drain;
 pub mod mark;
 pub mod orphan;
 pub mod sweep;
+pub mod tenant;
 
 /// PG advisory lock ID for TriggerGC. Arbitrary constant — just
 /// needs to not collide with other advisory locks in the schema
