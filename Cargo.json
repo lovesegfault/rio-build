@@ -15124,6 +15124,10 @@
           "packageId": "tempfile"
         },
         {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
         },
@@ -15660,6 +15664,10 @@
           "packageId": "ordered-float 5.1.0"
         },
         {
+          "name": "parking_lot",
+          "packageId": "parking_lot"
+        },
+        {
           "name": "prost",
           "packageId": "prost"
         },
@@ -15764,6 +15772,14 @@
           "packageId": "http 1.4.0"
         },
         {
+          "name": "opentelemetry",
+          "packageId": "opentelemetry"
+        },
+        {
+          "name": "opentelemetry_sdk",
+          "packageId": "opentelemetry_sdk"
+        },
+        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
@@ -15774,6 +15790,14 @@
         {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "tracing-opentelemetry",
+          "packageId": "tracing-opentelemetry"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
         },
         {
           "name": "tracing-test",
@@ -16016,6 +16040,10 @@
         {
           "name": "http",
           "packageId": "http 1.4.0"
+        },
+        {
+          "name": "http-body-util",
+          "packageId": "http-body-util"
         },
         {
           "name": "hyper-util",
