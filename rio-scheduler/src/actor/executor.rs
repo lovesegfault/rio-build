@@ -594,14 +594,21 @@ impl DagActor {
                 })
                 .then(|| h.clone())
         });
-        // Adopt heartbeat-reported build we don't know about (with warning).
+        // Adopt a heartbeat-reported build the scheduler doesn't have on
+        // record for this executor. Expected after a scheduler restart:
+        // recovery's reconcile may have reset the assignment to Ready
+        // (worker not yet reconnected) and re-dispatched, while the
+        // worker still has it in-flight (I-063 keeps the stream alive
+        // during drain). The worker is authoritative for what it's
+        // running — adopt into BOTH `worker.running_build` (so dispatch
+        // sees at-capacity) AND the DAG node (so dispatch_ready won't
+        // re-pop it; reconcile's cross-check matches). I-066: without
+        // the DAG-side adoption, openssl was re-dispatched while two
+        // draining workers were already running it → both ended up in
+        // failed_builders → I-065 poisoned a passing build.
         let mut reconciled: Option<DrvHash> = match (&prev_kept, &heartbeat_hash) {
             (None, Some(hb)) if prev_running.as_ref() != Some(hb) => {
-                warn!(
-                    executor_id = %executor_id,
-                    drv_hash = %hb,
-                    "heartbeat reports running build scheduler did not assign"
-                );
+                self.adopt_heartbeat_build(executor_id, hb);
                 Some(hb.clone())
             }
             (kept, _) => kept.clone(),
@@ -772,6 +779,87 @@ impl DagActor {
             self.persist_status(&phantom, DerivationStatus::Ready, None)
                 .await;
             self.push_ready(phantom);
+        }
+    }
+
+    /// DAG-side adoption of a heartbeat-reported build the scheduler
+    /// has no record of for this executor. The worker is authoritative
+    /// for what it's running — recovery's reconcile may have already
+    /// reset to Ready and re-dispatched elsewhere by the time the
+    /// worker's first post-restart heartbeat arrives.
+    ///
+    /// In-mem only (no PG persist): `handle_heartbeat` stays sync. The
+    /// next status change (completion/failure) persists; if the
+    /// scheduler crashes again before that, the next adoption is
+    /// idempotent.
+    fn adopt_heartbeat_build(&mut self, executor_id: &ExecutorId, hb: &DrvHash) {
+        let Some(state) = self.dag.node_mut(hb) else {
+            // hash_for_path resolved it, so the node existed a moment
+            // ago — concurrent removal would need another command in
+            // between, but the actor is single-threaded. Unreachable
+            // in practice; warn for visibility.
+            warn!(executor_id = %executor_id, drv_hash = %hb,
+                  "heartbeat-adopt: node vanished after hash_for_path");
+            return;
+        };
+        match state.status() {
+            DerivationStatus::Ready => {
+                // Recovery's reconcile reset it. Re-claim for this
+                // worker so dispatch_ready won't re-pop and the
+                // ~45s-later reconcile cross-check matches.
+                if let Err(e) = state.transition(DerivationStatus::Assigned) {
+                    warn!(executor_id = %executor_id, drv_hash = %hb, error = %e,
+                          "heartbeat-adopt: Ready→Assigned rejected");
+                    return;
+                }
+                state.assigned_executor = Some(executor_id.clone());
+                info!(executor_id = %executor_id, drv_hash = %hb,
+                      "adopted in-flight build from reconnecting worker (was Ready)");
+                metrics::counter!("rio_scheduler_heartbeat_adoptions_total").increment(1);
+            }
+            DerivationStatus::Assigned | DerivationStatus::Running => {
+                match state.assigned_executor.as_ref() {
+                    Some(a) if a == executor_id => {
+                        // Already correct — recovery loaded it Assigned
+                        // to this worker, worker reconnected before
+                        // reconcile reset it. Just the worker.running_
+                        // build side was stale (handle_worker_connected
+                        // creates a fresh entry with running_build=None).
+                        info!(executor_id = %executor_id, drv_hash = %hb,
+                              "re-adopted in-flight build (DAG already Assigned to this worker)");
+                    }
+                    other => {
+                        // Conflict: reconcile already re-dispatched to
+                        // someone else. Both will run; first to complete
+                        // uploads, second finds output-already-in-store.
+                        // Don't steal the DAG assignment (the other
+                        // worker's stream got a real WorkAssignment;
+                        // this one's relying on its old local state).
+                        // The caller still sets worker.running_build so
+                        // this worker is at-capacity.
+                        warn!(executor_id = %executor_id, drv_hash = %hb,
+                              dag_assigned_to = ?other,
+                              "heartbeat-adopt: DAG already Assigned elsewhere; \
+                               both will run (first-to-complete wins)");
+                        metrics::counter!("rio_scheduler_heartbeat_adopt_conflicts_total")
+                            .increment(1);
+                    }
+                }
+            }
+            other => {
+                // Terminal (Completed/Poisoned/DepFailed/Cancelled/
+                // Skipped) or pre-Ready (Created/Queued/Failed). Either
+                // way the DAG can't accept the worker's claim — the
+                // worker's local build is stale or split-brain. Its
+                // eventual completion report will no-op (handle_
+                // completion guards on status). Caller still sets
+                // worker.running_build = Some(hb) — one heartbeat
+                // cycle of false at-capacity, cleared once the worker's
+                // local build exits and next heartbeat omits it.
+                warn!(executor_id = %executor_id, drv_hash = %hb, status = ?other,
+                      "heartbeat-adopt: DAG node not adoptable; \
+                       worker's in-flight build is stale");
+            }
         }
     }
 

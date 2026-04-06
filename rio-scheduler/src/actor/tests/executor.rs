@@ -133,6 +133,124 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     Ok(())
 }
 
+/// I-066: a worker reconnecting after scheduler restart with an
+/// in-flight build (I-063 keeps the stream alive during drain)
+/// heartbeats `running=[X]`. The new leader has X as Ready (recovery's
+/// reconcile reset it before the worker reconnected). Adoption must
+/// claim X in the DAG (Ready→Assigned, assigned_executor=this) so
+/// `dispatch_ready` doesn't re-pop it and send it to ANOTHER idle
+/// worker. Live: openssl re-dispatched while two draining workers were
+/// already running it → both ended up in failed_builders → I-065
+/// poisoned a passing build.
+///
+/// The regression case is the SECOND worker: pre-fix, A's heartbeat
+/// adopted into `worker.running_build` only (DAG stayed Ready), then
+/// B's connect-time `dispatch_ready` found Ready + B idle → assigned
+/// to B. Post-fix, A's adoption transitions DAG to Assigned, B's
+/// dispatch sees not-Ready and skips.
+#[tokio::test]
+async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Derivation Ready with NO worker connected — simulates recovery's
+    // reconcile having reset the assignment before any reconnect.
+    let build_id = Uuid::new_v4();
+    let drv_hash = "i066-adopt-drv";
+    let drv_path = rio_test_support::fixtures::test_drv_path(drv_hash);
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("merged");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Ready,
+        "precondition: Ready, no worker yet"
+    );
+
+    // Worker A reconnects with the build in-flight: stream-connect
+    // (entry created, running_build=None) then FIRST heartbeat reports
+    // running=[drv]. No PrefetchComplete ACK — A is draining, it's
+    // not accepting new work, just reporting what it has.
+    let (stream_tx_a, _stream_rx_a) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::ExecutorConnected {
+            executor_id: "i066-a".into(),
+            stream_tx: stream_tx_a,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            draining: true,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            executor_id: "i066-a".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            running_builds: vec![drv_path.clone()],
+        })
+        .await?;
+
+    // Adoption: DAG node Assigned to A, A.running_build set, no
+    // failed_builders (adoption is reconciliation, not failure).
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Assigned,
+        "adoption transitioned Ready→Assigned"
+    );
+    assert_eq!(
+        info.assigned_executor.as_deref(),
+        Some("i066-a"),
+        "assigned_executor set to the reconnecting worker"
+    );
+    assert!(
+        info.failed_builders.is_empty(),
+        "adoption must not penalize the worker"
+    );
+    let workers = handle.debug_query_workers().await?;
+    let a = workers
+        .iter()
+        .find(|w| w.executor_id == "i066-a")
+        .expect("A registered");
+    assert!(
+        a.running_builds.contains(&drv_hash.to_string()),
+        "worker.running_build set so A reads at-capacity"
+    );
+
+    // Worker B connects idle. Its registration triggers dispatch_ready.
+    // The drv is Assigned (adopted) → not in the Ready filter → B
+    // gets nothing. Pre-I-066: drv was still Ready, B would receive it.
+    let _stream_rx_b = connect_executor(&handle, "i066-b", "x86_64-linux", 1).await?;
+    let workers = handle.debug_query_workers().await?;
+    let b = workers
+        .iter()
+        .find(|w| w.executor_id == "i066-b")
+        .expect("B registered");
+    assert!(
+        b.running_builds.is_empty(),
+        "B must NOT receive the drv — adoption prevented re-dispatch"
+    );
+    let info = handle
+        .debug_query_derivation(drv_hash)
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.assigned_executor.as_deref(),
+        Some("i066-a"),
+        "still A's after B's dispatch pass"
+    );
+
+    Ok(())
+}
+
 /// I-048b: a heartbeat arriving before any BuildExecution stream
 /// connects must NOT create an executor entry. Only stream-open
 /// (`handle_worker_connected`) creates. Heartbeat-creates-entry
@@ -735,18 +853,23 @@ async fn test_worker_disconnect_unknown_noop() -> TestResult {
 }
 
 /// Heartbeat reports a running build the scheduler never assigned
-/// (but which IS in the DAG) → warn + adopt it into running_builds.
-/// This is the "split-brain or restart" recovery path: maybe a
-/// previous scheduler assigned it, we lost in-mem state, worker
-/// still running it. The worker knows better than we do.
+/// (but which IS in the DAG) → adopt it: worker.running_build set
+/// AND DAG node transitioned Ready→Assigned to this worker. INFO
+/// (not WARN — this is the expected post-restart reconnect path,
+/// not split-brain). Log-level + DAG-side adoption are I-066;
+/// pre-fix this only warned + set running_build, leaving the DAG
+/// Ready for re-dispatch elsewhere.
 ///
 /// Note: the drv_path must resolve via `dag.hash_for_path` — unknown
 /// paths are silently filtered BEFORE the reconcile. So this test
 /// merges the drv first (puts it in the DAG) without dispatching it
 /// to the heartbeating worker.
+///
+/// See [`test_heartbeat_adopts_inflight_from_reconnecting_worker`]
+/// for the two-worker case proving no re-dispatch.
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
+async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Merge a drv into the DAG. NO worker connected yet → stays
@@ -788,12 +911,15 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     barrier(&handle).await;
 
     assert!(
-        logs_contain("heartbeat reports running build scheduler did not assign"),
-        "unknown-build heartbeat should warn"
+        logs_contain("adopted in-flight build from reconnecting worker"),
+        "adoption is the EXPECTED post-restart path — INFO, not WARN"
+    );
+    assert!(
+        !logs_contain("heartbeat reports running build scheduler did not assign"),
+        "the pre-I-066 phantom-warn no longer fires for adoptable nodes"
     );
 
-    // The drv SHOULD be adopted into running_build (worker is
-    // authoritative about what it's actually running).
+    // running_build adoption (pre-I-066 already did this).
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
@@ -801,8 +927,19 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
         .expect("worker registered");
     assert!(
         w.running_builds.contains(&"hb-drv".to_string()),
-        "worker's claim should be adopted into running_builds"
+        "worker's claim adopted into running_build"
     );
+
+    // DAG-side adoption (the I-066 fix). Without it, the post-
+    // heartbeat dispatch_ready would re-pop the still-Ready node and
+    // send it to the next idle worker.
+    let info = handle
+        .debug_query_derivation("hb-drv")
+        .await?
+        .expect("exists");
+    assert_eq!(info.status, DerivationStatus::Assigned);
+    assert_eq!(info.assigned_executor.as_deref(), Some("hb-worker"));
+    assert!(info.failed_builders.is_empty());
 
     Ok(())
 }

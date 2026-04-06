@@ -257,6 +257,20 @@ pub fn describe_metrics() {
          the drain is the safety net, not the fix."
     );
     describe_counter!(
+        "rio_scheduler_heartbeat_adoptions_total",
+        "Builds re-claimed in the DAG from a reconnecting worker's heartbeat. \
+         Expected after scheduler restart: recovery's reconcile may have reset \
+         to Ready before the worker reconnected (I-063 keeps the stream alive \
+         during drain). Adoption prevents re-dispatch of work already in flight."
+    );
+    describe_counter!(
+        "rio_scheduler_heartbeat_adopt_conflicts_total",
+        "Heartbeat-adoption found the DAG already Assigned to a DIFFERENT worker \
+         (reconcile re-dispatched before this worker reconnected). Both run; first \
+         to complete wins. Nonzero suggests reconcile delay is too short for the \
+         observed worker-reconnect time."
+    );
+    describe_counter!(
         "rio_scheduler_build_timeouts_total",
         "Builds failed by per-build wall-clock timeout (BuildOptions.build_timeout \
          seconds since submission). Distinct from backstop_timeouts_total \
