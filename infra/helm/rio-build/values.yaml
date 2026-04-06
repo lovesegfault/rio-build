@@ -255,9 +255,11 @@ store:
   s3MaxAttempts: 10
   # Cap on paths in a FindMissingPaths request (DoS guard). 100k path
   # strings ≈ 8 MB per request. Raise if a single `nix copy` of a
-  # very large closure (>100k store paths) is rejected with "too many
-  # paths"; lower on memory-constrained store pods.
-  maxBatchPaths: 100000
+  # very large closure is rejected with "too many paths"; lower on
+  # memory-constrained store pods. Matches gateway wire MAX_COLLECTION_COUNT
+  # (1M) — gateway is the trust boundary, store re-bounding tighter only
+  # rejects batches gateway already admitted (I-130).
+  maxBatchPaths: 1048576
   # PG connection pool size. The QueryPathInfo / FindMissingPaths hot
   # path under autoscaled builder load is bottlenecked on connection
   # acquisition (PK lookups, not query latency). Aurora handles
