@@ -98,6 +98,11 @@ pub fn build_child_workerpool(wps: &WorkerPoolSet, class: &SizeClassSpec) -> Res
         target_value: class.target_queue_per_replica.unwrap_or(5) as i32,
     };
 
+    // EXHAUSTIVE by design: when WorkerPoolSpec gains a field,
+    // E0063 here forces a decision — does PoolTemplate mirror it
+    // (expose to WPS users) or hardcode a default (controller
+    // concern)? This is the ONE production literal; test literals
+    // delegate to crate::fixtures::test_workerpool_spec().
     let spec = WorkerPoolSpec {
         // --- Per-class (SizeClassSpec) ---
         replicas,

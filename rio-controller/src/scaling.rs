@@ -1345,42 +1345,9 @@ mod tests {
     /// loop's class-specific depth → flap).
     #[test]
     fn is_wps_owned_detects_controller_ownerref() {
-        use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPoolSpec};
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
-        // Full WorkerPoolSpec — no Default derive (all required-in-
-        // CEL fields must be explicit). Same shape as
-        // workerpoolset/builders.rs build_child_workerpool output.
-        let spec = WorkerPoolSpec {
-            replicas: Replicas { min: 1, max: 10 },
-            autoscaling: Autoscaling {
-                metric: "queueDepth".into(),
-                target_value: 5,
-            },
-            max_concurrent_builds: 4,
-            fuse_cache_size: "50Gi".into(),
-            systems: vec!["x86_64-linux".into()],
-            size_class: "small".into(),
-            image: "rio-worker:test".into(),
-            features: vec![],
-            ephemeral: false,
-            resources: None,
-            image_pull_policy: None,
-            node_selector: None,
-            tolerations: None,
-            fuse_threads: None,
-            bloom_expected_items: None,
-            fuse_passthrough: None,
-            daemon_timeout_secs: None,
-            termination_grace_period_seconds: None,
-            privileged: None,
-            seccomp_profile: None,
-            host_network: None,
-            host_users: None,
-            tls_secret_name: None,
-            topology_spread: None,
-            fod_proxy_url: None,
-        };
+        let spec = crate::fixtures::test_workerpool_spec();
 
         // Standalone pool: no owner reference at all.
         let standalone = WorkerPool::new("standalone-pool", spec.clone());
@@ -1446,48 +1413,9 @@ mod tests {
     // Test helpers for the find_wps_child cases. These mirror the
     // builders::tests::test_wps_with_classes pattern but live here
     // because that helper is in a private #[cfg(test)] mod inside
-    // builders.rs (unreachable cross-module). Keeping the fixture
-    // local avoids either (a) hoisting to rio-test-support (heavy
-    // for a 3-test fixture) or (b) making builders' helper
-    // pub(crate) (leaks test surface).
-
-    fn test_wp_spec() -> crate::crds::workerpool::WorkerPoolSpec {
-        use crate::crds::workerpool::{Autoscaling, Replicas, WorkerPoolSpec};
-        // Full WorkerPoolSpec — no Default derive (all required-in-
-        // CEL fields must be explicit). Same shape as
-        // is_wps_owned_detects_controller_ownerref above — if that
-        // fixture changes (new WorkerPoolSpec field), update both.
-        WorkerPoolSpec {
-            replicas: Replicas { min: 1, max: 10 },
-            autoscaling: Autoscaling {
-                metric: "queueDepth".into(),
-                target_value: 5,
-            },
-            max_concurrent_builds: 4,
-            fuse_cache_size: "50Gi".into(),
-            systems: vec!["x86_64-linux".into()],
-            size_class: "small".into(),
-            image: "rio-worker:test".into(),
-            features: vec![],
-            ephemeral: false,
-            resources: None,
-            image_pull_policy: None,
-            node_selector: None,
-            tolerations: None,
-            fuse_threads: None,
-            fuse_passthrough: None,
-            daemon_timeout_secs: None,
-            termination_grace_period_seconds: None,
-            privileged: None,
-            seccomp_profile: None,
-            host_network: None,
-            host_users: None,
-            tls_secret_name: None,
-            topology_spread: None,
-            fod_proxy_url: None,
-            bloom_expected_items: None,
-        }
-    }
+    // builders.rs (unreachable cross-module). WorkerPoolSpec shape
+    // is pulled from crate::fixtures::test_workerpool_spec — the
+    // single touch point for E0063 on field adds.
 
     fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> WorkerPoolSet {
         use crate::crds::workerpoolset::{PoolTemplate, SizeClassSpec, WorkerPoolSetSpec};
@@ -1519,7 +1447,7 @@ mod tests {
     }
 
     fn test_wp_in_ns(name: &str, ns: &str) -> WorkerPool {
-        let mut wp = WorkerPool::new(name, test_wp_spec());
+        let mut wp = WorkerPool::new(name, crate::fixtures::test_workerpool_spec());
         wp.metadata.namespace = Some(ns.into());
         wp
     }

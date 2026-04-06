@@ -39,6 +39,12 @@ use crate::reconcilers::Ctx;
 mod builders;
 pub mod disruption;
 mod ephemeral;
+// pub(crate) so fixtures.rs (at crate root) can see it. Gated
+// on test: production code in this module pulls it via the glob
+// below; only the cfg(test) fixtures module needs the wider
+// visibility.
+#[cfg(test)]
+pub(crate) use builders::SchedulerAddrs;
 use builders::*;
 
 #[cfg(test)]
