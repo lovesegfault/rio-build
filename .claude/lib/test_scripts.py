@@ -1483,6 +1483,77 @@ def test_flake_mitigation_errors_on_multiple_matches(tmp_repo: Path):
     assert "deadbeef" not in flakes.read_text()
 
 
+# ─── excusable: nixbuild.net infra patterns ─────────────────────────────────
+
+
+def test_excusable_nixbuild_infra_patterns(tmp_path: Path, monkeypatch):
+    """Tier-1 infra-error patterns short-circuit to excusable=True without
+    a known-flakes entry. ^error: anchor excludes drv>-prefixed stdout relay
+    where these tokens appear benignly in green logs (postgres noise, test
+    names). P0430 iter-1: vm-le-build-k3s was in known-flakes but excusable()
+    hit the "no FAIL lines" branch on a remote crash — false negative."""
+    import onibus.build
+    from onibus.build import excusable
+
+    # Empty known-flakes → tier-1 must grant without a jsonl entry.
+    kf = tmp_path / "known-flakes.jsonl"
+    kf.write_text("")
+    monkeypatch.setattr(onibus.build, "KNOWN_FLAKES", kf)
+
+    log = tmp_path / "ci.log"
+
+    # Each of the 4 patterns at ^error: level → excusable, no FAIL line needed.
+    # These are realistic nix-level error lines (not inside drv> relay).
+    for marker, line in (
+        ("Broken pipe",         "error: writing to file: Broken pipe"),
+        ("internal_error",      "error: remote build on 'ssh-ng://eu.nixbuild.net' failed: internal_error: sandbox crashed"),
+        ("resource vanished",   "error: reading from ssh-ng://eu.nixbuild.net: fd:5: hGetLine: resource vanished (Connection reset by peer)"),
+        ("Transient build error", "error: Transient build error — nixbuild.net will retry automatically"),
+    ):
+        log.write_text(f"... builder prelude ...\n{line}\n... trailer ...\n")
+        v = excusable(log)
+        assert v.excusable, f"{marker!r} at ^error: should be tier-1 excusable; got: {v.reason}"
+        assert marker in v.reason
+        assert v.matched_flakes == []  # tier-1 bypasses known-flakes lookup
+
+    # P0430's shape: infra error WITH a co-occurring VM Cannot-build line.
+    # Tier-1 fires first → spurious failure ignored, still excusable.
+    log.write_text(
+        "error: writing to file: Broken pipe\n"
+        "error: Cannot build '/nix/store/abc123xyz-vm-test-run-rio-le-build.drv'.\n"
+    )
+    v = excusable(log)
+    assert v.excusable
+    assert "Broken pipe" in v.reason
+    assert v.failing_tests == ["rio-le-build"]  # still reported, just not gating
+
+    # Negative: real test FAIL, no infra marker, not in known-flakes → tier-2 rejects.
+    log.write_text("        FAIL [   1.234s] rio-store::tests::real_bug\n")
+    v = excusable(log)
+    assert not v.excusable
+    assert "not in known-flakes" in v.reason
+
+    # False-positive guard: 'Broken pipe' INSIDE drv> stdout relay. Real green-log
+    # sample (rio-p0454-impl-2.log:34269) — postgres client-disconnect noise.
+    # ^error: anchor excludes → falls through to tier-2 "no FAIL lines" → False.
+    log.write_text(
+        "vm-test-run-rio-chaos> control # [   29.074882] postgres[1058]: "
+        "[1058] LOG:  could not send data to client: Broken pipe\n"
+    )
+    v = excusable(log)
+    assert not v.excusable, f"drv>-prefixed Broken pipe must not be tier-1; got: {v.reason}"
+
+    # False-positive guard: 'internal_error' inside a test NAME. Real green-log
+    # sample — pin_path_internal_error_is_scrubbed passes in every .#ci run.
+    # ^error: anchor excludes.
+    log.write_text(
+        "rio-test-run-rio-store> test "
+        "grpc::admin::tests::pin_path_internal_error_is_scrubbed ... ok\n"
+    )
+    v = excusable(log)
+    assert not v.excusable, f"test-name internal_error must not be tier-1; got: {v.reason}"
+
+
 # ─── unassigned placeholder rename ───────────────────────────────────────────
 
 

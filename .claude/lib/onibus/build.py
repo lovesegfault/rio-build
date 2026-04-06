@@ -151,6 +151,29 @@ _VM_FAIL_RE = re.compile(
     re.MULTILINE,
 )
 
+# nixbuild.net remote-builder infra errors. ^error: anchor is load-bearing
+# (same rationale as _VM_FAIL_RE) — excludes `drv> ...` build-stdout relay
+# where these tokens appear benignly in GREEN logs:
+#   - vm-test-run-rio-chaos> ... postgres[1058]: ... Broken pipe  (client-disconnect noise)
+#   - rio-test-run-rio-store> test ...pin_path_internal_error_is_scrubbed ... ok  (test NAME)
+# Both observed in /tmp/rio-dev/ greens. A bare substring match would mark
+# every CI run excusable.
+#
+# These signal the build never reached completion — ssh pipe broke mid-run,
+# remote sandbox killed, server-side crash. Any co-occurring FAIL is a casualty
+# of the pipe break, not a real test failure. Retry regardless of known-flakes.
+#
+# nxb-dev retired 2026-03 (module docstring) — still catches residual
+# --store ssh-ng:// paths and anyone re-enabling remote builders.
+#
+# P0430 iter-1: vm-le-build-k3s was in known-flakes but excusable() returned
+# false — log had a remote-builder crash signature, not a FAIL/Cannot-build
+# line. Implementer blocked on a false-negative.
+_INFRA_ERROR_RE = re.compile(
+    r"^error: .*?(Broken pipe|internal_error|resource vanished|Transient build error)",
+    re.MULTILINE,
+)
+
 # 2026-03-20: HARD-STOP — KVM-denied is no longer excusable. The root cause
 # was two-fold: (1) kvmOnly module's dual `-machine accel=` breaks qemu 10.2.1
 # on multi-VM tests (FIXED @ 7bd70aba), (2) 7 of 13 kvm:y builders have
@@ -170,6 +193,20 @@ def excusable(log_path: Path) -> ExcusableVerdict:
     vm_fails = sorted(set(_VM_FAIL_RE.findall(text)))  # drv names
     failing = nextest_fails + vm_fails  # order: nextest first, VM second (for reason clarity)
 
+    # Tier-1: nixbuild.net infra error → always excusable. Checked BEFORE
+    # the failing-test gates — an ssh pipe break may produce spurious FAIL
+    # lines (interrupted mid-run) or none at all (crashed before nextest
+    # started). Either way the build never completed; known-flakes lookup
+    # is moot. P0430's false-negative: "no FAIL lines" branch fired on
+    # an infra crash.
+    infra_hit = _INFRA_ERROR_RE.search(text)
+    if infra_hit:
+        return ExcusableVerdict(
+            excusable=True, failing_tests=failing, matched_flakes=[],
+            reason=f"nixbuild.net infra error {infra_hit.group(1)!r} — build never completed, retry",
+        )
+
+    # Tier-2: known-flakes lookup (existing single-failure discipline).
     flake_rows = read_jsonl(KNOWN_FLAKES, KnownFlake)
     # Two match surfaces: nextest fails match against `test` (crate::path form);
     # VM fails match against `drv_name` (rio-lifecycle-* form).
