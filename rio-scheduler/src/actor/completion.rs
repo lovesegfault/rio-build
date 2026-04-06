@@ -100,7 +100,7 @@ impl DagActor {
     /// out the only matching row).
     ///
     /// Batch: single FindMissingPaths RPC covering all discovered
-    /// prior outputs. Bounded by MAX_CASCADE_DEPTH on both the in-mem
+    /// prior outputs. Bounded by MAX_CASCADE_NODES on both the in-mem
     /// DAG walk AND the PG realisation_deps walk.
     async fn verify_cutoff_candidates(
         &self,
@@ -117,7 +117,7 @@ impl DagActor {
         // cascade re-checks eligibility.
         let (candidates, _cap) = crate::dag::DerivationDag::speculative_cascade_reachable(
             trigger,
-            crate::dag::MAX_CASCADE_DEPTH,
+            crate::dag::MAX_CASCADE_NODES,
             |current, provisional| {
                 self.dag
                     .find_cutoff_eligible_speculative(current, provisional)
@@ -136,7 +136,7 @@ impl DagActor {
             crate::ca::walk_dependent_realisations(
                 self.db.pool(),
                 prior_seeds,
-                crate::dag::MAX_CASCADE_DEPTH,
+                crate::dag::MAX_CASCADE_NODES,
             ),
         )
         .await
@@ -187,7 +187,7 @@ impl DagActor {
                 };
                 // Find a prior output whose path ends with this
                 // suffix. Linear scan over prior_outputs — bounded
-                // by MAX_CASCADE_DEPTH, so small-N.
+                // by MAX_CASCADE_NODES, so small-N.
                 if let Some(((_, prior_out), (path, oh))) = prior_outputs
                     .iter()
                     .find(|((_, on), (p, _))| on == out_name && p.ends_with(&suffix))
@@ -532,9 +532,9 @@ impl DagActor {
         // CA early-cutoff compare: if this was a CA derivation, check
         // each output_path against the realisations table for a PRIOR
         // build (different modular_hash, same path). All-match →
-        // P0252's find_cutoff_eligible() will skip downstream builds.
-        // This hook only records the compare result + the prior
-        // realisation seeds; propagation happens below.
+        // P0252's cutoff-propagate cascade (cascade_cutoff) will skip
+        // downstream builds. This hook only records the compare result
+        // + the prior realisation seeds; propagation happens below.
         //
         // WHY realisation-based, not ContentLookup-based: CA
         // derivations produce IDENTICAL output_paths for identical
@@ -740,7 +740,7 @@ impl DagActor {
             if cap_hit {
                 tracing::warn!(
                     trigger = %drv_hash,
-                    depth = crate::dag::MAX_CASCADE_DEPTH,
+                    node_count = crate::dag::MAX_CASCADE_NODES,
                     skipped = skipped.len(),
                     "CA cutoff cascade hit depth cap; remaining downstream will run normally"
                 );
@@ -1224,7 +1224,7 @@ impl DagActor {
             // goes Failed→Ready (Failed is an intermediate); PG must
             // match the FINAL in-mem state. Crash in the backoff
             // window (up to 300s) with PG=Failed → recovery loads it
-            // (Failed not in db.rs:537 terminal filter) but only
+            // (Failed not in TERMINAL_STATUS_SQL filter) but only
             // pushes Ready-status drvs to the queue (recovery.rs:225)
             // → Failed drv sits in DAG forever, never dispatched.
             self.persist_status(drv_hash, DerivationStatus::Ready, None)

@@ -280,11 +280,9 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
             }
             Some(types::build_event::Event::InputsResolved(_)) => {
                 // Scheduler's store cache-check done; dispatch begins
-                // next. Could surface via stderr.log() ("inputs
-                // resolved") for `nix build` UX, but that's TODO —
-                // for now, matches the Started/Progress debug-only
-                // pattern. The info to print (N to build = total -
-                // cached) arrived in Started above.
+                // next. Matches the Started/Progress debug-only pattern
+                // — the info to print (N to build = total - cached)
+                // arrived in Started above.
                 debug!("build inputs resolved");
             }
             Some(types::build_event::Event::Progress(prog)) => {
@@ -369,7 +367,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // than silently drop auth on the floor.
     if let Some(token) = jwt_token {
         request.metadata_mut().insert(
-            "x-rio-tenant-token",
+            rio_common::jwt_interceptor::TENANT_TOKEN_HEADER,
             tonic::metadata::MetadataValue::try_from(token)?,
         );
     }

@@ -60,8 +60,8 @@ Read it. Extract every bullet under `## Exit criteria` — these are the claims 
 ### 2. Diff the branch
 
 ```bash
-git diff $TGT..<branch> --stat    # shape: which files, how big
-git diff $TGT..<branch>           # detail: what actually changed
+git diff $TGT...<branch> --stat    # shape: which files, how big
+git diff $TGT...<branch>           # detail: what actually changed
 ```
 
 ### 3. Evidence per exit criterion

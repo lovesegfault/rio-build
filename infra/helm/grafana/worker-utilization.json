@@ -29,7 +29,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "rio_controller_workerpool_replicas{pool=~\".+\"}",
+          "expr": "rio_controller_workerpool_replicas",
           "legendFormat": "{{pool}} ({{kind}})",
           "refId": "A"
         }
@@ -56,7 +56,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "rio_scheduler_class_queue_depth{class=~\".+\"}",
+          "expr": "rio_scheduler_class_queue_depth",
           "legendFormat": "{{class}}",
           "refId": "A"
         }

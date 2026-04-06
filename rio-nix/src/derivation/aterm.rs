@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(drv.outputs()[0].path(), "/nix/store/abc-simple-test");
         assert_eq!(drv.outputs()[0].hash_algo(), "");
         assert_eq!(drv.outputs()[0].hash(), "");
-        assert!(!drv.outputs()[0].is_fixed_output());
+        assert!(!drv.outputs()[0].has_hash_algo());
         assert!(drv.input_drvs().is_empty());
         assert!(drv.input_srcs().is_empty());
         assert_eq!(drv.platform(), "x86_64-linux");
@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].hash_algo(), "sha256");
         assert_eq!(drv.outputs()[0].hash(), "abcdef0123456789");
-        assert!(drv.outputs()[0].is_fixed_output());
+        assert!(drv.outputs()[0].has_hash_algo());
         Ok(())
     }
 

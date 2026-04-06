@@ -1025,6 +1025,7 @@ mod tests {
 
         let our_nar = dump_path(root)?;
 
+        #[allow(clippy::disallowed_methods)] // tempdir path, test-only
         let nix_output = std::process::Command::new("nix-store")
             .args(["--dump", &root.to_string_lossy()])
             .output();

@@ -56,7 +56,7 @@ pub(crate) struct SchedulerAddrs {
 /// Dashboards and `kubectl get pods -l` queries expect these.
 pub(super) fn labels(wp: &WorkerPool) -> BTreeMap<String, String> {
     BTreeMap::from([
-        ("rio.build/pool".into(), wp.name_any()),
+        (super::POOL_LABEL.into(), wp.name_any()),
         ("app.kubernetes.io/name".into(), "rio-worker".into()),
         ("app.kubernetes.io/component".into(), "worker".into()),
         ("app.kubernetes.io/part-of".into(), "rio-build".into()),

@@ -9,7 +9,7 @@ rio-build deltas:
     is POLLUTION → FAIL. Zero r[domain.*] refs → WARN (not FAIL — refactor
     plans legitimately cite zero).
   - PlanFile validator: +migrations/ +infra/ +scripts/ +codecov.yml,
-    -systemd/ -tests/ -benches/ -deny.toml
+    -systemd/ -tests/ -benches/
   - rename_unassigned fixtures: no r[plan.*] markers (use plain P<N> refs);
     the string-replace logic is format-agnostic
   - agent-def tests: @pytest.mark.skip pending separate agent port
@@ -940,7 +940,16 @@ def test_plan_file_validates_path_prefix():
     PlanFile(path="migrations/009_tenants.sql")
     PlanFile(path="infra/helm/rio-build/values.yaml")
     PlanFile(path="scripts/split-crds.sh")
-    # rio-build removals (vs rix): -systemd/ -tests/ -benches/ -deny.toml
+    # Root-level additions (P0304-T1): .github/, deny.toml, flake.lock,
+    # .envrc, ALL-CAPS.md
+    PlanFile(path=".github/workflows/ci.yml")
+    PlanFile(path="deny.toml")
+    PlanFile(path="flake.lock")
+    PlanFile(path=".envrc")
+    PlanFile(path="README.md")
+    PlanFile(path="CLAUDE.md")
+    PlanFile(path="CONTRIBUTING.md")
+    # rio-build removals (vs rix): -systemd/ -tests/ -benches/
     with pytest.raises(ValidationError):
         PlanFile(path="src/foo.rs")  # missing rio-*/ prefix
     with pytest.raises(ValidationError):
@@ -948,7 +957,7 @@ def test_plan_file_validates_path_prefix():
     with pytest.raises(ValidationError):
         PlanFile(path="rio-scheduler/foo.rs", action="INVALID")
     with pytest.raises(ValidationError):
-        PlanFile(path="deny.toml")  # not in rio pattern (lives in .config/ now)
+        PlanFile(path="random.md")  # lowercase-stem .md rejected
     with pytest.raises(ValidationError):
         PlanFile(path="systemd/rio-daemon.service")  # rio has no systemd/
 
@@ -2112,6 +2121,53 @@ def test_behind_check_not_phantom_real_two_behind(tmp_repo: Path):
         f"real behind-by-2: expected phantom_amend=False (no message "
         f"match for 'docs: plan-9' in last-2 sprint-1 commits), "
         f"got {bc!r}"
+    )
+
+
+def test_behind_check_phantom_amend_identical_tree(tmp_repo: Path):
+    """merger.md:146 no-op amend: row already DONE → dag set-status no-op
+    → git add stages nothing → --amend --no-edit rewrites with IDENTICAL
+    tree. Still produces a new SHA (new committer timestamp), orphaning
+    worktrees identically. amend_diff = diff(pre_amend, post_amend) = ∅.
+
+    The `amend_diff and` truthiness guard made empty-set short-circuit
+    False, missing this case. Empty-set IS a subset of _PHANTOM_AMEND_FILES;
+    same-msg + identical-tree is definitionally a phantom.
+    """
+    from onibus.git_ops import behind_check
+
+    repo = tmp_repo
+    (repo / ".claude" / "dag.jsonl").write_text('{"plan":1,"status":"DONE"}\n')
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "chore: seed dag", "--no-verify")
+
+    (repo / "feature.txt").write_text("ff'd work\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: ff'd work", "--no-verify")
+    pre_amend = _git(repo, "rev-parse", "HEAD")
+
+    # No-op amend: nothing staged, identical tree, message preserved,
+    # new committer timestamp → new SHA. Sleep ensures timestamp delta.
+    import time; time.sleep(1)
+    _git(repo, "commit", "--amend", "--no-edit", "--no-verify")
+    post_amend = _git(repo, "rev-parse", "HEAD")
+    assert pre_amend != post_amend, "no-op amend still rewrites SHA"
+    pre_tree = _git(repo, "rev-parse", f"{pre_amend}^{{tree}}")
+    post_tree = _git(repo, "rev-parse", f"{post_amend}^{{tree}}")
+    assert pre_tree == post_tree, "trees should be identical"
+
+    wt = repo.parent / "wt-p994"
+    _git(repo, "worktree", "add", "-b", "p994", str(wt), pre_amend)
+    (wt / "own-work.txt").write_text("p994 work\n")
+    _git(wt, "add", "own-work.txt")
+    _git(wt, "commit", "-m", "feat: p994 work", "--no-verify")
+
+    bc = behind_check(wt)
+    assert bc.behind == 1
+    assert bc.phantom_amend is True, (
+        f"identical-tree no-op amend: expected phantom_amend=True "
+        f"(diff={pre_amend[:8]}..{post_amend[:8]} is EMPTY → "
+        f"empty-set ⊆ _PHANTOM_AMEND_FILES), got {bc!r}"
     )
 
 

@@ -271,8 +271,9 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_scheduler_ca_cutoff_depth_cap_hits_total",
-        "CA cutoff cascade walks that hit MAX_CASCADE_DEPTH (1000). \
-         Non-zero means cascades are being truncated — pathological DAG \
-         shape or the cap is too low for the workload."
+        "CA cutoff cascade walks that hit MAX_CASCADE_NODES (1000). \
+         Node-count cap, not tree-depth — for wide DAGs (fanout>1), 1000 \
+         nodes hit well before depth>3. Non-zero = cascades truncated; \
+         operator should review if non-zero."
     );
 }

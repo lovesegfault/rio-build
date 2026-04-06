@@ -591,14 +591,10 @@ impl ConnectionHandler {
     /// reason. The error propagates via `handle_session_error`.
     fn ensure_permit(&self) -> Result<(), anyhow::Error> {
         if self.conn_permit.is_none() {
-            return Err(anyhow::anyhow!(
-                "connection cap reached ({} concurrent SSH connections)",
-                // Approximate: we don't know the cap at this point
-                // (the semaphore is on GatewayServer, not us). The
-                // client sees an SSH disconnect; the server logs
-                // the `conn_cap` error counter.
-                "max"
-            ));
+            // The cap value lives on GatewayServer (semaphore), not here.
+            // Client sees an SSH disconnect; server logs the `conn_cap`
+            // error counter. Operator checks gateway.toml max_connections.
+            return Err(anyhow::anyhow!("connection cap reached"));
         }
         Ok(())
     }

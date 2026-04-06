@@ -11,14 +11,15 @@ use uuid::Uuid;
 
 use crate::state::{DerivationState, DerivationStatus, DrvHash};
 
-/// CA-cutoff cascade depth cap. Bounds work on pathological DAGs
+/// CA-cutoff cascade node-count cap. Bounds work on pathological DAGs
 /// (e.g., a linear chain of 100k Queued nodes would otherwise walk
 /// the whole thing synchronously inside a single completion handler).
-/// Each iteration is one `find_cutoff_eligible` call (O(fanout ×
-/// children)), so 1000 iterations × typical fanout ≈ low-thousands
-/// of nodes skipped per cascade — ample for real-world DAGs, bounded
-/// for adversarial ones.
-pub const MAX_CASCADE_DEPTH: usize = 1000;
+/// Each iteration is one `find_cutoff_eligible_speculative` call
+/// (O(fanout × children)), so 1000 iterations × typical fanout ≈
+/// low-thousands of nodes skipped per cascade — ample for real-world
+/// DAGs, bounded for adversarial ones. This is a NODE-COUNT cap (pops
+/// from the frontier stack), not a BFS tree-depth cap.
+pub const MAX_CASCADE_NODES: usize = 1000;
 
 /// Errors from DAG operations.
 #[derive(Debug, thiserror::Error)]
@@ -532,6 +533,12 @@ impl DerivationDag {
     /// (or just-skipped) node — i.e., status is `Queued` and all deps are
     /// now terminal.
     ///
+    /// Treats nodes in `provisional_skipped` as-if-terminal. Used by
+    /// `speculative_cascade_reachable` (batch-verification prewalk +
+    /// cascade transition walk): verification needs to speculate "if B
+    /// WERE skipped, would C be eligible?" to batch the store RPC
+    /// across all reachable candidates.
+    ///
     /// Only `Queued` is checked (never touch `Running` —
     /// `r[sched.preempt.never-running]`). A `Ready` node has
     /// `all_deps_completed() == true`, which means its inputs were
@@ -544,16 +551,6 @@ impl DerivationDag {
     /// immediately (see `cascade_dependency_failure`), so a `Queued`
     /// node's terminal deps are in practice only `Completed` or
     /// `Skipped`.
-    pub fn find_cutoff_eligible(&self, completed: &str) -> Vec<DrvHash> {
-        self.find_cutoff_eligible_speculative(completed, &HashSet::new())
-    }
-
-    /// Variant of [`Self::find_cutoff_eligible`] that treats nodes in
-    /// `provisional_skipped` as-if-terminal. Used by the cascade's
-    /// batch-verification prewalk: the actual cascade transitions
-    /// nodes to Skipped, but verification needs to speculate "if B
-    /// WERE skipped, would C be eligible?" to batch the store RPC
-    /// across all reachable candidates.
     pub fn find_cutoff_eligible_speculative(
         &self,
         completed: &str,
@@ -666,7 +663,7 @@ impl DerivationDag {
     /// `expand`'s return → not added to visited → not treated
     /// as-if-Skipped → their parents stay ineligible (cascade halts).
     ///
-    /// Depth-capped at [`MAX_CASCADE_DEPTH`]. Returns
+    /// Depth-capped at [`MAX_CASCADE_NODES`]. Returns
     /// `(skipped_hashes, depth_cap_hit)`.
     pub fn cascade_cutoff(
         &mut self,
@@ -677,7 +674,7 @@ impl DerivationDag {
             return (Vec::new(), false);
         };
         let (candidates, cap_hit) =
-            Self::speculative_cascade_reachable(&start, MAX_CASCADE_DEPTH, |current, visited| {
+            Self::speculative_cascade_reachable(&start, MAX_CASCADE_NODES, |current, visited| {
                 self.find_cutoff_eligible_speculative(current, visited)
                     .into_iter()
                     .filter(&mut verify)

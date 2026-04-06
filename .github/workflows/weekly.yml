@@ -54,6 +54,10 @@ jobs:
     runs-on: rio-ci
     timeout-minutes: 240
     needs: golden-matrix
+    # needs: is for ordering (one-runner-at-a-time), not gating. golden-matrix
+    # overrides nix-unstable (P0348) — upstream regression would skip mutants
+    # silently. mutants runs against locked inputs, unaffected by upstream.
+    if: always() && !cancelled()
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix

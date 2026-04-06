@@ -36,7 +36,8 @@ def _next_iter(plan: str, role: str) -> int:
 
 
 def run(
-    target: str, *, role: BuildRole = "impl", copy: bool = False, loud: bool = False
+    target: str, *, role: BuildRole = "impl", copy: bool = False,
+    link: bool = False, loud: bool = False,
 ) -> BuildReport:
     LOG_DIR.mkdir(exist_ok=True)
     # REPO_ROOT is derived from __file__ (onibus/__init__.py:24) — cwd-independent.
@@ -106,6 +107,15 @@ def run(
                 f.write(f"\n[onibus build] nix copy failed: {cp.stderr}\n")
         else:
             store_path = out_paths[0]
+            # --link: create ./result → /nix/store/<hash>-<name> after --copy
+            # so the target exists locally. This is what plain `nix build`
+            # does by default; we suppress it with --no-link because the
+            # output is USUALLY remote-only. Needed for .#crds, .#coverage-html
+            # — outputs the caller cp's or opens, not just checks for existence.
+            if link:
+                result = Path(toplevel) / "result"
+                result.unlink(missing_ok=True)
+                result.symlink_to(store_path)
 
     tail = log_path.read_text().splitlines()[-80:] if rc != 0 else []
     return BuildReport(

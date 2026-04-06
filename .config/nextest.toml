@@ -70,7 +70,11 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # PostgreSQL integration tests. First test pays initdb cost; later tests
 # are fast (CREATE DATABASE + migrate + test body).
 [[profile.default.overrides]]
-filter = 'package(rio-scheduler) and test(/^tests::/)'
+# `tests::` (substring, not `^tests::` anchored) — also catches
+# actor::tests::completion::* which use TestDb+MIGRATOR but fell
+# through to DEFAULT (30s×3) instead of postgres (60s×2) group with
+# the anchored form. Group also serializes to max-threads=8.
+filter = 'package(rio-scheduler) and test(/tests::/)'
 test-group = 'postgres'
 slow-timeout = { period = "60s", terminate-after = 2 }
 

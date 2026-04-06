@@ -50,6 +50,10 @@ impl GatewaySession {
     ///
     /// [`new`]: Self::new
     pub async fn new_with_tenant(tenant_name: &str) -> anyhow::Result<Self> {
+        // Idempotent (try_init); output captured per-test via
+        // with_test_writer, shown only on failure. Without this,
+        // tracing::debug! in run_protocol error-log paths is void.
+        init_test_logging();
         let (store, store_addr, store_handle) = spawn_mock_store().await?;
         let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 

@@ -9,4 +9,6 @@ disallowed-methods = [
   # Allowed only in test assertions / log display / panic messages —
   # wrap those call sites with #[allow(clippy::disallowed_methods)].
   { path = "alloc::string::String::from_utf8_lossy", reason = "silently produces U+FFFD; use str::from_utf8 for parse paths (P0020/P0290)" },
+  { path = "std::ffi::OsStr::to_string_lossy", reason = "silently produces U+FFFD; use .to_str().ok_or(...) for parse paths (P0290)" },
+  { path = "std::path::Path::to_string_lossy", reason = "silently produces U+FFFD; use .to_str().ok_or(...) for parse paths (P0290)" },
 ]

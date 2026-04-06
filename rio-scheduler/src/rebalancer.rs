@@ -41,7 +41,8 @@ use crate::db::SchedulerDb;
 /// `scheduler.toml [rebalancer]` — defaults assume medium-volume
 /// (~70 builds/day minimum at 500 samples / 7d). Workload-dependent;
 /// operator tunes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct RebalancerConfig {
     /// Below this sample count, skip rebalancing (return `None`).
     /// Sparse data produces noisy cutoffs that thrash the EMA.
@@ -105,6 +106,14 @@ pub fn compute_cutoffs(
 
     // Sort by duration. Memory column ignored for partitioning.
     let mut durations: Vec<f64> = samples.iter().map(|(d, _)| *d).collect();
+
+    // After the min_samples gate passes, samples.len() > 0 is
+    // guaranteed IFF min_samples >= 1. If a caller passes min_samples=0
+    // (possible now that RebalancerConfig is Deserialize-able from TOML),
+    // durations can be empty here and len()-1 below wraps. Guard explicitly.
+    if durations.is_empty() {
+        return None;
+    }
     // total_cmp: defines NaN ordering (NaN sorts last under IEEE 754
     // total order) — same defense as assignment.rs:99. Samples come
     // from PG DOUBLE PRECISION NOT NULL so NaN is unlikely, but a

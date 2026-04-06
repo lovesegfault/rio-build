@@ -69,6 +69,12 @@ const OLD_FINALIZER: &str = "rio.build/workerpool-drain";
 /// authoritative for what it manages.
 const MANAGER: &str = "rio-controller";
 
+/// Label every WorkerPool-owned pod carries. `builders::labels()`
+/// sets it; `disruption::run` filters on it; `ephemeral` + cleanup
+/// list-selectors match on it. Single const — a typo in one site
+/// silently breaks the watch/selector coupling.
+pub(crate) const POOL_LABEL: &str = "rio.build/pool";
+
 /// Top-level reconcile. Wrapped in `finalizer()` which handles
 /// the metadata.finalizers dance: Apply on normal reconcile,
 /// Cleanup when deletionTimestamp is set.
@@ -549,7 +555,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // via RIO_WORKER_ID=$(POD_NAME) downward API in build_pod_spec).
     let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
     let pods = pods_api
-        .list(&kube::api::ListParams::default().labels(&format!("rio.build/pool={name}")))
+        .list(&kube::api::ListParams::default().labels(&format!("{POOL_LABEL}={name}")))
         .await?;
 
     // Best-effort DrainWorker per pod. Balanced client routes to

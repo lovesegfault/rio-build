@@ -21,7 +21,9 @@ use common::GatewaySession;
 use rio_nix::protocol::wire;
 use rio_test_support::fixtures::make_nar;
 use rio_test_support::grpc::MockSchedulerOutcome;
-use rio_test_support::wire::{drain_stderr_expecting_error, drain_stderr_until_last};
+use rio_test_support::wire::{
+    drain_stderr_expecting_error, drain_stderr_until_last, read_path_info,
+};
 use rio_test_support::{wire_bytes, wire_send};
 
 /// A valid-looking Nix store path (32-char nixbase32 hash + name).

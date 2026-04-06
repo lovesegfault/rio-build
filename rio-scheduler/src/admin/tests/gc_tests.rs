@@ -4,7 +4,6 @@
 //! `admin/gc.rs` submodule seam introduced by P0383.
 
 use super::*;
-use tokio_stream::StreamExt;
 
 /// TriggerGC with store unreachable → Status::Unavailable.
 /// The store_addr in setup_svc is `127.0.0.1:1` which never listens

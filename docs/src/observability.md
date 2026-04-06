@@ -115,15 +115,16 @@ r[obs.metric.scheduler]
 | `rio_scheduler_recovery_total` | Counter | State recovery runs (on LeaderAcquired). Labeled by `outcome`: `success`/`failure`. |
 | `rio_scheduler_recovery_duration_seconds` | Histogram | Time to reload non-terminal builds/derivations from PostgreSQL. |
 | `rio_scheduler_backstop_timeouts_total` | Counter | Running derivations reset to Ready by the backstop timeout (running_since > max(est_duration×3, daemon_timeout+10m)). Non-zero indicates wedged workers. |
+| `rio_scheduler_build_timeouts_total` | Counter | Builds failed by per-build wall-clock timeout (`BuildOptions.build_timeout` seconds since submission). Distinct from `backstop_timeouts_total` (per-derivation heuristic). |
 | `rio_scheduler_worker_disconnects_total` | Counter | BuildExecution stream closures (worker gone). Triggers reassignment. |
-| `rio_scheduler_cancel_signals_total` | Counter | CancelSignal messages sent to workers (explicit CancelBuild, backstop timeout, or finalizer drain). |
+| `rio_scheduler_cancel_signals_total` | Counter | CancelSignal messages sent to workers (explicit CancelBuild, backstop timeout, per-build timeout, or finalizer drain). |
 | `rio_scheduler_estimator_refresh_total` | Counter | Build-history estimator refresh ticks (60s cadence). *Internal — VM test sync signal.* |
 | `rio_scheduler_build_graph_edges` | Histogram | Edge count per `GetBuildGraph` response. Bounded by the induced subgraph over the node-cap (≤5000 nodes); a high p99 (>10k) means unusually dense DAGs. Suggested buckets: `[100, 500, 1000, 5000, 10000, 20000]`. |
 | `rio_scheduler_class_load_fraction` | Gauge | Load fraction per size class (adaptive rebalancer input) |
 | `rio_scheduler_ca_hash_compares_total` | Counter | CA cutoff-compare output-hash lookups against the content index on completion (labeled by `outcome`: `match`/`miss`/`skipped_after_miss`). High match ratio → CA derivations rebuilding identical content. `skipped_after_miss` counts outputs NOT looked up because an earlier output in the same derivation missed (short-circuit); the compare loop breaks early since the AND-fold result is already false. |
 | `rio_scheduler_ca_cutoff_saves_total` | Counter | Derivations skipped via CA early-cutoff (Queued→Skipped transitions). Each increment is one build that did NOT run because a CA dep's output matched the content index. |
 | `rio_scheduler_ca_cutoff_seconds_saved` | Counter | Sum of `est_duration` of skipped derivations. Lower-bound estimate of wall-clock saved (est_duration is the Estimator's EMA; a never-run derivation has the fallback, not actual). Divide by `saves_total` for avg-seconds-per-save. |
-| `rio_scheduler_ca_cutoff_depth_cap_hits_total` | Counter | CA cutoff cascade walks that hit `MAX_CASCADE_DEPTH` (1000). Non-zero → cascades truncated; pathological DAG shape or cap too low. |
+| `rio_scheduler_ca_cutoff_depth_cap_hits_total` | Counter | CA cutoff cascade walks that hit `MAX_CASCADE_NODES` (1000). Non-zero → cascades truncated; pathological DAG shape or cap too low. |
 
 r[obs.metric.scheduler-leader-gate]
 Scheduler state gauges (`_builds_active`, `_derivations_queued`, `_derivations_running`, `_workers_active`, `_class_queue_depth`) are published **only by the leader**. The standby's actor is warm (DAGs merge for fast takeover per `r[sched.lease.k8s-lease]`) but workers do not connect to it (leader-guarded gRPC per `r[sched.grpc.leader-guard]`), so its counts are stale or zero. With `replicas>1`, publishing from both would create duplicate Prometheus series with identical labels; a naked gauge query returns both, and stat-panel reducers pick one nondeterministically. Counters and histograms are unaffected --- the standby's dispatch loop no-ops, so its counters stay at zero naturally, and `sum(rate(...))` is the idiomatic query form anyway.
@@ -194,11 +195,9 @@ Operators set `spec.bloomExpectedItems` on the WorkerPool (injects
 resets the filter.
 
 r[obs.metric.transfer-volume]
-
 Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop: gateway (`rio_gateway_bytes_total{direction}`), store (`rio_store_{put,get}_path_bytes_total`), worker (`rio_worker_{upload,fuse_fetch}_bytes_total`). Summing these across the topology gives a full picture of data movement — e.g., `rate(rio_worker_fuse_fetch_bytes_total[5m])` vs `rate(rio_worker_upload_bytes_total[5m])` shows whether a worker is input-bound or output-bound.
 
 r[obs.metric.worker-util]
-
 Worker utilization gauges (`rio_worker_{cpu,memory}_fraction`) are polled from the worker's parent cgroup every 10s by `utilization_reporter_loop`. The same loop publishes a `ResourceSnapshot` that the heartbeat reads for `HeartbeatRequest.resources` — one sampling site means Prometheus and `ListWorkers` always agree. These capture the whole worker tree (rio-worker + per-build sub-cgroups + all subprocesses). CPU fraction >1.0 on multi-core is expected under full load. Memory fraction stays 0.0 if `memory.max` is unbounded — only meaningful when the pod has a memory limit configured.
 
 ### Controller Metrics
@@ -230,7 +229,6 @@ Histograms not listed here (e.g., `rio_gateway_opcode_duration_seconds`, `rio_st
 ## Graceful Drain
 
 r[common.drain.not-serving-before-exit]
-
 On SIGTERM, each long-lived server MUST call `set_not_serving()` on its tonic-health reporter BEFORE `serve_with_shutdown` returns, and MUST sleep for at least `readinessProbe.periodSeconds + 1` seconds between the two. This gives kubelet one full probe cycle to observe NOT_SERVING and the endpoint-controller time to remove the pod from the Service's Endpoint slice, preventing new connections from being routed to a process that is tearing down.
 
 For the scheduler specifically, whose readinessProbe is `tcpSocket` (not gRPC health), the drain sleep signals BalancedChannel clients via their `DEFAULT_PROBE_INTERVAL` (3s) loop — K8s endpoint routing is unaffected.
@@ -280,15 +278,12 @@ The OTel `service.name` resource attribute is set automatically per component (g
 ### Trace Propagation
 
 r[obs.trace.w3c-traceparent]
-
 Trace context is propagated via gRPC metadata using the W3C `traceparent` header format.
 
 r[sched.trace.assignment-traceparent]
-
 ssh-ng has no gRPC metadata channel, so the scheduler→worker hop cannot use `inject_current`/`link_parent`. Span context also does not cross the scheduler's mpsc actor channel — calling `current_traceparent()` at dispatch time would capture an orphan actor span. Instead, the `SubmitBuild` gRPC handler captures `current_traceparent()` **after** `link_parent()` (inside the scheduler handler span — which has its own trace_id, LINKED to the gateway trace), and carries it as plain data: `MergeDagRequest.traceparent` → `DerivationState.traceparent` → `WorkAssignment.traceparent` at dispatch. The worker extracts it via `span_from_traceparent()` and wraps the spawned build-executor future in `.instrument(span)`. The span is created then `set_parent()` is called **before it is entered** — the tracing-opentelemetry bridge allocates the OTel span lazily on first enter, at which point the stored parent context is available for the OTel SpanBuilder. This produces **parent-child** (same trace_id): the worker span's `parentSpanId` matches a scheduler `spanId`; Tempo shows scheduler→worker as one trace. **First-submitter-wins on dedup:** when two builds merge the same derivation, the existing state's traceparent is preserved unless it is empty (recovery/poison-reset set `""`), in which case the first live submitter upgrades it. Traceparent is not persisted to PG — recovered derivations dispatched before any re-submit get a fresh worker root span. Empty traceparent → fresh root span. This closes the SSH-boundary tracing gap — Tempo shows scheduler→worker as one trace (via the `WorkAssignment.traceparent` data-carry + `span_from_traceparent`), linked to the gateway trace upstream and linked to store traces downstream (the worker→store hop uses `inject_current` + store-side `link_parent`, the same `#[instrument]`-then-`set_parent` pattern proven to produce a LINK at the gateway→scheduler boundary). Injection and extraction are **manual**, not tonic interceptors: `rio_proto::interceptor::inject_current()` copies the current span's context into outgoing request metadata (client side), and `rio_proto::interceptor::link_parent()` adds an OTel span **link** to the incoming traceparent (server side, first line of each handler) — the `#[instrument]` span was already created and entered with its own trace_id before `set_parent()` runs, so the result is a link, not a parent-child edge. The explicit manual call makes propagation points greppable and avoids tonic's `Interceptor` trait (which changes `connect_*` return types and doesn't compose with server-side `#[instrument]`). The W3C `TraceContextPropagator` is registered globally in `init_tracing()` regardless of whether `RIO_OTEL_ENDPOINT` is set — propagation works even when spans aren't exported.
 
 r[obs.trace.scheduler-id-in-metadata]
-
 The scheduler sets `x-rio-trace-id` in `SubmitBuild` response metadata to its handler span's trace_id (captured AFTER `link_parent()`). The gateway emits THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`), not its own. Rationale: `link_parent()` + `#[instrument]` produces an orphan — the scheduler handler span has its own trace_id, LINKED to the gateway trace but not parented. The gateway's trace contains only gateway spans; the scheduler's trace is the one extended through worker via the `WorkAssignment.traceparent` data-carry. Operators grepping the emitted id land in the trace that actually spans the full scheduler→worker chain. Header absent (legacy scheduler / no OTel configured) → gateway falls back to its own `current_trace_id_hex()`.
 
 ## SLOs, SLIs, and Alerting

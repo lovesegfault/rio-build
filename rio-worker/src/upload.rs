@@ -91,7 +91,15 @@ pub fn scan_new_outputs(upper_store: &Path) -> std::io::Result<Vec<String>> {
     let mut outputs = Vec::new();
     for entry in read_dir {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        // Store paths are UTF-8 (nix enforces this). A non-UTF-8 name
+        // here is a violation — surface as InvalidData rather than
+        // lossy-decode and push a wrong path.
+        let name = entry.file_name().into_string().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "non-UTF-8 filename in upper store",
+            )
+        })?;
         // Skip hidden files and the .links directory
         if !name.starts_with('.') {
             outputs.push(name);
@@ -334,7 +342,8 @@ async fn do_upload_streaming(
         // for the impossible case (defensive, no crash on a bad
         // token format that came from US anyway).
         if let Ok(v) = assignment_token.parse() {
-            req.metadata_mut().insert("x-rio-assignment-token", v);
+            req.metadata_mut()
+                .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
         }
     }
     let put_result = rio_common::grpc::with_timeout_status(
@@ -831,7 +840,8 @@ async fn upload_outputs_batch(
     if !assignment_token.is_empty()
         && let Ok(v) = assignment_token.parse()
     {
-        req.metadata_mut().insert("x-rio-assignment-token", v);
+        req.metadata_mut()
+            .insert(rio_proto::ASSIGNMENT_TOKEN_HEADER, v);
     }
 
     let mut client = store_client.clone();

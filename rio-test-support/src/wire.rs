@@ -50,6 +50,40 @@ pub async fn send_set_options(s: &mut DuplexStream) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `wopQueryPathInfo` (opcode 26) response fields, wire-order.
+/// `r[gw.opcode.query-path-info]` at docs/src/components/gateway.md.
+///
+/// Returned AFTER `valid: bool` — caller reads `valid` first, then
+/// calls [`read_path_info`] if `valid == true`. Tests usually want one
+/// field (refs, nar_hash, ca) and discard the rest; this reads them all
+/// so callsites don't repeat the 8-field discard sequence.
+#[derive(Debug)]
+pub struct PathInfoWire {
+    pub deriver: String,
+    pub nar_hash: String,
+    pub references: Vec<String>,
+    pub registration_time: u64,
+    pub nar_size: u64,
+    pub ultimate: bool,
+    pub sigs: Vec<String>,
+    pub ca: String,
+}
+
+/// Read the `wopQueryPathInfo` response body (everything after `valid: bool`).
+/// Caller MUST read `valid` first — this reads deriver onwards.
+pub async fn read_path_info(s: &mut DuplexStream) -> anyhow::Result<PathInfoWire> {
+    Ok(PathInfoWire {
+        deriver: wire::read_string(s).await?,
+        nar_hash: wire::read_string(s).await?,
+        references: wire::read_strings(s).await?,
+        registration_time: wire::read_u64(s).await?,
+        nar_size: wire::read_u64(s).await?,
+        ultimate: wire::read_bool(s).await?,
+        sigs: wire::read_strings(s).await?,
+        ca: wire::read_string(s).await?,
+    })
+}
+
 /// Drain STDERR messages until STDERR_LAST. Returns all non-Last messages.
 /// Panics if STDERR_ERROR is received (use `drain_stderr_expecting_error` for
 /// error-path tests).

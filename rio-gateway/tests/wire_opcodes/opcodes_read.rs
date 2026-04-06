@@ -105,18 +105,11 @@ async fn test_query_path_info_exists() -> anyhow::Result<()> {
     // Response: bool(valid) + if valid: deriver, hex_nar_hash, refs, regtime, nar_size, ultimate, sigs, ca
     let valid = wire::read_bool(&mut h.stream).await?;
     assert!(valid, "path should be valid");
-    let deriver = wire::read_string(&mut h.stream).await?;
-    assert_eq!(deriver, "");
-    let nar_hash_hex = wire::read_string(&mut h.stream).await?;
-    assert_eq!(nar_hash_hex, hex::encode(hash), "nar hash should match");
-    let refs = wire::read_strings(&mut h.stream).await?;
-    assert!(refs.is_empty());
-    let _regtime = wire::read_u64(&mut h.stream).await?;
-    let nar_size = wire::read_u64(&mut h.stream).await?;
-    assert_eq!(nar_size, nar.len() as u64);
-    let _ultimate = wire::read_bool(&mut h.stream).await?;
-    let _sigs = wire::read_strings(&mut h.stream).await?;
-    let _ca = wire::read_string(&mut h.stream).await?;
+    let info = read_path_info(&mut h.stream).await?;
+    assert_eq!(info.deriver, "");
+    assert_eq!(info.nar_hash, hex::encode(hash), "nar hash should match");
+    assert!(info.references.is_empty());
+    assert_eq!(info.nar_size, nar.len() as u64);
 
     h.finish().await;
     Ok(())

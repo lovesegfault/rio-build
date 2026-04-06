@@ -448,7 +448,7 @@ impl ChunkBackend for S3ChunkBackend {
         // requests; S3 can handle it but the caller's network might not).
         //
         // NOTE: PutPath does NOT use this — it checks PG `chunks`
-        // refcounts (metadata::find_missing_chunks, cas.rs:do_upload)
+        // refcounts via the inline RETURNING clause in cas.rs:do_upload
         // for one RTT instead of N HeadObject calls. This S3
         // exists_batch is kept for trait completeness.
         //
@@ -708,6 +708,7 @@ mod tests {
         let subdir = dir.path().join("chunks").join("ab");
         for entry in std::fs::read_dir(&subdir)? {
             let name = entry?.file_name();
+            #[allow(clippy::disallowed_methods)] // test assertion display only
             let name = name.to_string_lossy();
             assert!(!name.ends_with(".tmp"), "leftover .tmp file: {name}");
         }

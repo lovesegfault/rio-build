@@ -67,8 +67,9 @@ The fenced `json files` block feeds `state.PlanFile` and `collisions-regen` —
 `_lib.plan_doc_files()` reads it. Each entry: `{"path": str, "action":
 "NEW"|"MODIFY"|"DELETE"|"RENAME", "note": str}`. `path` MUST start with
 `rio-*/`, `nix/`, `docs/`, `infra/`, `migrations/`, `scripts/`, `flake.nix`,
-`.claude/`, `Cargo`, `justfile`, `.config/`, or `codecov.yml` (validator
-enforces). The box-drawing tree below is human-readable duplication; the
+`flake.lock`, `.claude/`, `Cargo`, `justfile`, `.config/`, `.github/`,
+`.envrc`, `codecov.yml`, `deny.toml`, or an ALL-CAPS root `.md`
+(README.md, CLAUDE.md, CONTRIBUTING.md — validator enforces). The box-drawing tree below is human-readable duplication; the
 fenced block is the machine contract. Keep BOTH.
 
 ## Dependencies

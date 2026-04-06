@@ -77,8 +77,5 @@ figment = { workspace = true, features = ["test"] }
 rcgen = { workspace = true }
 # TcpListenerStream for test server.
 tokio-stream = { workspace = true, features = ["net"] }
-# Health service used as a trivial gRPC service to hit in the
-# integration test. Already in workspace deps.
-tonic-health = { workspace = true }
 # Direct rustls access for CryptoProvider install in tests.
 rustls = { workspace = true }

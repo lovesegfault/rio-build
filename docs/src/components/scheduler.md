@@ -89,11 +89,9 @@ r[sched.completion.idempotent]
 > **Completion report idempotency:** A `CompletionReport` for an already-completed derivation is accepted and ignored (no-op). The actor's state machine treats `completed → completed` as an idempotent transition. This handles duplicate reports caused by worker retries during scheduler failover, network retransmissions, or race conditions with CA early cutoff.
 
 r[sched.tenant.resolve]
-
 The gateway sends the tenant name in `SubmitBuildRequest.tenant_name` — captured from the server-side `authorized_keys` entry's comment field. The scheduler's `submit_build` handler resolves this to a UUID via `SELECT tenant_id FROM tenants WHERE tenant_name = $1`. Unknown tenant name → `InvalidArgument`. Empty string → `None` (single-tenant mode, no PG lookup). This keeps the gateway PostgreSQL-free — preserving stateless N-replica HA.
 
 r[sched.gc.path-tenants-upsert]
-
 On build completion, the scheduler upserts `(store_path_hash,
 tenant_id)` rows into `path_tenants` for every output path × every
 tenant whose build was interested in that derivation (dedup via
@@ -104,11 +102,9 @@ NOTHING` (composite PK on `(store_path_hash, tenant_id)`); repeated
 builds of the same path by the same tenant are idempotent.
 
 r[sched.poison.ttl-persist]
-
 `poisoned_at` is persisted to `derivations.poisoned_at TIMESTAMPTZ` when the poison threshold trips. Recovery loads poisoned rows via a separate `load_poisoned_derivations` query (since `TERMINAL_STATUSES` includes `"poisoned"` and `load_nonterminal_derivations` filters it out). The timestamp is converted back to `Instant` via PG-computed `EXTRACT(EPOCH FROM (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 
 r[sched.retry.per-worker-budget]
-
 `BuildResultStatus::InfrastructureFailure` does NOT count toward the
 poison threshold. It routes through a separate
 `handle_infrastructure_failure` handler: `reset_to_ready` + retry
@@ -142,23 +138,18 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
 ```
 
 r[sched.admin.list-workers]
-
 `AdminService.ListWorkers` returns a point-in-time snapshot of all connected workers via an `ActorCommand::ListWorkers` (O(workers) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `WorkerInfo` includes `worker_id`, `systems`, `supported_features`, `max_builds`, `running_builds`, `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
 
 r[sched.admin.list-builds]
-
 `AdminService.ListBuilds` paginates via a direct PostgreSQL query with `LIMIT/OFFSET` (proto field `offset = 3`). Per-build derivation counts come from `LEFT JOIN build_derivations + derivations`; `cached_derivations` uses the heuristic "completed with no assignment row" (a cache-hit derivation transitions directly to Completed at merge time without dispatch). Optional `status_filter` matches the `builds.status` column. `total_count` is from a separate `COUNT(*)` query (unaffected by pagination). `ClusterStatus.store_size_bytes` is now populated from a 60s background task that polls `SUM(nar_size) FROM narinfo` — kept out of the handler's hot path since the autoscaler hits it every 30s.
 
 r[sched.admin.clear-poison]
-
 `AdminService.ClearPoison` resets both in-memory state (`reset_from_poison()`: Poisoned→Created, clear `failed_workers`, zero `retry_count`, null `poisoned_at`) and PostgreSQL (`db.clear_poison()`). Returns `cleared=true` only if both succeed. If PG fails after in-mem reset, returns `false` so the operator retries — next recovery would restore Poisoned, so in-mem/PG drift is self-correcting. Idempotent: calling on a non-poisoned or non-existent derivation returns `cleared=false` without error.
 
 r[sched.admin.list-tenants]
-
 `AdminService.ListTenants` returns all rows from the `tenants` table. Each `TenantInfo` includes the UUID, name, GC retention settings, `created_at`, and a `has_cache_token` projection (boolean — does NOT leak the actual token value).
 
 r[sched.admin.create-tenant]
-
 `AdminService.CreateTenant` inserts a new tenant row. `tenant_name` is required (empty → `INVALID_ARGUMENT`). On name collision or cache_token collision, returns `ALREADY_EXISTS`. On success, returns the created `TenantInfo` including the generated UUID.
 
 r[sched.admin.sizeclass-status]
@@ -276,15 +267,12 @@ Nix builds cannot be paused or resumed, so **running builds are never preempted 
 ## CA Early Cutoff
 
 r[sched.ca.detect]
-
 The scheduler MUST distinguish content-addressed derivations from input-addressed at DAG merge time. The `is_ca` flag is set from `has_ca_floating_outputs() || is_fixed_output()` at gateway translate, propagated via proto `DerivationNode.is_content_addressed`, persisted on `DerivationState`.
 
 r[sched.ca.cutoff-compare]
-
 When a CA derivation completes successfully, the scheduler MUST compare the output `nar_hash` against the content index. A match means the output is byte-identical to a prior build — downstream builds depending only on this output can be skipped.
 
 r[sched.ca.cutoff-propagate]
-
 On hash match, the scheduler MUST transition downstream derivations whose only incomplete dependency was the matched CA output from `Queued` to `Skipped` without running them. The transition cascades recursively (depth-capped at 1000). Running derivations are NEVER killed — cutoff applies to `Queued` only (see `r[sched.preempt.never-running]`).
 
 r[sched.ca.resolve+2]
@@ -467,12 +455,12 @@ r[sched.backstop.timeout]
 **Backstop timeout:** Separately from worker deregistration, `handle_tick` checks each `running` derivation's `running_since` timestamp. If elapsed time exceeds `max(est_duration × 3, daemon_timeout + 10min)`, the scheduler sends a CancelSignal to the worker, resets the derivation to `ready`, increments `retry_count`, and adds the worker to `failed_workers`. This catches the "worker is heartbeating but daemon is wedged" case where no stream-close or heartbeat-timeout fires. The `rio_scheduler_backstop_timeouts_total` counter tracks these events.
 
 r[sched.timeout.per-build]
-
 `BuildOptions.build_timeout` (proto field, seconds) is a wall-clock
 limit on the *entire* build from submission to completion. In
 `handle_tick`, any build with `submitted_at.elapsed() > build_timeout`
 has its non-terminal derivations cancelled and transitions to
-`Failed { status: TimedOut }`. This is distinct from
+`Failed`, with `error_summary` set to `"build_timeout {N}s exceeded
+(wall-clock since submission)"`. This is distinct from
 `r[sched.backstop.timeout]` (per-derivation heuristic: est×3) and
 distinct from the worker-side daemon floor (which also receives
 `build_timeout` as a per-derivation `min_nonzero` — defense-in-depth,
@@ -661,7 +649,7 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/assignment.rs` — Worker scoring (bloom locality + load fraction) + size-class classify()
 - `rio-scheduler/src/estimator.rs` — Duration + peak-memory from build_history; fallback chain (exact → pname-cross-system → closure-size proxy → 30s default)
 - `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
-- `rio-scheduler/src/db.rs` — PostgreSQL persistence (derivations, assignments, build_history EMA)
+- `rio-scheduler/src/db/` — PostgreSQL persistence (derivations, assignments, build_history EMA; split into 9 domain modules per P0411)
 - `rio-scheduler/src/logs/` — LogBuffers ring buffer + S3 LogFlusher
 - `rio-scheduler/src/lease.rs` — Kubernetes Lease leader-election loop (generation counter, is_leader flag, recovery_complete gate)
 - `rio-scheduler/src/actor/recovery.rs` — State recovery: reload non-terminal builds/derivations from PG on LeaderAcquired
@@ -669,7 +657,7 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs, TriggerGC)
 - `rio-scheduler/src/rebalancer.rs` — CutoffRebalancer (SITA-E adaptive cutoff adjustment from `build_samples`)
 
-CA early cutoff is end-to-end: compare (`r[sched.ca.cutoff-compare]` — completion-time content-index lookup), propagate (`r[sched.ca.cutoff-propagate]` — `Queued`→`Skipped` cascade with `MAX_CASCADE_DEPTH=1000`), and resolve (`r[sched.ca.resolve]` — dispatch-time placeholder rewrite for CA-on-CA chains). The `Skipped` terminal state is distinct from `Completed` for metrics (`rio_scheduler_ca_cutoff_saves_total`, `rio_scheduler_ca_cutoff_seconds_saved`) and audit trail. Resolution uses the gateway-computed `ca_modular_hash` (plumbed via `DerivationNode.ca_modular_hash` post-BFS) to query the `realisations` table; each lookup is recorded in `realisation_deps` at completion time after the parent's own realisation lands (FK ordering).
+CA early cutoff is end-to-end: compare (`r[sched.ca.cutoff-compare]` — completion-time content-index lookup), propagate (`r[sched.ca.cutoff-propagate]` — `Queued`→`Skipped` cascade with `MAX_CASCADE_NODES=1000`), and resolve (`r[sched.ca.resolve]` — dispatch-time placeholder rewrite for CA-on-CA chains). The `Skipped` terminal state is distinct from `Completed` for metrics (`rio_scheduler_ca_cutoff_saves_total`, `rio_scheduler_ca_cutoff_seconds_saved`) and audit trail. Resolution uses the gateway-computed `ca_modular_hash` (plumbed via `DerivationNode.ca_modular_hash` post-BFS) to query the `realisations` table; each lookup is recorded in `realisation_deps` at completion time after the parent's own realisation lands (FK ordering).
 
 ```mermaid
 flowchart LR

@@ -82,11 +82,9 @@ r[store.chunk.refcount-txn]
 **Refcount increment:** In the same PostgreSQL transaction that writes `manifest_data` (step 2 of PutPath). Uses `INSERT ... ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1` — a single UPSERT over the full chunk list via `UNNEST`. PostgreSQL's conflict resolution serializes INSERT vs UPDATE per-row, so concurrent `PutPath` calls with overlapping chunk lists both increment correctly without explicit locking.
 
 r[store.chunk.put-standalone]
-
 The `PutChunk` RPC MUST accept chunks independent of any NAR manifest. A chunk with no manifest reference is held for the grace-TTL before GC eligibility. (Sibling to `r[store.chunk.refcount-txn]`.)
 
 r[store.chunk.grace-ttl]
-
 Chunks with zero manifest references AND `created_at < now() - grace_seconds` are GC-eligible. The grace period prevents a race where a worker's `PutChunk` arrives before its `PutPath` manifest. (Sibling to `r[store.chunk.refcount-txn]`.)
 
 r[store.chunk.tenant-scoped]
@@ -129,7 +127,6 @@ r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
 
 r[store.atomic.multi-output]
-
 Multi-output derivation registration MUST be atomic at the DB level: all output rows commit in one transaction, or none do. Blob-store writes are NOT rolled back (orphaned blobs are refcount-zero and GC-eligible on the next sweep). The bound is ≤1 NAR-size per failure.
 
 ## NAR Reassembly
@@ -175,7 +172,6 @@ rio-store serves the standard Nix binary cache protocol so Nix clients can use i
 - **Authentication:** Bearer token authentication for private caches. Nix supports `netrc-file` and `access-tokens` settings for HTTP cache auth.
 
 r[store.cache.auth-bearer]
-
 Binary cache authentication uses per-tenant Bearer tokens mapped via the `tenants.cache_token` column. The auth middleware queries `SELECT tenant_name FROM tenants WHERE cache_token = $1` on each request; a valid token authenticates as that tenant. Unknown/missing token → `401 Unauthorized` with `WWW-Authenticate: Bearer`. Unauthenticated access requires explicit opt-in via `cache_allow_unauthenticated = true` in the store config (default `false` — fail loud). When auth is required but no tenants have tokens configured (misconfigured deployment), requests return `503 Service Unavailable` with a descriptive message so operators notice immediately.
 
 ## Signing Key Management
@@ -188,15 +184,12 @@ r[store.signing.fingerprint]
 - Multi-tenant: each tenant can have their own signing key for their paths
 
 r[store.signing.empty-refs-warn]
-
 When signing a non-CA path with zero references, the store MUST emit a warning. Non-leaf derivations with empty references indicate the worker's reference scanner missed deps.
 
 r[store.tenant.sign-key]
-
 narinfo signing MUST use the tenant's active signing key from `tenant_keys` when present, falling back to the cluster key otherwise. A tenant with its own key produces narinfo that `nix store verify --trusted-public-keys tenant:<pk>` accepts for that tenant's paths only.
 
 r[store.tenant.narinfo-filter]
-
 Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = auth.tenant_id`. Anonymous (unauthenticated) requests return unfiltered results for backward compatibility.
 
 ### Key Rotation
@@ -221,7 +214,6 @@ r[store.gc.two-phase]
 **Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 2 hours). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
 
 r[store.gc.tenant-retention]
-
 A store path survives GC if *any* tenant that has referenced it still
 has the path inside its retention window. This is the 6th UNION arm in
 the mark phase CTE (after roots, uploading-manifests, global grace,
@@ -234,7 +226,6 @@ but never shortens it. An empty `path_tenants` table makes this arm a
 no-op (0 rows contributed).
 
 r[store.gc.tenant-quota]
-
 Per-tenant store accounting sums `narinfo.nar_size` over all paths
 the tenant has referenced (`JOIN path_tenants USING (store_path_hash)
 WHERE tenant_id = $1`). This is the accounting query; enforcement is
@@ -242,17 +233,14 @@ the sibling `r[store.gc.tenant-quota-enforce]` below (gateway rejects
 SubmitBuild over quota).
 
 r[store.gc.tenant-quota-enforce]
-
 The gateway MUST reject `SubmitBuild` with `STDERR_ERROR` when `tenant_store_bytes(tenant_id)` exceeds `tenants.gc_max_store_bytes`. Enforcement is eventually-consistent — `tenant_store_bytes` may be cached with ≤30s TTL. The connection stays open; the user can retry after GC. (Sibling to `r[store.gc.tenant-quota]` — distinguishes enforcement from accounting.)
 
 Supports dry-run mode via `GCRequest.dry_run`.
 
 r[store.gc.empty-refs-gate]
-
 Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the worker's reference scanner is broken.
 
 r[store.cas.upsert-inserted]
-
 The chunk-upsert batch INSERT returns per-row `(refcount = 1) AS inserted`
 so the caller knows which blake3 hashes need upload to backend. This
 replaces the racy re-query: previously `do_upload` re-SELECTed

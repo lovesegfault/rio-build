@@ -44,7 +44,19 @@ Loop:
 
    **merge-count:** merger owns the bump at step 7.5. Do NOT pre-bump on inferred merges — double-bump risk when notification lags.
 
-   **merger lock:** check `.claude/bin/onibus merge lock-status` before any direct-to-`$TGT` commit. `held: false` → safe. `held: true, stale: false` → merger in flight, WAIT. `held: true, stale: true` → merger died — read `ff_landed`: `false` → just `merge unlock`; `true` → ff landed, finish steps 7-8 manually then unlock.
+   **merger lock:** check `.claude/bin/onibus merge lock-status` before any direct-to-`$TGT` commit. `held: false` → safe. `held: true, stale: false` → merger in flight, WAIT. `held: true, stale: true` → merger died — read `ff_landed`: `false` → just `merge unlock`; `true` → ff landed, finish steps 7-8 manually then unlock. **A background-task notification is NOT a merger-done signal.** The merger may receive its `.#ci` subshell result and then retry (known-flake excusable, clause-4 fast-path, semantic-conflict fix loop) — the lock stays held through retries. `lock-status` is the only authoritative signal. Treating a task-notification as agent-termination is the same inference-vs-state mistake as the merge-count pre-bump at `:45`.
+
+   **Lock-released WITHOUT notification = merger still running.** The merger's `_LEASE_SECS` lease can auto-expire mid-CI-retry without the merger having exited. Before treating lock-released as merger-done: (1) check the output file for a MergerReport, (2) check merge-shas.jsonl for the expected mc bump, (3) check `ps aux | grep merger-agent-<id>`. All three must confirm before proceeding. If lock released but no report → WAIT for the task-notification, do NOT stomp sprint-1.
+
+   **Before acting on a merger/validator notification:** the task-tool's `<result>` is the ONLY source of truth — not the notification's `status:` field, not your expectation of what the agent probably did. Four mechanical checks before writing merge-state or re-dispatching:
+   1. `git merge-base --is-ancestor <hash-from-result> HEAD` → rc=0 (hash exists and is merged)
+   2. `cat .claude/state/merge-count.txt` matches the report's stated count
+   3. `grep '"plan": <N>' .claude/dag.jsonl | grep DONE` — dag status flipped
+   4. `grep 'clause-4\|rc=0' <result>` — `status:merged` alone does NOT distinguish full-green from clause-4(c) fast-path. If `failure_detail` contains `clause-4`, it was a fast-path merge (nextest-standalone passed, VM tier unproven).
+
+   If ANY diverges: re-read the `<result>` literal. Do NOT construct details from expectation ("FK plan → probably RESTRICT", "queued merge → probably full green"). The coordinator's history of content-fabrication (mc77 P0259 hash-wrong, mc78 P0332 filename-wrong, mc79 P0302 hash-not-in-tree) shares this root: treating `status:completed` as confirmation of expected outcome instead of cue to read what actually happened.
+
+   **Task-id discipline:** `<task-notification>` task-ids prefix-discriminate the source. Starts with `a` → agent subtask (merger, validator, impl). Starts with `b` → bash bg-task (`.#ci` run, coverage, etc). A bash-bg notification is NOT a merger-done signal — it's the merger's INTERNAL CI run completing. Check the task-id prefix before treating as agent-completion.
 
    **After each merge — `report.unblocked` tells you which plans just entered frontier.** Launch them immediately. The merge queue is a FIFO for serial merger work; it does not gate parallel impl work. Mergers are serialized (one `.#ci`); impls are parallel.
 

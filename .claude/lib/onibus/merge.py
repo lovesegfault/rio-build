@@ -52,12 +52,17 @@ from onibus.plan_doc import find_plan_doc, plan_doc_t_count
 
 _LOCK_FILE = STATE_DIR / "merger.lock"
 
-# Staleness threshold. The merge itself is ~10min (rebase + ff + .#ci cache-hit
-# re-validate); .#coverage-full is backgrounded so doesn't count against lease.
-# PID-liveness was the wrong mechanism: the `onibus merge lock` subprocess exits
-# immediately after writing the file (fire-and-forget CLI), so os.kill(pid, 0)
-# was always ProcessLookupError → stale=True → POISONED on every merge.
-_LEASE_SECS = 30 * 60
+# Staleness threshold. The merge itself is ~10min typically (rebase + ff
+# + .#ci cache-hit re-validate); .#coverage-full is backgrounded so
+# doesn't count against lease. 30min was the old value — P0216 under
+# TCG (cold-cache, every VM drv rebuilt on broken builders) ran ~30min
+# end-to-end. 45min gives headroom. Failure mode is safe (stale=True →
+# coordinator pings human, not auto-steal) but spurious pings waste time.
+# PID-liveness was the wrong mechanism: the `onibus merge lock`
+# subprocess exits immediately after writing (fire-and-forget CLI), so
+# os.kill(pid, 0) was always ProcessLookupError → stale=True → POISONED
+# on every merge.
+_LEASE_SECS = 45 * 60
 
 
 def _lock_age_secs(content: dict) -> float:
@@ -255,13 +260,22 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # the branch behind — the P0401 failure mode).
     tgt_sha = git("rev-parse", INTEGRATION_BRANCH, cwd=REPO_ROOT)
     head_sha = git("rev-parse", "HEAD", cwd=REPO_ROOT)
+    ref_forced = False
     if tgt_sha != head_sha:
         # Belt-and-suspenders: force-update the ref. The cur_branch
         # precondition above should make this unreachable. If it fires,
         # something about git's amend semantics under this worktree
         # layout is surprising — the update-ref recovers regardless.
+        print(
+            f"dag_flip: UNEXPECTED — {INTEGRATION_BRANCH!r} at {tgt_sha[:8]} "
+            f"but HEAD at {head_sha[:8]} post-amend. Force-updating ref. "
+            f"The cur_branch precondition should prevent this; investigate "
+            f"worktree layout.",
+            file=sys.stderr,
+        )
         git("update-ref", f"refs/heads/{INTEGRATION_BRANCH}", head_sha,
             cwd=REPO_ROOT)
+        ref_forced = True
 
     # count-bump MUST run AFTER amend — it records rev-parse
     # INTEGRATION_BRANCH in merge-shas.jsonl. Pre-amend that SHA is
@@ -274,6 +288,7 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     return DagFlipResult(
         plan=plan_num, amend_sha=amend_sha, mc=mc,
         unblocked=unblocked, queue_consumed=consumed,
+        ref_forced=ref_forced,
     )
 
 
@@ -597,6 +612,23 @@ def _rewrite_and_rename(
     ]
     touched.append(".claude/dag.jsonl")
     touched.extend(batch_docs)
+
+    # Defensive glob pass for batch-append targets: the writer may have
+    # written a cross-ref to a plan doc it ALSO modified, but a glob scan
+    # catches cases where a stale placeholder slipped into a doc outside
+    # the three-dot diff (e.g., manual coordinator edit). O(files × phs)
+    # — ~300 files × ≤5 placeholders, negligible.
+    placeholders = [r.placeholder for r in mapping]
+    for p in (worktree / ".claude/work").glob("plan-*.md"):
+        rel = str(p.relative_to(worktree))
+        if rel in touched:
+            continue  # already covered
+        try:
+            text = p.read_text()
+        except FileNotFoundError:
+            continue
+        if any(ph in text for ph in placeholders):
+            touched.append(rel)
 
     for rel in touched:
         p = worktree / rel

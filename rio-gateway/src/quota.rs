@@ -22,6 +22,7 @@ use rio_common::tenant::NormalizedName;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::TenantQuotaRequest;
 use tonic::transport::Channel;
+use tracing::warn;
 
 /// 30-second TTL on cached `(used, limit)`. Spec upper bound
 /// (`r[store.gc.tenant-quota-enforce]` says "≤30s"). A build burst
@@ -88,7 +89,7 @@ impl QuotaCache {
     /// `tenant_name` `None` → no RPC, `Unlimited`. `None` =
     /// single-tenant mode per `r[gw.auth.tenant-from-key-comment]`;
     /// there's no tenant row to quota against. The caller has already
-    /// normalized via [`NormalizedName::from_maybe_empty`] at the SSH
+    /// normalized via [`normalize_key_comment`] at the SSH
     /// auth boundary — this function doesn't re-normalize.
     pub async fn check(
         &self,
@@ -137,10 +138,9 @@ impl QuotaCache {
                 // want to retry next TTL. Log at warn so repeated
                 // misses are visible (a stuck store would show a
                 // steady stream of these).
-                tracing::warn!(
+                warn!(
                     tenant = %tenant_name,
-                    code = ?status.code(),
-                    error = %status.message(),
+                    error = %status,
                     "TenantQuota RPC failed; skipping quota gate (fail-open)"
                 );
                 return QuotaVerdict::Unlimited;
@@ -201,8 +201,8 @@ impl QuotaCache {
 
 /// Format a byte count as a human-readable string for error messages.
 ///
-/// IEC binary units (KiB/MiB/GiB/TiB), one decimal place, rounds up
-/// at the decimal so "1.0 GiB" means at least 1073741824 bytes. The
+/// IEC binary units (KiB/MiB/GiB/TiB), one decimal place, rounds to
+/// nearest at the decimal (standard `{:.1}` formatting). The
 /// STDERR_ERROR quota message goes to `nix build` stderr — humans
 /// read it, so "12.3 GiB / 10.0 GiB" beats "13207024435 / 10737418240".
 pub fn human_bytes(n: u64) -> String {

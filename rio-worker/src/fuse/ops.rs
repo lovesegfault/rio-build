@@ -159,7 +159,12 @@ impl Filesystem for NixStoreFs {
         // not a store path — don't gRPC-query it (would get InvalidArgument →
         // EIO, which cascades to callers like nix-daemon's mkdir .links).
         if parent.0 == INodeNo::ROOT.0 {
-            let name_str = name.to_string_lossy();
+            // Non-UTF-8 store basenames are invalid (nix enforces UTF-8);
+            // reject with ENOENT rather than lossy-decode into a wrong path.
+            let Some(name_str) = name.to_str() else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
             if name_str.len() < 34 || name_str.starts_with('.') {
                 reply.error(Errno::ENOENT);
                 return;
@@ -170,7 +175,7 @@ impl Filesystem for NixStoreFs {
             // `lookup(busybox_ino, "bin")` hits an empty cache_dir → ENOENT
             // → build fails. Fetching here ensures the whole tree is on disk
             // before any child lookup.
-            match self.ensure_cached(&name_str) {
+            match self.ensure_cached(name_str) {
                 Ok(local_path) => match local_path.symlink_metadata() {
                     Ok(meta) => {
                         let ino = self.get_or_create_inode_for_lookup(child_path);
@@ -199,8 +204,9 @@ impl Filesystem for NixStoreFs {
             }
         }
 
-        // ENOENT is normal for probing
-        let name_str = name.to_string_lossy();
+        // ENOENT is normal for probing. Non-UTF-8 names can't match
+        // the ASCII ".Trash" literals anyway — to_str None → log it.
+        let name_str = name.to_str().unwrap_or("");
         if name_str != ".Trash" && name_str != ".Trash-0" {
             tracing::trace!(parent = parent.0, name = ?name, "lookup: not found");
         }

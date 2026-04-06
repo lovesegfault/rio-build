@@ -168,10 +168,10 @@ def ff_try(branch: str, *, repo: Path | None = None) -> FfResult:
     return FfResult(status="ok", pre_merge=pre, post_merge=git("rev-parse", "HEAD", cwd=repo))
 
 
-_PHANTOM_AMEND_FILES = frozenset({
-    ".claude/dag.jsonl",
-    ".claude/state/merge-shas.jsonl",
-})
+# merge-shas.jsonl was here but is gitignored (.gitignore:50 .claude/state/)
+# — never in any commit, can never appear in `git diff --name-only`. Dead entry
+# removed; dag.jsonl is the only file the merger's --amend touches.
+_PHANTOM_AMEND_FILES = frozenset({".claude/dag.jsonl"})
 
 
 def behind_check(worktree: Path) -> BehindCheck:
@@ -191,7 +191,7 @@ def behind_check(worktree: Path) -> BehindCheck:
     `--amend --no-edit` preserves it). Detected by: behind>=1, AND the
     oldest commit exclusive to our side (the pre-amend candidate) has a
     message match against one of $TGT's last-N commits, AND differs from
-    that matched commit only in dag.jsonl/merge-shas.jsonl. When true,
+    that matched commit only in dag.jsonl (or identical-tree). When true,
     `git rebase $TGT` auto-drops the patch-already-upstream commit(s).
 
     The file_collision list in this case includes files from the pre-amend
@@ -237,7 +237,13 @@ def behind_check(worktree: Path) -> BehindCheck:
                         cwd=worktree,
                     ) or "").splitlines())
                     amend_diff.discard("")
-                    if amend_diff and amend_diff <= _PHANTOM_AMEND_FILES:
+                    # Empty-set IS a subset — no-op amend (row already DONE
+                    # → dag set-status no-op → --amend --no-edit rewrites
+                    # with identical tree) still produces a new SHA (new
+                    # committer timestamp), orphaning worktrees identically.
+                    # Same-msg + identical-tree is definitionally a phantom;
+                    # msg-check above already gated, so no false-positive risk.
+                    if amend_diff <= _PHANTOM_AMEND_FILES:
                         phantom = True
                     break
     return BehindCheck(

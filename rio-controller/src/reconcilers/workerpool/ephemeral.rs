@@ -134,7 +134,7 @@ pub(super) async fn reconcile_ephemeral(wp: &WorkerPool, ctx: &Ctx) -> Result<Ac
     // A Job whose pod is ContainerCreating is active for our purposes
     // (it'll heartbeat soon, don't double-spawn).
     let jobs = jobs_api
-        .list(&ListParams::default().labels(&format!("rio.build/pool={name}")))
+        .list(&ListParams::default().labels(&format!("{}={name}", super::POOL_LABEL)))
         .await?;
     let active: i32 = jobs
         .items

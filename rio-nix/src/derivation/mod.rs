@@ -117,17 +117,14 @@ impl DerivationOutput {
 
     /// Whether this output has a `hash_algo` set.
     ///
-    /// **Naming note**: this predicate returns true for *any*
-    /// content-addressed output — both fixed-output (hash_algo AND
-    /// hash set) and floating-CA (hash_algo set, hash empty). The
-    /// name "is_fixed_output" is inherited from older Nix code but
-    /// the semantics are closer to `is_content_addressed`. Don't
-    /// use this to distinguish FOD from floating-CA; check
-    /// `!hash().is_empty()` for that.
+    /// Returns true for *any* content-addressed output — both
+    /// fixed-output (hash_algo AND hash set) and floating-CA
+    /// (hash_algo set, hash empty). To distinguish FOD from
+    /// floating-CA, check `!hash().is_empty()`.
     ///
     /// See [`DerivationLike::is_fixed_output`] for the strict FOD
     /// predicate (single `out` output with both fields set).
-    pub fn is_fixed_output(&self) -> bool {
+    pub fn has_hash_algo(&self) -> bool {
         !self.hash_algo.is_empty()
     }
 }
@@ -149,21 +146,15 @@ impl DerivationOutput {
 pub trait DerivationLike {
     /// Output definitions.
     fn outputs(&self) -> &[DerivationOutput];
-    /// Input source store paths.
-    fn input_srcs(&self) -> &BTreeSet<String>;
     /// Build platform (e.g., `x86_64-linux`).
     fn platform(&self) -> &str;
-    /// Builder executable path.
-    fn builder(&self) -> &str;
-    /// Builder arguments.
-    fn args(&self) -> &[String];
     /// Environment variables.
     fn env(&self) -> &BTreeMap<String, String>;
 
     /// Strict FOD predicate: single output named `out` with both
     /// `hash_algo` AND `hash` set.
     ///
-    /// Contrast [`DerivationOutput::is_fixed_output`] which is the
+    /// Contrast [`DerivationOutput::has_hash_algo`] which is the
     /// loose per-output "has hash_algo" check (covers floating-CA
     /// too). Callers wanting "is this drv a FOD" MUST use this;
     /// callers wanting "is this output content-addressed in any
@@ -184,6 +175,14 @@ pub trait DerivationLike {
         self.outputs()
             .iter()
             .any(|o| !o.hash_algo().is_empty() && o.hash().is_empty())
+    }
+
+    /// Content-addressed in ANY form: either a strict FOD (hash_algo AND
+    /// hash both set on the single `out` output) or floating-CA (hash_algo
+    /// set, hash empty). This is the spec'd `is_ca` predicate — gateway
+    /// translate sets proto `DerivationNode.is_content_addressed` from this.
+    fn is_content_addressed(&self) -> bool {
+        self.is_fixed_output() || self.has_ca_floating_outputs()
     }
 }
 
@@ -275,17 +274,8 @@ impl DerivationLike for Derivation {
     fn outputs(&self) -> &[DerivationOutput] {
         &self.outputs
     }
-    fn input_srcs(&self) -> &BTreeSet<String> {
-        &self.input_srcs
-    }
     fn platform(&self) -> &str {
         &self.platform
-    }
-    fn builder(&self) -> &str {
-        &self.builder
-    }
-    fn args(&self) -> &[String] {
-        &self.args
     }
     fn env(&self) -> &BTreeMap<String, String> {
         &self.env
@@ -374,17 +364,8 @@ impl DerivationLike for BasicDerivation {
     fn outputs(&self) -> &[DerivationOutput] {
         &self.outputs
     }
-    fn input_srcs(&self) -> &BTreeSet<String> {
-        &self.input_srcs
-    }
     fn platform(&self) -> &str {
         &self.platform
-    }
-    fn builder(&self) -> &str {
-        &self.builder
-    }
-    fn args(&self) -> &[String] {
-        &self.args
     }
     fn env(&self) -> &BTreeMap<String, String> {
         &self.env

@@ -93,7 +93,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "rate(rio_scheduler_backstop_timeouts_total[5m])",
+          "expr": "sum(rate(rio_scheduler_backstop_timeouts_total[5m]))",
           "legendFormat": "timeouts/s",
           "refId": "A"
         }
@@ -121,7 +121,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "rate(rio_scheduler_cancel_signals_total[5m])",
+          "expr": "sum(rate(rio_scheduler_cancel_signals_total[5m]))",
           "legendFormat": "cancels/s",
           "refId": "A"
         }
@@ -148,7 +148,7 @@
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
-          "expr": "rate(rio_scheduler_misclassifications_total[5m])",
+          "expr": "sum(rate(rio_scheduler_misclassifications_total[5m]))",
           "legendFormat": "misclass/s",
           "refId": "A"
         }

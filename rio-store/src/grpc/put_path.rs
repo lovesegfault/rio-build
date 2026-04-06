@@ -155,7 +155,7 @@ impl StoreServiceImpl {
 
         let token = request
             .metadata()
-            .get("x-rio-assignment-token")
+            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok());
 
         match token {
@@ -209,9 +209,10 @@ impl StoreServiceImpl {
                         metrics::counter!("rio_store_hmac_rejected_total",
                                          "reason" => "missing_token")
                         .increment(1);
-                        Err(Status::permission_denied(
-                            "assignment token required (x-rio-assignment-token header)",
-                        ))
+                        Err(Status::permission_denied(format!(
+                            "assignment token required ({} header)",
+                            rio_proto::ASSIGNMENT_TOKEN_HEADER
+                        )))
                     }
                 }
             }

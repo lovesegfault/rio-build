@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, instrument};
 
 use crate::backend::chunk::ChunkBackend;
 
@@ -260,6 +260,7 @@ pub async fn sweep(
 /// the main GC run for a lightweight "just clean up orphan chunks"
 /// cron).
 // r[impl store.chunk.grace-ttl]
+#[instrument(skip(pool, chunk_backend))]
 pub async fn sweep_orphan_chunks(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,

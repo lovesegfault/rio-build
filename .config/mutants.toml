@@ -26,6 +26,15 @@ examine_globs = [
   "rio-common/src/hmac.rs",
   # Chunk manifest encoding. Length-prefixed binary format.
   "rio-store/src/manifest.rs",
+  # ─── Expansion candidates (uncomment after baseline stabilizes) ───
+  #   Scheduler dispatch heuristics. Comparisons galore.
+  # "rio-scheduler/src/actor/dispatch.rs",
+  #   Store GC sweep. Batch-size boundary arithmetic.
+  # "rio-store/src/gc/sweep.rs",
+  #   Worker overlay mount path construction. String slicing.
+  # "rio-worker/src/overlay.rs",
+  #   JWT interceptor verify logic. Expiry comparison.
+  # "rio-common/src/jwt_interceptor.rs",
 ]
 
 # Never mutate these — high churn, low signal.

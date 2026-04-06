@@ -137,9 +137,7 @@ impl SchedulerGrpc {
             // INTERNAL they'd surface the error to the user. Same
             // string as `actor_guards::check_actor_alive` so operators
             // grep for one signature, not two.
-            ActorError::ChannelSend => {
-                Status::unavailable("scheduler actor is unavailable (panicked or exited)")
-            }
+            ActorError::ChannelSend => Status::unavailable(actor_guards::ACTOR_UNAVAILABLE_MSG),
             ActorError::Database(e) => Status::internal(format!("database error: {e}")),
             ActorError::Dag(e) => Status::internal(format!("DAG merge failed: {e}")),
             ActorError::MissingDbId { .. } => Status::internal(err.to_string()),

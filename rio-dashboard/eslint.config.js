@@ -36,7 +36,7 @@ export default ts.config(
       // codegen config changes; the barrel is the one change-site.
       'no-restricted-imports': ['error', {
         patterns: [{
-          group: ['**/gen/*_pb', '**/gen/*_pb.js'],
+          group: ['**/gen/**/*_pb', '**/gen/**/*_pb.js'],
           message: 'Import from src/api/types (barrel) instead of gen/*_pb directly. See P0390.',
         }],
       }],

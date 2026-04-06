@@ -12,7 +12,7 @@ Your job is to be SKEPTICAL. The fixer wants green CI; you want to know whether 
 
 | Smell | How to detect | When it's acceptable | When it's NOT |
 |---|---|---|---|
-| **`#[ignore]` added** | `git diff $TGT..<branch> \| grep '^\+.*#\[ignore\]'` | Never for a flake fix — this is deleting the test | Always FAIL this |
+| **`#[ignore]` added** | `git diff $TGT...<branch> \| grep '^\+.*#\[ignore\]'` | Never for a flake fix — this is deleting the test | Always FAIL this |
 | **Gate widened** | Assertion threshold changed: `<0.15` → `<0.25`, `<14s` → `<20s`, timeout `300` → `600` | ONLY with **(a)** documented slack budget derived from measured variance, **AND (b)** test still catches the regression it was designed to catch | If the new gate would have passed the pre-feature baseline, the test is neutered |
 | **Retry-N added** | `#[retry(N)]` attribute, or a manual retry loop | Acceptable IF the flake is genuinely environmental (network, fs timing beyond our control) AND the test comment says so | NOT acceptable if the test is racy against our *own* code — retry masks a real bug |
 | **Assertion weakened** | `assert_eq!` → `assert!`; exact match → `.contains()`; `==` → `>=` | Only if the original assertion was over-specified (checking incidental ordering, exact whitespace) | If the weakening would accept the bug the test was written to catch |
@@ -26,8 +26,8 @@ Your job is to be SKEPTICAL. The fixer wants green CI; you want to know whether 
 
 ```bash
 TGT=$(/root/src/rio-build/main/.claude/bin/onibus integration-branch)
-git diff $TGT..<branch> --stat    # shape
-git diff $TGT..<branch>           # detail
+git diff $TGT...<branch> --stat    # shape
+git diff $TGT...<branch>           # detail
 ```
 
 What actually changed? Not what the commit message claims — what the diff shows.
@@ -37,8 +37,8 @@ What actually changed? Not what the commit message claims — what the diff show
 For each smell in the table above, grep the diff. Report every hit, even if it turns out acceptable — acceptable smells still need a justification comment at the test site.
 
 ```bash
-git diff $TGT..<branch> | grep -E '^\+.*(#\[ignore\]|#\[retry|#\[serial\]|\.contains\()'
-git diff $TGT..<branch> | grep -E '^\+.*assert' && git diff $TGT..<branch> | grep -E '^\-.*assert'
+git diff $TGT...<branch> | grep -E '^\+.*(#\[ignore\]|#\[retry|#\[serial\]|\.contains\()'
+git diff $TGT...<branch> | grep -E '^\+.*assert' && git diff $TGT...<branch> | grep -E '^\-.*assert'
 ```
 
 ### 3. The key question

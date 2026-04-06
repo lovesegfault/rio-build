@@ -1608,31 +1608,9 @@ let
               "--dry-run=client -o yaml | k3s kubectl apply -f -"
           )
 
-          # Scale-bounce gateway 0→1. Same rationale as
-          # fixture.sshKeySetup (k3s-full.nix:463-514): gateway loads
-          # authorized_keys once at startup (Arc, no hot-reload);
-          # rollout restart isn't enough because kubelet's
-          # SecretManager serves from a cached reflector until refcount
-          # hits 0. Scale-to-0 → wait gone (kubelet ack-deletes after
-          # full teardown → reflector.stop → cache evict) → scale-to-1
-          # → fresh pod does a fresh Secret LIST.
-          k3s_server.succeed(
-              "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=0"
-          )
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${ns} get pods "
-              "-l app.kubernetes.io/name=rio-gateway "
-              "--no-headers 2>/dev/null | grep -q .",
-              timeout=90,
-          )
-          k3s_server.succeed(
-              "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=1"
-          )
-          k3s_server.wait_until_succeeds(
-              "k3s kubectl -n ${ns} rollout status deploy/rio-gateway "
-              "--timeout=60s",
-              timeout=90,
-          )
+          # Scale-bounce gateway 0→1 — see fixture.bounceGatewayForSecret
+          # for the SecretManager reflector-refcount rationale.
+          ${fixture.bounceGatewayForSecret}
           # kube-proxy endpoint sync lag — poll SSH banner. Same
           # rationale as fixture.sshKeySetup (k3s-full.nix): nc -z
           # only proves kube-proxy has a DNAT rule, not that the

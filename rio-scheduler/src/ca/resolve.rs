@@ -171,10 +171,7 @@ pub struct ResolvedDerivation {
 /// This is the string that appears LITERALLY in the parent derivation's
 /// env/args wherever the input's output path would be — it's what
 /// [`resolve_ca_inputs`] string-replaces.
-pub fn downstream_placeholder(
-    drv_path: &StorePath,
-    output_name: &str,
-) -> Result<String, ResolveError> {
+pub fn downstream_placeholder(drv_path: &StorePath, output_name: &str) -> String {
     // drvName: the store-path name with the trailing ".drv" stripped.
     // Nix: `drvPath.name()` on a .drv path already strips the
     // extension (it's baked into DrvPath::name()). Our StorePath
@@ -198,7 +195,7 @@ pub fn downstream_placeholder(
         output_path_name
     );
     let hash: [u8; 32] = Sha256::digest(cleartext.as_bytes()).into();
-    Ok(format!("/{}", nixbase32::encode(&hash)))
+    format!("/{}", nixbase32::encode(&hash))
 }
 
 /// After all CA-input derivations complete, query realisations for
@@ -290,7 +287,7 @@ pub async fn resolve_ca_inputs(
             new_input_srcs.push(realized.clone());
 
             // Step 4: placeholder → realized path rewrite.
-            let placeholder = downstream_placeholder(&input_path, output_name)?;
+            let placeholder = downstream_placeholder(&input_path, output_name);
             rewrites.insert(placeholder, realized.clone());
 
             // Step 5 (caller's side-effect): record the dependency
@@ -586,7 +583,7 @@ pub type RealisationOutput = (String, [u8; 32]);
 ///
 /// Uses `realisation_deps_reverse_idx` (migration 015, explicitly
 /// indexed "for cutoff cascade"). Bounded at `max_nodes` to match
-/// the in-mem DAG's `MAX_CASCADE_DEPTH` — a runaway walk on a
+/// the in-mem DAG's `MAX_CASCADE_NODES` — a runaway walk on a
 /// pathological dependency graph shouldn't hang the actor loop.
 ///
 /// Returns `(drv_hash, output_name) → (output_path, output_hash)`.
@@ -835,7 +832,7 @@ mod tests {
     fn placeholder_golden_matches_nix_upstream() {
         let drv_path =
             StorePath::parse("/nix/store/g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-foo.drv").unwrap();
-        let p = downstream_placeholder(&drv_path, "out").unwrap();
+        let p = downstream_placeholder(&drv_path, "out");
         assert_eq!(
             p, "/0c6rn30q4frawknapgwq386zq358m8r6msvywcvc89n6m5p2dgbz",
             "must match upstream Nix golden value \
@@ -850,7 +847,7 @@ mod tests {
     fn placeholder_shape() {
         let drv_path =
             StorePath::parse("/nix/store/00000000000000000000000000000000-foo.drv").unwrap();
-        let p = downstream_placeholder(&drv_path, "out").unwrap();
+        let p = downstream_placeholder(&drv_path, "out");
         assert!(p.starts_with('/'), "placeholder must start with /");
         assert_eq!(p.len(), 53, "/ + 52-char nixbase32 of SHA-256");
         // nixbase32 alphabet is all lowercase alnum minus e/o/t/u.
@@ -868,8 +865,8 @@ mod tests {
     fn placeholder_output_name_matters() {
         let drv_path =
             StorePath::parse("/nix/store/00000000000000000000000000000000-multi.drv").unwrap();
-        let p_out = downstream_placeholder(&drv_path, "out").unwrap();
-        let p_dev = downstream_placeholder(&drv_path, "dev").unwrap();
+        let p_out = downstream_placeholder(&drv_path, "out");
+        let p_dev = downstream_placeholder(&drv_path, "dev");
         assert_ne!(p_out, p_dev, "different outputs → different placeholders");
     }
 
@@ -886,7 +883,7 @@ mod tests {
         let drv_path =
             StorePath::parse("/nix/store/11111111111111111111111111111111-bar.drv").unwrap();
         // The cleartext uses "bar" (stripped), not "bar.drv".
-        let p = downstream_placeholder(&drv_path, "out").unwrap();
+        let p = downstream_placeholder(&drv_path, "out");
         // Recompute manually with the expected cleartext shape.
         let expected_clear = format!(
             "nix-upstream-output:{}:bar",
@@ -927,7 +924,7 @@ mod tests {
         // its inputDrvs.
         let input_drv_path = "/nix/store/44444444444444444444444444444444-dep.drv";
         let input_sp = StorePath::parse(input_drv_path)?;
-        let placeholder = downstream_placeholder(&input_sp, "out")?;
+        let placeholder = downstream_placeholder(&input_sp, "out");
 
         // Build the parent CA derivation's ATerm. It references the
         // input via inputDrvs and embeds the placeholder in its env
@@ -1042,7 +1039,7 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let input_drv_path = "/nix/store/66666666666666666666666666666666-gone.drv";
-        let placeholder = downstream_placeholder(&StorePath::parse(input_drv_path)?, "out")?;
+        let placeholder = downstream_placeholder(&StorePath::parse(input_drv_path)?, "out");
         let parent_aterm = format!(
             r#"Derive([("out","","sha256","")],[("{input_drv_path}",["out"])],[],"x86_64-linux","/bin/sh",[],[("DEP","{placeholder}")])"#
         );
@@ -1180,7 +1177,7 @@ mod tests {
         .await?;
         let ca_drv = "/nix/store/44444444444444444444444444444444-ca.drv";
         let ca_sp = StorePath::parse(ca_drv)?;
-        let placeholder = downstream_placeholder(&ca_sp, "out")?;
+        let placeholder = downstream_placeholder(&ca_sp, "out");
 
         // --- IA input: just IaResolveInput, no PG needed ---
         let ia_drv = "/nix/store/88888888888888888888888888888888-ia.drv";

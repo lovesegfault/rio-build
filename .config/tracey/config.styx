@@ -68,6 +68,9 @@ specs (
           rio-gateway/tests/**/*.rs
           rio-proto/tests/**/*.rs
           rio-store/tests/**/*.rs
+          rio-scheduler/tests/**/*.rs
+          rio-worker/tests/**/*.rs
+          rio-controller/tests/**/*.rs
           nix/tests/default.nix
           rio-dashboard/src/lib/__tests__/*.ts
           rio-dashboard/src/components/__tests__/*.ts

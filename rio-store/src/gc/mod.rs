@@ -497,7 +497,9 @@ pub(super) struct DecrementStats {
 /// Skips hashes that fail `try_from` to `[u8; 32]` (can't-happen — the
 /// `chunks` PK is BYTEA but every writer inserts exactly 32 bytes;
 /// `warn!` + skip rather than panic so one corrupt row doesn't kill
-/// the sweep). Returns the number of keys actually enqueued.
+/// the sweep). Returns the number of keys attempted (duplicates already
+/// enqueued are no-ops via `ON CONFLICT DO NOTHING`; actual insert
+/// count may be lower).
 ///
 /// No-op if `backend` is None (inline-only store has no S3 keys).
 // r[impl store.gc.pending-deletes]

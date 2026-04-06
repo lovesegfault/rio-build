@@ -151,8 +151,12 @@
     style:height="{viewport.start * lineH}px"
     aria-hidden="true"
   ></div>
+  <!-- Keys are viewport-relative, NOT log-absolute — when the cap
+       splices the head, keyed nodes get new content without re-mount.
+       Invisible today (no animate:); don't add animate: without
+       rekeying on a stable offset like stream.firstLineNumber. -->
   {#each stream.lines.slice(viewport.start, viewport.end) as line, i (viewport.start + i)}
-    <pre class="line">{line}</pre>
+    <pre class="line" title={line}>{line}</pre>
   {/each}
   <div
     class="spacer"
