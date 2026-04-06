@@ -3395,6 +3395,91 @@ def test_collision_index_live_compute(tmp_repo: Path, monkeypatch):
     assert cx.check(1, {99}) == []
 
 
+def test_collisions_check_includes_claude_work(tmp_path: Path, monkeypatch):
+    """P0448 regression: check_vs_running must report overlaps on .claude/work/
+    paths. P0295↔P0437 both targeting plan-0304-*.md wasn't caught — the
+    their-side (diff_src_files) filtered to ^rio-*/src/*.rs$ only, so the
+    intersection with the PlanFile-scoped this-side was structurally empty
+    for any non-rust-src path. Also covers: nix/, docs/, rio-*/tests/."""
+    import onibus.collisions as coll
+    from onibus.models import Worktree
+
+    # Plan 295 declares it will touch the batch doc + a rust file.
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "plan-0295-batch-append.md").write_text(
+        "## Files\n\n```json files\n"
+        '[{"path": ".claude/work/plan-0304-trivial-batch.md", "action": "MODIFY"},'
+        ' {"path": "rio-scheduler/src/assignment.rs", "action": "MODIFY"},'
+        ' {"path": "nix/tests/default.nix", "action": "MODIFY"}]\n'
+        "```\n"
+    )
+    monkeypatch.setattr(
+        coll, "find_plan_doc", lambda n: work / "plan-0295-batch-append.md"
+    )
+
+    # Running p437 worktree: diff shows the same batch doc + a nix test + noise.
+    # Pre-P0448, the ^rio-*/src/*.rs$ filter dropped ALL of these → zero overlap.
+    wt437 = Worktree(path=tmp_path / "p437", branch="p437", head="deadbeef")
+    monkeypatch.setattr(coll, "plan_worktrees", lambda: [wt437])
+    monkeypatch.setattr(
+        coll,
+        "diff_files",
+        lambda wt: [
+            ".claude/work/plan-0304-trivial-batch.md",
+            "nix/tests/default.nix",
+            "Cargo.lock",  # not in 295's fence → no intersection → no noise
+        ],
+    )
+    monkeypatch.setattr(coll, "_verify_phase_plans", lambda: set())
+
+    r = coll.check_vs_running(295)
+    assert r.source == "fence"
+    assert ".claude/work/plan-0304-trivial-batch.md" in r.this_files
+    assert len(r.collisions) == 1
+    assert r.collisions[0].branch == "p437"
+    # THE bug: batch-doc overlap is reported. nix/ too. Cargo.lock isn't
+    # (not in fence — intersection scopes, no their-side filter needed).
+    assert r.collisions[0].files == [
+        ".claude/work/plan-0304-trivial-batch.md",
+        "nix/tests/default.nix",
+    ]
+
+
+def test_collisions_diff_files_unfiltered(tmp_repo: Path):
+    """P0448: diff_files returns ALL changed paths, not just rio-*/src/*.rs.
+    Direct test of the renamed function against a real git diff — proves the
+    filter is gone, not just that the mock above is wired right."""
+    from onibus.git_ops import diff_files
+    from onibus.models import Worktree
+    from onibus import INTEGRATION_BRANCH
+
+    # Branch off, touch a mix: rust-src, .claude/work/, nix/, tests/.
+    _git(tmp_repo, "checkout", "-b", "p999")
+    for p in [
+        "rio-scheduler/src/assignment.rs",
+        ".claude/work/plan-0304-batch.md",
+        "nix/tests/default.nix",
+        "rio-store/tests/manifest.rs",
+    ]:
+        f = tmp_repo / p
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "touch", "--no-verify")
+
+    wt = Worktree(
+        path=tmp_repo, branch="p999",
+        head=_git(tmp_repo, "rev-parse", "HEAD"),
+    )
+    files = diff_files(wt)
+    # All four present. Old diff_src_files would have returned only the first.
+    assert ".claude/work/plan-0304-batch.md" in files
+    assert "nix/tests/default.nix" in files
+    assert "rio-store/tests/manifest.rs" in files
+    assert "rio-scheduler/src/assignment.rs" in files
+
+
 def test_dag_markers_cli(tmp_repo: Path):
     """dag-markers subcommand: joins UNIMPL plan ❤ Tracey refs with piped
     tracey-uncovered. Surfaces planning gaps (uncovered+unclaimed)."""

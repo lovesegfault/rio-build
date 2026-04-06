@@ -12,7 +12,7 @@ from collections import defaultdict
 from typing import Iterable, Mapping
 
 from onibus import STATE_DIR, WORK_DIR
-from onibus.git_ops import diff_src_files, plan_worktrees
+from onibus.git_ops import diff_files, plan_worktrees
 from onibus.jsonl import read_jsonl
 from onibus.models import AgentRow, Collision, CollisionReport, CollisionRow, PlanFile
 from onibus.plan_doc import find_plan_doc, plan_doc_files, plan_doc_src_files
@@ -153,7 +153,7 @@ def check_vs_running(plan_num: int) -> CollisionReport:
             continue  # don't collide with self
         if wt.plan_num in frozen:
             continue  # verify-phase worktree — files won't change
-        their = set(diff_src_files(wt))
+        their = set(diff_files(wt))
         overlap = sorted(this_set & their)
         if overlap:
             collisions.append(Collision(branch=wt.branch or "?", files=overlap))

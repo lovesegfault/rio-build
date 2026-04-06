@@ -98,10 +98,18 @@ def plan_worktrees() -> list[Worktree]:
     return [w for w in list_worktrees() if w.plan_num is not None]
 
 
-def diff_src_files(wt: Worktree) -> list[str]:
-    """Files matching rio-*/src/*.rs changed on this worktree vs the integration branch."""
+def diff_files(wt: Worktree) -> list[str]:
+    """All files changed on this worktree vs the integration branch.
+
+    P0448: formerly `diff_src_files` with a `^rio-*/src/*.rs$` filter. That
+    filter made check_vs_running blind to collisions on .claude/work/ plan
+    docs, nix/, docs/, migrations/, rio-*/tests/ — anything the PlanFile
+    pattern accepts but the rust-src regex doesn't. P0295↔P0437 overlapping
+    on plan-0304-*.md was the observed miss. No their-side filter needed:
+    check_vs_running's intersection with this_set (already PlanFile-scoped
+    or rust-src-scoped) does the scoping."""
     out = git_try("diff", "--name-only", f"{INTEGRATION_BRANCH}..HEAD", cwd=wt.path) or ""
-    return sorted(f for f in out.splitlines() if re.match(r"^rio-[a-z-]+/src/.*\.rs$", f))
+    return sorted(f for f in out.splitlines() if f)
 
 
 # ─── compound merger ops (NEW — absorbed from merger.md bash) ────────────────
