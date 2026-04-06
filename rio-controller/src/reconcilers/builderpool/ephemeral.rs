@@ -473,11 +473,11 @@ pub(super) fn build_job(
     pod_spec.restart_policy = Some("Never".into());
 
     // Random suffix: 6 lowercase alphanumeric. Not crypto; just
-    // avoiding collisions. Using the executor_id downward-API pattern
-    // from build_container means each pod's RIO_WORKER_ID is the
+    // avoiding collisions. The executor_id downward-API pattern
+    // from common/sts.rs means each pod's RIO_EXECUTOR_ID is the
     // Job's pod name (also random-suffixed by K8s on top of our
     // suffix) — unique per ephemeral pod, which is what the
-    // scheduler needs for its workers map.
+    // scheduler needs for its executors map.
     let suffix = random_suffix();
     // K8s name limit: 63 chars. `{pool}-eph-{6}` = pool+11. Most
     // pool names are short (<20 chars); if someone names a pool

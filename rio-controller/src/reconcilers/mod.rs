@@ -12,6 +12,8 @@
 
 pub mod builderpool;
 pub mod builderpoolset;
+pub mod common;
+pub mod fetcherpool;
 pub mod gc_schedule;
 
 use std::collections::HashMap;

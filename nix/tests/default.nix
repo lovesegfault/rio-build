@@ -539,6 +539,16 @@ in
     subtests = [
       "pdb-ownerref"
       "wps-lifecycle"
+      # TODO(P0455): add verify markers for ctrl.fetcherpool.reconcile
+      # + fetcher.sandbox.strict-seccomp + fetcher.node.dedicated here
+      # once ADR-019 is in tracey spec_include (rules live in
+      # decisions/019 but tracey only scans components/ today).
+      #   FetcherPool CR → STS with rio.build/role:fetcher label,
+      #   readOnlyRootFilesystem:true, rio-fetcher.json seccomp,
+      #   fetcher nodeSelector+toleration. STS-shape-only — pod
+      #   readiness waits on P0452 (scheduler FOD routing) + P0454
+      #   (four-namespace helm values + fetcher node pool).
+      "fetcherpool-sts"
     ];
   };
 

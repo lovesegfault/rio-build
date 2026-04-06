@@ -138,7 +138,7 @@ fn seccomp_localhost_emits_correct_security_context() {
     let worker = pod
         .containers
         .iter()
-        .find(|c| c.name == "worker")
+        .find(|c| c.name == "builder")
         .expect("worker container");
     let worker_prof = worker
         .security_context
@@ -182,7 +182,7 @@ fn seccomp_non_localhost_no_init_container() {
             .expect("pod seccomp set");
         assert_eq!(pod_prof.type_, ty);
         // Worker container: no container-level override.
-        let worker = pod.containers.iter().find(|c| c.name == "worker").unwrap();
+        let worker = pod.containers.iter().find(|c| c.name == "builder").unwrap();
         assert!(
             worker
                 .security_context
@@ -830,13 +830,14 @@ fn statefulset_env_vars() {
     assert!(!envs.contains_key("RIO_DAEMON_TIMEOUT_SECS"));
     assert!(!envs.contains_key("RIO_BLOOM_EXPECTED_ITEMS"));
 
-    // RIO_WORKER_ID uses fieldRef, not value — check separately.
+    // RIO_EXECUTOR_ID uses fieldRef, not value — check separately.
+    // figment reads `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
     let executor_id = container
         .env
         .as_ref()
         .unwrap()
         .iter()
-        .find(|e| e.name == "RIO_WORKER_ID")
+        .find(|e| e.name == "RIO_EXECUTOR_ID")
         .unwrap();
     assert_eq!(executor_id.value, None, "not a literal value");
     assert_eq!(

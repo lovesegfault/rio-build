@@ -1,0 +1,770 @@
+//! Shared StatefulSet/PodSpec builder for executor pods (builders +
+//! fetchers).
+//!
+//! Extracted from `builderpool/builders.rs` when ADR-019 introduced
+//! the builder/fetcher split. The 600-line pod-spec — FUSE volumes,
+//! wait-seccomp initContainer, pod-level seccomp, TLS mounts,
+//! capability set, probes, coverage propagation — is role-agnostic.
+//! Parameterizing on [`ExecutorStsParams`] (instead of `&BuilderPool`)
+//! lets both reconcilers call the same builder.
+
+use std::collections::BTreeMap;
+
+use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
+use k8s_openapi::api::core::v1::{
+    Affinity, Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource,
+    EnvVar, EnvVarSource, HTTPGetAction, HostPathVolumeSource, ObjectFieldSelector,
+    PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext, Toleration,
+    TopologySpreadConstraint, Volume, VolumeMount, WeightedPodAffinityTerm,
+};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::ObjectMeta;
+
+use crate::crds::builderpool::SeccompProfileKind;
+use crate::error::{Error, Result};
+
+/// K8s extended-resource name exposed by the smarter-device-manager
+/// DaemonSet (infra/helm/rio-build/templates/device-plugin.yaml).
+/// The kubelet sees this in `resources.limits` and the device plugin
+/// injects `/dev/fuse` into the container's device cgroup allowlist —
+/// no hostPath volume needed, so `hostUsers: false` works (ADR-012).
+const FUSE_DEVICE_RESOURCE: &str = "smarter-devices/fuse";
+
+/// Pod label carrying the executor role. Scheduler routing, network
+/// policies, and `kubectl get pods -l rio.build/role=fetcher` all
+/// key on this.
+pub const ROLE_LABEL: &str = "rio.build/role";
+
+/// Pod label carrying the owning pool name. Finalizer cleanup lists
+/// pods by this; ephemeral mode counts Jobs by it. Shared between
+/// BuilderPool and FetcherPool reconcilers.
+pub const POOL_LABEL: &str = "rio.build/pool";
+
+/// Executor role. Determines the `rio.build/role` label value and
+/// gates role-specific pod-spec tweaks (readOnlyRootFilesystem,
+/// seccomp profile name, RIO_EXECUTOR_KIND env).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorRole {
+    /// Airgapped, arbitrary-code builds. `rio-builders` namespace.
+    Builder,
+    /// Internet-facing, hash-checked FOD fetches. `rio-fetchers`
+    /// namespace. Stricter seccomp + readOnlyRootFilesystem.
+    Fetcher,
+}
+
+impl ExecutorRole {
+    /// Value for the `rio.build/role` label and `RIO_EXECUTOR_KIND` env.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Builder => "builder",
+            Self::Fetcher => "fetcher",
+        }
+    }
+}
+
+/// Scheduler addresses injected into executor pod env. Bundled as
+/// a struct because threading 3+ `&str` params through the builder
+/// chain is noisy, and these always travel together.
+#[derive(Clone)]
+pub struct SchedulerAddrs {
+    /// ClusterIP Service `host:port` (`RIO_SCHEDULER_ADDR`).
+    pub addr: String,
+    /// Headless Service hostname (`RIO_SCHEDULER_BALANCE_HOST`).
+    /// `None` = env var NOT injected → executor falls back to
+    /// single-channel.
+    pub balance_host: Option<String>,
+    /// Headless Service port (`RIO_SCHEDULER_BALANCE_PORT`).
+    pub balance_port: u16,
+}
+
+/// Every spec field the pod-spec builder reads. Both reconcilers
+/// construct this from their respective CRD spec and call
+/// [`build_executor_statefulset`].
+///
+/// Optional fields with `None` get the builder's compiled-in
+/// default. The fetcher reconciler leaves most `None` — its spec
+/// is minimal (replicas, image, systems, nodeSelector, tolerations,
+/// resources).
+pub struct ExecutorStsParams {
+    // ── role-varying knobs (the ADR-019 diff) ────────────────────
+    /// Builder or Fetcher. Sets the `rio.build/role` label and
+    /// `RIO_EXECUTOR_KIND` env.
+    pub role: ExecutorRole,
+    /// `securityContext.readOnlyRootFilesystem` on the executor
+    /// container. Fetchers: `true` (overlay upperdir is a tmpfs
+    /// emptyDir; rootfs tampering blocked). Builders: `false`.
+    // TODO(P0455): add the fetcher.sandbox.strict-seccomp impl
+    // marker here once ADR-019 is in tracey spec_include.
+    pub read_only_root_fs: bool,
+    /// Extra env vars appended after the base set. Builders pass
+    /// their tuning knobs (bloom, daemon_timeout, fuse_passthrough,
+    /// size_class) here so the shared builder doesn't need fields
+    /// for every BuilderPool-only knob.
+    pub extra_env: Vec<EnvVar>,
+
+    // ── metadata ─────────────────────────────────────────────────
+    /// Pool CR name. STS name becomes `{pool_name}-{role}s`.
+    pub pool_name: String,
+    /// Pool CR namespace. STS + pods live here.
+    pub namespace: String,
+
+    // ── scheduling ───────────────────────────────────────────────
+    pub node_selector: Option<BTreeMap<String, String>>,
+    pub tolerations: Option<Vec<Toleration>>,
+    /// Soft topology spread on hostname. `None` → true.
+    pub topology_spread: Option<bool>,
+
+    // ── image ────────────────────────────────────────────────────
+    pub image: String,
+    pub image_pull_policy: Option<String>,
+
+    // ── capacity ─────────────────────────────────────────────────
+    /// Comma-joined → `RIO_SYSTEMS`.
+    pub systems: Vec<String>,
+    /// Comma-joined → `RIO_FEATURES`. Empty for fetchers.
+    pub features: Vec<String>,
+    /// `RIO_MAX_BUILDS`. Fetchers: typically 1–2.
+    pub max_concurrent_builds: i32,
+    pub resources: Option<ResourceRequirements>,
+
+    // ── FUSE ─────────────────────────────────────────────────────
+    /// Parsed GB for `RIO_FUSE_CACHE_SIZE_GB`.
+    pub fuse_cache_gb: u64,
+    /// Raw Quantity for the emptyDir sizeLimit.
+    pub fuse_cache_quantity: Quantity,
+    pub fuse_threads: Option<u32>,
+
+    // ── security ─────────────────────────────────────────────────
+    /// `true` = full privileged (escape hatch — k3s/kind without
+    /// the device plugin). Disables seccomp, hostUsers:false.
+    pub privileged: bool,
+    /// CRD seccomp profile. Converted via [`build_seccomp_profile`].
+    pub seccomp_profile: Option<SeccompProfileKind>,
+    pub host_network: Option<bool>,
+    /// Explicit override. `None` → derived from `!privileged &&
+    /// !host_network`.
+    pub host_users: Option<bool>,
+
+    // ── misc ─────────────────────────────────────────────────────
+    pub tls_secret_name: Option<String>,
+    /// `None` → 7200s (2h).
+    pub termination_grace_period_seconds: Option<i64>,
+}
+
+/// Labels for the StatefulSet, headless Service, pod template, and
+/// PDB selector. Includes the ADR-019 `rio.build/role` label so
+/// NetworkPolicies and `kubectl get pods -l rio.build/role=fetcher`
+/// can target by role.
+pub fn executor_labels(p: &ExecutorStsParams) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (POOL_LABEL.into(), p.pool_name.clone()),
+        (ROLE_LABEL.into(), p.role.as_str().into()),
+        ("app.kubernetes.io/name".into(), "rio-builder".into()),
+        ("app.kubernetes.io/component".into(), p.role.as_str().into()),
+        ("app.kubernetes.io/part-of".into(), "rio-build".into()),
+    ])
+}
+
+/// STS name for a given pool. `{pool_name}-{role}s` — e.g.
+/// `default-builders`, `default-fetchers`.
+pub fn sts_name(pool_name: &str, role: ExecutorRole) -> String {
+    format!("{pool_name}-{}s", role.as_str())
+}
+
+/// Build the executor StatefulSet.
+///
+/// `replicas`: `Some(n)` to claim SSA ownership (first create),
+/// `None` to omit from the patch (subsequent reconciles — lets
+/// the autoscaler's field manager own it).
+pub fn build_executor_statefulset(
+    p: &ExecutorStsParams,
+    oref: OwnerReference,
+    scheduler: &SchedulerAddrs,
+    store_addr: &str,
+    replicas: Option<i32>,
+) -> StatefulSet {
+    let name = sts_name(&p.pool_name, p.role);
+    let labels = executor_labels(p);
+
+    StatefulSet {
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            namespace: Some(p.namespace.clone()),
+            owner_references: Some(vec![oref]),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(StatefulSetSpec {
+            service_name: Some(name),
+            // None on subsequent reconciles → field omitted from
+            // SSA patch → autoscaler's ownership preserved.
+            replicas,
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels),
+                    ..Default::default()
+                }),
+                spec: Some(build_executor_pod_spec(p, scheduler, store_addr)),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The pod spec. `pub` so `builderpool::ephemeral::build_job` can
+/// reuse it — the ephemeral Job pod is the same executor container
+/// with one extra env var.
+pub fn build_executor_pod_spec(
+    p: &ExecutorStsParams,
+    scheduler: &SchedulerAddrs,
+    store_addr: &str,
+) -> PodSpec {
+    // cgroup handling: we do NOT hostPath-mount /sys/fs/cgroup.
+    // See builderpool/builders.rs pre-extraction commentary for the
+    // full cgroupns-vs-hostPath reasoning; short version: containerd
+    // cgroup-namespaces the container, and with privileged the
+    // namespaced mount is RW — no hostPath needed, and a hostPath
+    // would clobber host systemd.
+
+    let labels = executor_labels(p);
+    let spread_enabled = p.topology_spread.unwrap_or(true);
+    let privileged = p.privileged;
+    // Localhost seccomp: profile lives on node disk, delivered by a
+    // DaemonSet initContainer. A wait-seccomp initContainer blocks
+    // until it appears. Gated on !privileged (privileged disables
+    // seccomp at runtime, so the wait would be dead weight).
+    let seccomp_localhost = (!privileged)
+        .then_some(p.seccomp_profile.as_ref())
+        .flatten()
+        .filter(|k| k.type_ == "Localhost")
+        .and_then(|k| k.localhost_profile.as_deref());
+
+    PodSpec {
+        containers: vec![build_executor_container(p, scheduler, store_addr)],
+
+        // wait-seccomp initContainer: polls the hostPath-mounted
+        // kubelet seccomp dir until the Localhost profile lands.
+        // Uses the executor image (has busybox). RuntimeDefault at
+        // container-level so the initContainer can start before the
+        // profile file lands; the actual Localhost enforcement is on
+        // the executor container.
+        init_containers: seccomp_localhost.map(|profile| {
+            vec![Container {
+                name: "wait-seccomp".into(),
+                image: Some(p.image.clone()),
+                image_pull_policy: p.image_pull_policy.clone(),
+                command: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "until test -f /host-seccomp/{profile}; do \
+                         echo 'waiting for seccomp profile {profile}...'; \
+                         sleep 2; done"
+                    ),
+                ]),
+                security_context: Some(SecurityContext {
+                    seccomp_profile: Some(SeccompProfile {
+                        type_: "RuntimeDefault".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                volume_mounts: Some(vec![VolumeMount {
+                    name: "host-seccomp".into(),
+                    mount_path: "/host-seccomp".into(),
+                    read_only: Some(true),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]
+        }),
+
+        host_network: p.host_network.filter(|&h| h),
+        dns_policy: p
+            .host_network
+            .filter(|&h| h)
+            .map(|_| "ClusterFirstWithHostNet".into()),
+
+        // r[impl sec.pod.host-users-false]
+        // User-namespace isolation. See ADR-012. Incompatible with
+        // privileged, hostNetwork, and hostPath /dev/fuse. The
+        // spec.hostUsers override handles containerd<2.1 cgroup
+        // ownership issues (cgroup_writable knob).
+        host_users: p
+            .host_users
+            .or_else(|| (!privileged && p.host_network != Some(true)).then_some(false)),
+
+        // Pod-level seccomp. RuntimeDefault when Localhost is
+        // requested (so the sandbox+initContainer can start before
+        // the profile file lands); the Localhost enforcement moves
+        // to the executor container's SecurityContext.
+        security_context: if !privileged {
+            Some(PodSecurityContext {
+                seccomp_profile: Some(if seccomp_localhost.is_some() {
+                    SeccompProfile {
+                        type_: "RuntimeDefault".into(),
+                        ..Default::default()
+                    }
+                } else {
+                    build_seccomp_profile(p.seccomp_profile.as_ref())
+                }),
+                ..Default::default()
+            })
+        } else {
+            None
+        },
+
+        // Soft topology spread + anti-affinity. Node drain can make
+        // hard spread unsatisfiable; soft lets pods schedule then
+        // re-spread later.
+        topology_spread_constraints: spread_enabled.then(|| {
+            vec![TopologySpreadConstraint {
+                max_skew: 1,
+                topology_key: "kubernetes.io/hostname".into(),
+                when_unsatisfiable: "ScheduleAnyway".into(),
+                label_selector: Some(LabelSelector {
+                    match_labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]
+        }),
+        affinity: spread_enabled.then(|| Affinity {
+            pod_anti_affinity: Some(PodAntiAffinity {
+                preferred_during_scheduling_ignored_during_execution: Some(vec![
+                    WeightedPodAffinityTerm {
+                        weight: 100,
+                        pod_affinity_term: PodAffinityTerm {
+                            label_selector: Some(LabelSelector {
+                                match_labels: Some(labels.clone()),
+                                ..Default::default()
+                            }),
+                            topology_key: "kubernetes.io/hostname".into(),
+                            ..Default::default()
+                        },
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+
+        volumes: Some({
+            let mut v = vec![
+                // FUSE cache. emptyDir = local ephemeral storage,
+                // wiped on pod restart. sizeLimit enforced by
+                // kubelet.
+                Volume {
+                    name: "fuse-cache".into(),
+                    empty_dir: Some(EmptyDirVolumeSource {
+                        size_limit: Some(p.fuse_cache_quantity.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                // Overlay upperdir/workdir. MUST be a real
+                // filesystem (not the container's overlayfs root).
+                // emptyDir gives us the kubelet's local disk.
+                //
+                // When `read_only_root_fs` is true (fetchers), this
+                // is the ONLY writable path — overlay writes still
+                // work, rootfs tampering does not. ADR-019 §Sandbox
+                // hardening specs a tmpfs emptyDir; Memory medium
+                // gives that (writes hit RAM, not disk — faster
+                // for short-lived FOD fetches, and the pod's memory
+                // limit bounds it).
+                Volume {
+                    name: "overlays".into(),
+                    empty_dir: Some(if p.read_only_root_fs {
+                        EmptyDirVolumeSource {
+                            medium: Some("Memory".into()),
+                            ..Default::default()
+                        }
+                    } else {
+                        EmptyDirVolumeSource::default()
+                    }),
+                    ..Default::default()
+                },
+            ];
+            // r[impl sec.pod.fuse-device-plugin]
+            // /dev/fuse: device plugin path (non-privileged) needs no
+            // volume — kubelet+plugin inject the device node via
+            // resources.limits. Privileged escape hatch uses hostPath.
+            if privileged {
+                v.push(Volume {
+                    name: "dev-fuse".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/dev/fuse".into(),
+                        type_: Some("CharDevice".into()),
+                    }),
+                    ..Default::default()
+                });
+            }
+            if seccomp_localhost.is_some() {
+                v.push(Volume {
+                    name: "host-seccomp".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/var/lib/kubelet/seccomp".into(),
+                        type_: Some("DirectoryOrCreate".into()),
+                    }),
+                    ..Default::default()
+                });
+            }
+            if let Some(secret) = &p.tls_secret_name {
+                v.push(Volume {
+                    name: "tls".into(),
+                    secret: Some(SecretVolumeSource {
+                        secret_name: Some(secret.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+            // nix.conf ConfigMap. `optional: true` so a missing
+            // ConfigMap mounts an empty dir → setup_nix_conf falls
+            // back to WORKER_NIX_CONF.
+            v.push(Volume {
+                name: "nix-conf".into(),
+                config_map: Some(ConfigMapVolumeSource {
+                    name: "rio-nix-conf".into(),
+                    optional: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            // Coverage propagation: test-only hostPath when the
+            // controller is running under -Cinstrument-coverage.
+            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+                v.push(Volume {
+                    name: "cov".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/var/lib/rio/cov".into(),
+                        type_: Some("DirectoryOrCreate".into()),
+                    }),
+                    ..Default::default()
+                });
+            }
+            v
+        }),
+
+        automount_service_account_token: Some(false),
+        termination_grace_period_seconds: Some(p.termination_grace_period_seconds.unwrap_or(7200)),
+        node_selector: p.node_selector.clone(),
+        tolerations: p.tolerations.clone(),
+
+        ..Default::default()
+    }
+}
+
+/// The executor container.
+fn build_executor_container(
+    p: &ExecutorStsParams,
+    scheduler: &SchedulerAddrs,
+    store_addr: &str,
+) -> Container {
+    let privileged = p.privileged;
+
+    Container {
+        name: p.role.as_str().into(),
+        image: Some(p.image.clone()),
+        command: Some(vec!["/bin/rio-builder".into()]),
+        image_pull_policy: p.image_pull_policy.clone(),
+        env: Some({
+            let mut e = vec![
+                env("RIO_SCHEDULER_ADDR", &scheduler.addr),
+                env("RIO_STORE_ADDR", store_addr),
+                env("RIO_MAX_BUILDS", &p.max_concurrent_builds.to_string()),
+                env("RIO_FUSE_CACHE_SIZE_GB", &p.fuse_cache_gb.to_string()),
+                env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
+                env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
+                env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
+                env("RIO_LOG_FORMAT", "json"),
+                env("RIO_SYSTEMS", &p.systems.join(",")),
+                env("RIO_FEATURES", &p.features.join(",")),
+                // Executor self-identification. figment reads
+                // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
+                // StatefulSet pods are `<sts-name>-<ordinal>` —
+                // unique, stable.
+                env_from_field("RIO_EXECUTOR_ID", "metadata.name"),
+                // Role discriminator. rio-builder's `RIO_EXECUTOR_
+                // KIND` gates the FOD-vs-non-FOD refusal (ADR-019
+                // §Executor enforcement — a builder receiving a FOD
+                // returns WrongKind without spawning).
+                env("RIO_EXECUTOR_KIND", p.role.as_str()),
+            ];
+            if let Some(host) = &scheduler.balance_host {
+                e.push(env("RIO_SCHEDULER_BALANCE_HOST", host));
+                e.push(env(
+                    "RIO_SCHEDULER_BALANCE_PORT",
+                    &scheduler.balance_port.to_string(),
+                ));
+            }
+            if let Some(n) = p.fuse_threads {
+                e.push(env("RIO_FUSE_THREADS", &n.to_string()));
+            }
+            if p.tls_secret_name.is_some() {
+                e.push(env("RIO_TLS__CERT_PATH", "/etc/rio/tls/tls.crt"));
+                e.push(env("RIO_TLS__KEY_PATH", "/etc/rio/tls/tls.key"));
+                e.push(env("RIO_TLS__CA_PATH", "/etc/rio/tls/ca.crt"));
+            }
+            // Coverage + RUST_LOG passthrough (test-only / operator
+            // knob respectively).
+            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+                e.push(env(
+                    "LLVM_PROFILE_FILE",
+                    "/var/lib/rio/cov/rio-%p-%m.profraw",
+                ));
+            }
+            if let Ok(level) = std::env::var("RUST_LOG") {
+                e.push(env("RUST_LOG", &level));
+            }
+            // Role-specific extras: builders pass size_class,
+            // bloom_expected_items, daemon_timeout_secs,
+            // fuse_passthrough here. Fetchers pass nothing.
+            e.extend(p.extra_env.iter().cloned());
+            e
+        }),
+
+        volume_mounts: Some({
+            let mut m = vec![
+                VolumeMount {
+                    name: "fuse-cache".into(),
+                    mount_path: "/var/rio/cache".into(),
+                    ..Default::default()
+                },
+                VolumeMount {
+                    name: "overlays".into(),
+                    mount_path: "/var/rio/overlays".into(),
+                    ..Default::default()
+                },
+            ];
+            if privileged {
+                m.push(VolumeMount {
+                    name: "dev-fuse".into(),
+                    mount_path: "/dev/fuse".into(),
+                    ..Default::default()
+                });
+            }
+            if p.tls_secret_name.is_some() {
+                m.push(VolumeMount {
+                    name: "tls".into(),
+                    mount_path: "/etc/rio/tls".into(),
+                    read_only: Some(true),
+                    ..Default::default()
+                });
+            }
+            m.push(VolumeMount {
+                name: "nix-conf".into(),
+                mount_path: "/etc/rio/nix-conf".into(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+                m.push(VolumeMount {
+                    name: "cov".into(),
+                    mount_path: "/var/lib/rio/cov".into(),
+                    ..Default::default()
+                });
+            }
+            m
+        }),
+
+        security_context: Some(SecurityContext {
+            privileged: privileged.then_some(true),
+            capabilities: Some(Capabilities {
+                // nix-daemon sandbox cap set. See builderpool/
+                // builders.rs pre-extraction commentary for the
+                // per-cap rationale (SETUID/GID for nixbld drop,
+                // NET_ADMIN for lo up in newns, SETPCAP for the
+                // inheritable-caps dance post-CVE-2022-24769, etc).
+                add: Some(vec![
+                    "SYS_ADMIN".into(),
+                    "SYS_CHROOT".into(),
+                    "SETUID".into(),
+                    "SETGID".into(),
+                    "NET_ADMIN".into(),
+                    "CHOWN".into(),
+                    "DAC_OVERRIDE".into(),
+                    "KILL".into(),
+                    "FOWNER".into(),
+                    "SETPCAP".into(),
+                ]),
+                ..Default::default()
+            }),
+            // allowPrivilegeEscalation=true: runc's no_new_privs
+            // clears ambient caps on exec, breaking nix-daemon's
+            // pivot_root. k8s defaults to true when CAP_SYS_ADMIN
+            // is present, but PSA may override — be explicit.
+            allow_privilege_escalation: Some(true),
+            // Container-level seccomp: set ONLY when Localhost is
+            // requested. Pod-level stays RuntimeDefault in that case
+            // so the sandbox+initContainer can start before the
+            // profile file lands.
+            seccomp_profile: p
+                .seccomp_profile
+                .as_ref()
+                .filter(|k| k.type_ == "Localhost")
+                .map(|_| build_seccomp_profile(p.seccomp_profile.as_ref())),
+            // Fetcher hardening: rootfs tampering blocked. The
+            // overlay upperdir (tmpfs emptyDir) is still writable.
+            // ADR-019 §Sandbox hardening.
+            read_only_root_filesystem: p.read_only_root_fs.then_some(true),
+            ..Default::default()
+        }),
+
+        // r[impl sec.pod.fuse-device-plugin]
+        // Operator resources + device-plugin FUSE request. Privileged
+        // escape hatch: no FUSE resource (hostPath + privileged
+        // bypasses device cgroup).
+        resources: if privileged {
+            p.resources.clone()
+        } else {
+            let mut r = p.resources.clone().unwrap_or_default();
+            let fuse = (FUSE_DEVICE_RESOURCE.to_string(), Quantity("1".into()));
+            r.limits
+                .get_or_insert_with(BTreeMap::new)
+                .insert(fuse.0.clone(), fuse.1.clone());
+            r.requests
+                .get_or_insert_with(BTreeMap::new)
+                .insert(fuse.0, fuse.1);
+            Some(r)
+        },
+
+        ports: Some(vec![
+            ContainerPort {
+                name: Some("metrics".into()),
+                container_port: 9093,
+                ..Default::default()
+            },
+            ContainerPort {
+                name: Some("health".into()),
+                container_port: 9193,
+                ..Default::default()
+            },
+        ]),
+
+        liveness_probe: Some(http_probe("/healthz", 9193, 10, 3)),
+        readiness_probe: Some(http_probe("/readyz", 9193, 5, 3)),
+        startup_probe: Some(http_probe("/healthz", 9193, 4, 30)),
+
+        ..Default::default()
+    }
+}
+
+// ── small helpers ────────────────────────────────────────────────────
+
+/// Translate CRD `SeccompProfileKind` → k8s-openapi `SeccompProfile`.
+/// `None` and unknown types → `RuntimeDefault` (fail-closed — never
+/// fall through to Unconfined on a typo).
+// r[impl builder.seccomp.localhost-profile]
+pub fn build_seccomp_profile(kind: Option<&SeccompProfileKind>) -> SeccompProfile {
+    match kind.map(|k| k.type_.as_str()) {
+        Some("Localhost") => SeccompProfile {
+            type_: "Localhost".into(),
+            localhost_profile: kind.and_then(|k| k.localhost_profile.clone()),
+        },
+        Some("Unconfined") => SeccompProfile {
+            type_: "Unconfined".into(),
+            ..Default::default()
+        },
+        _ => SeccompProfile {
+            type_: "RuntimeDefault".into(),
+            ..Default::default()
+        },
+    }
+}
+
+pub fn env(name: &str, value: &str) -> EnvVar {
+    EnvVar {
+        name: name.into(),
+        value: Some(value.into()),
+        ..Default::default()
+    }
+}
+
+/// Downward API: env var from pod metadata field.
+pub fn env_from_field(name: &str, field_path: &str) -> EnvVar {
+    EnvVar {
+        name: name.into(),
+        value_from: Some(EnvVarSource {
+            field_ref: Some(ObjectFieldSelector {
+                field_path: field_path.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn http_probe(path: &str, port: i32, period: i32, failure_threshold: i32) -> Probe {
+    Probe {
+        http_get: Some(HTTPGetAction {
+            path: Some(path.into()),
+            port: IntOrString::Int(port),
+            ..Default::default()
+        }),
+        period_seconds: Some(period),
+        failure_threshold: Some(failure_threshold),
+        ..Default::default()
+    }
+}
+
+/// Parse a K8s Quantity string to gigabytes (integer, rounded DOWN).
+///
+/// Handles common cases: "100Gi" (binary), "100G" (decimal),
+/// "107374182400" (raw bytes), "1.5Gi" (decimal mantissa). Rounding
+/// DOWN: better to under-report cache ceiling than over (kubelet
+/// evicts on overshoot).
+pub fn parse_quantity_to_gb(q: &str) -> Result<u64> {
+    let q = q.trim();
+    // Suffixes in DECREASING length order so "Gi" matches before "G".
+    const SUFFIXES: &[(&str, u64)] = &[
+        ("Gi", 1024 * 1024 * 1024),
+        ("Mi", 1024 * 1024),
+        ("Ki", 1024),
+        ("Ti", 1024 * 1024 * 1024 * 1024),
+        ("G", 1_000_000_000),
+        ("M", 1_000_000),
+        ("K", 1_000),
+        ("T", 1_000_000_000_000),
+    ];
+
+    for (suffix, mult) in SUFFIXES {
+        if let Some(num) = q.strip_suffix(suffix) {
+            let n: f64 = num.trim().parse().map_err(|_| {
+                Error::InvalidSpec(format!(
+                    "fuseCacheSize {q:?}: {num:?} before suffix is not a number"
+                ))
+            })?;
+            if n < 0.0 || !n.is_finite() {
+                return Err(Error::InvalidSpec(format!(
+                    "fuseCacheSize {q:?}: must be a non-negative finite number"
+                )));
+            }
+            let bytes_f = n * *mult as f64;
+            if bytes_f > u64::MAX as f64 {
+                return Err(Error::InvalidSpec(format!(
+                    "fuseCacheSize {q:?}: overflows u64"
+                )));
+            }
+            return Ok(bytes_f.floor() as u64 / (1024 * 1024 * 1024));
+        }
+    }
+
+    let bytes: u64 = q.parse().map_err(|_| {
+        Error::InvalidSpec(format!(
+            "fuseCacheSize {q:?}: not a recognized quantity \
+             (expected e.g. '100Gi', '50G', or raw bytes)"
+        ))
+    })?;
+    Ok(bytes / (1024 * 1024 * 1024))
+}

@@ -131,7 +131,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         host_network: template.host_network,
         host_users: template.host_users,
         tls_secret_name: template.tls_secret_name.clone(),
-        // fod_proxy_url removed per ADR-019.
 
         // --- Hardcoded (neither in template nor class; see consts) ---
         max_concurrent_builds: DEFAULT_MAX_CONCURRENT_BUILDS,
