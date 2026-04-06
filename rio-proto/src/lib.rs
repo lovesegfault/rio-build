@@ -181,6 +181,9 @@ pub use admin::admin_service_client::AdminServiceClient;
 pub use admin::admin_service_server::{AdminService, AdminServiceServer};
 pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
+// TODO(P0430): ChunkServiceClient still has zero production callers
+// post-P0263. Decide whether client-side chunking is still planned; if
+// descoped, remove this re-export per the doc-comment above.
 pub use store::chunk_service_client::ChunkServiceClient;
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
 pub use store::store_admin_service_client::StoreAdminServiceClient;

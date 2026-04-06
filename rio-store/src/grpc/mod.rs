@@ -589,6 +589,14 @@ impl StoreService for StoreServiceImpl {
     /// Queries the content_index populated by PutPath. Empty
     /// `store_path` in the response = not found (proto convention;
     /// caller checks `.is_empty()` not Option).
+    // WONTFIX(P0432): no production callers — scheduler CA cutoff
+    // switched to realisation-based lookup because ContentLookup's
+    // self-exclusion is broken for CA (same content → same path →
+    // excludes the only matching row; see actor/completion.rs). Kept
+    // because 4 integration tests use it to verify content_index
+    // population after PutPath/PutPathBatch, and store.md still
+    // documents it. P0432 decides whether content_index itself is
+    // dead and can cascade-remove this RPC + tests + docs.
     #[instrument(skip(self, request), fields(rpc = "ContentLookup"))]
     async fn content_lookup(
         &self,
