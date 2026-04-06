@@ -521,10 +521,14 @@ pkgs.testers.runNixOSTest {
         # with burst=3, 3 rapid builds drain the bucket and the 4th
         # needs ~30s before the next token — well outside the test's
         # submit loop.
+        # /run/systemd/system/ not /etc/ — NixOS VM tests mount /etc
+        # read-only (declarative config). systemd reads drop-ins from
+        # /run/systemd/system/<unit>.d/ with the same precedence as
+        # /etc/; it's tmpfs-backed and writable at runtime.
         ${gatewayHost}.succeed(
-            "mkdir -p /etc/systemd/system/rio-gateway.service.d && "
+            "mkdir -p /run/systemd/system/rio-gateway.service.d && "
             "printf '[Service]\\nEnvironment=RIO_RATE_LIMIT__PER_MINUTE=2\\nEnvironment=RIO_RATE_LIMIT__BURST=3\\n' "
-            "> /etc/systemd/system/rio-gateway.service.d/ratelimit.conf && "
+            "> /run/systemd/system/rio-gateway.service.d/ratelimit.conf && "
             "systemctl daemon-reload && systemctl restart rio-gateway"
         )
         ${gatewayHost}.wait_for_unit("rio-gateway.service")
@@ -602,7 +606,7 @@ pkgs.testers.runNixOSTest {
         # narinfo serving — they don't, but future subtests might)
         # aren't rate-limited by the leftover burst=3.
         ${gatewayHost}.succeed(
-            "rm -f /etc/systemd/system/rio-gateway.service.d/ratelimit.conf && "
+            "rm -f /run/systemd/system/rio-gateway.service.d/ratelimit.conf && "
             "systemctl daemon-reload && systemctl restart rio-gateway"
         )
         ${gatewayHost}.wait_for_unit("rio-gateway.service")

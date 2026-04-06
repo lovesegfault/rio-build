@@ -542,6 +542,34 @@ pub async fn execute_build(
                     whiteout.display()
                 ))
             })?;
+            // Diagnostic: verify the whiteout is visible as ENOENT through
+            // the MERGED view. The mknod above writes directly to the
+            // upperdir backing fs; this stat goes through overlayfs. If it
+            // doesn't return ENOENT, the char-dev-0/0 whiteout approach
+            // isn't being honored in this environment (nested overlay,
+            // unusual mount options, kernel quirk) — the build will still
+            // proceed but the FOD-failure hang fix won't take effect.
+            // See TODO(P0308-followup) in fod-proxy.nix.
+            let merged_check = overlay_mount.merged_dir().join(basename);
+            match std::fs::symlink_metadata(&merged_check) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        output = basename,
+                        upper = %whiteout.display(),
+                        "FOD output whiteout created and visible as ENOENT via merged"
+                    );
+                }
+                other => {
+                    tracing::warn!(
+                        output = basename,
+                        upper = %whiteout.display(),
+                        merged = %merged_check.display(),
+                        result = ?other,
+                        "FOD output whiteout NOT visible as ENOENT via merged — \
+                         daemon post-fail stat may fall through to FUSE and hang"
+                    );
+                }
+            }
         }
     }
 

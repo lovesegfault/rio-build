@@ -241,6 +241,7 @@
           c2nWorkspaceFileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
+            ./rio-bench
             ./rio-cli
             ./rio-common
             ./rio-controller
@@ -253,6 +254,7 @@
             ./rio-store/src
             ./rio-store/tests
             ./rio-store/Cargo.toml
+            ./rio-store/build.rs
             ./rio-test-support
             ./rio-worker
             ./migrations
@@ -882,39 +884,85 @@
           #
           # `packages` not `checks` (same as golden-matrix): hours
           # per run, not something `nix flake check` should touch.
-          mutants = craneLib.mkCargoDerivation (
-            commonArgs
+          #
+          # crate2nix port: cargo-mutants fundamentally needs a
+          # writable cargo workspace (it mutates source in-place and
+          # re-invokes `cargo build` + `cargo nextest run` per
+          # mutation). crate2nix's per-crate-drv model doesn't map to
+          # that workflow — so this derivation BYPASSES crate2nix
+          # entirely and uses the same stdenv.mkDerivation +
+          # importCargoLock + cargoSetupHook pattern as the `deny`
+          # check and nix/fuzz.nix. The vendored dep tree is cached
+          # (same Cargo.lock as the main build), so the only
+          # per-invocation cost is the baseline cargo build +
+          # per-mutation rebuilds — same as it ever was under crane.
+          # No dep-level caching across invocations, but that was true
+          # of crane's buildDepsOnly too (weekly-tier, cold cache each
+          # cron run is acceptable).
+          mutants = pkgs.stdenv.mkDerivation (
+            sysCrateEnv.allEnv
             // {
-              inherit cargoArtifacts;
-              pnameSuffix = "-mutants";
-              # No separate src override: .config/mutants.toml is
-              # already in commonArgs.src via commonCargoSources'
-              # `*.toml` match (same as nextest.toml, deny.toml,
-              # book.toml — the explicit fileset entries above are
-              # belt-and-braces, the filter picks them up regardless).
-              # One-time drv rehash when adding a new .toml to the
-              # tree; future scope tweaks rehash too. Scope edits
-              # are rare (weekly-tier adjustment), so the simpler
-              # single-fileset model wins over fileset.difference.
-              # cargo-mutants runs `cargo build` + `cargo nextest run`
-              # per mutation. Needs the same test-time deps as the
-              # nextest check (PG for scheduler/store tests, nix-cli
-              # for golden-conformance, openssh for ssh-ng tests).
-              # Mutations are scoped to specific crates but the baseline
-              # run hits the whole workspace.
-              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
-                pkgs.cargo-mutants
-                pkgs.cargo-nextest
-                pkgs.jq
+              pname = "rio-mutants";
+              inherit version;
+
+              src = pkgs.lib.fileset.toSource {
+                root = unfilteredRoot;
+                fileset = pkgs.lib.fileset.unions [
+                  c2nWorkspaceFileset
+                  ./.config/mutants.toml
+                  ./.config/nextest.toml
+                ];
+              };
+
+              cargoDeps = rustPlatformStable.importCargoLock {
+                lockFile = ./Cargo.lock;
+              };
+
+              nativeBuildInputs = with pkgs; [
+                rustStable
+                rustPlatformStable.cargoSetupHook
+                cargo-mutants
+                cargo-nextest
+                jq
+                pkg-config
+                protobuf
+                cmake
+                # Test-time deps (baseline run hits the whole workspace).
+                # Same set as c2nChecks' runtimeTestInputs.
                 inputs.nix.packages.${system}.nix-cli
-                pkgs.openssh
-                pkgs.postgresql_18
+                openssh
+                postgresql_18
               ];
 
-              # `--in-place`: mutate the unpacked source in $PWD (crane
-              # unpacks to a writable tmpdir). Cheaper than the default
-              # copy-per-mutation mode when running inside a throwaway
-              # sandbox anyway.
+              buildInputs =
+                with pkgs;
+                [
+                  openssl
+                  llvmPackages.libclang.lib
+                ]
+                ++ sysCrateEnv.allLibs;
+
+              # cmake is in nativeBuildInputs for aws-lc-sys's build.rs,
+              # not for this derivation's configurePhase. The cmake setup
+              # hook would otherwise look for CMakeLists.txt at source
+              # root — there isn't one.
+              dontUseCmakeConfigure = true;
+
+              PROTOC = "${pkgs.protobuf}/bin/protoc";
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              PG_BIN = "${pkgs.postgresql_18}/bin";
+              # Golden fixture paths — the baseline run hits
+              # golden_conformance (workspace-wide). Same vars as
+              # c2nChecks' testEnv; cargo-mutants inherits the env.
+              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+              RIO_GOLDEN_FORCE_HERMETIC = "1";
+              NEXTEST_HIDE_PROGRESS_BAR = "1";
+
+              # `--in-place`: mutate the unpacked source in $PWD
+              # (cargoSetupHook unpacks to a writable tmpdir). Cheaper
+              # than the default copy-per-mutation mode when running
+              # inside a throwaway sandbox anyway.
               #
               # `--no-shuffle` is the default in current cargo-mutants
               # but kept explicit for the week-over-week diff guarantee.
@@ -922,42 +970,84 @@
               # `--output $out`: cargo-mutants creates mutants.out/
               # INSIDE the given dir, so result/mutants.out/outcomes.json.
               #
-              # `|| true`: exit 2 when mutants survive. That's the
-              # EXPECTED outcome — no codebase is 100% mutation-killed.
-              # The derivation succeeds; missed-count is diffed.
-              buildPhaseCargoCommand = ''
+              # Exit-code contract (mutants.rs/exit-codes.html): 0 = all
+              # caught, 2 = mutants survived (EXPECTED — no codebase is
+              # 100% mutation-killed), 3 = timeouts only, 4 = baseline
+              # failed, 1 = usage/internal error. We swallow only 2 and
+              # 3 (expected non-zero), propagate everything else, AND
+              # belt-and-braces jq-check that the mutation phase
+              # actually ran (non-baseline outcomes > 0).
+              buildPhase = ''
+                runHook preBuild
+                mkdir -p $out
                 cargo mutants \
                   --in-place --no-shuffle \
                   --config .config/mutants.toml \
                   --output $out \
                   --timeout-multiplier 2.0 \
-                  || true
+                  || { rc=$?; [ $rc -eq 2 ] || [ $rc -eq 3 ] || exit $rc; }
+
+                # Baseline-health gate: if outcomes.json has zero
+                # MUTATION outcomes (everything that isn't the baseline
+                # Success/Failure entry), the baseline failed and the
+                # run is void. Fail loud — cat debug.log so the build
+                # log shows the actual nextest failure. Catches the
+                # case where cargo-mutants exits 0 with an empty
+                # outcomes list (graceful baseline-skip) as well as
+                # the file-missing case (jq → stderr → tested=0).
+                tested=$(jq '[.outcomes[] | select(.summary != "Success" and .summary != "Failure")] | length' \
+                  $out/mutants.out/outcomes.json 2>/dev/null || echo 0)
+                if [ "$tested" -eq 0 ]; then
+                  echo "mutants baseline failed — zero mutations tested" >&2
+                  cat $out/mutants.out/debug.log >&2 2>/dev/null || true
+                  exit 1
+                fi
+                runHook postBuild
               '';
 
-              # Crane's default install copies target/ to $out for
-              # downstream-dep-caching. Mutants artifacts aren't useful
-              # downstream; $out already has mutants.out/.
-              doInstallCargoArtifacts = false;
-              installPhaseCommand = ''
+              installPhase = ''
+                runHook preInstall
                 # Extract caught/missed counts from the JSON outcome
-                # stream for the weekly-diff step. jq is cleaner than
-                # grep-c here — outcomes.json is a JSON array, and the
-                # same outcome string can appear in scenario_name.
+                # stream for the weekly-diff step. No `|| echo 0`
+                # fallback: the baseline-health gate above already
+                # fails if outcomes.json is missing — a jq failure
+                # here is a real error (malformed JSON).
                 jq '[.outcomes[] | select(.summary == "CaughtMutant")] | length' \
-                  $out/mutants.out/outcomes.json > $out/caught-count || echo 0 > $out/caught-count
+                  $out/mutants.out/outcomes.json > $out/caught-count
                 jq '[.outcomes[] | select(.summary == "MissedMutant")] | length' \
-                  $out/mutants.out/outcomes.json > $out/missed-count || echo 0 > $out/missed-count
+                  $out/mutants.out/outcomes.json > $out/missed-count
+                runHook postInstall
               '';
-
-              # Golden fixture paths — the baseline run hits
-              # golden_conformance (workspace-wide). Same vars as the
-              # nextest check above; cargo-mutants inherits the env.
-              RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-              RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-              RIO_GOLDEN_FORCE_HERMETIC = "1";
-              NEXTEST_HIDE_PROGRESS_BAR = "1";
             }
           );
+
+          # Smoke check: assert .#mutants produced ≥1 mutation
+          # outcome. Belt-and-braces with the baseline-health gate
+          # inside the mutants derivation itself — if that gate is
+          # accidentally relaxed, this still catches a void run.
+          # NOT in .#ci (transitively builds mutants, hours). The
+          # weekly cron sequences `nix build .#mutants .#mutants-smoke`
+          # — nix substitutes the mutants output from cache if already
+          # built, so the smoke check adds O(seconds).
+          mutants-smoke =
+            pkgs.runCommand "mutants-smoke"
+              {
+                nativeBuildInputs = [ pkgs.jq ];
+              }
+              ''
+                tested=$(jq '[.outcomes[] | select(.summary != "Success" and .summary != "Failure")] | length' \
+                  ${mutants}/mutants.out/outcomes.json)
+                echo "mutants-smoke: $tested mutations tested" >&2
+                if [ "$tested" -eq 0 ]; then
+                  echo "FAIL: mutants baseline failed — zero mutations tested" >&2
+                  cat ${mutants}/mutants.out/debug.log >&2 2>/dev/null || true
+                  exit 1
+                fi
+                caught=$(cat ${mutants}/caught-count)
+                missed=$(cat ${mutants}/missed-count)
+                echo "mutants-smoke: caught=$caught missed=$missed" >&2
+                echo "$tested" > $out
+              '';
 
           # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
@@ -1414,7 +1504,7 @@
           # build the three extra Nix source trees on every push.
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             golden-matrix = goldenMatrix;
-            inherit mutants;
+            inherit mutants mutants-smoke;
           };
 
           # --------------------------------------------------------------
