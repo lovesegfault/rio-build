@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -233,34 +233,22 @@ async fn main() -> anyhow::Result<()> {
     // migrations failed, the `?` above already bailed.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // Two-stage shutdown. `shutdown` (parent) stops background tasks
-    // (orphan scanner, GC drain, cache HTTP) immediately on SIGTERM.
-    // `serve_shutdown` is an INDEPENDENT token — NOT child_token(),
-    // which would cascade and cancel immediately. It fires only via
-    // the drain task below, AFTER set_not_serving + sleep. See
-    // rio-scheduler/src/main.rs drain_sets_not_serving_before_child_cancel
-    // test for why independent-not-child is load-bearing.
+    // Two-stage shutdown — see rio_common::server::spawn_drain_task
+    // for the INDEPENDENT-token rationale + proof test. Closure flips
+    // the NAMED StoreService (BalancedChannel probe target).
     let serve_shutdown = rio_common::signal::Token::new();
     {
         let reporter = health_reporter.clone();
-        let parent = shutdown.clone();
-        let child = serve_shutdown.clone();
-        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
-        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
-            parent.cancelled().await;
-            // r[impl common.drain.not-serving-before-exit]
-            reporter
-                .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
-                .await;
-            tracing::info!(
-                grace_secs = grace.as_secs(),
-                "SIGTERM: health=NOT_SERVING, draining"
-            );
-            if !grace.is_zero() {
-                tokio::time::sleep(grace).await;
-            }
-            child.cancel();
-        });
+        rio_common::server::spawn_drain_task(
+            shutdown.clone(),
+            serve_shutdown.clone(),
+            std::time::Duration::from_secs(cfg.drain_grace_secs),
+            move || async move {
+                reporter
+                    .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
+                    .await;
+            },
+        );
     }
 
     // Construct the chunk backend + ONE shared ChunkCache. The cache
@@ -470,41 +458,16 @@ async fn main() -> anyhow::Result<()> {
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
-    // r[impl gw.jwt.verify]
-    // r[impl gw.jwt.dual-mode]
-    // Load JWT pubkey from ConfigMap mount (if configured) + spawn the
-    // SIGHUP reload loop. Same shape as scheduler — one gateway signing
-    // key → one pubkey across all verifier services → same ConfigMap
-    // mount path, same SIGHUP rotation story.
-    //
-    // key_path=None → interceptor inert (dev mode). Fail-fast on boot
-    // if the file is set but unreadable/unparseable — operator
-    // misconfiguration surfaces immediately, not as a silent inert
-    // interceptor.
-    //
-    // shutdown (parent) token: reload loop stops on SIGTERM, not after
-    // drain. Same disposition as orphan-scanner/GC-drain tasks.
-    let jwt_pubkey: rio_common::jwt_interceptor::JwtPubkey = match &cfg.jwt.key_path {
-        None => {
-            tracing::warn!(
-                "jwt.key_path unset — JWT interceptor inert \
-                 (all RPCs pass through, Claims extension never attached)"
-            );
-            None
-        }
-        Some(path) => {
-            let initial = rio_common::jwt_interceptor::load_jwt_pubkey(path)
-                .map_err(|e| anyhow::anyhow!("JWT pubkey initial load: {e}"))?;
-            let shared = Arc::new(RwLock::new(initial));
-            rio_common::jwt_interceptor::spawn_pubkey_reload(
-                path.clone(),
-                Arc::clone(&shared),
-                shutdown.clone(),
-            );
-            info!(path = %path.display(), "JWT pubkey loaded; SIGHUP reloads");
-            Some(shared)
-        }
-    };
+    // JWT pubkey from ConfigMap mount + SIGHUP reload loop. One
+    // gateway signing key → one pubkey across all verifier services →
+    // same ConfigMap mount path, same SIGHUP rotation story as
+    // scheduler. See load_and_wire_jwt docstring for None→inert /
+    // Some→fail-fast. Parent shutdown token: reload loop stops on
+    // SIGTERM instantly, same disposition as orphan-scanner/GC-drain.
+    let jwt_pubkey = rio_common::jwt_interceptor::load_and_wire_jwt(
+        cfg.jwt.key_path.as_deref(),
+        shutdown.clone(),
+    )?;
 
     info!(
         addr = %addr,

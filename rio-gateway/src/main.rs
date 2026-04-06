@@ -298,41 +298,30 @@ async fn main() -> anyhow::Result<()> {
     // probe starts failing, pod restarts. Self-healing.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // Two-stage shutdown. `shutdown` (parent) fires on SIGTERM.
-    // `serve_shutdown` is an INDEPENDENT token — NOT child_token(),
-    // which would cascade and cancel the instant SIGTERM fires (zero
-    // drain window). It fires only via the drain task below, AFTER
-    // set_not_serving + sleep. Both the health server AND the SSH
-    // accept loop wait for serve_shutdown — new SSH connections that
-    // were already NLB-routed before endpoint propagation land on a
-    // live listener.
+    // Two-stage shutdown — see rio_common::server::spawn_drain_task
+    // for the INDEPENDENT-token rationale. Both the health server AND
+    // the SSH accept loop wait for serve_shutdown — new SSH
+    // connections that were already NLB-routed before endpoint
+    // propagation land on a live listener.
+    //
+    // Gateway's probe is empty-string (no `service:` field in helm
+    // gateway.yaml). set_not_serving::<S>() only flips the NAMED
+    // service — must use set_service_status("") directly. See
+    // scheduler/main.rs health_toggle_not_serving test for the proof
+    // that named-only is tonic-health's behavior.
     let serve_shutdown = rio_common::signal::Token::new();
     {
         let reporter = health_reporter.clone();
-        let parent = shutdown.clone();
-        let child = serve_shutdown.clone();
-        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
-        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
-            parent.cancelled().await;
-            // r[impl common.drain.not-serving-before-exit]
-            // Gateway's probe is empty-string (no `service:` field in
-            // helm gateway.yaml). set_not_serving::<S>() only flips
-            // the NAMED service — must use set_service_status("")
-            // directly. See scheduler/main.rs health_toggle_not_serving
-            // test for the proof that named-only is tonic-health's
-            // behavior.
-            reporter
-                .set_service_status("", tonic_health::ServingStatus::NotServing)
-                .await;
-            tracing::info!(
-                grace_secs = grace.as_secs(),
-                "SIGTERM: health=NOT_SERVING, draining"
-            );
-            if !grace.is_zero() {
-                tokio::time::sleep(grace).await;
-            }
-            child.cancel();
-        });
+        rio_common::server::spawn_drain_task(
+            shutdown.clone(),
+            serve_shutdown.clone(),
+            std::time::Duration::from_secs(cfg.drain_grace_secs),
+            move || async move {
+                reporter
+                    .set_service_status("", tonic_health::ServingStatus::NotServing)
+                    .await;
+            },
+        );
     }
 
     // Generic param: we don't have a "GatewayService" proto. Use the

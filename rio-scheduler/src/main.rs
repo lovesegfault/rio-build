@@ -2,7 +2,7 @@
 //!
 //! Starts the gRPC server, connects to PostgreSQL, and spawns the DAG actor.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -439,41 +439,28 @@ async fn main() -> anyhow::Result<()> {
     // blocking serve.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // Two-stage shutdown: `shutdown` (parent) fires on SIGTERM and
-    // stops background loops immediately. `serve_shutdown` is an
-    // INDEPENDENT token fired only by the drain task below, AFTER
-    // set_not_serving + sleep. NOT `shutdown.child_token()` —
-    // child_token cascades parent→child synchronously, which would
-    // cancel serve_shutdown the instant SIGTERM fires and give zero
-    // drain window (test drain_sets_not_serving_before_child_cancel
-    // proves this). The drain task is the ONLY path to serve_shutdown
-    // cancellation; if it somehow died, process hangs until SIGKILL
-    // at terminationGracePeriodSeconds — acceptable, the drain body
-    // cannot realistically panic.
+    // Two-stage shutdown — see rio_common::server::spawn_drain_task
+    // for the INDEPENDENT-token rationale. The closure flips the
+    // NAMED SchedulerService: BalancedChannel probes that name to
+    // find the leader (empty-string stays SERVING forever after
+    // first set_serving — probing "" would route to standby).
+    //
+    // The health-toggle loop below breaks on the SAME parent token
+    // and its break arm does NOT call set_serving — so it cannot
+    // un-flip us here. Last write wins.
     let serve_shutdown = rio_common::signal::Token::new();
     {
         let reporter = health_reporter.clone();
-        let parent = shutdown.clone();
-        let child = serve_shutdown.clone();
-        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
-        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
-            parent.cancelled().await;
-            // The health-toggle loop below breaks on the SAME parent
-            // token and its break arm does NOT call set_serving — so
-            // it cannot un-flip us here. Last write wins.
-            // r[impl common.drain.not-serving-before-exit]
-            reporter
-                .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
-                .await;
-            tracing::info!(
-                grace_secs = grace.as_secs(),
-                "SIGTERM: health=NOT_SERVING, draining"
-            );
-            if !grace.is_zero() {
-                tokio::time::sleep(grace).await;
-            }
-            child.cancel();
-        });
+        rio_common::server::spawn_drain_task(
+            shutdown.clone(),
+            serve_shutdown.clone(),
+            std::time::Duration::from_secs(cfg.drain_grace_secs),
+            move || async move {
+                reporter
+                    .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                    .await;
+            },
+        );
     }
 
     {
@@ -647,44 +634,18 @@ async fn main() -> anyhow::Result<()> {
         info!("server mTLS enabled — clients must present CA-signed certs");
     }
 
-    // r[impl gw.jwt.verify]
-    // r[impl gw.jwt.dual-mode]
-    // Load JWT pubkey from ConfigMap mount (if configured) + spawn the
-    // SIGHUP reload loop. kubelet remounts the ConfigMap on rotation;
-    // operator SIGHUPs the pod; spawn_pubkey_reload re-reads + swaps
-    // the Arc<RwLock> the interceptor closure captured below.
+    // JWT pubkey from ConfigMap mount (if configured) + SIGHUP reload
+    // loop. kubelet remounts the ConfigMap on rotation; operator
+    // SIGHUPs the pod; the spawned reload task re-reads + swaps the
+    // Arc<RwLock> the interceptor closure captured below.
     //
-    // key_path=None → jwt_pubkey=None → interceptor is inert (every
-    // call passes through, Claims never attached). That's the dual-mode
-    // "key-absent" half — dev clusters and pre-JWT-rotation deployments
-    // keep working. key_path=Some → load at boot (fail-fast if the file
-    // is missing/corrupt — better than silently running inert when the
-    // operator meant to enable verification).
-    //
-    // shutdown token (parent, not serve_shutdown): the reload loop is a
-    // background task like lease-loop/tick-loop — stops the instant
-    // SIGTERM fires, not after the drain window.
-    let jwt_pubkey: rio_common::jwt_interceptor::JwtPubkey = match &cfg.jwt.key_path {
-        None => {
-            tracing::warn!(
-                "jwt.key_path unset — JWT interceptor inert \
-                 (all RPCs pass through, Claims extension never attached)"
-            );
-            None
-        }
-        Some(path) => {
-            let initial = rio_common::jwt_interceptor::load_jwt_pubkey(path)
-                .map_err(|e| anyhow::anyhow!("JWT pubkey initial load: {e}"))?;
-            let shared = Arc::new(RwLock::new(initial));
-            rio_common::jwt_interceptor::spawn_pubkey_reload(
-                path.clone(),
-                Arc::clone(&shared),
-                shutdown.clone(),
-            );
-            info!(path = %path.display(), "JWT pubkey loaded; SIGHUP reloads");
-            Some(shared)
-        }
-    };
+    // Parent shutdown token: reload loop stops on SIGTERM instantly,
+    // not after the drain window. See load_and_wire_jwt docstring for
+    // the None→inert / Some→fail-fast semantics.
+    let jwt_pubkey = rio_common::jwt_interceptor::load_and_wire_jwt(
+        cfg.jwt.key_path.as_deref(),
+        shutdown.clone(),
+    )?;
 
     info!(
         listen_addr = %listen_addr,

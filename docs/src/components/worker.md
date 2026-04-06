@@ -285,6 +285,9 @@ Performance: direct SQLite writes handle 1000+ paths in <50ms. The bottleneck is
 r[worker.cgroup.sibling-layout]
 Per-build cgroups are **siblings** of the worker's own cgroup under the delegated root. With systemd `DelegateSubgroup=builds`, the worker lives at `.../service/builds/`; per-build cgroups go in `.../service/` as siblings. When running in a cgroup-namespace root (containerd in pods: `/proc/self/cgroup` shows `0::/`), the worker MUST move itself into a `/leaf/` subgroup first so the namespace root becomes the delegated_root --- otherwise writing to `/sys/fs/cgroup/` would hit the HOST root.
 
+r[worker.cgroup.ns-root-remount]
+When running in a cgroup-namespace root (`/proc/self/cgroup` shows `0::/`) under a non-privileged security context, the worker MUST remount `/sys/fs/cgroup` read-write before creating the `/leaf/` subgroup. Containerd mounts `/sys/fs/cgroup` read-only for non-privileged pods even with `CAP_SYS_ADMIN`; the `MS_REMOUNT | MS_BIND` call clears the per-mount-point RO flag (preserving superblock `nosuid`/`nodev`/`noexec`). Under `privileged: true` containerd mounts rw already and the remount is a no-op --- this path is load-bearing only in the production `privileged: false` + device-plugin configuration (ADR-012).
+
 r[worker.cgroup.memory-peak]
 cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accounting for each build. This fixes the Phase 2c bug where `VmHWM` (daemon PID only) measured ~10MB regardless of what the builder consumed.
 
