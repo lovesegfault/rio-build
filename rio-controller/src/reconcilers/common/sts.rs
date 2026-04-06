@@ -43,6 +43,29 @@ pub const ROLE_LABEL: &str = "rio.build/role";
 /// BuilderPool and FetcherPool reconcilers.
 pub const POOL_LABEL: &str = "rio.build/pool";
 
+/// emptyDir mounts that make `readOnlyRootFilesystem: true` workable
+/// for rio-builder. Each entry corresponds to a startup write path in
+/// `rio-builder/src/main.rs` (see the audit comment there). Adding a
+/// startup write? Add a row here — it feeds both the Volume list and
+/// the VolumeMount list.
+///
+/// Tuple: `(name, mount_path, medium, size_limit)`.
+const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
+    // tempfile::tempdir() defaults to /tmp. Small tmpfs — fetchers
+    // don't stage large artifacts here (NAR streams via upload.rs,
+    // overlays use /var/rio/overlays).
+    ("tmp", "/tmp", Some("Memory"), Some("64Mi")),
+    // RIO_FUSE_MOUNT_POINT points here; main.rs create_dir_all would
+    // hit EROFS without a mount. Actual store contents go via the
+    // kernel FUSE layer — this is just the mountpoint directory.
+    ("fuse-store", "/var/rio/fuse-store", None, None),
+    // nix-daemon writes /nix/var/nix/{profiles,temproots,gcroots,...}
+    // AND /nix/var/log/nix/drvs/. Mounted at /nix/var (not
+    // /nix/var/nix) to cover both. main.rs chmods nix/ to 0755 and
+    // creates nix/db/ at startup.
+    ("nix-var", "/nix/var", None, None),
+];
+
 /// Executor role. Determines the `rio.build/role` label value and
 /// gates role-specific pod-spec tweaks (readOnlyRootFilesystem,
 /// seccomp profile name, RIO_EXECUTOR_KIND env).
@@ -402,35 +425,16 @@ pub fn build_executor_pod_spec(
                 },
             ];
             if p.read_only_root_fs {
-                // /tmp for tempfile::tempdir() — small tmpfs, fetchers
-                // don't stage large artifacts here (NAR goes via
-                // upload.rs streaming, overlays use /var/rio/overlays).
-                v.push(Volume {
-                    name: "tmp".into(),
-                    empty_dir: Some(EmptyDirVolumeSource {
-                        medium: Some("Memory".into()),
-                        size_limit: Some(Quantity("64Mi".into())),
-                    }),
-                    ..Default::default()
-                });
-                // RIO_FUSE_MOUNT_POINT (set at :499) points here; main.rs
-                // create_dir_all would hit EROFS without a mount. The
-                // actual FUSE store contents go via the kernel FUSE layer
-                // — this is just the mountpoint directory itself.
-                v.push(Volume {
-                    name: "fuse-store".into(),
-                    empty_dir: Some(EmptyDirVolumeSource::default()),
-                    ..Default::default()
-                });
-                // nix-daemon writes /nix/var/nix/{profiles,temproots,
-                // gcroots,...} AND /nix/var/log/nix/drvs/ (build logs).
-                // Mount at /nix/var to cover both. main.rs chmods
-                // nix/ to 0755 and creates nix/db/ at startup.
-                v.push(Volume {
-                    name: "nix-var".into(),
-                    empty_dir: Some(EmptyDirVolumeSource::default()),
-                    ..Default::default()
-                });
+                for (name, _, medium, size_limit) in READ_ONLY_ROOT_MOUNTS {
+                    v.push(Volume {
+                        name: (*name).into(),
+                        empty_dir: Some(EmptyDirVolumeSource {
+                            medium: medium.map(Into::into),
+                            size_limit: size_limit.map(|s| Quantity(s.into())),
+                        }),
+                        ..Default::default()
+                    });
+                }
             }
             // r[impl sec.pod.fuse-device-plugin]
             // /dev/fuse: device plugin path (non-privileged) needs no
@@ -585,27 +589,13 @@ fn build_executor_container(
                 },
             ];
             if p.read_only_root_fs {
-                // readOnlyRootFilesystem breaks tempfile::tempdir()
-                // (defaults to /tmp). rio-builder uses it for
-                // transient NAR staging, .drv parsing scratch, etc.
-                m.push(VolumeMount {
-                    name: "tmp".into(),
-                    mount_path: "/tmp".into(),
-                    ..Default::default()
-                });
-                m.push(VolumeMount {
-                    name: "fuse-store".into(),
-                    mount_path: "/var/rio/fuse-store".into(),
-                    ..Default::default()
-                });
-                // rio-builder's main.rs chmods nix/ to 0755 and creates
-                // nix/db/ at startup. Mounted at /nix/var (not
-                // /nix/var/nix) to also cover /nix/var/log/nix/drvs/.
-                m.push(VolumeMount {
-                    name: "nix-var".into(),
-                    mount_path: "/nix/var".into(),
-                    ..Default::default()
-                });
+                for (name, mount_path, _, _) in READ_ONLY_ROOT_MOUNTS {
+                    m.push(VolumeMount {
+                        name: (*name).into(),
+                        mount_path: (*mount_path).into(),
+                        ..Default::default()
+                    });
+                }
             }
             if privileged {
                 m.push(VolumeMount {
