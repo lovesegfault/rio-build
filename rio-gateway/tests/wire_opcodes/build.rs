@@ -794,7 +794,9 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
                 fields,
                 &[
                     rio_nix::protocol::stderr::ResultField::String(target.clone()),
-                    rio_nix::protocol::stderr::ResultField::String(String::new()),
+                    rio_nix::protocol::stderr::ResultField::String(
+                        std::env::var("RIO_GATEWAY_MACHINE_NAME").unwrap_or_default(),
+                    ),
                     rio_nix::protocol::stderr::ResultField::Int(1),
                     rio_nix::protocol::stderr::ResultField::Int(1),
                 ]

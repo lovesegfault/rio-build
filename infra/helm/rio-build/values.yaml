@@ -390,6 +390,10 @@ gateway:
   enabled: true
   image: rio-gateway
   replicas: 2
+  # actBuild machineName field (what nom shows as "on <name>"). Defaults
+  # to karpenter.clusterName; set explicitly to override. The cluster
+  # appears as one machine to ssh-ng clients — per-pod IDs are not sent.
+  machineName: ""
   schedulerAddr: rio-scheduler.rio-system:9001
   storeAddr: rio-store.rio-store:9002
   # Balanced-channel: gateway DNS-resolves headless to pod IPs, probes
