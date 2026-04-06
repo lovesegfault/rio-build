@@ -392,6 +392,32 @@ impl DagActor {
         // gap between Completed and the S3 upload landing.
         self.trigger_log_flush(drv_hash, interested_builds.clone());
 
+        // r[impl sched.gc.path-tenants-upsert]
+        // Best-effort: GC may under-retain on failure, but never fail
+        // completion. The 24h global grace is the fallback.
+        //
+        // tenant_id: Option<Uuid> — filter_map drops None (single-tenant
+        // mode; empty SSH-key comment → gateway sends "" → scheduler
+        // stores None). Only builds with a resolved tenant contribute.
+        let tenant_ids: Vec<Uuid> = interested_builds
+            .iter()
+            .filter_map(|id| self.builds.get(id)?.tenant_id)
+            .collect();
+        if !tenant_ids.is_empty()
+            && !output_paths.is_empty()
+            && let Err(e) = self
+                .db
+                .upsert_path_tenants(&output_paths, &tenant_ids)
+                .await
+        {
+            warn!(
+                ?e,
+                output_paths = output_paths.len(),
+                tenants = tenant_ids.len(),
+                "path_tenants upsert failed; GC retention may under-retain"
+            );
+        }
+
         // Update ancestor priorities: this node is now terminal, so it
         // no longer contributes to its parents' max-child-priority.
         // Parents' priorities DROP. Propagates up until unchanged

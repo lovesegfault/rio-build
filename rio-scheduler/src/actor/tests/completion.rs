@@ -832,3 +832,123 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// path_tenants upsert on completion (per-tenant GC retention)
+// ---------------------------------------------------------------------------
+
+/// Two tenants submit the SAME derivation → dedup → 1 execution. On
+/// completion, interested_builds = {both} → upsert inserts 2 rows
+/// (same store_path_hash, distinct tenant_id). Re-call is idempotent
+/// (ON CONFLICT DO NOTHING → rows_affected == 0).
+// r[verify sched.gc.path-tenants-upsert]
+#[tokio::test]
+async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
+    use sha2::Digest;
+
+    let (db, handle, _task, mut stream_rx) =
+        setup_with_worker("pt-worker", "x86_64-linux", 1).await?;
+
+    // ── Seed 2 tenants. FK path_tenants→tenants ON DELETE CASCADE
+    // means these rows MUST exist before the upsert. ─────────────────
+    let tenant_a: Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (tenant_name) VALUES ('pt-tenant-a') RETURNING tenant_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let tenant_b: Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (tenant_name) VALUES ('pt-tenant-b') RETURNING tenant_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+
+    // ── Part A: actor flow — 2 builds share 1 derivation → dedup ────
+    // Both builds submit the same node (same drv_hash "pt-drv"). The
+    // actor dedups on drv_hash: one DerivationState, interested_builds
+    // = {build_a, build_b}. One dispatch, one completion.
+    let drv_tag = "pt-drv";
+    let drv_path = test_drv_path(drv_tag);
+    let out_path = test_store_path("pt-out");
+
+    for (build_id, tenant) in [(Uuid::new_v4(), tenant_a), (Uuid::new_v4(), tenant_b)] {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                req: MergeDagRequest {
+                    build_id,
+                    tenant_id: Some(tenant),
+                    priority_class: PriorityClass::Scheduled,
+                    nodes: vec![make_test_node(drv_tag, "x86_64-linux")],
+                    edges: vec![],
+                    options: BuildOptions::default(),
+                    keep_going: false,
+                    traceparent: String::new(),
+                },
+                reply: reply_tx,
+            })
+            .await?;
+        let _rx = reply_rx.await??;
+    }
+
+    // ONE assignment (dedup proof). Second merge saw existing node,
+    // just added build_b to interested_builds.
+    let assignment = recv_assignment(&mut stream_rx).await;
+    assert_eq!(assignment.drv_path, drv_path, "dedup: one dispatch");
+
+    // Complete with a real output_path. complete_success sends
+    // built_outputs[0].output_path → completion.rs:260 stores it on
+    // state.output_paths → :365 reads it → :406 upserts.
+    complete_success(&handle, "pt-worker", &drv_path, &out_path).await?;
+    barrier(&handle).await;
+
+    // ── Assertion: 2 rows for out_path's hash (one per tenant) ──────
+    let out_hash = sha2::Sha256::digest(out_path.as_bytes()).to_vec();
+    let rows: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM path_tenants WHERE store_path_hash = $1")
+            .bind(&out_hash)
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        rows.len(),
+        2,
+        "completion hook should upsert 1 row per interested tenant; \
+         got {} rows for out_path hash",
+        rows.len()
+    );
+    assert!(
+        rows.contains(&tenant_a),
+        "tenant_a should be in path_tenants"
+    );
+    assert!(
+        rows.contains(&tenant_b),
+        "tenant_b should be in path_tenants"
+    );
+
+    // ── Part B: direct upsert — 3 paths × 2 tenants = 6 rows ────────
+    // Exit-criterion shape: cartesian product fully materialized,
+    // idempotent on re-call. Fresh paths (no overlap with Part A).
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+    let paths = vec![
+        test_store_path("pt-p1"),
+        test_store_path("pt-p2"),
+        test_store_path("pt-p3"),
+    ];
+    let tenants = vec![tenant_a, tenant_b];
+
+    let first = sched_db.upsert_path_tenants(&paths, &tenants).await?;
+    assert_eq!(first, 6, "3 paths × 2 tenants = 6 rows inserted");
+
+    let second = sched_db.upsert_path_tenants(&paths, &tenants).await?;
+    assert_eq!(
+        second, 0,
+        "re-call with same inputs → 0 new rows (ON CONFLICT DO NOTHING)"
+    );
+
+    // Total in table: 2 (Part A) + 6 (Part B) = 8.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM path_tenants")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(total, 8, "2 from actor flow + 6 from direct call");
+
+    Ok(())
+}

@@ -179,6 +179,12 @@ let
   # Fragment architecture: gc-sweep builds its own victim.
   gcVictimDrv = drvs.mkTrivial { marker = "lifecycle-gc-victim"; };
 
+  # gc-sweep's path_tenants proof. Distinct marker so DAG-dedup doesn't
+  # reuse pinDrv/gcVictimDrv (those were built with the empty-comment
+  # key → tenant_id=None → completion hook's filter_map drops → upsert
+  # never fires). Fresh derivation = fresh build = completion runs.
+  tenantDrv = drvs.mkTrivial { marker = "lifecycle-gc-tenant"; };
+
   # refs-end-to-end: two-stage build where consumer's $out embeds dep's
   # store path as a literal string. The worker's RefScanSink finds the
   # hash part during NAR dump → PutPath sends references=[dep] → PG
@@ -1148,6 +1154,153 @@ let
               f"UnpinPath should restore gc_roots to baseline; "
               f"base={gc_roots_base}, now={unpin_after}"
           )
+          # ── path_tenants end-to-end: tenant-key build → upsert fires ──
+          # Proves the completion hook (completion.rs r[impl sched.gc.
+          # path-tenants-upsert]) fires end-to-end in the k3s fixture:
+          # SSH key comment → gateway tenant_name → scheduler resolves
+          # UUID → builds.tenant_id → completion filter_map YIELDS →
+          # upsert_path_tenants INSERTs.
+          #
+          # Also proves hash-encoding compat: scheduler writes
+          # sha2::Sha256::digest(path.as_bytes()) (db.rs:650, raw
+          # 32-byte Vec<u8> → BYTEA); this query reads
+          # sha256(convert_to(path, 'UTF8')) (PG builtin, raw 32-byte
+          # bytea). Same input bytes → same digest → same BYTEA. If
+          # either side hex-encoded, this would be 0 forever.
+          #
+          # The earlier builds (out_pin/out_victim) used the default
+          # key (empty comment → tenant_id=None → upsert skipped) —
+          # path_tenants is currently empty. We set up a tenant key
+          # now, bounce the gateway to load it, and do ONE build.
+
+          # Tenant key with non-empty comment. Gateway's
+          # load_authorized_keys parses the comment as tenant_name.
+          client.succeed(
+              "ssh-keygen -t ed25519 -N ''' -C 'gc-tenant-test' "
+              "-f /root/.ssh/id_gc_tenant"
+          )
+          default_pub = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
+          tenant_pub = client.succeed("cat /root/.ssh/id_gc_tenant.pub").strip()
+
+          # Re-patch the Secret with BOTH keys. The default key must
+          # stay — refs-end-to-end runs next and uses build() (default
+          # key). printf '%s\n%s\n' writes both on separate lines;
+          # pubkeys are base64+space+comment, no single-quotes → safe
+          # in shell single-quotes.
+          k3s_server.succeed(
+              f"printf '%s\n%s\n' '{default_pub}' '{tenant_pub}' "
+              f"> /tmp/ak_both && "
+              "k3s kubectl -n ${ns} create secret generic rio-gateway-ssh "
+              "--from-file=authorized_keys=/tmp/ak_both "
+              "--dry-run=client -o yaml | k3s kubectl apply -f -"
+          )
+
+          # Scale-bounce gateway 0→1. Same rationale as
+          # fixture.sshKeySetup (k3s-full.nix:463-514): gateway loads
+          # authorized_keys once at startup (Arc, no hot-reload);
+          # rollout restart isn't enough because kubelet's
+          # SecretManager serves from a cached reflector until refcount
+          # hits 0. Scale-to-0 → wait gone (kubelet ack-deletes after
+          # full teardown → reflector.stop → cache evict) → scale-to-1
+          # → fresh pod does a fresh Secret LIST.
+          k3s_server.succeed(
+              "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=0"
+          )
+          k3s_server.wait_until_succeeds(
+              "! k3s kubectl -n ${ns} get pods "
+              "-l app.kubernetes.io/name=rio-gateway "
+              "--no-headers 2>/dev/null | grep -q .",
+              timeout=90,
+          )
+          k3s_server.succeed(
+              "k3s kubectl -n ${ns} scale deploy/rio-gateway --replicas=1"
+          )
+          k3s_server.wait_until_succeeds(
+              "k3s kubectl -n ${ns} rollout status deploy/rio-gateway "
+              "--timeout=60s",
+              timeout=90,
+          )
+          # kube-proxy endpoint sync lag — poll TCP accept. See
+          # k3s-full.nix:503-515 for why nc (not ssh-keyscan).
+          client.wait_until_succeeds(
+              "${pkgs.netcat}/bin/nc -zw2 k3s-server 32222",
+              timeout=30,
+          )
+
+          # Seed tenant row (FK: path_tenants.tenant_id →
+          # tenants.tenant_id). INSERT…RETURNING via psql_k8s (-qtA).
+          tenant_uuid = psql_k8s(k3s_server,
+              "INSERT INTO tenants (tenant_name) VALUES ('gc-tenant-test') "
+              "RETURNING tenant_id"
+          )
+          k3s_server.log(f"path_tenants: seeded tenant gc-tenant-test = {tenant_uuid}")
+
+          # SSH Host alias for the tenant key. common.nix:362: ?ssh-key=
+          # URL param is unreliable across Nix versions; the Host alias
+          # in /root/.ssh/config overrides IdentityFile while inheriting
+          # nothing (explicit User/Port). programs.ssh.extraConfig went
+          # to /etc/ssh/ssh_config (system); per-user config wins.
+          #
+          # IdentitiesOnly yes: without it ssh offers ~/.ssh/id_ed25519
+          # (default key, empty comment) FIRST, gateway accepts THAT →
+          # tenant_id=None → upsert never fires. The build succeeds
+          # silently with the wrong identity.
+          client.succeed(
+              "cat >> /root/.ssh/config << 'EOF'\n"
+              "Host k3s-server-tenant\n"
+              "  HostName k3s-server\n"
+              "  User rio\n"
+              "  Port 32222\n"
+              "  IdentityFile /root/.ssh/id_gc_tenant\n"
+              "  IdentitiesOnly yes\n"
+              "  StrictHostKeyChecking no\n"
+              "  UserKnownHostsFile /dev/null\n"
+              "EOF"
+          )
+
+          # Build tenantDrv via the tenant-key alias. Fresh marker →
+          # fresh derivation → fresh build (no DAG-dedup). Completion
+          # sees tenant_id=Some(uuid) → upsert fires. Can't use build()
+          # — it hardcodes 'ssh-ng://k3s-server' (default key).
+          try:
+              out_tenant = client.succeed(
+                  "nix-build --no-out-link "
+                  "--store 'ssh-ng://k3s-server-tenant' "
+                  "--arg busybox '(builtins.storePath ${common.busybox})' "
+                  "${tenantDrv} 2>&1"
+              )
+          except Exception:
+              dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")
+              raise
+          out_tenant = [l.strip() for l in out_tenant.strip().split("\n")
+                        if l.strip()][-1]
+          assert out_tenant.startswith("/nix/store/"), (
+              f"tenant-key build should produce store path: {out_tenant!r}"
+          )
+          assert "lifecycle-gc-tenant" in out_tenant, (
+              f"wrong drv (DAG-dedup?): {out_tenant!r}"
+          )
+
+          # THE assertion. ≥1 not ==1: composite PK is (hash, tenant),
+          # and this is the only tenant in PG, so it's exactly 1 in
+          # practice. ≥1 per plan-0206 T5 spec — future test paths
+          # sharing this output shouldn't break us. Query matches on
+          # BOTH hash and tenant_id to prove the row is OURS (not a
+          # stray from some other tenant).
+          pt_count = int(psql_k8s(k3s_server,
+              f"SELECT COUNT(*) FROM path_tenants "
+              f"WHERE store_path_hash = sha256(convert_to('{out_tenant}', 'UTF8')) "
+              f"AND tenant_id = '{tenant_uuid}'"
+          ))
+          assert pt_count >= 1, (
+              f"path_tenants should have >=1 row for out_tenant after "
+              f"tenant-key build (completion hook fires upsert); got "
+              f"{pt_count}. Check: gateway loaded id_gc_tenant? scheduler "
+              f"resolved 'gc-tenant-test'? completion.rs filter_map yielded?"
+          )
+          print(f"path_tenants PASS: {pt_count} row(s) for {out_tenant} "
+                f"tenant={tenant_uuid} — completion hook + hash compat proven")
+
           print("gc-sweep PASS: pin protected, backdated path deleted, unpin round-trip OK")
     '';
 

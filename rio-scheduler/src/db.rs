@@ -642,6 +642,53 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Upsert the (output_path × tenant_id) cartesian product into
+    /// path_tenants. SHA-256 each path (matches narinfo.store_path_hash
+    /// keying — same as `pin_live_inputs`). ON CONFLICT DO NOTHING on
+    /// the composite PK (store_path_hash, tenant_id): repeated builds
+    /// of the same path by the same tenant are idempotent.
+    ///
+    /// Best-effort: caller warns on Err but does NOT fail completion.
+    /// GC may under-retain a path if this upsert fails, but the build
+    /// still succeeds (24h global grace is the fallback).
+    ///
+    /// Returns `rows_affected()` so callers/tests can assert on the
+    /// delta (0 on re-call = idempotence proof).
+    pub async fn upsert_path_tenants(
+        &self,
+        output_paths: &[String],
+        tenant_ids: &[Uuid],
+    ) -> Result<u64, sqlx::Error> {
+        if output_paths.is_empty() || tenant_ids.is_empty() {
+            return Ok(0);
+        }
+        use sha2::Digest;
+        // Cartesian product: every path × every tenant. Parallel arrays
+        // for UNNEST (same length by construction).
+        let n = output_paths.len() * tenant_ids.len();
+        let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut tids: Vec<Uuid> = Vec::with_capacity(n);
+        for p in output_paths {
+            let h = sha2::Sha256::digest(p.as_bytes()).to_vec();
+            for t in tenant_ids {
+                hashes.push(h.clone());
+                tids.push(*t);
+            }
+        }
+        let result = sqlx::query(
+            r#"
+            INSERT INTO path_tenants (store_path_hash, tenant_id)
+            SELECT * FROM UNNEST($1::bytea[], $2::uuid[])
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&hashes)
+        .bind(&tids)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Unpin all live inputs for a drv. Called on terminal status.
     /// Idempotent: unpinning a never-pinned drv = 0 rows deleted.
     pub async fn unpin_live_inputs(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
