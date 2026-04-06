@@ -413,6 +413,10 @@ pub(super) fn build_job(
     pod_spec.containers[0].liveness_probe = None;
     pod_spec.containers[0].readiness_probe = None;
     pod_spec.containers[0].startup_probe = None;
+    // I-120: 7200s grace is for STS-mode drain (let in-flight build
+    // finish). Ephemeral pods do ONE build; on SIGTERM they should
+    // exit fast. 30s covers FUSE unmount + completion report.
+    pod_spec.termination_grace_period_seconds = Some(30);
 
     // Random suffix: 6 lowercase alphanumeric. Not crypto; just
     // avoiding collisions. The executor_id downward-API pattern
