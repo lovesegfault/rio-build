@@ -132,18 +132,27 @@ impl DerivationStatus {
 
         // Valid transitions
         let valid = match (self, to) {
-            (Self::Created, Self::Completed) => true,       // cache hit
-            (Self::Created, Self::Queued) => true,          // build accepted
-            (Self::Queued, Self::Ready) => true,            // all deps complete
+            (Self::Created, Self::Completed) => true, // merge-time cache hit
+            // Dispatch-time cache hit (I-067): a Ready FOD whose
+            // output already exists in rio-store. Distinct from
+            // Created→Completed: the merge-time check_cached_outputs
+            // only checks newly_inserted, so a derivation that was
+            // already in-DAG as Ready (e.g. stuck via I-062's
+            // resource-fit, or reset via verify_preexisting_completed)
+            // never gets re-checked there. fod_outputs_in_store()
+            // re-checks at dispatch and short-circuits the fetch.
+            (Self::Ready, Self::Completed) => true,
+            (Self::Created, Self::Queued) => true, // build accepted
+            (Self::Queued, Self::Ready) => true,   // all deps complete
             (Self::Queued, Self::DependencyFailed) => true, // dep poisoned, cascade
-            (Self::Ready, Self::DependencyFailed) => true,  // dep poisoned, cascade
+            (Self::Ready, Self::DependencyFailed) => true, // dep poisoned, cascade
             (Self::Created, Self::DependencyFailed) => true, // dep poisoned before queue
-            (Self::Ready, Self::Assigned) => true,          // worker selected
-            (Self::Assigned, Self::Running) => true,        // worker ack
-            (Self::Assigned, Self::Ready) => true,          // worker lost
-            (Self::Running, Self::Completed) => true,       // build succeeded
-            (Self::Running, Self::Failed) => true,          // retriable failure
-            (Self::Running, Self::Poisoned) => true,        // failed on 3+ workers
+            (Self::Ready, Self::Assigned) => true, // worker selected
+            (Self::Assigned, Self::Running) => true, // worker ack
+            (Self::Assigned, Self::Ready) => true, // worker lost
+            (Self::Running, Self::Completed) => true, // build succeeded
+            (Self::Running, Self::Failed) => true, // retriable failure
+            (Self::Running, Self::Poisoned) => true, // failed on 3+ workers
             (Self::Ready, Self::Poisoned) => true, // failed_builders exhausts fleet (I-065)
             (Self::Failed, Self::Ready) => true,   // retry scheduled
             // Cancel: from any in-flight state. CancelBuild sends
@@ -867,6 +876,7 @@ mod tests {
 
         let valid_transitions = [
             (Created, Completed),        // cache hit
+            (Ready, Completed),          // dispatch-time FOD store-hit (I-067)
             (Created, Queued),           // build accepted
             (Queued, Ready),             // all deps complete
             (Ready, Assigned),           // worker selected
@@ -976,7 +986,8 @@ mod tests {
         assert!(Queued.validate_transition(Assigned).is_err());
         assert!(Queued.validate_transition(Running).is_err());
         assert!(Ready.validate_transition(Running).is_err());
-        assert!(Ready.validate_transition(Completed).is_err());
+        // ready -> completed IS valid (FOD output already in store; I-067)
+        assert!(Ready.validate_transition(Completed).is_ok());
 
         // Running -> Ready is NOT valid (must go through Failed)
         assert!(Running.validate_transition(Ready).is_err());
@@ -1123,6 +1134,7 @@ mod tests {
         let valid: std::collections::HashSet<(DerivationStatus, DerivationStatus)> = [
             // Happy path
             (Created, Completed), // cache hit
+            (Ready, Completed),   // dispatch-time FOD store-hit (I-067)
             (Created, Queued),
             (Queued, Ready),
             (Ready, Assigned),
