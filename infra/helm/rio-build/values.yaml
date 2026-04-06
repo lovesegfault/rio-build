@@ -353,8 +353,10 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # Test ceiling. Production target: max=1000 workers * ~4 cpu/pod = 4000.
-      limits: {cpu: 256}
+      # 2000 vCPU at ~2 cpu/builder = ~1000 builders. With
+      # maxConcurrentBuilds=2 that's 2000 concurrent build slots.
+      # Paired with builderPool.replicas.max below.
+      limits: {cpu: 2000}
       consolidateAfter: 30s
 
     # Worker fallback: m/r categories, any family. If c-capacity is
@@ -383,7 +385,9 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      limits: {cpu: 256}
+      # Overflow capacity when c6a/c7a is unavailable. preferred (2000)
+      # + fallback (500) = 2500 vCPU total builder ceiling.
+      limits: {cpu: 500}
       consolidateAfter: 30s
 
     # r[impl fetcher.node.dedicated]
@@ -409,7 +413,11 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      limits: {cpu: 64}
+      # FODs are short (~seconds) but spike at build start (40+ FODs
+      # ready simultaneously in a nixpkgs bootstrap). 128 vCPU at
+      # ~2 cpu/fetcher = ~64 fetchers — handles the spike without
+      # queueing FODs behind builders.
+      limits: {cpu: 128}
       consolidateAfter: 30s
 
     # General: untainted, for future gateway/scheduler HPA overflow.
@@ -625,8 +633,11 @@ builderPool:
     # one leaves another for immediate reassign. With min=0 and instant
     # dispatch (no queue pressure), autoscaler never scales past 1.
     # Production target: min=0 (scale-to-zero via SCALE_DOWN_WINDOW).
+    # max=500 paired with karpenter.nodePools rio-builder-preferred
+    # cpu=2000 (500 builders × 2 cpu/builder = 1000 vCPU baseline,
+    # 2000 NodePool limit gives Karpenter bin-packing headroom).
     min: 2
-    max: 10
+    max: 500
   autoscaling:
     metric: queueDepth
     targetValue: 5   # scale up when queued / active_workers > 5
@@ -719,7 +730,12 @@ builderPool:
 fetcherPool:
   enabled: false
   name: rio-fetchers
-  replicas: 2
+  # Static (no autoscaling — I-014). Low baseline; FOD spikes will
+  # queue briefly until I-014's {min,max} autoscaling lands. 4 keeps
+  # the smoke test's parallel-FOD coverage without idle waste. The
+  # rio-fetcher NodePool cpu=128 is the CEILING for when autoscaling
+  # exists; static replicas is the floor.
+  replicas: 4
   systems: [x86_64-linux]
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
