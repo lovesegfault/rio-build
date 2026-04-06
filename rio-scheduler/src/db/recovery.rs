@@ -39,6 +39,15 @@ impl SchedulerDb {
     /// planner can prove the predicate implies the partial index
     /// predicate (`migrations/004_recovery.sql:85`). Same exclusion
     /// set as `sweep_stale_live_pins`.
+    ///
+    /// CAVEAT: this query has NO join to builds. A derivation whose
+    /// own status is non-terminal loads even if every build that ever
+    /// referenced it is terminal (failed/cancelled). Those orphans get
+    /// `interested_builds = ∅` after the build_derivations join in
+    /// recover_from_pg, and the I-058 transition pass at recovery.rs
+    /// gates on that — DON'T remove that gate without adding a
+    /// `WHERE EXISTS (... builds.status IN pending/active)` here. The
+    /// gate is the cheaper invariant; this comment is the tripwire.
     pub async fn load_nonterminal_derivations(
         &self,
     ) -> Result<Vec<RecoveryDerivationRow>, sqlx::Error> {

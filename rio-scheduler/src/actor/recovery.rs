@@ -303,17 +303,39 @@ impl DagActor {
         // any_dep_terminally_failed() → DependencyFailed, else Queued.
         // Only Created/Queued are recomputed — Ready was already
         // correct, Assigned/Running are reconcile-assignments' job.
+        //
+        // I-059: gate on interested_builds. load_nonterminal_derivations
+        // has no JOIN to builds — a derivation whose own status is
+        // queued/created loads even if every interested build is
+        // terminal (failed/cancelled weeks ago). Pre-I-058 those orphans
+        // were inert (frozen at Queued). Post-I-058 they'd transition to
+        // Ready, dispatch, hit GC'd inputs, infrastructure-fail, poison.
+        // The build_derivations join above only populates
+        // interested_builds for builds that load_nonterminal_builds
+        // returned (status IN pending/active) — empty set = orphan.
+        let mut orphans_skipped = 0usize;
         let to_recompute: HashSet<DrvHash> = self
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
-                matches!(
+                let status_matches = matches!(
                     s.status(),
                     DerivationStatus::Created | DerivationStatus::Queued
-                )
+                );
+                if status_matches && s.interested_builds.is_empty() {
+                    orphans_skipped += 1;
+                    return false;
+                }
+                status_matches
             })
             .map(|(h, _)| h.into())
             .collect();
+        if orphans_skipped > 0 {
+            debug!(
+                count = orphans_skipped,
+                "recovery: skipping orphan Created/Queued nodes (no active build interested)"
+            );
+        }
         let initial_states = self.dag.compute_initial_states(&to_recompute);
         let mut transitioned_ready = 0usize;
         for (drv_hash, target) in initial_states {
