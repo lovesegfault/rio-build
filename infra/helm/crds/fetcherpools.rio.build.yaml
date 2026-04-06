@@ -119,10 +119,9 @@ spec:
                     name:
                       description: 'Class name. Becomes the StatefulSet name suffix
 
-                        (`rio-fetcher-{pool}-{name}`) AND the `RIO_SIZE_CLASS` env
+                        (`rio-fetcher-{name}`) AND the `RIO_SIZE_CLASS` env the
 
-                        the executor reports in its heartbeat. Convention: "tiny"
-                        /
+                        executor reports in its heartbeat. Convention: "tiny" /
 
                         "small"; nothing enforces that.'
                       type: string

@@ -722,6 +722,62 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     );
 }
 
+// r[verify sched.fod.size-class-reactive]
+/// P0556: `compute_fod_size_class_snapshot` buckets in-flight FODs by
+/// `size_class_floor`. floor=None → smallest class; unknown floor →
+/// also smallest (config-drift fallback). Σ queued ==
+/// `queued_fod_derivations` so the per-class signal and the flat
+/// signal agree.
+#[tokio::test]
+async fn fod_size_class_snapshot_buckets_by_floor() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
+        .with_fetcher_size_classes(vec![
+            crate::assignment::FetcherSizeClassConfig {
+                name: "tiny".into(),
+            },
+            crate::assignment::FetcherSizeClassConfig {
+                name: "small".into(),
+            },
+        ]);
+
+    // 5 FODs: 3 floor=None → tiny; 2 floor=small → small.
+    for h in ["f1", "f2", "f3"] {
+        actor.test_inject_ready_fod(h, "x86_64-linux", None);
+    }
+    for h in ["f4", "f5"] {
+        actor.test_inject_ready_fod(h, "x86_64-linux", Some("small"));
+    }
+    // Unknown floor (config dropped a class) → smallest.
+    actor.test_inject_ready_fod("f6", "x86_64-linux", Some("huge"));
+    // Non-FOD: ignored.
+    actor.test_inject_ready("nonfod", None, "x86_64-linux");
+
+    let fod = actor.compute_fod_size_class_snapshot();
+    assert_eq!(fod.len(), 2);
+    assert_eq!(fod[0].name, "tiny", "config order preserved");
+    assert_eq!(
+        fod[0].queued, 4,
+        "3×floor=None + 1×unknown-floor → smallest"
+    );
+    assert_eq!(fod[0].queued_by_system.get("x86_64-linux"), Some(&4));
+    assert_eq!(fod[1].name, "small");
+    assert_eq!(fod[1].queued, 2, "2×floor=small");
+    assert_eq!(fod[0].running, 0);
+
+    // Σ across classes == flat queued_fod_derivations (the invariant
+    // the controller's flat-fallback relies on).
+    let cluster = actor.compute_cluster_snapshot();
+    assert_eq!(
+        fod.iter().map(|s| s.queued).sum::<u64>(),
+        cluster.queued_fod_derivations as u64
+    );
+
+    // Feature off → empty.
+    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    assert!(actor.compute_fod_size_class_snapshot().is_empty());
+}
+
 /// Non-Ready derivations are excluded even with history present.
 /// Only the ready-queue set (same as `queued_derivations`) contributes.
 #[tokio::test]
@@ -848,7 +904,7 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
 
     // Snapshot before dispatch: 3 queued in small (est_dur=0 →
     // smallest covering class), 0 running.
-    let snap = handle
+    let (snap, _fod) = handle
         .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
         .await?;
     assert_eq!(snap.len(), 2);
@@ -898,7 +954,7 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
         .expect("assignment within 5s")
         .expect("assignment not dropped");
 
-    let snap = handle
+    let (snap, _fod) = handle
         .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
         .await?;
     let small = snap.iter().find(|s| s.name == "small").unwrap();
@@ -961,7 +1017,7 @@ async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> Te
     )
     .await?;
 
-    let snap = handle
+    let (snap, _fod) = handle
         .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
         .await?;
     assert_eq!(snap.len(), 2);

@@ -206,8 +206,8 @@ pub struct FetcherPoolSpec {
 #[serde(rename_all = "camelCase")]
 pub struct FetcherSizeClass {
     /// Class name. Becomes the StatefulSet name suffix
-    /// (`rio-fetcher-{pool}-{name}`) AND the `RIO_SIZE_CLASS` env
-    /// the executor reports in its heartbeat. Convention: "tiny" /
+    /// (`rio-fetcher-{name}`) AND the `RIO_SIZE_CLASS` env the
+    /// executor reports in its heartbeat. Convention: "tiny" /
     /// "small"; nothing enforces that.
     pub name: String,
 

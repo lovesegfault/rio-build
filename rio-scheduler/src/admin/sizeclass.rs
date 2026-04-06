@@ -34,16 +34,34 @@ pub(super) async fn get_size_class_status(
     // per-class replica targets. Dropping under backpressure blinds
     // the autoscaler exactly when it should scale up — same
     // reasoning as ClusterStatus.
-    let snapshots = actor
+    let (snapshots, fod_snapshots) = actor
         .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot { reply })
         .await
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+
+    // P0556: FOD classes are independent of builder classes — populate
+    // even if `size_classes` is off. cutoffs/sample_count are zero
+    // (fetcher routing is reactive, no duration estimate).
+    let fod_classes = fod_snapshots
+        .into_iter()
+        .map(|s| SizeClassStatus {
+            name: s.name,
+            effective_cutoff_secs: 0.0,
+            configured_cutoff_secs: 0.0,
+            queued: s.queued,
+            running: s.running,
+            sample_count: 0,
+            queued_by_system: s.queued_by_system,
+            running_by_system: s.running_by_system,
+        })
+        .collect();
 
     if snapshots.is_empty() {
         // Feature off (size_classes unconfigured). Empty response —
         // not an error. CLI renders "size-class routing disabled."
         return Ok(GetSizeClassStatusResponse {
             classes: Vec::new(),
+            fod_classes,
         });
     }
 
@@ -76,7 +94,10 @@ pub(super) async fn get_size_class_status(
         })
         .collect();
 
-    Ok(GetSizeClassStatusResponse { classes })
+    Ok(GetSizeClassStatusResponse {
+        classes,
+        fod_classes,
+    })
 }
 
 /// Partition `build_samples` rows from the last `SAMPLE_LOOKBACK_DAYS`

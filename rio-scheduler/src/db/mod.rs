@@ -231,6 +231,9 @@ pub struct RecoveryDerivationRow {
     pub is_fixed_output: bool,
     pub is_ca: bool,
     pub failed_builders: Vec<String>,
+    /// I-170/P0556: persisted reactive FOD size-class floor. NULL =
+    /// never promoted (smallest class). See `M_032`.
+    pub size_class_floor: Option<String>,
 }
 
 /// Row from `load_build_graph` nodes query. Thin — ~200B.

@@ -106,6 +106,32 @@ impl SchedulerDb {
         Ok(())
     }
 
+    // r[impl sched.fod.size-class-reactive]
+    /// Persist a FOD's reactive `size_class_floor` (I-170, P0556).
+    ///
+    /// Called from `record_failure_and_check_poison` right after the
+    /// in-mem promotion so a scheduler failover between OOM and retry
+    /// doesn't reset the floor to None → re-dispatch to tiny → OOM
+    /// again. Same write-at-mutation pattern as `append_failed_worker`
+    /// above (NOT in `batch_upsert_derivations` — merge-time floor is
+    /// always None and `ON CONFLICT DO UPDATE` there would clobber a
+    /// promoted floor on re-merge).
+    pub async fn update_size_class_floor(
+        &self,
+        drv_hash: &DrvHash,
+        floor: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE derivations SET size_class_floor = $2, updated_at = now() \
+             WHERE drv_hash = $1",
+            drv_hash.as_str(),
+            floor,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // r[impl sched.poison.ttl-persist]
     /// Atomically set `status='poisoned'` AND `poisoned_at=now()`.
     ///

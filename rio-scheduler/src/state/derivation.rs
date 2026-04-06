@@ -391,13 +391,10 @@ pub struct DerivationState {
     /// later, the controller can post a typed `OomKilled` result
     /// from `pod.status.containerStatuses[].terminated.reason`.
     ///
-    /// **NOT persisted** (in-mem only). Recovery resets to `None` →
-    /// a scheduler restart between OOM and retry sends the FOD back
-    /// to tiny → one wasted retry. Same conservative-degradation
-    /// class as `infra_retry_count` / `assigned_size_class` above.
-    /// TODO(P0556): persist as `derivations.size_class_floor`
-    /// nullable text column so the OOM loop doesn't resume across
-    /// scheduler failover.
+    /// Persisted as `derivations.size_class_floor` (P0556, `M_032`)
+    /// so the OOM loop doesn't resume across scheduler failover.
+    /// Written at promotion time (`update_size_class_floor`); loaded
+    /// by `from_recovery_row`.
     pub size_class_floor: Option<String>,
     /// Bucketed memory estimate for the resource-fit placement filter
     /// (ADR-020 §5). `hard_filter` checks `worker.memory_total_bytes
@@ -633,7 +630,7 @@ impl DerivationState {
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
             assigned_size_class: None, // lossy; misclassification detector skips None
-            size_class_floor: None,    // lossy; one wasted retry on tiny post-recovery
+            size_class_floor: row.size_class_floor, // P0556: persisted (M_032)
             est_memory_bytes: None,    // lossy; recomputed at next dispatch
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
@@ -1199,6 +1196,7 @@ mod tests {
             // regardless.
             is_ca: true,
             failed_builders: vec![],
+            size_class_floor: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
         assert!(state.is_ca, "precondition: recovered as CA");

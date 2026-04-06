@@ -426,6 +426,29 @@ pub const M_030: () = ();
 /// table is fine — no deadlock risk with concurrent uploads.
 pub const M_031: () = ();
 
+/// `migrations/032_derivations_size_class_floor.sql`
+///
+/// Nullable `size_class_floor TEXT` on `derivations` — persists the
+/// I-170 reactive FOD promotion (`r[sched.fod.size-class-reactive]`)
+/// across scheduler restart. P0556: without this, a scheduler failover
+/// between an OOMKilled tiny-fetcher attempt and the retry resets
+/// `DerivationState.size_class_floor` to `None` → the FOD goes back
+/// to tiny → OOMs again. With ephemeral FetcherPools (one Job per
+/// FOD, the production default since P0541) that's a guaranteed
+/// wasted pod-start per failover; under chaos-monkey scheduler
+/// restarts it's an OOM loop.
+///
+/// Written by `SchedulerDb::update_size_class_floor` at promotion
+/// time (`record_failure_and_check_poison`). Loaded by
+/// `load_nonterminal_derivations` → `from_recovery_row`. NOT in
+/// `batch_upsert_derivations` (merge-time floor is always None; an
+/// `ON CONFLICT DO UPDATE` there would clobber a promoted floor on
+/// re-merge).
+///
+/// Nullable, no default — existing rows read NULL → `None` →
+/// "smallest class" (same as fresh state). No backfill needed.
+pub const M_032: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

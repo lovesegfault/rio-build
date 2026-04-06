@@ -254,11 +254,13 @@ mod tests {
         };
         let resp = GetSizeClassStatusResponse {
             classes: vec![mk(10, 5), mk(0, 7), mk(100, 0)],
+            fod_classes: vec![],
         };
         assert_eq!(total_builders(&resp), 122);
 
         let resp = GetSizeClassStatusResponse {
             classes: vec![mk(u64::MAX, 1)],
+            fod_classes: vec![],
         };
         assert_eq!(total_builders(&resp), u64::MAX, "saturates, not wraps");
 
