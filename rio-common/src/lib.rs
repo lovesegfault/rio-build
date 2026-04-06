@@ -9,6 +9,7 @@ pub mod bloom;
 pub mod config;
 pub mod grpc;
 pub mod hmac;
+pub mod jwt;
 pub mod limits;
 pub mod newtype;
 pub mod observability;
