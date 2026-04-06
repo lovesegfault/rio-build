@@ -160,7 +160,7 @@ I-107's cluster-wide filter. This narrows but does not eliminate the
 `r[ctrl.pool.ephemeral-deadline]` backstop.
 
 r[ctrl.pool.per-feature-class-depth]
-For ephemeral pools with `spec.sizeClass` set, the spawn decision MUST
+For pools with `spec.sizeClass` set, the spawn/scale decision MUST
 pass `spec.features` as the `GetSizeClassStatus` feature filter
 (`r[sched.sizeclass.feature-filter+2]`) so the per-class count reflects
 derivations whose `requiredSystemFeatures` this pool's workers can

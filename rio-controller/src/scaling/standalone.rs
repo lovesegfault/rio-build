@@ -44,7 +44,6 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 use rio_proto::AdminServiceClient;
-use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
 use crate::crds::builderpool::BuilderPool;
 use crate::crds::builderpoolset::BuilderPoolSet;
@@ -131,27 +130,14 @@ impl Autoscaler {
         // scale signal for standalone BuilderPools (those not owned
         // by a WPS).
         //
-        // GetSizeClassStatus: per-class `queued` — the scale
-        // signal for WPS child pools. Best-effort: if the RPC
-        // fails, WPS children fall back to cluster-wide depth
-        // (worse signal but not wrong — still scales up under
-        // load). The RPC can fail independently of ClusterStatus
-        // if size-class routing is unconfigured.
+        // GetSizeClassStatus is NOT fetched here: WPS children need
+        // a per-child feature-filtered request (I-176), so
+        // `scale_wps_class` issues its own RPC per child.
         let status = self
             .scheduler
             .cluster_status(())
             .await
             .map(|r| r.into_inner())?;
-
-        let sc_resp = self
-            .scheduler
-            .get_size_class_status(GetSizeClassStatusRequest::default())
-            .await
-            .map(|r| r.into_inner())
-            .unwrap_or_else(|e| {
-                debug!(error = %e, "GetSizeClassStatus unavailable; WPS children use cluster-wide queue depth");
-                GetSizeClassStatusResponse::default()
-            });
 
         // ---- List all BuilderPools + BuilderPoolSets ----
         let pools_api: Api<BuilderPool> = Api::all(self.client.clone());
@@ -273,7 +259,7 @@ impl Autoscaler {
                 continue;
             }
             for class in &wps.spec.classes {
-                self.scale_wps_class(wps, class, &sc_resp, &pools).await;
+                self.scale_wps_class(wps, class, &pools).await;
             }
         }
 

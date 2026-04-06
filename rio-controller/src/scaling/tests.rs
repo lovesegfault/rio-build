@@ -428,6 +428,102 @@ fn class_queued_for_pool_feature_aware() {
     );
 }
 
+/// I-176, STS-mode: `scale_wps_class` (per_class.rs) computes its
+/// queue signal via `class_queued_for_pool` on a feature-filtered
+/// response — same helper as the ephemeral path. Before this fix it
+/// called `class_queued_for_systems` on an UNFILTERED shared
+/// response, so a kvm-required derivation in the `small` class
+/// counted toward a featureless `small` STS pool's scale signal →
+/// pool scaled up, hard_filter rejected every dispatch (idle
+/// replicas). This test pins the helper choice: a featureless WPS
+/// child sees 0 for kvm-only work, a kvm child sees it via
+/// cross-class sum.
+// r[verify ctrl.pool.per-feature-class-depth]
+#[test]
+fn per_class_sts_scaling_feature_aware() {
+    use rio_proto::types::{GetSizeClassStatusResponse, SizeClassStatus};
+
+    // WPS with two children: `small` (features=[]) and `kvm`
+    // (features=["kvm"]). One derivation queued: classified `small`,
+    // requires kvm. Scheduler's feature-filtered responses:
+    //
+    // Featureless child sent `pool_features=[]` → kvm drv excluded.
+    let resp_for_featureless = GetSizeClassStatusResponse {
+        classes: vec![SizeClassStatus {
+            name: "small".into(),
+            queued: 0,
+            queued_by_system: [("x86_64-linux".into(), 0)].into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut featureless_child =
+        with_wps_owner(test_wp_in_ns("prod-small", "rio"), "prod", "prod-uid");
+    featureless_child.spec.systems = vec!["x86_64-linux".into()];
+    featureless_child.spec.features = vec![];
+    assert_eq!(
+        class_queued_for_pool(
+            &resp_for_featureless,
+            "small",
+            &featureless_child.spec.systems,
+            &featureless_child.spec.features,
+        ),
+        Some(0),
+        "I-176 STS-mode: featureless WPS child must NOT scale for kvm work"
+    );
+
+    // kvm child sent `pool_features=["kvm"]` → kvm drv included
+    // (still classified `small`). Cross-class sum picks it up even
+    // though the kvm child's own size_class is `kvm`.
+    let resp_for_kvm = GetSizeClassStatusResponse {
+        classes: vec![
+            SizeClassStatus {
+                name: "small".into(),
+                queued: 1,
+                queued_by_system: [("x86_64-linux".into(), 1)].into(),
+                ..Default::default()
+            },
+            SizeClassStatus {
+                name: "kvm".into(),
+                queued: 0,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut kvm_child = with_wps_owner(test_wp_in_ns("prod-kvm", "rio"), "prod", "prod-uid");
+    kvm_child.spec.systems = vec!["x86_64-linux".into()];
+    kvm_child.spec.features = vec!["kvm".into()];
+    assert_eq!(
+        class_queued_for_pool(
+            &resp_for_kvm,
+            "kvm",
+            &kvm_child.spec.systems,
+            &kvm_child.spec.features,
+        ),
+        Some(1),
+        "I-176 STS-mode: kvm WPS child scales for the small-classified kvm drv"
+    );
+
+    // Regression tripwire: the OLD per_class.rs path —
+    // `class_queued_for_systems` on the UNFILTERED response — would
+    // have returned 1 here (over-count). Pin that the systems-only
+    // helper is NOT what per_class.rs should be calling for
+    // feature-aware scaling.
+    let unfiltered_small = SizeClassStatus {
+        name: "small".into(),
+        queued: 1,
+        queued_by_system: [("x86_64-linux".into(), 1)].into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        class_queued_for_systems(&unfiltered_small, &featureless_child.spec.systems),
+        1,
+        "systems-only helper over-counts (this is why per_class.rs must use \
+         class_queued_for_pool on a feature-filtered response instead)"
+    );
+}
+
 // ---- compute_desired: pure arithmetic ----
 
 #[test]

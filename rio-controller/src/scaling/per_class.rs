@@ -17,7 +17,7 @@ use kube::ResourceExt;
 use kube::api::{Api, Patch, PatchParams};
 use tracing::{debug, info, warn};
 
-use rio_proto::types::GetSizeClassStatusResponse;
+use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
 use crate::crds::builderpool::BuilderPool;
 use crate::crds::builderpoolset::BuilderPoolSet;
@@ -57,7 +57,6 @@ impl Autoscaler {
         &mut self,
         wps: &BuilderPoolSet,
         class: &crate::crds::builderpoolset::SizeClassSpec,
-        sc_resp: &GetSizeClassStatusResponse,
         pools: &[BuilderPool],
     ) {
         let child_name = crate::reconcilers::builderpoolset::builders::child_name(wps, class);
@@ -94,20 +93,42 @@ impl Autoscaler {
             return;
         }
 
-        // Per-class queue depth. Missing class in the RPC response
-        // = scheduler doesn't have size-class routing configured
-        // for this name, or the response was empty (RPC failed,
-        // default). Fall back to 0 → `compute_desired` returns
-        // `min` → no spurious scale-up on a misconfigured class.
-        let queued = sc_resp
-            .classes
-            .iter()
-            .find(|c| c.name == class.name)
-            // I-143: intersect with the child's systems — class-wide
-            // `queued` over-counts other-arch work this pool can't
-            // build. Falls back to scalar on empty map/systems.
-            .map(|c| super::class_queued_for_systems(c, &child.spec.systems))
-            .unwrap_or(0);
+        // r[impl ctrl.pool.per-feature-class-depth]
+        // Per-class queue depth, FEATURE-FILTERED. I-176 (STS-mode):
+        // the shared unfiltered response over-counted derivations
+        // whose `required_features` this child's workers can't
+        // satisfy — a kvm-required drv inflated a featureless pool's
+        // scale signal → STS scaled up, hard_filter rejected every
+        // dispatch. Mirror the ephemeral path
+        // (`builderpool/ephemeral.rs::queued_for_pool`): per-child
+        // RPC with `pool_features` so the scheduler excludes
+        // unsatisfiable work, then `class_queued_for_pool` for the
+        // I-143 system intersection + cross-class sum on
+        // feature-gated pools.
+        //
+        // RPC failure → default (empty) response → `None` from
+        // `class_queued_for_pool` → `queued=0` → `compute_desired`
+        // returns `min`. No spurious scale-up on a transient
+        // scheduler outage.
+        let sc_resp = self
+            .scheduler
+            .get_size_class_status(GetSizeClassStatusRequest {
+                pool_features: child.spec.features.clone(),
+                filter_features: true,
+            })
+            .await
+            .map(|r| r.into_inner())
+            .unwrap_or_else(|e| {
+                debug!(child = %child_name, error = %e, "GetSizeClassStatus unavailable; scaling to min");
+                GetSizeClassStatusResponse::default()
+            });
+        let queued = super::class_queued_for_pool(
+            &sc_resp,
+            &class.name,
+            &child.spec.systems,
+            &child.spec.features,
+        )
+        .unwrap_or(0);
 
         // Bounds come from the CHILD BuilderPool's spec (which the
         // WPS reconciler set from SizeClassSpec). Reading from
