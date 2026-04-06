@@ -29,6 +29,7 @@ gix.workspace = true
 
 # AWS
 aws-config.workspace = true
+aws-sdk-ec2.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-sts.workspace = true
 aws-sdk-ecr.workspace = true
@@ -72,6 +73,7 @@ anyhow.workspace = true
 # Utility
 tempfile.workspace = true
 scopeguard.workspace = true
+nix = { workspace = true, features = ["process", "signal"] }
 rustls.workspace = true
 regex.workspace = true
 filetime.workspace = true

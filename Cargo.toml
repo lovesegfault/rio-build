@@ -258,6 +258,7 @@ aws-smithy-mocks = "0.2"
 
 # Utility
 regex = "1"
+heck = "0.5"
 scopeguard = "1"
 
 # --- xtask (dev tooling) ---
@@ -275,6 +276,7 @@ gix = { version = "0.81", default-features = false, features = [
   "sha1",
   "parallel",
 ] }
+aws-sdk-ec2 = "1"
 aws-sdk-ecr = "1"
 aws-sdk-elasticloadbalancingv2 = "1"
 aws-sdk-sts = "1"

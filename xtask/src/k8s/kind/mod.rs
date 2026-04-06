@@ -120,7 +120,13 @@ impl Provider for Kind {
         push::push(images, cfg).await
     }
 
-    async fn deploy(&self, cfg: &XtaskConfig, log_level: &str, tenant: Option<&str>) -> Result<()> {
+    async fn deploy(
+        &self,
+        cfg: &XtaskConfig,
+        log_level: &str,
+        tenant: Option<&str>,
+        _skip_preflight: bool,
+    ) -> Result<()> {
         let client = kube::client().await?;
 
         ui::step("chart deps", || async { shared::chart_deps() }).await?;
