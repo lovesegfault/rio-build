@@ -3,6 +3,7 @@
 //! Each SSH channel runs an independent protocol session with its own
 //! handshake, option negotiation, derivation cache, and build tracking.
 
+use rio_common::signal::Token as CancellationToken;
 use rio_nix::protocol::handshake;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
@@ -17,30 +18,40 @@ use crate::handler::{self, SessionContext};
 
 /// Best-effort cancel of all builds tracked in `active_build_ids`.
 ///
-/// Called from two session-exit paths: between-opcode EOF (client sent
-/// clean EOF while we waited for the next opcode) and mid-opcode handler
-/// error (typically BrokenPipe — client dropped during a build). The build
-/// handler leaves the build_id in the map on client-disconnect Wire errors
-/// (see `handler/build.rs` `StreamProcessError::Wire` arm) so this loop
-/// has something to cancel in the mid-opcode case.
+/// Called from three session-exit paths, all converging here so
+/// `r[gw.conn.cancel-on-disconnect]` holds regardless of which wins the
+/// race on TCP RST:
 ///
-/// Not called on the channel_close → proto_task.abort() path (server.rs) —
-/// an aborted task has its future dropped, no cleanup runs. If channel_close
-/// races ahead of the Wire error surfacing, the build still leaks. That race
-/// window is narrow (the response-task fails handle.data() and drops the
-/// outbound pipe before russh fires channel_close in normal SSH shutdown),
-/// but TCP RST can reorder. Tracked as a TODO for a select!-based fix.
-async fn cancel_active_builds(ctx: &mut SessionContext) {
+/// 1. **Between-opcode EOF** — client sent clean EOF while we waited for
+///    the next opcode; `wire::read_u64` returns `UnexpectedEof`.
+/// 2. **Mid-opcode handler error** — typically `BrokenPipe` on a stderr
+///    write (client dropped during a build). The build handler leaves
+///    the build_id in the map on `StreamProcessError::Wire` (see
+///    `handler/build.rs`) specifically so this loop has something to
+///    cancel.
+/// 3. **Graceful-shutdown signal** — `ChannelSession::Drop` (server.rs)
+///    fires a `CancellationToken` instead of hard-aborting `proto_task`.
+///    The opcode-read `select!` picks it up and routes here. Without the
+///    token, `channel_close → Drop → abort()` could fire before path 1
+///    or 2 reached the cancel loop — the abort drops the future, no
+///    cleanup runs, build leaks until `r[sched.backstop.timeout]`.
+///
+/// The `reason` string propagates to `CancelBuildRequest.reason`:
+/// `"client_disconnect"` for paths 1+2 (the client went away),
+/// `"channel_close"` for path 3 (russh told us the channel is gone).
+/// Distinguishes "did the client send SSH-EOF cleanly or did the TCP
+/// connection die?" in scheduler-side debugging.
+async fn cancel_active_builds(ctx: &mut SessionContext, reason: &str) {
     // Collect build_ids first to avoid holding an immutable borrow on
     // active_build_ids across the await points (scheduler_client.cancel_build
     // needs &mut ctx.scheduler_client — split field borrows don't survive
     // across .await in all cases).
     let build_ids: Vec<String> = ctx.active_build_ids.keys().cloned().collect();
     for build_id in build_ids {
-        debug!(build_id = %build_id, "cancelling build on disconnect");
+        debug!(build_id = %build_id, reason = %reason, "cancelling build on disconnect");
         let req = types::CancelBuildRequest {
             build_id: build_id.clone(),
-            reason: "client_disconnect".to_string(),
+            reason: reason.to_string(),
         };
         // Best-effort cancel: wrap in timeout so an unreachable
         // scheduler doesn't block the disconnect cleanup loop.
@@ -86,6 +97,13 @@ pub async fn run_protocol<R, W>(
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: String,
     jwt_token: Option<String>,
+    // Fired by `ChannelSession::Drop` (server.rs) when russh signals
+    // `channel_close`. The opcode-read select picks this up and runs
+    // the cancel loop — same outcome as the UnexpectedEof arm, but
+    // reachable even when `channel_close → Drop` races ahead of the
+    // mpsc-sender drop that would otherwise surface EOF here. See
+    // `cancel_active_builds` docstring for the full race shape.
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send,
@@ -141,7 +159,29 @@ where
     }
 
     loop {
-        let opcode = match tokio::time::timeout(OPCODE_IDLE_TIMEOUT, wire::read_u64(reader)).await {
+        // r[impl gw.conn.cancel-on-disconnect]
+        // Select over shutdown-signal + opcode-read. `biased` polls
+        // shutdown first: when BOTH are ready on the same poll (TCP RST
+        // → russh fires channel_eof AND channel_close near-simultaneously
+        // → mpsc-EOF AND token-cancel both land), we prefer the
+        // channel_close attribution. Correctness is identical either
+        // way — both branches converge on cancel_active_builds — but the
+        // reason string is more accurate: the russh-level signal is what
+        // actually triggered the Drop.
+        //
+        // Without `biased;` tokio randomizes branch order (fairness for
+        // the starvation case). We don't want fairness here; we want the
+        // deterministic attribution.
+        let read_result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                debug!("channel closed (graceful shutdown signal)");
+                cancel_active_builds(&mut ctx, "channel_close").await;
+                return Ok(());
+            }
+            r = tokio::time::timeout(OPCODE_IDLE_TIMEOUT, wire::read_u64(reader)) => r,
+        };
+        let opcode = match read_result {
             Ok(Ok(op)) => op,
             Err(_elapsed) => {
                 warn!(timeout = ?OPCODE_IDLE_TIMEOUT, "idle timeout waiting for next opcode");
@@ -164,7 +204,7 @@ where
                 // is usually empty here (handlers remove on completion) —
                 // this catches abnormal handler exits that left an entry.
                 debug!("client disconnected (EOF)");
-                cancel_active_builds(&mut ctx).await;
+                cancel_active_builds(&mut ctx, "client_disconnect").await;
                 return Ok(());
             }
             Ok(Err(e)) => {
@@ -183,10 +223,10 @@ where
             // build_id in active_build_ids on StreamProcessError::Wire
             // (see handler/build.rs) specifically so we can cancel here.
             //
-            // Without this, the ? propagated straight out and the :107 EOF
-            // arm above was never reached — it only catches opcode-READ
-            // errors, not handler-execution errors. P0331.
-            cancel_active_builds(&mut ctx).await;
+            // Without this, the ? propagated straight out and the EOF arm
+            // above was never reached — it only catches opcode-READ errors,
+            // not handler-execution errors. P0331.
+            cancel_active_builds(&mut ctx, "client_disconnect").await;
             return Err(e);
         }
 

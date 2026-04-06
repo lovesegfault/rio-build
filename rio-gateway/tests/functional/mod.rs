@@ -139,8 +139,19 @@ impl RioStack {
         // assertion is the client-side drain_stderr_expecting_error.
         let server_task = tokio::spawn(async move {
             let (mut r, mut w) = tokio::io::split(server_stream);
-            if let Err(e) =
-                session::run_protocol(&mut r, &mut w, &mut sc, &mut scc, String::new(), None).await
+            // Functional tests don't exercise the shutdown-signal path —
+            // that's a wire_opcodes concern. Never-cancelled token.
+            let shutdown = rio_common::signal::Token::new();
+            if let Err(e) = session::run_protocol(
+                &mut r,
+                &mut w,
+                &mut sc,
+                &mut scc,
+                String::new(),
+                None,
+                shutdown,
+            )
+            .await
             {
                 let is_eof = e
                     .downcast_ref::<rio_nix::protocol::wire::WireError>()
