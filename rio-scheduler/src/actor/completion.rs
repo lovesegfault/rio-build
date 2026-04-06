@@ -483,6 +483,18 @@ impl DagActor {
             let (skipped, cap_hit) = self.dag.cascade_cutoff(drv_hash, |h| verified.contains(h));
             metrics::counter!("rio_scheduler_ca_cutoff_saves_total")
                 .increment(skipped.len() as u64);
+            // Sum of estimated durations — lower-bound on wall-clock
+            // saved. est_duration is the Estimator's EMA (set at
+            // merge time from build_history); for a derivation that
+            // has never run, it's the fallback (closure-size proxy
+            // or 30s default). Counter not gauge: cumulative across
+            // all cascades, like saves_total.
+            let seconds_saved: f64 = skipped
+                .iter()
+                .filter_map(|h| self.dag.node(h).map(|s| s.est_duration))
+                .sum();
+            metrics::counter!("rio_scheduler_ca_cutoff_seconds_saved")
+                .increment(seconds_saved.max(0.0) as u64);
             for hash in &skipped {
                 self.persist_status(hash, DerivationStatus::Skipped, None)
                     .await;
@@ -519,6 +531,53 @@ impl DagActor {
                     "CA cutoff cascade hit depth cap; remaining downstream will run normally"
                 );
                 metrics::counter!("rio_scheduler_ca_cutoff_depth_cap_hits_total").increment(1);
+            }
+        }
+
+        // r[impl sched.ca.resolve+2]
+        // realisation_deps insert: the CA-on-CA resolve at dispatch
+        // time recorded every `(dep_modular_hash, dep_output_name)`
+        // lookup into `pending_realisation_deps`. The FK ordering
+        // means those rows can only land AFTER this derivation's
+        // own realisation exists — which `wopRegisterDrvOutput`
+        // wrote before BuildComplete arrived (the worker's upload
+        // flow: PutPath → RegisterDrvOutput → BuildComplete). So
+        // this is the correct point: parent's realisation row is
+        // present, dep rows were present at resolve time (we
+        // queried them), both FK halves satisfied.
+        //
+        // Drained via `mem::take`: consumed once. A retry-after-
+        // failure that re-dispatches re-runs resolve → fresh
+        // `pending_realisation_deps`; the INSERT is ON CONFLICT
+        // DO NOTHING so a duplicate attempt is harmless.
+        //
+        // Best-effort: PG blip → warn, don't abort completion.
+        // `realisation_deps` is rio's derived-build-trace cache
+        // (ADR-018:45), not correctness-critical for the build.
+        if let Some(state) = self.dag.node_mut(drv_hash)
+            && let Some(modular_hash) = state.ca_modular_hash
+            && !state.pending_realisation_deps.is_empty()
+        {
+            let lookups = std::mem::take(&mut state.pending_realisation_deps);
+            let output_names: Vec<String> = result
+                .built_outputs
+                .iter()
+                .map(|o| o.output_name.clone())
+                .collect();
+            if let Err(e) = crate::ca::insert_realisation_deps(
+                self.db.pool(),
+                &modular_hash,
+                &output_names,
+                &lookups,
+            )
+            .await
+            {
+                warn!(
+                    drv_hash = %drv_hash,
+                    n_lookups = lookups.len(),
+                    error = %e,
+                    "insert_realisation_deps failed (best-effort cache; completion proceeds)"
+                );
             }
         }
 

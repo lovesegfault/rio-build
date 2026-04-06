@@ -256,6 +256,13 @@ pub fn describe_metrics() {
          efficacy."
     );
     describe_counter!(
+        "rio_scheduler_ca_cutoff_seconds_saved",
+        "Sum of est_duration of skipped derivations. Lower-bound estimate of \
+         wall-clock saved by CA early-cutoff (est_duration is the Estimator's \
+         EMA, not actual — a derivation that's never run has no actual). \
+         Paired with saves_total for avg-seconds-per-save."
+    );
+    describe_counter!(
         "rio_scheduler_ca_cutoff_depth_cap_hits_total",
         "CA cutoff cascade walks that hit MAX_CASCADE_DEPTH (1000). \
          Non-zero means cascades are being truncated — pathological DAG \

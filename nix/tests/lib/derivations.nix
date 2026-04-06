@@ -25,6 +25,13 @@ rec {
   # Also does `ls -la ${dep}/` to exercise FUSE readdir.
   chain = ./derivations/chain.nix;
 
+  # A → B → C floating-CA chain (`__contentAddressed = true`). Every
+  # step writes marker-independent content to `$out/chain`, so a
+  # rebuild of A with a different `marker` arg produces an identical
+  # nar_hash → cutoff-compare matches → B+C Skipped on the second
+  # submit. Drives vm-ca-cutoff-standalone.
+  caChain = ./derivations/ca-chain.nix;
+
   # Multi-attr set: `all` (chain+solo for critical-path), `bigthing`
   # (pname in env for estimator lookup), `bigblob` (300KiB → chunked).
   sizeclass = ./derivations/sizeclass.nix;

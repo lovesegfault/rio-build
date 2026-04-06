@@ -114,6 +114,16 @@ pub async fn reconstruct_dag(
     // Best-effort: store error → log, leave 0 (estimator skips).
     populate_input_srcs_sizes(&mut nodes, drv_cache, store_client).await;
 
+    // Populate ca_modular_hash for CA nodes. AFTER BFS so
+    // hash_derivation_modulo has the full drv_cache to recurse
+    // over (InputNotFound otherwise). Memoised via a single
+    // shared hash_cache across all nodes — the recursive walk
+    // hits every sub-hash once regardless of how many CA nodes
+    // reference it. Best-effort: hash failure → log, leave empty
+    // (scheduler's collect_ca_inputs skips; resolve degrades to
+    // worker-fail-on-placeholder + retry).
+    populate_ca_modular_hashes(&mut nodes, drv_cache);
+
     Ok((nodes, edges))
 }
 
@@ -226,6 +236,83 @@ async fn populate_input_srcs_sizes(
             .iter()
             .map(|s| sizes.get(s).copied().unwrap_or(0))
             .fold(0u64, |acc, x| acc.saturating_add(x));
+    }
+}
+
+/// Fill `ca_modular_hash` on each CA node via `hash_derivation_modulo`.
+///
+/// The scheduler's CA-on-CA resolve queries the `realisations` table
+/// keyed on `(modular_hash, output_name)`. The modular hash needs the
+/// full transitive closure of parsed derivations to recurse over
+/// (`inputDrvs` paths → `Derivation` → their `inputDrvs` → …). The
+/// BFS in `reconstruct_dag` populates exactly that closure into
+/// `drv_cache`, so computing here (post-BFS) gives the resolve what
+/// it needs without the scheduler having to hold and re-parse the
+/// full closure itself.
+///
+/// Memoised: one `hash_cache` shared across all nodes. For a DAG
+/// with N CA nodes that share a common CA input (the typical
+/// stdenv-as-CA case), the common input's sub-hash is computed once.
+/// Without memoisation it'd be N× the closure walk.
+///
+/// Best-effort: `InputNotFound` (drv referenced by `inputDrvs` but
+/// missing from the cache — shouldn't happen post-BFS since BFS
+/// fails hard on unresolved inputs) or cycle/depth errors → warn,
+/// leave that node's `ca_modular_hash` empty. The scheduler's
+/// `collect_ca_inputs` skips empty-hash children; resolve is
+/// incomplete for parents depending on them, worker fails on the
+/// placeholder path, retry-with-backoff gives the input time to
+/// land (if it's a race) or surfaces the hard error (if it's a
+/// structural bug).
+fn populate_ca_modular_hashes(
+    nodes: &mut [types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+) {
+    let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+    let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+
+    for node in nodes.iter_mut() {
+        // IA nodes: ca_modular_hash stays empty. The scheduler's
+        // realisations-table lookup is CA-only (the compare/resolve
+        // gates on is_ca). Computing and carrying it for IA would
+        // just be dead bytes on the wire.
+        if !node.is_content_addressed {
+            continue;
+        }
+        let Ok(sp) = StorePath::parse(&node.drv_path) else {
+            continue; // BFS would have failed already if truly bad
+        };
+        let Some(drv) = drv_cache.get(&sp) else {
+            // Our own BFS inconsistency (same as
+            // populate_input_srcs_sizes). debug, not warn — our bug.
+            debug!(
+                drv_path = %node.drv_path,
+                "populate_ca_modular_hashes: drv not in cache (BFS inconsistency)"
+            );
+            continue;
+        };
+        match rio_nix::derivation::hash_derivation_modulo(
+            drv,
+            &node.drv_path,
+            &resolve,
+            &mut hash_cache,
+        ) {
+            Ok(hash) => node.ca_modular_hash = hash.to_vec(),
+            Err(e) => {
+                // InputNotFound shouldn't fire — BFS fails hard on
+                // unresolved inputDrvs. Cycle/depth: same .drv that
+                // would have failed the build anyway; leave empty
+                // so the scheduler's resolve skip + worker-fail
+                // surfaces the structural error with a clearer
+                // message than "placeholder path not found."
+                warn!(
+                    drv_path = %node.drv_path,
+                    error = %e,
+                    "hash_derivation_modulo failed; ca_modular_hash left empty \
+                     (scheduler resolve will skip this node as CA input)"
+                );
+            }
+        }
     }
 }
 
@@ -354,6 +441,12 @@ fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::DerivationNo
         drv_content: Vec::new(),
         input_srcs_nar_size: 0,
         is_content_addressed: drv.is_fixed_output() || drv.has_ca_floating_outputs(),
+        // Empty here — populate_ca_modular_hashes() fills AFTER the
+        // full BFS so hash_derivation_modulo has the complete
+        // drv_cache to resolve transitive inputDrvs over. Doing it
+        // inline would be a partial-closure recurse (InputNotFound
+        // for inputs the BFS hasn't visited yet).
+        ca_modular_hash: Vec::new(),
     }
 }
 

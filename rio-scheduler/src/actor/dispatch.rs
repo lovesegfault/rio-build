@@ -341,22 +341,43 @@ impl DagActor {
         // works, just fetches on-demand via FUSE.
         self.send_prefetch_hint(worker_id, drv_hash);
 
+        // CA-depends-on-CA resolution: rewrite placeholder paths
+        // in env/args/builder to realized output paths before
+        // dispatch. Only fires when the derivation is CA AND has
+        // CA inputs (ADR-018 Appendix B: is_ca && !is_fixed_output
+        // is the gate — floating-CA always needs resolve).
+        //
+        // `maybe_resolve_ca` returns the (possibly rewritten)
+        // drv_content PLUS the realisation lookups performed. On
+        // resolve error (missing realisation, PG blip) it logs and
+        // returns the original unresolved bytes + empty lookups —
+        // the worker's build fails on the placeholder path, which
+        // is the correct signal (retry after the realisation lands).
+        //
+        // The resolve runs in its OWN scoped borrow of `self.dag`
+        // (node() + collect_ca_inputs both &-borrow) so the lookups
+        // can be stashed via node_mut() below before the main
+        // WorkAssignment construction takes its own & borrow.
+        let (drv_content_to_send, resolve_lookups) = {
+            let Some(state) = self.dag.node(drv_hash) else {
+                return false;
+            };
+            self.maybe_resolve_ca(drv_hash, state).await
+        };
+
+        // Stash lookups for handle_success_completion's
+        // insert_realisation_deps (the FK needs the parent's own
+        // realisation row to exist, which only happens post-build).
+        // Empty vec → no-op; non-empty only for CA-on-CA chains
+        // that actually resolved.
+        if !resolve_lookups.is_empty()
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.pending_realisation_deps = resolve_lookups;
+        }
+
         // Send WorkAssignment to worker via stream
         if let Some(state) = self.dag.node(drv_hash) {
-            // CA-depends-on-CA resolution: rewrite placeholder paths
-            // in env/args/builder to realized output paths before
-            // dispatch. Only fires when the derivation is CA AND has
-            // CA inputs (ADR-018 Appendix B: is_ca && !is_fixed_output
-            // is the gate — floating-CA always needs resolve).
-            //
-            // `maybe_resolve_ca` returns the (possibly rewritten)
-            // drv_content. On resolve error (missing realisation,
-            // PG blip) it logs and returns the original unresolved
-            // bytes — the worker's build will fail on the placeholder
-            // path not existing, which is the correct signal (retry
-            // after the realisation lands).
-            let drv_content_to_send = self.maybe_resolve_ca(drv_hash, state).await;
-
             let build_opts = self.build_options_for_derivation(drv_hash);
 
             // Assignment token: HMAC-signed if configured, else
@@ -621,7 +642,13 @@ impl DagActor {
 
     /// If this derivation is CA-floating with CA inputs, resolve
     /// placeholder paths to realized output paths before dispatch.
-    /// Returns the (possibly rewritten) `drv_content` bytes.
+    /// Returns `(drv_content_bytes, realisation_lookups)`: the
+    /// (possibly rewritten) ATerm plus every
+    /// `(dep_modular_hash, dep_output_name) → realized_path` lookup
+    /// the resolve performed. Caller stashes lookups on
+    /// `DerivationState.pending_realisation_deps` for the
+    /// completion-time `insert_realisation_deps` call (the FK needs
+    /// the parent's OWN realisation row to exist first).
     ///
     /// ADR-018 Appendix B: resolve fires for `is_ca && !is_fixed_output`
     /// (floating-CA always resolves). Fixed-output CA derivations
@@ -636,57 +663,63 @@ impl DagActor {
     /// to exist, which only happens post-build).
     ///
     /// Error handling: resolve failure (missing realisation, PG blip)
-    /// logs and returns the original unresolved bytes. The worker's
-    /// build will then fail on the placeholder path not existing
-    /// (`/1ril1qzj...` is not a real store path), triggering the
-    /// normal retry-with-backoff. This is correct: a missing
+    /// logs and returns the original unresolved bytes + empty lookups.
+    /// The worker's build will then fail on the placeholder path not
+    /// existing (`/1ril1qzj...` is not a real store path), triggering
+    /// the normal retry-with-backoff. This is correct: a missing
     /// realisation means the input's `wopRegisterDrvOutput` hasn't
     /// landed yet (race), and retry-after-backoff gives it time to.
     async fn maybe_resolve_ca(
         &self,
         drv_hash: &DrvHash,
         state: &crate::state::DerivationState,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, Vec<crate::ca::RealisationLookup>) {
         // Gate: floating-CA only. ADR-018 Appendix B `shouldResolve`
         // table. `is_ca && !is_fixed_output` means the output path
         // is UNKNOWN pre-build — which means the derivation's inputs
         // may themselves be CA with placeholder-embedded paths.
         if !state.is_ca || state.is_fixed_output {
-            return state.drv_content.clone();
+            return (state.drv_content.clone(), Vec::new());
         }
 
         // No drv_content → can't resolve (worker fetches from store
         // in this case, which gives the UNRESOLVED drv — that's a
         // known limitation for recovered derivations).
-        // TODO(P0254): fetch from store here when drv_content empty,
-        //   so recovered CA-on-CA chains resolve correctly.
+        //
+        // OUT OF SCOPE for the CA-on-CA milestone: recovered
+        // derivations (scheduler restart, DAG reloaded from PG,
+        // `drv_content` not persisted). Fetching the ATerm from the
+        // store at dispatch time would add a `GetPath` RPC per
+        // recovered-CA-on-CA dispatch. That's ~10-50ms, acceptable,
+        // but recovered CA-on-CA chains are an edge case of an edge
+        // case. Current behavior: the unresolved drv dispatches,
+        // worker fails on placeholder path ENOENT, retry-with-backoff
+        // fires, and the NEXT SubmitBuild referencing this derivation
+        // re-merges the proto with a fresh `drv_content` +
+        // `ca_modular_hash` — the chain self-heals without the
+        // store-fetch shortcut. The same lossy-on-recovery pattern
+        // applies to `ca_modular_hash` and
+        // `pending_realisation_deps`. Recovery-resolve-from-store is
+        // tracked at `TODO(recovery-resolve)` if profiling shows the
+        // retry cycle is costly enough to shortcut.
+        // TODO(recovery-resolve): fetch from store here when
+        //   drv_content empty, so recovered CA-on-CA chains resolve
+        //   on first dispatch instead of via worker-fail-retry.
         if state.drv_content.is_empty() {
-            return state.drv_content.clone();
+            return (state.drv_content.clone(), Vec::new());
         }
 
         // Build the CA-input list: walk DAG children, keep only the
         // CA ones. For each CA child, we need its MODULAR hash — the
-        // `realisations` table key. The DAG's `drv_hash` field is
-        // currently the drv STORE PATH (gateway sets
-        // `drv_hash = drv_path` for all nodes; see translate.rs:408),
-        // not the modular hash.
-        //
-        // TODO(P0254): the gateway already computes modular hashes
-        //   for builtOutputs (build.rs:1158). Plumb that through
-        //   `DerivationNode.ca_modular_hash` proto field so the
-        //   scheduler doesn't have to recompute it here (recompute
-        //   would need the FULL transitive closure of parsed .drvs,
-        //   which the scheduler doesn't hold).
-        //
-        // Until that plumbing lands, `ca_inputs` is empty for all
-        // dispatches — resolve is a no-op (fast-path in
-        // resolve_ca_inputs). The infrastructure is in place; the
-        // modular-hash wiring is the last mile. Floating-CA with
-        // NO CA inputs (the common case: a CA mkDerivation on IA
-        // stdenv) doesn't need resolve anyway.
+        // `realisations` table key. The gateway plumbs that through
+        // `DerivationNode.ca_modular_hash` (computed post-BFS from
+        // the full drv_cache — translate.rs:populate_ca_modular_hashes).
+        // Floating-CA with NO CA inputs (the common case: a CA
+        // mkDerivation on IA stdenv) doesn't need resolve — fast-path
+        // in resolve_ca_inputs on empty ca_inputs.
         let ca_inputs = self.collect_ca_inputs(drv_hash);
         if ca_inputs.is_empty() {
-            return state.drv_content.clone();
+            return (state.drv_content.clone(), Vec::new());
         }
 
         match crate::ca::resolve_ca_inputs(&state.drv_content, &ca_inputs, self.db.pool()).await {
@@ -697,36 +730,48 @@ impl DagActor {
                     n_lookups = resolved.lookups.len(),
                     "CA resolve: rewrote placeholders for dispatch"
                 );
-                // TODO(P0254): stash resolved.lookups on DerivationState
-                //   so handle_success_completion can insert into
-                //   realisation_deps AFTER the parent's own realisation
-                //   is registered (FK ordering). For now the lookups are
-                //   dropped — the demo (P0254) doesn't query
-                //   realisation_deps, only the rewritten drv_content.
-                resolved.drv_content
+                (resolved.drv_content, resolved.lookups)
             }
             Err(e) => {
+                // Swallow-to-warn for ALL ResolveError variants,
+                // including `Db` (transient PG blip). Rationale:
+                // the unresolved dispatch → worker fails on the
+                // placeholder path → retry-with-backoff fires →
+                // next dispatch re-runs resolve. For
+                // `RealisationMissing`, the backoff gives the
+                // input's `wopRegisterDrvOutput` time to land
+                // (race). For `Db`, the backoff IS the retry-PG
+                // mechanism — the wasted worker cycle (~seconds
+                // to fail on ENOENT) is acceptable vs adding a
+                // defer-and-requeue path here (would need a timer
+                // to re-dispatch, which `backoff_until` already
+                // provides on the FAILURE path). Slot-wasteful
+                // but correct; profiling can drive a `Db → defer`
+                // split if the waste proves measurable.
                 warn!(
                     drv_hash = %drv_hash,
                     error = %e,
                     "CA resolve failed; dispatching unresolved (worker will fail on placeholder)"
                 );
-                state.drv_content.clone()
+                (state.drv_content.clone(), Vec::new())
             }
         }
     }
 
     /// Collect CA inputs for resolve. Walks the DAG children (deps)
     /// and returns a `CaResolveInput` for each child with
-    /// `is_ca = true`.
+    /// `is_ca = true` AND a populated `ca_modular_hash`.
     ///
-    /// The `modular_hash` field requires the gateway to plumb
-    /// `hashDerivationModulo` through the proto — until `TODO(P0254)`
-    /// lands, this returns an empty vec (making resolve a no-op).
+    /// Children with `is_ca && ca_modular_hash.is_none()` are
+    /// skipped — the gateway couldn't compute the modular hash
+    /// (BasicDerivation fallback, or recovered state where the
+    /// hash wasn't persisted). The parent's resolve is incomplete
+    /// for that input → worker fails on the placeholder path →
+    /// retry-with-backoff. The next SubmitBuild referencing this
+    /// child re-merges the proto with a fresh `ca_modular_hash`.
     fn collect_ca_inputs(&self, drv_hash: &DrvHash) -> Vec<crate::ca::CaResolveInput> {
         // DAG children = dependencies (must complete before this drv).
         let children = self.dag.get_children(drv_hash);
-        #[allow(unused_mut)] // TODO(P0254): mut needed once the push below is live.
         let mut inputs = Vec::new();
         for child_hash in children {
             let Some(child) = self.dag.node(&child_hash) else {
@@ -735,18 +780,27 @@ impl DagActor {
             if !child.is_ca {
                 continue;
             }
-            // TODO(P0254): child.ca_modular_hash — not yet plumbed.
-            //   Without it, we can't query realisations. Skip this
-            //   child (the parent's resolve will be incomplete →
-            //   worker build fails on placeholder → retry).
-            //
-            // When plumbed:
-            //   inputs.push(crate::ca::CaResolveInput {
-            //       drv_path: child.drv_path().to_string(),
-            //       modular_hash: child.ca_modular_hash,
-            //       output_names: child.output_names.clone(),
-            //   });
-            let _ = child; // silence dead-code until P0254
+            let Some(modular_hash) = child.ca_modular_hash else {
+                // Gateway didn't populate (BasicDerivation fallback
+                // OR recovered state). Skip — resolve is incomplete
+                // for this input, worker fails on placeholder,
+                // retry-with-backoff handles it. debug not warn:
+                // recovered chains hit this legitimately; the
+                // scheduler-restart-mid-CA-chain case is expected
+                // to degrade to worker-retry, not spam logs.
+                debug!(
+                    drv_hash = %drv_hash,
+                    child = %child_hash,
+                    "collect_ca_inputs: child is CA but ca_modular_hash unset; \
+                     resolve incomplete, worker will fail on placeholder"
+                );
+                continue;
+            };
+            inputs.push(crate::ca::CaResolveInput {
+                drv_path: child.drv_path().to_string(),
+                modular_hash,
+                output_names: child.output_names.clone(),
+            });
         }
         inputs
     }

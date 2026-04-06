@@ -652,7 +652,7 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs, TriggerGC)
 - `rio-scheduler/src/rebalancer.rs` — CutoffRebalancer (SITA-E adaptive cutoff adjustment from `build_samples`)
 
-CA cutoff propagation (Skipped status variant + DAG cascade) remains scheduled at [P0252](../../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md).
+CA early cutoff is end-to-end: compare (`r[sched.ca.cutoff-compare]` — completion-time content-index lookup), propagate (`r[sched.ca.cutoff-propagate]` — `Queued`→`Skipped` cascade with `MAX_CASCADE_DEPTH=1000`), and resolve (`r[sched.ca.resolve]` — dispatch-time placeholder rewrite for CA-on-CA chains). The `Skipped` terminal state is distinct from `Completed` for metrics (`rio_scheduler_ca_cutoff_saves_total`, `rio_scheduler_ca_cutoff_seconds_saved`) and audit trail. Resolution uses the gateway-computed `ca_modular_hash` (plumbed via `DerivationNode.ca_modular_hash` post-BFS) to query the `realisations` table; each lookup is recorded in `realisation_deps` at completion time after the parent's own realisation lands (FK ordering).
 
 ```mermaid
 flowchart LR

@@ -83,8 +83,9 @@ pub enum ResolveError {
 /// `hash_derivation_modulo` — the same value Nix sends as the
 /// `sha256:<hex>` prefix of `wopRegisterDrvOutput`'s `id` field.
 /// The scheduler does NOT compute this itself; it receives it from
-/// the gateway (future work: `DerivationNode.ca_modular_hash` —
-/// `TODO(P0254)`) or from a sibling derivation's completion record.
+/// the gateway via `DerivationNode.ca_modular_hash` (computed
+/// post-BFS from the full drv_cache — see
+/// `rio-gateway/src/translate.rs:populate_ca_modular_hashes`).
 #[derive(Debug, Clone)]
 pub struct CaResolveInput {
     /// Store path of the input `.drv` file. Matches an `inputDrvs`
@@ -351,8 +352,10 @@ pub async fn resolve_ca_inputs(
 /// inserts at COMPLETION time, after `wopRegisterDrvOutput` lands
 /// the parent's realisation.
 ///
-/// `TODO(P0254)`: wire this into `handle_success_completion`
-/// alongside the existing `r[sched.ca.cutoff-compare]` hook.
+/// Wired into `handle_success_completion` (completion.rs) AFTER the
+/// `r[sched.ca.cutoff-compare]` / cutoff-propagate hooks — the
+/// parent's realisation row lands via `wopRegisterDrvOutput` before
+/// completion fires, so the FK is satisfied by the time this runs.
 #[instrument(skip_all, fields(
     parent = hex::encode(parent_modular_hash),
     n_outputs = parent_output_names.len(),
