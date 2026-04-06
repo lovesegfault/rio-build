@@ -23,10 +23,10 @@ use crate::crds::builderpool::{Replicas, Sizing};
 use crate::fixtures::test_sched_addrs;
 use crate::reconcilers::builderpool::manifest::{
     Bucket, CPU_CLASS_LABEL, CRASH_LOOP_WARN_THRESHOLD, FAILED_SWEEP_MIN, FLOOR_CLASS,
-    MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST, SpawnDirective, bucket_labels,
-    build_manifest_job, compute_spawn_plan, compute_surplus, crash_loop_tier, group_by_bucket,
-    inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs, select_failed_jobs,
-    sweep_cap, truncate_plan, update_idle_and_reapable,
+    MEMORY_CLASS_LABEL, SIZING_LABEL, SIZING_MANIFEST, SPAWN_FAIL_THRESHOLD, SpawnDirective,
+    bucket_labels, build_manifest_job, compute_spawn_plan, compute_surplus, crash_loop_tier,
+    group_by_bucket, inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs,
+    select_failed_jobs, spawn_manifest_jobs, sweep_cap, truncate_plan, update_idle_and_reapable,
 };
 
 use super::*;
@@ -1443,27 +1443,288 @@ fn sweep_ordered_before_spawn_in_source() {
 
 #[test]
 fn spawn_loop_no_early_return_on_error() {
-    // The Err arm at the jobs_api.create match is warn+continue, not
-    // return. grep for the specific `return Err(e.into())` that was
-    // the deadlock line — it should be gone from the spawn loop.
-    // Slices the source between `---- Spawn ----` and the next
-    // `---- Scale-down` header so a `return Err` elsewhere in the
-    // file doesn't false-positive.
+    // The Failed arm at the try_spawn_job match is warn+continue for
+    // <N consecutive fails, not unconditional return. grep for the
+    // specific `return Err(e.into())` that was the deadlock line —
+    // it should be gone from spawn_manifest_jobs. Slices from the
+    // helper's `fn` keyword to `reconcile_manifest` (next function)
+    // so a `return Err` elsewhere doesn't false-positive.
+    //
+    // P0522: the `return Err(Error::Kube(e))` inside the helper is
+    // the threshold bail (SPAWN_FAIL_THRESHOLD consecutive fails) —
+    // intentional. The pre-P0516 bail was `return Err(e.into())`
+    // on the FIRST failure; this test still guards that specific
+    // pattern (which the threshold preserves as NOT the behavior).
     let src = include_str!("../manifest.rs");
-    let spawn_start = src.find("---- Spawn ----").unwrap();
-    let spawn_end = src[spawn_start..]
-        .find("---- Scale-down")
-        .map(|i| i + spawn_start)
-        .expect("scale-down section follows spawn");
-    let spawn_block = &src[spawn_start..spawn_end];
+    let helper_start = src
+        .find("fn spawn_manifest_jobs(")
+        .expect("spawn_manifest_jobs helper present");
+    let helper_end = src[helper_start..]
+        .find("fn reconcile_manifest(")
+        .map(|i| i + helper_start)
+        .expect("reconcile_manifest follows spawn_manifest_jobs");
+    let helper_body = &src[helper_start..helper_end];
     assert!(
-        !spawn_block.contains("return Err(e.into())"),
-        "spawn loop must warn+continue on create error, not bail — \
-         bailing skips the idle-reapable pass + status patch"
+        !helper_body.contains("return Err(e.into())"),
+        "spawn helper must warn+continue on single create error, not \
+         bail — pre-P0516 unconditional bail skipped the idle-reapable \
+         pass + status patch"
     );
-    // Positive: the warn message is there.
+    // Positive: the warn message is there (proves the Failed arm
+    // exists and does something observable below threshold).
     assert!(
-        spawn_block.contains("manifest Job spawn failed; continuing tick"),
-        "spawn loop should warn on create error with a grep-able message"
+        helper_body.contains("manifest Job spawn failed; continuing tick"),
+        "spawn helper should warn on sub-threshold create error with \
+         a grep-able message"
+    );
+    // P0522 threshold bail IS present — the escalation path.
+    assert!(
+        helper_body.contains("return Err(Error::Kube(e))"),
+        "spawn helper should bail via Error::Kube after \
+         SPAWN_FAIL_THRESHOLD consecutive failures"
+    );
+}
+
+// ─── spawn_manifest_jobs threshold (runtime, ApiServerVerifier) ──────
+//
+// This IS the mock-infra P0311-T503 needs. The structural test above
+// can't distinguish `warn; continue` from `warn; Err(e)?` — both have
+// a warn followed by something. These runtime tests prove attempt
+// COUNT via ApiServerVerifier's scenario-consumption check: the
+// verifier panics if fewer/more requests arrive than scenarios.
+
+/// Minimal Job for spawn tests. The verifier only checks `POST
+/// /namespaces/rio/jobs`; kube's client only needs `.metadata.name`
+/// to construct the request path. Bucket is `None` (cold-start class)
+/// — irrelevant to the threshold logic, simplest for the fixture.
+fn spawn_test_job(i: u32) -> (Job, Option<Bucket>) {
+    let job = Job {
+        metadata: ObjectMeta {
+            name: Some(format!("mf-pool-mf-floor-floor-test{i:02}")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    (job, None)
+}
+
+/// 403 Forbidden stands in for "quota exceeded" — the persistent-
+/// spawn-error scenario P0516 originally fixed. ResourceQuota on
+/// `count/jobs.batch` exhausted → spawn returns 403 on every attempt.
+fn forbidden_scenario() -> Scenario {
+    Scenario {
+        method: http::Method::POST,
+        path_contains: "/namespaces/rio/jobs",
+        body_contains: None,
+        status: 403,
+        body_json: serde_json::json!({
+            "kind": "Status", "apiVersion": "v1",
+            "status": "Failure", "reason": "Forbidden", "code": 403,
+            "message": "jobs.batch is forbidden: exceeded quota",
+        })
+        .to_string(),
+    }
+}
+
+/// 201 Created. kube's `create` deserializes the body as a `Job`;
+/// the minimal valid shape is just `apiVersion` + `kind` +
+/// `metadata.name`. spawn_manifest_jobs reads nothing from the
+/// response (only classifies the outcome).
+fn created_scenario() -> Scenario {
+    Scenario {
+        method: http::Method::POST,
+        path_contains: "/namespaces/rio/jobs",
+        body_contains: None,
+        status: 201,
+        body_json: serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "created" },
+        })
+        .to_string(),
+    }
+}
+
+// r[verify ctrl.pool.manifest-reconcile]
+/// N consecutive fails → bail at N, not before, not after.
+/// Batch has N+1 jobs; mock has EXACTLY N 403 scenarios. The N-th
+/// fail trips the threshold → bail → (N+1)-th never attempted.
+///
+/// Verifier's `verified()` panics on scenario-count mismatch: if the
+/// code attempts N+1 (no threshold, pre-fix warn+continue), the mock
+/// has no (N+1)-th scenario → panic. If the code bails at N-1 (off
+/// by one), only N-1 scenarios consumed → panic on unconsumed.
+///
+/// Mutation: threshold `5 → 999` → test FAILS (all N+1 attempted,
+/// mock panics on (N+1)-th). Threshold `5 → 1` → also FAILS (only
+/// 1 scenario consumed, N-1 unconsumed).
+///
+/// Metric check: counter increments N times (once per Failed).
+#[tokio::test]
+async fn spawn_bails_after_consecutive_threshold_not_before() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: kube::api::Api<Job> = kube::api::Api::namespaced(client, "rio");
+
+    // Exactly SPAWN_FAIL_THRESHOLD failing scenarios. No success
+    // entry — the threshold bails BEFORE attempting beyond it.
+    let scenarios: Vec<Scenario> = (0..SPAWN_FAIL_THRESHOLD)
+        .map(|_| forbidden_scenario())
+        .collect();
+    let guard = verifier.run(scenarios);
+
+    // One more job than the threshold: the last one is never reached.
+    let jobs: Vec<_> = (0..SPAWN_FAIL_THRESHOLD + 1).map(spawn_test_job).collect();
+
+    let result = spawn_manifest_jobs(&jobs_api, "mf-pool", jobs).await;
+
+    // Bail: Error::Kube carrying the last 403.
+    match result {
+        Err(crate::error::Error::Kube(kube::Error::Api(ae))) => {
+            assert_eq!(ae.code, 403, "bail carries the last spawn error");
+        }
+        Err(e) => panic!("expected Error::Kube(Api(403)), got {e:?}"),
+        Ok(()) => panic!(
+            "{SPAWN_FAIL_THRESHOLD} consecutive 403s MUST bail — \
+             pre-fix warn+continue returned Ok here (silent \
+             degradation: operator sees zero reconcile_errors_total \
+             while pool spawns nothing)"
+        ),
+    }
+
+    // Exactly N attempts → all N scenarios consumed, none left over.
+    guard.verified().await;
+
+    // Metric incremented once per Failed (N times). Not once-at-
+    // threshold: the operator's decoder ring is "non-zero rate with
+    // zero reconcile_errors = warn+continue absorbing below threshold".
+    assert_eq!(
+        recorder.get("rio_controller_manifest_spawn_failures_total{pool=mf-pool}"),
+        u64::from(SPAWN_FAIL_THRESHOLD),
+        "metric increments on every Failed, not just at threshold; \
+         keys={:?}",
+        recorder.all_keys()
+    );
+}
+
+// r[verify ctrl.pool.manifest-reconcile]
+/// Intermittent fail (alternating fail/succeed) does NOT bail.
+/// Proves the threshold is CONSECUTIVE not CUMULATIVE. A webhook
+/// rejecting SOME buckets (big-memory denied, small-memory allowed)
+/// doesn't trip.
+///
+/// 2×SPAWN_FAIL_THRESHOLD jobs, alternating 403/201. Total fails =
+/// SPAWN_FAIL_THRESHOLD (cumulative), but consecutive never exceeds
+/// 1 (reset on each Spawned). Mock has all 2N scenarios — the code
+/// attempts all 2N.
+///
+/// Mutation: delete `consecutive_fails = 0` reset → test FAILS
+/// (cumulative count hits threshold at attempt 2N-1, bails early,
+/// last scenario unconsumed).
+#[tokio::test]
+async fn spawn_intermittent_fail_does_not_bail() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: kube::api::Api<Job> = kube::api::Api::namespaced(client, "rio");
+
+    // Alternating: fail, succeed, fail, succeed, ... 2N total.
+    let n = SPAWN_FAIL_THRESHOLD;
+    let scenarios: Vec<Scenario> = (0..2 * n)
+        .map(|i| {
+            if i % 2 == 0 {
+                forbidden_scenario()
+            } else {
+                created_scenario()
+            }
+        })
+        .collect();
+    let guard = verifier.run(scenarios);
+
+    let jobs: Vec<_> = (0..2 * n).map(spawn_test_job).collect();
+
+    let result = spawn_manifest_jobs(&jobs_api, "mf-pool", jobs).await;
+
+    assert!(
+        result.is_ok(),
+        "alternating fail/succeed: consecutive_fails never exceeds 1 \
+         (reset on each Spawned). Threshold is CONSECUTIVE not \
+         CUMULATIVE. Got {result:?}"
+    );
+
+    // All 2N attempts → all scenarios consumed.
+    guard.verified().await;
+
+    // Metric counts EVERY Failed regardless of reset — N increments.
+    // The reset is about the bail threshold, not the metric.
+    assert_eq!(
+        recorder.get("rio_controller_manifest_spawn_failures_total{pool=mf-pool}"),
+        u64::from(n),
+        "metric counts all fails (cumulative), not just consecutive; \
+         keys={:?}",
+        recorder.all_keys()
+    );
+}
+
+// r[verify ctrl.pool.manifest-reconcile]
+/// NameCollision does NOT increment — type-level guarantee via the
+/// SpawnOutcome enum. Random-suffix collision is expected-noise; a
+/// run of 409s followed by a real failure should only count the real
+/// one toward the threshold.
+#[tokio::test]
+async fn spawn_name_collision_neither_increments_nor_resets() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let jobs_api: kube::api::Api<Job> = kube::api::Api::namespaced(client, "rio");
+
+    // N-1 fails, then a 409 (NameCollision), then 1 more fail → bail.
+    // The 409 does NOT reset: if it did, consecutive_fails would be
+    // 1 (not N) after the last 403 → no bail → last scenario
+    // unconsumed → verified() panics.
+    // The 409 does NOT increment: if it did, consecutive_fails would
+    // hit N at the 409 itself → bail one early → last scenario
+    // unconsumed → verified() panics.
+    // Either bug → panic. Both correct → all consumed + Err returned.
+    let n = SPAWN_FAIL_THRESHOLD;
+    let mut scenarios: Vec<Scenario> = (0..n - 1).map(|_| forbidden_scenario()).collect();
+    scenarios.push(Scenario {
+        method: http::Method::POST,
+        path_contains: "/namespaces/rio/jobs",
+        body_contains: None,
+        status: 409,
+        body_json: serde_json::json!({
+            "kind": "Status", "apiVersion": "v1",
+            "status": "Failure", "reason": "AlreadyExists", "code": 409,
+            "message": "jobs.batch \"mf-pool-mf-test\" already exists",
+        })
+        .to_string(),
+    });
+    scenarios.push(forbidden_scenario()); // the Nth fail → bail
+
+    let guard = verifier.run(scenarios);
+
+    let jobs: Vec<_> = (0..n + 1).map(spawn_test_job).collect();
+
+    let result = spawn_manifest_jobs(&jobs_api, "mf-pool", jobs).await;
+
+    assert!(
+        matches!(result, Err(crate::error::Error::Kube(_))),
+        "N-1 fails, 409 (orthogonal), 1 fail = N consecutive fails → \
+         bail. 409 neither increments nor resets. Got {result:?}"
+    );
+
+    guard.verified().await;
+
+    // Only the real 403s increment — N times, not N+1.
+    assert_eq!(
+        recorder.get("rio_controller_manifest_spawn_failures_total{pool=mf-pool}"),
+        u64::from(n),
+        "NameCollision does NOT increment the metric; keys={:?}",
+        recorder.all_keys()
     );
 }

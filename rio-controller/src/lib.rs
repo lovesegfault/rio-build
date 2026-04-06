@@ -99,4 +99,10 @@ pub fn describe_metrics() {
         "DisruptionTarget watcher DrainExecutor calls. result=sent|rpc_error. \
          Zero rate with evictions happening = watcher dead, falling back to 2h SIGTERM self-drain."
     );
+    describe_counter!(
+        "rio_controller_manifest_spawn_failures_total",
+        "Manifest Job spawn failures (labeled by pool). Non-zero rate with zero \
+         reconcile_errors_total = warn+continue absorbing errors below threshold; \
+         sustained high rate = threshold bailing every tick (check admission webhooks/RBAC)."
+    );
 }
