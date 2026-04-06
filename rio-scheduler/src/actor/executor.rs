@@ -878,6 +878,13 @@ impl DagActor {
                 error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
                 continue;
             }
+            // r[impl sched.poison.ttl-persist]
+            // Prune BEFORE remove_node (reads interested_builds from
+            // the node). keep_going=true builds still Active would
+            // otherwise hang: derivation_hashes keeps the stale hash
+            // → total never reached. keep_going=false builds are
+            // already terminal (failed fast at poison time).
+            self.prune_interested_keep_going(&drv_hash);
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
         }

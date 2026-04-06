@@ -65,6 +65,11 @@ spec:
               value: {{ .Values.global.region | quote }}
             - name: CHUNK_BUCKET
               value: {{ .Values.store.chunkBackend.bucket | quote }}
+            # awscli2 writes config/cache to $HOME/.aws/. With UID 65532 and
+            # no explicit HOME, it falls back to / → tries /.aws → EROFS
+            # under readOnlyRootFilesystem. Point HOME at the /tmp emptyDir.
+            - name: HOME
+              value: /tmp
           # readOnlyRootFilesystem=true (rio.containerSecurityContext) makes
           # the in-image /tmp read-only. Script writes /tmp/hmac + mktemp -d
           # → needs a writable mount. emptyDir inherits the pod's fsGroup

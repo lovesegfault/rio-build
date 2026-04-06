@@ -142,11 +142,18 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
 
 pub async fn step_tenant(cli: &CliCtx) -> Result<()> {
     info!("bootstrapping tenant '{TENANT}'");
-    let out = cli.run(&["create-tenant", TENANT])?;
+    // rio-cli exits non-zero on AlreadyExists → CliCtx::run returns Err.
+    // Check the error text for idempotent re-run before propagating.
+    let out = match cli.run(&["create-tenant", TENANT]) {
+        Ok(s) => s,
+        Err(e) if format!("{e:#}").to_lowercase().contains("already exists") => {
+            info!("tenant '{TENANT}' already exists (idempotent re-run)");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     // print_tenant format: "tenant <name> (<uuid>)  gc_retention=..."
-    // AlreadyExists is printed on re-run (idempotent).
-    if !out.contains(&format!("tenant {TENANT}")) && !out.to_lowercase().contains("already exists")
-    {
+    if !out.contains(&format!("tenant {TENANT}")) {
         bail!("create-tenant failed: {out}");
     }
     Ok(())
