@@ -15,6 +15,7 @@ pub use retry::{RetryError, connect_with_retry};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
 use tonic::transport::{Channel, ClientTlsConfig};
@@ -85,9 +86,23 @@ pub(crate) fn client_tls() -> Option<ClientTlsConfig> {
 /// (even cross-AZ) and bounds the failure mode.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Apply h2 keepalive: 30s PING interval, 10s PONG timeout, while-idle.
+/// Initial h2 per-stream flow-control window (1 MiB). h2's default is
+/// 65 535 bytes — at 2-3 ms cross-AZ RTT that's a ~20-30 MB/s ceiling
+/// (each 256 KiB NAR chunk needs ~4 WINDOW_UPDATE round-trips before
+/// the next can flow). 1 MiB lifts the floor; `http2_adaptive_window`
+/// (BDP probing) auto-tunes upward from there. I-180: this was the
+/// 30 MB/s wall on builder NAR fetch, not S3 prefetch or proto decode.
+const H2_INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
+
+/// Initial h2 connection-level window (16 MiB). Shared across all
+/// streams on the connection; sized so a handful of concurrent
+/// GB-scale `GetPath` streams don't head-of-line block each other.
+const H2_INITIAL_CONN_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// Apply h2 keepalive + flow-control window tuning.
 ///
-/// Detects half-open connections in ~40s (next PING + PONG timeout)
+/// **Keepalive** (30s PING interval, 10s PONG timeout, while-idle):
+/// detects half-open connections in ~40s (next PING + PONG timeout)
 /// instead of falling through to kernel TCP keepalive --- Linux default
 /// `tcp_keepalive_time` is 7200s (2h). Without this, an ungracefully
 /// dead peer (SIGKILL, netsplit, OOM-kill --- anything that skips FIN)
@@ -98,37 +113,51 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// next RPC blocks until kernel TCP timeout. With it, the h2 layer
 /// fires `GoAway` proactively, all streams error, callers reconnect.
 ///
+/// **Flow-control windows** (1 MiB stream / 16 MiB conn / adaptive):
+/// see [`H2_INITIAL_STREAM_WINDOW`]. Mirrored server-side in each
+/// component's `Server::builder()` — h2 windows are per-direction.
+///
 /// Factored out after I-048c: the balanced channel diverged from
 /// `connect_store_lazy` and went 7 minutes dark on scheduler SIGKILL.
 pub(crate) fn with_h2_keepalive(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
-    ep.http2_keep_alive_interval(Duration::from_secs(30))
+    with_h2_throughput(ep)
+        .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true)
+}
+
+/// Apply h2 flow-control window tuning only (no keepalive). See
+/// [`H2_INITIAL_STREAM_WINDOW`].
+///
+/// Separate from [`with_h2_keepalive`] so the eager [`connect_channel`]
+/// path can take the throughput fix without keepalive: under heavy
+/// parallel-process load (workspace nextest), `keep_alive_while_idle`
+/// PING/PONG on a freshly-eager-connected channel raced and produced
+/// spurious GoAway → EIO in fetch tests. The lazy/balanced paths
+/// (long-lived channels, the production builder path) take both via
+/// [`with_h2_keepalive`].
+// r[impl proto.h2.adaptive-window]
+pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
+    ep.http2_adaptive_window(true)
+        .initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
+        .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
 
 async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     // `get().and_then(|o| o.as_ref())` collapses both "OnceLock not
     // initialized" and "initialized with None" to plaintext. Tests
     // that never call init_client_tls stay plaintext.
-    match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
-        Some(tls) => {
-            let endpoint = format!("https://{addr}");
-            Channel::from_shared(endpoint)?
-                .connect_timeout(CONNECT_TIMEOUT)
-                .tls_config(tls.clone())?
-                .connect()
-                .await
-                .map_err(Into::into)
-        }
-        None => {
-            let endpoint = format!("http://{addr}");
-            Channel::from_shared(endpoint)?
-                .connect_timeout(CONNECT_TIMEOUT)
-                .connect()
-                .await
-                .map_err(Into::into)
-        }
+    let (scheme, tls) = match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
+        Some(tls) => ("https", Some(tls.clone())),
+        None => ("http", None),
+    };
+    let mut ep = with_h2_throughput(
+        Channel::from_shared(format!("{scheme}://{addr}"))?.connect_timeout(CONNECT_TIMEOUT),
+    );
+    if let Some(tls) = tls {
+        ep = ep.tls_config(tls)?;
     }
+    ep.connect().await.map_err(Into::into)
 }
 
 /// Connect to the store service.
@@ -228,7 +257,7 @@ pub async fn connect_store_admin(
 // NAR stream helpers
 // ===========================================================================
 
-/// Error from [`collect_nar_stream`].
+/// Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`].
 #[derive(Debug, thiserror::Error)]
 pub enum NarCollectError {
     #[error("gRPC stream error: {0}")]
@@ -237,6 +266,10 @@ pub enum NarCollectError {
     SizeExceeded { got: u64, limit: u64 },
     #[error("store returned malformed PathInfo: {0}")]
     Validation(#[from] crate::validated::PathInfoValidationError),
+    /// Spool write failure ([`collect_nar_stream_to_writer`] only).
+    /// NOT transient — retrying the gRPC won't fix local disk.
+    #[error("NAR spool write failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl NarCollectError {
@@ -296,7 +329,16 @@ pub async fn collect_nar_stream(
 
     while let Some(msg) = stream.message().await? {
         match msg.msg {
-            Some(get_path_response::Msg::Info(i)) => info = Some(i),
+            Some(get_path_response::Msg::Info(i)) => {
+                // I-180 fix C: server sends Info first with the final
+                // nar_size. Pre-size the Vec so the chunk loop doesn't
+                // realloc-memcpy ~log2(size) times (a 1.8 GB NAR
+                // doubling from empty is ~31 reallocs ≈ 3.6 GB of
+                // memcpy). Clamp to max_size so a hostile/buggy server
+                // can't make us OOM on the reserve itself.
+                nar.reserve_exact((i.nar_size as usize).min(max_size as usize));
+                info = Some(i);
+            }
             Some(get_path_response::Msg::NarChunk(chunk)) => {
                 let new_len = (nar.len() as u64).saturating_add(chunk.len() as u64);
                 if new_len > max_size {
@@ -311,6 +353,47 @@ pub async fn collect_nar_stream(
         }
     }
     Ok((info, nar))
+}
+
+/// Drain a `GetPath` response stream into an `AsyncWrite` sink.
+///
+/// Same loop as [`collect_nar_stream`] but writes each chunk to `w`
+/// instead of accumulating into a `Vec<u8>`. Peak heap is one chunk
+/// (256 KiB), not the whole NAR. Returns `(Option<PathInfo>, bytes_written)`.
+///
+/// I-180: the builder's FUSE fetch path uses this to spool GB-scale NARs
+/// to a tempfile, then [`rio_nix::nar::restore_path_streaming`] extracts
+/// from the spool. The in-memory [`collect_nar_stream`] stays for
+/// small-payload callers (.drv files, gateway `wopNarFromPath`).
+///
+/// On error, `w` may have been partially written — caller is responsible
+/// for truncating/discarding the spool before retry.
+pub async fn collect_nar_stream_to_writer(
+    stream: &mut Streaming<GetPathResponse>,
+    max_size: u64,
+    w: &mut (impl AsyncWrite + Unpin),
+) -> Result<(Option<PathInfo>, u64), NarCollectError> {
+    let mut info = None;
+    let mut written: u64 = 0;
+
+    while let Some(msg) = stream.message().await? {
+        match msg.msg {
+            Some(get_path_response::Msg::Info(i)) => info = Some(i),
+            Some(get_path_response::Msg::NarChunk(chunk)) => {
+                let new_len = written.saturating_add(chunk.len() as u64);
+                if new_len > max_size {
+                    return Err(NarCollectError::SizeExceeded {
+                        got: new_len,
+                        limit: max_size,
+                    });
+                }
+                w.write_all(&chunk).await?;
+                written = new_len;
+            }
+            None => {} // empty oneof — ignore
+        }
+    }
+    Ok((info, written))
 }
 
 /// Build a `PutPath` request stream: metadata first, then [`NAR_CHUNK_SIZE`]
@@ -546,10 +629,96 @@ pub async fn get_path_nar(
     }
 }
 
+/// GetPath with timeout, NAR spooled to an `AsyncWrite` sink, and NotFound
+/// handling.
+///
+/// Streaming sibling of [`get_path_nar`]: same retry/NotFound/SizeExceeded
+/// semantics, but NAR bytes go to `spool` instead of a returned `Vec<u8>`.
+/// Returns just the `ValidatedPathInfo` (or `None` if absent). Peak heap
+/// is one chunk (256 KiB).
+///
+/// I-180: the builder's FUSE fetch passes a `tokio::fs::File` in the cache
+/// dir. On transient error, the caller truncates+seeks the spool and
+/// retries; on success, it `restore_path_streaming`s from the spool.
+pub async fn get_path_nar_to_file(
+    client: &mut StoreServiceClient<Channel>,
+    store_path: &str,
+    timeout: Duration,
+    max_nar_size: u64,
+    manifest_hint: Option<crate::types::ManifestHint>,
+    extra_metadata: &[(&'static str, &str)],
+    spool: &mut (impl AsyncWrite + Unpin),
+) -> Result<Option<ValidatedPathInfo>, NarCollectError> {
+    let mut req = tonic::Request::new(GetPathRequest {
+        store_path: store_path.to_string(),
+        manifest_hint,
+    });
+    crate::interceptor::inject_current(req.metadata_mut());
+    for (k, v) in extra_metadata {
+        req.metadata_mut().insert(
+            *k,
+            v.parse().map_err(|e| {
+                NarCollectError::Stream(tonic::Status::internal(format!("metadata {k}: {e}")))
+            })?,
+        );
+    }
+    let fut = async {
+        let mut stream = match client.get_path(req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => return Err(NarCollectError::Stream(status)),
+        };
+        let (info, _written) =
+            collect_nar_stream_to_writer(&mut stream, max_nar_size, spool).await?;
+        match info {
+            Some(raw) => {
+                let validated = ValidatedPathInfo::try_from(raw)?;
+                Ok(Some(validated))
+            }
+            None => Ok(None),
+        }
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
+            format!("GetPath({store_path}) timed out after {timeout:?}"),
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod retry_tests {
     use super::*;
     use std::time::Duration;
+
+    /// Regression guard: h2 flow-control windows must stay above the
+    /// 64 KiB default. A revert to defaults reintroduces the ~30 MB/s
+    /// cross-AZ ceiling on `GetPath` (I-180) — silently, since nothing
+    /// fails, throughput just drops. There's no public accessor on
+    /// `Endpoint` to inspect the configured window, so this asserts the
+    /// constants directly; `with_h2_keepalive` is the single application
+    /// site (covered by `connect_closed_port_fails_fast_then_succeeds`
+    /// going through it via `connect_channel`).
+    // r[verify proto.h2.adaptive-window]
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "the constants ARE the contract — this guards against a \
+                  silent revert to h2 defaults"
+    )]
+    fn h2_window_floor_not_regressed() {
+        const H2_DEFAULT: u32 = 65_535;
+        assert!(
+            H2_INITIAL_STREAM_WINDOW > H2_DEFAULT,
+            "stream window {} must exceed h2 default {} (I-180 30 MB/s ceiling)",
+            H2_INITIAL_STREAM_WINDOW,
+            H2_DEFAULT
+        );
+        assert!(
+            H2_INITIAL_CONN_WINDOW >= H2_INITIAL_STREAM_WINDOW,
+            "connection window must be at least the stream window"
+        );
+    }
 
     /// Retry loop pattern: connect to a closed port, assert it fails
     /// fast (not hang), bind the port, assert next attempt succeeds.

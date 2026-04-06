@@ -212,6 +212,22 @@ fn expect_str(r: &mut impl Read, expected: &str) -> Result<()> {
     Ok(())
 }
 
+// r[impl builder.nar.entry-name-safety]
+/// Path-traversal guard for NAR directory entry names: reject names that
+/// `Path::join` would interpret as upward (`..`) or absolute (`/...`),
+/// plus NUL (filesystem-invalid) and `.`/empty (self-reference). Matches
+/// Nix C++ `archive.cc parseDump`. Shared by [`parse`] and
+/// [`restore_path_streaming`] — both write the name into a host filesystem
+/// path, so both need the same safety boundary.
+fn validate_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+        return Err(NarError::InvalidEntryName {
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // NAR reader
 // ---------------------------------------------------------------------------
@@ -309,21 +325,9 @@ fn parse_directory(r: &mut impl Read, depth: usize) -> Result<NarNode> {
                     source: e,
                 })?;
 
-                // r[impl builder.nar.entry-name-safety]
-                // Path-traversal guard: reject names that Path::join would
-                // interpret as upward (`..`) or absolute (`/...`), plus
-                // NUL (filesystem-invalid) and `.`/empty (self-reference).
-                // Matches Nix C++ archive.cc parseDump. Check runs before
-                // prev_name update so a rejected name doesn't pollute
-                // sort-order state.
-                if name.is_empty()
-                    || name == "."
-                    || name == ".."
-                    || name.contains('/')
-                    || name.contains('\0')
-                {
-                    return Err(NarError::InvalidEntryName { name });
-                }
+                // Check runs before prev_name update so a rejected name
+                // doesn't pollute sort-order state.
+                validate_entry_name(&name)?;
 
                 // Enforce sorted order
                 if let Some(ref prev) = prev_name
@@ -572,6 +576,166 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path) -> Result<()> {
     }
 
     write_str(w, ")")?;
+    Ok(())
+}
+
+/// Extract a NAR archive directly to a filesystem path, reading file
+/// contents in 256 KiB chunks without buffering the full tree in memory.
+///
+/// Mirror of [`dump_path_streaming`]: walks the NAR token stream and
+/// writes each entry to disk as it's encountered. Regular-file contents
+/// are `io::copy`'d in fixed-size pieces — peak heap is O(chunk size),
+/// not O(NAR size). **Semantically equivalent to
+/// `extract_to_path(&parse(r)?, dest)`** without the intermediate
+/// [`NarNode`] tree.
+///
+/// Unlike [`parse`], there is no per-file `MAX_CONTENT_SIZE` cap — the
+/// caller bounds total size upstream (e.g., `MAX_NAR_SIZE` on the gRPC
+/// stream). This is the path the builder's FUSE fetch uses for GB-scale
+/// inputs (I-180: a 1.8 GB LLVM source NAR previously held ~3.6 GB peak
+/// — `Vec<u8>` of NAR bytes + the parsed `NarNode` tree).
+///
+/// `dest` must NOT exist; `restore_node` creates it (file, dir, or
+/// symlink) per the root node's type. On error, a partially-written tree
+/// may remain at `dest` — the caller is responsible for cleanup.
+pub fn restore_path_streaming(r: &mut impl Read, dest: &std::path::Path) -> Result<()> {
+    let magic = read_string(r)?;
+    if magic != NAR_MAGIC {
+        return Err(NarError::InvalidMagic(magic));
+    }
+    restore_node(r, dest, 0)
+}
+
+/// Streaming analogue of `extract_to_path(parse_node(r))`. Reads NAR
+/// framing tokens and writes the corresponding filesystem object at
+/// `dest`, copying regular-file contents in 256 KiB chunks.
+fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Result<()> {
+    /// Chunk size for file content writes. Matches `STREAM_CHUNK` in
+    /// `stream_node` (256 KiB).
+    const RESTORE_CHUNK: usize = 256 * 1024;
+
+    if depth > MAX_NAR_DEPTH {
+        return Err(NarError::NestingTooDeep(depth));
+    }
+    expect_str(r, "(")?;
+    expect_str(r, "type")?;
+
+    let node_type = read_string(r)?;
+    match node_type.as_str() {
+        "regular" => {
+            // Peek: either "executable" or "contents" (same as parse_regular).
+            let token = read_string(r)?;
+            let executable = match token.as_str() {
+                "executable" => {
+                    let _empty = read_string(r)?;
+                    expect_str(r, "contents")?;
+                    true
+                }
+                "contents" => false,
+                _ => {
+                    return Err(NarError::UnexpectedToken {
+                        expected: "\"executable\" or \"contents\"".to_string(),
+                        got: token,
+                    });
+                }
+            };
+
+            // THE POINT: read the u64 length prefix, then stream `len`
+            // bytes from `r` straight to disk in fixed-size chunks. No
+            // `vec![0; len]` — peak alloc is one RESTORE_CHUNK buffer.
+            // No MAX_CONTENT_SIZE check (caller bounds total upstream).
+            let len = read_u64(r)?;
+            let mut f = std::fs::File::create(dest)?;
+            let mut buf = vec![0u8; RESTORE_CHUNK];
+            let mut remaining = len;
+            while remaining > 0 {
+                let to_read = (RESTORE_CHUNK as u64).min(remaining) as usize;
+                // read() may return short — loop until we've copied
+                // exactly `len` bytes or hit EOF (truncated NAR).
+                let n = r.read(&mut buf[..to_read])?;
+                if n == 0 {
+                    return Err(NarError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "NAR truncated mid-file: expected {len} bytes for {dest:?}, \
+                             EOF at {} ({} remaining)",
+                            len - remaining,
+                            remaining
+                        ),
+                    )));
+                }
+                f.write_all(&buf[..n])?;
+                remaining -= n as u64;
+            }
+            // Consume NAR padding to 8-byte boundary.
+            let pad = padding_len(len as usize);
+            if pad > 0 {
+                let mut pad_buf = [0u8; 8];
+                r.read_exact(&mut pad_buf[..pad])?;
+            }
+            drop(f);
+            if executable {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
+            }
+            expect_str(r, ")")?;
+        }
+        "directory" => {
+            std::fs::create_dir(dest)?;
+            let mut prev_name: Option<String> = None;
+            loop {
+                let token = read_string(r)?;
+                match token.as_str() {
+                    ")" => break,
+                    "entry" => {
+                        expect_str(r, "(")?;
+                        expect_str(r, "name")?;
+                        let name_bytes = read_name_bytes(r)?;
+                        let name =
+                            String::from_utf8(name_bytes).map_err(|e| NarError::InvalidUtf8 {
+                                context: "entry name",
+                                offset: e.utf8_error().valid_up_to(),
+                                source: e,
+                            })?;
+                        // Same path-traversal + sort-order guards as
+                        // `parse_directory` — restore writes straight
+                        // to the host FS, so this is the safety boundary.
+                        validate_entry_name(&name)?;
+                        if let Some(ref prev) = prev_name
+                            && name <= *prev
+                        {
+                            return Err(NarError::UnsortedEntries {
+                                prev: prev.clone(),
+                                cur: name,
+                            });
+                        }
+                        expect_str(r, "node")?;
+                        restore_node(r, &dest.join(&name), depth + 1)?;
+                        expect_str(r, ")")?;
+                        prev_name = Some(name);
+                    }
+                    _ => {
+                        return Err(NarError::UnexpectedToken {
+                            expected: "\"entry\" or \")\"".to_string(),
+                            got: token,
+                        });
+                    }
+                }
+            }
+        }
+        "symlink" => {
+            expect_str(r, "target")?;
+            let target_bytes = read_target_bytes(r)?;
+            let target = String::from_utf8(target_bytes).map_err(|e| NarError::InvalidUtf8 {
+                context: "symlink target",
+                offset: e.utf8_error().valid_up_to(),
+                source: e,
+            })?;
+            std::os::unix::fs::symlink(&target, dest)?;
+            expect_str(r, ")")?;
+        }
+        _ => return Err(NarError::UnknownNodeType(node_type)),
+    }
     Ok(())
 }
 
@@ -998,6 +1162,27 @@ mod tests {
                 prop_assert_eq!(parsed, node);
             }
         }
+
+        proptest! {
+            // Fewer cases than the in-memory roundtrip — each case does
+            // real filesystem I/O (tempdir create/write/read/remove).
+            #![proptest_config(ProptestConfig::with_cases(256))]
+            /// `serialize → restore_path_streaming → dump_path` is
+            /// byte-identical for arbitrary NAR trees. This is the
+            /// streaming-restore equivalent of `nar_roundtrip`.
+            #[test]
+            fn restore_streaming_roundtrip_prop(node in arb_nar_node()) {
+                let mut buf = Vec::new();
+                serialize(&mut buf, &node)?;
+
+                let dst_dir = tempfile::TempDir::new().unwrap();
+                let dst = dst_dir.path().join("r");
+                restore_path_streaming(&mut Cursor::new(&buf), &dst)?;
+
+                let redumped = dump_path(&dst)?;
+                prop_assert_eq!(buf, redumped);
+            }
+        }
     }
 
     /// Compare our NAR output against `nix-store --dump` for a single file.
@@ -1203,6 +1388,150 @@ mod tests {
         dump_path_streaming(&f, &mut streamed)?;
         assert_eq!(eager, streamed);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // restore_path_streaming round-trip with dump_path_streaming
+    // -----------------------------------------------------------------------
+
+    /// THE correctness invariant for restore_path_streaming:
+    /// `dump → restore → dump` is byte-identical. If this diverges, the
+    /// builder's FUSE fetch path materializes corrupt store paths.
+    // r[verify builder.fuse.fetch-bounded-memory]
+    #[test]
+    fn restore_streaming_roundtrip() -> anyhow::Result<()> {
+        let src_dir = tempfile::TempDir::new()?;
+        let src = src_dir.path().join("root");
+        std::fs::create_dir(&src)?;
+
+        // All three node types + edge cases (empty file, executable, nested).
+        std::fs::create_dir(src.join("sub"))?;
+        std::fs::write(src.join("file.txt"), "hello restore\n")?;
+        std::fs::write(src.join("sub/inner.txt"), b"nested content")?;
+        std::os::unix::fs::symlink("file.txt", src.join("link"))?;
+        std::fs::write(src.join("empty"), b"")?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(src.join("script.sh"), "#!/bin/sh\necho hi\n")?;
+            std::fs::set_permissions(
+                src.join("script.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )?;
+        }
+
+        let mut nar = Vec::new();
+        dump_path_streaming(&src, &mut nar)?;
+
+        let dst_dir = tempfile::TempDir::new()?;
+        let dst = dst_dir.path().join("restored");
+        restore_path_streaming(&mut Cursor::new(&nar), &dst)?;
+
+        let mut nar2 = Vec::new();
+        dump_path_streaming(&dst, &mut nar2)?;
+        assert_eq!(
+            nar, nar2,
+            "dump → restore_path_streaming → dump must be byte-identical"
+        );
+
+        // Spot-check the executable bit survived.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dst.join("script.sh"))?
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "executable bit lost on restore");
+        Ok(())
+    }
+
+    /// `restore_path_streaming` has NO per-file `MAX_CONTENT_SIZE` cap
+    /// (unlike `parse`). A single regular file larger than 256 MiB must
+    /// extract successfully — this is the I-180 fix for GB-scale inputs
+    /// like vendored-tarball store paths.
+    ///
+    /// Builds the NAR via a chained reader (header + `io::repeat(0)` +
+    /// trailer) so the test itself stays bounded-memory; only the
+    /// restored file occupies disk.
+    #[test]
+    fn restore_streaming_large_file_over_256mib() -> anyhow::Result<()> {
+        // 256 MiB + 1 KiB — just past `parse`'s MAX_CONTENT_SIZE.
+        const LEN: u64 = 256 * 1024 * 1024 + 1024;
+
+        // Build NAR framing around a `len`-byte zero-filled regular file
+        // WITHOUT materializing `len` bytes in memory: header tokens +
+        // u64 len, then `io::repeat(0).take(len)` for content, then
+        // padding (LEN % 8 == 0, so none) + closing ")".
+        let mut head = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "regular", "contents"] {
+            write_str(&mut head, t).unwrap();
+        }
+        write_u64(&mut head, LEN).unwrap();
+        let mut tail = Vec::new();
+        write_str(&mut tail, ")").unwrap();
+
+        let mut r = Cursor::new(head)
+            .chain(io::repeat(0u8).take(LEN))
+            .chain(Cursor::new(tail));
+
+        let dst_dir = tempfile::TempDir::new()?;
+        let dst = dst_dir.path().join("big");
+        restore_path_streaming(&mut r, &dst)?;
+
+        let meta = std::fs::metadata(&dst)?;
+        assert_eq!(meta.len(), LEN, "restored file size mismatch");
+
+        // Sanity: `parse` on the SAME logical NAR would have rejected
+        // this with ContentTooLarge — that's the gap restore closes.
+        // (We don't actually run parse on a 256 MiB Vec here; the
+        // bound check fires on the u64 read before allocation, so a
+        // header-only Cursor suffices.)
+        let mut head_only = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "regular", "contents"] {
+            write_str(&mut head_only, t).unwrap();
+        }
+        write_u64(&mut head_only, LEN).unwrap();
+        let err = parse(&mut Cursor::new(&head_only)).unwrap_err();
+        assert!(
+            matches!(err, NarError::ContentTooLarge(n) if n == LEN),
+            "parse should reject {LEN}-byte file with ContentTooLarge, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Same path-traversal guard as `parse`: `..`, `/`, NUL, empty, `.`
+    /// in entry names are rejected BEFORE any filesystem write under
+    /// `dest` for that name.
+    // r[verify builder.nar.entry-name-safety]
+    #[test]
+    fn restore_streaming_rejects_bad_entry_names() {
+        for bad in [&b".."[..], b"etc/passwd", b"/etc/passwd", b"foo\0bar", b""] {
+            let nar = nar_with_entry_name(bad);
+            let dst_dir = tempfile::TempDir::new().unwrap();
+            let dst = dst_dir.path().join("out");
+            let err = restore_path_streaming(&mut Cursor::new(&nar), &dst).unwrap_err();
+            assert!(
+                matches!(err, NarError::InvalidEntryName { .. }),
+                "expected InvalidEntryName for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// Truncated NAR (EOF mid-file-contents) → typed UnexpectedEof, not
+    /// a hung read or a short file silently written.
+    #[test]
+    fn restore_streaming_truncated_file_fails() {
+        let mut nar = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "regular", "contents"] {
+            write_str(&mut nar, t).unwrap();
+        }
+        write_u64(&mut nar, 100).unwrap();
+        nar.extend_from_slice(&[0u8; 40]); // only 40 of 100 bytes
+
+        let dst_dir = tempfile::TempDir::new().unwrap();
+        let dst = dst_dir.path().join("out");
+        let err = restore_path_streaming(&mut Cursor::new(&nar), &dst).unwrap_err();
+        assert!(
+            matches!(&err, NarError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}"
+        );
     }
 
     // ------------------------------------------------------------------

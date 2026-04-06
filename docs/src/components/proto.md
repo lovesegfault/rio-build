@@ -2,6 +2,11 @@
 
 Internal gRPC APIs between components + external API for tooling.
 
+## Transport
+
+r[proto.h2.adaptive-window]
+All gRPC channels (client `Endpoint` builders and server `Server::builder()`) MUST enable `http2_adaptive_window` and set an initial per-stream window of at least 1 MiB (h2 default is 65 535 bytes). At cross-AZ RTT (~2-3 ms) the default 64 KiB window caps a `GetPath` NAR stream at ~20-30 MB/s regardless of link bandwidth — each 256 KiB chunk needs ~4 `WINDOW_UPDATE` round-trips before the next can flow. Adaptive-window BDP probing auto-tunes upward from the 1 MiB floor.
+
 ## Services
 
 ```protobuf

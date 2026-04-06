@@ -396,35 +396,50 @@ impl Cache {
         Arc::clone(&self.bloom)
     }
 
-    /// Remove stale `*.tmp-*` directories from the cache root. These are
-    /// remnants of interrupted NAR extractions.
+    /// Remove stale `*.tmp-*` extraction trees and `*.nar-*` spool files
+    /// from the cache root. These are remnants of interrupted NAR fetches.
     fn clean_stale_tmp_dirs(cache_dir: &Path) {
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
             return;
+        };
+        // Match foo.<tag>-<16 hex chars> EXACTLY for tag in {tmp, nar}.
+        // Require the suffix to be exactly 16 hex chars (rand::<u64>
+        // formatted {:016x}) — a loose substring match would delete
+        // legitimate store paths like "rust-1.75.0-tmp-build".
+        let has_hex16_suffix = |s: &str, tag: &str| {
+            s.rsplit_once(tag).is_some_and(|(_, sfx)| {
+                sfx.len() == 16 && sfx.chars().all(|c| c.is_ascii_hexdigit())
+            })
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            // Match foo.tmp-<16 hex chars> EXACTLY (the pattern used
-            // by fetch_and_extract). Require the suffix to be exactly
-            // 16 hex chars (tempfile's 8-byte random suffix) — a
-            // loose `.tmp-` substring match would delete legitimate
-            // store paths like "rust-1.75.0-tmp-build".
-            let is_stale_tmp = name_str.rsplit_once(".tmp-").is_some_and(|(_, suffix)| {
-                suffix.len() == 16 && suffix.chars().all(|c| c.is_ascii_hexdigit())
-            });
-            if is_stale_tmp {
-                let path = entry.path();
-                if let Err(e) = std::fs::remove_dir_all(&path) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to remove stale tmp extraction dir"
-                    );
-                } else {
-                    tracing::info!(path = %path.display(), "removed stale tmp extraction dir");
+            let path = entry.path();
+            if has_hex16_suffix(name_str, ".tmp-") {
+                // Partial extracted tree (dir OR single-file path —
+                // restore_path_streaming creates whichever the NAR
+                // root is). remove_dir_all handles dirs; fall back to
+                // remove_file for the single-regular-file case.
+                let res = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
+                match res {
+                    Ok(()) => {
+                        tracing::info!(path = %path.display(), "removed stale tmp extraction")
+                    }
+                    Err(e) => tracing::warn!(
+                        path = %path.display(), error = %e,
+                        "failed to remove stale tmp extraction"
+                    ),
+                }
+            } else if has_hex16_suffix(name_str, ".nar-") {
+                // I-180 NAR spool file (always a regular file).
+                match std::fs::remove_file(&path) {
+                    Ok(()) => tracing::info!(path = %path.display(), "removed stale NAR spool"),
+                    Err(e) => tracing::warn!(
+                        path = %path.display(), error = %e,
+                        "failed to remove stale NAR spool"
+                    ),
                 }
             }
         }
@@ -1169,9 +1184,19 @@ mod tests {
         std::fs::write(stale_tmp.join("partial_file"), b"incomplete")?;
         assert!(stale_tmp.exists());
 
+        // I-180: stale NAR spool file (regular file, not dir) from a
+        // process kill mid-spool.
+        let stale_spool = cache_dir.join("abc-hello.nar-0123456789abcdef");
+        std::fs::write(&stale_spool, b"partial nar bytes")?;
+        assert!(stale_spool.exists());
+
         // Also create a legitimate (non-tmp) entry to verify it's NOT removed.
         let real_entry = cache_dir.join("def-world");
         std::fs::create_dir_all(&real_entry)?;
+        // And a store path with `.nar-` in the NAME (not the suffix) —
+        // must NOT be swept. Only an exact 16-hex trailing suffix matches.
+        let nar_named = cache_dir.join("ghi-some.nar-fixture");
+        std::fs::create_dir_all(&nar_named)?;
 
         // Cache::new should clean the stale tmp dir but leave the real entry.
         let _cache = Cache::new(cache_dir, 10, None, false).await?;
@@ -1180,8 +1205,16 @@ mod tests {
             "stale tmp dir should be removed on init"
         );
         assert!(
+            !stale_spool.exists(),
+            "stale .nar- spool file should be removed on init"
+        );
+        assert!(
             real_entry.exists(),
             "real cache entries must not be removed"
+        );
+        assert!(
+            nar_named.exists(),
+            "store paths with .nar- in the name (not 16-hex suffix) must not be swept"
         );
         Ok(())
     }
