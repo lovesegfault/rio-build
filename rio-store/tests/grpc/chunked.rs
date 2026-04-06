@@ -376,6 +376,186 @@ async fn gt13_batch_rpc_atomic() -> TestResult {
     Ok(())
 }
 
+/// The `bail!` macro at `put_path_batch.rs:82-87` is load-bearing: it
+/// calls `abort_batch()` before returning. A bare `?` bypasses it —
+/// `owned_placeholders` leak, and the next `PutPathBatch` for those
+/// paths gets `Status::aborted("concurrent upload in progress")` until
+/// the 2h orphan sweep reclaims stale `'uploading'` rows.
+///
+/// P0342 fixed the lone `?` at `:275` (`.map_err(...)?` on
+/// `insert_manifest_uploading`). This test catches any future
+/// reintroduction: every error return in phase-2/phase-3 MUST go
+/// through `bail!` — no bare `?` after the first placeholder may be
+/// pushed.
+///
+/// Brittle-by-design: a false-positive on a `?` inside a closure or a
+/// pre-placeholder helper is preferable to the silent 2h wedge. If a
+/// legitimate `?` is added, slice the body more tightly or convert the
+/// `?` to `match + bail!`.
+#[test]
+fn put_path_batch_impl_no_question_mark_bypass() {
+    let src = include_str!("../../src/grpc/put_path_batch.rs");
+
+    // Slice the impl body: between `fn put_path_batch_impl(` and
+    // `async fn abort_batch(` (the next sibling fn). Every `?` in the
+    // phase-2/3 part of that slice is a suspect.
+    let start = src
+        .find("fn put_path_batch_impl(")
+        .expect("put_path_batch_impl present");
+    let end = src[start..]
+        .find("async fn abort_batch(")
+        .expect("abort_batch sibling present")
+        + start;
+    let body = &src[start..end];
+
+    // Phase-2/3: after placeholders MAY be inserted (phase-2's
+    // `owned_placeholders.push` at :284 happens inside a loop — output-0
+    // is pushed before output-1's insert runs). A `?` anywhere in
+    // phase-2/3 leaks output-0's placeholder if output-1 errors.
+    //
+    // Phase-1 (stream drain) never pushes placeholders, so a `?` there
+    // is harmless (abort_batch on an empty list is a no-op). Slice from
+    // the phase-2 marker.
+    let phase2_start = body.find("--- Phase 2:").expect("phase-2 marker present");
+    let tail = &body[phase2_start..];
+
+    // Count `?` tokens used as try-propagation. Match `?;` (expression
+    // terminator) and `?\n` (`?` at end of line without explicit `;`,
+    // e.g. inside a chain). Both are bypasses if they reach the outer
+    // `Result<_, Status>` return.
+    let q_count = tail.matches("?;").count() + tail.matches("?\n").count();
+    assert_eq!(
+        q_count, 0,
+        "found `?` inside put_path_batch_impl phase-2/3 body — \
+         every error return after a placeholder may be pushed MUST \
+         use bail! (which calls abort_batch). A bare `?` leaks the \
+         placeholder until the 2h orphan sweep. See P0342."
+    );
+}
+
+/// Phase-2 loop iteration: output-0's placeholder is inserted at
+/// `:284`, then output-1's `insert_manifest_uploading` returns
+/// `Ok(false)` (pre-seeded conflict — concurrent uploader owns it).
+/// The `bail!` at `:280` must call `abort_batch()` → delete output-0's
+/// placeholder too. Without cleanup, output-0 is wedged: next batch
+/// hits `!inserted` on output-0's stale placeholder → aborts forever
+/// (until the 2h orphan sweep).
+///
+/// NOTE: this tests the `:280` `bail!` path (the `!inserted` branch),
+/// which shares `abort_batch` with the `:275` fix. The `:275` path
+/// (`insert_manifest_uploading` returning `Err`, not `Ok(false)`)
+/// requires PG fault injection mid-handler — covered statically by
+/// [`put_path_batch_impl_no_question_mark_bypass`] instead. Both paths
+/// reach the same `abort_batch` cleanup.
+// r[verify store.atomic.multi-output]
+#[tokio::test]
+async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
+    let s = StoreSession::new().await?;
+
+    let out0_path = test_store_path("cleanup-out0");
+    let (out0_nar, _) = make_nar(b"cleanup zero");
+    let out0_info = make_path_info_for_nar(&out0_path, &out0_nar);
+
+    let out1_path = test_store_path("cleanup-out1");
+    let (out1_nar, _) = make_nar(b"cleanup one");
+    let out1_info = make_path_info_for_nar(&out1_path, &out1_nar);
+
+    // Pre-seed an 'uploading' placeholder for output-1 via raw SQL
+    // (simulates a concurrent uploader owning the slot).
+    // `insert_manifest_uploading` for output-1 will return `Ok(false)`
+    // → `:277` `!inserted` → `:280` bail!.
+    //
+    // Can't call `rio_store::metadata::insert_manifest_uploading`
+    // directly — the `metadata` module is `pub(crate)`. Inline the two
+    // INSERTs (see metadata/inline.rs:69-95). Skip the GC-lock
+    // preamble (no GC running in a test).
+    let out1_hash: Vec<u8> = out1_info.store_path.sha256_digest().to_vec();
+    sqlx::query(
+        r#"INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, "references")
+           VALUES ($1, $2, $3, 0, $4)"#,
+    )
+    .bind(&out1_hash)
+    .bind(&out1_path)
+    .bind(&[0u8; 32] as &[u8])
+    .bind(Vec::<String>::new())
+    .execute(&s.db.pool)
+    .await?;
+    sqlx::query(r#"INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'uploading')"#)
+        .bind(&out1_hash)
+        .execute(&s.db.pool)
+        .await?;
+
+    // Send the batch. Output-0 metadata+chunk+trailer, then output-1.
+    // Handler drains (phase-1) → validates + inserts placeholders
+    // (phase-2) → commits (phase-3). BTreeMap iteration: idx 0 first,
+    // then idx 1 — so output-0's placeholder IS inserted before
+    // output-1's insert hits the conflict.
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, out0_info.clone().into(), out0_nar.clone()).await;
+    send_batch_output(&tx, 1, out1_info.clone().into(), out1_nar.clone()).await;
+    drop(tx);
+
+    let mut client = s.client.clone();
+    let r = client.put_path_batch(ReceiverStream::new(rx)).await;
+    let status = r.expect_err("batch must fail — output-1 slot owned by concurrent uploader");
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    assert!(
+        status.message().contains("concurrent upload in progress"),
+        "expected concurrent-upload message, got: {}",
+        status.message()
+    );
+
+    // THE CLEANUP ASSERTION: output-0's placeholder was deleted by
+    // abort_batch. Only output-1's (pre-seeded, not owned by this
+    // handler — never pushed to owned_placeholders) remains. Total
+    // 'uploading' rows = 1, and it's output-1's hash.
+    let uploading: Vec<(Vec<u8>,)> =
+        sqlx::query_as("SELECT store_path_hash FROM manifests WHERE status = 'uploading'")
+            .fetch_all(&s.db.pool)
+            .await?;
+    assert_eq!(
+        uploading.len(),
+        1,
+        "only the pre-seeded output-1 placeholder survives; \
+         output-0's placeholder was cleaned up by abort_batch"
+    );
+    assert_eq!(
+        uploading[0].0, out1_hash,
+        "survivor is the pre-seeded output-1, not output-0 \
+         (pre-seed on the HIGHER index so a reversed iteration \
+         order would leave the wrong row and fail this assert)"
+    );
+
+    // Secondary: retry after external cleanup succeeds for BOTH —
+    // proves abort_batch left no junk blocking output-0, and
+    // output-1's slot is freed by deleting our pre-seed. Inline
+    // `delete_manifest_uploading` (manifests first, FK ordering).
+    sqlx::query("DELETE FROM manifests WHERE store_path_hash = $1 AND status = 'uploading'")
+        .bind(&out1_hash)
+        .execute(&s.db.pool)
+        .await?;
+    sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1 AND nar_size = 0")
+        .bind(&out1_hash)
+        .execute(&s.db.pool)
+        .await?;
+
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, out0_info.into(), out0_nar).await;
+    send_batch_output(&tx, 1, out1_info.into(), out1_nar).await;
+    drop(tx);
+    let resp = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    assert_eq!(
+        resp.created,
+        vec![true, true],
+        "clean retry succeeds for both outputs"
+    );
+
+    Ok(())
+}
+
 /// Send one output's full message sequence (metadata → chunk → trailer)
 /// tagged with `output_index`. Mirrors `put_path_raw` but wraps each
 /// inner message in `PutPathBatchRequest`.
