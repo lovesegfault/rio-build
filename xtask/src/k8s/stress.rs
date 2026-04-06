@@ -17,6 +17,7 @@
 //! State lives under `.stress-test/sessions/{unix_ts}/`:
 //!   `meta.json`         target, parallel, ports, start_time, provider
 //!   `pids.json`         { tunnels: [{port,pid}], builds: [{port,pid}] }
+//!   `chaos.json`        [{node, pod_name, target_ip, chain}] (chaos subcmd)
 //!   `build-{port}.log`  per-build stdout+stderr
 //!   `watch.jsonl`       poll snapshots (appended by `stress watch`)
 
@@ -33,6 +34,7 @@ use console::style;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use super::chaos::{self, ChaosFrom, ChaosKind, ChaosTarget};
 use super::provider::{Provider, ProviderKind};
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
@@ -75,12 +77,40 @@ pub enum StressCmd {
     },
     /// Show active sessions with build progress.
     List,
+    /// Inject a network fault. Unlike `run`, this BLOCKS for
+    /// `--duration` (or until Ctrl-C) and cleans up on exit. Chaos
+    /// that survives the xtask process is a footgun.
+    ///
+    /// `--kind blackhole`: privileged hostNetwork pod nsenters the
+    /// host and inserts iptables DROP rules for `--target`'s pod IP.
+    /// No FIN, no RST — only h2 keepalive can detect (I-048c).
+    ///
+    /// State is tracked in `<session>/chaos.json` BEFORE the rules go
+    /// in, so `stress cleanup` can remediate even if xtask is
+    /// SIGKILLed mid-chaos.
+    Chaos {
+        /// Fault kind. Only `blackhole` is implemented.
+        #[arg(long, value_enum)]
+        kind: ChaosKind,
+        /// What to blackhole. `scheduler-leader` reads the lease.
+        /// `builder-<N>`/`fetcher-<N>` index by sorted pod name.
+        #[arg(long, value_parser = clap::value_parser!(ChaosTarget))]
+        target: ChaosTarget,
+        /// Which workers lose connectivity. The chaos pod runs
+        /// hostNetwork on each worker's NODE.
+        #[arg(long, value_parser = clap::value_parser!(ChaosFrom),
+              default_value = "all-workers")]
+        from: ChaosFrom,
+        /// How long to hold the fault. `60s` or `60`.
+        #[arg(long, value_parser = chaos::parse_duration_secs)]
+        duration: Duration,
+    },
 }
 
 pub async fn run(
     cmd: StressCmd,
     p: &dyn Provider,
-    kind: ProviderKind,
+    p_kind: ProviderKind,
     cfg: &XtaskConfig,
 ) -> Result<()> {
     match cmd {
@@ -89,10 +119,44 @@ pub async fn run(
             parallel,
             base_port,
             bench_flake,
-        } => cmd_run(p, kind, cfg, &target, parallel, base_port, bench_flake).await,
+        } => cmd_run(p, p_kind, cfg, &target, parallel, base_port, bench_flake).await,
         StressCmd::Watch { session } => cmd_watch(session).await,
-        StressCmd::Cleanup { all } => cmd_cleanup(all),
+        StressCmd::Cleanup { all } => cmd_cleanup(all).await,
         StressCmd::List => cmd_list(),
+        StressCmd::Chaos {
+            kind,
+            target,
+            from,
+            duration,
+        } => {
+            // Chaos creates its own session dir (no detached PIDs to
+            // track, but chaos.json needs a home for SIGKILL-recovery).
+            // Reap dead sessions first — same courtesy as `run`.
+            let _ = reap_dead_sessions();
+            let ts = jiff::Timestamp::now().as_second();
+            let dir = session_root().join(ts.to_string());
+            fs::create_dir_all(&dir)?;
+            // Minimal meta so `list`/`cleanup` can identify what this is.
+            let meta = SessionMeta {
+                target: format!("chaos:{kind:?}:{target}"),
+                parallel: 0,
+                ports: vec![],
+                start_time: ts,
+                provider: p_kind.to_string(),
+            };
+            fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta)?)?;
+            // Empty pids.json so iter_sessions doesn't warn.
+            write_pids(&dir, &SessionPids::default())?;
+
+            let res = chaos::run(&dir, kind, target, from, duration).await;
+
+            // On clean exit, chaos.json is already cleared. If chaos
+            // errored, leave the dir for `stress cleanup` to remediate.
+            if res.is_ok() && chaos::read_chaos(&dir)?.entries.is_empty() {
+                fs::remove_dir_all(&dir)?;
+            }
+            res
+        }
     }
 }
 
@@ -345,12 +409,17 @@ fn resolve_bench_flake(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(p)
 }
 
-/// Drop session dirs where every recorded PID is dead. Called at the
-/// start of `run` as a courtesy — doesn't touch the session being
-/// created (it doesn't exist yet). Silently ignores unreadable dirs.
+/// Drop session dirs where every recorded PID is dead AND no chaos
+/// entries are pending. Called at the start of `run`/`chaos` as a
+/// courtesy — doesn't touch the session being created (it doesn't
+/// exist yet). Silently ignores unreadable dirs.
+///
+/// The chaos check matters: a chaos session has zero PIDs (empty
+/// pids.json) but a non-empty chaos.json. Reaping it before
+/// remediation would orphan the iptables rules.
 fn reap_dead_sessions() -> Result<()> {
     for (dir, pids) in iter_sessions()? {
-        if all_dead(&pids) {
+        if all_dead(&pids) && chaos::read_chaos(&dir)?.entries.is_empty() {
             fs::remove_dir_all(&dir)?;
             info!("reaped dead session {}", dir.display());
         }
@@ -499,7 +568,7 @@ fn find_session(explicit: Option<String>) -> Result<PathBuf> {
 
 // No progress bars here: plain iteration + kill + print.
 #[allow(clippy::print_stderr)]
-fn cmd_cleanup(all: bool) -> Result<()> {
+async fn cmd_cleanup(all: bool) -> Result<()> {
     let sessions = iter_sessions()?;
     if sessions.is_empty() {
         eprintln!("{} no sessions", style("·").dim());
@@ -508,9 +577,31 @@ fn cmd_cleanup(all: bool) -> Result<()> {
 
     let mut killed = 0usize;
     let mut removed = 0usize;
+    let mut chaos_remediated = 0usize;
 
     for (dir, pids) in sessions {
         let name = session_name(&dir);
+
+        // Chaos remediation first: if chaos.json has entries, the
+        // chaos pod might still be holding iptables DROP rules on
+        // worker nodes (xtask was SIGKILLed mid-chaos). Spawn a
+        // one-shot remediation pod per affected node, then proceed
+        // with the normal PID cleanup. Best-effort — kube errors warn
+        // but don't abort the rest of cleanup.
+        match chaos::remediate(&dir).await {
+            Ok((n, true)) => {
+                eprintln!(
+                    "{} session {} chaos: remediated {} node(s)",
+                    style("✓").green(),
+                    name,
+                    n,
+                );
+                chaos_remediated += n;
+            }
+            Ok((_, false)) => {} // no chaos.json — normal session
+            Err(e) => warn!("session {name} chaos remediation: {e:#}"),
+        }
+
         let entries: Vec<_> = pids
             .tunnels
             .iter()
@@ -568,8 +659,13 @@ fn cmd_cleanup(all: bool) -> Result<()> {
     }
 
     eprintln!();
+    let chaos_suffix = if chaos_remediated > 0 {
+        format!(", remediated {chaos_remediated} chaos node(s)")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "{} killed {} processes, removed {} sessions",
+        "{} killed {} processes, removed {} sessions{chaos_suffix}",
         style("✓").green(),
         killed,
         removed
