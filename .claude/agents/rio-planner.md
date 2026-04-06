@@ -42,6 +42,13 @@ The merger's `rename_unassigned` assigns real sequential T-numbers at merge time
 
 **Cross-references:** when T-item A references T-item B in the SAME batch-append run, use the placeholder `T9<runid>NN` form. When referencing a PRE-EXISTING T-item (from TGT, not your append), use its real number (`T157`). The merger rewrites only `T9\d{8}` tokens.
 
+**T-placeholder format — 9 digits, not 11:**
+
+RIGHT: `T980252601` (9 digits: `9` + `802526` runid + `01` seq)
+WRONG: `T98025260101` (11 digits: reused the P-placeholder as prefix + seq)
+
+The 11-digit form misses `_T_PLACEHOLDER_RE` and strands tokens. Use the 6-digit runid directly, not your P-placeholder. docs-993168 + docs-654701 both emitted the 11-digit form; the merger's regex now catches it defensively (P0418-T5), but the canonical form is 9-digit.
+
 **Do NOT compute next-T from your worktree base** (`grep '^### T' | tail -1` + 1) — that races with concurrent docs-writers on the same batch doc. docs-267443 + docs-758618 collided on P0304 T144-T148 this way.
 
 ## Step 2: propose the partition, don't decide it

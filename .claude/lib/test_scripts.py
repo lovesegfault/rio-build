@@ -1544,6 +1544,141 @@ def test_rename_unassigned_batch_doc_p_crossref(tmp_repo: Path, monkeypatch):
     assert "959435401" not in (work / "plan-0305-newfeat.md").read_text()
 
 
+def test_rename_placeholder_doc_t_crossref(tmp_repo: Path, monkeypatch):
+    """P0418 gap B + T4: a placeholder plan-doc cross-references a
+    batch-doc T-token ("see P0304-T912345601"). Pre-P0418:
+      - T-rewrite scanned batch_docs ONLY, so the placeholder doc's
+        T912345601 was never touched;
+      - P-rewrite's bare str.replace(placeholder, padded) would THEN
+        substring-corrupt T912345601 → T<padded>... if the T-placeholder
+        happened to contain a P-placeholder substring.
+
+    Post-P0418: T-rewrite's second pass scans placeholder_docs too
+    (T4), and P-rewrite is prefix-anchored (T3). The cross-ref in the
+    placeholder doc must end up with P0304's assigned T-number."""
+    from onibus import merge as merge_mod
+    from onibus.merge import rename_unassigned as run
+
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True)
+    _seed_batch_doc(work, "0304", 3)  # TGT: T1-T3
+    (work / "plan-0100-existing.md").write_text("# real\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
+
+    _git(tmp_repo, "checkout", "-b", "docs-123456")
+    # Writer creates a standalone plan (P-placeholder 912345601) that
+    # cross-references a T-task in P0304 (T-placeholder 912345601 — the
+    # SAME 9-digit body: writers emit 9<runid><NN> for BOTH P- and
+    # T-placeholders, sequences both start at 01). This is the gap-B
+    # collision: bare str.replace("912345601", padded) would corrupt the
+    # T-substring even though T-rewrite already handled it in batch_docs.
+    (work / "plan-912345601-followup.md").write_text(
+        "# Plan 912345601\n\n"
+        "Depends on P0304-T912345601 landing first.\n"
+        "Self-ref: [P912345601](plan-912345601-followup.md).\n"
+    )
+    # And appends the corresponding T-task to P0304.
+    p0304 = work / "plan-0304-batch.md"
+    p0304.write_text(
+        p0304.read_text()
+        + "### T912345601 — `fix(x):` the task in question\n\n"
+    )
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: new plan + batch append", "--no-verify")
+
+    monkeypatch.setattr(merge_mod, "_worktree_for", lambda _: tmp_repo)
+    monkeypatch.setattr(merge_mod, "DOCS_DIR", work)
+
+    report = run("docs-123456")
+    assert len(report.mapping) == 1
+    assert report.mapping[0].assigned == 305
+
+    # P0304's T-placeholder became T4 (max-T on TGT was 3).
+    p0304_text = p0304.read_text()
+    assert "### T4 —" in p0304_text
+    assert "T912345601" not in p0304_text
+
+    # The placeholder doc's T-cross-ref was rewritten using P0304's
+    # assignment — T4, not corrupted to T0305 by bare P-replace, not
+    # stale T912345601.
+    new_doc = (work / "plan-0305-followup.md").read_text()
+    assert "P0304-T4" in new_doc, (
+        f"placeholder doc's T-cross-ref must match P0304's assigned "
+        f"T-number (not corrupted by bare P-replace). Doc content:\n{new_doc}"
+    )
+    # Gap-B negative: bare replace("912345601", "0305") would produce
+    # "T0305" here. Anchoring + T-rewrite-scope prevent that.
+    assert "T0305" not in new_doc
+    assert "T912345601" not in new_doc
+    # P-placeholder (912345601) rewritten via P-prefix/plan-prefix anchors.
+    assert "[P0305](plan-0305-followup.md)" in new_doc
+    assert "912345601" not in new_doc
+
+
+def test_rename_deps_fence_leading_zero(tmp_repo: Path, monkeypatch):
+    """P0418 gap C: placeholder plan-doc's `json deps` fence contains a
+    bare-int P-placeholder (`"soft_deps": [307, 912345602]`). Pre-P0418,
+    the P-rewrite branched on `.jsonl` only — .md got f"{assigned:04d}"
+    zero-padded → `[307, 0416]` → json.loads JSONDecodeError.
+
+    Post-P0418: the anchored P-rewrite's json-context regex emits bare
+    int (unpadded) in .md json-fence contexts. json.loads must succeed."""
+    from onibus import merge as merge_mod
+    from onibus.merge import rename_unassigned as run
+
+    # Negative-control: confirm the bug class reproduces (leading zero
+    # breaks json.loads).
+    with pytest.raises(json.JSONDecodeError):
+        json.loads("[307, 0416]")
+
+    work = tmp_repo / ".claude" / "work"
+    work.mkdir(parents=True)
+    (work / "plan-0100-existing.md").write_text("# real\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "seed", "--no-verify")
+
+    _git(tmp_repo, "checkout", "-b", "docs-123456")
+    # Placeholder doc with a json deps fence containing a bare-int
+    # placeholder. The 307 is a real dep; 912345602 is a sibling
+    # placeholder from the same writer run.
+    (work / "plan-912345601-main.md").write_text(
+        "# Plan 912345601\n\n"
+        "See [P912345602](plan-912345602-sibling.md).\n\n"
+        "## Dependencies\n\n"
+        "```json deps\n"
+        '{"deps": [100], "soft_deps": [307, 912345602]}\n'
+        "```\n"
+    )
+    (work / "plan-912345602-sibling.md").write_text("# Plan 912345602\n")
+    _git(tmp_repo, "add", "-A")
+    _git(tmp_repo, "commit", "-m", "docs: placeholders", "--no-verify")
+
+    monkeypatch.setattr(merge_mod, "_worktree_for", lambda _: tmp_repo)
+    monkeypatch.setattr(merge_mod, "DOCS_DIR", work)
+
+    report = run("docs-123456")
+    assert len(report.mapping) == 2
+    # _next_real: max(100) + 1 = 101; 912345601 → 101, 912345602 → 102
+    assert report.mapping[0].assigned == 101
+    assert report.mapping[1].assigned == 102
+
+    main_text = (work / "plan-0101-main.md").read_text()
+    # Extract the deps-fence body and json.loads it — MUST succeed.
+    m = re.search(r"```json deps\n(.+?)\n```", main_text, re.S)
+    assert m, f"deps fence not found in:\n{main_text}"
+    fence_body = m.group(1)
+    parsed = json.loads(fence_body)
+    # Bare int, no leading zero. 912345602 → 102 unpadded.
+    assert parsed["soft_deps"] == [307, 102], (
+        f"deps-fence bare-int placeholder must rewrite to unpadded int. "
+        f"Got {parsed['soft_deps']!r} from {fence_body!r}"
+    )
+    # The P-prefix cross-ref in prose DOES get padded (that's the P-prefix
+    # anchored replace, distinct from the json-context regex).
+    assert "[P0102](plan-0102-sibling.md)" in main_text
+
+
 def test_t_placeholder_re():
     from onibus.merge import _T_PLACEHOLDER_RE, _T_HEADER_RE
 
@@ -1558,6 +1693,11 @@ def test_t_placeholder_re():
     assert _T_PLACEHOLDER_RE.search("T163") is None
     # Word boundary — T959435401x (no boundary) shouldn't match
     assert _T_PLACEHOLDER_RE.search("T959435401x") is None
+    # P0418-T5: 11-digit defensive widening (writer-bug format). docs-993168
+    # + docs-654701 emitted T<9-digit-P-placeholder><seq> = 11 digits.
+    assert _T_PLACEHOLDER_RE.search("T99316800101 ").group(1) == "99316800101"
+    # 12-digit still rejected (upper bound is 11).
+    assert _T_PLACEHOLDER_RE.search("T993168001012") is None
 
     # Header regex caps at 4 digits — excludes placeholders by construction
     assert _T_HEADER_RE.findall("### T163 — title\n### T959435401 — ph\n") == ["163"]
@@ -2262,6 +2402,50 @@ def test_dag_flip_already_done_case_a_preserves_old_rows(dag_flip_repo):
         f"plan=None rows must not match plan=99; case (a) should still "
         f"bump. Got mc={result.mc}"
     )
+
+
+def test_dag_flip_consumes_queue_row(dag_flip_repo):
+    """P0418 gap D: dag_flip called queue_consume(f"P{plan_num}") — unpadded
+    "P414" — but MergeQueueRow.plan is stored zero-padded ("P0414"). Bare
+    str-cmp at queue_consume never matched → row never removed.
+
+    The P0414 regression test (test_dag_flip_moves_integration_branch_ref)
+    seeds NO queue row, so queue_consumed:0 was untested. This test seeds
+    a MergeQueueRow(plan="P0099", ...) before dag_flip(99), asserts
+    queue_consumed==1 AND the jsonl has zero matching rows post-flip."""
+    from onibus.jsonl import append_jsonl, read_jsonl
+    from onibus.merge import dag_flip
+    from onibus.models import MergeQueueRow
+
+    repo, dag_path = dag_flip_repo
+    dag_path.write_text(
+        '{"plan":99,"title":"feat","status":"UNIMPL"}\n'
+    )
+    (repo / "feature.txt").write_text("p99\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: p99", "--no-verify")
+
+    # Seed a queue row in canonical zero-padded form (the shape
+    # /dag-tick writes).
+    q = repo / ".claude" / "state" / "merge-queue.jsonl"
+    append_jsonl(q, MergeQueueRow(
+        plan="P0099", worktree="/x/p99", verdict="PASS", commit="deadbee",
+    ))
+    # Also seed an unrelated row to prove consume is selective.
+    append_jsonl(q, MergeQueueRow(
+        plan="P0100", worktree="/x/p100", verdict="PASS", commit="cafef00",
+    ))
+
+    result = dag_flip(99)
+
+    assert result.queue_consumed == 1, (
+        f"dag_flip(99) must consume the stored 'P0099' row; "
+        f"pre-P0418 f'P{{plan_num}}'='P99' never matched. "
+        f"Got queue_consumed={result.queue_consumed}"
+    )
+    remaining = read_jsonl(q, MergeQueueRow)
+    assert len(remaining) == 1
+    assert remaining[0].plan == "P0100"
 
 
 # ─── schema emission ─────────────────────────────────────────────────────────

@@ -28,6 +28,7 @@ from onibus.models import (
     LockStatus,
     MergeQueueRow,
     MergeSha,
+    canonical_plan_id,
 )
 
 # Module-local alias — tests monkeypatch this (rename_unassigned scanned main's
@@ -197,7 +198,7 @@ def dag_flip(plan_num: int) -> DagFlipResult:
     # the diff reads empty.
     unblocked = Dag.load().unblocked_by(plan_num)
     set_status(plan_num, "DONE")
-    consumed = queue_consume(f"P{plan_num}")
+    consumed = queue_consume(canonical_plan_id(plan_num))
 
     dag_rel = str(DAG_JSONL.relative_to(REPO_ROOT))
     git("add", dag_rel, cwd=REPO_ROOT)
@@ -311,7 +312,8 @@ def cadence() -> CadenceReport:
 def queue_consume(plan: str) -> int:
     """Remove a plan's row(s) from merge-queue.jsonl. Called post-merge so the
     queue doesn't accumulate forever. Returns count removed."""
-    return remove_jsonl(STATE_DIR / "merge-queue.jsonl", MergeQueueRow, lambda r: r.plan == plan)
+    plan_c = canonical_plan_id(plan)
+    return remove_jsonl(STATE_DIR / "merge-queue.jsonl", MergeQueueRow, lambda r: r.plan == plan_c)
 
 
 # ─── agent-row convenience ───────────────────────────────────────────────────
@@ -324,7 +326,9 @@ def agent_start(role: str, plan: str, agent_id: str | None = None, note: str = "
     m = re.fullmatch(r"P?(\d+)", plan)
     worktree = f"/root/src/rio-build/p{int(m.group(1))}" if m else None
     row = AgentRow(
-        plan=plan if plan.startswith("P") else f"P{plan}",
+        # The AgentRow field_validator normalizes on construct anyway, but
+        # explicit canonicalization at the call site is clearer.
+        plan=canonical_plan_id(plan),
         role=role,  # type: ignore[arg-type]
         agent_id=agent_id,
         worktree=worktree,
@@ -340,9 +344,12 @@ def agent_mark(plan: str, role: str, status: AgentStatus) -> int:
     updated. Replaces hand-editing the row to status=consumed."""
     path = STATE_DIR / "agents-running.jsonl"
     rows = read_jsonl(path, AgentRow)
+    # r.plan is already normalized by the field_validator on load; this
+    # normalizes the CALLER's arg so "414"/"P414"/"P0414" all match.
+    plan_c = canonical_plan_id(plan)
     n = 0
     for r in rows:
-        if r.plan == plan and r.role == role:
+        if r.plan == plan_c and r.role == role:
             r.status = status  # type: ignore[assignment]
             n += 1
     write_jsonl(path, rows)
@@ -404,7 +411,11 @@ _REAL_RE = re.compile(r"^plan-(\d{1,4})-")
 # T-placeholder: T9<runid><NN> — same 9-digit scheme as P-placeholders but
 # with a T prefix to disambiguate. Per-batch-doc sequences (not global) so
 # P0304's T959435401 and P0311's T959435401 are distinct placeholders.
-_T_PLACEHOLDER_RE = re.compile(r"\bT(9\d{8})\b")
+# Regex is deliberately permissive (9-11 digits): the CANONICAL form is
+# 9-digit per rio-planner.md Step-1, but docs-993168 + docs-654701
+# emitted 11-digit T<P-placeholder><seq> tokens. Writer bugs shouldn't
+# strand tokens — catch them defensively here.
+_T_PLACEHOLDER_RE = re.compile(r"\bT(9\d{8,10})\b")
 # Real T-header: ### T<N> — where N is ≤4 digits. Cap excludes placeholders.
 _T_HEADER_RE = re.compile(r"^### T(\d{1,4}) —", re.M)
 
@@ -460,7 +471,9 @@ def _touched_batch_docs(worktree: Path, tgt: str) -> list[str]:
     touched = git("diff", "--name-only", f"{tgt}...HEAD", cwd=worktree).splitlines()
     return [
         rel for rel in touched
-        if re.match(r"\.claude/work/plan-0\d{3}-", rel)
+        # \d{4} (not 0\d{3}): plan-1NNN+ headroom. Still disjoint from
+        # 9-digit placeholder filenames by length.
+        if re.match(r"\.claude/work/plan-\d{4}-", rel)
         and (worktree / rel).exists()
     ]
 
@@ -494,13 +507,21 @@ def _max_existing_t(worktree: Path, rel_path: str, tgt: str) -> int:
 
 
 def _rewrite_t_placeholders(
-    worktree: Path, tgt: str, batch_docs: list[str]
+    worktree: Path, tgt: str, batch_docs: list[str],
+    placeholder_docs: list[str],
 ) -> dict[str, dict[str, int]]:
     """For each touched batch doc, assign real T-numbers to placeholders and
     rewrite in-place. Returns rel_path → {placeholder: assigned_t}.
 
     Per-doc sequence: each doc's assignments start from that doc's own
-    max-existing-T on TGT, not a global counter."""
+    max-existing-T on TGT, not a global counter.
+
+    placeholder_docs (P0418-T4): plan-9ddddddNN-*.md from the same
+    writer run. These are scanned for T-tokens and rewritten USING the
+    batch_docs' mappings (a T-ref in a placeholder doc points at a
+    batch-doc task, so the assignment is whatever that batch doc got).
+    Without this, a "see P0304-T912345601" cross-ref in a new standalone
+    plan doc would survive as a dead pointer."""
     found = _find_t_placeholders(worktree, batch_docs)
     result: dict[str, dict[str, int]] = {}
     for rel, phs in found.items():
@@ -516,6 +537,25 @@ def _rewrite_t_placeholders(
         if new != text:
             atomic_write_text(p, new)
         result[rel] = mapping
+
+    # Second pass: rewrite T-refs inside placeholder docs using the
+    # assignments just computed. One T-token can only point at one
+    # batch doc (writer emits T<runid><NN> where <runid><NN> is
+    # unique within the writer run), so union the mappings.
+    all_t: dict[str, int] = {}
+    for m in result.values():
+        all_t.update(m)
+    for rel in placeholder_docs:
+        p = worktree / rel
+        try:
+            text = p.read_text()
+        except FileNotFoundError:
+            continue
+        new = text
+        for ph, assigned in all_t.items():
+            new = new.replace(f"T{ph}", f"T{assigned}")
+        if new != text:
+            atomic_write_text(p, new)
     return result
 
 
@@ -555,8 +595,31 @@ def _rewrite_and_rename(
         new = text
         is_jsonl = rel.endswith(".jsonl")
         for r in mapping:
-            repl = str(r.assigned) if is_jsonl else f"{r.assigned:04d}"
-            new = new.replace(r.placeholder, repl)
+            padded = f"{r.assigned:04d}"
+            bare = str(r.assigned)
+            if is_jsonl:
+                # dag.jsonl: bare integer, no padding.
+                new = new.replace(r.placeholder, bare)
+            else:
+                # .md: anchored replaces. P-prefix and plan-prefix protect
+                # against T-substring collision (gap B: pre-P0418 bare
+                # replace would corrupt T959435401 → T0305 in placeholder
+                # docs, which the T-rewrite pass doesn't cover). The
+                # JSON-context regex handles the deps-fence bare-int case
+                # (gap C) — a zero-padded integer in `json deps` breaks
+                # json.loads.
+                new = new.replace(f"P{r.placeholder}", f"P{padded}")
+                new = new.replace(f"plan-{r.placeholder}", f"plan-{padded}")
+                # json-fence integer: immediately after `[`, `,`, `:`, or
+                # whitespace with word-boundary after. Unpadded. This also
+                # catches prose headers ("# Plan 924999901") — the token
+                # becomes bare-int, not padded, but the exact form there
+                # doesn't matter.
+                new = re.sub(
+                    rf"(?<=[\[,:\s]){re.escape(r.placeholder)}\b",
+                    bare,
+                    new,
+                )
         if new != text:
             atomic_write_text(p, new)
 
@@ -593,20 +656,27 @@ def rename_unassigned(branch: str) -> RenameReport:
         )
 
     # Enumerate touched batch-target docs once — shared by T-placeholder
-    # rewrite (P0401-T1) and P-cross-ref rewrite (P0304-T30).
+    # rewrite (P0401-T1) and P-cross-ref rewrite (P0304-T30). Also
+    # enumerate placeholder plan-docs up front so _rewrite_t_placeholders
+    # can cross-scan them (P0418-T4).
     batch_docs = _touched_batch_docs(worktree, INTEGRATION_BRANCH)
+    placeholders = _find_placeholders(worktree)
+    placeholder_docs = [
+        f".claude/work/plan-{ph}-{slug}.md" for ph, slug in placeholders
+    ]
 
     # T-placeholder rewrite FIRST. Writer uses 9<runid><NN> for BOTH
     # P-placeholders and T-placeholders (per-doc sequences both start at
     # 01), so the same 9-digit token can appear as T959435401 AND
-    # P959435401 in the same batch doc. The P-rewrite below does a bare
-    # str.replace("959435401", "0305") which would corrupt T959435401 →
-    # T0305. Running T-rewrite first consumes T959435401 → T4, leaving
-    # only P-contexts for the bare replace. Scan is pre-ff three-dot
-    # diff — see _touched_batch_docs for P0325 distinction.
-    t_map = _rewrite_t_placeholders(worktree, INTEGRATION_BRANCH, batch_docs)
-
-    placeholders = _find_placeholders(worktree)
+    # P959435401 in the same batch doc. Post-P0418 the P-rewrite below is
+    # prefix-anchored (P-prefix / plan-prefix / json-context), so this
+    # ordering is belt-and-suspenders — T-rewrite-first would be
+    # load-bearing only if a bare-int placeholder in .md ever coincided
+    # with a T-context, which anchoring excludes by construction. Scan is
+    # pre-ff three-dot diff — see _touched_batch_docs for P0325 distinction.
+    t_map = _rewrite_t_placeholders(
+        worktree, INTEGRATION_BRANCH, batch_docs, placeholder_docs,
+    )
     mapping: list[Rename] = []
     if placeholders:
         start = _next_real()

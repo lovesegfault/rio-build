@@ -827,9 +827,9 @@ def test_agent_start_derives_worktree(tmp_path: Path, monkeypatch):
     assert row.plan == "P0134"
     assert row.worktree == "/root/src/rio-build/p134"
     assert row.status == "running"
-    # Also accepts bare number.
+    # Also accepts bare number — canonicalized to zero-padded P0NNN (P0418).
     row2 = onibus.merge.agent_start("verify", "245")
-    assert row2.plan == "P245"
+    assert row2.plan == "P0245"
     assert row2.worktree == "/root/src/rio-build/p245"
 
 
@@ -857,7 +857,8 @@ def test_queue_consume_removes(tmp_path: Path, monkeypatch):
     append_jsonl(f, MergeQueueRow(plan="P2", worktree="/y", verdict="PASS", commit="b"))
     n = onibus.merge.queue_consume("P1")
     assert n == 1
-    assert [r.plan for r in read_jsonl(f, MergeQueueRow)] == ["P2"]
+    # P0418: field_validator normalizes stored plan to zero-padded canonical.
+    assert [r.plan for r in read_jsonl(f, MergeQueueRow)] == ["P0002"]
 
 
 def test_merger_report_unblocked_field():

@@ -37,6 +37,7 @@ from onibus.models import (
     KnownFlake,
     MergeQueueRow,
     PlanRow,
+    canonical_plan_id,
 )
 from onibus.plan_doc import qa_mechanical_check, tracey_coverage
 
@@ -205,8 +206,9 @@ def _cmd_state(args: argparse.Namespace) -> int:
         append_jsonl(STATE_DIR / "agents-running.jsonl", AgentRow.model_validate_json(args.json_row))
         return 0
     if args.state_cmd == "agent-lookup":
+        plan_c = canonical_plan_id(args.plan)
         for a in read_jsonl(STATE_DIR / "agents-running.jsonl", AgentRow):
-            if a.plan == args.plan and a.role == args.role:
+            if a.plan == plan_c and a.role == args.role:
                 print(a.model_dump_json())
                 break
         return 0
