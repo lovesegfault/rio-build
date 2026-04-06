@@ -59,7 +59,16 @@ spec:
     - deviceName: /dev/xvda
       ebs:
         volumeSize: {{ $k.dataVolumeSize }}
+        # gp3 with provisioned IOPS+throughput. Build workloads are
+        # IOPS-bound (NAR extract, cc1 -MMD dep writes, link); gp3
+        # baseline 3000 IOPS throttles -j32+. gp3 max is 16k IOPS /
+        # 1000 MiB/s — same IOPS we wanted from io2, but NO separate
+        # provisioned-IOPS account quota (io1/io2 cap at 300k/100k
+        # account-wide → 18/6 nodes at 16k each). io1/io2 once the
+        # quota increase lands (L-B3A130E6).
         volumeType: gp3
+        iops: {{ $k.dataVolumeIops }}
+        throughput: {{ $k.dataVolumeThroughputMiBps }}
         deleteOnTermination: true
         encrypted: true
   tags:

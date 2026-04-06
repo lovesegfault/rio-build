@@ -1042,22 +1042,25 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.reassign.no-promote-on-ephemeral-disconnect]
-/// I-188 (fix 1, defense-in-depth): a non-FOD assigned to a tiny
-/// EPHEMERAL builder that disconnects MUST NOT get its
-/// `size_class_floor` promoted. Ephemeral disconnect is the expected
-/// one-shot Job exit — not a size-adequacy signal. Without this gate
-/// the I-188 chain (ProcessCompletion → re-dispatch to freed slot →
-/// ephemeral exit → reassign → promote) walked the size ladder one
-/// class per derivation. Converse (non-ephemeral disconnect → DOES
-/// promote) at `test_assigned_disconnect_promotes_builder_floor`.
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
+/// I-197 (refines I-188 fix 1): a non-FOD assigned to a tiny EPHEMERAL
+/// builder that disconnects WITHOUT having sent a CompletionReport
+/// MUST get its `size_class_floor` promoted. The pod was OOMKilled
+/// mid-build — that IS a size-adequacy signal. I-188's blanket
+/// "ephemeral disconnect → never promote" made openssl OOM-loop on
+/// `tiny` for hours with `size_class_floor` empty.
 ///
-/// Tests Fix 1 in isolation from Fix 2: this disconnect is direct
+/// Converse (ephemeral disconnect AFTER completion → does NOT promote,
+/// the original I-188 race) at
+/// `test_ephemeral_disconnect_after_completion_no_promote`.
+/// Non-ephemeral disconnect → promote at
+/// `test_assigned_disconnect_promotes_builder_floor`.
+///
+/// Tests the reassign-side gate in isolation: disconnect is direct
 /// (ExecutorDisconnected), not via ProcessCompletion, so the
-/// draining-on-completion gate doesn't apply — only the
-/// reassign-side ephemeral check does.
+/// draining-on-completion gate (Fix 2) doesn't apply.
 #[tokio::test]
-async fn test_ephemeral_disconnect_does_not_promote_floor() -> TestResult {
+async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
@@ -1105,9 +1108,10 @@ async fn test_ephemeral_disconnect_does_not_promote_floor() -> TestResult {
     let asgn = recv_assignment(&mut rx).await;
     assert!(asgn.drv_path.contains("eph-glibc-188"));
 
-    // Ephemeral builder exits (one-shot) → disconnect with drv
-    // still Assigned. Status==Assigned is the production path
-    // (Running is only set at completion via ensure_running()).
+    // Ephemeral builder OOMKilled mid-build → disconnect with drv
+    // still Assigned, NO CompletionReport sent (last_completed=None).
+    // Status==Assigned is the production path (Running is only set at
+    // completion via ensure_running()).
     handle
         .send_unchecked(ActorCommand::ExecutorDisconnected {
             executor_id: "b-eph".into(),
@@ -1121,8 +1125,10 @@ async fn test_ephemeral_disconnect_does_not_promote_floor() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        info.size_class_floor, None,
-        "I-188: ephemeral disconnect must NOT promote floor; got {:?}",
+        info.size_class_floor.as_deref(),
+        Some("small"),
+        "I-197: ephemeral OOMKilled disconnect (no CompletionReport) \
+         must promote floor tiny→small; got {:?}",
         info.size_class_floor
     );
     assert!(
@@ -1130,6 +1136,135 @@ async fn test_ephemeral_disconnect_does_not_promote_floor() -> TestResult {
         "I-097: Assigned-only disconnect must not record failure"
     );
     assert_eq!(info.status, DerivationStatus::Ready);
+
+    Ok(())
+}
+
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
+/// I-188 race case (the suppress that I-197 KEEPS): an EPHEMERAL
+/// builder that disconnects with `running_build == Some(X)` AFTER
+/// having sent CompletionReport(X) MUST NOT promote `size_class_
+/// floor`. `last_completed == running_build` → expected one-shot
+/// exit, not a size-adequacy signal.
+///
+/// Setup synthesizes the race directly: complete X (sets
+/// `last_completed=X`, clears `running_build`, sets `draining`),
+/// then a heartbeat re-reports X as running (out-of-order delivery
+/// — heartbeat snapshotted before completion landed) repopulating
+/// `running_build=X`, then disconnect. This is the narrowest
+/// surviving window where Fix 1's gate fires; Fix 2
+/// (`r[sched.ephemeral.no-redispatch-after-completion]`) closes the
+/// dependent-redispatch race at the source so this is defense-in-
+/// depth.
+#[tokio::test]
+async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ])
+    });
+
+    let mut rx = connect_builder_classed(&handle, "b-eph2", "x86_64-linux", "tiny").await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            ephemeral: true,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: Some("tiny".into()),
+            executor_id: "b-eph2".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            running_builds: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    let node = make_test_node("eph-race-188", "x86_64-linux");
+    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(asgn.drv_path.contains("eph-race-188"));
+    let drv_path = asgn.drv_path.clone();
+
+    // CompletionReport(X) → last_completed=X, running_build=None,
+    // draining=true (Fix 2).
+    complete_success_empty(&handle, "b-eph2", "eph-race-188").await?;
+    barrier(&handle).await;
+
+    // Out-of-order heartbeat (snapshotted before completion landed)
+    // re-reports X as running → reconcile repopulates running_build=X
+    // (adopt_heartbeat_build's terminal-status arm warns but the
+    // caller still sets running_build). last_completed stays X
+    // (heartbeat doesn't touch it).
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            ephemeral: true,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            bloom: None,
+            size_class: Some("tiny".into()),
+            executor_id: "b-eph2".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            running_builds: vec![drv_path],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Precondition: running_build re-populated. Without this the
+    // disconnect's reassign loop is empty and the assertion below
+    // passes trivially.
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.executor_id == "b-eph2")
+        .expect("b-eph2 still registered");
+    assert_eq!(
+        w.running_count, 1,
+        "precondition: heartbeat reconcile re-populated running_build; \
+         test would pass trivially otherwise"
+    );
+
+    // Ephemeral exits → disconnect. running_build=Some(X),
+    // last_completed=Some(X) → expected one-shot exit → NO promote.
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "b-eph2".into(),
+        })
+        .await?;
+    barrier(&handle).await;
+    drop(rx);
+
+    let info = handle
+        .debug_query_derivation("eph-race-188")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        info.size_class_floor, None,
+        "I-188: ephemeral disconnect AFTER CompletionReport for the \
+         running drv (last_completed == running_build) must NOT \
+         promote floor; got {:?}",
+        info.size_class_floor
+    );
 
     Ok(())
 }

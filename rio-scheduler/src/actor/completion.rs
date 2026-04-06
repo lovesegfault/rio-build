@@ -538,6 +538,13 @@ impl DagActor {
             && worker.running_build.as_ref() == Some(drv_hash)
         {
             worker.running_build = None;
+            // I-197: record that THIS drv terminated on THIS executor.
+            // `reassign_derivations` reads it on disconnect to tell
+            // OOMKilled-mid-build (last_completed != running) from the
+            // I-188 post-completion race (last_completed == running).
+            // Any terminal report counts — success, failure, infra,
+            // cancelled — the build is no longer "in flight" either way.
+            worker.last_completed = Some(drv_hash.clone());
             // r[impl sched.ephemeral.no-redispatch-after-completion]
             // I-188: an ephemeral (one-shot Job) executor will exit
             // after this completion. Mark it draining NOW — before

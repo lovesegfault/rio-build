@@ -98,6 +98,19 @@ pub struct ExecutorState {
     /// anyway, but in the gap the new scheduler would mis-dispatch.
     /// Heartbeat is the only writer.
     pub draining_hb: bool,
+    /// Last derivation this executor sent a `CompletionReport` for
+    /// (any terminal status). Set in `handle_completion` alongside the
+    /// `running_build = None` clear. In-memory only.
+    ///
+    /// I-197: refines the I-188 ephemeral-disconnect gate. An ephemeral
+    /// disconnect with `running_build == Some(X)` and `last_completed
+    /// != Some(X)` means X was mid-build when the pod died (OOMKilled)
+    /// → promote `size_class_floor`. Only when `last_completed ==
+    /// running_build` is the disconnect the expected post-completion
+    /// one-shot exit (the I-188 race) → suppress promotion. The
+    /// blanket I-188 suppress made an OOMKilled `tiny` ephemeral loop
+    /// at the same class for hours (openssl, `size_class_floor` empty).
+    pub last_completed: Option<DrvHash>,
     /// FUSE circuit breaker open on the executor — it can't fetch inputs
     /// from rio-store. Treated like `draining`: `has_capacity()` returns
     /// false, `best_executor()` excludes it. Unlike `draining` this is
@@ -180,6 +193,7 @@ impl ExecutorState {
             size_class: None,
             draining: false,
             draining_hb: false,
+            last_completed: None,
             store_degraded: false,
             connected_since: Instant::now(),
             last_resources: None,

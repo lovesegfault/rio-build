@@ -564,7 +564,7 @@ pub(crate) fn parse_cpu_max(content: &str) -> u32 {
     }
 }
 
-// r[impl builder.cores.cgroup-clamp]
+// r[impl builder.cores.cgroup-clamp+2]
 /// Effective core count for `build_cores` (`nix --cores`, → `make -jN`).
 ///
 /// Reads `cpu.max` from the delegated-root cgroup (`parent`). In a k8s
@@ -575,9 +575,11 @@ pub(crate) fn parse_cpu_max(content: &str) -> u32 {
 /// at ~100MB → cgroup OOM-loop (cc1 killed, make respawns, never
 /// converges). I-196: python3-minimal stuck 15min on a `tiny` builder.
 ///
-/// Returns host nproc if `cpu.max` is unreadable (e.g. running outside
-/// a cgroup-limited container in tests) — same value the daemon would
-/// have picked on its own.
+/// I-197: builder/fetcher pools set `limits.cpu == requests.cpu`
+/// (hard, no burst — `672d1bf8`), so `cpu.max` is always a real quota
+/// in production. The `"max"` → nproc fallback only fires in VM tests
+/// / bare-metal dev. Also written to nix.conf `cores =` as
+/// defense-in-depth (see `executor::setup_nix_conf`).
 pub fn effective_cores(parent: &Path) -> u32 {
     match fs::read_to_string(parent.join("cpu.max")) {
         Ok(s) => parse_cpu_max(&s),
@@ -1028,7 +1030,7 @@ mod tests {
         assert_eq!(read_single_u64(&dir.path().join("nope")), None);
     }
 
-    // r[verify builder.cores.cgroup-clamp]
+    // r[verify builder.cores.cgroup-clamp+2]
     /// I-196: cpu.max → effective whole-core count for `make -jN`.
     /// Ceiling division, min 1, "max" → host nproc.
     #[test]
@@ -1041,6 +1043,8 @@ mod tests {
         assert_eq!(parse_cpu_max("200000 100000\n"), 2);
         // unbounded: literal "max". Period is still present
         // (kernel writes "max 100000"); period-less also handled.
+        // I-197: builder/fetcher pools set limits.cpu == requests.cpu
+        // (672d1bf8) so this path is dev/VM-test only in production.
         assert_eq!(parse_cpu_max("max 100000\n"), nproc());
         assert_eq!(parse_cpu_max("max\n"), nproc());
         // garbage → nproc fallback (advisory clamp; cgroup throttle

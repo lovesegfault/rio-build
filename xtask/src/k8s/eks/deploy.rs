@@ -51,13 +51,13 @@ const BUILDER_POOL_SETS_JSON: &str = r#"[
   {"name":"x86-64-kvm","systems":["x86_64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
    "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
-     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"60Gi"},
-                  "limits":{"memory":"256Gi"}}}]},
+     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"96Gi"},
+                  "limits":{"cpu":"128","memory":"256Gi"}}}]},
   {"name":"aarch64-kvm","systems":["aarch64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
    "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
-     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"60Gi"},
-                  "limits":{"memory":"256Gi"}}}]}
+     "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"96Gi"},
+                  "limits":{"cpu":"128","memory":"256Gi"}}}]}
 ]"#;
 
 /// One FetcherPool per arch — `system="builtin"` FODs overflow to
@@ -219,9 +219,9 @@ pub async fn run(
             // per-class resource requests. The scheduler's classify()
             // routes each derivation to the smallest covering class by
             // (est_duration, peak_memory) so a 50MB hello build gets a
-            // 512Mi pod and gcc gets 16Gi. Ephemeral children: one Job
-            // per build, sized by class. Karpenter bin-packs across
-            // c6a.large..c6a.8xlarge.
+            // 2-core/4Gi pod and llvm gets 128-core/256Gi. Ephemeral
+            // children: one Job per build, sized by class. Karpenter
+            // bin-packs across c6a.large..c6a.32xlarge.
             //
             // I-117b: one BuilderPoolSet per arch (same I-108 list/
             // defaults split). Both arches get adaptive sizing — child

@@ -457,8 +457,22 @@ pub async fn execute_build(
         input_metadata,
     } = resolve_inputs(&*store_client, &drv, drv_path).await?;
 
+    // r[impl builder.cores.cgroup-clamp+2]
+    // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
+    // and wopSetOptions build_cores below. I-196/I-197 rationale at
+    // crate::cgroup::effective_cores.
+    let effective_cores = crate::cgroup::effective_cores(&env.cgroup_parent);
+
     // 4. Populate sandbox: synth DB, nix.conf, FOD output whiteouts.
-    prepare_sandbox(&overlay_mount, &drv, drv_path, input_metadata, is_fod).await?;
+    prepare_sandbox(
+        &overlay_mount,
+        &drv,
+        drv_path,
+        input_metadata,
+        is_fod,
+        effective_cores,
+    )
+    .await?;
 
     // 4b. Arm JIT FUSE fetch (I-043 redesign): register the input
     // closure as the FUSE `lookup()` allowlist. The daemon's first
@@ -545,16 +559,18 @@ pub async fn execute_build(
         .map(|o| o.max_silent_time)
         .filter(|&v| v > 0)
         .unwrap_or(env.max_silent_time);
-    // r[impl builder.cores.cgroup-clamp]
+    // r[impl builder.cores.cgroup-clamp+2]
     // I-196: NEVER pass build_cores=0 to the daemon. 0 means "use
     // nproc", and nproc inside a pod sees ALL node cores (cgroup CPU
     // quota throttles scheduling, doesn't hide CPUs). On a 16-core
     // node a `tiny` (0.5-core, 1Gi) builder would run `make -j16` →
     // 16×cc1×~100MB → cgroup OOM-loop. Clamp to the pod's cpu.max
-    // (delegated-root cgroup), and cap any client-requested value at
-    // the same ceiling — a client asking for --cores 64 on a 2-core
-    // pod gets 2.
-    let effective_cores = u64::from(crate::cgroup::effective_cores(&env.cgroup_parent));
+    // (I-197: pools set limits.cpu == requests.cpu so cpu.max is
+    // always a real quota), and cap any client-requested value at the
+    // same ceiling — a client asking for --cores 64 on a 2-core pod
+    // gets 2. Computed once above (also written to nix.conf in
+    // prepare_sandbox as defense-in-depth).
+    let effective_cores = u64::from(effective_cores);
     let build_cores = match opts.map(|o| o.build_cores).filter(|&c| c > 0) {
         Some(client) => client.min(effective_cores),
         None => effective_cores,
@@ -1093,6 +1109,7 @@ async fn prepare_sandbox(
     drv_path: &str,
     synth_paths: Vec<SynthPathInfo>,
     is_fod: bool,
+    effective_cores: u32,
 ) -> Result<(), ExecutorError> {
     // Generate synthetic DB from caller-supplied metadata (I-106:
     // captured during compute_input_closure's BFS, no second QPI pass).
@@ -1126,7 +1143,7 @@ async fn prepare_sandbox(
     synth_db::generate_db(&db_path, &synth_paths, &drv_outputs).await?;
 
     // Set up nix.conf in overlay
-    setup_nix_conf(&overlay_mount.upper_nix_conf())?;
+    setup_nix_conf(&overlay_mount.upper_nix_conf(), effective_cores)?;
 
     // Whiteout declared output paths in the overlay upper layer.
     //
@@ -1538,12 +1555,20 @@ async fn collect_outputs(
 ///
 /// Checks for an operator override at [`NIX_CONF_OVERRIDE_PATH`]
 /// first (mounted from the `rio-nix-conf` ConfigMap in K8s). If
-/// present, copies it verbatim; else uses [`WORKER_NIX_CONF`].
+/// present, copies it; else uses [`WORKER_NIX_CONF`]. In BOTH cases,
+/// `cores = <effective_cores>` and `max-jobs = 1` are appended last
+/// (later lines win in nix.conf, so the operator override is
+/// preserved for everything else but cannot un-clamp cores).
 ///
 /// Override use case: operator wants to add e.g. `extra-sandbox-
 /// paths = /some/secret` or tweak `sandbox-build-dir`. ConfigMap
 /// edit + pod restart, no image rebuild.
-fn setup_nix_conf(upper_nix_conf: &Path) -> Result<(), ExecutorError> {
+///
+/// I-197 defense-in-depth: `effective_cores` is ALSO sent via
+/// `wopSetOptions.build_cores`, which is the primary path. Writing
+/// it to nix.conf catches an upstream `wopSetOptions` regression
+/// (the daemon would otherwise fall back to nix.conf → host nproc).
+fn setup_nix_conf(upper_nix_conf: &Path, effective_cores: u32) -> Result<(), ExecutorError> {
     std::fs::create_dir_all(upper_nix_conf).map_err(ExecutorError::NixConf)?;
 
     // Try the override first. `read` (not `read_to_string`) —
@@ -1559,7 +1584,7 @@ fn setup_nix_conf(upper_nix_conf: &Path) -> Result<(), ExecutorError> {
     // the ConfigMap is missing → empty nix.conf → Nix defaults →
     // substitute=true → cache.nixos.org lookup → airgap DNS
     // timeout (600s+ hang).
-    let content = match std::fs::read(NIX_CONF_OVERRIDE_PATH) {
+    let mut content = match std::fs::read(NIX_CONF_OVERRIDE_PATH) {
         Ok(bytes) if !bytes.is_empty() => {
             tracing::debug!(
                 path = NIX_CONF_OVERRIDE_PATH,
@@ -1573,6 +1598,21 @@ fn setup_nix_conf(upper_nix_conf: &Path) -> Result<(), ExecutorError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => WORKER_NIX_CONF.as_bytes().to_vec(),
         Err(e) => return Err(ExecutorError::NixConf(e)),
     };
+
+    // r[impl builder.cores.cgroup-clamp+2]
+    // Append AFTER the base/override (later lines win). max-jobs=1:
+    // single-slot builder (P0537) — the daemon should never start a
+    // second build even if the wopBuildDerivation flow somehow
+    // requests it. cores: same value sent via wopSetOptions; nix.conf
+    // is the fallback if that opcode is dropped/ignored. .max(1):
+    // never write `cores = 0` (daemon resolves 0 → nproc, the I-196
+    // failure mode).
+    if !content.ends_with(b"\n") {
+        content.push(b'\n');
+    }
+    content.extend_from_slice(
+        format!("max-jobs = 1\ncores = {}\n", effective_cores.max(1)).as_bytes(),
+    );
 
     std::fs::write(upper_nix_conf.join("nix.conf"), content).map_err(ExecutorError::NixConf)?;
     Ok(())
@@ -1818,16 +1858,33 @@ mod tests {
         assert!(WORKER_NIX_CONF.contains("sandbox-fallback = false"));
     }
 
+    // r[verify builder.cores.cgroup-clamp+2]
     #[test]
     fn test_setup_nix_conf() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let conf_dir = dir.path().join("etc/nix");
-        setup_nix_conf(&conf_dir)?;
+        setup_nix_conf(&conf_dir, 2)?;
 
         let conf_path = conf_dir.join("nix.conf");
         assert!(conf_path.exists());
         let content = std::fs::read_to_string(&conf_path)?;
         assert!(content.contains("sandbox = true"));
+        // I-197 defense-in-depth: cores/max-jobs appended AFTER the
+        // base content (later lines win in nix.conf).
+        assert!(content.contains("max-jobs = 1\n"));
+        assert!(content.contains("cores = 2\n"));
+        let sandbox_pos = content.find("sandbox = true").unwrap();
+        let cores_pos = content.find("cores = 2").unwrap();
+        assert!(
+            cores_pos > sandbox_pos,
+            "cores= appended after base content so it wins over any \
+             override; got:\n{content}"
+        );
+        // Never `cores = 0` (daemon resolves 0 → nproc, the I-196 bug).
+        setup_nix_conf(&conf_dir, 0)?;
+        let content = std::fs::read_to_string(&conf_path)?;
+        assert!(content.contains("cores = 1\n"), "0 clamped to 1");
+        assert!(!content.contains("cores = 0"));
         Ok(())
     }
 

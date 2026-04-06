@@ -469,11 +469,17 @@ karpenter:
   # "use whatever was last tagged".
   amiTag: ""
   # Root volume (/dev/xvda — single root, NixOS doesn't split OS/data).
-  # boot.growPartition expands / to fill on first boot. Builder pods
-  # request 25Gi ephemeral-storage (fuseCacheSize + headroom); size for
-  # a few workers bin-packed on one node plus image layers. gp3 100Gi
-  # ≈ $8/mo per node.
-  dataVolumeSize: 100Gi
+  # boot.growPartition expands / to fill on first boot. xlarge requests
+  # 96Gi ephemeral-storage; kubelet reserves ~10% for eviction threshold
+  # + image cache, so the node needs headroom above the largest request.
+  dataVolumeSize: 200Gi
+  # gp3 provisioned IOPS+throughput (max for gp3). Build workloads are
+  # IOPS-bound; baseline 3000 throttles -j32+. gp3 has no separate
+  # provisioned-IOPS account quota — io1/io2 do (300k/100k → 18/6
+  # nodes at 16k each). Switch to io1/io2 after quota increase
+  # (L-B3A130E6) lands.
+  dataVolumeIops: 16000
+  dataVolumeThroughputMiBps: 1000
 
   # Three NodePools, one EC2NodeClass. Weighted priority: Karpenter tries
   # high-weight first, falls through if pod doesn't fit or capacity is
@@ -579,10 +585,10 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # ~2-3 metal hosts max (96-192 vCPU each). nixos-test derivations
-      # are rare relative to the general build stream; queue a little
-      # rather than burn $$ on idle metal.
-      limits: {cpu: 512}
+      # ~26 metal hosts max at 192 vCPU each. kvm-xlarge=128 cores ×
+      # maxReplicas 10 × 2 arches = 2560 vCPU at full burst — this
+      # leaves headroom. consolidateAfter:30s reaps idle metal fast.
+      limits: {cpu: 5000}
       consolidateAfter: 30s
 
     # r[impl fetcher.node.dedicated]
@@ -874,16 +880,19 @@ builderPoolSetDefaults:
   # with the given resources. cutoffSecs/mem feed the SCHEDULER's
   # classify() (via scheduler.sizeClasses — keep names in sync).
   # Five-tier default sized for c6a/c7a bin-packing on EKS:
-  #   tiny→c6a.large, small→c6a.xlarge, medium→c6a.2xlarge,
-  #   large→c6a.4xlarge, xlarge→c6a.8xlarge.
+  #   tiny→c6a.large(2), small→c6a.2xlarge(8), medium→c6a.8xlarge(32),
+  #   large→c6a.16xlarge(64), xlarge→c6a.32xlarge(128).
   # Memory limit at 2× request (same blast-radius cap as
-  # builderPoolDefaults.resources). No CPU limit — compressible.
-  # I-196: 2/8/32/64/128 cores. <2 means make -j1 which serializes
-  # configure scripts; the steep ramp lets the EMA classifier route
-  # compile-heavy work straight to a node that finishes it fast
-  # rather than thrashing on a 2-core box. Memory ≈ 2Gi/core (cc1
-  # peaks ~100-200MB; -jN headroom). MUST track scheduler.sizeClasses
-  # in deploy.rs SIZE_CLASSES_JSON.
+  # builderPoolDefaults.resources).
+  # I-196/I-197: 2/8/32/64/128 cores. CPU+memory are HARD LIMITS
+  # (limits = requests, Guaranteed QoS) — a build that needs more
+  # than its class's envelope should be PROMOTED (I-177), not burst
+  # into a neighbor's headroom. Bursting makes EMA duration estimates
+  # unreliable and defeats size-class learning. With limits.cpu set,
+  # cgroup cpu.max = limit → effective_cores() reads it directly →
+  # NIX_BUILD_CORES = -jN matches the class. Memory limit at 2×
+  # request gives OOM headroom while keeping the envelope bounded.
+  # MUST track scheduler.sizeClasses in deploy.rs SIZE_CLASSES_JSON.
   classes:
     - name: tiny
       cutoffSecs: 30
@@ -892,31 +901,31 @@ builderPoolSetDefaults:
         # I-118: 2Gi storage — hello-class builds need <500MB FUSE
         # cache + overlay. 10Gi was the dominant scheduling blocker.
         requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "2Gi"}
-        limits: {memory: "4Gi"}
+        limits: {cpu: "2", memory: "4Gi"}
     - name: small
       cutoffSecs: 120
       maxReplicas: 200
       resources:
-        requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "8Gi"}
-        limits: {memory: "16Gi"}
+        requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "4Gi"}
+        limits: {cpu: "8", memory: "16Gi"}
     - name: medium
       cutoffSecs: 600
       maxReplicas: 100
       resources:
-        requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "25Gi"}
-        limits: {memory: "64Gi"}
+        requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "32Gi"}
+        limits: {cpu: "32", memory: "64Gi"}
     - name: large
       cutoffSecs: 1800
       maxReplicas: 50
       resources:
-        requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "40Gi"}
-        limits: {memory: "128Gi"}
+        requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "64Gi"}
+        limits: {cpu: "64", memory: "128Gi"}
     - name: xlarge
       cutoffSecs: 7200
       maxReplicas: 20
       resources:
-        requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "60Gi"}
-        limits: {memory: "256Gi"}
+        requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "96Gi"}
+        limits: {cpu: "128", memory: "256Gi"}
   # poolTemplate fields layer over builderPoolDefaults (deep-merge), so
   # seccomp/tolerations/nodeSelector/privileged/hostUsers stay single-
   # sourced. Override here only what differs from the flat-pool defaults.
