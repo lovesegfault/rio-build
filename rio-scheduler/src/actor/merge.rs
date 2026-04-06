@@ -186,6 +186,11 @@ impl DagActor {
                     ),
                 );
             }
+            // r[impl sched.gc.path-tenants-upsert]
+            // Cache hit during merge: path already in store, new
+            // tenant needs attribution so GC retains under their
+            // policy. output_paths were just set above.
+            self.upsert_path_tenants_for(drv_hash).await;
         }
 
         // Compute critical-path priorities for newly-inserted nodes.
@@ -297,6 +302,15 @@ impl DagActor {
                     cached_count += 1;
                     metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
                         .increment(1);
+                    // r[impl sched.gc.path-tenants-upsert]
+                    // Pre-existing Completed/Skipped merged from
+                    // another build: this build's tenant now also
+                    // wants those output_paths retained. The node's
+                    // interested_builds already includes this build
+                    // (merge() added it); output_paths was set when
+                    // the node originally completed.
+                    self.upsert_path_tenants_for(&node.drv_hash.as_str().into())
+                        .await;
                 }
                 DerivationStatus::Poisoned | DerivationStatus::DependencyFailed => {
                     first_dep_failed.get_or_insert_with(|| node.drv_hash.as_str().into());

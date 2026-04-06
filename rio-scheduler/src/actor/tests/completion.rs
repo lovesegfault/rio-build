@@ -934,20 +934,16 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
 
     // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
     //
-    // debug_force_assign between failures: backoff_until prevents
-    // immediate re-dispatch after each failure. The test drives
-    // the assignment directly — we're testing the poison-threshold
-    // logic (3 distinct failed_workers → poisoned), not dispatch
-    // timing.
+    // debug_force_assign before each failure: backoff_until prevents
+    // immediate re-dispatch after each failure, AND the initial
+    // dispatch picks any of the 4 workers (not necessarily w1).
+    // Force-assign so the completion's worker_id matches
+    // assigned_worker — the stale-report guard would otherwise drop
+    // the completion. We're testing the poison-threshold logic
+    // (3 distinct failed_workers → poisoned), not dispatch timing.
     for (i, worker) in ["poison-w1", "poison-w2", "poison-w3"].iter().enumerate() {
-        if i > 0 {
-            // After the first failure, dispatch won't re-assign
-            // until backoff elapses. Force it. The worker is
-            // distinct each time so failed_workers exclusion
-            // wouldn't block (if backoff weren't in play).
-            let ok = handle.debug_force_assign(drv_hash, worker).await?;
-            assert!(ok, "force-assign should succeed");
-        }
+        let ok = handle.debug_force_assign(drv_hash, worker).await?;
+        assert!(ok, "force-assign should succeed (iter {i})");
         complete_failure(
             &handle,
             worker,
@@ -1007,13 +1003,14 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // Fail on both workers. After 2nd: failed_workers.len()=2 >=
-    // worker_count=2 → poison (clamp fires before threshold=3).
+    // Fail on both workers. After 2nd: all live workers in
+    // failed_workers → poison (clamp fires before threshold=3).
+    // Force-assign before each failure so the completion's
+    // worker_id matches assigned_worker (the stale-report guard
+    // would otherwise drop mismatched completions).
     for (i, worker) in ["starve-w1", "starve-w2"].iter().enumerate() {
-        if i > 0 {
-            let ok = handle.debug_force_assign(drv_hash, worker).await?;
-            assert!(ok, "force-assign should succeed");
-        }
+        let ok = handle.debug_force_assign(drv_hash, worker).await?;
+        assert!(ok, "force-assign should succeed (iter {i})");
         complete_failure(
             &handle,
             worker,
@@ -1070,12 +1067,12 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     // failed_workers insert and WITHOUT backoff — so immediate
     // re-dispatch to whatever worker wins. We drive via
     // debug_force_assign to make the per-worker assertion
-    // deterministic (avoid racing dispatch).
+    // deterministic AND so the completion's worker_id matches
+    // assigned_worker (the stale-report guard drops mismatched
+    // completions).
     for (i, worker) in ["infra-w1", "infra-w2", "infra-w3"].iter().enumerate() {
-        if i > 0 {
-            let ok = handle.debug_force_assign(drv_hash, worker).await?;
-            assert!(ok, "force-assign should succeed (no backoff, no exclusion)");
-        }
+        let ok = handle.debug_force_assign(drv_hash, worker).await?;
+        assert!(ok, "force-assign should succeed (iter {i})");
         complete_failure(
             &handle,
             worker,

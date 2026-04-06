@@ -108,6 +108,53 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.gc.path-tenants-upsert]
+    /// Best-effort `path_tenants` upsert for a derivation that just
+    /// reached a completed-equivalent state (Completed/Skipped/
+    /// cache-hit). Resolves `interested_builds → tenant_ids` via the
+    /// builds map, collects the node's `output_paths`, calls
+    /// `db.upsert_path_tenants`. Logs warn! on failure — GC may
+    /// under-retain, but never blocks the completion flow. The 24h
+    /// global grace is the fallback.
+    ///
+    /// Called at every path that marks a derivation's outputs as
+    /// "this tenant wants them": handle_success_completion, CA-cutoff
+    /// skipped nodes, merge-time cache hits, merge-time pre-existing
+    /// Completed, recovery orphan-completion. Missing any of these =
+    /// paths GC'd prematurely under that tenant's retention policy.
+    pub(super) async fn upsert_path_tenants_for(&self, drv_hash: &DrvHash) {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return;
+        };
+        if state.output_paths.is_empty() {
+            return;
+        }
+        // tenant_id: Option<Uuid> — filter_map drops None
+        // (single-tenant mode; empty SSH-key comment → gateway sends
+        // "" → scheduler stores None). Only builds with a resolved
+        // tenant contribute.
+        let tenant_ids: Vec<Uuid> = state
+            .interested_builds
+            .iter()
+            .filter_map(|id| self.builds.get(id)?.tenant_id)
+            .collect();
+        if tenant_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self
+            .db
+            .upsert_path_tenants(&state.output_paths, &tenant_ids)
+            .await
+        {
+            warn!(
+                drv_hash = %drv_hash, ?e,
+                output_paths = state.output_paths.len(),
+                tenants = tenant_ids.len(),
+                "path_tenants upsert failed; GC retention may under-retain"
+            );
+        }
+    }
+
     /// Walk downstream from `trigger` (a CA-unchanged completion) and
     /// discover prior output_paths for each cascade candidate via the
     /// `realisation_deps` reverse walk. Returns candidates whose
@@ -370,6 +417,22 @@ impl DagActor {
                 drv_hash = %drv_hash,
                 current_status = %current_status,
                 "completion for derivation not in assigned/running state, ignoring"
+            );
+            return;
+        }
+
+        // r[impl sched.completion.idempotent]
+        // Stale-report guard: if this completion is from a worker that no
+        // longer owns the derivation (reassigned after disconnect/timeout),
+        // drop it. The current assigned_worker's report is authoritative.
+        if let Some(assigned) = &state.assigned_worker
+            && assigned != worker_id
+        {
+            debug!(
+                drv_hash = %drv_hash,
+                stale_worker = %worker_id,
+                current_worker = %assigned,
+                "dropping stale completion report"
             );
             return;
         }
@@ -692,6 +755,13 @@ impl DagActor {
         //
         // Placement BEFORE find_newly_ready: skipped nodes don't get
         // promoted to Ready + pushed to the dispatch queue.
+        //
+        // `skipped_interested`: union of interested_builds over all
+        // skipped nodes. A skipped node may belong to a merged build
+        // that the trigger does NOT — without unioning this into the
+        // completion-check loop below, that merged build never sees
+        // check_build_completion fire and hangs Active forever.
+        let mut skipped_interested: HashSet<Uuid> = HashSet::new();
         if self
             .dag
             .node(drv_hash)
@@ -753,6 +823,18 @@ impl DagActor {
                         }
                     }
                 }
+                // Collect interested_builds BEFORE persist (though
+                // persist doesn't clear them — just for locality with
+                // the node-mut block above).
+                if let Some(state) = self.dag.node(hash) {
+                    skipped_interested.extend(state.interested_builds.iter().copied());
+                }
+                // r[impl sched.gc.path-tenants-upsert]
+                // Skipped node's output_paths (from the prior build's
+                // realization, stamped above) need tenant attribution
+                // — the build's tenant wants them retained, same as
+                // if the node had actually built them.
+                self.upsert_path_tenants_for(hash).await;
                 self.persist_status(hash, DerivationStatus::Skipped, None)
                     .await;
                 debug!(drv_hash = %hash, trigger = %drv_hash,
@@ -1029,30 +1111,7 @@ impl DagActor {
         self.trigger_log_flush(drv_hash, interested_builds.clone());
 
         // r[impl sched.gc.path-tenants-upsert]
-        // Best-effort: GC may under-retain on failure, but never fail
-        // completion. The 24h global grace is the fallback.
-        //
-        // tenant_id: Option<Uuid> — filter_map drops None (single-tenant
-        // mode; empty SSH-key comment → gateway sends "" → scheduler
-        // stores None). Only builds with a resolved tenant contribute.
-        let tenant_ids: Vec<Uuid> = interested_builds
-            .iter()
-            .filter_map(|id| self.builds.get(id)?.tenant_id)
-            .collect();
-        if !tenant_ids.is_empty()
-            && !output_paths.is_empty()
-            && let Err(e) = self
-                .db
-                .upsert_path_tenants(&output_paths, &tenant_ids)
-                .await
-        {
-            warn!(
-                ?e,
-                output_paths = output_paths.len(),
-                tenants = tenant_ids.len(),
-                "path_tenants upsert failed; GC retention may under-retain"
-            );
-        }
+        self.upsert_path_tenants_for(drv_hash).await;
 
         // Update ancestor priorities: this node is now terminal, so it
         // no longer contributes to its parents' max-child-priority.
@@ -1094,16 +1153,21 @@ impl DagActor {
             }
         }
 
-        // Update build completion status
-        for build_id in &interested_builds {
-            self.update_build_counts(*build_id);
+        // Update build completion status. Union the trigger's
+        // interested_builds with skipped nodes' — a CA-cutoff-skipped
+        // node may belong to a merged build the trigger does not, and
+        // that build needs check_build_completion too.
+        let mut check_builds: HashSet<Uuid> = interested_builds.iter().copied().collect();
+        check_builds.extend(skipped_interested);
+        for build_id in check_builds {
+            self.update_build_counts(build_id);
             // Progress snapshot AFTER update_ancestors (critpath is
             // fresh — root priority dropped when this drv went
             // terminal) and BEFORE check_build_completion (which may
             // emit BuildCompleted; a final Progress showing 0
             // remaining is still useful right before that).
-            self.emit_progress(*build_id);
-            self.check_build_completion(*build_id).await;
+            self.emit_progress(build_id);
+            self.check_build_completion(build_id).await;
         }
     }
 
@@ -1151,11 +1215,13 @@ impl DagActor {
 
         // Cascade: parents of a poisoned derivation can never complete.
         // Transition them to DependencyFailed so keepGoing builds terminate.
-        self.cascade_dependency_failure(drv_hash).await;
+        let cascaded = self.cascade_dependency_failure(drv_hash).await;
 
-        // Propagate failure to interested builds.
-        let interested_builds = self.get_interested_builds(drv_hash);
-        for build_id in interested_builds {
+        // Propagate failure to interested builds — union of trigger's
+        // AND cascaded nodes'. A cascaded parent may belong to a
+        // merged build the trigger does not; that build must also get
+        // handle_derivation_failure or it hangs Active forever.
+        for build_id in self.union_interested_with_cascaded(drv_hash, &cascaded) {
             self.handle_derivation_failure(build_id, drv_hash).await;
         }
     }
@@ -1209,6 +1275,7 @@ impl DagActor {
             .record_failure_and_check_poison(drv_hash, worker_id)
             .await;
 
+        // r[impl sched.retry.per-worker-budget]
         // Starvation guard: clamp effective threshold to worker_count.
         // If worker_count < configured threshold and ALL connected
         // workers are in failed_workers, best_worker returns None
@@ -1218,23 +1285,27 @@ impl DagActor {
         // threshold=3), never dispatches. Poison now so the operator
         // gets a signal instead of a silent stuck derivation.
         //
-        // worker_count > 0 guard: an empty cluster (all workers
+        // Starvation = every LIVE worker has failed this derivation.
+        // failed_workers may contain dead workers (disconnected since
+        // recording); intersect with the live set so a single stale
+        // failed-worker entry + one live worker doesn't false-poison.
+        //
+        // !workers.is_empty() guard: an empty cluster (all workers
         // disconnected mid-failure) shouldn't auto-poison — the
         // derivation CAN dispatch once workers reconnect.
-        let worker_count = self.workers.len();
         let all_workers_failed = !reached_poison
-            && worker_count > 0
+            && !self.workers.is_empty()
             && self
                 .dag
                 .node(drv_hash)
-                .is_some_and(|s| s.failed_workers.len() >= worker_count);
+                .is_some_and(|s| self.workers.keys().all(|w| s.failed_workers.contains(w)));
         if all_workers_failed {
             warn!(
                 drv_hash = %drv_hash,
-                worker_count,
+                worker_count = self.workers.len(),
                 configured_threshold = self.poison_config.threshold,
-                "all available workers failed — poisoning below configured threshold \
-                 (effective threshold clamped to worker_count)"
+                "all live workers failed — poisoning below configured threshold \
+                 (effective threshold clamped to live worker set)"
             );
         }
         let reached_poison = reached_poison || all_workers_failed;
@@ -1411,21 +1482,26 @@ impl DagActor {
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.
-        self.cascade_dependency_failure(drv_hash).await;
+        let cascaded = self.cascade_dependency_failure(drv_hash).await;
 
-        // Propagate failure to interested builds
-        let interested_builds = self.get_interested_builds(drv_hash);
+        // Propagate failure to interested builds — union of trigger's
+        // AND cascaded nodes' (a cascaded parent may belong to a
+        // merged build the trigger does not). Log-flush + failure
+        // event use the trigger's set (those builds saw THIS drv
+        // fail); handle_derivation_failure uses the union (those
+        // builds saw SOME drv fail, possibly a cascaded one).
+        let trigger_builds = self.get_interested_builds(drv_hash);
 
         // Flush logs for failed builds too — the failure's log is often the
         // most useful log (compile errors, test output). Do this BEFORE
         // handle_derivation_failure below, which may transition builds to
         // terminal and schedule cleanup.
-        self.trigger_log_flush(drv_hash, interested_builds.clone());
+        self.trigger_log_flush(drv_hash, trigger_builds.clone());
 
-        for build_id in interested_builds {
+        for build_id in &trigger_builds {
             // Emit failure event
             self.emit_build_event(
-                build_id,
+                *build_id,
                 rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
                     derivation_path: self.drv_path_or_hash_fallback(drv_hash),
                     status: Some(rio_proto::dag::derivation_event::Status::Failed(
@@ -1437,7 +1513,9 @@ impl DagActor {
                     )),
                 }),
             );
+        }
 
+        for build_id in self.union_interested_with_cascaded(drv_hash, &cascaded) {
             self.handle_derivation_failure(build_id, drv_hash).await;
         }
     }
@@ -1473,14 +1551,14 @@ impl DagActor {
 
         // Cascade: parents of a timed-out derivation can't complete THIS
         // time (resubmit-reset handles the next attempt).
-        self.cascade_dependency_failure(drv_hash).await;
+        let cascaded = self.cascade_dependency_failure(drv_hash).await;
 
-        let interested_builds = self.get_interested_builds(drv_hash);
-        self.trigger_log_flush(drv_hash, interested_builds.clone());
+        let trigger_builds = self.get_interested_builds(drv_hash);
+        self.trigger_log_flush(drv_hash, trigger_builds.clone());
 
-        for build_id in interested_builds {
+        for build_id in &trigger_builds {
             self.emit_build_event(
-                build_id,
+                *build_id,
                 rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
                     derivation_path: self.drv_path_or_hash_fallback(drv_hash),
                     status: Some(rio_proto::dag::derivation_event::Status::Failed(
@@ -1491,6 +1569,9 @@ impl DagActor {
                     )),
                 }),
             );
+        }
+
+        for build_id in self.union_interested_with_cascaded(drv_hash, &cascaded) {
             self.handle_derivation_failure(build_id, drv_hash).await;
         }
     }
@@ -1498,8 +1579,15 @@ impl DagActor {
     /// Transitively walk parents of a poisoned derivation and transition all
     /// Queued/Ready/Created ancestors to DependencyFailed.
     ///
-    /// Without this, keepGoing builds with a poisoned leaf hang forever:
-    /// parents stay Queued, so completed+failed never reaches total.
+    /// Returns the set of derivations actually transitioned. Callers
+    /// union the `interested_builds` of each transitioned node with the
+    /// trigger's — a cascaded node may belong to a merged build that
+    /// the trigger does NOT (shared dep, different upstream). Without
+    /// the union, that merged build hangs Active forever.
+    ///
+    /// Without the cascade itself, keepGoing builds with a poisoned
+    /// leaf hang forever: parents stay Queued, so completed+failed
+    /// never reaches total.
     //
     // Same BFS-frontier shape as speculative_cascade_reachable but
     // async (per-step persist_status().await) + walks get_parents()
@@ -1507,9 +1595,13 @@ impl DagActor {
     // see P0405-T3 route-(a). If a 4th async walker appears, consider
     // route-(b): collect-then-batch-persist (safe because recovery
     // re-cascades from the original poisoned leaf on partial persist).
-    pub(super) async fn cascade_dependency_failure(&mut self, poisoned_hash: &DrvHash) {
+    pub(super) async fn cascade_dependency_failure(
+        &mut self,
+        poisoned_hash: &DrvHash,
+    ) -> HashSet<DrvHash> {
         let mut to_visit: Vec<DrvHash> = self.dag.get_parents(poisoned_hash);
         let mut visited: HashSet<DrvHash> = HashSet::new();
+        let mut transitioned: HashSet<DrvHash> = HashSet::new();
 
         while let Some(parent_hash) = to_visit.pop() {
             if !visited.insert(parent_hash.clone()) {
@@ -1552,7 +1644,28 @@ impl DagActor {
 
             // Continue cascade: this parent's parents also cannot complete.
             to_visit.extend(self.dag.get_parents(&parent_hash));
+            transitioned.insert(parent_hash);
         }
+        transitioned
+    }
+
+    /// Collect the union of `interested_builds` over the trigger
+    /// derivation AND all cascaded derivations. A cascaded node may
+    /// belong to a merged build that the trigger does not — without
+    /// this union, `handle_derivation_failure` is never called for
+    /// that build and it hangs Active forever.
+    fn union_interested_with_cascaded(
+        &self,
+        trigger: &DrvHash,
+        cascaded: &HashSet<DrvHash>,
+    ) -> HashSet<Uuid> {
+        let mut builds: HashSet<Uuid> = self.get_interested_builds(trigger).into_iter().collect();
+        for h in cascaded {
+            if let Some(s) = self.dag.node(h) {
+                builds.extend(s.interested_builds.iter().copied());
+            }
+        }
+        builds
     }
 
     pub(super) async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
@@ -1565,9 +1678,21 @@ impl DagActor {
         };
 
         if !build.keep_going {
-            // Fail the entire build immediately
+            // r[impl sched.build.keep-going]
+            // Fail the entire build immediately. Cancel remaining
+            // derivations first — without this, sole-interest Queued/
+            // Ready/Assigned derivations for this build linger:
+            // Assigned ones keep burning worker CPU, Queued/Ready
+            // ones occupy the ready queue. cancel_build_derivations
+            // sends CancelSignal + transitions DependencyFailed/
+            // Cancelled + removes build interest.
             build.error_summary = Some(format!("derivation {drv_hash} failed"));
             build.failed_derivation = Some(drv_hash.to_string());
+            self.cancel_build_derivations(
+                build_id,
+                &format!("build {build_id} failed fast (keep_going=false)"),
+            )
+            .await;
             if let Err(e) = self.transition_build_to_failed(build_id).await {
                 error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
             }

@@ -136,6 +136,38 @@ impl DagActor {
                 .increment(to_cancel.len() as u64);
         }
 
+        // Sole-interest Queued/Ready/Created → DependencyFailed.
+        // Without this, remove_build_interest orphans them (no
+        // interested build → never dispatched → never terminal) but
+        // they linger in the DAG with no accounting path. Shared
+        // derivations (another build still cares) are left alone —
+        // the other build will drive them.
+        let to_depfail: Vec<DrvHash> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Queued | DerivationStatus::Ready | DerivationStatus::Created
+                ) && s.interested_builds.len() == 1
+                    && s.interested_builds.contains(&build_id)
+            })
+            .map(|(h, _)| h.into())
+            .collect();
+        let mut depfailed: Vec<&str> = Vec::with_capacity(to_depfail.len());
+        for drv_hash in &to_depfail {
+            if let Some(state) = self.dag.node_mut(drv_hash)
+                && state.transition(DerivationStatus::DependencyFailed).is_ok()
+            {
+                self.ready_queue.remove(drv_hash);
+                depfailed.push(drv_hash.as_str());
+            }
+        }
+        if !depfailed.is_empty() {
+            self.persist_status_batch(&depfailed, DerivationStatus::DependencyFailed)
+                .await;
+        }
+
         // Remove build interest from derivations
         let orphaned = self.dag.remove_build_interest(build_id);
 

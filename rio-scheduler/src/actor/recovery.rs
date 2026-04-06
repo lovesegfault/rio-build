@@ -651,6 +651,14 @@ impl DagActor {
                 }
                 self.persist_status(&drv_hash, DerivationStatus::Completed, None)
                     .await;
+                // r[impl sched.gc.path-tenants-upsert]
+                // Orphan completion during recovery: derivation was
+                // Running at crash, completed during downtime. The
+                // normal completion path (handle_success_completion)
+                // never fired → no tenant attribution → GC
+                // under-retains. output_paths was just set above
+                // (= expected_outputs, verified present in store).
+                self.upsert_path_tenants_for(&drv_hash).await;
                 // Terminal → unpin. Without this, the pins
                 // (written at original dispatch before the crash)
                 // leak until next restart's sweep_stale_live_pins.

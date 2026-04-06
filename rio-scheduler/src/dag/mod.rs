@@ -808,13 +808,30 @@ impl DerivationDag {
 
         transitions
     }
-    /// Find all root derivations (no parents) for a build.
+    // r[impl sched.dag.build-scoped-roots]
+    /// Find all root derivations for a build.
     /// These are the top-level derivations the client actually wants built.
+    ///
+    /// A derivation is a root FOR THIS BUILD if no parent *interested
+    /// in this build* depends on it. The global `parents` map includes
+    /// parents from all merged builds — a derivation that's a root for
+    /// build X may have a parent from build Y. Using the unscoped
+    /// parent set incorrectly marks X's root as a non-root, stalling
+    /// X's dispatch (bug_022).
     pub fn find_roots(&self, build_id: Uuid) -> Vec<DrvHash> {
         self.nodes
             .iter()
             .filter(|(_, state)| state.interested_builds.contains(&build_id))
-            .filter(|(hash, _)| self.parents.get(hash.as_str()).is_none_or(|p| p.is_empty()))
+            .filter(|(hash, _)| {
+                // No parent interested in THIS build depends on it.
+                !self.parents.get(hash.as_str()).is_some_and(|parents| {
+                    parents.iter().any(|p| {
+                        self.nodes
+                            .get(p)
+                            .is_some_and(|ps| ps.interested_builds.contains(&build_id))
+                    })
+                })
+            })
             .map(|(hash, _)| hash.clone())
             .collect()
     }

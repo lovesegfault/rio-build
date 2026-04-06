@@ -313,6 +313,11 @@ impl DagActor {
             }
 
             if let Some(state) = self.dag.node_mut(drv_hash) {
+                // Capture BEFORE reset_to_ready clobbers status. An
+                // Assigned-but-never-Running derivation didn't consume
+                // a retry budget — the worker disconnected before
+                // starting it. Only was-Running counts as an attempt.
+                let was_running = matches!(state.status(), DerivationStatus::Running);
                 if let Err(e) = state.reset_to_ready() {
                     warn!(
                         drv_hash = %drv_hash, error = %e,
@@ -321,9 +326,11 @@ impl DagActor {
                     continue;
                 }
                 // Worker-loss mid-build is a failed attempt: count it.
-                state.retry_count += 1;
-                if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                    error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
+                if was_running {
+                    state.retry_count += 1;
+                    if let Err(e) = self.db.increment_retry_count(drv_hash).await {
+                        error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
+                    }
                 }
                 self.persist_status(drv_hash, DerivationStatus::Ready, None)
                     .await;
