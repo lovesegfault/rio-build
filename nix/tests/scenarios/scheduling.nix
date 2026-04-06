@@ -20,36 +20,36 @@
 # Fragment architecture: returns { fragments, mkTest }. default.nix
 # composes into 2 parallel VM tests (core, disrupt). fanout → fuse-direct
 # → fuse-slowpath chain via FUSE cache state; all else independent.
-# r[verify worker.overlay.stacked-lower]
-# r[verify worker.ns.order]
+# worker.overlay.stacked-lower — verify marker at default.nix:subtests[fanout]
+# worker.ns.order — verify marker at default.nix:subtests[fanout]
 #   The writableStore=false pattern in common.nix:mkWorkerNode keeps the
 #   worker VM's /nix/store as a plain 9p mount (not itself an overlay),
 #   so the per-build overlay's lowerdir=/nix/store:{fuse} stack is valid.
 #   A build succeeding also proves mount-namespace ordering: both overlayfs
 #   and nix-daemon's sandbox need unshare(CLONE_NEWNS); wrong order → fail.
 #
-# r[verify obs.metric.scheduler]
-# r[verify obs.metric.worker]
-# r[verify obs.metric.store]
+# obs.metric.scheduler — verify marker at default.nix:subtests[load-50drv]
+# obs.metric.worker — verify marker at default.nix:subtests[load-50drv]
+# obs.metric.store — verify marker at default.nix:subtests[load-50drv]
 #
-# r[verify worker.fuse.lookup-caches]
+# worker.fuse.lookup-caches — verify marker at default.nix:subtests[fanout]
 #   fanout asserts rio_worker_fuse_cache_misses_total ≥1 on each small
 #   worker. Nonzero misses prove lookup()→ensure_cached()→materialize
 #   ran and the inode→realpath mapping is cached (ops.rs:52+).
 #
-# r[verify store.inline.threshold]
+# store.inline.threshold — verify marker at default.nix:subtests[chunks]
 #   chunks builds a 300 KiB blob (> INLINE_THRESHOLD=256 KiB) and asserts
 #   chunk_after > chunk_baseline. Proves put_path.rs:494 nar_data.len()
 #   >= INLINE_THRESHOLD gate fired (tiny-text builds go inline).
 #
-# r[verify obs.metric.transfer-volume]
+# obs.metric.transfer-volume — verify marker at default.nix:subtests[chunks]
 #   chunks asserts rio_store_put_path_bytes_total delta ≥300000 after
 #   bigblob upload. Proves the volume counter (put_path.rs:574) runs on
 #   the chunked path.
 #   Asserted end-to-end from /metrics scrapes via assert_metric_*: exact
 #   values (not grep '[1-9]') so CI logs show actual-vs-expected on failure.
 #
-# r[verify worker.shutdown.sigint]
+# worker.shutdown.sigint — verify marker at default.nix:subtests[sigint-graceful]
 #   sigint-graceful sends SIGINT (not SIGTERM) to rio-worker on wsmall2
 #   and asserts ExecMainCode=1 + ExecMainStatus=0 → main() RETURNED
 #   (stack unwound, Drop ran) rather than death-by-signal. Also guards
@@ -689,7 +689,7 @@ let
           print(f"fuse-slowpath PASS: {slowpath_warns} total slow-path warns\n{breakdown}")
     '';
 
-    # r[verify worker.silence.timeout-kill]
+    # worker.silence.timeout-kill — verify marker at default.nix:subtests[max-silent-time]
     max-silent-time = ''
       import time as _time
 
@@ -782,7 +782,7 @@ let
           print(f"max-silent-time PASS: killed at {elapsed:.1f}s wall-clock (drv sleep was 60s)")
     '';
 
-    # r[verify gw.opcode.set-options.propagation+2]
+    # gw.opcode.set-options.propagation — verify marker at default.nix:subtests[setoptions-unreachable]
     setoptions-unreachable = ''
       # ══════════════════════════════════════════════════════════════════
       # setoptions-unreachable — ssh-ng NEVER sends wopSetOptions

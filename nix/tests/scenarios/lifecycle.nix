@@ -24,7 +24,7 @@
 # over — a strictly stronger recovery test than phase3b's single-instance
 # restart.
 #
-# r[verify obs.metric.controller]
+# obs.metric.controller — verify marker at default.nix:subtests[autoscaler]
 #   autoscaler scrapes rio_controller_scaling_decisions_total{direction="up"}
 #   — exact name from observability.md controller metrics table.
 #
@@ -44,28 +44,28 @@
 #     };
 #   };
 #
-# r[verify ctrl.probe.named-service]
+# ctrl.probe.named-service — verify marker at default.nix:subtests[health-shared]
 #   health-shared probes with `-service rio.scheduler.SchedulerService`
 #   (the named service, NOT empty-string) and asserts NOT_SERVING on
 #   standby. scheduler/main.rs:380-392: set_not_serving only affects
 #   the named service; if the K8s readinessProbe probed "" instead,
 #   standby would pass readiness.
 #
-# r[verify ctrl.autoscale.skip-deleting]
+# ctrl.autoscale.skip-deleting — verify marker at default.nix:subtests[finalizer]
 #   finalizer subtest deletes the WorkerPool and waits ~300s for pod
 #   termination. The autoscaler's 30s poll fires DURING that window;
 #   scaling.rs:222 deletion_timestamp.is_some() skip-gate MUST fire
 #   or the autoscaler would race the finalizer's scale-to-0.
 #
-# r[verify worker.cancel.cgroup-kill]
+# worker.cancel.cgroup-kill — verify marker at default.nix:subtests[cancel-cgroup-kill]
 #   cancel-cgroup-kill calls CancelBuild via gRPC mid-exec and asserts
 #   the cgroup is rmdir'd before the sleep completes. cgroup.rs:180
 #   kill() writes "1" to cgroup.kill → kernel SIGKILLs the tree. No
 #   other test cancels a RUNNING build (recovery kills the scheduler,
 #   build keeps running on the worker).
 #
-# r[verify worker.cgroup.kill-on-teardown]
-# r[verify worker.timeout.no-reassign]
+# worker.cgroup.kill-on-teardown — verify marker at default.nix:subtests[build-timeout]
+# worker.timeout.no-reassign — verify marker at default.nix:subtests[build-timeout]
 #   build-timeout submits via gRPC SubmitBuild with buildTimeout=5 against
 #   a 30s sleep. The timeout fires mid-build → run_daemon_build returns
 #   → executor/mod.rs:764 build_cgroup.kill() fires unconditionally →
@@ -75,18 +75,18 @@
 #   Distinct from cancel-cgroup-kill: that tests runtime.rs's explicit
 #   CancelSignal path; this tests the executor's post-daemon teardown.
 #
-# r[verify worker.upload.references-scanned]
+# worker.upload.references-scanned — verify marker at default.nix:subtests[refs-end-to-end]
 #   refs-end-to-end builds a consumer derivation whose $out embeds a
 #   dep's store path, then asserts PG narinfo."references" contains
 #   that path. Proves RefScanSink → PutPath → PG end-to-end (not just
 #   unit-level scanner correctness).
 #
-# r[verify worker.upload.deriver-populated]
+# worker.upload.deriver-populated — verify marker at default.nix:subtests[refs-end-to-end]
 #   refs-end-to-end asserts narinfo.deriver is the consumer's .drv path
 #   (name-matched + .drv suffix). Before the phase4a fix, deriver was
 #   always empty — upload.rs never plumbed it from the executor.
 #
-# r[verify store.gc.two-phase]
+# store.gc.two-phase — verify marker at default.nix:subtests[refs-end-to-end]
 #   refs-end-to-end pins ONLY the consumer, backdates both paths past
 #   grace, sweeps, and asserts the dep SURVIVES. Proves mark's recursive
 #   CTE actually walks narinfo."references" — if it didn't, dep would
@@ -94,7 +94,7 @@
 #   is the ONLY VM-level test of mark-follows-refs; gc-sweep's victim
 #   has refs=[] by construction (mkTrivial output embeds no store paths).
 #
-# r[verify store.gc.tenant-retention]
+# store.gc.tenant-retention — verify marker at default.nix:subtests[gc-sweep]
 #   gc-sweep tail: backdates out_tenant's narinfo past global grace but
 #   leaves path_tenants.first_referenced_at inside the tenant's 168h
 #   retention window → sweep collects 0 (seed f protects it). Then
@@ -102,7 +102,7 @@
 #   Proves tenant retention EXTENDS global grace (the spec's "floor"
 #   semantics) end-to-end with completion-hook-produced rows.
 #
-# r[verify ctrl.pool.ephemeral]
+# ctrl.pool.ephemeral — verify marker at default.nix:subtests[ephemeral-pool]
 #   ephemeral-pool: applies WorkerPoolSpec.ephemeral=true; asserts NO
 #   StatefulSet (apply() took the ephemeral branch, mod.rs:118-132);
 #   asserts status.desiredReplicas == replicas.max (reconcile_ephemeral

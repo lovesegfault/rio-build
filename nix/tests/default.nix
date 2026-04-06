@@ -217,9 +217,14 @@ in
       {
         name = "core";
         subtests = [
+          # r[verify worker.overlay.stacked-lower]
+          # r[verify worker.ns.order]
+          # r[verify worker.fuse.lookup-caches]
           "fanout"
           "fuse-direct"
           "overlay-readdir"
+          # r[verify store.inline.threshold]
+          # r[verify obs.metric.transfer-volume]
           "chunks"
           "cgroup"
           "fuse-slowpath"
@@ -235,7 +240,9 @@ in
         name = "disrupt";
         subtests = [
           "sizeclass"
+          # r[verify worker.silence.timeout-kill]
           "max-silent-time"
+          # r[verify gw.opcode.set-options.propagation+2]
           # setoptions-unreachable greps ALL gateway journal history —
           # placed after sizeclass + max-silent-time so it also covers
           # THEIR ssh-ng sessions (neither passed --option, but the
@@ -243,11 +250,15 @@ in
           "setoptions-unreachable"
           "cancel-timing"
           "reassign"
+          # r[verify worker.shutdown.sigint]
           # sigint-graceful AFTER reassign: reassign already disturbs a
           # worker (SIGKILL + wait_for_unit restart); sigint is the
           # gentler sibling. Uses wsmall2 only — no cache-chain coupling.
           # ~35s: SIGINT + 30s inactive-wait + restart + FUSE remount.
           "sigint-graceful"
+          # r[verify obs.metric.scheduler]
+          # r[verify obs.metric.worker]
+          # r[verify obs.metric.store]
           "load-50drv"
         ];
         # Default 600s is tight now: sizeclass ~30s + max-silent-time
@@ -258,6 +269,15 @@ in
         globalTimeout = 900;
       };
 
+  # r[verify gw.jwt.dual-mode]
+  # r[verify sec.boundary.grpc-hmac]
+  # r[verify store.tenant.narinfo-filter]
+  # r[verify gw.reject.nochroot]
+  # r[verify gw.rate.per-tenant]
+  # r[verify store.gc.tenant-quota-enforce]
+  #   Single-test scenario (no subtests list). Markers at the wiring
+  #   point per P0341 convention — scenario header prose explains which
+  #   subtest proves each rule.
   vm-security-standalone = security {
     inherit pkgs common;
     fixture = standalone {
@@ -292,6 +312,10 @@ in
     fixture = toxiproxy { };
   };
 
+  # r[verify obs.metric.gateway]
+  #   EXPECTED_METRICS[(gateway,9090)] asserts rio_gateway_* metric
+  #   names after a build — presence proves describe_*! wiring AND
+  #   actual increments (metrics-rs registers on first increment).
   vm-observability-standalone = observability {
     inherit pkgs common;
     fixture = standalone {
@@ -320,20 +344,28 @@ in
   # build-crd-flow + build-crd-errors dropped from core.
   vm-lifecycle-core-k3s = lifecycleMod.mkTest {
     name = "core";
-    # r[verify sec.jwt.pubkey-mount]
-    #   jwt-mount-present: scheduler+store have rio-jwt-pubkey ConfigMap
-    #   at /etc/rio/jwt; gateway has rio-jwt-signing Secret. Placed
-    #   FIRST — pure precondition check, no pod disruption, ~5s.
-    #   Everything else (health-shared onward) assumes the same stable
-    #   2-replica state so ordering is immaterial wrt those.
     subtests = [
+      # r[verify sec.jwt.pubkey-mount]
+      #   jwt-mount-present: scheduler+store have rio-jwt-pubkey ConfigMap
+      #   at /etc/rio/jwt; gateway has rio-jwt-signing Secret. Placed
+      #   FIRST — pure precondition check, no pod disruption, ~5s.
+      #   Everything else (health-shared onward) assumes the same stable
+      #   2-replica state so ordering is immaterial wrt those.
       "jwt-mount-present"
+      # r[verify ctrl.probe.named-service]
       "health-shared"
+      # r[verify worker.cancel.cgroup-kill]
       "cancel-cgroup-kill"
+      # r[verify worker.cgroup.kill-on-teardown]
+      # r[verify worker.timeout.no-reassign]
       "build-timeout"
       "gc-dry-run"
       "reconciler-replicas"
+      # r[verify store.gc.tenant-retention]
       "gc-sweep"
+      # r[verify worker.upload.references-scanned]
+      # r[verify worker.upload.deriver-populated]
+      # r[verify store.gc.two-phase]
       "refs-end-to-end"
     ];
   };
@@ -346,8 +378,11 @@ in
   vm-lifecycle-autoscale-k3s = lifecycleAutoscaleMod.mkTest {
     name = "autoscale";
     subtests = [
+      # r[verify obs.metric.controller]
       "autoscaler"
+      # r[verify ctrl.autoscale.skip-deleting]
       "finalizer"
+      # r[verify ctrl.pool.ephemeral]
       # After finalizer: workers_active=0, clean slate for the
       # ephemeral pool (no STS worker steals dispatch before
       # reconcile_ephemeral's 10s tick spawns a Job). ~180s:
@@ -367,7 +402,10 @@ in
     subtests = [
       "antiAffinity"
       "lease-acquired"
+      # r[verify sched.lease.k8s-lease]
       "stable-leadership"
+      # r[verify sched.lease.graceful-release]
+      # r[verify sched.lease.deletion-cost]
       "graceful-release"
       "failover"
     ];
@@ -378,6 +416,11 @@ in
     subtests = [ "build-during-failover" ];
   };
 
+  # r[verify sched.admin.create-tenant]
+  # r[verify sched.admin.list-tenants]
+  # r[verify sched.admin.list-workers]
+  # r[verify sched.admin.list-builds]
+  # r[verify sched.admin.clear-poison]
   # rio-cli had 0% coverage — never invoked by any test. This runs
   # status + create-tenant + list-tenants against the live scheduler's
   # AdminService. ~5min (mostly k3s bring-up).

@@ -10,11 +10,8 @@
 # closure interpolation) — same trick here. No need to extract from the
 # k8s Secret.
 #
-# r[verify sched.admin.create-tenant]
-# r[verify sched.admin.list-tenants]
-# r[verify sched.admin.list-workers]
-# r[verify sched.admin.list-builds]
-# r[verify sched.admin.clear-poison]
+# sched.admin.{create-tenant,list-tenants,list-workers,list-builds,
+# clear-poison} — verify markers at default.nix:vm-cli-k3s
 {
   pkgs,
   common,

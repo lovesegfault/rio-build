@@ -18,13 +18,13 @@
 # Fragment architecture: returns { fragments, mkTest }. default.nix
 # composes into 2 parallel VM tests (stability, build). No Python-var
 # chains — each subtest queries current leader_pod() independently.
-# r[verify sched.lease.k8s-lease]
+# sched.lease.k8s-lease — verify marker at default.nix:subtests[stable-leadership]
 #   stable-leadership: observed-record rv tracking → no live-lease steal.
 #   failover: ungraceful kill (no step_down) → standby observes unchanged
 #     rv for TTL → steals → leaseTransitions +1.
 #
-# r[verify sched.lease.graceful-release]
-# r[verify sched.lease.deletion-cost]
+# sched.lease.graceful-release — verify marker at default.nix:subtests[graceful-release]
+# sched.lease.deletion-cost — verify marker at default.nix:subtests[graceful-release]
 #   graceful-release: SIGTERM leader (no --force, --grace-period=30)
 #   → step_down() runs to completion → standby acquires in <10s (vs
 #   ~15s TTL-steal on ungraceful kill). lease/mod.rs:409-420. The

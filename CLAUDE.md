@@ -185,6 +185,20 @@ Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` st
 
 **When adding spec text that describes a new behavior or constraint:** add an `r[...]` marker (standalone paragraph, blank line before, col 0), then annotate the implementing code with `// r[impl ...]` and the test with `// r[verify ...]`. The marker-first discipline means `tracey query uncovered` surfaces unimplemented spec requirements immediately.
 
+**VM-test `r[verify]` placement:** for NixOS VM tests under `nix/tests/`, place `# r[verify ...]` markers in `default.nix` at the `subtests = [...]` entry that wires the fragment — NOT in the scenario file's col-0 header block. A marker in a scenario header tells tracey the rule is tested; it does not tell tracey the fragment runs. A marker at the subtests entry structurally couples the two: no wiring → no marker → tracey catches it.
+
+```nix
+subtests = [
+  "gc-sweep"        # r[verify store.gc.tenant-retention]
+  # r[verify worker.upload.references-scanned]
+  # r[verify worker.upload.deriver-populated]
+  # r[verify store.gc.two-phase]
+  "refs-end-to-end"
+];
+```
+
+Scenario-file header blocks MAY keep prose descriptions of what each marker covers (useful for humans); they MUST NOT carry the marker token itself. `config.styx`'s `test_include` is narrowed to `nix/tests/default.nix` only, so a stray marker in a scenario file is invisible to tracey — the rule stays listed as untested until properly wired.
+
 **When spec text changes meaningfully:** run `tracey bump` before committing. This version-bumps the marker (e.g., `r[gw.opcode.foo]` → `r[gw.opcode.foo+2]`), making existing `r[impl gw.opcode.foo]` annotations stale until someone reviews and bumps them.
 
 **tracey ≠ `TODO(P0NNN)`.** tracey answers "what does the spec say, what's covered, what's tested." `TODO(P0NNN)` answers "which plan owns this." A feature with a spec marker but no `r[impl]` shows up in `tracey query uncovered` — pair that with a `TODO(P0NNN)` pointing at the plan that will land it.
