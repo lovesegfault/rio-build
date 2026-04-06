@@ -394,8 +394,8 @@ mod tests {
         // Seed placeholder (upgrade requires an existing 'uploading'
         // manifest row).
         let store_path_hash = vec![0xAAu8; 32];
-        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dup-chunks";
-        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path, &[])
+        let path = rio_test_support::fixtures::test_store_path("dup-chunks");
+        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, &path, &[])
             .await
             .unwrap();
 
@@ -434,8 +434,8 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let store_path_hash = vec![0xCCu8; 32];
-        let path = "/nix/store/cccccccccccccccccccccccccccccccc-deduped";
-        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path, &[])
+        let path = rio_test_support::fixtures::test_store_path("deduped");
+        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, &path, &[])
             .await
             .unwrap();
 

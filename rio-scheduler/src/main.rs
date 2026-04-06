@@ -282,33 +282,28 @@ impl rio_common::config::ValidateConfig for Config {
     }
 }
 
+impl rio_common::server::HasCommonConfig for Config {
+    fn tls(&self) -> &rio_common::tls::TlsConfig {
+        &self.tls
+    }
+    fn metrics_addr(&self) -> std::net::SocketAddr {
+        self.metrics_addr
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // rustls CryptoProvider MUST be installed before any TLS
-    // use. kube → hyper-rustls enables `ring`; rio-proto →
-    // aws-sdk enables `aws-lc-rs`. With BOTH active, rustls 0.23
-    // can't auto-select and PANICS on first TLS handshake (the
-    // Lease loop's K8s API call). Pin aws-lc-rs.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("scheduler", cli)?;
-    let _otel_guard = rio_common::observability::init_tracing("scheduler")?;
-
-    // Client TLS init BEFORE connect_store. One config, all outgoing
-    // connections. server_name is a fallback; K8s DNS addressing
-    // means :authority from the URL ("rio-store") is the actual SAN
-    // match, so this just needs to be A valid SAN of SOME target.
-    rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls)
-            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
-    );
-    if cfg.tls.is_configured() {
-        info!("client mTLS enabled for outgoing gRPC");
-    }
-
-    use rio_common::config::ValidateConfig as _;
-    cfg.validate()?;
+    let rio_common::server::Bootstrap::<Config> {
+        cfg,
+        shutdown,
+        otel_guard: _otel_guard,
+    } = rio_common::server::bootstrap(
+        "scheduler",
+        cli,
+        rio_proto::client::init_client_tls,
+        rio_scheduler::describe_metrics,
+    )?;
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
@@ -316,11 +311,6 @@ async fn main() -> anyhow::Result<()> {
         "starting rio-scheduler"
     );
 
-    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Cloned into each
-    // background loop; .cancelled_owned() for serve_with_shutdown.
-    // Enables atexit handlers (LLVM coverage profraw flush, tracing
-    // shutdown) by letting main() return normally.
-    //
     // Shutdown chain for the actor: token cancels → actor's select!
     // loop sees it → drops all worker stream_tx → build-exec-bridge
     // tasks exit → ReceiverStream closes → serve_with_shutdown
@@ -329,10 +319,6 @@ async fn main() -> anyhow::Result<()> {
     // all mpsc::Sender clones drop → actor's rx.recv() returns None
     // → actor exits → drops event_persist_tx → event-persister also
     // exits (channel-close). event_log::spawn doesn't need a token.
-    let shutdown = rio_common::signal::shutdown_signal();
-
-    rio_common::observability::init_metrics(cfg.metrics_addr)?;
-    rio_scheduler::describe_metrics();
 
     let (pool, db) = init_db_pool(&cfg.database_url).await?;
     let store_client = connect_store_with_retry(&cfg.store_addr, &shutdown).await;
@@ -627,8 +613,7 @@ async fn main() -> anyhow::Result<()> {
     // set to NOT_SERVING (no toggle loop for it) → standby always
     // appears Ready → K8s routes to a non-leader → cluster split.
     // Shared reporter is load-bearing.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
-        .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
+    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)?;
 
     if server_tls.is_some() {
         // r[impl sched.health.shared-reporter]
@@ -1325,51 +1310,19 @@ mod tests {
         cfg.validate().expect("positive cpu_limit should be valid");
     }
 
-    // -----------------------------------------------------------------------
-    // figment::Jail standing-guard tests — catch the NEXT orphan.
-    //
-    // P0219 shipped PoisonConfig + with_poison_config, zero TOML side.
-    // The struct existed, the builder existed, main.rs never called the
-    // builder from config. `config_defaults_are_stable` above is
-    // STRUCTURALLY BLIND to that — it only checks Config-struct fields;
-    // if the field isn't ON Config, the test doesn't know to miss it.
-    //
-    // The rio-store side (P0218) landed equivalent wiring WITH Jail
-    // tests (rio-store/src/main.rs figment::Jail per-field roundtrips)
-    // proving TOML→Config→builder. This
-    // ports the same pattern so the next `with_X` builder added
-    // without a `Config` field is a failing test, not a silent orphan.
-    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // When you add Config.newfield: ADD IT to both assert blocks below.
 
-    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
-    /// table via the REAL `rio_common::config::load` path (not raw
-    /// figment). Jail changes cwd to a temp dir; `./scheduler.toml`
-    /// there is picked up by load()'s `{component}.toml` layer.
-    ///
-    /// When you add `Config.newfield`: ADD IT HERE or this test's
-    /// doc-comment is a lie. The companion `all_subconfigs_default_
-    /// when_absent` catches "new required field breaks existing
-    /// deployments" (figment missing-field error).
-    ///
-    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_roundtrip_toml() {
-        figment::Jail::expect_with(|jail| {
-            // Every sub-config table with at least one NON-default
-            // value. Proves: (a) the table name is wired; (b) the
-            // Deserialize derive works; (c) the value reaches Config.
-            jail.create_file(
-                "scheduler.toml",
-                r#"
-                [poison]
-                threshold = 7
+    rio_test_support::jail_roundtrip!(
+        "scheduler",
+        r#"
+        [poison]
+        threshold = 7
 
-                [retry]
-                backoff_base_secs = 3.33
-                "#,
-            )?;
-            let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+        [retry]
+        backoff_base_secs = 3.33
+        "#,
+        |cfg: Config| {
             assert_eq!(
                 cfg.poison.threshold, 7,
                 "[poison] table must thread through figment into PoisonConfig"
@@ -1379,42 +1332,23 @@ mod tests {
                 "[retry] table must thread through figment into RetryPolicy"
             );
             // Unspecified fields default via #[serde(default)] on
-            // the sub-struct, not the outer Config's default layer
-            // (figment's Serialized::defaults covers those too, but
-            // the sub-struct attr is what lets PARTIAL tables work).
+            // the sub-struct — PARTIAL tables must work.
             assert!(
                 cfg.poison.require_distinct_workers,
                 "unspecified sub-field must fall through to Default"
             );
-            Ok(())
-        });
-    }
+        }
+    );
 
-    /// Empty scheduler.toml → every sub-config gets its Default impl.
-    /// If `Config.foo` is added WITHOUT `#[serde(default)]` at the
-    /// struct level (Config itself has it) AND the sub-struct lacks
-    /// `impl Default`, this fails with a figment missing-field error —
-    /// catches "new required field breaks existing deployments".
-    ///
-    /// `listen_addr` is set to prove the TOML IS loaded (a truly
-    /// empty file would be indistinguishable from a missing one in
-    /// terms of sub-config defaults).
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_default_when_absent() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("scheduler.toml", r#"listen_addr = "0.0.0.0:9001""#)?;
-            let cfg: Config = rio_common::config::load("scheduler", CliArgs::default()).unwrap();
+    rio_test_support::jail_defaults!(
+        "scheduler",
+        r#"listen_addr = "0.0.0.0:9001""#,
+        |cfg: Config| {
             assert_eq!(cfg.poison, rio_scheduler::PoisonConfig::default());
             assert_eq!(cfg.retry, rio_scheduler::RetryPolicy::default());
-            // size_classes: already covered by config_defaults_are_
-            // stable, but include it here for the "every sub-config"
-            // claim — this is the standing-guard test, not the unit
-            // test. When you add Config.newfield: ADD IT HERE.
             assert!(cfg.size_classes.is_empty());
-            Ok(())
-        });
-    }
+        }
+    );
 
     // -----------------------------------------------------------------------
     // gRPC health service wiring smoke tests.

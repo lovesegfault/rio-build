@@ -37,19 +37,7 @@ async fn test_not_leader_does_not_dispatch() -> TestResult {
     merge_single_node(&handle, Uuid::new_v4(), "nl-drv", PriorityClass::Scheduled).await?;
 
     // Extra heartbeat to trigger dispatch_ready.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            resources: None,
-            worker_id: "nl-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 1,
-            running_builds: vec![],
-            bloom: None,
-            size_class: None,
-        })
-        .await?;
+    send_heartbeat(&handle, "nl-worker", "x86_64-linux", 1).await?;
     barrier(&handle).await;
 
     // No assignment — dispatch gated by !is_leader.
@@ -126,19 +114,7 @@ async fn test_recovery_not_complete_does_not_dispatch() -> TestResult {
     let mut rx = connect_worker(&handle, "rc-worker", "x86_64-linux", 1).await?;
     merge_single_node(&handle, Uuid::new_v4(), "rc-drv", PriorityClass::Scheduled).await?;
 
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            resources: None,
-            worker_id: "rc-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            max_builds: 1,
-            running_builds: vec![],
-            bloom: None,
-            size_class: None,
-        })
-        .await?;
+    send_heartbeat(&handle, "rc-worker", "x86_64-linux", 1).await?;
     barrier(&handle).await;
 
     assert!(
@@ -225,27 +201,24 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
     let mut worker_rx = connect_worker(&handle, "clamp-w", "x86_64-linux", 1).await?;
 
     // Merge with build_timeout = u64::MAX.
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: Uuid::new_v4(),
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node("clamp-drv", "x86_64-linux")],
-                edges: vec![],
-                options: BuildOptions {
-                    build_timeout: u64::MAX,
-                    ..Default::default()
-                },
-                keep_going: false,
-                traceparent: String::new(),
-                jti: None,
+    let _ = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: Uuid::new_v4(),
+            tenant_id: None,
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![make_test_node("clamp-drv", "x86_64-linux")],
+            edges: vec![],
+            options: BuildOptions {
+                build_timeout: u64::MAX,
+                ..Default::default()
             },
-            reply: reply_tx,
-        })
-        .await?;
-    let _ = reply_rx.await??;
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+        },
+    )
+    .await?;
 
     let assignment = recv_assignment(&mut worker_rx).await;
 

@@ -192,64 +192,31 @@ impl rio_common::config::ValidateConfig for Config {
     }
 }
 
+impl rio_common::server::HasCommonConfig for Config {
+    fn tls(&self) -> &rio_common::tls::TlsConfig {
+        &self.tls
+    }
+    fn metrics_addr(&self) -> std::net::SocketAddr {
+        self.metrics_addr
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // rustls CryptoProvider MUST be installed before any TLS use.
-    // tonic's tls-aws-lc feature enables aws-lc-rs; without
-    // this install_default, rustls can't auto-select and panics on
-    // first handshake. Gateway's outgoing gRPC (scheduler + store)
-    // is the TLS user here — incoming is SSH.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("gateway", cli)?;
-    let _otel_guard = rio_common::observability::init_tracing("gateway")?;
-
-    // Initialize the process-global client TLS config BEFORE any
-    // connect_* call. None (TLS unconfigured) → plaintext. Some →
-    // https + client cert. One config serves all outgoing
-    // connections: server_name is scoped to the target DNS name,
-    // not the client identity. cert-manager's per-component
-    // Certificates all chain to the same CA, so the gateway's
-    // client cert verifies against scheduler's and store's
-    // client_ca_root identically.
-    //
-    // server_name here is a DEFAULT for the most common target. For
-    // a gateway connecting to scheduler + store, the domain_name
-    // in ClientTlsConfig needs to match EACH target's cert SAN.
-    // We can't set per-target in a single ClientTlsConfig — but
-    // tonic's domain_name is overridden by the `:authority` header
-    // (which is the hostname from the endpoint URL). So as long as
-    // we connect to `rio-scheduler:9001` (hostname), rustls verifies
-    // against THAT SAN. The domain_name in ClientTlsConfig is a
-    // fallback when `:authority` is absent (IP-literal endpoints).
-    //
-    // With K8s DNS addressing (`rio-scheduler`, `rio-store`), the
-    // authority matches the SAN, so any domain_name works. We pick
-    // "rio-scheduler" as a reasonable default (gateway→scheduler is
-    // the most-used link).
-    rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls)
-            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
-    );
-    if cfg.tls.is_configured() {
-        info!("client mTLS enabled for outgoing gRPC");
-    }
-
-    use rio_common::config::ValidateConfig as _;
-    cfg.validate()?;
+    let rio_common::server::Bootstrap::<Config> {
+        cfg,
+        shutdown,
+        otel_guard: _otel_guard,
+    } = rio_common::server::bootstrap(
+        "gateway",
+        cli,
+        rio_proto::client::init_client_tls,
+        rio_gateway::describe_metrics,
+    )?;
 
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
-
-    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Lets main()
-    // return normally so atexit handlers (LLVM coverage profraw flush,
-    // tracing shutdown) fire. Health server gets serve_with_shutdown;
-    // the SSH server.run() is wrapped in a select! below.
-    let shutdown = rio_common::signal::shutdown_signal();
-
-    rio_common::observability::init_metrics(cfg.metrics_addr)?;
-    rio_gateway::describe_metrics();
 
     // Retry-until-connected via connect_with_retry (shutdown-aware,
     // exponential backoff). Cold-start race: all rio-* pods start in
@@ -492,53 +459,26 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
-    // -----------------------------------------------------------------------
-    // figment::Jail standing-guard tests — catch the NEXT orphan.
-    //
-    // `config_defaults_are_stable` above only checks fields that ARE
-    // on Config; if a builder `with_foo()` ships without a `Config.foo`
-    // field, that test doesn't know to miss it. This pair proves
-    // STRUCTURE: every sub-config table wired + empty-toml defaults
-    // hold. See rio-scheduler/src/main.rs all_subconfigs_roundtrip_toml + all_subconfigs_default_when_absent for the pattern
-    // rationale + the P0219 failure mode that motivated it.
-    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // When you add Config.newfield: ADD IT to both assert blocks below.
 
-    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
-    /// table via the REAL `rio_common::config::load` path (not raw
-    /// figment). Jail changes cwd to a temp dir; `./gateway.toml`
-    /// there is picked up by load()'s `{component}.toml` layer.
-    ///
-    /// When you add `Config.newfield`: ADD IT HERE or this test's
-    /// doc-comment is a lie. The companion `all_subconfigs_default_
-    /// when_absent` catches "new required field breaks existing
-    /// deployments" (figment missing-field error).
-    ///
-    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_roundtrip_toml() {
-        figment::Jail::expect_with(|jail| {
-            // Every sub-config table with at least one NON-default
-            // value. Proves: (a) the table name is wired; (b) the
-            // Deserialize derive works; (c) the value reaches Config.
-            jail.create_file(
-                "gateway.toml",
-                r#"
-                max_connections = 555
+    rio_test_support::jail_roundtrip!(
+        "gateway",
+        r#"
+        max_connections = 555
 
-                [tls]
-                cert_path = "/etc/tls/cert.pem"
+        [tls]
+        cert_path = "/etc/tls/cert.pem"
 
-                [jwt]
-                required = true
-                key_path = "/etc/rio/jwt/ed25519_seed"
+        [jwt]
+        required = true
+        key_path = "/etc/rio/jwt/ed25519_seed"
 
-                [rate_limit]
-                per_minute = 42
-                burst = 7
-                "#,
-            )?;
-            let cfg: Config = rio_common::config::load("gateway", CliArgs::default()).unwrap();
+        [rate_limit]
+        per_minute = 42
+        burst = 7
+        "#,
+        |cfg: Config| {
             assert_eq!(cfg.max_connections, 555);
             assert_eq!(
                 cfg.tls.cert_path.as_deref(),
@@ -561,38 +501,19 @@ mod tests {
                 .expect("[rate_limit] table must deserialize to Some");
             assert_eq!(rl.per_minute, 42);
             assert_eq!(rl.burst, 7);
-            Ok(())
-        });
-    }
+        }
+    );
 
-    /// Near-empty gateway.toml → every sub-config gets its Default
-    /// impl. If `Config.foo` is added WITHOUT `#[serde(default)]` AND
-    /// the sub-struct lacks `impl Default`, this fails with a figment
-    /// missing-field error — catches "new required field breaks
-    /// existing deployments".
-    ///
-    /// `drain_grace_secs` is set to prove the TOML IS loaded (a
-    /// truly empty file would be indistinguishable from a missing one
-    /// in terms of sub-config defaults).
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_default_when_absent() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("gateway.toml", "drain_grace_secs = 6")?;
-            let cfg: Config = rio_common::config::load("gateway", CliArgs::default()).unwrap();
-            // Every sub-config / optional field at its default. When
-            // you add Config.newfield: ADD IT HERE.
-            assert!(!cfg.tls.is_configured());
-            assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
-            assert!(cfg.rate_limit.is_none());
-            assert!(cfg.scheduler_balance_host.is_none());
-            assert_eq!(
-                cfg.max_connections,
-                rio_gateway::server::DEFAULT_MAX_CONNECTIONS
-            );
-            Ok(())
-        });
-    }
+    rio_test_support::jail_defaults!("gateway", "drain_grace_secs = 6", |cfg: Config| {
+        assert!(!cfg.tls.is_configured());
+        assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
+        assert!(cfg.rate_limit.is_none());
+        assert!(cfg.scheduler_balance_host.is_none());
+        assert_eq!(
+            cfg.max_connections,
+            rio_gateway::server::DEFAULT_MAX_CONNECTIONS
+        );
+    });
 
     // -----------------------------------------------------------------------
     // validate_config rejection tests — spreads the P0409 pattern

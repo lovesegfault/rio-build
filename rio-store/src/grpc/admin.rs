@@ -13,6 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, instrument, warn};
 
+use rio_common::grpc::StatusExt;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::{
     GcProgress, GcRequest, PinPathRequest, PinPathResponse, ResignPathsRequest, ResignPathsResponse,
@@ -137,8 +138,7 @@ impl StoreAdminServiceImpl {
             ManifestKind::Inline(bytes) => {
                 // io::Write on an in-memory sink is infallible; the
                 // map_err is just type plumbing for ? ergonomics.
-                sink.write_all(&bytes)
-                    .map_err(|e| Status::internal(format!("refscan write: {e}")))?;
+                sink.write_all(&bytes).status_internal("refscan write")?;
             }
             ManifestKind::Chunked(entries) => {
                 let cache = self.chunk_cache.as_ref().ok_or_else(|| {
@@ -159,8 +159,7 @@ impl StoreAdminServiceImpl {
                     let chunk = cache.get_verified(hash).await.map_err(|e| {
                         Status::data_loss(format!("chunk reassembly for {store_path}: {e}"))
                     })?;
-                    sink.write_all(&chunk)
-                        .map_err(|e| Status::internal(format!("refscan write: {e}")))?;
+                    sink.write_all(&chunk).status_internal("refscan write")?;
                 }
             }
         }
@@ -493,9 +492,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         let cursor_bytes: Vec<u8> = if req.cursor.is_empty() {
             Vec::new()
         } else {
-            hex::decode(&req.cursor).map_err(|e| {
-                Status::invalid_argument(format!("cursor must be hex-encoded store_path_hash: {e}"))
-            })?
+            hex::decode(&req.cursor).status_invalid("cursor must be hex-encoded store_path_hash")?
         };
 
         let batch = match req.batch_size as i64 {
@@ -643,8 +640,10 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
 mod tests {
     use super::*;
     use crate::gc::GC_LOCK_ID;
+    use crate::test_helpers::{StoreSeed, path_hash};
     use rio_proto::StoreAdminService;
     use rio_test_support::TestDb;
+    use rio_test_support::fixtures::test_store_path;
 
     /// PinPath for a path NOT in narinfo → FK violation → success=
     /// false with "path not in store" message. Verifies the SQLSTATE
@@ -658,7 +657,7 @@ mod tests {
         // Pin a path that doesn't exist in narinfo. The FK to
         // narinfo.store_path_hash will reject with SQLSTATE 23503.
         let req = Request::new(PinPathRequest {
-            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-doesnt-exist".into(),
+            store_path: test_store_path("doesnt-exist"),
             source: "test".into(),
         });
         let resp = svc.pin_path(req).await.expect("returns Ok(response)");
@@ -677,24 +676,16 @@ mod tests {
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
 
         // Seed narinfo so the FK passes.
-        let path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-exists";
-        use sha2::Digest;
-        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
-        sqlx::query(
-            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
-             VALUES ($1, $2, $3, 42)",
-        )
-        .bind(&hash)
-        .bind(path)
-        .bind(vec![0u8; 32])
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        let path = test_store_path("exists");
+        StoreSeed::raw_path(&path)
+            .with_nar_size(42)
+            .seed(&db.pool)
+            .await;
 
         // Pin.
         let resp = svc
             .pin_path(Request::new(PinPathRequest {
-                store_path: path.into(),
+                store_path: path.clone(),
                 source: "test-roundtrip".into(),
             }))
             .await
@@ -712,7 +703,7 @@ mod tests {
         // Unpin.
         let resp = svc
             .unpin_path(Request::new(PinPathRequest {
-                store_path: path.into(),
+                store_path: path.clone(),
                 source: String::new(),
             }))
             .await
@@ -906,33 +897,18 @@ mod tests {
     // --- GC empty-refs safety gate (remediation 02) ---
 
     /// Seed a narinfo+manifests row pair for gate tests.
-    /// `created_at` is forced into the past so the row is sweep-eligible
-    /// under any non-zero grace window. `ca` and `references` are the
-    /// two axes the gate pivots on.
+    /// `created_at` is forced 7 days into the past so the row is
+    /// sweep-eligible under any non-zero grace window. `ca` and
+    /// `references` are the two axes the gate pivots on.
     async fn seed_narinfo_for_gate(pool: &PgPool, name: &str, refs: &[String], ca: Option<&str>) {
-        use sha2::Digest;
-        let path = rio_test_support::fixtures::test_store_path(name);
-        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
-        // created_at = 7 days ago — comfortably past any test grace.
-        sqlx::query(
-            r#"INSERT INTO narinfo
-               (store_path_hash, store_path, nar_hash, nar_size, "references", ca, created_at)
-               VALUES ($1, $2, $3, 42, $4, $5, now() - interval '7 days')"#,
-        )
-        .bind(&hash)
-        .bind(&path)
-        .bind(vec![0u8; 32])
-        .bind(refs)
-        .bind(ca)
-        .execute(pool)
-        .await
-        .expect("seed narinfo");
-        // Manifest must be 'complete' — gate query joins on this.
-        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
-            .bind(&hash)
-            .execute(pool)
-            .await
-            .expect("seed manifest");
+        let mut seed = StoreSeed::path(name)
+            .with_refs(refs)
+            .with_nar_size(42)
+            .created_hours_ago(7 * 24);
+        if let Some(c) = ca {
+            seed = seed.with_ca(c);
+        }
+        seed.seed(pool).await;
     }
 
     /// Drain the TriggerGC stream to the first Err, or return the final
@@ -1119,29 +1095,12 @@ mod tests {
     /// on manifests.status='complete', so both rows are needed even for
     /// dry-run tests. Inline blob is empty — dry-run never scans it.
     async fn seed_narinfo_pending_backfill(pool: &PgPool, name: &str) -> Vec<u8> {
-        use sha2::Digest;
-        let path = rio_test_support::fixtures::test_store_path(name);
-        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
-        sqlx::query(
-            r#"INSERT INTO narinfo
-               (store_path_hash, store_path, nar_hash, nar_size, "references", refs_backfilled)
-               VALUES ($1, $2, $3, 42, '{}', FALSE)"#,
-        )
-        .bind(&hash)
-        .bind(&path)
-        .bind(vec![0u8; 32])
-        .execute(pool)
-        .await
-        .expect("seed pending-backfill narinfo");
-        sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
-             VALUES ($1, 'complete', ''::bytea)",
-        )
-        .bind(&hash)
-        .execute(pool)
-        .await
-        .expect("seed pending-backfill manifest");
-        hash
+        StoreSeed::path(name)
+            .with_nar_size(42)
+            .with_refs_backfilled(false)
+            .with_inline_blob(b"")
+            .seed(pool)
+            .await
     }
 
     /// Wet-run seeder: distinct hash-part per path (so the ref-scanner
@@ -1164,7 +1123,7 @@ mod tests {
         use sha2::Digest;
         assert_eq!(hash_part.len(), 32, "hash_part must be 32 nixbase32 chars");
         let path = format!("/nix/store/{hash_part}-{name}");
-        let sph: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        let sph = path_hash(&path);
         // nar_hash = SHA-256(blob) so fingerprint() gets a real digest
         // (signature verify is out of scope here, but no reason to
         // seed garbage). nar_size = blob.len() for the same reason.
@@ -1211,15 +1170,13 @@ mod tests {
         }
         // Control rows that must NOT appear in the batch.
         for (name, state) in [("done", Some(true)), ("postfix", None::<bool>)] {
-            use sha2::Digest;
-            let path = rio_test_support::fixtures::test_store_path(name);
-            let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+            let path = test_store_path(name);
             sqlx::query(
                 r#"INSERT INTO narinfo
                    (store_path_hash, store_path, nar_hash, nar_size, "references", refs_backfilled)
                    VALUES ($1, $2, $3, 42, '{}', $4)"#,
             )
-            .bind(&hash)
+            .bind(path_hash(&path))
             .bind(&path)
             .bind(vec![0u8; 32])
             .bind(state)
@@ -1507,16 +1464,15 @@ mod tests {
         // =NULL) but NO manifest_data → get_manifest returns
         // InvariantViolation. Constructed raw because
         // seed_backfill_path always sets inline_blob.
-        use sha2::Digest;
-        let bad_path = "/nix/store/88888888888888888888888888888888-bad";
-        let bad_sph: Vec<u8> = sha2::Sha256::digest(bad_path.as_bytes()).to_vec();
+        let bad_path = test_store_path("bad");
+        let bad_sph = path_hash(&bad_path);
         sqlx::query(
             r#"INSERT INTO narinfo
                (store_path_hash, store_path, nar_hash, nar_size, refs_backfilled)
                VALUES ($1, $2, $3, 0, FALSE)"#,
         )
         .bind(&bad_sph)
-        .bind(bad_path)
+        .bind(&bad_path)
         .bind(vec![0u8; 32])
         .execute(&db.pool)
         .await
@@ -1555,7 +1511,7 @@ mod tests {
 
         let (done_bad,): (Option<bool>,) =
             sqlx::query_as("SELECT refs_backfilled FROM narinfo WHERE store_path = $1")
-                .bind(bad_path)
+                .bind(&bad_path)
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();

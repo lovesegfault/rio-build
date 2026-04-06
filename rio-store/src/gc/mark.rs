@@ -154,43 +154,23 @@ pub async fn compute_unreachable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{StoreSeed, path_hash};
     use rio_test_support::fixtures::test_store_path;
     use rio_test_support::{TenantSeed, TestDb, seed_tenant};
 
-    /// Minimal narinfo + manifest seeding. Tests need paths with
-    /// known references to verify the CTE walks correctly.
+    /// Thin wrapper: mark tests seed paths with (refs, created_at)
+    /// to verify the CTE walks correctly.
     async fn seed_path(
         pool: &PgPool,
         path: &str,
         refs: &[&str],
         created_hours_ago: u32,
     ) -> Vec<u8> {
-        use sha2::Digest;
-        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
-        sqlx::query(
-            r#"
-            INSERT INTO narinfo
-                (store_path_hash, store_path, nar_hash, nar_size,
-                 "references", created_at)
-            VALUES ($1, $2, $3, 0, $4,
-                    now() - make_interval(hours => $5::int))
-            "#,
-        )
-        .bind(&hash)
-        .bind(path)
-        // nar_hash: any 32 bytes, not verified in mark phase.
-        .bind(&hash)
-        .bind(refs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        .bind(created_hours_ago as i32)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
-            .bind(&hash)
-            .execute(pool)
+        StoreSeed::raw_path(path)
+            .with_refs(refs)
+            .created_hours_ago(created_hours_ago as i32)
+            .seed(pool)
             .await
-            .unwrap();
-        hash
     }
 
     #[tokio::test]
@@ -297,27 +277,13 @@ mod tests {
     #[tokio::test]
     async fn uploading_status_protects() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        use sha2::Digest;
-        let path = "/nix/store/ggg-uploading";
-        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
         // Seed with status='uploading' instead of 'complete'.
         // Old (past grace).
-        sqlx::query(
-            r#"
-            INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, created_at)
-            VALUES ($1, $2, $1, 0, now() - interval '48 hours')
-            "#,
-        )
-        .bind(&hash)
-        .bind(path)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'uploading')")
-            .bind(&hash)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        StoreSeed::path("uploading")
+            .with_manifest_status("uploading")
+            .created_hours_ago(48)
+            .seed(&db.pool)
+            .await;
 
         let unreachable = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
         // uploading status → seed → NOT in "unreachable" (even
@@ -389,9 +355,8 @@ mod tests {
         // insert_manifest_uploading's new references-populated behavior,
         // not the full gRPC path. A is NOT seeded via seed_path (that
         // would make it a complete manifest, not a placeholder).
-        use sha2::Digest;
         let a = test_store_path("uploader");
-        let a_hash: Vec<u8> = sha2::Sha256::digest(a.as_bytes()).to_vec();
+        let a_hash = path_hash(&a);
         let inserted = crate::metadata::insert_manifest_uploading(
             &db.pool,
             &a_hash,

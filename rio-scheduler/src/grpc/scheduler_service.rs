@@ -11,6 +11,7 @@ use tonic::{Request, Response, Status};
 use tracing::{info, instrument};
 use uuid::Uuid;
 
+use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 use rio_proto::SchedulerService;
 
@@ -193,7 +194,7 @@ impl SchedulerService for SchedulerGrpc {
                     .bind(&claims.jti)
                     .fetch_one(pool)
                     .await
-                    .map_err(|e| Status::internal(format!("jti revocation lookup failed: {e}")))?;
+                    .status_internal("jti revocation lookup failed")?;
             if revoked {
                 return Err(Status::unauthenticated("token revoked"));
             }
@@ -213,7 +214,7 @@ impl SchedulerService for SchedulerGrpc {
             } else {
                 req.priority_class
                     .parse()
-                    .map_err(|e| Status::invalid_argument(format!("priority_class: {e}")))?
+                    .status_invalid("priority_class")?
             },
             nodes: req.nodes,
             edges: req.edges,

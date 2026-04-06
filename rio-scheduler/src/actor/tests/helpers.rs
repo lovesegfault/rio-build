@@ -232,6 +232,54 @@ pub(crate) async fn connect_worker_no_ack(
     Ok(stream_rx)
 }
 
+/// Send a default heartbeat (no bloom, no size_class, empty
+/// running_builds, store_degraded=false). For the "extra heartbeat to
+/// trigger dispatch_ready" pattern where the test doesn't care about
+/// heartbeat field values, only that the actor processes one.
+///
+/// Shared field list with [`connect_worker_no_ack`] — when
+/// `ActorCommand::Heartbeat` grows a field, this is the second edit
+/// site (not 20+ scattered across test modules).
+pub(crate) async fn send_heartbeat(
+    handle: &ActorHandle,
+    worker_id: &str,
+    system: &str,
+    max_builds: u32,
+) -> anyhow::Result<()> {
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            store_degraded: false,
+            resources: None,
+            bloom: None,
+            size_class: None,
+            worker_id: worker_id.into(),
+            systems: vec![system.into()],
+            supported_features: vec![],
+            max_builds,
+            running_builds: vec![],
+        })
+        .await?;
+    Ok(())
+}
+
+/// Merge a DAG with a caller-supplied [`MergeDagRequest`]. Thin wrapper
+/// over the `ActorCommand::MergeDag` + oneshot-reply boilerplate for
+/// tests that need custom `options`/`priority_class`/`traceparent` but
+/// don't need to inspect the reply channel directly.
+pub(crate) async fn merge_dag_req(
+    handle: &ActorHandle,
+    req: MergeDagRequest,
+) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req,
+            reply: reply_tx,
+        })
+        .await?;
+    Ok(reply_rx.await??)
+}
+
 /// Connect a worker (stream + heartbeat) so it becomes fully registered.
 /// Returns the mpsc::Receiver for scheduler→worker messages.
 pub(crate) async fn connect_worker(

@@ -24,6 +24,7 @@ use tonic::Status;
 use tracing::warn;
 use uuid::Uuid;
 
+use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 
 use crate::actor::{ActorCommand, ActorError, ActorHandle};
@@ -152,8 +153,7 @@ impl SchedulerGrpc {
     /// Parse a build_id string into a Uuid with a standard error message.
     /// Includes the parse error detail so CLI users see why it's invalid.
     pub(crate) fn parse_build_id(s: &str) -> Result<Uuid, Status> {
-        s.parse()
-            .map_err(|e| Status::invalid_argument(format!("invalid build_id UUID: {e}")))
+        s.parse().status_invalid("invalid build_id UUID")
     }
 }
 
@@ -175,7 +175,7 @@ pub(crate) async fn resolve_tenant_name(
         .bind(name.as_str())
         .fetch_optional(pool)
         .await
-        .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
+        .status_internal("tenant lookup failed")?
         .ok_or_else(|| Status::invalid_argument(format!("unknown tenant: {name}")))
 }
 

@@ -487,18 +487,11 @@ mod tests {
         key_name: &str,
         seed: &[u8; 32],
     ) -> uuid::Uuid {
-        let tid = rio_test_support::seed_tenant(pool, tenant_name).await;
-        sqlx::query(
-            "INSERT INTO tenant_keys (tenant_id, key_name, ed25519_seed) \
-             VALUES ($1, $2, $3)",
-        )
-        .bind(tid)
-        .bind(key_name)
-        .bind(seed.as_slice())
-        .execute(pool)
-        .await
-        .unwrap();
-        tid
+        rio_test_support::TenantSeed::new(tenant_name)
+            .with_ed25519_key(*seed)
+            .with_key_name(key_name)
+            .seed(pool)
+            .await
     }
 
     // r[verify store.tenant.sign-key]

@@ -12,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 
+use rio_common::grpc::StatusExt;
 use rio_proto::WorkerService;
 
 use crate::actor::ActorCommand;
@@ -358,7 +359,7 @@ impl WorkerService for SchedulerGrpc {
                     p.hash_algorithm,
                     p.version,
                 )
-                .map_err(|e| Status::invalid_argument(format!("invalid bloom filter: {e}")))
+                .status_invalid("invalid bloom filter")
             })
             .transpose()?;
 

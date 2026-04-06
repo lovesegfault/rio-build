@@ -446,32 +446,14 @@ pub fn spawn_orphan_chunk_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{ChunkSeed, StoreSeed, path_hash};
     use rio_test_support::TestDb;
-    use sha2::Digest;
+    use rio_test_support::fixtures::test_store_path;
 
     /// Never-cancelled token for sweep tests that don't exercise
     /// the shutdown path.
     fn no_shutdown() -> rio_common::signal::Token {
         rio_common::signal::Token::new()
-    }
-
-    async fn seed_complete_path(pool: &PgPool, path: &str) -> Vec<u8> {
-        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
-        sqlx::query(
-            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
-             VALUES ($1, $2, $1, 0)",
-        )
-        .bind(&hash)
-        .bind(path)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
-            .bind(&hash)
-            .execute(pool)
-            .await
-            .unwrap();
-        hash
     }
 
     /// Sweep must DELETE realisations rows pointing to swept paths.
@@ -483,8 +465,8 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         // Seed a complete path + a realisation pointing to it.
-        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sweep-target";
-        let hash = seed_complete_path(&db.pool, path).await;
+        let path = test_store_path("sweep-target");
+        let hash = StoreSeed::raw_path(&path).seed(&db.pool).await;
         sqlx::query(
             "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
              VALUES ($1, 'out', $2, $3)",
@@ -524,8 +506,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_dry_run_rolls_back() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dryrun";
-        let hash = seed_complete_path(&db.pool, path).await;
+        let hash = StoreSeed::path("dryrun").seed(&db.pool).await;
 
         let stats = sweep(&db.pool, None, vec![hash.clone()], true, &no_shutdown())
             .await
@@ -550,28 +531,15 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         // P: marked unreachable (would be swept).
-        let p = "/nix/store/pppppppppppppppppppppppppppppppp-resurrected";
-        let p_hash = seed_complete_path(&db.pool, p).await;
+        let p = test_store_path("resurrected");
+        let p_hash = StoreSeed::raw_path(&p).seed(&db.pool).await;
 
         // Q: references P. Seeded AFTER mark (simulating the race:
         // mark returned [p_hash], THEN PutPath for Q completed).
-        let q = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-referrer";
-        let q_hash: Vec<u8> = sha2::Sha256::digest(q.as_bytes()).to_vec();
-        sqlx::query(
-            r#"INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, "references")
-               VALUES ($1, $2, $1, 0, ARRAY[$3::text])"#,
-        )
-        .bind(&q_hash)
-        .bind(q)
-        .bind(p)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
-            .bind(&q_hash)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        StoreSeed::path("referrer")
+            .with_refs(&[&p])
+            .seed(&db.pool)
+            .await;
 
         // Sweep with P in the unreachable list. The reference re-check should
         // find Q.references=[P] → skip P → paths_resurrected=1.
@@ -601,8 +569,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_unreferenced_path_deleted() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let p = "/nix/store/cccccccccccccccccccccccccccccccc-unreferenced";
-        let hash = seed_complete_path(&db.pool, p).await;
+        let hash = StoreSeed::path("unreferenced").seed(&db.pool).await;
 
         let stats = sweep(&db.pool, None, vec![hash], false, &no_shutdown())
             .await
@@ -624,42 +591,25 @@ mod tests {
         use std::sync::Arc;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let path = "/nix/store/dddddddddddddddddddddddddddddddd-chunked";
-        let path_hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        let path = test_store_path("chunked");
+        let sp_hash = path_hash(&path);
 
         // Seed two chunks at refcount=1 (will zero + enqueue).
-        let mut chunk_h1 = [0u8; 32];
-        chunk_h1[0] = 0xAA;
-        let mut chunk_h2 = [0u8; 32];
-        chunk_h2[0] = 0xBB;
-        for (h, size) in [(&chunk_h1, 1000i64), (&chunk_h2, 2000i64)] {
-            sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 1, $2)")
-                .bind(&h[..])
-                .bind(size)
-                .execute(&db.pool)
-                .await
-                .unwrap();
-        }
+        let chunk_h1 = ChunkSeed::new(0xAA)
+            .with_refcount(1)
+            .with_size(1000)
+            .seed(&db.pool)
+            .await;
+        let chunk_h2 = ChunkSeed::new(0xBB)
+            .with_refcount(1)
+            .with_size(2000)
+            .seed(&db.pool)
+            .await;
 
-        // Seed narinfo + manifest + manifest_data (chunked: inline_blob
-        // NULL, chunk_list set).
-        sqlx::query(
-            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
-             VALUES ($1, $2, $1, 0)",
-        )
-        .bind(&path_hash)
-        .bind(path)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
-             VALUES ($1, 'complete', NULL)",
-        )
-        .bind(&path_hash)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        // Seed narinfo + manifest (chunked: inline_blob NULL → StoreSeed
+        // default). manifest_data with chunk_list seeded separately.
+        let seeded = StoreSeed::raw_path(&path).seed(&db.pool).await;
+        assert_eq!(seeded, sp_hash);
         let chunk_list = Manifest {
             entries: vec![
                 ManifestEntry {
@@ -674,7 +624,7 @@ mod tests {
         }
         .serialize();
         sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
-            .bind(&path_hash)
+            .bind(&sp_hash)
             .bind(&chunk_list)
             .execute(&db.pool)
             .await
@@ -685,7 +635,7 @@ mod tests {
         let stats = sweep(
             &db.pool,
             Some(&backend),
-            vec![path_hash.clone()],
+            vec![sp_hash.clone()],
             false,
             &no_shutdown(),
         )
@@ -721,27 +671,14 @@ mod tests {
     }
 
     /// Seed a standalone chunk at refcount=0 with a backdated
-    /// `created_at`. Simulates a PutChunk that happened `age_secs`
-    /// ago. Returns the blake3 hash.
-    ///
-    /// Distinct first byte per seed avoids the git-rename-detection
-    /// trap (identical test fixtures across branches look like a
-    /// rename to git's diff heuristic — see tooling-gotchas.md).
+    /// `created_at`. Thin wrapper keeping the (seed, size, age) call
+    /// shape the orphan-chunk tests below use heavily.
     async fn seed_orphan_chunk(pool: &PgPool, seed: u8, size: i64, age_secs: i64) -> [u8; 32] {
-        let mut hash = [0u8; 32];
-        hash[0] = seed;
-        hash[31] = 0xCC; // Marker byte to distinguish from seed_complete_path's SHA fixtures.
-        sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, created_at) \
-             VALUES ($1, 0, $2, now() - make_interval(secs => $3))",
-        )
-        .bind(hash.as_slice())
-        .bind(size)
-        .bind(age_secs)
-        .execute(pool)
-        .await
-        .unwrap();
-        hash
+        ChunkSeed::new(seed)
+            .with_size(size)
+            .age_secs(age_secs)
+            .seed(pool)
+            .await
     }
 
     // r[verify store.chunk.grace-ttl]

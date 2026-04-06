@@ -35,6 +35,7 @@ use rio_proto::types::{
 };
 use rio_proto::validated::ValidatedPathInfo;
 
+use rio_common::grpc::StatusExt;
 use rio_common::limits::MAX_NAR_SIZE;
 use rio_common::tenant::NormalizedName;
 
@@ -168,8 +169,7 @@ pub(super) fn validate_put_metadata(
 
     // Step 5: centralized validation — store_path parses, nar_hash is
     // 32 bytes (placeholder), each reference parses.
-    let info = ValidatedPathInfo::try_from(raw_info)
-        .map_err(|e| Status::invalid_argument(format!("{ctx_label}: {e}")))?;
+    let info = ValidatedPathInfo::try_from(raw_info).status_invalid(ctx_label)?;
 
     // Step 6: HMAC path-in-claims check. None = verifier disabled OR
     // mTLS bypass (gateway) → no check. Floating-CA (claims.is_ca) →
@@ -767,7 +767,7 @@ impl StoreService for StoreServiceImpl {
 
         realisations::insert(&self.pool, &r)
             .await
-            .map_err(|e| internal_error("RegisterRealisation: insert", e))?;
+            .map_err(|e| metadata_status("RegisterRealisation: insert", e))?;
 
         Ok(Response::new(RegisterRealisationResponse {}))
     }
@@ -793,7 +793,7 @@ impl StoreService for StoreServiceImpl {
 
         let r = realisations::query(&self.pool, &drv_hash, &req.output_name)
             .await
-            .map_err(|e| internal_error("QueryRealisation: query", e))?
+            .map_err(|e| metadata_status("QueryRealisation: query", e))?
             .ok_or_else(|| {
                 // Cache miss, not an error. Gateway maps this to an
                 // empty-set wire response.

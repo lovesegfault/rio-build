@@ -6,7 +6,9 @@
 //! - [`fixtures`]: NAR and PathInfo builders
 //! - [`kube_mock`]: scenario-driven mock kube::Client (tower-test)
 //! - [`metrics`]: test-only `metrics::Recorder` impls (DescribedNames, CountingRecorder)
+//! - [`config`]: figment::Jail standing-guard test macros (jail_roundtrip!, jail_defaults!)
 
+pub mod config;
 pub mod fixtures;
 pub mod grpc;
 pub mod kube_mock;

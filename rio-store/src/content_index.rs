@@ -48,7 +48,7 @@ pub async fn insert(
     pool: &PgPool,
     nar_hash: &[u8; 32],
     store_path_hash: &[u8],
-) -> anyhow::Result<()> {
+) -> crate::metadata::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO content_index (content_hash, store_path_hash)
@@ -220,7 +220,7 @@ mod tests {
 
         // Minimal narinfo setup.
         let sp = rio_nix::store_path::StorePath::parse(
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-idem",
+            &rio_test_support::fixtures::test_store_path("idem"),
         )?;
         let sp_hash = sp.sha256_digest().to_vec();
         let nar_hash = [0x11u8; 32];

@@ -367,48 +367,21 @@ mod tests {
         assert_eq!(args.fuse_passthrough, None);
     }
 
-    // -----------------------------------------------------------------------
-    // figment::Jail standing-guard tests — catch the NEXT orphan.
-    //
-    // `config_defaults_are_stable` above only checks fields that ARE
-    // on Config; if an executor/fuse knob ships without a `Config.foo`
-    // field, that test doesn't know to miss it. This pair proves
-    // STRUCTURE: every sub-config table wired + empty-toml defaults
-    // hold. See rio-scheduler/src/main.rs all_subconfigs_roundtrip_toml + all_subconfigs_default_when_absent for the pattern
-    // rationale + the P0219 failure mode that motivated it.
-    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // When you add Config.newfield: ADD IT to both assert blocks below.
 
-    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
-    /// table via the REAL `rio_common::config::load` path (not raw
-    /// figment). Jail changes cwd to a temp dir; `./worker.toml`
-    /// there is picked up by load()'s `{component}.toml` layer.
-    ///
-    /// When you add `Config.newfield`: ADD IT HERE or this test's
-    /// doc-comment is a lie. The companion `all_subconfigs_default_
-    /// when_absent` catches "new required field breaks existing
-    /// deployments" (figment missing-field error).
-    ///
-    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_roundtrip_toml() {
-        figment::Jail::expect_with(|jail| {
-            // Every sub-config table with at least one NON-default
-            // value. Proves: (a) the table name is wired; (b) the
-            // Deserialize derive works; (c) the value reaches Config.
-            jail.create_file(
-                "worker.toml",
-                r#"
-                fuse_passthrough = false
-                fuse_fetch_timeout_secs = 222
-                bloom_expected_items = 123456
-                systems = ["x86_64-linux", "aarch64-linux"]
+    rio_test_support::jail_roundtrip!(
+        "worker",
+        r#"
+        fuse_passthrough = false
+        fuse_fetch_timeout_secs = 222
+        bloom_expected_items = 123456
+        systems = ["x86_64-linux", "aarch64-linux"]
 
-                [tls]
-                cert_path = "/etc/tls/cert.pem"
-                "#,
-            )?;
-            let cfg: Config = rio_common::config::load("worker", CliArgs::default()).unwrap();
+        [tls]
+        cert_path = "/etc/tls/cert.pem"
+        "#,
+        |cfg: Config| {
             assert!(
                 !cfg.fuse_passthrough,
                 "TOML scalar must override the non-serde-bool default of true"
@@ -424,45 +397,28 @@ mod tests {
             // Unspecified sub-field defaults via #[serde(default)]
             // on TlsConfig (partial table must work).
             assert!(cfg.tls.key_path.is_none());
-            Ok(())
-        });
-    }
+        }
+    );
 
-    /// Near-empty worker.toml → every sub-config gets its Default
-    /// impl. Catches "new required field breaks existing
-    /// deployments" (figment missing-field error).
-    ///
-    /// `max_builds` is set to prove the TOML IS loaded (a truly
-    /// empty file would be indistinguishable from a missing one in
-    /// terms of sub-config defaults).
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_default_when_absent() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("worker.toml", "max_builds = 1")?;
-            let cfg: Config = rio_common::config::load("worker", CliArgs::default()).unwrap();
-            // Every sub-config / optional field at its default. When
-            // you add Config.newfield: ADD IT HERE.
-            assert!(!cfg.tls.is_configured());
-            assert!(cfg.scheduler_balance_host.is_none());
-            assert!(cfg.fod_proxy_url.is_none());
-            assert!(cfg.bloom_expected_items.is_none());
-            assert!(cfg.systems.is_empty());
-            assert!(cfg.features.is_empty());
-            // The critical non-serde-bool default: fuse_passthrough
-            // must survive the Serialized::defaults → TOML merge as
-            // `true`. This is the load-bearing check — serde's bool
-            // default is `false`, so if figment's base-layer
-            // serialization drops it, a pre-phase3a config silently
-            // loses kernel passthrough.
-            assert!(
-                cfg.fuse_passthrough,
-                "near-empty TOML must preserve fuse_passthrough=true \
-                 via Serialized::defaults base layer"
-            );
-            assert_eq!(cfg.fuse_fetch_timeout_secs, 180);
-            assert_eq!(cfg.max_leaked_mounts, 3);
-            Ok(())
-        });
-    }
+    rio_test_support::jail_defaults!("worker", "max_builds = 1", |cfg: Config| {
+        assert!(!cfg.tls.is_configured());
+        assert!(cfg.scheduler_balance_host.is_none());
+        assert!(cfg.fod_proxy_url.is_none());
+        assert!(cfg.bloom_expected_items.is_none());
+        assert!(cfg.systems.is_empty());
+        assert!(cfg.features.is_empty());
+        // The critical non-serde-bool default: fuse_passthrough
+        // must survive the Serialized::defaults → TOML merge as
+        // `true`. This is the load-bearing check — serde's bool
+        // default is `false`, so if figment's base-layer
+        // serialization drops it, a pre-phase3a config silently
+        // loses kernel passthrough.
+        assert!(
+            cfg.fuse_passthrough,
+            "near-empty TOML must preserve fuse_passthrough=true \
+             via Serialized::defaults base layer"
+        );
+        assert_eq!(cfg.fuse_fetch_timeout_secs, 180);
+        assert_eq!(cfg.max_leaked_mounts, 3);
+    });
 }

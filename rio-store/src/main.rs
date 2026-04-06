@@ -183,33 +183,34 @@ impl rio_common::config::ValidateConfig for Config {
     }
 }
 
+impl rio_common::server::HasCommonConfig for Config {
+    fn tls(&self) -> &rio_common::tls::TlsConfig {
+        &self.tls
+    }
+    fn metrics_addr(&self) -> std::net::SocketAddr {
+        self.metrics_addr
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // rustls CryptoProvider install. Phase 3b enables tonic
-    // tls-aws-lc; without this, first TLS handshake panics.
-    // Store is a gRPC SERVER (incoming TLS) — the S3 client has
-    // its own TLS stack (aws-sdk's rustls) but it's the same
-    // aws-lc-rs feature, so one install covers both.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let cli = CliArgs::parse();
-    let cfg: Config = rio_common::config::load("store", cli)?;
-    let _otel_guard = rio_common::observability::init_tracing("store")?;
-
-    use rio_common::config::ValidateConfig as _;
-    cfg.validate()?;
+    // Store doesn't dial out via rio-proto (S3 has its own auth), so
+    // init_client_tls is a harmless no-op — the OnceLock gets set but
+    // never read. Passing it keeps all 5 bootstrap() calls uniform.
+    let rio_common::server::Bootstrap::<Config> {
+        cfg,
+        shutdown,
+        otel_guard: _otel_guard,
+    } = rio_common::server::bootstrap(
+        "store",
+        cli,
+        rio_proto::client::init_client_tls,
+        rio_store::describe_metrics,
+    )?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
-
-    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Cloned into each
-    // background loop; .cancelled_owned() for serve_with_shutdown. Lets
-    // main() return normally so atexit handlers (LLVM coverage profraw
-    // flush, tracing shutdown) fire.
-    let shutdown = rio_common::signal::shutdown_signal();
-
-    rio_common::observability::init_metrics(cfg.metrics_addr)?;
-    rio_store::describe_metrics();
 
     let pool = init_db_pool(&cfg.database_url).await?;
 
@@ -383,8 +384,7 @@ async fn main() -> anyhow::Result<()> {
     // mTLS, so when TLS is on, spawn a second plaintext listener
     // with ONLY health, sharing the SAME HealthReporter so
     // set_serving above propagates. See rio_common::server docs.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
-        .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
+    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)?;
     if server_tls.is_some() {
         rio_common::server::spawn_health_plaintext(
             health_service.clone(),
@@ -764,56 +764,27 @@ mod tests {
         CliArgs::command().debug_assert();
     }
 
-    // -----------------------------------------------------------------------
-    // figment::Jail standing-guard tests — catch the NEXT orphan.
-    //
-    // Per-field tests above prove individual keys (chunk_backend kind
-    // tag, nar_buffer_budget roundtrip); this pair proves STRUCTURE:
-    // every sub-config table wired + empty-toml defaults hold. See
-    // rio-scheduler/src/main.rs all_subconfigs_roundtrip_toml + all_subconfigs_default_when_absent for the pattern rationale +
-    // the P0219 failure mode that motivated it (builder added, Config
-    // field missing — `config_defaults_are_stable` above is
-    // STRUCTURALLY BLIND to that: it only checks fields that ARE on
-    // Config, not fields that SHOULD be).
-    // -----------------------------------------------------------------------
+    // figment::Jail standing-guard tests — see rio-test-support/src/config.rs.
+    // When you add Config.newfield: ADD IT to both assert blocks below.
 
-    /// Standing guard: TOML → Config roundtrip for EVERY sub-config
-    /// table via the REAL `rio_common::config::load` path (not raw
-    /// figment). Jail changes cwd to a temp dir; `./store.toml` there
-    /// is picked up by load()'s `{component}.toml` layer.
-    ///
-    /// When you add `Config.newfield`: ADD IT HERE or this test's
-    /// doc-comment is a lie. The companion `all_subconfigs_default_
-    /// when_absent` catches "new required field breaks existing
-    /// deployments" (figment missing-field error).
-    ///
-    /// `#[allow(result_large_err)]` — figment::Error is 208B, API-fixed.
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_roundtrip_toml() {
-        figment::Jail::expect_with(|jail| {
-            // Every sub-config table with at least one NON-default
-            // value. Proves: (a) the table name is wired; (b) the
-            // Deserialize derive works; (c) the value reaches Config.
-            jail.create_file(
-                "store.toml",
-                r#"
-                nar_buffer_budget_bytes = 99999
-                hmac_bypass_cns = ["rio-gateway", "rio-admin"]
-                chunk_cache_capacity_bytes = 123456
+    rio_test_support::jail_roundtrip!(
+        "store",
+        r#"
+        nar_buffer_budget_bytes = 99999
+        hmac_bypass_cns = ["rio-gateway", "rio-admin"]
+        chunk_cache_capacity_bytes = 123456
 
-                [chunk_backend]
-                kind = "filesystem"
-                base_dir = "/custom/path"
+        [chunk_backend]
+        kind = "filesystem"
+        base_dir = "/custom/path"
 
-                [tls]
-                cert_path = "/etc/tls/cert.pem"
+        [tls]
+        cert_path = "/etc/tls/cert.pem"
 
-                [jwt]
-                required = true
-                "#,
-            )?;
-            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+        [jwt]
+        required = true
+        "#,
+        |cfg: Config| {
             assert_eq!(cfg.nar_buffer_budget_bytes, Some(99999));
             assert_eq!(cfg.chunk_cache_capacity_bytes, 123456);
             assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway", "rio-admin"]);
@@ -833,40 +804,20 @@ mod tests {
             // Unspecified sub-field defaults via #[serde(default)]
             // on the sub-struct (partial table must work).
             assert_eq!(cfg.jwt.resolve_timeout_ms, 500);
-            Ok(())
-        });
-    }
+        }
+    );
 
-    /// Near-empty store.toml → every sub-config gets its Default
-    /// impl. If `Config.foo` is added WITHOUT `#[serde(default)]` at
-    /// the struct level (Config itself has it) AND the sub-struct
-    /// lacks `impl Default`, this fails with a figment missing-field
-    /// error — catches "new required field breaks existing
-    /// deployments".
-    ///
-    /// `listen_addr` is set to prove the TOML IS loaded (a truly
-    /// empty file would be indistinguishable from a missing one in
-    /// terms of sub-config defaults).
-    #[test]
-    #[allow(clippy::result_large_err)]
-    fn all_subconfigs_default_when_absent() {
-        figment::Jail::expect_with(|jail| {
-            jail.create_file("store.toml", r#"listen_addr = "0.0.0.0:9002""#)?;
-            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
-            // Every sub-config / optional field at its default. When
-            // you add Config.newfield: ADD IT HERE.
-            assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
-            assert!(cfg.nar_buffer_budget_bytes.is_none());
-            assert!(!cfg.tls.is_configured());
-            assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
-            assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
-            assert!(cfg.signing_key_path.is_none());
-            assert!(cfg.hmac_key_path.is_none());
-            assert!(cfg.cache_http_addr.is_none());
-            assert!(!cfg.cache_allow_unauthenticated);
-            Ok(())
-        });
-    }
+    rio_test_support::jail_defaults!("store", r#"listen_addr = "0.0.0.0:9002""#, |cfg: Config| {
+        assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
+        assert!(cfg.nar_buffer_budget_bytes.is_none());
+        assert!(!cfg.tls.is_configured());
+        assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
+        assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
+        assert!(cfg.signing_key_path.is_none());
+        assert!(cfg.hmac_key_path.is_none());
+        assert!(cfg.cache_http_addr.is_none());
+        assert!(!cfg.cache_allow_unauthenticated);
+    });
 
     // -----------------------------------------------------------------------
     // validate_config rejection tests — spreads the P0409 pattern
