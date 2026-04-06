@@ -70,3 +70,5 @@ mutants.out*/
 *.qcow2
 .stress-test/
 .claude/worktrees/
+.claude/work/
+.claude/notes/
