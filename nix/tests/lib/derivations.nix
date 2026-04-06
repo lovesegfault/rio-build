@@ -48,6 +48,12 @@ rec {
   # http_proxy is absent — proves executor's is_fod gate.
   envDump = ./derivations/env-dump.nix;
 
+  # 50 parallel leaves + 1 collector. Load-test fanout for
+  # scheduling.nix:load-50drv. Fanout not linear chain: 50 serial
+  # builds at tick=2s ≈ 150-200s; fanout is ~40-60s and exercises
+  # bulk-ready dispatch (the actual load concern).
+  fiftyFanout = ./derivations/fifty-fanout.nix;
+
   # Host-side pre-fetch of the busybox for airgapped VM workers. Served
   # via Python http.server on the client VM (see coldBootstrapServer
   # below); cold-bootstrap.nix's url is overridden to http://client:8000/
