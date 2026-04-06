@@ -79,5 +79,8 @@ devicePlugin:
   # VM nodes don't have rio.build/node-role labels or the worker taint.
   # null clears the chart default (same Helm deep-merge semantics as
   # builderPool.tolerations:null in vmtest-full.yaml — indexed key removal).
+  # nodeAffinity must ALSO be cleared — the chart default uses
+  # matchExpressions In [builder,fetcher] which matches zero VM nodes.
   nodeSelector: null
+  nodeAffinity: null
   tolerations: null

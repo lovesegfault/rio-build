@@ -628,12 +628,19 @@ in
   # route to FetcherPool with direct egress + hash-check integrity
   # boundary. Scenario file deleted too.
 
-  # Builder egress NetworkPolicy: IMDS + public internet + k8s API all
-  # blocked. networkPolicy.enabled via extraValues (--set-string "true"
-  # is truthy for `{{ if }}`).
+  # Builder + store egress NetworkPolicy: IMDS + public internet + k8s
+  # API all blocked. networkPolicy.enabled via extraValues (--set-string
+  # "true" is truthy for `{{ if }}`).
   # vmtest-full.yaml defaults it to false; the override renders
-  # networkpolicy.yaml → rio-builder-egress into 02-workloads.yaml.
+  # networkpolicy.yaml into 02-workloads.yaml.
   # Stock k3s kube-router enforces (P0220) — no Calico preload.
+  #
+  # r[verify store.netpol.egress]
+  #   store-egress IMDS-deny + postgres-allow probe via nsenter into
+  #   rio-store pod netns (netpol-store-egress subtest).
+  # r[verify builder.netpol.airgap]
+  #   builder-egress IMDS-deny + k8s-API-deny + DNS-TCP-allow probes
+  #   (netpol-kubeapi / netpol-imds / netpol-dns-tcp subtests).
   vm-netpol-k3s = netpol {
     inherit pkgs common;
     fixture = k3sFull {

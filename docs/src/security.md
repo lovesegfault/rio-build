@@ -76,6 +76,18 @@ non-privileged security context. `privileged: true` remains an escape hatch
 for k3s/kind clusters lacking the device plugin; it falls back to the
 hostPath mechanism and MUST NOT be the production default.
 
+r[sec.psa.control-plane-restricted]
+
+The `rio-system` and `rio-store` namespaces MUST enforce Pod Security
+Admission `restricted`. Control-plane pods (scheduler, gateway, controller,
+store) set `runAsNonRoot: true`, `capabilities.drop: [ALL]`,
+`allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, and
+`readOnlyRootFilesystem: true`. These are gRPC servers with no FUSE, no
+mount, no raw-socket requirements — `restricted` is the correct floor. The
+executor namespaces (`rio-builders`, `rio-fetchers`) stay at `privileged`
+per [ADR-019](./decisions/019-builder-fetcher-split.md); they need
+`CAP_SYS_ADMIN` for FUSE.
+
 > **seccomp:** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is available — see `r[builder.seccomp.localhost-profile]` below.
 
 r[builder.seccomp.localhost-profile]
