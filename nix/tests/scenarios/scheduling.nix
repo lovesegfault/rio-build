@@ -234,31 +234,15 @@ let
           # fanout. 4 parallel leaves across 2 small workers means
           # BOTH get at least one leaf. If either sat idle, dispatch
           # is broken (scheduler not round-robin, or worker
-          # registration metadata wrong).
+          # registration metadata wrong). journald-counted because
+          # rio-builder is one-shot — per-process counters reset on
+          # every restart.
           for w in small_workers:
-              assert_metric_ge(w, 9093,
-                  "rio_builder_builds_total", 1.0,
-                  labels='{role="builder",outcome="success"}')
-
-          # FUSE fetch: each SMALL worker pulled ≥1 path from rio-store
-          # (busybox must be fetched before any build runs). lookup()
-          # materializes the tree on miss (ops.rs:105 ensure_cached)
-          # then caches the inode→realpath mapping for the kernel TTL.
-          # Nonzero misses prove the cold-lookup→fetch→cache path ran.
-          # wlarge never built anything → never fetched anything.
-          for w in small_workers:
-              assert_metric_ge(w, 9093,
-                  "rio_builder_fuse_cache_misses_total", 1.0,
-                  labels='{role="builder"}')
-
-          # wsmall2 runs with RIO_FUSE_PASSTHROUGH=false (default.nix).
-          # Its reads go through the userspace FUSE callback instead of
-          # kernel passthrough. fallback_reads_total ≥1 proves fuse/ops.rs
-          # read() actually ran — passthrough bypasses it entirely.
-          # wsmall1 (passthrough ON) should be near-zero or absent.
-          assert_metric_ge(wsmall2, 9093,
-              "rio_builder_fuse_fallback_reads_total", 1.0,
-              labels='{role="builder"}')
+              n = journal_builds_succeeded(w)
+              assert n >= 1, (
+                  f"{w.name} did 0 builds (journald); fanout should "
+                  f"hit every small worker"
+              )
 
           # Store: received 5 build outputs via PutPath (+ busybox seed).
           # ≥5 to be robust against retries.
@@ -307,19 +291,13 @@ let
               # forwards the permission check to userspace access().
               w.succeed("test -r /var/rio/fuse-store/")
 
-          # Subdir readdir — fast path at ops.rs:410 (tree already
-          # materialized by a prior lookup). Cache contains BOTH .drv
-          # files (regular files) and output dirs; `find -type d` filters
-          # to dirs. busybox is always there (fetched as input for the
-          # leaves wsmall1 built).
-          cached = wsmall1.succeed(
-              "find /var/rio/cache/ -mindepth 1 -maxdepth 1 -type d "
-              "-printf '%f\\n'"
-          ).strip()
-          assert cached, "wsmall1 /var/rio/cache/ has no dirs after fanout"
-          cached = cached.split("\n")[0]
-          sub = wsmall1.succeed(f"ls -la /var/rio/fuse-store/{cached}/ 2>&1")
-          print(f"wsmall1 fuse-store/{cached}:\n{sub}")
+          # Subdir readdir dropped — one-shot builder restarts with a
+          # fresh :memory: index after every build, so paths cached by
+          # the prior process aren't lookup-able on the new mount.
+          # /var/rio/cache/ on disk has stale dirs (clean_stale_tmp_dirs
+          # was removed) that root readdir lists but lookup() can't
+          # resolve. Root readdir + access above proves readdir() fires;
+          # overlay-readdir below proves the in-build path.
     '';
 
     overlay-readdir = ''
@@ -387,12 +365,12 @@ let
           # could false-pass if an earlier fanout leaf somehow routed to
           # large. The delta proves THIS build specifically went large.
           sched_before = scrape_metrics(${gatewayHost}, 9091)
-          wlarge_before = scrape_metrics(wlarge, 9093)
+          wl_before = journal_builds_succeeded(wlarge)
 
           build("${drvs.sizeclass}", attr="bigthing")
 
           sched_after = scrape_metrics(${gatewayHost}, 9091)
-          wlarge_after = scrape_metrics(wlarge, 9093)
+          wl_after = journal_builds_succeeded(wlarge)
 
           # size_class_assignments_total{class="large"} incremented ≥1.
           # bigthing is single-node so expected delta is exactly 1, but
@@ -407,17 +385,12 @@ let
               f"(delta={large_after - large_before})"
           )
 
-          # wlarge's worker_builds_total incremented (proves DISPATCH,
-          # not just classification).
-          wl_before = metric_value(wlarge_before,
-              "rio_builder_builds_total",
-              '{role="builder",outcome="success"}') or 0.0
-          wl_after = metric_value(wlarge_after,
-              "rio_builder_builds_total",
-              '{role="builder",outcome="success"}') or 0.0
+          # wlarge's journald build count incremented (proves DISPATCH,
+          # not just classification). Per-process Prometheus counter
+          # resets on one-shot restart, so journald is the signal.
           assert wl_after >= wl_before + 1, (
               f"wlarge should have built bigthing; "
-              f"before={wl_before}, after={wl_after}"
+              f"journald before={wl_before}, after={wl_after}"
           )
 
           # Small workers: NEITHER got it. journalctl grep is noisier
@@ -1284,9 +1257,9 @@ let
           else:
               _ = profraw_before  # silence unused in non-coverage
 
-          # Restart for later fragments + collectCoverage. systemd
-          # Restart=on-failure (worker.nix:191) does NOT fire for
-          # exit 0 (it's on-FAILURE). Must start manually.
+          # Restart=always (nix/modules/builder.nix) respawns after the
+          # clean exit; explicit start is idempotent and avoids racing
+          # the 1s RestartSec window before wait_for_unit.
           wsmall2.succeed("systemctl start rio-builder.service")
           wsmall2.wait_for_unit("rio-builder.service")
           # Wait for FUSE remount so subsequent fragments (none

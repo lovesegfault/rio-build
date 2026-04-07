@@ -45,11 +45,27 @@ def parse_prometheus(text):
 
 def scrape_metrics(node, port, host="localhost"):
     """curl + parse_prometheus. For standalone-fixture VMs where
-    services bind a host-reachable port. k3s fixtures should use
-    parse_prometheus(kubectl_get_raw) instead."""
+    services bind a host-reachable port. Retries — rio-builder is
+    one-shot and the port is briefly down across systemd restarts.
+    k3s fixtures should use parse_prometheus(kubectl_get_raw) instead."""
     return parse_prometheus(
-        node.succeed(f"curl -sf http://{host}:{port}/metrics")
+        node.wait_until_succeeds(
+            f"curl -sf http://{host}:{port}/metrics", timeout=15
+        )
     )
+
+
+def journal_builds_succeeded(node, unit="rio-builder", since=None):
+    """Count successful builds from journald. Per-process Prometheus
+    counters reset on every one-shot exit; journald survives restarts.
+    Greps for executor/mod.rs's 'build succeeded, uploading outputs'
+    INFO log."""
+    since_arg = f"--since='{since}' " if since else ""
+    rc, out = node.execute(
+        f"journalctl -u {unit} {since_arg}--no-pager | "
+        "grep -c 'build succeeded, uploading outputs'"
+    )
+    return int(out.strip() or "0")
 
 
 def metric_value(scraped, name, labels=""):

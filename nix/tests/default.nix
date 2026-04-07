@@ -373,7 +373,12 @@ in
           # r[verify obs.metric.transfer-volume]
           "chunks"
           "cgroup"
-          "fuse-slowpath"
+          # TODO: fuse-slowpath tests SQLite-index-vs-disk divergence
+          # by rm'ing cache files while the index says present. With
+          # one-shot + :memory: index, there's no inter-build window
+          # with a populated index — needs redesign to inject the
+          # fault during an in-flight build (long sleep drv).
+          # "fuse-slowpath"
         ];
       };
 

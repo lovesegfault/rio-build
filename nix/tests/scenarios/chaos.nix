@@ -249,16 +249,18 @@ pkgs.testers.runNixOSTest {
             "grep -c 'received work assignment.*chaos-reset') -ge 2 ]"
         )
 
-        # NO exhausted uploads. status="exhausted" (upload.rs:247) would
-        # mean a build output failed all 3 attempts. Metric not registered
-        # = zero (good); registered with value 0.0 also good.
-        m = scrape_metrics(worker, 9093)
-        exhausted = metric_value(
-            m, "rio_builder_uploads_total",
-            labels='{role="builder",status="exhausted"}'
-        ) or 0.0
-        assert exhausted == 0.0, (
-            f"upload retries exhausted ({exhausted}×) — heal too slow"
+        # NO exhausted uploads — UploadError::UploadExhausted's Display
+        # ("upload failed after N retries for ...") would appear in
+        # journald if any output hit the retry ceiling. Per-process
+        # counter resets on one-shot restart, so journald is the signal.
+        rc, out = worker.execute(
+            f"journalctl -u rio-builder --since=@{mark} --no-pager "
+            "| grep -c 'upload failed after'"
+        )
+        exhausted = int(out.strip() or "0")
+        assert exhausted == 0, (
+            f"upload retries exhausted ({exhausted}× per journald) — "
+            f"heal too slow"
         )
 
     # ══════════════════════════════════════════════════════════════════

@@ -152,48 +152,29 @@ pkgs.testers.runNixOSTest {
                 f"{sorted(m for m in present if m.startswith(f'rio_{component}_'))}"
             )
 
-        # Find a worker that actually built something, then check it
-        # has all expected worker metrics. (Proves the metrics exist
-        # in the rio-builder binary; scheduling scenario proves exact
-        # per-worker counts.)
-        busy_worker = None
-        for w in workers:
-            scraped = scrape_metrics(w, 9093)
-            if "rio_builder_builds_total" in scraped:
-                busy_worker = (w, scraped)
-                break
-        assert busy_worker is not None, (
-            "no worker has rio_builder_builds_total — chain build "
-            "didn't dispatch anywhere?"
+        # Worker metrics: rio-builder is one-shot (exits after each
+        # build, systemd restarts), so a scrape sees a fresh process
+        # with zero counter series. Verify describe_metrics() ran by
+        # checking the # HELP lines instead — those are emitted at
+        # startup regardless of whether the counter has fired.
+        w = workers[0]
+        raw = w.wait_until_succeeds(
+            "curl -sf http://localhost:9093/metrics", timeout=15
         )
-        w, scraped = busy_worker
-        present = set(scraped.keys())
-        missing = [n for n in EXPECTED_WORKER_METRICS if n not in present]
+        missing = [
+            n for n in EXPECTED_WORKER_METRICS
+            if f"# HELP {n} " not in raw
+        ]
         assert not missing, (
-            f"worker {w.name} (:9093) missing metrics: {missing}\n"
-            f"  present rio_builder_* metrics: "
-            f"{sorted(m for m in present if m.startswith('rio_builder_'))}"
+            f"worker {w.name} (:9093) missing # HELP for: {missing}\n"
+            f"  rio-builder describe_metrics() incomplete?"
         )
-
-        # Bloom fill gauge: set every heartbeat (10s). busy_worker
-        # inserted ≥1 path into its bloom (busybox FUSE fetch →
-        # cache.insert → bloom.insert); by the time the chain
-        # completes; on KVM the chain can finish in <10s (before the
-        # 10s heartbeat tick), so fill==0.0 is valid. Far below 0.5
-        # — filter sized for 50k items, VM test inserts a handful.
-        # obs.metric.bloom-fill-ratio — verify marker at
-        # default.nix:vm-observability-standalone.
-        # 5a3dd30f added role={builder,fetcher} as a global label —
-        # the series key is now '{role="builder"}', not "".
-        fill = scraped.get("rio_builder_bloom_fill_ratio", {}).get('{role="builder"}')
-        assert fill is not None, (
-            f"rio_builder_bloom_fill_ratio gauge missing on {w.name}; "
-            f"present rio_builder_* metrics: "
-            f"{sorted(m for m in present if m.startswith('rio_builder_'))}"
-        )
-        assert 0.0 <= fill < 0.5, (
-            f"unexpected bloom fill ratio on {w.name}: {fill} "
-            "(expected [0, 0.5) with 50k-item capacity; 0.0 valid if chain <10s)"
+        # The chain build that ran above DID exercise the increment
+        # paths — verify via journald (survives one-shot restarts).
+        total_builds = sum(journal_builds_succeeded(w) for w in workers)
+        assert total_builds >= 3, (
+            f"chain A→B→C should produce ≥3 successful builds across "
+            f"workers; journald shows {total_builds}"
         )
 
     # ══════════════════════════════════════════════════════════════════

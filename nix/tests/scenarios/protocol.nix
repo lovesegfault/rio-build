@@ -137,17 +137,12 @@ let
             "rio_scheduler_builds_total", 1.0,
             labels='{outcome="success"}',
         )
-        # 5a3dd30f: role is a global label on rio_builder_* metrics.
-        assert_metric_exact(
-            worker, 9093,
-            "rio_builder_builds_total", 1.0,
-            labels='{role="builder",outcome="success"}',
-        )
-        assert_metric_exact(
-            fetcher, 9093,
-            "rio_builder_builds_total", 1.0,
-            labels='{role="fetcher",outcome="success"}',
-        )
+        # rio-builder is one-shot — per-process counter resets across
+        # systemd restarts. journald is the persistent signal.
+        nb = journal_builds_succeeded(worker)
+        assert nb == 1, f"worker journald shows {nb} builds, expected 1"
+        nf = journal_builds_succeeded(fetcher)
+        assert nf == 1, f"fetcher journald shows {nf} builds, expected 1"
   '';
 
   warmScript = ''

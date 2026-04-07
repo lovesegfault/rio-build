@@ -178,11 +178,12 @@ in
         #     cpu.stat              ← tree-wide cumulative, polled 1Hz
         Delegate = "yes";
         DelegateSubgroup = "builds";
-        # Worker connects to scheduler at startup; scheduler might not be
-        # ready yet (remote host, no `After=` ordering across machines).
-        # Retry on failure with backoff.
-        Restart = "on-failure";
-        RestartSec = "5s";
+        # The builder is one-shot: exits cleanly after completing a
+        # build. systemd respawns it for the next assignment — same
+        # role the k8s controller plays with Jobs. Also covers startup
+        # races (scheduler not ready → connect refused → exit).
+        Restart = "always";
+        RestartSec = "1s";
         # Default StartLimitBurst (5 in 10s) is too tight for startup
         # races: worker starts before cross-VM scheduler → connect
         # refused → exit → restart. A few of these in quick succession
