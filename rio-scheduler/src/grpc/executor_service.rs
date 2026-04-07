@@ -5,9 +5,9 @@
 //! bounds-checking and the stream message-dispatch tree change on a
 //! schedule independent of the client-facing SchedulerService RPCs.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
@@ -17,6 +17,11 @@ use rio_proto::ExecutorService;
 use crate::actor::ActorCommand;
 
 use super::SchedulerGrpc;
+
+/// Cap on in-flight proactive ema PG writes. Progress arrives ~10s ×
+/// every running build; under PG slowdown, unbounded spawns accumulate.
+/// Dropped writes are caught by the next 10s tick (memory.peak monotone).
+static EMA_WRITE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
 
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
@@ -213,6 +218,8 @@ impl ExecutorService for SchedulerGrpc {
                             // is monotone — no info lost).
                             if let (Some(pool), Some(res)) = (&pool_for_recv, &progress.resources)
                                 && res.memory_used_bytes > 0
+                                && let Ok(permit) =
+                                    Arc::clone(&EMA_WRITE_PERMITS).try_acquire_owned()
                             {
                                 let db = crate::db::SchedulerDb::new(pool.clone());
                                 let drv_path = progress.drv_path;
@@ -220,6 +227,7 @@ impl ExecutorService for SchedulerGrpc {
                                 rio_common::task::spawn_monitored(
                                     "ema-proactive-write",
                                     async move {
+                                        let _permit = permit;
                                         match db
                                             .update_ema_peak_memory_proactive(&drv_path, observed)
                                             .await
