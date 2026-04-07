@@ -2,7 +2,7 @@
 //!
 //! **Layering rule:** anything that depends on `tonic` types but NOT on
 //! generated proto types belongs here — timeout wrappers, [`StatusExt`],
-//! [`check_bound`], the [`CLIENT_TLS`] OnceLock, [`max_message_size`], h2
+//! [`check_bound`], the `CLIENT_TLS` OnceLock, [`max_message_size`], h2
 //! tuning, the shared retry predicate, backoff/jitter, `x-rio-*` metadata
 //! key constants. Anything that names a generated client or message type
 //! (`connect_store`, `BalancedChannel`, NAR stream chunk/collect) belongs
