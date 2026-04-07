@@ -35,6 +35,11 @@
   # (nix/nixos-node/nodeadm.nix). Track kubernetes_version's minor —
   # nodeadm emits a KubeletConfiguration matching the control plane.
   # Hashes: build once with lib.fakeHash, copy "got:" lines.
+  #
+  # nix/tests/fixtures/mock-imds.py sets featureGates.InstanceIdNodeName
+  # =true so nodeadm-init skips the EC2 DescribeInstances call (only
+  # IMDS is mocked). If a bump removes that gate, vm-nixos-node will
+  # hang ~10min on a DescribeInstances retry loop — check there first.
   nodeadm_rev = "v20260318";
   nodeadm_src_hash = "sha256-lrkifYFc9XXBienp15gZ2gJkeFqcJH21cGl7SWyj+Qw=";
 

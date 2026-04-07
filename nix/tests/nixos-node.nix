@@ -68,6 +68,11 @@ pkgs.testers.runNixOSTest {
       virtualisation = {
         memorySize = 2048;
         cores = 2;
+        # nodeadm's KubeletConfiguration reserves ~1.1 GiB ephemeral-
+        # storage; the qemu-vm default ~1 GiB disk fails kubelet's
+        # NodeAllocatable check ("reservation > capacity") and kubelet
+        # exits 1. 4096 matches common.nix's worker default.
+        diskSize = 4096;
       };
 
       # ── mock IMDS ─────────────────────────────────────────────────────
@@ -80,7 +85,8 @@ pkgs.testers.runNixOSTest {
         # entering its Restart=on-failure loop against a dead :80.
         requiredBy = [ "nodeadm-init.service" ];
         serviceConfig = {
-          ExecStartPre = "${lib.getExe' pkgs.iproute2 "ip"} addr add 169.254.169.254/32 dev lo";
+          # `replace` (not `add`): idempotent if the unit restarts.
+          ExecStartPre = "${lib.getExe' pkgs.iproute2 "ip"} addr replace 169.254.169.254/32 dev lo";
           ExecStart = "${pkgs.python3.interpreter} ${./fixtures/mock-imds.py}";
         };
       };
@@ -141,24 +147,14 @@ pkgs.testers.runNixOSTest {
         node.succeed("sysctl -n user.max_user_namespaces | grep -qx 65536")
         node.succeed("test -f /var/lib/kubelet/seccomp/operator/rio-builder.json")
 
-    # kubelet (Type=simple, Restart=always) loads NODEADM_KUBELET_ARGS
-    # from /etc/eks/kubelet/environment, parses flags, loads
-    # KubeletConfiguration + drop-ins, validates sysctls
-    # (protectKernelDefaults=true → hardening.nix's vm.overcommit_memory
-    # etc. must be present), then tries TLS-bootstrap to 127.0.0.1:6443.
-    # There's no apiserver — kubelet either sits retrying or exits and
-    # gets restarted. Either way the journal shows it got past config
-    # load. Don't wait_for_unit: the active→failed→activating flap
-    # races the test driver's poll.
+    # kubelet loads NODEADM_KUBELET_ARGS from /etc/eks/kubelet/
+    # environment, parses flags, loads KubeletConfiguration + drop-ins,
+    # validates sysctls (protectKernelDefaults=true → hardening.nix's
+    # vm.overcommit_memory etc. must be present), starts the
+    # ContainerManager (NodeAllocatable check passes — diskSize above),
+    # then sits retrying registration to 127.0.0.1:6443. No apiserver →
+    # registration never succeeds, but the process stays active.
     with subtest("kubelet starts under nodeadm-written config"):
-        try:
-            node.wait_until_succeeds(
-                "journalctl -u kubelet.service "
-                r"| grep -qE 'Started kubelet|Starting kubelet main sync loop|Attempting to register node'",
-                timeout=60,
-            )
-        except Exception:
-            print(node.succeed("journalctl -u kubelet.service --no-pager | tail -40"))
-            raise
+        node.wait_for_unit("kubelet.service")
   '';
 }
