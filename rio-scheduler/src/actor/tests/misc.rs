@@ -685,6 +685,51 @@ async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
     );
 }
 
+/// I-204: `soft_features` strips capability-hint features at DAG
+/// insertion. A `{big-parallel}` derivation MUST count toward the
+/// featureless pool (any builder can run it) and MUST NOT count toward
+/// the kvm pool (it doesn't need kvm). Regression: `rsb large-shallow`
+/// (firefox/chromium carry `big-parallel`) spawned `x86-64-kvm-xlarge`
+/// because the I-181 ∅-guard only fires on truly-empty
+/// `required_features`; `{big-parallel} ⊆ {kvm,nixos-test,big-parallel}`
+/// passed the subset check. With `soft_features=[big-parallel]` the
+/// derivation enters the DAG as ∅-feature and I-181 fires.
+// r[verify sched.dispatch.soft-features]
+#[tokio::test]
+async fn size_class_snapshot_soft_features_strip() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
+        .with_size_classes(vec![crate::assignment::SizeClassConfig {
+            name: "medium".into(),
+            cutoff_secs: 600.0,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        }])
+        .with_soft_features(vec!["big-parallel".into()]);
+
+    actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
+    actor.test_inject_ready_with_features("vm", None, "x86_64-linux", &["kvm", "big-parallel"]);
+
+    // Featureless pool: counts ff (stripped → ∅), NOT vm (stripped →
+    // {kvm}, fails subset check vs []).
+    let snap = actor.compute_size_class_snapshot(Some(&[]));
+    assert_eq!(
+        snap.iter().find(|s| s.name == "medium").unwrap().queued,
+        1,
+        "I-204: featureless pool owns big-parallel-only work after strip"
+    );
+
+    // kvm pool: counts vm (stripped → {kvm} ⊆ pf), NOT ff (stripped → ∅,
+    // I-181 ∅-guard fires).
+    let kvm: Vec<String> = vec!["kvm".into(), "nixos-test".into(), "big-parallel".into()];
+    let snap = actor.compute_size_class_snapshot(Some(&kvm));
+    assert_eq!(
+        snap.iter().find(|s| s.name == "medium").unwrap().queued,
+        1,
+        "I-204: kvm pool excludes big-parallel-only work, keeps kvm work"
+    );
+}
+
 /// I-187: snapshot honors `size_class_floor`. A derivation that
 /// `classify()` puts in `tiny` (no estimator sample → smallest class)
 /// but has `size_class_floor=small` (I-177 reactive promotion after a

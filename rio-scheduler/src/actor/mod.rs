@@ -479,6 +479,16 @@ impl DagActor {
         self
     }
 
+    /// Inject soft-feature config (I-204). `requiredSystemFeatures`
+    /// values listed here are stripped from each derivation's
+    /// `required_features` at DAG insertion, so neither spawn-snapshot
+    /// nor dispatch treat them as hardware gates. Empty (the default)
+    /// preserves pre-I-204 behavior — every feature is a gate.
+    pub fn with_soft_features(mut self, soft: Vec<String>) -> Self {
+        self.dag.set_soft_features(soft);
+        self
+    }
+
     /// Inject poison-detection config. Default (3 distinct workers)
     /// matches prior `POISON_THRESHOLD` const behavior. Overriding
     /// `require_distinct_workers=false` lets single-worker dev

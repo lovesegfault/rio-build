@@ -362,6 +362,14 @@ scheduler:
   # memory exceeds it routes to the NEXT larger class even if duration
   # fits. Set it to ≈ the class's resources.limits.memory.
   sizeClasses: []
+  # I-204: requiredSystemFeatures values that are CAPABILITY HINTS, not
+  # hardware gates. Stripped at DAG-insert so spawn/dispatch ignore them.
+  # nixpkgs convention: big-parallel = "uses many cores", benchmark =
+  # "wants quiet machine". Neither needs special hardware — any builder
+  # qualifies. Without this, {big-parallel}-only work routes exclusively
+  # to the kvm pool (the only one advertising it) → spawns .metal for
+  # firefox/chromium.
+  softFeatures: [big-parallel, benchmark]
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +

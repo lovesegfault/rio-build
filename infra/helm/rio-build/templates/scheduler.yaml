@@ -250,5 +250,8 @@ data:
     [[fetcher_size_classes]]
     name = {{ .name | quote }}
     {{- end }}
+    {{- with $s.softFeatures }}
+    soft_features = [{{ range $i, $f := . }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}]
+    {{- end }}
 {{- end }}
 {{- end }}

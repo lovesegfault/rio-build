@@ -54,6 +54,11 @@ struct Config {
     ///   [[fetcher_size_classes]]
     ///   name = "small"
     fetcher_size_classes: Vec<rio_scheduler::FetcherSizeClassConfig>,
+    /// I-204: `requiredSystemFeatures` values that are capability HINTS,
+    /// not hardware gates. Stripped from each derivation at DAG-insert so
+    /// they don't drive pool spawn or block dispatch. nixpkgs convention:
+    /// `big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.
+    soft_features: Vec<String>,
     /// Plaintext health listen address for K8s probes when mTLS is on.
     /// Shares the same HealthReporter as the main server → leadership
     /// toggles propagate. Only listens if server TLS is configured.
@@ -131,6 +136,7 @@ impl Default for Config {
             log_s3_prefix: "logs".into(),
             size_classes: Vec::new(),
             fetcher_size_classes: Vec::new(),
+            soft_features: Vec::new(),
             // 9101 = gRPC (9001) + 100. Same +100 pattern as
             // gateway. Only used when server TLS is configured.
             health_addr: rio_common::default_addr(9101),
@@ -485,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
         log_flush_tx,
         cfg.size_classes,
         cfg.fetcher_size_classes,
+        cfg.soft_features,
         cfg.poison,
         cfg.retry,
         cfg.substitute_max_concurrent,

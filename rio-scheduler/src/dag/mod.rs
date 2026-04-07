@@ -69,12 +69,28 @@ pub struct DerivationDag {
     /// Eliminates O(n) scans in completion handling (gRPC layer receives
     /// drv_path from workers but the DAG is keyed by drv_hash).
     path_to_hash: HashMap<String, DrvHash>,
+    /// I-204: `requiredSystemFeatures` values stripped from
+    /// `DerivationState.required_features` at insertion. nixpkgs treats
+    /// `big-parallel` / `benchmark` as capability HINTS (any multi-core
+    /// box qualifies), unlike `kvm` / `nixos-test` which are hardware
+    /// gates. Stripping here means both spawn-snapshot and dispatch see
+    /// the same gate-only set without threading a param through 50
+    /// `rejection_reason` call sites. The DB persists the unstripped
+    /// original (merge.rs writes `node.required_features`).
+    soft_features: Vec<String>,
 }
 
 impl DerivationDag {
     /// Create an empty DAG.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set soft features. Called once from `DagActor::with_soft_features`
+    /// before any merge/recovery; stripping in `insert_recovered_node`
+    /// and the merge path read this. No-op if called with an empty vec.
+    pub fn set_soft_features(&mut self, soft: Vec<String>) {
+        self.soft_features = soft;
     }
 
     /// Insert a pre-built node (Phase 3b state recovery). No cycle
@@ -85,12 +101,16 @@ impl DerivationDag {
     /// If the node already exists (shouldn't — recover_from_pg
     /// clears the DAG first), the existing one is kept (first-wins,
     /// no overwrite). warn! since it indicates a double-insert bug.
-    pub fn insert_recovered_node(&mut self, state: DerivationState) {
+    pub fn insert_recovered_node(&mut self, mut state: DerivationState) {
         let hash = state.drv_hash.clone();
         if self.nodes.contains_key(&hash) {
             tracing::warn!(drv_hash = %hash, "duplicate recovered node (skipping)");
             return;
         }
+        // r[impl sched.dispatch.soft-features]
+        state
+            .required_features
+            .retain(|f| !self.soft_features.contains(f));
         self.path_to_hash
             .insert(state.drv_path().to_string(), hash.clone());
         self.nodes.insert(hash, state);
@@ -254,6 +274,17 @@ impl DerivationDag {
                         path: node.drv_path.clone(),
                         source: e,
                     })?;
+                // r[impl sched.dispatch.soft-features]
+                // I-204: strip soft features at insertion so the
+                // I-181/I-176 snapshot filter and rejection_reason's
+                // `feature-missing` clause both see hardware-gate
+                // features only. With `soft_features=[big-parallel]`,
+                // a `{big-parallel}` derivation becomes ∅-feature →
+                // featureless pools count it (subset vacuously true),
+                // kvm pool skips it (I-181 ∅ guard).
+                state
+                    .required_features
+                    .retain(|f| !self.soft_features.contains(f));
                 state.interested_builds.insert(build_id);
                 // Carry over interested_builds + retry_count from the
                 // removed retriable node (if any) — other stuck builds
