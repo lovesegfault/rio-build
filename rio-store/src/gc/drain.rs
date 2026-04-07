@@ -455,14 +455,15 @@ mod tests {
         let (drain_res, upsert_res) = tokio::join!(
             drain_once(&pool_a, &backend_a),
             // PutPath's chunk upsert: ON CONFLICT bumps refcount,
-            // clears deleted. RETURNING (refcount = 1) tells caller
-            // whether to upload (true = first reference, must upload).
+            // clears deleted. RETURNING (uploaded_at IS NULL) tells
+            // caller whether to upload (true = no prior upload
+            // committed). Mirrors metadata::upgrade_manifest_to_chunked.
             sqlx::query_scalar::<_, bool>(
                 "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
                  VALUES ($1, 1, 14, false) \
                  ON CONFLICT (blake3_hash) DO UPDATE SET \
                    refcount = chunks.refcount + 1, deleted = false \
-                 RETURNING (refcount = 1)"
+                 RETURNING (uploaded_at IS NULL)"
             )
             .bind(hash_x.as_slice())
             .fetch_one(&pool_b),
@@ -474,18 +475,18 @@ mod tests {
         // Two valid serializations:
         //
         // A) Drain wins: re-check sees (deleted AND refcount=0)=true,
-        //    S3-deletes, commits. THEN upsert runs, sees refcount=0 →
-        //    sets refcount=1 → RETURNING (refcount=1)=true → caller
-        //    re-uploads. deleted=1, must_upload=true.
+        //    S3-deletes, commits. THEN upsert runs against the
+        //    deleted row → uploaded_at is NULL → must_upload=true →
+        //    caller re-uploads. deleted=1, must_upload=true.
         //
         // B) Upsert wins: refcount→1, deleted→false, commits. THEN
         //    drain's re-check sees (deleted AND refcount=0)=false,
-        //    skips S3 delete. deleted=0, must_upload=true (refcount
-        //    went 0→1).
+        //    skips S3 delete. deleted=0, must_upload=true (uploaded_at
+        //    still NULL — drain seed never set it).
         //
         // What must NEVER happen (the bug FOR UPDATE fixes):
-        // deleted=1 AND must_upload=false → S3 deleted but PG thinks
-        // refcount≥2 so nobody re-uploads → permanent loss.
+        // deleted=1 AND must_upload=false → S3 deleted but caller
+        // skipped re-upload → permanent loss.
         // nonminimal_bool: the negated-conjunction form directly
         // encodes "NOT the bad state"; De Morgan obscures the
         // invariant being asserted.
@@ -493,7 +494,7 @@ mod tests {
         let no_loss = !(deleted == 1 && !must_upload);
         assert!(
             no_loss,
-            "permanent data loss: S3 deleted but upsert saw refcount>=2 \
+            "permanent data loss: S3 deleted but upsert saw uploaded_at set \
              (skipped re-upload). deleted={deleted} must_upload={must_upload}"
         );
         // In practice, with this timing, upsert always sees

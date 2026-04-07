@@ -234,18 +234,22 @@ impl ChunkService for ChunkServiceImpl {
             .map_err(|e| storage_error("PutChunk backend put", e))?;
 
         // PG row at refcount=0. `created_at` DEFAULT now() is the
-        // grace-TTL clock start. `ON CONFLICT DO NOTHING`: if another
-        // manifest already references this chunk (refcount > 0), or a
-        // concurrent PutChunk beat us, leave the existing row alone —
-        // resetting created_at would LENGTHEN the grace window on
-        // every PutChunk retry, which lets a slow-retrying client keep
-        // a dead chunk alive indefinitely.
+        // grace-TTL clock start. backend.put() already succeeded, so
+        // `uploaded_at = now()` records the S3-presence commit point.
+        //
+        // ON CONFLICT: only touch uploaded_at via COALESCE — keeps an
+        // existing timestamp, fills NULL (e.g. row created by a crashed
+        // cas::put_chunked) since WE just uploaded the bytes. Leaves
+        // created_at/refcount alone so retries don't extend the grace
+        // window or double-count.
         //
         // i64 cast for PG BIGINT (declared_size fits — we capped it
         // at 256 KiB above).
         sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 0, $2) \
-             ON CONFLICT (blake3_hash) DO NOTHING",
+            "INSERT INTO chunks (blake3_hash, refcount, size, uploaded_at) \
+             VALUES ($1, 0, $2, now()) \
+             ON CONFLICT (blake3_hash) DO UPDATE \
+                 SET uploaded_at = COALESCE(chunks.uploaded_at, EXCLUDED.uploaded_at)",
         )
         .bind(digest.as_slice())
         .bind(declared_size as i64)
