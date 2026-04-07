@@ -785,7 +785,9 @@ impl DagActor {
                 // + PG) + check poison threshold (same helper as
                 // reassign_derivations).
                 let should_poison = if let Some(w) = &executor_id {
-                    self.record_failure_and_check_poison(&drv_hash, w).await
+                    self.record_failure_and_check_poison(&drv_hash, w)
+                        .await
+                        .reached_poison
                 } else {
                     self.dag
                         .node(&drv_hash)

@@ -31,6 +31,18 @@ struct CaCutoffVerified {
     output_hash: [u8; 32],
 }
 
+/// Result of [`DagActor::record_failure_and_check_poison`]. The
+/// `promoted` flag lets `handle_transient_failure` exempt
+/// floor-promotion retries from `max_retries` (I-213).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FailureOutcome {
+    pub(super) reached_poison: bool,
+    /// `promote_size_class_floor` actually changed the floor. False if
+    /// already at the largest class, executor unclassed, or floor
+    /// already at the target.
+    pub(super) promoted: bool,
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Best-effort persist helpers (13 call sites across actor/*)
@@ -355,8 +367,10 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         failed_class: Option<&str>,
-    ) {
-        let Some(from) = failed_class else { return };
+    ) -> bool {
+        let Some(from) = failed_class else {
+            return false;
+        };
         let mut promoted_to: Option<String> = None;
         if let Some(state) = self.dag.node_mut(drv_hash) {
             let (to, kind) = if state.is_fixed_output {
@@ -369,7 +383,7 @@ impl DagActor {
                 let to = crate::assignment::next_builder_class(from, &classes);
                 (to, "builder")
             };
-            let Some(to) = to else { return };
+            let Some(to) = to else { return false };
             // Change-detector, NOT an ordinal compare — fires on any
             // `to != current floor`, not strictly `to > floor`. The
             // "only ever bumps UP" property is structural: dispatch
@@ -408,12 +422,13 @@ impl DagActor {
         // re-OOM on tiny. Outside the node_mut borrow (await point);
         // best-effort — a lost write degrades to one wasted retry,
         // same as pre-P0556 behavior.
-        if let Some(to) = promoted_to
-            && let Err(e) = self.db.update_size_class_floor(drv_hash, &to).await
+        if let Some(to) = &promoted_to
+            && let Err(e) = self.db.update_size_class_floor(drv_hash, to).await
         {
             error!(drv_hash = %drv_hash, to = %to, error = %e,
                    "failed to persist size_class_floor");
         }
+        promoted_to.is_some()
     }
 
     /// Record a worker failure for `drv_hash` (in-mem + PG
@@ -431,7 +446,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
-    ) -> bool {
+    ) -> FailureOutcome {
         // I-170/I-173/I-177: promote size_class_floor on any recorded
         // failure (FOD or builder). The executor lookup here covers
         // handle_transient_failure and recovery-reconcile (executor
@@ -444,7 +459,8 @@ impl DagActor {
             .executors
             .get(executor_id)
             .and_then(|e| e.size_class.clone());
-        self.promote_size_class_floor(drv_hash, failed_class.as_deref())
+        let promoted = self
+            .promote_size_class_floor(drv_hash, failed_class.as_deref())
             .await;
         if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_builders.insert(executor_id.clone());
@@ -457,10 +473,15 @@ impl DagActor {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
                    "failed to persist failed_worker");
         }
-        self.dag
+        let reached_poison = self
+            .dag
             .node(drv_hash)
             .map(|s| self.poison_config.is_poisoned(s))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        FailureOutcome {
+            reached_poison,
+            promoted,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1500,7 +1521,10 @@ impl DagActor {
         // best-effort) + get poison verdict in one call — same
         // helper as reassign_derivations (worker.rs) and
         // handle_reconcile_assignments (recovery.rs).
-        let reached_poison = self
+        let FailureOutcome {
+            reached_poison,
+            promoted,
+        } = self
             .record_failure_and_check_poison(drv_hash, executor_id)
             .await;
 
@@ -1527,15 +1551,32 @@ impl DagActor {
             reached_poison || self.failed_builders_exhausts_fleet(drv_hash, is_fod);
 
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
+            // r[impl sched.retry.promotion-exempt]
+            // I-213: a failure that promoted the floor is a sizing
+            // signal, not a build-determinism signal. It always
+            // retries (on the next-larger class) and doesn't consume
+            // `max_retries` — bounded instead by the ladder length
+            // (`next_*_class` returns None at the top, so `promoted`
+            // is false there and the budget applies). Without this,
+            // `max_retries=2` capped the climb at 3 rungs of a 5-rung
+            // ladder; firefox poisoned at `medium` with xlarge never
+            // tried.
             if reached_poison {
                 false // poison_and_cascade below does the transition
-            } else if state.retry_count < self.retry_policy.max_retries {
+            } else if promoted || state.retry_count < self.retry_policy.max_retries {
                 state.ensure_running();
                 if let Err(e) = state.transition(DerivationStatus::Failed) {
                     warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
                 }
                 true
             } else {
+                warn!(
+                    drv_hash = %drv_hash,
+                    retry_count = state.retry_count,
+                    max = self.retry_policy.max_retries,
+                    size_class_floor = ?state.size_class_floor,
+                    "transient failure: max_retries exhausted, poisoning"
+                );
                 false // poison_and_cascade below does the transition
             }
         } else {
@@ -1550,17 +1591,20 @@ impl DagActor {
             let drv_hash_owned: DrvHash = drv_hash.clone();
 
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
-                state.retry_count += 1;
+                if !promoted {
+                    state.retry_count += 1;
+                }
                 state.assigned_executor = None;
             }
 
-            if let Err(e) = self.db.increment_retry_count(drv_hash).await {
+            if !promoted && let Err(e) = self.db.increment_retry_count(drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
             }
 
             debug!(
                 drv_hash = %drv_hash,
-                retry_count = retry_count + 1,
+                retry_count = retry_count + u32::from(!promoted),
+                promoted,
                 backoff_secs = backoff.as_secs_f64(),
                 "scheduling retry after transient failure"
             );
@@ -1691,6 +1735,7 @@ impl DagActor {
                 executor_id = %executor_id,
                 infra_retry_count = state.infra_retry_count,
                 max = self.retry_policy.max_infra_retries,
+                size_class_floor = ?state.size_class_floor,
                 "infrastructure failure: max_infra_retries exhausted, poisoning"
             );
             self.poison_and_cascade(drv_hash).await;

@@ -422,6 +422,7 @@ impl DagActor {
                     if was_running {
                         self.record_failure_and_check_poison(drv_hash, executor_id)
                             .await
+                            .reached_poison
                     } else {
                         // I-097: Assigned-only — don't record failure
                         // (scheduling race, drv never attempted). Re-

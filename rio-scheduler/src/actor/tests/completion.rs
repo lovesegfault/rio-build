@@ -921,6 +921,111 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
     Ok(())
 }
 
+/// I-213: a transient failure that promotes `size_class_floor` does
+/// NOT consume `max_retries`. Promotion is a sizing signal, bounded by
+/// the ladder length; `max_retries` becomes "retries at the same size
+/// class". Regression: firefox-unwrapped climbed tiny→small→medium and
+/// poisoned at retry_count=2 with the ladder's `large`/`xlarge` never
+/// tried.
+// r[verify sched.retry.promotion-exempt]
+#[tokio::test]
+async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+    let db = TestDb::new(&MIGRATOR).await;
+    let classes = ["tiny", "small", "medium", "large", "xlarge"];
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(
+            classes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| SizeClassConfig {
+                    name: (*n).into(),
+                    cutoff_secs: 30.0 * (i + 1) as f64,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                })
+                .collect(),
+        )
+        .with_retry_policy(crate::RetryPolicy {
+            backoff_base_secs: 0.0,
+            ..Default::default()
+        })
+        // Disable distinct-worker poison so we test ONLY max_retries.
+        .with_poison_config(crate::PoisonConfig {
+            threshold: 99,
+            ..Default::default()
+        })
+    });
+    let mut rxs = Vec::new();
+    for c in classes {
+        rxs.push(connect_builder_classed(&handle, &format!("b-{c}"), "x86_64-linux", c).await?);
+    }
+
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "ladder-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let p = test_drv_path("ladder-drv");
+
+    // Walk tiny→small→medium→large: each failure promotes,
+    // retry_count stays 0.
+    for (i, c) in classes[..4].iter().enumerate() {
+        handle
+            .debug_force_assign("ladder-drv", &format!("b-{c}"))
+            .await?;
+        complete_failure(
+            &handle,
+            &format!("b-{c}"),
+            &p,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            "simulated OOM",
+        )
+        .await?;
+        let s = handle
+            .debug_query_derivation("ladder-drv")
+            .await?
+            .expect("exists");
+        assert_eq!(
+            s.size_class_floor.as_deref(),
+            Some(classes[i + 1]),
+            "failure on {c} → floor promoted to {}",
+            classes[i + 1]
+        );
+        assert_eq!(
+            s.retry_count, 0,
+            "I-213: promotion-causing failure does NOT increment retry_count (after {c})"
+        );
+        assert_ne!(s.status, DerivationStatus::Poisoned);
+    }
+
+    // At xlarge (top of ladder): no promotion → retry_count
+    // increments. After 3 same-tier failures (max_retries=2): poison.
+    for attempt in 0..3 {
+        handle.debug_force_assign("ladder-drv", "b-xlarge").await?;
+        complete_failure(
+            &handle,
+            "b-xlarge",
+            &p,
+            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            &format!("xlarge attempt {attempt}"),
+        )
+        .await?;
+    }
+    let s = handle
+        .debug_query_derivation("ladder-drv")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "max_retries applies once at top of ladder (no promotion)"
+    );
+    Ok(())
+}
+
 /// Derivation poisoned after POISON_THRESHOLD (3) distinct worker failures.
 #[tokio::test]
 async fn test_poison_threshold_after_distinct_workers() -> TestResult {
