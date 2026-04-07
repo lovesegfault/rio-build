@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Kubernetes operator for rio-build: WorkerPool + WorkerPoolSet CRDs"
+description = "Kubernetes operator for rio-build: BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler CRDs"
 
 [[bin]]
 name = "rio-controller"

@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "CustomResourceDefinition types for rio-build (WorkerPool, WorkerPoolSet)"
+description = "CustomResourceDefinition types for rio-build (BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)"
 
 # CRD types extracted from rio-controller so rio-cli (P0237) can
 # depend on them without pulling the full reconciler stack (~500

@@ -156,7 +156,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         ui::step("NLB target health", || step_nlb_health(&client, &region)).await?;
         let _tunnel = ui::step("SSM tunnel", || ssm_tunnel(LOCAL_PORT)).await?;
         ui::step("builderpool reconcile", || {
-            step_workerpool_reconciled(&client)
+            step_builderpoolset_reconciled(&client)
         })
         .await?;
         // SMOKE_EXPR has a builtin:fetchurl FOD + raw consumer.
@@ -533,7 +533,7 @@ pub async fn ssh_banner(port: u16) -> Option<()> {
     buf.starts_with(b"SSH-2.0-").then_some(())
 }
 
-pub async fn step_workerpool_reconciled(client: &kube::Client) -> Result<()> {
+pub async fn step_builderpoolset_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::builderpoolset::BuilderPoolSet;
     // The chart creates a BuilderPoolSet (not a BuilderPool); the
     // controller stamps out {set}-{class} child BuilderPools from it.

@@ -92,7 +92,7 @@ Deploy history: `just eks history`. Rollback: `just eks rollback [REV]`
 
 Two layers, chained:
 
-1. **Pod layer** (`rio-controller/src/scaling.rs`): polls scheduler queue depth every 30s, SSA-patches the WorkerPool StatefulSet replica count between `spec.replicas.{min,max}`. Scale-up is immediate; scale-down requires 10 minutes of quiet (`SCALE_DOWN_WINDOW`).
+1. **Pod layer** (`rio-controller/src/scaling.rs`): polls scheduler queue depth every 30s, SSA-patches the BuilderPool StatefulSet replica count between `spec.replicas.{min,max}`. Scale-up is immediate; scale-down requires 10 minutes of quiet (`SCALE_DOWN_WINDOW`).
 2. **Node layer** (Karpenter): watches for Pending pods that can't schedule, provisions an EC2 instance that fits (~30-60s boot). When pods scale to zero, empty nodes are consolidated after `consolidateAfter` (30s for workers, 5m for general).
 
 The chain: build submitted → queue depth > 0 → rio-controller scales STS to N → N pods Pending (no worker nodes exist) → Karpenter provisions node(s) → pods Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a worker mid-build — only consolidates after rio-controller has scaled the pods away.
@@ -119,7 +119,7 @@ Worker cost scales with build load. rio-controller's 10-min scale-down + Karpent
 just eks destroy                  # ~15min
 ```
 
-This deletes WorkerPools first (their finalizers hold pods → NLB
+This deletes BuilderPools/FetcherPools first (their finalizers hold pods → NLB
 → tofu destroy blocks), then `tofu -chdir=infra/eks destroy`.
 
 The S3 bucket has `force_destroy = true` so it deletes even with

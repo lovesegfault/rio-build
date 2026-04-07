@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 rio-common = { workspace = true }
 rio-proto = { workspace = true }
-# CRD types only (WorkerPool, WorkerPoolSet) — NOT rio-controller.
+# CRD types only (BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler) — NOT rio-controller.
 # rio-crds was extracted specifically so rio-cli can import CRD
 # structs without pulling the reconciler stack.
 rio-crds = { workspace = true }

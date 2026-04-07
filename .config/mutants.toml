@@ -13,7 +13,7 @@ examine_globs = [
   # Scheduler state machine transitions. Off-by-one or wrong-comparison
   # bugs here compile cleanly and pass "does it return something" tests.
   "rio-scheduler/src/state/derivation.rs",
-  # best_worker scoring + hard/soft filters. Arithmetic-heavy.
+  # best_executor scoring + hard/soft filters. Arithmetic-heavy.
   "rio-scheduler/src/assignment.rs",
   # Protocol primitives: u64/string/bytes padding, framed I/O.
   "rio-nix/src/protocol/wire/mod.rs",
@@ -31,7 +31,7 @@ examine_globs = [
   # "rio-scheduler/src/actor/dispatch.rs",
   #   Store GC sweep. Batch-size boundary arithmetic.
   # "rio-store/src/gc/sweep.rs",
-  #   Worker overlay mount path construction. String slicing.
+  #   Builder overlay mount path construction. String slicing.
   # "rio-builder/src/overlay.rs",
   #   JWT interceptor verify logic. Expiry comparison.
   # "rio-common/src/jwt_interceptor.rs",

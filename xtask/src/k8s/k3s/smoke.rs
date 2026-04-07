@@ -34,7 +34,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // Port-forward to the gateway Service (instead of SSM→NLB).
         let _tunnel = ui::step("establish tunnel", || tunnel(LOCAL_PORT)).await?;
         ui::step("builderpool reconcile", || {
-            chaos::step_workerpool_reconciled(&client)
+            chaos::step_builderpoolset_reconciled(&client)
         })
         .await?;
         ui::step("fetcherpool reconcile", || {
