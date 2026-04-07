@@ -27,7 +27,7 @@ use k8s_openapi::api::core::v1::Pod;
 #[allow(unused_imports)]
 use kube::Resource;
 use kube::ResourceExt;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::Api;
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
 use tracing::{info, warn};
@@ -56,13 +56,6 @@ pub(super) mod tests;
 /// suffix describes WHAT the finalizer gates. K8s stores this in
 /// `metadata.finalizers`; delete blocks until we remove it.
 const FINALIZER: &str = "builderpool.rio.build/drain";
-
-/// Pre-Kubebuilder-convention finalizer name. Objects created before
-/// the rename carry this; [`migrate_finalizer`] rewrites it to
-/// [`FINALIZER`] on the next reconcile. Kept as a const so a grep
-/// for the old name finds the migration, not just a dangling string
-/// in a cluster manifest.
-const OLD_FINALIZER: &str = "rio.build/builderpool-drain";
 
 /// Field manager for server-side apply. K8s tracks which fields
 /// each manager owns; conflicting managers get a 409 unless
@@ -121,13 +114,6 @@ async fn reconcile_inner(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> 
     })?;
     let api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
 
-    // Finalizer retrofit: if the old-style name is present, rewrite
-    // it to the new Kubebuilder-style name before entering the
-    // finalizer() wrap. See [`migrate_finalizer`].
-    if let Some(action) = migrate_finalizer(&api, &wp, OLD_FINALIZER, FINALIZER).await? {
-        return Ok(action);
-    }
-
     // finalizer() manages the metadata.finalizers entry. It calls
     // our closure with Event::Apply or Event::Cleanup. After
     // Cleanup returns Ok, it removes the finalizer → K8s GC
@@ -143,100 +129,6 @@ async fn reconcile_inner(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> 
     })
     .await
     .map_err(|e| Error::Finalizer(Box::new(e)))
-}
-
-/// Rewrite a legacy finalizer name to a new one in-place.
-///
-/// Migration for the Kubebuilder naming retrofit. If `old_name`
-/// is present in `obj.metadata.finalizers`, issue a JSON merge
-/// patch that replaces it with `new_name` at the same index.
-/// Returns `Some(Action::await_change())` to short-circuit the
-/// current reconcile — the patch triggers a fresh reconcile with
-/// the updated finalizers list, which then flows into `finalizer()`
-/// normally.
-///
-/// Lost-update safety: the merge-patch carries `resourceVersion` so
-/// a concurrent finalizer add (foreign controller, between our read
-/// of `obj.finalizers()` and the `api.patch()` below) gets 409
-/// Conflict instead of silently stomped. On 409, the reconciler
-/// requeues and retries with the fresh list. Without resourceVersion,
-/// merge-patch on an array = full replace — foreign finalizers added
-/// in the window vanish.
-///
-/// OLD→NEW atomicity (original concern) holds regardless: the swap
-/// is one apiserver write, no window where NEITHER finalizer blocks.
-/// Idempotent: if old is absent, returns `None` and the caller
-/// proceeds.
-///
-/// Why replace-in-place (not add-new-then-remove-old): two
-/// separate patches means two reconcile round-trips and a window
-/// where BOTH are present. Harmless (deletion blocked either way),
-/// but noisy. Merge-patch of the full array is one write.
-///
-/// kube-rs has no `finalizer::add`/`finalizer::remove` helpers —
-/// [`kube::runtime::finalizer::finalizer`] manages exactly one name
-/// internally via JSON patch. For migration (managing TWO names
-/// briefly), merge-patch on the full array is the path of least
-/// ceremony.
-pub(crate) async fn migrate_finalizer<K>(
-    api: &Api<K>,
-    obj: &K,
-    old_name: &str,
-    new_name: &str,
-) -> Result<Option<Action>>
-where
-    K: kube::Resource + Clone + serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug,
-{
-    let fins = obj.finalizers();
-    let Some(idx) = fins.iter().position(|f| f == old_name) else {
-        return Ok(None);
-    };
-    // Rewrite old→new at the same index. Preserves any other
-    // finalizers (foreign controllers) exactly.
-    let mut patched: Vec<String> = fins.to_vec();
-    patched[idx] = new_name.to_string();
-    let name = obj
-        .meta()
-        .name
-        .clone()
-        .ok_or_else(|| Error::InvalidSpec("migrate_finalizer: object has no name".into()))?;
-    // resourceVersion for optimistic locking. Without it, a foreign
-    // controller's finalizer added between our read (fins above) and
-    // the patch below gets silently stomped — merge-patch of an array
-    // = full replace. With it, the apiserver returns 409 Conflict on
-    // a stale rv and we requeue instead of losing data.
-    let rv = obj.meta().resource_version.clone().ok_or_else(|| {
-        Error::InvalidSpec("migrate_finalizer: object has no resourceVersion".into())
-    })?;
-    info!(
-        object = %name, from = %old_name, to = %new_name,
-        "migrating legacy finalizer name"
-    );
-    api.patch(
-        &name,
-        &PatchParams::default(),
-        &Patch::Merge(serde_json::json!({
-            "metadata": {
-                "resourceVersion": rv,
-                "finalizers": patched,
-            }
-        })),
-    )
-    .await
-    .map_err(|e| match e {
-        // 409 Conflict = someone else patched between our read and
-        // write. The reconciler's error_policy() requeues at 30s;
-        // next reconcile reads the fresh finalizers list (including
-        // whatever the foreign controller added) and migrates
-        // correctly.
-        kube::Error::Api(ae) if ae.code == 409 => {
-            info!(object = %name, "migrate_finalizer: resourceVersion conflict, requeuing");
-            Error::Conflict(format!("finalizer migration conflicted on {name}: {ae}"))
-        }
-        e => e.into(),
-    })?;
-    // Patch triggers a watch event → next reconcile sees new-only.
-    Ok(Some(Action::await_change()))
 }
 
 /// Emit Warning events for every spec field the builder will silently

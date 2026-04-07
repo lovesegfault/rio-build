@@ -29,21 +29,13 @@ pub enum Error {
     /// retries. Not transient.
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
-
-    /// Optimistic-lock conflict (resourceVersion mismatch). The
-    /// apiserver returned 409 on a patch that carried a stale
-    /// resourceVersion — something else modified the object between
-    /// our read and write. The reconciler requeues; next iteration
-    /// reads the fresh state and retries.
-    #[error("resourceVersion conflict: {0}")]
-    Conflict(String),
 }
 
 /// Result alias used throughout reconcilers.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Discriminator string for metric labels. Stable across
-/// error-message changes; low cardinality (5 values).
+/// error-message changes; low cardinality (3 values).
 ///
 /// `rio_controller_reconcile_errors_total{error_kind=...}` uses
 /// this. Don't switch to Display — error messages contain
@@ -54,6 +46,5 @@ pub fn error_kind(err: &Error) -> &'static str {
         Error::Kube(_) => "kube",
         Error::Finalizer(_) => "finalizer",
         Error::InvalidSpec(_) => "invalid_spec",
-        Error::Conflict(_) => "conflict",
     }
 }
