@@ -1,8 +1,8 @@
 //! helm upgrade from the working tree.
 //!
 //! Reads infra values from tofu outputs, image tag from .rio-image-tag
-//! (written by `eks push`). No git roundtrip — chart changes on a dirty
-//! tree deploy directly.
+//! (written by `eks push`) or recomputed from git if absent. No git
+//! roundtrip — chart changes on a dirty tree deploy directly.
 
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use crate::config::XtaskConfig;
 use crate::k8s::provider::ProviderKind;
 use crate::k8s::{NS, ensure_namespaces, shared, status};
 use crate::sh::repo_root;
-use crate::{helm, kube, tofu, ui};
+use crate::{git, helm, kube, tofu, ui};
 
 /// Scheduler `[[size_classes]]` config — names + cutoffs MUST match
 /// `builderPoolSetDefaults.classes` in values.yaml. `memLimitBytes` ≈ the
@@ -81,12 +81,31 @@ pub async fn run(
     skip_preflight: bool,
     no_hooks: bool,
 ) -> Result<()> {
-    let tag = std::fs::read_to_string(repo_root().join(".rio-image-tag"))
-        .context("no .rio-image-tag — run `cargo xtask k8s -p eks up --push` first")?;
-    let tag = tag.trim();
+    // Image tag: the `.rio-image-tag` handoff file if `--push` ran in
+    // THIS worktree, else recompute (same `git::image_tag` push uses —
+    // short-SHA + `-dirty-${hash}`, deterministic from tree state). A
+    // fresh worktree at the same commit yields the same tag, so a
+    // sibling worktree's `--push` satisfies it. The real "run --push
+    // first" gate is `assert_in_ecr` below — the registry is the source
+    // of truth, not the per-worktree file.
+    let tag = match std::fs::read_to_string(repo_root().join(".rio-image-tag")) {
+        Ok(s) => s.trim().to_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let t = git::image_tag(&git::open()?)?;
+            info!(
+                "computed image tag {t} (no .rio-image-tag — \
+                 run `cargo xtask k8s -p eks up --push` if images aren't in ECR)"
+            );
+            t
+        }
+        Err(e) => return Err(e).context("read .rio-image-tag"),
+    };
+    let tag = tag.as_str();
 
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
+
+    super::push::assert_in_ecr(tag, &region).await?;
 
     // ADR-021: NixOS node AMI is the only EC2NodeClass. I-182: resolve
     // the content-addressed `rio.build/ami` tag from EC2 (newest image

@@ -261,6 +261,38 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
+/// Deploy-time guard: bail if `rio-gateway:{tag}` isn't in ECR. Mirrors
+/// [`super::ami::assert_registered`] — `--deploy` recomputes the image
+/// tag on a fresh worktree (no `.rio-image-tag` handoff file), so the
+/// real "run --push first" signal is the registry, not the file.
+/// `rio-gateway` is the canary repo (always pushed; see `rio_images` in
+/// `infra/eks/ecr.tf`). The manifest-list tag (no `-{arch}` suffix) is
+/// what the chart pulls, so that's what's checked.
+pub async fn assert_in_ecr(tag: &str, region: &str) -> Result<()> {
+    let conf = crate::aws::config(Some(region)).await;
+    let ecr = aws_sdk_ecr::Client::new(conf);
+    let found = ecr
+        .describe_images()
+        .repository_name("rio-gateway")
+        .image_ids(
+            aws_sdk_ecr::types::ImageIdentifier::builder()
+                .image_tag(tag)
+                .build(),
+        )
+        .send()
+        .await;
+    match found {
+        Ok(_) => Ok(()),
+        Err(e) if matches!(e.as_service_error(), Some(se) if se.is_image_not_found_exception()) => {
+            bail!(
+                "no rio-gateway:{tag} in ECR — run `cargo xtask k8s -p eks up --push` first \
+                 (deploying a non-existent tag wedges pods in ImagePullBackOff)"
+            )
+        }
+        Err(e) => Err(e).context("ECR DescribeImages"),
+    }
+}
+
 async fn ecr_login(registry: &str, region: &str, authfile: &str) -> Result<()> {
     let conf = crate::aws::config(Some(region)).await;
     let ecr = aws_sdk_ecr::Client::new(conf);
