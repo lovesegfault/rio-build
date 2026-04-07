@@ -23,8 +23,7 @@
 //!      gone before it can terminate its instances → EC2 orphans.
 //!   5. **Delete xtask-managed K8s objects.** rio-* namespaces (xtask
 //!      created them with `namespace.create=false`), the SSH Secret,
-//!      SPO + spod (kubectl-applied, not helm). Envoy Gateway too if
-//!      it was installed.
+//!      and Envoy Gateway if it was installed.
 //!   6. **tofu destroy.** Everything else: cluster, VPC, RDS, S3, ECR,
 //!      tofu-managed helm releases (cert-manager, aws-lbc, karpenter,
 //!      ESO). RDS `skip_final_snapshot=true`, S3 `force_destroy=true`,

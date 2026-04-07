@@ -1126,7 +1126,6 @@
                   helm-lint
                   crds-drift
                   tfvars-fresh
-                  seccomp-fresh
                   ;
                 inherit (config.checks) pre-commit;
                 dashboard = rioDashboard;

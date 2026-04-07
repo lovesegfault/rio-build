@@ -193,7 +193,6 @@ let
     nixForBuilder # nix-daemon --stdio, spawned per-build
     pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
     pkgs.util-linux # mount, umount for overlay teardown
-    pkgs.busybox # sh/test/sleep for the wait-seccomp initContainer (builders.rs)
 
     # nix-daemon drops privs to a nixbld{N} user inside its sandbox.
     # It enumerates build users via getgrnam("nixbld")->gr_mem — the

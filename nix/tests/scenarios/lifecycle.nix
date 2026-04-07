@@ -3127,8 +3127,9 @@ let
 
           # ── seccomp: Localhost rio-fetcher.json ───────────────────────
           # Container-level (not pod-level — pod-level stays
-          # RuntimeDefault so wait-seccomp initContainer can run
-          # before the profile lands on the node).
+          # RuntimeDefault so a missing profile surfaces as the
+          # executor container's CreateContainerError, not a generic
+          # CreatePodSandBoxError on the pause container).
           seccomp = (
               ctr.get("securityContext", {})
               .get("seccompProfile", {})
