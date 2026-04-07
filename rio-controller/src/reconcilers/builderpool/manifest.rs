@@ -410,7 +410,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     let surplus = compute_surplus(&demand, &supply);
     let pool_key = format!("{ns}/{name}");
     let reapable: BTreeMap<Bucket, usize> = {
-        let mut state = ctx.manifest_idle.lock().expect("manifest_idle poisoned");
+        let mut state = ctx.manifest_idle.lock();
         let idle = state.entry(pool_key).or_default();
         update_idle_and_reapable(idle, &surplus, Instant::now(), ctx.scale_down_window)
     };

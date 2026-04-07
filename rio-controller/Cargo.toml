@@ -49,6 +49,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
 clap = { workspace = true }
+parking_lot = { workspace = true }
 # Ephemeral Job name suffixes (ephemeral.rs random_suffix).
 rand = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

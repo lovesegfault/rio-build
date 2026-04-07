@@ -18,10 +18,10 @@ pub mod fetcherpool;
 pub mod gc_schedule;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use kube::Client;
+use parking_lot::Mutex;
 
 /// Per-pool manifest idle-tracking state: `builderpool::job_common::
 /// Bucket` → when it first went surplus. See `builderpool::manifest::
@@ -85,9 +85,10 @@ pub struct Ctx {
     /// Consecutive error count per `{kind}/{ns}/{name}`. Incremented
     /// by `error_policy`, reset on successful reconcile. Drives
     /// exponential backoff so a persistent apiserver 5xx doesn't
-    /// retry every 30s indefinitely. `std::sync::Mutex` (not tokio)
-    /// — error_policy is a sync fn and the critical section is a
-    /// single HashMap op.
+    /// retry every 30s indefinitely. `parking_lot::Mutex` (not
+    /// tokio): error_policy is a sync fn, the critical section is
+    /// a single HashMap op, and parking_lot has no poison so a
+    /// panic in one reconciler can't wedge another's error_policy.
     pub error_counts: Mutex<HashMap<String, u32>>,
     /// Per-pool per-bucket idle-since timestamp for manifest-mode
     /// scale-down (`r[ctrl.pool.manifest-scaledown]`). Outer key:
@@ -97,8 +98,7 @@ pub struct Ctx {
     /// (`supply > demand`). Cleared when demand returns. A bucket
     /// idle for `scale_down_window` is eligible for Job deletion.
     ///
-    /// `std::sync::Mutex` (not tokio) — same reasoning as
-    /// `error_counts`: the critical section is a single map op.
+    /// `parking_lot::Mutex` — same reasoning as `error_counts`.
     pub manifest_idle: Mutex<HashMap<String, ManifestIdleState>>,
     /// TTL-cached `GetSizeClassStatus` response. The ephemeral
     /// builderpool reconciler and the ComponentScaler reconciler
@@ -174,7 +174,7 @@ impl Ctx {
     /// Keyed by `{kind}/{ns}/{name}` — stable across error_policy
     /// calls for the same object; distinct across reconcilers.
     pub fn error_backoff(&self, key: &str) -> Duration {
-        let mut counts = self.error_counts.lock().expect("error_counts poisoned");
+        let mut counts = self.error_counts.lock();
         let n = counts.entry(key.to_string()).or_insert(0);
         *n = n.saturating_add(1);
         transient_backoff(*n)
@@ -190,7 +190,10 @@ impl Ctx {
     /// The lock is held across the gRPC call so two concurrent
     /// callers don't both miss-then-fetch (the second waits for the
     /// first's fetch then reads the fresh cache). Starvation isn't a
-    /// concern: ≤2 reconcilers, ~10s tick.
+    /// concern: ≤2 reconcilers, ~10s tick. The gRPC has a 5s timeout
+    /// so a wedged scheduler can't park BOTH reconcilers on the lock
+    /// indefinitely; on timeout we fail-open with the stale cached
+    /// value (reconcilers tolerate half-a-tick staleness already).
     pub async fn size_class_status(
         &self,
     ) -> std::result::Result<rio_proto::types::GetSizeClassStatusResponse, tonic::Status> {
@@ -201,21 +204,25 @@ impl Ctx {
         {
             return Ok(resp.clone());
         }
-        let resp = self
-            .admin
-            .clone()
-            .get_size_class_status(rio_proto::types::GetSizeClassStatusRequest::default())
-            .await?
-            .into_inner();
+        let mut admin = self.admin.clone();
+        let fut =
+            admin.get_size_class_status(rio_proto::types::GetSizeClassStatusRequest::default());
+        let resp = match tokio::time::timeout(TTL, fut).await {
+            Ok(r) => r?.into_inner(),
+            Err(_) => {
+                tracing::warn!("get_size_class_status timed out; using stale cache");
+                return cache
+                    .as_ref()
+                    .map(|(_, r)| r.clone())
+                    .ok_or_else(|| tonic::Status::unavailable("scheduler timed out (no cache)"));
+            }
+        };
         *cache = Some((Instant::now(), resp.clone()));
         Ok(resp)
     }
 
     pub fn reset_error_count(&self, key: &str) {
-        self.error_counts
-            .lock()
-            .expect("error_counts poisoned")
-            .remove(key);
+        self.error_counts.lock().remove(key);
     }
 }
 

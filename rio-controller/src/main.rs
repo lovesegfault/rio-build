@@ -483,7 +483,9 @@ fn spawn_health_server(addr: std::net::SocketAddr, shutdown: rio_common::signal:
                 // /healthz. If someone else sends POST /foo they
                 // still get 200. Not a real HTTP server.
                 let mut buf = [0u8; 512];
-                let _ = stream.read(&mut buf).await;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+                        .await;
 
                 // Connection: close — no keep-alive. Probe is
                 // one-shot per periodSeconds.

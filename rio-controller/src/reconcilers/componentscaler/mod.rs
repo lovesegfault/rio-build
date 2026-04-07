@@ -147,7 +147,6 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     let low_ticks_in = ctx
         .component_low_ticks
         .lock()
-        .expect("component_low_ticks poisoned")
         .get(&key)
         .copied()
         .unwrap_or(0);
@@ -157,7 +156,6 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     let decision = component::decide(spec, &status_in, current, builders, max_load, since_up);
     ctx.component_low_ticks
         .lock()
-        .expect("component_low_ticks poisoned")
         .insert(key, decision.low_load_ticks);
 
     publish_metrics(&cs, &decision, max_load);

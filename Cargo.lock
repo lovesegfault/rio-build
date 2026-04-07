@@ -6186,6 +6186,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "metrics",
+ "parking_lot",
  "rand 0.9.2",
  "regex",
  "rio-common",
