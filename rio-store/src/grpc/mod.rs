@@ -46,7 +46,7 @@ use crate::cas::{self, ChunkCache};
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
 use crate::signing::TenantSigner;
-use crate::substitute::Substituter;
+use crate::substitute::{SubstituteError, Substituter};
 use crate::validate::validate_nar_digest;
 
 mod admin;
@@ -532,9 +532,21 @@ impl StoreServiceImpl {
         let (Some(sub), Some(tid)) = (&self.substituter, tenant_id) else {
             return Ok(None);
         };
-        sub.try_substitute(tid, store_path)
-            .await
-            .status_internal("substitute")
+        sub.try_substitute(tid, store_path).await.map_err(|e| {
+            tracing::warn!(error = %e, store_path, "substitution failed");
+            match e {
+                SubstituteError::Fetch(_) => {
+                    Status::unavailable("upstream substitute fetch failed")
+                }
+                SubstituteError::HashMismatch { .. } => {
+                    metrics::counter!("rio_store_substitute_integrity_failures_total").increment(1);
+                    Status::data_loss("upstream substitute NAR hash mismatch")
+                }
+                SubstituteError::NarInfo(_)
+                | SubstituteError::Ingest(_)
+                | SubstituteError::Chunked(_) => Status::internal("substitute ingest failed"),
+            }
+        })
     }
 
     // r[impl store.substitute.tenant-sig-visibility]

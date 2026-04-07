@@ -167,6 +167,11 @@ pub fn describe_metrics() {
          upstream instability or aggressive pod rollouts."
     );
     describe_counter!(
+        "rio_store_substitute_integrity_failures_total",
+        "Upstream substitution NAR hash mismatches. Nonzero is a \
+         security-relevant signal: upstream served corrupt or tampered bytes."
+    );
+    describe_counter!(
         "rio_store_putpath_stale_reclaimed_total",
         "Stale 'uploading' placeholders reclaimed on the PutPath hot path \
          (I-207). Nonzero expected under fetcher churn; sustained high \
