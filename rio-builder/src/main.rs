@@ -124,22 +124,10 @@ async fn main() -> anyhow::Result<()> {
         "connected to gRPC services"
     );
 
-    // Set up FUSE cache and mount. Arc so we can clone handles
-    // BEFORE moving into mount_fuse_background: bloom_handle for
-    // heartbeat, and the Arc itself for the prefetch handler.
-    // Same extract-before-move pattern as bloom_handle always used.
-    let cache = Arc::new(
-        fuse::cache::Cache::new(
-            cfg.fuse_cache_dir,
-            cfg.fuse_cache_size_gb,
-            cfg.bloom_expected_items,
-        )
-        .await?,
-    );
-    // Extract the bloom handle. The heartbeat loop reads from the
-    // same RwLock that cache.insert() writes to — inserts by FUSE
-    // ops show up in subsequent heartbeat snapshots.
-    let heartbeat_bloom = cache.bloom_handle();
+    // Set up FUSE cache and mount. Arc so we can clone for the
+    // prefetch handler before moving into mount_fuse_background.
+    let cache =
+        Arc::new(fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?);
     // Clone for prefetch. Cache methods use runtime.block_on
     // internally (sync, designed for FUSE callbacks on dedicated
     // threads). The prefetch handler will call them via
@@ -302,7 +290,6 @@ async fn main() -> anyhow::Result<()> {
         slot: Arc::clone(&slot),
         ready: Arc::clone(&ready),
         resources: Arc::clone(&resource_snapshot),
-        bloom: heartbeat_bloom,
         // FUSE circuit breaker: polled each tick. move into the task:
         // main() has no other use for the handle.
         circuit: fuse_circuit,
@@ -1233,7 +1220,6 @@ struct HeartbeatCtx {
     slot: Arc<rio_builder::runtime::BuildSlot>,
     ready: Arc<std::sync::atomic::AtomicBool>,
     resources: rio_builder::cgroup::ResourceSnapshotHandle,
-    bloom: Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>,
     circuit: Arc<rio_builder::fuse::circuit::CircuitBreaker>,
     draining: Arc<std::sync::atomic::AtomicBool>,
     generation: Arc<std::sync::atomic::AtomicU64>,
@@ -1256,7 +1242,6 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
         slot,
         ready,
         resources,
-        bloom,
         circuit,
         draining,
         generation,
@@ -1274,7 +1259,6 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
                 &features,
                 &size_class,
                 &slot,
-                Some(&bloom),
                 &resources,
                 circuit.is_open(),
                 draining.load(std::sync::atomic::Ordering::Relaxed),

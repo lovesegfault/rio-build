@@ -690,8 +690,8 @@ fn build_executor_container(
                 e.push(env("RUST_LOG", &level));
             }
             // Role-specific extras: builders pass size_class,
-            // bloom_expected_items, daemon_timeout_secs,
-            // fuse_passthrough here. Fetchers pass nothing.
+            // daemon_timeout_secs, fuse_passthrough here. Fetchers
+            // pass nothing.
             e.extend(p.extra_env.iter().cloned());
             e
         }),

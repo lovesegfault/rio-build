@@ -57,11 +57,8 @@ pub(crate) fn is_active_job(j: &Job) -> bool {
 ///
 /// NOT the exact inverse of [`is_active_job`]: a Succeeded Job is
 /// neither active nor failed. The manifest sweep cares only about
-/// the Failed dimension — Succeeded only happens on deliberate
-/// scale-down (manifest pods loop, no `RIO_EPHEMERAL=1`) and the
-/// reapable pass already handles those. Deduplicated from two
-/// open-coded sites (inventory count + `select_failed_jobs`) after
-/// P0511 landed both.
+/// the Failed dimension — Succeeded Jobs are reaped by
+/// `ttlSecondsAfterFinished`.
 pub(super) fn is_failed_job(j: &Job) -> bool {
     j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0
 }
@@ -94,9 +91,9 @@ pub(crate) fn is_running_job(j: &Job) -> bool {
 }
 
 /// Minimum age before a Running Job is orphan-reapable. 5min: MUST
-/// exceed the builder's `RIO_EPHEMERAL_IDLE_SECS` (default 120s) so
+/// exceed the builder's `RIO_IDLE_SECS` (default 120s) so
 /// the process-level idle-exit gets first chance — a healthy idle
-/// ephemeral pod self-terminates at 120s and the Job goes Complete
+/// pod self-terminates at 120s and the Job goes Complete
 /// well before this fires. The reap targets pods that CANNOT
 /// self-exit (I-165: D-state FUSE wait, OOM-loop) and would otherwise
 /// burn `activeDeadlineSeconds` (default 1h) holding a node.

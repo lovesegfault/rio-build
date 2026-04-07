@@ -2,10 +2,8 @@
 //!
 //! Leaf crate — no `rio-*` dependencies. Provides the `string_newtype!` macro
 //! and [`DrvHash`](newtype::DrvHash) / [`ExecutorId`](newtype::ExecutorId) shared
-//! across the workspace, plus [`limits`] constants, [`observability`] init,
-//! and the self-describing [`BloomFilter`](bloom::BloomFilter).
+//! across the workspace, plus [`limits`] constants and [`observability`] init.
 
-pub mod bloom;
 pub mod config;
 pub mod grpc;
 pub mod hmac;

@@ -37,10 +37,6 @@ fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) ->
     if let Some(s) = wp.spec.daemon_timeout_secs {
         extra_env.push(pod::env("RIO_DAEMON_TIMEOUT_SECS", &s.to_string()));
     }
-    // r[impl ctrl.pool.bloom-knob]
-    if let Some(n) = wp.spec.bloom_expected_items {
-        extra_env.push(pod::env("RIO_BLOOM_EXPECTED_ITEMS", &n.to_string()));
-    }
 
     ExecutorPodParams {
         role: ExecutorRole::Builder,

@@ -171,11 +171,6 @@ rules:
   - apiGroups: [apps]
     resources: [deployments/scale]
     verbs: [get, patch, update]
-  # TODO(cleanup-1-controller): vestigial — main.rs .owns(StatefulSet)
-  # watch still registered at this commit. Drop once that's removed.
-  - apiGroups: [apps]
-    resources: [statefulsets]
-    verbs: [get, list, watch]
   # Reconciler inventories live worker pods by label to compute Job
   # deficit; no mutation — pod lifecycle is the Job controller's.
   - apiGroups: [""]

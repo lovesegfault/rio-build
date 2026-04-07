@@ -152,13 +152,12 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_prefetch_hints_sent_total",
         "PrefetchHint messages sent (one per assignment with paths to warm). \
-         Missing from a dispatch = either leaf drv (no children), or bloom \
-         filter says worker already has everything (scoring working)."
+         Missing from a dispatch = leaf drv (no children)."
     );
     describe_counter!(
         "rio_scheduler_prefetch_paths_sent_total",
         "Total paths in sent PrefetchHints. Divide by hints_sent for avg \
-         paths-per-hint. High avg = workers cold (poor locality) or bloom stale."
+         paths-per-hint."
     );
     describe_counter!(
         "rio_scheduler_warm_gate_fallback_total",

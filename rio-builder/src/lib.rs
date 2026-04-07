@@ -37,9 +37,7 @@ pub mod upload;
 
 // Re-exports for main.rs — keeps `use rio_builder::{...}` imports stable
 // after the lib.rs → runtime.rs extraction.
-pub use runtime::{
-    BloomHandle, BuildSpawnContext, build_heartbeat_request, spawn_build_task, try_cancel_build,
-};
+pub use runtime::{BuildSpawnContext, build_heartbeat_request, spawn_build_task, try_cancel_build};
 
 /// Register `# HELP` descriptions for all worker metrics.
 ///
@@ -105,14 +103,6 @@ pub fn describe_metrics() {
         "rio_builder_fuse_cache_size_bytes",
         "FUSE SSD cache usage in bytes"
     );
-    describe_gauge!(
-        "rio_builder_bloom_fill_ratio",
-        "Fraction of bloom filter bits set (0.0-1.0). Alert >= 0.5: at k=7, \
-         FPR climbs past 1% nonlinearly. Saturation is SILENT — already_cached \
-         prefetch rate DECREASES under saturation (scheduler skips hints it thinks \
-         worker has). The filter never shrinks; only restart clears it. Fix: bump \
-         bloom_expected_items or restart the pod."
-    );
     describe_counter!(
         "rio_builder_fuse_cache_hits_total",
         "FUSE cache hits (local symlink_metadata succeeded)"
@@ -132,9 +122,8 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_prefetch_total",
         "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|error|malformed|panic. \
-         High already_cached rate = scheduler bloom filter stale (10s heartbeat lag is normal; \
-         sustained high = check bloom sizing). error = store fetch failed (debug-only log; \
-         build's own FUSE ops surface the real problem if store is flaky)."
+         error = store fetch failed (debug-only log; build's own FUSE ops surface \
+         the real problem if store is flaky)."
     );
     describe_counter!(
         "rio_builder_upload_bytes_total",

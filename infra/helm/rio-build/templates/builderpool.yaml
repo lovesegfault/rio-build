@@ -15,9 +15,6 @@ metadata:
     rio.build/role: builder
 spec:
   maxConcurrent: {{ $bp.maxConcurrent }}
-  autoscaling:
-    metric: {{ $bp.autoscaling.metric }}
-    targetValue: {{ $bp.autoscaling.targetValue }}
   fuseCacheSize: {{ $bp.fuseCacheSize }}
   systems:
     {{- toYaml $bp.systems | nindent 4 }}

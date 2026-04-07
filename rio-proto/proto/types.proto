@@ -7,7 +7,7 @@ package rio.types;
 //   - dag.proto          — DerivationNode/Edge/Event*, GraphNode/Edge, GetBuildGraph*
 //   - build_types.proto  — BuildEvent*, SubmitBuild*, BuildResult*, Executor/Scheduler stream, Heartbeat*
 //   - admin_types.proto  — ClusterStatus*, ListExecutors*/Builds*/Tenants*, Drain/Poison/SizeClass*
-//   - types.proto (this) — ResourceUsage, BloomFilter, PathInfo, store/chunk/GC/realisation RPCs
+//   - types.proto (this) — ResourceUsage, PathInfo, store/chunk/GC/realisation RPCs
 //
 // All four share `package rio.types;` → prost merges into one `rio.types.rs`.
 // Rust callers see every type at `rio_proto::types::*` regardless of source
@@ -35,33 +35,8 @@ enum BuildResultStatus {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Executor resource / bloom (shared: HeartbeatRequest + ExecutorInfo)
+// Executor resource (shared: HeartbeatRequest + ExecutorInfo)
 // ───────────────────────────────────────────────────────────────────────────
-
-// Self-describing Bloom filter for store path membership testing.
-message BloomFilter {
-  bytes data = 1;                         // Filter bit array
-  uint32 hash_count = 2;                  // Number of hash functions
-  uint32 num_bits = 3;                    // Total bits in filter
-  BloomHashAlgorithm hash_algorithm = 4;  // Hash algorithm used
-  uint32 version = 5;                     // Filter format version
-}
-
-enum BloomHashAlgorithm {
-  BLOOM_HASH_ALGORITHM_UNSPECIFIED = 0;
-  // 1 (MURMUR3_128) and 2 (XXHASH64) were never implemented; only
-  // blake3 is supported. We control both ends of this protocol, so
-  // there's no cross-version ambiguity to preserve.
-  reserved 1, 2;
-  reserved "BLOOM_HASH_ALGORITHM_MURMUR3_128", "BLOOM_HASH_ALGORITHM_XXHASH64";
-  // blake3 split into double-hash indices (Kirsch-Mitzenmacher). Chosen
-  // because it's PORTABLE — the bloom filter is a wire protocol (executor
-  // builds it, scheduler queries it); AES-NI-based hashes like gxhash
-  // produce different output on different architectures, which would
-  // turn every query into a false negative on a heterogeneous cluster.
-  // blake3 is deterministic everywhere. Also: already a dep (chunking).
-  BLOOM_HASH_ALGORITHM_BLAKE3_256 = 3;
-}
 
 // Executor resource usage reported in heartbeats and progress updates.
 message ResourceUsage {

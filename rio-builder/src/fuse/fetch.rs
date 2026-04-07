@@ -496,11 +496,8 @@ impl NixStoreFs {
 /// vs in-flight). Both are "success" from prefetch's perspective.
 #[derive(Debug, Clone, Copy)]
 pub enum PrefetchSkip {
-    /// `cache.get_path()` returned Some — already on disk. The
-    /// scheduler's bloom filter should have caught this (it doesn't
-    /// send hints for paths the worker has), but bloom false
-    /// negatives + stale filter (10s heartbeat interval) mean some
-    /// slip through. Cheap check, harmless.
+    /// `cache.get_path()` returned Some — already on disk. Cheap
+    /// check, harmless.
     AlreadyCached,
     /// `try_start_fetch` returned WaitFor — FUSE or another
     /// prefetch already owns it. We DON'T wait (that's
@@ -1377,7 +1374,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = Arc::new(
-            Cache::new(dir.path().to_path_buf(), 10, None)
+            Cache::new(dir.path().to_path_buf(), 10)
                 .await
                 .expect("Cache::new"),
         );

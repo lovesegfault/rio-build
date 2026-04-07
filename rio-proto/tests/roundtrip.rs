@@ -137,5 +137,4 @@ fn p0376_domain_split_reexports_resolve() {
     // Original types.proto residual primitives:
     let _: rio_proto::types::PathInfo = rio_proto::types::PathInfo::default();
     let _: rio_proto::types::ResourceUsage = rio_proto::types::ResourceUsage::default();
-    let _: rio_proto::types::BloomFilter = rio_proto::types::BloomFilter::default();
 }

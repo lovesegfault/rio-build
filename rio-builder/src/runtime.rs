@@ -25,12 +25,6 @@ use crate::{executor, fuse, log_stream};
 
 use crate::cgroup::ResourceSnapshotHandle;
 
-/// Handle to the FUSE cache's bloom filter. Extracted via
-/// `Cache::bloom_handle()` before the Cache is moved into the FUSE
-/// mount — lets the heartbeat loop read the same filter that `insert()`
-/// writes to.
-pub type BloomHandle = Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>;
-
 /// Per-build cancel registration: cgroup path (for cgroup.kill) +
 /// cancelled flag (for spawn_build_task to distinguish Cancelled
 /// from InfrastructureFailure when execute_build returns Err).
@@ -130,16 +124,7 @@ impl Drop for BuildSlotGuard {
 }
 
 /// Build a heartbeat request, populating `running_builds` from the shared
-/// tracker and `local_paths` from the FUSE cache bloom filter.
-///
-/// `bloom` is `Option<&BloomHandle>` because not every test has FUSE
-/// mounted. `None` = no filter sent; scheduler treats that worker's
-/// locality score as "unknown" (neutral, not penalized).
-///
-/// Takes a bloom HANDLE (not `&Cache`) because main.rs has to move the
-/// Cache into `mount_fuse_background`. The handle is Arc-cloned out
-/// before the move; same underlying RwLock, so Cache::insert writes
-/// show up in our snapshots.
+/// tracker.
 ///
 /// Extracted for testability — the heartbeat loop in main.rs calls this.
 ///
@@ -147,8 +132,6 @@ impl Drop for BuildSlotGuard {
 /// Both are `.to_vec()`'d into the proto — a heartbeat every 10s
 /// means ~100 allocs/min for typically 1-3 elements; not worth the
 /// lifetime-threading to avoid.
-// 9 args: all distinct worker-identity/state fields. A struct would
-// just move the same 9 lines to the call site.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_heartbeat_request(
     executor_id: &str,
@@ -157,50 +140,11 @@ pub async fn build_heartbeat_request(
     features: &[String],
     size_class: &str,
     slot: &BuildSlot,
-    bloom: Option<&BloomHandle>,
     resources: &ResourceSnapshotHandle,
     store_degraded: bool,
     draining: bool,
 ) -> HeartbeatRequest {
     let current: Vec<String> = slot.running().into_iter().collect();
-
-    // Snapshot + serialize. The snapshot clone is ~60 KB (default
-    // sizing); cheap for a 10s interval. Cloning out of the lock
-    // (instead of holding the guard) means insert() isn't blocked
-    // for the duration of the gRPC send.
-    //
-    // to_wire() returns a tuple because rio-common can't depend on
-    // rio-proto (cycle). We unpack into the proto struct here.
-    //
-    // fill_ratio() is read off the SAME snapshot before to_wire()
-    // moves it — popcount over ~60 KB is microseconds, and reading
-    // it here (inside the single-clone critical section) means the
-    // gauge and the wire bytes describe the exact same filter state.
-    // r[impl obs.metric.bloom-fill-ratio]
-    let (local_paths, bloom_fill) = bloom
-        .map(|b| {
-            let snapshot = b.read().unwrap_or_else(|e| e.into_inner()).clone();
-            let fill = snapshot.fill_ratio();
-            let (data, hash_count, num_bits, version) = snapshot.to_wire();
-            (
-                rio_proto::types::BloomFilter {
-                    data,
-                    hash_count,
-                    num_bits,
-                    hash_algorithm: rio_proto::types::BloomHashAlgorithm::Blake3256 as i32,
-                    version,
-                },
-                fill,
-            )
-        })
-        .unzip();
-    // Emit even when fill is 0.0 — "present but empty" is the
-    // heartbeat-0 state and is a distinct signal from "absent"
-    // (bloom=None, e.g., tests without FUSE). The gauge existing
-    // on /metrics at value 0.0 proves the emission path is wired.
-    if let Some(fill) = bloom_fill {
-        metrics::gauge!("rio_builder_bloom_fill_ratio").set(fill);
-    }
 
     // Snapshot is Copy; the read lock is held for one struct load.
     // First heartbeat (before first 10s poll) sends zeros — same
@@ -221,7 +165,6 @@ pub async fn build_heartbeat_request(
         executor_id: executor_id.to_string(),
         running_builds: current,
         resources: Some(resources),
-        local_paths,
         systems: systems.to_vec(),
         supported_features: features.to_vec(),
         // Empty string = unclassified (scheduler maps to None). We
@@ -969,7 +912,6 @@ pub fn handle_prefetch_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse;
 
     // ---- try_cancel_build ----
 
@@ -1069,7 +1011,6 @@ mod tests {
             &[],
             "",
             &slot,
-            None,
             &ResourceSnapshotHandle::default(),
             false,
             false,
@@ -1078,8 +1019,6 @@ mod tests {
         assert_eq!(req.running_builds, vec!["/nix/store/foo.drv".to_string()]);
         assert_eq!(req.executor_id, "worker-1");
         assert_eq!(req.systems, vec!["x86_64-linux"]);
-        // No cache → no bloom filter.
-        assert!(req.local_paths.is_none());
         // ResourceUsage.running_builds mirrors the top-level field.
         assert_eq!(req.resources.unwrap().running_builds, 1);
     }
@@ -1094,7 +1033,6 @@ mod tests {
             &[],
             "",
             &slot,
-            None,
             &ResourceSnapshotHandle::default(),
             false,
             false,
@@ -1114,7 +1052,6 @@ mod tests {
             &[],
             "large",
             &slot,
-            None,
             &ResourceSnapshotHandle::default(),
             false,
             false,
@@ -1129,7 +1066,6 @@ mod tests {
             &[],
             "",
             &slot,
-            None,
             &ResourceSnapshotHandle::default(),
             false,
             false,
@@ -1159,7 +1095,6 @@ mod tests {
             &[],
             "",
             &slot,
-            None,
             &ResourceSnapshotHandle::default(),
             true,
             false,
@@ -1179,7 +1114,6 @@ mod tests {
             &[],
             "",
             &slot,
-            None,
             &ResourceSnapshotHandle::default(),
             false,
             false,
@@ -1201,7 +1135,6 @@ mod tests {
             &["kvm".into(), "big-parallel".into()],
             "",
             &slot,
-            None,
             &ResourceSnapshotHandle::default(),
             false,
             false,
@@ -1209,76 +1142,6 @@ mod tests {
         .await;
         assert_eq!(req.systems, vec!["x86_64-linux", "aarch64-linux"]);
         assert_eq!(req.supported_features, vec!["kvm", "big-parallel"]);
-    }
-
-    /// With a cache, the heartbeat includes a bloom filter that
-    /// positive-matches inserted paths.
-    #[tokio::test]
-    async fn test_heartbeat_includes_bloom_from_cache() {
-        // Real Cache needs SQLite on disk — tempdir.
-        let dir = tempfile::tempdir().unwrap();
-        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None)
-            .await
-            .unwrap();
-
-        // Cache::insert uses Handle::block_on (designed for FUSE's sync
-        // callbacks which run on dedicated threads). Calling it directly
-        // from an async test = "cannot block_on within a runtime" panic.
-        // spawn_blocking moves it to a blocking-thread-pool thread where
-        // block_on is legal.
-        let cache = Arc::new(cache);
-        {
-            let c = Arc::clone(&cache);
-            tokio::task::spawn_blocking(move || {
-                c.insert("/nix/store/aaa-test-one", 100).unwrap();
-                c.insert("/nix/store/bbb-test-two", 200).unwrap();
-            })
-            .await
-            .unwrap();
-        }
-
-        // Extract handle (same thing main.rs does before moving Cache
-        // into the FUSE mount).
-        let bloom = cache.bloom_handle();
-
-        let slot = Arc::new(BuildSlot::default());
-        let req = build_heartbeat_request(
-            "worker-1",
-            rio_proto::types::ExecutorKind::Builder,
-            &["x86_64-linux".into()],
-            &[],
-            "",
-            &slot,
-            Some(&bloom),
-            &ResourceSnapshotHandle::default(),
-            false,
-            false,
-        )
-        .await;
-
-        let bloom_proto = req.local_paths.expect("cache present → bloom present");
-        assert_eq!(
-            bloom_proto.hash_algorithm,
-            rio_proto::types::BloomHashAlgorithm::Blake3256 as i32
-        );
-        assert_eq!(bloom_proto.version, 1);
-
-        // Deserialize and query — proves the wire roundtrip works AND
-        // the scheduler would see the inserted paths.
-        let filter = rio_common::bloom::BloomFilter::from_wire(
-            bloom_proto.data,
-            bloom_proto.hash_count,
-            bloom_proto.num_bits,
-            bloom_proto.hash_algorithm,
-            bloom_proto.version,
-        )
-        .unwrap();
-
-        assert!(filter.maybe_contains("/nix/store/aaa-test-one"));
-        assert!(filter.maybe_contains("/nix/store/bbb-test-two"));
-        // Absent path — probably-false (could be a false positive, but
-        // at 1% FPR with 2 items inserted, that's vanishingly unlikely).
-        assert!(!filter.maybe_contains("/nix/store/zzz-never-inserted"));
     }
 }
 

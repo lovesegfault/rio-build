@@ -81,7 +81,7 @@ pub mod validated;
 /// Shared protobuf types (messages, enums) used across all services.
 ///
 /// P0376 domain split: the underlying `.proto` definitions are spread across
-/// `types.proto` (shared primitives: store, chunk, GC, bloom, ResourceUsage,
+/// `types.proto` (shared primitives: store, chunk, GC, ResourceUsage,
 /// BuildResultStatus), `dag.proto` (DAG + derivation events + GraphNode/Edge),
 /// `build_types.proto` (build lifecycle, executor stream, heartbeat), and
 /// `admin_types.proto` (admin RPC data types). All four share

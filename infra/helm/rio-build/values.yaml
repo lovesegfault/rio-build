@@ -951,9 +951,6 @@ builderPoolDefaults:
   # (500 builders × 2 cpu/builder = 1000 vCPU baseline, 2000 NodePool
   # limit gives Karpenter bin-packing headroom).
   maxConcurrent: 500
-  autoscaling:
-    metric: queueDepth
-    targetValue: 5   # scale up when queued / active_workers > 5
   fuseCacheSize: 20Gi
   features: []
   sizeClass: ""   # unclassified — scheduler with size_classes configured
@@ -1068,9 +1065,6 @@ fetcherPoolDefaults:
   # build start (40+ ready when chains hit FOD-phase together) but
   # are short (~seconds).
   maxConcurrent: 32
-  autoscaling:
-    metric: fodQueueDepth
-    targetValue: 5   # scale up when queued_fod / fetchers > 5
   # Same binary as builders; RIO_EXECUTOR_KIND=fetcher env baked into
   # the image (nix/docker.nix rio-fetcher wraps rio-builder).
   # PLAN-PREBAKE: per-entry override with `localhost/…@sha256:<digest>`.

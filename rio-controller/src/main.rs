@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use futures_util::StreamExt;
-use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
 use kube::runtime::{Controller, watcher};
 use kube::{Api, Client};
@@ -275,25 +274,16 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ---- BuilderPool controller ----
-    // .owns(StatefulSet): when a StatefulSet with our
-    // ownerReference changes, enqueue the owning BuilderPool.
-    // That's how status updates propagate: reconciler patches
-    // StatefulSet → StatefulSet controller updates its status →
-    // we get notified → re-reconcile → patch BuilderPool.status.
+    // .owns(Job): pools spawn one Job per build. Without this,
+    // re-spawn latency is the 10s poll interval; with it,
+    // kube-runtime watch fires on Job status change → <1s re-enqueue.
     //
     // graceful_shutdown_on: SIGTERM cancels the token (registered
     // eagerly at top of main()), which drains in-flight reconciles.
     // K8s sends SIGTERM on pod delete.
     let pools: Api<BuilderPool> = Api::all(client.clone());
-    let stses: Api<StatefulSet> = Api::all(client.clone());
-    // .owns(Job): ephemeral-mode pools spawn one Job per build
-    // (reconcilers/builderpool/ephemeral.rs). Without this, re-spawn
-    // latency is the 10s poll interval; with it, kube-runtime
-    // watch fires on Job status change → <1s re-enqueue. Doesn't
-    // change poll semantics, just adds reactive triggers.
     let jobs: Api<Job> = Api::all(client.clone());
     let wp_controller = Controller::new(pools, watcher::Config::default())
-        .owns(stses, watcher::Config::default())
         .owns(jobs, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(
@@ -348,14 +338,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- FetcherPool controller ----
     // ADR-019: FOD-only executor pods with open egress + stricter
-    // seccomp. Minimal reconciler (no autoscaler, no ephemeral
-    // mode) — the shared STS builder in common/sts.rs does the
-    // heavy lifting. .owns(StatefulSet): status updates propagate
-    // same as builderpool.
+    // seccomp. .owns(Job): same reactive trigger as BuilderPool.
     let fp_api: Api<FetcherPool> = Api::all(client.clone());
-    let fp_stses: Api<StatefulSet> = Api::all(client.clone());
+    let fp_jobs: Api<Job> = Api::all(client.clone());
     let fp_controller = Controller::new(fp_api, watcher::Config::default())
-        .owns(fp_stses, watcher::Config::default())
+        .owns(fp_jobs, watcher::Config::default())
         .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(
             fetcherpool::reconcile,

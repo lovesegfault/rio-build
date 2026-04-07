@@ -60,8 +60,8 @@ pub struct NixStoreFs {
     /// LRU cache on local SSD.
     ///
     /// `Arc` so main.rs can clone a handle BEFORE moving into
-    /// `mount_fuse_background` (same pattern as `bloom_handle()`).
-    /// The clone goes to the PrefetchHint handler. All Cache
+    /// `mount_fuse_background`. The clone goes to the PrefetchHint
+    /// handler. All Cache
     /// methods use `runtime.block_on` internally — they're SYNC,
     /// designed for FUSE callbacks (dedicated blocking threads).
     /// The prefetch handler calls them via `spawn_blocking` to
@@ -487,9 +487,8 @@ fn fusectl_abort_path_at(mount_point: &Path, connections_root: &Path) -> Option<
 ///
 /// Returns the [`FuseMount`] handle (drop on shutdown — `Drop` writes
 /// the fusectl abort then unmounts) plus the circuit breaker handle
-/// (cloned out BEFORE
-/// `spawn_mount2` consumes the fs — same extract-before-move pattern
-/// as `bloom_handle`). The heartbeat loop polls `is_open()` on the
+/// (cloned out BEFORE `spawn_mount2` consumes the fs). The heartbeat
+/// loop polls `is_open()` on the
 /// returned handle; the fuser thread pool writes to the same breaker
 /// via `ensure_cached`.
 pub fn mount_fuse_background(

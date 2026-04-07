@@ -157,14 +157,6 @@ pub(crate) struct Config {
     pub(crate) tls: rio_common::tls::TlsConfig,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
-    /// Bloom filter expected-items capacity. `None` → default 50 000.
-    /// Oversizing is cheap (~1.2 bytes/item at 1% FPR — 500k = ~600 KB
-    /// filter). Long-lived low-ordinal StatefulSet builders churn past
-    /// the default via eviction; the filter never shrinks (evicted
-    /// paths stay as stale positives), only restart clears it. Bump
-    /// this when `rio_builder_bloom_fill_ratio` alerts ≥ 0.5.
-    /// Env: `RIO_BLOOM_EXPECTED_ITEMS`. TOML: `bloom_expected_items`.
-    pub(crate) bloom_expected_items: Option<usize>,
 }
 
 impl Default for Config {
@@ -202,7 +194,6 @@ impl Default for Config {
             daemon_timeout_secs: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
             max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
-            bloom_expected_items: None,
         }
     }
 }
@@ -363,10 +354,6 @@ mod tests {
         // Spec values from configuration.md:68-69.
         assert_eq!(d.log_rate_limit, 10_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
-        assert!(
-            d.bloom_expected_items.is_none(),
-            "bloom_expected_items defaults to None → Cache::new uses 50k compile-time fallback"
-        );
     }
 
     #[test]
@@ -395,7 +382,6 @@ mod tests {
         r#"
         fuse_passthrough = false
         fuse_fetch_timeout_secs = 222
-        bloom_expected_items = 123456
         systems = ["x86_64-linux", "aarch64-linux"]
 
         [tls]
@@ -407,7 +393,6 @@ mod tests {
                 "TOML scalar must override the non-serde-bool default of true"
             );
             assert_eq!(cfg.fuse_fetch_timeout_secs, 222);
-            assert_eq!(cfg.bloom_expected_items, Some(123456));
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
                 cfg.tls.cert_path.as_deref(),
@@ -424,7 +409,6 @@ mod tests {
         assert!(!cfg.tls.is_configured());
         assert!(cfg.scheduler_balance_host.is_none());
         assert_eq!(cfg.executor_kind, ExecutorKind::Builder);
-        assert!(cfg.bloom_expected_items.is_none());
         assert!(cfg.systems.is_empty());
         assert!(cfg.features.is_empty());
         // The critical non-serde-bool default: fuse_passthrough

@@ -199,21 +199,12 @@ spec:
                 \ a single-size pool"
               rule: size(self.classes) == 0 || !has(self.resources)
           status:
-            description: 'FetcherPool status. Reconciler + autoscaler write; `kubectl
-              get fp`
-
-              reads. Same SSA field-manager split as BuilderPool: reconciler owns
-
-              `readyReplicas`/`desiredReplicas`, autoscaler owns `lastScaleTime`/
-
-              `conditions`.'
+            description: FetcherPool status. Reconciler writes; `kubectl get fp` reads.
             nullable: true
             properties:
               conditions:
                 default: []
-                description: 'Standard K8s Conditions. One type, `Scaling`: reason
-
-                  ScaledUp / ScaledDown / Stabilizing / UnknownMetric.'
+                description: Standard K8s Conditions.
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -221,25 +212,17 @@ spec:
                 type: array
               desiredReplicas:
                 default: 0
-                description: 'What the autoscaler set on `StatefulSet.spec.replicas`
-                  (or
+                description: 'In-flight Job count the reconciler is targeting (queued
+                  FOD
 
-                  `min` on first create). Reconciler reads this back from the
-
-                  STS so the printcolumn tracks autoscaler decisions.'
+                  demand, capped at `maxConcurrent`).'
                 format: int32
                 type: integer
-              lastScaleTime:
-                description: 'Last actual replica patch. For stabilization-window
-
-                  observability.'
-                nullable: true
-                type: string
               readyReplicas:
                 default: 0
-                description: 'StatefulSet `.status.readyReplicas`. Passed readinessProbe
+                description: 'Count of active Jobs whose pod passed readinessProbe
 
-                  = heartbeating to scheduler as `ExecutorKind::Fetcher`.'
+                  (heartbeating to scheduler as `ExecutorKind::Fetcher`).'
                 format: int32
                 type: integer
             type: object

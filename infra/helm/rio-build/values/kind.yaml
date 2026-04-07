@@ -81,7 +81,6 @@ fetcherPools:
 fetcherPoolDefaults:
   enabled: true
   maxConcurrent: 1
-  autoscaling: {metric: fodQueueDepth, targetValue: 5}
   image: rio-fetcher
   hostUsers: true
 

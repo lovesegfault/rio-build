@@ -2092,12 +2092,9 @@ let
       # dispatches before reconcile_ephemeral's 10s tick spawns a Job.
       #
       # Proves end-to-end:
-      #   - apply() branches on spec.ephemeral (mod.rs:118-132) — no STS
-      #   - reconcile_ephemeral polls ClusterStatus + spawns Jobs when
-      #     queued > 0 (ephemeral.rs:107-215)
-      #   - Job pod has RIO_EPHEMERAL=1 → worker exits after one build
-      #     (main.rs single-shot gate)
-      #   - pod terminates → Job Complete → ttlSecondsAfterFinished reaps
+      #   - reconciler polls ClusterStatus + spawns Jobs when queued > 0
+      #   - worker exits after one build → Job Complete →
+      #     ttlSecondsAfterFinished reaps
       #   - second build → fresh Job (zero cross-build state)
       #
       # NOT proven here: the actual isolation property (tenant A can't
@@ -2236,20 +2233,6 @@ let
               "-o jsonpath='{.items[0].metadata.name}'"
           ).strip()
           print(f"ephemeral: build 1 spawned Job {job1}")
-
-          # RIO_EPHEMERAL=1 on the Job's pod spec. This is the load-
-          # bearing env var: without it the worker loops forever.
-          # jsonpath into Job.spec.template (not pod — pod name is
-          # Job-generated, less stable for the query).
-          eph_env = k3s_server.succeed(
-              f"k3s kubectl -n ${nsBuilders} get job {job1} "
-              "-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name==\"RIO_EPHEMERAL\")].value}'"
-          ).strip()
-          assert eph_env == "1", (
-              f"RIO_EPHEMERAL must be '1' on ephemeral Job pod; got "
-              f"{eph_env!r}. Without it, worker never exits → Job never "
-              f"completes → pod leaked."
-          )
 
           # nix-build completes. 120s: Job pod schedule (~5s) + container
           # pull from local registry (~2s, image already loaded) + FUSE
@@ -2400,10 +2383,8 @@ let
       #     early-return dark path where non-409 create error returns
       #     BEFORE status is patched, leaving .status.replicas stale
       #   - Job carries rio.build/sizing=manifest + rio.build/
-      #     {memory,cpu}-class labels (manifest.rs:1012-1015 — the
-      #     inventory round-trip boundary)
-      #   - Job pod has NO RIO_EPHEMERAL env (manifest.rs:980 does NOT
-      #     set it) → worker loops, doesn't exit-after-one-build
+      #     {memory,cpu}-class labels (the inventory round-trip
+      #     boundary)
       #   - Delete BuilderPool → ownerRef cascade GCs Jobs
       #
       # Cold-start floor path (not per-bucket diff): manifestDrv has no
@@ -2420,7 +2401,7 @@ let
       # running_builds=0 via ListExecutors — full round-trip, follow-
       # on if this times in under ~150s). Failed-Job sweep (P0511) is
       # also follow-on (needs deliberate crash injection).
-      with subtest("manifest-pool: sizing=Manifest, cold-start Job, status_patch, no RIO_EPHEMERAL"):
+      with subtest("manifest-pool: sizing=Manifest, cold-start Job, status_patch"):
           # Precondition: no workers. ephemeral-pool's cleanup waits
           # ALL pool=ephemeral pods gone (not just CR gone — see that
           # fragment's comment re: SIGTERM-reconnect bounce, GHA run
@@ -2532,23 +2513,6 @@ let
           print(f"manifest-pool labels: memory-class={mem_class} "
                 f"cpu-class={cpu_class} ✓")
 
-          # ── r[ctrl.pool.manifest-long-lived]: NO RIO_EPHEMERAL env ────
-          # Ephemeral Jobs set RIO_EPHEMERAL=1 so the worker exits after
-          # one build. Manifest pods loop (ADR-020 §Decision ¶4 — amortize
-          # pod-start cost over multiple same-size builds). jsonpath
-          # filter on the env array: if RIO_EPHEMERAL is NOT in the list,
-          # the filter returns empty. That's the assertion.
-          eph_env = k3s_server.succeed(
-              f"k3s kubectl -n ${nsBuilders} get job {mfjob} "
-              "-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name==\"RIO_EPHEMERAL\")].value}'"
-          ).strip()
-          assert eph_env == "", (
-              f"manifest Job pod must NOT have RIO_EPHEMERAL env (long-"
-              f"lived loop, not exit-after-one); got {eph_env!r}. If set, "
-              f"build_manifest_job is wrongly sharing ephemeral's env path."
-          )
-          print("manifest-pool long-lived: no RIO_EPHEMERAL env ✓")
-
           # ── r[ctrl.pool.manifest-reconcile]: status_patch ran ─────────
           # .status.replicas = active_total (manifest.rs:466) where
           # active_total is listed BEFORE spawn. Tick 1: list finds 0
@@ -2624,8 +2588,6 @@ let
           )
           # ALL manifest-pool pods gone. Job-gone above does NOT imply
           # pods-gone (background-propagation delete; 180s grace).
-          # Manifest-mode pods are long-lived (no RIO_EPHEMERAL) so
-          # they ALWAYS hit the SIGTERM `continue 'reconnect` bounce.
           # Nothing currently chains after this subtest, but every
           # pool-deleting subtest waits its own pods gone so any future
           # subtest appended to the chain inherits a clean
@@ -2638,8 +2600,7 @@ let
               timeout=300,
           )
           print("manifest-pool PASS: sizing=Manifest → cold-start Job, "
-                "labels present, no RIO_EPHEMERAL, status patched, "
-                "ownerRef cascade cleanup")
+                "labels present, status patched, ownerRef cascade cleanup")
     '';
 
     disruption-drain = ''

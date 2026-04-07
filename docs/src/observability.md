@@ -213,24 +213,12 @@ r[obs.metric.builder]
 | `rio_builder_cpu_fraction` | Gauge | Worker cgroup CPU utilization: delta `cpu.stat usage_usec` / wall-clock µs. 1.0 = one core fully used; >1.0 on multi-core. Directly comparable to cgroup `cpu.max` limits. |
 | `rio_builder_memory_fraction` | Gauge | Worker cgroup memory utilization: `memory.current` / `memory.max`. 0.0 if `memory.max` is `"max"` (unbounded). |
 | `rio_builder_stale_assignments_rejected_total` | Counter | WorkAssignments rejected by the generation fence (assignment.generation < latest heartbeat-observed generation). Nonzero only during leader failover split-brain; sustained nonzero = deposed scheduler replica still dispatching. |
-| `rio_builder_bloom_fill_ratio` | Gauge | Fraction of bloom filter bits set. Alert ≥ 0.5: at k=7, FPR climbs past 1% nonlinearly. Saturation is SILENT — `prefetch_total{result="already_cached"}` DECREASES under saturation (scheduler skips hints it thinks worker has), indistinguishable from healthy locality. Long-lived STS workers churn past `bloom_expected_items` via eviction; the filter never shrinks. Fix: bump `worker.toml bloom_expected_items` or restart the pod. |
 | `rio_builder_cgroup_leak_total` | Counter | Per-build cgroup `rmdir` failures on Drop (typically `EBUSY` — processes still in the tree). Leaked cgroups are harmless empty directories; pod restart clears the whole subtree. Alert if rate > 0 sustained: indicates process-kill sequencing bug. |
 
 > **Note on ratio metrics:** For aggregatable cache metrics, use counter pairs (e.g., `rio_store_chunk_cache_hits_total` + `rio_store_chunk_cache_misses_total`) and compute ratios at query time with PromQL's `rate()`. Pre-computed gauge ratios lose meaning when averaged across instances. Exception: `rio_store_chunk_dedup_ratio` is a per-upload event gauge (last-written-wins, not averaged) — useful for eyeballing recent PutPath dedup effectiveness but NOT for cross-instance aggregation.
 
 r[obs.metric.input-materialization-failures]
 `rio_builder_input_materialization_failures_total` (counter): incremented each time a daemon `MiscFailure` is reclassified as `InfrastructureFailure` under `r[builder.result.input-enoent-is-infra]`. Sustained nonzero rate indicates `JIT_MIN_THROUGHPUT_BPS` is set above actual store→builder throughput.
-
-r[obs.metric.bloom-fill-ratio]
-The worker emits `rio_builder_bloom_fill_ratio` (gauge, 0.0–1.0) every heartbeat
-tick (10s). Alert threshold 0.5 — at k=7 hash functions, fill ≥ 0.5 means FPR
-has climbed past the configured 1% nonlinearly. Saturation causes scheduler
-locality scoring to silently degrade (`count_missing()` undercounts → all
-candidates tie on locality) with NO direct symptom in existing metrics. The filter
-never shrinks (evicted paths stay as stale positives); only restart clears it.
-Operators set `spec.bloomExpectedItems` on the WorkerPool (injects
-`RIO_BLOOM_EXPECTED_ITEMS`); the pod restart that applies the CRD edit also
-resets the filter.
 
 r[obs.metric.transfer-volume]
 Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop: gateway (`rio_gateway_bytes_total{direction}`), store (`rio_store_{put,get}_path_bytes_total`), worker (`rio_builder_{upload,fuse_fetch}_bytes_total`). Summing these across the topology gives a full picture of data movement — e.g., `rate(rio_builder_fuse_fetch_bytes_total[5m])` vs `rate(rio_builder_upload_bytes_total[5m])` shows whether a worker is input-bound or output-bound.

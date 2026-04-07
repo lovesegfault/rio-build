@@ -16,7 +16,7 @@ package rio.types;
 import "google/protobuf/timestamp.proto";
 import "dag.proto";   // BuildEvent.derivation → DerivationEvent;
                       // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
-import "types.proto"; // HeartbeatRequest → ResourceUsage, BloomFilter;
+import "types.proto"; // HeartbeatRequest → ResourceUsage;
                       // ProgressUpdate → ResourceUsage;
                       // BuildResult.status → BuildResultStatus
 
@@ -325,7 +325,6 @@ message HeartbeatRequest {
   string executor_id = 1;
   repeated string running_builds = 2;     // Derivation paths currently building
   ResourceUsage resources = 3;            // (types.proto)
-  BloomFilter local_paths = 4;            // Bloom filter of cached store paths (types.proto)
   // Systems this executor can build for (e.g., ["x86_64-linux",
   // "aarch64-linux"] for a multi-arch executor). Replaces the old
   // singular `system` field — same field number, wire-compatible

@@ -515,11 +515,6 @@ in
   #   EXPECTED_METRICS[(gateway,9090)] asserts rio_gateway_* metric
   #   names after a build — presence proves describe_*! wiring AND
   #   actual increments (metrics-rs registers on first increment).
-  # r[verify obs.metric.bloom-fill-ratio]
-  #   metrics-registered subtest asserts rio_builder_bloom_fill_ratio
-  #   gauge present on the busy worker with 0.0 < fill < 0.5 after
-  #   a chain build — proves the 10s heartbeat emit is wired AND
-  #   FUSE inserts populated the filter.
   # r[verify obs.trace.scheduler-id-in-metadata]
   #   trace-id-propagation subtest: STDERR_NEXT `rio trace_id:` line
   #   is the scheduler's x-rio-trace-id (not the gateway's own span);

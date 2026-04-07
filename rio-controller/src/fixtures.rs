@@ -48,7 +48,6 @@ pub fn test_workerpool_spec() -> BuilderPoolSpec {
         resources: None,
         fuse_cache_size: "50Gi".into(),
         fuse_threads: None,
-        bloom_expected_items: None,
         fuse_passthrough: None,
         daemon_timeout_secs: None,
         features: vec!["kvm".into()],

@@ -134,9 +134,6 @@ gateway:
 builderPoolDefaults:
   enabled: true
   maxConcurrent: 2
-  autoscaling:
-    metric: queueDepth
-    targetValue: 2
   fuseCacheSize: 5Gi
   features: []
   sizeClass: ""

@@ -48,15 +48,6 @@
 //! must exactly match what [`parse_bucket_from_labels`] READS. A
 //! typo = perpetual over-spawn (every reconcile thinks supply=0).
 //! `label_roundtrip` in tests proves they agree.
-//!
-//! # Not `RIO_EPHEMERAL=1`
-//!
-//! Manifest pods are long-lived (ADR-020 § Decision ¶4): they loop
-//! for MULTIPLE builds of the same size class. A 48Gi pod is expensive
-//! to schedule (node provision, image pull, FUSE warm); amortizing
-//! that over several 48Gi builds is the point. Ephemeral mode's
-//! "exit after one build" is for ISOLATION (untrusted tenants);
-//! manifest mode is for RIGHT-SIZING (heterogeneous workloads).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -265,10 +256,9 @@ pub(super) async fn spawn_manifest_jobs(
 /// Reconcile a manifest-mode BuilderPool: poll manifest, diff against
 /// inventory, spawn Jobs for the deficit.
 ///
-/// NO StatefulSet / headless Service / PDB — same as ephemeral
-/// (Job-based). DIFFERENCE from ephemeral: no `RIO_EPHEMERAL=1`
-/// (pods loop for multiple builds); per-bucket `ResourceRequirements`
-/// (not one-size from `spec.resources`).
+/// Same one-shot Job lifecycle as static-sizing pools; the only
+/// difference is per-bucket `ResourceRequirements` instead of
+/// one-size from `spec.resources`.
 pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
 
@@ -907,9 +897,8 @@ pub(super) fn update_idle_and_reapable(
 ///
 /// The filter is the inverse of the active-Job predicate at the
 /// inventory site (`status.failed == 0 && status.succeeded == 0`).
-/// A Job with `succeeded > 0` is NOT swept — manifest pods loop
-/// (no `RIO_EPHEMERAL=1`), so Complete only happens on deliberate
-/// scale-down; the reapable pass already handles those.
+/// Succeeded Jobs are NOT swept here — `ttlSecondsAfterFinished`
+/// reaps those.
 pub(super) fn select_failed_jobs(jobs: &[Job], cap: usize) -> Vec<&Job> {
     let mut failed: Vec<&Job> = jobs.iter().filter(|j| is_failed_job(j)).collect();
     // Oldest-first: under backlog, sweep the crashes that have been
@@ -1027,10 +1016,7 @@ fn bucket_to_resources(bucket: Bucket) -> ResourceRequirements {
 /// floor, same as the STS path).
 ///
 /// Differences from `ephemeral::build_job`:
-///   - NO `RIO_EPHEMERAL=1` (pod loops for multiple builds)
-///   - NO `activeDeadlineSeconds` (long-lived; wrong-pool-spawn
-///     isn't a concern — manifest pods are demand-driven by the
-///     bucket diff, not by cluster-wide queue depth)
+///   - Per-bucket `ResourceRequirements` override
 ///   - Labels: `rio.build/sizing=manifest` + class labels
 ///   - Name: `{pool}-mf-{mem}g-{cpu}m-{random6}`
 pub(super) fn build_manifest_job(

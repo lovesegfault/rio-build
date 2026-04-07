@@ -24,9 +24,6 @@ spec:
   deadlineSeconds: {{ . }}
   {{- end }}
   maxConcurrent: {{ $fp.maxConcurrent }}
-  autoscaling:
-    metric: {{ $fp.autoscaling.metric }}
-    targetValue: {{ $fp.autoscaling.targetValue }}
   systems:
     {{- toYaml $fp.systems | nindent 4 }}
   image: {{ include "rio.image" (list $root $fp.image) }}

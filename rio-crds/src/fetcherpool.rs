@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -174,29 +174,19 @@ pub struct FetcherSizeClass {
     pub max_concurrent: Option<u32>,
 }
 
-/// FetcherPool status. Reconciler + autoscaler write; `kubectl get fp`
-/// reads. Same SSA field-manager split as BuilderPool: reconciler owns
-/// `readyReplicas`/`desiredReplicas`, autoscaler owns `lastScaleTime`/
-/// `conditions`.
+/// FetcherPool status. Reconciler writes; `kubectl get fp` reads.
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolStatus {
-    /// StatefulSet `.status.readyReplicas`. Passed readinessProbe
-    /// = heartbeating to scheduler as `ExecutorKind::Fetcher`.
+    /// Count of active Jobs whose pod passed readinessProbe
+    /// (heartbeating to scheduler as `ExecutorKind::Fetcher`).
     #[serde(default)]
     pub ready_replicas: i32,
-    /// What the autoscaler set on `StatefulSet.spec.replicas` (or
-    /// `min` on first create). Reconciler reads this back from the
-    /// STS so the printcolumn tracks autoscaler decisions.
+    /// In-flight Job count the reconciler is targeting (queued FOD
+    /// demand, capped at `maxConcurrent`).
     #[serde(default)]
     pub desired_replicas: i32,
-    /// Last actual replica patch. For stabilization-window
-    /// observability.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<String>")]
-    pub last_scale_time: Option<Time>,
-    /// Standard K8s Conditions. One type, `Scaling`: reason
-    /// ScaledUp / ScaledDown / Stabilizing / UnknownMetric.
+    /// Standard K8s Conditions.
     #[serde(default)]
     #[schemars(schema_with = "crate::any_object_array")]
     pub conditions: Vec<Condition>,
@@ -231,7 +221,6 @@ mod tests {
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("readyReplicas"));
         assert!(json.contains("desiredReplicas"));
-        assert!(json.contains("lastScaleTime"));
         // FetcherSizeClass nested
         assert!(json.contains("maxConcurrent"));
         // Negative: no snake_case leaked as a property KEY.

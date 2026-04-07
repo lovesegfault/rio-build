@@ -5,7 +5,7 @@
 //! `StatefulSet.spec.replicas` based on `ClusterStatus.queued_derivations`.
 
 use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -171,21 +171,6 @@ pub struct BuilderPoolSpec {
     /// with low CPU).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_threads: Option<u32>,
-
-    /// Bloom filter capacity (expected number of paths). Maps to
-    /// `RIO_BLOOM_EXPECTED_ITEMS`. The worker's FUSE cache bloom
-    /// filter never shrinks — evicted paths stay as stale
-    /// positives. For long-lived STS pools churning past the
-    /// default (50k), the fill ratio climbs and FPR degrades.
-    /// Bump this before restarting the pool. Not applicable to
-    /// ephemeral pools (fresh pod = fresh bloom).
-    ///
-    /// `None` = worker compile-time default (50_000). See
-    /// `rio_builder_bloom_fill_ratio` gauge for when to tune.
-    /// `u64` not `usize` — CRD schema types must be platform-
-    /// independent; the cast at env injection is safe on 64-bit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bloom_expected_items: Option<u64>,
 
     /// FUSE passthrough mode (kernel handles reads directly, no
     /// userspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =
@@ -474,17 +459,8 @@ pub struct BuilderPoolStatus {
     /// stabilization window (we want 8 but haven't patched yet).
     #[serde(default)]
     pub desired_replicas: i32,
-    /// Last time replicas was actually patched (for stabilization
-    /// window computation). kube 3.0: Time = jiff::Timestamp
-    /// wrapper, not chrono.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<String>")]
-    pub last_scale_time: Option<Time>,
-    /// Standard K8s Conditions. Two types:
-    ///   - `Scaling`: reason ScaledUp / ScaledDown / UnknownMetric
-    ///     (status=False for errors). Shows WHY replicas is what it
-    ///     is. Written by the autoscaler.
-    ///   - `SchedulerUnreachable`: status=True when the ephemeral
+    /// Standard K8s Conditions. One type:
+    ///   - `SchedulerUnreachable`: status=True when the
     ///     reconciler's ClusterStatus RPC fails. Disambiguates
     ///     "scheduler idle (queued=0)" from "scheduler down
     ///     (queued unknown, fail-open to 0)." Written by the
@@ -591,7 +567,6 @@ mod tests {
         assert!(json.contains("fuseThreads"));
         assert!(json.contains("fusePassthrough"));
         assert!(json.contains("daemonTimeoutSecs"));
-        assert!(json.contains("bloomExpectedItems"));
         // P0347: ephemeral Job activeDeadlineSeconds knob.
         assert!(json.contains("deadlineSeconds"));
         assert!(json.contains("maxConcurrent"));

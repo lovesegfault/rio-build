@@ -45,21 +45,6 @@ spec:
               \ generates the full CRD\nwrapper, KubeSchema handles the schema internals\
               \ (including\nthe JsonSchema impl, so don't derive that separately)."
             properties:
-              bloomExpectedItems:
-                description: "Bloom filter capacity (expected number of paths). Maps\
-                  \ to\n`RIO_BLOOM_EXPECTED_ITEMS`. The worker's FUSE cache bloom\n\
-                  filter never shrinks \u2014 evicted paths stay as stale\npositives.\
-                  \ For long-lived STS pools churning past the\ndefault (50k), the\
-                  \ fill ratio climbs and FPR degrades.\nBump this before restarting\
-                  \ the pool. Not applicable to\nephemeral pools (fresh pod = fresh\
-                  \ bloom).\n\n`None` = worker compile-time default (50_000). See\n\
-                  `rio_builder_bloom_fill_ratio` gauge for when to tune.\n`u64` not\
-                  \ `usize` \u2014 CRD schema types must be platform-\nindependent;\
-                  \ the cast at env injection is safe on 64-bit."
-                format: uint64
-                minimum: 0.0
-                nullable: true
-                type: integer
               daemonTimeoutSecs:
                 description: 'Timeout (seconds) for the local nix-daemon subprocess
                   when
@@ -411,13 +396,11 @@ spec:
             properties:
               conditions:
                 default: []
-                description: "Standard K8s Conditions. Two types:\n  - `Scaling`:\
-                  \ reason ScaledUp / ScaledDown / UnknownMetric\n    (status=False\
-                  \ for errors). Shows WHY replicas is what it\n    is. Written by\
-                  \ the autoscaler.\n  - `SchedulerUnreachable`: status=True when\
-                  \ the ephemeral\n    reconciler's ClusterStatus RPC fails. Disambiguates\n\
-                  \    \"scheduler idle (queued=0)\" from \"scheduler down\n    (queued\
-                  \ unknown, fail-open to 0).\" Written by the\n    ephemeral reconciler."
+                description: "Standard K8s Conditions. One type:\n  - `SchedulerUnreachable`:\
+                  \ status=True when the\n    reconciler's ClusterStatus RPC fails.\
+                  \ Disambiguates\n    \"scheduler idle (queued=0)\" from \"scheduler\
+                  \ down\n    (queued unknown, fail-open to 0).\" Written by the\n\
+                  \    ephemeral reconciler."
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -432,14 +415,6 @@ spec:
                   stabilization window (we want 8 but haven''t patched yet).'
                 format: int32
                 type: integer
-              lastScaleTime:
-                description: 'Last time replicas was actually patched (for stabilization
-
-                  window computation). kube 3.0: Time = jiff::Timestamp
-
-                  wrapper, not chrono.'
-                nullable: true
-                type: string
               readyReplicas:
                 default: 0
                 description: 'Observed StatefulSet.status.readyReplicas. Passed

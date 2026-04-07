@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use rio_common::bloom::BloomFilter;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::runtime::Handle;
@@ -175,26 +174,6 @@ pub struct Cache {
     runtime: Handle,
     /// In-flight fetches with per-path condition variables for waiter notification.
     inflight: Mutex<HashMap<String, Arc<InflightEntry>>>,
-    /// Bloom filter of cached store paths, for heartbeat locality scoring.
-    ///
-    /// Built once at startup from the SQLite inventory, then incrementally
-    /// updated on each `insert()`. Never removed from (bloom filters don't
-    /// support deletion) — evicted paths stay in the filter as stale
-    /// positives. That's fine: the scheduler treats the filter as a HINT
-    /// for scoring, not ground truth. A stale positive just means a
-    /// worker scores slightly better than it should for one dispatch;
-    /// the actual fetch still happens if the path isn't really cached.
-    ///
-    /// Rebuilt on process restart (filter isn't persisted). Restarting
-    /// with a warm SSD cache but a fresh filter means the first few
-    /// heartbeats under-report — harmless, corrects quickly as `new()`
-    /// bulk-inserts from SQLite.
-    ///
-    /// `Arc<RwLock>` because: heartbeat loop reads (clone-and-serialize
-    /// every 10s), `insert()` writes. Reads vastly outnumber writes.
-    /// parking_lot would be marginally faster but std's RwLock is fine
-    /// for this access pattern.
-    bloom: Arc<RwLock<BloomFilter>>,
     /// I-110c: per-path manifest hints, keyed by store basename.
     /// Primed by the executor (one `BatchGetManifest` before daemon
     /// spawn); consumed by `fetch_extract_insert` (which removes on
@@ -247,33 +226,12 @@ pub enum JitClass {
     KnownInput { nar_size: u64 },
 }
 
-/// Default expected cache inventory size for bloom filter sizing. A
-/// worker with a 100 GB SSD and typical 10 MB outputs holds ~10k paths.
-/// We size for 50k at 1% FPR — headroom for workers with bigger caches,
-/// cheap enough (~60 KB filter) that over-sizing doesn't matter.
-///
-/// If the actual inventory blows past this, FPR degrades gracefully
-/// (more false positives, scheduler scoring gets noisier, but nothing
-/// breaks). Operators with larger caches — or long-lived low-ordinal
-/// StatefulSet workers that churn past 50k inserts via eviction —
-/// override via `worker.toml bloom_expected_items`. Oversizing is
-/// cheap: ~1.2 bytes/item at 1% FPR, so 500k items = ~600 KB filter.
-const BLOOM_EXPECTED_ITEMS_DEFAULT: usize = 50_000;
-const BLOOM_TARGET_FPR: f64 = 0.01;
-
 impl Cache {
     /// Create a new cache rooted at `cache_dir` with the given size limit.
     ///
     /// Creates the cache directory and SQLite index if they don't exist.
     /// Must be called from within a tokio runtime (captures the current `Handle`).
-    ///
-    /// `bloom_expected_items` — bloom filter capacity. `None` →
-    /// `BLOOM_EXPECTED_ITEMS_DEFAULT` (50 000).
-    pub async fn new(
-        cache_dir: PathBuf,
-        max_size_gb: u64,
-        bloom_expected_items: Option<usize>,
-    ) -> Result<Self, CacheError> {
+    pub async fn new(cache_dir: PathBuf, max_size_gb: u64) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
 
         let runtime = Handle::current();
@@ -310,37 +268,12 @@ impl Cache {
             .execute(&pool)
             .await?;
 
-        // Build the bloom filter from the existing SQLite inventory.
-        // Startup-only cost: one full-table scan + N inserts. For 10k
-        // paths that's ~100ms — acceptable once at boot.
-        //
-        // We don't rebuild periodically — evicted paths stay in the
-        // filter as stale positives (see the struct field doc for why
-        // that's OK). Only restart clears it.
-        let expected = bloom_expected_items.unwrap_or(BLOOM_EXPECTED_ITEMS_DEFAULT);
-        let mut bloom = BloomFilter::new(expected, BLOOM_TARGET_FPR);
-        let existing: Vec<(String,)> = sqlx::query_as("SELECT store_path FROM cached_paths")
-            .fetch_all(&pool)
-            .await?;
-        for (path,) in &existing {
-            bloom.insert(path);
-        }
-        tracing::info!(
-            paths = existing.len(),
-            bloom_expected_items = expected,
-            bloom_bits = bloom.num_bits(),
-            bloom_k = bloom.hash_count(),
-            bloom_bytes = bloom.byte_len(),
-            "FUSE cache bloom filter initialized"
-        );
-
         Ok(Self {
             cache_dir,
             max_size_bytes: max_size_gb * 1024 * 1024 * 1024,
             pool,
             runtime,
             inflight: Mutex::new(HashMap::new()),
-            bloom: Arc::new(RwLock::new(bloom)),
             manifest_hints: Mutex::new(HashMap::new()),
             known_inputs: RwLock::new(None),
         })
@@ -388,29 +321,6 @@ impl Cache {
             .map_or(0, HashMap::len)
     }
 
-    /// Snapshot the bloom filter for heartbeat serialization.
-    ///
-    /// Clones the filter under a read lock — cheap (`Vec<u8>` clone, ~60 KB
-    /// for the default sizing). The heartbeat loop calls this every 10s;
-    /// the clone avoids holding the read lock across the gRPC send (which
-    /// would block `insert()` for the duration of a network roundtrip).
-    ///
-    /// Returns the clone, not a guard — caller serializes at leisure.
-    pub fn bloom_snapshot(&self) -> BloomFilter {
-        self.bloom.read().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// Get a shareable handle to the bloom filter.
-    ///
-    /// main.rs needs this because the `Cache` itself is MOVED into
-    /// `mount_fuse_background` (the FUSE session owns it). But the
-    /// heartbeat loop (a separate spawned task) also needs to read
-    /// the bloom every 10s. Giving it an Arc-clone of the inner
-    /// `Arc<RwLock<BloomFilter>>` lets both coexist: FUSE owns the
-    /// Cache, heartbeat owns a read-handle to just the bloom.
-    ///
-    /// The returned handle reads from the SAME RwLock that `insert()`
-    /// writes to — inserts show up in subsequent heartbeat snapshots.
     /// I-110c: prime the manifest-hint map. Called once per build by
     /// the executor (after `BatchGetManifest`), before the FUSE-warm
     /// stat loop. Keys are store BASENAMES (`abc..-hello`, not
@@ -439,10 +349,6 @@ impl Cache {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(store_basename)
-    }
-
-    pub fn bloom_handle(&self) -> Arc<RwLock<BloomFilter>> {
-        Arc::clone(&self.bloom)
     }
 
     /// Root directory where cached paths are materialized.
@@ -546,21 +452,6 @@ impl Cache {
             .await?;
             Ok::<_, sqlx::Error>(())
         })?;
-
-        // Bloom insert AFTER the SQLite write succeeds. If we did it
-        // before and the SQLite write failed, we'd have a bloom positive
-        // for a path we don't actually have — a confusing stale positive
-        // that doesn't correct on restart (restart rebuilds from SQLite,
-        // which doesn't have the path). Ordering after means bloom and
-        // SQLite stay consistent modulo evictions (which we intentionally
-        // don't remove from bloom).
-        //
-        // Write lock is brief: one blake3 hash + k bit-sets (~1μs).
-        // Heartbeat readers won't notice.
-        self.bloom
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(store_path);
 
         // Update cache size metric (ground-truth from DB)
         self.update_size_gauge();
@@ -746,7 +637,7 @@ mod tests {
     /// Cache sync methods use `block_on`, so tests create the cache in async
     /// context then exercise the sync methods via `spawn_blocking`.
     async fn make_cache(cache_dir: PathBuf, max_size_gb: u64) -> anyhow::Result<Arc<Cache>> {
-        Ok(Arc::new(Cache::new(cache_dir, max_size_gb, None).await?))
+        Ok(Arc::new(Cache::new(cache_dir, max_size_gb).await?))
     }
 
     #[tokio::test]

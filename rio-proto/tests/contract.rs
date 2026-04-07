@@ -120,17 +120,6 @@ fn check_bound_exactly_at_limit_is_ok() {
 // ===========================================================================
 // Proto enum wire-value contract
 // ===========================================================================
-
-/// `rio-common/src/bloom.rs` hardcodes `BLAKE3_256 = 3` to avoid a
-/// circular dep on rio-proto. This test pins the proto enum value so
-/// a proto renumber fails CI instead of silently breaking bloom filter
-/// validation at runtime.
-#[test]
-fn bloom_hash_enum_matches_common_hardcode() {
-    assert_eq!(rio_proto::types::BloomHashAlgorithm::Blake3256 as i32, 3);
-}
-
-// ===========================================================================
 // Limits are reasonable (compile-time sanity)
 // ===========================================================================
 
