@@ -6419,6 +6419,7 @@ dependencies = [
  "regex",
  "rio-nix",
  "rio-proto",
+ "scopeguard",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",

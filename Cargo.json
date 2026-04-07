@@ -20619,6 +20619,10 @@
           "packageId": "rio-proto"
         },
         {
+          "name": "scopeguard",
+          "packageId": "scopeguard"
+        },
+        {
           "name": "serde_json",
           "packageId": "serde_json"
         },

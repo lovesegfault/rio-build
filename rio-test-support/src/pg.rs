@@ -163,6 +163,13 @@ impl PgServer {
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn postgres at {postgres:?}: {e}"));
 
+        // Kill the child if we panic before the socket appears. Child::drop
+        // does NOT kill; PR_SET_PDEATHSIG is Linux-only and only fires at
+        // process exit, not on the panic unwind back into the test thread.
+        let child = scopeguard::guard(child, |mut c| {
+            let _ = c.kill();
+        });
+
         // Wait for readiness: poll for the socket file. Postgres writes
         // .s.PGSQL.{port} in unix_socket_directories when accepting connections.
         let sock_file = sockdir.join(".s.PGSQL.5432");
@@ -178,6 +185,7 @@ impl PgServer {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        let child = scopeguard::ScopeGuard::into_inner(child);
 
         // sqlx Unix-socket URL format: host query param with socket directory.
         // Port is still needed — postgres encodes it in the socket filename.
