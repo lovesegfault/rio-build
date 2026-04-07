@@ -169,11 +169,19 @@ async fn main() -> anyhow::Result<()> {
     // refuses to open if any ancestor of X is world-writable. The k8s
     // emptyDir at overlay_base_dir is 0777; clamp it and its parent.
     {
+        use anyhow::Context as _;
         use std::os::unix::fs::PermissionsExt;
         let mode_755 = std::fs::Permissions::from_mode(0o755);
-        let _ = std::fs::set_permissions(&cfg.overlay_base_dir, mode_755.clone());
-        if let Some(parent) = cfg.overlay_base_dir.parent() {
-            let _ = std::fs::set_permissions(parent, mode_755);
+        std::fs::set_permissions(&cfg.overlay_base_dir, mode_755.clone()).with_context(|| {
+            format!(
+                "chmod 0755 {} (nix LocalStore refuses world-writable ancestor)",
+                cfg.overlay_base_dir.display()
+            )
+        })?;
+        if let Some(parent) = cfg.overlay_base_dir.parent()
+            && let Err(e) = std::fs::set_permissions(parent, mode_755)
+        {
+            tracing::warn!(path = %parent.display(), error = %e, "chmod parent of overlay_base_dir");
         }
     }
 
