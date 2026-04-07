@@ -947,6 +947,170 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     Ok(())
 }
 
+// r[verify sched.merge.stale-substitutable]
+/// I-202: a pre-existing `Completed` node whose GC'd output is
+/// substitutable from upstream stays `Completed` (eager-fetched), not
+/// reset to `Ready`. Same setup as the GC'd-output test above, but
+/// the path is seeded in `MockStore.substitutable` — the verify must
+/// fire QueryPathInfo (eager fetch) and skip the reset.
+///
+/// Before the fix: `verify_preexisting_completed` ignored
+/// `substitutable_paths` (and sent no JWT, so the real store returned
+/// none anyway). The node reset to Ready and the whole subtree —
+/// including FOD sources with dead origin URLs — re-dispatched.
+#[tokio::test]
+async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let mut worker_rx = connect_executor(&handle, "w-sub", "x86_64-linux", 1).await?;
+
+    let fod_out = test_store_path("fod-substitutable");
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![
+            make_test_node("app-a", "x86_64-linux"),
+            make_test_node("fod-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("app-a", "fod-dep")],
+        false,
+    )
+    .await?;
+
+    let assn = recv_assignment(&mut worker_rx).await;
+    assert!(assn.drv_path.ends_with("fod-dep.drv"));
+    store.seed_with_content(&fod_out, b"fod-contents");
+    complete_success(&handle, "w-sub", &assn.drv_path, &fod_out).await?;
+    barrier(&handle).await;
+
+    // Hold app-a Running so Build A stays Active and fod-dep stays in
+    // the global DAG (pre-existing for Build B).
+    let mut worker_appa = connect_executor(&handle, "w-sub-appa", "x86_64-linux", 1).await?;
+    let _assn_app_a = recv_assignment(&mut worker_appa).await;
+
+    // GC removes the output from rio-store, BUT cache.nixos.org has it.
+    store.paths.write().unwrap().remove(&fod_out);
+    store.substitutable.write().unwrap().push(fod_out.clone());
+
+    // Spare worker — should stay IDLE because fod-dep doesn't reset.
+    let mut worker_spare = connect_executor(&handle, "w-sub-spare", "x86_64-linux", 1).await?;
+
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![
+            make_test_node("app-b", "x86_64-linux"),
+            make_test_node("fod-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("app-b", "fod-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Eager-fetch fired: QueryPathInfo called for fod_out.
+    let qpi = store.qpi_calls.read().unwrap().clone();
+    assert!(
+        qpi.contains(&fod_out),
+        "stale-completed verify should eager-fetch the substitutable output; \
+         qpi_calls={qpi:?}"
+    );
+
+    // fod-dep stayed Completed → app-b is Ready (not Queued) and
+    // dispatches to the spare worker. fod-dep itself does NOT
+    // re-dispatch.
+    let assn_spare = recv_assignment(&mut worker_spare).await;
+    assert!(
+        assn_spare.drv_path.ends_with("app-b.drv"),
+        "fod-dep must stay Completed (substituted, not reset); spare worker \
+         should get app-b, not fod-dep; got {}",
+        assn_spare.drv_path
+    );
+
+    let status_b = query_status(&handle, build_b).await?;
+    assert_eq!(
+        status_b.cached_derivations, 1,
+        "fod-dep should count as cached for Build B (output substituted)"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.merge.stale-substitutable]
+/// Negative case: the GC'd output is reported substitutable, but the
+/// eager fetch FAILS (QueryPathInfo errors). The node falls through
+/// to reset-to-Ready — same as if it were never substitutable.
+#[tokio::test]
+async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+    use std::sync::atomic::Ordering;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let mut worker_rx = connect_executor(&handle, "w-sf", "x86_64-linux", 1).await?;
+
+    let fod_out = test_store_path("fod-sub-fail");
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![
+            make_test_node("app-a", "x86_64-linux"),
+            make_test_node("fod-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("app-a", "fod-dep")],
+        false,
+    )
+    .await?;
+
+    let assn = recv_assignment(&mut worker_rx).await;
+    store.seed_with_content(&fod_out, b"fod-contents");
+    complete_success(&handle, "w-sf", &assn.drv_path, &fod_out).await?;
+    barrier(&handle).await;
+    let mut worker_appa = connect_executor(&handle, "w-sf-appa", "x86_64-linux", 1).await?;
+    let _assn_app_a = recv_assignment(&mut worker_appa).await;
+
+    // GC; substitutable; but QPI is broken → eager-fetch fails.
+    store.paths.write().unwrap().remove(&fod_out);
+    store.substitutable.write().unwrap().push(fod_out.clone());
+    store.fail_query_path_info.store(true, Ordering::SeqCst);
+
+    let mut worker_spare = connect_executor(&handle, "w-sf-spare", "x86_64-linux", 1).await?;
+
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![
+            make_test_node("app-b", "x86_64-linux"),
+            make_test_node("fod-dep", "x86_64-linux"),
+        ],
+        vec![make_test_edge("app-b", "fod-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Eager-fetch failed → fod-dep reset to Ready → re-dispatched.
+    let reassn = recv_assignment(&mut worker_spare).await;
+    assert!(
+        reassn.drv_path.ends_with("fod-dep.drv"),
+        "fetch-fail must fall through to reset-to-Ready (re-dispatch fod-dep); \
+         got {}",
+        reassn.drv_path
+    );
+
+    Ok(())
+}
+
 // r[verify sched.merge.stale-completed-verify]
 /// Fail-open: if the store is unreachable during the stale-Completed
 /// verify, skip verification and treat pre-existing Completed as

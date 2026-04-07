@@ -391,6 +391,9 @@ When a build merges and finds a pre-existing `poisoned` node in the global DAG, 
 r[sched.merge.stale-completed-verify]
 When a build merges and finds a pre-existing `completed` node in the global DAG, the scheduler batches a `FindMissingPaths` against rio-store with that node's `output_paths` before computing initial states for newly-inserted dependents. If any output is missing, the node resets to `ready` (clearing `output_paths`), is pushed to the dispatch queue, and `rio_scheduler_stale_completed_reset_total` increments. Newly-inserted dependents then correctly compute as `queued` rather than `ready`. The same store-existence check applies to newly-inserted CA nodes whose `realisations`-table lookup found a hit: the realized path is verified before the node counts as a cache hit (`rio_scheduler_stale_realisation_filtered_total`). Both checks are fail-open: store unreachable → skip verification, treat existing `completed` (or the realisation) as valid (the GC race is rare; blocking merge on store availability would be a worse regression).
 
+r[sched.merge.stale-substitutable]
+The stale-completed `FindMissingPaths` is sent with the build's tenant token so the store reports `substitutable_paths`. Outputs that are missing-but-substitutable are eagerly fetched (per `r[sched.merge.substitute-fetch]`) and the node stays `completed`; only outputs that are missing AND not successfully substituted reset to `ready`. Without this, post-GC re-submissions re-dispatch the entire subtree — including FOD sources whose origin URLs may be dead — for paths cache.nixos.org already has.
+
 ## Build State Machine
 
 r[sched.build.state]

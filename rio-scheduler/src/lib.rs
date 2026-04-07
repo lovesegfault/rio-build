@@ -124,6 +124,11 @@ pub fn describe_metrics() {
          GC'd from store. Nonzero rate = GC retention shorter than DAG node lifetime."
     );
     describe_counter!(
+        "rio_scheduler_stale_completed_substituted_total",
+        "Pre-existing Completed nodes whose GC'd output was repopulated via upstream \
+         substitution at merge (instead of reset-to-Ready re-dispatch)."
+    );
+    describe_counter!(
         "rio_scheduler_stale_realisation_filtered_total",
         "CA realisations dropped from cache-hit set because the realized path was \
          GC'd from store. Same operator signal as stale_completed_reset; this counts \
