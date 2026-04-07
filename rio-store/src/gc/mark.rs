@@ -136,11 +136,7 @@ pub async fn compute_unreachable(
     // `now() - ($1::int || ' hours')::interval` or `make_interval`.
     // `make_interval(hours => $1)` is the cleanest.
     let rows: Vec<(Vec<u8>,)> = sqlx::query_as(COMPUTE_UNREACHABLE_SQL)
-        // Clamp before i32 cast. u32 > i32::MAX wraps negative →
-        // make_interval(hours => negative) → now() - (negative) = future →
-        // grace protects NOTHING → everything sweepable. 24*365 = one year
-        // ceiling; "infinite grace" is a misuse (use PinPath instead).
-        .bind(grace_hours.min(24 * 365) as i32)
+        .bind(grace_hours.min(super::GRACE_HOURS_CAP) as i32)
         .bind(extra_roots)
         .fetch_all(pool)
         .await?;

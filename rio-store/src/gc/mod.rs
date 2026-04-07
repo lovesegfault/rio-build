@@ -118,6 +118,12 @@ pub struct GcParams {
     pub extra_roots: Vec<String>,
 }
 
+/// Ceiling on `grace_hours` before the `as i32` bind. u32 > i32::MAX
+/// wraps negative → `make_interval(hours => negative)` → grace covers
+/// nothing → everything sweepable. One year is the practical max;
+/// "infinite grace" is `PinPath`, not a huge grace window.
+pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
+
 /// Default threshold for the empty-refs safety gate. 10% is
 /// intentionally low: in a healthy post-fix store, empty-ref non-CA
 /// paths should be ~0% (only genuinely ref-free outputs like static
@@ -383,7 +389,7 @@ async fn check_empty_refs_gate(
           AND n.created_at < now() - make_interval(hours => $1::int)
         "#,
     )
-    .bind(grace_hours as i32)
+    .bind(grace_hours.min(GRACE_HOURS_CAP) as i32)
     .fetch_one(pool)
     .await
     .map_err(|e| {
