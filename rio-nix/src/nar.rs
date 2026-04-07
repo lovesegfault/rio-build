@@ -683,11 +683,16 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
         "directory" => {
             std::fs::create_dir(dest)?;
             let mut prev_name: Option<String> = None;
+            let mut count = 0usize;
             loop {
+                if count >= MAX_DIRECTORY_ENTRIES {
+                    return Err(NarError::ContentTooLarge(count as u64));
+                }
                 let token = read_string(r)?;
                 match token.as_str() {
                     ")" => break,
                     "entry" => {
+                        count += 1;
                         expect_str(r, "(")?;
                         expect_str(r, "name")?;
                         let name_bytes = read_name_bytes(r)?;
