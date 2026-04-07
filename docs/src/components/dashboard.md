@@ -46,14 +46,14 @@ endpoint). CORS `allowOrigins` defaults to the in-cluster nginx Service hostname
 
 | Page | Data Source | Description |
 |------|-------------|-------------|
-| Cluster | `AdminService.ClusterStatus` | Worker/build/derivation counts, entry point to GC |
+| Cluster | `AdminService.ClusterStatus` | Executor/build/derivation counts, entry point to GC |
 | Builds | `AdminService.ListBuilds` | Paginated list with status filter + per-build drawer; entry point to the killer journey |
 | Graph | `AdminService.GetBuildGraph` | Interactive DAG visualization (`@xyflow/svelte`), color-coded status, degrades to table >2000 nodes |
-| Workers | `AdminService.ListWorkers` | Per-worker load bar, stale-heartbeat highlight, drain button |
+| Executors | `AdminService.ListExecutors` | Busy/idle pill (one-build-per-pod ⇒ binary), kind filter (builder/fetcher), stale-heartbeat highlight, drain button |
 | GC | `AdminService.TriggerGC` (server stream) | Dry-run toggle, grace-period slider, live sweep progress |
 | Log viewer | `AdminService.GetBuildLogs` (server stream) | Live-tail build output, UTF-8-lossy decode, embedded in the build drawer |
 
-Worker utilization time-series and cache hit-rate analytics are **NOT** dashboard
+Executor utilization time-series and cache hit-rate analytics are **NOT** dashboard
 scope — they live in the Grafana dashboards (`infra/helm/grafana/`). The
 rio-dashboard focuses on interactive per-build detail (DAG, logs, management
 actions) that a Prometheus/Grafana stack can't give you.
@@ -63,8 +63,8 @@ actions) that a Prometheus/Grafana stack can't give you.
 r[dash.envoy.grpc-web-translate+2]
 Envoy Gateway (deployed via nixhelm `gateway-helm` chart) translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. A `GRPCRoute` CRD routes `rio.admin.AdminService` and `rio.scheduler.SchedulerService` methods to `rio-scheduler:9001`; attaching a `GRPCRoute` to a listener automatically injects the `envoy.filters.http.grpc_web` filter into that listener's filter chain (no `EnvoyPatchPolicy` escape hatch). `SecurityPolicy` configures CORS with `grpc-status`/`grpc-message`/`grpc-status-details-bin` in `exposeHeaders`. `BackendTLSPolicy` + `EnvoyProxy.spec.backendTLS.clientCertificateRef` provide upstream mTLS.
 
-r[dash.auth.method-gate]
-The `GRPCRoute` splits `AdminService` methods by impact: read-only methods (`ClusterStatus`, `ListWorkers`, `ListBuilds`, `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSizeClassStatus`) route unconditionally; mutating methods (`ClearPoison`, `DrainWorker`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods` is true (default false). Until dashboard-native authz lands, mutating operations go through `rio-cli` with an mTLS client certificate. CORS `allowOrigins` defaults to the in-cluster nginx Service hostname, not wildcard.
+r[dash.auth.method-gate+2]
+The `GRPCRoute` splits `AdminService` methods by impact: read-only methods (`ClusterStatus`, `ListExecutors`, `ListPoisoned`, `ListBuilds`, `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSizeClassStatus`) route unconditionally; mutating methods (`ClearPoison`, `DrainExecutor`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods` is true (default false). Until dashboard-native authz lands, mutating operations go through `rio-cli` with an mTLS client certificate. CORS `allowOrigins` defaults to the in-cluster nginx Service hostname, not wildcard.
 
 r[dash.journey.build-to-logs]
 The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
