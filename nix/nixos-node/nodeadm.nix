@@ -40,8 +40,9 @@ buildGoModule rec {
   #   static binary, sub-100 ms — and is what the AL2 path used before
   #   nodeadm. The token format is identical (STS presigned URL).
   #
-  # (containerd templates are unpatched: nodeadm runs with `-d kubelet`
-  # so its containerd config path never executes — see eks-node.nix.)
+  # (containerd templates are unpatched: nodeadm runs with `--daemon
+  # kubelet` so its containerd config path never executes — see
+  # eks-node.nix.)
   postPatch = ''
     cat > nodeadm/internal/kubelet/kubeconfig.template.yaml <<'EOF'
     ---
