@@ -621,8 +621,9 @@
   # depend on actually BUILDING the AMI.
   node-ami-eval = pkgs.runCommand "rio-node-ami-eval" { } ''
     cat > $out <<'EOF'
-    ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux").drvPath}
-    ${builtins.unsafeDiscardStringContext (nodeAmi "aarch64-linux").drvPath}
+    ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux" { }).drvPath}
+    ${builtins.unsafeDiscardStringContext (nodeAmi "aarch64-linux" { }).drvPath}
+    ${builtins.unsafeDiscardStringContext (nodeAmi "x86_64-linux" { efi = false; }).drvPath}
     EOF
   '';
 }

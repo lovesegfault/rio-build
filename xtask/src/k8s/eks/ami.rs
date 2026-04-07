@@ -43,17 +43,47 @@ pub enum AmiArch {
     All,
 }
 
+/// One AMI build target. `boot` is the EC2 boot mode the image registers
+/// with AND the `rio.build/boot` tag value — the (k8s_arch, boot) pair
+/// is the EC2NodeClass amiSelectorTerms key, so two amd64 images with
+/// the same content tag stay distinguishable (I-205).
+#[derive(Clone)]
+struct Target {
+    attr: &'static str,
+    ec2_arch: ArchitectureValues,
+    k8s_arch: &'static str,
+    boot: &'static str,
+}
+
+const X86: Target = Target {
+    attr: "x86_64",
+    ec2_arch: ArchitectureValues::X8664,
+    k8s_arch: "amd64",
+    boot: "uefi",
+};
+const ARM: Target = Target {
+    attr: "aarch64",
+    ec2_arch: ArchitectureValues::Arm64,
+    k8s_arch: "arm64",
+    boot: "uefi",
+};
+// I-205: AWS x86_64 .metal SKUs reject UEFI AMIs (every one is
+// SupportedBootModes=["legacy-bios"] per `aws ec2 describe-instance-
+// types`). The rio-builder-metal NodePool selects this via the
+// `rio-metal` EC2NodeClass.
+const X86_BIOS: Target = Target {
+    attr: "x86_64-bios",
+    ec2_arch: ArchitectureValues::X8664,
+    k8s_arch: "amd64",
+    boot: "legacy-bios",
+};
+
 impl AmiArch {
-    /// (flake-attr suffix, EC2 architecture, kubernetes.io/arch tag value).
-    fn targets(self) -> &'static [(&'static str, ArchitectureValues, &'static str)] {
-        const X86: (&str, ArchitectureValues, &str) =
-            ("x86_64", ArchitectureValues::X8664, "amd64");
-        const ARM: (&str, ArchitectureValues, &str) =
-            ("aarch64", ArchitectureValues::Arm64, "arm64");
+    fn targets(self) -> &'static [Target] {
         match self {
-            AmiArch::X86_64 => &[X86],
+            AmiArch::X86_64 => &[X86, X86_BIOS],
             AmiArch::Aarch64 => &[ARM],
-            AmiArch::All => &[X86, ARM],
+            AmiArch::All => &[X86, ARM, X86_BIOS],
         }
     }
 }
@@ -84,9 +114,10 @@ struct ImageInfo {
 /// still tie up a runtime worker.
 pub async fn ami_tag() -> Result<String> {
     let mut h = Sha256::new();
-    for &(attr, _, _) in AmiArch::All.targets() {
+    for t in AmiArch::All.targets() {
         // Shell scoped tight so it isn't held across the await
         // (xshell::Shell is !Sync; keeping the future Send-clean).
+        let attr = t.attr;
         let fut = {
             let sh = shell()?;
             run_read(cmd!(sh, "nix eval --raw .#node-ami-{attr}.drvPath"))
@@ -115,12 +146,12 @@ pub async fn run_phase(arch: AmiArch) -> Result<()> {
     let conf = crate::aws::config(Some(&region)).await;
     let ec2 = aws_sdk_ec2::Client::new(conf);
 
-    // I-182 fast path: every requested arch already registered for
+    // I-182 fast path: every requested target already registered for
     // this content tag → write the handoff file and stop. No build,
     // no coldsnap, no re-tag.
     let mut all_present = true;
-    for &(_, _, k8s_arch) in arch.targets() {
-        if find_existing(&ec2, &ami_tag, k8s_arch).await?.is_none() {
+    for t in arch.targets() {
+        if find_existing(&ec2, &ami_tag, t).await?.is_none() {
             all_present = false;
             break;
         }
@@ -149,24 +180,23 @@ pub async fn run_phase(arch: AmiArch) -> Result<()> {
     Ok(())
 }
 
-/// One arch's build → coldsnap upload → register-image → tag pipeline.
-/// Extracted from `run_phase` so `AmiArch::All` runs both concurrently.
+/// One target's build → coldsnap upload → register-image → tag pipeline.
+/// Extracted from `run_phase` so `AmiArch::All` runs all concurrently.
 async fn build_and_register_one(
     ec2: &aws_sdk_ec2::Client,
     ami_tag: &str,
     sha: &str,
     region: &str,
     cluster: &str,
-    &(attr, ref ec2_arch, k8s_arch): &(&'static str, ArchitectureValues, &'static str),
+    t: &Target,
 ) -> Result<()> {
-    // Per-arch idempotency: a prior partial push (e.g. x86 done,
-    // aarch64 interrupted) skips the done arch.
-    if let Some(existing) = find_existing(ec2, ami_tag, k8s_arch).await? {
-        info!(
-            "AMI {existing} already tagged rio.build/ami={ami_tag} ({k8s_arch}) — skipping upload"
-        );
-        tag(ec2, &existing, ami_tag, sha, k8s_arch, cluster).await?;
-        untag_prior_latest(ec2, &existing, k8s_arch).await?;
+    let (attr, k8s_arch) = (t.attr, t.k8s_arch);
+    // Per-target idempotency: a prior partial push (e.g. x86 done,
+    // aarch64 interrupted) skips the done one.
+    if let Some(existing) = find_existing(ec2, ami_tag, t).await? {
+        info!("AMI {existing} already tagged rio.build/ami={ami_tag} ({attr}) — skipping upload");
+        tag(ec2, &existing, ami_tag, sha, t, cluster).await?;
+        untag_prior_latest(ec2, &existing, t).await?;
         return Ok(());
     }
 
@@ -179,6 +209,13 @@ async fn build_and_register_one(
     };
     let out = ui::step(&format!("nix build .#node-ami-{attr}"), || build).await?;
     let info = read_image_info(Path::new(out.trim()))?;
+    anyhow::ensure!(
+        info.boot_mode == t.boot,
+        ".#node-ami-{attr} built boot_mode={} but target expects {} — \
+         flake nodeAmi efi arg out of sync with xtask Target table",
+        info.boot_mode,
+        t.boot
+    );
 
     let snap = ui::step(&format!("coldsnap upload ({k8s_arch})"), || async {
         // coldsnap's Rust SDK doesn't pick up SSO creds from
@@ -194,7 +231,7 @@ async fn build_and_register_one(
             .await?,
         )?;
         let file = &info.file;
-        let desc = format!("rio-nixos-node {ami_tag} {k8s_arch}");
+        let desc = format!("rio-nixos-node {ami_tag} {attr}");
         // I-198: was `sh.push_env()` RAII guards (hold `&Shell`, `!Sync`)
         // across the await — broke per-phase `tokio::spawn`. Per-command
         // `.env()` keeps the future `Send`.
@@ -225,19 +262,21 @@ async fn build_and_register_one(
     })
     .await?;
 
-    let ami = ui::step(&format!("register-image ({k8s_arch})"), || {
-        register(ec2, &info, &snap, ec2_arch.clone(), ami_tag, k8s_arch)
+    let ami = ui::step(&format!("register-image ({attr})"), || {
+        register(ec2, &info, &snap, t.ec2_arch.clone(), ami_tag, attr)
     })
     .await?;
 
     ui::step(&format!("tag {ami}"), || {
-        tag(ec2, &ami, ami_tag, sha, k8s_arch, cluster)
+        tag(ec2, &ami, ami_tag, sha, t, cluster)
     })
     .await?;
-    untag_prior_latest(ec2, &ami, k8s_arch).await?;
+    untag_prior_latest(ec2, &ami, t).await?;
 
     info!(
-        "registered {ami} (snapshot {snap}) — rio.build/ami={ami_tag} kubernetes.io/arch={k8s_arch}"
+        "registered {ami} (snapshot {snap}) — \
+         rio.build/ami={ami_tag} kubernetes.io/arch={k8s_arch} rio.build/boot={}",
+        t.boot
     );
     Ok(())
 }
@@ -257,13 +296,14 @@ fn read_image_info(out: &Path) -> Result<ImageInfo> {
 async fn find_existing(
     ec2: &aws_sdk_ec2::Client,
     ami_tag: &str,
-    arch: &str,
+    t: &Target,
 ) -> Result<Option<String>> {
     let resp = ec2
         .describe_images()
         .owners("self")
         .filters(tag_filter("rio.build/ami", ami_tag))
-        .filters(tag_filter("kubernetes.io/arch", arch))
+        .filters(tag_filter("kubernetes.io/arch", t.k8s_arch))
+        .filters(tag_filter("rio.build/boot", t.boot))
         .send()
         .await?;
     Ok(resp
@@ -331,12 +371,14 @@ fn latest_ami_tag_of(images: &[Image]) -> Result<String> {
 pub async fn assert_registered(ami_tag: &str, region: &str) -> Result<()> {
     let conf = crate::aws::config(Some(region)).await;
     let ec2 = aws_sdk_ec2::Client::new(conf);
-    for &(_, _, k8s_arch) in AmiArch::All.targets() {
-        if find_existing(&ec2, ami_tag, k8s_arch).await?.is_none() {
+    for t in AmiArch::All.targets() {
+        if find_existing(&ec2, ami_tag, t).await?.is_none() {
             anyhow::bail!(
-                "no AMI tagged rio.build/ami={ami_tag} ({k8s_arch}) — \
+                "no AMI tagged rio.build/ami={ami_tag} ({}, rio.build/boot={}) — \
                  run `cargo xtask k8s -p eks up --ami` first \
-                 (deploying a non-existent tag wedges Karpenter)"
+                 (deploying a non-existent tag wedges Karpenter)",
+                t.k8s_arch,
+                t.boot
             );
         }
     }
@@ -345,11 +387,12 @@ pub async fn assert_registered(ami_tag: &str, region: &str) -> Result<()> {
 
 /// AMI Name + Description for register-image. Split out so the unit
 /// test can assert ASCII without an EC2 client.
-fn image_identity(info: &ImageInfo, ami_tag: &str, k8s_arch: &str) -> (String, String) {
+fn image_identity(info: &ImageInfo, ami_tag: &str, attr: &str) -> (String, String) {
     // Name must be unique-per-account-per-region. label is the NixOS
     // system.nixos.label (release + git rev of nixpkgs); the
-    // content-addressed tag + arch disambiguates.
-    let name = format!("rio-nixos-node-{}-{ami_tag}-{k8s_arch}", info.label);
+    // content-addressed tag + flake attr (encodes arch + boot variant)
+    // disambiguates — two amd64 images share a content tag post-I-205.
+    let name = format!("rio-nixos-node-{}-{ami_tag}-{attr}", info.label);
     // EC2 rejects non-ASCII (em-dash etc.) in Description with
     // "Character sets beyond ASCII are not supported."
     let desc = format!("rio-build NixOS EKS node (ADR-021) - {ami_tag}");
@@ -363,9 +406,9 @@ async fn register(
     snapshot_id: &str,
     arch: ArchitectureValues,
     ami_tag: &str,
-    k8s_arch: &str,
+    attr: &str,
 ) -> Result<String> {
-    let (name, desc) = image_identity(info, ami_tag, k8s_arch);
+    let (name, desc) = image_identity(info, ami_tag, attr);
     let resp = ec2
         .register_image()
         .name(&name)
@@ -399,13 +442,15 @@ async fn tag(
     ami: &str,
     ami_tag: &str,
     git_sha: &str,
-    k8s_arch: &str,
+    t: &Target,
     cluster: &str,
 ) -> Result<()> {
     // rio.build/ami=<tag> is what the EC2NodeClass amiSelectorTerms
     // match — content-addressed (I-182), pin to a value for
     // reproducible rollback. rio.build/git-sha is traceability only
     // (changes every commit; the content tag does not).
+    // rio.build/boot disambiguates the two amd64 variants for the
+    // rio-default vs rio-metal NodeClass selectors (I-205).
     // karpenter.sh/discovery scopes the AMI to this cluster's selector
     // (same key as subnets/SGs).
     ec2.create_tags()
@@ -413,11 +458,12 @@ async fn tag(
         .tags(mk_tag("rio.build/ami", ami_tag))
         .tags(mk_tag("rio.build/git-sha", git_sha))
         .tags(mk_tag("rio.build/ami-latest", "true"))
-        .tags(mk_tag("kubernetes.io/arch", k8s_arch))
+        .tags(mk_tag("kubernetes.io/arch", t.k8s_arch))
+        .tags(mk_tag("rio.build/boot", t.boot))
         .tags(mk_tag("karpenter.sh/discovery", cluster))
         .tags(mk_tag(
             "Name",
-            &format!("rio-nixos-node-{ami_tag}-{k8s_arch}"),
+            &format!("rio-nixos-node-{ami_tag}-{}", t.attr),
         ))
         .send()
         .await?;
@@ -432,16 +478,13 @@ async fn tag(
 /// and `resolve_latest_tag` walks an ever-growing describe-images
 /// result. Only the `ami-latest` key is removed — `rio.build/ami`
 /// (content tag) and `rio.build/git-sha` stay for rollback pinning.
-async fn untag_prior_latest(
-    ec2: &aws_sdk_ec2::Client,
-    keep_ami: &str,
-    k8s_arch: &str,
-) -> Result<()> {
+async fn untag_prior_latest(ec2: &aws_sdk_ec2::Client, keep_ami: &str, t: &Target) -> Result<()> {
     let resp = ec2
         .describe_images()
         .owners("self")
         .filters(tag_filter("rio.build/ami-latest", "true"))
-        .filters(tag_filter("kubernetes.io/arch", k8s_arch))
+        .filters(tag_filter("kubernetes.io/arch", t.k8s_arch))
+        .filters(tag_filter("rio.build/boot", t.boot))
         .send()
         .await?;
     let prior: Vec<String> = resp
@@ -455,8 +498,9 @@ async fn untag_prior_latest(
         return Ok(());
     }
     info!(
-        "untagging rio.build/ami-latest from {} prior {k8s_arch} AMI(s)",
-        prior.len()
+        "untagging rio.build/ami-latest from {} prior {} AMI(s)",
+        prior.len(),
+        t.attr
     );
     ec2.delete_tags()
         .set_resources(Some(prior))
@@ -591,10 +635,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arch_targets_cover_both() {
-        assert_eq!(AmiArch::All.targets().len(), 2);
-        assert_eq!(AmiArch::X86_64.targets()[0].2, "amd64");
-        assert_eq!(AmiArch::Aarch64.targets()[0].2, "arm64");
+    fn arch_targets_cover_all_variants() {
+        assert_eq!(AmiArch::All.targets().len(), 3);
+        assert_eq!(AmiArch::Aarch64.targets()[0].k8s_arch, "arm64");
+        // I-205: --arch x86_64 builds BOTH the uefi and bios amd64
+        // variants (rio-default + rio-metal NodeClass coverage).
+        let x86: Vec<_> = AmiArch::X86_64.targets().iter().map(|t| t.boot).collect();
+        assert_eq!(x86, ["uefi", "legacy-bios"]);
     }
 
     #[test]
@@ -609,12 +656,12 @@ mod tests {
             file: String::new(),
             boot_mode: "uefi".into(),
         };
-        for &(_, _, k8s_arch) in AmiArch::All.targets() {
-            let (name, desc) = image_identity(&info, "af8a6f093dcd", k8s_arch);
+        for t in AmiArch::All.targets() {
+            let (name, desc) = image_identity(&info, "af8a6f093dcd", t.attr);
             assert!(name.is_ascii(), "non-ASCII in AMI name: {name:?}");
             assert!(desc.is_ascii(), "non-ASCII in AMI description: {desc:?}");
             // AMI Name: 3-128 chars, [A-Za-z0-9 ()./_-]. The label
-            // and sha are alphanumeric+dot; k8s_arch is alphanumeric.
+            // and sha are alphanumeric+dot; attr is alnum/-/_.
             assert!(name.len() <= 128);
         }
     }

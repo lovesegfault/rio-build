@@ -34,9 +34,11 @@ spec:
     - tags:
         rio.build/ami: {{ required "karpenter.amiTag is required when karpenter.enabled=true — run `cargo xtask k8s -p eks up --ami` first" $k.amiTag }}
         kubernetes.io/arch: amd64
+        rio.build/boot: uefi
     - tags:
         rio.build/ami: {{ $k.amiTag }}
         kubernetes.io/arch: arm64
+        rio.build/boot: uefi
   role: {{ required "karpenter.nodeRoleName is required when karpenter.enabled=true" $k.nodeRoleName }}
   subnetSelectorTerms:
     - tags:
@@ -73,6 +75,54 @@ spec:
         encrypted: true
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
+---
+# I-205: x86_64 .metal SKUs are legacy-bios ONLY (zero support UEFI per
+# `aws ec2 describe-instance-types`), so the rio-builder-metal NodePool
+# can't use the UEFI/UKI AMI on x86. This NodeClass selects the
+# `node-ami-x86_64-bios` variant for amd64 and the regular UEFI image
+# for arm64 (Graviton .metal requires UEFI). Spec is otherwise identical
+# to rio-default — same role/subnets/SGs/IMDS/blockdev. Only the
+# rio-builder-metal NodePool references this; virtualized pools stay on
+# rio-default (UEFI/UKI).
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: rio-metal
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - tags:
+        rio.build/ami: {{ $k.amiTag }}
+        kubernetes.io/arch: amd64
+        rio.build/boot: legacy-bios
+    - tags:
+        rio.build/ami: {{ $k.amiTag }}
+        kubernetes.io/arch: arm64
+        rio.build/boot: uefi
+  role: {{ $k.nodeRoleName }}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ $k.clusterName }}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ $k.clusterName }}
+  metadataOptions:
+    httpEndpoint: enabled
+    httpTokens: required
+    httpPutResponseHopLimit: 2
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: {{ $k.dataVolumeSize }}
+        volumeType: gp3
+        iops: {{ $k.dataVolumeIops }}
+        throughput: {{ $k.dataVolumeThroughputMiBps }}
+        deleteOnTermination: true
+        encrypted: true
+  tags:
+    karpenter.sh/discovery: {{ $k.clusterName }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1
@@ -91,7 +141,7 @@ spec:
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
-        name: rio-default
+        name: {{ .nodeClass | default "rio-default" }}
       {{- with .taints }}
       taints:
         {{- toYaml . | nindent 8 }}

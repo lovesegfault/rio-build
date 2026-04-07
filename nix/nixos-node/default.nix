@@ -25,10 +25,13 @@
   # composition that doesn't pass it (e.g., a future VM-test fixture).
   _module.args.rioSeedImages = lib.mkDefault [ ];
 
+  # Boot loader (uki-boot.nix vs bios-boot.nix) is composed by the
+  # CALLER alongside this module — flake.nix nodeAmi picks per `efi`
+  # arg (I-205). The VM test (nix/tests/nixos-node.nix) imports neither;
+  # qemu-vm direct-kernel boot bypasses the loader entirely.
   imports = [
     ./minimal.nix
     ./initrd-net.nix
-    ./uki-boot.nix
     ./eks-node.nix
     ./hardening.nix
   ];

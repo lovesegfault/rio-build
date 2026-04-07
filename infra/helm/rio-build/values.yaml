@@ -556,6 +556,10 @@ karpenter:
     # that happen to tolerate both taints, and reap aggressively.
     - name: rio-builder-metal
       weight: 1
+      # I-205: x86_64 .metal SKUs reject UEFI AMIs (legacy-bios only).
+      # rio-metal NodeClass selects node-ami-x86_64-bios for amd64 and
+      # the regular UEFI AMI for arm64. See templates/karpenter.yaml.
+      nodeClass: rio-metal
       labels:
         rio.build/node-role: builder
         rio.build/kvm: "true"

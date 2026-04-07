@@ -614,6 +614,16 @@
           # scattershot.
           nodeAmi =
             nodeSystem:
+            {
+              # I-205: x86_64 .metal SKUs are legacy-bios ONLY (zero
+              # support UEFI per `aws ec2 describe-instance-types`). The
+              # bios variant swaps uki-boot.nix for bios-boot.nix and
+              # registers boot_mode=legacy-bios; everything else is
+              # identical so the rio-metal EC2NodeClass can select it for
+              # the rio-builder-metal NodePool while rio-default keeps
+              # the UEFI/UKI image for virtualized + arm64 .metal.
+              efi ? true,
+            }:
             (nixpkgs.lib.nixosSystem {
               system = nodeSystem;
               specialArgs = {
@@ -631,13 +641,14 @@
               modules = [
                 (nixpkgs + "/nixos/maintainers/scripts/ec2/amazon-image.nix")
                 ./nix/nixos-node
+                (if efi then ./nix/nixos-node/uki-boot.nix else ./nix/nixos-node/bios-boot.nix)
                 {
                   # raw → coldsnap uploads directly to an EBS snapshot
                   # via the EBS Direct API (no S3 / VM-Import round-trip,
                   # ~20min → ~2min for an 8 GB image).
                   amazonImage.format = "raw";
                   virtualisation.diskSize = "auto";
-                  ec2.efi = true;
+                  ec2.efi = efi;
                 }
               ];
             }).config.system.build.amazonImage;
@@ -1620,8 +1631,10 @@
             # build host cross-builds both, like .#packages.<sys>.
             # dockerImages. xtask asks for both explicitly.
             # ──────────────────────────────────────────────────────────
-            node-ami-x86_64 = nodeAmi "x86_64-linux";
-            node-ami-aarch64 = nodeAmi "aarch64-linux";
+            node-ami-x86_64 = nodeAmi "x86_64-linux" { };
+            node-ami-aarch64 = nodeAmi "aarch64-linux" { };
+            # I-205: x86 .metal NodePool only — see nodeAmi comment.
+            node-ami-x86_64-bios = nodeAmi "x86_64-linux" { efi = false; };
 
             # CRD YAML for kustomize. runCommand invokes the crdgen
             # binary (serde_yaml write-only) and dumps two YAML
