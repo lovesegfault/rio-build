@@ -123,7 +123,7 @@ pkgs.testers.runNixOSTest {
         # Mutating route MUST NOT exist — enableMutatingMethods defaults
         # false. The k3s fixture doesn't set it (fixture sets
         # dashboard.enabled=true only). Any accidental render =
-        # fail-open on ClearPoison/DrainWorker/CreateTenant/TriggerGC.
+        # fail-open on ClearPoison/DrainExecutor/CreateTenant/TriggerGC.
         k3s_server.fail(
             "k3s kubectl -n ${ns} get grpcroute rio-scheduler-mutating"
         )
@@ -358,6 +358,31 @@ pkgs.testers.runNixOSTest {
         assert code == "200", (
             f"ClusterStatus unexpectedly unrouted (http_code={code}). "
             "The readonly GRPCRoute may have lost its match list."
+        )
+
+    # Regression guard for the proto rename class of bug: the GRPCRoute
+    # method literal must track admin.proto. ListExecutors is the canary
+    # — it was renamed once and the helm template missed it (404 in prod).
+    # Unlike ClusterStatus (never renamed), this proves the renamed
+    # method is actually wired. Body grep for grpc-status:0 confirms the
+    # scheduler accepted the request, not just that envoy routed it.
+    with subtest("method-gate: ListExecutors returns 200 + grpc-status:0"):
+        out = k3s_server.succeed(
+            "printf '\\x00\\x00\\x00\\x00\\x00' | "
+            "curl -s -w '\\n%{http_code}' "
+            "-X POST http://localhost:18080/rio.admin.AdminService/ListExecutors "
+            "-H 'content-type: application/grpc-web+proto' "
+            "-H 'x-grpc-web: 1' "
+            "--data-binary @- | tee /tmp/listexec.out"
+        )
+        code = out.rstrip().rsplit("\n", 1)[-1]
+        print(f"ListExecutors http_code={code}")
+        assert code == "200", (
+            f"ListExecutors unrouted (http_code={code}). "
+            "GRPCRoute method literal drifted from admin.proto."
+        )
+        k3s_server.succeed(
+            "grep -a 'grpc-status:[[:space:]]*0' /tmp/listexec.out"
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-envoy.pid) 2>/dev/null || true")

@@ -723,12 +723,14 @@ in
   #   (listener.go:424-425) actually fired. ~6min (k3s bring-up +
   #   operator reconcile). Heavy: +2 images (envoyproxy/gateway +
   #   envoy:distroless) — dedicated test so vm-cli-k3s stays fast.
-  # r[verify dash.auth.method-gate]
+  # r[verify dash.auth.method-gate+2]
   #   Same curl shape against ClearPoison → expects 404. The fixture
   #   doesn't set dashboard.enableMutatingMethods so the mutating
   #   GRPCRoute is absent. Proves the helm-template fail-closed holds
   #   at runtime through the operator's xDS reconcile. Positive
-  #   control: ClusterStatus on the readonly route returns 200.
+  #   controls: ClusterStatus + ListExecutors on the readonly route
+  #   return 200; ListExecutors specifically guards the proto-rename
+  #   class of bug (helm method literal drifting from admin.proto).
   # r[verify dash.journey.build-to-logs]
   #   The GetBuildLogs 0x80 trailer assertion proves server-streaming
   #   works through the nginx→Envoy Gateway→scheduler chain. Handler
