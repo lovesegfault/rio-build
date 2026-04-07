@@ -220,8 +220,8 @@ pub struct BuilderPoolSpec {
 
     /// Container imagePullPolicy. None = K8s default (IfNotPresent
     /// for tagged images, Always for `:latest`). Airgap/dev clusters
-    /// (k3s/kind with `ctr images import`) MUST set "IfNotPresent"
-    /// or "Never" — `:latest` otherwise tries docker.io and fails.
+    /// (k3s with `ctr images import`) MUST set "IfNotPresent" or
+    /// "Never" — `:latest` otherwise tries docker.io and fails.
     ///
     /// Controller-managed Jobs can't be kustomize-patched (the CRD
     /// is patched, not the generated Job), so this has to be a CRD
@@ -260,10 +260,10 @@ pub struct BuilderPoolSpec {
     /// sufficient on most clusters. true = full privileged,
     /// which disables seccomp and grants ALL caps.
     ///
-    /// When to set true: k3s/kind often have containerd seccomp
-    /// profiles that block mount(2) even with SYS_ADMIN.
-    /// Production on EKS/GKE with proper runtime config should
-    /// NOT need this.
+    /// When to set true: clusters whose containerd seccomp profile
+    /// blocks mount(2) even with SYS_ADMIN and whose nodes don't
+    /// pre-install the Localhost profile. Production on EKS/GKE
+    /// with proper runtime config should NOT need this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privileged: Option<bool>,
 
@@ -400,10 +400,10 @@ pub struct SeccompProfileKind {
 
     /// Path relative to `/var/lib/kubelet/seccomp/`. REQUIRED when
     /// `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
-    /// rio's profiles are distributed via cluster-scoped
-    /// `SeccompProfile` CRs (security-profiles-operator) and land at
-    /// `operator/{name}.json`; the chart's default builderPool value
-    /// is `operator/rio-builder.json`.
+    /// rio's profiles are written by systemd-tmpfiles on every node
+    /// before kubelet starts (`nix/nixos-node/hardening.nix`) and land
+    /// at `operator/{name}.json`; the chart's default builderPool
+    /// value is `operator/rio-builder.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localhost_profile: Option<String>,
 }

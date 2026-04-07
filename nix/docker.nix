@@ -395,7 +395,7 @@ let
       name = imageName;
       extraCommands = derefEtc + extraCommands;
       # "dev" not "latest": :latest defaults to imagePullPolicy=Always
-      # in K8s (never checks local store), which breaks airgap k3s/kind.
+      # in K8s (never checks local store), which breaks airgap k3s.
       # Non-latest tag → IfNotPresent default → locally-imported image
       # works. Real release images are tagged by CI with git SHAs
       # anyway; this tag is for local dev + VM tests.

@@ -167,10 +167,10 @@ spec:
               imagePullPolicy:
                 description: "Container imagePullPolicy. None = K8s default (IfNotPresent\n\
                   for tagged images, Always for `:latest`). Airgap/dev clusters\n\
-                  (k3s/kind with `ctr images import`) MUST set \"IfNotPresent\"\n\
-                  or \"Never\" \u2014 `:latest` otherwise tries docker.io and fails.\n\
-                  \nController-managed Jobs can't be kustomize-patched (the CRD\n\
-                  is patched, not the generated Job), so this has to be a CRD\nfield."
+                  (k3s with `ctr images import`) MUST set \"IfNotPresent\" or\n\"\
+                  Never\" \u2014 `:latest` otherwise tries docker.io and fails.\n\n\
+                  Controller-managed Jobs can't be kustomize-patched (the CRD\nis\
+                  \ patched, not the generated Job), so this has to be a CRD\nfield."
                 nullable: true
                 type: string
               maxConcurrent:
@@ -199,13 +199,13 @@ spec:
                   which disables seccomp and grants ALL caps.
 
 
-                  When to set true: k3s/kind often have containerd seccomp
+                  When to set true: clusters whose containerd seccomp profile
 
-                  profiles that block mount(2) even with SYS_ADMIN.
+                  blocks mount(2) even with SYS_ADMIN and whose nodes don''t
 
-                  Production on EKS/GKE with proper runtime config should
+                  pre-install the Localhost profile. Production on EKS/GKE
 
-                  NOT need this.'
+                  with proper runtime config should NOT need this.'
                 nullable: true
                 type: boolean
               resources:
@@ -244,13 +244,13 @@ spec:
 
                       `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
 
-                      rio''s profiles are distributed via cluster-scoped
+                      rio''s profiles are written by systemd-tmpfiles on every node
 
-                      `SeccompProfile` CRs (security-profiles-operator) and land at
+                      before kubelet starts (`nix/nixos-node/hardening.nix`) and land
 
-                      `operator/{name}.json`; the chart''s default builderPool value
+                      at `operator/{name}.json`; the chart''s default builderPool
 
-                      is `operator/rio-builder.json`.'
+                      value is `operator/rio-builder.json`.'
                     nullable: true
                     type: string
                   type:

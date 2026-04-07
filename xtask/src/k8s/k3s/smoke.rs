@@ -47,7 +47,7 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         .await?;
         // 1 MiB NAR — over cas::INLINE_THRESHOLD (256 KiB) — forces
         // the chunked object-store path. On k3s the backend is
-        // rook/rustfs, not S3 — but a misconfigured bucket endpoint
+        // rook, not S3 — but a misconfigured bucket endpoint
         // or credential fails the same way. See I-006.
         ui::step("large-NAR build", || {
             chaos::smoke_build("large", 5, 1024, &store_url)
@@ -156,7 +156,7 @@ pub(crate) async fn scheduler_leader_pod() -> Result<String> {
 
 /// Port-forward scheduler:9001 + store:9002, wait for TCP accept on both.
 /// Shared by all three providers — kubectl reaches the apiserver proxy
-/// regardless of whether that's via kind/k3s loopback or `aws eks
+/// regardless of whether that's via k3s loopback or `aws eks
 /// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
 /// rio-store — per-service `-n`. Scheduler forward targets the leader
 /// pod (from the Lease) because standbys reject admin writes.

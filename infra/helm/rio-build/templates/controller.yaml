@@ -66,10 +66,6 @@ spec:
             - name: RIO_STORE_BALANCE_PORT
               value: {{ $c.storeBalancePort | quote }}
             {{- end }}
-            {{- if $c.seccompPreinstalled }}
-            - name: RIO_SECCOMP_PREINSTALLED
-              value: "true"
-            {{- end }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
             {{- with $c.extraEnv }}
             {{- toYaml . | nindent 12 }}

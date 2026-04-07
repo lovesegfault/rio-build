@@ -168,14 +168,6 @@ pub async fn run(
     })
     .await?;
 
-    // ADR-021: SPO replaced by AMI-baked seccomp profiles (nix/nixos-node/
-    // hardening.nix tmpfiles) — profiles are on disk before kubelet starts,
-    // so no spod DS, no wait-seccomp init. The chart's seccomp-profiles.yaml
-    // (SeccompProfile CRs) is gated on securityProfilesOperator.enabled,
-    // which we set false below alongside controller.seccompPreinstalled=
-    // true. To remove a leftover SPO from a pre-cutover cluster:
-    //   kubectl delete -f infra/k8s/security-profiles-operator.yaml --ignore-not-found
-
     // JWT keypair: mint-or-read. If `rio-jwt-signing` Secret exists,
     // reuse its seed (idempotent across deploys). Otherwise generate
     // fresh. Seed never touches disk or source — passes via --set,
@@ -321,12 +313,6 @@ pub async fn run(
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
             .set("monitoring.enabled", "true")
-            // ADR-021: NixOS AMI bakes the Localhost seccomp profiles
-            // (nix/nixos-node/hardening.nix) — no SPO, no wait-seccomp
-            // init. SeccompProfile CRs (templates/seccomp-profiles.yaml)
-            // are gated on securityProfilesOperator.enabled.
-            .set("securityProfilesOperator.enabled", "false")
-            .set("controller.seccompPreinstalled", "true")
             .wait(Duration::from_secs(600))
             // AMI bring-up chicken-and-egg: the chart's post-install
             // hook smoke-tests through the gateway, which needs working

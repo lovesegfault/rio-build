@@ -12,7 +12,6 @@ use crate::{helm, kube, ui};
 
 mod push;
 mod rook;
-// pub(super) so kind can reuse the port-forward tunnel + chaos test.
 pub(super) mod smoke;
 
 pub struct K3s;
@@ -29,7 +28,7 @@ impl Provider for K3s {
         Ok(())
     }
 
-    async fn provision(&self, cfg: &XtaskConfig, _auto: bool, _nodes: u8) -> Result<()> {
+    async fn provision(&self, cfg: &XtaskConfig, _auto: bool) -> Result<()> {
         ui::step("kubeconfig", || self.kubeconfig(cfg)).await?;
         ui::step("rook install", rook::install).await?;
         ui::step("s3 bridge", rook::s3_bridge).await

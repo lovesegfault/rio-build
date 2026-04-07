@@ -16,7 +16,6 @@ use crate::{helm, kube, sh, ui};
 mod chaos;
 mod eks;
 mod k3s;
-mod kind;
 mod metrics;
 pub mod provider;
 pub mod shared;
@@ -137,21 +136,21 @@ impl Phase {
 
 #[derive(Args, Default)]
 pub struct UpOpts {
-    /// tofu state bucket (eks). No-op on k3s/kind.
+    /// tofu state bucket (eks). No-op on k3s.
     #[arg(long)]
     bootstrap: bool,
-    /// tofu apply (eks) | rook install (k3s) | kind create cluster.
+    /// tofu apply (eks) | rook install (k3s).
     #[arg(long)]
     provision: bool,
-    /// aws eks update-kubeconfig | k3s.yaml copy | kind export kubeconfig.
+    /// aws eks update-kubeconfig | k3s.yaml copy.
     #[arg(long)]
     kubeconfig: bool,
     /// Build + register the NixOS node AMI (ADR-021). EKS-only;
-    /// silently skipped on k3s/kind in the all-phases path, hard error
+    /// silently skipped on k3s in the all-phases path, hard error
     /// when explicitly requested.
     #[arg(long)]
     ami: bool,
-    /// Build + push docker images (ECR | ctr import | kind load).
+    /// Build + push docker images (ECR | ctr import).
     #[arg(long)]
     push: bool,
     /// helm upgrade rio chart.
@@ -185,9 +184,6 @@ pub struct UpOpts {
     /// working nodes that don't exist yet.
     #[arg(long = "deploy-no-hooks")]
     deploy_no_hooks: bool,
-    /// Cluster node count (kind only: 1 control + N-1 workers).
-    #[arg(long = "provision-nodes", value_parser = clap::value_parser!(u8).range(1..))]
-    provision_nodes: Option<u8>,
 
     /// Skip interactive confirmation prompts (tofu apply diff).
     #[arg(long)]
@@ -259,11 +255,6 @@ impl UpOpts {
             "--ami-arch",
             Phase::Ami
         );
-        req!(
-            self.provision_nodes.is_some(),
-            "--provision-nodes",
-            Phase::Provision
-        );
         Ok(())
     }
 }
@@ -312,9 +303,9 @@ pub enum K8sCmd {
         /// Emit machine-readable JSON instead of the human report.
         #[arg(long)]
         json: bool,
-        /// Cordon and delete NodeClaims for nodes where the seccomp-
-        /// installer DaemonSet is stuck (I-020 cleanup). Also deletes
-        /// stuck NodeClaims. Karpenter reprovisions healthy replacements.
+        /// Delete NodeClaims stuck in Unknown >2min (Karpenter blocked
+        /// on ResourceNotRegistered, InsufficientCapacity, etc.).
+        /// Karpenter reprovisions healthy replacements.
         #[arg(long)]
         reap_stuck_nodes: bool,
     },
@@ -424,7 +415,7 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
         None => {
             ui::select("Provider?", ProviderKind::value_variants().to_vec())?.ok_or_else(|| {
                 anyhow!(
-                    "provider required: pass -p {{kind,k3s,eks}} or set RIO_K8S_PROVIDER in .env.local"
+                    "provider required: pass -p {{k3s,eks}} or set RIO_K8S_PROVIDER in .env.local"
                 )
             })?
         }
@@ -457,7 +448,6 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
                     .map(|n| format!("EKS cluster '{n}' (RDS, S3, ECR, VPC, IAM)"))
                     .unwrap_or_else(|_| "the EKS cluster (RDS, S3, ECR, VPC, IAM)".into()),
                 ProviderKind::K3s => "the local k3s rio deployment + rook".into(),
-                ProviderKind::Kind => format!("kind cluster '{}'", kind::CLUSTER),
             };
             // confirm_destroy returns false on non-TTY stdin — `--yes`
             // is the only way to run this from a script.
@@ -523,8 +513,8 @@ pub async fn run(args: K8sArgs, cfg: &XtaskConfig) -> Result<()> {
 
 /// Dispatch the selected `up` phases.
 ///
-/// `explicit` distinguishes `up --ami -p kind` (hard error: the user
-/// asked for an EKS-only phase on the wrong provider) from `up -p kind`
+/// `explicit` distinguishes `up --ami -p k3s` (hard error: the user
+/// asked for an EKS-only phase on the wrong provider) from `up -p k3s`
 /// (silent skip: ami is part of the canonical sequence but not
 /// applicable here). Same distinction lets `validate_phase_opts`
 /// reject `--push --deploy-tenant foo` while accepting
@@ -545,15 +535,14 @@ async fn run_up(
     o.validate_phase_opts(&selected)?;
     // Provider-support validation BEFORE dispatch — same upfront-fail
     // discipline as validate_phase_opts. Without this,
-    // `-p kind up --bootstrap --provision --ami` would create a real
-    // cluster THEN error.
+    // `-p k3s up --bootstrap --provision --ami` would install rook
+    // THEN error.
     if explicit && selected.contains(&Phase::Ami) && !matches!(kind, ProviderKind::Eks) {
         bail!("--ami is EKS-only (NixOS node AMI, ADR-021); pass -p eks");
     }
 
     let pp = PhaseParams {
         yes: o.yes,
-        nodes: o.provision_nodes.unwrap_or(3),
         log_level: o
             .deploy_log_level
             .clone()
@@ -576,7 +565,7 @@ async fn run_up(
         match kind {
             ProviderKind::Eks => ui::step("ami", || eks::ami::run_phase(ami_arch)).await,
             // explicit + non-EKS already rejected above; reaching here
-            // means implicit full-sequence on kind/k3s — skip.
+            // means implicit full-sequence on k3s — skip.
             _ => {
                 debug!("ami: provider={kind}, skipping");
                 Ok(())
@@ -601,7 +590,6 @@ async fn run_up(
 #[derive(Clone)]
 struct PhaseParams {
     yes: bool,
-    nodes: u8,
     log_level: String,
     tenant: Option<String>,
     skip_preflight: bool,
@@ -696,12 +684,9 @@ where
                 }
                 Phase::Provision => {
                     let (p, cfg) = (p.clone(), cfg.clone());
-                    let (yes, nodes) = (pp.yes, pp.nodes);
+                    let yes = pp.yes;
                     running.spawn(async move {
-                        (
-                            ph,
-                            ui::step("provision", || p.provision(&cfg, yes, nodes)).await,
-                        )
+                        (ph, ui::step("provision", || p.provision(&cfg, yes)).await)
                     });
                 }
                 Phase::Kubeconfig => {
@@ -965,7 +950,7 @@ mod tests {
             self.record("bootstrap");
             Ok(())
         }
-        async fn provision(&self, _: &XtaskConfig, _: bool, _: u8) -> Result<()> {
+        async fn provision(&self, _: &XtaskConfig, _: bool) -> Result<()> {
             tokio::time::sleep(self.provision_delay).await;
             self.record("provision");
             self.provision_done.store(true, Ordering::SeqCst);
@@ -1024,7 +1009,6 @@ mod tests {
     fn pp() -> PhaseParams {
         PhaseParams {
             yes: true,
-            nodes: 1,
             log_level: "info".into(),
             tenant: None,
             skip_preflight: true,
@@ -1265,8 +1249,8 @@ mod tests {
             *self.at.lock().unwrap() = Some(self.t0.elapsed());
             Ok(())
         }
-        async fn provision(&self, c: &XtaskConfig, a: bool, n: u8) -> Result<()> {
-            self.inner.provision(c, a, n).await
+        async fn provision(&self, c: &XtaskConfig, a: bool) -> Result<()> {
+            self.inner.provision(c, a).await
         }
         async fn kubeconfig(&self, c: &XtaskConfig) -> Result<()> {
             self.inner.kubeconfig(c).await

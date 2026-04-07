@@ -242,7 +242,7 @@ let
   };
   # Reconstruct the sibling-dir structure that cross-crate compile-time
   # reads expect. Called from all three override shapes (withMigrations,
-  # withMetricsGrep, withHelmFiles) — the golden/ symlink is only USED
+  # withMetricsGrep, withSeccompProfiles) — the golden/ symlink is only USED
   # by rio-scheduler but costs nothing in crates that don't reference it.
   linkMetricsGrep = ''
     mkdir -p $NIX_BUILD_TOP/rio-test-support/src
@@ -279,22 +279,22 @@ let
   };
 
   # rio-controller's builderpool tests include_str! the seccomp profile
-  # from ../../../../infra/helm/rio-build/files/ (4 levels up from
-  # src/reconcilers/builderpool/ = repo root). Same cross-directory
+  # from ../../../../../nix/nixos-node/seccomp/ (5 levels up from
+  # src/reconcilers/builderpool/tests/ = repo root). Same cross-directory
   # compile-time-read problem as migrations: buildRustCrate's src is
   # just rio-controller/, so the relative path resolves outside the
-  # unpacked sourceRoot. Symlink the files/ dir at $NIX_BUILD_TOP/infra/
+  # unpacked sourceRoot. Symlink the seccomp/ dir at $NIX_BUILD_TOP/nix/
   # so the include_str! path resolves. Narrow fileset keeps the hash
-  # stable when unrelated helm templates change.
-  helmFilesFileset = pkgs.lib.fileset.toSource {
-    root = ../infra/helm/rio-build/files;
-    fileset = ../infra/helm/rio-build/files;
+  # stable when unrelated nixos-node files change.
+  seccompFileset = pkgs.lib.fileset.toSource {
+    root = ./nixos-node/seccomp;
+    fileset = ./nixos-node/seccomp;
   };
 
-  withHelmFiles = _: {
+  withSeccompProfiles = _: {
     postUnpack = ''
-      mkdir -p $NIX_BUILD_TOP/infra/helm/rio-build
-      ln -sf ${helmFilesFileset} $NIX_BUILD_TOP/infra/helm/rio-build/files
+      mkdir -p $NIX_BUILD_TOP/nix/nixos-node
+      ln -sf ${seccompFileset} $NIX_BUILD_TOP/nix/nixos-node/seccomp
       ${linkMetricsGrep}
     '';
   };
@@ -409,10 +409,11 @@ let
     # compile-time file read crossing crate boundary.
     rio-builder = withMetricsGrep;
 
-    # include_str!("../../../../infra/helm/rio-build/files/...") in
+    # include_str!("../../../../../nix/nixos-node/seccomp/...") in
     # builderpool tests + build.rs metrics_grep include — both compile-
-    # time file reads crossing crate boundary. See `withHelmFiles` above.
-    rio-controller = withHelmFiles;
+    # time file reads crossing crate boundary. See `withSeccompProfiles`
+    # above.
+    rio-controller = withSeccompProfiles;
 
     # tonic-health ships a bundled .proto and its build.rs compiles it.
     # Same PROTOC need as rio-proto.

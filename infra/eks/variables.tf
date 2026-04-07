@@ -42,11 +42,6 @@ variable "karpenter_version" {
   type        = string
 }
 
-variable "spo_version" {
-  description = "security-profiles-operator version. Informational only — SPO is applied by xtask k8s deploy from the vendored manifest at infra/k8s/security-profiles-operator.yaml, not by tofu (no published chart since v0.7.1)."
-  type        = string
-}
-
 variable "system_instance_type" {
   description = "Instance type for system nodegroup (scheduler/store/gateway/controller)"
   type        = string

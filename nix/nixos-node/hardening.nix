@@ -68,13 +68,15 @@
 
   # ── seccomp profiles ────────────────────────────────────────────────
   # r[impl builder.seccomp.localhost-profile+2]
-  # Replaces the rio-seccomp-bootstrap container (P0541): profiles are
-  # store paths in the AMI, symlinked into kubelet's seccomp dir before
-  # kubelet starts. By the time any pod schedules the file is guaranteed
-  # present — controller.seccompPreinstalled=true, no wait-seccomp init.
-  # `C` (copy, not `L` symlink): kubelet/runc open the profile via the
-  # Localhost path; a /nix/store symlink target would change on every
-  # AMI rebuild and confuse Drift-based diffs of node state.
+  # Profiles are store paths in the AMI, copied into kubelet's seccomp
+  # dir before kubelet starts. By the time any pod schedules the file is
+  # guaranteed present — rio-controller emits seccompProfile: Localhost
+  # without any wait machinery. Same delivery on k3s VM tests
+  # (nix/tests/fixtures/k3s-full.nix), so the profile JSON here is the
+  # single source of truth. `C` (copy, not `L` symlink): kubelet/runc
+  # open the profile via the Localhost path; a /nix/store symlink target
+  # would change on every AMI rebuild and confuse Drift-based diffs of
+  # node state.
   systemd.tmpfiles.rules = [
     "d /var/lib/kubelet/seccomp/operator 0755 root root -"
     "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${./seccomp/rio-builder.json}"

@@ -49,11 +49,4 @@
   ecr_credential_provider_rev = "v1.35.1";
   ecr_credential_provider_src_hash = "sha256-kCDhkwcxYNDAmYrrk+dnHkVG2Qzcw8USPcaxHKZwxzs=";
   ecr_credential_provider_vendor_hash = "sha256-eW9vsuhDaudnq34onV5LH1hY9S7Zt2jkzhL5UhbUlHY=";
-
-  # security-profiles-operator. NOT a tofu-managed helm release: SPO
-  # stopped publishing chart tarballs after v0.7.1 (only the in-repo
-  # deploy/helm/ exists). The static deploy/operator.yaml is vendored
-  # at infra/k8s/security-profiles-operator.yaml; bump = re-download
-  # from this tag. Requires cert-manager (above).
-  spo_version = "v0.10.0";
 }

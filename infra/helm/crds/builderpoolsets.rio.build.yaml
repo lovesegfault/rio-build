@@ -218,15 +218,15 @@ spec:
 
                           `type: Localhost`, FORBIDDEN otherwise (CEL enforces both).
 
-                          rio''s profiles are distributed via cluster-scoped
+                          rio''s profiles are written by systemd-tmpfiles on every
+                          node
 
-                          `SeccompProfile` CRs (security-profiles-operator) and land
-                          at
+                          before kubelet starts (`nix/nixos-node/hardening.nix`) and
+                          land
 
-                          `operator/{name}.json`; the chart''s default builderPool
-                          value
+                          at `operator/{name}.json`; the chart''s default builderPool
 
-                          is `operator/rio-builder.json`.'
+                          value is `operator/rio-builder.json`.'
                         nullable: true
                         type: string
                       type:

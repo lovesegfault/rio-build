@@ -108,8 +108,8 @@ After deployment:
 #    scheduler:9001 + store:9002, fetches the mTLS client cert from
 #    the rio-scheduler-tls Secret, and runs rio-cli LOCALLY. No need
 #    for rio-cli (or jq, column, …) inside the scheduler image.
-cargo xtask k8s cli -p kind -- create-tenant my-team
-cargo xtask k8s cli -p kind -- status
+cargo xtask k8s cli -p k3s -- create-tenant my-team
+cargo xtask k8s cli -p k3s -- status
 
 # 2. SSH key with tenant-name comment. The gateway maps the
 #    authorized_keys comment field to tenant_name (server-side

@@ -29,7 +29,7 @@ helm template rio . -f values/vmtest-full.yaml
 | Profile | TLS | PG | S3 | Replicas | Used by |
 |---|---|---|---|---|---|
 | `values.yaml` (default) | on | external | external | 2 | `just eks deploy` (EKS) |
-| `values/dev.yaml` | off | bitnami subchart | Rook Ceph RGW | 1 | `just dev apply` (local k3s/kind) |
+| `values/dev.yaml` | off | bitnami subchart | Rook Ceph RGW | 1 | `just dev apply` (local k3s) |
 | `values/vmtest-full.yaml` | off | n/a | n/a | controller only | `nix/helm-render.nix` → VM tests |
 
 ## CRDs

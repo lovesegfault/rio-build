@@ -416,6 +416,22 @@ let
       pkgs.kubectl
       pkgs.grpc-health-probe # health-shared probe (lifecycle.nix)
     ];
+
+    # r[impl builder.seccomp.localhost-profile+2]
+    # Same tmpfiles delivery as the NixOS AMI (nix/nixos-node/hardening.nix):
+    # profiles are store paths, copied into kubelet's seccomp dir before k3s
+    # (and its embedded kubelet) starts. k3s passes `--root-dir
+    # /var/lib/kubelet` to kubelet, so the path matches EKS — no
+    # /var/lib/rancher indirection. By the time any pod schedules the file
+    # is guaranteed present; rio-controller emits Localhost without a wait.
+    # `C` (copy, not `L` symlink): runc opens the profile via the literal
+    # localhostProfile path; a /nix/store symlink would have a different
+    # store path on every fixture rebuild.
+    systemd.tmpfiles.rules = [
+      "d /var/lib/kubelet/seccomp/operator 0755 root root -"
+      "C /var/lib/kubelet/seccomp/operator/rio-builder.json 0644 root root - ${../../nixos-node/seccomp/rio-builder.json}"
+      "C /var/lib/kubelet/seccomp/operator/rio-fetcher.json 0644 root root - ${../../nixos-node/seccomp/rio-fetcher.json}"
+    ];
   };
 
   # ── Server node ─────────────────────────────────────────────────────

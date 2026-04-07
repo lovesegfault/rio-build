@@ -1,5 +1,5 @@
 # Default values = prod topology (TLS on, external PG/S3, PDBs, NetworkPolicy).
-# values/dev.yaml flips everything for local k3s/kind.
+# values/dev.yaml flips everything for local k3s.
 # values/vmtest.yaml renders controller-only for VM test k3s injection.
 
 global:
@@ -162,7 +162,7 @@ networkPolicy:
 # the monitoring.coreos.com/v1 CRDs — kube-prometheus-stack (infra/eks/
 # monitoring.tf on the reference deploy) or a standalone prometheus-operator
 # install. Disabled by default so the chart applies on CRD-less clusters
-# (k3s VM tests, kind); xtask k8s deploy flips it on for EKS.
+# (k3s VM tests); xtask k8s deploy flips it on for EKS.
 monitoring:
   enabled: false
   scrapeInterval: 30s
@@ -200,17 +200,6 @@ controller:
   # distribution. Empty → single-channel fallback.
   storeBalanceHost: rio-store-headless.rio-store
   storeBalancePort: 9002
-  # P0541: Localhost seccomp profiles are written to /var/lib/kubelet/
-  # seccomp/operator/ BEFORE kubelet starts (NixOS AMI bakes them via
-  # systemd-tmpfiles, nix/nixos-node/hardening.nix). When true, the
-  # controller skips the wait-seccomp initContainer + host-seccomp
-  # hostPath volumes — the file is guaranteed present, the wait is
-  # dead weight (5-15s × thousands of ephemeral Jobs/hour).
-  #
-  # Default false: VM-test k3s + non-EKS providers still use SPO (or
-  # privileged:true with no Localhost profile at all). EKS deploy.rs
-  # sets this true alongside disabling securityProfilesOperator.
-  seccompPreinstalled: false
   # Extra env injected after base vars. VM tests use this for autoscaler
   # tuning (RIO_AUTOSCALER_POLL_SECS=3 etc); coverage mode injects
   # LLVM_PROFILE_FILE here.
@@ -272,7 +261,7 @@ store:
   # logs during large-NAR ingest (but try s3MaxAttempts first).
   chunkUploadMaxConcurrent: 32
   # aws-sdk retry ceiling per S3 op. Raised from sdk default (3) —
-  # S3-compatible backends (rustfs, MinIO) recycle idle connections
+  # S3-compatible backends (Rook RGW, MinIO) recycle idle connections
   # more aggressively than AWS S3; closed-pool-connection surfaces as
   # transient DispatchFailure that retries absorb. Raise further if
   # DispatchFailure persists; each retry has exponential backoff so
@@ -735,27 +724,6 @@ dashboard:
       - "http://rio-dashboard.rio-system.svc.cluster.local"
 
 # ──────────────────────────────────────────────────────────────────────────
-# security-profiles-operator (SeccompProfile CR distribution)
-# ──────────────────────────────────────────────────────────────────────────
-# Renders SeccompProfile CRs from files/seccomp-rio-{builder,fetcher}.json.
-# SPO's spod DaemonSet reconciles them to /var/lib/kubelet/seccomp/operator/
-# {name}.json on every node it schedules to. Builder/fetcher pods reference
-# those paths via seccompProfile.type=Localhost.
-#
-# SPO itself is installed BEFORE this chart (xtask k8s deploy applies the
-# vendored infra/k8s/security-profiles-operator.yaml; cert-manager is its
-# prerequisite, installed by tofu addons.tf). This block only renders the
-# CRs and the spod scheduling-constraint CR.
-#
-# Disable when builderPoolDefaults.seccompProfile.type != Localhost (RuntimeDefault,
-# Unconfined, privileged:true escape hatch) — the CRs are dead weight then.
-securityProfilesOperator:
-  enabled: true
-  # spod DaemonSet scheduling (tolerations/affinity) is NOT chart-
-  # managed — the operator creates the `spod` CR; xtask deploy patches
-  # it via server-side-apply (see seccomp-profiles.yaml trailer).
-
-# ──────────────────────────────────────────────────────────────────────────
 # Default BuilderPool
 # ──────────────────────────────────────────────────────────────────────────
 # I-108: one BuilderPool per arch. `builderPools` is the list of pools to
@@ -910,14 +878,14 @@ builderPoolDefaults:
   #
   # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
   # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist. The
-  # Localhost profile (files/seccomp-rio-builder.json, baked into the AMI
-  # at /var/lib/kubelet/seccomp/operator/ via nix/nixos-node/hardening.nix)
-  # is RuntimeDefault + pivot_root − {ptrace, bpf, setns, process_vm_*}.
-  # Keeps granular caps and the base_runtime_spec /dev/fuse path while
-  # denying syscalls a sandbox escapee with CAP_SYS_ADMIN would otherwise
-  # have.
+  # Localhost profile (nix/nixos-node/seccomp/rio-builder.json, baked into
+  # the AMI at /var/lib/kubelet/seccomp/operator/ via nix/nixos-node/
+  # hardening.nix) is RuntimeDefault + pivot_root − {ptrace, bpf, setns,
+  # process_vm_*}. Keeps granular caps and the base_runtime_spec /dev/fuse
+  # path while denying syscalls a sandbox escapee with CAP_SYS_ADMIN would
+  # otherwise have.
   #
-  # hostUsers default = true here so k3s/kind VM tests work without
+  # hostUsers default = true here so k3s VM tests work without
   # idmap-mount support on /dev/fuse. EKS (NixOS AMI with containerd
   # cgroup_writable=true, nix/nixos-node/eks-node.nix) overrides to
   # false via xtask deploy.rs — ADR-012 userns isolation only applies
@@ -926,11 +894,11 @@ builderPoolDefaults:
   hostUsers: true
   seccompProfile:
     type: Localhost
-    # Relative to /var/lib/kubelet/seccomp/. The SeccompProfile CR
-    # (templates/seccomp-profiles.yaml) is reconciled by SPO's spod
-    # DaemonSet to operator/rio-builder.json on every node spod runs.
-    # SeccompProfile is cluster-scoped since SPO v0.9.0, so no
-    # namespace component in the path.
+    # Relative to /var/lib/kubelet/seccomp/. Written by systemd-tmpfiles
+    # before kubelet starts on every supported target (NixOS AMI:
+    # nix/nixos-node/hardening.nix; k3s VM tests: fixtures/k3s-full.nix).
+    # The `operator/` path component is historical (SPO wrote there);
+    # kept so existing nodes don't need a tmpfiles change to roll out.
     localhostProfile: operator/rio-builder.json
   # Pairs with the NodePool taint. Change NodePool taint/labels → change
   # these too.
@@ -1025,7 +993,7 @@ postgresql:
     database: rio
     username: rio
     # Used ONLY when existingSecret is unset (VM tests — airgapped,
-    # hardcoded is fine). xtask k3s/kind deploy generates a random
+    # hardcoded is fine). xtask k3s deploy generates a random
     # password, pre-creates rio-postgres + rio-postgres-auth Secrets,
     # and sets existingSecret so this value and postgres-secret.yaml
     # are both bypassed. Keeps the password out of helm values.
@@ -1034,8 +1002,3 @@ postgresql:
   primary:
     persistence:
       size: 5Gi
-
-# RustFS S3 backend (kind provider only). Standalone mode — single pod,
-# local-path PVC. See values/kind.yaml for the enabled configuration.
-rustfs:
-  enabled: false

@@ -773,8 +773,8 @@ in
   # Fetcher pod needs the nonpriv path (hard-coded privileged:false +
   # Localhost seccomp at reconcilers/fetcherpool/mod.rs) — same
   # nonpriv overlay as vm-security-nonpriv-k3s. Seccomp profile
-  # delivered at runtime by testScript (security-profiles-operator
-  # not airgapped). fetcherPools[] enabled via extraValues with name=
+  # delivered via systemd-tmpfiles (k3sBase, same as the NixOS
+  # AMI). fetcherPools[] enabled via extraValues with name=
   # "x86-64" + classes=[tiny] (I-170 + multiarch naming → pod
   # rio-fetcher-x86-64-tiny-0) and image=rio-fetcher (per-component ref
   # from the vmTestSeed preload). Systems

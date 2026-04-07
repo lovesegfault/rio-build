@@ -1,4 +1,4 @@
-//! Helpers all three providers (kind/k3s/eks) use.
+//! Helpers both providers (k3s/eks) use.
 
 use std::collections::BTreeMap;
 
@@ -58,7 +58,7 @@ pub const NIX_SSHOPTS_SMOKE: &str = NIX_SSHOPTS_BASE;
 /// charts/ against Chart.yaml BEFORE evaluating `condition: *.enabled`,
 /// so every entry must be symlinked even when disabled for a given
 /// provider (eks uses Aurora+S3, k3s uses Rook).
-const SUBCHARTS: &[&str] = &["postgresql", "rustfs"];
+const SUBCHARTS: &[&str] = &["postgresql"];
 
 /// Symlink all subcharts from their nix-store derivations into
 /// `infra/helm/rio-build/charts/`. Gitignored.
@@ -84,8 +84,8 @@ pub async fn chart_deps() -> Result<()> {
 }
 
 /// Build the dockerImages linkFarm for the host arch only.
-/// Shared by k3s (`ctr import`) and kind (`kind load image-archive`) —
-/// both run on the local machine so only need the host arch.
+/// Used by k3s (`ctr import`) — runs on the local machine so only
+/// needs the host arch.
 pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
     let repo = git::open()?;
     let tag = git::image_tag(&repo)?;
@@ -112,7 +112,7 @@ pub async fn build_host_arch(_cfg: &XtaskConfig) -> Result<BuiltImages> {
 }
 
 /// Create the two postgres Secrets for the in-cluster bitnami path
-/// (kind/k3s). Generates a random password on first deploy; reuses
+/// (k3s). Generates a random password on first deploy; reuses
 /// the existing one on upgrades so the DB doesn't get locked out.
 ///
 /// - `rio-postgres-auth` key `password` — raw password, what bitnami
@@ -201,7 +201,7 @@ pub struct JwtKeypair {
 }
 
 // r[impl gw.jwt.issue]
-/// Generate or reuse the JWT ed25519 keypair for kind/k3s deploys.
+/// Generate or reuse the JWT ed25519 keypair for k3s deploys.
 /// Idempotent: first deploy generates a fresh 32-byte seed; subsequent
 /// deploys read it back from the helm-rendered `rio-jwt-signing` Secret
 /// so tokens stay valid across `xtask k8s deploy` reruns.
@@ -252,15 +252,14 @@ pub async fn ensure_jwt_keypair(client: &kube::Client) -> Result<JwtKeypair> {
 pub const RIO_LABEL_SELECTOR: &str = "app.kubernetes.io/part-of=rio-build";
 
 /// Rollout-restart every rio Deployment across all rio namespaces.
-/// Called by kind/k3s after a same-tag `:dev` push: the Deployment spec
+/// Called by k3s after a same-tag `:dev` push: the Deployment spec
 /// is unchanged (same image tag), so kube won't re-pull the image on its
 /// own. EKS skips this — git-SHA tags change on every push, so helm
 /// upgrade already triggers a rollout.
 ///
 /// Restarts are fire-and-forget: no `wait_rollout` here. If the caller
 /// wants to block until pods are healthy, `helm --wait` on the upgrade
-/// already covers it (kind does this), or call `wait_rollout` per
-/// deployment after.
+/// already covers it, or call `wait_rollout` per deployment after.
 pub async fn rollout_restart_rio(client: &kube::Client) -> Result<()> {
     let mut all = Vec::new();
     for &(ns, _) in super::NAMESPACES {

@@ -20,7 +20,6 @@ pub struct BuiltImages {
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 #[value(rename_all = "lower")]
 pub enum ProviderKind {
-    Kind,
     K3s,
     Eks,
 }
@@ -46,24 +45,23 @@ impl std::fmt::Display for ProviderKind {
 pub trait Provider: Send + Sync {
     /// True if `ctx` (from `kubectl config current-context`) looks
     /// like it belongs to this provider. Used by `status` to guard
-    /// against `-p kind` reading an EKS kubeconfig.
+    /// against `-p k3s` reading an EKS kubeconfig.
     fn context_matches(&self, ctx: &str) -> bool;
 
-    /// tofu state bucket (eks) | no-op (kind/k3s).
+    /// tofu state bucket (eks) | no-op (k3s).
     async fn bootstrap(&self, cfg: &XtaskConfig) -> Result<()>;
 
-    /// tofu apply (eks) | rook install (k3s) | kind create cluster.
-    /// `nodes` is kind-only (1 control + N-1 workers); others ignore it.
-    async fn provision(&self, cfg: &XtaskConfig, auto: bool, nodes: u8) -> Result<()>;
+    /// tofu apply (eks) | rook install (k3s).
+    async fn provision(&self, cfg: &XtaskConfig, auto: bool) -> Result<()>;
 
-    /// aws eks update-kubeconfig | sudo cat k3s.yaml | kind export kubeconfig.
+    /// aws eks update-kubeconfig | sudo cat k3s.yaml.
     async fn kubeconfig(&self, cfg: &XtaskConfig) -> Result<()>;
 
-    /// nix build the dockerImages linkFarm(s). Multi-arch (eks) | host-arch (kind/k3s).
+    /// nix build the dockerImages linkFarm(s). Multi-arch (eks) | host-arch (k3s).
     /// Independent of provision — `up` runs them concurrently.
     async fn build(&self, cfg: &XtaskConfig) -> Result<BuiltImages>;
 
-    /// ECR skopeo (eks) | ctr import (k3s) | kind load image-archive.
+    /// ECR skopeo (eks) | ctr import (k3s).
     async fn push(&self, images: &BuiltImages, cfg: &XtaskConfig) -> Result<()>;
 
     /// helm upgrade with provider-specific values/--set args.
@@ -71,7 +69,7 @@ pub trait Provider: Send + Sync {
     /// `tenant` overrides the authorized_keys comment (→ gateway's
     /// `tenant_name`); `None` falls through to RIO_SSH_TENANT then
     /// `ssh::DEFAULT_TENANT`. `skip_preflight` bypasses the pre-deploy
-    /// cluster health check (EKS-only; kind/k3s ignore it). `no_hooks`
+    /// cluster health check (EKS-only; k3s ignores it). `no_hooks`
     /// passes `--no-hooks` to helm — skips post-install/upgrade hooks
     /// (smoke tests etc.) for AMI bring-up where the hook itself needs
     /// the thing being brought up.
@@ -84,11 +82,11 @@ pub trait Provider: Send + Sync {
         no_hooks: bool,
     ) -> Result<()>;
 
-    /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (kind/k3s).
+    /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (k3s).
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()>;
 
     /// Open a tunnel to the gateway's SSH port, waiting until the SSH
-    /// banner reads through. SSM→NLB (eks) | kubectl port-forward (kind/k3s).
+    /// banner reads through. SSM→NLB (eks) | kubectl port-forward (k3s).
     /// Drop the guard to tear down.
     async fn tunnel(&self, local_port: u16) -> Result<super::shared::ProcessGuard>;
 
@@ -109,13 +107,12 @@ pub trait Provider: Send + Sync {
         (u16, super::shared::ProcessGuard),
     )>;
 
-    /// helm uninstall + tofu destroy (eks) | rook teardown (k3s) | kind delete.
+    /// helm uninstall + tofu destroy (eks) | rook teardown (k3s).
     async fn destroy(&self, cfg: &XtaskConfig) -> Result<()>;
 }
 
 pub fn get(kind: ProviderKind) -> Arc<dyn Provider> {
     match kind {
-        ProviderKind::Kind => Arc::new(super::kind::Kind),
         ProviderKind::K3s => Arc::new(super::k3s::K3s),
         ProviderKind::Eks => Arc::new(super::eks::Eks),
     }

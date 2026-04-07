@@ -2,7 +2,7 @@
 //!
 //! Extracted from `builderpool/builders.rs` when ADR-019 introduced
 //! the builder/fetcher split. The 600-line pod-spec — FUSE volumes,
-//! wait-seccomp initContainer, pod-level seccomp, TLS mounts,
+//! pod-level seccomp, TLS mounts,
 //! capability set, probes, coverage propagation — is role-agnostic.
 //! Parameterizing on [`ExecutorPodParams`] (instead of `&BuilderPool`)
 //! lets both reconcilers call the same builder.
@@ -170,21 +170,11 @@ pub struct ExecutorPodParams {
     pub fuse_threads: Option<u32>,
 
     // ── security ─────────────────────────────────────────────────
-    /// `true` = full privileged (escape hatch — k3s/kind without
-    /// the device plugin). Disables seccomp, hostUsers:false.
+    /// `true` = full privileged (escape hatch). Disables seccomp,
+    /// hostUsers:false.
     pub privileged: bool,
     /// CRD seccomp profile. Converted via [`build_seccomp_profile`].
     pub seccomp_profile: Option<SeccompProfileKind>,
-    /// Localhost seccomp profile is on disk before any pod schedules
-    /// (P0541: Bottlerocket bootstrap container, EC2NodeClass userData
-    /// `essential=true`). When `true` and the profile type is
-    /// `Localhost`, skip the wait-seccomp initContainer + host-seccomp
-    /// hostPath volumes — the file is guaranteed present, the wait is
-    /// dead weight (5-15s × thousands of ephemeral Jobs/hour). The
-    /// Localhost ENFORCEMENT (executor container's securityContext)
-    /// stays in place; only the WAIT machinery is elided. See
-    /// [`seccomp_preinstalled`].
-    pub seccomp_preinstalled: bool,
     pub host_network: Option<bool>,
     /// Explicit override. `None` → derived from `!privileged &&
     /// !host_network`.
@@ -247,22 +237,6 @@ pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str
 /// is the disambiguating SUFFIX (typically arch: `x86-64`, `aarch64`).
 const NAME_PREFIX: &str = "rio";
 
-/// Cluster-wide knob: Localhost seccomp profiles are written to
-/// `/var/lib/kubelet/seccomp/operator/` BEFORE kubelet starts (P0541
-/// Bottlerocket bootstrap container, EC2NodeClass userData). Both
-/// reconcilers read this once at params-construction time so the
-/// pod-spec builder stays pure (testable without env mutation).
-///
-/// Not a per-pool field: distribution is per-NODE (one EC2NodeClass),
-/// not per-pool. Exposing it on the CRD would let an operator set
-/// `seccompPreinstalled: true` on a pool whose nodes don't have the
-/// bootstrap container — pods CrashLoopBackOff with "seccomp profile
-/// not found" at sandbox creation. The controller-level env var keeps
-/// the knob aligned with the deploy that wires the bootstrap.
-pub fn seccomp_preinstalled() -> bool {
-    std::env::var("RIO_SECCOMP_PREINSTALLED").is_ok_and(|v| v == "true")
-}
-
 /// STS name for a given pool. `rio-{role}-{pool_name}` — e.g. pool
 /// Job name. `rio-{role}-{pool_name}-{6-char-suffix}` — logs/metrics
 /// group naturally by role+pool prefix.
@@ -287,85 +261,22 @@ pub fn build_executor_pod_spec(
     let labels = executor_labels(p);
     let spread_enabled = p.topology_spread.unwrap_or(true);
     let privileged = p.privileged;
-    // Localhost seccomp: profile lives on node disk. Either:
-    //   - reconciled by SPO's spod DaemonSet from a SeccompProfile CR
-    //     (legacy path; spod may schedule after this pod on a fresh
-    //     Karpenter node → wait-seccomp initContainer needed), OR
-    //   - written by a Bottlerocket bootstrap container BEFORE kubelet
-    //     starts (P0541; `seccomp_preinstalled=true` → no wait needed).
-    // Gated on !privileged (privileged disables seccomp at runtime).
+    // Localhost seccomp: profile lives on node disk, written by
+    // systemd-tmpfiles BEFORE kubelet starts on every supported target
+    // (NixOS AMI: nix/nixos-node/hardening.nix; k3s VM tests:
+    // fixtures/k3s-full.nix). The file is guaranteed present before any
+    // pod schedules, so no wait machinery is needed — only the
+    // pod-level/container-level split (sandbox uses RuntimeDefault, the
+    // executor container enforces Localhost). Gated on !privileged
+    // (privileged disables seccomp at runtime).
     let seccomp_localhost = (!privileged)
         .then_some(p.seccomp_profile.as_ref())
         .flatten()
         .filter(|k| k.type_ == "Localhost")
-        .and_then(|k| k.localhost_profile.as_deref());
-    // The wait-seccomp init + host-seccomp/host-spo hostPath volumes
-    // are the WAIT machinery — only emitted when the profile path
-    // existence is racy (SPO). The Localhost ENFORCEMENT on the
-    // executor container (below) reads `seccomp_localhost` directly.
-    let seccomp_wait = seccomp_localhost.filter(|_| !p.seccomp_preinstalled);
+        .is_some();
 
     PodSpec {
         containers: vec![build_executor_container(p, scheduler, store)],
-
-        // wait-seccomp initContainer: polls the hostPath-mounted
-        // kubelet seccomp dir until the Localhost profile lands.
-        // Uses the executor image (has busybox). RuntimeDefault at
-        // container-level so the initContainer can start before the
-        // profile file lands; the actual Localhost enforcement is on
-        // the executor container.
-        init_containers: seccomp_wait.map(|profile| {
-            vec![Container {
-                name: "wait-seccomp".into(),
-                image: Some(p.image.clone()),
-                image_pull_policy: p.image_pull_policy.clone(),
-                // busybox-static so the loop has `sleep` regardless of
-                // the builder image's PATH (which is set for nix-daemon
-                // + fuse + util-linux only — sh's builtins suffice for
-                // `test`/`echo`, but `sleep` is external).
-                command: Some(vec![
-                    "/bin/busybox".into(),
-                    "sh".into(),
-                    "-c".into(),
-                    // `test -s` (non-empty), not `test -f` (exists):
-                    // SPO's spod writes via tmp+rename (saveProfileOnDisk
-                    // → atomic.WriteFile) so a partial is unlikely, but
-                    // a truncated profile loads with a partial ALLOW
-                    // list → cryptic EACCES persisting until a new
-                    // cgroup path. -s costs nothing.
-                    format!(
-                        "until test -s /host-seccomp/{profile}; do \
-                         echo 'waiting for seccomp profile {profile}...'; \
-                         busybox sleep 2; done"
-                    ),
-                ]),
-                security_context: Some(SecurityContext {
-                    seccomp_profile: Some(SeccompProfile {
-                        type_: "RuntimeDefault".into(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                volume_mounts: Some(vec![
-                    VolumeMount {
-                        name: "host-seccomp".into(),
-                        mount_path: "/host-seccomp".into(),
-                        read_only: Some(true),
-                        ..Default::default()
-                    },
-                    // Mount the symlink TARGET at the same path it has
-                    // on the host so the absolute symlink resolves
-                    // inside the container too.
-                    VolumeMount {
-                        name: "host-spo".into(),
-                        mount_path: "/var/lib/security-profiles-operator".into(),
-                        read_only: Some(true),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            }]
-        }),
 
         host_network: p.host_network.filter(|&h| h),
         dns_policy: p
@@ -383,12 +294,16 @@ pub fn build_executor_pod_spec(
             .or_else(|| (!privileged && p.host_network != Some(true)).then_some(false)),
 
         // Pod-level seccomp. RuntimeDefault when Localhost is
-        // requested (so the sandbox+initContainer can start before
-        // the profile file lands); the Localhost enforcement moves
-        // to the executor container's SecurityContext.
+        // requested — the pod sandbox (pause container) doesn't need
+        // pivot_root, and keeping it on RuntimeDefault means a missing
+        // profile surfaces as the executor container's
+        // CreateContainerError (with the profile path in the message)
+        // instead of a generic sandbox CreatePodSandBoxError. The
+        // Localhost enforcement is on the executor container's
+        // SecurityContext.
         security_context: if !privileged {
             Some(PodSecurityContext {
-                seccomp_profile: Some(if seccomp_localhost.is_some() {
+                seccomp_profile: Some(if seccomp_localhost {
                     SeccompProfile {
                         type_: "RuntimeDefault".into(),
                         ..Default::default()
@@ -497,29 +412,6 @@ pub fn build_executor_pod_spec(
                     host_path: Some(HostPathVolumeSource {
                         path: "/dev/fuse".into(),
                         type_: Some("CharDevice".into()),
-                    }),
-                    ..Default::default()
-                });
-            }
-            if seccomp_wait.is_some() {
-                // SPO's non-root-enabler symlinks /var/lib/kubelet/
-                // seccomp/operator → /var/lib/security-profiles-operator
-                // (absolute). wait-seccomp's `test -s` can't follow it
-                // unless the target dir is ALSO mounted. Kubelet (host-
-                // side) resolves the symlink fine for localhostProfile.
-                v.push(Volume {
-                    name: "host-seccomp".into(),
-                    host_path: Some(HostPathVolumeSource {
-                        path: "/var/lib/kubelet/seccomp".into(),
-                        type_: Some("DirectoryOrCreate".into()),
-                    }),
-                    ..Default::default()
-                });
-                v.push(Volume {
-                    name: "host-spo".into(),
-                    host_path: Some(HostPathVolumeSource {
-                        path: "/var/lib/security-profiles-operator".into(),
-                        type_: Some("DirectoryOrCreate".into()),
                     }),
                     ..Default::default()
                 });
@@ -769,8 +661,7 @@ fn build_executor_container(
             allow_privilege_escalation: Some(true),
             // Container-level seccomp: set ONLY when Localhost is
             // requested. Pod-level stays RuntimeDefault in that case
-            // so the sandbox+initContainer can start before the
-            // profile file lands.
+            // (see build_executor_pod_spec security_context).
             seccomp_profile: p
                 .seccomp_profile
                 .as_ref()

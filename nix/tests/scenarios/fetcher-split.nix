@@ -8,8 +8,8 @@
 # coded false at reconcilers/fetcherpool/mod.rs:237) AND a hard-coded
 # Localhost seccomp (operator/rio-fetcher.json, :241). To get a RUNNING
 # fetcher pod in the airgap VM:
-#   - seccomp profile pre-installed on both nodes via testScript mkdir+cp
-#     (security-profiles-operator + cert-manager images not in the airgap set)
+#   - seccomp profile pre-installed on both nodes via systemd-tmpfiles
+#     (k3sBase in fixtures/k3s-full.nix — same delivery as the NixOS AMI)
 #   - nonpriv path enabled (vmtest-full-nonpriv.yaml overlay) — same as
 #     vm-security-nonpriv-k3s; /dev/fuse via k3s containerd
 #     base_runtime_spec (fixtures/k3s-full.nix containerdConfigTemplate)
@@ -52,12 +52,6 @@ let
 
   inherit (fixture) nsBuilders nsFetchers ns;
 
-  # Seccomp profiles from the chart's files/. Same JSON the SPO
-  # SeccompProfile CRs render from — we cp directly since SPO +
-  # cert-manager images aren't in the airgap set.
-  seccompFetcher = ../../../infra/helm/rio-build/files/seccomp-rio-fetcher.json;
-  seccompBuilder = ../../../infra/helm/rio-build/files/seccomp-rio-builder.json;
-
   # TEST-NET-3 "public" origin. RFC5737 reserves 203.0.113.0/24 for
   # documentation — guaranteed never routed on the real internet.
   # Importantly NOT in RFC1918/link-local/loopback → passes the
@@ -95,21 +89,19 @@ pkgs.testers.runNixOSTest {
     ${common.seedBusybox "k3s-server"}
 
     # ══════════════════════════════════════════════════════════════════
-    # FIXTURE PREP — seccomp profiles + node labels + "public" origin
+    # FIXTURE PREP — node labels + "public" origin
     # ══════════════════════════════════════════════════════════════════
 
-    # ── Seccomp profiles on both nodes ────────────────────────────────
+    # ── Seccomp profiles already on both nodes via tmpfiles ───────────
     # Fetcher reconciler hard-codes Localhost operator/rio-fetcher.json
-    # (fetcherpool/mod.rs:254). SPO's spod DaemonSet would reconcile it
-    # there but SPO + cert-manager aren't airgapped. cp directly — same
-    # JSON, same kubelet-relative path SPO writes (cluster-scoped CR →
-    # operator/{name}.json, no namespace component). Both profiles:
-    # nonpriv overlay flips builderPool to Localhost too.
+    # (fetcherpool/mod.rs). k3sBase (fixtures/k3s-full.nix) writes both
+    # profiles via systemd-tmpfiles before k3s starts — same delivery
+    # as the NixOS AMI. Assert presence so a fixture regression surfaces
+    # here and not as a CreateContainerError 60s downstream.
     for n in [k3s_server, k3s_agent]:
         n.succeed(
-            "mkdir -p /var/lib/kubelet/seccomp/operator && "
-            "cp ${seccompFetcher} /var/lib/kubelet/seccomp/operator/rio-fetcher.json && "
-            "cp ${seccompBuilder} /var/lib/kubelet/seccomp/operator/rio-builder.json"
+            "test -s /var/lib/kubelet/seccomp/operator/rio-fetcher.json && "
+            "test -s /var/lib/kubelet/seccomp/operator/rio-builder.json"
         )
 
     # ── Label k3s-agent as the dedicated fetcher node ─────────────────

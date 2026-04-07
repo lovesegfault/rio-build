@@ -188,14 +188,13 @@ fn executor_params(
         privileged: false,
         // ADR-019 §Sandbox hardening: stricter Localhost profile
         // with extra denies (ptrace/bpf/setns/process_vm_*/keyctl/
-        // add_key). The SeccompProfile CR is cluster-scoped (SPO
-        // ≥0.9.0), so the path is operator/{name}.json with no
-        // namespace component.
+        // add_key). Written by systemd-tmpfiles on every node before
+        // kubelet starts (nix/nixos-node/hardening.nix on EKS;
+        // fixtures/k3s-full.nix in VM tests).
         seccomp_profile: Some(SeccompProfileKind {
             type_: "Localhost".into(),
             localhost_profile: Some("operator/rio-fetcher.json".into()),
         }),
-        seccomp_preinstalled: pod::seccomp_preinstalled(),
         host_network: None,
         host_users: fp.spec.host_users,
         // Same mTLS client cert as builders — same binary, same

@@ -17,7 +17,7 @@ use crate::config::XtaskConfig;
 /// create-tenant default` or the bootstrap-job).
 ///
 /// Was empty-string (→ single-tenant mode) pre-P0477. Changed because
-/// JWT-enabled deploys (now the kind/k3s default) need a non-empty
+/// JWT-enabled deploys (now the k3s default) need a non-empty
 /// `sub` claim — the gateway can't mint a token for an anonymous
 /// session (see `r[gw.jwt.issue]`).
 pub const DEFAULT_TENANT: &str = "default";

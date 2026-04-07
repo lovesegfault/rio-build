@@ -147,12 +147,10 @@
         cd $TMPDIR/chart
         mkdir -p charts
         ln -s ${subcharts.postgresql} charts/postgresql
-        ln -s ${subcharts.rustfs} charts/rustfs
         helm lint .
         # Default (prod) profile: tag must be set (empty → bad image ref).
         helm template rio . --set global.image.tag=test > /tmp/default.yaml
         helm template rio . -f values/dev.yaml > /dev/null
-        helm template rio . -f values/kind.yaml > /dev/null
         helm template rio . -f values/vmtest-full.yaml > /dev/null
         # ADR-021: karpenter.enabled requires amiTag (NixOS AMI is
         # the only EC2NodeClass — no Bottlerocket fallback). The
@@ -599,24 +597,6 @@
           echo "Run: nix build .#tfvars && jq -S . result > infra/eks/generated.auto.tfvars.json" >&2
           exit 1
         }
-        touch $out
-      '';
-
-  # ADR-021: seccomp profiles dual-sourced under
-  # nix/nixos-node/seccomp/ (canonical, AMI bakes them via
-  # hardening.nix tmpfiles) and infra/helm/rio-build/files/
-  # (helm `.Files.Get` for SPO/k3s — cleanSource can't follow
-  # out-of-tree symlinks). Fail on drift.
-  seccomp-fresh =
-    pkgs.runCommand "rio-seccomp-fresh"
-      {
-        nativeBuildInputs = [ pkgs.diffutils ];
-      }
-      ''
-        diff ${./nixos-node/seccomp/rio-builder.json} \
-             ${../infra/helm/rio-build/files/seccomp-rio-builder.json}
-        diff ${./nixos-node/seccomp/rio-fetcher.json} \
-             ${../infra/helm/rio-build/files/seccomp-rio-fetcher.json}
         touch $out
       '';
 }

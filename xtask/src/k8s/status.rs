@@ -11,12 +11,11 @@ use std::net::Ipv4Addr;
 use anyhow::{Context, Result, bail};
 use console::style;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::fetcherpool::FetcherPool;
 use serde::Serialize;
-use serde_json::json;
 use tracing::{debug, info};
 
 use crate::k8s::eks::smoke::CliCtx;
@@ -44,19 +43,12 @@ pub struct Report {
     builder_pools: Vec<BpStatus>,
     fetcher_pools: Vec<FpStatus>,
     /// Per-subnet IP health. EKS-only (aws-sdk-ec2 describe-subnets);
-    /// None for kind/k3s (no subnet concept).
+    /// None for k3s (no subnet concept).
     subnets: Option<Vec<SubnetHealth>>,
     /// NodeClaims stuck in Unknown/Initialized=Unknown over 2min. The
     /// I-021/I-022 signal — Karpenter blocked on ResourceNotRegistered,
     /// InsufficientCapacity, etc.
     stuck_nodeclaims: Vec<StuckNodeClaim>,
-    /// Nodes where the SPO spod DaemonSet pod is non-Running over 2min.
-    /// The I-020 signal — these are dead weight (typically IP-starved);
-    /// cordon + delete NodeClaim lets Karpenter reprovision. spod is the
-    /// node-health canary because (a) it schedules on every builder/
-    /// fetcher node and (b) builder pods block in wait-seccomp until it
-    /// reconciles the profile, so a stuck spod = stuck builders.
-    stuck_nodes: Vec<StuckNode>,
     /// Scheduler Prometheus scrape via port-forward (leader pod :9091).
     /// The I-025 signal — fod_queue_depth + fetcher_utilization.
     scheduler_metrics: Option<SchedulerMetrics>,
@@ -122,16 +114,6 @@ pub struct StuckNodeClaim {
 }
 
 #[derive(Serialize)]
-pub struct StuckNode {
-    name: String,
-    /// None = EKS managed node group (not Karpenter, can't
-    /// auto-delete via NodeClaim).
-    nodeclaim: Option<String>,
-    seccomp_pod_age_secs: u64,
-    already_cordoned: bool,
-}
-
-#[derive(Serialize)]
 pub struct SchedulerMetrics {
     fod_queue_depth: f64,
     fetcher_utilization: f64,
@@ -164,9 +146,9 @@ pub async fn run(
     json: bool,
     reap_stuck_nodes: bool,
 ) -> Result<()> {
-    // `-p kind` means "show me kind" — if kubeconfig points elsewhere,
-    // switch it. Only error if the switch itself fails (e.g. kind
-    // cluster doesn't exist), not just because we're currently on EKS.
+    // `-p k3s` means "show me k3s" — if kubeconfig points elsewhere,
+    // switch it. Only error if the switch itself fails (e.g. k3s
+    // not installed), not just because we're currently on EKS.
     let ctx = k::current_context().unwrap_or_default();
     if !p.context_matches(&ctx) {
         tracing::info!("switching kubeconfig: {ctx} → {kind}");
@@ -221,12 +203,8 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         });
     }
 
-    // Node → InternalIP map, used by both subnet and stuck_node gathering.
+    // Node → InternalIP map, used by subnet gathering.
     let node_ips = node_internal_ips(client).await;
-
-    // Stuck nodes first: ip_assign_failures cross-references these for
-    // subnet fragmentation detection.
-    let stuck_nodes = gather_stuck_nodes(client, &node_ips).await;
 
     let ip_assign_failures = gather_ip_assign_failures(client).await;
 
@@ -244,7 +222,6 @@ pub(crate) async fn gather(client: &k::Client, context: String, kind: ProviderKi
         fetcher_pools: list_fetcher_pools(client).await.unwrap_or_default(),
         subnets,
         stuck_nodeclaims: gather_stuck_nodeclaims(client).await,
-        stuck_nodes,
         scheduler_metrics: gather_scheduler_metrics(client).await,
         ip_assign_failures,
         // Lease lives in rio-system (scheduler's own namespace).
@@ -414,69 +391,6 @@ async fn gather_stuck_nodeclaims(client: &k::Client) -> Vec<StuckNodeClaim> {
                 nodepool,
                 age_secs,
                 blocking_reason,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
-}
-
-/// Nodes where the SPO spod DS pod is non-Running >2min. Maps
-/// pod.spec.nodeName → NodeClaim by iterating NodeClaims and matching
-/// .status.nodeName (None if the node is managed-NG, not Karpenter).
-async fn gather_stuck_nodes(
-    client: &k::Client,
-    node_ips: &HashMap<String, (String, bool)>,
-) -> Vec<StuckNode> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), "security-profiles-operator");
-    let Ok(pods) = pods.list(&ListParams::default().labels("name=spod")).await else {
-        debug!("spod pod list failed");
-        return Vec::new();
-    };
-
-    // Reverse map: nodeName → NodeClaim name. Cheap: one extra list
-    // call, bounded by node count (~dozens for a stress cluster).
-    let nc_by_node: HashMap<String, String> = {
-        let api = nodeclaim_api(client);
-        api.list(&ListParams::default())
-            .await
-            .map(|l| {
-                l.into_iter()
-                    .filter_map(|nc| {
-                        let claim = nc.metadata.name?;
-                        let node = nc
-                            .data
-                            .pointer("/status/nodeName")
-                            .and_then(|v| v.as_str())?
-                            .to_string();
-                        Some((node, claim))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-
-    let now = jiff::Timestamp::now();
-    let mut out: Vec<_> = pods
-        .into_iter()
-        .filter_map(|p| {
-            let st = p.status.as_ref()?;
-            let phase = st.phase.as_deref().unwrap_or_default();
-            if phase == "Running" || phase == "Succeeded" {
-                return None;
-            }
-            let since = st.start_time.as_ref()?.0;
-            let age_secs = now.duration_since(since).as_secs().max(0) as u64;
-            if age_secs <= STUCK_SECS {
-                return None;
-            }
-            let node = p.spec.as_ref()?.node_name.clone()?;
-            let already_cordoned = node_ips.get(&node).map(|(_, c)| *c).unwrap_or(false);
-            Some(StuckNode {
-                nodeclaim: nc_by_node.get(&node).cloned(),
-                already_cordoned,
-                name: node,
-                seccomp_pod_age_secs: age_secs,
             })
         })
         .collect();
@@ -659,47 +573,16 @@ async fn list_fetcher_pools(client: &k::Client) -> Result<Vec<FpStatus>> {
     Ok(out)
 }
 
-// -- reap (I-020 cleanup) -----------------------------------------------
+// -- reap (stuck NodeClaim cleanup) -------------------------------------
 
-/// Cordon stuck nodes and delete their NodeClaims. Karpenter
-/// reprovisions healthy replacements. Also deletes stuck NodeClaims
-/// that never got a node. Idempotent: re-cordoning is a no-op,
-/// deleting an already-deleted NodeClaim is ignored.
+/// Delete stuck NodeClaims that never reached Ready. Karpenter
+/// reprovisions healthy replacements. Idempotent: deleting an
+/// already-deleted NodeClaim is ignored.
 #[allow(clippy::print_stderr)]
 async fn reap(client: &k::Client, r: &Report) -> Result<()> {
-    let nodes: Api<Node> = Api::all(client.clone());
     let claims = nodeclaim_api(client);
 
-    let mut cordoned = 0usize;
     let mut deleted = 0usize;
-    let mut managed_ng: Vec<&str> = Vec::new();
-
-    for sn in &r.stuck_nodes {
-        // Cordon is idempotent: patch unschedulable=true even if
-        // already true (Merge is a no-op on matching fields).
-        let patch = json!({ "spec": { "unschedulable": true } });
-        nodes
-            .patch(&sn.name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await
-            .with_context(|| format!("cordon node {}", sn.name))?;
-        cordoned += 1;
-        info!("cordoned node {}", sn.name);
-
-        match &sn.nodeclaim {
-            Some(nc) => {
-                // DeleteParams::default = graceful. Karpenter's
-                // finalizer drains + terminates the EC2 instance.
-                if let Err(e) = claims.delete(nc, &DeleteParams::default()).await {
-                    debug!("delete NodeClaim {nc}: {e:#}");
-                } else {
-                    deleted += 1;
-                    info!("deleted NodeClaim {nc} (node {})", sn.name);
-                }
-            }
-            None => managed_ng.push(&sn.name),
-        }
-    }
-
     for snc in &r.stuck_nodeclaims {
         if let Err(e) = claims.delete(&snc.name, &DeleteParams::default()).await {
             debug!("delete stuck NodeClaim {}: {e:#}", snc.name);
@@ -714,17 +597,9 @@ async fn reap(client: &k::Client, r: &Report) -> Result<()> {
 
     eprintln!();
     eprintln!(
-        "  {} {cordoned} nodes cordoned, {deleted} NodeClaims deleted",
+        "  {} {deleted} stuck NodeClaims deleted",
         style("✓").green()
     );
-    if !managed_ng.is_empty() {
-        eprintln!(
-            "  {} {} managed-NG nodes cordoned but not deleted (not Karpenter-managed): {}",
-            style("·").dim(),
-            managed_ng.len(),
-            managed_ng.join(", ")
-        );
-    }
     Ok(())
 }
 
@@ -980,41 +855,6 @@ fn render_human(r: &Report) {
         }
     }
 
-    if !r.stuck_nodes.is_empty() {
-        eprintln!();
-        header("Stuck Nodes (spod non-Running >2min)");
-        let w = r
-            .stuck_nodes
-            .iter()
-            .map(|n| n.name.len())
-            .max()
-            .unwrap_or(0);
-        for n in &r.stuck_nodes {
-            let cordoned = if n.already_cordoned {
-                style(" cordoned").dim().to_string()
-            } else {
-                String::new()
-            };
-            let nc = n
-                .nodeclaim
-                .as_deref()
-                .map(|c| format!("  nodeclaim={c}"))
-                .unwrap_or_else(|| style("  managed-NG").dim().to_string());
-            eprintln!(
-                "  {} {:w$}  {}s{}{}",
-                style("✗").red(),
-                n.name,
-                n.seccomp_pod_age_secs,
-                nc,
-                cordoned
-            );
-        }
-        eprintln!(
-            "  {} run `cargo xtask k8s status --reap-stuck-nodes` to cordon + delete",
-            style("→").dim()
-        );
-    }
-
     if !r.ip_assign_failures.is_empty() {
         eprintln!();
         header("IP-assign failures (last 5min)");
@@ -1095,7 +935,6 @@ mod tests {
                 possibly_fragmented: false,
             }]),
             stuck_nodeclaims: vec![],
-            stuck_nodes: vec![],
             scheduler_metrics: None,
             ip_assign_failures: vec![],
             scheduler_leader: None,
@@ -1124,7 +963,6 @@ mod tests {
             fetcher_pools: vec![],
             subnets: None,
             stuck_nodeclaims: vec![],
-            stuck_nodes: vec![],
             scheduler_metrics: None,
             ip_assign_failures: vec![],
             scheduler_leader: None,
@@ -1158,7 +996,6 @@ mod tests {
                 possibly_fragmented: false,
             }]),
             stuck_nodeclaims: vec![],
-            stuck_nodes: vec![],
             scheduler_metrics: None,
             ip_assign_failures: vec![],
             scheduler_leader: None,

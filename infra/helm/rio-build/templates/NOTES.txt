@@ -23,31 +23,14 @@ Verify on a builder pod:
   kubectl -n {{ .Values.namespace.builders }} debug rio-builder-x86-64-0 -it --image=busybox -- ls -l /dev/fuse
 {{- end }}
 
-{{- if and (not .Values.builderPoolDefaults.privileged) .Values.securityProfilesOperator.enabled }}
+{{- if not .Values.builderPoolDefaults.privileged }}
 
-── Seccomp Localhost profile (security-profiles-operator) ─────────────
-SeccompProfile CRs (rio-builder, rio-fetcher) are reconciled by SPO's
-spod DaemonSet to /var/lib/kubelet/seccomp/operator/{name}.json.
-Builder pods use seccompProfile: Localhost (RuntimeDefault + pivot_root
-− ptrace/bpf/setns/process_vm_*).
-
-Verify:
-  kubectl get seccompprofile rio-builder rio-fetcher
-  kubectl -n security-profiles-operator get ds spod
-
-Builder pods on fresh nodes may briefly wait in the wait-seccomp init
-container until spod reconciles the profile (seconds). See
-docs/src/security.md r[worker.seccomp.localhost-profile].
-{{- end }}
-
-{{- if and .Values.controller.seccompPreinstalled .Values.karpenter.enabled }}
-
-── Seccomp Localhost profile (NixOS AMI, ADR-021) ─────────────────────
-Profiles are baked into the NixOS node AMI and copied to
+── Seccomp Localhost profile (node-baked, ADR-021) ────────────────────
+Profiles are baked into the node image and copied to
 /var/lib/kubelet/seccomp/operator/ by systemd-tmpfiles BEFORE kubelet
-starts (nix/nixos-node/hardening.nix) — no spod DaemonSet, no
-wait-seccomp init. Builder pods use seccompProfile: Localhost
-(RuntimeDefault + pivot_root − ptrace/bpf/setns/process_vm_*).
+starts (nix/nixos-node/hardening.nix on EKS; fixtures/k3s-full.nix in
+VM tests). Builder pods use seccompProfile: Localhost (RuntimeDefault +
+pivot_root − ptrace/bpf/setns/process_vm_*).
 
 Verify on a builder node:
   kubectl debug node/$(kubectl get node -l rio.build/node-role=builder -o name | head -1 | cut -d/ -f2) -it --image=busybox -- ls -l /host/var/lib/kubelet/seccomp/operator/

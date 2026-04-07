@@ -14,7 +14,6 @@
 {
   nixhelm,
   system,
-  pkgs,
 }:
 let
   charts = nixhelm.chartsDerivations.${system};
@@ -50,14 +49,4 @@ in
   # via nix/envoy-gateway-render.nix because helm's crds/ is
   # install-once-never-upgrade semantics.
   inherit (charts.envoyproxy) gateway-helm gateway-crds-helm;
-
-  # RustFS — Rust-written S3-compatible object store. Subchart for the
-  # kind provider (`cargo xtask k8s -p kind`): standalone mode, single
-  # pod, local-path PVC. ~10s startup vs Rook's 2-5min. nixhelm doesn't
-  # carry it, so hand-roll the FOD. Update: bump version + re-run
-  # `nix-prefetch-url --unpack https://charts.rustfs.com/rustfs-N.tgz`.
-  rustfs = pkgs.fetchzip {
-    url = "https://charts.rustfs.com/rustfs-0.0.90.tgz";
-    hash = "sha256-QoBu6mNbuJeF8DZLTQfG+QhZP/mU2ZD/uq6TZbPbqpU=";
-  };
 }

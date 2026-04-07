@@ -1,7 +1,7 @@
 //! Import host-arch images into k3s's containerd.
 //!
 //! Much simpler than EKS push: no ECR login, no skopeo, no manifest
-//! lists. Build is shared with kind via `shared::build_host_arch`.
+//! lists.
 
 use anyhow::{Context, Result, bail};
 

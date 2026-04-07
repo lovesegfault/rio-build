@@ -11,7 +11,7 @@
 //!      ephemeral pools have CEL `max>0`, and the finalizer-strip
 //!      makes graceful drain best-effort anyway.
 //!   2. **helm uninstall rio.** Removes the chart's NodePool /
-//!      EC2NodeClass / Service type=LoadBalancer (NLB) / SeccompProfile
+//!      EC2NodeClass / Service type=LoadBalancer (NLB)
 //!      CRs / etc. Tofu's `helm_release.aws_lbc` is what tears down the
 //!      NLB infra, but the *Service* must go first or aws-lbc never gets
 //!      the delete event → NLB orphaned.
@@ -260,43 +260,6 @@ pub async fn run() -> Result<()> {
             "--wait=true",
             "--timeout=600s",
             "--ignore-not-found",
-        ])
-        .await
-    })
-    .await?;
-
-    // ── 5a. Delete xtask-applied resources ─────────────────────────
-    // P0541: deploy.rs no longer applies SPO on EKS (Bottlerocket
-    // bootstrap container replaces it). This step stays for clusters
-    // provisioned pre-P0541 — `--ignore-not-found` makes it a no-op
-    // on a P0541 cluster.
-    ui::step("delete security-profiles-operator", || async {
-        let spo = repo_root().join("infra/k8s/security-profiles-operator.yaml");
-        let spo = spo.to_str().unwrap();
-        // spod CR first (it has its own finalizer that the operator
-        // clears), then the manifest. `--wait=false` — the namespace
-        // delete below blocks for us.
-        k(&[
-            "-n",
-            "security-profiles-operator",
-            "delete",
-            "securityprofilesoperatordaemon",
-            "spod",
-            "--ignore-not-found",
-            "--wait=true",
-            "--timeout=120s",
-        ])
-        .await?;
-        k(&["delete", "--ignore-not-found", "--wait=false", "-f", spo]).await?;
-        // Namespace delete catches anything the manifest left behind
-        // (and the spod-config.yaml CR is namespaced here too).
-        k(&[
-            "delete",
-            "ns",
-            "security-profiles-operator",
-            "--ignore-not-found",
-            "--wait=true",
-            "--timeout=180s",
         ])
         .await
     })

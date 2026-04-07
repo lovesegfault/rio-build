@@ -3,7 +3,7 @@
 # Shared by both delivery paths:
 #   - EKS (NixOS AMI): nix/nixos-node/containerd-config.nix sets
 #     `base_runtime_spec` on the runc runtime directly.
-#   - k3s/kind VM tests: nix/tests/fixtures/k3s-full.nix renders a
+#   - k3s VM tests: nix/tests/fixtures/k3s-full.nix renders a
 #     full `config.toml.tmpl` (services.k3s.containerdConfigTemplate)
 #     for k3s's embedded containerd with `base_runtime_spec` set on
 #     the runc runtime.

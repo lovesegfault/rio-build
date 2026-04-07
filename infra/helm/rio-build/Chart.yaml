@@ -19,10 +19,3 @@ dependencies:
     version: "18.5.6"
     repository: https://charts.bitnami.com/bitnami
     condition: postgresql.enabled
-  # RustFS S3 backend for the kind provider. Standalone mode, single
-  # pod, local-path PVC. ~10s startup vs Rook's 2-5min. Same FOD
-  # symlink pattern as postgresql.
-  - name: rustfs
-    version: "0.0.90"
-    repository: https://rustfs.github.io/helm/
-    condition: rustfs.enabled

@@ -78,12 +78,13 @@ fn seccomp_default_is_runtime_default() {
 #[test]
 fn seccomp_localhost_emits_correct_security_context() {
     // spec.seccompProfile={type: Localhost, localhostProfile: ...}
-    // splits across three places:
-    //   - pod-level: RuntimeDefault (sandbox + initContainer can
-    //     start before the profile file lands on the node)
-    //   - wait-seccomp initContainer: polls hostPath for the file
+    // splits across two places:
+    //   - pod-level: RuntimeDefault (sandbox doesn't need pivot_root;
+    //     a missing profile surfaces as the executor container's
+    //     CreateContainerError, not a generic sandbox error)
     //   - worker container: Localhost (the actual enforcement)
-    // See the spod-race comment in common/sts.rs.
+    // The profile file is written by systemd-tmpfiles before kubelet
+    // starts on every supported target — no wait machinery.
     let mut wp = test_wp();
     wp.spec.seccomp_profile = Some(SeccompProfileKind {
         type_: "Localhost".into(),
@@ -91,8 +92,7 @@ fn seccomp_localhost_emits_correct_security_context() {
     });
     let pod = test_pod_spec(&wp);
 
-    // Pod-level: RuntimeDefault floor (NOT Localhost — sandbox
-    // would fail CreateContainerConfigError if file missing).
+    // Pod-level: RuntimeDefault floor.
     let pod_prof = pod
         .security_context
         .as_ref()
@@ -103,39 +103,15 @@ fn seccomp_localhost_emits_correct_security_context() {
     assert_eq!(pod_prof.type_, "RuntimeDefault");
     assert_eq!(pod_prof.localhost_profile, None);
 
-    // wait-seccomp initContainer: present, mounts host-seccomp,
-    // polls for the profile path.
-    let inits = pod.init_containers.as_ref().expect("initContainers set");
-    assert_eq!(inits.len(), 1);
-    let wait = &inits[0];
-    assert_eq!(wait.name, "wait-seccomp");
-    assert_eq!(wait.image, Some(wp.spec.image.clone()));
-    let cmd = wait.command.as_ref().expect("wait command");
-    assert!(
-        cmd.last().unwrap().contains("operator/rio-builder.json"),
-        "wait loop references the requested profile path"
-    );
-    let wait_prof = wait
-        .security_context
-        .as_ref()
-        .and_then(|sc| sc.seccomp_profile.as_ref())
-        .expect("wait initContainer seccomp set");
-    assert_eq!(wait_prof.type_, "RuntimeDefault");
-    assert!(
-        wait.volume_mounts
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|m| m.name == "host-seccomp" && m.read_only == Some(true))
-    );
-
-    // host-seccomp hostPath volume present.
-    assert!(pod.volumes.as_ref().unwrap().iter().any(|v| {
-        v.name == "host-seccomp"
-            && v.host_path
-                .as_ref()
-                .is_some_and(|h| h.path == "/var/lib/kubelet/seccomp")
-    }));
+    // No initContainers, no hostPath volumes — profiles preinstalled.
+    assert!(pod.init_containers.is_none(), "no wait-seccomp init");
+    let vols = pod.volumes.as_ref().unwrap();
+    for forbidden in ["host-seccomp", "host-spo"] {
+        assert!(
+            !vols.iter().any(|v| v.name == forbidden),
+            "no {forbidden} hostPath volume"
+        );
+    }
 
     // Worker container: Localhost (the actual security boundary).
     let worker = pod
@@ -156,10 +132,9 @@ fn seccomp_localhost_emits_correct_security_context() {
 }
 
 #[test]
-fn seccomp_non_localhost_no_init_container() {
-    // RuntimeDefault/Unconfined: no wait-seccomp initContainer,
-    // no host-seccomp volume. Pod-level carries the profile
-    // directly (original behavior — no file dependency).
+fn seccomp_non_localhost_pod_level_only() {
+    // RuntimeDefault/Unconfined: pod-level carries the profile
+    // directly (no file dependency). No container-level override.
     for ty in ["RuntimeDefault", "Unconfined"] {
         let mut wp = test_wp();
         wp.spec.seccomp_profile = Some(SeccompProfileKind {
@@ -169,14 +144,6 @@ fn seccomp_non_localhost_no_init_container() {
         let pod = test_pod_spec(&wp);
 
         assert!(pod.init_containers.is_none(), "{ty}: no initContainer");
-        assert!(
-            !pod.volumes
-                .as_ref()
-                .unwrap()
-                .iter()
-                .any(|v| v.name == "host-seccomp"),
-            "{ty}: no host-seccomp volume"
-        );
         let pod_prof = pod
             .security_context
             .unwrap()
@@ -194,72 +161,6 @@ fn seccomp_non_localhost_no_init_container() {
             "{ty}: no container-level seccomp override"
         );
     }
-}
-
-// r[verify builder.seccomp.localhost-profile+2]
-#[test]
-fn seccomp_preinstalled_skips_wait_keeps_enforcement() {
-    // P0541: Bottlerocket bootstrap container writes the profile
-    // BEFORE kubelet starts. seccomp_preinstalled=true elides the
-    // WAIT (initContainer + host-seccomp/host-spo hostPath volumes)
-    // but the ENFORCEMENT (container-level Localhost) stays. Tested
-    // via build_executor_pod_spec directly so the env-var read in
-    // executor_params() doesn't need set_var (parallel-test-unsafe).
-    use crate::reconcilers::common::pod::build_executor_pod_spec;
-    let mut wp = test_wp();
-    wp.spec.seccomp_profile = Some(SeccompProfileKind {
-        type_: "Localhost".into(),
-        localhost_profile: Some("operator/rio-builder.json".into()),
-    });
-    let mut params = executor_params_for_test(&wp);
-    params.seccomp_preinstalled = true;
-    let pod = build_executor_pod_spec(&params, &test_sched_addrs(), &test_store_addrs());
-
-    // No wait-seccomp init.
-    assert!(pod.init_containers.is_none(), "preinstalled: no wait init");
-    // No host-seccomp / host-spo hostPath volumes.
-    let vols = pod.volumes.as_ref().unwrap();
-    for forbidden in ["host-seccomp", "host-spo"] {
-        assert!(
-            !vols.iter().any(|v| v.name == forbidden),
-            "preinstalled: no {forbidden} volume"
-        );
-    }
-
-    // Pod-level: still RuntimeDefault (sandbox can start regardless;
-    // no behavior change here — the split between pod-level and
-    // container-level is independent of the wait gate).
-    let pod_prof = pod
-        .security_context
-        .as_ref()
-        .and_then(|sc| sc.seccomp_profile.as_ref())
-        .expect("pod seccomp set");
-    assert_eq!(pod_prof.type_, "RuntimeDefault");
-
-    // Worker container: Localhost — the ENFORCEMENT is unchanged.
-    let worker = pod
-        .containers
-        .iter()
-        .find(|c| c.name == "builder")
-        .expect("worker container");
-    let worker_prof = worker
-        .security_context
-        .as_ref()
-        .and_then(|sc| sc.seccomp_profile.as_ref())
-        .expect("worker container seccompProfile set");
-    assert_eq!(worker_prof.type_, "Localhost");
-    assert_eq!(
-        worker_prof.localhost_profile,
-        Some("operator/rio-builder.json".into())
-    );
-
-    // Sanity: same params with preinstalled=false DO emit the wait.
-    params.seccomp_preinstalled = false;
-    let pod = build_executor_pod_spec(&params, &test_sched_addrs(), &test_store_addrs());
-    assert!(
-        pod.init_containers.as_ref().is_some_and(|v| v.len() == 1),
-        "preinstalled=false: wait-seccomp init present"
-    );
 }
 
 // r[verify builder.seccomp.localhost-profile+2]
@@ -283,12 +184,12 @@ fn seccomp_privileged_drops_profile() {
     );
 }
 
-/// Localhost profile JSON — `infra/helm/rio-build/files/`. Compiled
-/// in via include_str! so the test fails at BUILD time if the file
-/// goes missing (rather than being a silent no-op at deploy time
-/// when someone forgets to install it on nodes).
+/// Localhost profile JSON — `nix/nixos-node/seccomp/`. Compiled in
+/// via include_str! so the test fails at BUILD time if the file goes
+/// missing (rather than being a silent no-op at deploy time when
+/// someone forgets to install it on nodes).
 const SECCOMP_PROFILE_JSON: &str =
-    include_str!("../../../../../infra/helm/rio-build/files/seccomp-rio-builder.json");
+    include_str!("../../../../../nix/nixos-node/seccomp/rio-builder.json");
 
 #[test]
 fn seccomp_profile_json_is_valid() {

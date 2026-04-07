@@ -1241,20 +1241,25 @@ in
                 f"worker container still privileged: securityContext={sc}"
             )
 
-            # seccompProfile: controller defaults None → RuntimeDefault
-            # at pod level. k3s may normalize; accept RuntimeDefault or
-            # absent-at-container-level-with-pod-level-set.
+            # seccompProfile: vmtest-full-nonpriv inherits the chart
+            # default (Localhost), which the controller renders as
+            # POD-level RuntimeDefault + CONTAINER-level Localhost
+            # (security.md worker.seccomp.localhost-profile). The pod
+            # sandbox doesn't need pivot_root; enforcement is on the
+            # worker container.
             pod_sc = pod["spec"].get("securityContext", {})
             seccomp = pod_sc.get("seccompProfile", {})
-            seccomp_type = seccomp.get("type")
-            # vmtest-full-nonpriv.yaml sets Unconfined — k3s's
-            # containerd RuntimeDefault doesn't allowlist pivot_root
-            # even with CAP_SYS_ADMIN (nix-daemon sandbox EPERM).
-            # Production uses a Localhost profile with pivot_root
-            # added (security.md worker.seccomp.localhost-profile).
-            assert seccomp_type in ("RuntimeDefault", "Unconfined"), (
-                f"expected seccompProfile.type=RuntimeDefault|"
-                f"Unconfined, got {seccomp!r}"
+            assert seccomp.get("type") == "RuntimeDefault", (
+                f"expected pod-level seccompProfile.type=RuntimeDefault, "
+                f"got {seccomp!r}"
+            )
+            worker_seccomp = sc.get("seccompProfile", {})
+            assert worker_seccomp.get("type") == "Localhost", (
+                f"expected container-level seccompProfile.type=Localhost, "
+                f"got {worker_seccomp!r}"
+            )
+            assert worker_seccomp.get("localhostProfile") == "operator/rio-builder.json", (
+                f"unexpected localhostProfile path: {worker_seccomp!r}"
             )
 
             # procMount NOT set — k8s PSA rejects procMount:Unmasked
@@ -1274,7 +1279,7 @@ in
             )
             print(
                 f"nonpriv-admitted PASS: privileged absent, "
-                f"seccomp={seccomp_type}, no hostPath /dev/fuse, "
+                f"seccomp=Localhost, no hostPath /dev/fuse, "
                 f"hostUsers={host_users!r} (k3s opt-out)"
             )
 

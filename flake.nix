@@ -277,7 +277,7 @@
             # Seccomp profile JSON (embedded via include_str! in
             # rio-controller tests — build-time presence check so a
             # missing profile fails compile, not silently at deploy).
-            ./infra/helm/rio-build/files
+            ./nix/nixos-node/seccomp
             # observability.md — build.rs greps the per-component
             # metrics tables to derive SPEC_METRICS for the
             # spec→describe check (see rio-test-support
@@ -648,7 +648,7 @@
           # the result path into the working-tree charts/ — gitignored).
           subcharts = import ./nix/helm-charts.nix {
             inherit (inputs) nixhelm;
-            inherit system pkgs;
+            inherit system;
           };
 
           # --------------------------------------------------------------
@@ -1543,11 +1543,6 @@
             # gateway*.yaml templates are applied.
             helm-envoy-gateway = subcharts.gateway-helm;
             helm-envoy-gateway-crds = subcharts.gateway-crds-helm;
-            # RustFS S3 backend for the kind provider. Subchart of
-            # rio-build (condition: rustfs.enabled) — symlinked into
-            # charts/ by xtask's chart_deps() for all providers since
-            # helm validates charts/ before evaluating conditions.
-            helm-rustfs = subcharts.rustfs;
             # nix/pins.nix rendered as *.auto.tfvars.json. snake_case
             # keys in pins.nix → direct toJSON passthrough, no mapping
             # layer. Regenerate the committed copy:

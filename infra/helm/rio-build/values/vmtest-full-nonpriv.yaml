@@ -38,34 +38,11 @@ builderPoolDefaults:
   # sec.pod.host-users-false spec marker stays verified by the
   # builders.rs unit test (renders-shape check).
   hostUsers: true
-  # seccompProfile: Unconfined — k3s's containerd RuntimeDefault does
-  # NOT allowlist pivot_root even with CAP_SYS_ADMIN (differs from
-  # upstream containerd's default which gates it on CAP_SYS_ADMIN).
-  # nix-daemon's sandbox does pivot_root → EPERM under RuntimeDefault.
-  #
-  # Bisection chain (root-cause hunt, commit 8f925549):
-  #   1. seccomp=Unconfined BEFORE /proc-remount: still failed at
-  #      namespace-check (different issue — /proc masking)
-  #   2. /proc-remount fix: namespace-check passes, pivot_root EPERM
-  #   3. ambient-caps raise (capset inheritable → PR_CAP_AMBIENT_
-  #      RAISE): verified CapAmb=002411eb in pre_exec diag,
-  #      NoNewPrivs=0 — caps ARE propagated, pivot_root EPERM is NOT
-  #      from may_mount()
-  #   4. seccomp=Unconfined WITH /proc-remount+ambient: PASSES
-  #
-  # Production (EKS/GKE): Localhost seccomp profile (RuntimeDefault +
-  # pivot_root − ptrace/bpf/setns) distributed via SeccompProfile CR
-  # — the chart default. Unconfined here is test-only: the SPO +
-  # cert-manager images aren't in the airgap set, and wiring those
-  # into the VM fixture isn't worth the test-surface for what the EKS
-  # smoke test already covers end-to-end.
-  seccompProfile:
-    type: Unconfined
-    # null clears the deep-merged default (values.yaml sets
-    # localhostProfile: operator/rio-builder.json alongside
-    # type: Localhost). Without this, Helm merges to {type:
-    # Unconfined, localhostProfile: operator/...} which the
-    # BuilderPool CRD's CEL rule rejects (localhostProfile
-    # allowed iff type==Localhost). Same Helm-null-deletes-
-    # key semantics as nodeSelector:null below.
-    localhostProfile: null
+  # seccompProfile inherits the chart default (Localhost,
+  # operator/rio-builder.json). k3s's containerd RuntimeDefault does
+  # NOT allowlist pivot_root even with CAP_SYS_ADMIN — nix-daemon's
+  # sandbox does pivot_root → EPERM under RuntimeDefault. The
+  # Localhost profile (RuntimeDefault + pivot_root − ptrace/bpf/setns)
+  # is delivered via systemd-tmpfiles by k3sBase before k3s starts
+  # (fixtures/k3s-full.nix — same path as the NixOS AMI), so the file
+  # is guaranteed present before any pod schedules.

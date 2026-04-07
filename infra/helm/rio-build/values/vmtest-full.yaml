@@ -45,15 +45,6 @@ karpenter:
 networkPolicy:
   enabled: false
 
-# SPO + cert-manager images not in the airgap set + builderPoolDefaults.
-# privileged=true below disables seccomp at the runtime level anyway.
-# The nonpriv variant (vmtest-full-nonpriv.yaml) uses seccompProfile:
-# Unconfined for the same reason. Production on EKS/GKE leaves this
-# enabled (the chart default); xtask k8s deploy applies the SPO
-# manifest before this chart.
-securityProfilesOperator:
-  enabled: false
-
 # Tests the pdb.yaml template. Gateway PDB with minAvailable=1 is a
 # no-op at replicas=1 (blocks drain, which we don't do) but renders.
 podDisruptionBudget:
