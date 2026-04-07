@@ -154,7 +154,7 @@ proto/
 src/
 ├── lib.rs             # tonic::include_proto! + domain re-export modules
 ├── client/
-│   ├── mod.rs         # connect_{store,scheduler,builder,admin}, get_path_nar, collect_nar_stream,
+│   ├── mod.rs         # connect_{store,scheduler,executor,admin}, get_path_nar, collect_nar_stream,
 │   │                  #   chunk_nar_for_put (lazy PutPath stream), query_path_info_opt (NotFound→None)
 │   ├── balance.rs     # Client-side health-probe balancer (scheduler leader discovery)
 │   └── retry.rs       # Shutdown-aware connect retry with exponential backoff (cold-start loop)
@@ -225,7 +225,7 @@ src/
 │   ├── mod.rs         # gRPC service wiring → actor message send
 │   ├── actor_guards.rs    # Leader-guard + actor-alive request interceptors
 │   ├── scheduler_service.rs # SchedulerService impl (SubmitBuild, WatchBuild, CancelBuild)
-│   ├── worker_service.rs    # BuilderService impl (BuildExecution stream, Heartbeat)
+│   ├── executor_service.rs  # ExecutorService impl (BuildExecution stream, Heartbeat)
 │   └── tests/         # bridge, guards, stream, submit
 ├── logs/
 │   ├── mod.rs         # LogBuffers: DashMap ring buffers per derivation
@@ -238,7 +238,7 @@ src/
 │   ├── logs.rs        # GetBuildLogs (ring buffer + S3 replay)
 │   ├── sizeclass.rs   # GetCutoffs / SetCutoffs
 │   ├── tenants.rs     # ListTenants / tenant quota inspect
-│   ├── workers.rs     # ListWorkers / DrainWorker / ClusterStatus
+│   ├── executors.rs   # ListExecutors / DrainExecutor / ClusterStatus
 │   └── tests/         # per-handler admin tests
 ├── ca/
 │   ├── mod.rs         # CA early-cutoff: output-hash compare against content index
