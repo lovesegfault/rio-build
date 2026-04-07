@@ -51,6 +51,13 @@ let
             gid = 0;
           }
         ];
+        # CRI appends its default device-cgroup rules (deny-all + the
+        # /dev/{null,zero,random,tty,…} allows) AFTER loading this spec
+        # (oci.WithSpecFromFile → CRI spec opts), so this list is
+        # additive, not the full allowlist. Live check on a booted node:
+        #   crictl inspect <cid> | jq '.info.runtimeSpec.linux.resources.devices | length'
+        # — must be >2. If a containerd bump changes merge semantics,
+        # that's where it surfaces.
         resources.devices = [
           {
             allow = true;

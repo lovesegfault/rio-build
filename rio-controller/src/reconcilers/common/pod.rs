@@ -23,17 +23,20 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::error::{Error, Result};
 
-/// K8s extended-resource name exposed by the smarter-device-manager
+/// K8s extended-resource name for `/dev/fuse`. On EKS (NixOS AMI),
+/// declared by Karpenter NodeOverlay and injected via containerd
+/// `base_runtime_spec` (nix/nixos-node/containerd-config.nix); on
+/// k3s/kind, registered+injected by the smarter-device-manager
 /// DaemonSet (infra/helm/rio-build/templates/device-plugin.yaml).
-/// The kubelet sees this in `resources.limits` and the device plugin
-/// injects `/dev/fuse` into the container's device cgroup allowlist —
-/// no hostPath volume needed, so `hostUsers: false` works (ADR-012).
+/// Either way: no hostPath volume, so `hostUsers: false` works (ADR-012).
 const FUSE_DEVICE_RESOURCE: &str = "smarter-devices/fuse";
 
-/// Same device-plugin mechanism for `/dev/kvm`. Only `.metal` EC2
-/// instance types expose `/dev/kvm` (nested virt); the plugin
-/// advertises 0 elsewhere. Requested only when [`KVM_FEATURE`] is in
-/// `spec.features`.
+/// Same mechanism for `/dev/kvm`. On EKS (NixOS AMI), declared by
+/// Karpenter NodeOverlay and injected via containerd `base_runtime_spec`;
+/// on k3s/kind, registered+injected by the smarter-device-manager
+/// DaemonSet. Only `.metal` EC2 instance types expose host KVM (nested
+/// virt); on non-metal the device node ENXIOs on open. Requested only
+/// when [`KVM_FEATURE`] is in `spec.features`.
 const KVM_DEVICE_RESOURCE: &str = "smarter-devices/kvm";
 
 /// Nix `system-features` string that signals "this builder runs

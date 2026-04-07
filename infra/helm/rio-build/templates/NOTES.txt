@@ -6,7 +6,7 @@ Post-install prerequisites that the chart cannot apply itself
 */ -}}
 rio-build installed to namespace {{ .Values.namespace.name }}.
 
-{{- if .Values.devicePlugin.enabled }}
+{{- if and .Values.devicePlugin.enabled (not .Values.karpenter.enabled) }}
 
 ── FUSE device plugin (smarter-device-manager) ────────────────────────
 The rio-device-plugin DaemonSet exposes /dev/fuse as the

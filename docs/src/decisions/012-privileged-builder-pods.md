@@ -53,7 +53,7 @@ The Phase 1a spike discovered two constraints:
 
 The controller-generated pod spec (`rio-controller/src/reconcilers/workerpool/builders.rs`) matches the recommended configuration above:
 
-- **`/dev/fuse` via device plugin.** The `smarter-device-manager` DaemonSet (`infra/helm/rio-build/templates/device-plugin.yaml`) exposes `/dev/fuse` as an extended resource `smarter-devices/fuse`. The worker container requests it via `resources.limits["smarter-devices/fuse"] = 1`; the kubelet+plugin inject the device node and add it to the container's device cgroup allowlist. No hostPath volume — `hostUsers: false` works.
+- **`/dev/fuse` via device plugin.** The `smarter-device-manager` DaemonSet (`infra/helm/rio-build/templates/device-plugin.yaml`) exposes `/dev/fuse` as an extended resource `smarter-devices/fuse`. The worker container requests it via `resources.limits["smarter-devices/fuse"] = 1`; the kubelet+plugin inject the device node and add it to the container's device cgroup allowlist (on EKS, since [ADR-021](021-nixos-node-ami.md) §7, via containerd `base_runtime_spec` instead — no plugin). No hostPath volume — `hostUsers: false` works.
 - **`hostUsers: false` set.** User-namespace isolation active on non-privileged pods. `CAP_SYS_ADMIN` is scoped to the user namespace; a container escape cannot use it on the host.
 - **Helm chart default is `workerPool.privileged: false`.** The device plugin is enabled by default (`devicePlugin.enabled: true`), digest-pinned to a known-good upstream release (`values.yaml` `devicePlugin.image` — bump via `skopeo inspect docker://<repo>:<new-tag> --format '{{.Digest}}'` on upstream updates; the helm-lint check enforces the pin).
 
