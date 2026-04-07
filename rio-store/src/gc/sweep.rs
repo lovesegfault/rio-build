@@ -236,19 +236,28 @@ pub async fn sweep(
             // temp table holds the WHOLE `unreachable` set (not just
             // `batch`) — a cycle may span SWEEP_BATCH_SIZE boundaries.
             // r[impl store.gc.sweep-cycle-reclaim]
+            //
+            // Also re-check `gc_roots` and `scheduler_live_pins`: a
+            // PinPath or scheduler dispatch that landed between mark
+            // and now is a direct root on THIS path that mark's snapshot
+            // missed. Both tables key on store_path_hash (PK / first
+            // index column) so each EXISTS is a point probe.
             let has_referrer: bool = sqlx::query_scalar(
                 r#"
-                SELECT EXISTS (
-                  SELECT 1 FROM narinfo n
-                   WHERE n."references" @> ARRAY[
-                           (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
-                         ]
-                     AND NOT EXISTS (
-                       SELECT 1 FROM sweep_unreachable su
-                        WHERE su.path_hash = n.store_path_hash
-                     )
-                   LIMIT 1
-                )
+                SELECT
+                  EXISTS (
+                    SELECT 1 FROM narinfo n
+                     WHERE n."references" @> ARRAY[
+                             (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
+                           ]
+                       AND NOT EXISTS (
+                         SELECT 1 FROM sweep_unreachable su
+                          WHERE su.path_hash = n.store_path_hash
+                       )
+                     LIMIT 1
+                  )
+                  OR EXISTS (SELECT 1 FROM gc_roots WHERE store_path_hash = $1)
+                  OR EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
                 "#,
             )
             .bind(store_path_hash)
@@ -261,6 +270,31 @@ pub async fn sweep(
                 );
                 metrics::counter!("rio_store_gc_path_resurrected_total").increment(1);
                 stats.paths_resurrected += 1;
+                // Transitive resurrection: this path is now live, so
+                // its own references (and theirs, recursively) must
+                // not be excluded by the anti-join above when later
+                // batch entries are checked. Walk the closure within
+                // sweep_unreachable and remove it. The recursion is
+                // bounded to nodes in the temp table, so it terminates
+                // and stays small (≤ |unreachable|).
+                sqlx::query(
+                    r#"
+                    WITH RECURSIVE closure(path_hash) AS (
+                        SELECT $1::bytea
+                      UNION
+                        SELECT dep.store_path_hash
+                          FROM closure c
+                          JOIN narinfo n ON n.store_path_hash = c.path_hash
+                          JOIN narinfo dep ON dep.store_path = ANY(n."references")
+                          JOIN sweep_unreachable su ON su.path_hash = dep.store_path_hash
+                    )
+                    DELETE FROM sweep_unreachable
+                     WHERE path_hash IN (SELECT path_hash FROM closure)
+                    "#,
+                )
+                .bind(store_path_hash)
+                .execute(&mut *tx)
+                .await?;
                 continue;
             }
 
@@ -760,6 +794,102 @@ mod tests {
                 .await
                 .unwrap();
         assert!(q_exists, "Q's narinfo must survive sweep");
+    }
+
+    /// Transitive resurrection: when Y is resurrected because live P
+    /// references it, Y's own dependency Z (also in the unreachable
+    /// set) must NOT be swept — Y is now a live referrer of Z.
+    /// Without the closure-delete from sweep_unreachable, the
+    /// anti-join keeps excluding Y as a referrer of Z and Z is
+    /// deleted, leaving live P→Y→Z dangling.
+    #[tokio::test]
+    async fn sweep_resurrection_is_transitive() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Z: leaf, marked unreachable.
+        let z = test_store_path("transitive-z");
+        let z_hash = StoreSeed::raw_path(&z).seed(&db.pool).await;
+        // Y: references Z, marked unreachable.
+        let y = test_store_path("transitive-y");
+        let y_hash = StoreSeed::raw_path(&y)
+            .with_refs(&[&z])
+            .seed(&db.pool)
+            .await;
+        // P: references Y. NOT in unreachable (the post-mark live
+        // referrer that triggers Y's resurrection).
+        StoreSeed::path("transitive-p")
+            .with_refs(&[&y])
+            .seed(&db.pool)
+            .await;
+
+        // Y first so its resurrection clears Z from sweep_unreachable
+        // before Z is processed.
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![y_hash.clone(), z_hash.clone()],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_deleted, 0, "neither Y nor Z deleted");
+        assert_eq!(stats.paths_resurrected, 2, "Y resurrected by P; Z by Y");
+
+        for (h, name) in [(&y_hash, "Y"), (&z_hash, "Z")] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)",
+            )
+            .bind(h)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(exists, "{name} must survive (transitive resurrection)");
+        }
+    }
+
+    /// Re-check must consult `gc_roots` and `scheduler_live_pins`: a
+    /// PinPath or scheduler dispatch between mark and sweep is a
+    /// direct root mark's snapshot missed.
+    #[tokio::test]
+    async fn sweep_recheck_sees_late_pins() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // P: pinned via gc_roots after mark.
+        let p_hash = StoreSeed::path("late-gc-root").seed(&db.pool).await;
+        sqlx::query("INSERT INTO gc_roots (store_path_hash, source) VALUES ($1, 'test')")
+            .bind(&p_hash)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Q: pinned via scheduler_live_pins after mark.
+        let q_hash = StoreSeed::path("late-live-pin").seed(&db.pool).await;
+        sqlx::query(
+            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'drv')",
+        )
+        .bind(&q_hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![p_hash.clone(), q_hash.clone()],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_deleted, 0);
+        assert_eq!(stats.paths_resurrected, 2);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "both pinned paths survive");
     }
 
     /// Sweep must DELETE path_tenants rows for swept paths.
