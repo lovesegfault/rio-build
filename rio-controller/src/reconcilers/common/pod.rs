@@ -126,7 +126,7 @@ pub type StoreAddrs = UpstreamAddrs;
 
 /// Every spec field the pod-spec builder reads. Both reconcilers
 /// construct this from their respective CRD spec and call
-/// [`build_executor_statefulset`].
+/// [`build_executor_pod_spec`].
 ///
 /// Optional fields with `None` get the builder's compiled-in
 /// default. The fetcher reconciler leaves most `None` — its spec

@@ -231,6 +231,12 @@ pkgs.testers.runNixOSTest {
     # won't exist until the FOD completes, so waiting for it first
     # guarantees the fetcher is already gone.
     fetcher_vm, fetcher_pid = netns_handle(fetcher_pod, "${nsFetchers}")
+    # Snapshot pod spec NOW for fetcher-node-dedicated below — the
+    # one-shot pod is reaped (ttlSecondsAfterFinished) before that
+    # subtest runs.
+    fetcher_pod_spec = _json.loads(
+        kubectl(f"get pod {fetcher_pod} -o json", ns="${nsFetchers}")
+    )["spec"]
     def fetcher_exec(cmd):
         return fetcher_vm.execute(f"nsenter -t {fetcher_pid} -n -- {cmd}")
 
@@ -320,9 +326,7 @@ pkgs.testers.runNixOSTest {
     # k3s-agent. Proves the params→podspec chain; actual node-pool
     # enforcement is EKS-only.
     with subtest("fetcher-node-dedicated: toleration + selector present"):
-        spec = _json.loads(
-            kubectl(f"get pod {fetcher_pod} -o json", ns="${nsFetchers}")
-        )["spec"]
+        spec = fetcher_pod_spec
         tols = spec.get("tolerations", [])
         assert any(t.get("key") == "rio.build/fetcher" for t in tols), (
             f"expected toleration key rio.build/fetcher, got {tols!r}"

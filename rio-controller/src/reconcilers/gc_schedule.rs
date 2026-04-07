@@ -2,9 +2,8 @@
 //! interval (default 24h, `gc_interval_hours` config; 0 = disabled).
 //!
 //! Unlike the BuilderPool reconciler (event-driven, watches CRDs),
-//! this is a plain interval loop — no K8s resource to watch. More
-//! like [`crate::scaling::Autoscaler::run`] than like a kube-rs
-//! `Controller::run`.
+//! this is a plain interval loop — no K8s resource to watch, so not
+//! a kube-rs `Controller::run`.
 //!
 //! # Connect-per-tick (R-CONN constraint)
 //!

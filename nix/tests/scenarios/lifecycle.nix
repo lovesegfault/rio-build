@@ -2116,7 +2116,6 @@ let
           assert_cel_rejects(
               "zero-max-concurrent",
               "  maxConcurrent: 0\n"
-              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               "  image: rio-builder",
@@ -2131,7 +2130,6 @@ let
               "hostnet-unprivileged",
               "  hostNetwork: true\n"
               "  maxConcurrent: 4\n"
-              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               "  image: rio-builder",
@@ -2153,7 +2151,6 @@ let
               "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  maxConcurrent: 4\n"
-              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               # rio-builder:dev — MUST match the ref from nix/docker.nix
@@ -2427,7 +2424,6 @@ let
               "spec:\n"
               "  sizing: Manifest\n"
               "  maxConcurrent: 3\n"
-              "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               # Same rio-builder:dev tag + tlsSecretName rationale as
@@ -3022,16 +3018,7 @@ let
                   f"expected {child} ownerRef[0].kind=BuilderPoolSet, "
                   f"got {owner['kind']!r}"
               )
-              # autoscaling.targetValue = class.targetQueuePerReplica
-              # (default 5, per-class in builders.rs:98). Proves the
-              # per-class autoscaler wiring — each child carries its
-              # own target, not a shared WPS-level value.
-              tv = str(bp["spec"]["autoscaling"]["targetValue"])
-              assert tv == "5", (
-                  f"expected {child}.spec.autoscaling.targetValue=5 "
-                  f"(default targetQueuePerReplica), got {tv!r}"
-              )
-          print("wps-lifecycle: 3 children created, sizeClass+ownerRef+autoscaling correct")
+          print("wps-lifecycle: 3 children created, sizeClass+ownerRef correct")
 
           # ── Delete WPS → children GC'd ────────────────────────────────
           # --wait=false: don't block on the WPS finalizer. cleanup()
@@ -3099,7 +3086,6 @@ let
               "  namespace: ${nsFetchers}\n"
               "spec:\n"
               "  maxConcurrent: 1\n"
-              "  autoscaling: {metric: fodQueueDepth, targetValue: 5}\n"
               "  image: rio-fetcher:dev\n"
               "  systems: [x86_64-linux]\n"
               "EOF"
