@@ -951,11 +951,14 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             match translate::reconstruct_dag(&drv_path, drv, store_client, drv_cache).await {
                 Ok((n, e)) => (n, e),
                 Err(dag_err) => {
-                    warn!(error = %dag_err, "DAG reconstruction failed, using single-node DAG");
-                    (
-                        translate::single_node_from_basic(&drv_path_str, &basic_drv),
-                        Vec::new(),
-                    )
+                    // Degrading to a 1-node DAG here is wrong: an
+                    // input-addressed root with no inputs would dispatch
+                    // and fail on the builder with "input not found".
+                    // The errors here (transitive-input cap exceeded,
+                    // child .drv resolve failure mid-BFS) are
+                    // user-actionable — surface them.
+                    warn!(error = %dag_err, "DAG reconstruction failed");
+                    stderr_err!(stderr, "cannot build '{drv_path_str}': {dag_err}");
                 }
             }
         }
