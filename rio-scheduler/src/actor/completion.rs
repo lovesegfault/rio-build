@@ -612,6 +612,16 @@ impl DagActor {
             return;
         }
 
+        // Cancelled: scheduler transitioned BEFORE sending CancelSignal
+        // (build.rs:cancel_sole_interest_derivations), so the executor's
+        // Cancelled report finds the derivation already in this state.
+        // Expected; capacity was freed above. No further action.
+        if current_status == DerivationStatus::Cancelled {
+            debug!(drv_hash = %drv_hash, executor_id = %executor_id,
+                   "cancelled completion report (expected after CancelSignal)");
+            return;
+        }
+
         // Only process completions for assigned/running derivations
         if !matches!(
             current_status,
@@ -694,17 +704,7 @@ impl DagActor {
                     .await;
             }
             rio_proto::build_types::BuildResultStatus::Cancelled => {
-                // Worker reports Cancelled after cgroup.kill. The
-                // scheduler already transitioned the DerivationState
-                // when it SENT the CancelSignal (see handle_cancel_
-                // build / handle_drain_executor), so this report is
-                // expected but needs no further action on the
-                // derivation itself. Just the worker-capacity cleanup
-                // below. Log at debug: every CancelBuild generates
-                // one of these per running drv, and it's the happy
-                // path for cancel.
-                debug!(drv_hash = %drv_hash, executor_id = %executor_id,
-                       "cancelled completion report (expected after CancelSignal)");
+                // Unreachable: handled by the Cancelled early-return above.
             }
             rio_proto::build_types::BuildResultStatus::Unspecified => {
                 warn!(

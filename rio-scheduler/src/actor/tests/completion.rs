@@ -2065,13 +2065,16 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
         .expect("drv exists");
     assert_eq!(info.status, DerivationStatus::Cancelled);
 
-    // The state check at handle_completion's top catches this —
-    // drv is already Cancelled (not Assigned/Running), so it hits
-    // the "not in assigned/running state, ignoring" early-return.
-    // This IS the no-op path for acknowledging a cancel.
+    // Cancelled has its own early-return (debug, not warn). The
+    // generic "not in assigned/running" warn must NOT fire — that's
+    // the spurious-WARN-per-cancel this guards against.
     assert!(
-        logs_contain("not in assigned/running state"),
-        "expected early-return for already-Cancelled state"
+        logs_contain("cancelled completion report (expected after CancelSignal)"),
+        "expected Cancelled-specific early-return"
+    );
+    assert!(
+        !logs_contain("not in assigned/running state"),
+        "spurious WARN fired for expected Cancelled report"
     );
     Ok(())
 }
