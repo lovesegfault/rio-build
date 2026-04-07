@@ -728,6 +728,19 @@ async fn size_class_snapshot_soft_features_strip() {
         1,
         "I-204: kvm pool excludes big-parallel-only work, keeps kvm work"
     );
+
+    // Regression: leader-acquire calls clear_persisted_state which
+    // replaces self.dag. soft_features MUST survive — first prod deploy
+    // of I-204 was a no-op because recovery's `self.dag =
+    // DerivationDag::new()` reset it to empty before the first merge.
+    actor.clear_persisted_state();
+    actor.test_inject_ready_with_features("ff2", None, "x86_64-linux", &["big-parallel"]);
+    let snap = actor.compute_size_class_snapshot(Some(&kvm));
+    assert_eq!(
+        snap.iter().find(|s| s.name == "medium").unwrap().queued,
+        0,
+        "I-204: soft_features survives clear_persisted_state (leader transition)"
+    );
 }
 
 /// I-187: snapshot honors `size_class_floor`. A derivation that

@@ -414,6 +414,9 @@ async fn main() -> anyhow::Result<()> {
             "fetcher size-class routing enabled (reactive)"
         );
     }
+    if !cfg.soft_features.is_empty() {
+        info!(soft_features = ?cfg.soft_features, "soft-feature stripping enabled");
+    }
 
     // ---- Leader election (gated on RIO_LEASE_NAME) ----
     // None → non-K8s mode: is_leader=true immediately, generation

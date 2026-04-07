@@ -74,11 +74,7 @@ impl DagActor {
         // DON'T clear self.executors: those are live connections
         // (ExecutorConnected + Heartbeat), not persisted state. A
         // worker connected to the standby is still connected.
-        self.dag = DerivationDag::new();
-        self.ready_queue.clear();
-        self.builds.clear();
-        self.build_events.clear();
-        self.build_sequences.clear();
+        self.clear_persisted_state();
 
         // --- Load builds ---
         let build_rows = self.db.load_nonterminal_builds().await?;
@@ -526,11 +522,7 @@ impl DagActor {
             // again but do it here too so any Tick that sneaks in
             // before the next LeaderAcquired sees a consistent
             // (empty) DAG.
-            self.dag = DerivationDag::new();
-            self.ready_queue.clear();
-            self.builds.clear();
-            self.build_events.clear();
-            self.build_sequences.clear();
+            self.clear_persisted_state();
             // DON'T set recovery_complete — the lease loop's clear
             // at the lose-transition stays in effect. dispatch_ready
             // gates on this (dispatch.rs:27); early-return here
@@ -598,11 +590,7 @@ impl DagActor {
                 );
                 // Explicitly re-clear: recovery may have partially
                 // populated before failing.
-                self.dag = DerivationDag::new();
-                self.ready_queue.clear();
-                self.builds.clear();
-                self.build_events.clear();
-                self.build_sequences.clear();
+                self.clear_persisted_state();
                 self.recovery_complete
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }

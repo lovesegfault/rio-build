@@ -224,6 +224,10 @@ pub struct DagActor {
     /// `Vec` (not `Arc<RwLock>`): no rebalancer mutates this — it's
     /// just an ordered name list, config-static after construction.
     fetcher_size_classes: Vec<crate::assignment::FetcherSizeClassConfig>,
+    /// I-204: capability-hint features stripped at DAG insertion.
+    /// Mirrored onto `self.dag` by `with_soft_features` and re-applied
+    /// in `clear_persisted_state` (recovery replaces the DAG).
+    soft_features: Vec<String>,
     /// ADR-020 capacity manifest headroom. Applied by both
     /// `compute_capacity_manifest` (manifest RPC) and the dispatch-time
     /// resource-fit filter. Config-global; per-pool later if needed.
@@ -388,6 +392,7 @@ impl DagActor {
             self_tx: None,
             size_classes: Arc::new(parking_lot::RwLock::new(Vec::new())),
             fetcher_size_classes: Vec::new(),
+            soft_features: Vec::new(),
             headroom_mult: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER,
             configured_cutoffs: Vec::new(),
             log_flush_tx: None,
@@ -484,9 +489,31 @@ impl DagActor {
     /// `required_features` at DAG insertion, so neither spawn-snapshot
     /// nor dispatch treat them as hardware gates. Empty (the default)
     /// preserves pre-I-204 behavior — every feature is a gate.
+    ///
+    /// Stored on the actor (not just the DAG) because
+    /// `clear_persisted_state` replaces `self.dag` on every leader
+    /// transition — the actor copy is what survives.
     pub fn with_soft_features(mut self, soft: Vec<String>) -> Self {
-        self.dag.set_soft_features(soft);
+        self.dag.set_soft_features(soft.clone());
+        self.soft_features = soft;
         self
+    }
+
+    /// Reset DAG + per-build maps to empty. Called on leader-acquire,
+    /// leader-lost, and recovery-failure — every path that discards
+    /// in-memory persisted state. Re-applies `soft_features` to the
+    /// fresh DAG so the I-204 strip survives leader transitions
+    /// (regression: the original `self.dag = DerivationDag::new()` at
+    /// each site dropped soft_features → first prod deploy of I-204
+    /// was a no-op after the lease acquired). Does NOT touch
+    /// `self.executors` — those are live connections, not persisted.
+    pub(super) fn clear_persisted_state(&mut self) {
+        self.dag = DerivationDag::new();
+        self.dag.set_soft_features(self.soft_features.clone());
+        self.ready_queue.clear();
+        self.builds.clear();
+        self.build_events.clear();
+        self.build_sequences.clear();
     }
 
     /// Inject poison-detection config. Default (3 distinct workers)
