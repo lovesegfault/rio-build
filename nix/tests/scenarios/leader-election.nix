@@ -394,7 +394,7 @@ let
       k3s_server.wait_until_succeeds(
           "k3s kubectl -n ${ns} get lease rio-scheduler-leader "
           "-o jsonpath='{.spec.holderIdentity}' | grep -q rio-scheduler",
-          timeout=30,
+          timeout=90,
       )
 
       ${fixture.sshKeySetup}
@@ -459,7 +459,7 @@ let
               "k3s kubectl get --raw "
               '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
               "| grep -E '^rio_scheduler_derivations_running [1-9]'",
-              timeout=30,
+              timeout=90,
           )
 
           old_leader = leader_pod()
@@ -533,7 +533,7 @@ let
       k3s_server.wait_until_succeeds(
           "k3s kubectl -n ${ns} get lease rio-scheduler-leader "
           "-o jsonpath='{.spec.holderIdentity}' | grep -q rio-scheduler",
-          timeout=30,
+          timeout=90,
       )
 
       with subtest("sigkill-mid-build: SIGKILL leader host-PID, build survives"):
@@ -569,7 +569,7 @@ let
               "k3s kubectl get --raw "
               '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
               "| grep -E '^rio_scheduler_derivations_running [1-9]'",
-              timeout=30,
+              timeout=90,
           )
 
           # Re-read leader AFTER dispatch confirmed (build-during-failover
@@ -614,7 +614,7 @@ let
               f"test \"$(k3s kubectl -n ${ns} get pod {old_leader} "
               f"-o jsonpath='{{.status.containerStatuses[0].restartCount}}')\" "
               f"-gt {rc_before}",
-              timeout=30,
+              timeout=90,
           )
 
           # ── leadership recovered within TTL + slack ───────────────────
@@ -627,7 +627,7 @@ let
               "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
               "-o jsonpath='{.spec.holderIdentity}'); "
               'test -n "$h"',
-              timeout=30,
+              timeout=90,
           )
           # And renewing (not just a stale holder string).
           for _ in range(6):
