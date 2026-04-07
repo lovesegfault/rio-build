@@ -52,6 +52,11 @@ pub enum StorePathError {
 
     #[error("invalid nixbase32 string: non-zero padding bits (non-canonical encoding)")]
     InvalidBase32Padding,
+
+    #[error(
+        "fixed-output path with references requires recursive SHA-256 (got {algo}, recursive={recursive})"
+    )]
+    FixedOutputRefsNotAllowed { algo: &'static str, recursive: bool },
 }
 
 /// The 20-byte hash part of a Nix store path.
@@ -178,15 +183,46 @@ impl StorePath {
     ///
     /// `hash` is the content hash, `is_recursive` indicates NAR vs flat hashing.
     ///
-    /// Nix algorithm: for fixed outputs, there's an inner hash step:
+    /// Nix has two cases (`StoreDirConfig::makeFixedOutputPath`):
+    ///
+    /// **Recursive SHA-256** — single-level `source` fingerprint, references
+    /// allowed (sorted into the type-string):
+    ///   type = "source" + ":" + ref1 + ":" + ref2 + ...
+    ///   fingerprint = "{type}:sha256:{hex(hash)}:/nix/store:{name}"
+    ///
+    /// **Everything else** — references must be empty; inner-hash step:
     ///   inner = SHA-256("fixed:out:{r:}{algo}:{hex(hash)}:")
     ///   fingerprint = "output:out:sha256:{hex(inner)}:/nix/store:{name}"
-    ///   pathHash = compressHash(SHA-256(fingerprint))
     pub fn make_fixed_output(
         name: &str,
         hash: &crate::hash::NixHash,
         is_recursive: bool,
+        references: &[StorePath],
     ) -> Result<Self, StorePathError> {
+        use crate::hash::HashAlgo;
+
+        if is_recursive && hash.algo() == HashAlgo::SHA256 {
+            let mut sorted: Vec<&str> = references.iter().map(|r| r.as_str()).collect();
+            sorted.sort_unstable();
+            let mut type_str = "source".to_string();
+            for r in sorted {
+                type_str.push(':');
+                type_str.push_str(r);
+            }
+            let fingerprint = format!(
+                "{type_str}:sha256:{}:{STORE_DIR}:{name}",
+                hex::encode(hash.digest()),
+            );
+            return Self::from_fingerprint(name, &fingerprint);
+        }
+
+        if !references.is_empty() {
+            return Err(StorePathError::FixedOutputRefsNotAllowed {
+                algo: hash.algo().as_str(),
+                recursive: is_recursive,
+            });
+        }
+
         let r_prefix = if is_recursive { "r:" } else { "" };
         let inner = format!(
             "fixed:out:{r_prefix}{}:{}:",
@@ -612,6 +648,72 @@ mod tests {
         let dbg = format!("{:?}", p.hash);
         assert!(dbg.starts_with("StorePathHash("));
         assert!(dbg.contains("7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y"));
+        Ok(())
+    }
+
+    /// Golden: `nix-store --add-fixed --recursive sha256` on a 5-byte file
+    /// containing `"hello"`. Recursive-SHA256 takes the `source` type-string
+    /// path (single-level fingerprint, no inner hash).
+    #[test]
+    fn test_make_fixed_output_recursive_sha256_golden() -> anyhow::Result<()> {
+        let nar_hash = crate::hash::NixHash::new(
+            crate::hash::HashAlgo::SHA256,
+            hex::decode("0a430879c266f8b57f4092a0f935cf3facd48bbccde5760d4748ca405171e969")?,
+        )?;
+        let p = StorePath::make_fixed_output("rio-golden-src", &nar_hash, true, &[])?;
+        assert_eq!(
+            p.as_str(),
+            "/nix/store/3qn89hl6wq39p2ixq28c7iqq2ifcy3i3-rio-golden-src"
+        );
+        Ok(())
+    }
+
+    /// Golden: `nix-store --add-fixed sha256` (flat) on the same `"hello"` file.
+    /// Non-recursive takes the `output:out` + inner-hash path.
+    #[test]
+    fn test_make_fixed_output_flat_sha256_golden() -> anyhow::Result<()> {
+        let flat_hash = crate::hash::NixHash::new(
+            crate::hash::HashAlgo::SHA256,
+            hex::decode("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")?,
+        )?;
+        let p = StorePath::make_fixed_output("rio-golden-flat", &flat_hash, false, &[])?;
+        assert_eq!(
+            p.as_str(),
+            "/nix/store/bgl87mmq51gwdn64nvbnxp8vql0164vn-rio-golden-flat"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_make_fixed_output_recursive_sha256_sorts_references() -> anyhow::Result<()> {
+        let r_a = StorePath::parse("/nix/store/00000000000000000000000000000000-a-ref")?;
+        let r_b = StorePath::parse("/nix/store/11111111111111111111111111111111-b-ref")?;
+        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
+
+        let p_sorted =
+            StorePath::make_fixed_output("src", &hash, true, &[r_a.clone(), r_b.clone()])?;
+        let p_rev = StorePath::make_fixed_output("src", &hash, true, &[r_b, r_a.clone()])?;
+        assert_eq!(p_sorted, p_rev, "ref ordering must not affect path");
+
+        let p_noref = StorePath::make_fixed_output("src", &hash, true, &[])?;
+        assert_ne!(p_sorted, p_noref, "refs must change the path");
+        Ok(())
+    }
+
+    #[test]
+    fn test_make_fixed_output_refs_rejected_unless_recursive_sha256() -> anyhow::Result<()> {
+        let r = StorePath::parse("/nix/store/00000000000000000000000000000000-a-ref")?;
+        let sha256 = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
+        let sha512 = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA512, vec![0u8; 64])?;
+
+        assert!(matches!(
+            StorePath::make_fixed_output("x", &sha256, false, std::slice::from_ref(&r)),
+            Err(StorePathError::FixedOutputRefsNotAllowed { .. })
+        ));
+        assert!(matches!(
+            StorePath::make_fixed_output("x", &sha512, true, std::slice::from_ref(&r)),
+            Err(StorePathError::FixedOutputRefsNotAllowed { .. })
+        ));
         Ok(())
     }
 

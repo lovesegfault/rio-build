@@ -355,7 +355,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
             ),
         }
     } else {
-        match StorePath::make_fixed_output(&name, &content_hash, is_recursive) {
+        match StorePath::make_fixed_output(&name, &content_hash, is_recursive, &ref_paths) {
             Ok(p) => p,
             Err(e) => stderr_err!(
                 stderr,
