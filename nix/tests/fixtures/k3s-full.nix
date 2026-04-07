@@ -523,15 +523,25 @@ rec {
         assert name, f"no Running pod for rio.build/pool={pool} in ns={ns}"
         return name
 
-    def wait_worker_pod(pool="x86-64", ns="${nsBuilders}", timeout=120):
+    def wait_worker_pod(pool="x86-64", ns="${nsBuilders}", timeout=180):
         """Poll until a worker pod is Running for the pool; return its
         name. With ephemeral Jobs, a build must be queued first."""
-        k3s_server.wait_until_succeeds(
-            f"test -n \"$(k3s kubectl -n {ns} get pod "
-            f"-l rio.build/pool={pool} "
-            "--field-selector=status.phase=Running -o name)\"",
-            timeout=timeout,
-        )
+        try:
+            k3s_server.wait_until_succeeds(
+                f"test -n \"$(k3s kubectl -n {ns} get pod "
+                f"-l rio.build/pool={pool} "
+                "--field-selector=status.phase=Running -o name)\"",
+                timeout=timeout,
+            )
+        except Exception:
+            print(f"=== wait_worker_pod TIMEOUT pool={pool} ns={ns} ===")
+            print(k3s_server.execute(
+                f"k3s kubectl -n {ns} get builderpool,fetcherpool,job,pod -o wide 2>&1; "
+                f"k3s kubectl -n {ns} describe builderpool 2>&1; "
+                "k3s kubectl -n rio-system logs deploy/rio-controller --tail=60 2>&1; "
+                "k3s kubectl -n rio-system logs deploy/rio-scheduler --tail=40 2>&1"
+            )[1])
+            raise
         return worker_pod(pool=pool, ns=ns)
   '';
 
