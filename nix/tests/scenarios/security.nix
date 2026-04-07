@@ -1064,6 +1064,13 @@ in
       # One trivial build to prove FUSE works end-to-end. Distinct
       # marker (no DAG-dedup with any other scenario's drvs).
       nonprivDrv = drvs.mkTrivial { marker = "sec-nonpriv-e2e"; };
+      # Ephemeral workers: long-sleep warmup so the pod-introspection
+      # subtests (nonpriv-admitted, cgroup-remount) have a Running pod
+      # to inspect. Outlives those subtests; never awaited.
+      warmupDrv = drvs.mkTrivial {
+        marker = "sec-nonpriv-warmup";
+        sleepSecs = 300;
+      };
     in
     pkgs.testers.runNixOSTest {
       name = "rio-security-nonpriv";
@@ -1085,6 +1092,22 @@ in
         start_all()
         ${fixture.waitReady}
         ${fixture.kubectlHelpers}
+
+        # Ephemeral workers: spawn one before the pod-introspection
+        # subtests below. sshKeySetup + seed + warmup build → wait_worker_pod.
+        ${fixture.sshKeySetup}
+        ${common.seedBusybox "k3s-server"}
+        ${common.mkBuildHelperV2 {
+          gatewayHost = "k3s-server";
+          dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")'';
+        }}
+        client.succeed(
+            "nohup nix-build --no-out-link --store ssh-ng://k3s-server "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${warmupDrv} >/tmp/warmup.log 2>&1 &"
+        )
+        wp = wait_worker_pod(timeout=270)
+        print(f"nonpriv: warmup spawned worker pod {wp}")
 
         ${
           # ── PSA restricted: control-plane namespaces enforce + pods admitted ──
@@ -1228,7 +1251,7 @@ in
         # miss, null vs false semantics), the DS check above might still
         # pass (DS runs regardless) but THIS fails — the load-bearing half.
         with subtest("nonpriv-admitted: privileged:false + device-plugin rendered and admitted"):
-            pod_json = kubectl("get pod rio-builder-x86-64-0 -o json", ns="${nsBuilders}")
+            pod_json = kubectl(f"get pod {wp} -o json", ns="${nsBuilders}")
             pod = json.loads(pod_json)
 
             # hostUsers: vmtest-full-nonpriv.yaml sets hostUsers:true
@@ -1313,7 +1336,7 @@ in
             #    the remount failed (EROFS) or mkdir failed (EACCES
             #    under userns), the worker crashes BEFORE this log
             #    line → CrashLoopBackOff → we never reach this subtest.
-            log = kubectl("logs rio-builder-x86-64-0", ns="${nsBuilders}")
+            log = kubectl(f"logs {wp}", ns="${nsBuilders}")
             assert "moved self into leaf sub-cgroup" in log, (
                 "worker log should show 'moved self into leaf sub-"
                 "cgroup' (delegated_root() success signal). Log tail: "
@@ -1326,7 +1349,7 @@ in
             #    cri-containerd-<id>.scope/leaf. Checking on k3s-agent
             #    (where the pod scheduled — see describe Node field).
             cid = kubectl(
-                "get pod rio-builder-x86-64-0 "
+                f"get pod {wp} "
                 "-o jsonpath='{.status.containerStatuses[0].containerID}'",
                 ns="${nsBuilders}",
             ).strip().removeprefix("containerd://")
@@ -1364,19 +1387,6 @@ in
                 f"cgroup-remount PASS: worker log shows leaf move, "
                 f"host-side leaf/ exists, subtree_control={subtree!r}"
             )
-
-        # ── SSH + seed (top-level — interpolated helpers emit col-0) ────
-        # fixture.sshKeySetup patches the rio-gateway-ssh Secret +
-        # scale-bounces; seedBusybox copies the static busybox closure.
-        # Both expand to multi-line Python at col-0 — placing them
-        # inside a `with subtest(...)` block would IndentationError.
-        ${fixture.sshKeySetup}
-        ${common.seedBusybox "k3s-server"}
-
-        ${common.mkBuildHelperV2 {
-          gatewayHost = "k3s-server";
-          dumpLogsExpr = ''dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")'';
-        }}
 
         # ── Build completes: FUSE works via device-plugin injection ─────
         # The FUSE mount is the overlay lower layer. If device-plugin

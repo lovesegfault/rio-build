@@ -40,6 +40,13 @@ let
   jq = "${pkgs.jq}/bin/jq";
   dig = "${pkgs.dnsutils}/bin/dig";
   inherit (fixture) nsBuilders nsStore;
+  drvs = import ../lib/derivations.nix { inherit pkgs; };
+  # Ephemeral workers: spawn one via a long-sleep build so the netns
+  # probes have a pod to enter. 300s outlives the probe sequence.
+  warmupDrv = drvs.mkTrivial {
+    marker = "netpol-warmup";
+    sleepSecs = 300;
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-netpol";
@@ -47,7 +54,8 @@ pkgs.testers.runNixOSTest {
 
   # k3s bring-up ~4min + kube-router sync + a handful of 5s connect
   # probes. No builds, no rollouts.
-  globalTimeout = 600 + common.covTimeoutHeadroom;
+  # +180s for sshKeySetup gateway-bounce + warmup Job spawn.
+  globalTimeout = 780 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -60,6 +68,24 @@ pkgs.testers.runNixOSTest {
     start_all()
     ${fixture.waitReady}
     ${fixture.kubectlHelpers}
+    ${fixture.sshKeySetup}
+    ${common.seedBusybox "k3s-server"}
+    ${common.mkBuildHelperV2 {
+      gatewayHost = "k3s-server";
+      dumpLogsExpr = ''print("(netpol: build failed; pod logs follow)")'';
+    }}
+
+    # Ephemeral workers: no pod exists until a build is queued. Submit
+    # a long-sleep build in the background so the probes below have a
+    # netns to enter. The build is never awaited — test ends before it
+    # completes.
+    client.succeed(
+        "nohup nix-build --no-out-link --store ssh-ng://k3s-server "
+        "--arg busybox '(builtins.storePath ${common.busybox})' "
+        "${warmupDrv} >/tmp/warmup.log 2>&1 &"
+    )
+    wp = wait_worker_pod(timeout=180)
+    print(f"netpol: warmup spawned worker pod {wp}")
 
     # ── NetworkPolicy object exists (helm template rendered + applied) ──
     # vmtest-full.yaml has networkPolicy.enabled=false; extraValues
@@ -79,26 +105,25 @@ pkgs.testers.runNixOSTest {
     time.sleep(10)
 
     # ── Resolve worker pod → VM node → container PID ──────────────────
-    # Same node-resolution trick as lifecycle.nix:561-565 — STS may
-    # schedule rio-builder-x86-64-0 to either k3s-server or k3s-agent.
-    # Then crictl → container PID → nsenter -n into its netns. All
+    # The Job pod may schedule to either k3s-server or k3s-agent. Then
+    # crictl → container PID → nsenter -n into its netns. All
     # containers in one pod share one netns (pause container's), so
     # head -1 of any running container works.
     worker_node = kubectl(
-        "get pod rio-builder-x86-64-0 -o jsonpath='{.spec.nodeName}'",
+        f"get pod {wp} -o jsonpath='{{.spec.nodeName}}'",
         ns="${nsBuilders}",
     ).strip()
     worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
-    print(f"netpol: rio-builder-x86-64-0 is on {worker_node}")
+    print(f"netpol: {wp} is on {worker_node}")
 
     # crictl ps --label filters to THIS pod's containers. -q gives bare
     # container IDs. k3s bundles crictl (k3s crictl). .info.pid is the
     # container's PID 1 in the host's PID namespace — nsenter -t target.
     cid = worker_vm.succeed(
         "k3s crictl ps -q "
-        "--label io.kubernetes.pod.name=rio-builder-x86-64-0 | head -1"
+        f"--label io.kubernetes.pod.name={wp} | head -1"
     ).strip()
-    assert cid, "no running container found for rio-builder-x86-64-0"
+    assert cid, f"no running container found for {wp}"
     pid = worker_vm.succeed(
         f"k3s crictl inspect {cid} | ${jq} -r .info.pid"
     ).strip()

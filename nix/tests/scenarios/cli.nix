@@ -86,31 +86,19 @@ pkgs.testers.runNixOSTest {
     # print_status formats as "executors: N total, ...". At least one
     # builder pod (rio-builder-x86-64-0) should be registered by now —
     # waitReady blocks until it's Ready.
-    with subtest("cli status: ClusterStatus shows executors"):
-        # I-163: cluster_status reads a watch-cached snapshot published
-        # per-Tick (~1s). A worker that just connected won't appear in
-        # the executor COUNT until the next Tick fires (the per-worker
-        # ListWorkers detail below is actor-routed and live, so it CAN
-        # show the worker while the count is still 0 — the very race
-        # this retry guards). Retry up to 5× / 1s.
+    with subtest("cli status: ClusterStatus RPC succeeds"):
+        # Ephemeral workers: zero executors until a build is queued.
+        # The test cares that the AdminService RPCs succeed and the
+        # output is well-formed, not that a specific count is present.
         import re
-        import time
-        for attempt in range(5):
-            out = cli("status")
-            print(f"cli status output (attempt {attempt+1}):\n{out}")
-            m = re.search(r'executors:\s+(\d+)\s+total', out)
-            if m and int(m.group(1)) >= 1:
-                break
-            time.sleep(1)
+        out = cli("status")
+        print(f"cli status output:\n{out}")
         assert "executors:" in out, (
             f"status output should contain 'executors:' summary line:\n{out!r}"
         )
-        assert m and int(m.group(1)) >= 1, (
-            f"expected ≥1 executor in status summary after 5 retries:\n{out!r}"
-        )
-        # ListWorkers detail line (main.rs:143): "  worker <id> [<status>] ..."
-        assert "  worker " in out, (
-            f"status should include per-worker detail lines:\n{out!r}"
+        m = re.search(r'executors:\s+(\d+)\s+total', out)
+        assert m and int(m.group(1)) >= 0, (
+            f"expected non-negative executor count in status:\n{out!r}"
         )
 
     # ══════════════════════════════════════════════════════════════════
@@ -140,25 +128,17 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # workers — standalone ListWorkers (detailed view) + --json
     # ══════════════════════════════════════════════════════════════════
-    with subtest("cli workers: detailed view + --json is valid"):
-        # Human output: print_worker multi-line format, "worker <id> [<status>]"
-        # on line 1. Same ≥1-worker invariant as status — waitReady
-        # guarantees rio-builder-x86-64-0 registered.
+    with subtest("cli workers: --json is valid"):
+        # Ephemeral workers: zero until a build is queued. Assert the
+        # JSON shape (`.executors` is an array), not a count.
         out = cli("workers")
         print(f"cli workers output:\n{out}")
-        assert "worker " in out and "[" in out, (
-            f"workers should print per-worker blocks:\n{out!r}"
-        )
-
-        # --json: jq -e '.executors | length >= 1' exits nonzero if the
-        # key is absent, not an array, or empty. Store-path jq pulls
-        # it into the VM closure (same trick as netcat above).
         k3s_server.succeed(
             "${common.covShellEnv}"
             "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             "${rioCli} workers --json "
-            "| ${pkgs.jq}/bin/jq -e '.executors | length >= 1'"
+            "| ${pkgs.jq}/bin/jq -e '.executors | type == \"array\"'"
         )
 
     # ══════════════════════════════════════════════════════════════════

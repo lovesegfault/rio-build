@@ -64,11 +64,12 @@ let
   # fetcher-egress ipBlock except-clause.
   originIP = "203.0.113.1";
 
-  builderPod = "rio-builder-x86-64-0";
-  # I-170 + multi-arch: per-class STS naming → rio-fetcher-{pool}-
-  # {class}-{ordinal}. fetcherPools[] entry name is "x86-64";
-  # smallest class (tiny) hosts the test's FOD.
-  fetcherPod = "rio-fetcher-x86-64-tiny-0";
+  # Ephemeral workers: pod names are Job-generated, not STS ordinals.
+  # Resolved at runtime via wait_worker_pod() after the build is
+  # queued. fetcherPools[] entry "x86-64" + class "tiny" → pool
+  # label `x86-64-tiny`.
+  builderPool = "x86-64";
+  fetcherPool = "x86-64-tiny";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-fetcher-split";
@@ -92,6 +93,7 @@ pkgs.testers.runNixOSTest {
     ${fixture.waitReady}
     ${fixture.kubectlHelpers}
     ${fixture.sshKeySetup}
+    ${common.seedBusybox "k3s-server"}
 
     # ══════════════════════════════════════════════════════════════════
     # FIXTURE PREP — seccomp profiles + node labels + "public" origin
@@ -133,44 +135,29 @@ pkgs.testers.runNixOSTest {
         "ip addr add ${originIP}/24 dev eth1 && "
         "iptables -I nixos-fw -p tcp --dport 80 -j ACCEPT && "
         "mkdir -p /srv && "
-        "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox"
+        "ln -sf ${drvs.coldBootstrapBusybox} /srv/busybox && "
+        "echo ok > /srv/ok"
     )
-    # systemd-run detaches cleanly — nohup+& can leave the test
-    # driver's pipe open (succeed() reads until EOF → hangs forever).
+    # /busybox is delayed 30s so the one-shot fetcher pod stays Running
+    # long enough for the netns probe below. /ok and / serve immediately
+    # (the netpol probes use those, not /busybox). systemd-run detaches
+    # cleanly — nohup+& can leave the driver's pipe open → succeed() hangs.
     k3s_server.succeed(
-        "systemd-run --unit=test-origin ${py3} -m http.server 80 "
-        "--bind 0.0.0.0 --directory /srv"
+        "cat >/srv/slow.py <<'PY'\n"
+        "import http.server, time, os\n"
+        "os.chdir('/srv')\n"
+        "class H(http.server.SimpleHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        if self.path == '/busybox': time.sleep(30)\n"
+        "        super().do_GET()\n"
+        "http.server.ThreadingHTTPServer(('0.0.0.0', 80), H).serve_forever()\n"
+        "PY"
+    )
+    k3s_server.succeed(
+        "systemd-run --unit=test-origin ${py3} /srv/slow.py"
     )
     for n in [k3s_agent, client]:
         n.succeed("ip route add 203.0.113.0/24 dev eth1 || true")
-
-    # ── Wait for BOTH pool pods Ready ─────────────────────────────────
-    # Builder pod was already awaited by waitReady. Fetcher pod is NEW:
-    # helm-rendered FetcherPool CR → reconciler SSA-applies STS →
-    # wait-seccomp initContainer (profile lands above → passes) →
-    # device-plugin injects /dev/fuse → main container starts. ~30-60s
-    # on top of the builder-Ready baseline.
-    rc, _ = k3s_server.execute(
-        "k3s kubectl -n ${nsFetchers} wait --for=condition=Ready "
-        "pod/${fetcherPod} --timeout=180s"
-    )
-    if rc != 0:
-        print("=== fetcher-Ready TIMEOUT: diagnostic dump ===")
-        print(k3s_server.execute(
-            "k3s kubectl -n ${nsFetchers} get fetcherpool,sts,pod -o wide 2>&1; "
-            "k3s kubectl -n ${nsFetchers} describe fetcherpool 2>&1; "
-            "k3s kubectl -n ${nsFetchers} describe pod ${fetcherPod} 2>&1"
-        )[1])
-        print("--- controller logs (reconcile errors) ---")
-        print(k3s_server.execute(
-            "k3s kubectl -n rio-system logs deploy/rio-controller --tail=80 2>&1"
-        )[1])
-        print("--- kubectl logs --previous (the crash stderr) ---")
-        print(k3s_server.execute(
-            "k3s kubectl -n ${nsFetchers} logs ${fetcherPod} -c fetcher --previous 2>&1 "
-            "|| k3s kubectl -n ${nsFetchers} logs ${fetcherPod} -c fetcher 2>&1"
-        )[1])
-        raise Exception("${fetcherPod} not Ready after 180s (see dump above)")
 
     # ── NetworkPolicies rendered + applied ────────────────────────────
     # networkPolicy.enabled=true in extraValues → helm-render puts
@@ -197,46 +184,19 @@ pkgs.testers.runNixOSTest {
       dumpLogsExpr = ''[dump_all_logs([], kube_node=k3s_server, kube_namespace=n) for n in ("${ns}", "${nsFetchers}", "${nsBuilders}")]'';
     }}
 
-    with subtest("dispatch-fod+nonfod: FOD→fetcher, consumer→builder"):
-        # url override → TEST-NET-3 origin. The FOD's http fetch goes
-        # through the fetcher pod's fetcher-egress NetPol (80 allowed).
-        out = build(
-            "${drvs.fodConsumer}",
-            extra_args="--argstr url http://${originIP}/busybox",
-            timeout_wrap=180,
-        )
-        assert out.startswith("/nix/store/"), f"build returned {out!r}"
-        assert "rio-split" in out, f"wrong output name: {out!r}"
-
-        # Log-grep: which pod ran which half. rio-builder logs the
-        # drv name at INFO on build start. FOD name is "busybox"
-        # (derivation.name); consumer is "rio-split-split".
-        # Container name is role.as_str() (common/sts.rs:476) —
-        # "builder" / "fetcher". -c required: pods have initContainers
-        # (wait-seccomp, wait-fuse).
-        fetcher_logs = kubectl(
-            "logs ${fetcherPod} -c fetcher", ns="${nsFetchers}"
-        )
-        builder_logs = kubectl(
-            "logs ${builderPod} -c builder", ns="${nsBuilders}"
-        )
-        assert "busybox" in fetcher_logs, (
-            "FOD (busybox) not in fetcher logs — misrouted to builder? "
-            f"fetcher logs:\n{fetcher_logs[-2000:]}"
-        )
-        assert "rio-split" in builder_logs, (
-            "consumer (rio-split) not in builder logs — misrouted to "
-            f"fetcher? builder logs:\n{builder_logs[-2000:]}"
-        )
-        print("dispatch PASS: FOD→fetcher, consumer→builder")
-
-    # ══════════════════════════════════════════════════════════════════
-    # netns-resolve helpers (builder + fetcher)
-    # ══════════════════════════════════════════════════════════════════
-    # Same pattern as netpol.nix:80-112: crictl → container PID →
-    # nsenter -n into the pod netns. Keep host mountns so store-path
-    # curl/nc resolve. Both pods may land on either k3s node — resolve
-    # via .spec.nodeName first.
+    # Ephemeral workers: submit the build in BACKGROUND so pods stay
+    # Running while the netns probes below execute. sleepSecs=120 keeps
+    # the builder pod alive past the probe sequence; the fetcher pod
+    # lives only as long as the FOD fetch — probe it first.
+    client.succeed(
+        "nohup nix-build --no-out-link --store ssh-ng://k3s-server "
+        "--arg busybox '(builtins.storePath ${common.busybox})' "
+        "--argstr url http://${originIP}/busybox "
+        "--arg sleepSecs 30 "
+        "${drvs.fodConsumer} >/tmp/split-build.log 2>&1 &"
+    )
+    # crictl → container PID → nsenter -n into the pod netns. Keep host
+    # mountns so store-path curl/nc resolve. Same pattern as netpol.nix.
     def netns_handle(pod, ns_):
         node = kubectl(
             f"get pod {pod} -o jsonpath='{{.spec.nodeName}}'", ns=ns_
@@ -253,37 +213,30 @@ pkgs.testers.runNixOSTest {
         print(f"{pod} on {node} pid={pid}")
         return vm, pid
 
-    builder_vm, builder_pid = netns_handle("${builderPod}", "${nsBuilders}")
-    fetcher_vm, fetcher_pid = netns_handle("${fetcherPod}", "${nsFetchers}")
-
-    def builder_exec(cmd):
-        return builder_vm.execute(f"nsenter -t {builder_pid} -n -- {cmd}")
+    try:
+        fetcher_pod = wait_worker_pod(
+            pool="${fetcherPool}", ns="${nsFetchers}", timeout=180
+        )
+    except Exception:
+        print("=== fetcher pod TIMEOUT: diagnostic dump ===")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${nsFetchers} get fetcherpool,job,pod -o wide 2>&1; "
+            "k3s kubectl -n ${nsFetchers} describe fetcherpool 2>&1; "
+            "k3s kubectl -n rio-system logs deploy/rio-controller --tail=80 2>&1"
+        )[1])
+        raise
+    # Resolve fetcher netns NOW and run all fetcher_exec probes BEFORE
+    # waiting for the builder. One-shot pod lives only as long as the
+    # FOD (held to ~30s by the slow /busybox handler); the builder pod
+    # won't exist until the FOD completes, so waiting for it first
+    # guarantees the fetcher is already gone.
+    fetcher_vm, fetcher_pid = netns_handle(fetcher_pod, "${nsFetchers}")
     def fetcher_exec(cmd):
         return fetcher_vm.execute(f"nsenter -t {fetcher_pid} -n -- {cmd}")
 
-    # ══════════════════════════════════════════════════════════════════
-    # builder-airgap — builder BLOCKED from TEST-NET-3 origin
-    # ══════════════════════════════════════════════════════════════════
-    # Positive control first: scheduler ClusterIP MUST connect
-    # (builder-egress explicitly allows it). Then the origin probe.
-    with subtest("builder-airgap: builder blocked from 'public' origin"):
-        sched_ip = kubectl(
-            "get svc rio-scheduler -o jsonpath='{.spec.clusterIP}'"
-        ).strip()
-        rc, out = builder_exec(f"${nc} -z -w5 {sched_ip} 9001")
-        assert rc == 0, (
-            f"POSITIVE CONTROL FAILED: builder→scheduler:{sched_ip}:9001 "
-            f"rc={rc}. NetPol allows this; subsequent rc!=0 VACUOUS.\n{out}"
-        )
-
-        rc, out = builder_exec(
-            "${curl} --max-time 5 -sS http://${originIP}/"
-        )
-        assert rc != 0, (
-            f"builder reached ${originIP}:80 (rc=0) — builder-egress NOT "
-            f"enforcing. ADR-019 airgap: no 0.0.0.0/0 allow-rule.\n{out}"
-        )
-        print(f"builder-airgap PASS: ${originIP}:80 blocked (rc={rc})")
+    sched_ip = kubectl(
+        "get svc rio-scheduler -o jsonpath='{.spec.clusterIP}'"
+    ).strip()
 
     # ══════════════════════════════════════════════════════════════════
     # fetcher-egress — fetcher REACHES TEST-NET-3 origin
@@ -300,7 +253,7 @@ pkgs.testers.runNixOSTest {
 
         rc, out = fetcher_exec(
             "${curl} --max-time 5 -sS -o /dev/null -w '%{http_code}' "
-            "http://${originIP}/busybox"
+            "http://${originIP}/ok"
         )
         assert rc == 0, (
             f"fetcher BLOCKED from ${originIP}:80 (rc={rc}) — "
@@ -327,6 +280,37 @@ pkgs.testers.runNixOSTest {
         print(f"fetcher-imds PASS: blocked (rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
+    # builder-airgap — builder BLOCKED from TEST-NET-3 origin
+    # ══════════════════════════════════════════════════════════════════
+    # Builder pod appears once the FOD completes; sleepSecs=120 in the
+    # consumer drv keeps it alive for these probes. Positive control
+    # first: scheduler ClusterIP MUST connect (builder-egress explicitly
+    # allows it). Then the origin probe.
+    builder_pod = wait_worker_pod(
+        pool="${builderPool}", ns="${nsBuilders}", timeout=180
+    )
+    builder_vm, builder_pid = netns_handle(builder_pod, "${nsBuilders}")
+    print(f"fetcher-split: fetcher={fetcher_pod} builder={builder_pod}")
+    def builder_exec(cmd):
+        return builder_vm.execute(f"nsenter -t {builder_pid} -n -- {cmd}")
+
+    with subtest("builder-airgap: builder blocked from 'public' origin"):
+        rc, out = builder_exec(f"${nc} -z -w5 {sched_ip} 9001")
+        assert rc == 0, (
+            f"POSITIVE CONTROL FAILED: builder→scheduler:{sched_ip}:9001 "
+            f"rc={rc}. NetPol allows this; subsequent rc!=0 VACUOUS.\n{out}"
+        )
+
+        rc, out = builder_exec(
+            "${curl} --max-time 5 -sS http://${originIP}/"
+        )
+        assert rc != 0, (
+            f"builder reached ${originIP}:80 (rc=0) — builder-egress NOT "
+            f"enforcing. ADR-019 airgap: no 0.0.0.0/0 allow-rule.\n{out}"
+        )
+        print(f"builder-airgap PASS: ${originIP}:80 blocked (rc={rc})")
+
+    # ══════════════════════════════════════════════════════════════════
     # fetcher-node-dedicated — toleration + nodeSelector wired
     # ══════════════════════════════════════════════════════════════════
     # Full Karpenter NodePool isolation isn't testable in k3s (no
@@ -337,7 +321,7 @@ pkgs.testers.runNixOSTest {
     # enforcement is EKS-only.
     with subtest("fetcher-node-dedicated: toleration + selector present"):
         spec = _json.loads(
-            kubectl("get pod ${fetcherPod} -o json", ns="${nsFetchers}")
+            kubectl(f"get pod {fetcher_pod} -o json", ns="${nsFetchers}")
         )["spec"]
         tols = spec.get("tolerations", [])
         assert any(t.get("key") == "rio.build/fetcher" for t in tols), (
@@ -356,6 +340,20 @@ pkgs.testers.runNixOSTest {
         )
         print(f"fetcher-node-dedicated PASS: toleration+selector wired, "
               f"pod on {node}")
+
+    with subtest("dispatch-fod+nonfod: FOD→fetcher, consumer→builder"):
+        # Placement proof is structural: wait_worker_pod found
+        # fetcher_pod in nsFetchers and builder_pod in nsBuilders after
+        # this build was the only work submitted — wrong routing would
+        # leave one namespace empty. Log-grep dropped: one-shot pods
+        # are reaped by the controller before this subtest runs.
+        # Await the background build → assert it succeeded.
+        client.wait_until_succeeds(
+            "grep -q '^/nix/store/' /tmp/split-build.log", timeout=240
+        )
+        out = client.succeed("tail -1 /tmp/split-build.log").strip()
+        assert "rio-split" in out, f"build returned {out!r}"
+        print("dispatch PASS: FOD→fetcher, consumer→builder")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

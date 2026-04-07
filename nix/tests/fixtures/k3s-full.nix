@@ -511,6 +511,28 @@ rec {
             "get lease rio-scheduler-leader "
             "-o jsonpath='{.spec.holderIdentity}'"
         ).strip()
+
+    def worker_pod(pool="x86-64", ns="${nsBuilders}", node=k3s_server):
+        """First Running worker pod for a pool. Ephemeral Jobs have no
+        stable ordinal — resolve by label. Raises if none found."""
+        name = node.succeed(
+            f"k3s kubectl -n {ns} get pod -l rio.build/pool={pool} "
+            "--field-selector=status.phase=Running "
+            "-o jsonpath='{.items[0].metadata.name}'"
+        ).strip()
+        assert name, f"no Running pod for rio.build/pool={pool} in ns={ns}"
+        return name
+
+    def wait_worker_pod(pool="x86-64", ns="${nsBuilders}", timeout=120):
+        """Poll until a worker pod is Running for the pool; return its
+        name. With ephemeral Jobs, a build must be queued first."""
+        k3s_server.wait_until_succeeds(
+            f"test -n \"$(k3s kubectl -n {ns} get pod "
+            f"-l rio.build/pool={pool} "
+            "--field-selector=status.phase=Running -o name)\"",
+            timeout=timeout,
+        )
+        return worker_pod(pool=pool, ns=ns)
   '';
 
   # Full bring-up: ~3-4min wall. Heavy ordering dependency chain —
