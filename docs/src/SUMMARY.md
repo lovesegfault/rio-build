@@ -27,6 +27,7 @@
   - [ADR-020: Per-Derivation Capacity Manifest](./decisions/020-per-derivation-capacity-manifest.md)
   - [ADR-021: NixOS Worker-Node AMI](./decisions/021-nixos-node-ami.md)
   - [ADR-022: Lazy Store FS (composefs-style)](./decisions/022-lazy-store-fs-erofs-vs-riofs.md)
+    - [Design Overview](./decisions/022-design-overview.md)
     - [Implementation Plan](./decisions/022-implementation-plan.md)
   - [ADR-024: Build-Log Archival Stays in Scheduler](./decisions/024-log-archival-placement.md)
 - [Components](./components.md)
