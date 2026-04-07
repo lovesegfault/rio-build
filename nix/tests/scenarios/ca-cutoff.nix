@@ -30,7 +30,7 @@ in
 pkgs.testers.runNixOSTest {
   name = "rio-ca-cutoff";
   skipTypeCheck = true;
-  # Build-1 ~24s (3×8s serial) + build-2 <15s + VM boot ~30s + slack.
+  # Build-1 ~24s (3×8s serial) + build-2 <25s + VM boot ~30s + slack.
   # 600s matches observability.nix's generous ceiling.
   globalTimeout = 600 + common.covTimeoutHeadroom;
 
@@ -113,13 +113,14 @@ pkgs.testers.runNixOSTest {
             "or cutoff-compare not matching (check scheduler logs for "
             "'CA cutoff-compare: ... counting as miss')."
         )
-        # A rebuilds (~8s), B+C skip (instant) → total <15s not 24s.
-        # Upper bound gives ~7s slack for VM noise. If this assertion
-        # fails but saves_total passed, something ELSE is slow (the
-        # scheduler isn't releasing C after B skips, or the gateway
-        # is blocking on a timeout).
-        assert elapsed < 15, (
-            f"build-2 took {elapsed:.1f}s (expected <15s with cutoff). "
+        # A rebuilds (~8s), B+C skip (instant) → ~8s of build work.
+        # One-shot worker overhead: build-1's worker exited; build-2
+        # waits for systemd Restart=always (1s) + scheduler re-register
+        # (~5-10s under VM load). 25s bound = 8s build + ~10s restart
+        # + 7s slack. The saves_total check above is the cutoff PROOF;
+        # this asserts "closer to one-build than three-builds" timing.
+        assert elapsed < 25, (
+            f"build-2 took {elapsed:.1f}s (expected <25s with cutoff). "
             f"saves_total delta={saves_after2 - saves_after1} — "
             "if saves≥2, B+C WERE skipped but something else is slow."
         )

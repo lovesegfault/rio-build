@@ -2102,14 +2102,22 @@ let
       # overlapping closures with one malicious. The "fresh pod = fresh
       # emptyDir" property is structural — K8s guarantees it.
       with subtest("ephemeral-pool: no STS, Job spawned, pod reaped, second build = new Job"):
-          # Precondition: no STS workers. The finalizer fragment (run
-          # before this) deletes the default pool and waits its own
-          # pods gone. wait_workers_zero (see prelude) bounds the
-          # scheduler's view by the heartbeat-timeout fallback path —
-          # I-195 closed the coverage-mode SIGTERM-reconnect re-
-          # register (GHA 24018216226) but also removed the second-
-          # chance stream-EOF; under GHA load the single EOF can be
-          # lost, falling back to ~60s heartbeat-reap per executor.
+          # Precondition: no other BuilderPool may serve this subtest's
+          # builds. Before the STS-path removal, the finalizer fragment
+          # ran first and deleted the default `x86-64` pool; with it
+          # unwired this subtest is first in the chain, so delete the
+          # default pool here. Otherwise the x86-64 pool's ephemeral
+          # reconciler ALSO sees queued>0 and spawns — build 2 may
+          # dispatch there, leaving no `rio.build/pool=ephemeral` Job.
+          kubectl(
+              "delete builderpool x86-64 --ignore-not-found --wait=true",
+              ns="${nsBuilders}",
+          )
+          # wait_workers_zero (see prelude) bounds the scheduler's view
+          # by the heartbeat-timeout fallback — I-195 closed the
+          # coverage-mode SIGTERM-reconnect re-register but also removed
+          # the second-chance stream-EOF; under GHA load the single EOF
+          # can be lost, falling back to ~60s heartbeat-reap.
           wait_workers_zero("ephemeral-pool precondition")
 
           # ── CEL: maxConcurrent must be > 0 ───────────────────────────

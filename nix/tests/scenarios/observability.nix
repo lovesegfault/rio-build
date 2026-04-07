@@ -130,17 +130,6 @@ pkgs.testers.runNixOSTest {
             "rio_store_put_path_total",
         ],
     }
-    # Worker metrics checked separately below — chain is sequential
-    # (A→B→C), scheduler MAY dispatch all 3 to one worker. Find one
-    # that actually built. The metrics exist; we just need a worker
-    # that incremented them.
-    EXPECTED_WORKER_METRICS = [
-        "rio_builder_builds_total",
-        "rio_builder_builds_active",
-        "rio_builder_fuse_cache_misses_total",
-        "rio_builder_uploads_total",
-    ]
-
     with subtest("metrics-registered: spec'd metrics present on /metrics"):
         for (node, port, component), names in EXPECTED_METRICS.items():
             scraped = scrape_metrics(node, port)
@@ -153,21 +142,16 @@ pkgs.testers.runNixOSTest {
             )
 
         # Worker metrics: rio-builder is one-shot (exits after each
-        # build, systemd restarts), so a scrape sees a fresh process
-        # with zero counter series. Verify describe_metrics() ran by
-        # checking the # HELP lines instead — those are emitted at
-        # startup regardless of whether the counter has fired.
+        # build, systemd restarts). A scrape sees a fresh idle process
+        # — metrics-exporter-prometheus emits no series (and thus no
+        # # HELP line) for counters/gauges that haven't recorded yet,
+        # even when describe_*!() ran. So per-name presence on an idle
+        # worker is untestable. Assert the endpoint is UP (proves
+        # bootstrap() wired the exporter); the journald check below
+        # proves the increment paths fired across restarts.
         w = workers[0]
-        raw = w.wait_until_succeeds(
+        w.wait_until_succeeds(
             "curl -sf http://localhost:9093/metrics", timeout=15
-        )
-        missing = [
-            n for n in EXPECTED_WORKER_METRICS
-            if f"# HELP {n} " not in raw
-        ]
-        assert not missing, (
-            f"worker {w.name} (:9093) missing # HELP for: {missing}\n"
-            f"  rio-builder describe_metrics() incomplete?"
         )
         # The chain build that ran above DID exercise the increment
         # paths — verify via journald (survives one-shot restarts).
