@@ -2,8 +2,8 @@
 #
 # nodeadm reads the Karpenter-generated NodeConfig (MIME-multipart
 # userData via IMDSv2), writes kubelet config + bootstrap kubeconfig +
-# CA + containerd drop-in, then exits. It does NOT manage kubelet/
-# containerd lifecycle — those are NixOS systemd units (eks-node.nix).
+# CA, then exits. It does NOT manage kubelet/containerd lifecycle —
+# those are NixOS systemd units (eks-node.nix).
 #
 # Pinned to the release tag matching pins.nix kubernetes_version so the
 # KubeletConfiguration schema nodeadm emits matches the control plane.
@@ -32,26 +32,17 @@ buildGoModule rec {
 
   subPackages = [ "cmd/nodeadm" ];
 
-  # Two NixOS-side adjustments to the embedded templates:
-  #
-  # • containerd: upstream's template is the WHOLE /etc/containerd/
-  #   config.toml, not a drop-in. Our cgroup_writable=true (ADR-012
-  #   hostUsers:false unblock) lives in config.d/10-rio.toml — splice an
-  #   `imports` line so containerd merges it. Both schema versions
-  #   patched (v2 template used if Karpenter passes a legacy
-  #   spec.containerd.config fragment).
+  # One NixOS-side adjustment to the embedded templates:
   #
   # • kubeconfig: upstream hard-codes `command: aws` (`eks get-token`).
   #   awscli2 is ~500 MB Python with ~1-2 s cold start, paid on every
   #   kubelet credential refresh. aws-iam-authenticator is a ~20 MB Go
   #   static binary, sub-100 ms — and is what the AL2 path used before
   #   nodeadm. The token format is identical (STS presigned URL).
+  #
+  # (containerd templates are unpatched: nodeadm runs with `-d kubelet`
+  # so its containerd config path never executes — see eks-node.nix.)
   postPatch = ''
-    for tmpl in nodeadm/internal/containerd/config.template.toml nodeadm/internal/containerd/config2.template.toml; do
-      sed -i '/^state = /a imports = ["/etc/containerd/config.d/*.toml"]' "$tmpl"
-      grep -q '^imports = ' "$tmpl"  # assert the splice landed
-    done
-
     cat > nodeadm/internal/kubelet/kubeconfig.template.yaml <<'EOF'
     ---
     apiVersion: v1

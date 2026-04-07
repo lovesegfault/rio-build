@@ -12,9 +12,10 @@
 #   /etc/eks/kubelet/environment          NODEADM_KUBELET_ARGS=<all flags>
 #   /etc/kubernetes/pki/ca.crt            cluster CA
 #   /var/lib/kubelet/kubeconfig           kubeconfig (exec: aws-iam-authenticator)
-#   /etc/containerd/config.toml           full containerd config (NOT a drop-in)
-#   /etc/containerd/base-runtime-spec.json
 #   /etc/eks/image-credential-provider/config.json
+#
+# containerd config is build-time static (containerd-config.nix) — nodeadm
+# is invoked with `-d kubelet` and never touches /etc/containerd/.
 {
   config,
   lib,
@@ -55,19 +56,9 @@ let
     config.Entrypoint = [ "/bin/pause" ];
   };
 
+  pauseRef = "localhost/kubernetes/pause:latest";
   # r[impl sec.pod.host-users-false]
-  # cgroup_writable=true is the ADR-012 §3 unblock for hostUsers:false —
-  # Bottlerocket couldn't set this (no arbitrary containerd TOML). With
-  # it, runc chowns the pod cgroup to the userns root so the worker's
-  # `mkdir /sys/fs/cgroup/leaf` succeeds inside the userns. values.yaml
-  # builderPoolDefaults/fetcherDefaults flip back to hostUsers:false on
-  # the strength of this. Lives in a drop-in (nodeadm owns the main
-  # config.toml; its template is patched to `imports` this dir).
-  containerdDropIn = pkgs.writeText "10-rio.toml" ''
-    version = 3
-    [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
-    cgroup_writable = true
-  '';
+  containerdConfig = import ./containerd-config.nix { inherit lib pkgs pauseRef; };
 in
 {
   options.services.rio.eksNode = {
@@ -148,14 +139,13 @@ in
     programs.nix-ld.enable = true;
 
     # ── containerd ────────────────────────────────────────────────────
-    # nodeadm OWNS /etc/containerd/config.toml — it writes the whole file
-    # (sandbox image, base-runtime-spec, CNI dirs, runc BinaryName,
-    # SystemdCgroup) from a template every boot. The nixpkgs
-    # `virtualisation.containerd` module would point ExecStart at a
-    # build-time store path and ignore nodeadm's file, so use a thin
-    # bespoke unit instead. Our one TOML addition (cgroup_writable, see
-    # `containerdDropIn` above) goes in config.d/; nodeadm's template is
-    # patched (nodeadm.nix postPatch) to `imports` that dir.
+    # Config is a build-time store path (containerd-config.nix). Every
+    # value nodeadm's template would fill is constant for this AMI, so
+    # there's no reason to wait on nodeadm's IMDS round-trip — containerd
+    # starts at local-fs.target. Still a bespoke unit rather than nixpkgs
+    # `virtualisation.containerd`: that module renders TOML via
+    # `pkgs.formats.toml` which can't express the v3 single-quoted plugin
+    # keys and pulls in the OCI image module.
     environment.systemPackages = [
       pkgs.containerd
       pkgs.runc
@@ -167,7 +157,9 @@ in
     # the image so the hostPath mount finds a real dir, not a tmpfs.
     environment.etc = {
       "cni/net.d/.keep".text = "";
-      "containerd/config.d/10-rio.toml".source = containerdDropIn;
+      # nodeadm's GetKubeletVersion() reads this (regex `v[0-9]+…`) before
+      # falling back to `exec kubelet --version` — saves a fork during init.
+      "eks/kubelet-version.txt".text = "v${cfg.kubernetesPackage.version}";
       # kubelet defaults registryPullQPS=5, registryBurst=10. Ephemeral
       # builders spawn in waves (hundreds on a fresh node within
       # seconds); each pod's IfNotPresent check triggers a manifest
@@ -261,15 +253,11 @@ in
       };
 
       services = {
-        # ── containerd: nodeadm-configured ────────────────────────────
         containerd = {
-          description = "containerd (EKS, nodeadm-configured)";
+          description = "containerd (EKS, build-time configured)";
           wantedBy = [ "multi-user.target" ];
-          after = [
-            "network.target"
-            "nodeadm-init.service"
-          ];
-          requires = [ "nodeadm-init.service" ];
+          # No nodeadm dep — config is a store path. local-fs is enough.
+          after = [ "local-fs.target" ];
           path = [
             pkgs.containerd
             pkgs.runc
@@ -277,7 +265,7 @@ in
           ];
           serviceConfig = {
             Slice = "runtime.slice";
-            ExecStart = "${pkgs.containerd}/bin/containerd --config /etc/containerd/config.toml";
+            ExecStart = "${pkgs.containerd}/bin/containerd --config ${containerdConfig}";
             Type = "notify";
             Delegate = "yes";
             KillMode = "process";
@@ -291,29 +279,27 @@ in
           };
         };
 
-        # ── nodeadm-init: oneshot, before containerd/kubelet ──────────
-        # `init --skip run`: write configs, don't try to systemctl-start
-        # kubelet (nodeadm assumes AL2023 unit names; ours differ).
+        # ── nodeadm-init: oneshot, before kubelet ─────────────────────
+        # `init --skip run -d kubelet`: write kubelet config only, don't
+        # systemctl-start it (nodeadm assumes AL2023 unit names; ours
+        # differ). `-d kubelet` filters the daemon list so containerd's
+        # Configure() never runs — its config is build-time static now.
         nodeadm-init = {
           description = "EKS node bootstrap (nodeadm)";
           wantedBy = [ "multi-user.target" ];
-          before = [
-            "containerd.service"
-            "kubelet.service"
-          ];
+          before = [ "kubelet.service" ];
           # nodeadm's IMDS client retries with backoff (aws-sdk-go
           # default); network.target is "networkd started", not "link
           # routable". The ~1–2 s wait-online gap is wasted when nodeadm
           # would just retry through it anyway. Restart=on-failure below
           # is the belt to this suspender.
           after = [ "network.target" ];
-          # nodeadm shells out to `containerd --version` / `kubelet
-          # --version` for telemetry fields and probes a few AL2023 paths.
-          # PATH covers the binaries; tmpfiles below covers the path probes.
+          # nodeadm shells out to `kubelet --version` (or reads /etc/eks/
+          # kubelet-version.txt — populated above) and probes a few
+          # AL2023 paths. tmpfiles below covers the path probes.
           path = [
             nodeadm
             cfg.kubernetesPackage
-            pkgs.containerd
             pkgs.iproute2
           ];
           # nodeadm stat()s ecr-credential-provider before writing the
@@ -324,7 +310,11 @@ in
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
-            ExecStart = "${lib.getExe nodeadm} init --skip run";
+            # Upstream marks `-d` "for testing"; if a future bump drops it,
+            # the fallback is to remove the flag — nodeadm then writes a
+            # harmless /etc/containerd/config.toml that nothing reads
+            # (containerd's ExecStart points at the store-path config).
+            ExecStart = "${lib.getExe nodeadm} init --skip run -d kubelet";
             # IMDS can be briefly unreachable at very early boot on some
             # instance families; nodeadm retries internally but a unit-
             # level retry is cheap insurance for the P1 spike.
@@ -483,14 +473,6 @@ in
         "d /opt/cni/bin 0755 root root -"
         "d /var/lib/kubelet 0755 root root -"
         "d /var/lib/kubelet/device-plugins 0755 root root -"
-        # AL2023 path shims. nodeadm probes /usr/bin/containerd; its
-        # containerd template hard-codes BinaryName=/usr/sbin/runc (no
-        # env override — runtime_config.go defaultRuntimeBinaryPath).
-        # Symlink rather than patch: keeps nodeadm.nix's diff to the one
-        # `imports` splice, and the containerd v2 shim PATH-resolves runc
-        # for everything except the explicit BinaryName.
-        "L+ /usr/bin/containerd - - - - ${pkgs.containerd}/bin/containerd"
-        "L+ /usr/sbin/runc - - - - ${lib.getExe pkgs.runc}"
       ];
     };
   };
