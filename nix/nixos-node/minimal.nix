@@ -6,11 +6,27 @@
 # SSM Session Manager — neither needs on-image tooling.
 {
   lib,
+  modulesPath,
   pins,
   pkgs,
   ...
 }:
 {
+  imports = [ "${modulesPath}/profiles/perlless.nix" ];
+
+  # Perlless activation: overlay-/etc (read-only store-backed lowerdir +
+  # tmpfs upper) + userborn replace the Perl populate-/etc + update-users
+  # scripts. ~0.5-1s off stage-2, ~130MB closure. The profile already sets
+  # both via mkDefault — restated here so the mutable override reads in
+  # context, and so a future profile reshuffle can't silently regress.
+  system.etc.overlay = {
+    enable = true;
+    # nodeadm writes /etc/{kubernetes,eks}/*; vpc-cni writes
+    # /etc/cni/net.d/*. Immutable overlay would EROFS all of them.
+    mutable = true;
+  };
+  services.userborn.enable = true;
+
   # Node never evaluates Nix — builds run inside the builder POD, which
   # carries its own nix. Dropping the daemon saves ~80 MB closure and
   # removes a root-socket attack surface. (ADR-021 Q2.)
