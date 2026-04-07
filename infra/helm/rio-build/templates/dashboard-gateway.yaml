@@ -1,7 +1,7 @@
 {{- if .Values.dashboard.enabled }}
 {{- $ns := .Values.namespace.name -}}
 # r[impl dash.envoy.grpc-web-translate+2]
-# r[impl dash.auth.method-gate]
+# r[impl dash.auth.method-gate+2]
 #   (markers are documentary — tracey does not scan yaml; the r[verify]
 #    for both lives at nix/tests/default.nix which IS scanned)
 #
@@ -84,7 +84,8 @@ spec:
   rules:
     - matches:
         - method: { service: rio.admin.AdminService, method: ClusterStatus }
-        - method: { service: rio.admin.AdminService, method: ListWorkers }
+        - method: { service: rio.admin.AdminService, method: ListExecutors }
+        - method: { service: rio.admin.AdminService, method: ListPoisoned }
         - method: { service: rio.admin.AdminService, method: ListBuilds }
         - method: { service: rio.admin.AdminService, method: GetBuildLogs }
         - method: { service: rio.admin.AdminService, method: ListTenants }
@@ -99,7 +100,7 @@ spec:
 ---
 # ── Mutating methods: gated behind values flag ────────────────────────
 # ClearPoison   — un-brakes a deliberately blocked derivation
-# DrainWorker   — marks a worker draining; can stall the fleet if abused
+# DrainExecutor — marks an executor draining; can stall the fleet if abused
 # CreateTenant  — writes PG rows; resource creation
 # TriggerGC     — deletes store paths; data loss potential
 #
@@ -120,7 +121,7 @@ spec:
   rules:
     - matches:
         - method: { service: rio.admin.AdminService, method: ClearPoison }
-        - method: { service: rio.admin.AdminService, method: DrainWorker }
+        - method: { service: rio.admin.AdminService, method: DrainExecutor }
         - method: { service: rio.admin.AdminService, method: CreateTenant }
         - method: { service: rio.admin.AdminService, method: TriggerGC }
       backendRefs:
