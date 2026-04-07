@@ -23,7 +23,15 @@ pub enum DerivedPathError {
 
     #[error("duplicate output name")]
     DuplicateOutputName,
+
+    #[error("too many output names: {0} (max {MAX_OUTPUT_NAMES})")]
+    TooManyOutputs(usize),
 }
+
+/// Upper bound on output names in a single DerivedPath. Real derivations
+/// have a handful (`out`, `dev`, `lib`, ...); this caps the comma-split
+/// allocation when the input string is huge.
+pub const MAX_OUTPUT_NAMES: usize = 256;
 
 /// Which outputs to build from a derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +78,10 @@ impl DerivedPath {
             let outputs = if output_part == "*" {
                 OutputSpec::All
             } else {
+                let n = output_part.matches(',').count() + 1;
+                if n > MAX_OUTPUT_NAMES {
+                    return Err(DerivedPathError::TooManyOutputs(n));
+                }
                 let names: Vec<String> = output_part.split(',').map(String::from).collect();
                 OutputSpec::names(names)?
             };
@@ -248,6 +260,37 @@ mod tests {
                 }
             }
             DerivedPath::Opaque(_) => panic!("expected Built"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rejects_too_many_outputs() {
+        let outputs: String = (0..=MAX_OUTPUT_NAMES)
+            .map(|i| format!("o{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let path_str = format!("{}!{outputs}", make_path("hello.drv"));
+        assert!(matches!(
+            DerivedPath::parse(&path_str),
+            Err(DerivedPathError::TooManyOutputs(n)) if n == MAX_OUTPUT_NAMES + 1
+        ));
+    }
+
+    #[test]
+    fn parse_accepts_max_outputs() -> anyhow::Result<()> {
+        let outputs: String = (0..MAX_OUTPUT_NAMES)
+            .map(|i| format!("o{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let path_str = format!("{}!{outputs}", make_path("hello.drv"));
+        let dp = DerivedPath::parse(&path_str)?;
+        match dp {
+            DerivedPath::Built {
+                outputs: OutputSpec::Names(names),
+                ..
+            } => assert_eq!(names.len(), MAX_OUTPUT_NAMES),
+            _ => panic!("expected Built/Names"),
         }
         Ok(())
     }
