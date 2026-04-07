@@ -454,21 +454,22 @@ in
             # cycle (3× in 2ms observed) orphans the ListAndWatch goroutine
             # → registered-but-zero-capacity (`smarter-devices/fuse: 0`)
             # forever, until a manual restart. Gate startup on the sock
-            # existing AND having settled (mtime >3s old → no recent
-            # recreate). Restart=always covers the residual race + later
-            # kubelet restarts.
+            # existing AND having settled. Was 3 s; the I-184 rapid-recreate
+            # burst is ~2 ms wide, so 1 s is ample margin. The 15 s
+            # allocatable-watchdog (below) catches the residual race the
+            # settle can't.
             ExecStartPre = pkgs.writeShellScript "wait-kubelet-device-sock" ''
               sock=/var/lib/kubelet/device-plugins/kubelet.sock
-              while ! test -S "$sock"; do sleep 1; done
-              # Settle: wait for the sock's mtime to be >3s old.
-              while [ "$(( $(date +%s) - $(stat -c %Y "$sock") ))" -lt 3 ]; do sleep 1; done
+              while ! test -S "$sock"; do sleep 0.2; done
+              # Settle: wait for the sock's mtime to be >1s old.
+              while [ "$(( $(date +%s) - $(stat -c %Y "$sock") ))" -lt 1 ]; do sleep 0.2; done
             '';
             ExecStart = "${lib.getExe smarter-device-manager} -logtostderr -v=0 -config=${devicePluginConf}";
             # Registers a Unix socket under /var/lib/kubelet/device-plugins/
             # then serves Allocate RPCs. No state of its own; restart is
             # cheap (kubelet re-queries ListAndWatch).
             Restart = "always";
-            RestartSec = "10s";
+            RestartSec = "2s";
             # Host /dev access. The plugin only stat()s + advertises; the
             # actual device-node injection into pod cgroups is kubelet's
             # job (DevicePlugin Allocate response → CRI). No CAP_SYS_ADMIN
@@ -477,6 +478,42 @@ in
             ReadWritePaths = [ "/var/lib/kubelet/device-plugins" ];
             PrivateTmp = true;
           };
+        };
+
+        # I-184 watchdog: smarter-device-manager can wedge into "registered
+        # but ListAndWatch goroutine orphaned" → allocatable.smarter-devices/
+        # fuse stays 0 forever. Process is alive, so Restart=always never
+        # fires. Probe kubelet's device-plugin checkpoint; restart on zero.
+        smarter-device-watchdog = lib.mkIf cfg.devicePlugin.enable {
+          description = "Restart smarter-device-manager if fuse allocatable is zero";
+          after = [ "kubelet.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = pkgs.writeShellScript "sdm-watchdog" ''
+              set -u
+              # crictl→kubelet :10250 needs auth; the device-plugin
+              # checkpoint is kubelet-internal but readable and rewritten on
+              # every ListAndWatch. Format-change risk: jq -e returns false
+              # on parse error → restart, which is the safe direction.
+              cp=/var/lib/kubelet/device-plugins/kubelet_internal_checkpoint
+              test -f "$cp" || exit 0
+              if ! ${pkgs.jq}/bin/jq -e \
+                   '.Data.RegisteredDevices["smarter-devices/fuse"] | length > 0' \
+                   "$cp" >/dev/null 2>&1; then
+                echo "<4>rio: smarter-devices/fuse allocatable=0, bouncing plugin" >&2
+                systemctl restart smarter-device-manager.service
+              fi
+            '';
+          };
+        };
+      };
+
+      timers.smarter-device-watchdog = lib.mkIf cfg.devicePlugin.enable {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          # 30 s first-fire clears the plugin's own settle+register window; 15 s steady-state thereafter.
+          OnActiveSec = "30s";
+          OnUnitActiveSec = "15s";
         };
       };
 
