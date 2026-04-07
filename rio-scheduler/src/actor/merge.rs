@@ -914,7 +914,7 @@ impl DagActor {
         let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
 
         // Batch 2: link all nodes to this build.
-        let db_ids: Vec<Uuid> = id_map.values().copied().collect();
+        let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
         // Batch 3: insert edges. Resolve drv_path -> db_id via:
@@ -930,7 +930,7 @@ impl DagActor {
         let resolve = |drv_path: &str| -> Option<Uuid> {
             path_to_hash
                 .get(drv_path)
-                .and_then(|h| id_map.get(*h).copied())
+                .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
                 .or_else(|| self.find_db_id_by_path(drv_path))
         };
         let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
@@ -988,9 +988,20 @@ impl DagActor {
         // In-mem db_id write ONLY after the tx is durable. If anything
         // above returned Err, the tx rolled back and we never reach
         // here — cleanup_failed_merge sees nodes with db_id = None.
-        for (hash, db_id) in &id_map {
+        // r[impl sched.fod.floor-survives-merge]
+        // I-208: hydrate `size_class_floor` for newly-inserted nodes
+        // from the DB row. `try_from_node` sets `floor=None`, but the
+        // row may pre-exist (ON CONFLICT) with a floor promoted by a
+        // prior run's failures. Only newly_inserted: nodes already in
+        // memory have a floor ≥ DB (recovery loaded it; any promotion
+        // since then wrote both in-mem and DB), so overwriting would
+        // downgrade.
+        for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);
+                if newly_inserted.contains(hash.as_str()) && floor.is_some() {
+                    state.size_class_floor = floor.clone();
+                }
             }
         }
         Ok(())

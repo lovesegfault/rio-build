@@ -1850,3 +1850,64 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
     Ok(())
 }
+
+// r[verify sched.fod.floor-survives-merge]
+/// I-208: a FOD whose DB row pre-exists with `size_class_floor='small'`
+/// (promoted by a prior run's failures, then the build terminated and
+/// the node left memory) MUST come back at floor=small when re-merged.
+/// Regression: `try_from_node` set `floor=None` and the upsert's
+/// RETURNING didn't carry `size_class_floor`, so the FOD snapshot
+/// bucketed to `fetcher_size_classes[0]` and the controller re-spawned
+/// `tiny` every run — chromium/firefox sources looped on 2Gi-storage
+/// tiny fetchers indefinitely.
+#[tokio::test]
+async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_fetcher_size_classes(vec![
+            crate::assignment::FetcherSizeClassConfig {
+                name: "tiny".into(),
+            },
+            crate::assignment::FetcherSizeClassConfig {
+                name: "small".into(),
+            },
+        ])
+    });
+
+    // Pre-seed: prior run promoted this FOD to floor='small', then went
+    // terminal. New build re-merges it; ON CONFLICT RETURNING must
+    // bring the floor back into the freshly-constructed in-memory state.
+    let mut fod = make_test_node("i208-fod", "x86_64-linux");
+    fod.is_fixed_output = true;
+    fod.expected_output_paths = vec![test_store_path("i208-out")];
+    sqlx::query(
+        "INSERT INTO derivations
+             (drv_hash, drv_path, system, status, is_fixed_output,
+              size_class_floor, expected_output_paths, output_names)
+         VALUES ($1, $2, 'x86_64-linux', 'completed', true, 'small',
+                 ARRAY[$3], ARRAY['out'])",
+    )
+    .bind(&fod.drv_hash)
+    .bind(&fod.drv_path)
+    .bind(&fod.expected_output_paths[0])
+    .execute(&db.pool)
+    .await?;
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![fod], vec![], false).await?;
+
+    let (_builder, fod_snap) = handle
+        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
+            pool_features: None,
+            reply,
+        })
+        .await?;
+    let tiny = fod_snap.iter().find(|s| s.name == "tiny").unwrap();
+    let small = fod_snap.iter().find(|s| s.name == "small").unwrap();
+    assert_eq!(
+        tiny.queued, 0,
+        "I-208: floor='small' from DB must NOT bucket to tiny"
+    );
+    assert_eq!(small.queued, 1, "I-208: hydrated floor buckets to small");
+    Ok(())
+}

@@ -119,8 +119,8 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
 
     assert_eq!(id_map.len(), N, "RETURNING gave back every row");
     // Spot-check: row 0 and row N-1 both present, distinct ids.
-    let id0 = id_map.get(&format!("{:032x}", 0)).copied().unwrap();
-    let id_last = id_map.get(&format!("{:032x}", N - 1)).copied().unwrap();
+    let id0 = id_map.get(&format!("{:032x}", 0)).unwrap().0;
+    let id_last = id_map.get(&format!("{:032x}", N - 1)).unwrap().0;
     assert_ne!(id0, id_last);
 
     // And they actually landed in PG, with nested arrays intact.
@@ -197,13 +197,13 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
     let t_derivs = t0.elapsed();
 
-    let db_ids: Vec<Uuid> = id_map.values().copied().collect();
+    let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
     SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
     let t_bd = t0.elapsed();
 
     // ~4× edges (matches typical fanout per recovery.rs:242 commentary).
     let ids: Vec<Uuid> = (0..N)
-        .map(|i| *id_map.get(&format!("fk{i:030x}")).unwrap())
+        .map(|i| id_map.get(&format!("fk{i:030x}")).unwrap().0)
         .collect();
     let ids = &ids;
     let edges: Vec<(Uuid, Uuid)> = (1..N)
@@ -264,7 +264,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
     // 40k edges: each node i>0 has 4 parents among [i-1, i-2, ...].
     // ON CONFLICT DO NOTHING dedups any collisions.
     let ids: Vec<Uuid> = (0..N)
-        .map(|i| *id_map.get(&format!("{i:032x}")).unwrap())
+        .map(|i| id_map.get(&format!("{i:032x}")).unwrap().0)
         .collect();
     let ids = &ids; // borrow so inner `move` closure copies the ref
     let edges: Vec<(Uuid, Uuid)> = (1..N)
