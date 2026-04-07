@@ -64,7 +64,7 @@
 #
 # worker.cgroup.kill-on-teardown — verify marker at default.nix:subtests[build-timeout]
 # worker.timeout.no-reassign — verify marker at default.nix:subtests[build-timeout]
-#   build-timeout submits via gRPC SubmitBuild with buildTimeout=5 against
+#   build-timeout submits via gRPC SubmitBuild with buildTimeout=45 against
 #   a 30s sleep. The timeout fires mid-build → run_daemon_build returns
 #   → executor/mod.rs:764 build_cgroup.kill() fires unconditionally →
 #   drain → Drop rmdirs. Asserts cgroup GONE (kernel rejects rmdir on
@@ -206,14 +206,14 @@ let
     sleepSecs = 60;
   };
 
-  # build-timeout victim. sleepSecs=30 vs buildTimeout=5 — wide gap so
+  # build-timeout victim. sleepSecs=90 vs buildTimeout=45 — wide gap so
   # neither TCG dispatch lag (timeout may fire at 8-12s wall) nor the
   # scheduler's 10s tick granularity lets the sleep finish first. Same
   # marker-in-drvname pattern so the cgroup dir is findable from the
   # VM host (sanitize_build_id: ".drv" → "_drv").
   timeoutDrv = drvs.mkTrivial {
     marker = "lifecycle-timeout";
-    sleepSecs = 30;
+    sleepSecs = 90;
   };
 
   # disruption-drain in-flight build. 120s sleep: must survive the
@@ -980,7 +980,7 @@ let
       # build-timeout — gRPC buildTimeout < sleep → TimedOut, cgroup cleaned
       # ══════════════════════════════════════════════════════════════════
       # Post-P0294: no Build CR. Submit via gRPC SubmitBuild with
-      # buildTimeout=5 directly. The value flows two places:
+      # buildTimeout=45 directly. The value flows two places:
       #   (1) scheduler per-build timeout (actor/worker.rs:597) — checked
       #       on Tick (10s here), fires cancel_build_derivations
       #   (2) worker per-derivation daemon timeout (executor/mod.rs:567 →
@@ -995,9 +995,15 @@ let
       # build-timeout tests executor/mod.rs:764 (post-daemon teardown).
       # Both write cgroup.kill; different call sites, different r[impl].
       #
-      # sleepSecs=30 vs buildTimeout=5: wide gap for TCG dispatch lag.
-      # Under TCG the timeout may fire at ~8-12s wall-clock; sleep is
-      # nowhere near done. Narrower gaps flake.
+      # sleepSecs=90 vs buildTimeout=45. buildTimeout starts at
+      # SubmitBuild and is checked on the scheduler's 10s Tick. With
+      # one-shot workers, no pod exists at submit time — controller
+      # reconcile (10s) + Job-spawn + pod-schedule + heartbeat is
+      # ~20-30s before dispatch. buildTimeout must exceed that or the
+      # build is cancelled before it ever runs. The previous value (5)
+      # raced against the cancel-subtest's worker draining: locally
+      # the drain hadn't completed and dispatch reused it; under GHA
+      # nested-virt the drain finished first.
       with subtest("build-timeout: gRPC buildTimeout < sleep → cgroup cleaned, no EEXIST"):
           drv_path = client.succeed(
               "nix-instantiate "
@@ -1012,7 +1018,7 @@ let
           # port-forward + mTLS + JSON-parse + buildId-extract
           # boilerplate. buildTimeout is SubmitBuildRequest field 6
           # (types.proto:655, camelCase for grpcurl). max_time=3 caps
-          # the stream read well under buildTimeout=5 so we always
+          # the stream read well under buildTimeout so we always
           # capture the first BuildEvent before timeout races in.
           build_id = submit_build_grpc({
               "nodes": [{
@@ -1022,7 +1028,7 @@ let
                   "outputNames": ["out"],
               }],
               "edges": [],
-              "buildTimeout": 5,
+              "buildTimeout": 45,
           }, max_time=3)
           print(f"build-timeout: submitted, build_id={build_id}")
 
@@ -1056,18 +1062,18 @@ let
           # ── Assertion 2: cgroup GONE (kill-on-teardown fired). ──────
           # Kernel rejects rmdir on non-empty cgroup (EBUSY), so gone ⇒
           # procs drained ⇒ cgroup.kill fired. Without the teardown fix,
-          # this would EBUSY-leak: the sleep-30 builder is a grandchild
+          # this would EBUSY-leak: the sleep-90 builder is a grandchild
           # (nix-daemon forked it), daemon.kill() doesn't reach it, and
-          # only ~10-20s have elapsed (sleep not done). The explicit
+          # only ~50s have elapsed (sleep not done). The explicit
           # build_cgroup.kill() + drain-poll at executor/mod.rs:764-796
           # is what makes rmdir succeed.
           #
-          # timeout=60: buildTimeout=5 + 10s scheduler tick granularity
-          # + daemon-teardown latency + TCG headroom.
+          # timeout=120: buildTimeout=45 + 10s scheduler tick granularity
+          # + daemon-teardown latency + cold-start headroom.
           try:
               worker_vm.wait_until_succeeds(
                   f"! test -e {cgroup_path}",
-                  timeout=60,
+                  timeout=120,
               )
           except Exception:
               procs_after = worker_vm.succeed(
@@ -1090,8 +1096,8 @@ let
           # timeout won the race — both are terminal-no-reassign. The
           # scheduler metric rio_scheduler_build_timeouts_total is the
           # less racy check: it increments when actor/worker.rs:606
-          # fires. With tick=10s and buildTimeout=5, it will fire by
-          # T+~15s (first tick where elapsed > 5) unless the build
+          # fires. With tick=10s and buildTimeout=45, it will fire by
+          # T+~50s (first tick where elapsed > 45) unless the build
           # already reached a terminal state via the worker path (in
           # which case the worker reported BuildResultStatus::TimedOut,
           # which is also permanent-no-reassign per types.proto:278).
