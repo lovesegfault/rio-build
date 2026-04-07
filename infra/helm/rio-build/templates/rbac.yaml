@@ -106,10 +106,10 @@ rules:
   # /finalizers subresource: OwnerReferencesPermissionEnforcement
   # admission plugin checks `update` on `<owner>/finalizers` when
   # creating a child with `blockOwnerDeletion: true` (which
-  # controller_owner_ref sets on StatefulSet/Service/PDB/Job).
-  # Without this verb, child creates fail with "cannot set
-  # blockOwnerDeletion ... not permitted to update the owner
-  # resource." Mirrors the builderpoolsets/finalizers rule below.
+  # controller_owner_ref sets on the per-build Job). Without this
+  # verb, child creates fail with "cannot set blockOwnerDeletion ...
+  # not permitted to update the owner resource." Mirrors the
+  # builderpoolsets/finalizers rule below.
   - apiGroups: [rio.build]
     resources: [builderpools/finalizers]
     verbs: [update]
@@ -138,11 +138,11 @@ rules:
     resources: [builderpoolsets/finalizers]
     verbs: [update]
   # FetcherPool: ADR-019 FOD-only executor pods. Same lifecycle verbs as
-  # builderpools — the reconciler SSA-applies StatefulSets into the
-  # rio-fetchers namespace (the ClusterRoleBinding below grants this
-  # cluster-wide, so no per-namespace RoleBinding needed; the controller
-  # SA in rio-system can manage STS in rio-builders AND rio-fetchers via
-  # the statefulsets rule below).
+  # builderpools — the reconciler SSA-applies per-FOD Jobs into the
+  # rio-fetchers namespace (the ClusterRoleBinding below grants
+  # batch/jobs cluster-wide, so no per-namespace RoleBinding needed;
+  # the controller SA in rio-system can manage Jobs in rio-builders
+  # AND rio-fetchers).
   - apiGroups: [rio.build]
     resources: [fetcherpools]
     verbs: [get, list, watch, create, update, patch, delete]
@@ -162,31 +162,25 @@ rules:
   - apiGroups: [rio.build]
     resources: [componentscalers/status]
     verbs: [get, patch, update]
-  # Deployment read for current .spec.replicas + /scale subresource for
-  # the patch. The controller previously had NO apps/deployments rights
-  # — BuilderPool/FetcherPool reconcilers manage StatefulSets only.
+  # Deployment read for current .spec.replicas + /scale subresource
+  # for the patch. BuilderPool/FetcherPool reconcilers don't touch
+  # Deployments — this is ComponentScaler-only.
   - apiGroups: [apps]
     resources: [deployments]
     verbs: [get, list, watch]
   - apiGroups: [apps]
     resources: [deployments/scale]
     verbs: [get, patch, update]
-  # Owned children. `create` because SSA PATCH creates if missing but some
-  # clusters still check `create` perm.
+  # TODO(cleanup-1-controller): vestigial — main.rs .owns(StatefulSet)
+  # watch still registered at this commit. Drop once that's removed.
   - apiGroups: [apps]
     resources: [statefulsets]
-    verbs: [get, list, watch, create, update, patch, delete]
-  # List/watch: the DisruptionTarget watcher (disruption.rs) watches for
-  # status.conditions[DisruptionTarget=True] to fire preemptive DrainWorker;
-  # the finalizer enumerates pods by label for graceful scale-to-0.
-  # No mutation — pod lifecycle is the StatefulSet controller's job.
+    verbs: [get, list, watch]
+  # Reconciler inventories live worker pods by label to compute Job
+  # deficit; no mutation — pod lifecycle is the Job controller's.
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch]
-  # Headless Service per BuilderPool. Created by apply(), deleted by ownerRef GC.
-  - apiGroups: [""]
-    resources: [services]
-    verbs: [get, list, watch, create, update, patch, delete]
   # `kubectl describe workerpool` shows events. create/patch for
   # aggregation (K8s dedups by key). events.k8s.io (NOT core "")
   # — kube-runtime's Recorder uses the events.k8s.io/v1 API. K8s
@@ -194,17 +188,11 @@ rules:
   - apiGroups: [events.k8s.io]
     resources: [events]
     verbs: [create, patch]
-  # Per-BuilderPool PDB (maxUnavailable=1) managed by reconciler.
-  - apiGroups: [policy]
-    resources: [poddisruptionbudgets]
-    verbs: [get, list, watch, create, update, patch, delete]
-  # Job-mode BuilderPool (ephemeral | manifest). reconcile_* lists
-  # Jobs by label for inventory, creates new Jobs for deficit.
-  # `delete`: manifest-mode scale-down explicitly deletes surplus
-  # Jobs after idle grace (r[ctrl.pool.manifest-scaledown]) —
-  # manifest pods don't self-terminate (no ttlSecondsAfterFinished).
-  # Ephemeral mode still TTL-reaps; ownerRef GC still handles
-  # BuilderPool-delete cleanup for both.
+  # Owned children: one Job per build/FOD. reconcile_* lists Jobs by
+  # label for inventory, creates new Jobs for deficit. `delete`:
+  # manifest-mode scale-down explicitly deletes surplus Jobs after
+  # idle grace (r[ctrl.pool.manifest-scaledown]); ownerRef GC handles
+  # BuilderPool-delete cleanup.
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create, delete]

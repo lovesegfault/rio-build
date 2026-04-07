@@ -119,11 +119,10 @@ spec:
 {{- end }}
 
 {{- /*
-Executor certs (builder + fetcher): wildcard SAN. StatefulSet headless-
-Service pod DNS is <pod>.<svc>.<ns>.svc.cluster.local. Each pod has its
-own DNS but shares ONE cert — per-pod certs would require the controller
-to create Certificate objects per pod. Scheduler doesn't verify WHICH
-executor, just CA-signed.
+Executor certs (builder + fetcher): wildcard SAN. Per-build Job pods
+share ONE cert — per-pod certs would require the controller to create
+Certificate objects per Job. Scheduler doesn't verify WHICH executor,
+just CA-signed.
 
 Wildcard caveat: `*.X` matches ONE label only. Executors don't RECEIVE
 gRPC so server SAN doesn't strictly matter — purely client-cert. Wildcard

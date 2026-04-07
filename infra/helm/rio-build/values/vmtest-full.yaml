@@ -161,10 +161,9 @@ builderPoolDefaults:
   # on EKS/GKE uses privileged:false (the chart default).
   privileged: true
   # Default is 7200 (2h, for LLVM-cold-ccache builds). Test builds
-  # are ≤90s sleeps. 180s covers the longest + drain overhead.
-  # Also bounds the finalizer's cleanup() wait (grace + 60s) —
-  # without this, a stuck/never-Ready pod-1 stalls BuilderPool
-  # delete for 2h (STS terminates reverse-ordinal; pod-0 waits).
+  # are ≤90s sleeps. 180s covers the longest + drain overhead and
+  # bounds the finalizer's cleanup() wait (grace + 60s) so a stuck
+  # Job pod doesn't stall BuilderPool delete for 2h.
   terminationGracePeriodSeconds: 180
   # No Karpenter nodepools → no dedicated worker nodes. Workers
   # schedule on any k3s node.

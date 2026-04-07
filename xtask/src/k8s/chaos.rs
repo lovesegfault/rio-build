@@ -85,14 +85,16 @@ pub enum ChaosKind {
 }
 
 /// What to blackhole. `--target scheduler-leader` resolves the lease;
-/// `builder-<N>` / `fetcher-<N>` index into the role-labeled pod set
-/// (sorted by name, so `-0` is the lowest StatefulSet ordinal).
+/// `builder` / `fetcher` resolve to any currently-Running pod with the
+/// matching `rio.build/role` label. Worker pods are one-shot Jobs with
+/// no stable identity, so the chosen pod is whichever happens to be
+/// Running at resolve time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChaosTarget {
     SchedulerLeader,
     Store,
-    Builder(u32),
-    Fetcher(u32),
+    Builder,
+    Fetcher,
 }
 
 impl FromStr for ChaosTarget {
@@ -101,27 +103,24 @@ impl FromStr for ChaosTarget {
         match s {
             "scheduler-leader" => Ok(Self::SchedulerLeader),
             "store" => Ok(Self::Store),
-            _ => parse_ordinal(s, "builder-")
-                .map(Self::Builder)
-                .or_else(|| parse_ordinal(s, "fetcher-").map(Self::Fetcher))
-                .with_context(|| {
-                    format!(
-                        "invalid --target {s:?} \
-                         (expected: scheduler-leader, store, builder-<N>, fetcher-<N>)"
-                    )
-                }),
+            "builder" => Ok(Self::Builder),
+            "fetcher" => Ok(Self::Fetcher),
+            _ => bail!(
+                "invalid --target {s:?} \
+                 (expected: scheduler-leader, store, builder, fetcher)"
+            ),
         }
     }
 }
 
 impl fmt::Display for ChaosTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SchedulerLeader => f.write_str("scheduler-leader"),
-            Self::Store => f.write_str("store"),
-            Self::Builder(n) => write!(f, "builder-{n}"),
-            Self::Fetcher(n) => write!(f, "fetcher-{n}"),
-        }
+        f.write_str(match self {
+            Self::SchedulerLeader => "scheduler-leader",
+            Self::Store => "store",
+            Self::Builder => "builder",
+            Self::Fetcher => "fetcher",
+        })
     }
 }
 
@@ -132,8 +131,8 @@ impl fmt::Display for ChaosTarget {
 pub enum ChaosFrom {
     /// Every node hosting a builder OR fetcher pod (deduped).
     AllWorkers,
-    Builder(u32),
-    Fetcher(u32),
+    Builder,
+    Fetcher,
 }
 
 impl FromStr for ChaosFrom {
@@ -141,33 +140,21 @@ impl FromStr for ChaosFrom {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "all-workers" => Ok(Self::AllWorkers),
-            _ => parse_ordinal(s, "builder-")
-                .map(Self::Builder)
-                .or_else(|| parse_ordinal(s, "fetcher-").map(Self::Fetcher))
-                .with_context(|| {
-                    format!(
-                        "invalid --from {s:?} \
-                         (expected: all-workers, builder-<N>, fetcher-<N>)"
-                    )
-                }),
+            "builder" => Ok(Self::Builder),
+            "fetcher" => Ok(Self::Fetcher),
+            _ => bail!("invalid --from {s:?} (expected: all-workers, builder, fetcher)"),
         }
     }
 }
 
 impl fmt::Display for ChaosFrom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AllWorkers => f.write_str("all-workers"),
-            Self::Builder(n) => write!(f, "builder-{n}"),
-            Self::Fetcher(n) => write!(f, "fetcher-{n}"),
-        }
+        f.write_str(match self {
+            Self::AllWorkers => "all-workers",
+            Self::Builder => "builder",
+            Self::Fetcher => "fetcher",
+        })
     }
-}
-
-/// Parse `<prefix><N>` → `Some(N)`. None on no-match (caller chains
-/// with `or_else`).
-fn parse_ordinal(s: &str, prefix: &str) -> Option<u32> {
-    s.strip_prefix(prefix)?.parse().ok()
 }
 
 /// `60s` / `60` → 60 seconds. Tiny parser — no humantime dep just for
@@ -231,8 +218,8 @@ async fn resolve_target_ip(client: &k::Client, target: &ChaosTarget) -> Result<S
             .await?;
             (NS_STORE, name)
         }
-        ChaosTarget::Builder(n) => (NS_BUILDERS, nth_worker(client, "builder", *n).await?),
-        ChaosTarget::Fetcher(n) => (NS_FETCHERS, nth_worker(client, "fetcher", *n).await?),
+        ChaosTarget::Builder => (NS_BUILDERS, running_worker(client, "builder").await?),
+        ChaosTarget::Fetcher => (NS_FETCHERS, running_worker(client, "fetcher").await?),
     };
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
     let pod = pods.get(&pod_name).await?;
@@ -267,47 +254,40 @@ async fn resolve_from_nodes(client: &k::Client, from: &ChaosFrom) -> Result<Vec<
             anyhow::ensure!(!nodes.is_empty(), "no worker pods found");
             Ok(nodes)
         }
-        ChaosFrom::Builder(n) => {
-            let name = nth_worker(client, "builder", *n).await?;
+        ChaosFrom::Builder => {
+            let name = running_worker(client, "builder").await?;
             let node = node_of(client, NS_BUILDERS, &name).await?;
             Ok(vec![(name, node)])
         }
-        ChaosFrom::Fetcher(n) => {
-            let name = nth_worker(client, "fetcher", *n).await?;
+        ChaosFrom::Fetcher => {
+            let name = running_worker(client, "fetcher").await?;
             let node = node_of(client, NS_FETCHERS, &name).await?;
             Ok(vec![(name, node)])
         }
     }
 }
 
-/// Nth pod with `rio.build/role=<role>`, sorted by name. StatefulSet
-/// pod names end in `-<ordinal>`, so sorted order = ordinal order.
-async fn nth_worker(client: &k::Client, role: &str, n: u32) -> Result<String> {
+/// Any Running pod with `rio.build/role=<role>`. Worker pods are
+/// one-shot Jobs — Pending/Succeeded pods are skipped so the caller
+/// gets a podIP and a live netns.
+async fn running_worker(client: &k::Client, role: &str) -> Result<String> {
     let ns = match role {
         "builder" => NS_BUILDERS,
         "fetcher" => NS_FETCHERS,
         _ => unreachable!(),
     };
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-    let mut names: Vec<String> = pods
-        .list(&ListParams::default().labels(&format!("rio.build/role={role}")))
+    pods.list(&ListParams::default().labels(&format!("rio.build/role={role}")))
         .await?
         .into_iter()
-        .filter_map(|p| p.metadata.name)
-        .collect();
-    names.sort();
-    names.into_iter().nth(n as usize).with_context(|| {
-        format!(
-            "no {role} pod at ordinal {n} (have: {} pods)",
-            names_len(ns)
-        )
-    })
-}
-
-// Helper for the error message above (can't borrow `names` after
-// into_iter consumes it).
-fn names_len(_ns: &str) -> &'static str {
-    "see `kubectl get pods -l rio.build/role=...`"
+        .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+        .and_then(|p| p.metadata.name)
+        .with_context(|| {
+            format!(
+                "no Running {role} pod in {ns} — submit a build first so a \
+                 worker exists (kubectl get pods -n {ns} -l rio.build/role={role})"
+            )
+        })
 }
 
 async fn first_pod_by_label(
@@ -745,22 +725,20 @@ mod tests {
         );
         assert_eq!("store".parse::<ChaosTarget>().unwrap(), ChaosTarget::Store);
         assert_eq!(
-            "builder-0".parse::<ChaosTarget>().unwrap(),
-            ChaosTarget::Builder(0)
+            "builder".parse::<ChaosTarget>().unwrap(),
+            ChaosTarget::Builder
         );
         assert_eq!(
-            "fetcher-7".parse::<ChaosTarget>().unwrap(),
-            ChaosTarget::Fetcher(7)
+            "fetcher".parse::<ChaosTarget>().unwrap(),
+            ChaosTarget::Fetcher
         );
         assert!("scheduler".parse::<ChaosTarget>().is_err());
-        assert!("builder".parse::<ChaosTarget>().is_err());
-        assert!("builder-".parse::<ChaosTarget>().is_err());
-        assert!("builder-x".parse::<ChaosTarget>().is_err());
+        assert!("builder-0".parse::<ChaosTarget>().is_err());
     }
 
     #[test]
     fn target_display_roundtrip() {
-        for s in ["scheduler-leader", "store", "builder-3", "fetcher-0"] {
+        for s in ["scheduler-leader", "store", "builder", "fetcher"] {
             let t: ChaosTarget = s.parse().unwrap();
             assert_eq!(t.to_string(), s);
         }
@@ -772,18 +750,13 @@ mod tests {
             "all-workers".parse::<ChaosFrom>().unwrap(),
             ChaosFrom::AllWorkers
         );
-        assert_eq!(
-            "fetcher-0".parse::<ChaosFrom>().unwrap(),
-            ChaosFrom::Fetcher(0)
-        );
-        assert_eq!(
-            "builder-2".parse::<ChaosFrom>().unwrap(),
-            ChaosFrom::Builder(2)
-        );
+        assert_eq!("fetcher".parse::<ChaosFrom>().unwrap(), ChaosFrom::Fetcher);
+        assert_eq!("builder".parse::<ChaosFrom>().unwrap(), ChaosFrom::Builder);
         // scheduler-leader is a valid TARGET but not a valid FROM —
         // you blackhole the scheduler FROM a worker, not the reverse.
         assert!("scheduler-leader".parse::<ChaosFrom>().is_err());
         assert!("all".parse::<ChaosFrom>().is_err());
+        assert!("builder-0".parse::<ChaosFrom>().is_err());
     }
 
     #[test]

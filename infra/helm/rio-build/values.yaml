@@ -170,11 +170,11 @@ monitoring:
 # ──────────────────────────────────────────────────────────────────────────
 # rio-controller
 # ──────────────────────────────────────────────────────────────────────────
-# K8s operator. Watches BuilderPool CRDs, reconciles StatefulSets.
-# HARD replicas=1: NOT leader-elected. Two controllers fight — both SSA-patch
-# same StatefulSet, fieldManager conflicts. kube-runtime handles concurrent
-# reconcile within one process but not across processes. 30s reschedule gap
-# during pod restart is acceptable.
+# K8s operator. Watches BuilderPool/FetcherPool CRDs, spawns one Job per
+# build/FOD. HARD replicas=1: NOT leader-elected. Two controllers fight —
+# both create Jobs for the same queue depth, doubling spawn. kube-runtime
+# handles concurrent reconcile within one process but not across processes.
+# 30s reschedule gap during pod restart is acceptable.
 controller:
   enabled: true
   image: rio-controller

@@ -10,8 +10,8 @@
 
   ServiceMonitor.spec.endpoints[].port references the Service port NAME
   ("metrics"); the operator resolves that to the targetPort (the
-  containerPort named "metrics" each Deployment/StatefulSet declares —
-  9090/9091/9092/9094 respectively).
+  containerPort named "metrics" each Deployment declares —
+  9090/9091/9092/9094 respectively). Workers use the PodMonitor below.
 */ -}}
 {{- range $c := list
       (dict "name" "gateway"    "ns" $.Values.namespace.name "port" 9090)
@@ -55,12 +55,12 @@ spec:
       interval: {{ $.Values.monitoring.scrapeInterval }}
 {{- end }}
 ---
-# Builders: ephemeral Jobs (one drv per pod) — no stable Service to hang
-# a ServiceMonitor off. PodMonitor scrapes pods directly by label. The
-# controller stamps rio.build/role + rio.build/pool on every executor pod
-# (reconcilers/common/sts.rs ROLE_LABEL/POOL_LABEL); matching on `pool`
-# existence covers all pools without enumerating them. portName resolves
-# against the pod's containerPort name ("metrics" → 9093, set in sts.rs).
+# Builders: one Job per drv — no stable Service to hang a ServiceMonitor
+# off. PodMonitor scrapes pods directly by label. The controller stamps
+# rio.build/role + rio.build/pool on every executor pod (reconcilers/
+# common/pod.rs ROLE_LABEL/POOL_LABEL); matching on `pool` existence
+# covers all pools without enumerating them. portName resolves against
+# the pod's containerPort name ("metrics" → 9093, set in pod.rs).
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:

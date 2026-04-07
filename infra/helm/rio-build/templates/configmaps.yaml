@@ -1,13 +1,13 @@
 {{- if .Values.controller.enabled }}
 {{- range $ns := list .Values.namespaces.builders.name .Values.namespaces.fetchers.name }}
 ---
-# Mounted into WORKER pods by the controller's StatefulSet builder — NOT by
-# any Deployment in this chart. Every line is correctness-critical; not
-# parameterized on purpose.
+# Mounted into WORKER pods by the controller's Job pod-spec builder —
+# NOT by any Deployment in this chart. Every line is correctness-
+# critical; not parameterized on purpose.
 #
 # ADR-019: builders and fetchers moved to their own namespaces.
-# ConfigMaps are ns-scoped; duplicate to both so the STS pod mount
-# resolves. Mount is optional:true (common/sts.rs) so a missing CM
+# ConfigMaps are ns-scoped; duplicate to both so the Job pod mount
+# resolves. Mount is optional:true (common/pod.rs) so a missing CM
 # doesn't block pod start — but the nix.conf it carries is
 # correctness-critical (sandbox=true, builders=), so we want it there.
 apiVersion: v1

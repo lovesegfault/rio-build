@@ -27,8 +27,8 @@ metadata:
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  # Matches pods created by BuilderPool reconciler — build_statefulset
-  # sets rio.build/role (common/sts.rs ROLE_LABEL).
+  # Matches pods created by BuilderPool reconciler — the Job pod-spec
+  # builder sets rio.build/role (common/pod.rs ROLE_LABEL).
   podSelector:
     matchLabels:
       rio.build/role: builder
