@@ -233,6 +233,13 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 data:
   scheduler.toml: |
+    {{- /* I-204: root-level keys MUST precede any [[table]] header —
+           TOML attaches bare keys after [[...]] to that table's last
+           entry. soft_features after the loops landed inside
+           fetcher_size_classes[-1] and was silently dropped. */ -}}
+    {{- with $s.softFeatures }}
+    soft_features = [{{ range $i, $f := . }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}]
+    {{- end }}
     {{- range $s.sizeClasses }}
     [[size_classes]]
     name = {{ .name | quote }}
@@ -249,9 +256,6 @@ data:
     {{- range .Values.fetcherPoolDefaults.classes }}
     [[fetcher_size_classes]]
     name = {{ .name | quote }}
-    {{- end }}
-    {{- with $s.softFeatures }}
-    soft_features = [{{ range $i, $f := . }}{{ if $i }}, {{ end }}{{ $f | quote }}{{ end }}]
     {{- end }}
 {{- end }}
 {{- end }}
