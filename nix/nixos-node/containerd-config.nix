@@ -28,7 +28,6 @@ pkgs.writeText "containerd-config.toml" ''
   version = 3
   root = "/var/lib/containerd"
   state = "/run/containerd"
-  imports = ["/etc/containerd/config.d/*.toml"]
 
   [grpc]
   address = "/run/containerd/containerd.sock"
@@ -38,10 +37,6 @@ pkgs.writeText "containerd-config.toml" ''
 
   [plugins.'io.containerd.cri.v1.images'.pinned_images]
   sandbox = "${pauseRef}"
-
-  [plugins.'io.containerd.cri.v1.runtime']
-  enable_unprivileged_ports = true
-  enable_unprivileged_icmp = true
 
   [plugins.'io.containerd.cri.v1.runtime'.containerd]
   default_runtime_name = "runc"

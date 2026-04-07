@@ -42,9 +42,9 @@ let
       nummaxdevices: ${toString cfg.devicePlugin.kvmMaxDevices}
   '';
 
-  # nodeadm hard-codes sandbox = "localhost/kubernetes/pause" and expects
-  # the AMI bake to have pre-loaded it (templates/shared/runtime/bin/
-  # cache-pause-container in the AL2023 builder). Build the pause binary
+  # containerd-config.nix pins sandbox = "localhost/kubernetes/pause" and
+  # expects the AMI bake to have pre-loaded it (templates/shared/runtime/
+  # bin/cache-pause-container in the AL2023 builder). Build the pause binary
   # from the same kubernetes derivation kubelet comes from and wrap it as
   # a single-layer OCI tarball; kubelet preStart `ctr image import`s it.
   # The CRI pinned label is set on import so kubelet's image-GC won't
@@ -461,13 +461,12 @@ in
         };
       };
 
-      # ── path shims + writable dirs nodeadm/aws-node expect ──────────
+      # ── writable dirs nodeadm/aws-node expect ───────────────────────
       # nodeadm hardcodes a couple of AL2023 paths it probes (not
       # writes); vpc-cni's aws-node DaemonSet hostPath-mounts /opt/cni/
       # bin and /etc/cni/net.d and writes there. Both must exist + be
       # writable.
       tmpfiles.rules = [
-        "d /etc/containerd/config.d 0755 root root -"
         "d /etc/kubernetes/manifests 0755 root root -"
         "d /etc/cni/net.d 0755 root root -"
         "d /opt/cni/bin 0755 root root -"
