@@ -905,7 +905,7 @@ mod tests {
         seed_with_refs(&store, &p_b, &[]);
 
         let dir = tempfile::tempdir()?;
-        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"), 1, None, false).await?;
+        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"), 1, None).await?;
 
         prefetch_manifests(&client, &cache, &[p_a.clone(), p_b.clone()]).await;
 
@@ -952,7 +952,7 @@ mod tests {
         seed_with_refs(&store, &p, &[]);
 
         let dir = tempfile::tempdir()?;
-        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"), 1, None, false).await?;
+        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"), 1, None).await?;
 
         // Must NOT panic / error.
         prefetch_manifests(&client, &cache, std::slice::from_ref(&p)).await;

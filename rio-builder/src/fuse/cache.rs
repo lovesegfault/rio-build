@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rio_common::bloom::BloomFilter;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::runtime::Handle;
 
 /// Errors from cache operations.
@@ -268,66 +268,34 @@ impl Cache {
     /// Must be called from within a tokio runtime (captures the current `Handle`).
     ///
     /// `bloom_expected_items` — bloom filter capacity. `None` →
-    /// `BLOOM_EXPECTED_ITEMS_DEFAULT` (50 000). Operators with
-    /// long-lived StatefulSet workers override via `worker.toml`;
-    /// the filter never shrinks (evicted paths stay as stale
-    /// positives) so churn eventually saturates the default.
+    /// `BLOOM_EXPECTED_ITEMS_DEFAULT` (50 000).
     pub async fn new(
         cache_dir: PathBuf,
         max_size_gb: u64,
         bloom_expected_items: Option<usize>,
-        ephemeral: bool,
     ) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
 
-        // Clean up stale .tmp-* directories left behind by interrupted NAR
-        // extractions (fetch_and_extract extracts to a sibling tmp dir then
-        // renames atomically; a crash mid-extraction leaves the tmp dir behind).
-        Self::clean_stale_tmp_dirs(&cache_dir);
-
         let runtime = Handle::current();
 
-        // r[impl builder.fuse.cache-ephemeral-memory]
-        let pool = if ephemeral {
-            // Ephemeral builders (RIO_EPHEMERAL=1, the P0537 default)
-            // execute exactly one build then exit; the pod's emptyDir
-            // filesystem is discarded. Persisting the cache index to
-            // disk is pointless and on tiny-class node storage costs
-            // >1s per write under load (I-141: ~10s wasted per build).
-            //
-            // :memory: with a pool: each pooled connection would be a
-            // SEPARATE in-memory DB. Pin to one connection and disable
-            // idle/lifetime reaping (closing it would drop the DB and
-            // lose the index mid-build). Single-connection serialization
-            // is fine — in-memory SQLite ops are µs-scale and FUSE
-            // already serializes on the inflight map for the hot path.
-            SqlitePoolOptions::new()
-                .min_connections(1)
-                .max_connections(1)
-                .idle_timeout(None)
-                .max_lifetime(None)
-                .connect_with(SqliteConnectOptions::new().filename(":memory:"))
-                .await?
-        } else {
-            // Long-lived (StatefulSet) builders persist across builds;
-            // the on-disk index lets them remember what's already
-            // fetched. WAL + synchronous=NORMAL via connect options so
-            // EVERY pooled connection gets it — a post-connect
-            // `PRAGMA synchronous` only hits the one connection that
-            // ran it; other pool connections stay at FULL and fsync
-            // every commit. Durability is not critical: this is a
-            // local cache index, rio-store is the source of truth, and
-            // a lost row just means one extra fetch.
-            SqlitePoolOptions::new()
-                .connect_with(
-                    SqliteConnectOptions::new()
-                        .filename(cache_dir.join("cache_index.sqlite"))
-                        .create_if_missing(true)
-                        .journal_mode(SqliteJournalMode::Wal)
-                        .synchronous(SqliteSynchronous::Normal),
-                )
-                .await?
-        };
+        // The pod's emptyDir filesystem is discarded at exit, so the
+        // cache index lives only in memory — persisting it on tiny-class
+        // node storage cost >1s per write under load (I-141: ~10s wasted
+        // per build).
+        //
+        // :memory: with a pool: each pooled connection would be a
+        // SEPARATE in-memory DB. Pin to one connection and disable
+        // idle/lifetime reaping (closing it would drop the DB and lose
+        // the index mid-build). Single-connection serialization is fine
+        // — in-memory SQLite ops are µs-scale and FUSE already
+        // serializes on the inflight map for the hot path.
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+            .await?;
 
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS cached_paths (
@@ -383,11 +351,7 @@ impl Cache {
     /// result (already computed as `input_sized` at the executor).
     ///
     /// EXTENDS the existing map (no implicit clear): store paths are
-    /// immutable, so a basename registered by build A is still valid
-    /// for build N on a multi-build STS pod. Memory: ~60 B/entry ×
-    /// ~1k paths/build; ephemeral pods (the default) exit after one
-    /// build so it never accumulates. STS callers MAY call
-    /// [`Self::clear_inputs`] at build end if growth becomes a concern.
+    /// immutable. Memory: ~60 B/entry × ~1k paths for the one build.
     // r[impl builder.fuse.jit-register]
     pub fn register_inputs(&self, inputs: impl IntoIterator<Item = (String, u64)>) {
         let mut g = self.known_inputs.write().unwrap_or_else(|e| e.into_inner());
@@ -479,55 +443,6 @@ impl Cache {
 
     pub fn bloom_handle(&self) -> Arc<RwLock<BloomFilter>> {
         Arc::clone(&self.bloom)
-    }
-
-    /// Remove stale `*.tmp-*` extraction trees and `*.nar-*` spool files
-    /// from the cache root. These are remnants of interrupted NAR fetches.
-    fn clean_stale_tmp_dirs(cache_dir: &Path) {
-        let Ok(entries) = std::fs::read_dir(cache_dir) else {
-            return;
-        };
-        // Match foo.<tag>-<16 hex chars> EXACTLY for tag in {tmp, nar}.
-        // Require the suffix to be exactly 16 hex chars (rand::<u64>
-        // formatted {:016x}) — a loose substring match would delete
-        // legitimate store paths like "rust-1.75.0-tmp-build".
-        let has_hex16_suffix = |s: &str, tag: &str| {
-            s.rsplit_once(tag).is_some_and(|(_, sfx)| {
-                sfx.len() == 16 && sfx.chars().all(|c| c.is_ascii_hexdigit())
-            })
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            let path = entry.path();
-            if has_hex16_suffix(name_str, ".tmp-") {
-                // Partial extracted tree (dir OR single-file path —
-                // restore_path_streaming creates whichever the NAR
-                // root is). remove_dir_all handles dirs; fall back to
-                // remove_file for the single-regular-file case.
-                let res = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
-                match res {
-                    Ok(()) => {
-                        tracing::info!(path = %path.display(), "removed stale tmp extraction")
-                    }
-                    Err(e) => tracing::warn!(
-                        path = %path.display(), error = %e,
-                        "failed to remove stale tmp extraction"
-                    ),
-                }
-            } else if has_hex16_suffix(name_str, ".nar-") {
-                // I-180 NAR spool file (always a regular file).
-                match std::fs::remove_file(&path) {
-                    Ok(()) => tracing::info!(path = %path.display(), "removed stale NAR spool"),
-                    Err(e) => tracing::warn!(
-                        path = %path.display(), error = %e,
-                        "failed to remove stale NAR spool"
-                    ),
-                }
-            }
-        }
     }
 
     /// Root directory where cached paths are materialized.
@@ -831,19 +746,22 @@ mod tests {
     /// Cache sync methods use `block_on`, so tests create the cache in async
     /// context then exercise the sync methods via `spawn_blocking`.
     async fn make_cache(cache_dir: PathBuf, max_size_gb: u64) -> anyhow::Result<Arc<Cache>> {
-        Ok(Arc::new(
-            Cache::new(cache_dir, max_size_gb, None, false).await?,
-        ))
+        Ok(Arc::new(Cache::new(cache_dir, max_size_gb, None).await?))
     }
 
     #[tokio::test]
-    async fn test_cache_new_creates_dir_and_db() -> anyhow::Result<()> {
+    async fn test_cache_new_creates_dir_memory_index() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cache_dir = dir.path().join("cache");
 
         let cache = make_cache(cache_dir.clone(), 1).await?;
+        // cache_dir is created (NAR trees land here); the SQLite index
+        // is in :memory: only.
         assert!(cache_dir.exists());
-        assert!(cache_dir.join("cache_index.sqlite").exists());
+        assert!(
+            !cache_dir.join("cache_index.sqlite").exists(),
+            "index must be in-memory, not on disk"
+        );
 
         let size = tokio::task::spawn_blocking(move || cache.total_size()).await??;
         assert_eq!(size, 0);
@@ -900,39 +818,9 @@ mod tests {
         Ok(())
     }
 
-    // r[verify builder.fuse.cache-ephemeral-memory]
-    /// Ephemeral mode keeps the index in `:memory:` — no on-disk SQLite
-    /// file is created, but the cache_dir (for materialized NAR trees)
-    /// still is. Insert/contains must round-trip across the single
-    /// pinned pool connection.
-    #[tokio::test]
-    async fn cache_ephemeral_uses_memory() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache_dir = dir.path().join("cache");
-
-        let cache = Arc::new(Cache::new(cache_dir.clone(), 1, None, true).await?);
-        // cache_dir is still created (NAR trees land here); only the
-        // SQLite index is in-memory.
-        assert!(cache_dir.exists());
-        assert!(
-            !cache_dir.join("cache_index.sqlite").exists(),
-            "ephemeral mode must not write cache_index.sqlite to disk"
-        );
-
-        // Index round-trips across the pinned single connection. Guards
-        // against a future refactor that lets the pool open a second
-        // :memory: connection (which would be an empty DB).
-        let c = Arc::clone(&cache);
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            c.insert("abc-hello-1.0", 1024)?;
-            assert!(c.contains("abc-hello-1.0")?);
-            assert_eq!(c.total_size()?, 1024);
-            Ok(())
-        })
-        .await??;
-        Ok(())
-    }
-
+    /// Index round-trips across the pinned single :memory: connection.
+    /// Guards against a future refactor that lets the pool open a second
+    /// :memory: connection (which would be a separate, empty DB).
     #[tokio::test]
     async fn test_cache_insert_and_contains() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1306,51 +1194,5 @@ mod tests {
             start.elapsed() < Duration::from_millis(50),
             "acquire with available permit should be immediate"
         );
-    }
-
-    #[tokio::test]
-    async fn test_tmp_cleanup_on_init() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let cache_dir = dir.path().to_path_buf();
-
-        // Create a stale tmp dir that mimics an interrupted extraction.
-        let stale_tmp = cache_dir.join("abc-hello.tmp-deadbeef12345678");
-        std::fs::create_dir_all(&stale_tmp)?;
-        std::fs::write(stale_tmp.join("partial_file"), b"incomplete")?;
-        assert!(stale_tmp.exists());
-
-        // I-180: stale NAR spool file (regular file, not dir) from a
-        // process kill mid-spool.
-        let stale_spool = cache_dir.join("abc-hello.nar-0123456789abcdef");
-        std::fs::write(&stale_spool, b"partial nar bytes")?;
-        assert!(stale_spool.exists());
-
-        // Also create a legitimate (non-tmp) entry to verify it's NOT removed.
-        let real_entry = cache_dir.join("def-world");
-        std::fs::create_dir_all(&real_entry)?;
-        // And a store path with `.nar-` in the NAME (not the suffix) —
-        // must NOT be swept. Only an exact 16-hex trailing suffix matches.
-        let nar_named = cache_dir.join("ghi-some.nar-fixture");
-        std::fs::create_dir_all(&nar_named)?;
-
-        // Cache::new should clean the stale tmp dir but leave the real entry.
-        let _cache = Cache::new(cache_dir, 10, None, false).await?;
-        assert!(
-            !stale_tmp.exists(),
-            "stale tmp dir should be removed on init"
-        );
-        assert!(
-            !stale_spool.exists(),
-            "stale .nar- spool file should be removed on init"
-        );
-        assert!(
-            real_entry.exists(),
-            "real cache entries must not be removed"
-        );
-        assert!(
-            nar_named.exists(),
-            "store paths with .nar- in the name (not 16-hex suffix) must not be swept"
-        );
-        Ok(())
     }
 }

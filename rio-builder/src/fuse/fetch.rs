@@ -880,8 +880,9 @@ fn fetch_extract_insert_with(
     // heavy parallel-process load surfaced as load-dependent hangs/EIO
     // in the workspace test suite).
     //
-    // Spool name pattern `*.nar-<16hex>` so `clean_stale_tmp_dirs`
-    // catches orphans from a process kill mid-spool.
+    // Spool name pattern `*.nar-<16hex>`; the scopeguard below removes
+    // it on any exit. A process-kill mid-spool leaves the orphan in
+    // emptyDir, which dies with the pod.
     let spool_path = cache.cache_dir().join(format!(
         "{store_basename}.nar-{:016x}",
         rand::random::<u64>()
@@ -1376,7 +1377,7 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = Arc::new(
-            Cache::new(dir.path().to_path_buf(), 10, None, false)
+            Cache::new(dir.path().to_path_buf(), 10, None)
                 .await
                 .expect("Cache::new"),
         );

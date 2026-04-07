@@ -23,21 +23,20 @@ use config::{CliArgs, Config, detect_system};
 const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
-/// I-116: ephemeral-mode idle timeout. Controller spawns N Jobs based
-/// on queue depth; if the queue drains before all Jobs receive work,
-/// the unlucky ones would otherwise idle until activeDeadlineSeconds
-/// (3600s). Override via `RIO_EPHEMERAL_IDLE_SECS` (tests use a short
-/// value).
-const EPHEMERAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// I-116: idle timeout. Controller spawns N Jobs based on queue depth;
+/// if the queue drains before all Jobs receive work, the unlucky ones
+/// would otherwise idle until activeDeadlineSeconds (3600s). Override
+/// via `RIO_IDLE_SECS` (tests use a short value).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Parse `RIO_EPHEMERAL_IDLE_SECS`. Separate from the env read so the
-/// default + fallback are unit-testable without `set_var` (unsafe in
-/// edition 2024, and racy under nextest's shared-process model).
-fn parse_ephemeral_idle_timeout(env_val: Option<&str>) -> Duration {
+/// Parse `RIO_IDLE_SECS`. Separate from the env read so the default +
+/// fallback are unit-testable without `set_var` (unsafe in edition
+/// 2024, and racy under nextest's shared-process model).
+fn parse_idle_timeout(env_val: Option<&str>) -> Duration {
     env_val
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
-        .unwrap_or(EPHEMERAL_IDLE_TIMEOUT)
+        .unwrap_or(IDLE_TIMEOUT)
 }
 
 impl rio_common::config::ValidateConfig for Config {
@@ -85,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         rio_builder::describe_metrics,
     )?;
 
-    let (executor_id, systems, features, ephemeral) = resolve_executor_identity(
+    let (executor_id, systems, features) = resolve_executor_identity(
         std::mem::take(&mut cfg.executor_id),
         std::mem::take(&mut cfg.systems),
         std::mem::take(&mut cfg.features),
@@ -94,10 +93,7 @@ async fn main() -> anyhow::Result<()> {
 
     let _root_guard =
         tracing::info_span!("builder", component = "builder", executor_id = %executor_id).entered();
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        ephemeral, "starting rio-builder"
-    );
+    info!(version = env!("CARGO_PKG_VERSION"), "starting rio-builder");
 
     // cgroup setup BEFORE the health server: if cgroup fails, we don't
     // want liveness passing while startup is hung on `?` propagation.
@@ -137,7 +133,6 @@ async fn main() -> anyhow::Result<()> {
             cfg.fuse_cache_dir,
             cfg.fuse_cache_size_gb,
             cfg.bloom_expected_items,
-            ephemeral,
         )
         .await?,
     );
@@ -262,36 +257,31 @@ async fn main() -> anyhow::Result<()> {
     // it (worker is authority); the assignment handler rejects while
     // set; the reconnect loop KEEPS the stream alive (completions for
     // in-flight builds reach whichever scheduler is leader) until
-    // `drain_done` fires (slot idle via the same wait_idle()
-    // synchronization the ephemeral path uses).
+    // `drain_done` fires (slot idle via wait_idle()).
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let drain_done = Arc::new(tokio::sync::Notify::new());
 
-    // Ephemeral-done signal. Notified by the select loop after a
-    // build is spawned AND its permit returns (CompletionReport was
-    // sent — spawn_build_task's scopeguard drops the permit after
-    // build_tx.send(completion).await). The select loop has an arm
-    // that awaits this; in ephemeral mode, one notification = exit.
+    // Build-complete signal. Notified after the one build is spawned
+    // AND its permit returns (CompletionReport sent — spawn_build_task's
+    // scopeguard drops the permit after build_tx.send(completion).await).
+    // The select loop awaits this; one notification = exit.
     //
     // Notify not oneshot: Notify is cheaper (no channel allocation)
-    // and `notified()` is cancel-safe for select!. We only ever
-    // fire it once in ephemeral mode; in STS mode it's never
-    // notified (the select arm is conditionally added).
-    let ephemeral_done = Arc::new(tokio::sync::Notify::new());
-    // Spawn the ephemeral-done watcher task exactly ONCE (on the
-    // first assignment), not per-assignment. AtomicBool swap(true)
-    // returns the previous value — only the first caller sees false.
-    // Lives outside the reconnect loop: a scheduler failover mid-
-    // build must NOT spawn a second watcher (the build task keeps
-    // running and returns its permit regardless of stream state).
-    let ephemeral_watcher_spawned = std::sync::atomic::AtomicBool::new(false);
-    // I-116: ephemeral idle timeout. `last_activity` is bumped on every
-    // received stream message; the select arm below fires when
-    // `last_activity + idle_timeout` passes with the slot still idle.
-    // Lives outside 'reconnect: a scheduler restart (stream churn with
-    // no Assignment) is still "idle" from the Job's perspective.
-    let idle_timeout =
-        parse_ephemeral_idle_timeout(std::env::var("RIO_EPHEMERAL_IDLE_SECS").ok().as_deref());
+    // and `notified()` is cancel-safe for select!.
+    let build_done = Arc::new(tokio::sync::Notify::new());
+    // Spawn the build-done watcher task exactly ONCE (on the first
+    // assignment). AtomicBool swap(true) returns the previous value —
+    // only the first caller sees false. Lives outside the reconnect
+    // loop: a scheduler failover mid-build must NOT spawn a second
+    // watcher (the build task keeps running and returns its permit
+    // regardless of stream state).
+    let done_watcher_spawned = std::sync::atomic::AtomicBool::new(false);
+    // I-116: idle timeout. `last_activity` is bumped on every received
+    // stream message; the select arm below fires when `last_activity +
+    // idle_timeout` passes with the slot still idle. Lives outside
+    // 'reconnect: a scheduler restart (stream churn with no Assignment)
+    // is still "idle" from the Job's perspective.
+    let idle_timeout = parse_idle_timeout(std::env::var("RIO_IDLE_SECS").ok().as_deref());
     let mut last_activity = tokio::time::Instant::now();
 
     // Latest generation observed in an accepted HeartbeatResponse.
@@ -317,7 +307,6 @@ async fn main() -> anyhow::Result<()> {
         // main() has no other use for the handle.
         circuit: fuse_circuit,
         draining: Arc::clone(&draining),
-        ephemeral,
         generation: Arc::clone(&latest_generation),
         client: scheduler_client.clone(),
     });
@@ -341,12 +330,10 @@ async fn main() -> anyhow::Result<()> {
         // Build tasks' sends never fail on scheduler failover.
         stream_tx: sink_tx,
         slot: Arc::clone(&slot),
-        leaked_mounts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         log_limits: rio_builder::log_stream::LogLimits {
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
-        max_leaked_mounts: cfg.max_leaked_mounts,
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
         max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
@@ -472,42 +459,39 @@ async fn main() -> anyhow::Result<()> {
                     break 'reconnect;
                 }
 
-                // Ephemeral single-shot exit. Guarded on `ephemeral`
-                // so STS-mode workers don't pay the Notify poll cost
-                // (select! with an always-pending arm is cheap, but
-                // why bother). The watcher task spawned after
-                // spawn_build_task fires this once the build's
-                // permit returns.
+                // Single-shot exit. The watcher task spawned after
+                // spawn_build_task fires this once the build's permit
+                // returns.
                 //
                 // biased; ordering: this comes AFTER shutdown (SIGTERM
                 // always wins) but BEFORE the stream arm. If a Cancel
                 // arrives at the same instant the build completes, we
                 // prefer to exit (the build is done; Cancel is moot).
-                _ = ephemeral_done.notified(), if ephemeral => {
-                    info!("ephemeral build complete; exiting single-shot mode");
-                    break StreamEnd::EphemeralDone;
+                _ = build_done.notified() => {
+                    info!("build complete; exiting");
+                    break StreamEnd::BuildComplete;
                 }
 
-                // I-116: ephemeral idle exit. Controller spawns N Jobs
-                // for queue-depth N; if the queue drains first, surplus
-                // Jobs never get an Assignment. Exit cleanly instead of
-                // idling to activeDeadlineSeconds.
+                // I-116: idle exit. Controller spawns N Jobs for
+                // queue-depth N; if the queue drains first, surplus
+                // Jobs never get an Assignment. Exit cleanly instead
+                // of idling to activeDeadlineSeconds.
                 //
                 // `sleep_until(last_activity + timeout)`: the deadline
                 // shifts each time the stream arm bumps `last_activity`
                 // (loop iterates → arm recreated). Guard `!is_busy()`:
                 // once a build starts this arm goes inert — the
-                // `ephemeral_done` arm above owns the post-build exit.
-                // biased; ordering: AFTER ephemeral_done (a completed
+                // `build_done` arm above owns the post-build exit.
+                // biased; ordering: AFTER build_done (a completed
                 // build's exit wins over an idle-timeout that happens
                 // to coincide).
                 _ = tokio::time::sleep_until(last_activity + idle_timeout),
-                    if ephemeral && !slot.is_busy() => {
+                    if !slot.is_busy() => {
                     info!(
                         idle_secs = idle_timeout.as_secs(),
-                        "ephemeral idle timeout (no assignment); exiting"
+                        "idle timeout (no assignment); exiting"
                     );
-                    break StreamEnd::EphemeralDone;
+                    break StreamEnd::BuildComplete;
                 }
 
                 msg_result = tokio_stream::StreamExt::next(&mut build_stream) => {
@@ -609,21 +593,17 @@ async fn main() -> anyhow::Result<()> {
 
                             spawn_build_task(assignment, guard, &build_ctx).await;
 
-                            // r[impl ctrl.pool.ephemeral]
-                            // Ephemeral mode: after spawning the ONE
-                            // build, wait for its permit to return
-                            // (build complete + CompletionReport sent
-                            // — spawn_build_task's scopeguard drops
-                            // the permit after the send), then exit.
-                            //
-                            // This is the single-shot gate. The select
-                            // arm below on `ephemeral_done.notified()`
-                            // breaks the inner loop with
-                            // StreamEnd::EphemeralDone → outer loop
-                            // breaks → run_drain (which is a no-op
-                            // here: slot already idle, DrainExecutor
-                            // deregisters us) → FUSE drop
-                            // → exit 0 → pod terminates → Job complete.
+                            // After spawning the ONE build, wait for
+                            // its permit to return (build complete +
+                            // CompletionReport sent — spawn_build_task's
+                            // scopeguard drops the permit after the
+                            // send), then exit. The select arm on
+                            // `build_done.notified()` breaks the inner
+                            // loop → outer loop breaks → run_drain
+                            // (no-op here: slot already idle,
+                            // DrainExecutor deregisters us) → FUSE
+                            // drop → exit 0 → pod terminates → Job
+                            // complete.
                             //
                             // Why not break immediately here: the build
                             // is still RUNNING (spawn_build_task
@@ -638,24 +618,19 @@ async fn main() -> anyhow::Result<()> {
                             // wait_idle here): inlining would block
                             // the select loop, which means Cancel
                             // messages wouldn't be processed while the
-                            // build runs. An ephemeral build MUST
-                            // still be cancellable (a stuck 2h build
-                            // in a Job pod is wasted compute). The
-                            // watcher runs concurrently; select still
-                            // processes Cancel.
+                            // build runs. The watcher runs concurrently;
+                            // select still processes Cancel.
                             //
-                            // swap(true) gates to ONCE: the first
-                            // assignment sees false and spawns; any
-                            // subsequent assignment (shouldn't happen
-                            // — one build per pod, but belt-and-
-                            // suspenders against scheduler bugs) sees
-                            // true and skips.
-                            if ephemeral
-                                && !ephemeral_watcher_spawned
-                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            // swap(true) gates to ONCE: belt-and-
+                            // suspenders against a scheduler double-
+                            // dispatch bug — the first assignment sees
+                            // false and spawns; any subsequent
+                            // assignment sees true and skips.
+                            if !done_watcher_spawned
+                                .swap(true, std::sync::atomic::Ordering::Relaxed)
                             {
                                 let watch_slot = Arc::clone(&slot);
-                                let done = Arc::clone(&ephemeral_done);
+                                let done = Arc::clone(&build_done);
                                 tokio::spawn(async move {
                                     watch_slot.wait_idle().await;
                                     done.notify_one();
@@ -704,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         match stream_end {
-            StreamEnd::EphemeralDone => break 'reconnect,
+            StreamEnd::BuildComplete => break 'reconnect,
             StreamEnd::Closed | StreamEnd::Error => {
                 // Swap relay target to None — relay buffers until
                 // we open the next stream. Running builds' send()s
@@ -740,16 +715,16 @@ async fn main() -> anyhow::Result<()> {
     // ordering hazards), and any in-flight HeartbeatRequest is
     // harmless (scheduler tolerates a final heartbeat after Drain).
     //
-    // Manual verification (no main-loop test harness): start an
-    // ephemeral builder against a scheduler with admin RPCs blocked
+    // Manual verification (no main-loop test harness): start a
+    // builder against a scheduler with admin RPCs blocked
     // (iptables DROP), trigger a build → completion. Pre-fix: process
     // logs "drain complete, exiting" never appears; heartbeats keep
     // landing every 10s. Post-fix: heartbeats stop within one
     // interval; process exits at the 5s timeout below.
     heartbeat_handle.abort();
 
-    // Exit deregister. By now in_flight=0 (drain_done fired, or
-    // ephemeral's single build returned its permit). DrainExecutor
+    // Exit deregister. By now in_flight=0 (drain_done fired, or the
+    // single build returned its permit). DrainExecutor
     // here is the explicit "I'm leaving" — heartbeat already told
     // the scheduler `draining=true` during the wait. Best-effort:
     // 50% chance of standby (I-046), but the stream-close that
@@ -792,8 +767,8 @@ async fn main() -> anyhow::Result<()> {
     // to process DESTROY in the common case. It's best-effort — if the
     // mount is busy (fusermount fails EBUSY) or the FUSE thread is
     // stuck on a slow request, destroy() won't run. That's fine:
-    // kernel unmounts on process death anyway (the fd closes), and
-    // the next worker instance can remount.
+    // kernel unmounts on process death anyway (the fd closes); a
+    // missed flush only loses profraw for this one build.
     //
     // Why not umount_and_join()? It takes self by value — if it
     // blocks (busy mount → join never returns), there's no clean way
@@ -843,7 +818,7 @@ fn reconnect_drain_gate(
             "shutdown signal received, draining \
              (stream stays connected for completion reports)"
         );
-        // Watcher: same wait_idle synchronization the ephemeral path
+        // Watcher: same wait_idle synchronization the build_done path
         // uses. Spawned (not awaited): the reconnect loop keeps the
         // stream alive; the select arms pick up the notification.
         // Spawned even when idle (the Break below skips the select):
@@ -865,7 +840,7 @@ fn reconnect_drain_gate(
 }
 
 /// Exit-time deregister. The wait-for-in-flight is already done by
-/// the drain watcher (or ephemeral's permit return) before we get
+/// the drain watcher (or the build's permit return) before we get
 /// here — this just sends DrainExecutor as an explicit goodbye.
 ///
 /// K8s preStop sequence is now:
@@ -924,7 +899,7 @@ async fn run_drain(scheduler_addr: &str, executor_id: &str) {
     info!("drain complete, exiting");
 }
 
-/// Why the inner select loop exited. EphemeralDone breaks the outer
+/// Why the inner select loop exited. BuildComplete breaks the outer
 /// reconnect loop; Closed/Error trigger a reconnect. Shutdown no
 /// longer flows through here — the SIGTERM arm `continue 'reconnect`s
 /// directly so the drain transition runs, then `drain_done` (in_flight
@@ -932,10 +907,10 @@ async fn run_drain(scheduler_addr: &str, executor_id: &str) {
 enum StreamEnd {
     Closed,
     Error,
-    /// Ephemeral mode: one build completed. Exit the process so
+    /// One build completed (or idle timeout fired). Exit the process so
     /// the pod terminates → Job completes → ttlSecondsAfterFinished
-    /// reaps it. See `RIO_EPHEMERAL` handling in main().
-    EphemeralDone,
+    /// reaps it.
+    BuildComplete,
 }
 
 /// Pump the permanent sink channel into the current gRPC outbound
@@ -1024,9 +999,9 @@ async fn relay_loop(
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────
 
-/// Resolve executor_id / systems / features / ephemeral from config +
-/// environment. Consumes the config's owned fields (caller passes via
-/// `mem::take` — main() has no further use for them).
+/// Resolve executor_id / systems / features from config + environment.
+/// Consumes the config's owned fields (caller passes via `mem::take` —
+/// main() has no further use for them).
 ///
 /// Errors if executor_id is empty AND gethostname() fails — two workers
 /// with the same ID would steal each other's builds via heartbeat
@@ -1035,7 +1010,7 @@ fn resolve_executor_identity(
     executor_id: String,
     systems: Vec<String>,
     features: Vec<String>,
-) -> anyhow::Result<(String, Vec<String>, Vec<String>, bool)> {
+) -> anyhow::Result<(String, Vec<String>, Vec<String>)> {
     let executor_id = if executor_id.is_empty() {
         nix::unistd::gethostname()
             .ok()
@@ -1076,20 +1051,7 @@ fn resolve_executor_identity(
     // surprising (worker on a kvm-capable host but operator wants
     // to reserve it for other work).
 
-    // r[impl ctrl.pool.ephemeral]
-    // Ephemeral mode: controller's build_job (ephemeral.rs) sets
-    // RIO_EPHEMERAL=1 on Job pods. Worker exits after the one build
-    // completes → pod terminates → Job goes Complete →
-    // ttlSecondsAfterFinished reaps it. Fresh pod per build = zero
-    // cross-build state (FUSE cache, overlayfs upper, filesystem
-    // are all emptyDir, wiped on pod termination).
-    //
-    // is_ok() not == "1": the controller sets "1" but any non-empty
-    // value is a clear intent signal. Matches the pattern at
-    // builders.rs:554 for LLVM_PROFILE_FILE (var_os.is_some).
-    let ephemeral = std::env::var("RIO_EPHEMERAL").is_ok();
-
-    Ok((executor_id, systems, features, ephemeral))
+    Ok((executor_id, systems, features))
 }
 
 /// I-098: refuse to start when the host arch isn't in `RIO_SYSTEMS`.
@@ -1274,11 +1236,6 @@ struct HeartbeatCtx {
     bloom: Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>,
     circuit: Arc<rio_builder::fuse::circuit::CircuitBreaker>,
     draining: Arc<std::sync::atomic::AtomicBool>,
-    /// I-188: one-shot Job mode (RIO_EPHEMERAL). Static — bool, not
-    /// AtomicBool. Reported every heartbeat so the scheduler marks
-    /// draining-on-completion instead of re-dispatching to the
-    /// about-to-exit slot.
-    ephemeral: bool,
     generation: Arc<std::sync::atomic::AtomicU64>,
     client: WorkerClient,
 }
@@ -1302,7 +1259,6 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
         bloom,
         circuit,
         draining,
-        ephemeral,
         generation,
         mut client,
     } = ctx;
@@ -1322,7 +1278,6 @@ fn spawn_heartbeat(ctx: HeartbeatCtx) -> tokio::task::JoinHandle<()> {
                 &resources,
                 circuit.is_open(),
                 draining.load(std::sync::atomic::Ordering::Relaxed),
-                ephemeral,
             )
             .await;
 
@@ -1742,36 +1697,36 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // I-116: ephemeral idle timeout
+    // I-116: idle timeout
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ephemeral_idle_timeout_parses_env() {
+    fn idle_timeout_parses_env() {
         assert_eq!(
-            parse_ephemeral_idle_timeout(None),
+            parse_idle_timeout(None),
             Duration::from_secs(120),
             "unset → default 120s"
         );
         assert_eq!(
-            parse_ephemeral_idle_timeout(Some("5")),
+            parse_idle_timeout(Some("5")),
             Duration::from_secs(5),
             "override honoured"
         );
         assert_eq!(
-            parse_ephemeral_idle_timeout(Some("garbage")),
+            parse_idle_timeout(Some("garbage")),
             Duration::from_secs(120),
             "unparseable → default (fail open: a bad env value shouldn't \
-             wedge ephemeral pods forever)"
+             wedge pods forever)"
         );
     }
 
-    /// I-116 scenario: ephemeral mode, scheduler never dispatches →
-    /// idle-timeout arm fires. Mirrors the select-arm guard +
-    /// `sleep_until` shape in main()'s event loop (the loop itself is
-    /// not extractable — FUSE/gRPC entanglement — so this reproduces
-    /// the two arms that matter under paused time).
+    /// I-116 scenario: scheduler never dispatches → idle-timeout arm
+    /// fires. Mirrors the select-arm guard + `sleep_until` shape in
+    /// main()'s event loop (the loop itself is not extractable —
+    /// FUSE/gRPC entanglement — so this reproduces the two arms that
+    /// matter under paused time).
     #[tokio::test(start_paused = true)]
-    async fn ephemeral_idle_timeout_fires_with_no_assignment() {
+    async fn idle_timeout_fires_with_no_assignment() {
         use rio_builder::runtime::BuildSlot;
         let slot = Arc::new(BuildSlot::default());
         let idle_timeout = Duration::from_secs(120);
@@ -1796,10 +1751,10 @@ mod tests {
 
     /// I-116 scenario: assignment received → slot busy → guard is
     /// false → idle-timeout arm inert for the entire build, even past
-    /// the 120s deadline. The post-build exit is `ephemeral_done`'s
+    /// the 120s deadline. The post-build exit is `build_done`'s
     /// job (covered by `drain_wait_slot_synchronization`).
     #[tokio::test(start_paused = true)]
-    async fn ephemeral_idle_timeout_inert_while_building() {
+    async fn idle_timeout_inert_while_building() {
         use rio_builder::runtime::BuildSlot;
         let slot = Arc::new(BuildSlot::default());
         let idle_timeout = Duration::from_secs(120);
@@ -1832,7 +1787,7 @@ mod tests {
     /// lifetime" semantics — `sleep_until` is recreated each loop
     /// iteration with the bumped `last_activity`.
     #[tokio::test(start_paused = true)]
-    async fn ephemeral_idle_timeout_resets_on_message() {
+    async fn idle_timeout_resets_on_message() {
         use rio_builder::runtime::BuildSlot;
         let slot = Arc::new(BuildSlot::default());
         let idle_timeout = Duration::from_secs(120);

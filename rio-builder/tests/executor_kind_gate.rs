@@ -6,7 +6,7 @@
 //! cross-kind assignments BEFORE overlay setup or daemon spawn.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
 
 use rio_builder::executor::{DEFAULT_DAEMON_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
 use rio_builder::log_stream::LogLimits;
@@ -29,7 +29,6 @@ fn make_env(kind: ExecutorKind, dir: &std::path::Path) -> ExecutorEnv {
         overlay_base_dir: dir.to_path_buf(),
         executor_id: "test-executor".into(),
         log_limits: LogLimits::UNLIMITED,
-        max_leaked_mounts: 3,
         daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
         max_silent_time: 0,
         cgroup_parent: dir.to_path_buf(),
@@ -61,8 +60,7 @@ async fn run(kind: ExecutorKind, drv: &[u8], is_fod: bool) -> Result<(), Executo
     let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
     let mut store = StoreServiceClient::new(channel);
     let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
-    let leak = Arc::new(AtomicUsize::new(0));
-    execute_build(&assignment, &env, &mut store, &log_tx, &leak)
+    execute_build(&assignment, &env, &mut store, &log_tx)
         .await
         .map(|_| ())
 }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore, mpsc};
@@ -69,8 +69,8 @@ pub struct BuildSlot {
     /// are serial; heartbeat reads every 10s).
     running: std::sync::Mutex<Option<String>>,
     /// Notified on release. `notify_waiters` (not `_one`): the drain
-    /// watcher and ephemeral watcher may both be parked at once
-    /// (SIGTERM during ephemeral mode's single build).
+    /// watcher and the build-done watcher may both be parked at once
+    /// (SIGTERM during the build).
     idle: Notify,
 }
 
@@ -161,7 +161,6 @@ pub async fn build_heartbeat_request(
     resources: &ResourceSnapshotHandle,
     store_degraded: bool,
     draining: bool,
-    _ephemeral: bool,
 ) -> HeartbeatRequest {
     let current: Vec<String> = slot.running().into_iter().collect();
 
@@ -269,15 +268,10 @@ pub struct BuildSpawnContext {
     /// main.rs's assignment handler `try_claim`s before calling
     /// [`spawn_build_task`].
     pub slot: Arc<BuildSlot>,
-    /// Worker-lifetime count of overlay mounts whose teardown failed.
-    /// `execute_build` checks this at entry; `OverlayMount::Drop` increments.
-    pub leaked_mounts: Arc<AtomicUsize>,
     /// Per-build log rate/size limits. `Copy`, so cloning into each spawned
     /// task is cheap. Worker-wide (set once at startup from config), not
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
-    /// Leaked overlay mount threshold (from `Config.max_leaked_mounts`).
-    pub max_leaked_mounts: usize,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
     pub daemon_timeout: std::time::Duration,
     /// Silence timeout default (from `Config.max_silent_time_secs`).
@@ -505,13 +499,10 @@ where
 /// `ctx.stream_tx` and drops the slot guard on exit (success, failure,
 /// or panic).
 ///
-/// Ephemeral mode (`RIO_EPHEMERAL` env, set by the controller's
-/// `ephemeral::build_job` on Job pods — see `r[ctrl.pool.ephemeral]`):
 /// main.rs's event loop spawns a watcher AFTER calling this that
 /// `slot.wait_idle()`s, then signals exit. The guard-drop on completion
 /// IS the signal. The single-shot gate is in main.rs's select! loop,
-/// not here; putting it here would mean every `spawn_build_task` caller
-/// (including tests) would need to handle the ephemeral branch.
+/// not here.
 #[instrument(skip_all, fields(drv_path = %assignment.drv_path))]
 pub async fn spawn_build_task(
     assignment: WorkAssignment,
@@ -561,7 +552,6 @@ pub async fn spawn_build_task(
     // Clone state needed by spawned tasks ('static lifetime).
     let mut build_store_client = ctx.store_clients.store.clone();
     let build_tx = ctx.stream_tx.clone();
-    let build_leaked_mounts = Arc::clone(&ctx.leaked_mounts);
     let build_drv_path = drv_path.clone();
     let build_cancel_registry = Arc::clone(&ctx.cancel_registry);
     let build_cancelled = cancelled;
@@ -570,7 +560,6 @@ pub async fn spawn_build_task(
         overlay_base_dir: ctx.overlay_base_dir.clone(),
         executor_id: ctx.executor_id.clone(),
         log_limits: ctx.log_limits,
-        max_leaked_mounts: ctx.max_leaked_mounts,
         daemon_timeout: ctx.daemon_timeout,
         max_silent_time: ctx.max_silent_time,
         cgroup_parent: ctx.cgroup_parent.clone(),
@@ -595,7 +584,7 @@ pub async fn spawn_build_task(
     let executor_future = async move {
         // Hold the slot until build completes — drop on any exit
         // (success, failure, panic, cancellation) clears slot.running
-        // and wakes drain/ephemeral wait_idle().
+        // and wakes wait_idle().
         let _slot_guard = guard;
 
         // Remove from cancel_registry on task exit. Same lifetime as
@@ -634,7 +623,6 @@ pub async fn spawn_build_task(
                     &build_env,
                     &mut build_store_client,
                     &build_tx,
-                    &build_leaked_mounts,
                 ),
                 &build_cgroup_path,
                 &build_drv_path,
@@ -1085,7 +1073,6 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
-            false,
         )
         .await;
         assert_eq!(req.running_builds, vec!["/nix/store/foo.drv".to_string()]);
@@ -1111,7 +1098,6 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
-            false,
         )
         .await;
         assert!(req.running_builds.is_empty());
@@ -1132,7 +1118,6 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
-            false,
         )
         .await;
         assert_eq!(req.size_class, "large");
@@ -1146,7 +1131,6 @@ mod tests {
             &slot,
             None,
             &ResourceSnapshotHandle::default(),
-            false,
             false,
             false,
         )
@@ -1179,7 +1163,6 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             true,
             false,
-            false,
         )
         .await;
         assert!(
@@ -1198,7 +1181,6 @@ mod tests {
             &slot,
             None,
             &ResourceSnapshotHandle::default(),
-            false,
             false,
             false,
         )
@@ -1223,7 +1205,6 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
-            false,
         )
         .await;
         assert_eq!(req.systems, vec!["x86_64-linux", "aarch64-linux"]);
@@ -1236,7 +1217,7 @@ mod tests {
     async fn test_heartbeat_includes_bloom_from_cache() {
         // Real Cache needs SQLite on disk — tempdir.
         let dir = tempfile::tempdir().unwrap();
-        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None, false)
+        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None)
             .await
             .unwrap();
 
@@ -1272,7 +1253,6 @@ mod tests {
             &ResourceSnapshotHandle::default(),
             false,
             false,
-            false,
         )
         .await;
 
@@ -1299,41 +1279,6 @@ mod tests {
         // Absent path — probably-false (could be a false positive, but
         // at 1% FPR with 2 items inserted, that's vanishingly unlikely).
         assert!(!filter.maybe_contains("/nix/store/zzz-never-inserted"));
-    }
-
-    /// Bloom filter is populated from SQLite at Cache::new — paths that
-    /// were cached in a PREVIOUS run are in the filter immediately.
-    #[tokio::test]
-    async fn test_bloom_rebuilt_from_sqlite_on_restart() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // First "run": insert a path, drop the Cache.
-        {
-            let cache = Arc::new(
-                fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None, false)
-                    .await
-                    .unwrap(),
-            );
-            let c = Arc::clone(&cache);
-            // spawn_blocking for the same block_on-in-async reason as above.
-            tokio::task::spawn_blocking(move || {
-                c.insert("/nix/store/persistent-path", 100).unwrap();
-            })
-            .await
-            .unwrap();
-        }
-
-        // Second "run": fresh Cache on the SAME dir. SQLite persisted;
-        // bloom should be rebuilt from it.
-        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1, None, false)
-            .await
-            .unwrap();
-        let snapshot = cache.bloom_snapshot();
-
-        assert!(
-            snapshot.maybe_contains("/nix/store/persistent-path"),
-            "bloom should include paths from previous run's SQLite"
-        );
     }
 }
 

@@ -129,17 +129,6 @@ pub(crate) struct Config {
     /// memory-optimized. The scheduler routes by estimated duration;
     /// this just declares which bucket this builder serves.
     pub(crate) size_class: String,
-    /// Threshold for leaked overlay mounts before refusing new builds.
-    /// After N umount2 failures (stuck-busy mounts), the builder is
-    /// degraded; execute_build short-circuits with InfrastructureFailure
-    /// so the scheduler reassigns and the supervisor can restart.
-    ///
-    /// NOT in BuilderPoolSpec (CRD): this is a "when to give up"
-    /// threshold, not a tunable. 3 leaked mounts is the point where
-    /// the overlay namespace is corrupt enough that continuing to
-    /// accept builds wastes scheduler time. No operator has a reason
-    /// to set this to 5 or 10.
-    pub(crate) max_leaked_mounts: usize,
     /// Timeout (seconds) for the local nix-daemon subprocess build when
     /// the client didn't specify BuildOptions.build_timeout. Intentionally
     /// long (2h default) — some builds genuinely take that long; this is
@@ -210,7 +199,6 @@ impl Default for Config {
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),
-            max_leaked_mounts: 3,
             daemon_timeout_secs: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
             max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
@@ -308,11 +296,6 @@ pub(crate) struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     size_class: Option<String>,
 
-    /// Max leaked overlay mounts before refusing builds (default: 3)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_leaked_mounts: Option<usize>,
-
     /// Daemon build timeout seconds (default: 7200)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,7 +363,6 @@ mod tests {
         // Spec values from configuration.md:68-69.
         assert_eq!(d.log_rate_limit, 10_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
-        assert_eq!(d.max_leaked_mounts, 3);
         assert!(
             d.bloom_expected_items.is_none(),
             "bloom_expected_items defaults to None → Cache::new uses 50k compile-time fallback"
@@ -457,6 +439,5 @@ mod tests {
              via Serialized::defaults base layer"
         );
         assert_eq!(cfg.fuse_fetch_timeout_secs, 60);
-        assert_eq!(cfg.max_leaked_mounts, 3);
     });
 }

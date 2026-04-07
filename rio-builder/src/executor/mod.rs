@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -63,13 +63,6 @@ pub struct ExecutorEnv {
     pub overlay_base_dir: std::path::PathBuf,
     pub executor_id: String,
     pub log_limits: LogLimits,
-    /// Threshold for leaked overlay mounts before refusing new builds.
-    /// A leaked mount means `umount2` failed in `OverlayMount::Drop` —
-    /// typically the mount is stuck busy (open file handles, zombie
-    /// nix-daemon). After N leaks the worker is degraded; refusing builds
-    /// and reporting `InfrastructureFailure` lets the scheduler reassign
-    /// to a healthy worker, and the supervisor can restart this one.
-    pub max_leaked_mounts: usize,
     /// Timeout for the local nix-daemon subprocess build. Used when the
     /// client didn't specify `BuildOptions.build_timeout`. Intentionally
     /// long (default 2h) — some builds genuinely take that long; the
@@ -317,7 +310,6 @@ pub async fn execute_build(
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
     log_tx: &mpsc::Sender<ExecutorMessage>,
-    leak_counter: &Arc<AtomicUsize>,
 ) -> Result<ExecutionResult, ExecutorError> {
     // Destructure for ergonomics — the body was written with these as
     // params, and rewriting every `fuse_mount_point` to `env.fuse_mount_point`
@@ -336,42 +328,6 @@ pub async fn execute_build(
         is_fod = assignment.is_fixed_output,
         "starting build"
     );
-
-    // Refuse new builds once the worker has leaked too many overlay mounts.
-    // A leaked mount (umount2 failed in OverlayMount::Drop) usually means
-    // the mount is stuck busy — open file handles, zombie nix-daemon, FUSE
-    // hang. After N leaks the worker is degraded; returning
-    // InfrastructureFailure here lets the scheduler reassign to a healthy
-    // worker, and the supervisor can restart this one. We check at ENTRY,
-    // not exit: a build that completes successfully shouldn't have its
-    // result overridden just because its own teardown later fails — the
-    // NEXT build is what gets refused.
-    let leaked = leak_counter.load(Ordering::Relaxed);
-    let threshold = env.max_leaked_mounts;
-    if leaked >= threshold {
-        tracing::error!(
-            leaked,
-            threshold,
-            drv_path = %drv_path,
-            "refusing build: leaked overlay mount threshold exceeded; worker needs restart"
-        );
-        return Ok(ExecutionResult {
-            drv_path: drv_path.clone(),
-            result: ProtoBuildResult {
-                status: BuildResultStatus::InfrastructureFailure.into(),
-                error_msg: format!(
-                    "worker has {leaked} leaked overlay mounts (threshold {threshold}); refusing new builds"
-                ),
-                ..Default::default()
-            },
-            assignment_token: assignment.assignment_token.clone(),
-            // Infra failure before daemon spawn → cgroup never
-            // created, never populated. All resource fields = 0.
-            peak_memory_bytes: 0,
-            output_size_bytes: 0,
-            peak_cpu_cores: 0.0,
-        });
-    }
 
     // 1. Parse the derivation. Scheduler inlines drv_content for
     // missing-output nodes; empty means cache-hit or
@@ -442,9 +398,8 @@ pub async fn execute_build(
     let fuse_mp = fuse_mount_point.to_path_buf();
     let overlay_base = overlay_base_dir.to_path_buf();
     let build_id_owned = build_id.clone();
-    let leak_counter_owned = Arc::clone(leak_counter);
     let overlay_mount = tokio::task::spawn_blocking(move || {
-        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned, leak_counter_owned)
+        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned)
     })
     .await
     .map_err(ExecutorError::OverlayTaskPanic)??;
@@ -1885,76 +1840,6 @@ mod tests {
         let content = std::fs::read_to_string(&conf_path)?;
         assert!(content.contains("cores = 1\n"), "0 clamped to 1");
         assert!(!content.contains("cores = 0"));
-        Ok(())
-    }
-
-    /// When the leak counter is at or over threshold, execute_build must
-    /// short-circuit with InfrastructureFailure BEFORE touching the overlay.
-    /// This test does NOT require CAP_SYS_ADMIN: it sets the counter over
-    /// the threshold and asserts the short-circuit path, which runs before
-    /// setup_overlay is ever called.
-    #[tokio::test]
-    async fn test_execute_build_refuses_when_leaked_exceeds_threshold() -> anyhow::Result<()> {
-        // Set well over any plausible threshold (default is 3).
-        let leak_counter = Arc::new(AtomicUsize::new(999));
-
-        let assignment = WorkAssignment {
-            drv_path: rio_test_support::fixtures::test_drv_path("test"),
-            assignment_token: "token-123".into(),
-            ..Default::default()
-        };
-
-        // store_client: execute_build short-circuits before any gRPC call, so
-        // we pass a client pointed at a garbage endpoint. connect_lazy() does
-        // not dial until first use.
-        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
-        let mut store_client = StoreServiceClient::new(channel);
-
-        let (log_tx, _log_rx) = mpsc::channel(1);
-        let dir = tempfile::tempdir()?;
-
-        let env = ExecutorEnv {
-            fuse_mount_point: dir.path().to_path_buf(),
-            overlay_base_dir: dir.path().to_path_buf(),
-            executor_id: "test-worker".into(),
-            log_limits: LogLimits::UNLIMITED,
-            max_leaked_mounts: 3,
-            daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
-            max_silent_time: 0,
-            // Short-circuit path never reaches cgroup setup (bails at
-            // the leak-threshold check). Tempdir is fine.
-            cgroup_parent: dir.path().to_path_buf(),
-            executor_kind: rio_proto::types::ExecutorKind::Builder,
-            fuse_cache: None,
-            fuse_fetch_timeout: Duration::from_secs(60),
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
-        let result =
-            execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;
-
-        // Must be Ok(ExecutionResult{InfrastructureFailure}), NOT Err —
-        // Ok ensures CompletionReport is sent so the scheduler reassigns.
-        let exec = result.expect("short-circuit path returns Ok, not Err");
-        assert_eq!(exec.drv_path, assignment.drv_path);
-        assert_eq!(exec.assignment_token, "token-123");
-        assert_eq!(
-            exec.result.status,
-            BuildResultStatus::InfrastructureFailure as i32,
-            "should report InfrastructureFailure"
-        );
-        assert!(
-            exec.result.error_msg.contains("leaked overlay mount"),
-            "error message should mention leaked mounts, got: {}",
-            exec.result.error_msg
-        );
-        assert!(
-            exec.result.error_msg.contains("999"),
-            "error message should include the leak count, got: {}",
-            exec.result.error_msg
-        );
-
-        // Counter unchanged — short-circuit doesn't touch the overlay.
-        assert_eq!(leak_counter.load(Ordering::Relaxed), 999);
         Ok(())
     }
 
