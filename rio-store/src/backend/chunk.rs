@@ -320,10 +320,16 @@ impl ChunkBackend for FilesystemChunkBackend {
         // put() returning and complete_manifest() committing leaves the
         // manifest claiming a chunk exists that's zero-length or absent.
         //
-        // `.tmp` extension gives the rename atomicity (same directory,
-        // same filesystem). tempfile::NamedTempFile would put the temp
-        // in /tmp — cross-filesystem rename isn't atomic.
-        let tmp_path = path.with_extension("tmp");
+        // Temp goes in the same directory (rename atomicity needs same
+        // filesystem) with a random suffix so concurrent puts of the
+        // same content-addressed chunk don't race on the same temp name.
+        let tmp_path = path.with_extension(format!(
+            "{:016x}.tmp",
+            uuid::Uuid::new_v4().as_u128() as u64
+        ));
+        let tmp_guard = scopeguard::guard(tmp_path.clone(), |p| {
+            let _ = std::fs::remove_file(&p);
+        });
         {
             use tokio::io::AsyncWriteExt;
             let mut f = tokio::fs::File::create(&tmp_path).await?;
@@ -331,6 +337,7 @@ impl ChunkBackend for FilesystemChunkBackend {
             f.sync_all().await?;
         }
         tokio::fs::rename(&tmp_path, &path).await?;
+        scopeguard::ScopeGuard::into_inner(tmp_guard);
 
         // fsync parent dir. Without this, the rename's directory entry
         // can be lost on power failure even though the file data is
