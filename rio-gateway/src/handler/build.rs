@@ -335,16 +335,49 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                                 ],
                             )
                             .await?;
-                        act.drv.insert(drv_event.derivation_path.clone(), aid);
+                        // I-206: a duplicate Started (replay after
+                        // reconnect, or scheduler retry) overwrites the
+                        // prior aid — the client then has TWO actBuild
+                        // for this drv, and Completed only stops the
+                        // newest. Stop the old one here so nom doesn't
+                        // show a phantom-stuck build.
+                        if let Some(prev) = act.drv.insert(drv_event.derivation_path.clone(), aid) {
+                            debug!(
+                                drv = %drv_event.derivation_path,
+                                prev_aid = prev,
+                                new_aid = aid,
+                                "duplicate Started; stopping prior activity"
+                            );
+                            stderr.stop_activity(prev).await?;
+                        }
                     }
                     Some(types::derivation_event::Status::Completed(_)) => {
                         if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                             stderr.stop_activity(aid).await?;
+                        } else {
+                            // I-206 witness: Completed for a drv we
+                            // never (or no longer) have an aid for —
+                            // path-key mismatch, or Started was dropped
+                            // by a Lagged window. Display-only; the
+                            // root actBuilds stop at terminal clears
+                            // children. Logged so the next repro
+                            // captures which case.
+                            debug!(
+                                drv = %drv_event.derivation_path,
+                                tracked = act.drv.len(),
+                                "Completed with no tracked activity (I-206)"
+                            );
                         }
                     }
                     Some(types::derivation_event::Status::Failed(ref failed)) => {
                         if let Some(aid) = act.drv.remove(&drv_event.derivation_path) {
                             stderr.stop_activity(aid).await?;
+                        } else {
+                            debug!(
+                                drv = %drv_event.derivation_path,
+                                tracked = act.drv.len(),
+                                "Failed with no tracked activity (I-206)"
+                            );
                         }
                         // Log failure via STDERR_NEXT
                         stderr
