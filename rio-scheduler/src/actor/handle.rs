@@ -149,7 +149,7 @@ impl ActorHandle {
         log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
         size_classes: Vec<crate::assignment::SizeClassConfig>,
         fetcher_size_classes: Vec<crate::assignment::FetcherSizeClassConfig>,
-        soft_features: Vec<String>,
+        soft_features: Vec<crate::assignment::SoftFeature>,
         poison_config: PoisonConfig,
         retry_policy: RetryPolicy,
         substitute_max_concurrent: usize,

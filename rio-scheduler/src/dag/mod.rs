@@ -77,7 +77,16 @@ pub struct DerivationDag {
     /// the same gate-only set without threading a param through 50
     /// `rejection_reason` call sites. The DB persists the unstripped
     /// original (merge.rs writes `node.required_features`).
-    soft_features: Vec<String>,
+    ///
+    /// I-213: each entry MAY carry a `floor_hint` --- the strip raises
+    /// `size_class_floor` to that class so a `big-parallel` build lands
+    /// on `xlarge` directly instead of climbing from tiny.
+    soft_features: Vec<crate::assignment::SoftFeature>,
+    /// Builder size-class names smallest→largest (cutoff order) for
+    /// comparing `floor_hint`s during the strip. Snapshot from
+    /// `with_size_classes` --- the rebalancer mutates cutoffs but never
+    /// reorders or renames classes, so a one-time copy is stable.
+    class_order: Vec<String>,
 }
 
 impl DerivationDag {
@@ -89,8 +98,46 @@ impl DerivationDag {
     /// Set soft features. Called once from `DagActor::with_soft_features`
     /// before any merge/recovery; stripping in `insert_recovered_node`
     /// and the merge path read this. No-op if called with an empty vec.
-    pub fn set_soft_features(&mut self, soft: Vec<String>) {
+    pub fn set_soft_features(
+        &mut self,
+        soft: Vec<crate::assignment::SoftFeature>,
+        class_order: Vec<String>,
+    ) {
         self.soft_features = soft;
+        self.class_order = class_order;
+    }
+
+    // r[impl sched.dispatch.soft-features]
+    // r[impl sched.sizing.soft-feature-floor]
+    /// Strip configured soft features from `state.required_features`
+    /// and raise `state.size_class_floor` to the highest `floor_hint`
+    /// among the stripped features. Only RAISES --- a recovered node
+    /// with a persisted floor higher than the hint keeps it.
+    fn apply_soft_features(&self, state: &mut DerivationState) {
+        if self.soft_features.is_empty() {
+            return;
+        }
+        let mut hint: Option<&str> = None;
+        state.required_features.retain(|f| {
+            match self.soft_features.iter().find(|sf| sf.name == *f) {
+                Some(sf) => {
+                    if let Some(h) = sf.floor_hint.as_deref() {
+                        hint =
+                            crate::assignment::max_class_by_order(hint, Some(h), &self.class_order);
+                    }
+                    false
+                }
+                None => true,
+            }
+        });
+        if let Some(h) = hint {
+            let raised = crate::assignment::max_class_by_order(
+                state.size_class_floor.as_deref(),
+                Some(h),
+                &self.class_order,
+            );
+            state.size_class_floor = raised.map(String::from);
+        }
     }
 
     /// Insert a pre-built node (Phase 3b state recovery). No cycle
@@ -107,10 +154,7 @@ impl DerivationDag {
             tracing::warn!(drv_hash = %hash, "duplicate recovered node (skipping)");
             return;
         }
-        // r[impl sched.dispatch.soft-features]
-        state
-            .required_features
-            .retain(|f| !self.soft_features.contains(f));
+        self.apply_soft_features(&mut state);
         self.path_to_hash
             .insert(state.drv_path().to_string(), hash.clone());
         self.nodes.insert(hash, state);
@@ -274,17 +318,15 @@ impl DerivationDag {
                         path: node.drv_path.clone(),
                         source: e,
                     })?;
-                // r[impl sched.dispatch.soft-features]
                 // I-204: strip soft features at insertion so the
                 // I-181/I-176 snapshot filter and rejection_reason's
                 // `feature-missing` clause both see hardware-gate
                 // features only. With `soft_features=[big-parallel]`,
                 // a `{big-parallel}` derivation becomes ∅-feature →
                 // featureless pools count it (subset vacuously true),
-                // kvm pool skips it (I-181 ∅ guard).
-                state
-                    .required_features
-                    .retain(|f| !self.soft_features.contains(f));
+                // kvm pool skips it (I-181 ∅ guard). I-213: also
+                // raises `size_class_floor` to the configured hint.
+                self.apply_soft_features(&mut state);
                 state.interested_builds.insert(build_id);
                 // Carry over interested_builds + retry_count from the
                 // removed retriable node (if any) — other stuck builds

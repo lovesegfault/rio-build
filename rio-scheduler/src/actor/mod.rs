@@ -227,7 +227,7 @@ pub struct DagActor {
     /// I-204: capability-hint features stripped at DAG insertion.
     /// Mirrored onto `self.dag` by `with_soft_features` and re-applied
     /// in `clear_persisted_state` (recovery replaces the DAG).
-    soft_features: Vec<String>,
+    soft_features: Vec<crate::assignment::SoftFeature>,
     /// ADR-020 capacity manifest headroom. Applied by both
     /// `compute_capacity_manifest` (manifest RPC) and the dispatch-time
     /// resource-fit filter. Config-global; per-pool later if needed.
@@ -493,8 +493,15 @@ impl DagActor {
     /// Stored on the actor (not just the DAG) because
     /// `clear_persisted_state` replaces `self.dag` on every leader
     /// transition — the actor copy is what survives.
-    pub fn with_soft_features(mut self, soft: Vec<String>) -> Self {
-        self.dag.set_soft_features(soft.clone());
+    ///
+    /// MUST be called after [`Self::with_size_classes`]: the DAG
+    /// snapshot of class-order (for I-213 floor-hint comparison) is
+    /// computed here. main.rs's `validate()` asserts the call-order
+    /// invariant indirectly (every `floor_hint` must name a known
+    /// class), and `handle.rs` wires them in the right order.
+    pub fn with_soft_features(mut self, soft: Vec<crate::assignment::SoftFeature>) -> Self {
+        let order = crate::assignment::builder_class_order(&self.size_classes.read());
+        self.dag.set_soft_features(soft.clone(), order);
         self.soft_features = soft;
         self
     }
@@ -509,7 +516,9 @@ impl DagActor {
     /// `self.executors` — those are live connections, not persisted.
     pub(super) fn clear_persisted_state(&mut self) {
         self.dag = DerivationDag::new();
-        self.dag.set_soft_features(self.soft_features.clone());
+        let order = crate::assignment::builder_class_order(&self.size_classes.read());
+        self.dag
+            .set_soft_features(self.soft_features.clone(), order);
         self.ready_queue.clear();
         self.builds.clear();
         self.build_events.clear();

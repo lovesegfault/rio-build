@@ -705,7 +705,10 @@ async fn size_class_snapshot_soft_features_strip() {
             mem_limit_bytes: u64::MAX,
             cpu_limit_cores: None,
         }])
-        .with_soft_features(vec!["big-parallel".into()]);
+        .with_soft_features(vec![crate::assignment::SoftFeature {
+            name: "big-parallel".into(),
+            floor_hint: None,
+        }]);
 
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
     actor.test_inject_ready_with_features("vm", None, "x86_64-linux", &["kvm", "big-parallel"]);
@@ -740,6 +743,115 @@ async fn size_class_snapshot_soft_features_strip() {
         snap.iter().find(|s| s.name == "medium").unwrap().queued,
         0,
         "I-204: soft_features survives clear_persisted_state (leader transition)"
+    );
+}
+
+/// I-213: a soft feature with `floor_hint` raises `size_class_floor`
+/// at DAG-insert. firefox-unwrapped (`{big-parallel}`, ~50GB build dir)
+/// previously landed on `tiny` after the strip, climbed
+/// tiny→small→medium, and poisoned at `max_retries=2` before reaching
+/// a tier with enough disk.
+// r[verify sched.sizing.soft-feature-floor]
+#[tokio::test]
+async fn soft_feature_floor_hint_seeds_size_class_floor() {
+    use crate::assignment::{SizeClassConfig, SoftFeature};
+    let db = TestDb::new(&MIGRATOR).await;
+    let classes = |names: &[(&str, f64)]| {
+        names
+            .iter()
+            .map(|(n, c)| SizeClassConfig {
+                name: (*n).into(),
+                cutoff_secs: *c,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
+        .with_size_classes(classes(&[
+            ("tiny", 30.0),
+            ("small", 120.0),
+            ("medium", 600.0),
+            ("large", 3600.0),
+            ("xlarge", 36000.0),
+        ]))
+        .with_soft_features(vec![
+            SoftFeature {
+                name: "big-parallel".into(),
+                floor_hint: Some("xlarge".into()),
+            },
+            SoftFeature {
+                name: "benchmark".into(),
+                floor_hint: None,
+            },
+        ]);
+
+    // big-parallel → stripped + floor=xlarge.
+    actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
+    let s = actor.dag.node("ff").unwrap();
+    assert!(s.required_features.is_empty(), "stripped");
+    assert_eq!(
+        s.size_class_floor.as_deref(),
+        Some("xlarge"),
+        "floor_hint applied on strip"
+    );
+
+    // benchmark only → stripped, no hint → floor stays None.
+    actor.test_inject_ready_with_features("bench", None, "x86_64-linux", &["benchmark"]);
+    assert_eq!(
+        actor.dag.node("bench").unwrap().size_class_floor.as_deref(),
+        None,
+        "no-hint soft feature is strip-only"
+    );
+
+    // Hint must only RAISE: a recovered node with floor=xlarge keeps it
+    // even if a lower-hint feature is stripped. Exercise via a node
+    // whose persisted floor (medium) is BELOW the hint (xlarge) →
+    // raised; and one whose persisted floor would be ABOVE a lower hint.
+    let mut actor2 = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
+        .with_size_classes(classes(&[("tiny", 30.0), ("xlarge", 36000.0)]))
+        .with_soft_features(vec![SoftFeature {
+            name: "big-parallel".into(),
+            floor_hint: Some("tiny".into()),
+        }]);
+    let row = crate::db::RecoveryDerivationRow {
+        derivation_id: uuid::Uuid::new_v4(),
+        drv_hash: "persisted".into(),
+        drv_path: rio_test_support::fixtures::test_drv_path("persisted"),
+        pname: None,
+        system: "x86_64-linux".into(),
+        status: "ready".into(),
+        required_features: vec!["big-parallel".into()],
+        assigned_builder_id: None,
+        retry_count: 0,
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        failed_builders: vec![],
+        size_class_floor: Some("xlarge".into()),
+    };
+    let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
+        .expect("valid path");
+    actor2.dag.insert_recovered_node(state);
+    assert_eq!(
+        actor2
+            .dag
+            .node("persisted")
+            .unwrap()
+            .size_class_floor
+            .as_deref(),
+        Some("xlarge"),
+        "floor_hint never demotes a higher persisted floor"
+    );
+
+    // Survives leader transition.
+    actor.clear_persisted_state();
+    actor.test_inject_ready_with_features("ff2", None, "x86_64-linux", &["big-parallel"]);
+    assert_eq!(
+        actor.dag.node("ff2").unwrap().size_class_floor.as_deref(),
+        Some("xlarge"),
+        "floor_hint survives clear_persisted_state"
     );
 }
 

@@ -369,7 +369,14 @@ scheduler:
   # qualifies. Without this, {big-parallel}-only work routes exclusively
   # to the kvm pool (the only one advertising it) → spawns .metal for
   # firefox/chromium.
-  softFeatures: [big-parallel, benchmark]
+  #
+  # I-213: floorHint seeds size_class_floor on strip so big-parallel
+  # work lands on xlarge directly instead of climbing tiny→small→medium
+  # and poisoning before reaching a viable tier. Omit floorHint for
+  # strip-only (pre-I-213) behavior.
+  softFeatures:
+    - {name: big-parallel, floorHint: xlarge}
+    - {name: benchmark}
   resources:
     requests: {cpu: 500m, memory: 512Mi}
     # 1M-node DAG merge ≈ ~1GB (DerivationState + cycle-check color map +

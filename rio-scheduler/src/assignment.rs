@@ -67,6 +67,60 @@ pub struct FetcherSizeClassConfig {
     pub name: String,
 }
 
+/// One soft-feature entry (`[[soft_features]]` in scheduler.toml).
+/// `name` is stripped from `requiredSystemFeatures` at DAG-insert
+/// (`r[sched.dispatch.soft-features]`). `floor_hint` is the I-213
+/// addition: a stripped feature MAY carry a builder size-class name
+/// that becomes the derivation's initial `size_class_floor` --- so
+/// `big-parallel` lands on `xlarge` directly instead of climbing
+/// tiny→small→medium and exhausting the retry budget before reaching
+/// a viable tier (firefox-unwrapped: ~50GB build dir, evicted on
+/// every tier <large).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftFeature {
+    pub name: String,
+    /// Builder size-class name to use as initial `size_class_floor`
+    /// when this feature is stripped. `None` = strip-only (pre-I-213
+    /// behavior). Validated against `[[size_classes]].name` at startup.
+    #[serde(default)]
+    pub floor_hint: Option<String>,
+}
+
+/// Builder class names sorted smallest→largest by `cutoff_secs`.
+/// Same ordering [`next_builder_class`] / [`classify`] use. Computed
+/// once at actor construction so the DAG's soft-feature strip can
+/// compare `floor_hint`s without holding the `size_classes` RwLock.
+pub fn builder_class_order(classes: &[SizeClassConfig]) -> Vec<String> {
+    let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
+    sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
+    sorted.into_iter().map(|c| c.name.clone()).collect()
+}
+
+/// Higher-ranked of two class names by position in `order`
+/// (smallest→largest). `None` ranks below any `Some`. A name not in
+/// `order` (stale floor after config change) ranks below any known
+/// name --- matches `cutoff_for() = None` degrade-to-no-clamp
+/// elsewhere. Both unknown → `a`.
+pub fn max_class_by_order<'a>(
+    a: Option<&'a str>,
+    b: Option<&'a str>,
+    order: &[String],
+) -> Option<&'a str> {
+    let rank = |n: Option<&str>| n.and_then(|n| order.iter().position(|c| c == n));
+    match (rank(a), rank(b)) {
+        (Some(ra), Some(rb)) => {
+            if rb > ra {
+                b
+            } else {
+                a
+            }
+        }
+        (Some(_), None) => a,
+        (None, Some(_)) => b,
+        (None, None) => a.or(b),
+    }
+}
+
 /// Next-larger fetcher class after `current`, or `None` if `current`
 /// is already the largest (or unknown). Clamps at the top: a FOD
 /// that OOMs on the largest class stays there until poison.
@@ -395,6 +449,56 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 mod tests {
     use super::*;
     use rio_test_support::fixtures::make_derivation_node;
+
+    #[test]
+    fn max_class_by_order_picks_higher_rank() {
+        let order = vec!["tiny".into(), "small".into(), "xlarge".into()];
+        assert_eq!(
+            max_class_by_order(Some("tiny"), Some("xlarge"), &order),
+            Some("xlarge")
+        );
+        assert_eq!(
+            max_class_by_order(Some("xlarge"), Some("tiny"), &order),
+            Some("xlarge")
+        );
+        assert_eq!(
+            max_class_by_order(None, Some("tiny"), &order),
+            Some("tiny"),
+            "None ranks below any Some"
+        );
+        assert_eq!(max_class_by_order(Some("tiny"), None, &order), Some("tiny"));
+        assert_eq!(
+            max_class_by_order(Some("stale"), Some("tiny"), &order),
+            Some("tiny"),
+            "unknown class (stale floor after config change) ranks below known"
+        );
+        assert_eq!(
+            max_class_by_order(Some("a"), Some("b"), &[]),
+            Some("a"),
+            "no order configured → preserve a (degrade to no-clamp)"
+        );
+        assert_eq!(max_class_by_order(None, None, &order), None);
+    }
+
+    #[test]
+    fn builder_class_order_sorts_by_cutoff() {
+        let classes = vec![
+            SizeClassConfig {
+                name: "large".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+            SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            },
+        ];
+        assert_eq!(builder_class_order(&classes), vec!["tiny", "large"]);
+        assert!(builder_class_order(&[]).is_empty());
+    }
 
     fn make_worker(id: &str, _max: u32, running: u32) -> ExecutorState {
         let mut w = ExecutorState::new(id.into());

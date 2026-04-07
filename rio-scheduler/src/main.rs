@@ -58,7 +58,9 @@ struct Config {
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
     /// `big-parallel`, `benchmark`. Helm sets via `scheduler.softFeatures`.
-    soft_features: Vec<String>,
+    /// I-213: each entry MAY carry `floor_hint = "<size-class>"` so the
+    /// strip also seeds `size_class_floor` (e.g. big-parallel → xlarge).
+    soft_features: Vec<rio_scheduler::SoftFeature>,
     /// Plaintext health listen address for K8s probes when mTLS is on.
     /// Shares the same HealthReporter as the main server → leadership
     /// toggles propagate. Only listens if server TLS is configured.
@@ -331,6 +333,22 @@ impl rio_common::config::ValidateConfig for Config {
                     "size_classes[{}].cpu_limit_cores must be finite and positive when set, got {}",
                     class.name,
                     limit
+                );
+            }
+        }
+        // r[impl sched.sizing.soft-feature-floor]
+        // I-213: a `floor_hint` that doesn't name a configured class
+        // would silently no-op (`max_class_by_order` ranks unknown
+        // below known) — big-parallel work would still land on tiny.
+        // Fail fast at startup instead of after the first eviction.
+        for sf in &cfg.soft_features {
+            if let Some(hint) = &sf.floor_hint {
+                anyhow::ensure!(
+                    cfg.size_classes.iter().any(|c| &c.name == hint),
+                    "soft_features[{}].floor_hint = {hint:?} is not a configured size_class \
+                     (known: {:?})",
+                    sf.name,
+                    cfg.size_classes.iter().map(|c| &c.name).collect::<Vec<_>>()
                 );
             }
         }
@@ -1067,6 +1085,30 @@ mod tests {
         assert_eq!(cfg.retry.jitter_fraction, 0.1);
     }
 
+    /// `[[soft_features]]` array-of-tables (the helm-rendered shape)
+    /// parses into `Vec<SoftFeature>` with `floor_hint` optional.
+    #[test]
+    fn soft_features_load_from_toml() {
+        use figment::providers::{Format, Toml};
+        let toml = r#"
+            [[soft_features]]
+            name = "big-parallel"
+            floor_hint = "xlarge"
+            [[soft_features]]
+            name = "benchmark"
+        "#;
+        let cfg: Config =
+            figment::Figment::from(figment::providers::Serialized::defaults(Config::default()))
+                .merge(Toml::string(toml))
+                .extract()
+                .expect("toml parses into Config");
+        assert_eq!(cfg.soft_features.len(), 2);
+        assert_eq!(cfg.soft_features[0].name, "big-parallel");
+        assert_eq!(cfg.soft_features[0].floor_hint.as_deref(), Some("xlarge"));
+        assert_eq!(cfg.soft_features[1].name, "benchmark");
+        assert_eq!(cfg.soft_features[1].floor_hint, None);
+    }
+
     /// Empty TOML → `#[serde(default)]` on Config + sub-struct
     /// defaults → identical to `Config::default()`. This is the
     /// "operator didn't configure it" case — existing deployments
@@ -1203,6 +1245,34 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("poison.threshold"), "{err}");
         assert!(err.contains("0"), "{err}");
+    }
+
+    // r[verify sched.sizing.soft-feature-floor]
+    /// `floor_hint` naming an unconfigured size class would silently
+    /// no-op (the strip ranks unknown below known) — big-parallel
+    /// work would still land on tiny. Fail at startup instead.
+    #[test]
+    fn config_rejects_unknown_floor_hint() {
+        let cfg = Config {
+            size_classes: vec![rio_scheduler::SizeClassConfig {
+                name: "tiny".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            }],
+            soft_features: vec![rio_scheduler::SoftFeature {
+                name: "big-parallel".into(),
+                floor_hint: Some("xlarge".into()),
+            }],
+            ..test_valid_config()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("floor_hint"), "{err}");
+        assert!(err.contains("xlarge"), "{err}");
+        assert!(
+            err.contains("tiny"),
+            "error must list known classes for operator diagnosis: {err}"
+        );
     }
 
     /// Boundary values: the INCLUSIVE endpoints of each range are
