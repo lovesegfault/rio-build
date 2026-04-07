@@ -25,9 +25,25 @@
     # systemd-in-initrd: parallel device probe + structured stage-1
     # logging (journalctl -b shows initrd). amazon-image.nix's NVMe-
     # root + ENA modules already load via availableKernelModules; this
-    # just swaps the busybox stage-1 script for systemd. Shaves a few
-    # seconds off cold boot, which matters for ephemeral builders.
-    initrd.systemd.enable = lib.mkDefault true;
+    # just swaps the busybox stage-1 script for systemd.
+    initrd = {
+      systemd.enable = lib.mkDefault true;
+      # Nitro only: drop xen-blkfront/dm_mod and the 28 SATA/USB/HID
+      # defaults. nvme + ext4 stay via amazon-image.nix's
+      # availableKernelModules. A future QEMU VM-test fixture will need
+      # virtio_blk/virtio_pci added back in its own module.
+      kernelModules = lib.mkForce [ ];
+      includeDefaultModules = false;
+    };
+
+    # amazon-image.nix sets `loader.timeout = 1` with no mkDefault — the
+    # 1 s GRUB countdown is dead time on a headless ephemeral node.
+    loader.timeout = lib.mkForce 0;
+
+    # systemd's status output goes to ttyS0 @ 115200 baud; the per-unit
+    # "[  OK  ] Started …" lines are serial-bound. `quiet` drops them.
+    # Kernel printk stays at the NixOS default loglevel=4.
+    kernelParams = [ "quiet" ];
   };
 
   documentation.enable = false;
