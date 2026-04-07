@@ -27,6 +27,7 @@
 
   imports = [
     ./minimal.nix
+    ./initrd-net.nix
     ./eks-node.nix
     ./hardening.nix
   ];
