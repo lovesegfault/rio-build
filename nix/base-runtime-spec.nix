@@ -57,13 +57,18 @@ let
           gid = 0;
         }
       ];
-      # CRI appends its default device-cgroup rules (deny-all + the
-      # /dev/{null,zero,random,tty,…} allows) AFTER loading this spec
-      # (oci.WithSpecFromFile → CRI spec opts), so this list is
-      # additive, not the full allowlist. Live check on a booted node:
-      #   crictl inspect <cid> | jq '.info.runtimeSpec.linux.resources.devices | length'
-      # — must be >2. If a containerd bump changes merge semantics,
-      # that's where it surfaces.
+      # This is NOT the full cgroup allowlist. With base_runtime_spec
+      # set, CRI does NOT append default devices — `crictl inspect`
+      # shows exactly these 2 entries in BOTH linux.devices and
+      # linux.resources.devices (verified by the base-runtime-spec-
+      # passthrough subtest in nix/tests/scenarios/security.nix,
+      # vm-security-nonpriv-k3s). runc's libcontainer (specconv
+      # AllowedDevices + CreateCgroupConfig) appends /dev/{null,zero,
+      # full,tty,urandom,random} nodes AND the deny-all + standard
+      # cgroup allows when converting OCI spec → libcontainer config
+      # — below crictl-inspect visibility. The CI subtest gates that
+      # our entries SURVIVE to the OCI spec; runc's append is proven
+      # functionally by build-completes (would fail without /dev/null).
       resources.devices = [
         {
           allow = true;

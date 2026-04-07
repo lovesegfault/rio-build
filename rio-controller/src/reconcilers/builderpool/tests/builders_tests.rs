@@ -351,7 +351,7 @@ fn seccomp_profile_json_is_valid() {
 
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
-fn job_pod_fuse_via_device_plugin_when_unprivileged() {
+fn job_pod_fuse_via_extended_resource_when_unprivileged() {
     // Default (privileged=None→false): NO hostPath /dev/fuse volume.
     // Instead, resources.limits has rio.build/fuse=1 (scheduling
     // signal — containerd base_runtime_spec injects the device node).

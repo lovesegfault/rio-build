@@ -270,6 +270,11 @@ let
   # agent-startup with its NodeConfig (root/state paths under /var/
   # lib/rancher/k3s/agent, k3s-bundled pause image, CNI dirs). Nix
   # `''${` escapes literal `${` so k3s sees them.
+  #
+  # Resync against k3s ${k3sPinned.version} on bump:
+  #   https://github.com/k3s-io/k3s/blob/${k3sPinned.version}/pkg/agent/templates/templates.go
+  # Template-var drift surfaces as a vm-*-k3s CI failure; the
+  # waitReady diagnostic dump cats the rendered config.toml.
   baseRuntimeSpec = import ../../base-runtime-spec.nix { inherit pkgs; };
   k3sContainerdConfigTmpl = ''
     version = 3
@@ -693,7 +698,7 @@ rec {
 
     # ── rio.build/{fuse,kvm} extended-resource capacity ─────────────
     # No device plugin runs (containerd base_runtime_spec injects the
-    # device nodes directly — see k3sContainerdDropIn above). The
+    # device nodes directly — see k3sContainerdConfigTmpl above). The
     # rio.build/{fuse,kvm} resource is scheduling-signal-only; on EKS
     # a Karpenter NodeOverlay declares it, here we patch node status
     # directly. kubelet leaves extended resources it never saw via a

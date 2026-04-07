@@ -1380,6 +1380,59 @@ in
                 f"host-side leaf/ exists, subtree_control={subtree!r}"
             )
 
+        # ── base_runtime_spec passthrough: our entries reach runc ───────
+        # nix/base-runtime-spec.nix sets exactly 2 linux.devices nodes
+        # (fuse+kvm) and 2 linux.resources.devices cgroup-allow rules.
+        # `crictl inspect` shows the OCI spec containerd hands to runc
+        # — with base_runtime_spec, that's our base spec MODIFIED by
+        # CRI for container-specifics (process.args/env/cwd/mounts) but
+        # NOT for default devices: CRI's WithDefaultUnixDevices does
+        # not run when a base spec is loaded. runc's libcontainer
+        # (specconv AllowedDevices + CreateCgroupConfig) then adds
+        # /dev/{null,zero,full,tty,urandom,random} nodes AND the
+        # deny-all + standard-dev cgroup allows BELOW the OCI-spec
+        # layer — invisible here, proven functionally by build-
+        # completes below (build would fail without /dev/null).
+        #
+        # What this gate locks in: a containerd bump that makes CRI
+        # DROP the base spec's device entries (e.g. a spec opt that
+        # resets linux.devices/resources.devices instead of leaving
+        # them) would surface here as fuse missing — before the
+        # 270s+ build-timeout it'd otherwise take to notice.
+        # `cid` is reused from cgroup-remount above.
+        with subtest("base-runtime-spec-passthrough: fuse/kvm reach the OCI spec handed to runc"):
+            node_name = kubectl(
+                f"get pod {wp} -o jsonpath='{{.spec.nodeName}}'",
+                ns="${nsBuilders}",
+            ).strip()
+            node = {"k3s-server": k3s_server, "k3s-agent": k3s_agent}[node_name]
+            spec = json.loads(node.succeed(
+                f"k3s crictl inspect {cid} | "
+                "${pkgs.jq}/bin/jq -c '.info.runtimeSpec.linux | "
+                "{devs: [.devices[].path], resdevs: .resources.devices}'"
+            ))
+            devs, resdevs = spec["devs"], spec["resdevs"]
+            assert "/dev/fuse" in devs and "/dev/kvm" in devs, (
+                f"linux.devices={devs!r} — base_runtime_spec /dev/fuse "
+                f"or /dev/kvm missing from OCI spec handed to runc. "
+                f"CRI spec opt reset the list? See nix/base-runtime-spec.nix."
+            )
+            assert any(
+                r.get("allow") and r.get("major") == 10 and r.get("minor") == 229
+                for r in resdevs
+            ), (
+                f"linux.resources.devices={resdevs!r} — fuse cgroup "
+                f"allow (10:229) missing from OCI spec. CRI spec opt "
+                f"reset the list?"
+            )
+            print(
+                f"base-runtime-spec-passthrough PASS: linux.devices="
+                f"{sorted(devs)!r}, resources.devices={len(resdevs)} "
+                f"entries (runc-libcontainer adds /dev/null etc. + "
+                f"deny-all post-OCI-spec — not visible here, proven "
+                f"by build-completes)"
+            )
+
         # ── Build completes: FUSE works via base_runtime_spec ───────────
         # The FUSE mount is the overlay lower layer. If base_runtime_spec
         # injection failed (containerd didn't mknod /dev/fuse inside the

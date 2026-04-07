@@ -66,6 +66,7 @@ The `privileged: true` escape hatch (for clusters whose containerd lacks
 containers cannot be user-namespaced.
 
 r[sec.pod.fuse-device-plugin]
+<!-- rule-id is historical; mechanism is base_runtime_spec since ADR-021 §7 -->
 Worker pods MUST NOT obtain `/dev/fuse` via a hostPath volume — the kernel
 rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding), so
 hostPath is incompatible with `hostUsers: false`. Pods request
