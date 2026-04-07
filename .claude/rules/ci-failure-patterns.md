@@ -25,7 +25,8 @@ Reference catalog of `.#ci` failure signatures that have bitten this project at 
 | Pattern | Signature | Fix strategies |
 |---|---|---|
 | **k3s airgap import timing** | VM test flakes on agent readiness — airgap imports serially/alphabetically before kubelet | Gate on server-node-exists (validated 3/3 — agent-Ready 106.70→1.9s, 56×). Budget for tail, not typical (builder variance 5×). |
-| **flannel subnet race** | `CreatePodSandbox` fails, pod restarts, timing shifts downstream subtests | Platform flake, not test flake — RERUN. Distinct from airgap-gate bug. |
+| **flannel subnet race** | `loadFlannelSubnetEnv failed: open /run/flannel/subnet.env` early in boot | Gated since 7679316a (`k3s-full.nix:720`). The log line is now a benign blip that recovers in <1s; if a subtest still times out, look past the flannel error for the real cause. |
+| **job-tracking finalizer orphan** | `ephemeral-pool` pod-phase wait at 180s; pod cleaned on node but `phase=Running` in apiserver | `reap_excess_pending` background-delete raced Job-Complete → pod's `batch.kubernetes.io/job-tracking` finalizer orphaned. Fixed at source (`job_common.rs:reap_excess_pending` → foreground propagation). If seen again, check for another `DeleteParams::background()` on a Job (e.g. `reap_orphan_running`). |
 | **Machine.succeed() thread-unsafe** | `rc int-on-empty` when bg+main threads both call succeed | Use `--wait=false` instead of threading. |
 | **kubectl logs poll churn** | `http2: stream closed` errors under TCG — `kubectl logs\|grep` in wait_until_succeeds triggers kubelet churn | Don't poll logs for readiness — use cgroup/kernel/metric state instead. |
 | **Wall-clock gate under load** | `assert!(elapsed < Ns)` flakes under builder CPU contention | **(a)** retry-N-times; **(b)** widen gate with documented slack budget; **(c)** convert to structural assertion — count ops, not wall-clock. Prefer (c). |

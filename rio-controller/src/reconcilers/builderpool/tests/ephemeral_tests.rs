@@ -220,11 +220,16 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
             "NotFound",
             "jobs.batch \"rio-builder-med-oldest\" not found",
         ),
-        Scenario::ok(
-            http::Method::DELETE,
-            "/namespaces/rio/jobs/rio-builder-med-mid",
-            serde_json::to_string(&Job::default()).unwrap(),
-        ),
+        Scenario {
+            method: http::Method::DELETE,
+            path_contains: "/namespaces/rio/jobs/rio-builder-med-mid",
+            // Foreground propagation: Job stays until pod's
+            // job-tracking finalizer is processed. See the
+            // DeleteParams::foreground() call site for why.
+            body_contains: Some(r#""propagationPolicy":"Foreground""#),
+            status: 200,
+            body_json: serde_json::to_string(&Job::default()).unwrap(),
+        },
     ]);
 
     let reaped = reap_excess_pending(&jobs_api, &jobs, Some(1), "med-pool", "medium").await;

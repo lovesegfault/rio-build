@@ -77,8 +77,15 @@ pub(super) fn is_failed_job(j: &Job) -> bool {
 /// `None` status (Job controller hasn't reconciled yet → pod not
 /// created) is treated as Pending. That's the safe direction: a Job
 /// with no pod is trivially reapable.
+///
+/// A Job with `deletionTimestamp` set is NOT pending — it's already
+/// terminating (foreground-delete in flight). Re-selecting it would
+/// be a no-op apiserver round-trip + log spam every tick until the
+/// pod's `job-tracking` finalizer clears.
 pub(crate) fn is_pending_job(j: &Job) -> bool {
-    is_active_job(j) && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) == 0
+    j.metadata.deletion_timestamp.is_none()
+        && is_active_job(j)
+        && j.status.as_ref().and_then(|s| s.ready).unwrap_or(0) == 0
 }
 
 /// Active AND `status.ready > 0` — the Job's pod container has
@@ -196,7 +203,15 @@ pub(crate) async fn reap_excess_pending(
     let mut reaped = 0u32;
     for job in excess {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
-        match jobs_api.delete(job_name, &DeleteParams::background()).await {
+        // Foreground: the Job stays (with deletionTimestamp) until its
+        // pod is gone, so the Job controller gets to remove the pod's
+        // `batch.kubernetes.io/job-tracking` finalizer. Background
+        // races Job-Complete: if the Job vanishes first the finalizer
+        // is orphaned and the pod sits Terminating until GC catches up
+        // — >180s under TCG, which times out the lifecycle VM-test
+        // pod-phase wait. Reap targets are ready==0 (unscheduled /
+        // ContainerCreating / just-completed) so foreground adds <1s.
+        match jobs_api.delete(job_name, &DeleteParams::foreground()).await {
             Ok(_) => {
                 info!(
                     pool, class, job = %job_name, queued,
@@ -706,6 +721,15 @@ mod tests {
         assert!(!is_pending_job(&job_with("a", Some(1), Some(0), 0)));
         // succeeded=1 → Completed. NOT pending — TTL reaps.
         assert!(!is_pending_job(&job_with("a", Some(0), Some(1), 0)));
+        // deletionTimestamp set → already terminating (foreground
+        // delete in flight). NOT pending — re-selecting is a no-op
+        // apiserver round-trip per tick.
+        let mut terminating = job_with("a", Some(0), Some(0), 0);
+        terminating.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
+        assert!(!is_pending_job(&terminating));
     }
 
     const NO_GRACE: std::time::Duration = std::time::Duration::ZERO;
