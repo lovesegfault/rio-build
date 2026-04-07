@@ -283,7 +283,7 @@ in
         };
 
         # ── nodeadm-init: oneshot, before kubelet ─────────────────────
-        # `init --skip run -d kubelet`: write kubelet config only, don't
+        # `init --skip run --daemon kubelet`: write kubelet config only, don't
         # systemctl-start it (nodeadm assumes AL2023 unit names; ours
         # differ). `-d kubelet` filters the daemon list so containerd's
         # Configure() never runs — its config is build-time static now.
@@ -313,11 +313,14 @@ in
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
-            # Upstream marks `-d` "for testing"; if a future bump drops it,
-            # the fallback is to remove the flag — nodeadm then writes a
-            # harmless /etc/containerd/config.toml that nothing reads
-            # (containerd's ExecStart points at the store-path config).
-            ExecStart = "${lib.getExe nodeadm} init --skip run -d kubelet";
+            # Upstream marks `--daemon` "for testing"; if a future bump
+            # drops it, the fallback is to remove the flag — nodeadm then
+            # writes a harmless /etc/containerd/config.toml that nothing
+            # reads (containerd's ExecStart points at the store-path
+            # config). Long form required: short `-d` collides with the
+            # global `-d/--development` bool and parses `kubelet` as a
+            # stray positional.
+            ExecStart = "${lib.getExe nodeadm} init --skip run --daemon kubelet";
             # IMDS can be briefly unreachable at very early boot on some
             # instance families; nodeadm retries internally but a unit-
             # level retry is cheap insurance for the P1 spike.
