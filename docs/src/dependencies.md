@@ -16,7 +16,7 @@
 | `clap` | CLI argument parsing | 2b | `features = ["derive", "env"]`. Used by all binaries (gateway, scheduler, store, worker, controller) via figment's `CliArgs` pattern. |
 | `fastcdc` | Content-defined chunking | 2 | For NAR deduplication |
 | `sha2` | SHA-256 hashing | 1 | NAR hash verification, store path computation, content index. All Nix-facing hashes use SHA-256. |
-| `blake3` | Fast cryptographic hashing | 2 | Chunk content addressing; also bloom filter hashing (Kirsch-Mitzenmacher double-hash from split 256-bit output). |
+| `blake3` | Fast cryptographic hashing | 2 | Chunk content addressing (rio-store CAS). |
 | `moka` | In-process LRU cache | 2c | Chunk cache in rio-store. Lock-free, weight-based eviction (tracks byte-size per entry so the 2GB cap is a real memory bound). `features = ["future"]`. |
 | `zstd` / `async-compression` | Zstandard compression | 2 | Binary cache serves `.nar.zst`. `zstd` for buffered paths; `async-compression` for streaming `/nar/` endpoint (O(chunk) memory instead of O(NAR)). |
 | `dashmap` | Concurrent hash map | 2 | Scheduler log ring buffers (written outside actor loop); singleflight for concurrent S3 fetches. |

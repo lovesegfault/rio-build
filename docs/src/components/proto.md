@@ -28,7 +28,7 @@ service WorkerService {
 }
 ```
 
-> **Worker registration:** Worker registration is implicit and two-step: (1) the worker opens a `BuildExecution` bidirectional stream, (2) the worker calls the separate `Heartbeat` unary RPC with its initial capabilities (worker_id, systems, supported_features, size_class, bloom_filter). The scheduler creates the worker entry when it receives a heartbeat from a worker_id that also has an open `BuildExecution` stream. Periodic heartbeats update the bloom filter and resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
+> **Worker registration:** Worker registration is implicit and two-step: (1) the worker opens a `BuildExecution` bidirectional stream, (2) the worker calls the separate `Heartbeat` unary RPC with its initial capabilities (worker_id, systems, supported_features, size_class). The scheduler creates the worker entry when it receives a heartbeat from a worker_id that also has an open `BuildExecution` stream. Periodic heartbeats update resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
 
 ```protobuf
 // store.proto --- inspired by tvix castore/store protos (MIT)
@@ -160,25 +160,16 @@ message HeartbeatRequest {
   string worker_id = 1;
   repeated string running_builds = 2;
   ResourceUsage resources = 3;
-  BloomFilter local_paths = 4;     // Bloom filter of cached store paths
+  reserved 4;                      // was BloomFilter local_paths — locality routing dropped with persistent workers
   repeated string systems = 5;     // Systems this worker builds for (e.g. ["x86_64-linux", "aarch64-linux"])
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
   reserved 7;                      // P0537: was max_builds (always 1 now)
   string size_class = 8;           // Static size-class from worker.toml ("small"/"large"/"" = wildcard)
   bool store_degraded = 9;         // Store-upload circuit breaker OPEN; scheduler routes away until cleared
 }
-
-message BloomFilter {
-  bytes data = 1;
-  uint32 hash_count = 2;
-  uint32 num_bits = 3;
-  BloomHashAlgorithm hash_algorithm = 4;  // enum: BLAKE3_256 (Kirsch-Mitzenmacher double-hash).
-                                          // MURMUR3_128/XXHASH64 were never implemented; reserved.
-  uint32 version = 5;                     // filter format version
-}
 ```
 
-The `BloomFilter` message is self-describing: it includes the hash algorithm and bit count so the scheduler can validate the filter without implicit coupling to worker code. Only `BLAKE3_256` is supported — blake3 is portable and deterministic across architectures (a requirement since the bloom filter crosses the wire between worker and scheduler; AES-NI-dependent hashes would produce different output on heterogeneous clusters).
+> **Locality routing removed:** Field 4 previously carried a bloom filter of cached store paths for transfer-cost-weighted placement. Under the ephemeral one-build-per-pod model a worker has no warm cache to advertise, so locality routing was dropped entirely.
 
 ### BuildEvent
 
@@ -294,7 +285,7 @@ message WatchBuildRequest {
 | `worker.proto` | `WorkerService` --- worker-facing RPCs (BuildExecution, Heartbeat) |
 | `store.proto` | `StoreService`, `ChunkService`, `StoreAdminService` |
 | `admin.proto` | `AdminService` --- dashboard and CLI RPCs |
-| `types.proto` | Shared primitives: `PathInfo`, `ResourceUsage`, `BloomFilter`, `BuildResultStatus`, store/chunk/GC/realisation RPC messages |
+| `types.proto` | Shared primitives: `PathInfo`, `ResourceUsage`, `BuildResultStatus`, store/chunk/GC/realisation RPC messages |
 | `dag.proto` | DAG wire types: `DerivationNode`/`Edge`/`Event*`, `GraphNode`/`Edge`, `GetBuildGraph*` |
 | `build_types.proto` | Build lifecycle: `BuildEvent*`, `SubmitBuildRequest`, `BuildResult`, `BuildStatus`, `WorkerMessage`/`SchedulerMessage` bidi-stream types, `Heartbeat*` |
 | `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListWorkers*`/`Builds*`/`Tenants*`, `SizeClassStatus`, `DrainWorker*`, `ClearPoison*` |

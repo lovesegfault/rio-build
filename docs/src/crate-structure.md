@@ -95,7 +95,6 @@ Notable edges:
 ```
 src/
 ├── lib.rs
-├── bloom.rs           # Self-describing BloomFilter (blake3-based)
 ├── config.rs          # figment-based config layering helpers
 ├── grpc.rs            # gRPC timeouts, message-size constants
 ├── hmac.rs            # HMAC-SHA256 for PutPath metadata integrity
@@ -258,7 +257,7 @@ src/
 ├── lease/
 │   ├── mod.rs         # LeaseState enum + leader-guard helpers
 │   └── election.rs    # Kubernetes Lease-based leader election (HOSTNAME-driven identity)
-├── assignment.rs      # Executor scoring (bloom locality + load) + size-class classify()
+├── assignment.rs      # Executor selection (hard-filter, first-match) + size-class classify()
 ├── critical_path.rs   # Bottom-up priority computation + incremental update
 ├── estimator.rs       # Duration/memory estimates from build_history
 ├── event_log.rs       # BuildEvent ring buffer + PG replay for WatchBuild since_sequence

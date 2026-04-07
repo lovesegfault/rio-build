@@ -702,7 +702,6 @@ When a Nix client uses `--builders` (build hook mode) instead of `--store ssh-ng
 **Scheduling optimizations lost in build hook mode:**
 - **No critical-path analysis** --- the scheduler sees each derivation in isolation, not as part of a graph
 - **No multi-build DAG merging** --- shared derivations between concurrent builds cannot be deduplicated at the scheduling level
-- **Limited closure-locality scoring** --- the scheduler can still use bloom filter locality data, but cannot pre-plan affinity across the build graph
 - **No CA early cutoff** --- without the full DAG, the scheduler cannot propagate cutoffs to downstream nodes
 
 r[gw.hook.ifd-detection]
