@@ -10,12 +10,6 @@
   pkgs,
   pauseRef,
 }:
-let
-  # /dev/{fuse,kvm} injection — shared with the k3s VM-test path
-  # (nix/tests/fixtures/k3s-full.nix). r[impl sec.pod.fuse-device-plugin]
-  # marker lives on the shared file.
-  baseRuntimeSpec = import ../base-runtime-spec.nix { inherit pkgs; };
-in
 pkgs.writeText "containerd-config.toml" ''
   version = 3
   root = "/var/lib/containerd"
@@ -35,7 +29,14 @@ pkgs.writeText "containerd-config.toml" ''
 
   [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
   runtime_type = "io.containerd.runc.v2"
-  base_runtime_spec = "${baseRuntimeSpec}"
+  # /dev/{fuse,kvm} injection — shared with the k3s VM-test path
+  # (nix/tests/fixtures/k3s-full.nix). r[impl sec.pod.fuse-device-plugin]
+  # marker lives on the shared file. Both withKvm variants are baked
+  # into the AMI; eks-node.nix's containerd ExecStartPre symlinks the
+  # right one to /run/base-runtime-spec.json based on host /dev/kvm
+  # presence (so non-.metal pods don't see a dead mknod that fools
+  # `test -c /dev/kvm` probes).
+  base_runtime_spec = "/run/base-runtime-spec.json"
   # ADR-012 §3 — hostUsers:false unblock. Was the only reason for the
   # config.d/10-rio.toml drop-in; folded in now that we own the file.
   cgroup_writable = true
@@ -45,6 +46,6 @@ pkgs.writeText "containerd-config.toml" ''
   BinaryName = "${lib.getExe pkgs.runc}"
 
   [plugins.'io.containerd.cri.v1.runtime'.cni]
-  bin_dir = "/opt/cni/bin"
+  bin_dirs = ["/opt/cni/bin"]
   conf_dir = "/etc/cni/net.d"
 ''

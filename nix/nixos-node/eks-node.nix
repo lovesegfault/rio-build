@@ -15,7 +15,7 @@
 #   /etc/eks/image-credential-provider/config.json
 #
 # containerd config is build-time static (containerd-config.nix) — nodeadm
-# is invoked with `-d kubelet` and never touches /etc/containerd/.
+# is invoked with `--daemon kubelet` and never touches /etc/containerd/.
 {
   config,
   lib,
@@ -45,6 +45,21 @@ let
   pauseRef = "localhost/kubernetes/pause:latest";
   # r[impl sec.pod.host-users-false]
   containerdConfig = import ./containerd-config.nix { inherit lib pkgs pauseRef; };
+
+  # /dev/{fuse,kvm} OCI base spec — both variants baked into the AMI;
+  # containerd's ExecStartPre below picks based on host /dev/kvm
+  # presence and symlinks to /run/base-runtime-spec.json (the path
+  # containerd-config.nix points base_runtime_spec at). Non-.metal
+  # nodes get the fuse-only spec, so pods don't see a dead /dev/kvm
+  # mknod that fools `test -c /dev/kvm` probes.
+  baseRuntimeSpecFuse = import ../base-runtime-spec.nix {
+    inherit pkgs;
+    withKvm = false;
+  };
+  baseRuntimeSpecKvm = import ../base-runtime-spec.nix {
+    inherit pkgs;
+    withKvm = true;
+  };
 in
 {
   options.services.rio.eksNode = {
@@ -226,6 +241,13 @@ in
           ];
           serviceConfig = {
             Slice = "runtime.slice";
+            ExecStartPre = [
+              (pkgs.writeShellScript "pick-base-runtime-spec" ''
+                spec=${baseRuntimeSpecFuse}
+                test -c /dev/kvm && spec=${baseRuntimeSpecKvm}
+                ln -sfn "$spec" /run/base-runtime-spec.json
+              '')
+            ];
             ExecStart = "${pkgs.containerd}/bin/containerd --config ${containerdConfig}";
             Type = "notify";
             Delegate = "yes";
@@ -285,7 +307,7 @@ in
         # ── nodeadm-init: oneshot, before kubelet ─────────────────────
         # `init --skip run --daemon kubelet`: write kubelet config only, don't
         # systemctl-start it (nodeadm assumes AL2023 unit names; ours
-        # differ). `-d kubelet` filters the daemon list so containerd's
+        # differ). `--daemon kubelet` filters the daemon list so containerd's
         # Configure() never runs — its config is build-time static now.
         nodeadm-init = {
           description = "EKS node bootstrap (nodeadm)";

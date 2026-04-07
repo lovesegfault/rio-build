@@ -11,9 +11,14 @@
 # r[impl sec.pod.fuse-device-plugin]
 # runc mknods these inside the container's /dev (container-namespace
 # uid/gid) — NOT a hostPath mount, so no hostUsers:false idmap-mount
-# rejection. Every pod gets both; mounting fuse still needs
-# CAP_SYS_ADMIN, and /dev/kvm ENXIOs on non-.metal. kvm pods route to
-# .metal via the `rio.build/kvm` nodeSelector (controller-derived from
+# rejection. Every pod gets /dev/fuse; mounting fuse still needs
+# CAP_SYS_ADMIN. /dev/kvm is included only when withKvm=true — both
+# delivery paths build BOTH variants and pick at boot via `test -c
+# /dev/kvm` → `ln -sfn … /run/base-runtime-spec.json`, so on
+# non-.metal the node never appears in the container at all (instead
+# of mknod-ing a dead 10:232 that fools `test -c /dev/kvm` probes
+# then ENXIOs on open). kvm pods route to .metal via the
+# `rio.build/kvm` nodeSelector (controller-derived from
 # features:[kvm], r[ctrl.builderpool.kvm-device]).
 #
 # `base_runtime_spec` is the STARTING spec — CRI's spec opts layer on
@@ -25,8 +30,35 @@
 # without a private MNT namespace"). Hence: start from `ctr oci spec`
 # (containerd's full default) and merge our additions, instead of
 # hand-writing a minimal JSON.
-{ pkgs }:
+{
+  pkgs,
+  withKvm ? false,
+}:
 let
+  fuseDev = {
+    path = "/dev/fuse";
+    type = "c";
+    major = 10;
+    minor = 229;
+    fileMode = 438; # 0666
+    uid = 0;
+    gid = 0;
+  };
+  kvmDev = {
+    path = "/dev/kvm";
+    type = "c";
+    major = 10;
+    minor = 232;
+    fileMode = 432; # 0660
+    uid = 0;
+    gid = 0;
+  };
+  cgroupAllow = d: {
+    allow = true;
+    inherit (d) type major minor;
+    access = "rwm";
+  };
+  devs = [ fuseDev ] ++ pkgs.lib.optional withKvm kvmDev;
   rioAdditions = builtins.toJSON {
     process.rlimits = [
       {
@@ -36,29 +68,10 @@ let
       }
     ];
     linux = {
-      devices = [
-        {
-          path = "/dev/fuse";
-          type = "c";
-          major = 10;
-          minor = 229;
-          fileMode = 438; # 0666
-          uid = 0;
-          gid = 0;
-        }
-        {
-          path = "/dev/kvm";
-          type = "c";
-          major = 10;
-          minor = 232;
-          fileMode = 432; # 0660
-          uid = 0;
-          gid = 0;
-        }
-      ];
+      devices = devs;
       # This is NOT the full cgroup allowlist. With base_runtime_spec
       # set, CRI does NOT append default devices — `crictl inspect`
-      # shows exactly these 2 entries in BOTH linux.devices and
+      # shows exactly these entries in BOTH linux.devices and
       # linux.resources.devices (verified by the base-runtime-spec-
       # passthrough subtest in nix/tests/scenarios/security.nix,
       # vm-security-nonpriv-k3s). runc's libcontainer (specconv
@@ -68,22 +81,7 @@ let
       # — below crictl-inspect visibility. The CI subtest gates that
       # our entries SURVIVE to the OCI spec; runc's append is proven
       # functionally by build-completes (would fail without /dev/null).
-      resources.devices = [
-        {
-          allow = true;
-          type = "c";
-          major = 10;
-          minor = 229;
-          access = "rwm";
-        }
-        {
-          allow = true;
-          type = "c";
-          major = 10;
-          minor = 232;
-          access = "rwm";
-        }
-      ];
+      resources.devices = map cgroupAllow devs;
     };
   };
 in
@@ -92,7 +90,7 @@ in
 # object merge: rioAdditions wins on leaf collisions, arrays REPLACE
 # (not append) — fine here since the default spec has no linux.devices
 # and process.rlimits we want to override anyway.
-pkgs.runCommand "base-runtime-spec.json"
+pkgs.runCommand "base-runtime-spec${pkgs.lib.optionalString withKvm "-kvm"}.json"
   {
     nativeBuildInputs = [
       pkgs.containerd
@@ -104,11 +102,13 @@ pkgs.runCommand "base-runtime-spec.json"
   ''
     ctr oci spec | jq -S --slurpfile add "$rioAdditionsPath" '. * $add[0]' > $out
     # Sanity: the merge produced what we expect AND kept the
-    # load-bearing defaults runc needs.
+    # load-bearing defaults runc needs. kvm presence is asserted
+    # to MATCH withKvm (present iff true).
     jq -e '
       .process.cwd != null and .process.cwd != ""
       and (.linux.namespaces | length) > 0
-      and (.linux.devices | map(.path) | contains(["/dev/fuse","/dev/kvm"]))
+      and (.linux.devices | map(.path) | contains(["/dev/fuse"]))
+      and ((.linux.devices | map(.path) | contains(["/dev/kvm"])) == ${pkgs.lib.boolToString withKvm})
       and (.process.rlimits[0].type == "RLIMIT_NOFILE")
     ' $out >/dev/null
   ''

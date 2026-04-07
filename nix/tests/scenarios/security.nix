@@ -1384,10 +1384,23 @@ in
                 "{devs: [.devices[].path], resdevs: .resources.devices}'"
             ))
             devs, resdevs = spec["devs"], spec["resdevs"]
-            assert "/dev/fuse" in devs and "/dev/kvm" in devs, (
+            # /dev/kvm is host-conditional: the k3s ExecStartPre picks
+            # the withKvm spec variant iff `test -c /dev/kvm` on the
+            # node. CI VM tests run with nested KVM (the NixOS test
+            # driver passes -enable-kvm and the guest kernel loads
+            # kvm_intel/kvm_amd), so host_has_kvm is normally True —
+            # the iff check guards both directions if that ever changes.
+            host_has_kvm = node.succeed("test -c /dev/kvm && echo y || echo n").strip() == "y"
+            assert "/dev/fuse" in devs, (
                 f"linux.devices={devs!r} — base_runtime_spec /dev/fuse "
-                f"or /dev/kvm missing from OCI spec handed to runc. "
+                f"missing from OCI spec handed to runc. "
                 f"CRI spec opt reset the list? See nix/base-runtime-spec.nix."
+            )
+            assert ("/dev/kvm" in devs) == host_has_kvm, (
+                f"linux.devices={devs!r} host_has_kvm={host_has_kvm} — "
+                f"/dev/kvm presence in OCI spec must match host. "
+                f"pick-base-runtime-spec ExecStartPre symlinked wrong "
+                f"variant? See nix/tests/fixtures/k3s-full.nix."
             )
             assert any(
                 r.get("allow") and r.get("major") == 10 and r.get("minor") == 229
@@ -1399,8 +1412,9 @@ in
             )
             print(
                 f"base-runtime-spec-passthrough PASS: linux.devices="
-                f"{sorted(devs)!r}, resources.devices={len(resdevs)} "
-                f"entries (runc-libcontainer adds /dev/null etc. + "
+                f"{sorted(devs)!r} host_has_kvm={host_has_kvm}, "
+                f"resources.devices={len(resdevs)} entries "
+                f"(runc-libcontainer adds /dev/null etc. + "
                 f"deny-all post-OCI-spec — not visible here, proven "
                 f"by build-completes)"
             )

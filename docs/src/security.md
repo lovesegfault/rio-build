@@ -73,10 +73,14 @@ hostPath is incompatible with `hostUsers: false`. The device node is
 delivered by containerd's `base_runtime_spec` declaring `/dev/{fuse,kvm}`
 in OCI `linux.devices` (`nix/base-runtime-spec.nix`) — runc `mknod`s them
 inside the container's `/dev` with container-namespace uid/gid, so no
-idmap-mount rejection. Every pod on a configured node gets both
-unconditionally; no extended resource is requested and no device plugin
-runs. kvm pods route to `.metal` via the `rio.build/kvm` nodeSelector
-(`r[ctrl.builderpool.kvm-device]`). `privileged: true` remains an escape
+idmap-mount rejection. Every pod on a configured node gets `/dev/fuse`;
+`/dev/kvm` is host-conditional — containerd's `ExecStartPre` picks the
+`withKvm` spec variant iff `test -c /dev/kvm` succeeds on the host and
+symlinks it to `/run/base-runtime-spec.json`, so non-`.metal` pods don't
+see a dead device node. No extended resource is requested and no device
+plugin runs. kvm pods route to `.metal` via the `rio.build/kvm`
+nodeSelector (`r[ctrl.builderpool.kvm-device]`). `privileged: true`
+remains an escape
 hatch for clusters whose containerd lacks `base_runtime_spec` device
 injection; it falls back to the hostPath mechanism and MUST NOT be the
 production default.

@@ -275,7 +275,19 @@ let
   #   https://github.com/k3s-io/k3s/blob/${k3sPinned.version}/pkg/agent/templates/templates.go
   # Template-var drift surfaces as a vm-*-k3s CI failure; the
   # waitReady diagnostic dump cats the rendered config.toml.
-  baseRuntimeSpec = import ../../base-runtime-spec.nix { inherit pkgs; };
+  #
+  # Both withKvm variants are built; k3s.service ExecStartPre (k3sBase
+  # below) symlinks the matching one to /run/base-runtime-spec.json
+  # based on host /dev/kvm presence — same mechanism as the EKS path
+  # (nix/nixos-node/eks-node.nix containerd ExecStartPre).
+  baseRuntimeSpecFuse = import ../../base-runtime-spec.nix {
+    inherit pkgs;
+    withKvm = false;
+  };
+  baseRuntimeSpecKvm = import ../../base-runtime-spec.nix {
+    inherit pkgs;
+    withKvm = true;
+  };
   k3sContainerdConfigTmpl = ''
     version = 3
     root = {{ printf "%q" .NodeConfig.Containerd.Root }}
@@ -315,7 +327,7 @@ let
 
     [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
       runtime_type = "io.containerd.runc.v2"
-      base_runtime_spec = "${baseRuntimeSpec}"
+      base_runtime_spec = "/run/base-runtime-spec.json"
 
     [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
       SystemdCgroup = {{ .SystemdCgroup }}
@@ -347,6 +359,16 @@ let
     };
 
     systemd.services.k3s.serviceConfig = {
+      # Pick the base_runtime_spec variant matching host /dev/kvm
+      # presence (k3s embeds containerd, so this runs pre-containerd).
+      # List form so it merges with the nixpkgs k3s module's preStart.
+      ExecStartPre = [
+        (pkgs.writeShellScript "pick-base-runtime-spec" ''
+          spec=${baseRuntimeSpecFuse}
+          test -c /dev/kvm && spec=${baseRuntimeSpecKvm}
+          ln -sfn "$spec" /run/base-runtime-spec.json
+        '')
+      ];
       # containerd needs cgroup delegation for pod cgroups. Without:
       # ContainerCreating forever.
       Delegate = "yes";
@@ -825,6 +847,8 @@ rec {
         print("--- containerd base_runtime_spec ---")
         print(k3s_server.execute(
             "set +e; "
+            "echo '--- /run/base-runtime-spec.json -> '; "
+            "readlink -f /run/base-runtime-spec.json 2>&1; "
             "echo '--- /var/lib/rancher/k3s/agent/etc/containerd/config.toml ---'; "
             "cat /var/lib/rancher/k3s/agent/etc/containerd/config.toml 2>&1; "
             "true"
