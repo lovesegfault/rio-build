@@ -121,9 +121,19 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_builder_prefetch_total",
-        "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|error|malformed|panic. \
+        "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|not_input|size_cap|error|malformed|panic. \
          error = store fetch failed (debug-only log; build's own FUSE ops surface \
          the real problem if store is flaky)."
+    );
+    describe_counter!(
+        "rio_builder_prefetch_filtered_total",
+        "PrefetchHint paths skipped by the I-212 filter, by reason. \
+         reason=not_input: JIT allowlist armed and path is not a declared \
+         input (build can never read it). reason=size_cap: warm-gate batch \
+         (allowlist NotArmed) and QueryPathInfo.nar_size exceeds the cap — \
+         scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); \
+         the build fetches it on-demand via JIT lookup if it turns out to be \
+         a real input."
     );
     describe_counter!(
         "rio_builder_upload_bytes_total",

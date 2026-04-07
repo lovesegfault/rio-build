@@ -733,6 +733,23 @@ pub async fn spawn_build_task(
     });
 }
 
+/// I-212: warm-gate size cap. PrefetchHint paths whose `nar_size`
+/// exceeds this are skipped when the JIT allowlist is `NotArmed` (i.e.,
+/// during the initial warm-gate batch, before any assignment, when the
+/// builder can't tell declared inputs from over-included sibling
+/// outputs). The scheduler's `approx_input_closure` sends ALL outputs of
+/// each input drv — a 2.9 GB `clang-debug` arrives alongside the
+/// `clang-out` the build actually needs. Declared inputs the build DOES
+/// need and that exceed the cap are fetched on-demand by JIT lookup
+/// (which has the size-aware `jit_fetch_timeout`), so this never blocks
+/// a correct build; it only stops the warm-gate from speculatively
+/// pulling multi-GB paths it can't prove are needed.
+///
+/// 256 MiB: large enough to cover the common-set inputs the warm-gate is
+/// for (glibc ~40 MB, gcc-unwrapped ~200 MB), small enough to exclude
+/// debug outputs (clang-debug 2.9 GB, llvm-debug ~1.5 GB).
+const PREFETCH_WARM_SIZE_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Handle a PrefetchHint from the scheduler: spawn one fire-and-forget
 /// task per path to warm the FUSE cache, then send `PrefetchComplete`
 /// once all paths have finished (succeeded, cached, or errored).
@@ -814,6 +831,58 @@ pub fn handle_prefetch_hint(
             let Ok(_permit) = sem.acquire_owned().await else {
                 return "shutdown";
             };
+
+            // I-212 filter, BEFORE spawn_blocking: jit_classify is a
+            // cheap RwLock read; QueryPathInfo (NotArmed arm) is a
+            // single async RPC. Both belong in the async half so the
+            // blocking pool only sees work that's actually going to
+            // fetch.
+            use crate::fuse::cache::JitClass;
+            let store_path = format!("/nix/store/{basename}");
+            match cache.jit_classify(&basename) {
+                JitClass::NotInput => {
+                    // Armed and NOT a declared input → the build can
+                    // never read this path (FUSE lookup would ENOENT).
+                    metrics::counter!("rio_builder_prefetch_filtered_total",
+                                      "reason" => "not_input")
+                    .increment(1);
+                    metrics::counter!("rio_builder_prefetch_total",
+                                      "result" => "not_input")
+                    .increment(1);
+                    return "not_input";
+                }
+                JitClass::NotArmed => {
+                    // Warm-gate batch (before any assignment). The
+                    // scheduler over-includes; we can't tell declared
+                    // from sibling. Size-cap via QPI: skip paths above
+                    // PREFETCH_WARM_SIZE_CAP_BYTES. On QPI error, fall
+                    // through to fetch — I-211's progress-based timeout
+                    // makes a large fetch correct, just slow.
+                    let mut sc = clients.store.clone();
+                    if let Ok(Some(info)) = rio_proto::client::query_path_info_opt(
+                        &mut sc,
+                        &store_path,
+                        fetch_timeout,
+                        &[],
+                    )
+                    .await
+                        && info.nar_size > PREFETCH_WARM_SIZE_CAP_BYTES
+                    {
+                        metrics::counter!("rio_builder_prefetch_filtered_total",
+                                          "reason" => "size_cap")
+                        .increment(1);
+                        metrics::counter!("rio_builder_prefetch_total",
+                                          "result" => "size_cap")
+                        .increment(1);
+                        return "size_cap";
+                    }
+                }
+                JitClass::KnownInput { .. } => {
+                    // Declared input — fetch unconditionally. A huge
+                    // declared input is still needed; JIT lookup would
+                    // fetch it anyway, just later.
+                }
+            }
 
             // spawn_blocking: Cache methods use
             // block_on internally (nested-runtime
@@ -1142,6 +1211,196 @@ mod tests {
         .await;
         assert_eq!(req.systems, vec!["x86_64-linux", "aarch64-linux"]);
         assert_eq!(req.supported_features, vec!["kvm", "big-parallel"]);
+    }
+
+    /// I-212: when the JIT allowlist is armed, `handle_prefetch_hint`
+    /// MUST skip paths the build can never read (jit_classify=NotInput).
+    /// The scheduler's per-assignment hint over-includes (sends ALL
+    /// outputs of each input drv — e.g., 2.9 GB clang-debug when only
+    /// clang-out is declared). Filter at the latest possible point
+    /// (inside the spawned task, after the sem permit) so register_inputs
+    /// has the widest window to land first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_hint_filters_not_input_when_armed() {
+        use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
+        use rio_test_support::grpc::spawn_mock_store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            crate::fuse::cache::Cache::new(dir.path().to_path_buf(), 10)
+                .await
+                .unwrap(),
+        );
+        let (store, addr, _srv) = spawn_mock_store().await.unwrap();
+        let ch = rio_proto::client::connect_channel(&addr.to_string())
+            .await
+            .unwrap();
+        let clients = crate::fuse::StoreClients::from_channel(ch);
+
+        // Seed both paths so a fetch (if attempted) would succeed.
+        let known = test_store_basename("i212-known");
+        let extra = test_store_basename("i212-extra");
+        for b in [&known, &extra] {
+            let p = format!("/nix/store/{b}");
+            let (nar, hash) = make_nar(b"x");
+            store.seed(make_path_info(&p, &nar, hash), nar);
+        }
+
+        // Arm JIT with ONLY `known`. `extra` → NotInput.
+        cache.register_inputs([(known.clone(), 1)]);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_prefetch_hint(
+            PrefetchHint {
+                store_paths: vec![format!("/nix/store/{known}"), format!("/nix/store/{extra}")],
+            },
+            Arc::clone(&cache),
+            clients,
+            tokio::runtime::Handle::current(),
+            Arc::new(Semaphore::new(4)),
+            Duration::from_secs(5),
+            tx,
+        );
+
+        // Joiner sends PrefetchComplete after all per-path tasks finish.
+        let ack = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("ACK within 10s")
+            .expect("channel open");
+        assert!(
+            matches!(
+                ack.msg,
+                Some(rio_proto::types::executor_message::Msg::PrefetchComplete(_))
+            ),
+            "expected PrefetchComplete ACK, got: {ack:?}"
+        );
+
+        assert!(
+            dir.path().join(&known).exists(),
+            "known input MUST be fetched"
+        );
+        assert!(
+            !dir.path().join(&extra).exists(),
+            "I-212: NotInput path MUST be skipped when JIT armed"
+        );
+    }
+
+    /// I-212: when JIT is NOT armed (initial warm-gate hint, before any
+    /// assignment), the filter MUST NOT fire — every hinted path is
+    /// fetched. Skipping here would defeat the warm cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_hint_unarmed_fetches_all() {
+        use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
+        use rio_test_support::grpc::spawn_mock_store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            crate::fuse::cache::Cache::new(dir.path().to_path_buf(), 10)
+                .await
+                .unwrap(),
+        );
+        let (store, addr, _srv) = spawn_mock_store().await.unwrap();
+        let ch = rio_proto::client::connect_channel(&addr.to_string())
+            .await
+            .unwrap();
+        let clients = crate::fuse::StoreClients::from_channel(ch);
+
+        let a = test_store_basename("i212-warm-a");
+        let b = test_store_basename("i212-warm-b");
+        for name in [&a, &b] {
+            let p = format!("/nix/store/{name}");
+            let (nar, hash) = make_nar(b"x");
+            store.seed(make_path_info(&p, &nar, hash), nar);
+        }
+        // NO register_inputs → NotArmed.
+
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_prefetch_hint(
+            PrefetchHint {
+                store_paths: vec![format!("/nix/store/{a}"), format!("/nix/store/{b}")],
+            },
+            Arc::clone(&cache),
+            clients,
+            tokio::runtime::Handle::current(),
+            Arc::new(Semaphore::new(4)),
+            Duration::from_secs(5),
+            tx,
+        );
+
+        let _ack = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("ACK within 10s")
+            .expect("channel open");
+
+        assert!(
+            dir.path().join(&a).exists() && dir.path().join(&b).exists(),
+            "NotArmed → both paths fetched (warm-gate preserved)"
+        );
+    }
+
+    /// I-212: warm-gate (NotArmed) size cap. A path whose
+    /// `QueryPathInfo.nar_size` exceeds `PREFETCH_WARM_SIZE_CAP_BYTES` is
+    /// skipped; a small one alongside is still fetched. The build can
+    /// always fetch the large path on-demand via JIT lookup if it turns
+    /// out to be a real input — this only stops the warm-gate from
+    /// speculatively pulling 2.9 GB clang-debug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_hint_unarmed_size_cap_skips_large() {
+        use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
+        use rio_test_support::grpc::spawn_mock_store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            crate::fuse::cache::Cache::new(dir.path().to_path_buf(), 10)
+                .await
+                .unwrap(),
+        );
+        let (store, addr, _srv) = spawn_mock_store().await.unwrap();
+        let ch = rio_proto::client::connect_channel(&addr.to_string())
+            .await
+            .unwrap();
+        let clients = crate::fuse::StoreClients::from_channel(ch);
+
+        let small = test_store_basename("i212-cap-small");
+        let large = test_store_basename("i212-cap-large");
+        let (nar, hash) = make_nar(b"x");
+        store.seed(
+            make_path_info(&format!("/nix/store/{small}"), &nar, hash),
+            nar.clone(),
+        );
+        // Large: PathInfo.nar_size lies (> cap) so QPI sees it as huge;
+        // actual NAR is tiny (we never GetPath it).
+        let mut large_info = make_path_info(&format!("/nix/store/{large}"), &nar, hash);
+        large_info.nar_size = super::PREFETCH_WARM_SIZE_CAP_BYTES + 1;
+        store.seed(large_info, nar);
+        // NotArmed → size-cap arm.
+
+        let (tx, mut rx) = mpsc::channel(4);
+        handle_prefetch_hint(
+            PrefetchHint {
+                store_paths: vec![format!("/nix/store/{small}"), format!("/nix/store/{large}")],
+            },
+            Arc::clone(&cache),
+            clients,
+            tokio::runtime::Handle::current(),
+            Arc::new(Semaphore::new(4)),
+            Duration::from_secs(5),
+            tx,
+        );
+
+        let _ack = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("ACK within 10s")
+            .expect("channel open");
+
+        assert!(
+            dir.path().join(&small).exists(),
+            "small path under cap MUST be fetched"
+        );
+        assert!(
+            !dir.path().join(&large).exists(),
+            "I-212: NotArmed path over size cap MUST be skipped"
+        );
     }
 }
 
