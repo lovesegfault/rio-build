@@ -29,9 +29,9 @@
     initrd = {
       systemd.enable = lib.mkDefault true;
       # Nitro only: drop xen-blkfront/dm_mod and the 28 SATA/USB/HID
-      # defaults. nvme + ext4 stay via amazon-image.nix's
-      # availableKernelModules. A future QEMU VM-test fixture will need
-      # virtio_blk/virtio_pci added back in its own module.
+      # defaults. nvme stays via amazon-image.nix's availableKernelModules;
+      # ext4 via fileSystems."/".fsType → supportedFilesystems. A future
+      # QEMU VM-test fixture will need virtio_blk/virtio_pci added back.
       kernelModules = lib.mkForce [ ];
       includeDefaultModules = false;
     };
@@ -49,6 +49,22 @@
   documentation.enable = false;
   programs.command-not-found.enable = false;
   environment.defaultPackages = lib.mkForce [ ];
+  fonts.fontconfig.enable = false;
+  xdg = {
+    autostart.enable = false;
+    icons.enable = false;
+    menus.enable = false;
+    mime.enable = false;
+    sounds.enable = false;
+  };
+
+  # Headless: keep booting on initrd/mount failure — there's no console to
+  # reach an emergency shell from; a wedged unit is worse than a degraded
+  # boot Karpenter can drift-replace. nodeadm-init orders on
+  # network.target (not network-online), so wait-online itself is dead
+  # weight.
+  systemd.enableEmergencyMode = false;
+  systemd.network.wait-online.enable = false;
 
   # VPC security groups are the network boundary; the nixpkgs firewall
   # default-denies NodePort + kubelet :10250 health, which breaks the
