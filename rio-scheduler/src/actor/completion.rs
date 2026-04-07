@@ -446,6 +446,12 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
+        // Promotion already done by the caller with a class captured
+        // BEFORE executor removal (executor.rs disconnect path). The
+        // internal promote below misses there (executor gone from
+        // `self.executors`), so the caller threads its result through.
+        // `false` for paths where the executor is still registered.
+        external_promoted: bool,
     ) -> FailureOutcome {
         // I-170/I-173/I-177: promote size_class_floor on any recorded
         // failure (FOD or builder). The executor lookup here covers
@@ -453,25 +459,37 @@ impl DagActor {
         // still in self.executors). The reassign_derivations caller
         // promotes separately with the class captured BEFORE executor
         // removal — on the disconnect path this lookup returns None,
-        // and the second promote is the one that fires; on drain/
+        // and `external_promoted` carries the result; on drain/
         // backstop paths both fire, idempotent.
         let failed_class = self
             .executors
             .get(executor_id)
             .and_then(|e| e.size_class.clone());
-        let promoted = self
-            .promote_size_class_floor(drv_hash, failed_class.as_deref())
-            .await;
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.failed_builders.insert(executor_id.clone());
-            // Unconditional (doesn't check HashSet::insert's bool) —
-            // same worker counts twice. Only used when
-            // require_distinct_workers=false.
-            state.failure_count += 1;
-        }
-        if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
-            error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
-                   "failed to persist failed_worker");
+        let promoted = external_promoted
+            || self
+                .promote_size_class_floor(drv_hash, failed_class.as_deref())
+                .await;
+        // r[impl sched.retry.promotion-exempt]
+        // I-213: a failure that promoted the floor is a sizing signal.
+        // Recording it in `failed_builders`/`failure_count` would count
+        // toward `PoisonConfig.threshold` (default 3) and poison before
+        // the ladder is climbed — the production firefox case hit this
+        // via the kubelet-eviction → disconnect path, NOT
+        // `handle_transient_failure`. Skip the record so the threshold
+        // becomes "N failures that did NOT promote" (top of ladder or
+        // unclassed worker — same semantics as the retry_count gate).
+        if !promoted {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.failed_builders.insert(executor_id.clone());
+                // Unconditional (doesn't check HashSet::insert's bool) —
+                // same worker counts twice. Only used when
+                // require_distinct_workers=false.
+                state.failure_count += 1;
+            }
+            if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
+                error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                       "failed to persist failed_worker");
+            }
         }
         let reached_poison = self
             .dag
@@ -1525,7 +1543,7 @@ impl DagActor {
             reached_poison,
             promoted,
         } = self
-            .record_failure_and_check_poison(drv_hash, executor_id)
+            .record_failure_and_check_poison(drv_hash, executor_id, false)
             .await;
 
         // r[impl sched.retry.per-worker-budget]

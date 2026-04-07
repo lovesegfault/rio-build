@@ -824,6 +824,109 @@ async fn test_three_running_disconnects_poisons() -> TestResult {
     Ok(())
 }
 
+/// I-213: a Running-disconnect on a CLASSED worker promotes the floor;
+/// that promotion exempts the failure from `failed_builders` /
+/// `failure_count` / `retry_count`. The production firefox case is
+/// exactly this: kubelet evicts (ephemeral-storage) → SIGKILL →
+/// disconnect → reassign_derivations. Before this fix,
+/// `record_failure_and_check_poison` recorded all 3 evictions and
+/// `PoisonConfig.threshold=3` poisoned at `medium` with the ladder
+/// half-climbed. The unclassed-worker case
+/// (`test_three_running_disconnects_poisons`) is unaffected.
+// r[verify sched.retry.promotion-exempt]
+#[tokio::test]
+async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+    let db = TestDb::new(&MIGRATOR).await;
+    let classes = ["tiny", "small", "medium", "large", "xlarge"];
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(
+            classes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| SizeClassConfig {
+                    name: (*n).into(),
+                    cutoff_secs: 30.0 * (i + 1) as f64,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                })
+                .collect(),
+        )
+    });
+
+    let _ev = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "ladder-213",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // Climb tiny→small→medium→large via Running-disconnects: each
+    // promotes, none recorded.
+    for (i, c) in classes[..4].iter().enumerate() {
+        let id = format!("b-213-{c}");
+        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", c).await?;
+        let asgn = recv_assignment(&mut rx).await;
+        assert!(asgn.drv_path.contains("ladder-213"));
+        assert!(handle.debug_backdate_running("ladder-213", 0).await?);
+        handle
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: id.into(),
+            })
+            .await?;
+        barrier(&handle).await;
+        drop(rx);
+
+        let s = handle
+            .debug_query_derivation("ladder-213")
+            .await?
+            .expect("exists");
+        assert_eq!(
+            s.size_class_floor.as_deref(),
+            Some(classes[i + 1]),
+            "disconnect on {c} → floor promoted"
+        );
+        assert_eq!(
+            s.failure_count, 0,
+            "I-213: promoted disconnect not recorded in failure_count (after {c})"
+        );
+        assert!(
+            s.failed_builders.is_empty(),
+            "I-213: promoted disconnect not recorded in failed_builders (after {c})"
+        );
+        assert_eq!(s.retry_count, 0);
+        assert_ne!(s.status, DerivationStatus::Poisoned);
+    }
+
+    // Top of ladder: 3 disconnects on xlarge → recorded → poison
+    // (threshold=3, default).
+    for i in 0..3 {
+        let id = format!("b-213-xl-{i}");
+        let mut rx = connect_builder_classed(&handle, &id, "x86_64-linux", "xlarge").await?;
+        let asgn = recv_assignment(&mut rx).await;
+        assert!(asgn.drv_path.contains("ladder-213"));
+        assert!(handle.debug_backdate_running("ladder-213", 0).await?);
+        handle
+            .send_unchecked(ActorCommand::ExecutorDisconnected {
+                executor_id: id.into(),
+            })
+            .await?;
+        barrier(&handle).await;
+        drop(rx);
+    }
+    let s = handle
+        .debug_query_derivation("ladder-213")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        s.status,
+        DerivationStatus::Poisoned,
+        "threshold applies once at top of ladder (no promotion)"
+    );
+    Ok(())
+}
+
 /// I-097 regression: 3 disconnects while ASSIGNED (never Running) must
 /// NOT poison. The drv was never attempted — the worker exited between
 /// receiving the assignment and starting it (ephemeral-fetcher race).

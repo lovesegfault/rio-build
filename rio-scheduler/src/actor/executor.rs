@@ -389,6 +389,7 @@ impl DagActor {
             // Track the lost worker (in-mem + PG) + check poison
             // threshold BEFORE reset_to_ready — poison_and_cascade
             // expects Assigned/Running, not Ready.
+            let mut promoted = false;
             let should_poison = match lost_worker {
                 Some(executor_id) => {
                     // r[impl sched.fod.size-class-reactive]
@@ -415,14 +416,18 @@ impl DagActor {
                     // suppress made openssl OOM-loop on `tiny` for
                     // hours with size_class_floor empty.
                     let expected_oneshot_exit = lost_worker_last_completed == Some(drv_hash);
-                    if !expected_oneshot_exit {
+                    promoted = if expected_oneshot_exit {
+                        false
+                    } else {
                         self.promote_size_class_floor(drv_hash, lost_worker_class)
-                            .await;
-                    }
-                    if was_running {
-                        self.record_failure_and_check_poison(drv_hash, executor_id)
                             .await
-                            .reached_poison
+                    };
+                    if was_running {
+                        let outcome = self
+                            .record_failure_and_check_poison(drv_hash, executor_id, promoted)
+                            .await;
+                        promoted = outcome.promoted;
+                        outcome.reached_poison
                     } else {
                         // I-097: Assigned-only — don't record failure
                         // (scheduling race, drv never attempted). Re-
@@ -458,8 +463,11 @@ impl DagActor {
                     );
                     continue;
                 }
-                // Worker-loss mid-build is a failed attempt: count it.
-                if was_running {
+                // Worker-loss mid-build is a failed attempt: count it
+                // unless it promoted the floor (`r[sched.retry.
+                // promotion-exempt]` — sizing signal, bounded by
+                // ladder length, not the retry budget).
+                if was_running && !promoted {
                     state.retry_count += 1;
                     if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                         error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
