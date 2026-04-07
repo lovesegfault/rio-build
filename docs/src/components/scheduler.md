@@ -15,7 +15,7 @@ Receives derivation build requests, analyzes the DAG, and publishes work to work
 - Closure-locality affinity: score workers by normalized transfer cost, using bloom filter approximation from worker heartbeats
 - Priority queue with inter-build priority (CI > interactive > scheduled) and intra-build priority (critical path)
 - IFD prioritization: builds that block evaluation get maximum priority (detected by protocol sequencing --- `wopBuildDerivation` arriving before `wopBuildPathsWithResults` on the same session)
-- CA early cutoff: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved. Compare implemented ([P0251](../../../.claude/work/plan-0251-ca-cutoff-compare.md)); propagate is [P0252](../../../.claude/work/plan-0252-ca-cutoff-propagate-skipped.md)
+- CA early cutoff: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved. Compare implemented (P0251); propagate is P0252
 - Work reassignment: when a worker fails (stream closed, heartbeat timeout), reassign its in-flight derivations to another worker. _Slow-worker speculative reassignment (actual\_time > estimated\_time × 3) is not currently implemented._
 - Poison derivation tracking: mark derivations that fail on 3+ different workers; auto-expire after 24h. See [Error Taxonomy](../errors.md) for details.
 
@@ -272,7 +272,7 @@ When a worker reports `memory_used_bytes > 0` in a `Progress` update, the schedu
 r[sched.rebalancer.sita-e]
 The scheduler periodically recomputes size-class cutoffs from raw `build_samples` (configurable `lookback_days`, default 7). The algorithm: sort samples by duration, compute cumulative sum, bisect at `total/N * i` for each class boundary — this yields cutoffs where `sum(duration)` is equal across classes (SITA-E: Size Interval Task Assignment with Equal load). New cutoffs are EMA-smoothed against previous (`ema_alpha`, default 0.3, ~3 iterations to converge) to prevent oscillation. Rebalancing is gated on `min_samples` (default 500). All three parameters default to `min_samples=500, ema_alpha=0.3, lookback_days=7`.
 
-> **Scheduled:** [P0304-T95](../../../.claude/work/plan-0304-trivial-batch-p0222-harness.md) — config-load wiring via `scheduler.toml [rebalancer]`.
+> **TODO:** config-load wiring via `scheduler.toml [rebalancer]`.
 
  Cutoffs are applied via `Arc<RwLock<Vec<SizeClassConfig>>>`.
 

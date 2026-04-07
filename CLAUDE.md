@@ -74,7 +74,7 @@ Three tiers:
 
 - **Unit-test only** (~5min): `nix build .#checks.x86_64-linux.coverage`. Output: `result/lcov.info`. HTML via `nix build .#coverage-html`.
 - **Cov-smoke** (~5min, in `.#ci`): `nix build .#cov-smoke`. One representative VM scenario in coverage mode, asserts profraw→lcov pipeline produced non-empty data. Catches "coverage infrastructure broken" at merge-gate. A PSA break went 118 commits undetected before this was added — coverage-full failures were triaged as individual test-gaps instead of a pipeline-level halt.
-- **Combined unit+VM** (~25min, backgrounded by merger, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — backgrounded non-gating per merge.
+- **Combined unit+VM** (~25min, needs KVM): `/nixbuild .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-<scenario>-<fixture>.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — run on demand.
 
 VM coverage architecture details: see `.claude/rules/coverage.md` (loads when editing `nix/coverage.nix`).
 
@@ -102,42 +102,19 @@ Pre-commit hooks run treefmt automatically on commit.
 
 ### Migration files are frozen after they ship
 
-`sqlx::migrate!()` checksums `.sql` files by content (SHA-384 over the full file body, including comments). Editing a comment changes the checksum → persistent-DB deploys fail with `VersionMismatch`. Hit twice pre-production before P0353 froze it.
+`sqlx::migrate!()` checksums `.sql` files by content (SHA-384 over the full file body, including comments). Editing a comment changes the checksum → persistent-DB deploys fail with `VersionMismatch`.
 
 - **Commentary, rationale, history:** goes in `rio-store/src/migrations.rs` (per-migration `M_NNN` doc-consts). NOT in the `.sql`.
 - **New migration:** add the SQL, run `cargo test -p rio-store --test migrations`, copy the hex-SHA from the `unpinned migration NNN` panic into `PINNED` at `rio-store/tests/migrations.rs`, commit both.
 - **Behavior change to a shipped migration:** write a NEW migration. Never edit shipped ones. The checksum-freeze test (`migration_checksums_frozen`) fails CI on any content change.
 
-## Plan-driven development
+## CI gate
 
-Work is granularized into plan docs at `.claude/work/plan-NNNN-*.md`. The DAG (deps, status, frontier) lives at `.claude/dag.jsonl` — typed `PlanRow` records, `onibus dag render` for display. File-collision matrix is live-computed via `onibus collisions top` / `onibus collisions check`.
+**Every change MUST pass `.#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.
 
-**Every implementation MUST pass `/nixbuild .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done. `/nixbuild` runs `nix build` locally (this host handles x86_64+aarch64 KVM directly) with structured log lifecycle — use it over raw `nix build` for the log capture.
+From agent/subagent context, prefer `/nixbuild .#ci` over raw `nix build` — it captures the log to `/tmp/rio-dev/` and emits a JSON report instead of streaming megabytes of build output. For interactive debugging, plain `nix build -L .#ci` is fine.
 
-### DAG runner workflow
-
-Invoke `/dag-run` to become the coordinator. The loop: frontier → `/implement <N>` (≤10 parallel) → `/dag-tick` (mechanical reflex) → `/validate-impl` → `/review-impl` (post-PASS, advisory) → `/merge-impl` → coverage backgrounded → cadence agents every 5th/7th merge.
-
-**State machine** (`.claude/bin/onibus` — grouped CLI, pydantic models + JSONL):
-
-| File | Model | Written by | Consumed by |
-|---|---|---|---|
-| `dag.jsonl` | `PlanRow` | `rio-planner` via `onibus dag append`; merger via `onibus dag set-status` | frontier computation, `/dag-status` |
-| `known-flakes.jsonl` | `KnownFlake` | `rio-ci-flake-fixer` (add/remove) | impl `.#ci` retry gate |
-| `state/agents-running.jsonl` | `AgentRow` | coordinator via `onibus state agent-row` | `/dag-tick` scan |
-| `state/merge-queue.jsonl` | `MergeQueueRow` | `/dag-tick` on PASS | coordinator merge ordering |
-| `state/coverage-pending.jsonl` | `CoverageResult` | merger step 6 (backgrounded) | `/dag-tick` → test-gap followup |
-| `state/followups-pending.jsonl` | `Followup` | `rio-impl-reviewer`, cadence agents | `/plan` promotion to plan docs |
-
-**Agents** (`.claude/agents/`): `rio-implementer`, `rio-impl-validator`, `rio-impl-reviewer`, `rio-impl-merger`, `rio-planner`, `rio-plan-reviewer`, `rio-ci-fixer`, `rio-ci-flake-fixer`, `rio-ci-flake-validator`, `rio-impl-consolidator`, `rio-impl-bughunter`.
-
-**Skills** (`.claude/skills/`): `/dag-run`, `/dag-tick`, `/dag-stop`, `/dag-status`, `/implement`, `/validate-impl`, `/review-impl`, `/merge-impl`, `/fix-impl`, `/plan`, `/check`, `/nixbuild`, `/bump-refs`.
-
-**Coverage policy:** `.#ci` gates (includes `.#cov-smoke` — one-scenario coverage-infra smoke, ~5min, blocking); `.#coverage-full` is backgrounded non-gating. Merger step 6 fires coverage-full in a subshell, writes `CoverageResult` to `coverage-pending.jsonl`. `/dag-tick` consumes: `exit_code≠0` → `test-gap` followup. Regression means "write a test", not "undo the merge." **Infrastructure-class red** (≥3 scenarios fail) additionally writes `queue-halted` — same sentinel P0479 uses for clause-4. A PSA break went 118 commits undetected when all-scenarios-red got triaged as individual test-gaps; the ≥3 heuristic catches "pipeline broken" vs "one test regressed".
-
-**Cadence:** merge-count%5 → `rio-impl-consolidator` (duplication across last 5); %7 → `rio-impl-bughunter` (smell accumulation across last 7). Both write to followups sink with `origin` field; don't auto-flush — coordinator reviews.
-
-Historical phase boundaries are git tags (`phase-1a`..`phase-4a`). Backfill plan docs (P0000-P0150, status=DONE) were generated from these ranges — onboarding-grade archaeology.
+When `.#ci` is red and the cause isn't obvious from the log, see `.claude/rules/ci-failure-patterns.md` — it catalogs every failure signature that has bitten this project before.
 
 ## Fuzzing
 
@@ -161,7 +138,7 @@ When adding a new parser, also add a fuzz target:
 
 ## Design Book
 
-This project has a comprehensive design book in `docs/src/`. When implementing a plan, cross-reference ALL relevant design docs — not just the plan doc:
+This project has a comprehensive design book in `docs/src/`. When implementing a feature, cross-reference ALL relevant design docs:
 
 - **Component specs** (`docs/src/components/`): Protocol details, API contracts
 - **Observability spec** (`docs/src/observability.md`): Metric names, log format, tracing structure
@@ -204,53 +181,9 @@ Scenario-file header blocks MAY keep prose descriptions of what each marker cove
 
 **When spec text changes meaningfully:** run `tracey bump` before committing. This version-bumps the marker (e.g., `r[gw.opcode.foo]` → `r[gw.opcode.foo+2]`), making existing `r[impl gw.opcode.foo]` annotations stale until someone reviews and bumps them.
 
-**tracey ≠ `TODO(P0NNN)`.** tracey answers "what does the spec say, what's covered, what's tested." `TODO(P0NNN)` answers "which plan owns this." A feature with a spec marker but no `r[impl]` shows up in `tracey query uncovered` — pair that with a `TODO(P0NNN)` pointing at the plan that will land it.
+### Deferred work
 
-### Deferred work and TODOs
-
-**Every deferred task must have a plan-tagged TODO comment.** Untagged TODOs accumulate into an untracked backlog.
-
-Format: `TODO(P0NNN): <what>` where `P0NNN` is the plan number that will close the TODO.
-
-```rust
-// GOOD: tagged with the owning plan
-// TODO(P0208): xmax-based inserted-check. Currently re-queries refcount
-// post-upsert (race: concurrent PutPath can bump refcount between).
-
-// GOOD: points to the blocking plan
-// TODO(P0NNN): this path is unreachable under the escape-hatch
-// config. Exercise it once the production path (see ADR-NNN) lands.
-
-// BAD: no plan tag — nothing schedules this
-// TODO: fix this later
-```
-
-**Finding the right plan:**
-- Grep `.claude/work/plan-*.md` for the file/feature — the plan that touches it is usually the owner
-- `.claude/bin/onibus dag render | grep <keyword>` for a quick title scan
-- If NO plan exists, the work needs a plan first: write to `followups-pending.jsonl` via `onibus state followup`, or `/plan --inline`
-
-**When to write a TODO:**
-- You're implementing a stub/placeholder that a scheduled plan will fill in
-- You're making a simplifying assumption that a scheduled plan will relax
-- You're skipping something that's another plan's responsibility
-
-**When NOT to write a TODO:**
-- The deferred behavior is already in a `> **Scheduled:** [P0NNN](...)` block in the design doc — reference that instead
-- No plan owns it — write a plan, don't leave an orphan TODO
-
-**Audit periodically:** `grep -rn 'TODO[^(]' rio-*/src/` finds untagged TODOs (should be zero). `grep -rn 'TODO(P0NNN)' rio-*/src/` where the plan is DONE finds stale TODOs the plan should have closed.
-
-**Format for explicitly-not-doing:** `WONTFIX(P0NNN): <why>` where `P0NNN` is the plan whose investigation concluded this won't be fixed. Unlike TODO, WONTFIX does NOT schedule future work — it's a grep-able marker that someone looked at this and decided against it. The plan doc contains the rationale.
-
-```rust
-// WONTFIX(P0310): ssh-ng client options are dropped client-side — Nix
-// overrides setOptions() with an empty body (088ef8175, intentional).
-// The accessor stays for future-proofing if rio ever advertises
-// `set-options-map-only`; until then this path is unreachable.
-```
-
-Audit: `grep -rn 'WONTFIX[^(]' rio-*/src/` finds untagged WONTFIX (should be zero).
+Mark deferred work with a plain `// TODO:` comment that says *what* and *why* in enough detail that someone else could pick it up. Mark explicit non-goals with `// WONTFIX:` and the rationale inline. Existing `TODO(P0NNN)`/`WONTFIX(P0NNN)` tags reference historical plan docs; the plan number is archaeology — `git log -S P0NNN` finds the relevant commits.
 
 ## Protocol Implementation Guidelines
 

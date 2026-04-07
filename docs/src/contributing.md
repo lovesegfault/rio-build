@@ -82,7 +82,7 @@ The workspace is split into 12 crates (`rio-common`, `rio-nix`, `rio-proto`, `ri
 
 Good first contributions:
 
-- **Scheduled work** — grep the codebase for `TODO(P0` markers; each points at a plan doc in `.claude/work/plan-NNNN-*.md`
+- **Spec gaps** — `tracey query uncovered` lists spec requirements with no implementation yet
 - **Fuzzing targets** described in [verification.md](./verification.md) --- wire format parsers are security-critical
 - **Golden tests** --- add live-daemon conformance scenarios for new opcodes (see `rio-gateway/tests/golden/`)
 - **Documentation** --- improvements to this design book (typos, clarifications, missing details)

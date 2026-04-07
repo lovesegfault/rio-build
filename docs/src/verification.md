@@ -68,7 +68,7 @@ Gateway wire protocol against **real `rio-store`** (`StoreServiceImpl` + ephemer
 
 Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-project/lix/src/branch/main/tests/functional2). Port is **scenario** (what's being proved), not **invocation shape** (Lix's harness is nix-CLI, rio's is wire-protocol). White-box assertions query PG directly (`narinfo`, `manifests`) to prove the graph is real — not an in-memory echo.
 
-**Coverage:** tranche 1 is store-roundtrip (put/get/query). Tranche 2 (CA builds, refscan, trustless remote) needs real scheduler; tranche 4 (ssh-ng transport) needs russh fixture. Survey at `.claude/work/plan-0305-functional-tests-tranche1.md § Survey output`.
+**Coverage:** tranche 1 is store-roundtrip (put/get/query). Tranche 2 (CA builds, refscan, trustless remote) needs real scheduler; tranche 4 (ssh-ng transport) needs russh fixture.
 
 ## Integration Tests
 

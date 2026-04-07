@@ -52,12 +52,7 @@ rio-dashboard/dist/
 
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
-
-# DAG-runner runtime state (agents-running.jsonl, merge-queue.jsonl, etc.)
-.claude/state/
-.claude/lib/.pytest_cache/
-# write_jsonl crash artifact (tmp+rename — crash leaves .tmp sibling)
-.claude/*.jsonl.tmp
+.claude/notes/
 
 # tracey daemon state (unix socket, cache)
 .tracey/
@@ -69,6 +64,3 @@ mutants.out*/
 .data/
 *.qcow2
 .stress-test/
-.claude/worktrees/
-.claude/work/
-.claude/notes/

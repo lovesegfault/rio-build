@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Quiet nix build with structured log lifecycle. Keeps build output out of
+# agent context — emits a JSON report instead. See .claude/skills/nixbuild/.
+set -uo pipefail
+
+target="${1:?usage: nixbuild <flake-target> [extra nix args...]}"
+shift
+
+root="$(git rev-parse --show-toplevel)"
+branch="$(git -C "$root" rev-parse --abbrev-ref HEAD | tr '/' '-')"
+logdir="/tmp/rio-dev"
+mkdir -p "$logdir"
+iter=0
+for f in "$logdir"/rio-"${branch}"-*.log; do
+  [[ -e "$f" ]] || break
+  n="${f##*-}"; n="${n%.log}"
+  [[ "$n" =~ ^[0-9]+$ ]] && ((n > iter)) && iter=$n
+done
+log="${logdir}/rio-${branch}-$((iter + 1)).log"
+
+echo "nixbuild: log → $log" >&2
+out=$(nix build -L --no-link --print-out-paths "${root}#${target#*#}" "$@" 2>"$log")
+rc=$?
+store_path="${out%%$'\n'*}"
+
+drv_failed=$(grep -oP "(Cannot build|builder for|build of) '\K/nix/store/[^']+\.drv" "$log" | sort -u | jq -Rs 'split("\n") | map(select(length>0))')
+log_tail=""
+[[ $rc -ne 0 ]] && log_tail=$(tail -n 80 "$log")
+
+jq -n \
+  --arg log "$log" \
+  --arg store_path "$store_path" \
+  --arg log_tail "$log_tail" \
+  --argjson rc "$rc" \
+  --argjson log_bytes "$(stat -c %s "$log")" \
+  --argjson drv_failed "$drv_failed" \
+  '{rc: $rc, log: $log, log_bytes: $log_bytes, store_path: $store_path, drv_failed: $drv_failed, log_tail: $log_tail}'

@@ -5,7 +5,7 @@
 //! changes the checksum → any persistent DB that already applied the
 //! old checksum fails with `VersionMismatch` on next deploy. We hit
 //! this twice pre-production (`76ba3999` renumber comment;
-//! [P0350] CASCADE dead-code note).
+//! P0350 CASCADE dead-code note).
 //!
 //! **POLICY:** `migrations/*.sql` are **frozen** after they ship to
 //! any persistent DB. Commentary, rationale, "why we chose X over Y",
@@ -17,8 +17,6 @@
 //! `M_NNN` const below. Do NOT edit the `.sql`. The checksum-freeze
 //! test at `rio-store/tests/migrations.rs` enforces this — a comment
 //! edit to a shipped `.sql` fails CI with a pointer back here.
-//!
-//! [P0350]: ../../../.claude/work/plan-0350-chunk-tenants-junction-cleanup-on-gc.md
 
 #![allow(dead_code)] // M_NNN doc-consts; never referenced, only `cargo doc`'d
 
@@ -324,7 +322,7 @@ pub const M_025: () = ();
 /// `migrations/026_tenant_upstreams.sql`
 ///
 /// Per-tenant upstream binary-cache configuration for block-and-fetch
-/// substitution ([P0461]..[P0464]). Follows the `tenant_keys` precedent
+/// substitution (P0461..P0464). Follows the `tenant_keys` precedent
 /// (migration 014): per-tenant config table, FK CASCADE on tenant
 /// removal, surrogate SERIAL PK with a business-unique constraint
 /// `(tenant_id, url)`.
@@ -365,9 +363,6 @@ pub const M_025: () = ();
 /// `SELECT * FROM tenant_upstreams WHERE tenant_id = $1 ORDER BY
 /// priority ASC`. Composite index makes that a single index scan
 /// (no sort step).
-///
-/// [P0461]: ../../../.claude/work/plan-0461-upstream-substitution-foundation.md
-/// [P0464]: ../../../.claude/work/plan-0464-upstream-substitution-validation.md
 // r[impl store.substitute.upstream]
 // r[impl store.substitute.sig-mode]
 pub const M_026: () = ();
@@ -375,7 +370,7 @@ pub const M_026: () = ();
 /// `migrations/027_cluster_key_history.sql`
 ///
 /// Prior cluster signing keys for `sig_visibility_gate` verification
-/// after rotation. Route I of [P0521] — history-row pattern instead of
+/// after rotation. Route I of P0521 — history-row pattern instead of
 /// GC re-sign.
 ///
 /// ## Why this exists
@@ -412,8 +407,6 @@ pub const M_026: () = ();
 /// NULL = old key still within grace period, gate trusts it.
 /// Non-NULL = grace expired; row retained for audit only. The loader
 /// query filters `WHERE retired_at IS NULL`.
-///
-/// [P0521]: ../../../.claude/work/plan-0521-cluster-key-rotation-contradiction.md
 // r[impl store.key.rotation-cluster-history]
 pub const M_027: () = ();
 

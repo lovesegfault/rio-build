@@ -22,7 +22,7 @@ The gateway authenticates SSH connections via public key authentication. Authori
 - **Threat**: Malicious `.drv` files, crafted protocol messages, resource exhaustion
 - **Mitigations**: Protocol parser fuzzing (see `rio-nix/fuzz/`), global NAR size limits (`MAX_NAR_SIZE`)
 
-> **Scheduled hardening:** per-tenant rate limiting → [P0213](../../.claude/work/plan-0213-gateway-ratelimit-conn-cap.md); connection/channel limits → P0213; SSH-key→tenant mapping → [P0258](../../.claude/work/plan-0258-jwt-issuance-gateway.md). (Key-algorithm filtering is not planned — operator's `authorized_keys` is operator's trust boundary.)
+> **TODO:** per-tenant rate limiting; connection/channel limits; SSH-key→tenant mapping. (Key-algorithm filtering is not planned — operator's `authorized_keys` is operator's trust boundary.)
 
 ### Boundary 2: Gateway/Worker → Internal Services (gRPC)
 

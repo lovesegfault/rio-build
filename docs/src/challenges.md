@@ -134,7 +134,7 @@ Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16
 
 ## 14. Size-Class Cold Start and Misclassification
 
-> **Implemented:** `WorkerPoolSet` CRD ([P0232](../../.claude/work/plan-0232-wps-crd-struct-crdgen.md)), child-builder reconciler ([P0233](../../.claude/work/plan-0233-wps-child-builder-reconciler.md)), per-class status refresh + autoscaler ([P0234](../../.claude/work/plan-0234-wps-status-perclass-autoscaler-yjoin.md)). See [controller.md](components/controller.md#workerpoolset). Alternative for simpler deployments: multiple independent `WorkerPool` CRs with operator-configured cutoffs in `scheduler.toml`.
+> **Implemented:** `WorkerPoolSet` CRD (P0232), child-builder reconciler (P0233), per-class status refresh + autoscaler (P0234). See [controller.md](components/controller.md#workerpoolset). Alternative for simpler deployments: multiple independent `WorkerPool` CRs with operator-configured cutoffs in `scheduler.toml`.
 
 With size-class routing, two related challenges arise:
 

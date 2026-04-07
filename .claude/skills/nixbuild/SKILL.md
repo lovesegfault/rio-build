@@ -1,58 +1,38 @@
 ---
 name: nixbuild
-description: Local nix build with structured log lifecycle. Use for ALL .#ci / .#coverage-full runs. This host handles x86_64+aarch64 KVM builds directly (nxb-dev retired 2026-03).
+description: Local nix build with structured log lifecycle. Use for .#ci / .#coverage-full runs from agent context to avoid flooding it with build output.
 ---
 
 ## Invocation
 
 ```bash
-.claude/bin/onibus build <target>                    # e.g. .#ci
-.claude/bin/onibus build <target> --role verify      # validator/reviewer runs
-.claude/bin/onibus build <target> --copy             # pull output to local store
-.claude/bin/onibus build <target> --copy --link      # pull output + ./result symlink (for .#crds, .#coverage-html)
-.claude/bin/onibus build --coverage <branch> <merged_at>   # merger step 6
-.claude/bin/onibus build <target> --loud             # debugging: tee output live
+.claude/bin/nixbuild .#ci
+.claude/bin/nixbuild .#checks.x86_64-linux.vm-lifecycle   # single check
+.claude/bin/nixbuild .#coverage-full --keep-going         # extra args pass through
 ```
 
-**Quiet by default.** Two lines: log path to stderr (tail it if impatient), `BuildReport` JSON to stdout at the end. No 3MB tee into agent context. `--loud` restores stream-to-stderr for interactive debugging. `--schema` for the contract. onibus resolves `git rev-parse --show-toplevel` so `.#<target>` works from any subdirectory.
+**Quiet by default.** Stderr gets one line (the log path); stdout gets a JSON report at the end. No 3MB build log streamed into context. For interactive debugging where you want live output, use plain `nix build -L` instead.
 
-**Callers jq.** Process exit is always 0 — `rc` is in the JSON. `report=$(.claude/bin/onibus build .#ci); rc=$(jq -r .rc <<<"$report")`.
+**Callers jq.** Once a build is attempted, process exit is 0 — `rc` is in the JSON. (Missing target arg exits 1 with usage.)
 
-## What it runs
-
+```bash
+report=$(.claude/bin/nixbuild .#ci)
+rc=$(jq -r .rc <<<"$report")
+[[ $rc -eq 0 ]] || jq -r .log_tail <<<"$report"
 ```
-nix build --no-link --print-out-paths -L <target>
-```
-
-Local build — this host handles x86_64+aarch64 KVM directly. Outputs land in the local `/nix/store`. `--no-link` keeps the worktree clean; callers that want `./result` use `--link`.
-
-`store_path` is the first outpath from `--print-out-paths` (single-output derivations; `.#coverage-full` is single-output with subdirectories inside). `--copy` is a no-op kept for API compat (outputs are already local).
-
-With `--link`, creates `./result` → store path. Use for `.#crds` regen (`cp result/*.yaml infra/helm/...`) and `.#coverage-html` (`open result/index.html`). Without `--link`, `store_path` in the JSON is still the handle — `ln -sf $(jq -r .store_path) result` is the manual equivalent.
-
-## `--coverage <branch> <merged_at>`
-
-Composite mode for the merger's backgrounded coverage step. Internally fixes target=`.#coverage-full`, role=`merge`, copy=`True`, then writes a `CoverageResult` row to `.claude/state/coverage-pending.jsonl`. Prints the `CoverageResult` JSON that was written.
-
-`branch` and `merged_at` are passed explicitly — coverage runs from `main/` after the ff-merge, so cwd branch is `main` (not the merged branch) and HEAD may move while backgrounded.
-
-## Logs
-
-`/tmp/rio-dev/rio-{plan}-{role}-{iter}.log` — always kept, green or red.
-
-| Component | Source |
-|---|---|
-| `{plan}` | branch name: `p214` → `p0214` (zero-pad); non-`pNNN` branches kept verbatim (`docs-171650`) |
-| `{role}` | `--role {impl,verify,merge,writer}`, default `impl` |
-| `{iter}` | auto-increments per `(plan, role)` pair — `rio-p0214-impl-1.log`, `rio-p0214-impl-2.log`, … |
-
-History is discoverable: `ls /tmp/rio-dev/rio-p0214-*` shows every run for that plan.
 
 ## Output
 
-| `rc` | Meaning |
-|---|---|
-| `0` | Green — `log_tail` empty, log kept for reference |
-| nonzero | Build or copy failed — `log_tail` has last 80 lines |
+```json
+{"rc": 0, "log": "/tmp/rio-dev/rio-<branch>-<n>.log", "log_bytes": 123456, "store_path": "/nix/store/...", "drv_failed": [], "log_tail": ""}
+```
 
-`store_path` is set when `--copy` succeeded. No `result/` symlink — `store_path` is the handle. `log_bytes` is the build-log size at `proc.wait()`; a real `.#ci` run is ~100KB+.
+| Field | Meaning |
+|---|---|
+| `rc` | nix build exit code; 0 = green |
+| `log` | full build log path (always kept) |
+| `store_path` | first output path (empty on failure) |
+| `drv_failed` | list of `.drv` paths that failed (parsed from log) |
+| `log_tail` | last 80 lines on failure, empty on success |
+
+Logs accumulate at `/tmp/rio-dev/rio-<branch>-<n>.log` — `<n>` auto-increments per branch.

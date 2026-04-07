@@ -1120,7 +1120,6 @@
                   crds-drift
                   tfvars-fresh
                   seccomp-fresh
-                  onibus-pytest
                   ;
                 inherit (config.checks) pre-commit;
                 dashboard = rioDashboard;
@@ -1394,7 +1393,7 @@
                 lldb
                 gdb
                 lcov # `lcov --summary`/`--list` on the coverage output
-                stress-ng # flake-repro under load (rio-ci-flake-fixer/validator)
+                stress-ng # flake-repro under load (.claude/rules/ci-failure-patterns.md)
 
                 # Documentation
                 mdbook
@@ -1464,14 +1463,8 @@
                 openssl # openssl rand 32 → HMAC key
                 git
 
-                # Python env for .claude/lib/ + co-located skill scripts —
-                # pydantic models are the agent-boundary contracts (each
-                # script has `--schema` to print JSON Schema).
-                (python3.withPackages (ps: [
-                  ps.pydantic
-                  ps.pytest
-                  ps.pyyaml # cargo xtask regen crds → scripts/split-crds.py
-                ]))
+                # cargo xtask regen crds → scripts/split-crds.py
+                (python3.withPackages (ps: [ ps.pyyaml ]))
               ];
               # Shared mkShell builder. Lists build deps explicitly
               # (openssl, libclang, sys-crate libs for pkg-config
