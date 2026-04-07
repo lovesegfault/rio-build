@@ -176,6 +176,12 @@ pub enum ExecutorError {
     DaemonSetup(String),
     #[error("build failed: {0}")]
     BuildFailed(String),
+    /// The assignment's `.drv` content is malformed (UTF-8, ATerm parse,
+    /// BasicDerivation conversion). Deterministic per-derivation: every
+    /// pod sees the same bytes, so retry-on-another-pod is pointless.
+    /// Maps to `InputRejected` instead of `InfrastructureFailure`.
+    #[error("invalid derivation: {0}")]
+    InvalidDerivation(String),
     #[error("upload failed: {0}")]
     Upload(#[from] upload::UploadError),
     #[error("gRPC error: {0}")]
@@ -236,6 +242,27 @@ impl ExecutorError {
             }
             _ => false,
         }
+    }
+
+    /// Whether this error is deterministic per-derivation (same on every
+    /// pod) and so should map to `InputRejected` rather than
+    /// `InfrastructureFailure`. Prevents the scheduler from burning N
+    /// ephemeral cold-starts on a derivation that will fail identically
+    /// each time before the poison threshold trips.
+    ///
+    /// Everything NOT matched here stays `InfrastructureFailure`: node-
+    /// or network-local conditions (overlay/mount, IO, gRPC, daemon
+    /// crashes, cgroup, OOM) where another pod plausibly succeeds.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            // FOD/non-FOD routed to wrong executor kind. Scheduler bug
+            // or malformed `is_fod` — same kind, same failure.
+            ExecutorError::WrongKind { .. }
+            // .drv content failed UTF-8/ATerm/BasicDerivation parse.
+            // The bytes are what they are; every pod parses identically.
+            | ExecutorError::InvalidDerivation(_)
+        )
     }
 }
 
@@ -342,10 +369,11 @@ pub async fn execute_build(
         // eliminated this pattern; 395e826f reintroduced it one day after
         // P0020 closed. Clippy disallowed-methods (P0290) prevents round 3.
         let drv_text = std::str::from_utf8(&assignment.drv_content).map_err(|e| {
-            ExecutorError::BuildFailed(format!("drv content is not valid UTF-8: {e}"))
+            ExecutorError::InvalidDerivation(format!("drv content is not valid UTF-8: {e}"))
         })?;
-        Derivation::parse(drv_text)
-            .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))?
+        Derivation::parse(drv_text).map_err(|e| {
+            ExecutorError::InvalidDerivation(format!("failed to parse derivation: {e}"))
+        })?
     };
 
     // wkr-fod-flag-trust (21-p2-p3-rollup Batch B): the .drv is ground
@@ -1011,7 +1039,9 @@ async fn resolve_inputs(
         drv.args().to_vec(),
         drv.env().clone(),
     )
-    .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
+    .map_err(|e| {
+        ExecutorError::InvalidDerivation(format!("failed to build BasicDerivation: {e}"))
+    })?;
 
     // Compute input closure for the synthetic DB (ValidPaths table)
     // and the FUSE warm. The BFS seeds with resolved_input_srcs so
@@ -1803,6 +1833,29 @@ mod tests {
         // pod just OOM-loops again — must escalate to scheduler for
         // size-class promotion (I-196).
         assert!(!ExecutorError::CgroupOom.is_daemon_transient());
+    }
+
+    #[test]
+    fn test_is_permanent() {
+        use std::io::Error as IoError;
+        // Permanent: derivation-intrinsic, same on every pod.
+        assert!(
+            ExecutorError::WrongKind {
+                is_fod: true,
+                executor_kind: rio_proto::types::ExecutorKind::Builder
+            }
+            .is_permanent()
+        );
+        assert!(ExecutorError::InvalidDerivation("not UTF-8".into()).is_permanent());
+
+        // NOT permanent: node-/network-local — another pod might succeed.
+        assert!(!ExecutorError::DaemonSpawn(IoError::other("spawn")).is_permanent());
+        assert!(!ExecutorError::CgroupOom.is_permanent());
+        assert!(!ExecutorError::BuildFailed("exit 1".into()).is_permanent());
+        assert!(!ExecutorError::Cgroup("EACCES".into()).is_permanent());
+        assert!(!ExecutorError::NixConf(IoError::other("disk full")).is_permanent());
+        // is_permanent and is_daemon_transient are disjoint.
+        assert!(!ExecutorError::InvalidDerivation("x".into()).is_daemon_transient());
     }
 
     #[test]

@@ -622,9 +622,20 @@ pub async fn spawn_build_task(
                     // (already transitioned the derivation when it sent
                     // the CancelSignal).
                     (rio_proto::build_types::BuildResultStatus::Cancelled, false)
+                } else if e.is_permanent() {
+                    // Deterministic per-derivation (WrongKind, .drv
+                    // parse failure). Another pod will fail identically;
+                    // surface as InputRejected so the scheduler stops
+                    // burning ephemeral cold-starts before the poison
+                    // threshold trips.
+                    (
+                        rio_proto::build_types::BuildResultStatus::InputRejected,
+                        true,
+                    )
                 } else {
-                    // Genuine executor failure (overlay mount fail,
-                    // daemon spawn fail, etc). Error-log.
+                    // Node- or network-local executor failure (overlay
+                    // mount, daemon crash, gRPC, IO). Another pod might
+                    // succeed → InfrastructureFailure → reassign.
                     (
                         rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
                         true,

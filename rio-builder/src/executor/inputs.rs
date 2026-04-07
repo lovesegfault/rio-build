@@ -271,8 +271,9 @@ pub(super) async fn fetch_drv_from_store(
         )));
     };
 
-    Derivation::parse_from_nar(&nar_data)
-        .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse .drv from NAR: {e}")))
+    Derivation::parse_from_nar(&nar_data).map_err(|e| {
+        ExecutorError::InvalidDerivation(format!("failed to parse .drv from NAR: {e}"))
+    })
 }
 
 /// Compute the input closure for a derivation by querying the store.
@@ -1181,7 +1182,7 @@ mod tests {
             .await
             .expect_err("should fail on bad NAR");
 
-        assert!(matches!(err, ExecutorError::BuildFailed(_)));
+        assert!(matches!(err, ExecutorError::InvalidDerivation(_)));
         assert!(
             err.to_string().contains("failed to parse .drv from NAR"),
             "got: {err}"
