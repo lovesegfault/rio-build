@@ -185,7 +185,7 @@ pkgs.testers.runNixOSTest {
     }}
 
     # Ephemeral workers: submit the build in BACKGROUND so pods stay
-    # Running while the netns probes below execute. sleepSecs=120 keeps
+    # Running while the netns probes below execute. sleepSecs=30 keeps
     # the builder pod alive past the probe sequence; the fetcher pod
     # lives only as long as the FOD fetch — probe it first.
     client.succeed(
@@ -282,7 +282,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # builder-airgap — builder BLOCKED from TEST-NET-3 origin
     # ══════════════════════════════════════════════════════════════════
-    # Builder pod appears once the FOD completes; sleepSecs=120 in the
+    # Builder pod appears once the FOD completes; sleepSecs=30 in the
     # consumer drv keeps it alive for these probes. Positive control
     # first: scheduler ClusterIP MUST connect (builder-egress explicitly
     # allows it). Then the origin probe.
