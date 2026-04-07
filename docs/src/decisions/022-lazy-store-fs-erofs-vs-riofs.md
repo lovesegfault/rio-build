@@ -236,3 +236,64 @@ Our code:
 - `rio-builder/src/fuse/{mod,ops,fetch}.rs`, `overlay.rs`
 
 ---
+
+## 6. Extension: chunked output upload (`PutPathChunked`)
+
+The §2 stack optimizes the **read** side — inputs reach the build via per-file redirects into a content-addressed lower. Outputs still leave the build via the pre-ADR-022 `PutPath`: two disk passes over the overlay upper (refscan, then NAR-stream), full NAR over gRPC, store-side **whole-NAR `Vec<u8>` buffer** ([`put_path.rs:431/485`](../../rio-store/src/grpc/put_path.rs)) before FastCDC. Output bytes are traversed ≥4× and the RAM buffer is the standing 40 GiB-RSS hazard the `nar_bytes_budget` semaphore exists to fence.
+
+`PutPathChunked` moves chunking to the builder and reduces the wire to missing chunks plus a manifest. The justification holds at zero dedup: the store-side RAM buffer disappears, builder-side disk reads drop 2×→1×, and FastCDC CPU moves off the shared rio-store replicas onto per-build ephemeral cores. Dedup is upside, not the gate.
+
+r[store.put.chunked]
+
+```text
+builder ──gRPC──▶ rio-store ──verify blake3──▶ S3 PutObject ──best-effort──▶ FSx
+   │  (only egress)     │  (per-chunk, on arrival;             (TieredChunkBackend §9)
+   │                    │   no whole-NAR buffer)
+   └── air-gapped: never reaches S3, FSx, or any network endpoint other than rio-store
+```
+
+**This does not widen the builder trust boundary or the FSx surface.** The builder's only network egress remains rio-store gRPC — the air-gap invariant is unchanged. S3 and FSx are reached **exclusively by rio-store**, exactly as in `PutPath` today; the difference is internal to rio-store: it S3-writes each verified chunk on arrival instead of accumulating the full NAR in a `Vec<u8>` first. rio-mountd is uninvolved; the per-AZ FSx cache stays read-only from the builder's perspective — chunks reach FSx via rio-store's existing `TieredChunkBackend.put` (S3-first, then best-effort FSx; [Design Overview §9](./022-design-overview.md)). The §2.7 rejection of a builder-writable shared FS stands unchanged.
+
+### 6.1 Builder-side fused walk
+
+r[builder.upload.fused-walk]
+
+After the build exits, `upload_all_outputs` walks each output's directory tree **once**, in canonical NAR entry order (`r[builder.nar.entry-name-safety]`). Per regular file, a single read drives four sinks in lockstep: FastCDC rolling-hash boundary detection (same `16/64/256 KiB` params as `rio-store/src/chunker.rs`, `r[store.cas.fastcdc]`) emitting `(offset, len, blake3)` per chunk; a whole-file blake3 accumulator yielding `file_digest`; the Boyer-Moore reference scanner over raw bytes (`r[builder.upload.references-scanned]`); and the SHA-256 accumulator over **NAR-framed** bytes (the walk emits NAR framing — `nar::Encoder` headers/padding — into the SHA-256 sink only; no NAR byte stream is materialized). At end-of-walk the builder holds `{chunk_manifest, file_digests, root_dir_digest, refs, nar_hash, nar_size}` having read each output byte exactly once. This closes `TODO(P0433)` (refs forced into a separate pre-pass) and `TODO(P0434)` (manifest-first upload).
+
+r[builder.upload.chunked-manifest]
+
+The chunk manifest is the ordered list `[(chunk_digest, len)]` per file, alongside the `Directory` tree (`r[store.index.dir-digest]`). It is sufficient for rio-store to reconstruct the NAR byte stream from CAS chunks without builder participation.
+
+**Input-reuse shortcut (builder-local, no protocol change).** Before chunking an output regular file, the walk may consult a `(size, file_digest)` table of the build's declared inputs — already known from the EROFS metadata image's redirect xattrs (§2.1). On a size match, a content `cmp` against the composefs-lower file confirms identity and the input's `file_digest` and chunk list are reused without hashing. This is the [ostree `devino_to_csum_cache`](https://ostreedev.github.io/ostree/reference/ostree-OstreeRepo.html) pattern adapted to a content-addressed lower; it pays off for `cp`-heavy and fixed-output builds.
+
+### 6.2 Wire protocol
+
+r[store.chunk.has-chunks-durable]
+
+`HasChunks([chunk_digest]) → bitmap` is the chunk-granular sibling of the file-level `HasBlobs` (P0573, `r[store.castore.blob-read]`). A bit is set **only if the chunk is S3-durable** — i.e., referenced by at least one *complete* manifest, not merely refcount ≥1. The distinction is I-201 (stranded-chunk race): a SIGKILL between refcount-bump and S3 `PutObject`, combined with a concurrent uploader's presence-skip, permanently strands the digest. Under durable-presence semantics two builders racing on the same novel chunk both see `false`, both upload, and the second S3 `PutObject` is an idempotent overwrite of identical content. The builder MAY first probe `HasBlobs([file_digest])` to short-circuit whole files before chunking them.
+
+r[store.chunk.self-verify]
+
+`PutPathChunked` is a client-stream: `Begin{hmac_token, store_path, deriver, refs, root_dir_digest, nar_hash, nar_size, chunk_manifest}` then zero or more `Chunk{digest, bytes}` for the digests `HasChunks` reported absent. rio-store validates the HMAC assignment token (`r[store.hmac.san-bypass]` — scheduler-signed authorization for *this* builder to upload *this* derivation's outputs), inserts a placeholder manifest (`r[store.put.wal-manifest]`), then for each received `Chunk` asserts `blake3(bytes) == digest` and — **rio-store, not the builder** — issues the S3 `PutObject` via `cas::put` (×32-parallel, `r[store.cas.upload-bounded]`). The whole-NAR `Vec<u8>` is gone: rio-store's working set per stream is one ≤256 KiB chunk in flight, not `nar_size` bytes. A `Chunk` whose digest was not declared in `Begin.chunk_manifest`, or whose blake3 mismatches, fails the stream with `INVALID_ARGUMENT`.
+
+Commit: when every `chunk_manifest` digest is S3-durable (uploaded now or pre-existing), the placeholder flips `uploading → complete` in the manifest WAL. Builder death mid-stream leaves a placeholder and orphan chunks; both are swept by the existing GC (`r[store.gc.orphan-heartbeat]`, `r[store.chunk.grace-ttl]`). `PutPathChunked` is idempotent (`r[store.put.idempotent]`) — re-drive after transport failure repeats `HasChunks` and re-sends only still-missing chunks.
+
+### 6.3 NarHash trust — async verify
+
+r[store.put.narhash-async]
+
+The builder is untrusted (`r[builder.upload.references-scanned]` context: outputs are adversary-controlled bytes); rio-store signs `narinfo`. The `nar_hash` in `Begin` is therefore **claimed**, not attested. On commit, rio-store records `nar_hash_verified = false` and enqueues a background job that NAR-serializes the path from CAS chunks (via `chunk_manifest` + `Directory` tree — same machinery as `ReadBlob`, `r[store.castore.blob-read]`), computes SHA-256, and compares. The verify reads chunks from S3/FSx — never from the builder — so the wire cost stays missing-chunks-only.
+
+The path is **immediately usable for chunk-addressed reads**: §2's digest-FUSE, `ReadBlob`, and delta-sync (`r[gw.substitute.dag-delta-sync]`) key on `file_digest`/`chunk_digest`, which are self-certifying. Only the legacy binary-cache surface (`narinfo` + NAR fetch) depends on `nar_hash`; serving a `narinfo` for an unverified path **blocks on the verify job** (or returns 404, configuration-dependent).
+
+r[store.put.narhash-quarantine]
+
+On mismatch the path is quarantined: manifest flips to `quarantined`, the path is excluded from all query surfaces, and an alert fires carrying `{store_path, drv_path, builder_pod, claimed_nar_hash, computed_nar_hash}`. Chunks are **not** deleted — they are content-addressed and may be legitimately referenced by other manifests. A mismatch is either a builder bug (NAR-framing divergence in the fused walk's SHA-256 sink) or a compromised builder; both warrant operator attention, neither warrants serving the claimed hash.
+
+**Considered and rejected:** synchronous verify before commit (re-reads every chunk on the hot path; defeats the latency win for the common case where downstream consumers are rio builds, not `nix copy`); trusting builder `nar_hash` outright (rio-store's narinfo signature would attest an adversary-controlled value); dropping `nar_hash` from the manifest entirely (breaks substitution by stock Nix clients — a non-goal to break).
+
+### 6.4 Prior art
+
+REAPI [`FindMissingBlobs`](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto) → `HasChunks`; BuildBarn [ADR-0003 CAS decomposition](https://github.com/buildbarn/bb-adrs/blob/main/0003-cas-decomposition.md) → upload chunk granularity matches read-path chunk granularity; ostree `devino_to_csum_cache` → §6.1 input-reuse shortcut; [`mkcomposefs --digest-store`](https://man.archlinux.org/man/mkcomposefs.1.en) → walk-and-reflink-into-object-store (inapplicable directly: upper is local SSD, FSx is Lustre, no cross-FS reflink — but the walk shape is the same); Nix [#4075](https://github.com/NixOS/nix/issues/4075)/[#7527](https://github.com/NixOS/nix/issues/7527) → existence-check before serialize, and the whole-NAR-granularity pain point this section eliminates.
+
+---
