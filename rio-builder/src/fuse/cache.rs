@@ -213,8 +213,8 @@ pub struct Cache {
 /// per-build JIT allowlist. See [`Cache::jit_classify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JitClass {
-    /// JIT not armed (`register_inputs` never called, or `clear_inputs`
-    /// since). `lookup` falls back to legacy heuristic gRPC.
+    /// JIT not armed (`register_inputs` never called). `lookup` falls
+    /// back to legacy heuristic gRPC.
     NotArmed,
     /// JIT armed; name is NOT a registered input. Daemon probes
     /// (`.lock`, `.chroot`, output-path checks) land here. Fast ENOENT,
@@ -290,13 +290,6 @@ impl Cache {
     pub fn register_inputs(&self, inputs: impl IntoIterator<Item = (String, u64)>) {
         let mut g = self.known_inputs.write().unwrap_or_else(|e| e.into_inner());
         g.get_or_insert_with(HashMap::new).extend(inputs);
-    }
-
-    /// Disarm JIT: drop the allowlist back to `None`. Subsequent
-    /// `lookup`s fall back to [`JitClass::NotArmed`] (legacy heuristic
-    /// gRPC) until the next `register_inputs`.
-    pub fn clear_inputs(&self) {
-        *self.known_inputs.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Classify `basename` against the JIT allowlist. See [`JitClass`].
@@ -657,9 +650,8 @@ mod tests {
         Ok(())
     }
 
-    /// JIT allowlist round-trip: unarmed → NotArmed; register →
-    /// KnownInput / NotInput; clear → NotArmed again. Also: register
-    /// EXTENDS, not replaces.
+    /// JIT allowlist: unarmed → NotArmed; register → KnownInput /
+    /// NotInput. Second register EXTENDS, not replaces.
     // r[verify builder.fuse.jit-register]
     #[tokio::test]
     async fn test_jit_classify_roundtrip() -> anyhow::Result<()> {
@@ -698,12 +690,6 @@ mod tests {
             }
         );
         assert_eq!(cache.known_inputs_len(), 2);
-
-        // Clear disarms back to NotArmed (NOT NotInput).
-        cache.clear_inputs();
-        assert_eq!(cache.jit_classify(hello), JitClass::NotArmed);
-        assert_eq!(cache.jit_classify(probe), JitClass::NotArmed);
-        assert_eq!(cache.known_inputs_len(), 0);
         Ok(())
     }
 
