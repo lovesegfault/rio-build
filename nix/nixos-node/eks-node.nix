@@ -294,28 +294,31 @@ in
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
-            ExecStart = pkgs.writeShellScript "seed-warm" ''
-              set -u
-              ctr='${pkgs.containerd}/bin/ctr -n k8s.io'
-              ${lib.concatMapStringsSep "\n" (seed: ''
-                # --local: containerd 2.x transfer-API path drops --label and
-                # handles multi-manifest ref.name annotations differently;
-                # --local forces the legacy client-side path which honours
-                # both (PLAN-PREBAKE Q1/Q6). Seed-import failure is degraded-
-                # but-functional, so log-warn rather than fail-hard — a
-                # corrupt seed shouldn't take the node out of the pool.
-                $ctr image import --local ${seed} \
-                  || echo "rio: seed import ${seed} failed; first-pod pull will be cold" >&2
+            ExecStart =
+              let
+                ctr = "${pkgs.containerd}/bin/ctr -n k8s.io";
+              in
+              pkgs.writeShellScript "seed-warm" ''
+                set -u
+                ${lib.concatMapStringsSep "\n" (seed: ''
+                  # --local: containerd 2.x transfer-API path drops --label and
+                  # handles multi-manifest ref.name annotations differently;
+                  # --local forces the legacy client-side path which honours
+                  # both (PLAN-PREBAKE Q1/Q6). Seed-import failure is degraded-
+                  # but-functional, so log-warn rather than fail-hard — a
+                  # corrupt seed shouldn't take the node out of the pool.
+                  ${ctr} image import --local ${seed} \
+                    || echo "<4>rio: seed import ${seed} failed; first-pod pull will be cold" >&2
+                '') cfg.seedImages}
                 # Pin both seed.local/…:prebaked refs. The label stops
                 # kubelet's CRI image-GC from deleting the IMAGE RECORD; the
                 # record's mere existence stops containerd's content-GC from
                 # deleting the LAYER BLOBS (Q8 — gc.Scheduler walks image-
                 # store refs, not labels). No content-label or lease needed.
                 for ref in seed.local/rio-builder:prebaked seed.local/rio-fetcher:prebaked; do
-                  $ctr image label "$ref" io.cri-containerd.pinned=pinned || true
+                  ${ctr} image label "$ref" io.cri-containerd.pinned=pinned || true
                 done
-              '') cfg.seedImages}
-            '';
+              '';
           };
         };
 

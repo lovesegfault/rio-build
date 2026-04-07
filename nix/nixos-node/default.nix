@@ -11,8 +11,8 @@
 # Design: docs/src/decisions/021-nixos-node-ami.md (ADR-021).
 {
   lib,
-  # OCI archive(s) to import into containerd's content store before
-  # kubelet starts (layer-cache warm — r[infra.node.prebake-layer-warm]).
+  # OCI archive(s) to import into containerd's content store concurrent
+  # with kubelet start (layer-cache warm — r[infra.node.prebake-layer-warm]).
   # Threaded via specialArgs from flake.nix's nodeAmi.
   rioSeedImages,
   ...
