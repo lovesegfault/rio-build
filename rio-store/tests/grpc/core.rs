@@ -431,6 +431,72 @@ async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     Ok(())
 }
 
+// r[verify store.put.stale-reclaim]
+/// I-207: a stale `'uploading'` placeholder (crashed prior fetcher) MUST
+/// NOT block a fresh PutPath until the orphan scanner's 15-minute sweep.
+/// PutPath reaps it on the hot path (5-minute threshold) and proceeds.
+/// A young placeholder (live concurrent uploader) still aborts.
+#[tokio::test]
+async fn test_putpath_reclaims_stale_uploading() -> TestResult {
+    let mut s = StoreSession::new().await?;
+    let store_path = test_store_path("i207-stale");
+    let nar = make_nar(b"i207 stale-reclaim").0;
+    let info = make_path_info_for_nar(&store_path, &nar);
+
+    // Seed a stale placeholder backdated past SUBSTITUTE_STALE_THRESHOLD
+    // (5min). Same shape as `metadata::insert_manifest_uploading` (narinfo
+    // stub + manifests row), inlined because the metadata module is
+    // pub(crate). Backdating updated_at simulates the crashed-uploader.
+    let seed_placeholder = |path: String, age_secs: i64| {
+        let pool = s.db.pool.clone();
+        async move {
+            let sph = rio_nix::store_path::StorePath::parse(&path)
+                .unwrap()
+                .sha256_digest();
+            sqlx::query(
+                r#"INSERT INTO narinfo (store_path_hash, store_path, nar_hash,
+                       nar_size, "references") VALUES ($1, $2, $3, 0, '{}')"#,
+            )
+            .bind(sph.as_slice())
+            .bind(&path)
+            .bind(&[0u8; 32] as &[u8])
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO manifests (store_path_hash, status, updated_at) \
+                 VALUES ($1, 'uploading', now() - make_interval(secs => $2))",
+            )
+            .bind(sph.as_slice())
+            .bind(age_secs)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    seed_placeholder(store_path.clone(), 600).await;
+
+    let created = put_path(&mut s.client, info.clone(), nar.clone()).await?;
+    assert!(
+        created,
+        "I-207: stale placeholder reclaimed → fresh PutPath proceeds with created=true"
+    );
+
+    // Young placeholder still aborts (live-uploader guard).
+    let young_path = test_store_path("i207-young");
+    let young_nar = make_nar(b"i207 young").0;
+    let young_info = make_path_info_for_nar(&young_path, &young_nar);
+    seed_placeholder(young_path.clone(), 0).await;
+    let r = put_path(&mut s.client, young_info, young_nar).await;
+    assert_eq!(
+        r.expect_err("young placeholder must abort").code(),
+        tonic::Code::Aborted,
+        "I-207: young placeholder = live concurrent uploader → still Aborted"
+    );
+
+    Ok(())
+}
+
 /// I-125a: client disconnect mid-upload (handler future dropped) must
 /// release the in-progress placeholder so a subsequent PutPath for the
 /// same path succeeds instead of getting `Aborted: concurrent PutPath`.

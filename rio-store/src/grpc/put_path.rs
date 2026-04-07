@@ -355,7 +355,7 @@ impl StoreServiceImpl {
         // update_narinfo_complete will write at completion (references
         // don't change between metadata arrival and trailer).
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-        let inserted = match metadata::insert_manifest_uploading(
+        let mut inserted = match metadata::insert_manifest_uploading(
             &self.pool,
             &store_path_hash,
             &info.store_path,
@@ -372,6 +372,43 @@ impl StoreServiceImpl {
                 ));
             }
         };
+        // r[impl store.put.stale-reclaim]
+        // I-207: a fetcher that died mid-upload (storage eviction, OOM)
+        // leaves a placeholder this insert ON CONFLICT DO NOTHING'd
+        // against. The orphan scanner reaps it in 15min, but the
+        // scheduler retries within seconds — the next fetcher hits
+        // Aborted below and the FOD loops until the sweep. Same
+        // hot-path reclaim as `r[store.substitute.stale-reclaim]`:
+        // reap_one's threshold check guards a LIVE concurrent uploader
+        // (heartbeat keeps its updated_at fresh).
+        if !inserted {
+            let threshold = crate::substitute::SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
+            match crate::gc::orphan::reap_one(
+                &self.pool,
+                &store_path_hash,
+                Some(threshold),
+                self.chunk_backend.as_ref(),
+            )
+            .await
+            {
+                Ok(true) => {
+                    warn!(store_path = %info.store_path,
+                          "PutPath: stale 'uploading' placeholder — reclaimed");
+                    metrics::counter!("rio_store_putpath_stale_reclaimed_total").increment(1);
+                    inserted = metadata::insert_manifest_uploading(
+                        &self.pool,
+                        &store_path_hash,
+                        &info.store_path,
+                        &refs_str,
+                    )
+                    .await
+                    .unwrap_or(false);
+                }
+                Ok(false) => {} // not stale → live concurrent uploader
+                Err(e) => warn!(error = %e,
+                    "PutPath: stale-reclaim failed (proceeding to concurrent-abort)"),
+            }
+        }
         if !inserted {
             // Another upload is in progress (or just completed in the window
             // between check_manifest_complete above and now). Re-check: if

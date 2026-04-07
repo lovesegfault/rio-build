@@ -245,6 +245,9 @@ r[store.substitute.probe-bounded]
 r[store.substitute.stale-reclaim]
 When `try_substitute` finds an existing `'uploading'` placeholder for the requested path, it MUST check the placeholder's age. If older than `stale_threshold_secs` (default 5 minutes), the substituter reclaims the placeholder (DELETE + re-INSERT) and proceeds with the fetch. A young placeholder indicates a live concurrent uploader and returns a miss. This prevents a crashed substitution from blocking the path for the full orphan-scanner interval (15 minutes). The `rio_store_substitute_stale_reclaimed_total` counter tracks reclaim events.
 
+r[store.put.stale-reclaim]
+`PutPath` and `PutPathBatch` MUST apply the same stale-reclaim as `r[store.substitute.stale-reclaim]` when `insert_manifest_uploading` reports a pre-existing placeholder: reap it via `gc::orphan::reap_one` with the same `stale_threshold_secs`, then retry the insert once. A fetcher that died mid-upload (storage eviction, OOM) otherwise blocks the next attempt with `Aborted("concurrent PutPath in progress")` until the orphan scanner's 15-minute sweep. The `rio_store_putpath_stale_reclaimed_total` counter tracks reclaim events; sustained high alongside `rio_scheduler_size_class_promotions_total{kind="fod"}` indicates under-sized fetcher pods (I-207/I-208).
+
 ## Two-Phase Garbage Collection
 
 r[store.gc.two-phase]

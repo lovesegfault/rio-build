@@ -246,7 +246,7 @@ impl StoreServiceImpl {
             // Insert placeholder. Same references-on-placeholder semantics
             // as PutPath (GC mark protection from the instant this commits).
             let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-            let inserted = match metadata::insert_manifest_uploading(
+            let mut inserted = match metadata::insert_manifest_uploading(
                 &self.pool,
                 &accum.store_path_hash,
                 info.store_path.as_str(),
@@ -260,6 +260,30 @@ impl StoreServiceImpl {
                     e
                 )),
             };
+            // r[impl store.put.stale-reclaim]
+            // Same hot-path reclaim as PutPath (I-207). reap_one's
+            // threshold check guards a live concurrent uploader.
+            if !inserted {
+                let threshold = crate::substitute::SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
+                if let Ok(true) = crate::gc::orphan::reap_one(
+                    &self.pool,
+                    &accum.store_path_hash,
+                    Some(threshold),
+                    self.chunk_backend.as_ref(),
+                )
+                .await
+                {
+                    metrics::counter!("rio_store_putpath_stale_reclaimed_total").increment(1);
+                    inserted = metadata::insert_manifest_uploading(
+                        &self.pool,
+                        &accum.store_path_hash,
+                        info.store_path.as_str(),
+                        &refs_str,
+                    )
+                    .await
+                    .unwrap_or(false);
+                }
+            }
 
             if !inserted {
                 // Concurrent uploader owns the slot. For a batch, we can't
