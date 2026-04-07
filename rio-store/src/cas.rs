@@ -335,7 +335,7 @@ async fn do_upload(
                 // block upload progress on the PG round-trip).
                 if let Some((pool, sp_hash, state)) = &hb {
                     let fire = {
-                        let mut g = state.lock().unwrap();
+                        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
                         g.1 += 1;
                         if g.1 >= HEARTBEAT_CHUNK_INTERVAL
                             || g.0.elapsed() >= HEARTBEAT_TIME_INTERVAL
@@ -349,7 +349,7 @@ async fn do_upload(
                     if fire {
                         let pool = pool.clone();
                         let sp_hash = sp_hash.clone();
-                        tokio::spawn(async move {
+                        rio_common::task::spawn_monitored("chunk-heartbeat", async move {
                             heartbeat_uploading(&pool, &sp_hash).await;
                         });
                     }
