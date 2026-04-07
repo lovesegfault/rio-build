@@ -360,14 +360,6 @@ message HeartbeatRequest {
   // when the SAME draining process reconnects after a scheduler
   // restart). Default false — wire-compatible.
   bool draining = 11;
-  // One-shot Job executor: exits after completing its single build
-  // (r[ctrl.pool.ephemeral]). Scheduler marks it draining immediately
-  // on completion so dispatch_ready in the same actor turn doesn't
-  // re-assign to the about-to-exit slot (I-188). Static config from
-  // RIO_EPHEMERAL; reported every heartbeat. Default false — wire-
-  // compatible (old executors don't send it; treated as long-lived).
-  // Spec: r[sched.ephemeral.no-redispatch-after-completion]
-  bool ephemeral = 12;
 }
 
 message HeartbeatResponse {

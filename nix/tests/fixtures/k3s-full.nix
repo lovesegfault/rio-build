@@ -629,7 +629,21 @@ rec {
         timeout=30,
     )
 
-    # ── Worker STS exists ───────────────────────────────────────────
+    # ── BuilderPool reconciled ──────────────────────────────────────
+    # All worker pods are ephemeral Jobs — no standing pod to wait
+    # for. The reconciler patches `.status` on first reconcile;
+    # presence of status confirms the controller has seen the CR and
+    # the Job-spawn loop is live. First build in each test triggers a
+    # Job spawn (~10s reconcile tick + ~10s pod schedule).
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
+        "-o jsonpath='{.status}' | grep -q .",
+        timeout=60,
+    )
+  '';
+
+  # ═══ DEAD: STS-mode worker-wait (phase 6 deletes) ═══════════════════
+  _deadStsWorkerWait = ''
     # `kubectl wait pod/X` fails IMMEDIATELY (rc=1, "NotFound") if the
     # pod doesn't exist — it does NOT block for --timeout. Controller
     # became Available above, but its first BuilderPool reconcile

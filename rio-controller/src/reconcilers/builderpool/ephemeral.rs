@@ -142,7 +142,7 @@ pub(crate) const DEADLINE_MULTIPLIER: i64 = 5;
 /// at least observable (pod starts, then dies) rather than a silent
 /// no-op spawn loop.
 fn ephemeral_deadline(spec: &crate::crds::builderpool::BuilderPoolSpec) -> i64 {
-    if let Some(explicit) = spec.ephemeral_deadline_seconds {
+    if let Some(explicit) = spec.deadline_seconds {
         return i64::from(explicit);
     }
     if let Some(cutoff) = spec.size_class_cutoff_secs {
@@ -166,7 +166,7 @@ fn ephemeral_deadline(spec: &crate::crds::builderpool::BuilderPoolSpec) -> i64 {
 /// ceiling (`spec.replicas.max`).
 pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
-    let ceiling = wp.spec.replicas.max;
+    let ceiling = wp.spec.max_concurrent as i32;
 
     // ---- Poll queue depth ----
     // Same ClusterStatus the autoscaler polls. One RPC per reconcile
@@ -575,7 +575,6 @@ pub(super) fn build_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::builderpool::Replicas;
     use crate::fixtures::{test_sched_addrs, test_store_addrs};
     // `controller_owner_ref` comes from `kube::Resource`. Module-
     // level import moved to job_common with spawn_prerequisites;
@@ -588,8 +587,7 @@ mod tests {
         // out of the E0063 blast radius when BuilderPoolSpec gains
         // a field — the fixture is the single touch point.
         let mut spec = crate::fixtures::test_workerpool_spec();
-        spec.replicas = Replicas { min: 0, max: 4 };
-        spec.ephemeral = true;
+        spec.max_concurrent = 4;
         spec.fuse_cache_size = "10Gi".into();
         spec.features = vec![];
         spec.size_class = String::new();
@@ -786,7 +784,7 @@ mod tests {
     #[test]
     fn ephemeral_deadline_some_propagates_to_job_spec() {
         let mut wp = test_wp();
-        wp.spec.ephemeral_deadline_seconds = Some(7200);
+        wp.spec.deadline_seconds = Some(7200);
         // Cutoff also set → would compute 30×5=150 if precedence
         // were wrong. 7200 must win.
         wp.spec.size_class_cutoff_secs = Some(30.0);

@@ -900,32 +900,32 @@ builderPoolSetDefaults:
   classes:
     - name: tiny
       cutoffSecs: 30
-      maxReplicas: 200
+      maxConcurrent: 200
       resources:
         # I-118: hello-class builds need <500MB FUSE cache + overlay.
         requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "1300Mi"}
         limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "2Gi"}
     - name: small
       cutoffSecs: 120
-      maxReplicas: 200
+      maxConcurrent: 200
       resources:
         requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "2600Mi"}
         limits: {cpu: "8", memory: "16Gi", ephemeral-storage: "4Gi"}
     - name: medium
       cutoffSecs: 600
-      maxReplicas: 100
+      maxConcurrent: 100
       resources:
         requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "21Gi"}
         limits: {cpu: "32", memory: "64Gi", ephemeral-storage: "32Gi"}
     - name: large
       cutoffSecs: 1800
-      maxReplicas: 50
+      maxConcurrent: 50
       resources:
         requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "42Gi"}
         limits: {cpu: "64", memory: "128Gi", ephemeral-storage: "64Gi"}
     - name: xlarge
       cutoffSecs: 7200
-      maxReplicas: 20
+      maxConcurrent: 20
       resources:
         requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "62Gi"}
         limits: {cpu: "128", memory: "256Gi", ephemeral-storage: "96Gi"}
@@ -947,21 +947,10 @@ builderPools:
 
 builderPoolDefaults:
   enabled: false
-  # P0537: CRD default is `true` (one Job per build). The chart's
-  # default pool is long-lived (StatefulSet) for autoscaler-driven
-  # smoke testing — opt out explicitly. Ephemeral pools must also set
-  # replicas.min=0 (CEL-enforced).
-  ephemeral: false
-  replicas:
-    # min=2 for smoke-test worker-kill phase: need >=2 workers so killing
-    # one leaves another for immediate reassign. With min=0 and instant
-    # dispatch (no queue pressure), autoscaler never scales past 1.
-    # Production target: min=0 (scale-to-zero via SCALE_DOWN_WINDOW).
-    # max=500 paired with karpenter.nodePools rio-builder-preferred
-    # cpu=2000 (500 builders × 2 cpu/builder = 1000 vCPU baseline,
-    # 2000 NodePool limit gives Karpenter bin-packing headroom).
-    min: 2
-    max: 500
+  # max paired with karpenter.nodePools rio-builder-preferred cpu=2000
+  # (500 builders × 2 cpu/builder = 1000 vCPU baseline, 2000 NodePool
+  # limit gives Karpenter bin-packing headroom).
+  maxConcurrent: 500
   autoscaling:
     metric: queueDepth
     targetValue: 5   # scale up when queued / active_workers > 5
@@ -1074,22 +1063,11 @@ fetcherPools:
 
 fetcherPoolDefaults:
   enabled: false
-  # P0541: ephemeral defaults true at the CRD level. The chart's
-  # default sets it explicitly here so flipping the chart default
-  # is a one-line diff (and so `helm get values` shows the mode
-  # without consulting the CRD schema). false → STS path, min=2
-  # standing set; true → Job-per-FOD, requires min=0.
-  ephemeral: false
-  # ephemeralDeadlineSeconds: ~  # only with ephemeral:true; default 300
-  replicas:
-    # min=2: matches the smoke test's parallel-FOD coverage. Same
-    # rationale as builderPoolDefaults.replicas.min — there's always
-    # a warm fetcher so the first FOD doesn't wait for cold-start.
-    min: 2
-    # max paired with karpenter rio-fetcher cpu=128. FODs spike at
-    # build start (40+ ready when chains hit FOD-phase together) but
-    # are short (~seconds).
-    max: 32
+  # deadlineSeconds: ~  # default 300
+  # max paired with karpenter rio-fetcher cpu=128. FODs spike at
+  # build start (40+ ready when chains hit FOD-phase together) but
+  # are short (~seconds).
+  maxConcurrent: 32
   autoscaling:
     metric: fodQueueDepth
     targetValue: 5   # scale up when queued_fod / fetchers > 5
@@ -1116,10 +1094,7 @@ fetcherPoolDefaults:
         requests: {cpu: 500m, memory: 1Gi}
         limits: {memory: 2Gi}
     - name: small
-      # minReplicas: 0 — small is the rare-promotion tier; tolerate
-      # cold-start (a drv that already burned a retry can wait 30s).
-      minReplicas: 0
-      maxReplicas: 4
+      maxConcurrent: 4
       resources:
         requests: {cpu: "1", memory: 4Gi}
         limits: {memory: 8Gi}

@@ -14,13 +14,7 @@ use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::builderpool::{Autoscaling, Replicas};
-
-/// serde default for `ephemeral`. Function (not const) because
-/// `#[serde(default = ..)]` takes `fn() -> T`.
-fn default_true() -> bool {
-    true
-}
+use crate::builderpool::Autoscaling;
 
 /// FetcherPool spec. The reconciler labels pods `rio.build/role:
 /// fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
@@ -49,21 +43,9 @@ fn default_true() -> bool {
     printcolumn = r#"{"name":"Desired","type":"integer","jsonPath":".status.desiredReplicas"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
-// CEL: ephemeral=true requires replicas.min==0. Same rationale as
-// BuilderPool — ephemeral has no standing set, only a concurrent-Job
-// ceiling. See rio-crds/src/builderpool.rs:61 for the full reasoning.
 #[x_kube(
-    validation = Rule::new(
-        "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0)"
-    ).message(
-        "ephemeral:true requires replicas.min==0 and replicas.max>0 — ephemeral has no standing set, only a concurrent-Job ceiling"
-    )
-)]
-#[x_kube(
-    validation = Rule::new(
-        "!has(self.ephemeralDeadlineSeconds) || self.ephemeral"
-    ).message(
-        "ephemeralDeadlineSeconds is only valid with ephemeral:true — the field sets the Job's activeDeadlineSeconds; STS pools have no Jobs"
+    validation = Rule::new("self.maxConcurrent > 0").message(
+        "maxConcurrent must be > 0 — it is the concurrent-Job ceiling"
     )
 )]
 // CEL: classes[] and resources are mutually exclusive. When classes is
@@ -79,45 +61,19 @@ fn default_true() -> bool {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolSpec {
-    /// Ephemeral mode: one Job per FOD instead of a StatefulSet. The
-    /// reconciler polls `queued_fod_derivations` and spawns Jobs (one
-    /// per outstanding FOD, up to `replicas.max`). Each pod runs with
-    /// `RIO_EPHEMERAL=1` → exits after one fetch → `ttlSecondsAfter
-    /// Finished` reaps. Same Job lifecycle as ephemeral BuilderPool;
-    /// see `r[ctrl.pool.ephemeral]`.
-    ///
-    /// Default `true` (P0541, follows P0537): one pod, one fetch,
-    /// exit. Long-lived StatefulSet pools must set `ephemeral: false`.
-    ///
-    /// FODs are seconds-long and bursty (40+ ready when build-chain
-    /// FOD phases align), which is exactly the Job-mode shape: no
-    /// 10min scale-down stabilization tax for spikes, no idle pods
-    /// between bursts.
-    #[serde(default = "default_true")]
-    pub ephemeral: bool,
-
-    /// Backstop `activeDeadlineSeconds` on ephemeral Jobs. Same field
-    /// as BuilderPool. Default 300 (`reconcilers/fetcherpool/
-    /// ephemeral.rs::FOD_EPHEMERAL_DEADLINE_SECS`) — fetches are
-    /// network-bound and short; a stuck download is the failure mode,
-    /// not a 90min compile. Only meaningful when `ephemeral: true`
-    /// (CEL-enforced).
+    /// Backstop `activeDeadlineSeconds` on Jobs. Same field as
+    /// BuilderPool. Default 300 (`reconcilers/fetcherpool/
+    /// ephemeral.rs::FOD_DEADLINE_SECS`) — fetches are network-bound
+    /// and short; a stuck download is the failure mode, not a 90min
+    /// compile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ephemeral_deadline_seconds: Option<u32>,
+    pub deadline_seconds: Option<u32>,
 
-    /// Replica bounds. Autoscaler clamps to [min, max] based on
-    /// `ClusterStatus.queued_fod_derivations`.
-    ///
-    /// Same `{min, max}` shape as BuilderPool. FODs spike at build
-    /// start (40+ FODs ready simultaneously when chains hit FOD-phase
-    /// together) but are short (~seconds each), so the autoscaler
-    /// scales up fast (30s window) and back down slow (10m window) —
-    /// same stabilization timing as builders.
-    ///
-    /// **BREAKING** (I-014): was `replicas: i32`. Existing FetcherPool
-    /// CRs need `kubectl edit` or re-apply with `{min: N, max: N}` to
-    /// pin the prior static count.
-    pub replicas: Replicas,
+    /// Concurrent-Job ceiling. The reconciler spawns one Job per
+    /// outstanding FOD up to this many active at once. FODs spike at
+    /// build start (40+ ready simultaneously when chains hit FOD-phase
+    /// together) but are short (~seconds each).
+    pub max_concurrent: u32,
 
     /// Autoscaling policy. Same struct as BuilderPool. The expected
     /// `metric` is `"fodQueueDepth"` (`ClusterStatus.queued_fod_
@@ -220,17 +176,10 @@ pub struct FetcherSizeClass {
     #[schemars(schema_with = "crate::any_object")]
     pub resources: ResourceRequirements,
 
-    /// Replica floor for this class's StatefulSet. `None` = inherit
-    /// `spec.replicas.min`. Per-class because "tiny" wants warm
-    /// replicas (most FODs land here) while "small" tolerates
-    /// scale-from-zero (rare promotions; +30s spinup is fine for a
-    /// drv that already burned a retry).
+    /// Concurrent-Job ceiling for this class. `None` = inherit
+    /// `spec.max_concurrent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_replicas: Option<i32>,
-
-    /// Replica ceiling. `None` = inherit `spec.replicas.max`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_replicas: Option<i32>,
+    pub max_concurrent: Option<u32>,
 }
 
 /// FetcherPool status. Reconciler + autoscaler write; `kubectl get fp`
@@ -292,13 +241,12 @@ mod tests {
         assert!(json.contains("desiredReplicas"));
         assert!(json.contains("lastScaleTime"));
         // FetcherSizeClass nested
-        assert!(json.contains("minReplicas"));
-        assert!(json.contains("maxReplicas"));
+        assert!(json.contains("maxConcurrent"));
         // Negative: no snake_case leaked as a property KEY.
         assert!(!json.contains("\"node_selector\":"));
         assert!(!json.contains("\"ready_replicas\":"));
         assert!(!json.contains("\"desired_replicas\":"));
-        assert!(!json.contains("\"min_replicas\":"));
+        assert!(!json.contains("\"max_concurrent\":"));
     }
 
     /// `classes` defaults to empty (back-compat: existing FetcherPool
@@ -306,7 +254,7 @@ mod tests {
     #[test]
     fn classes_default_empty() {
         let yaml = r#"
-            replicas: {min: 0, max: 8}
+            maxConcurrent: 8
             autoscaling: {metric: fodQueueDepth, targetValue: 5}
             image: rio-fetcher:test
             systems: [x86_64-linux]
@@ -325,44 +273,14 @@ mod tests {
         assert!(json.contains("size(self.classes) == 0 || !has(self.resources)"));
     }
 
-    /// Replicas inherits the `min <= max` CEL rule from BuilderPool's
-    /// shared struct. Surfaced in the CRD's openAPIV3Schema as an
-    /// `x-kubernetes-validations` entry — the apiserver enforces it.
+    /// The `maxConcurrent > 0` CEL rule renders.
     #[test]
-    fn replicas_cel_inherited() {
+    fn max_concurrent_cel_renders() {
         let crd = FetcherPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
         assert!(
-            json.contains("self.min <= self.max"),
-            "Replicas CEL rule renders; without it the autoscaler's clamp() panics on inverted bounds"
+            json.contains("self.maxConcurrent > 0"),
+            "maxConcurrent>0 CEL rule missing from schema"
         );
-    }
-
-    /// `ephemeral` defaults to true. P0541 follows P0537: ephemeral is
-    /// the simpler model. A FetcherPool YAML without the field gets
-    /// the Job-mode reconciler.
-    #[test]
-    fn ephemeral_defaults_true() {
-        let yaml = r#"
-            replicas: {min: 0, max: 8}
-            autoscaling: {metric: fodQueueDepth, targetValue: 5}
-            image: rio-fetcher:test
-            systems: [x86_64-linux]
-        "#;
-        let spec: FetcherPoolSpec = serde_yml::from_str(yaml).expect("deserializes");
-        assert!(spec.ephemeral, "absent → true (P0541 default)");
-        assert_eq!(spec.ephemeral_deadline_seconds, None);
-    }
-
-    /// Both `#[x_kube]` ephemeral CEL rules render. Same shape as
-    /// BuilderPool's. Absence means a misformed `replicas.min: 2` +
-    /// `ephemeral: true` is accepted at admission and the reconciler
-    /// has to runtime-reject.
-    #[test]
-    fn ephemeral_cel_rules_render() {
-        let crd = FetcherPool::crd();
-        let json = serde_json::to_string(&crd).expect("serializes");
-        assert!(json.contains("!self.ephemeral || (self.replicas.min == 0"));
-        assert!(json.contains("!has(self.ephemeralDeadlineSeconds) || self.ephemeral"));
     }
 }

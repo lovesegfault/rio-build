@@ -19,9 +19,7 @@ use std::collections::BTreeMap;
 use super::builders::*;
 use super::*;
 use crate::crds::builderpool::SeccompProfileKind;
-use crate::fixtures::{
-    ApiServerVerifier, Scenario, apply_ok_scenarios, test_sched_addrs, test_store_addrs,
-};
+use crate::fixtures::{ApiServerVerifier, Scenario, test_sched_addrs, test_store_addrs};
 
 mod apply_tests;
 mod builders_tests;
@@ -48,7 +46,7 @@ pub(crate) fn test_sts(wp: &BuilderPool) -> StatefulSet {
         wp.controller_owner_ref(&()).unwrap(),
         &test_sched_addrs(),
         &test_store_addrs(),
-        Some(wp.spec.replicas.min),
+        Some(0),
     )
     .unwrap()
 }

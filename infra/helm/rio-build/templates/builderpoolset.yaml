@@ -31,11 +31,8 @@ spec:
     {{- range $bps.classes }}
     - name: {{ .name }}
       cutoffSecs: {{ .cutoffSecs }}
-      {{- with .minReplicas }}
-      minReplicas: {{ . }}
-      {{- end }}
-      {{- with .maxReplicas }}
-      maxReplicas: {{ . }}
+      {{- with .maxConcurrent }}
+      maxConcurrent: {{ . }}
       {{- end }}
       {{- with .targetQueuePerReplica }}
       targetQueuePerReplica: {{ . }}
@@ -52,7 +49,6 @@ spec:
     {{- if $root.Values.tls.enabled }}
     tlsSecretName: rio-builder-tls
     {{- end }}
-    {{- include "rio.optBool" (list $tpl "ephemeral" $tpl.ephemeral) | nindent 4 }}
     {{- include "rio.optBool" (list $tpl "privileged" $tpl.privileged) | nindent 4 }}
     {{- include "rio.optBool" (list $tpl "hostUsers" $tpl.hostUsers) | nindent 4 }}
     {{- with $tpl.seccompProfile }}

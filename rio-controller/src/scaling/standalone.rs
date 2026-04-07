@@ -133,6 +133,7 @@ impl Autoscaler {
         // GetSizeClassStatus is NOT fetched here: WPS children need
         // a per-child feature-filtered request (I-176), so
         // `scale_wps_class` issues its own RPC per child.
+        #[allow(unused_variables)]
         let status = self
             .scheduler
             .cluster_status(())
@@ -207,14 +208,11 @@ impl Autoscaler {
                 debug!(pool = %pool_key(pool), "skipping: pool is being deleted");
                 continue;
             }
-            // Ephemeral pools have no STS to patch. Job spawning is
-            // driven by the reconciler (ephemeral.rs), not this
-            // autoscaler. Without this skip, scale_one would log
-            // a spurious "STS not found" every poll.
-            if pool.spec.ephemeral {
-                debug!(pool = %pool_key(pool), "skipping: ephemeral pool (Job mode, no STS)");
-                continue;
-            }
+            // All pools are Job-mode now — Job spawning is driven by
+            // the reconciler (ephemeral.rs), not this autoscaler.
+            debug!(pool = %pool_key(pool), "skipping: Job mode, no STS");
+            continue;
+            #[allow(unreachable_code)]
             if is_wps_owned(pool) {
                 debug!(pool = %pool_key(pool), "skipping: WPS-owned (scaled per-class below)");
                 continue;
@@ -235,10 +233,9 @@ impl Autoscaler {
                 debug!(pool = %fp_pool_key(fp), "skipping: FetcherPool is being deleted");
                 continue;
             }
-            if fp.spec.ephemeral {
-                debug!(pool = %fp_pool_key(fp), "skipping: ephemeral pool, reconciler owns Job count");
-                continue;
-            }
+            debug!(pool = %fp_pool_key(fp), "skipping: Job mode, reconciler owns Job count");
+            continue;
+            #[allow(unreachable_code)]
             if let Some(err) = self.scale_fetcher_one(fp, &status).await {
                 self.patch_fp_error_condition(fp, &err).await;
             }
@@ -269,11 +266,7 @@ impl Autoscaler {
         for pool in &pools {
             let key = pool_key(pool);
             let actual = pool.status.as_ref().map(|s| s.replicas).unwrap_or(0);
-            let desired = self
-                .states
-                .get(&key)
-                .map(|s| s.last_desired)
-                .unwrap_or(pool.spec.replicas.min);
+            let desired = self.states.get(&key).map(|s| s.last_desired).unwrap_or(0);
             metrics::gauge!("rio_controller_workerpool_replicas",
                 "pool" => key.clone(), "kind" => "actual")
             .set(actual as f64);
@@ -326,8 +319,8 @@ impl Autoscaler {
         let desired = compute_desired(
             queued,
             pool.spec.autoscaling.target_value,
-            pool.spec.replicas.min,
-            pool.spec.replicas.max,
+            0,
+            pool.spec.max_concurrent as i32,
         );
 
         // ---- Current (from StatefulSet, not pool.status — the
@@ -534,8 +527,8 @@ impl Autoscaler {
         let desired = compute_desired(
             status.queued_fod_derivations,
             pool.spec.autoscaling.target_value,
-            pool.spec.replicas.min,
-            pool.spec.replicas.max,
+            0,
+            pool.spec.max_concurrent as i32,
         );
 
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &ns);

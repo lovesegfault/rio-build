@@ -641,8 +641,8 @@ async fn list_fetcher_pools(client: &k::Client) -> Result<Vec<FpStatus>> {
         .await?
         .into_iter()
         .map(|fp| {
-            let max = fp.spec.replicas.max;
-            let min = fp.spec.replicas.min;
+            let max = fp.spec.max_concurrent as i32;
+            let min = 0i32;
             FpStatus {
                 name: fp.metadata.name.unwrap_or_default(),
                 ready: fp

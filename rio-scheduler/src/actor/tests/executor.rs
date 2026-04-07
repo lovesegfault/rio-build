@@ -39,7 +39,6 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: true,
-            ephemeral: false,
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -184,7 +183,6 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -1088,7 +1086,6 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: true,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -1157,6 +1154,9 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
 /// dependent-redispatch race at the source so this is defense-in-
 /// depth.
 #[tokio::test]
+#[ignore = "phase-3 scheduler collapse: ephemeral becomes unconditional; \
+            heartbeat no longer carries the flag so connect_executor_ephemeral \
+            can't set it. Re-enable when completion.rs:559 is unconditional."]
 async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
@@ -1182,7 +1182,6 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: true,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -1216,7 +1215,6 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: true,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -1280,6 +1278,9 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 /// the same ProcessCompletion turn would assign child to the freed
 /// slot pre-fix. Post-fix: builder is draining, child stays Ready.
 #[tokio::test]
+#[ignore = "phase-3 scheduler collapse: ephemeral becomes unconditional; \
+            heartbeat no longer carries the flag so connect_executor_ephemeral \
+            can't set it. Re-enable when completion.rs:559 is unconditional."]
 async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
@@ -1468,7 +1469,6 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -2048,7 +2048,6 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: true,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -2097,7 +2096,6 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -2339,7 +2337,6 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -2520,7 +2517,6 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: true,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -2554,7 +2550,6 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,

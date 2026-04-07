@@ -487,7 +487,7 @@ mod tests {
                     "kind": "BuilderPool",
                     "metadata": { "name": name, "namespace": "rio" },
                     "spec": {
-                        "replicas": { "min": 0, "max": 1 },
+                        "maxConcurrent": 1,
                         "autoscaling": { "metric": "queueDepth", "targetValue": 1 },
                         "systems": ["x86_64-linux"],
                         "sizeClass": name,

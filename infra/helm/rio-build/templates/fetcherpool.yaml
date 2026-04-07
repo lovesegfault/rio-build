@@ -20,13 +20,10 @@ metadata:
     app.kubernetes.io/part-of: rio-build
     rio.build/role: fetcher
 spec:
-  ephemeral: {{ $fp.ephemeral }}
-  {{- with $fp.ephemeralDeadlineSeconds }}
-  ephemeralDeadlineSeconds: {{ . }}
+  {{- with $fp.deadlineSeconds }}
+  deadlineSeconds: {{ . }}
   {{- end }}
-  replicas:
-    min: {{ $fp.replicas.min }}
-    max: {{ $fp.replicas.max }}
+  maxConcurrent: {{ $fp.maxConcurrent }}
   autoscaling:
     metric: {{ $fp.autoscaling.metric }}
     targetValue: {{ $fp.autoscaling.targetValue }}

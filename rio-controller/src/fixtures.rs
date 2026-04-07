@@ -26,7 +26,7 @@
 
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
-use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas, Sizing};
+use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Sizing};
 use crate::reconcilers::common::sts::{SchedulerAddrs, StoreAddrs};
 
 /// Minimal BuilderPoolSpec with all CEL-required fields explicit
@@ -41,10 +41,9 @@ use crate::reconcilers::common::sts::{SchedulerAddrs, StoreAddrs};
 /// point; don't `#[derive(Default)]` on `BuilderPoolSpec`.
 pub fn test_workerpool_spec() -> BuilderPoolSpec {
     BuilderPoolSpec {
-        replicas: Replicas { min: 2, max: 10 },
-        ephemeral: false,
+        max_concurrent: 10,
         sizing: Sizing::Static,
-        ephemeral_deadline_seconds: None,
+        deadline_seconds: None,
         size_class_cutoff_secs: None,
         autoscaling: Autoscaling {
             metric: "queueDepth".into(),
@@ -116,6 +115,7 @@ pub fn test_store_addrs() -> StoreAddrs {
 /// `sts_exists`: whether the STS GET (before PATCH) returns 200
 /// or 404. apply() uses this to decide whether to set
 /// spec.replicas (first-create) or omit it (autoscaler owns it).
+#[allow(dead_code)]
 pub fn apply_ok_scenarios(
     pool_name: &str,
     ns: &str,
@@ -169,7 +169,7 @@ pub fn apply_ok_scenarios(
         "kind": "BuilderPool",
         "metadata": { "name": pool_name, "namespace": ns },
         "spec": {
-            "replicas": { "min": 1, "max": 1 },
+            "maxConcurrent": 1,
             "autoscaling": { "metric": "queueDepth", "targetValue": 1 },
             "fuseCacheSize": "1Gi",
             "features": [],

@@ -400,7 +400,6 @@ impl ExecutorService for SchedulerGrpc {
             store_degraded: req.store_degraded,
             draining: req.draining,
             kind,
-            ephemeral: req.ephemeral,
         };
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load

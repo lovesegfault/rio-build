@@ -72,7 +72,6 @@ impl InstantWorker {
                 store_degraded: false,
                 draining: false,
                 kind: rio_proto::types::ExecutorKind::Builder,
-                ephemeral: false,
             })
             .await?;
         Ok(Self {

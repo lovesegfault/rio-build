@@ -337,7 +337,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // pre-cap count for the Warning event; the sweep acts on the
     // capped slice.
     let failed_total = jobs.items.iter().filter(|j| is_failed_job(j)).count();
-    let cap = sweep_cap(wp.spec.replicas.max);
+    let cap = sweep_cap(wp.spec.max_concurrent as i32);
     let failed_jobs = select_failed_jobs(&jobs.items, cap);
     let supply = inventory_by_bucket(&active_jobs);
     let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
@@ -433,7 +433,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // the small-first starvation livelock where large buckets and
     // cold-start never spawn under sustained tiny-heavy load. Spec:
     // `ctrl.pool.manifest-fairness` in docs/src/components/controller.md.
-    let ceiling = wp.spec.replicas.max;
+    let ceiling = wp.spec.max_concurrent as i32;
     let headroom = ceiling.saturating_sub(active_total).max(0) as usize;
     let budget = to_spawn.min(headroom);
     let truncated = truncate_plan(&plan, budget);

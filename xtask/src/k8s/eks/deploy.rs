@@ -50,12 +50,12 @@ const BUILDER_POOL_SETS_JSON: &str = r#"[
   {"name":"aarch64","systems":["aarch64-linux"]},
   {"name":"x86-64-kvm","systems":["x86_64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
-   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
+   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxConcurrent":10,
      "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"62Gi"},
                   "limits":{"cpu":"128","memory":"256Gi","ephemeral-storage":"96Gi"}}}]},
   {"name":"aarch64-kvm","systems":["aarch64-linux"],
    "poolTemplate":{"features":["kvm","nixos-test","big-parallel"]},
-   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxReplicas":10,
+   "classes":[{"name":"xlarge","cutoffSecs":7200,"maxConcurrent":10,
      "resources":{"requests":{"cpu":"128","memory":"128Gi","ephemeral-storage":"62Gi"},
                   "limits":{"cpu":"128","memory":"256Gi","ephemeral-storage":"96Gi"}}}]}
 ]"#;
@@ -241,7 +241,6 @@ pub async fn run(
             .set("builderPoolDefaults.enabled", "false")
             .set_json("builderPools", "[]")
             .set("builderPoolSetDefaults.enabled", "true")
-            .set("builderPoolSetDefaults.poolTemplate.ephemeral", "true")
             // I-186: hostUsers:false breaks FUSE passthrough
             // (FUSE_DEV_IOC_BACKING_OPEN needs init-userns
             // CAP_SYS_ADMIN) and fusectl mount (I-165b). Passthrough
@@ -265,12 +264,6 @@ pub async fn run(
             // has capacity.
             .set_json("fetcherPools", FETCHER_POOLS_JSON)
             .set("fetcherPoolDefaults.enabled", "true")
-            // P0541: ephemeral fetchers (one Job per FOD). Chart default
-            // is false (preserves existing STS pools); EKS opts in. The
-            // CRD's CEL requires replicas.min==0 for ephemeral (no
-            // standing set).
-            .set("fetcherPoolDefaults.ephemeral", "true")
-            .set("fetcherPoolDefaults.replicas.min", "0")
             // I-054: JWT enables per-tenant upstream substitution
             // (cache.nixos.org). Keypair minted/read by jwt_keypair().
             // I-128: store.replicas was a fixed "8" here (I-105

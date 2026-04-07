@@ -673,7 +673,6 @@ impl DagActor {
                     store_degraded,
                     draining,
                     kind,
-                    ephemeral,
                 } => {
                     let (phantoms, became_idle) = self.handle_heartbeat(
                         &executor_id,
@@ -686,7 +685,6 @@ impl DagActor {
                         store_degraded,
                         draining,
                         kind,
-                        ephemeral,
                     );
                     // I-035: drain phantom assignments BEFORE the next
                     // dispatch so the freed slot + re-queued derivation

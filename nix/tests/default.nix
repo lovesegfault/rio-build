@@ -572,19 +572,12 @@ in
       # r[verify builder.timeout.no-reassign]
       "build-timeout"
       "gc-dry-run"
-      "reconciler-replicas"
       # r[verify store.gc.tenant-retention]
       "gc-sweep"
       # r[verify builder.upload.references-scanned]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"
-      # r[verify ctrl.drain.disruption-target]
-      #   LAST: evicts rio-builder-x86-64-0 (STS recreates it ~120s later,
-      #   but core has no subsequent subtests needing a ready worker).
-      #   Proves the watcher (disruption.rs) fires DrainWorker{force=
-      #   true} — before P0285, force=true had ZERO prod callers.
-      "disruption-drain"
     ];
   };
 
@@ -606,10 +599,6 @@ in
   vm-lifecycle-autoscale-k3s = lifecycleAutoscaleMod.mkTest {
     name = "autoscale";
     subtests = [
-      # r[verify obs.metric.controller]
-      "autoscaler"
-      # r[verify ctrl.autoscale.skip-deleting]
-      "finalizer"
       # r[verify ctrl.pool.ephemeral]
       # r[verify ctrl.pool.ephemeral-deadline]
       # r[verify ctrl.crd.host-users-network-exclusive]
@@ -691,16 +680,7 @@ in
   vm-lifecycle-wps-k3s = lifecycleMod.mkTest {
     name = "wps";
     subtests = [
-      "pdb-ownerref"
       "wps-lifecycle"
-      # r[verify ctrl.fetcherpool.reconcile]
-      # r[verify fetcher.sandbox.strict-seccomp]
-      #   FetcherPool CR → STS with rio.build/role:fetcher label,
-      #   readOnlyRootFilesystem:true, rio-fetcher.json seccomp,
-      #   fetcher nodeSelector+toleration. STS-shape-only — pod
-      #   readiness lives in vm-fetcher-split-k3s below (needs
-      #   device-plugin + seccomp-profile-on-node + labeled node).
-      "fetcherpool-sts"
     ];
   };
 
@@ -869,15 +849,7 @@ in
               systems: [x86_64-linux, builtin]
           fetcherPoolDefaults:
             enabled: true
-            # P0541: ephemeral defaults true at CRD level. This test
-            # exercises fetcher-split routing via the STS path (stable
-            # pod name for the kubectl-exec assertions below).
-            ephemeral: false
-            # I-014: replicas is now {min, max} for autoscaling. min=max
-            # pins the replica count — this test exercises fetcher-split
-            # routing, not autoscaling. autoscaling block inherits from
-            # base values.yaml (helm coalesce).
-            replicas: {min: 1, max: 1}
+            maxConcurrent: 1
             image: rio-fetcher
             # k3s containerd doesn't chown the pod cgroup under
             # hostUsers:false → rio-builder's mkdir /sys/fs/cgroup/

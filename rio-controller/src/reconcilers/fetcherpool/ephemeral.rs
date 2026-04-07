@@ -110,8 +110,8 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
             .map(|c| format!("{name}-{}", c.name))
             .unwrap_or_else(|| name.clone());
         let ceiling = class
-            .and_then(|c| c.max_replicas)
-            .unwrap_or(fp.spec.replicas.max);
+            .and_then(|c| c.max_concurrent)
+            .unwrap_or(fp.spec.max_concurrent) as i32;
         let queued = signals.queued_for(class.map(|c| c.name.as_str()), idx);
 
         let jobs = jobs_api
@@ -181,7 +181,7 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
         &ns,
         &name,
         total_active,
-        fp.spec.replicas.max,
+        fp.spec.max_concurrent as i32,
         scheduler_err.as_deref(),
     )
     .await?;
@@ -392,7 +392,7 @@ pub(super) fn build_job(
             ttl_seconds_after_finished: Some(JOB_TTL_SECS),
             active_deadline_seconds: Some(
                 fp.spec
-                    .ephemeral_deadline_seconds
+                    .deadline_seconds
                     .map(i64::from)
                     .unwrap_or(FOD_EPHEMERAL_DEADLINE_SECS),
             ),
@@ -418,16 +418,15 @@ pub(super) fn build_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::builderpool::{Autoscaling, Replicas};
+    use crate::crds::builderpool::Autoscaling;
     use crate::fixtures::test_sched_addrs;
     use kube::Resource;
 
     fn test_fp() -> FetcherPool {
         let spec: crate::crds::fetcherpool::FetcherPoolSpec = serde_json::from_value(
             serde_json::to_value(crate::crds::fetcherpool::FetcherPoolSpec {
-                ephemeral: true,
-                ephemeral_deadline_seconds: None,
-                replicas: Replicas { min: 0, max: 8 },
+                deadline_seconds: None,
+                max_concurrent: 8,
                 autoscaling: Autoscaling {
                     metric: "fodQueueDepth".into(),
                     target_value: 5,
@@ -521,7 +520,7 @@ mod tests {
     #[test]
     fn build_job_honors_deadline_override() {
         let mut fp = test_fp();
-        fp.spec.ephemeral_deadline_seconds = Some(900);
+        fp.spec.deadline_seconds = Some(900);
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(
             &fp,
@@ -575,8 +574,7 @@ mod tests {
                 )])),
                 ..Default::default()
             },
-            min_replicas: None,
-            max_replicas: Some(4),
+            max_concurrent: Some(4),
         };
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(
@@ -639,8 +637,7 @@ mod tests {
         let class = FetcherSizeClass {
             name: "tiny".into(),
             resources: Default::default(),
-            min_replicas: None,
-            max_replicas: None,
+            max_concurrent: None,
         };
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(

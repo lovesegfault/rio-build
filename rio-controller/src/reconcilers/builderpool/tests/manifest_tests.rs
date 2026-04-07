@@ -19,7 +19,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 use rio_proto::types::{DerivationResourceEstimate, ExecutorInfo};
 
-use crate::crds::builderpool::{Replicas, Sizing};
+use crate::crds::builderpool::Sizing;
 use crate::fixtures::{test_sched_addrs, test_store_addrs};
 use crate::reconcilers::builderpool::manifest::{
     Bucket, CPU_CLASS_LABEL, CRASH_LOOP_WARN_THRESHOLD, FAILED_SWEEP_MIN, FLOOR_CLASS,
@@ -37,7 +37,7 @@ const GI: u64 = 1024 * 1024 * 1024;
 /// fixture (E0063-proof) and overrides the manifest-relevant fields.
 fn test_manifest_wp() -> BuilderPool {
     let mut spec = crate::fixtures::test_workerpool_spec();
-    spec.replicas = Replicas { min: 0, max: 10 };
+    spec.max_concurrent = 10;
     spec.sizing = Sizing::Manifest;
     spec.fuse_cache_size = "10Gi".into();
     let mut wp = BuilderPool::new("mf-pool", spec);

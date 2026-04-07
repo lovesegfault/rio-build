@@ -144,8 +144,8 @@ impl Autoscaler {
         let desired = compute_desired(
             queued_u32,
             child.spec.autoscaling.target_value,
-            child.spec.replicas.min,
-            child.spec.replicas.max,
+            0,
+            child.spec.max_concurrent as i32,
         );
 
         let key = pool_key(child);

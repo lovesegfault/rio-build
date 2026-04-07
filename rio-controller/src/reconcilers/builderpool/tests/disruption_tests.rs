@@ -65,7 +65,7 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
                 "kind": "BuilderPool",
                 "metadata": {"name": "test-pool", "namespace": "rio"},
                 "spec": {
-                    "replicas": {"min": 0, "max": 10},
+                    "maxConcurrent": 10,
                     "autoscaling": {"metric": "x", "targetValue": 1},
                     "fuseCacheSize": "1Gi",
                     "features": [],
@@ -249,8 +249,6 @@ async fn warn_fires_for_ephemeral_with_host_network() {
     let ctx = test_ctx(client);
 
     let mut wp = test_wp();
-    wp.spec.ephemeral = true;
-    wp.spec.replicas.min = 0; // CEL: ephemeral requires min==0
     wp.spec.host_network = Some(true);
     wp.spec.privileged = None;
 
@@ -276,13 +274,12 @@ async fn warn_fires_for_sts_mode_with_host_network() {
     let ctx = test_ctx(client);
 
     let mut wp = test_wp();
-    wp.spec.ephemeral = false; // STS-mode (default, but explicit)
     wp.spec.host_network = Some(true);
     wp.spec.privileged = None;
 
-    // Event POST first, then the full STS-mode apply() call chain.
+    // Event POST first, then the full apply() call chain.
     let mut scenarios = vec![event_post_scenario(REASON_HOST_USERS_SUPPRESSED)];
-    scenarios.extend(apply_ok_scenarios("test-pool", "rio", 2, false));
+    scenarios.extend(ephemeral_reconcile_scenarios());
     let guard = verifier.run(scenarios);
 
     apply(Arc::new(wp), &ctx).await.expect("apply completes");

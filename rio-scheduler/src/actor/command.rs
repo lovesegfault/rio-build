@@ -153,12 +153,6 @@ pub enum ActorCommand {
         /// Wire-default 0 = Builder (pre-ADR-019 executors don't send
         /// it; treated as builders, the safe default).
         kind: rio_proto::types::ExecutorKind,
-        /// One-shot Job executor (from `HeartbeatRequest.ephemeral`,
-        /// proto field 12). Stored on ExecutorState; on completion
-        /// the scheduler marks it draining so dispatch doesn't
-        /// re-assign to the about-to-exit slot (I-188). Wire-default
-        /// false (long-lived executor).
-        ephemeral: bool,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).

@@ -77,20 +77,11 @@ pub struct SizeClassSpec {
     /// (it catches everything above the previous cutoff).
     pub cutoff_secs: f64,
 
-    /// Replica floor for this class's child BuilderPool. `None`
-    /// = inherit from `pool_template` or fall through to child
-    /// BuilderPool's own default. Per-class because "small" wants
-    /// many warm replicas (low-latency dispatch) while "large"
-    /// tolerates scale-from-zero (builds are hours; +2min spinup
-    /// is noise).
+    /// Concurrent-Job ceiling for this class. `None` = inherit.
+    /// Per-class because "large" workers have big resource requests
+    /// — capping them prevents one class from starving the cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_replicas: Option<i32>,
-
-    /// Replica ceiling. `None` = inherit. Per-class because
-    /// "large" workers have big resource requests — capping them
-    /// prevents one class from starving the cluster.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_replicas: Option<i32>,
+    pub max_concurrent: Option<u32>,
 
     /// Queued-builds-per-replica target for this class's
     /// autoscaler. `compute_desired` (P0234) scales to
@@ -194,19 +185,6 @@ pub struct PoolTemplate {
     /// the same for all class pods. See `BuilderPoolSpec.host_users`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_users: Option<bool>,
-
-    /// Ephemeral mode for child pools. Shared — pod lifecycle is a
-    /// deploy-wide decision (one Job per build vs. long-lived STS),
-    /// not a per-class one. `None` = `false` (STS children, the
-    /// original WPS behavior). `Some(true)` = each child BuilderPool
-    /// gets `ephemeral: true` and spawns Jobs sized by its class's
-    /// `resources`; the ephemeral reconciler consults per-class
-    /// queue depth (via `GetSizeClassStatus`) so a "tiny" pool
-    /// only spawns for tiny-classified work. CEL on the child
-    /// requires `replicas.min == 0` — leave `SizeClassSpec.
-    /// min_replicas` unset (defaults to 0) when ephemeral.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ephemeral: Option<bool>,
 
     /// mTLS client cert Secret name. Shared — same cert-manager
     /// Certificate across all builder pods regardless of size.
@@ -335,15 +313,13 @@ mod tests {
         assert!(json.contains("cutoffLearning"));
         // SizeClassSpec
         assert!(json.contains("cutoffSecs"));
-        assert!(json.contains("minReplicas"));
-        assert!(json.contains("maxReplicas"));
+        assert!(json.contains("maxConcurrent"));
         assert!(json.contains("targetQueuePerReplica"));
         // PoolTemplate
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("seccompProfile"));
         assert!(json.contains("hostNetwork"));
         assert!(json.contains("hostUsers"));
-        assert!(json.contains("ephemeral"));
         assert!(json.contains("tlsSecretName"));
         // CutoffLearningConfig
         assert!(json.contains("minSamples"));

@@ -133,15 +133,7 @@ gateway:
 # nonpriv overlay can null-clear them via Helm's deep-merge.
 builderPoolDefaults:
   enabled: true
-  # P0537: CRD default is `true`. VM tests use the long-lived STS
-  # path (replicas.min>0); ephemeral-pool subtest applies its own CR.
-  ephemeral: false
-  replicas:
-    # min=1 so there's always a worker ready (protocol-cold doesn't
-    # want to wait for autoscaling). Scenarios that need >1 use
-    # --set builderPoolDefaults.replicas.min=2.
-    min: 1
-    max: 2
+  maxConcurrent: 2
   autoscaling:
     metric: queueDepth
     targetValue: 2

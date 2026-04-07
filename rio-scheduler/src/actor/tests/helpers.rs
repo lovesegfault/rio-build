@@ -244,7 +244,6 @@ pub(crate) async fn connect_executor_no_ack_kind(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind,
             resources: None,
@@ -280,7 +279,6 @@ pub(crate) async fn connect_fetcher_classed(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Fetcher,
             resources: None,
@@ -321,7 +319,6 @@ pub(crate) async fn connect_builder_classed(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -362,7 +359,6 @@ pub(crate) async fn connect_executor_ephemeral(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: true,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -407,7 +403,6 @@ pub(crate) async fn send_heartbeat(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
@@ -444,7 +439,6 @@ pub(crate) async fn send_heartbeat_draining(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             store_degraded: false,
-            ephemeral: false,
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,

@@ -2107,19 +2107,15 @@ let
           # lost, falling back to ~60s heartbeat-reap per executor.
           wait_workers_zero("ephemeral-pool precondition")
 
-          # ── CEL: ephemeralDeadlineSeconds without ephemeral rejected ──
-          # ctrl.pool.ephemeral-deadline — field tunes Job's
-          # activeDeadlineSeconds; STS pools have no Jobs.
+          # ── CEL: maxConcurrent must be > 0 ───────────────────────────
           assert_cel_rejects(
-              "sts-with-deadline",
-              "  ephemeral: false\n"
-              "  ephemeralDeadlineSeconds: 7200\n"
-              "  replicas: {min: 1, max: 4}\n"
+              "zero-max-concurrent",
+              "  maxConcurrent: 0\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               "  image: rio-builder",
-              "ephemeralDeadlineSeconds",
+              "maxConcurrent must be > 0",
           )
 
           # ── CEL: hostNetwork without privileged rejected ──────────────
@@ -2129,7 +2125,7 @@ let
           assert_cel_rejects(
               "hostnet-unprivileged",
               "  hostNetwork: true\n"
-              "  replicas: {min: 0, max: 4}\n"
+              "  maxConcurrent: 4\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
@@ -2151,8 +2147,7 @@ let
               "  name: ephemeral\n"
               "  namespace: ${nsBuilders}\n"
               "spec:\n"
-              "  ephemeral: true\n"
-              "  replicas: {min: 0, max: 4}\n"
+              "  maxConcurrent: 4\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
@@ -2442,7 +2437,7 @@ let
               "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  sizing: Manifest\n"
-              "  replicas: {min: 0, max: 3}\n"
+              "  maxConcurrent: 3\n"
               "  autoscaling: {metric: queueDepth, targetValue: 2}\n"
               "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
@@ -3134,13 +3129,7 @@ let
               "  name: test-fp\n"
               "  namespace: ${nsFetchers}\n"
               "spec:\n"
-              # P0541: ephemeral defaults true. This test asserts on the
-              # STS path (securityContext, ownerRef, labels).
-              "  ephemeral: false\n"
-              # I-014: replicas is now {min,max}, autoscaling required.
-              # min=max pins it; this test exercises STS reconcile +
-              # securityContext, not autoscaling.
-              "  replicas: {min: 1, max: 1}\n"
+              "  maxConcurrent: 1\n"
               "  autoscaling: {metric: fodQueueDepth, targetValue: 5}\n"
               "  image: rio-fetcher:dev\n"
               "  systems: [x86_64-linux]\n"
@@ -3689,24 +3678,7 @@ let
     scenario = "lifecycle";
     inherit prelude fragments fixture;
     defaultTimeout = 900;
-    # Eval-time ordering guards. finalizer needs autoscaler to have
-    # scaled STS to 2 first (pod-1 for reverse-ordinal termination
-    # coverage — v24/v25 regression). ephemeral-pool requires
-    # workers_active=0 (finalizer deletes the default STS pool); without
-    # it the STS worker steals dispatches before reconcile_ephemeral's
-    # 10s tick spawns a Job.
-    chains = [
-      {
-        before = "autoscaler";
-        after = "finalizer";
-        msg = "finalizer requires autoscaler earlier (pod-1 reverse-ordinal coverage)";
-      }
-      {
-        before = "finalizer";
-        after = "ephemeral-pool";
-        msg = "ephemeral-pool requires finalizer earlier (no STS workers stealing dispatch)";
-      }
-    ];
+    chains = [ ];
   };
 in
 {

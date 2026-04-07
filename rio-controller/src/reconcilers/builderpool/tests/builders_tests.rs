@@ -1159,14 +1159,10 @@ fn bloom_expected_items_env_not_injected_when_unset() {
 }
 
 #[test]
-fn statefulset_replicas_starts_at_min() {
+fn statefulset_replicas_starts_at_zero() {
     let wp = test_wp();
     let sts = test_sts(&wp);
-    assert_eq!(
-        sts.spec.unwrap().replicas,
-        Some(2),
-        "initial create: set to spec.replicas.min"
-    );
+    assert_eq!(sts.spec.unwrap().replicas, Some(0));
 }
 
 /// replicas=None → field omitted from the SSA patch → the

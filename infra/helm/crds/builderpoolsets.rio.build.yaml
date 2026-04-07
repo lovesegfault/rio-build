@@ -57,27 +57,13 @@ spec:
                         (it catches everything above the previous cutoff).'
                       format: double
                       type: number
-                    maxReplicas:
-                      description: "Replica ceiling. `None` = inherit. Per-class because\n\
-                        \"large\" workers have big resource requests \u2014 capping\
-                        \ them\nprevents one class from starving the cluster."
-                      format: int32
-                      nullable: true
-                      type: integer
-                    minReplicas:
-                      description: 'Replica floor for this class''s child BuilderPool.
-                        `None`
-
-                        = inherit from `pool_template` or fall through to child
-
-                        BuilderPool''s own default. Per-class because "small" wants
-
-                        many warm replicas (low-latency dispatch) while "large"
-
-                        tolerates scale-from-zero (builds are hours; +2min spinup
-
-                        is noise).'
-                      format: int32
+                    maxConcurrent:
+                      description: "Concurrent-Job ceiling for this class. `None`\
+                        \ = inherit.\nPer-class because \"large\" workers have big\
+                        \ resource requests\n\u2014 capping them prevents one class\
+                        \ from starving the cluster."
+                      format: uint32
+                      minimum: 0.0
                       nullable: true
                       type: integer
                     name:
@@ -176,20 +162,6 @@ spec:
 
                   (image, node_selector, seccomp) apply uniformly.'
                 properties:
-                  ephemeral:
-                    description: "Ephemeral mode for child pools. Shared \u2014 pod\
-                      \ lifecycle is a\ndeploy-wide decision (one Job per build vs.\
-                      \ long-lived STS),\nnot a per-class one. `None` = `false` (STS\
-                      \ children, the\noriginal WPS behavior). `Some(true)` = each\
-                      \ child BuilderPool\ngets `ephemeral: true` and spawns Jobs\
-                      \ sized by its class's\n`resources`; the ephemeral reconciler\
-                      \ consults per-class\nqueue depth (via `GetSizeClassStatus`)\
-                      \ so a \"tiny\" pool\nonly spawns for tiny-classified work.\
-                      \ CEL on the child\nrequires `replicas.min == 0` \u2014 leave\
-                      \ `SizeClassSpec.\nmin_replicas` unset (defaults to 0) when\
-                      \ ephemeral."
-                    nullable: true
-                    type: boolean
                   features:
                     default: []
                     description: 'requiredSystemFeatures this pool advertises. Shared

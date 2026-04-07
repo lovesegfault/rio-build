@@ -6,7 +6,7 @@
 
 use kube::{Resource, ResourceExt};
 
-use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Replicas, Sizing};
+use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Sizing};
 use crate::crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use crate::error::{Error, Result};
 
@@ -15,12 +15,15 @@ use crate::error::{Error, Result};
 /// queue depth warrants. Matches BuilderPool's semantics where
 /// `replicas.min` is an explicit operator decision, not a magic
 /// floor.
+#[allow(dead_code)]
 const DEFAULT_MIN_REPLICAS: i32 = 0;
+const DEFAULT_MAX_CONCURRENT: u32 = 10;
 
 /// Default replica ceiling when `max_replicas` is unset. 10 is a
 /// conservative cap — large enough that a class won't starve under
 /// normal load, small enough that a misconfigured WPS on a shared
 /// cluster won't burn through it.
+#[allow(dead_code)]
 const DEFAULT_MAX_REPLICAS: i32 = 10;
 
 /// Default FUSE cache size for child pools. Mirrors
@@ -74,15 +77,8 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         ));
     }
 
-    // Replicas: per-class bounds with conservative defaults. The
-    // autoscaler (P0234) patches `StatefulSet.spec.replicas` within
-    // these bounds via a distinct SSA field manager, so the child
-    // BuilderPool reconciler's "omit replicas after first create"
-    // semantics apply (it doesn't fight the autoscaler).
-    let replicas = Replicas {
-        min: class.min_replicas.unwrap_or(DEFAULT_MIN_REPLICAS),
-        max: class.max_replicas.unwrap_or(DEFAULT_MAX_REPLICAS),
-    };
+    // Concurrent-Job ceiling per class.
+    let max_concurrent = class.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
 
     // Autoscaling: `target_value` from the class's
     // `target_queue_per_replica`. The BuilderPool autoscaler reads
@@ -105,7 +101,7 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
     // delegate to crate::fixtures::test_workerpool_spec().
     let spec = BuilderPoolSpec {
         // --- Per-class (SizeClassSpec) ---
-        replicas,
+        max_concurrent,
         autoscaling,
         resources: Some(class.resources.clone()),
         // `size_class` is what the scheduler matches. Setting it to
@@ -129,24 +125,16 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         fuse_cache_size: DEFAULT_FUSE_CACHE_SIZE.into(),
 
         // --- Unset optional (use BuilderPool defaults) ---
-        // Ephemeral mode propagates from PoolTemplate. Shared
-        // across classes — pod lifecycle (Job-per-build vs STS)
-        // is a deploy-wide decision. The ephemeral reconciler
-        // consults per-class queue depth when `size_class` is
-        // set, so each child only spawns for work classified
-        // into its class.
-        ephemeral: template.ephemeral.unwrap_or(false),
         // WPS is inherently size-class-based (ADR-015) — that IS
         // Sizing::Static. A Manifest-mode WPS would be a distinct
         // feature (controller would poll GetCapacityManifest per-WPS).
         // Until then, WPS children are always Static.
         sizing: Sizing::Static,
-        // Deadline only applies to ephemeral Jobs. None →
-        // build_job derives `cutoff × DEADLINE_MULTIPLIER` from
-        // `size_class_cutoff_secs` below (I-200, `r[ctrl.ephemeral.
+        // None → build_job derives `cutoff × DEADLINE_MULTIPLIER`
+        // from `size_class_cutoff_secs` below (I-200, `r[ctrl.pool.
         // per-class-deadline]`). No PoolTemplate override knob — the
         // WPS author controls cutoff_secs which controls the deadline.
-        ephemeral_deadline_seconds: None,
+        deadline_seconds: None,
         // I-200: stamp the class cutoff so build_job can derive a
         // per-class activeDeadlineSeconds. The static spec value, NOT
         // `effective_cutoff_secs` (status-side EMA-smoothed) — the
@@ -228,8 +216,7 @@ pub(super) mod tests {
                 // builder doesn't actually read cutoff_secs — it's
                 // a scheduler-side field).
                 cutoff_secs: (i as f64 + 1.0) * 60.0,
-                min_replicas: Some(i as i32 + 1),
-                max_replicas: Some((i as i32 + 1) * 5),
+                max_concurrent: Some((i as u32 + 1) * 5),
                 target_queue_per_replica: Some(5),
                 resources: ResourceRequirements::default(),
             })
@@ -246,7 +233,6 @@ pub(super) mod tests {
                 privileged: None,
                 host_network: None,
                 host_users: None,
-                ephemeral: None,
                 tls_secret_name: None,
             },
             cutoff_learning: None,
@@ -341,45 +327,9 @@ pub(super) mod tests {
             .map(|c| build_child_builderpool(&wps, c).unwrap())
             .collect();
 
-        // min_replicas in the fixture: 1, 2, 3 (enumerate + 1).
-        assert_eq!(children[0].spec.replicas.min, 1);
-        assert_eq!(children[1].spec.replicas.min, 2);
-        assert_eq!(children[2].spec.replicas.min, 3);
-        // max_replicas: 5, 10, 15.
-        assert_eq!(children[0].spec.replicas.max, 5);
-        assert_eq!(children[2].spec.replicas.max, 15);
-    }
-
-    /// `PoolTemplate.ephemeral` propagates to every child. The
-    /// default (None) yields STS-mode children (`ephemeral: false`,
-    /// preserving pre-I-117 WPS behavior); `Some(true)` yields
-    /// ephemeral children that spawn Jobs sized by their class's
-    /// `resources`. CEL on the child requires `replicas.min == 0`
-    /// for ephemeral — the fixture's `min_replicas: Some(i+1)`
-    /// would violate that, so the ephemeral case clears it.
-    #[test]
-    fn template_ephemeral_propagates() {
-        let mut wps = test_wps_with_classes(&["small", "large"]);
-        // Default (None) → STS children.
-        for class in &wps.spec.classes {
-            let child = build_child_builderpool(&wps, class).unwrap();
-            assert!(!child.spec.ephemeral, "None → ephemeral=false (STS)");
-        }
-        // Some(true) → ephemeral children. Clear min_replicas so the
-        // child's CEL `ephemeral → replicas.min==0` would pass on
-        // apply (not enforced here, but keep the fixture realistic).
-        wps.spec.pool_template.ephemeral = Some(true);
-        for class in wps.spec.classes.iter_mut() {
-            class.min_replicas = None;
-        }
-        for class in &wps.spec.classes {
-            let child = build_child_builderpool(&wps, class).unwrap();
-            assert!(child.spec.ephemeral, "Some(true) → ephemeral=true");
-            assert_eq!(child.spec.replicas.min, 0);
-            // size_class still set — the ephemeral reconciler uses
-            // this to filter queue depth per-class.
-            assert_eq!(child.spec.size_class, class.name);
-        }
+        // max_concurrent in the fixture: 5, 10, 15.
+        assert_eq!(children[0].spec.max_concurrent, 5);
+        assert_eq!(children[2].spec.max_concurrent, 15);
     }
 
     /// I-119 regression: `class.resources` propagates to the child,

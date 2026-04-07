@@ -58,30 +58,9 @@ pub enum Sizing {
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
-// CEL: ephemeral=true requires replicas.min==0. "Pool size" is purely a
-// concurrent-Job ceiling (replicas.max); there IS no standing set. A
-// non-zero min would mean "always have N Jobs running" which isn't what
-// ephemeral means — it's "spawn a Job when there's work." replicas.max
-// > 0 so the ceiling is meaningful.
 #[x_kube(
-    validation = Rule::new(
-        "!self.ephemeral || (self.replicas.min == 0 && self.replicas.max > 0)"
-    ).message(
-        "ephemeral:true requires replicas.min==0 and replicas.max>0 — ephemeral has no standing set, only a concurrent-Job ceiling"
-    )
-)]
-// r[impl ctrl.pool.ephemeral-deadline]
-// CEL: ephemeralDeadlineSeconds only settable when ephemeral==true. The
-// field tunes the Job's activeDeadlineSeconds (backstop for wrong-pool
-// spawns that never match dispatch); meaningless on STS pods (no Job,
-// no deadline). Rule reads: "field unset OR ephemeral true" —
-// equivalently "field set → ephemeral". has() because the CRD field is
-// Option<u32> + skip_serializing_if_none, so absence is the common case.
-#[x_kube(
-    validation = Rule::new(
-        "!has(self.ephemeralDeadlineSeconds) || self.ephemeral"
-    ).message(
-        "ephemeralDeadlineSeconds is only valid with ephemeral:true — the field sets the Job's activeDeadlineSeconds (backstop for wrong-pool spawns); STS pools have no Jobs"
+    validation = Rule::new("self.maxConcurrent > 0").message(
+        "maxConcurrent must be > 0 — it is the concurrent-Job ceiling"
     )
 )]
 // r[impl ctrl.crd.host-users-network-exclusive]
@@ -111,78 +90,50 @@ pub enum Sizing {
     )
 )]
 pub struct BuilderPoolSpec {
-    /// Replica bounds. Autoscaler clamps to [min, max].
-    ///
-    /// CEL on the struct (not this field) because it's a cross-field
-    /// constraint. See `Replicas` below.
-    pub replicas: Replicas,
-
-    /// Ephemeral mode: one pod per build. The controller spawns a K8s
-    /// Job per dispatch-need, builder exits after one build, pod
-    /// terminates, Job reaps. Zero cross-build contamination (fresh
-    /// FUSE cache, fresh filesystem). Tradeoffs: cold-start per build
-    /// (~10-30s), no locality (every builder has an empty cache), pod
-    /// churn.
-    ///
-    /// `false` = long-lived StatefulSet builders. Same one-build-at-a-
-    /// time invariant (P0537), but the pod resets and accepts another
-    /// build after each completion. Gains locality (warm FUSE cache);
-    /// costs cross-build state on disk.
-    ///
-    /// Job spawning is driven by the reconciler polling `ClusterStatus.
-    /// queued_derivations` — when queued > 0 and active Jobs <
-    /// `replicas.max`, spawn Jobs. `replicas.min` MUST be 0 (CEL
-    /// enforced): there's no "standing set," only a concurrent-Job
-    /// ceiling. `replicas.max` becomes that ceiling.
-    ///
-    /// See `r[ctrl.pool.ephemeral]` in `docs/src/components/controller.md`.
-    ///
-    /// Default `true` (P0537): ephemeral is the simpler model — one pod,
-    /// one build, exit. Long-lived StatefulSet pools opt in with
-    /// `ephemeral: false`.
-    #[serde(default = "default_true")]
-    pub ephemeral: bool,
+    /// Concurrent-Job ceiling. The reconciler spawns one Job per
+    /// dispatch-need up to this many active at once. There is no
+    /// standing set — Jobs spawn when there's work, exit after one
+    /// build. CEL enforces `> 0`.
+    pub max_concurrent: u32,
 
     /// Pod sizing mode (ADR-020). `Static` = operator-set
-    /// `spec.resources`, STS path. `Manifest` = controller polls
+    /// `spec.resources`. `Manifest` = controller polls
     /// `GetCapacityManifest`, spawns Jobs with per-derivation resources.
     /// `#[serde(default)]` + `#[default] Static` means existing YAMLs
     /// without `sizing:` parse unchanged.
     #[serde(default)]
     pub sizing: Sizing,
 
-    /// Ephemeral Job `activeDeadlineSeconds` — K8s kills the pod if
-    /// it doesn't complete within this many seconds. Backstop for
-    /// wrong-pool spawns: `reconcile_ephemeral` spawns from the
-    /// CLUSTER-WIDE `queued_derivations` count, not pool-matching
-    /// depth. A queue full of `x86_64-linux` work on an
-    /// `aarch64-darwin` ephemeral pool triggers a Job spawn; the
-    /// worker heartbeats, never matches dispatch, and would hang
-    /// indefinitely without a deadline. Default 3600 (1h): long
-    /// enough that a matched dispatch + build completes; short
-    /// enough that a wrong-pool spawn doesn't leak for the life of
-    /// the cluster. Raise for pools running known-long builds. This
-    /// bounds BUILD time too — `backoffLimit: 0` means K8s doesn't
-    /// distinguish "builder idle" from "builder busy on 90min build").
-    /// CEL-enforced: only settable when `ephemeral: true`.
+    /// Job `activeDeadlineSeconds` — K8s kills the pod if it doesn't
+    /// complete within this many seconds. Backstop for wrong-pool
+    /// spawns: `reconcile` spawns from the CLUSTER-WIDE
+    /// `queued_derivations` count, not pool-matching depth. A queue
+    /// full of `x86_64-linux` work on an `aarch64-darwin` pool
+    /// triggers a Job spawn; the worker heartbeats, never matches
+    /// dispatch, and would hang indefinitely without a deadline.
+    /// Default 3600 (1h): long enough that a matched dispatch + build
+    /// completes; short enough that a wrong-pool spawn doesn't leak
+    /// for the life of the cluster. Raise for pools running known-long
+    /// builds. This bounds BUILD time too — `backoffLimit: 0` means
+    /// K8s doesn't distinguish "builder idle" from "builder busy on
+    /// 90min build").
     ///
     /// Per-pool queue depth (the proper fix) is deferred to phase5's
     /// ClusterStatus proto extension. See `r[ctrl.pool.ephemeral-
     /// deadline]` in controller.md.
+    // r[impl ctrl.pool.ephemeral-deadline]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ephemeral_deadline_seconds: Option<u32>,
+    pub deadline_seconds: Option<u32>,
 
     /// The class's `cutoffSecs` (upper-bound predicted build duration).
     /// Stamped onto BuilderPoolSet children from `SizeClassSpec.cutoff_
     /// secs`; standalone BuilderPools may set it directly. When set and
-    /// `ephemeral_deadline_seconds` is unset, ephemeral Jobs derive
-    /// `activeDeadlineSeconds = cutoff * DEADLINE_MULTIPLIER` instead of
-    /// the flat 3600 default --- per-class hung-build detection (I-200,
+    /// `deadline_seconds` is unset, Jobs derive `activeDeadlineSeconds
+    /// = cutoff * DEADLINE_MULTIPLIER` instead of the flat 3600
+    /// default --- per-class hung-build detection (I-200,
     /// `r[ctrl.ephemeral.per-class-deadline]`). f64 to match
     /// `SizeClassSpec.cutoff_secs` (EMA-smoothed cutoffs are
-    /// fractional); the controller `ceil`s before casting. NOT CEL-gated
-    /// to `ephemeral: true`: it's a no-op in STS mode but harmless to
-    /// carry, and BuilderPoolSet stamps it unconditionally.
+    /// fractional); the controller `ceil`s before casting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_class_cutoff_secs: Option<f64>,
 
@@ -568,10 +519,6 @@ pub struct BuilderPoolStatus {
 // ----- serde defaults --------------------------------------------------------
 // Functions because serde default needs fn() -> T, not const.
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_fuse_cache_size() -> String {
     "50Gi".into()
 }
@@ -618,35 +565,13 @@ mod tests {
     fn cel_rules_in_schema() {
         let crd = BuilderPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes to JSON");
-        // The three #[x_kube(validation)] rules, verbatim.
         assert!(
-            json.contains("self.min <= self.max"),
-            "Replicas min<=max CEL rule missing from schema"
+            json.contains("self.maxConcurrent > 0"),
+            "maxConcurrent>0 CEL rule missing from schema"
         );
         assert!(
             json.contains("size(self) > 0"),
             "systems non-empty CEL rule missing"
-        );
-        // P0296 ephemeral: cross-field constraint on the spec struct.
-        // The rule must be emitted at the BuilderPoolSpec schema level,
-        // not on the `ephemeral` field itself (it references
-        // self.replicas.{min,max}).
-        assert!(
-            json.contains("!self.ephemeral || (self.replicas.min == 0"),
-            "ephemeral CEL rule missing from schema"
-        );
-        // r[verify ctrl.pool.ephemeral-deadline]
-        // P0347: ephemeralDeadlineSeconds only settable on ephemeral
-        // pools. The field tunes the Job's activeDeadlineSeconds
-        // backstop for wrong-pool spawns; meaningless on STS pools.
-        assert!(
-            json.contains("!has(self.ephemeralDeadlineSeconds) || self.ephemeral"),
-            "ephemeralDeadlineSeconds→ephemeral CEL rule missing from schema"
-        );
-        assert!(
-            json.contains("ephemeralDeadlineSeconds is only valid with ephemeral:true"),
-            "ephemeralDeadlineSeconds CEL rule has no message — \
-             Rule::new().message() may have been replaced with bare string"
         );
         // r[verify ctrl.crd.host-users-network-exclusive]
         // hostNetwork→privileged CEL rule (P0359). Cross-field at the
@@ -675,29 +600,6 @@ mod tests {
         );
     }
 
-    /// Serde default for `ephemeral`: true (P0537). A BuilderPool YAML
-    /// without the field gets the simpler one-pod-one-build-exit model.
-    /// Long-lived StatefulSet pools opt out with `ephemeral: false`.
-    // r[verify ctrl.pool.ephemeral]
-    #[test]
-    fn ephemeral_defaults_true() {
-        // Deserialize a minimal spec with ephemeral OMITTED. Pins the
-        // default so a future serde-default change is caught here
-        // before a cluster upgrade silently flips pool mode.
-        let json = serde_json::json!({
-            "replicas": {"min": 0, "max": 5},
-            "autoscaling": {},
-            "systems": ["x86_64-linux"],
-            "image": "rio-builder:test"
-        });
-        let spec: BuilderPoolSpec = serde_json::from_value(json).expect("deserializes");
-        assert!(
-            spec.ephemeral,
-            "ephemeral must default to true (P0537) — long-lived STS \
-             pools opt out with ephemeral: false"
-        );
-    }
-
     /// camelCase field renames applied. The K8s convention is
     /// camelCase in JSON/YAML; Rust is snake_case. serde rename_all
     /// bridges. If someone removes #[serde(rename_all)] from a
@@ -721,6 +623,7 @@ mod tests {
         assert!(json.contains("daemonTimeoutSecs"));
         assert!(json.contains("bloomExpectedItems"));
         // P0347: ephemeral Job activeDeadlineSeconds knob.
-        assert!(json.contains("ephemeralDeadlineSeconds"));
+        assert!(json.contains("deadlineSeconds"));
+        assert!(json.contains("maxConcurrent"));
     }
 }

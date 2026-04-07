@@ -98,24 +98,13 @@ spec:
                     config carries just the names (for ordering); per-class\n`resources`\
                     \ live here on the controller side."
                   properties:
-                    maxReplicas:
-                      description: Replica ceiling. `None` = inherit `spec.replicas.max`.
-                      format: int32
-                      nullable: true
-                      type: integer
-                    minReplicas:
-                      description: 'Replica floor for this class''s StatefulSet. `None`
+                    maxConcurrent:
+                      description: 'Concurrent-Job ceiling for this class. `None`
                         = inherit
 
-                        `spec.replicas.min`. Per-class because "tiny" wants warm
-
-                        replicas (most FODs land here) while "small" tolerates
-
-                        scale-from-zero (rare promotions; +30s spinup is fine for
-                        a
-
-                        drv that already burned a retry).'
-                      format: int32
+                        `spec.max_concurrent`.'
+                      format: uint32
+                      minimum: 0.0
                       nullable: true
                       type: integer
                     name:
@@ -140,26 +129,11 @@ spec:
                   - resources
                   type: object
                 type: array
-              ephemeral:
-                default: true
-                description: "Ephemeral mode: one Job per FOD instead of a StatefulSet.\
-                  \ The\nreconciler polls `queued_fod_derivations` and spawns Jobs\
-                  \ (one\nper outstanding FOD, up to `replicas.max`). Each pod runs\
-                  \ with\n`RIO_EPHEMERAL=1` \u2192 exits after one fetch \u2192 `ttlSecondsAfter\n\
-                  Finished` reaps. Same Job lifecycle as ephemeral BuilderPool;\n\
-                  see `r[ctrl.pool.ephemeral]`.\n\nDefault `true` (P0541, follows\
-                  \ P0537): one pod, one fetch,\nexit. Long-lived StatefulSet pools\
-                  \ must set `ephemeral: false`.\n\nFODs are seconds-long and bursty\
-                  \ (40+ ready when build-chain\nFOD phases align), which is exactly\
-                  \ the Job-mode shape: no\n10min scale-down stabilization tax for\
-                  \ spikes, no idle pods\nbetween bursts."
-                type: boolean
-              ephemeralDeadlineSeconds:
-                description: "Backstop `activeDeadlineSeconds` on ephemeral Jobs.\
-                  \ Same field\nas BuilderPool. Default 300 (`reconcilers/fetcherpool/\n\
-                  ephemeral.rs::FOD_EPHEMERAL_DEADLINE_SECS`) \u2014 fetches are\n\
-                  network-bound and short; a stuck download is the failure mode,\n\
-                  not a 90min compile. Only meaningful when `ephemeral: true`\n(CEL-enforced)."
+              deadlineSeconds:
+                description: "Backstop `activeDeadlineSeconds` on Jobs. Same field\
+                  \ as\nBuilderPool. Default 300 (`reconcilers/fetcherpool/\nephemeral.rs::FOD_DEADLINE_SECS`)\
+                  \ \u2014 fetches are network-bound\nand short; a stuck download\
+                  \ is the failure mode, not a 90min\ncompile."
                 format: uint32
                 minimum: 0.0
                 nullable: true
@@ -178,6 +152,18 @@ spec:
 
                   different `RIO_EXECUTOR_KIND` env baked into the pod spec.'
                 type: string
+              maxConcurrent:
+                description: 'Concurrent-Job ceiling. The reconciler spawns one Job
+                  per
+
+                  outstanding FOD up to this many active at once. FODs spike at
+
+                  build start (40+ ready simultaneously when chains hit FOD-phase
+
+                  together) but are short (~seconds each).'
+                format: uint32
+                minimum: 0.0
+                type: integer
               nodeSelector:
                 additionalProperties:
                   type: string
@@ -186,38 +172,6 @@ spec:
                   label on the Karpenter NodePool (spec: fetcher.node.dedicated).'
                 nullable: true
                 type: object
-              replicas:
-                description: "Replica bounds. Autoscaler clamps to [min, max] based\
-                  \ on\n`ClusterStatus.queued_fod_derivations`.\n\nSame `{min, max}`\
-                  \ shape as BuilderPool. FODs spike at build\nstart (40+ FODs ready\
-                  \ simultaneously when chains hit FOD-phase\ntogether) but are short\
-                  \ (~seconds each), so the autoscaler\nscales up fast (30s window)\
-                  \ and back down slow (10m window) \u2014\nsame stabilization timing\
-                  \ as builders.\n\n**BREAKING** (I-014): was `replicas: i32`. Existing\
-                  \ FetcherPool\nCRs need `kubectl edit` or re-apply with `{min: N,\
-                  \ max: N}` to\npin the prior static count."
-                properties:
-                  max:
-                    description: "Ceiling. Cost control \u2014 don't burn through\
-                      \ the cluster\nunder a pathological burst."
-                    format: int32
-                    type: integer
-                  min:
-                    description: 'Floor. Autoscaler never scales below this, even
-                      with empty
-
-                      queue. Keeps a warm pool for fast dispatch when builds
-
-                      arrive (cold start = minutes of pod scheduling + FUSE warm).'
-                    format: int32
-                    type: integer
-                required:
-                - max
-                - min
-                type: object
-                x-kubernetes-validations:
-                - message: replicas.min must be <= replicas.max
-                  rule: self.min <= self.max
               resources:
                 description: "K8s resource requests/limits for a single-size pool.\
                   \ Fetchers\nare typically lighter than builders (network-bound)\
@@ -265,18 +219,13 @@ spec:
             required:
             - autoscaling
             - image
-            - replicas
+            - maxConcurrent
             - systems
             type: object
             x-kubernetes-validations:
-            - message: "ephemeral:true requires replicas.min==0 and replicas.max>0\
-                \ \u2014 ephemeral has no standing set, only a concurrent-Job ceiling"
-              rule: '!self.ephemeral || (self.replicas.min == 0 && self.replicas.max
-                > 0)'
-            - message: "ephemeralDeadlineSeconds is only valid with ephemeral:true\
-                \ \u2014 the field sets the Job's activeDeadlineSeconds; STS pools\
-                \ have no Jobs"
-              rule: '!has(self.ephemeralDeadlineSeconds) || self.ephemeral'
+            - message: "maxConcurrent must be > 0 \u2014 it is the concurrent-Job\
+                \ ceiling"
+              rule: self.maxConcurrent > 0
             - message: "classes[] and resources are mutually exclusive \u2014 set\
                 \ per-class resources in classes[].resources, or omit classes[] for\
                 \ a single-size pool"

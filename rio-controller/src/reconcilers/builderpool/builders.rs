@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Object builders (pure: BuilderPool → K8s objects)
 //!
 //! Thin wrapper over [`common::sts`](crate::reconcilers::common::sts)

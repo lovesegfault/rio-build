@@ -221,14 +221,9 @@ fn class_queued_for_systems_ignores_other_arch() {
     let wp = crate::fixtures::test_workerpool_spec();
     let q = class_queued_for_systems(&class, &wp.systems).min(u32::MAX as u64) as u32;
     assert_eq!(
-        compute_desired(
-            q,
-            wp.autoscaling.target_value,
-            wp.replicas.min,
-            wp.replicas.max
-        ),
-        wp.replicas.min,
-        "x86 pool desired=min for an aarch64-only class backlog"
+        compute_desired(q, wp.autoscaling.target_value, 0, wp.max_concurrent as i32),
+        0,
+        "x86 pool desired=0 for an aarch64-only class backlog"
     );
 
     // The matching pool DOES see the work.
@@ -813,8 +808,7 @@ pub(super) fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> BuilderPoo
         .map(|n| SizeClassSpec {
             name: (*n).to_string(),
             cutoff_secs: 60.0,
-            min_replicas: Some(1),
-            max_replicas: Some(10),
+            max_concurrent: Some(10),
             target_queue_per_replica: Some(5),
             resources: ResourceRequirements::default(),
         })
@@ -989,16 +983,15 @@ fn fp_status_patch_has_gvk_and_partial_status() {
 /// `stable_since`).
 #[test]
 fn fp_pool_key_disjoint_from_builder_pool_key() {
-    use crate::crds::builderpool::{Autoscaling, Replicas};
+    use crate::crds::builderpool::Autoscaling;
     use crate::crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
 
     let bp = test_wp_in_ns("rio", "rio-builders");
     let mut fp = FetcherPool::new(
         "rio",
         FetcherPoolSpec {
-            ephemeral: false,
-            ephemeral_deadline_seconds: None,
-            replicas: Replicas { min: 1, max: 4 },
+            deadline_seconds: None,
+            max_concurrent: 4,
             autoscaling: Autoscaling {
                 metric: "fodQueueDepth".into(),
                 target_value: 5,

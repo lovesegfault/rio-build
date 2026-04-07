@@ -647,7 +647,6 @@ impl DagActor {
         store_degraded: bool,
         draining: bool,
         kind: rio_proto::types::ExecutorKind,
-        ephemeral: bool,
     ) -> (Vec<DrvHash>, bool) {
         // I-048b: heartbeat for an executor without a stream entry is
         // dropped. Only `handle_worker_connected` (BuildExecution
@@ -819,10 +818,11 @@ impl DagActor {
         // reflect the most recent heartbeat (not a stale default).
         // hard_filter reads this for FOD routing (ADR-019).
         worker.kind = kind;
-        // ephemeral: overwrite unconditionally (static config; same
-        // shape as kind). handle_process_completion reads this to
-        // mark draining-on-slot-free (I-188).
-        worker.ephemeral = ephemeral;
+        // ephemeral: no longer carried on heartbeat. ExecutorState
+        // keeps the field (default false) until phase-3 collapses the
+        // branches and adapts the multi-dispatch tests. I-095's
+        // tx.is_closed() check covers the one-shot-exit race in the
+        // interim.
         // resources: DON'T clobber with None. Prost makes message
         // fields Option<T>; worker always populates, but if a future
         // proto version omits it, keep the last-known reading for

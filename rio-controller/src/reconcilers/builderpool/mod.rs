@@ -26,14 +26,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[allow(unused_imports)]
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{Pod, Service};
-use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+#[allow(unused_imports)]
+use k8s_openapi::api::core::v1::Pod;
+#[allow(unused_imports)]
+use kube::Resource;
+use kube::ResourceExt;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
-use kube::{CustomResourceExt, Resource, ResourceExt};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::crds::builderpool::{BuilderPool, Sizing};
 use crate::error::{Error, Result, error_kind};
@@ -48,6 +51,7 @@ mod manifest;
 // on test: production code in this module pulls it via the glob
 // below; only the cfg(test) fixtures module needs the wider
 // visibility.
+#[allow(unused_imports)]
 use builders::*;
 
 #[cfg(test)]
@@ -77,7 +81,6 @@ const MANAGER: &str = "rio-controller";
 /// list-selectors match on it. Re-exported from common — shared
 /// with the fetcherpool reconciler.
 pub(crate) use crate::reconcilers::common::sts::POOL_LABEL;
-use crate::reconcilers::common::sts::{ExecutorRole, sts_name as compute_sts_name};
 
 /// Top-level reconcile. Wrapped in `finalizer()` which handles
 /// the metadata.finalizers dance: Apply on normal reconcile,
@@ -298,15 +301,13 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     // re-derive via ok_or rather than .expect() — cross-function
     // invariants are refactor-fragile, and a panic here is a pod
     // crash-loop. InvalidSpec surfaces in error_policy instead.
-    let ns = wp
+    let _ns = wp
         .namespace()
         .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
-    let name = wp.name_any();
+    let _name = wp.name_any();
 
-    // Surface silent degrades BEFORE branching on ephemeral — both
-    // paths share build_pod_spec, both get the Warning. Previously
-    // the HostUsersSuppressedForHostNetwork emit was AFTER the
-    // ephemeral early-return → unreachable for ephemeral pools.
+    // Surface silent degrades — shared by Static and Manifest
+    // reconcile paths (both use build_pod_spec).
     warn_on_spec_degrades(&wp, ctx).await;
 
     // ---- Job-mode dispatch (ephemeral | manifest) ----
@@ -331,181 +332,14 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     if wp.spec.sizing == Sizing::Manifest {
         return manifest::reconcile_manifest(&wp, ctx).await;
     }
-    // r[impl ctrl.pool.ephemeral]
-    if wp.spec.ephemeral {
-        return ephemeral::reconcile_ephemeral(&wp, ctx).await;
-    }
-
-    // ownerReference: ties children to this CRD. Delete the
-    // BuilderPool → K8s GC deletes the StatefulSet + Service.
-    // `controller_owner_ref` sets controller=true and
-    // blockOwnerDeletion=true — the GC waits for children
-    // before removing the parent from etcd.
-    //
-    // `&()` because our DynamicType is () (statically typed CRD).
-    // Returns None only if metadata.uid or name is missing —
-    // impossible for an apiserver-sourced object (those fields are
-    // set on every read). Still: error-return, not panic. A
-    // reconciler panic is a pod crash-loop.
-    let oref = wp.controller_owner_ref(&()).ok_or_else(|| {
-        Error::InvalidSpec("BuilderPool has no metadata.uid (not from apiserver?)".into())
-    })?;
-
-    // ---- Headless Service ----
-    // StatefulSet's serviceName MUST point to a real Service.
-    // Headless (clusterIP: None) gives stable pod DNS
-    // (`<pod>.<service>.<ns>.svc.cluster.local`) without load
-    // balancing. Workers don't serve anything inbound (they
-    // connect OUT to scheduler/store), but StatefulSet needs
-    // this for pod identity.
-    let svc = build_headless_service(&wp, oref.clone());
-    let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
-    svc_api
-        .patch(
-            svc.metadata
-                .name
-                .as_deref()
-                .ok_or_else(|| Error::InvalidSpec("built Service has no name".into()))?,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(&svc),
-        )
-        .await?;
-
-    // ---- PodDisruptionBudget ----
-    // maxUnavailable=1: at most one worker evicted at a time
-    // during node drain. The evicting pod's builds get reassigned
-    // (via DrainExecutor force → preemption); the rest of the pool
-    // keeps working. ownerRef → GC on BuilderPool delete.
-    // (wired: P0285 disruption.rs watcher)
-    let pdb = build_pdb(&wp, oref.clone());
-    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
-    pdb_api
-        .patch(
-            pdb.metadata.name.as_deref().ok_or_else(|| {
-                Error::InvalidSpec("built PodDisruptionBudget has no name".into())
-            })?,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(&pdb),
-        )
-        .await?;
-
-    // ---- StatefulSet ----
-    let sts_name = compute_sts_name(&name, ExecutorRole::Builder);
-    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
-
-    // Check if STS already exists to decide whether to set
-    // spec.replicas. SSA semantics: sending a field claims
-    // ownership; omitting it releases ownership. The autoscaler
-    // (scaling.rs) owns replicas via fieldManager
-    // "rio-controller-autoscaler". If WE keep sending
-    // replicas=min with .force(), every reconcile reverts the
-    // autoscaler's patch. Instead: set it ONLY on first create
-    // (STS doesn't exist), then omit it — SSA releases our
-    // claim, autoscaler's value sticks.
-    //
-    // The extra GET is one round-trip per reconcile. Acceptable —
-    // reconciles are driven by CR/STS changes, not a hot loop.
-    let existing = sts_api.get_opt(&sts_name).await?;
-    let initial_replicas = existing.is_none().then_some(wp.spec.replicas.min);
-    // For status.desired_replicas: read what's ACTUALLY on the STS
-    // (autoscaler's last decision). Falls back to min on first
-    // create. Prevents kubectl's "Desired" column from showing min
-    // regardless of autoscaler activity.
-    let current_replicas = existing
-        .as_ref()
-        .and_then(|s| s.spec.as_ref())
-        .and_then(|s| s.replicas)
-        .unwrap_or(wp.spec.replicas.min);
-
-    let sts = build_statefulset(
-        &wp,
-        oref,
-        &ctx.scheduler_addrs(),
-        &ctx.store_addrs(),
-        initial_replicas,
-    )?;
-    let applied = sts_api
-        .patch(
-            &sts_name,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(&sts),
-        )
-        .await?;
-
-    // ---- Status ----
-    // Read back what the StatefulSet controller observed. May lag
-    // (StatefulSet controller hasn't reconciled our patch yet) —
-    // that's fine, next reconcile catches up. `.owns()` in the
-    // Controller setup watches StatefulSets; changes there
-    // enqueue this reconcile.
-    let sts_status = applied.status.unwrap_or_default();
-
-    // Patch status subresource. Separate from spec — status is
-    // write-only from the controller's perspective (operators
-    // can't `kubectl edit` it into existence; only
-    // PATCH /status works).
-    //
-    // apiVersion + kind are REQUIRED by server-side apply even
-    // for status patches — apiserver uses them to resolve the
-    // schema. Without them: 400 "apiVersion must be set in
-    // apply patch".
-    //
-    // Partial status: we patch ONLY replicas/ready/desired. The
-    // autoscaler owns lastScaleTime + conditions via a separate
-    // SSA field-manager ("rio-controller-autoscaler-status").
-    // SSA merges field ownership — our patch here doesn't touch
-    // lastScaleTime, so the autoscaler's value persists across
-    // our reconciles. Setting them here would clobber the
-    // autoscaler's writes on every reconcile.
-    let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let ar = BuilderPool::api_resource();
-    let status_patch = serde_json::json!({
-        "apiVersion": ar.api_version,
-        "kind": ar.kind,
-        "status": {
-            "replicas": sts_status.replicas,
-            "readyReplicas": sts_status.ready_replicas.unwrap_or(0),
-            // What the autoscaler set on STS.spec.replicas (or min
-            // on first create).
-            "desiredReplicas": current_replicas,
-            // lastScaleTime + conditions: NOT here. Autoscaler owns.
-        },
-    });
-    wp_api
-        .patch_status(
-            &name,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(&status_patch),
-        )
-        .await?;
-
-    info!(
-        builderpool = %name,
-        namespace = %ns,
-        replicas = sts_status.replicas,
-        ready = sts_status.ready_replicas.unwrap_or(0),
-        "reconciled"
-    );
-
-    // Requeue in 5 minutes as a fallback. `.owns()` on StatefulSet
-    // means changes there trigger us anyway; this catches the
-    // edge case where something external deletes the StatefulSet
-    // and the watch drops the event.
-    Ok(Action::requeue(Duration::from_secs(300)))
+    ephemeral::reconcile_ephemeral(&wp, ctx).await
 }
 
-/// Poll interval while waiting for StatefulSet scale-down. Long
-/// enough to not spam the apiserver, short enough that a 30s
-/// build completion doesn't add much latency to delete.
+#[allow(dead_code)]
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Default pod terminationGracePeriodSeconds. 2h — long builds
-/// (LLVM from cold ccache, NixOS closures). Overridable via
-/// `BuilderPoolSpec.termination_grace_period_seconds`.
+#[allow(dead_code)]
 const DEFAULT_TERMINATION_GRACE: i64 = 7200;
-
-/// Slop for kubelet/STS controller to observe pod termination
-/// and update status.replicas AFTER grace period SIGKILL.
+#[allow(dead_code)]
 const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 
 /// Cleanup on delete. Three phases:
@@ -532,7 +366,7 @@ const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 /// to scale-0 → SIGTERM still drains in-flight (worker's own
 /// logic, doesn't need the scheduler). We just lose the "stop
 /// accepting NEW work early" optimization for pods 0,1.
-async fn cleanup(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
+async fn cleanup(wp: Arc<BuilderPool>, _ctx: &Ctx) -> Result<Action> {
     let ns = wp
         .namespace()
         .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
@@ -556,181 +390,11 @@ async fn cleanup(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     //
     // If an operator wants to interrupt in-flight builds, they can
     // `kubectl delete jobs -l rio.build/pool=X` separately.
-    if wp.spec.sizing == Sizing::Manifest || wp.spec.ephemeral {
-        info!(builderpool = %name, sizing = ?wp.spec.sizing, ephemeral = wp.spec.ephemeral,
-              "cleanup: Job-mode pool; ownerRef GC handles Jobs");
-        return Ok(Action::await_change());
-    }
-
-    let sts_name = compute_sts_name(&name, ExecutorRole::Builder);
-    info!(builderpool = %name, "cleanup: starting drain");
-
-    // ---- Phase 1: DrainExecutor each pod ----
-    // List pods by label. The pod's NAME is its executor_id (set
-    // via RIO_WORKER_ID=$(POD_NAME) downward API in build_pod_spec).
-    let pods_api: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
-    let pods = pods_api
-        .list(&kube::api::ListParams::default().labels(&format!("{POOL_LABEL}={name}")))
-        .await?;
-
-    // Best-effort DrainExecutor per pod. Balanced client routes to
-    // the leader; if the scheduler is down, each RPC fails and we
-    // log+continue (SIGTERM still drains in-flight). If the leader
-    // comes back mid-loop, later pods succeed.
-    let mut admin = ctx.admin.clone();
-    for pod in &pods.items {
-        let Some(executor_id) = &pod.metadata.name else {
-            continue;
-        };
-        // force=false: in-flight builds complete. The scheduler
-        // just stops dispatching NEW work. SIGTERM (phase 2) is
-        // what triggers the worker to actually exit once drained.
-        match admin
-            .drain_executor(rio_proto::types::DrainExecutorRequest {
-                executor_id: executor_id.clone(),
-                force: false,
-            })
-            .await
-        {
-            Ok(resp) => {
-                let r = resp.into_inner();
-                debug!(worker = %executor_id, running = r.running_builds, "DrainExecutor OK");
-            }
-            Err(e) => {
-                // One pod's drain failed --- log and continue.
-                // SIGTERM still drains it (just doesn't prevent
-                // the scheduler from sending it one more assignment
-                // in the gap).
-                warn!(worker = %executor_id, error = %e, "DrainExecutor failed (continuing)");
-            }
-        }
-    }
-
-    // ---- Phase 2: scale StatefulSet to 0 ----
-    // JSON merge patch on spec.replicas. NOT server-side apply:
-    // we used SSA with fieldManager=rio-controller to OWN the
-    // whole spec at apply time, but here we're in cleanup — the
-    // CRD is being deleted, no more reconcile conflicts possible.
-    // A simple merge patch is less ceremony (no apiVersion/kind
-    // envelope, no fieldManager).
-    //
-    // 404 tolerance: the STS might already be gone (operator
-    // manually deleted, or ownerRef GC ran early somehow). That's
-    // fine — skip to await_change, finalizer removed, done.
-    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
-    let scale_patch = serde_json::json!({ "spec": { "replicas": 0 } });
-    match sts_api
-        .patch(
-            &sts_name,
-            &PatchParams::default(),
-            &Patch::Merge(&scale_patch),
-        )
-        .await
-    {
-        Ok(_) => debug!(statefulset = %sts_name, "scaled to 0"),
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {
-            info!(statefulset = %sts_name, "already gone; cleanup done");
-            return Ok(Action::await_change());
-        }
-        Err(e) => return Err(e.into()),
-    }
-
-    // ---- Phase 3: check replicas=0 (requeue if not) ----
-    // Single-shot check, NOT an inline poll loop. kube-rs
-    // Controller has no `.with_concurrency()` — an inline sleep
-    // loop here monopolizes the reconcile slot for up to
-    // `terminationGracePeriodSeconds + 60s` (2h+ default). With
-    // multiple deleting pools, ALL other reconciliation stops.
-    // Instead: one GET, if still draining return
-    // `Action::requeue(DRAIN_POLL_INTERVAL)`. The finalizer
-    // stays (we haven't returned Ok from a path that removes
-    // it); next tick re-enters cleanup() via Event::Cleanup and
-    // re-checks. Other pools reconcile in between.
-    //
-    // `replicas` field, not `ready_replicas`: replicas counts
-    // pods that exist (any state); ready_replicas counts pods
-    // passing readiness. A terminating pod is NOT ready (it
-    // fails readiness immediately) but still exists until
-    // exit+grace. We want "all pods GONE" not "all pods not-
-    // ready" — otherwise we'd remove the finalizer while pods
-    // are still running builds.
-    //
-    // Deadline derived from `metadata.deletionTimestamp` (wall
-    // clock, set once by the apiserver at delete time) instead
-    // of a stored Instant — each requeue re-enters cleanup()
-    // fresh, so a monotonic Instant would reset every tick and
-    // the deadline would never trip. `deletionTimestamp + grace
-    // + slop` is stable across requeues.
-    //
-    // Grace period from the spec (+ 60s slop) instead of a
-    // hardcoded 2h: a cluster with 90s builds and
-    // terminationGracePeriodSeconds=180 shouldn't block
-    // BuilderPool delete for 2h on a stuck/never-Ready pod
-    // (vm-lifecycle-autoscale-k3s v24/v25: autoscaler-spawned
-    // pod-1 never went Ready; STS sequential termination stalls
-    // on it).
-    let grace = wp
-        .spec
-        .termination_grace_period_seconds
-        .unwrap_or(DEFAULT_TERMINATION_GRACE);
-    let drain_max_wait = Duration::from_secs(grace.max(0) as u64) + DRAIN_WAIT_SLOP;
-    // deletionTimestamp is set by the apiserver when the delete
-    // was accepted. Absent only if something called cleanup()
-    // outside the finalizer() wrapper (shouldn't happen — treat
-    // as "just started," deadline far in the future).
-    let deletion_ts = wp
-        .metadata
-        .deletion_timestamp
-        .as_ref()
-        .map(|t| t.0)
-        .unwrap_or_else(k8s_openapi::jiff::Timestamp::now);
-    let elapsed = k8s_openapi::jiff::Timestamp::now()
-        .as_second()
-        .saturating_sub(deletion_ts.as_second())
-        .max(0) as u64;
-    let timed_out = elapsed >= drain_max_wait.as_secs();
-
-    match sts_api.get_opt(&sts_name).await? {
-        Some(sts) => {
-            let replicas = sts.status.map(|s| s.replicas).unwrap_or(0);
-            if replicas == 0 {
-                info!(builderpool = %name, "drain complete (replicas=0)");
-            } else if timed_out {
-                // Grace expired. Pods are STILL running —
-                // either a build is stuck or the kubelet is
-                // dead. We can't do anything more from here.
-                // Remove the finalizer; ownerRef GC will
-                // SIGKILL (kubelet's `deletion_grace_period`
-                // handling) eventually. Operator sees the
-                // stuck pods in `kubectl get pods`.
-                warn!(
-                    builderpool = %name,
-                    remaining = replicas,
-                    timeout = ?drain_max_wait,
-                    "drain timeout; proceeding (ownerRef GC will force-delete)"
-                );
-            } else {
-                // Still draining. Requeue — finalizer stays,
-                // next cleanup() tick re-checks. Other pools
-                // reconcile in the meantime.
-                debug!(builderpool = %name, remaining = replicas, "waiting for drain; requeuing");
-                return Ok(Action::requeue(DRAIN_POLL_INTERVAL));
-            }
-        }
-        None => {
-            // STS deleted out from under us. Unusual (we
-            // own it via ownerRef; GC shouldn't run until
-            // the finalizer is removed) but handle it.
-            info!(builderpool = %name, "STS disappeared mid-wait; done");
-        }
-    }
-
-    // ownerReference GC deletes the STS + Service once the
-    // finalizer is removed (which happens when we return Ok).
-    // No explicit delete needed — it'd race with GC anyway.
+    let _ = ns;
+    info!(builderpool = %name, sizing = ?wp.spec.sizing,
+          "cleanup: Job-mode pool; ownerRef GC handles Jobs");
     Ok(Action::await_change())
 }
-
 /// Requeue policy on error. Transient (Kube, Scheduler) →
 /// exponential backoff (5s → 300s). InvalidSpec → fixed 5min
 /// (operator needs to fix it; retrying fast is noise).

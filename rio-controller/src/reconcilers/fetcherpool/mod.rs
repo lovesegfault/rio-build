@@ -20,18 +20,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec, Toleration};
+use k8s_openapi::api::core::v1::Toleration;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::api::{Api, ObjectMeta, Patch, PatchParams};
+use kube::ResourceExt;
+use kube::api::Api;
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
-use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{info, warn};
 
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 use crate::error::{Error, Result, error_kind};
+#[allow(unused_imports)]
 use crate::reconcilers::common::sts::{self, ExecutorRole, ExecutorStsParams, sts_name};
 use crate::reconcilers::{Ctx, error_key};
 
@@ -85,148 +85,7 @@ async fn reconcile_inner(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> 
 
 /// Normal reconcile: make the world match spec.
 async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
-    if fp.spec.ephemeral {
-        return ephemeral::reconcile_ephemeral(&fp, ctx).await;
-    }
-
-    let ns = fp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("FetcherPool has no namespace".into()))?;
-    let name = fp.name_any();
-    let oref = fp.controller_owner_ref(&()).ok_or_else(|| {
-        Error::InvalidSpec("FetcherPool has no metadata.uid (not from apiserver?)".into())
-    })?;
-
-    // r[impl ctrl.fetcherpool.classes]
-    // I-170: when `classes` is non-empty, stamp one STS+Service per
-    // class. When empty (back-compat), single STS at `spec.resources`.
-    // Status aggregates ready/desired across classes.
-    let mut total_ready = 0i32;
-    let mut total_desired = 0i32;
-    if fp.spec.classes.is_empty() {
-        let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, None).await?;
-        total_ready += ready;
-        total_desired += desired;
-    } else {
-        for class in &fp.spec.classes {
-            let (ready, desired) = apply_one(&fp, ctx, &ns, &oref, Some(class)).await?;
-            total_ready += ready;
-            total_desired += desired;
-        }
-    }
-
-    // ── Status ──────────────────────────────────────────────────
-    // Partial: reconciler owns readyReplicas/desiredReplicas;
-    // autoscaler owns lastScaleTime/conditions via a separate
-    // field-manager. Same SSA split as builderpool.
-    let fp_api: Api<FetcherPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let ar = FetcherPool::api_resource();
-    fp_api
-        .patch_status(
-            &name,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(serde_json::json!({
-                "apiVersion": ar.api_version,
-                "kind": ar.kind,
-                "status": {
-                    "readyReplicas": total_ready,
-                    "desiredReplicas": total_desired,
-                },
-            })),
-        )
-        .await?;
-
-    info!(pool = %name, classes = fp.spec.classes.len(), "reconciled FetcherPool");
-    Ok(Action::requeue(Duration::from_secs(300)))
-}
-
-/// Apply one STS+Service for a single size-class (or the unclassed
-/// pool when `class` is `None`). Returns `(ready, desired)` from
-/// the resulting STS for status aggregation.
-///
-/// `pool_name` (and thus the STS/Service name + `rio.build/pool`
-/// label) is derived once via [`executor_params`] — single source of
-/// truth so the SSA-apply URL and body cannot disagree.
-async fn apply_one(
-    fp: &FetcherPool,
-    ctx: &Ctx,
-    ns: &str,
-    oref: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
-    class: Option<&FetcherSizeClass>,
-) -> Result<(i32, i32)> {
-    let params = executor_params(fp, class)?;
-    let labels = sts::executor_labels(&params);
-    let sts_name = sts_name(&params.pool_name, ExecutorRole::Fetcher);
-
-    // ── Headless Service ────────────────────────────────────────
-    let svc = Service {
-        metadata: ObjectMeta {
-            name: Some(sts_name.clone()),
-            namespace: Some(ns.into()),
-            owner_references: Some(vec![oref.clone()]),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
-        spec: Some(ServiceSpec {
-            cluster_ip: Some("None".into()),
-            // I-085: omit ip_families (single-stack-safe; see 46b3c590).
-            ip_family_policy: Some("PreferDualStack".into()),
-            selector: Some(labels),
-            ports: Some(vec![ServicePort {
-                name: Some("metrics".into()),
-                port: 9093,
-                ..Default::default()
-            }]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    Api::<Service>::namespaced(ctx.client.clone(), ns)
-        .patch(
-            &sts_name,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(&svc),
-        )
-        .await?;
-
-    // ── StatefulSet ─────────────────────────────────────────────
-    // Autoscaler handshake (same SSA dance as builderpool/mod.rs):
-    // set replicas only on first create, omit on subsequent
-    // reconciles. The autoscaler ("rio-controller-autoscaler") owns
-    // `spec.replicas` after that; sending it here with .force()
-    // would revert every scale decision back to min.
-    let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
-    let existing = sts_api.get_opt(&sts_name).await?;
-    // Per-class min override falls back to pool-wide replicas.min.
-    let min = class
-        .and_then(|c| c.min_replicas)
-        .unwrap_or(fp.spec.replicas.min);
-    let initial_replicas = existing.is_none().then_some(min);
-    // For status.desiredReplicas: read what's actually on the STS
-    // (autoscaler's last decision, or min on first create).
-    let current_replicas = existing
-        .as_ref()
-        .and_then(|s| s.spec.as_ref())
-        .and_then(|s| s.replicas)
-        .unwrap_or(min);
-
-    let sts = sts::build_executor_statefulset(
-        &params,
-        oref.clone(),
-        &ctx.scheduler_addrs(),
-        &ctx.store_addrs(),
-        initial_replicas,
-    );
-    let applied = sts_api
-        .patch(
-            &sts_name,
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(&sts),
-        )
-        .await?;
-
-    let sts_status = applied.status.unwrap_or_default();
-    Ok((sts_status.ready_replicas.unwrap_or(0), current_replicas))
+    ephemeral::reconcile_ephemeral(&fp, ctx).await
 }
 
 /// Cleanup: ownerRef GC handles the STS + Service. Fetches are
@@ -382,13 +241,13 @@ mod tests {
     use k8s_openapi::api::core::v1::ResourceRequirements;
 
     fn mk(min: i32, max: i32) -> FetcherPool {
-        use crate::crds::builderpool::{Autoscaling, Replicas};
+        use crate::crds::builderpool::Autoscaling;
+        let _ = min;
         let mut fp = FetcherPool::new(
             "test",
             crate::crds::fetcherpool::FetcherPoolSpec {
-                ephemeral: false,
-                ephemeral_deadline_seconds: None,
-                replicas: Replicas { min, max },
+                deadline_seconds: None,
+                max_concurrent: max as u32,
                 autoscaling: Autoscaling {
                     metric: "fodQueueDepth".into(),
                     target_value: 5,
@@ -489,8 +348,7 @@ mod tests {
                 limits: Some(BTreeMap::from([("memory".into(), Quantity("8Gi".into()))])),
                 ..Default::default()
             },
-            min_replicas: Some(0),
-            max_replicas: Some(4),
+            max_concurrent: Some(4),
         };
         let params = executor_params(&fp, Some(&class)).unwrap();
         // RIO_SIZE_CLASS injected via extra_env (sts.rs appends it
@@ -535,14 +393,12 @@ mod tests {
             FetcherSizeClass {
                 name: "tiny".into(),
                 resources: ResourceRequirements::default(),
-                min_replicas: None,
-                max_replicas: None,
+                max_concurrent: None,
             },
             FetcherSizeClass {
                 name: "small".into(),
                 resources: ResourceRequirements::default(),
-                min_replicas: None,
-                max_replicas: None,
+                max_concurrent: None,
             },
         ];
         let names: Vec<_> = fp
@@ -572,8 +428,7 @@ mod tests {
         let class = FetcherSizeClass {
             name: "tiny".into(),
             resources: ResourceRequirements::default(),
-            min_replicas: None,
-            max_replicas: None,
+            max_concurrent: None,
         };
         let mut x86 = mk(2, 8);
         x86.metadata.name = Some("x86-64".into());

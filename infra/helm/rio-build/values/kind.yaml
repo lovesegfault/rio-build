@@ -67,11 +67,7 @@ builderPools:
 
 builderPoolDefaults:
   enabled: true
-  # P0537: STS path for smoke; CRD default is `true` (ephemeral).
-  ephemeral: false
-  # min=2: smoke's worker-kill chaos step needs ≥2 to kill one
-  # mid-build and verify reassignment.
-  replicas: {min: 2, max: 3}
+  maxConcurrent: 3
   image: rio-builder
   # kind's docker-in-docker containerd doesn't support the device-
   # plugin path cleanly; privileged:true is the escape hatch.
@@ -84,13 +80,7 @@ fetcherPools:
 
 fetcherPoolDefaults:
   enabled: true
-  # kind is single-node STS; ephemeral Job-mode would need RBAC for
-  # batch/v1 in the rio-fetchers namespace and the smoke test asserts
-  # on a stable pod name.
-  ephemeral: false
-  # kind is single-node; pin to 1. min==max → autoscaler computes
-  # desired=1 always (compute_desired clamps), no scaling churn.
-  replicas: {min: 1, max: 1}
+  maxConcurrent: 1
   autoscaling: {metric: fodQueueDepth, targetValue: 5}
   image: rio-fetcher
   hostUsers: true
