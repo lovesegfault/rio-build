@@ -391,11 +391,11 @@ pub async fn find_missing_chunks_for_tenant(
     // blake3_hash) index covers this — equality on tenant_id + ANY
     // probe on blake3_hash is an index-only scan.
     //
-    // PG-not-S3: the `chunks` row (and thus its junction row) is
-    // populated BEFORE S3 upload, so a hash can be "present" here
-    // while the upload is in flight. Fine — another of THIS TENANT'S
-    // workers is handling it; if their upload fails, they decrement
-    // and we see it missing on retry. One roundtrip for N hashes.
+    // S3-presence: PutChunk (the only writer of chunk_tenants) inserts
+    // the junction row AFTER backend.put() succeeds (chunk.rs:219), so
+    // a "present" hit here implies S3 has the bytes. No `uploaded_at`
+    // join needed — that column guards the cas::put_chunked path, which
+    // upserts `chunks` BEFORE upload but never writes chunk_tenants.
     let present: Vec<(Vec<u8>,)> = sqlx::query_as(
         r#"
         SELECT blake3_hash FROM chunk_tenants
