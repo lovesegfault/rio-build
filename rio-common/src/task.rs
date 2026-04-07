@@ -136,7 +136,18 @@ where
                 }
                 _ = ticker.tick() => {}
             }
-            body().await;
+            // Race body() against shutdown too — otherwise a long-running
+            // body (GC sweep, S3 batch delete) blocks SIGTERM until it
+            // completes. All current callers are idempotent batch ops, so
+            // dropping mid-await is safe.
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(task = name, "periodic task shutting down mid-body");
+                    break;
+                }
+                () = body() => {}
+            }
         }
     })
 }
@@ -259,6 +270,53 @@ mod tests {
             extra_ticks, 0,
             "biased; should make shutdown win over ready tick every time; \
              observed {extra_ticks} extra ticks across {ROUNDS} rounds"
+        );
+    }
+
+    /// Shutdown fires while body() is mid-await → loop exits promptly,
+    /// body is dropped. Without the inner select, a long-running body
+    /// (GC sweep, S3 batch delete) would block SIGTERM until completion.
+    #[tokio::test(start_paused = true)]
+    async fn spawn_periodic_shutdown_interrupts_body() {
+        let shutdown = Token::new();
+        let body_completed = Arc::new(AtomicU32::new(0));
+        let bc = Arc::clone(&body_completed);
+
+        let handle = spawn_periodic(
+            "test-interrupt",
+            Duration::from_millis(10),
+            shutdown.clone(),
+            move || {
+                let bc = Arc::clone(&bc);
+                async move {
+                    // Long body: would block shutdown without the inner select.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    bc.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        );
+
+        // Drive first tick — body starts, parks on the 1h sleep.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Cancel while body is mid-sleep. Inner select picks shutdown;
+        // body future is dropped before the sleep completes.
+        shutdown.cancel();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            handle.is_finished(),
+            "task should exit promptly on shutdown, not wait for body"
+        );
+        handle.await.expect("clean shutdown");
+        assert_eq!(
+            body_completed.load(Ordering::Relaxed),
+            0,
+            "body should be dropped mid-await, not run to completion"
         );
     }
 
