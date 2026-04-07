@@ -1,18 +1,13 @@
-//! FetcherPool reconciler: rio-builder pods in fetcher mode
-//! (`RIO_EXECUTOR_KIND=fetcher`).
+//! FetcherPool reconciler: one-shot Jobs of rio-builder in fetcher
+//! mode (`RIO_EXECUTOR_KIND=fetcher`), with the stricter security
+//! posture from ADR-019 §Sandbox hardening.
 //!
-//! Two modes (P0541): `ephemeral: true` (default) → Job-per-FOD via
-//! the `ephemeral` submodule; `ephemeral: false` → StatefulSet + headless
-//! Service, autoscaled on `queued_fod_derivations`. Both apply the
-//! stricter security posture per ADR-019 §Sandbox hardening.
-//!
-//! Optionally size-classed via `spec.classes[]` (I-170): when
-//! non-empty, one StatefulSet (or ephemeral Job loop) per class;
-//! each registers `RIO_SIZE_CLASS=name` so the scheduler can route
-//! by `size_class_floor`. Still simpler than
-//! [`builderpool`](super::builderpool): no PDB, no manifest mode,
-//! no duration-cutoff rebalancer.
-// TODO(P0455): add the ctrl.fetcherpool.reconcile impl marker once
+//! Optionally size-classed via `spec.classes[]` (I-170): one Job
+//! loop per class, each registering `RIO_SIZE_CLASS=name` so the
+//! scheduler can route by `size_class_floor`. Simpler than
+//! [`builderpool`](super::builderpool): no manifest mode, no
+//! duration-cutoff rebalancer.
+// TODO: add the ctrl.fetcherpool.reconcile impl marker once
 // ADR-019 is in tracey spec_include (the rule is defined in
 // decisions/019 but tracey only scans components/ today).
 

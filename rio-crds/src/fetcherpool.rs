@@ -1,4 +1,4 @@
-//! FetcherPool CRD: StatefulSet of rio-builder pods in fetcher mode
+//! FetcherPool CRD: one-shot Jobs of rio-builder in fetcher mode
 //! (`RIO_EXECUTOR_KIND=fetcher`).
 //!
 //! Fetchers run FOD-only (fixed-output derivations — source tarballs,
@@ -106,9 +106,8 @@ pub struct FetcherPoolSpec {
     pub resources: Option<ResourceRequirements>,
 
     /// Optional size classes (I-170). When empty (default), single
-    /// STS/Job-set at `spec.resources` — original behavior. When
-    /// non-empty, the reconciler stamps one StatefulSet (or
-    /// ephemeral Job loop) per class; each registers with
+    /// Job loop at `spec.resources`. When non-empty, the reconciler
+    /// runs one Job loop per class; each registers with
     /// `size_class = name` so the scheduler can route by
     /// `DerivationState.size_class_floor`.
     ///
@@ -155,8 +154,8 @@ pub struct FetcherPoolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherSizeClass {
-    /// Class name. Becomes the StatefulSet name suffix
-    /// (`rio-fetcher-{name}`) AND the `RIO_SIZE_CLASS` env the
+    /// Class name. Becomes the Job name component
+    /// (`rio-fetcher-{pool}-{name}-*`) AND the `RIO_SIZE_CLASS` env the
     /// executor reports in its heartbeat. Convention: "tiny" /
     /// "small"; nothing enforces that.
     pub name: String,

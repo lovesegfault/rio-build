@@ -1,35 +1,34 @@
 //! Kubernetes operator for rio-build.
 //!
-//! Watches `BuilderPool` CRDs, reconciles worker StatefulSets,
-//! autoscales based on `AdminService.ClusterStatus` queue depth.
+//! Watches `BuilderPool`/`FetcherPool` CRDs and spawns one-shot
+//! worker Jobs to match the scheduler's queue depth.
 //!
 //! # Architecture
 //!
 //! ```text
 //!   kube-apiserver
 //!        │
-//!        │ watch: BuilderPool, StatefulSet
+//!        │ watch: BuilderPool, FetcherPool, Job
 //!        ▼
 //! ┌──────────────────────────────────────┐
 //! │ rio-controller                        │
 //! │                                       │
 //! │  ┌─────────────────────────────────┐  │
-//! │  │ BuilderPool reconciler           │  │
-//! │  │  - ensure StatefulSet exists    │  │
-//! │  │  - sync spec (resources, caps)  │  │
-//! │  │  - patch status.replicas        │  │
-//! │  │  - finalizer: drain on delete   │  │
+//! │  │ BuilderPool / FetcherPool        │  │
+//! │  │  - poll ClusterStatus / manifest │  │
+//! │  │  - spawn Jobs to match queue     │  │
+//! │  │  - reap completed/orphan Jobs    │  │
+//! │  │  - patch status.readyReplicas    │  │
 //! │  └─────────────────────────────────┘  │
 //! │                                       │
 //! │  ┌─────────────────────────────────┐  │
-//! │  │ Autoscaler loop (30s)           │  │
-//! │  │  - ClusterStatus.queued_drvs    │  │
-//! │  │  - patch StatefulSet.replicas   │  │
-//! │  │  - 30s up / 10m down windows    │  │
+//! │  │ ComponentScaler (30s)            │  │
+//! │  │  - gateway/scheduler Deployment  │  │
+//! │  │    replica scaling on load       │  │
 //! │  └─────────────────────────────────┘  │
 //! └──────────────────────────────────────┘
 //!        │
-//!        │ gRPC: AdminService (ClusterStatus, DrainExecutor)
+//!        │ gRPC: AdminService (ClusterStatus, GetCapacityManifest)
 //!        ▼
 //!   rio-scheduler
 //! ```
@@ -37,11 +36,10 @@
 //! # What the controller does NOT manage
 //!
 //! Scheduler/store/gateway Deployments are NOT managed by CRD —
-//! they're deployed via kustomize as standard Deployments. The
-//! controller only manages worker StatefulSets (complex lifecycle:
-//! drain before scale-down, terminationGracePeriodSeconds=7200).
-//! Build submission is via SSH (`nix build --store ssh-ng://`) —
-//! no K8s-native submission CRD.
+//! they're deployed via helm as standard Deployments (the
+//! ComponentScaler only patches their replica counts). Build
+//! submission is via SSH (`nix build --store ssh-ng://`) — no
+//! K8s-native submission CRD.
 
 // CRD types live in rio-crds (extracted so rio-cli can use them
 // without pulling the full reconciler stack). Re-exported as `crds`

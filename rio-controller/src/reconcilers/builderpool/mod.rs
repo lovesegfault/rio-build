@@ -23,8 +23,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-#[allow(unused_imports)]
-use k8s_openapi::api::apps::v1::StatefulSet;
+// Pod + Resource are used by the tests/ submodule via `use super::*`;
+// lib code only needs ResourceExt.
 #[allow(unused_imports)]
 use k8s_openapi::api::core::v1::Pod;
 #[allow(unused_imports)]
@@ -307,24 +307,10 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     // reconcile paths (both use build_pod_spec).
     warn_on_spec_degrades(&wp, ctx).await;
 
-    // ---- Job-mode dispatch (ephemeral | manifest) ----
-    // Three reconcile modes, all NO StatefulSet / Service / PDB when
-    // Job-based. Branch HERE because everything below is STS-mode.
-    //
-    // sizing=Manifest takes PRECEDENCE over spec.ephemeral. ADR-020
-    // § Decision ¶4: manifest pods are long-lived (loop for multiple
-    // builds of the same size class), so `ephemeral: true` is not
-    // required — and if set, is ignored for Manifest mode. An
-    // operator setting both gets manifest behavior. CEL doesn't
-    // reject the combo (not contradictory, just redundant);
-    // warn_on_spec_degrades could surface it if it becomes a
-    // footgun in practice.
-    //
-    // sizing=Static + ephemeral=true → ephemeral (today's behavior).
-    // sizing=Static + ephemeral=false → STS (fall through).
-    //
-    // cleanup() branches on the same shape — Job modes need no STS
-    // scale-to-0.
+    // Both reconcile paths spawn one-shot Jobs. The only difference
+    // is sizing: Manifest reads per-derivation resource estimates
+    // from GetCapacityManifest (ADR-020); Static uses fixed pool
+    // resources from spec.
     // r[impl ctrl.pool.manifest-reconcile]
     if wp.spec.sizing == Sizing::Manifest {
         return manifest::reconcile_manifest(&wp, ctx).await;
@@ -332,64 +318,14 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     ephemeral::reconcile_ephemeral(&wp, ctx).await
 }
 
-#[allow(dead_code)]
-const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
-#[allow(dead_code)]
-const DEFAULT_TERMINATION_GRACE: i64 = 7200;
-#[allow(dead_code)]
-const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
-
-/// Cleanup on delete. Three phases:
-///
-///   1. DrainExecutor each pod → scheduler marks them draining,
-///      stops dispatching new work. In-flight builds continue.
-///   2. Scale STS to 0 → K8s sends SIGTERM to each pod. The
-///      worker's SIGTERM handler does `acquire_many` on its
-///      build semaphore → blocks until in-flight builds finish
-///      → exits 0. terminationGracePeriodSeconds=7200 gives it
-///      time.
-///   3. Wait for replicas=0. THEN return → finalizer removed →
-///      ownerReference GC deletes the StatefulSet + Service.
-///
-/// Why DrainExecutor FIRST (not scale-to-0 then drain): with 3
-/// replicas, scaling to 0 terminates pods ONE AT A TIME (STS
-/// podManagementPolicy default is OrderedReady). Pod-2 gets
-/// SIGTERM, starts draining; pods 0,1 are STILL SERVING. If
-/// the scheduler doesn't know they're draining, it dispatches
-/// new work to them — exactly what we want to prevent. Mark
-/// ALL as draining up front, THEN let K8s terminate.
-///
-/// All best-effort. Scheduler down → skip DrainExecutor, proceed
-/// to scale-0 → SIGTERM still drains in-flight (worker's own
-/// logic, doesn't need the scheduler). We just lose the "stop
-/// accepting NEW work early" optimization for pods 0,1.
+/// Cleanup on delete. Jobs are one-shot and complete on their own;
+/// in-flight builds finish naturally (the worker doesn't know the CR
+/// is being deleted). Returning here removes the finalizer and
+/// ownerReference GC deletes the Jobs. To interrupt in-flight builds,
+/// `kubectl delete jobs -l rio.build/pool=X`.
 async fn cleanup(wp: Arc<BuilderPool>, _ctx: &Ctx) -> Result<Action> {
-    let ns = wp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
-    let name = wp.name_any();
-
-    // Job modes (ephemeral | manifest): no STS to scale to 0.
-    // Jobs complete on their own; ownerRef GC deletes them once the
-    // finalizer is removed. We return immediately.
-    //
-    // Ephemeral: in-flight Jobs finish their one build naturally
-    // (worker doesn't know the CR is being deleted).
-    //
-    // Manifest: in-flight Jobs are LONG-LIVED (loop for multiple
-    // builds). ownerRef GC will delete them, which sends SIGTERM,
-    // which the worker handles gracefully (acquire_many on the
-    // build semaphore → finish in-flight → exit). Proper graceful
-    // drain (DrainExecutor each manifest pod first) is P0505's job
-    // — this is the crude path for now.
-    // TODO(P0505): DrainExecutor manifest Jobs before finalizer
-    // removal, same as the STS path does for STS pods.
-    //
-    // If an operator wants to interrupt in-flight builds, they can
-    // `kubectl delete jobs -l rio.build/pool=X` separately.
-    let _ = ns;
-    info!(builderpool = %name, sizing = ?wp.spec.sizing,
-          "cleanup: Job-mode pool; ownerRef GC handles Jobs");
+    info!(builderpool = %wp.name_any(), sizing = ?wp.spec.sizing,
+          "cleanup: ownerRef GC handles Jobs");
     Ok(Action::await_change())
 }
 /// Requeue policy on error. Transient (Kube, Scheduler) →

@@ -1039,19 +1039,19 @@ let
               "-o jsonpath='{.spec.nodeName}'"
           ).strip()
           worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
+          # find + non-empty-procs check atomically: one-shot workers
+          # tear down the cgroup fast enough that a separate
+          # `succeed(wc -l < $p/cgroup.procs)` after the find can hit
+          # ENOENT. `grep -q .` (NOT `test -s` — cgroupfs st_size is 0)
+          # retries until the cgroup exists WITH procs; 2>/dev/null
+          # makes the gone-already case a clean retry.
           cgroup_path = worker_vm.wait_until_succeeds(
-              "find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
-              "-print -quit 2>/dev/null | grep .",
+              "p=$(find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
+              "-print -quit 2>/dev/null) && "
+              'grep -q . "$p/cgroup.procs" 2>/dev/null && echo "$p"',
               timeout=120,
           ).strip()
-          procs = int(worker_vm.succeed(
-              f"wc -l < {cgroup_path}/cgroup.procs"
-          ).strip())
-          assert procs > 0, (
-              f"cgroup.procs empty ({cgroup_path}) — build not actually "
-              f"running in the cgroup; kill-on-teardown assert vacuous"
-          )
-          print(f"build-timeout: cgroup={cgroup_path}, procs={procs}")
+          print(f"build-timeout: cgroup={cgroup_path} (procs non-empty)")
 
           # ── Assertion 2: cgroup GONE (kill-on-teardown fired). ──────
           # Kernel rejects rmdir on non-empty cgroup (EBUSY), so gone ⇒
@@ -1079,8 +1079,8 @@ let
                   f"k3s kubectl -n ${nsBuilders} logs {wp} --since=2m "
                   "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
               )
-              print(f"build-timeout DIAG: procs_after={procs_after} "
-                    f"(was {procs}), build_id={build_id}")
+              print(f"build-timeout DIAG: procs_after={procs_after}, "
+                    f"build_id={build_id}")
               raise
           print(f"build-timeout: cgroup {cgroup_path} removed "
                 f"(builder killed, rmdir succeeded)")

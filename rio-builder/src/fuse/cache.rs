@@ -241,6 +241,7 @@ impl Cache {
         // node storage cost >1s per write under load (I-141: ~10s wasted
         // per build).
         //
+        // r[impl builder.fuse.cache-ephemeral-memory]
         // :memory: with a pool: each pooled connection would be a
         // SEPARATE in-memory DB. Pin to one connection and disable
         // idle/lifetime reaping (closing it would drop the DB and lose
@@ -712,6 +713,7 @@ mod tests {
     /// Index round-trips across the pinned single :memory: connection.
     /// Guards against a future refactor that lets the pool open a second
     /// :memory: connection (which would be a separate, empty DB).
+    // r[verify builder.fuse.cache-ephemeral-memory]
     #[tokio::test]
     async fn test_cache_insert_and_contains() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
