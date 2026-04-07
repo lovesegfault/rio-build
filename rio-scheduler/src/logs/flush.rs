@@ -92,7 +92,7 @@ impl LogFlusher {
     /// `JoinHandle` is returned — callers never abort this task
     /// directly, and the previous handle was always `let _ =`-dropped.
     pub fn spawn(self, mut flush_rx: mpsc::Receiver<FlushRequest>) {
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("log-flusher", async move {
             let mut tick = tokio::time::interval(PERIODIC_FLUSH_INTERVAL);
             // Skip-behind: if a flush takes > 30s (shouldn't happen, but
             // S3 tail latencies exist), don't fire N missed ticks in a burst.

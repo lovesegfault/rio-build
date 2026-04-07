@@ -627,7 +627,7 @@ impl DagActor {
         // Skip if no persister configured (tests without PG).
         if self.event_persist_tx.is_some() {
             let pool = self.db.pool().clone();
-            tokio::spawn(async move {
+            rio_common::task::spawn_monitored("event-log-gc", async move {
                 if let Err(e) = sqlx::query("DELETE FROM build_event_log WHERE build_id = $1")
                     .bind(build_id)
                     .execute(&pool)
