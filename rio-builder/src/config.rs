@@ -92,17 +92,16 @@ pub(crate) struct Config {
     /// a stalled fetch blocks a fuser thread, and a few stalls freeze the
     /// whole mount.
     ///
-    /// 60s, not the previous 180s rationale ("let slow-but-alive fetches
-    /// refresh `last_success` so `wall_clock_trip` doesn't false-open"):
-    /// on a fresh ephemeral builder there IS no `last_success` (it starts
-    /// `None` and only flips on first cache hit), so `wall_clock_trip`
-    /// can't fire and only the consecutive-failure threshold is live.
-    /// I-165: 600s here meant ~3 paths resolve per 600s when all fuser
-    /// threads are parked behind a saturated store. 60s × 5 threshold
-    /// failures = 300s to circuit-open, matching `GRPC_STREAM_TIMEOUT`;
-    /// detached warm-stat threads (dropped when the warm deadline or a
-    /// pre-cgroup cancel fires) unpark within 60s instead of 600s.
-    /// Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
+    /// I-211: this is an IDLE bound — 60s without a stream message — not
+    /// a wall-clock bound on the whole fetch. A stuck store (no chunks
+    /// arriving) still trips at 60s; a healthy store streaming a 2.9 GB
+    /// NAR completes regardless of total duration. Preserves the I-165
+    /// circuit-breaker tuning: a genuinely stalled fetch fails at 60s, so
+    /// 60s × 5 threshold failures = 300s to circuit-open (matching
+    /// `GRPC_STREAM_TIMEOUT`), and detached warm-stat threads unpark
+    /// within 60s. Pre-I-211, the wall-clock bound aborted a 2.9 GB
+    /// `clang-21.1.8-debug` mid-stream → daemon EIO → build failure on a
+    /// healthy store. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
     pub(crate) fuse_fetch_timeout_secs: u64,
     pub(crate) overlay_base_dir: PathBuf,
     pub(crate) metrics_addr: std::net::SocketAddr,

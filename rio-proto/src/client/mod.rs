@@ -376,15 +376,39 @@ pub async fn collect_nar_stream(
 ///
 /// On error, `w` may have been partially written — caller is responsible
 /// for truncating/discarding the spool before retry.
+///
+/// `idle_timeout`: when `Some`, bounds the time between successive stream
+/// messages — a stalled store (no chunks arriving) trips at the timeout,
+/// but a healthy-but-slow store (steady chunks) completes regardless of
+/// total NAR size. `None` = unbounded (caller wraps the whole call).
 pub async fn collect_nar_stream_to_writer(
     stream: &mut Streaming<GetPathResponse>,
     max_size: u64,
+    idle_timeout: Option<Duration>,
     w: &mut (impl AsyncWrite + Unpin),
 ) -> Result<(Option<PathInfo>, u64), NarCollectError> {
     let mut info = None;
     let mut written: u64 = 0;
 
-    while let Some(msg) = stream.message().await? {
+    loop {
+        // r[impl builder.fuse.fetch-progress-timeout]
+        // I-211: per-message idle timeout. Each `stream.message()` is a
+        // fresh deadline; receiving any message (Info or NarChunk) is
+        // progress. A wall-clock bound on the whole loop would conflate
+        // "stuck" with "large" — a 2.9 GB clang-debug NAR cannot complete
+        // in 60s even on a healthy 30 MB/s store, but it never goes 60s
+        // without yielding a 256 KiB chunk.
+        let next = match idle_timeout {
+            Some(t) => tokio::time::timeout(t, stream.message())
+                .await
+                .map_err(|_| {
+                    NarCollectError::Stream(tonic::Status::deadline_exceeded(format!(
+                        "GetPath stream idle for {t:?} (no chunk received)"
+                    )))
+                })??,
+            None => stream.message().await?,
+        };
+        let Some(msg) = next else { break };
         match msg.msg {
             Some(get_path_response::Msg::Info(i)) => info = Some(i),
             Some(get_path_response::Msg::NarChunk(chunk)) => {
@@ -670,27 +694,29 @@ pub async fn get_path_nar_to_file(
             })?,
         );
     }
-    let fut = async {
-        let mut stream = match client.get_path(req).await {
-            Ok(resp) => resp.into_inner(),
-            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
-            Err(status) => return Err(NarCollectError::Stream(status)),
-        };
-        let (info, _written) =
-            collect_nar_stream_to_writer(&mut stream, max_nar_size, spool).await?;
-        match info {
-            Some(raw) => {
-                let validated = ValidatedPathInfo::try_from(raw)?;
-                Ok(Some(validated))
-            }
-            None => Ok(None),
+    // I-211: `timeout` is now an IDLE bound, not a wall-clock bound on the
+    // whole fetch. It applies twice: (1) the initial RPC (covers connect +
+    // server-side first-response — a hung store still trips at 60s); (2)
+    // each subsequent `stream.message()` inside the collector. A 2.9 GB
+    // NAR completes as long as the store yields a chunk every <`timeout`.
+    let mut stream = match tokio::time::timeout(timeout, client.get_path(req)).await {
+        Ok(Ok(resp)) => resp.into_inner(),
+        Ok(Err(status)) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Ok(Err(status)) => return Err(NarCollectError::Stream(status)),
+        Err(_) => {
+            return Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
+                format!("GetPath({store_path}) initial response timed out after {timeout:?}"),
+            )));
         }
     };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(r) => r,
-        Err(_) => Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
-            format!("GetPath({store_path}) timed out after {timeout:?}"),
-        ))),
+    let (info, _written) =
+        collect_nar_stream_to_writer(&mut stream, max_nar_size, Some(timeout), spool).await?;
+    match info {
+        Some(raw) => {
+            let validated = ValidatedPathInfo::try_from(raw)?;
+            Ok(Some(validated))
+        }
+        None => Ok(None),
     }
 }
 

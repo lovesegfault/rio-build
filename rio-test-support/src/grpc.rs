@@ -8,8 +8,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -75,6 +76,12 @@ pub struct MockStore {
     /// Whether `get_path_gate` is armed. When false, `GetPath` ignores the
     /// gate (backwards-compatible with existing tests).
     pub get_path_gate_armed: Arc<AtomicBool>,
+    /// Per-NarChunk delay (millis) injected in `GetPath`'s stream. 0 = no
+    /// delay. For I-211 progress-based timeout tests: with a multi-chunk
+    /// NAR, `delay × chunk_count > idle_timeout` proves the fetch
+    /// completes; `delay > idle_timeout` proves the per-chunk timeout
+    /// trips on the first stalled chunk.
+    pub get_path_chunk_delay_ms: Arc<AtomicU64>,
     /// If true, `content_lookup` hangs indefinitely (awaits a Notify
     /// that never fires). For scheduler CA-compare timeout tests:
     /// proves the `tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, ...)`
@@ -155,6 +162,7 @@ impl Default for MockStore {
             get_path_garbage: Arc::default(),
             get_path_gate: Arc::new(tokio::sync::Notify::new()),
             get_path_gate_armed: Arc::default(),
+            get_path_chunk_delay_ms: Arc::default(),
             content_lookup_hang: Arc::default(),
             fail_content_lookup: Arc::default(),
             content_lookup_calls: Arc::default(),
@@ -527,9 +535,14 @@ impl StoreService for MockStore {
             return Err(Status::not_found(format!("not found: {store_path}")));
         }
         let entry = self.paths.read().unwrap().get(&store_path).cloned();
+        let chunk_delay = self.get_path_chunk_delay_ms.load(Ordering::SeqCst);
         match entry {
             Some((info, nar)) => {
-                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                // Channel depth 1 (not 4): with `chunk_delay > 0` the
+                // sender must not race ahead of the receiver, or the
+                // delay is masked by buffered chunks. Depth-1 backpressure
+                // makes each delay observable as a true inter-recv gap.
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tokio::spawn(async move {
                     let _ = tx
                         .send(Ok(types::GetPathResponse {
@@ -538,6 +551,9 @@ impl StoreService for MockStore {
                         .await;
                     // Send NAR in 64 KiB chunks (matches real store)
                     for chunk in nar.chunks(64 * 1024) {
+                        if chunk_delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(chunk_delay)).await;
+                        }
                         let _ = tx
                             .send(Ok(types::GetPathResponse {
                                 msg: Some(types::get_path_response::Msg::NarChunk(chunk.to_vec())),

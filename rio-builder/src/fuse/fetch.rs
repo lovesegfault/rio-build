@@ -598,7 +598,6 @@ pub(super) async fn fetch_chunks_to_spool(
     max_size: u64,
     spool: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<u64, NarCollectError> {
-    let n_chunks = chunks.len();
     let concurrency = concurrency.max(1);
     let fut = async {
         // Per-chunk fetch (with transient retry) as a closure so the
@@ -664,7 +663,22 @@ pub(super) async fn fetch_chunks_to_spool(
 
         let mut written: u64 = 0;
         let mut first_err: Option<NarCollectError> = None;
-        while let Some(r) = in_flight.next().await {
+        // r[impl builder.fuse.fetch-progress-timeout]
+        // I-211: `timeout` bounds the gap between chunk completions, not
+        // the whole fan-out. With K=CHUNK_FETCH_CONCURRENCY in flight, "no
+        // chunk completed in `timeout`" means all K stalled — same
+        // store-health signal the wall-clock bound was meant to detect,
+        // without aborting healthy multi-GB fetches mid-stream.
+        loop {
+            let r = match tokio::time::timeout(timeout, in_flight.next()).await {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
+                        format!("GetChunk fan-out idle for {timeout:?} (no chunk completed)"),
+                    )));
+                }
+            };
             match r {
                 Ok(bytes) if first_err.is_none() => {
                     let new_len = written.saturating_add(bytes.len() as u64);
@@ -701,14 +715,9 @@ pub(super) async fn fetch_chunks_to_spool(
             return Err(e);
         }
         spool.flush().await?;
-        Ok(written)
+        Ok::<_, NarCollectError>(written)
     };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(r) => r,
-        Err(_) => Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
-            format!("GetChunk×{n_chunks} timed out after {timeout:?}"),
-        ))),
-    }
+    fut.await
 }
 
 /// Drain one `GetChunk` server-stream into a `Vec<u8>`. The store sends
@@ -844,12 +853,14 @@ fn fetch_extract_insert_with(
 
     tracing::debug!(store_path = %store_path, "fetching from remote store");
 
-    // Fetch NAR data via gRPC (async bridged to sync). Timeout bounds the
-    // entire fetch (initial call + stream drain) — a stalled store would
-    // otherwise block this FUSE thread forever, and a few stalls exhaust
-    // the FUSE thread pool and freeze the whole mount. Uses `fetch_timeout`
-    // (60s default from worker.toml), NOT `GRPC_STREAM_TIMEOUT` (300s) —
-    // FUSE is the build-critical path; uploads get the longer deadline.
+    // Fetch NAR data via gRPC (async bridged to sync). `fetch_timeout`
+    // (60s default from worker.toml) is an IDLE bound — it applies to the
+    // initial RPC and to each subsequent stream message, NOT the whole
+    // fetch wall-clock (I-211). A stalled store still trips at 60s and
+    // unparks this FUSE thread; a healthy store streaming a 2.9 GB NAR
+    // completes regardless of total duration. NOT `GRPC_STREAM_TIMEOUT`
+    // (300s) — FUSE is the build-critical path; uploads get the longer
+    // deadline.
     //
     // Transient errors (Unavailable/Unknown — store pod restarting,
     // transport disconnect) are retried with backoff: see RETRY_BACKOFF.
@@ -1708,6 +1719,82 @@ mod tests {
 
         let err = result.expect_err("expected Err(EIO) from NAR parse failure");
         assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
+    }
+
+    /// I-211: a fetch whose total wall-clock exceeds `fetch_timeout`
+    /// completes as long as every inter-chunk gap is below the timeout.
+    /// 5 chunks × 200ms = 1s total against a 500ms idle bound — pre-I-211
+    /// the 500ms wall-clock wrapper aborted at chunk 2-3 → EIO.
+    // r[verify builder.fuse.fetch-progress-timeout]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_idle_timeout_slow_but_progressing_ok() {
+        let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        // 320 KiB payload → 5+ NarChunks at MockStore's 64 KiB stride.
+        let payload = vec![0xab; 320 * 1024];
+        let basename = test_store_basename("i211-slow");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(&payload);
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+        store.get_path_chunk_delay_ms.store(200, Ordering::SeqCst);
+
+        let idle = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache, &clients, &rt, idle, &basename)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        assert!(
+            matches!(result, Ok(None)),
+            "I-211: total > idle timeout but per-chunk gap < idle timeout MUST succeed; got: {result:?}"
+        );
+        assert!(
+            started.elapsed() > idle,
+            "test precondition: total fetch time ({:?}) must exceed idle timeout ({idle:?}) \
+             or this isn't proving the wall-clock bound is gone",
+            started.elapsed()
+        );
+        let local = dir.path().join(test_store_basename("i211-slow"));
+        let content = std::fs::read(&local).expect("read extracted file");
+        assert_eq!(content.len(), payload.len());
+    }
+
+    /// I-211: a stream that goes silent for longer than `fetch_timeout`
+    /// trips the idle bound on the FIRST stalled gap → DeadlineExceeded
+    /// (non-transient) → EIO without retry. This is the I-165 stuck-store
+    /// behavior the idle bound preserves.
+    // r[verify builder.fuse.fetch-progress-timeout]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_idle_timeout_stalled_chunk_eio() {
+        let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
+
+        let basename = test_store_basename("i211-stall");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(&vec![0xcd; 128 * 1024]);
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+        // 800ms gap > 300ms idle bound → first NarChunk after Info trips.
+        store.get_path_chunk_delay_ms.store(800, Ordering::SeqCst);
+
+        let idle = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache, &clients, &rt, idle, &basename)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        let err = result.expect_err("expected Err(EIO) from idle timeout");
+        assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
+        // Tripped on the first gap, not after multiple — bound is per-chunk.
+        // Allow slack for CI variance but assert it's well under the 800ms
+        // gap (i.e., the receiver gave up, not the sender).
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "idle timeout should trip near 300ms, took {:?}",
+            started.elapsed()
+        );
     }
 
     /// Second prefetch of the same path returns PrefetchSkip::AlreadyCached
