@@ -2,7 +2,7 @@
 //!
 //! Extracted from lib.rs — this is the glue between main.rs's event loop
 //! and the executor/FUSE/upload subsystems. `build_heartbeat_request`
-//! snapshots the FUSE cache bloom filter; `spawn_build_task` wraps
+//! assembles capability/resource data; `spawn_build_task` wraps
 //! `executor::execute_build` with ACK + CompletionReport + panic-catcher.
 
 use std::collections::HashMap;

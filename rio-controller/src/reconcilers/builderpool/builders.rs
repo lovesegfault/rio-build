@@ -23,7 +23,7 @@ pub(super) fn labels(wp: &BuilderPool) -> BTreeMap<String, String> {
 }
 
 /// Convert `BuilderPool` → `ExecutorPodParams`. The builder-specific
-/// tuning knobs (size_class, bloom, daemon_timeout, fuse_passthrough)
+/// tuning knobs (size_class, daemon_timeout, fuse_passthrough)
 /// become `extra_env` entries — keeps them out of the shared params
 /// struct where the fetcher reconciler would have to supply dummies.
 fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) -> ExecutorPodParams {

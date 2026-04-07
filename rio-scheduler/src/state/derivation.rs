@@ -464,9 +464,9 @@ pub struct DerivationState {
     /// Realized output store paths (filled on completion).
     pub output_paths: Vec<String>,
     /// Expected output paths (from the proto node at merge time).
-    /// Used for: cache-check (merge.rs), transfer-cost scoring, and
-    /// as the closure approximation for locality (children's
-    /// expected_output_paths = parent's inputs).
+    /// Used for: cache-check (merge.rs), and prefetch-hint closure
+    /// approximation (children's expected_output_paths = parent's
+    /// inputs; see `approx_input_closure`).
     pub expected_output_paths: Vec<String>,
     /// Estimated build duration (from Estimator). Set at merge time;
     /// never updated after. The critical-path priority uses this;

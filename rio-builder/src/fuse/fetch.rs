@@ -535,8 +535,7 @@ pub fn prefetch_path_blocking(
     fetch_timeout: Duration,
     store_basename: &str,
 ) -> Result<Option<PrefetchSkip>, Errno> {
-    // Fast-path: already cached. Bloom should have caught this
-    // scheduler-side but stale filters happen.
+    // Fast-path: already cached (concurrent prefetch or earlier hint).
     match cache.get_path(store_basename) {
         Ok(Some(_)) => {
             // I-110c: drop any primed hint — we won't fetch.

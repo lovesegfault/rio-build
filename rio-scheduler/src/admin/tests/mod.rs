@@ -533,9 +533,9 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     let _ev =
         merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
 
-    // ONE of them got it. With two equal-score workers (no bloom,
-    // both 0/2 load), best_executor's tiebreak is HashMap iteration
-    // order → nondeterministic. Poll both with try_recv to find which.
+    // ONE of them got it. With two equal-score workers (both 0/2
+    // load), best_executor's tiebreak is HashMap iteration order →
+    // nondeterministic. Poll both with try_recv to find which.
     let (first_worker, other_rx) = if let Ok(msg) = rx1.try_recv() {
         assert!(matches!(
             msg.msg,

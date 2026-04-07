@@ -896,12 +896,6 @@ impl DagActor {
         // A few seconds of head-start on a multi-minute fetch
         // is the win.
         //
-        // Same closure approximation as best_executor's bloom
-        // scoring (approx_input_closure) — if scoring said "w1
-        // has most of these," the hint should be "the few w1
-        // DOESN'T have." Consistent approximation = consistent
-        // filtering.
-        //
         // Best-effort: try_send, failure logs debug not warn
         // (hint not contract). If the channel is full (worker's
         // recv loop busy), the assignment that follows will
@@ -1123,24 +1117,13 @@ impl DagActor {
     /// Send a PrefetchHint for the chosen worker to warm its FUSE
     /// cache. Best-effort: `try_send`, failure logs at debug.
     ///
-    /// Same closure approximation as [`best_executor`]'s scoring
-    /// (both call `approx_input_closure`). Bloom-filtered against
-    /// the worker's last heartbeat filter: skip paths the worker
-    /// PROBABLY has. False positives (bloom says yes, worker
-    /// doesn't have it) mean we skip a hint we should have sent
-    /// — the build's FUSE op fetches it on-demand. False negatives
-    /// are impossible (bloom never false-negative on a positive
-    /// insert). So we only ever UNDER-hint, never OVER-hint.
-    /// Under-hinting is a missed optimization; over-hinting would
-    /// waste worker bandwidth on paths it already has.
+    /// Paths come from [`approx_input_closure`] (DAG children's
+    /// expected outputs), truncated to `MAX_PREFETCH_PATHS`. Under
+    /// ephemeral one-build-per-pod the worker's cache is always
+    /// empty, so the full closure is always sent — no per-worker
+    /// filtering. Empty closure (leaf derivation) = don't send.
     ///
-    /// No bloom = send everything (pessimistic, same as scoring).
-    /// Empty hint (everything filtered) = don't send the message
-    /// at all (saves one try_send for the common case where
-    /// best_executor picked a warm worker — that's the point of
-    /// bloom-locality scoring).
-    ///
-    /// [`best_executor`]: crate::assignment::best_executor
+    /// [`approx_input_closure`]: crate::assignment::approx_input_closure
     fn send_prefetch_hint(&self, executor_id: &ExecutorId, drv_hash: &DrvHash) {
         let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
         if input_paths.is_empty() {

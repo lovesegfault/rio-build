@@ -134,7 +134,7 @@ pub struct ExecutorPodParams {
     // marker here once ADR-019 is in tracey spec_include.
     pub read_only_root_fs: bool,
     /// Extra env vars appended after the base set. Builders pass
-    /// their tuning knobs (bloom, daemon_timeout, fuse_passthrough,
+    /// their tuning knobs (daemon_timeout, fuse_passthrough,
     /// size_class) here so the shared builder doesn't need fields
     /// for every BuilderPool-only knob.
     pub extra_env: Vec<EnvVar>,

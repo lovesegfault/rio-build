@@ -192,13 +192,11 @@ async fn main() -> anyhow::Result<()> {
         fuse_fetch_timeout,
     )?;
 
-    // Prefetch concurrency limit. Separate from build_semaphore —
-    // prefetch shouldn't compete with the build for slots. 8 is
-    // conservative: each holds a tokio blocking-pool thread (default
-    // pool is 512, so no starvation concern) AND pins an in-flight
-    // gRPC stream to the store (which is what we're bounding —
-    // don't DDoS the store with 100 parallel NARs when the scheduler
-    // sends a big hint list).
+    // Prefetch concurrency limit. 8 is conservative: each holds a
+    // tokio blocking-pool thread (default pool is 512, so no
+    // starvation concern) AND pins an in-flight gRPC stream to the
+    // store (which is what we're bounding — don't DDoS the store with
+    // 100 parallel NARs when the scheduler sends a big hint list).
     let prefetch_sem = Arc::new(Semaphore::new(8));
 
     info!(

@@ -202,7 +202,7 @@ pub struct Cache {
     ///   `Some`  → JIT armed: ONLY names in the map are fetched.
     ///
     /// Lives on `Cache` (not `NixStoreFs`) for the same reason as
-    /// `manifest_hints` and `bloom`: `NixStoreFs` is consumed by
+    /// `manifest_hints`: `NixStoreFs` is consumed by
     /// `fuser::spawn_mount2`; the executor only holds `Arc<Cache>`.
     /// Not thread-local: FUSE callbacks run on `fuser`'s own thread
     /// pool, not the executor's tokio worker.
@@ -418,9 +418,6 @@ impl Cache {
     /// the file is gone from disk (external rm, interrupted eviction).
     /// Best-effort: logs on failure but doesn't propagate — if the DELETE
     /// fails, the next fetch will `INSERT OR REPLACE` over it anyway.
-    ///
-    /// Does NOT touch the bloom filter (bloom doesn't support deletion;
-    /// `insert()` already documents stale-positive tolerance).
     pub fn remove_stale(&self, store_path: &str) {
         let pool = &self.pool;
         if let Err(e) = self.runtime.block_on(async {

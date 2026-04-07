@@ -251,8 +251,7 @@ let
 
           # PrefetchHint: the collector (rio-root) has 4 DAG children.
           # When root dispatches, approx_input_closure returns the 4
-          # leaf output paths. Worker bloom filter is cold (first hint
-          # for that worker) → hint sent with ≥1 path. paths_sent is
+          # leaf output paths → hint sent with ≥1 path. paths_sent is
           # tighter than hints_sent: an empty-hint bug (message sent,
           # 0 paths) would pass hints≥1 but fail paths≥1. (phase3a:485)
           assert_metric_ge(${gatewayHost}, 9091,
