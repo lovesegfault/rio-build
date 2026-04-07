@@ -52,7 +52,7 @@ impl StoreClients {
     /// max-message-size on both (chunks are ≤1 MiB but the headroom
     /// matches `connect_store`'s convention).
     pub fn from_channel(ch: Channel) -> Self {
-        let max = rio_proto::max_message_size();
+        let max = rio_common::grpc::max_message_size();
         Self {
             store: StoreServiceClient::new(ch.clone())
                 .max_decoding_message_size(max)

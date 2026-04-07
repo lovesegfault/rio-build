@@ -1,8 +1,9 @@
 //! gRPC client connection and streaming helpers.
 //!
 //! - Connection: `connect_*` build `"http(s)://{addr}"` from a `host:port`
-//!   string, apply global TLS config if [`init_client_tls`] was called,
-//!   connect, and apply [`max_message_size`](crate::max_message_size).
+//!   string, apply the process-global TLS config (see
+//!   [`rio_common::grpc::init_client_tls`]), connect, and apply
+//!   [`max_message_size`].
 //! - NAR streaming: [`collect_nar_stream`] drains `GetPath` responses;
 //!   [`chunk_nar_for_put`] builds a lazy `PutPath` request stream.
 
@@ -12,13 +13,14 @@ pub use balance::BalancedChannel;
 pub mod retry;
 pub use retry::{RetryError, connect_with_retry};
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
+use rio_common::grpc::{client_tls, max_message_size};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
-use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::transport::Channel;
 
 use crate::StoreServiceClient;
 use crate::types::{
@@ -34,48 +36,13 @@ use crate::validated::ValidatedPathInfo;
 /// negligible latency impact.
 pub const NAR_CHUNK_SIZE: usize = 256 * 1024;
 
-/// Process-global client TLS config. Set once via [`init_client_tls`] in
-/// each binary's `main()` AFTER config load but BEFORE any `connect_*`.
-///
-/// Why a global instead of threading `ClientTlsConfig` through every
-/// connect call: the controller's reconcilers connect lazily per-reconcile
-/// (`Ctx` holds only `String` addrs — see `rio-controller/src/reconcilers/
-/// mod.rs`). Threading TLS config through ~11 call sites + 4 wrapper fns
-/// is invasive. A OnceLock initialized once in main() is the minimal
-/// change — and TLS config IS process-global (same cert for all outgoing
-/// connections; we don't vary it per target).
-///
-/// `None` in the OnceLock = plaintext (init_client_tls called with None,
-/// or never called at all). Both mean "TLS not configured."
-static CLIENT_TLS: OnceLock<Option<ClientTlsConfig>> = OnceLock::new();
-
-/// Set the process-wide client TLS config. Call ONCE in each binary's
-/// main(), after loading TlsConfig but before any `connect_*`.
-///
-/// `None` → plaintext (http://). `Some` → TLS (https:// + the given
-/// config). Calling twice is a silent no-op (OnceLock semantics) — the
-/// first call wins. Tests that need to re-init should use a fresh
-/// process (nextest's default) or accept the first-wins behavior.
-pub fn init_client_tls(cfg: Option<ClientTlsConfig>) {
-    // `let _`: set() returns Err if already set. Not an error —
-    // just means another call raced us (main-only → shouldn't
-    // happen) or tests re-init (first wins, fine).
-    let _ = CLIENT_TLS.set(cfg);
-}
-
-/// Crate-internal accessor for the global TLS config. Used by
-/// `balance.rs` to build per-endpoint channels with a domain_name
-/// override (connect to pod IP, verify against service SAN).
-pub(crate) fn client_tls() -> Option<ClientTlsConfig> {
-    CLIENT_TLS.get().and_then(|o| o.as_ref()).cloned()
-}
-
 /// Connect to a gRPC endpoint at `host:port` and return a raw [`Channel`].
 ///
-/// Scheme and TLS wiring depend on the process-global [`CLIENT_TLS`]:
-/// set → `https://` + `.tls_config()`; unset → `http://` (plaintext).
-/// The global is initialized by [`init_client_tls`] in each binary's
-/// main; if main doesn't call it (or calls it with `None`), plaintext.
+/// Scheme and TLS wiring depend on the process-global
+/// [`rio_common::grpc::client_tls`]: set → `https://` + `.tls_config()`;
+/// unset → `http://` (plaintext). The global is initialized by
+/// [`rio_common::grpc::init_client_tls`] (via `bootstrap()` in each
+/// binary's main); if never called (or called with `None`), plaintext.
 ///
 /// 10s connect timeout: tonic's default is UNBOUNDED. A stale address
 /// (e.g., scheduler pod killed → replacement has new IP, but DNS TTL /
@@ -144,11 +111,11 @@ pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::trans
 }
 
 pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
-    // `get().and_then(|o| o.as_ref())` collapses both "OnceLock not
-    // initialized" and "initialized with None" to plaintext. Tests
-    // that never call init_client_tls stay plaintext.
-    let (scheme, tls) = match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
-        Some(tls) => ("https", Some(tls.clone())),
+    // `client_tls()` collapses both "OnceLock not initialized" and
+    // "initialized with None" to plaintext. Tests that never call
+    // init_client_tls stay plaintext.
+    let (scheme, tls) = match client_tls() {
+        Some(tls) => ("https", Some(tls)),
         None => ("http", None),
     };
     let mut ep = with_h2_throughput(
@@ -164,8 +131,8 @@ pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
 pub async fn connect_store(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
     Ok(StoreServiceClient::new(ch)
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size()))
+        .max_decoding_message_size(max_message_size())
+        .max_encoding_message_size(max_message_size()))
 }
 
 /// Lazy-connect store client with HTTP/2 keepalive.
@@ -190,8 +157,8 @@ pub async fn connect_store(addr: &str) -> anyhow::Result<StoreServiceClient<Chan
 /// config — never on connection failure (that's deferred to first RPC).
 /// So callers can drop their retry loop: the channel ALWAYS constructs.
 pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
-    let (scheme, tls) = match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
-        Some(tls) => ("https", Some(tls.clone())),
+    let (scheme, tls) = match client_tls() {
+        Some(tls) => ("https", Some(tls)),
         None => ("http", None),
     };
     let mut ep = with_h2_keepalive(
@@ -203,8 +170,8 @@ pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Chann
     }
     let ch = ep.connect_lazy();
     Ok(StoreServiceClient::new(ch)
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size()))
+        .max_decoding_message_size(max_message_size())
+        .max_encoding_message_size(max_message_size()))
 }
 
 /// Connect to the scheduler service (gateway-facing).
@@ -213,16 +180,16 @@ pub async fn connect_scheduler(
 ) -> anyhow::Result<crate::SchedulerServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
     Ok(crate::SchedulerServiceClient::new(ch)
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size()))
+        .max_decoding_message_size(max_message_size())
+        .max_encoding_message_size(max_message_size()))
 }
 
 /// Connect to the executor service (builder/fetcher-facing scheduler RPCs).
 pub async fn connect_executor(addr: &str) -> anyhow::Result<crate::ExecutorServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
     Ok(crate::ExecutorServiceClient::new(ch)
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size()))
+        .max_decoding_message_size(max_message_size())
+        .max_encoding_message_size(max_message_size()))
 }
 
 /// Connect to the admin service (controller + executor preStop).
@@ -234,8 +201,8 @@ pub async fn connect_executor(addr: &str) -> anyhow::Result<crate::ExecutorServi
 pub async fn connect_admin(addr: &str) -> anyhow::Result<crate::AdminServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
     Ok(crate::AdminServiceClient::new(ch)
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size()))
+        .max_decoding_message_size(max_message_size())
+        .max_encoding_message_size(max_message_size()))
 }
 
 /// Connect to the store admin service (scheduler's TriggerGC proxy).
@@ -249,8 +216,8 @@ pub async fn connect_store_admin(
 ) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
     Ok(crate::StoreAdminServiceClient::new(ch)
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size()))
+        .max_decoding_message_size(max_message_size())
+        .max_encoding_message_size(max_message_size()))
 }
 
 // ===========================================================================

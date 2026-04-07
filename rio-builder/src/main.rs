@@ -77,12 +77,7 @@ async fn main() -> anyhow::Result<()> {
         mut cfg,
         shutdown,
         otel_guard: _otel_guard,
-    } = rio_common::server::bootstrap(
-        "builder",
-        cli,
-        rio_proto::client::init_client_tls,
-        rio_builder::describe_metrics,
-    )?;
+    } = rio_common::server::bootstrap("builder", cli, rio_builder::describe_metrics)?;
 
     let (executor_id, systems, features) = resolve_executor_identity(
         std::mem::take(&mut cfg.executor_id),

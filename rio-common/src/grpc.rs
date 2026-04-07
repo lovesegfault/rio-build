@@ -1,4 +1,14 @@
-//! Shared helpers for gRPC client calls.
+//! Proto-agnostic gRPC helpers shared across rio binaries.
+//!
+//! **Layering rule:** anything that depends on `tonic` types but NOT on
+//! generated proto types belongs here — timeout wrappers, [`StatusExt`],
+//! [`check_bound`], the [`CLIENT_TLS`] OnceLock, [`max_message_size`], h2
+//! tuning, the shared retry predicate, backoff/jitter, `x-rio-*` metadata
+//! key constants. Anything that names a generated client or message type
+//! (`connect_store`, `BalancedChannel`, NAR stream chunk/collect) belongs
+//! in `rio-proto::client`. `rio-proto` depends on this crate, not the
+//! other way round, so `rio-controller` can take a backoff helper without
+//! pulling in the whole proto crate.
 //!
 //! Missing timeouts on gRPC calls are a systemic footgun in a distributed
 //! system: a hung store/scheduler causes cascading hangs in gateway sessions,
@@ -7,9 +17,11 @@
 
 use std::fmt::Display;
 use std::future::Future;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tonic::Status;
+use tonic::transport::ClientTlsConfig;
 
 /// Default timeout for metadata gRPC calls (QueryPathInfo, FindMissingPaths, etc.).
 ///
@@ -29,6 +41,74 @@ pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// At `MAX_NAR_SIZE` = 4 GiB and ~15 MB/s, a full transfer is ~270s. 300s
 /// gives headroom without being unbounded.
 pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Default max gRPC message size: 256 MiB.
+///
+/// Sized for `MAX_DAG_NODES`-scale SubmitBuild requests: hello-deep-1024x at
+/// 153,821 nodes serializes to ~120 MB (I-138). At the 1M-node cap, ~400 MB
+/// — operators submitting near that scale should raise
+/// `RIO_GRPC_MAX_MESSAGE_SIZE`. A streaming SubmitBuild would remove this
+/// coupling entirely (followup).
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Read the max message size from the `RIO_GRPC_MAX_MESSAGE_SIZE` environment
+/// variable, falling back to [`DEFAULT_MAX_MESSAGE_SIZE`] if not set or invalid.
+///
+/// Single underscore (not `__`): this is a direct env read, not figment.
+/// The double underscore is figment's nesting separator — misleading here.
+pub fn max_message_size() -> usize {
+    match std::env::var("RIO_GRPC_MAX_MESSAGE_SIZE") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(size) => size,
+            Err(_) => {
+                // Direct env read, pre-tracing-init — eprintln not warn!.
+                eprintln!(
+                    "warning: invalid RIO_GRPC_MAX_MESSAGE_SIZE={val:?}, expected bytes as a positive integer; defaulting to {DEFAULT_MAX_MESSAGE_SIZE}"
+                );
+                DEFAULT_MAX_MESSAGE_SIZE
+            }
+        },
+        Err(_) => DEFAULT_MAX_MESSAGE_SIZE,
+    }
+}
+
+/// Process-global client TLS config. Set once via [`init_client_tls`] in
+/// each binary's `main()` (via [`crate::server::bootstrap`]) AFTER config
+/// load but BEFORE any `connect_*`.
+///
+/// Why a global instead of threading `ClientTlsConfig` through every
+/// connect call: the controller's reconcilers connect lazily per-reconcile,
+/// holding only `String` addrs. Threading TLS config through ~11 call
+/// sites + 4 wrapper fns is invasive. A OnceLock initialized once in
+/// main() is the minimal change — and TLS config IS process-global (same
+/// cert for all outgoing connections; we don't vary it per target).
+///
+/// `None` in the OnceLock = plaintext (init_client_tls called with None,
+/// or never called at all). Both mean "TLS not configured."
+static CLIENT_TLS: OnceLock<Option<ClientTlsConfig>> = OnceLock::new();
+
+/// Set the process-wide client TLS config. Call ONCE in each binary's
+/// main(), after loading TlsConfig but before any `connect_*`.
+///
+/// `None` → plaintext (`http://`). `Some` → TLS (`https://` + the given
+/// config). Calling twice is a silent no-op (OnceLock semantics) — the
+/// first call wins. Tests that need to re-init should use a fresh
+/// process (nextest's default) or accept the first-wins behavior.
+pub fn init_client_tls(cfg: Option<ClientTlsConfig>) {
+    // `let _`: set() returns Err if already set. Not an error —
+    // just means another call raced us (main-only → shouldn't
+    // happen) or tests re-init (first wins, fine).
+    let _ = CLIENT_TLS.set(cfg);
+}
+
+/// Read the process-global client TLS config. `None` if [`init_client_tls`]
+/// was never called or was called with `None` (plaintext). Used by
+/// `rio-proto::client` to wire scheme + `.tls_config()` on each
+/// `connect_*`, and by `BalancedChannel` to build per-endpoint channels
+/// with a `domain_name` override.
+pub fn client_tls() -> Option<ClientTlsConfig> {
+    CLIENT_TLS.get().and_then(|o| o.as_ref()).cloned()
+}
 
 /// Timeout for `SubmitBuild`.
 ///
@@ -126,7 +206,9 @@ pub fn check_bound(field: &str, got: usize, max: usize) -> Result<(), Status> {
 /// s.parse().status_invalid("invalid UUID")?
 /// ```
 pub trait StatusExt<T> {
-    /// Map the error to `Status::internal("{ctx}: {e}")`.
+    /// Log the full error at `error!` and map to `Status::internal(ctx)`.
+    /// The runtime error text is NOT included in the returned status —
+    /// see [`internal`].
     fn status_internal(self, ctx: &str) -> Result<T, Status>;
     /// Map the error to `Status::invalid_argument("{ctx}: {e}")`.
     fn status_invalid(self, ctx: &str) -> Result<T, Status>;
@@ -134,11 +216,32 @@ pub trait StatusExt<T> {
 
 impl<T, E: Display> StatusExt<T> for Result<T, E> {
     fn status_internal(self, ctx: &str) -> Result<T, Status> {
-        self.map_err(|e| Status::internal(format!("{ctx}: {e}")))
+        self.map_err(|e| internal(ctx, e))
     }
     fn status_invalid(self, ctx: &str) -> Result<T, Status> {
         self.map_err(|e| Status::invalid_argument(format!("{ctx}: {e}")))
     }
+}
+
+/// Log the full error server-side and return `Status::internal(ctx)` —
+/// the developer-authored context string only.
+///
+/// `Status::internal` is server-fault; the underlying error text (sqlx
+/// connection strings, filesystem paths, backend SDK detail) is an
+/// operator concern, not a client one. Log it; don't ship it. `ctx` is
+/// hand-written at each call site and is safe to expose — it tells the
+/// client *which* operation failed without leaking *why*.
+///
+/// `status_invalid` deliberately does NOT scrub: `InvalidArgument` is
+/// client-fault, and the parse error tells the client what they sent
+/// wrong.
+///
+/// Prefer [`StatusExt::status_internal`] (`result.status_internal(ctx)?`)
+/// where the value is already a `Result`. This free fn is for match
+/// arms / `bail!` sites where the trait form is awkward.
+pub fn internal(ctx: &str, e: impl Display) -> Status {
+    tracing::error!(context = ctx, error = %e, "internal error");
+    Status::internal(ctx)
 }
 
 #[cfg(test)]
@@ -206,10 +309,12 @@ mod tests {
         assert_eq!(s.code(), tonic::Code::InvalidArgument);
         assert_eq!(s.message(), "bad field: parse failed");
 
+        // status_internal scrubs: error text logged, NOT in the message.
         let r: Result<(), std::io::Error> = Err(std::io::Error::other("boom"));
         let s = r.status_internal("write").unwrap_err();
         assert_eq!(s.code(), tonic::Code::Internal);
-        assert_eq!(s.message(), "write: boom");
+        assert_eq!(s.message(), "write");
+        assert!(!s.message().contains("boom"));
 
         // Ok passes through unchanged.
         let r: Result<u32, &str> = Ok(7);

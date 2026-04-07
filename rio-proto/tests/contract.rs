@@ -152,7 +152,7 @@ fn limits_are_reasonable() {
     // Lower this and SubmitBuild fails opaquely ("message too large").
     const {
         assert!(
-            rio_proto::DEFAULT_MAX_MESSAGE_SIZE >= 16 * 1024 * 1024,
+            rio_common::grpc::DEFAULT_MAX_MESSAGE_SIZE >= 16 * 1024 * 1024,
             "DEFAULT_MAX_MESSAGE_SIZE must fit nixpkgs DAG (~12MB + headroom)"
         )
     };

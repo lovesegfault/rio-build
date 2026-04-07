@@ -25,6 +25,7 @@ tokio-util = { workspace = true }
 # ±25% jitter in connect_with_retry's backoff.
 rand = { workspace = true }
 futures-util = { workspace = true }
+rio-common = { workspace = true }
 rio-nix = { workspace = true }
 tracing = { workspace = true }
 
@@ -37,8 +38,6 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 # Interceptor roundtrip test needs a real (non-noop) tracer to get
 # non-zero trace IDs, and the W3C propagator to register.
 opentelemetry_sdk = { workspace = true }
-# Contract tests check rio-common limits + check_bound.
-rio-common = { workspace = true }
 # connect_with_retry tests use paused-clock time (start_paused/advance).
 tokio = { workspace = true, features = ["test-util"] }
 

@@ -238,19 +238,11 @@ impl rio_common::server::HasCommonConfig for Config {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
-    // Store doesn't dial out via rio-proto (S3 has its own auth), so
-    // init_client_tls is a harmless no-op — the OnceLock gets set but
-    // never read. Passing it keeps all 5 bootstrap() calls uniform.
     let rio_common::server::Bootstrap::<Config> {
         cfg,
         shutdown,
         otel_guard: _otel_guard,
-    } = rio_common::server::bootstrap(
-        "store",
-        cli,
-        rio_proto::client::init_client_tls,
-        rio_store::describe_metrics,
-    )?;
+    } = rio_common::server::bootstrap("store", cli, rio_store::describe_metrics)?;
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
@@ -447,7 +439,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let max_msg_size = rio_proto::max_message_size();
+    let max_msg_size = rio_common::grpc::max_message_size();
 
     let addr = cfg.listen_addr.parse()?;
 

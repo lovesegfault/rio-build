@@ -5,15 +5,6 @@
 //! [`ValidatedPathInfo`](validated::ValidatedPathInfo) for proto→domain
 //! validation and [`interceptor`] for W3C traceparent propagation.
 
-/// Default max gRPC message size: 256 MiB.
-///
-/// Sized for `MAX_DAG_NODES`-scale SubmitBuild requests: hello-deep-1024x at
-/// 153,821 nodes serializes to ~120 MB (I-138). At the 1M-node cap, ~400 MB
-/// — operators submitting near that scale should raise
-/// `RIO_GRPC_MAX_MESSAGE_SIZE`. A streaming SubmitBuild would remove this
-/// coupling entirely (followup).
-pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
-
 /// gRPC initial-metadata key carrying the scheduler-assigned build_id
 /// on `SubmitBuild` responses. Server-streaming RPCs send initial
 /// metadata (headers) BEFORE any stream message, so the client has
@@ -52,27 +43,6 @@ pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
 /// path. See rio-common::hmac for the token format. Value is
 /// base64-encoded bytes (always ASCII).
 pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
-
-/// Read the max message size from the `RIO_GRPC_MAX_MESSAGE_SIZE` environment
-/// variable, falling back to [`DEFAULT_MAX_MESSAGE_SIZE`] if not set or invalid.
-///
-/// Single underscore (not `__`): this is a direct env read, not figment.
-/// The double underscore is figment's nesting separator — misleading here.
-pub fn max_message_size() -> usize {
-    match std::env::var("RIO_GRPC_MAX_MESSAGE_SIZE") {
-        Ok(val) => match val.parse::<usize>() {
-            Ok(size) => size,
-            Err(_) => {
-                // Direct env read, pre-tracing-init — eprintln not warn!.
-                eprintln!(
-                    "warning: invalid RIO_GRPC_MAX_MESSAGE_SIZE={val:?}, expected bytes as a positive integer; defaulting to {DEFAULT_MAX_MESSAGE_SIZE}"
-                );
-                DEFAULT_MAX_MESSAGE_SIZE
-            }
-        },
-        Err(_) => DEFAULT_MAX_MESSAGE_SIZE,
-    }
-}
 
 pub mod client;
 pub mod interceptor;

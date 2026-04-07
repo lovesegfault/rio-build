@@ -91,7 +91,7 @@ pub(super) async fn trigger_gc(
     );
 
     // Step 2: connect to store admin service. Same TLS config
-    // as connect_store (OnceLock CLIENT_TLS).
+    // as connect_store (OnceLock rio_common::grpc::CLIENT_TLS).
     let mut store_admin = rio_proto::client::connect_store_admin(store_addr)
         .await
         .map_err(|e| Status::unavailable(format!("store admin connect failed: {e}")))?;

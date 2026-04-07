@@ -41,7 +41,7 @@ use crate::handler::{ClientOptions, resolve_derivations_batch};
 pub const DEFAULT_MAX_TRANSITIVE_INPUTS: usize = 1_048_576;
 
 /// Process-global limit. Set once via [`init_max_transitive_inputs`] in main()
-/// AFTER config load. Same OnceLock pattern as `rio_proto::client::CLIENT_TLS`
+/// AFTER config load. Same OnceLock pattern as `rio_common::grpc::CLIENT_TLS`
 /// — threading this through `reconstruct_dag` + `resolve_derivation` +
 /// `try_cache_drv` (~18 call sites including tests) is invasive for a value
 /// that IS process-global (one DoS guard, not per-session policy).

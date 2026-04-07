@@ -366,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.validate()?;
     }
 
-    rio_proto::client::init_client_tls(rio_common::tls::load_client_tls(&cfg.tls)?);
+    rio_common::grpc::init_client_tls(rio_common::tls::load_client_tls(&cfg.tls)?);
 
     // Store-admin subcommands — dispatched AFTER config load (need
     // store_addr + TLS) but BEFORE the scheduler connect. `upstream`

@@ -52,7 +52,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// balance feed (Insert) and the health probe itself need to
 /// connect to pod IPs with the same TLS config.
 fn build_endpoint(addr: SocketAddr, tls_domain: &str) -> anyhow::Result<Endpoint> {
-    let ep = match super::client_tls() {
+    let ep = match rio_common::grpc::client_tls() {
         Some(tls) => {
             // domain_name overrides the SNI + SAN-verify domain.
             // The connect URI's host (the pod IP) is still what
@@ -348,8 +348,8 @@ pub async fn connect_scheduler_balanced(
     )
     .await?;
     let client = crate::SchedulerServiceClient::new(bc.channel())
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size());
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size());
     Ok((client, bc))
 }
 
@@ -369,8 +369,8 @@ pub async fn connect_executor_balanced(
     )
     .await?;
     let client = crate::ExecutorServiceClient::new(bc.channel())
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size());
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size());
     Ok((client, bc))
 }
 
@@ -399,8 +399,8 @@ pub async fn connect_store_admin_at(
     let ep = build_endpoint(addr, STORE_TLS_DOMAIN)?;
     let ch = ep.connect().await?;
     Ok(crate::StoreAdminServiceClient::new(ch)
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size()))
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size()))
 }
 
 /// Connect to rio-store via a health-aware balanced channel.
@@ -423,8 +423,8 @@ pub async fn connect_store_balanced(
     )
     .await?;
     let client = crate::StoreServiceClient::new(bc.channel())
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size());
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size());
     Ok((client, bc))
 }
 
@@ -446,8 +446,8 @@ pub async fn connect_admin_balanced(
     )
     .await?;
     let client = crate::AdminServiceClient::new(bc.channel())
-        .max_decoding_message_size(crate::max_message_size())
-        .max_encoding_message_size(crate::max_message_size());
+        .max_decoding_message_size(rio_common::grpc::max_message_size())
+        .max_encoding_message_size(rio_common::grpc::max_message_size());
     Ok((client, bc))
 }
 
@@ -456,7 +456,7 @@ mod tests {
     use super::*;
 
     /// Smoke: build_endpoint formats IPv4/v6 URIs correctly.
-    /// (No TLS in tests --- CLIENT_TLS is unset.)
+    /// (No TLS in tests --- `rio_common::grpc::CLIENT_TLS` is unset.)
     #[test]
     fn build_endpoint_formats_uri() {
         let v4: SocketAddr = "10.42.2.140:9001".parse().unwrap();

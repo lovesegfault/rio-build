@@ -240,18 +240,13 @@ async fn main() -> anyhow::Result<()> {
         cfg,
         shutdown,
         otel_guard: _otel_guard,
-    } = rio_common::server::bootstrap(
-        "gateway",
-        cli,
-        rio_proto::client::init_client_tls,
-        rio_gateway::describe_metrics,
-    )?;
+    } = rio_common::server::bootstrap("gateway", cli, rio_gateway::describe_metrics)?;
 
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
 
     // Process-global DoS cap. Set ONCE before any SSH session can
-    // call reconstruct_dag. Same OnceLock pattern as init_client_tls
+    // call reconstruct_dag. Same OnceLock pattern as CLIENT_TLS
     // — the alternative (threading through ~18 call sites) is
     // invasive for a value that IS process-wide.
     rio_gateway::translate::init_max_transitive_inputs(cfg.max_transitive_inputs);

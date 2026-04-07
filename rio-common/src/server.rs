@@ -18,7 +18,6 @@ use std::net::SocketAddr;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::ClientTlsConfig;
 use tonic_health::pb::health_server::{Health, HealthServer};
 
 use crate::config::ValidateConfig;
@@ -48,7 +47,6 @@ pub trait HasCommonConfig {
 /// let Bootstrap { cfg, shutdown, otel_guard: _otel_guard } =
 ///     rio_common::server::bootstrap(
 ///         "gateway", cli,
-///         rio_proto::client::init_client_tls,
 ///         rio_gateway::describe_metrics,
 ///     )?;
 /// ```
@@ -75,11 +73,10 @@ pub struct Bootstrap<C> {
 ///    use — dual ring+aws-lc-rs feature activation panics otherwise)
 /// 2. figment config load (defaults → TOML → env → CLI)
 /// 3. tracing init (returns OtelGuard, held by `Bootstrap`)
-/// 4. client TLS load + `init_tls` callback — `rio-common` is a leaf
-///    crate and can't name `rio_proto::client::init_client_tls`
-///    directly, so the caller passes it as a fn pointer. The
-///    `info!("client mTLS enabled")` log fires here, not at the call
-///    site, so it lands once regardless of which binary.
+/// 4. client TLS load + [`crate::grpc::init_client_tls`] — sets the
+///    process-global OnceLock that `rio-proto::client::connect_*`
+///    reads. The `info!("client mTLS enabled")` log fires here so it
+///    lands once regardless of which binary.
 /// 5. `ValidateConfig::validate` bounds check (after TLS load so a bad
 ///    TLS path surfaces BEFORE a bad required-field — TLS errors are
 ///    more actionable; a missing `scheduler_addr` often masks "wrong
@@ -91,7 +88,6 @@ pub struct Bootstrap<C> {
 pub fn bootstrap<C, A>(
     component: &'static str,
     cli: A,
-    init_tls: fn(Option<ClientTlsConfig>),
     describe_metrics: fn(),
 ) -> anyhow::Result<Bootstrap<C>>
 where
@@ -113,7 +109,7 @@ where
     if cfg.tls().is_configured() {
         tracing::info!("client mTLS enabled for outgoing gRPC");
     }
-    init_tls(client_tls);
+    crate::grpc::init_client_tls(client_tls);
 
     cfg.validate()?;
 

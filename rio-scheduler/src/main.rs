@@ -378,12 +378,7 @@ async fn main() -> anyhow::Result<()> {
         cfg,
         shutdown,
         otel_guard: _otel_guard,
-    } = rio_common::server::bootstrap(
-        "scheduler",
-        cli,
-        rio_proto::client::init_client_tls,
-        rio_scheduler::describe_metrics,
-    )?;
+    } = rio_common::server::bootstrap("scheduler", cli, rio_scheduler::describe_metrics)?;
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
@@ -693,7 +688,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start gRPC server
     let listen_addr: std::net::SocketAddr = cfg.listen_addr.parse()?;
-    let max_message_size = rio_proto::max_message_size();
+    let max_message_size = rio_common::grpc::max_message_size();
 
     // Server TLS: if configured, the main port requires client certs.
     // K8s gRPC probes can't do mTLS — so we spawn a SECOND server on
