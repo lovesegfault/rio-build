@@ -833,10 +833,11 @@ in
             # leaf EACCES → CrashLoop. Same escape hatch builderPool
             # uses (via privileged:true which implies hostUsers:true).
             hostUsers: true
-            # I-170: values.yaml defaults classes=[tiny(1Gi req),
-            # small(4Gi req)]. k3s-agent VM can't fit 1Gi alongside the
-            # builder pod. Override tiny to 128Mi — this test exercises
-            # routing/netpol, not memory sizing.
+            # I-170/I-208: values.yaml defaults classes mirror the
+            # 5-tier builder ladder (tiny=2cpu/2Gi … xlarge=128cpu).
+            # k3s-agent VM can't fit even tiny alongside the builder
+            # pod. Override to a single 128Mi tier — this test
+            # exercises routing/netpol, not memory sizing.
             classes:
               - name: tiny
                 resources:
