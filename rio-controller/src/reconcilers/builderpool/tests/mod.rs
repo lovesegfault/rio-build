@@ -1,18 +1,13 @@
 //! BuilderPool reconciler test suite.
 //!
-//! Shared fixtures (`test_wp`, `test_sts`, `test_ctx`) live here and
-//! are `pub(crate)` so sibling reconcilers (builderpoolset/tests) can
-//! reuse them. Tests mirror the
-//! prod seams in `builderpool/{builders,disruption,ephemeral,mod}.rs`:
+//! Shared fixtures (`test_wp`, `test_pod_spec`, `test_ctx`) live
+//! here and are `pub(crate)` so sibling reconcilers
+//! (builderpoolset/tests) can reuse them.
 //!
-//! - `builders_tests` — StatefulSet/PDB spec coverage + quantity
-//!   parsing (pure struct-to-struct, no K8s interaction)
-//! - `apply_tests` — mock-apiserver reconcile loop wiring (apply,
-//!   cleanup, migrate_finalizer ordering + SSA params)
+//! - `builders_tests` — Job pod-spec coverage + quantity parsing
+//!   (pure struct-to-struct, no K8s interaction)
 //! - `disruption_tests` — env-propagation via figment::Jail + the
 //!   `warn_on_spec_degrades` event-reason reachability tests
-//!
-//! Split from the 1716L monolith (P0396) following the P0386 pattern.
 
 use std::collections::BTreeMap;
 
@@ -20,8 +15,9 @@ use super::builders::*;
 use super::*;
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::fixtures::{ApiServerVerifier, Scenario, test_sched_addrs, test_store_addrs};
+use k8s_openapi::api::core::v1::PodSpec;
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-mod apply_tests;
 mod builders_tests;
 mod disruption_tests;
 mod ephemeral_tests;
@@ -37,18 +33,19 @@ pub(crate) fn test_wp() -> BuilderPool {
     crate::fixtures::test_builderpool("test-pool")
 }
 
-/// Shorthand for tests: builds with default scheduler/store
-/// addrs and replicas=Some(min). Use `build_statefulset`
-/// directly for tests that care about those params.
-pub(crate) fn test_sts(wp: &BuilderPool) -> StatefulSet {
-    build_statefulset(
+/// Shorthand for tests: builds the Job pod spec with default
+/// scheduler/store addrs. Tests that need a full Job object
+/// use `build_job` directly.
+pub(crate) fn test_pod_spec(wp: &BuilderPool) -> PodSpec {
+    let cache_gb = parse_quantity_to_gb(&wp.spec.fuse_cache_size).unwrap();
+    build_pod_spec(
         wp,
-        wp.controller_owner_ref(&()).unwrap(),
         &test_sched_addrs(),
         &test_store_addrs(),
-        Some(0),
+        cache_gb,
+        Quantity(wp.spec.fuse_cache_size.clone()),
+        None,
     )
-    .unwrap()
 }
 
 /// Build a `Ctx` wired to the mock apiserver client. Scheduler/

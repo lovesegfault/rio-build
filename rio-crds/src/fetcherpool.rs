@@ -14,8 +14,6 @@ use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::builderpool::Autoscaling;
-
 /// FetcherPool spec. The reconciler labels pods `rio.build/role:
 /// fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
 /// true`, stricter seccomp).
@@ -74,12 +72,6 @@ pub struct FetcherPoolSpec {
     /// build start (40+ ready simultaneously when chains hit FOD-phase
     /// together) but are short (~seconds each).
     pub max_concurrent: u32,
-
-    /// Autoscaling policy. Same struct as BuilderPool. The expected
-    /// `metric` is `"fodQueueDepth"` (`ClusterStatus.queued_fod_
-    /// derivations`); the controller's autoscaler validates and
-    /// surfaces unrecognized metrics in `.status.conditions`.
-    pub autoscaling: Autoscaling,
 
     /// Container image. Same binary as builders (`rio-builder`),
     /// different `RIO_EXECUTOR_KIND` env baked into the pod spec.
@@ -255,7 +247,6 @@ mod tests {
     fn classes_default_empty() {
         let yaml = r#"
             maxConcurrent: 8
-            autoscaling: {metric: fodQueueDepth, targetValue: 5}
             image: rio-fetcher:test
             systems: [x86_64-linux]
         "#;

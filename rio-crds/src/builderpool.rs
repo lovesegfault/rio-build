@@ -137,10 +137,6 @@ pub struct BuilderPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_class_cutoff_secs: Option<f64>,
 
-    /// Autoscaling policy. `target_value` is queued-derivations-per-
-    /// worker: scale up when `queued / active_executors > target`.
-    pub autoscaling: Autoscaling,
-
     /// K8s resource requests/limits for the worker container.
     /// `None` = unbounded (cluster default). Operators should set
     /// this — unbounded workers on a shared node is a noisy-
@@ -457,24 +453,6 @@ pub struct Replicas {
     pub max: i32,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct Autoscaling {
-    /// Metric driving scale decisions. Currently only "queueDepth"
-    /// (scheduler's ClusterStatus.queued_derivations). String not
-    /// enum so future metrics don't need a CRD version bump —
-    /// unknown metric is a RECONCILE error (surfaces in
-    /// .status.conditions), not a schema rejection.
-    #[serde(default = "default_metric")]
-    pub metric: String,
-    /// Scale up when `queued_derivations / active_executors >
-    /// target_value`. "5" means "scale up when there are more
-    /// than 5 queued builds per worker." Lower = more aggressive
-    /// scaling (more pods, lower queue latency, higher cost).
-    #[serde(default = "default_target")]
-    pub target_value: i32,
-}
-
 /// BuilderPool status — reconciler writes, operators read.
 ///
 /// `Default` because kube-rs initializes it to `None` → `Some(default())`
@@ -521,14 +499,6 @@ pub struct BuilderPoolStatus {
 
 fn default_fuse_cache_size() -> String {
     "50Gi".into()
-}
-
-fn default_metric() -> String {
-    "queueDepth".into()
-}
-
-fn default_target() -> i32 {
-    5
 }
 
 #[cfg(test)]
@@ -613,7 +583,7 @@ mod tests {
         let json = serde_json::to_string(&crd).expect("serializes");
         assert!(!json.contains("fuse_cache_size"));
         assert!(json.contains("fuseCacheSize"));
-        assert!(json.contains("targetValue"));
+        assert!(json.contains("maxConcurrent"));
         // P0223 seccomp: field + nested variant field both camelCase.
         assert!(json.contains("seccompProfile"));
         assert!(json.contains("localhostProfile"));

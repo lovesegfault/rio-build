@@ -26,8 +26,8 @@
 
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
-use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Sizing};
-use crate::reconcilers::common::sts::{SchedulerAddrs, StoreAddrs};
+use crate::crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
+use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs};
 
 /// Minimal BuilderPoolSpec with all CEL-required fields explicit
 /// and optional fields `None`. Used by [`test_builderpool`] and
@@ -45,10 +45,6 @@ pub fn test_workerpool_spec() -> BuilderPoolSpec {
         sizing: Sizing::Static,
         deadline_seconds: None,
         size_class_cutoff_secs: None,
-        autoscaling: Autoscaling {
-            metric: "queueDepth".into(),
-            target_value: 5,
-        },
         resources: None,
         fuse_cache_size: "50Gi".into(),
         fuse_threads: None,
@@ -100,115 +96,4 @@ pub fn test_store_addrs() -> StoreAddrs {
         balance_host: Some("store-headless".into()),
         balance_port: 9002,
     }
-}
-
-/// Convenience: a "do-nothing-extra" scenario list for apply().
-/// Service PATCH → StatefulSet PATCH → status PATCH, all 200.
-/// Use when testing "apply succeeds" without caring about the
-/// specific patch bodies (those are covered by the pure builder
-/// tests).
-///
-/// The STATEFULSET response body matters: apply() reads
-/// `.status.replicas` from it to patch BuilderPool.status.
-/// Service + status responses are ignored.
-///
-/// `sts_exists`: whether the STS GET (before PATCH) returns 200
-/// or 404. apply() uses this to decide whether to set
-/// spec.replicas (first-create) or omit it (autoscaler owns it).
-#[allow(dead_code)]
-pub fn apply_ok_scenarios(
-    pool_name: &str,
-    ns: &str,
-    sts_replicas: i32,
-    sts_exists: bool,
-) -> Vec<Scenario> {
-    let sts_name = crate::reconcilers::common::sts::sts_name(
-        pool_name,
-        crate::reconcilers::common::sts::ExecutorRole::Builder,
-    );
-    // Minimal Service: apply() doesn't read anything from the
-    // response. Empty-ish JSON that parses as a Service.
-    let svc_body = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": { "name": sts_name, "namespace": ns },
-    });
-    // StatefulSet WITH status: apply() reads
-    // applied.status.replicas + ready_replicas.
-    let sts_body = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "StatefulSet",
-        "metadata": { "name": sts_name, "namespace": ns },
-        "spec": { "replicas": sts_replicas },
-        "status": { "replicas": sts_replicas, "readyReplicas": sts_replicas },
-    });
-    // GET response: 404 "not found" or the same sts_body for 200.
-    // apply() uses get_opt which maps 404 → None → first-create.
-    let sts_get = if sts_exists {
-        Scenario::ok(
-            http::Method::GET,
-            Box::leak(format!("/statefulsets/{sts_name}").into_boxed_str()),
-            sts_body.to_string(),
-        )
-    } else {
-        // kube's get_opt parses the 404 body as a Status, not a
-        // StatefulSet. Standard K8s NotFound shape.
-        Scenario::k8s_error(
-            http::Method::GET,
-            Box::leak(format!("/statefulsets/{sts_name}").into_boxed_str()),
-            404,
-            "NotFound",
-            "",
-        )
-    };
-    // BuilderPool status patch response: also ignored by apply().
-    // Needs at least valid metadata + spec for the serde
-    // round-trip in kube's response decode.
-    let wp_body = serde_json::json!({
-        "apiVersion": "rio.build/v1alpha1",
-        "kind": "BuilderPool",
-        "metadata": { "name": pool_name, "namespace": ns },
-        "spec": {
-            "maxConcurrent": 1,
-            "autoscaling": { "metric": "queueDepth", "targetValue": 1 },
-            "fuseCacheSize": "1Gi",
-            "features": [],
-            "systems": ["x86_64-linux"],
-            "sizeClass": "small",
-            "image": "x",
-        },
-    });
-    // PDB response: ignored like Service. Minimal shape that parses.
-    let pdb_body = serde_json::json!({
-        "apiVersion": "policy/v1",
-        "kind": "PodDisruptionBudget",
-        "metadata": { "name": format!("{pool_name}-pdb"), "namespace": ns },
-    });
-    vec![
-        Scenario::ok(
-            http::Method::PATCH,
-            // Can't use format! in a const context, and Scenario
-            // takes &'static str. Leak — fine for tests, the
-            // process ends before the heap is reclaimed anyway.
-            Box::leak(format!("/services/{sts_name}").into_boxed_str()),
-            svc_body.to_string(),
-        ),
-        // PDB PATCH — after Service, before STS (apply() order).
-        Scenario::ok(
-            http::Method::PATCH,
-            Box::leak(format!("/poddisruptionbudgets/{pool_name}-pdb").into_boxed_str()),
-            pdb_body.to_string(),
-        ),
-        sts_get,
-        Scenario::ok(
-            http::Method::PATCH,
-            Box::leak(format!("/statefulsets/{sts_name}").into_boxed_str()),
-            sts_body.to_string(),
-        ),
-        Scenario::ok(
-            http::Method::PATCH,
-            Box::leak(format!("/builderpools/{pool_name}/status").into_boxed_str()),
-            wp_body.to_string(),
-        ),
-    ]
 }

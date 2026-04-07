@@ -488,7 +488,6 @@ mod tests {
                     "metadata": { "name": name, "namespace": "rio" },
                     "spec": {
                         "maxConcurrent": 1,
-                        "autoscaling": { "metric": "queueDepth", "targetValue": 1 },
                         "systems": ["x86_64-linux"],
                         "sizeClass": name,
                         "image": "x",

@@ -135,8 +135,8 @@ impl Ctx {
     /// Bundle the scheduler address fields for pod-spec injection.
     /// Every reconciler that builds an executor pod-spec calls this
     /// instead of constructing `SchedulerAddrs` inline.
-    pub fn scheduler_addrs(&self) -> common::sts::SchedulerAddrs {
-        common::sts::UpstreamAddrs {
+    pub fn scheduler_addrs(&self) -> common::pod::SchedulerAddrs {
+        common::pod::UpstreamAddrs {
             addr: self.scheduler_addr.clone(),
             balance_host: self.scheduler_balance_host.clone(),
             balance_port: self.scheduler_balance_port,
@@ -144,8 +144,8 @@ impl Ctx {
     }
 
     /// Bundle the store address fields for pod-spec injection.
-    pub fn store_addrs(&self) -> common::sts::StoreAddrs {
-        common::sts::UpstreamAddrs {
+    pub fn store_addrs(&self) -> common::pod::StoreAddrs {
+        common::pod::UpstreamAddrs {
             addr: self.store_addr.clone(),
             balance_host: self.store_balance_host.clone(),
             balance_port: self.store_balance_port,

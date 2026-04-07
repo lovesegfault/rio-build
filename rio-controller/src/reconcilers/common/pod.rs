@@ -1,27 +1,24 @@
-//! Shared StatefulSet/PodSpec builder for executor pods (builders +
-//! fetchers).
+//! Shared Job pod-spec builder for executor pods (builders + fetchers).
 //!
 //! Extracted from `builderpool/builders.rs` when ADR-019 introduced
 //! the builder/fetcher split. The 600-line pod-spec — FUSE volumes,
 //! wait-seccomp initContainer, pod-level seccomp, TLS mounts,
 //! capability set, probes, coverage propagation — is role-agnostic.
-//! Parameterizing on [`ExecutorStsParams`] (instead of `&BuilderPool`)
+//! Parameterizing on [`ExecutorPodParams`] (instead of `&BuilderPool`)
 //! lets both reconcilers call the same builder.
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource,
     EnvVar, EnvVarSource, HTTPGetAction, HostPathVolumeSource, ObjectFieldSelector,
-    PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
-    ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext, Toleration,
-    TopologySpreadConstraint, Volume, VolumeMount, WeightedPodAffinityTerm,
+    PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, Probe, ResourceRequirements,
+    SeccompProfile, SecretVolumeSource, SecurityContext, Toleration, TopologySpreadConstraint,
+    Volume, VolumeMount, WeightedPodAffinityTerm,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::ObjectMeta;
 
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::error::{Error, Result};
@@ -135,7 +132,7 @@ pub type StoreAddrs = UpstreamAddrs;
 /// default. The fetcher reconciler leaves most `None` — its spec
 /// is minimal (replicas, image, systems, nodeSelector, tolerations,
 /// resources).
-pub struct ExecutorStsParams {
+pub struct ExecutorPodParams {
     // ── role-varying knobs (the ADR-019 diff) ────────────────────
     /// Builder or Fetcher. Sets the `rio.build/role` label and
     /// `RIO_EXECUTOR_KIND` env.
@@ -209,7 +206,7 @@ pub struct ExecutorStsParams {
     pub termination_grace_period_seconds: Option<i64>,
 }
 
-impl ExecutorStsParams {
+impl ExecutorPodParams {
     /// Pool advertises the `kvm` Nix system-feature → pod needs
     /// `/dev/kvm` (device resource + metal nodeSelector + toleration).
     /// See `r[ctrl.builderpool.kvm-device]`.
@@ -222,7 +219,7 @@ impl ExecutorStsParams {
 /// PDB selector. Includes the ADR-019 `rio.build/role` label so
 /// NetworkPolicies and `kubectl get pods -l rio.build/role=fetcher`
 /// can target by role.
-pub fn executor_labels(p: &ExecutorStsParams) -> BTreeMap<String, String> {
+pub fn executor_labels(p: &ExecutorPodParams) -> BTreeMap<String, String> {
     BTreeMap::from([
         (POOL_LABEL.into(), p.pool_name.clone()),
         (ROLE_LABEL.into(), p.role.as_str().into()),
@@ -277,83 +274,16 @@ pub fn seccomp_preinstalled() -> bool {
 }
 
 /// STS name for a given pool. `rio-{role}-{pool_name}` — e.g. pool
-/// `x86-64` → `rio-builder-x86-64`, fetcher pool `x86-64` class
-/// `tiny` → `rio-fetcher-x86-64-tiny`. Ephemeral Jobs use the same
-/// prefix with a random suffix.
-pub fn sts_name(pool_name: &str, role: ExecutorRole) -> String {
-    format!("{NAME_PREFIX}-{}-{pool_name}", role.as_str())
-}
-
-/// Ephemeral Job name. `rio-{role}-{pool_name}-{6-char-suffix}` —
-/// same prefix as the STS so logs/metrics group naturally by role.
-pub fn ephemeral_job_name(pool_name: &str, role: ExecutorRole, suffix: &str) -> String {
+/// Job name. `rio-{role}-{pool_name}-{6-char-suffix}` — logs/metrics
+/// group naturally by role+pool prefix.
+pub fn job_name(pool_name: &str, role: ExecutorRole, suffix: &str) -> String {
     format!("{NAME_PREFIX}-{}-{pool_name}-{suffix}", role.as_str())
 }
 
-/// Build the executor StatefulSet.
-///
-/// `replicas`: `Some(n)` to claim SSA ownership (first create),
-/// `None` to omit from the patch (subsequent reconciles — lets
-/// the autoscaler's field manager own it).
-pub fn build_executor_statefulset(
-    p: &ExecutorStsParams,
-    oref: OwnerReference,
-    scheduler: &SchedulerAddrs,
-    store: &StoreAddrs,
-    replicas: Option<i32>,
-) -> StatefulSet {
-    let name = sts_name(&p.pool_name, p.role);
-    let labels = executor_labels(p);
-
-    StatefulSet {
-        metadata: ObjectMeta {
-            name: Some(name.clone()),
-            namespace: Some(p.namespace.clone()),
-            owner_references: Some(vec![oref]),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
-        spec: Some(StatefulSetSpec {
-            service_name: Some(name),
-            // Parallel: all pods create/delete at once instead of
-            // ordinal-by-ordinal. Executors are stateless (no ordinal-
-            // dependent data) so ordering buys nothing. With OrderedReady
-            // (the default), scaling 2 to 50 means STS creates pod-N only
-            // after pod-(N-1) is Ready; on a cold cluster that is
-            // ~60s/pod (Karpenter provision + boot), so 50 pods = ~48min.
-            // Parallel: all 50 go Pending at once, Karpenter bursts
-            // ~25 nodes, 50 builders in 2-3min (I-018, EKS stress test).
-            //
-            // Immutable field: flipping on an existing STS requires
-            // delete+recreate. The reconciler handles first-create; a
-            // manual kubectl delete sts --cascade=orphan triggers
-            // recreate with the new policy while keeping pods alive.
-            pod_management_policy: Some("Parallel".to_string()),
-            // None on subsequent reconciles → field omitted from
-            // SSA patch → autoscaler's ownership preserved.
-            replicas,
-            selector: LabelSelector {
-                match_labels: Some(labels.clone()),
-                ..Default::default()
-            },
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels),
-                    ..Default::default()
-                }),
-                spec: Some(build_executor_pod_spec(p, scheduler, store)),
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-/// The pod spec. `pub` so `builderpool::ephemeral::build_job` can
-/// reuse it — the ephemeral Job pod is the same executor container
-/// with one extra env var.
+/// The Job pod spec — shared by `builderpool::build_job`,
+/// `manifest::build_manifest_job`, and `fetcherpool::build_job`.
 pub fn build_executor_pod_spec(
-    p: &ExecutorStsParams,
+    p: &ExecutorPodParams,
     scheduler: &SchedulerAddrs,
     store: &StoreAddrs,
 ) -> PodSpec {
@@ -693,7 +623,7 @@ pub fn build_executor_pod_spec(
 
 /// The executor container.
 fn build_executor_container(
-    p: &ExecutorStsParams,
+    p: &ExecutorPodParams,
     scheduler: &SchedulerAddrs,
     store: &StoreAddrs,
 ) -> Container {

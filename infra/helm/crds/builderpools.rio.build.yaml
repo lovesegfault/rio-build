@@ -45,32 +45,6 @@ spec:
               \ generates the full CRD\nwrapper, KubeSchema handles the schema internals\
               \ (including\nthe JsonSchema impl, so don't derive that separately)."
             properties:
-              autoscaling:
-                description: 'Autoscaling policy. `target_value` is queued-derivations-per-
-
-                  worker: scale up when `queued / active_executors > target`.'
-                properties:
-                  metric:
-                    default: queueDepth
-                    description: "Metric driving scale decisions. Currently only \"\
-                      queueDepth\"\n(scheduler's ClusterStatus.queued_derivations).\
-                      \ String not\nenum so future metrics don't need a CRD version\
-                      \ bump \u2014\nunknown metric is a RECONCILE error (surfaces\
-                      \ in\n.status.conditions), not a schema rejection."
-                    type: string
-                  targetValue:
-                    default: 5
-                    description: 'Scale up when `queued_derivations / active_executors
-                      >
-
-                      target_value`. "5" means "scale up when there are more
-
-                      than 5 queued builds per worker." Lower = more aggressive
-
-                      scaling (more pods, lower queue latency, higher cost).'
-                    format: int32
-                    type: integer
-                type: object
               bloomExpectedItems:
                 description: "Bloom filter capacity (expected number of paths). Maps\
                   \ to\n`RIO_BLOOM_EXPECTED_ITEMS`. The worker's FUSE cache bloom\n\
@@ -415,7 +389,6 @@ spec:
                 nullable: true
                 type: boolean
             required:
-            - autoscaling
             - image
             - maxConcurrent
             - systems

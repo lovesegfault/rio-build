@@ -9,9 +9,9 @@
 //!   2. If `queued > 0` and active Jobs for this pool <
 //!      `spec.replicas.max`, spawn Jobs (one per outstanding
 //!      derivation, up to the ceiling).
-//!   3. Each Job runs one rio-builder pod with `RIO_EPHEMERAL=1` →
-//!      worker's main loop exits after one build → pod terminates →
-//!      `ttlSecondsAfterFinished` ([`JOB_TTL_SECS`]) reaps the Job.
+//!   3. Each Job runs one rio-builder pod → worker exits after one
+//!      build → pod terminates → `ttlSecondsAfterFinished`
+//!      ([`JOB_TTL_SECS`]) reaps the Job.
 //!
 //! From the scheduler's perspective, an ephemeral Job pod is
 //! indistinguishable from an STS pod: it heartbeats in, gets a
@@ -71,7 +71,7 @@ use tracing::{debug, info, warn};
 use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
-use crate::reconcilers::common::sts::{self, ExecutorRole};
+use crate::reconcilers::common::pod::{self, ExecutorRole};
 
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
 use super::job_common::{
@@ -425,8 +425,7 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 /// Build a K8s Job for one ephemeral worker pod.
 ///
 /// The pod spec is REUSED from `build_pod_spec` — same volumes,
-/// security context, env. One addition: `RIO_EPHEMERAL=1` so the
-/// worker's main loop exits after one build.
+/// security context, env.
 ///
 /// Job-specific settings:
 ///   - `restartPolicy: Never` — if the worker crashes (OOM,
@@ -471,27 +470,8 @@ pub(super) fn build_job(
     let mut pod_spec =
         builders::build_pod_spec(wp, scheduler, store, cache_gb, cache_quantity, None);
 
-    // Append RIO_EPHEMERAL=1 to the worker container's env. The
-    // container is always index 0 (build_pod_spec constructs exactly
-    // one). build_container ALWAYS sets env=Some(vec![..]); if a
-    // future refactor breaks that invariant, return InvalidSpec
-    // rather than panic — a reconciler panic means pod crash-loop,
-    // which is worse than a surfaced reconcile error. An ephemeral
-    // pod without RIO_EPHEMERAL would loop forever (Job never
-    // completes → ttlSecondsAfterFinished never fires → leaked pod),
-    // so failing the reconcile is correct.
-    pod_spec.containers[0]
-        .env
-        .as_mut()
-        .ok_or_else(|| {
-            Error::InvalidSpec("build_container produced a container with no env".into())
-        })?
-        .push(builders::env("RIO_EPHEMERAL", "1"));
-
     // restartPolicy: Never is REQUIRED by K8s for Jobs with
     // backoffLimit=0. "Always" (the PodSpec default) is rejected.
-    // build_pod_spec doesn't set it (STS pods default to Always
-    // which is correct there). Set it here.
     pod_spec.restart_policy = Some("Never".into());
     // I-090: ephemeral Jobs bin-pack — STS-mode spread is for HA of
     // long-lived pods, wasteful here (one node per Job).
@@ -519,7 +499,7 @@ pub(super) fn build_job(
     // K8s name limit: 63 chars. `rio-builder-{pool}-{6}` = pool+19.
     // Pool names are short (<20 chars); a 49+ char pool gets a
     // clear K8s rejection — no silent truncation.
-    let job_name = sts::ephemeral_job_name(&pool, ExecutorRole::Builder, &random_suffix());
+    let job_name = pod::job_name(&pool, ExecutorRole::Builder, &random_suffix());
 
     Ok(Job {
         metadata: ObjectMeta {
@@ -598,9 +578,7 @@ mod tests {
     }
 
     /// Built Job has all the load-bearing settings. If any of these
-    /// drift, ephemeral mode breaks silently:
-    ///   - RIO_EPHEMERAL missing → worker loops forever, Job never
-    ///     completes, pod leaked until manual intervention
+    /// drift, the Job reconciler breaks silently:
     ///   - restartPolicy != Never → K8s rejects the Job on create
     ///     (hard error, at least visible)
     ///   - backoffLimit > 0 → K8s retries on crash, scheduler ALSO
@@ -680,17 +658,9 @@ mod tests {
             "I-090: ephemeral Jobs bin-pack (no anti-affinity/spread)"
         );
 
-        // RIO_EPHEMERAL=1 present. The MOST load-bearing assertion —
-        // without it the worker doesn't know to exit after one build.
+        // Sanity: build_pod_spec env is present (reuse, not a
+        // from-scratch pod). Check one representative.
         let env = pod_spec.containers[0].env.as_ref().unwrap();
-        let eph = env
-            .iter()
-            .find(|e| e.name == "RIO_EPHEMERAL")
-            .expect("RIO_EPHEMERAL env must be set");
-        assert_eq!(eph.value.as_deref(), Some("1"));
-
-        // Sanity: the REST of the env is still there (build_pod_spec
-        // reuse, not a from-scratch pod). Check one representative.
         assert!(
             env.iter().any(|e| e.name == "RIO_SCHEDULER_ADDR"),
             "build_pod_spec env should be preserved"

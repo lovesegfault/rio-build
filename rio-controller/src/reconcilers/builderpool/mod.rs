@@ -80,7 +80,7 @@ const MANAGER: &str = "rio-controller";
 /// sets it; `disruption::run` filters on it; `ephemeral` + cleanup
 /// list-selectors match on it. Re-exported from common — shared
 /// with the fetcherpool reconciler.
-pub(crate) use crate::reconcilers::common::sts::POOL_LABEL;
+pub(crate) use crate::reconcilers::common::pod::POOL_LABEL;
 
 /// Top-level reconcile. Wrapped in `finalizer()` which handles
 /// the metadata.finalizers dance: Apply on normal reconcile,

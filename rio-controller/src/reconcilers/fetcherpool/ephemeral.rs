@@ -7,7 +7,7 @@
 //!   - Queue signal is `queued_fod_derivations` (in-flight FOD
 //!     demand), not `queued_derivations`.
 //!   - Pod spec comes from `executor_params(fp)` →
-//!     `sts::build_executor_pod_spec` (the fetcher-hardened params:
+//!     `pod::build_executor_pod_spec` (the fetcher-hardened params:
 //!     `readOnlyRootFilesystem`, stricter seccomp, fetcher node
 //!     affinity).
 //!   - Default `activeDeadlineSeconds` is 300 not 3600 — fetches
@@ -37,7 +37,7 @@ use crate::reconcilers::builderpool::job_common::{
     SpawnOutcome, is_active_job, random_suffix, reap_excess_pending, reap_orphan_running,
     scheduler_unreachable_condition, try_spawn_job,
 };
-use crate::reconcilers::common::sts::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs, env};
+use crate::reconcilers::common::pod::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs};
 
 use super::{MANAGER, executor_params};
 
@@ -346,23 +346,16 @@ pub(super) fn build_job(
     class: Option<&FetcherSizeClass>,
     oref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
     scheduler: &SchedulerAddrs,
-    store: &sts::StoreAddrs,
+    store: &pod::StoreAddrs,
 ) -> Result<Job> {
     let params = executor_params(fp, class)?;
     // P0556: pool_name (= `rio.build/pool` label) is `class.name` when
     // classed, `fp.name_any()` when not — set inside executor_params.
     // Reused for the Job name prefix so logs/metrics group per class.
     let pool = params.pool_name.clone();
-    let labels = sts::executor_labels(&params);
+    let labels = pod::executor_labels(&params);
 
-    let mut pod_spec = sts::build_executor_pod_spec(&params, scheduler, store);
-    pod_spec.containers[0]
-        .env
-        .as_mut()
-        .ok_or_else(|| {
-            Error::InvalidSpec("build_container produced a container with no env".into())
-        })?
-        .push(env("RIO_EPHEMERAL", "1"));
+    let mut pod_spec = pod::build_executor_pod_spec(&params, scheduler, store);
     pod_spec.restart_policy = Some("Never".into());
     // I-090: ephemeral Jobs are short-lived single-FOD downloads — the
     // STS-mode anti-affinity/spread (HA for long-lived pods) makes
@@ -375,7 +368,7 @@ pub(super) fn build_job(
     pod_spec.containers[0].startup_probe = None;
     pod_spec.termination_grace_period_seconds = Some(30);
 
-    let job_name = sts::ephemeral_job_name(&pool, ExecutorRole::Fetcher, &random_suffix());
+    let job_name = pod::job_name(&pool, ExecutorRole::Fetcher, &random_suffix());
 
     Ok(Job {
         metadata: ObjectMeta {
@@ -418,7 +411,6 @@ pub(super) fn build_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::builderpool::Autoscaling;
     use crate::fixtures::test_sched_addrs;
     use kube::Resource;
 
@@ -427,10 +419,6 @@ mod tests {
             serde_json::to_value(crate::crds::fetcherpool::FetcherPoolSpec {
                 deadline_seconds: None,
                 max_concurrent: 8,
-                autoscaling: Autoscaling {
-                    metric: "fodQueueDepth".into(),
-                    target_value: 5,
-                },
                 image: "rio-fetcher:test".into(),
                 systems: vec!["x86_64-linux".into()],
                 node_selector: None,
@@ -451,7 +439,7 @@ mod tests {
 
     /// Job carries the fetcher-hardened pod spec (not the builder
     /// one): `RIO_EXECUTOR_KIND=fetcher`, `readOnlyRootFilesystem:
-    /// true`, fetcher seccomp, plus `RIO_EPHEMERAL=1`.
+    /// true`, fetcher seccomp.
     #[test]
     fn build_job_uses_fetcher_params() {
         let fp = test_fp();
@@ -475,7 +463,6 @@ mod tests {
             .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
             .collect();
         assert_eq!(envs.get("RIO_EXECUTOR_KIND"), Some(&"fetcher"));
-        assert_eq!(envs.get("RIO_EPHEMERAL"), Some(&"1"));
         assert_eq!(
             c.security_context
                 .as_ref()
@@ -612,7 +599,6 @@ mod tests {
             .filter_map(|e| Some((e.name.as_str(), e.value.as_deref()?)))
             .collect();
         assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small"));
-        assert_eq!(envs.get("RIO_EPHEMERAL"), Some(&"1"));
         assert_eq!(
             c.resources
                 .as_ref()

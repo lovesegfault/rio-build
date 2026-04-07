@@ -30,7 +30,6 @@ use rio_controller::crds::builderpoolset::BuilderPoolSet;
 use rio_controller::crds::componentscaler::ComponentScaler;
 use rio_controller::crds::fetcherpool::FetcherPool;
 use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset, componentscaler, fetcherpool};
-use rio_controller::scaling::Autoscaler;
 
 // ----- config (figment two-struct) --------------------------------------------
 
@@ -66,16 +65,6 @@ struct Config {
     metrics_addr: std::net::SocketAddr,
     /// HTTP /healthz listen address. K8s livenessProbe hits this.
     health_addr: std::net::SocketAddr,
-    /// Autoscaler poll interval (seconds). Default 30s; VM tests
-    /// override to 3s so a scale decision happens within the test
-    /// timeout.
-    autoscaler_poll_secs: u64,
-    autoscaler_scale_up_window_secs: u64,
-    /// Scale-down stabilization window. Default 600s (K8s HPA
-    /// convention). VM tests shorten this to ~10s to observe a
-    /// full up→down cycle within the test timeout.
-    autoscaler_scale_down_window_secs: u64,
-    autoscaler_min_interval_secs: u64,
     /// GC cron interval (hours). 0 = disabled (reconciler not
     /// spawned). The cron calls StoreAdminService.TriggerGC with
     /// default params (dry_run=false, force=false, store's 2h
@@ -103,13 +92,6 @@ impl Default for Config {
             metrics_addr: rio_common::default_addr(9094),
             // Same +100 pattern as gateway/worker.
             health_addr: rio_common::default_addr(9194),
-            // Match ScalingTiming::default(). Duplicated rather
-            // than .as_secs()-ing from the Default impl to avoid
-            // a const-fn dance — keep them in sync when changing.
-            autoscaler_poll_secs: 30,
-            autoscaler_scale_up_window_secs: 30,
-            autoscaler_scale_down_window_secs: 600,
-            autoscaler_min_interval_secs: 30,
             // 24h: typical store growth between sweeps is a few
             // thousand paths. Lower values are fine for VM tests.
             gc_interval_hours: 24,
@@ -149,33 +131,6 @@ impl rio_common::config::ValidateConfig for Config {
     fn validate(&self) -> anyhow::Result<()> {
         use rio_common::config::ensure_required as required;
         required(&self.scheduler_addr, "scheduler_addr", "controller")?;
-        // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
-        // `from_secs(self.autoscaler_poll_secs)` into interval() —
-        // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
-        // (logged, controller survives, but autoscaling silently dead).
-        // Fail fast at config load instead.
-        anyhow::ensure!(
-            self.autoscaler_poll_secs > 0,
-            "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
-        );
-        // These three feed Duration::from_secs but NOT tokio::interval —
-        // 0 value is DEGRADED (thrash / no-cooldown) not PANIC. Still
-        // reject to prevent operator foot-shooting.
-        anyhow::ensure!(
-            self.autoscaler_scale_up_window_secs > 0,
-            "autoscaler_scale_up_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
-            self.autoscaler_scale_up_window_secs
-        );
-        anyhow::ensure!(
-            self.autoscaler_scale_down_window_secs > 0,
-            "autoscaler_scale_down_window_secs must be > 0 (got {}); 0 → no cooldown → thrash",
-            self.autoscaler_scale_down_window_secs
-        );
-        anyhow::ensure!(
-            self.autoscaler_min_interval_secs > 0,
-            "autoscaler_min_interval_secs must be > 0 (got {}); 0 → no rate-limit on scale ops",
-            self.autoscaler_min_interval_secs
-        );
         Ok(())
     }
 }
@@ -316,10 +271,7 @@ async fn main() -> anyhow::Result<()> {
         manifest_idle: Default::default(),
         size_class_cache: Default::default(),
         component_low_ticks: Default::default(),
-        // Same cfg source as the Autoscaler's ScalingTiming below —
-        // manifest-mode scale-down reuses the STS autoscaler's
-        // grace window (same anti-flap rationale, per-bucket).
-        scale_down_window: std::time::Duration::from_secs(cfg.autoscaler_scale_down_window_secs),
+        scale_down_window: std::time::Duration::from_secs(600),
     });
 
     // ---- BuilderPool controller ----
@@ -445,20 +397,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
-
-    // ---- Autoscaler ----
-    // Separate task. spawn_monitored: if it panics, logged;
-    // controller keeps reconciling (spec changes still apply),
-    // just no autoscale. Better than the whole pod dying.
-    let timing = rio_controller::scaling::ScalingTiming {
-        poll_interval: std::time::Duration::from_secs(cfg.autoscaler_poll_secs),
-        scale_up_window: std::time::Duration::from_secs(cfg.autoscaler_scale_up_window_secs),
-        scale_down_window: std::time::Duration::from_secs(cfg.autoscaler_scale_down_window_secs),
-        min_scale_interval: std::time::Duration::from_secs(cfg.autoscaler_min_interval_secs),
-    };
-    info!(?timing, "autoscaler timing");
-    let autoscaler = Autoscaler::new(client.clone(), admin.clone(), timing, recorder);
-    rio_common::task::spawn_monitored("autoscaler", autoscaler.run(shutdown.clone()));
 
     // ---- DisruptionTarget watcher ----
     // Pod watcher: K8s sets DisruptionTarget=True on a pod BEFORE
@@ -611,19 +549,12 @@ mod tests {
     rio_test_support::jail_roundtrip!(
         "controller",
         r#"
-        autoscaler_poll_secs = 5
-        autoscaler_scale_down_window_secs = 77
         gc_interval_hours = 0
 
         [tls]
         cert_path = "/etc/tls/cert.pem"
         "#,
         |cfg: Config| {
-            assert_eq!(
-                cfg.autoscaler_poll_secs, 5,
-                "autoscaler timing knobs must thread through figment"
-            );
-            assert_eq!(cfg.autoscaler_scale_down_window_secs, 77);
             assert_eq!(cfg.gc_interval_hours, 0);
             assert_eq!(
                 cfg.tls.cert_path.as_deref(),
@@ -636,12 +567,9 @@ mod tests {
         }
     );
 
-    rio_test_support::jail_defaults!("controller", "autoscaler_poll_secs = 30", |cfg: Config| {
+    rio_test_support::jail_defaults!("controller", "gc_interval_hours = 24", |cfg: Config| {
         assert!(!cfg.tls.is_configured());
         assert!(cfg.scheduler_balance_host.is_none());
-        assert_eq!(cfg.autoscaler_scale_up_window_secs, 30);
-        assert_eq!(cfg.autoscaler_scale_down_window_secs, 600);
-        assert_eq!(cfg.autoscaler_min_interval_secs, 30);
         assert_eq!(cfg.gc_interval_hours, 24);
     });
 
@@ -661,20 +589,6 @@ mod tests {
             store_addr: "http://localhost:9001".into(),
             ..Config::default()
         }
-    }
-
-    /// `autoscaler_poll_secs = 0` → `tokio::time::interval(ZERO)`
-    /// panics inside Autoscaler::run. validate_config catches at
-    /// startup instead of a panic inside spawn_monitored (logged,
-    /// controller survives, autoscaling silently dead).
-    #[test]
-    fn config_rejects_zero_autoscaler_poll() {
-        let cfg = Config {
-            autoscaler_poll_secs: 0,
-            ..test_valid_config()
-        };
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("autoscaler_poll_secs"), "{err}");
     }
 
     #[test]

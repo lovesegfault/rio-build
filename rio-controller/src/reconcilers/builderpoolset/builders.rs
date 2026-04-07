@@ -6,7 +6,7 @@
 
 use kube::{Resource, ResourceExt};
 
-use crate::crds::builderpool::{Autoscaling, BuilderPool, BuilderPoolSpec, Sizing};
+use crate::crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
 use crate::crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use crate::error::{Error, Result};
 
@@ -38,14 +38,6 @@ const DEFAULT_FUSE_CACHE_SIZE: &str = "50Gi";
 /// get wp` shows the structure at a glance.
 pub(crate) fn child_name(wps: &BuilderPoolSet, class: &SizeClassSpec) -> String {
     format!("{}-{}", wps.name_any(), class.name)
-}
-
-/// Same naming as [`child_name`] but taking bare strings. Used by
-/// scaling module which has `class_name: &str` not a full
-/// `SizeClassSpec`. Single source of truth for the `{wps}-{class}`
-/// convention.
-pub(crate) fn child_name_str(wps_name: &str, class_name: &str) -> String {
-    format!("{wps_name}-{class_name}")
 }
 
 /// Build one child BuilderPool for one size class.
@@ -80,20 +72,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
     // Concurrent-Job ceiling per class.
     let max_concurrent = class.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
 
-    // Autoscaling: `target_value` from the class's
-    // `target_queue_per_replica`. The BuilderPool autoscaler reads
-    // this, so per-class scaling "just works" once the child exists.
-    // Per-class STATUS aggregation uses GetSizeClassStatus plumbing
-    // in scaling::per_class::scale_wps_class (orthogonal concern).
-    let autoscaling = Autoscaling {
-        metric: "queueDepth".into(),
-        // `target_queue_per_replica` is Option<u32>; Autoscaling.
-        // target_value is i32. Cast is safe (queue-per-replica
-        // values are tiny — 1-20 range). Default 5 mirrors
-        // `default_target_queue()` in the CRD.
-        target_value: class.target_queue_per_replica.unwrap_or(5) as i32,
-    };
-
     // EXHAUSTIVE by design: when BuilderPoolSpec gains a field,
     // E0063 here forces a decision — does PoolTemplate mirror it
     // (expose to WPS users) or hardcode a default (controller
@@ -102,7 +80,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
     let spec = BuilderPoolSpec {
         // --- Per-class (SizeClassSpec) ---
         max_concurrent,
-        autoscaling,
         resources: Some(class.resources.clone()),
         // `size_class` is what the scheduler matches. Setting it to
         // the class name is the contract — `r[sched.classify.*]`

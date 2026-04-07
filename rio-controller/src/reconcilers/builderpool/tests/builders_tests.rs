@@ -1,37 +1,15 @@
-//! StatefulSet/PDB builder spec coverage + quantity parsing.
+//! Job pod-spec builder coverage + quantity parsing.
 //!
 //! Pure struct-to-struct tests — no K8s apiserver interaction.
-//! Covers what `build_statefulset`/`build_pdb`/`parse_quantity_to_gb`
-//! PRODUCE; the wiring (when/how it's patched) lives in
-//! `apply_tests`. Split from the 1716L monolith (P0396).
+//! Covers what `build_pod_spec`/`parse_quantity_to_gb` PRODUCE.
 
 use super::*;
 
-// r[verify ctrl.crd.workerpool]
-// r[verify ctrl.reconcile.owner-refs]
 #[test]
-fn statefulset_has_owner_reference() {
-    let wp = test_wp();
-    let sts = test_sts(&wp);
-
-    let orefs = sts.metadata.owner_references.expect("ownerRef set");
-    assert_eq!(orefs.len(), 1);
-    assert_eq!(orefs[0].kind, "BuilderPool");
-    assert_eq!(orefs[0].name, "test-pool");
-    assert_eq!(orefs[0].controller, Some(true), "controller=true for GC");
-}
-
-#[test]
-fn statefulset_derives_arch_node_selector_from_systems() {
+fn job_pod_derives_arch_node_selector_from_systems() {
     // I-098: fixture has systems=[x86_64-linux] → kubernetes.io/arch=amd64
     let wp = test_wp();
-    let sts = test_sts(&wp);
-    let ns = sts
-        .spec
-        .unwrap()
-        .template
-        .spec
-        .unwrap()
+    let ns = test_pod_spec(&wp)
         .node_selector
         .expect("node_selector set (arch derived)");
     assert_eq!(
@@ -47,15 +25,7 @@ fn statefulset_derives_arch_node_selector_from_systems() {
             .into_iter()
             .collect(),
     );
-    let sts = test_sts(&wp);
-    let ns = sts
-        .spec
-        .unwrap()
-        .template
-        .spec
-        .unwrap()
-        .node_selector
-        .unwrap();
+    let ns = test_pod_spec(&wp).node_selector.unwrap();
     assert_eq!(
         ns.get("kubernetes.io/arch").map(String::as_str),
         Some("arm64"),
@@ -64,11 +34,10 @@ fn statefulset_derives_arch_node_selector_from_systems() {
 }
 
 #[test]
-fn statefulset_security_context() {
+fn job_pod_security_context() {
     let wp = test_wp();
-    let sts = test_sts(&wp);
-
-    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let pod = test_pod_spec(&wp);
+    let container = &pod.containers[0];
     let caps = container
         .security_context
         .as_ref()
@@ -97,14 +66,7 @@ fn seccomp_default_is_runtime_default() {
     // The builder must always emit SOMETHING.
     let wp = test_wp();
     assert!(wp.spec.seccomp_profile.is_none(), "test_wp() baseline");
-    let sts = test_sts(&wp);
-
-    let pod_sc = sts
-        .spec
-        .unwrap()
-        .template
-        .spec
-        .unwrap()
+    let pod_sc = test_pod_spec(&wp)
         .security_context
         .expect("pod security_context set (privileged=None)");
     let prof = pod_sc.seccomp_profile.expect("seccompProfile set");
@@ -127,8 +89,7 @@ fn seccomp_localhost_emits_correct_security_context() {
         type_: "Localhost".into(),
         localhost_profile: Some("operator/rio-builder.json".into()),
     });
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     // Pod-level: RuntimeDefault floor (NOT Localhost — sandbox
     // would fail CreateContainerConfigError if file missing).
@@ -205,8 +166,7 @@ fn seccomp_non_localhost_no_init_container() {
             type_: ty.into(),
             localhost_profile: None,
         });
-        let sts = test_sts(&wp);
-        let pod = sts.spec.unwrap().template.spec.unwrap();
+        let pod = test_pod_spec(&wp);
 
         assert!(pod.init_containers.is_none(), "{ty}: no initContainer");
         assert!(
@@ -245,7 +205,7 @@ fn seccomp_preinstalled_skips_wait_keeps_enforcement() {
     // but the ENFORCEMENT (container-level Localhost) stays. Tested
     // via build_executor_pod_spec directly so the env-var read in
     // executor_params() doesn't need set_var (parallel-test-unsafe).
-    use crate::reconcilers::common::sts::build_executor_pod_spec;
+    use crate::reconcilers::common::pod::build_executor_pod_spec;
     let mut wp = test_wp();
     wp.spec.seccomp_profile = Some(SeccompProfileKind {
         type_: "Localhost".into(),
@@ -316,9 +276,7 @@ fn seccomp_privileged_drops_profile() {
         type_: "Localhost".into(),
         localhost_profile: Some("rio-builder.json".into()),
     });
-    let sts = test_sts(&wp);
-
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
     assert!(
         pod.security_context.is_none(),
         "privileged disables seccomp — don't emit a dead profile"
@@ -393,15 +351,14 @@ fn seccomp_profile_json_is_valid() {
 
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
-fn statefulset_fuse_via_device_plugin_when_unprivileged() {
+fn job_pod_fuse_via_device_plugin_when_unprivileged() {
     // Default (privileged=None→false): NO hostPath /dev/fuse volume.
     // Instead, resources.limits has smarter-devices/fuse=1 and the
     // kubelet+device-plugin inject the device. This is the ADR-012
     // production path — enables hostUsers:false (hostPath /dev/fuse
     // is incompatible with idmap mounts).
     let wp = test_wp();
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     // No dev-fuse volume (device plugin injects, no volume needed).
     assert!(
@@ -445,7 +402,7 @@ fn statefulset_fuse_via_device_plugin_when_unprivileged() {
 
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
-fn statefulset_fuse_device_merges_with_operator_resources() {
+fn job_pod_fuse_device_merges_with_operator_resources() {
     // Operator-supplied resources (cpu/memory/ephemeral) must be
     // PRESERVED when the builder adds the FUSE device request.
     // A naive overwrite would drop the operator's limits → unbounded
@@ -462,8 +419,7 @@ fn statefulset_fuse_device_merges_with_operator_resources() {
         limits: Some(BTreeMap::from([("memory".into(), Quantity("8Gi".into()))])),
         ..Default::default()
     });
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     let resources = pod.containers[0].resources.as_ref().unwrap();
     let limits = resources.limits.as_ref().unwrap();
@@ -483,15 +439,14 @@ fn statefulset_fuse_device_merges_with_operator_resources() {
 
 // r[verify ctrl.builderpool.kvm-device]
 #[test]
-fn statefulset_kvm_feature_adds_device_nodeselector_toleration() {
+fn job_pod_kvm_feature_adds_device_nodeselector_toleration() {
     // Fixture wp has features=["kvm"]. The controller derives the
     // device-cgroup request + metal-NodePool scheduling constraints
     // from that one feature string — operator doesn't set them
     // explicitly (mirrors I-098's arch derivation from systems).
     let wp = test_wp();
     assert!(wp.spec.features.iter().any(|f| f == "kvm"), "precondition");
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     // smarter-devices/kvm:1 in resources.{limits,requests} alongside
     // fuse. kubelet → device-plugin → /dev/kvm in device cgroup.
@@ -532,15 +487,14 @@ fn statefulset_kvm_feature_adds_device_nodeselector_toleration() {
 
 // r[verify ctrl.builderpool.kvm-device]
 #[test]
-fn statefulset_no_kvm_feature_no_kvm_wiring() {
+fn job_pod_no_kvm_feature_no_kvm_wiring() {
     // The CONDITIONAL is the load-bearing part: a non-kvm pool must
     // NOT request smarter-devices/kvm (would Pending forever — no
     // non-metal node advertises it) and must NOT tolerate the metal
     // taint (would bin-pack cheap builds onto $$ metal).
     let mut wp = test_wp();
     wp.spec.features = vec!["big-parallel".into()];
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     let resources = pod.containers[0].resources.as_ref().unwrap();
     assert!(
@@ -567,14 +521,13 @@ fn statefulset_no_kvm_feature_no_kvm_wiring() {
 
 // r[verify ctrl.builderpool.kvm-device]
 #[test]
-fn statefulset_kvm_privileged_keeps_selector_drops_device() {
+fn job_pod_kvm_privileged_keeps_selector_drops_device() {
     // Privileged escape hatch bypasses device cgroup → no resource
     // request. But the pod still needs a host that HAS /dev/kvm, so
     // nodeSelector + toleration stay.
     let mut wp = test_wp();
     wp.spec.privileged = Some(true);
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     let resources = pod.containers[0].resources.as_ref();
     assert!(
@@ -596,14 +549,13 @@ fn statefulset_kvm_privileged_keeps_selector_drops_device() {
 
 // r[verify sec.pod.host-users-false]
 #[test]
-fn statefulset_host_users_false_when_unprivileged() {
+fn job_pod_host_users_false_when_unprivileged() {
     // hostUsers:false → K8s user-namespace isolation. Container UIDs
     // remapped to unprivileged host UIDs; CAP_SYS_ADMIN applies only
     // within the user namespace. The LOAD-BEARING defense-in-depth
     // layer (ADR-012 §User Namespace Isolation).
     let wp = test_wp();
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
     assert_eq!(
         pod.host_users,
         Some(false),
@@ -627,8 +579,7 @@ fn host_users_suppressed_when_host_network() {
     let mut wp = test_wp();
     wp.spec.host_network = Some(true);
     wp.spec.privileged = None;
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     assert_eq!(
         pod.host_users, None,
@@ -659,8 +610,7 @@ fn host_users_false_when_neither_escape_hatch() {
     let mut wp = test_wp();
     wp.spec.host_network = Some(false);
     wp.spec.privileged = None;
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     assert_eq!(
         pod.host_users,
@@ -677,14 +627,13 @@ fn host_users_false_when_neither_escape_hatch() {
 // r[verify sec.pod.host-users-false]
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
-fn statefulset_privileged_escape_hatch_uses_hostpath() {
+fn job_pod_privileged_escape_hatch_uses_hostpath() {
     // privileged=true → hostPath /dev/fuse fallback. No device
     // plugin resource, no hostUsers:false (both incompatible with
     // privileged containers). This is the k3s/kind escape hatch.
     let mut wp = test_wp();
     wp.spec.privileged = Some(true);
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     // hostPath /dev/fuse volume present (escape hatch).
     let fuse_vol = pod
@@ -724,15 +673,14 @@ fn statefulset_privileged_escape_hatch_uses_hostpath() {
 }
 
 #[test]
-fn statefulset_overlays_volume_mounted() {
+fn job_pod_overlays_volume_mounted() {
     // RIO_OVERLAY_BASE_DIR points to /var/rio/overlays. If
     // there's no volume mount for it, it lands on the
     // container's root filesystem — which is overlayfs.
     // Overlayfs-as-upperdir can't create trusted.* xattrs →
     // every overlay mount fails with EINVAL. Regression guard.
     let wp = test_wp();
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     let vol = pod
         .volumes
@@ -842,63 +790,14 @@ fn disruption_filter_false_or_absent_returns_none() {
     assert_eq!(disruption::is_disruption_target(&healthy), None);
 }
 
-// r[verify ctrl.pdb.workers]
 #[test]
-fn pdb_has_correct_selector_and_max_unavailable() {
-    // build_pdb produces maxUnavailable=1 with the SAME selector
-    // as the STS → matches worker pods. ownerRef set so GC on
-    // BuilderPool delete takes the PDB too.
-    let wp = test_wp();
-    let oref = wp.controller_owner_ref(&()).unwrap();
-    let pdb = build_pdb(&wp, oref.clone());
-
-    // Name: <pool>-pdb
-    assert_eq!(pdb.metadata.name, Some("test-pool-pdb".into()));
-    // ownerRef: controller=true for GC.
-    let orefs = pdb.metadata.owner_references.expect("ownerRef set");
-    assert_eq!(orefs.len(), 1);
-    assert_eq!(orefs[0].kind, "BuilderPool");
-    assert_eq!(orefs[0].controller, Some(true));
-
-    let spec = pdb.spec.expect("spec");
-    // maxUnavailable=1: at most one worker evicted at a time
-    // during node drain. Builds on the evicting pod get
-    // reassigned (DrainExecutor force); rest keep working.
-    assert_eq!(
-        spec.max_unavailable,
-        Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(1))
-    );
-    // minAvailable NOT set: maxUnavailable is stable regardless
-    // of scale (works for 2 replicas or 200); minAvailable
-    // would need to track spec.replicas.min.
-    assert!(spec.min_available.is_none());
-
-    // Selector matches pod labels (same as STS). If these
-    // diverge, PDB protects nothing.
-    let selector = spec
-        .selector
-        .expect("selector")
-        .match_labels
-        .expect("labels");
-    assert_eq!(
-        selector.get("rio.build/pool"),
-        Some(&"test-pool".to_string())
-    );
-    assert_eq!(
-        selector.get("app.kubernetes.io/name"),
-        Some(&"rio-builder".to_string())
-    );
-}
-
-#[test]
-fn statefulset_tls_secret_mounted_when_set() {
+fn job_pod_tls_secret_mounted_when_set() {
     // spec.tlsSecretName set → volume + mount + 3 RIO_TLS__* env
     // vars. Unset → none of these (plaintext mode). Both paths
     // tested: the base test_wp has it unset; this test sets it.
     let mut wp = test_wp();
     wp.spec.tls_secret_name = Some("rio-builder-tls".into());
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     // Volume: Secret source with the configured name.
     let tls_vol = pod
@@ -944,12 +843,11 @@ fn statefulset_tls_secret_mounted_when_set() {
 }
 
 #[test]
-fn statefulset_no_tls_when_unset() {
+fn job_pod_no_tls_when_unset() {
     // The default test_wp has tls_secret_name=None. No tls
     // volume, no mount, no RIO_TLS__* env — clean plaintext.
     let wp = test_wp();
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
 
     assert!(
         !pod.volumes
@@ -980,10 +878,9 @@ fn statefulset_no_tls_when_unset() {
 }
 
 #[test]
-fn statefulset_termination_grace() {
+fn job_pod_termination_grace() {
     let wp = test_wp();
-    let sts = test_sts(&wp);
-    let pod = sts.spec.unwrap().template.spec.unwrap();
+    let pod = test_pod_spec(&wp);
     assert_eq!(
         pod.termination_grace_period_seconds,
         Some(7200),
@@ -997,11 +894,10 @@ fn statefulset_termination_grace() {
 }
 
 #[test]
-fn statefulset_env_vars() {
+fn job_pod_env_vars() {
     let wp = test_wp();
-    let sts = test_sts(&wp);
-
-    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let pod = test_pod_spec(&wp);
+    let container = &pod.containers[0];
     let envs: BTreeMap<String, String> = container
         .env
         .as_ref()
@@ -1083,14 +979,13 @@ fn statefulset_env_vars() {
 /// Complements the `statefulset_env_vars` assertions above (which
 /// check the unset → not-injected case).
 #[test]
-fn statefulset_worker_knobs_injected_when_set() {
+fn job_pod_worker_knobs_injected_when_set() {
     let mut wp = test_wp();
     wp.spec.fuse_threads = Some(8);
     wp.spec.fuse_passthrough = Some(false);
     wp.spec.daemon_timeout_secs = Some(14400);
-    let sts = test_sts(&wp);
-
-    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let pod = test_pod_spec(&wp);
+    let container = &pod.containers[0];
     let envs: BTreeMap<String, String> = container
         .env
         .as_ref()
@@ -1117,9 +1012,8 @@ fn statefulset_worker_knobs_injected_when_set() {
 fn bloom_expected_items_env_injected_when_set() {
     let mut wp = test_wp();
     wp.spec.bloom_expected_items = Some(200_000);
-    let sts = test_sts(&wp);
-
-    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let pod = test_pod_spec(&wp);
+    let container = &pod.containers[0];
     let envs: BTreeMap<String, String> = container
         .env
         .as_ref()
@@ -1141,9 +1035,8 @@ fn bloom_expected_items_env_injected_when_set() {
 #[test]
 fn bloom_expected_items_env_not_injected_when_unset() {
     let wp = test_wp(); // spec.bloom_expected_items = None
-    let sts = test_sts(&wp);
-
-    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let pod = test_pod_spec(&wp);
+    let container = &pod.containers[0];
     let envs: BTreeMap<String, String> = container
         .env
         .as_ref()
@@ -1159,65 +1052,20 @@ fn bloom_expected_items_env_not_injected_when_unset() {
 }
 
 #[test]
-fn statefulset_replicas_starts_at_zero() {
-    let wp = test_wp();
-    let sts = test_sts(&wp);
-    assert_eq!(sts.spec.unwrap().replicas, Some(0));
-}
-
-/// replicas=None → field omitted from the SSA patch → the
-/// autoscaler's field-manager ownership is preserved.
-/// Without this, every reconcile would revert the autoscaler's
-/// scaling decision to min (SSA .force() takes ownership of
-/// every field in the patch).
-///
-/// k8s-openapi's custom Serialize impl skips Option::None
-/// fields, so None → field absent → SSA leaves it alone.
-#[test]
-fn statefulset_replicas_omitted_when_none() {
-    let wp = test_wp();
-    let sts = build_statefulset(
-        &wp,
-        wp.controller_owner_ref(&()).unwrap(),
-        &test_sched_addrs(),
-        &test_store_addrs(),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(
-        sts.spec.as_ref().unwrap().replicas,
-        None,
-        "subsequent reconciles: replicas=None → autoscaler owns it"
-    );
-
-    // And the crucial part: serialized JSON doesn't contain
-    // the field. SSA semantics: absent field = "I don't
-    // manage this." Verifies k8s-openapi's skip-None-on-
-    // serialize behavior hasn't regressed.
-    let json = serde_json::to_string(&sts).unwrap();
-    assert!(
-        !json.contains("\"replicas\""),
-        "replicas must be absent from serialized JSON for SSA to \
-         preserve autoscaler ownership. Found in: {json}"
-    );
-}
-
-#[test]
-fn statefulset_image_pull_policy_passthrough() {
+fn job_pod_image_pull_policy_passthrough() {
     // None stays None — K8s applies its tag-based default
     // (IfNotPresent for non-:latest, Always for :latest).
     let wp = test_wp();
-    let sts = test_sts(&wp);
-    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let pod = test_pod_spec(&wp);
+    let container = &pod.containers[0];
     assert_eq!(container.image_pull_policy, None);
 
     // Explicit value passes through. Airgap k3s/kind need
     // IfNotPresent or Never to use ctr-imported images.
     let mut wp = test_wp();
     wp.spec.image_pull_policy = Some("IfNotPresent".into());
-    let sts = test_sts(&wp);
-    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let pod = test_pod_spec(&wp);
+    let container = &pod.containers[0];
     assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
 }
 
@@ -1309,24 +1157,4 @@ fn quantity_decimal_fraction() {
     assert_eq!(parse_quantity_to_gb("0.5Gi").unwrap(), 0);
     // 1.5Ti = 1536 GiB.
     assert_eq!(parse_quantity_to_gb("1.5Ti").unwrap(), 1536);
-}
-
-#[test]
-fn quantity_invalidspec_from_statefulset() {
-    let mut wp = test_wp();
-    wp.spec.fuse_cache_size = "garbage".into();
-    let result = build_statefulset(
-        &wp,
-        wp.controller_owner_ref(&()).unwrap(),
-        &test_sched_addrs(),
-        &test_store_addrs(),
-        Some(1),
-    );
-    match result {
-        Err(Error::InvalidSpec(msg)) => {
-            assert!(msg.contains("fuseCacheSize"));
-            assert!(msg.contains("garbage"));
-        }
-        other => panic!("expected InvalidSpec with helpful message, got {other:?}"),
-    }
 }

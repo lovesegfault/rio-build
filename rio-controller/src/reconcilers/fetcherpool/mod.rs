@@ -31,8 +31,7 @@ use tracing::{info, warn};
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 use crate::error::{Error, Result, error_kind};
-#[allow(unused_imports)]
-use crate::reconcilers::common::sts::{self, ExecutorRole, ExecutorStsParams, sts_name};
+use crate::reconcilers::common::pod::{self, ExecutorPodParams, ExecutorRole};
 use crate::reconcilers::{Ctx, error_key};
 
 mod ephemeral;
@@ -96,7 +95,7 @@ async fn cleanup(fp: Arc<FetcherPool>, _ctx: &Ctx) -> Result<Action> {
     Ok(Action::await_change())
 }
 
-/// Convert `FetcherPool` → `ExecutorStsParams` with fetcher-specific
+/// Convert `FetcherPool` → `ExecutorPodParams` with fetcher-specific
 /// hardening defaults.
 ///
 /// `class`: when `Some`, overrides `pool_name` suffix, `resources`,
@@ -108,8 +107,8 @@ async fn cleanup(fp: Arc<FetcherPool>, _ctx: &Ctx) -> Result<Action> {
 fn executor_params(
     fp: &FetcherPool,
     class: Option<&FetcherSizeClass>,
-) -> Result<ExecutorStsParams> {
-    let cache_gb = sts::parse_quantity_to_gb(FETCHER_FUSE_CACHE)?;
+) -> Result<ExecutorPodParams> {
+    let cache_gb = pod::parse_quantity_to_gb(FETCHER_FUSE_CACHE)?;
 
     // ADR-019 §Node isolation: fetchers land on dedicated nodes via
     // the `rio.build/fetcher=true:NoSchedule` taint + matching
@@ -133,7 +132,7 @@ fn executor_params(
         }])
     });
 
-    Ok(ExecutorStsParams {
+    Ok(ExecutorPodParams {
         role: ExecutorRole::Fetcher,
         // ADR-019 §Sandbox hardening: rootfs tampering blocked. The
         // overlay upperdir (tmpfs emptyDir in common/sts.rs) stays
@@ -150,7 +149,7 @@ fn executor_params(
         // (`class=None`) leaves it empty → executor reports
         // size_class=None → hard_filter passes through (back-compat).
         extra_env: class
-            .map(|c| vec![sts::env("RIO_SIZE_CLASS", &c.name)])
+            .map(|c| vec![pod::env("RIO_SIZE_CLASS", &c.name)])
             .unwrap_or_default(),
         // r[impl ctrl.fetcherpool.multiarch]
         // Per-class pool_name → STS name `rio-fetcher-{fp}-{class}`.
@@ -201,7 +200,7 @@ fn executor_params(
             type_: "Localhost".into(),
             localhost_profile: Some("operator/rio-fetcher.json".into()),
         }),
-        seccomp_preinstalled: sts::seccomp_preinstalled(),
+        seccomp_preinstalled: pod::seccomp_preinstalled(),
         host_network: None,
         host_users: fp.spec.host_users,
         // Same mTLS client cert as builders — same binary, same
@@ -241,17 +240,12 @@ mod tests {
     use k8s_openapi::api::core::v1::ResourceRequirements;
 
     fn mk(min: i32, max: i32) -> FetcherPool {
-        use crate::crds::builderpool::Autoscaling;
         let _ = min;
         let mut fp = FetcherPool::new(
             "test",
             crate::crds::fetcherpool::FetcherPoolSpec {
                 deadline_seconds: None,
                 max_concurrent: max as u32,
-                autoscaling: Autoscaling {
-                    metric: "fodQueueDepth".into(),
-                    target_value: 5,
-                },
                 image: "rio-builder:test".into(),
                 systems: vec!["x86_64-linux".into()],
                 node_selector: None,
@@ -273,7 +267,7 @@ mod tests {
     fn labels_include_fetcher_role() {
         let fp = mk(2, 8);
         let params = executor_params(&fp, None).unwrap();
-        let labels = sts::executor_labels(&params);
+        let labels = pod::executor_labels(&params);
         assert_eq!(labels.get("rio.build/role"), Some(&"fetcher".into()));
         assert_eq!(labels.get("rio.build/pool"), Some(&"test".into()));
     }
@@ -360,11 +354,11 @@ mod tests {
             .collect();
         assert_eq!(env.get("RIO_SIZE_CLASS"), Some(&"small"));
         // pool_name = `{fp.name}-{class.name}` so per-arch pools
-        // don't collide (multiarch_pools_distinct_sts_names below).
+        // don't collide (multiarch_pools_distinct_job_names below).
         assert_eq!(params.pool_name, "test-small");
         assert_eq!(
-            sts_name(&params.pool_name, ExecutorRole::Fetcher),
-            "rio-fetcher-test-small"
+            pod::job_name(&params.pool_name, ExecutorRole::Fetcher, "abc123"),
+            "rio-fetcher-test-small-abc123"
         );
         // Per-class resources, NOT spec.resources (which is None).
         assert_eq!(
@@ -383,11 +377,10 @@ mod tests {
 
     // r[verify ctrl.fetcherpool.classes]
     /// I-170: a FetcherPool with `classes=[tiny, small]` produces two
-    /// distinct STS names. The reconciler iterates `spec.classes` and
-    /// stamps one STS+Service per class; this verifies the name
-    /// derivation (the apply loop itself needs a kube-apiserver mock).
+    /// distinct pool_names → distinct Job-name prefixes. The reconciler
+    /// iterates `spec.classes` and spawns one Job loop per class.
     #[test]
-    fn classes_produce_distinct_sts_names() {
+    fn classes_produce_distinct_job_names() {
         let mut fp = mk(2, 8);
         fp.spec.classes = vec![
             FetcherSizeClass {
@@ -405,26 +398,18 @@ mod tests {
             .spec
             .classes
             .iter()
-            .map(|c| {
-                sts_name(
-                    &executor_params(&fp, Some(c)).unwrap().pool_name,
-                    ExecutorRole::Fetcher,
-                )
-            })
+            .map(|c| executor_params(&fp, Some(c)).unwrap().pool_name)
             .collect();
-        assert_eq!(
-            names,
-            vec!["rio-fetcher-test-tiny", "rio-fetcher-test-small"]
-        );
+        assert_eq!(names, vec!["test-tiny", "test-small"]);
     }
 
     // r[verify ctrl.fetcherpool.multiarch]
     /// Two FetcherPools (one per arch) with the same `classes=[tiny]`
-    /// produce DISTINCT STS names. P0556's `pool_name = class.name`
-    /// would collide both at `rio-fetcher-tiny`; the `{fp}-{class}`
-    /// form keeps them separate. Mirrors `rio-builder-{arch}-{class}`.
+    /// produce DISTINCT pool_names. P0556's `pool_name = class.name`
+    /// would collide both at `tiny`; the `{fp}-{class}` form keeps
+    /// them separate. Mirrors `rio-builder-{arch}-{class}`.
     #[test]
-    fn multiarch_pools_distinct_sts_names() {
+    fn multiarch_pools_distinct_job_names() {
         let class = FetcherSizeClass {
             name: "tiny".into(),
             resources: ResourceRequirements::default(),
@@ -435,18 +420,13 @@ mod tests {
         let mut arm = mk(2, 8);
         arm.metadata.name = Some("aarch64".into());
 
-        let n = |fp: &FetcherPool| {
-            sts_name(
-                &executor_params(fp, Some(&class)).unwrap().pool_name,
-                ExecutorRole::Fetcher,
-            )
-        };
-        assert_eq!(n(&x86), "rio-fetcher-x86-64-tiny");
-        assert_eq!(n(&arm), "rio-fetcher-aarch64-tiny");
+        let n = |fp: &FetcherPool| executor_params(fp, Some(&class)).unwrap().pool_name;
+        assert_eq!(n(&x86), "x86-64-tiny");
+        assert_eq!(n(&arm), "aarch64-tiny");
         assert_ne!(n(&x86), n(&arm), "per-arch pools must not collide");
-        // Max length headroom: `rio-fetcher-aarch64-small-abcdef`
+        // Max length headroom: job_name `rio-fetcher-aarch64-small-abcdef`
         // = 32 chars; RFC 1123 limit is 63.
-        assert!(n(&arm).len() < 63 - 7);
+        assert!(pod::job_name(&n(&arm), ExecutorRole::Fetcher, "abcdef").len() < 63);
     }
 
     /// Unclassed path: `class=None` → no RIO_SIZE_CLASS env, bare
@@ -462,21 +442,17 @@ mod tests {
         assert_eq!(params.pool_name, "test");
     }
 
-    /// STS name is `rio-{role}-{pool}` (I-104) — pool name is the
-    /// disambiguating suffix (typically arch).
+    /// Job name is `rio-{role}-{pool}-{suffix}` (I-104) — pool name
+    /// is the disambiguating part (typically arch).
     #[test]
-    fn sts_name_has_role_then_pool_suffix() {
+    fn job_name_has_role_then_pool_then_suffix() {
         assert_eq!(
-            sts_name("default", ExecutorRole::Fetcher),
-            "rio-fetcher-default"
+            pod::job_name("default", ExecutorRole::Fetcher, "abc"),
+            "rio-fetcher-default-abc"
         );
         assert_eq!(
-            sts_name("x86-64", ExecutorRole::Builder),
-            "rio-builder-x86-64"
-        );
-        assert_eq!(
-            sts_name("aarch64", ExecutorRole::Builder),
-            "rio-builder-aarch64"
+            pod::job_name("x86-64", ExecutorRole::Builder, "abc"),
+            "rio-builder-x86-64-abc"
         );
     }
 }

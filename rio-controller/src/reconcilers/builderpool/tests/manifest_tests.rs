@@ -619,11 +619,8 @@ fn cold_start_job_uses_spec_resources_floor() {
     );
 }
 
-/// Job spec load-bearing fields. Mirror of ephemeral's
-/// `job_spec_load_bearing_fields` with manifest-specific assertions.
-/// Key DIFFERENCES from ephemeral:
-///   - NO RIO_EPHEMERAL (pod loops — would never complete with it)
-///   - NO active_deadline_seconds (long-lived)
+/// Job spec load-bearing fields. Manifest pods are one-shot like
+/// static-sizing pods — same TTL/deadline/restartPolicy assertions.
 #[test]
 fn job_spec_load_bearing_fields() {
     let wp = test_manifest_wp();
@@ -645,33 +642,17 @@ fn job_spec_load_bearing_fields() {
     let spec = job.spec.as_ref().unwrap();
     assert_eq!(spec.backoff_limit, Some(0), "K8s must not retry");
     assert_eq!(spec.parallelism, Some(1));
-    // r[verify ctrl.pool.manifest-long-lived]
     assert_eq!(
-        spec.ttl_seconds_after_finished, None,
-        "manifest pods never self-terminate (no RIO_EPHEMERAL) → \
-         controller deletion is the only scale-down path → TTL \
-         would race it"
-    );
-    assert_eq!(
-        spec.active_deadline_seconds, None,
-        "manifest pods are long-lived — no deadline (wrong-pool-spawn \
-         isn't a concern for demand-driven buckets)"
+        spec.ttl_seconds_after_finished,
+        Some(crate::reconcilers::builderpool::ephemeral::JOB_TTL_SECS),
+        "one-shot manifest pods → TTL reaps completed Jobs"
     );
 
     let pod_spec = spec.template.spec.as_ref().unwrap();
     assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
 
-    // r[verify ctrl.pool.manifest-long-lived]
-    // NO RIO_EPHEMERAL — manifest pods loop. An accidental
-    // RIO_EPHEMERAL=1 here would make every manifest pod exit
-    // after one build → constant respawn churn.
-    let env = pod_spec.containers[0].env.as_ref().unwrap();
-    assert!(
-        !env.iter().any(|e| e.name == "RIO_EPHEMERAL"),
-        "manifest pods are NOT ephemeral — no RIO_EPHEMERAL env"
-    );
-
     // Sanity: build_pod_spec reuse — scheduler addr env present.
+    let env = pod_spec.containers[0].env.as_ref().unwrap();
     assert!(env.iter().any(|e| e.name == "RIO_SCHEDULER_ADDR"));
 }
 

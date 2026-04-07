@@ -41,37 +41,6 @@ spec:
               \ No CEL on this struct yet, but KubeSchema\nkeeps the door open without\
               \ a re-derive."
             properties:
-              autoscaling:
-                description: 'Autoscaling policy. Same struct as BuilderPool. The
-                  expected
-
-                  `metric` is `"fodQueueDepth"` (`ClusterStatus.queued_fod_
-
-                  derivations`); the controller''s autoscaler validates and
-
-                  surfaces unrecognized metrics in `.status.conditions`.'
-                properties:
-                  metric:
-                    default: queueDepth
-                    description: "Metric driving scale decisions. Currently only \"\
-                      queueDepth\"\n(scheduler's ClusterStatus.queued_derivations).\
-                      \ String not\nenum so future metrics don't need a CRD version\
-                      \ bump \u2014\nunknown metric is a RECONCILE error (surfaces\
-                      \ in\n.status.conditions), not a schema rejection."
-                    type: string
-                  targetValue:
-                    default: 5
-                    description: 'Scale up when `queued_derivations / active_executors
-                      >
-
-                      target_value`. "5" means "scale up when there are more
-
-                      than 5 queued builds per worker." Lower = more aggressive
-
-                      scaling (more pods, lower queue latency, higher cost).'
-                    format: int32
-                    type: integer
-                type: object
               classes:
                 description: "Optional size classes (I-170). When empty (default),\
                   \ single\nSTS/Job-set at `spec.resources` \u2014 original behavior.\
@@ -217,7 +186,6 @@ spec:
                 nullable: true
                 type: array
             required:
-            - autoscaling
             - image
             - maxConcurrent
             - systems

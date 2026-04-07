@@ -66,7 +66,6 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
                 "metadata": {"name": "test-pool", "namespace": "rio"},
                 "spec": {
                     "maxConcurrent": 10,
-                    "autoscaling": {"metric": "x", "targetValue": 1},
                     "fuseCacheSize": "1Gi",
                     "features": [],
                     "systems": ["x"],
@@ -94,8 +93,7 @@ fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
         jail.set_env("LLVM_PROFILE_FILE", "/var/lib/rio/cov/ctrl-%p-%m.profraw");
 
         let wp = test_wp();
-        let sts = test_sts(&wp);
-        let spec = sts.spec.unwrap().template.spec.unwrap();
+        let spec = test_pod_spec(&wp);
         let container = &spec.containers[0];
 
         // Env var injected with the canonical pod-side template (NOT
@@ -138,8 +136,8 @@ fn rust_log_propagated_verbatim() -> figment::error::Result<()> {
         jail.set_env("RUST_LOG", "info,rio_builder=debug");
 
         let wp = test_wp();
-        let sts = test_sts(&wp);
-        let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+        let spec = test_pod_spec(&wp);
+        let container = &spec.containers[0];
 
         let envs = container.env.as_ref().expect("env vars");
         let rust_log = envs
@@ -167,8 +165,8 @@ fn rust_log_absent_when_controller_env_unset() -> figment::error::Result<()> {
         }
 
         let wp = test_wp();
-        let sts = test_sts(&wp);
-        let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+        let spec = test_pod_spec(&wp);
+        let container = &spec.containers[0];
 
         let envs = container.env.as_ref().expect("env vars");
         assert!(
@@ -195,8 +193,7 @@ fn coverage_absent_when_controller_env_unset() -> figment::error::Result<()> {
         }
 
         let wp = test_wp();
-        let sts = test_sts(&wp);
-        let spec = sts.spec.unwrap().template.spec.unwrap();
+        let spec = test_pod_spec(&wp);
         let container = &spec.containers[0];
 
         // NO env var, volume, or mount — prod pods are clean.

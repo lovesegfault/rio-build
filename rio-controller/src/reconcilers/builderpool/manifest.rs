@@ -1099,26 +1099,11 @@ pub(super) fn build_manifest_job(
             parallelism: Some(1),
             completions: Some(1),
             backoff_limit: Some(0),
-            // r[impl ctrl.pool.manifest-long-lived]
-            // NO ttl_seconds_after_finished. Manifest pods loop
-            // (no RIO_EPHEMERAL=1), so "finished" only happens on
-            // crash/OOM. A crashed Job is already filtered from
-            // active_jobs (status.failed > 0 check in the inventory
-            // pass), so it doesn't count as supply → replacement
-            // spawns next tick. TTL-based reaping would race the
-            // controller's deliberate scale-down deletes. Controller
-            // deletion (scale-down above) + ownerRef GC (BuilderPool
-            // delete) are the ONLY Job-removal paths.
-            //
-            // Crashed Jobs are swept by select_failed_jobs in the
-            // scale-down pass. Spec: `ctrl.pool.manifest-failed-
-            // sweep` in docs/src/components/controller.md. No TTL
-            // here: TTL-based reaping would race deliberate
-            // scale-down deletes.
-            //
-            // NO active_deadline_seconds — manifest pods are
-            // long-lived. Scale-down (above) handles the
-            // demand-dropped case.
+            // Manifest pods are one-shot (same as static-sizing
+            // Jobs); ttlSecondsAfterFinished reaps the completed
+            // Job, activeDeadlineSeconds caps a hung build.
+            ttl_seconds_after_finished: Some(super::ephemeral::JOB_TTL_SECS),
+            active_deadline_seconds: wp.spec.deadline_seconds.map(i64::from),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels),
