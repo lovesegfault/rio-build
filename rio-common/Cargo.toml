@@ -40,12 +40,6 @@ tonic-health = { workspace = true }
 # line. Previously 5×-duplicated at each main.rs top.
 rustls = { workspace = true }
 
-# Bloom filter hash (phase2c D1). blake3: portable (deterministic across
-# architectures — matters for a WIRE PROTOCOL where worker builds and
-# scheduler queries must agree on bit indices). Single 256-bit output
-# split into double-hash values; no seeded re-hash.
-blake3 = { workspace = true }
-
 # HMAC-SHA256 assignment tokens (phase3b B track). Constant-time
 # verify via Mac::verify_slice.
 hmac = { workspace = true }

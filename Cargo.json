@@ -19492,10 +19492,6 @@
           "packageId": "base64"
         },
         {
-          "name": "blake3",
-          "packageId": "blake3"
-        },
-        {
           "name": "ed25519-dalek",
           "packageId": "ed25519-dalek"
         },
