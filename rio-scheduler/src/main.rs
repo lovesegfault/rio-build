@@ -341,15 +341,21 @@ impl rio_common::config::ValidateConfig for Config {
         // would silently no-op (`max_class_by_order` ranks unknown
         // below known) — big-parallel work would still land on tiny.
         // Fail fast at startup instead of after the first eviction.
-        for sf in &cfg.soft_features {
-            if let Some(hint) = &sf.floor_hint {
-                anyhow::ensure!(
-                    cfg.size_classes.iter().any(|c| &c.name == hint),
-                    "soft_features[{}].floor_hint = {hint:?} is not a configured size_class \
-                     (known: {:?})",
-                    sf.name,
-                    cfg.size_classes.iter().map(|c| &c.name).collect::<Vec<_>>()
-                );
+        // Skipped when size_classes is empty: tiered-sizing is OFF
+        // (vmtest, single-pool dev), so the hint is a deliberate no-op
+        // and validating it would force every values overlay to also
+        // override softFeatures.
+        if !cfg.size_classes.is_empty() {
+            for sf in &cfg.soft_features {
+                if let Some(hint) = &sf.floor_hint {
+                    anyhow::ensure!(
+                        cfg.size_classes.iter().any(|c| &c.name == hint),
+                        "soft_features[{}].floor_hint = {hint:?} is not a configured size_class \
+                         (known: {:?})",
+                        sf.name,
+                        cfg.size_classes.iter().map(|c| &c.name).collect::<Vec<_>>()
+                    );
+                }
             }
         }
         Ok(())
@@ -1273,6 +1279,22 @@ mod tests {
             err.contains("tiny"),
             "error must list known classes for operator diagnosis: {err}"
         );
+
+        // size_classes=[] (tiered-sizing OFF, vmtest/single-pool) →
+        // hint is a no-op; validation must NOT reject. Otherwise the
+        // chart default (floorHint: xlarge) crashloops the scheduler
+        // in every overlay that doesn't also configure sizeClasses.
+        let cfg_unclassed = Config {
+            size_classes: vec![],
+            soft_features: vec![rio_scheduler::SoftFeature {
+                name: "big-parallel".into(),
+                floor_hint: Some("xlarge".into()),
+            }],
+            ..test_valid_config()
+        };
+        cfg_unclassed
+            .validate()
+            .expect("floor_hint must be ignored when size_classes is empty");
     }
 
     /// Boundary values: the INCLUSIVE endpoints of each range are
