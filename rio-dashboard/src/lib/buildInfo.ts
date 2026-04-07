@@ -1,6 +1,6 @@
 // Shared progress / timestamp formatters for BuildInfo rendering.
 //
-// EXTRACTED from Builds.svelte + BuildDrawer.svelte + Workers.svelte
+// EXTRACTED from Builds.svelte + BuildDrawer.svelte + Executors.svelte
 // (consolidator-mc210: progress() was byte-identical 2×, proto-Timestamp
 // → ms hand-rolled 4× with inconsistent nanos handling). Standardized on
 // @bufbuild/protobuf/wkt's timestampMs — the canonical converter, which

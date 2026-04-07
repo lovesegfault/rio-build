@@ -1,5 +1,5 @@
 // r[impl dash.envoy.grpc-web-translate+2]
-// r[impl dash.auth.method-gate]
+// r[impl dash.auth.method-gate+2]
 // Shared gRPC-Web transport for the AdminService client.
 //
 // The translation and method-gate enforcement are IN Envoy Gateway (Helm

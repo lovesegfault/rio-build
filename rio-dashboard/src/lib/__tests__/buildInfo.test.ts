@@ -1,5 +1,5 @@
 // Table-driven unit tests for the shared BuildInfo formatters extracted
-// from Builds.svelte / BuildDrawer.svelte / Workers.svelte. Pure functions,
+// from Builds.svelte / BuildDrawer.svelte / Executors.svelte. Pure functions,
 // no DOM — these pin the 4× duplicated logic down in one place.
 import { timestampFromMs } from '@bufbuild/protobuf/wkt';
 import { describe, expect, it } from 'vitest';

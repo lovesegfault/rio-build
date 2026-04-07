@@ -2,7 +2,7 @@
   // DrainExecutor write action with optimistic UI: the button flips the
   // parent-owned ExecutorInfo[] entry to `draining` before the RPC returns,
   // and reverts on error. The `executors` array is bound from
-  // Workers.svelte via `$bindable()` so the mutation propagates back
+  // Executors.svelte via `$bindable()` so the mutation propagates back
   // into the page's rune-backed state without an event roundtrip.
   //
   // The button is disabled once an executor is draining/dead — repeated
@@ -26,7 +26,7 @@
   const disabled = $derived(!target || target.status !== 'alive');
 
   // Key the mutation on executorId, not on an index captured before the
-  // await: Workers.svelte's 5s refresh() reassigns `executors` wholesale,
+  // await: Executors.svelte's 5s refresh() reassigns `executors` wholesale,
   // so a pre-await index may point at the wrong row (or off the end) by
   // the time the catch fires. Re-find at each mutation site.
   function setStatus(s: string) {

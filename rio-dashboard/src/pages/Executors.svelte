@@ -1,9 +1,10 @@
 <script lang="ts">
   // Executors page: listExecutors poll + per-row DrainButton + kind
-  // filter. The load bar and >30s-stale heartbeat are the two operator
-  // affordances that a metrics dashboard can't give you: the bar is
-  // per-executor capacity (not aggregate), the red-timestamp is the
-  // "something's wrong with this node, go look at its pod" signal.
+  // filter. The busy/idle pill and >30s-stale heartbeat are the two
+  // operator affordances a metrics dashboard can't give you: under
+  // one-build-per-pod the load is binary (so a pill, not a bar), and
+  // the red-timestamp is the "something's wrong with this node, go
+  // look at its pod" signal.
   //
   // r[impl builder.executor.kind-gate]
   // The kind filter is the dashboard surface for the ADR-019 builder/

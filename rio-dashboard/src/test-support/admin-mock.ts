@@ -54,7 +54,7 @@ export const adminMock = {
   debugListExecutors: vi.fn(),
   listTenants: vi.fn(),
   createTenant: vi.fn(),
-  // Empty-default so pages embedding DagView/Graph (which calls
+  // Empty-default so pages embedding Graph (which calls
   // getBuildGraph at mount) don't crash on undefined.nodes. Per-test
   // overrides via .mockResolvedValueOnce(...) still work.
   getBuildGraph: vi
@@ -94,7 +94,7 @@ export async function flushSvelte(): Promise<void> {
 /**
  * Standard beforeEach: fake timers, fixed system time, confirm
  * auto-accept. Fixed `now` keeps relative-time rendering (e.g.
- * Workers' heartbeat-ago cells) deterministic. jsdom's `confirm()` is
+ * Executors' heartbeat-ago cells) deterministic. jsdom's `confirm()` is
  * a real prompt that would block the test — the stub makes the
  * click-path proceed past the guard.
  */

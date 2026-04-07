@@ -87,9 +87,8 @@ describe('Builds', () => {
     const drawer = screen.getByTestId('build-drawer');
     expect(drawer).toHaveTextContent('click-target-id');
     expect(drawer).toHaveTextContent('succeeded');
-    // Both tab buttons render; Logs is active by default and now hosts
-    // the live LogViewer (P0279). Graph is still a placeholder until
-    // P0280 swaps it for the @xyflow DAG.
+    // Both tab buttons render; Logs is active by default and hosts the
+    // live LogViewer.
     expect(drawer).toHaveTextContent('Logs');
     expect(drawer).toHaveTextContent('Graph');
     expect(screen.getByTestId('log-viewer')).toBeInTheDocument();
