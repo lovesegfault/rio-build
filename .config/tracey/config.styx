@@ -4,7 +4,7 @@
 //
 // Single spec "rio" with prefix `r` (inferred from markers). Requirement
 // IDs carry the domain: r[gw.*], r[sched.*], r[store.*], r[builder.*],
-// r[fetcher.*], r[ctrl.*], r[obs.*], r[sec.*], r[proto.*].
+// r[fetcher.*], r[ctrl.*], r[obs.*], r[sec.*], r[proto.*], r[infra.*].
 //
 // test_include semantics: matched files allow ONLY `verify` annotations —
 // using `impl` in a test file is a hard error. That's why inline
@@ -42,6 +42,7 @@ specs (
       docs/src/components/proto.md
       docs/src/observability.md
       docs/src/security.md
+      docs/src/deployment.md
       docs/src/decisions/019-builder-fetcher-split.md
     )
     impls (
@@ -57,6 +58,7 @@ specs (
           rio-nix/src/**/*.rs
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs
+          nix/nixos-node/**/*.nix
           rio-dashboard/src/lib/logStream.svelte.ts
           rio-dashboard/src/lib/graphLayout.ts
           rio-dashboard/src/api/transport.ts
