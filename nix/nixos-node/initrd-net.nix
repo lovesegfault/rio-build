@@ -6,8 +6,14 @@
 _: {
   boot.initrd = {
     # ena MUST be in initrd now — minimal.nix's mkForce[] dropped it.
-    # virtio_net stays in nix/tests/nixos-node.nix's own override.
-    availableKernelModules = [ "ena" ];
+    # af_packet: networkd's DHCP client + LLDP both use raw packet
+    # sockets; without it the link goes "Failed → reconfigure" loop and
+    # initrd networkd provides no win. virtio_net stays in
+    # nix/tests/nixos-node.nix's own override.
+    availableKernelModules = [
+      "ena"
+      "af_packet"
+    ];
     systemd.network = {
       enable = true;
       # Stage-2's eks-node.nix defines the full 80-ec2-primary unit;
@@ -23,6 +29,9 @@ _: {
         networkConfig = {
           DHCP = "yes";
           IPv6DuplicateAddressDetection = 0;
+          # LLDP is useless on a VPC; skip the socket open.
+          LLDP = false;
+          EmitLLDP = false;
         };
         dhcpV6Config.WithoutRA = "solicit";
       };
