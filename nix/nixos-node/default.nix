@@ -46,14 +46,8 @@
   # nixpkgs amazon-image.nix pulls in amazon-init.service, which fetches
   # userData and pipes it to `nixos-rebuild switch`. We want the node
   # IMMUTABLE post-boot — userData is consumed by nodeadm-init (eks-node.
-  # nix), not by a Nix evaluator. Disabling here (not in minimal.nix) so
-  # the option only resolves when amazon-image.nix is actually imported
-  # (the VM-test composition won't have it).
+  # nix), not by a Nix evaluator. The VM-test fixture (nix/tests/
+  # nixos-node.nix) imports virtualisation/amazon-init.nix directly so
+  # this option resolves there too.
   virtualisation.amazon-init.enable = lib.mkDefault false;
-
-  # TODO(P0-nixos-vm-test): nix/tests/nixos-node.nix — boot the toplevel
-  # (not the disk image) under QEMU with mocked IMDS, assert nodeadm-init
-  # succeeds, kubelet starts, seccomp profiles exist, containerd
-  # base_runtime_spec reflects /dev/{fuse,kvm}, `sysctl
-  # user.max_user_namespaces` = 65536.
 }

@@ -811,7 +811,14 @@
               # fails. The test is ABOUT PSA — running it under a mode that changes
               # PSA defeats the point. No coverage delta lost: PSA rendering is
               # Helm+YAML, no r[impl]-annotated Rust.
-              [ "vm-lifecycle-prod-parity-k3s" ];
+              #
+              # nixos-node boots no rio-* binaries (nodeadm + kubelet only) —
+              # zero profraws, so a coverage-mode rebuild is wasted CI time
+              # and would skew after_n_builds.
+              [
+                "vm-lifecycle-prod-parity-k3s"
+                "vm-nixos-node"
+              ];
 
           # --------------------------------------------------------------
           # Coverage merge pipeline (Linux-only — depends on vmTestsCov)

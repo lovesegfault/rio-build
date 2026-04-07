@@ -210,6 +210,18 @@ let
   };
 in
 {
+  # ── nixos-node AMI bootstrap (mocked IMDS, no AWS) ────────────────────
+  # r[verify infra.node.nixos-ami]
+  #   Single-node test, no fixture/scenario split. Boots the
+  #   nix/nixos-node module tree (NOT the disk image) under QEMU with
+  #   a mocked IMDSv2 on lo. nodeadm-init must parse the multipart
+  #   NodeConfig + write /etc/eks/kubelet/environment; containerd's
+  #   ActiveEnterTimestamp must precede nodeadm-init's; kubelet forks
+  #   under NODEADM_KUBELET_ARGS. Would have caught the Phase-1
+  #   `-d kubelet` short-flag collision that only surfaced on live EC2.
+  #   Gates Phase-2 boot-path changes (initrd-networkd, UKI, perlless).
+  vm-nixos-node = import ./nixos-node.nix { inherit pkgs; };
+
   vm-protocol-warm-standalone = protocol {
     inherit pkgs common;
     fixture = standalone {
