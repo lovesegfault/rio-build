@@ -31,10 +31,10 @@
     ./hardening.nix
   ];
 
-  # amazon-image.nix → ec2-data.nix wires three services that race
-  # nodeadm for IMDS: apply-ec2-data (hostname/ssh-keys), print-host-key,
-  # fetch-ec2-metadata. nodeadm + networkd-DHCP cover hostname; sshd is
-  # disabled (minimal.nix); the rest is dead. Runs PARALLEL to nodeadm so
+  # amazon-image.nix wires three IMDS-racing services: fetch-ec2-metadata
+  # (inline) plus apply-ec2-data/print-host-key (via ec2-data.nix import).
+  # nodeadm + networkd-DHCP cover hostname; sshd is disabled (minimal.nix);
+  # the rest is dead. Runs PARALLEL to nodeadm so
   # the win is contention-only — closure shrink (openssh, lzip, file,
   # hostname-debian) is the real prize.
   disabledModules = [ "virtualisation/ec2-data.nix" ];
