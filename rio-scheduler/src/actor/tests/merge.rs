@@ -470,6 +470,97 @@ async fn test_ca_cache_miss_stale_realisation() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.ca-fod-substitute]
+/// Fixed-CA FOD: `ca_modular_hash` is 32 bytes (every FOD per
+/// translate.rs:343) AND `expected_output_paths` is non-empty (the
+/// content-addressed path computed from outputHash). No realisation
+/// row exists. The output is NOT in rio-store but IS substitutable
+/// from upstream → MUST cache-hit via the path-based lane.
+///
+/// Regression for I-203: filtering on `ca_modular_hash.len() != 32`
+/// excluded these from the path-based lane → dispatched to a fetcher
+/// → hit the (dead) origin URL.
+#[tokio::test]
+async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    let fod_out = test_store_path("chromium-buildtools-source");
+    store.substitutable.write().unwrap().push(fod_out.clone());
+
+    // Production shape: FOD ⇒ is_content_addressed + 32-byte modular
+    // hash + known expected_output_path. NO realisation row in PG.
+    let mut node = make_test_node("ca-fod-sub", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.is_fixed_output = true;
+    node.ca_modular_hash = [0x42u8; 32].to_vec();
+    node.expected_output_paths = vec![fod_out.clone()];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "fixed-CA FOD with known path + substitutable output MUST cache-hit \
+         via path-based lane; got state={}",
+        status.state
+    );
+    assert_eq!(status.cached_derivations, 1);
+
+    let qpi = store.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&fod_out),
+        "path-based lane should eager-fetch substitutable FOD output; \
+         qpi_calls={qpi:?}"
+    );
+
+    Ok(())
+}
+
+/// Negative case for `r[sched.merge.ca-fod-substitute]`: same fixed-CA
+/// FOD shape but the output is plain-missing (not substitutable). Node
+/// proceeds to Ready and dispatches to a fetcher.
+#[tokio::test]
+async fn test_fixed_ca_fod_not_substitutable_dispatches() -> TestResult {
+    use rio_test_support::grpc::spawn_mock_store_with_client;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    // FOD ⇒ Fetcher pool, not Builder.
+    let mut fetcher_rx =
+        connect_fetcher_classed(&handle, "f-ca-fod", "x86_64-linux", "tiny").await?;
+
+    let fod_out = test_store_path("not-in-any-cache");
+    let mut node = make_test_node("ca-fod-miss", "x86_64-linux");
+    node.is_content_addressed = true;
+    node.is_fixed_output = true;
+    node.ca_modular_hash = [0x43u8; 32].to_vec();
+    node.expected_output_paths = vec![fod_out];
+
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let assn = recv_assignment(&mut fetcher_rx).await;
+    assert!(
+        assn.drv_path.ends_with("ca-fod-miss.drv"),
+        "fixed-CA FOD not in store/upstream → must dispatch; got {}",
+        assn.drv_path
+    );
+
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(status.cached_derivations, 0);
+
+    Ok(())
+}
+
 /// Negative case: CA node with a modular_hash that has NO realisation
 /// row → cache-miss → proceeds to Ready (not Completed).
 #[tokio::test]

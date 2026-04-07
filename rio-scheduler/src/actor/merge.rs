@@ -1067,19 +1067,29 @@ impl DagActor {
         let mut hits: HashMap<DrvHash, Vec<String>> = HashMap::new();
 
         // --- Floating-CA: realisations-table lookup --------------------
-        // GAP-3 fix: CA nodes can't use FindMissingPaths (expected path is
-        // ""). Query realisations by (modular_hash, output_name) instead —
-        // same lookup resolve_ca_inputs uses at dispatch time. A hit here
-        // means a prior build (via gateway wopRegisterDrvOutput or scheduler
-        // insert_realisation on completion) already produced this output.
+        // Floating-CA nodes have expected_output_paths == [""] (path
+        // unknown until built). Query realisations by (modular_hash,
+        // output_name) instead — same lookup resolve_ca_inputs uses at
+        // dispatch time. A hit means a prior build (via gateway
+        // wopRegisterDrvOutput or scheduler insert_realisation on
+        // completion) already produced this output.
+        //
+        // Fixed-CA FODs have ca_modular_hash set (translate.rs:343) but
+        // ALSO have a known expected_output_path — those go through the
+        // path-based lane below, which checks upstream substitutability.
         for h in probe_set {
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
             };
             let Ok(modular_hash): Result<[u8; 32], _> = n.ca_modular_hash.as_slice().try_into()
             else {
-                continue; // IA or malformed — handled by FindMissingPaths below
+                continue; // IA or malformed — handled by path-based lane below
             };
+            if n.expected_output_paths.iter().any(|p| !p.is_empty()) {
+                // Fixed-CA FOD: output path known at eval time. The
+                // path-based lane handles it (incl. substitutability).
+                continue;
+            }
             // All output_names must resolve for a full cache-hit. Collect
             // realized paths index-paired with output_names (same layout
             // as DerivationState.output_paths).
@@ -1107,7 +1117,7 @@ impl DagActor {
             }
         }
 
-        // --- CA store-existence verify (I-048) -------------------------
+        // --- Floating-CA store-existence verify (I-048) ----------------
         // r[impl sched.merge.stale-completed-verify]
         // The realisations table is scheduler-local PG; store GC doesn't
         // touch it. A realisation can point to a path that's been GC'd.
@@ -1116,8 +1126,13 @@ impl DagActor {
         // NEXT merge — ping-pong, with the dependent dispatching against
         // a missing output in between.
         //
+        // No upstream substitution here: floating-CA paths can't be
+        // probed against cache.nixos.org by path (the path is local-
+        // realisation-derived, not a globally-known FOD output), and
+        // rio-store has no upstream realisations lookup.
+        //
         // Fail-open like I-047: store unreachable → keep `hits` as-is.
-        // No breaker interaction — the IA path's FindMissingPaths below
+        // No breaker interaction — the path-based FindMissingPaths below
         // is the breaker-gated availability check; this is best-effort
         // correctness on the rare GC-race window.
         if !hits.is_empty()
@@ -1166,21 +1181,21 @@ impl DagActor {
             }
         }
 
-        // --- IA / fixed-CA: FindMissingPaths by expected path ----------
+        // --- Path-based: FindMissingPaths by expected path -------------
         let Some(store_client) = &self.store_client else {
             return Ok(hits);
         };
 
-        // Collect expected output paths for IA probe-set derivations
-        // (newly-inserted + existing not-done re-probe per I-099).
-        // Skip CA nodes (handled above) and nodes without expected_output_paths.
-        // Also skip empty-string paths defensively (a stray "" would be
-        // reported missing, defeating the cache-hit for that node anyway,
-        // but no reason to send it over the wire).
+        // r[impl sched.merge.ca-fod-substitute]
+        // Collect expected output paths for ALL probe-set derivations
+        // with a known path — IA, fixed-CA FODs, or anything else where
+        // the gateway computed expected_output_paths. The is_empty filter
+        // excludes floating-CA (translate.rs sends [""] for those —
+        // handled by the realisations lane above). Newly-inserted +
+        // existing not-done re-probe per I-099.
         let check_paths: Vec<String> = probe_set
             .iter()
             .filter_map(|h| node_index.get(h.as_str()))
-            .filter(|n| n.ca_modular_hash.len() != 32)
             .flat_map(|n| n.expected_output_paths.iter())
             .filter(|p| !p.is_empty())
             .cloned()
@@ -1320,17 +1335,21 @@ impl DagActor {
             .filter(|p| !missing.contains(p))
             .collect();
 
-        // An IA derivation is cached if it has at least one expected output
-        // path AND all of them are present (locally or upstream-substitutable).
+        // A derivation is cached if it has at least one non-empty
+        // expected output path AND all of them are present (locally or
+        // upstream-substitutable). Skip nodes the floating-CA lane
+        // already resolved.
         for h in probe_set {
+            if hits.contains_key(h) {
+                continue; // floating-CA — already resolved above
+            }
             let Some(n) = node_index.get(h.as_str()) else {
                 continue;
             };
-            if n.ca_modular_hash.len() == 32 {
-                continue; // CA — already handled above
-            }
-            if !n.expected_output_paths.is_empty()
-                && n.expected_output_paths.iter().all(|p| present.contains(p))
+            if n.expected_output_paths.iter().any(|p| !p.is_empty())
+                && n.expected_output_paths
+                    .iter()
+                    .all(|p| p.is_empty() || present.contains(p))
             {
                 hits.insert(h.clone(), n.expected_output_paths.clone());
             }
