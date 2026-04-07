@@ -33,7 +33,7 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 - **Threat**: Compromised pod impersonating another component
 - **Mitigations**: mTLS with per-service certificates, NetworkPolicy restricting pod-to-pod communication
 - **Authorization**: mTLS authenticates component identity. Application-level authorization uses assignment-scoped tokens for sensitive RPCs:
-  - The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(Claims)).base64url(hmac_sha256(key, claims_json))`. The `Claims` struct has exactly four fields: `worker_id` (string, audit only), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `expiry_unix` (u64 Unix seconds, replay prevention).
+  - The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(Claims)).base64url(hmac_sha256(key, claims_json))`. The `Claims` struct has exactly five fields: `executor_id` (string, audit only), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `is_ca` (bool, skips the membership check for floating-CA derivations whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds, replay prevention).
   - Workers present the assignment token in the `x-rio-assignment-token` gRPC metadata header when calling `PutPath` on the store. The store verifies the token signature, checks `now < expiry_unix`, and rejects with `PERMISSION_DENIED` if the uploaded `store_path ∉ expected_outputs`.
   - This prevents a compromised worker from writing to store paths it was never assigned to build.
   - Token lifetime is scoped to the build assignment; tokens expire after a configurable TTL (default: 2× the build timeout).
@@ -230,8 +230,8 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 ## Ephemeral Builders
 
 For untrusted multi-tenant deployments where **isolation > throughput**,
-`WorkerPoolSpec.ephemeral: true` (see `r[ctrl.pool.ephemeral]` in
-[components/controller.md](components/controller.md#ephemeral-workerpools))
+`BuilderPoolSpec.ephemeral: true` (see `r[ctrl.pool.ephemeral]` in
+[components/controller.md](components/controller.md#job-lifecycle))
 provides the strongest cross-build isolation rio offers: one pod per
 build, zero shared state. Each build gets a fresh emptyDir for the FUSE
 cache and overlayfs upper — an untrusted tenant cannot leave behind
@@ -252,9 +252,9 @@ exfiltrate.
 
 | Layer | Mechanism | What it provides |
 |---|---|---|
-| Pod lifetime | `WorkerPoolSpec.ephemeral: true` (the CRD default) | Zero cross-build state; no cache/overlay poisoning |
+| Pod lifetime | `BuilderPoolSpec.ephemeral: true` (the CRD default) | Zero cross-build state; no cache/overlay poisoning |
 | User namespace | `hostUsers: false` (K8s 1.33+) | `CAP_SYS_ADMIN` scoped to unprivileged host UIDs (see limitation #2) |
-| Seccomp | `WorkerPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[builder.seccomp.localhost-profile]`) |
+| Seccomp | `BuilderPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[builder.seccomp.localhost-profile]`) |
 | Node isolation | Dedicated tainted node pool | Sandbox escape confined to worker nodes |
 | Network | NetworkPolicy egress deny + FOD proxy allowlist | No exfil to arbitrary endpoints |
 

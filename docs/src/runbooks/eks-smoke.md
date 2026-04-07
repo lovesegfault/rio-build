@@ -66,12 +66,12 @@ echo "Gateway: $GATEWAY_HOST"
 - Check Events: `kubectl -n rio-system describe svc rio-gateway`
 - Common: missing IAM permissions for the controller's SA
 
-## Step 4: Create WorkerPool
+## Step 4: Create BuilderPool
 
 ```bash
 cat <<EOF | kubectl apply -f -
 apiVersion: rio.build/v1alpha1
-kind: WorkerPool
+kind: BuilderPool
 metadata:
   name: smoke-test
   namespace: rio-system
@@ -159,7 +159,7 @@ grpcurl -d '{"dry_run": true, "grace_period_hours": 2}' \
 ## Cleanup
 
 ```bash
-kubectl -n rio-system delete workerpool smoke-test
+kubectl -n rio-system delete builderpool smoke-test
 helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for full teardown
 ```
 

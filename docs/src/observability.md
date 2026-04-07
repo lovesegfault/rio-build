@@ -224,7 +224,7 @@ r[obs.metric.transfer-volume]
 Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop: gateway (`rio_gateway_bytes_total{direction}`), store (`rio_store_{put,get}_path_bytes_total`), worker (`rio_builder_{upload,fuse_fetch}_bytes_total`). Summing these across the topology gives a full picture of data movement — e.g., `rate(rio_builder_fuse_fetch_bytes_total[5m])` vs `rate(rio_builder_upload_bytes_total[5m])` shows whether a worker is input-bound or output-bound.
 
 r[obs.metric.builder-util]
-Builder utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled from the builder's parent cgroup every 10s by `utilization_reporter_loop`. The same loop publishes a `ResourceSnapshot` that the heartbeat reads for `HeartbeatRequest.resources` — one sampling site means Prometheus and `ListWorkers` always agree. These capture the whole builder tree (rio-builder + per-build sub-cgroups + all subprocesses). CPU fraction >1.0 on multi-core is expected under full load. Memory fraction stays 0.0 if `memory.max` is unbounded — only meaningful when the pod has a memory limit configured.
+Builder utilization gauges (`rio_builder_{cpu,memory}_fraction`) are polled from the builder's parent cgroup every 10s by `utilization_reporter_loop`. The same loop publishes a `ResourceSnapshot` that the heartbeat reads for `HeartbeatRequest.resources` — one sampling site means Prometheus and `ListExecutors` always agree. These capture the whole builder tree (rio-builder + per-build sub-cgroups + all subprocesses). CPU fraction >1.0 on multi-core is expected under full load. Memory fraction stays 0.0 if `memory.max` is unbounded — only meaningful when the pod has a memory limit configured.
 
 r[obs.metric.fetcher-util]
 The `fetcher-utilization.json` Grafana dashboard's cAdvisor pod selectors MUST use the `-fetchers-` infix regex (`pod=~".*-fetchers-.*"`) to match the controller's `format!("{name}-fetchers")` STS naming. A prefix-anchored regex (`rio-fetchers.*`) works only when the FetcherPool is named `rio`; renames or additional pools silently blank the panels.
@@ -236,13 +236,13 @@ r[obs.metric.controller]
 |--------|------|-------------|
 | `rio_controller_reconcile_duration_seconds` | Histogram | Reconcile loop latency (labeled by reconciler) |
 | `rio_controller_reconcile_errors_total` | Counter | Reconcile errors (labeled by reconciler) |
-| `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
+| `rio_controller_workerpool_replicas` | Gauge | BuilderPool replica count (labeled desired vs actual). Metric name predates the BuilderPool rename. |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
 | `rio_controller_manifest_spawn_failures_total` | Counter | Manifest Job spawn failures (labeled by pool). Non-zero rate with zero `reconcile_errors_total` = warn+continue absorbing errors below threshold; sustained high rate = threshold bailing every tick (check admission webhooks/RBAC). |
 | `rio_controller_ephemeral_jobs_reaped_total` | Counter | Excess Pending ephemeral Jobs deleted (labeled by `pool`, `class`). Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); zero rate with stuck Pending pods = reap not firing (check RBAC `delete` on `batch/jobs`). |
 | `rio_controller_orphan_jobs_reaped_total` | Counter | Running ephemeral Jobs deleted after orphan grace with no scheduler assignment (labeled by `pool`, `class`). Non-zero rate = builders stuck unable to self-exit (I-165 D-state FUSE wait, OOM-loop); investigate node/kernel health. |
 | `rio_controller_gc_runs_total` | Counter | GC cron runs. `result=success\|connect_failure\|rpc_failure`. `connect_failure` = store unreachable (pod down, stale IP); `rpc_failure` = TriggerGC error or progress stream aborted. |
-| `rio_controller_disruption_drains_total` | Counter | DisruptionTarget watcher DrainWorker calls. `result=sent\|rpc_error`. Zero rate while evictions occur = watcher dead, falling back to SIGTERM self-drain. |
+| `rio_controller_disruption_drains_total` | Counter | DisruptionTarget watcher DrainExecutor calls. `result=sent\|rpc_error`. Zero rate while evictions occur = watcher dead, falling back to SIGTERM self-drain. |
 | `rio_controller_component_scaler_learned_ratio` | Gauge | ComponentScaler learned `builders_per_replica` (labelled by `cs=ns/name`). EMA-adjusted against observed PG-pool load; persisted in `.status.learnedRatio`. |
 | `rio_controller_component_scaler_desired_replicas` | Gauge | ComponentScaler desired replica count (labelled by `cs=ns/name`). What was last patched onto `deployments/scale`. |
 | `rio_controller_component_scaler_observed_load` | Gauge | ComponentScaler `max(GetLoad.pg_pool_utilization)` across `loadEndpoint` pods at the last tick (labelled by `cs=ns/name`). |
@@ -371,7 +371,7 @@ All components emit structured JSON logs via `tracing-subscriber` with the follo
 | `component` | string | Emitting component (gateway, scheduler, store, worker, controller) |
 | `build_id` | string | Build request ID (if applicable) |
 | `derivation_hash` | string | Derivation hash (if applicable) |
-| `worker_id` | string | Worker instance ID (worker component only) |
+| `executor_id` | string | Executor instance ID (builder/fetcher components only) |
 | `message` | string | Human-readable log message |
 
 Conditionally present:

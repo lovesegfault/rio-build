@@ -17,7 +17,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 | rio-scheduler | Deployment | 2 (leader-elected) | Leader election via Kubernetes Lease. One leader, one hot standby. ~15s failover. |
 | rio-store | Deployment | 1 | Stateless at runtime (PG + S3 hold everything), but concurrent startup migrations from multiple replicas would race. Scale horizontally later after adding a migration-lock mechanism. |
 | rio-controller | Deployment | 1 | K8s operator. **Single replica, not leader-elected** --- two controllers would fight over SSA patches (conflicting fieldManager). Add leader election later if the ~30s pod-reschedule gap during restart becomes a problem. |
-| rio-worker | StatefulSet | 2+ (autoscaled) | Managed by rio-controller via WorkerPool CRD. Requires dedicated node pool. |
+| rio-builder | Job (ephemeral) | 0+ (autoscaled) | Managed by rio-controller via BuilderPool CRD. Requires dedicated node pool. |
 
 ## Deployment Order
 
@@ -26,7 +26,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 3. **rio-store** (needs PostgreSQL and S3)
 4. **rio-scheduler** (needs PostgreSQL and rio-store)
 5. **rio-gateway** (needs rio-scheduler and rio-store)
-6. **WorkerPool CRD** (rio-controller creates and manages worker StatefulSets)
+6. **BuilderPool CRD** (rio-controller creates and manages builder Jobs)
 
 `helm upgrade --wait` blocks until all Deployments report Available — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires PG migrations done, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable.
 
@@ -39,7 +39,7 @@ For development or evaluation, a minimal deployment needs:
 1x rio-scheduler
 1x rio-store
 1x rio-controller
-1x WorkerPool (2 workers)
+1x BuilderPool (maxConcurrent: 2)
 1x PostgreSQL (single instance, e.g., via CloudNativePG)
 1x MinIO (for S3-compatible storage)
 ```
@@ -69,9 +69,9 @@ The AMI also bakes a `rio-executor-seed.oci.tar` (builder+fetcher images, dedupl
 
 ### Node autoscaling
 
-Worker pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller scales the WorkerPool StatefulSet replica count based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
+Builder pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller spawns BuilderPool Jobs based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
 
-The EKS reference deployment (`infra/eks/`) uses Karpenter: the `workers` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on worker NodePools means Karpenter never evicts a node with a worker pod on it --- the 10-minute `SCALE_DOWN_WINDOW` in rio-controller scales pods away first, then Karpenter consolidates the empty node. Scale-to-zero is the default (`WorkerPool.spec.replicas.min: 0`): cold start from zero is ~50-80s (node boot + pod start).
+The EKS reference deployment (`infra/eks/`) uses Karpenter: the `workers` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on builder NodePools means Karpenter never evicts a node with a builder pod on it --- ephemeral Jobs terminate on completion, then Karpenter consolidates the empty node. Scale-to-zero is the default: cold start from zero is ~50-80s (node boot + pod start).
 
 ## Key Configuration
 
@@ -95,7 +95,7 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 - Authorized SSH keys (gateway)
 - NAR signing key (store)
 - Database credentials (scheduler, store)
-- HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{worker_id, drv_hash, expected_outputs, expiry} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
+- HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{executor_id, drv_hash, expected_outputs, is_ca, expiry_unix} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
 > **SSH key mounting:** The default chart values do **not** set `gateway.ssh.hostKeySecret` — the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production should set it to a Secret with a persistent key so all replicas present the same host key. `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.
 

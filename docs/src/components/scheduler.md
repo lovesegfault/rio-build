@@ -42,7 +42,7 @@ r[sched.admin.snapshot-cached]
 
 ## Scheduling Algorithm
 
-**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, build-history Estimator with fallback chain, PrefetchHint (full `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`, WorkerPoolSet CRD + child-pool reconciler, CutoffRebalancer (SITA-E adaptive cutoffs from `build_samples`). Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).
+**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, build-history Estimator with fallback chain, PrefetchHint (full `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainExecutor`, BuilderPoolSet CRD + child-pool reconciler, CutoffRebalancer (SITA-E adaptive cutoffs from `build_samples`). Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).
 
 ```
 1. Receive derivation DAG from gateway
@@ -65,7 +65,7 @@ r[sched.admin.snapshot-cached]
         idle candidates that pass, dispatch falls through to first-fit.
    d. Assign to the first eligible worker via the bidirectional BuildExecution stream.
       The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
-      `worker_id`, `drv_hash`, `expected_outputs`, `expiry_unix`). The store verifies
+      `executor_id`, `drv_hash`, `expected_outputs`, `is_ca`, `expiry_unix`). The store verifies
       the token on PutPath and rejects uploads for paths not in `expected_outputs`.
       See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
 8. As builds complete (reported via BuildExecution stream):
@@ -143,7 +143,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
 ```
 
 r[sched.admin.list-workers]
-`AdminService.ListWorkers` returns a point-in-time snapshot of all connected workers via an `ActorCommand::ListWorkers` (O(workers) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `WorkerInfo` includes `worker_id`, `systems`, `supported_features`, `running_builds` (0 or 1), `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
+`AdminService.ListExecutors` returns a point-in-time snapshot of all connected executors via an `ActorCommand::ListExecutors` (O(executors) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `ExecutorInfo` includes `executor_id`, `systems`, `supported_features`, `running_builds` (0 or 1), `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
 
 r[sched.admin.list-builds]
 `AdminService.ListBuilds` paginates via a direct PostgreSQL query with `LIMIT/OFFSET` (proto field `offset = 3`). Per-build derivation counts come from `LEFT JOIN build_derivations + derivations`; `cached_derivations` uses the heuristic "completed with no assignment row" (a cache-hit derivation transitions directly to Completed at merge time without dispatch). Optional `status_filter` matches the `builds.status` column. `total_count` is from a separate `COUNT(*)` query (unaffected by pagination). `ClusterStatus.store_size_bytes` is now populated from a 60s background task that polls `SUM(nar_size) FROM narinfo` — kept out of the handler's hot path since the controller polls it every reconcile tick.
@@ -237,7 +237,7 @@ The `build_history` table also tracks peak resource usage (memory, CPU, output s
 
 ## Size-Class Routing
 
-> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Workers declare their class in the heartbeat. The `WorkerPoolSet` CRD declares the class set and manages one child `WorkerPool` per class; the CutoffRebalancer (below) adjusts cutoffs adaptively from `build_samples`.
+> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Executors declare their class in the heartbeat. The `BuilderPoolSet` CRD declares the class set and manages one child `BuilderPool` per class; the CutoffRebalancer (below) adjusts cutoffs adaptively from `build_samples`.
 
 When size classes are configured, the scheduler routes derivations to right-sized worker pools based on estimated duration and resource needs. This is inspired by [SITA-E (Size Interval Task Assignment with Equal load)](https://dl.acm.org/doi/10.1145/506147.506154), adapted for non-preemptible Nix builds.
 
@@ -256,7 +256,7 @@ If `ema_peak_memory_bytes` for a derivation exceeds the target class's memory li
 r[sched.classify.cpu-bump]
 If `ema_peak_cpu_cores` for a derivation exceeds the target class's `cpu_limit_cores`, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping, mirroring mem-bump).
 
-If no size classes are configured (empty `[[size_classes]]`), classification is skipped and all workers are candidates (backward compatible with single `WorkerPool` deployments).
+If no size classes are configured (empty `[[size_classes]]`), classification is skipped and all executors are candidates (backward compatible with single `BuilderPool` deployments).
 
 ### Misclassification Handling
 
@@ -298,7 +298,7 @@ SITA-E sets cutoffs such that load_1 ~= load_2 ~= ... ~= load_k
 2. Compute the empirical CDF of build durations
 3. Find cutoffs that equalize load across classes
 4. Blend new cutoffs with current: `c_new = alpha * c_computed + (1-alpha) * c_old` (default alpha=0.1)
-5. Update `WorkerPoolSet` status with new cutoffs; log changes as structured events
+5. Update `BuilderPoolSet` status with new cutoffs; log changes as structured events
 
 **Cold start:** Operator-configured `durationCutoff` values from the CRD are used until sufficient history accumulates. **Stability guard:** Cutoffs only change if >= `minSamples` (default: 100) builds have been observed since the last adjustment and the computed cutoff differs by > 10%.
 
@@ -365,7 +365,7 @@ stateDiagram-v2
     note right of dependency_failed : Terminal; maps to\nNix BuildStatus=10
 ```
 
-> **Note on the architecture diagram:** The mermaid flowchart in [architecture.md](../architecture.md) shows arrows FROM the scheduler TO workers for the `BuildExecution` stream. This reflects data flow direction (scheduler sends assignments). The gRPC connection direction is the reverse: workers are the gRPC client calling the scheduler's `WorkerService.BuildExecution` RPC.
+> **Note on the architecture diagram:** The mermaid flowchart in [architecture.md](../architecture.md) shows arrows FROM the scheduler TO executors for the `BuildExecution` stream. This reflects data flow direction (scheduler sends assignments). The gRPC connection direction is the reverse: executors are the gRPC client calling the scheduler's `ExecutorService.BuildExecution` RPC.
 
 r[sched.state.transitions]
 **Transition guards:**
@@ -491,12 +491,12 @@ Recovered builds whose derivations include failure-terminal states (Poisoned, De
 r[sched.worker.dual-register]
 Worker registration is **two-step** --- there is no single registration RPC; instead, the scheduler infers registration from two separate interactions:
 
-1. Worker opens a `BuildExecution` bidirectional stream to the scheduler (calling `WorkerService.BuildExecution`).
-2. Worker calls the separate `Heartbeat` unary RPC with its initial capabilities:
-   - `worker_id` (unique, derived from pod UID)
-   - `systems` (list, e.g., `[x86_64-linux]`; a worker may support multiple target systems via emulation)
-   - `supported_features` (list of `requiredSystemFeatures` the worker supports)
-3. When the scheduler receives the first `Heartbeat` from a `worker_id` that also has an open `BuildExecution` stream, it creates an in-memory worker entry with the reported capabilities and marks the worker as `alive`.
+1. Executor opens a `BuildExecution` bidirectional stream to the scheduler (calling `ExecutorService.BuildExecution`).
+2. Executor calls the separate `Heartbeat` unary RPC with its initial capabilities:
+   - `executor_id` (unique, derived from pod UID)
+   - `systems` (list, e.g., `[x86_64-linux]`; an executor may support multiple target systems via emulation)
+   - `supported_features` (list of `requiredSystemFeatures` the executor supports)
+3. When the scheduler receives the first `Heartbeat` from an `executor_id` that also has an open `BuildExecution` stream, it creates an in-memory executor entry with the reported capabilities and marks the executor as `alive`.
 4. Scheduler begins sending `WorkAssignment` messages on the stream.
 
 r[sched.dispatch.fod-to-fetcher]
@@ -653,7 +653,7 @@ CREATE TABLE derivations (
     system              TEXT NOT NULL,
     status              TEXT NOT NULL CHECK (status IN ('created', 'queued', 'ready', 'assigned', 'running', 'completed', 'failed', 'poisoned', 'dependency_failed')),
     required_features   TEXT[] NOT NULL DEFAULT '{}',
-    assigned_worker_id  TEXT,
+    assigned_builder_id TEXT,
     -- assignment_gen lives on assignments table (as generation), not here
     retry_count         INT NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -681,14 +681,14 @@ CREATE INDEX build_derivations_deriv_idx ON build_derivations (derivation_id);
 CREATE TABLE assignments (
     assignment_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     derivation_id       UUID NOT NULL REFERENCES derivations (derivation_id),
-    worker_id           TEXT NOT NULL,
+    builder_id          TEXT NOT NULL,
     generation          BIGINT NOT NULL,        -- leader generation counter
     status              TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged', 'completed', 'failed', 'cancelled')),
     assigned_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at        TIMESTAMPTZ
 );
 CREATE UNIQUE INDEX assignments_active_uq ON assignments (derivation_id) WHERE status IN ('pending', 'acknowledged');
-CREATE INDEX assignments_worker_idx ON assignments (worker_id, status);
+CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
 
 CREATE TABLE build_history (
     pname                   TEXT NOT NULL,
@@ -732,7 +732,7 @@ ports. A fresh `health_reporter()` on the plaintext port would never be
 set to NOT_SERVING → standby always appears Ready → cluster split.
 
 r[sched.grpc.leader-guard]
-Every gRPC handler (SchedulerService, WorkerService, AdminService) checks `is_leader` at entry and returns `UNAVAILABLE` ("not leader") when false. This decouples K8s readiness from leadership: both pods are Ready (process up, gRPC listening), but only the leader serves RPCs. Clients with a health-aware balanced channel discover the leader via `grpc.health.v1/Check` (which reports NOT_SERVING on the standby) and route accordingly. A client that hits the standby anyway (race during failover, or a per-call connect via the ClusterIP Service) gets UNAVAILABLE, which by gRPC convention is retryable --- on the health-aware balancer, the retry goes to the leader.
+Every gRPC handler (SchedulerService, ExecutorService, AdminService) checks `is_leader` at entry and returns `UNAVAILABLE` ("not leader") when false. This decouples K8s readiness from leadership: both pods are Ready (process up, gRPC listening), but only the leader serves RPCs. Clients with a health-aware balanced channel discover the leader via `grpc.health.v1/Check` (which reports NOT_SERVING on the standby) and route accordingly. A client that hits the standby anyway (race during failover, or a per-call connect via the ClusterIP Service) gets UNAVAILABLE, which by gRPC convention is retryable --- on the health-aware balancer, the retry goes to the leader.
 
 r[sched.lease.deletion-cost]
 On the acquire transition, the lease loop annotates its own Pod with `controller.kubernetes.io/pod-deletion-cost: "1"`; on the lose transition, it sets `"0"`. Kubernetes's ReplicaSet controller sorts pods by this annotation (ascending, lower = kill first) when picking which pod to evict during scale-down --- including the surge-reconcile phase of RollingUpdate. With cost=1 on the leader and cost=0 on the standby, `kubectl rollout restart` kills the standby first, new pod comes up, acquires (old leader step_down on SIGTERM), no double leadership churn. The PATCH is fire-and-forget (the lease loop must not block on it) and failure is non-fatal: without the annotation, K8s picks arbitrarily, which means 50% of rollouts churn leadership twice instead of once. Annoying but correct.
@@ -761,13 +761,13 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/critical_path.rs` — Bottom-up priority: `est_duration + max(children's priority)`; incremental ancestor-walk on completion
 - `rio-scheduler/src/assignment.rs` — Hard-filter worker selection + size-class classify()
 - `rio-scheduler/src/estimator.rs` — Duration + peak-memory from build_history; fallback chain (exact → pname-cross-system → closure-size proxy → 30s default)
-- `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
+- `rio-scheduler/src/grpc/` — SchedulerService + ExecutorService gRPC implementations
 - `rio-scheduler/src/db/` — PostgreSQL persistence (derivations, assignments, build_history EMA; split into 9 domain modules per P0411)
 - `rio-scheduler/src/logs/` — LogBuffers ring buffer + S3 LogFlusher
 - `rio-scheduler/src/lease/` — Kubernetes Lease leader-election loop (generation counter, is_leader flag, recovery_complete gate)
 - `rio-scheduler/src/actor/recovery.rs` — State recovery: reload non-terminal builds/derivations from PG on LeaderAcquired
 - `rio-scheduler/src/event_log.rs` — PostgreSQL-backed build_event_log writes for gateway `since_sequence` replay
-- `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs, TriggerGC)
+- `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainExecutor, GetBuildLogs, TriggerGC)
 - `rio-scheduler/src/rebalancer.rs` — CutoffRebalancer (SITA-E adaptive cutoff adjustment from `build_samples`)
 
 CA early cutoff is end-to-end: compare (`r[sched.ca.cutoff-compare]` — completion-time content-index lookup), propagate (`r[sched.ca.cutoff-propagate]` — `Queued`→`Skipped` cascade with `MAX_CASCADE_NODES=1000`), and resolve (`r[sched.ca.resolve]` — dispatch-time placeholder rewrite for CA-on-CA chains). The `Skipped` terminal state is distinct from `Completed` for metrics (`rio_scheduler_ca_cutoff_saves_total`, `rio_scheduler_ca_cutoff_seconds_saved`) and audit trail. Resolution uses the gateway-computed `ca_modular_hash` (plumbed via `DerivationNode.ca_modular_hash` post-BFS) to query the `realisations` table; each lookup is recorded in `realisation_deps` at completion time after the parent's own realisation lands (FK ordering).

@@ -122,7 +122,7 @@ This is useful for bootstrapping a new rio-build deployment with commonly-used p
 
 ## Multi-Architecture Builds
 
-rio-build supports multiple architectures via separate worker pools. Each `WorkerPool` CRD declares a `systems` list (e.g., `["x86_64-linux"]`, or `["aarch64-linux", "aarch64-darwin"]` for a macOS host with Linux builder). The scheduler matches derivation `system` to workers whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the worker's `features` list.
+rio-build supports multiple architectures via separate builder pools. Each `BuilderPool` CRD declares a `systems` list (e.g., `["x86_64-linux"]`, or `["aarch64-linux", "aarch64-darwin"]` for a macOS host with Linux builder). The scheduler matches derivation `system` to executors whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the executor's `features` list.
 
 ```bash
 # Build for a specific architecture (requires workers with matching system)

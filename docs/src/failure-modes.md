@@ -12,7 +12,7 @@ This page documents the behavior of rio-build when individual components fail, i
 | **PostgreSQL** | Scheduler can't persist state; store can't query metadata | Full system halt --- no scheduling, no metadata lookups, no new builds | Restore PG from backup. All components reconnect via connection retry. Scheduler rebuilds DAG via `recover_from_pg` on next LeaderAcquired. If PG is restored but DAG state is lost (full data loss), clients must resubmit. |
 | **S3 (object storage)** | Chunk reads/writes fail | Store returns errors to workers and gateways; worker uploads fail. Builds whose inputs are fully SSD-cached may continue. | Retry with backoff (S3 DELETE is idempotent). Worker overlay outputs are lost if all upload retries fail. |
 | **Worker pod** | Running builds on that worker are orphaned | Scheduler detects via missed heartbeats (~50-60s wall-clock), calls `reset_to_ready()` on affected derivations --- they go straight back to Ready (increment `retry_count`) and re-queue, no intermediate `InfrastructureFailure` classification | StatefulSet recreates pod. New pod starts with cold FUSE cache. |
-| **Controller** | No autoscaling decisions; CRD reconciliation pauses | WorkerPool sizes remain static; no GC scheduling | Restart controller. State is in CRDs and K8s API; no persistent state lost. |
+| **Controller** | No autoscaling decisions; CRD reconciliation pauses | BuilderPool sizes remain static; no GC scheduling | Restart controller. State is in CRDs and K8s API; no persistent state lost. |
 
 ## Partial Failure Scenarios
 

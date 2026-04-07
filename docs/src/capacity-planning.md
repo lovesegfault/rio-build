@@ -63,7 +63,7 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
 - Large pool (2 workers, 2 concurrent each): handles 10% of builds (GCC, LLVM, Firefox)
 - Better utilization: small workers aren't blocked by multi-hour builds
 
-The `WorkerPoolSet` CRD wraps this: one WPS defines all size classes declaratively, spawns one child `WorkerPool` per class (ownerReference → cascade delete), and surfaces per-class `effective_cutoff_secs` + `queued` in `.status.classes[]`. See [controller component spec](components/controller.md) for the reconciler flow.
+The `BuilderPoolSet` CRD wraps this: one BPS defines all size classes declaratively, spawns one child `BuilderPool` per class (ownerReference → cascade delete), and surfaces per-class `effective_cutoff_secs` + `queued` in `.status.classes[]`. See [controller component spec](components/controller.md) for the reconciler flow.
 
 ## Gateway and Scheduler
 

@@ -5,7 +5,7 @@ Accepted
 
 ## Context
 
-Nix build workloads are heavy-tailed: most derivations complete in seconds (shell scripts, trivial packages), but a small fraction consume hours of CPU and gigabytes of RAM (GCC, LLVM, Firefox, NixOS system closures). The current design uses a single `WorkerPool` CRD with uniform pod sizing, meaning every worker is provisioned for worst-case resource demands. This wastes resources when running many small builds and may still be insufficient for the largest.
+Nix build workloads are heavy-tailed: most derivations complete in seconds (shell scripts, trivial packages), but a small fraction consume hours of CPU and gigabytes of RAM (GCC, LLVM, Firefox, NixOS system closures). At the time of this decision the design used a single `BuilderPool` CRD with uniform pod sizing, meaning every builder was provisioned for worst-case resource demands. This wastes resources when running many small builds and may still be insufficient for the largest.
 
 [Harchol-Balter's "Task Assignment with Unknown Duration" (JACM 2002)](https://dl.acm.org/doi/10.1145/506147.506154) demonstrates that under heavy-tailed distributions, size-based task routing (SITA-E) dramatically outperforms uniform assignment by isolating short jobs from long jobs on separate, right-sized hosts. The TAGS variant handles the case where job sizes are unknown a priori by using duration estimates with retroactive correction.
 
@@ -13,7 +13,7 @@ rio-build already has the building blocks: per-derivation EMA duration estimatio
 
 ## Decision
 
-Introduce a `WorkerPoolSet` CRD that defines multiple size-class worker pools (e.g., small/medium/large) with different resource allocations and concurrency limits. The scheduler classifies derivations into size classes based on estimated duration and routes them to the appropriate pool.
+Introduce a `BuilderPoolSet` CRD that defines multiple size-class builder pools (e.g., small/medium/large) with different resource allocations and concurrency limits. The scheduler classifies derivations into size classes based on estimated duration and routes them to the appropriate pool.
 
 Key design choices:
 
@@ -38,19 +38,19 @@ Key design choices:
 - **Positive:** Resource utilization improves dramatically. Small workers with high concurrency (8 builds/pod) handle the bulk of trivial derivations at low cost. Large workers with dedicated resources handle the long tail without OOM risk.
 - **Positive:** Automatic cutoff learning adapts to workload changes without operator intervention.
 - **Positive:** Misclassification is self-correcting via EMA feedback --- each mistake improves future routing.
-- **Negative:** Adds a new CRD (`WorkerPoolSet`) and reconciler complexity to the controller.
+- **Negative:** Adds a new CRD (`BuilderPoolSet`) and reconciler complexity to the controller.
 - **Negative:** Cold start: with no build history, all derivations use operator-configured cutoffs or the default fallback (30s). Cutoff quality improves with data.
 - **Negative:** Size-class boundaries create potential for queue imbalance: if all ready derivations are "medium" but only "small" workers are idle, the derivations wait even though resources exist. Mitigation: allow overflow routing (small class can spill to medium workers when small queue is empty).
 
 ## Implementation Status
 
-The scheduler-side subset landed early; the Kubernetes control plane followed via `WorkerPoolSet`. The following are live:
+The scheduler-side subset landed early; the Kubernetes control plane followed via `BuilderPoolSet`. The following are live:
 
 - **Static size-class routing:** Workers declare a `size_class` (CRD field + `RIO_SIZE_CLASS` env); the scheduler classifies derivations via `build_history` EMA duration and routes accordingly.
 - **Passive misclassification with EMA penalty:** Builds exceeding 2× their class cutoff overwrite (not blend) the EMA estimate. No kill/restart.
 - **Memory-based class bumping:** A derivation whose `ema_peak_memory_bytes` exceeds its class's memory cutoff is bumped up regardless of duration.
 - **Overflow routing:** Smaller classes spill upward when no matching-class worker is idle (up-only overflow).
-- **`WorkerPoolSet` CRD:** One WPS → one child `WorkerPool` per `spec.classes[]` entry (ownerReference → cascade delete). Per-class `.status.classes[].{effective_cutoff_secs,queued}` joins the scheduler's `GetSizeClassStatus` RPC with observed child replica counts. Per-class autoscaler (`scale_wps_class`) patches child `spec.replicas` via a distinct SSA field manager so template-sync and scale decisions don't fight.
+- **`BuilderPoolSet` CRD:** One BPS → one child `BuilderPool` per `spec.classes[]` entry (ownerReference → cascade delete). Per-class `.status.classes[].{effective_cutoff_secs,queued}` joins the scheduler's `GetSizeClassStatus` RPC with observed child replica counts. Per-class autoscaler (`scale_wps_class`) patches child `spec.replicas` via a distinct SSA field manager so template-sync and scale decisions don't fight.
 
 The following remain **deferred**:
 

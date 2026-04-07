@@ -142,7 +142,7 @@ NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgrou
 | `vm-phase2a` | 4 | Distributed 2-worker build, FUSE assertions, metrics |
 | `vm-phase2b` | 5 | OTLP trace export (Tempo), build log forwarding, config overlay |
 | `vm-phase2c` | 5 | Size-class routing, chunked CAS, binary cache HTTP |
-| `vm-phase3a` | 3 | k3s in-cluster: WorkerPool CRD → pod → FUSE → build → cgroup memory.peak → build\_history |
+| `vm-phase3a` | 3 | k3s in-cluster: BuilderPool CRD → pod → FUSE → build → cgroup memory.peak → build\_history |
 
 ## Test Environment
 

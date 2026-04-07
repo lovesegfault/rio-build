@@ -66,7 +66,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `worker_id` | string | (auto: hostname) | Builder identity. Empty → auto-detect via hostname. |
+| `executor_id` | string | (auto: hostname) | Builder identity. Empty → auto-detect via hostname. |
 | `scheduler_addr` | string | (required) | Scheduler gRPC endpoint |
 | `store_addr` | string | (required) | Store gRPC endpoint |
 | `systems` | list\<string\> | (auto: `{arch}-{os}`) | Nix systems this builder can build for (any-match). Env `RIO_SYSTEMS` is comma-separated; TOML is an array. |
@@ -94,7 +94,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 |-----------|------|---------|-------------|
 | `health_addr` | socket addr | `0.0.0.0:9194` | HTTP `/healthz` listen address |
 | `metrics_addr` | socket addr | `0.0.0.0:9094` | Prometheus metrics listen address |
-| `scheduler_addr` | string | (required) | Scheduler gRPC endpoint (for queue depth queries + DrainWorker on finalizer) |
+| `scheduler_addr` | string | (required) | Scheduler gRPC endpoint (for queue depth queries + DrainExecutor on finalizer) |
 
 > **The controller is NOT leader-elected** (single replica by design). Only the scheduler uses a Kubernetes Lease (see scheduler `RIO_LEASE_NAME` / `RIO_LEASE_NAMESPACE` env vars documented in [scheduler: Leader Election](./components/scheduler.md#leader-election)).
 
