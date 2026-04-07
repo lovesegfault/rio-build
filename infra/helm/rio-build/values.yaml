@@ -860,7 +860,7 @@ securityProfilesOperator:
 # field is deep-merged from `builderPoolSetDefaults`. Per-set entries
 # can override `classes` (e.g., aarch64 wants different maxReplicas) or
 # `poolTemplate` (e.g., arm-specific nodeSelector). Overlays that want
-# to change a property for ALL sets (classes, poolTemplate.ephemeral)
+# to change a property for ALL sets (classes, poolTemplate.resources)
 # set it on `builderPoolSetDefaults`. Overlays that want a different
 # SET LIST replace `builderPoolSets` (lists are replaced wholesale).
 builderPoolSets:

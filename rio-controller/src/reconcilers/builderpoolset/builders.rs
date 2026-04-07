@@ -282,8 +282,8 @@ pub(super) mod tests {
         }
     }
 
-    /// Per-class fields (replicas, autoscaling.target_value) differ
-    /// across children — proves the merge isn't accidentally
+    /// Per-class fields (max_concurrent, resources) differ across
+    /// children — proves the merge isn't accidentally
     /// stamping one class's values onto all.
     #[test]
     fn per_class_fields_diverge() {

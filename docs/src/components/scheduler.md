@@ -12,7 +12,6 @@ Receives derivation build requests, analyzes the DAG, and publishes work to work
 - Resource-aware scheduling: match derivation `requiredSystemFeatures` and resource needs to worker capabilities (subset matching: all required features must be present on the worker)
 - Auto-pin live build inputs: on dispatch, `pin_live_inputs` writes the derivation's input closure to the `scheduler_live_pins` table (used by rio-store's GC mark phase as a root seed); unpinned on completion
 - Proxy `AdminService.TriggerGC` to rio-store, first collecting live-build output paths via `ActorCommand::GcRoots` and forwarding them as `extra_roots`
-- Closure-locality affinity: score workers by normalized transfer cost, using bloom filter approximation from worker heartbeats
 - Priority queue with inter-build priority (CI > interactive > scheduled) and intra-build priority (critical path)
 - IFD prioritization: builds that block evaluation get maximum priority (detected by protocol sequencing --- `wopBuildDerivation` arriving before `wopBuildPathsWithResults` on the same session)
 - CA early cutoff: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved. Compare implemented (P0251); propagate is P0252
@@ -27,7 +26,7 @@ The scheduler uses a **single-owner actor model** for the in-memory global DAG. 
 - `SubmitBuild` → DAG merge command
 - `ReportCompletion` → node completion + downstream release command
 - `CancelBuild` → orphan derivations command
-- Heartbeat → worker liveness + running_builds merge + bloom filter + size_class
+- Heartbeat → worker liveness + running_builds merge + size_class
 - CA early cutoff → edge cutoff + potential cancellation command
 
 gRPC handler tasks send commands to the DAG actor and `await` responses. This eliminates lock contention, makes operation ordering deterministic, and simplifies reasoning about correctness. PostgreSQL writes are batched and performed asynchronously by the actor.
@@ -39,11 +38,11 @@ r[sched.dispatch.became-idle-immediate]
 A `Heartbeat` that transitions an executor's capacity 0→1 (fresh registration, `store_degraded` clear, `draining` clear, phantom drain) dispatches inline instead of deferring to `Tick`. This is the carve-out from `r[sched.actor.dispatch-decoupled]`: the 0→1 transition is at most once per executor per degrade/spawn cycle (not N/10 per second), and deferring it adds up to one full tick interval of idle time to every freshly-spawned ephemeral builder --- the controller spawned the pod *because* work is queued, so the slot is immediately useful. Steady-state heartbeats from already-idle or already-busy executors still only set `dispatch_dirty`.
 
 r[sched.admin.snapshot-cached]
-`AdminService.ClusterStatus` reads a `watch::channel` snapshot that the actor publishes once per `Tick`, instead of round-tripping `ActorCommand::ClusterSnapshot` through the mailbox. The handler itself is ~37µs; queuing it behind a saturated mailbox (I-163: 9.5k commands) made it time out at exactly the moment the autoscaler and operators need a reading. The cached value is at most one Tick (~1s) stale.
+`AdminService.ClusterStatus` reads a `watch::channel` snapshot that the actor publishes once per `Tick`, instead of round-tripping `ActorCommand::ClusterSnapshot` through the mailbox. The handler itself is ~37µs; queuing it behind a saturated mailbox (I-163: 9.5k commands) made it time out at exactly the moment the controller's reconcile loop and operators need a reading. The cached value is at most one Tick (~1s) stale.
 
 ## Scheduling Algorithm
 
-**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain, PrefetchHint (bloom-filtered `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`, WorkerPoolSet CRD + child-pool reconciler, CutoffRebalancer (SITA-E adaptive cutoffs from `build_samples`). Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).
+**Implemented:** critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, build-history Estimator with fallback chain, PrefetchHint (full `approx_input_closure` before WorkAssignment), leader election via Kubernetes Lease gated on `RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainWorker`, WorkerPoolSet CRD + child-pool reconciler, CutoffRebalancer (SITA-E adaptive cutoffs from `build_samples`). Interactive builds get a +1e9 priority boost (dwarfs any critical-path value).
 
 ```
 1. Receive derivation DAG from gateway
@@ -59,16 +58,12 @@ r[sched.admin.snapshot-cached]
    b. Classify into size class based on estimated duration vs configured cutoffs
       (see Size-Class Routing below). If no size classes are configured, skip this step.
       If ema_peak_memory_bytes exceeds the target class's memory limit, bump to the next class.
-   c. Score each worker (filtered to the target size class if applicable):
+   c. Filter workers to the target size class if applicable:
       - Resource fit (hard filter): does worker have required features, enough CPU/memory?
         Workers that fail this check are excluded entirely.
-      - Transfer cost (locality):
-          missing(drv, worker) = |closure(drv) - worker_cached_paths|  (path count, not nar_size sum)
-        Closure membership approximated via bloom filters in worker heartbeats (target FPR: 1%).
-        Path count is used as a proxy for transfer size; nar_size-weighted scoring is a possible future refinement.
-        The hard filter already excludes busy workers (one build per pod), so among the
-        idle candidates the lowest `missing` count wins; ties fall through to first-fit.
-   d. Assign to the best-scoring worker via the bidirectional BuildExecution stream.
+        The hard filter also excludes busy workers (one build per pod); among
+        idle candidates that pass, dispatch falls through to first-fit.
+   d. Assign to the first eligible worker via the bidirectional BuildExecution stream.
       The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
       `worker_id`, `drv_hash`, `expected_outputs`, `expiry_unix`). The store verifies
       the token on PutPath and rejects uploads for paths not in `expected_outputs`.
@@ -151,7 +146,7 @@ r[sched.admin.list-workers]
 `AdminService.ListWorkers` returns a point-in-time snapshot of all connected workers via an `ActorCommand::ListWorkers` (O(workers) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `WorkerInfo` includes `worker_id`, `systems`, `supported_features`, `running_builds` (0 or 1), `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
 
 r[sched.admin.list-builds]
-`AdminService.ListBuilds` paginates via a direct PostgreSQL query with `LIMIT/OFFSET` (proto field `offset = 3`). Per-build derivation counts come from `LEFT JOIN build_derivations + derivations`; `cached_derivations` uses the heuristic "completed with no assignment row" (a cache-hit derivation transitions directly to Completed at merge time without dispatch). Optional `status_filter` matches the `builds.status` column. `total_count` is from a separate `COUNT(*)` query (unaffected by pagination). `ClusterStatus.store_size_bytes` is now populated from a 60s background task that polls `SUM(nar_size) FROM narinfo` — kept out of the handler's hot path since the autoscaler hits it every 30s.
+`AdminService.ListBuilds` paginates via a direct PostgreSQL query with `LIMIT/OFFSET` (proto field `offset = 3`). Per-build derivation counts come from `LEFT JOIN build_derivations + derivations`; `cached_derivations` uses the heuristic "completed with no assignment row" (a cache-hit derivation transitions directly to Completed at merge time without dispatch). Optional `status_filter` matches the `builds.status` column. `total_count` is from a separate `COUNT(*)` query (unaffected by pagination). `ClusterStatus.store_size_bytes` is now populated from a 60s background task that polls `SUM(nar_size) FROM narinfo` — kept out of the handler's hot path since the controller polls it every reconcile tick.
 
 r[sched.admin.clear-poison]
 `AdminService.ClearPoison` resets both in-memory state (`reset_from_poison()`: Poisoned→Created, clear `failed_workers`, zero `retry_count`, null `poisoned_at`) and PostgreSQL (`db.clear_poison()`). Returns `cleared=true` only if both succeed. If PG fails after in-mem reset, returns `false` so the operator retries — next recovery would restore Poisoned, so in-mem/PG drift is self-correcting. Idempotent: calling on a non-poisoned or non-existent derivation returns `cleared=false` without error. The DAG is keyed on the full `.drv` store path; `rio-cli poison-clear` validates this client-side and rejects bare hashes (a silent no-match would look like "not poisoned" when it's actually "wrong key format").
@@ -166,7 +161,7 @@ r[sched.admin.create-tenant]
 `AdminService.CreateTenant` inserts a new tenant row. `tenant_name` is required (empty → `INVALID_ARGUMENT`). On name collision or cache_token collision, returns `ALREADY_EXISTS`. On success, returns the created `TenantInfo` including the generated UUID.
 
 r[sched.admin.sizeclass-status]
-`AdminService.GetSizeClassStatus` returns per-class status: configured vs effective cutoffs (the rebalancer may have recomputed), queued/running counts, sample counts in the rebalancer's lookback window. HUB for the WPS autoscaler, CLI cutoffs table, and CLI WPS describe. Returns empty `classes` list when size-class routing is disabled (no `[[size_classes]]` entries in scheduler.toml).
+`AdminService.GetSizeClassStatus` returns per-class status: configured vs effective cutoffs (the rebalancer may have recomputed), queued/running counts, sample counts in the rebalancer's lookback window. HUB for the WPS reconciler's status patch, CLI cutoffs table, and CLI WPS describe. Returns empty `classes` list when size-class routing is disabled (no `[[size_classes]]` entries in scheduler.toml).
 
 r[sched.sizeclass.feature-filter+2]
 When `GetSizeClassStatusRequest.filter_features` is set, the per-class `queued` / `queued_by_system` counts MUST only include Ready derivations whose `requiredSystemFeatures` is a subset of `pool_features` --- i.e., derivations a worker advertising exactly `pool_features` would pass `hard_filter`'s feature check for. Feature-gated pools (`pool_features ≠ ∅`) MUST exclude derivations with empty `requiredSystemFeatures` --- those are owned by the featureless pool. The subset check alone (∅ ⊆ anything) would over-count (I-181). The controller sets this per-pool so a feature-gated ephemeral pool (e.g., `features:["kvm"]`) spawns for derivations that need its features, and a featureless pool stops spawning for feature-gated work it can never build (I-176). Unset (default) = unfiltered, preserving CLI / pre-I-176 controller behavior.
@@ -486,7 +481,6 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
    - `worker_id` (unique, derived from pod UID)
    - `systems` (list, e.g., `[x86_64-linux]`; a worker may support multiple target systems via emulation)
    - `supported_features` (list of `requiredSystemFeatures` the worker supports)
-   - `local_paths` (initial store path bloom filter for closure-locality scoring)
 3. When the scheduler receives the first `Heartbeat` from a `worker_id` that also has an open `BuildExecution` stream, it creates an in-memory worker entry with the reported capabilities and marks the worker as `alive`.
 4. Scheduler begins sending `WorkAssignment` messages on the stream.
 
@@ -509,10 +503,10 @@ r[sched.timeout.promote-on-exceed]
 A `BuildResultStatus::TimedOut` completion MUST promote `size_class_floor` to the next-larger class (same `promote_size_class_floor` path as `r[sched.builder.size-class-reactive]`) and reset the derivation to `Ready` for re-dispatch, NOT terminal-cancel. With per-class `activeDeadlineSeconds` (`r[ctrl.ephemeral.per-class-deadline]`) the next dispatch lands on a larger class with a proportionally longer deadline --- "same inputs -> same timeout" no longer holds. Bounded by a separate `timeout_retry_count` against `RetryPolicy.max_timeout_retries` (default = number of size-class steps a build can climb): a genuinely-infinite build still goes terminal (`Cancelled`, retriable on explicit resubmit) after exhausting promotions instead of walking the ladder forever. `timeout_retry_count` is in-memory only (recovery resets to 0, conservative) and separate from `retry_count` / `infra_retry_count` so timeouts neither consume the transient budget nor get masked by the infra time-window reset. I-200: before this, `TimedOut` went straight to `Cancelled` and the I-199/I-197 promotion only fired on the K8s-deadline-kill -> disconnect path, not on the worker-side `daemon_timeout_secs` -> clean `TimedOut` report path.
 
 r[sched.reassign.no-promote-on-ephemeral-disconnect+2]
-Reassigning a derivation after an `ephemeral=true` executor disconnects MUST NOT promote `size_class_floor` **when the executor already sent a `CompletionReport` for that derivation** (`ExecutorState.last_completed == running_build`). That disconnect is the expected one-shot Job exit --- not a size-adequacy signal. An ephemeral disconnect WITHOUT a prior completion for the running derivation (`last_completed != running_build`, typically `None`) MUST promote: the pod was OOMKilled mid-build, which is exactly the size-adequacy signal `r[sched.builder.size-class-reactive]` / `r[sched.fod.size-class-reactive]` reacts to. Non-ephemeral disconnect promotes unconditionally (unexpected death, plausibly OOM; no clean OOM signal reaches the scheduler so any non-ephemeral disconnect is treated as one). I-188: an ephemeral builder that completes its one build then disconnects races `dispatch_ready` --- the dependent gets `Assigned` to the just-freed slot, the builder exits, `reassign_derivations` fires; promoting on every disconnect walked the chain up the size ladder one class per derivation. I-197: the I-188 blanket suppress over-corrected --- an ephemeral `tiny` builder OOMKilled on openssl looped at the same class for hours with `size_class_floor` empty. The gate is `ephemeral && last_completed == drv`, not `DerivationStatus::Running` --- status stays `Assigned` for the build's whole lifetime (Running is set only at completion via `ensure_running()`), so a `was_running` gate would never fire in production. Defense-in-depth with `r[sched.ephemeral.no-redispatch-after-completion]`: that closes the race at the source (no re-dispatch); this catches any other ephemeral-disconnect path.
+Reassigning a derivation after an executor disconnects MUST NOT promote `size_class_floor` **when the executor already sent a `CompletionReport` for that derivation** (`ExecutorState.last_completed == running_build`). That disconnect is the expected one-shot Job exit --- not a size-adequacy signal. A disconnect WITHOUT a prior completion for the running derivation (`last_completed != running_build`, typically `None`) MUST promote: the pod was OOMKilled mid-build, which is exactly the size-adequacy signal `r[sched.builder.size-class-reactive]` / `r[sched.fod.size-class-reactive]` reacts to. I-188: a builder that completes its one build then disconnects races `dispatch_ready` --- the dependent gets `Assigned` to the just-freed slot, the builder exits, `reassign_derivations` fires; promoting on every disconnect walked the chain up the size ladder one class per derivation. I-197: the I-188 blanket suppress over-corrected --- a `tiny` builder OOMKilled on openssl looped at the same class for hours with `size_class_floor` empty. The gate is `last_completed == drv`, not `DerivationStatus::Running` --- status stays `Assigned` for the build's whole lifetime (Running is set only at completion via `ensure_running()`), so a `was_running` gate would never fire in production. Defense-in-depth with `r[sched.ephemeral.no-redispatch-after-completion]`: that closes the race at the source (no re-dispatch); this catches any other disconnect path.
 
 r[sched.ephemeral.no-redispatch-after-completion]
-When an executor with `ephemeral=true` (one-shot Job builder/fetcher; reported via `HeartbeatRequest.ephemeral`) completes a build and its `running_build` slot becomes empty, the scheduler MUST mark it `draining=true` immediately --- before the same actor turn's `dispatch_ready` runs. `has_capacity()` then rejects it. Closes the I-188 race at the source: an ephemeral executor will exit after its one build, so re-dispatching to its freed slot guarantees an Assigned-never-Running reassign. Non-ephemeral executors (`ephemeral=false`, the wire-default) are unaffected: their freed slot is genuine capacity.
+When an executor completes a build and its `running_build` slot becomes empty, the scheduler MUST mark it `draining=true` immediately --- before the same actor turn's `dispatch_ready` runs. `has_capacity()` then rejects it. Closes the I-188 race at the source: every executor exits after its one build, so re-dispatching to its freed slot guarantees an Assigned-never-Running reassign.
 
 r[sched.assign.resource-fit]
 Under manifest mode ([ADR-020](../decisions/020-per-derivation-capacity-manifest.md) §5), `hard_filter()` rejects any worker whose `memory_total_bytes < drv.est_memory_bytes` as a hard filter preceding transfer-cost scoring, same position as `has_capacity()`. A worker reporting `memory_total_bytes == 0` (cgroup `memory.max=max`, no k8s limit set --- [rio-builder/src/cgroup.rs](../../rio-builder/src/cgroup.rs) sends 0 for `None`) is treated as unlimited-fit. A derivation with `est_memory_bytes == None` (cold start: no `build_history` row, no `pname`, or no memory sample) fits any worker. Overflow routing is natural: a 16Gi derivation may be placed on a 64Gi worker if that worker is the best transfer-cost fit among those that pass the hard filter. The size-class string match remains gated on `target_class.is_some()` (Static mode); manifest-mode pods don't carry `size_class`, so the string match passes them through and resource-fit does the work.
@@ -744,7 +738,7 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/state/` — State machines (DerivationStatus, BuildState), transition validation, RetryPolicy, newtypes (DrvHash, WorkerId)
 - `rio-scheduler/src/queue.rs` — Priority BinaryHeap ReadyQueue (OrderedFloat + lazy invalidation)
 - `rio-scheduler/src/critical_path.rs` — Bottom-up priority: `est_duration + max(children's priority)`; incremental ancestor-walk on completion
-- `rio-scheduler/src/assignment.rs` — Worker scoring (bloom locality + load fraction) + size-class classify()
+- `rio-scheduler/src/assignment.rs` — Hard-filter worker selection + size-class classify()
 - `rio-scheduler/src/estimator.rs` — Duration + peak-memory from build_history; fallback chain (exact → pname-cross-system → closure-size proxy → 30s default)
 - `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
 - `rio-scheduler/src/db/` — PostgreSQL persistence (derivations, assignments, build_history EMA; split into 9 domain modules per P0411)

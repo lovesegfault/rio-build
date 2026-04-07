@@ -71,9 +71,9 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │                   rio-controller (K8s Operator)                       │
 │                                                                      │
-│  Manages: BuilderPool scaling, Build lifecycle, GC                    │
-│  CRDs: BuilderPool, BuilderPoolSet, FetcherPool                                     │
-│  Watches: K8s API -> reconciles StatefulSets, Services               │
+│  Manages: BuilderPool Jobs, GC                                       │
+│  CRDs: BuilderPool, BuilderPoolSet, FetcherPool                      │
+│  Watches: K8s API -> reconciles Jobs                                 │
 │  Single-replica by design (not leader-elected)                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -89,7 +89,7 @@ The controller is a supervisor that manages the lifecycle of all other component
 - **[rio-controller](./components/controller.md)** --- Kubernetes operator
 - **[rio-proto](./components/proto.md)** --- gRPC service definitions
 - **rio-nix** --- Nix protocol implementation library (wire primitives, ATerm, NAR, store paths)
-- **rio-common** --- shared utilities (limits, bloom filter, observability init)
+- **rio-common** --- shared utilities (limits, observability init)
 - **[rio-dashboard](./components/dashboard.md)** --- Web dashboard (Phase 5)
 
 ```mermaid

@@ -221,12 +221,11 @@ fn coverage_absent_when_controller_env_unset() -> figment::error::Result<()> {
 // =========================================================
 // warn_on_spec_degrades reachability tests
 //
-// These prove the helper runs BEFORE the ephemeral early-return.
-// The Recorder POSTs to the mock apiserver; the verifier asserts
-// the POST arrives with the expected reason in the body. If the
-// helper call moves AFTER the `if wp.spec.ephemeral { return ... }`
-// branch, the event POST never happens for ephemeral pools and
-// the verifier fails (scenario 0 = event POST; actual = jobs GET).
+// These prove the helper runs BEFORE the Job-spawn path. The
+// Recorder POSTs to the mock apiserver; the verifier asserts the
+// POST arrives with the expected reason in the body. If the helper
+// call moves AFTER the spawn path, scenario 0 expects the event
+// POST but sees a jobs GET instead.
 // =========================================================
 
 /// Regression: ephemeral pool with hostNetwork:true gets the

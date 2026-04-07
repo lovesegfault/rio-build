@@ -169,9 +169,8 @@ spec:
                   for tagged images, Always for `:latest`). Airgap/dev clusters\n\
                   (k3s/kind with `ctr images import`) MUST set \"IfNotPresent\"\n\
                   or \"Never\" \u2014 `:latest` otherwise tries docker.io and fails.\n\
-                  \nController-managed StatefulSets can't be kustomize-patched\n(the\
-                  \ CRD is patched, not the generated STS), so this has to\nbe a CRD\
-                  \ field."
+                  \nController-managed Jobs can't be kustomize-patched (the CRD\n\
+                  is patched, not the generated Job), so this has to be a CRD\nfield."
                 nullable: true
                 type: string
               maxConcurrent:
@@ -185,7 +184,7 @@ spec:
               nodeSelector:
                 additionalProperties:
                   type: string
-                description: 'Node selector for the StatefulSet pod spec. Common:
+                description: 'Node selector for the Job pod spec. Common:
 
                   `rio.build/builder: "true"` to confine to tainted nodes.'
                 nullable: true
@@ -351,7 +350,7 @@ spec:
                 nullable: true
                 type: string
               tolerations:
-                description: 'Tolerations for the StatefulSet pod spec. Pairs with
+                description: 'Tolerations for the Job pod spec. Pairs with
 
                   node_selector: tolerate the `rio.build/builder:NoSchedule`
 
@@ -408,25 +407,21 @@ spec:
                 type: array
               desiredReplicas:
                 default: 0
-                description: 'What the autoscaler WANTS. Clamped to [min, max]. May
-
-                  differ from StatefulSet.spec.replicas during the
-
-                  stabilization window (we want 8 but haven''t patched yet).'
+                description: Concurrent-Job ceiling (`spec.maxConcurrent`).
                 format: int32
                 type: integer
               readyReplicas:
                 default: 0
-                description: 'Observed StatefulSet.status.readyReplicas. Passed
-
-                  readinessProbe = heartbeat accepted.'
+                description: Jobs whose pod has passed readinessProbe = heartbeat
+                  accepted.
                 format: int32
                 type: integer
               replicas:
                 default: 0
-                description: 'Observed StatefulSet.status.replicas. What''s actually
+                description: 'Active Job count. What''s actually running (may lag
+                  desired
 
-                  running (may lag desired during rollout).'
+                  during cold start).'
                 format: int32
                 type: integer
             type: object

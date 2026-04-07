@@ -172,7 +172,7 @@ let
       # simultaneously. Block scheduler until store's gRPC port is open,
       # which happens post-migration. k8s deployments dodge this via
       # pod startup jitter; standalone VM boot is deterministic enough
-      # to trigger the race reliably. Restart=on-failure (module-level)
+      # to trigger the race reliably. Restart=always (module-level)
       # covers any residual window.
       rio-scheduler.preStart = ''
         for _ in $(seq 1 60); do

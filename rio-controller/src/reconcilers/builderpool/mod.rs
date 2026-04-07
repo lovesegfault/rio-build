@@ -1,19 +1,16 @@
-//! BuilderPool reconciler: one StatefulSet of rio-builder pods.
+//! BuilderPool reconciler: spawn/reap one-shot rio-builder Jobs.
 //!
 //! Reconcile flow:
-//! 1. Ensure headless Service exists (StatefulSet needs one for
-//!    stable pod DNS; workers don't actually serve anything, but
+//! 1. Poll `ClusterStatus`/`GetSizeClassStatus` for queued depth.
+//! 2. Spawn Jobs up to `spec.maxConcurrent` (see `ephemeral.rs`).
+//! 3. Reap excess Pending and orphan Running Jobs.
+//! 4. Patch BuilderPool.status from active Job count.
 // r[impl ctrl.crd.workerpool]
-// TODO(P0455): add the ctrl.builderpool.reconcile impl marker once
-// Phase R5 adds ADR-019 to tracey spec_include (the rule is defined
-// in decisions/019 but tracey only scans components/ today).
+// TODO: add the ctrl.builderpool.reconcile impl marker once ADR-019
+// is added to tracey spec_include (the rule is defined in
+// decisions/019 but tracey only scans components/ today).
 // r[impl ctrl.reconcile.owner-refs]
-// r[impl ctrl.drain.all-then-scale]
 // r[impl ctrl.drain.sigterm]
-//!    the StatefulSet controller requires `serviceName` to point
-//!    to a real Service).
-//! 2. Ensure StatefulSet exists with spec derived from the CRD.
-//! 3. Read StatefulSet.status → patch BuilderPool.status.
 //!
 //! Server-side apply throughout: we PATCH with `fieldManager:
 //! rio-controller`, K8s merges. Idempotent — same patch twice is

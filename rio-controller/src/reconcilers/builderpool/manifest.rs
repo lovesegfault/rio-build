@@ -111,9 +111,9 @@ pub(super) const CPU_CLASS_LABEL: &str = "rio.build/cpu-class";
 pub(super) const FLOOR_CLASS: &str = "floor";
 
 /// Floor for per-tick Failed-Job deletes. The actual cap is
-/// `max(FAILED_SWEEP_MIN, spec.replicas.max)` — under a full crash-
+/// `max(FAILED_SWEEP_MIN, spec.max_concurrent)` — under a full crash-
 /// loop (bad image, `backoff_limit=0`), the spawn pass fires
-/// `headroom` replacements every tick, bounded by `replicas.max`.
+/// `headroom` replacements every tick, bounded by `max_concurrent`.
 /// The sweep MUST clear at least that many to converge (net ≤
 /// 0/tick). This floor guarantees small pools (`max < 20`) still
 /// sweep at a reasonable rate and clear historical backlog.
@@ -121,13 +121,13 @@ pub(super) const FLOOR_CLASS: &str = "floor";
 /// rio.build/sizing=manifest --field-selector status.successful=0`.
 pub(super) const FAILED_SWEEP_MIN: usize = 20;
 
-/// Per-tick Failed-Job sweep cap. Tracks `replicas.max` so the sweep
+/// Per-tick Failed-Job sweep cap. Tracks `max_concurrent` so the sweep
 /// converges under full crash-loop (net accumulation ≤ 0 per tick:
-/// at most `replicas.max` Failed Jobs spawn, at most that many swept).
-/// Floors at FAILED_SWEEP_MIN for small pools — even replicas.max=2
+/// at most `max_concurrent` Failed Jobs spawn, at most that many swept).
+/// Floors at FAILED_SWEEP_MIN for small pools — even max_concurrent=2
 /// gets a 20/tick sweep so a short burst clears quickly.
 ///
-/// The `.max(0)` clamp: `replicas.max` is i32 (k8s typed
+/// The `.max(0)` clamp: `max_concurrent` is i32 (k8s typed
 /// `IntOrString` backing type); negative values have no CEL floor in
 /// manifest mode. `-1_i32 as usize` wraps to `usize::MAX`.
 // r[impl ctrl.pool.manifest-failed-sweep+2]
@@ -151,7 +151,7 @@ pub(super) const CRASH_LOOP_WARN_THRESHOLD: usize = 3;
 /// nothing for hours. `Spawned` resets; `NameCollision` is orthogonal
 /// noise (neither increments nor resets).
 pub(super) const SPAWN_FAIL_THRESHOLD: u32 = 5;
-// A manifest batch is bounded by `replicas.max` (typically ≤100). A
+// A manifest batch is bounded by `max_concurrent` (typically ≤100). A
 // threshold larger than any realistic batch is effectively "never
 // bail" — silently reintroducing the P0516 trade-off this plan
 // narrows. Compile-time floor keeps a misguided "relax the threshold"
@@ -321,7 +321,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // Failed Jobs: not supply, not capacity, but still ours to reap.
     // backoff_limit=0 means one pod crash → Job Failed permanently.
     // Under crash-loop (bad image, OOM-on-start) these accumulate at
-    // up to `replicas.max` per tick (headroom-worth all fail); sweep
+    // up to `max_concurrent` per tick (headroom-worth all fail); sweep
     // them alongside idle-surplus deletes. Cap tracks the pool's own
     // spawn ceiling — see FAILED_SWEEP_MIN. failed_total is the
     // pre-cap count for the Warning event; the sweep acts on the
@@ -346,7 +346,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     // idle-check (no running pod) and no ListExecutors RPC. This block
     // is self-contained — runs unconditionally, bounded-per-tick
     // (select_failed_jobs caps internally at cap =
-    // sweep_cap(replicas.max)).
+    // sweep_cap(max_concurrent)).
     //
     // CrashLoopDetected: operator visibility via `kubectl describe
     // builderpool`. The message interpolates a coarse tier
@@ -416,7 +416,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     };
 
     // ---- Spawn ----
-    // Ceiling: same `spec.replicas.max` cap as ephemeral. A manifest
+    // Ceiling: same `spec.max_concurrent` cap as ephemeral. A manifest
     // with 200 distinct derivations shouldn't spawn 200 pods if the
     // operator said max=10. `truncate_plan` applies per-bucket-floor:
     // every bucket with demand gets ≥1 before any gets 2 — prevents
@@ -431,7 +431,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     if !truncated.is_empty() {
         let (oref, scheduler, store) = spawn_prerequisites(wp, ctx)?;
         // Pre-build all Jobs, then spawn via the threshold-aware
-        // helper. Batch size is bounded by `headroom` (≤ replicas.max)
+        // helper. Batch size is bounded by `headroom` (≤ max_concurrent)
         // so the Vec is small. spawn_manifest_jobs bails with
         // `Error::Kube` after SPAWN_FAIL_THRESHOLD consecutive
         // failures — that `?` propagates to error_policy → requeue
@@ -891,8 +891,8 @@ pub(super) fn update_idle_and_reapable(
 /// to interrupt. Bounded to `cap`; a day-long crash-loop leaves
 /// ~8640 Failed Jobs, firing 8640 deletes in one tick would be its
 /// own incident. Callers compute `cap` as
-/// `max(FAILED_SWEEP_MIN, spec.replicas.max)` so the sweep
-/// converges under full crash-loop (accumulation ≤ `replicas.max`
+/// `max(FAILED_SWEEP_MIN, spec.max_concurrent)` so the sweep
+/// converges under full crash-loop (accumulation ≤ `max_concurrent`
 /// per tick).
 ///
 /// The filter is the inverse of the active-Job predicate at the

@@ -1,6 +1,6 @@
 # rio-builder
 
-Long-running process in a StatefulSet pod that executes individual derivations.
+One-shot process in a K8s Job pod that executes a single derivation, then exits.
 
 Per [ADR-019](../decisions/019-builder-fetcher-split.md), this component is scoped to **non-FOD builds only** — fully airgapped, no internet egress. Fixed-output derivation fetches route to the separate [rio-fetcher](fetcher.md) executor. Both share the same `rio-builder` binary, distinguished by `RIO_EXECUTOR_KIND`.
 
@@ -63,10 +63,10 @@ r[builder.fuse.cache-lru]
 - **Eviction**: LRU by last-access time when cache exceeds configured size limit
 - **Granularity**: Whole store paths (not individual chunks). The FUSE daemon reassembles NARs from chunks via rio-store and materializes them as directory trees on disk.
 - **Metadata**: A lightweight SQLite index tracks cached paths, sizes, and access timestamps for eviction decisions
-- **Cache warming**: On startup, the cache is cold. The first build on a new builder fetches all inputs from rio-store. Subsequent builds benefit from cached common paths (glibc, coreutils, etc.)
+- **Cache warming**: On startup, the cache is cold. Every build fetches its inputs from rio-store; node-level FSx caching survives pod churn, so common paths (glibc, coreutils, etc.) are warm at the storage layer even though every pod-level FUSE cache is fresh.
 
 r[builder.fuse.cache-ephemeral-memory]
-Ephemeral builders (`RIO_EPHEMERAL=1`, the P0537 default) keep the SQLite cache index in `:memory:` rather than on disk — the pod's filesystem is discarded after the single build, so persistence is pointless, and on tiny-class node storage on-disk writes cost >1s each (I-141). Long-lived (StatefulSet) builders keep the index on disk with `journal_mode=WAL` + `synchronous=NORMAL` applied via connect options (per-connection, so every pooled connection gets it); durability is not critical since rio-store is the source of truth and a lost row just means one extra fetch.
+The SQLite cache index is `:memory:` — the pod's filesystem is discarded after the single build, so persistence is pointless, and on tiny-class node storage on-disk writes cost >1s each (I-141).
 
 r[builder.nar.entry-name-safety]
 NAR directory entry names MUST be rejected at parse time if empty,
@@ -332,7 +332,7 @@ On any error exit after the build cgroup is populated, the executor MUST write `
 
 ### Build Resource Limits
 
-A builder pod runs **one** build at a time (P0537). The pod's `resources.limits` ARE the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max` layer. A runaway build can OOM only its own pod; ephemeral pools spawn a fresh Job, long-lived pools restart the StatefulSet replica. Operators size the pod via `BuilderPool.spec.resources`.
+A builder pod runs **one** build, then exits. The pod's `resources.limits` ARE the build's limits --- there is no per-build cgroup `memory.max`/`cpu.max` layer. A runaway build can OOM only its own pod; the next queued derivation gets a fresh Job. Operators size the pod via `BuilderPool.spec.resources`.
 
 The per-build sub-cgroup is **measurement and cancellation only**: cgroup v2 `memory.peak` + polled `cpu.stat` for resource accounting (`r[builder.cgroup.memory-peak]`), and `cgroup.kill` for clean teardown (`r[builder.cgroup.kill-on-teardown]`) without touching the rio-builder process or its FUSE threads.
 
@@ -342,7 +342,7 @@ The executor MUST clamp `build_cores` (passed to nix-daemon via `wopSetOptions`,
 r[builder.oom.cgroup-watch]
 The executor MUST sample the pod cgroup's `memory.events` `oom_kill` counter at build start and poll it during the build. On increment, it MUST `cgroup.kill` the per-build cgroup and report `InfrastructureFailure` (not `BuildFailed`) so the scheduler reassigns to a larger size class. Without this, an under-provisioned build OOM-loops (kernel kills cc1, make respawns) until the silence timeout, and the eventual failure is misattributed to the derivation.
 
-The overlay is per-build. Each build gets its own overlayfs mount with separate upper and work directories. The Nix sandbox provides process-level isolation (user, mount, PID, and network namespaces). Even if the Nix sandbox is compromised, the per-build overlay upper layer ensures rogue writes are isolated and discarded; the next build (ephemeral: fresh pod; long-lived: fresh overlay) sees none of it.
+The overlay is per-build. Each build gets its own overlayfs mount with separate upper and work directories. The Nix sandbox provides process-level isolation (user, mount, PID, and network namespaces). Even if the Nix sandbox is compromised, the per-build overlay upper layer ensures rogue writes are isolated and discarded; the next build runs in a fresh pod and sees none of it.
 
 ## Fixed-Output Derivation (FOD) Handling
 
@@ -498,7 +498,7 @@ r[builder.shutdown.idle-no-reregister]
 On SIGTERM with an idle build slot, the builder MUST break the reconnect loop without sending a fresh `ExecutorRegister`. The reconnect-under-drain machinery exists so an in-flight build's `CompletionReport` reaches the (possibly new) leader; an idle slot has nothing to report. Re-registering bumps the scheduler's `workers_active`, and the heartbeat task (aborted only after the loop exits) keeps `last_heartbeat` fresh until the process actually exits --- under coverage instrumentation the profraw atexit write delays that by ~80s (I-195, GHA 24018216226). The same fast-path applies on any subsequent `'reconnect` iteration where `draining=true` and the slot has since gone idle.
 
 r[builder.ephemeral.exit-aborts-heartbeat]
-On exit from the reconnect loop (ephemeral single-shot done, idle timeout, or drain complete), the builder MUST abort the heartbeat task before `run_drain()`. A live heartbeat with a closed BuildExecution stream presents to the scheduler as an undispatchable zombie executor (I-142). `run_drain()` itself MUST be bounded by a hard timeout (5s) --- it is best-effort deregistration, redundant with the stream-close `ExecutorDisconnected` path, and must not block the process from reaching `drop(fuse_session)`.
+On exit from the reconnect loop (single-shot build done, idle timeout, or drain complete), the builder MUST abort the heartbeat task before `run_drain()`. A live heartbeat with a closed BuildExecution stream presents to the scheduler as an undispatchable zombie executor (I-142). `run_drain()` itself MUST be bounded by a hard timeout (5s) --- it is best-effort deregistration, redundant with the stream-close `ExecutorDisconnected` path, and must not block the process from reaching `drop(fuse_session)`.
 
 r[builder.shutdown.fuse-abort]
 On the shutdown path, the builder MUST abort the FUSE connection (write `1` to `/sys/fs/fuse/connections/<dev_minor>/abort`) BEFORE dropping the `BackgroundSession`. The builder serves the FUSE mount (fuser threads) while nix-daemon consumes it (overlay→FUSE `lstat` during JIT input fetch); if the runtime tears down while the daemon's threads are parked in the kernel's FUSE request queue, those threads enter uninterruptible D-state waiting for a userspace reply that will never come (I-165: main thread zombie, 4× D-state stat threads). Aborting the connection makes the kernel return `ECONNABORTED`/`ENOTCONN` to all pending requests, unblocking the D-state threads so the process can fully exit. fuser's `Mount::Drop` (via `AutoUnmount` socket close → `fusermount -u` → lazy `MNT_DETACH`) does NOT abort pending requests, and dropping `BackgroundSession` does NOT close `/dev/fuse` (the fd is `Arc`-shared with the detached bg thread). The device minor is captured at mount time --- statting the mountpoint at abort time would itself queue a FUSE `getattr(ROOT)` behind the stuck requests. The builder mounts `fusectl` itself if `/sys/fs/fuse/connections` is unpopulated (I-165b: Bottlerocket + `hostUsers:false` containers don't inherit the host's systemd-mounted fusectl, so the abort path was silently `None` and the deadlock recurred); the mount is best-effort under the same `CAP_SYS_ADMIN` the FUSE mount already requires.

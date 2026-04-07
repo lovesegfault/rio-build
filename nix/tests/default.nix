@@ -602,53 +602,32 @@ in
       # r[verify ctrl.pool.ephemeral]
       # r[verify ctrl.pool.ephemeral-deadline]
       # r[verify ctrl.crd.host-users-network-exclusive]
-      # After finalizer: workers_active=0, clean slate for the
-      # ephemeral pool (no STS worker steals dispatch before
-      # reconcile_ephemeral's 10s tick spawns a Job). ~180s:
-      # two builds × (reconcile tick + pod schedule + FUSE +
-      # heartbeat + build + exit). Chain enforced by assertChains.
-      # ephemeral-deadline: negative kubectl apply asserts CEL
-      # rejects ephemeralDeadlineSeconds on non-ephemeral pools.
+      # ~180s: two builds × (reconcile tick + pod schedule + FUSE +
+      # heartbeat + build + exit). Subtest deletes the default x86-64
+      # pool first so its reconciler doesn't steal dispatch.
       "ephemeral-pool"
       # r[verify ctrl.pool.manifest-reconcile]
       # r[verify ctrl.pool.manifest-labels]
-      # r[verify ctrl.pool.manifest-long-lived]
       # After ephemeral-pool: workers_active=0 again (ephemeral
-      # cleaned up its own pool via ownerRef GC). Manifest-mode
-      # pod is long-lived (no RIO_EPHEMERAL) — ONE cold-start
-      # floor Job spawns and persists. ~150s: workers_active=0
-      # drain wait + reconcile tick + Job schedule + pod start
-      # + heartbeat + build + status_patch assertion (needs 2
-      # reconcile ticks) + ownerRef delete cascade.
+      # cleaned up its own pool via ownerRef GC). Manifest-mode pod
+      # is one-shot like ephemeral; only the per-derivation resource
+      # sizing differs. ~150s: workers_active=0 drain wait +
+      # reconcile tick + Job schedule + pod start + heartbeat +
+      # build + status_patch assertion + ownerRef delete cascade.
       "manifest-pool"
     ];
-    # autoscaler ~238s + finalizer 300s + ephemeral ~180s + manifest ~150s.
+    # ephemeral ~180s + manifest ~150s.
     globalTimeout = 1600;
   };
 
-  # r[verify ctrl.pdb.workers]
-  #   pdb-ownerref: fixture's `rio` BuilderPool → reconciler
-  #   SSA-applies `x86-64-pdb` with maxUnavailable=1 + ownerRef
-  #   [0]→BuilderPool. Delete `rio` → ownerRef cascade GCs the
-  #   PDB. Unit test (tests.rs:550) proves struct shape; this proves
-  #   SSA-apply + K8s GC end-to-end.
   # r[verify ctrl.wps.reconcile]
   #   wps-lifecycle: apply 3-class WPS → 3 child WorkerPools named
   #   `{wps}-{class}` each with sizeClass=class.name + ownerRef[0]=
   #   BuilderPoolSet (controller=true). Delete WPS → finalizer
   #   cleanup explicitly deletes children; ownerRef GC as fallback.
-  # r[verify ctrl.wps.autoscale]
-  #   wps-lifecycle asserts each child's .spec.autoscaling.targetValue
-  #   = class.targetQueuePerReplica (default 5). Proves the per-class
-  #   autoscaler wiring (builders.rs:92-99); scale-up/down mechanics
-  #   are unit-tested in scaling.rs.
   #
-  # Own split (not folded into core/autoscale): pdb-ownerref deletes
-  # the `rio` BuilderPool, which core's disruption-drain needs
-  # intact and autoscale's finalizer already deletes (can't check
-  # exists+ownerRef after). Fresh fixture → clean state → fast
-  # finalizers (no in-flight builds to drain). ~4min boot + ~3min
-  # subtests.
+  # Own split (not folded into autoscale): fresh fixture → clean
+  # state → fast finalizers. ~4min boot + ~3min subtests.
   # r[verify ctrl.scaler.component]
   # r[verify ctrl.scaler.ratio-learn]
   # r[verify store.admin.get-load]

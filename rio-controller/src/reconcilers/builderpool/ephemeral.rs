@@ -1,13 +1,10 @@
-//! Ephemeral BuilderPool: Job-per-assignment instead of StatefulSet.
-//!
-//! When `BuilderPoolSpec.ephemeral: true`, the reconciler does NOT
-//! create a StatefulSet. Instead:
+//! BuilderPool Job-per-build reconciler.
 //!
 //!   1. Each `apply()` tick polls `ClusterStatus.queued_derivations`
 //!      via the same `ctx.admin` client the finalizer uses for
 //!      DrainExecutor.
 //!   2. If `queued > 0` and active Jobs for this pool <
-//!      `spec.replicas.max`, spawn Jobs (one per outstanding
+//!      `spec.maxConcurrent`, spawn Jobs (one per outstanding
 //!      derivation, up to the ceiling).
 //!   3. Each Job runs one rio-builder pod → worker exits after one
 //!      build → pod terminates → `ttlSecondsAfterFinished`
@@ -155,21 +152,15 @@ fn ephemeral_deadline(spec: &crate::crds::builderpool::BuilderPoolSpec) -> i64 {
 /// Reconcile an ephemeral BuilderPool: count active Jobs, poll queue
 /// depth, spawn Jobs if work is waiting.
 ///
-/// NO StatefulSet / Service / PDB — those are STS-mode artifacts.
-/// A headless Service for pod DNS is pointless (Job pods have random
-/// names, no stable identity). A PDB is meaningless (Jobs aren't
-/// evicted mid-drain; they run to completion or fail).
-///
-/// Status: `replicas` / `readyReplicas` / `desiredReplicas` are
-/// repurposed to mean "active Jobs." `kubectl get wp` shows the same
-/// columns either way. `desiredReplicas` is the concurrent-Job
-/// ceiling (`spec.replicas.max`).
+/// Status: `replicas` / `readyReplicas` / `desiredReplicas` mean
+/// "active Jobs." `desiredReplicas` is the concurrent-Job ceiling
+/// (`spec.maxConcurrent`).
 pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
     let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
     let ceiling = wp.spec.max_concurrent as i32;
 
     // ---- Poll queue depth ----
-    // Same ClusterStatus the autoscaler polls. One RPC per reconcile
+    // One ClusterStatus RPC per reconcile
     // per ephemeral pool. If the scheduler is unreachable (UNAVAILABLE
     // from standby, or genuinely down): log + treat as queued=0 +
     // requeue. Next tick retries. Spawning Jobs when we can't reach
@@ -228,10 +219,9 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     // ---- Spawn decision ----
     // The cast dance: queued is u32 (proto field), active/ceiling
     // are i32 (K8s replicas convention). saturating_sub handles
-    // active >= ceiling (autoscaler isn't running for ephemeral
-    // pools, so this can only happen if replicas.max was edited
-    // down while Jobs were in flight — don't spawn more, but don't
-    // try to cancel either).
+    // active >= ceiling can happen if max_concurrent was edited down
+    // while Jobs were in flight — don't spawn more, but don't try to
+    // cancel either.
     let headroom = ceiling.saturating_sub(active).max(0) as u32;
     let to_spawn = spawn_count(queued, active as u32, headroom);
 
@@ -412,8 +402,7 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
         ) {
             // proto field is u64; spawn_count takes u32. Saturate —
             // a queue > 4 billion derivations is pathological but
-            // shouldn't wrap to 0 (would scale DOWN under extreme
-            // load). Same cast as scaling::per_class::scale_wps_class.
+            // shouldn't wrap to 0 (would scale DOWN under extreme load).
             return Ok(queued.min(u32::MAX as u64) as u32);
         }
         // Class not in response → fall through to systems filter.
@@ -442,7 +431,7 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 ///     triggers a spawn; the worker heartbeats, never matches
 ///     dispatch, and would hang indefinitely. K8s kills the pod
 ///     at deadline → Job Failed → TTL reaps. Default 1h; raise
-///     via `spec.ephemeralDeadlineSeconds` for known-long-build
+///     via `spec.deadlineSeconds` for known-long-build
 ///     pools. This DOES bound build time too (K8s doesn't
 ///     distinguish "worker idle" from "worker busy on 90min
 ///     build"), so the default is a compromise — per-pool queue

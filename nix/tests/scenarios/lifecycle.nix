@@ -24,12 +24,8 @@
 # over — a strictly stronger recovery test than phase3b's single-instance
 # restart.
 #
-# obs.metric.controller — verify marker at default.nix:subtests[autoscaler]
-#   autoscaler scrapes rio_controller_scaling_decisions_total{direction="up"}
-#   — exact name from observability.md controller metrics table.
-#
-# Caller (default.nix) constructs the fixture with autoscaler tuning via
-# controller.extraEnv (see end-of-file comment block for exact extraValues):
+# Caller (default.nix) constructs the fixture via controller.extraEnv
+# (see end-of-file comment block for exact extraValues):
 #
 #   fixture = k3sFull {
 #     extraValues = {
@@ -104,13 +100,11 @@
 #   Proves tenant retention EXTENDS global grace (the spec's "floor"
 #   semantics) end-to-end with completion-hook-produced rows.
 #
-# ctrl.drain.disruption-target — verify marker at default.nix:subtests[disruption-drain]
-#   disruption-drain submits a 120s-sleep build, evicts rio-builder-x86-64-0
-#   via the K8s eviction API (sets status.conditions[DisruptionTarget]=
-#   True), and asserts the controller's watcher fires DrainWorker
-#   {force:true}. The pod self-drain (SIGTERM, force=false) is the
-#   fallback; the watcher runs FIRST. Log signal:
-#   "DisruptionTarget: DrainWorker force=true" in controller logs.
+# ctrl.drain.disruption-target — disruption-drain submits a 120s-sleep
+#   build, evicts the builder pod via the K8s eviction API (sets
+#   status.conditions[DisruptionTarget]=True), and asserts the
+#   controller's watcher fires DrainWorker{force:true}. (Subtest
+#   currently unwired pending one-shot-pod targeting redesign.)
 #
 # ctrl.pool.ephemeral — verify marker at default.nix:subtests[ephemeral-pool]
 #   ephemeral-pool: applies WorkerPoolSpec.ephemeral=true; asserts NO
@@ -138,13 +132,7 @@
 #   (builderpoolset/mod.rs:131) creates 3 child WorkerPools named
 #   `{wps}-{class}` with sizeClass=class.name + ownerReferences[0]→WPS
 #   + controller=true. Delete WPS → finalizer cleanup explicitly
-#   deletes each child (mod.rs:375), ownerRef GC as fallback. The
-#   autoscale marker piggybacks on the child spec: each child carries
-#   autoscaling.targetValue from class.targetQueuePerReplica
-#   (builders.rs:92-99) — the per-class autoscaler reads this. That
-#   wiring is verified structurally here; the scale-up/down mechanics
-#   are covered by scaling.rs unit tests (r[verify ctrl.wps.autoscale]
-#   there).
+#   deletes each child (mod.rs:375), ownerRef GC as fallback.
 {
   pkgs,
   common,
@@ -2187,10 +2175,9 @@ let
           )
 
           # ── No StatefulSet ────────────────────────────────────────────
-          # The reconciler's apply() branches on spec.ephemeral BEFORE
-          # the STS/Service/PDB block. Give it one reconcile tick (CRD
-          # watch fires immediately on create), then assert. If an STS
-          # ever appears for this pool, the branch didn't fire.
+          # Regression guard: the reconciler creates Jobs only. Give it
+          # one reconcile tick (CRD watch fires immediately on create),
+          # then assert no StatefulSet exists for this pool.
           import time
           time.sleep(3)  # one reconcile tick (kube-runtime is fast)
           k3s_server.fail(
@@ -2330,9 +2317,8 @@ let
           )
 
           # ── Cleanup ───────────────────────────────────────────────────
-          # Delete the ephemeral pool. cleanup() branches on
-          # spec.ephemeral and returns immediately (no STS scale-to-0,
-          # no DrainWorker loop). In-flight Jobs finish naturally;
+          # Delete the pool. cleanup() removes the finalizer
+          # immediately; in-flight Jobs finish naturally and
           # ownerRef GC deletes them.
           kubectl("delete builderpool ephemeral --wait=false", ns="${nsBuilders}")
           # CR gone quickly — finalizer removed on first cleanup() call.

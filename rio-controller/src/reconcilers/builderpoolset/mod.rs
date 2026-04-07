@@ -17,9 +17,8 @@
 //!
 //! # Child lifecycle
 //!
-//! The child BuilderPool is SSA-applied every reconcile. Same
-//! idempotency as the BuilderPool→StatefulSet path: same patch
-//! twice is a no-op. The apiserver merges field ownership.
+//! The child BuilderPool is SSA-applied every reconcile. Same patch
+//! twice is a no-op; the apiserver merges field ownership.
 //!
 //! Children carry `ownerReferences` with `controller=true` → K8s
 //! GC deletes them when the WPS is deleted. The finalizer-wrapped
@@ -37,11 +36,6 @@
 //! orphaned: the standalone autoscaler skips it (has ownerRef),
 //! the per-class autoscaler skips it (not in `spec.classes`
 //! iteration) — neither scales it. See `prune_stale_children`.
-//!
-//! # What this does NOT do
-//!
-//! - Per-class autoscaling: lives in scaling.rs (`scale_wps_class`
-//!   — separate task, poll-driven at autoscaler cadence).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,10 +66,7 @@ pub(crate) const FINALIZER: &str = "builderpoolset.rio.build/cleanup";
 /// SSA field manager for child BuilderPool patches. Distinct from
 /// the BuilderPool reconciler's `"rio-controller"` so `kubectl get
 /// wp -o yaml | grep managedFields` shows which controller owns
-/// which fields. The per-class autoscaler (scaling.rs) uses a
-/// THIRD field manager (`rio-controller-wps-autoscaler`) so its
-/// `spec.replicas` patches don't conflict with this reconciler's
-/// template sync.
+/// which fields.
 pub(crate) const MANAGER: &str = "rio-controller-wps";
 
 /// SSA field manager for the WPS STATUS patch (per-class

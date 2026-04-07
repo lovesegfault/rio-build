@@ -1,8 +1,7 @@
-//! BuilderPool CRD: one StatefulSet of rio-builder pods.
+//! BuilderPool CRD: spawns one-shot rio-builder Jobs.
 //!
-//! The reconciler creates/updates a StatefulSet owned by this CR
-//! (ownerReference → GC on delete). Autoscaler patches
-//! `StatefulSet.spec.replicas` based on `ClusterStatus.queued_derivations`.
+//! The reconciler polls `ClusterStatus.queued_derivations` and spawns
+//! Jobs (ownerReference → GC on delete) up to `spec.maxConcurrent`.
 
 use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
@@ -224,18 +223,18 @@ pub struct BuilderPoolSpec {
     /// (k3s/kind with `ctr images import`) MUST set "IfNotPresent"
     /// or "Never" — `:latest` otherwise tries docker.io and fails.
     ///
-    /// Controller-managed StatefulSets can't be kustomize-patched
-    /// (the CRD is patched, not the generated STS), so this has to
-    /// be a CRD field.
+    /// Controller-managed Jobs can't be kustomize-patched (the CRD
+    /// is patched, not the generated Job), so this has to be a CRD
+    /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_pull_policy: Option<String>,
 
-    /// Node selector for the StatefulSet pod spec. Common:
+    /// Node selector for the Job pod spec. Common:
     /// `rio.build/builder: "true"` to confine to tainted nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<BTreeMap<String, String>>,
 
-    /// Tolerations for the StatefulSet pod spec. Pairs with
+    /// Tolerations for the Job pod spec. Pairs with
     /// node_selector: tolerate the `rio.build/builder:NoSchedule`
     /// taint so workers (and only workers) land on those nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -446,17 +445,14 @@ pub struct Replicas {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BuilderPoolStatus {
-    /// Observed StatefulSet.status.replicas. What's actually
-    /// running (may lag desired during rollout).
+    /// Active Job count. What's actually running (may lag desired
+    /// during cold start).
     #[serde(default)]
     pub replicas: i32,
-    /// Observed StatefulSet.status.readyReplicas. Passed
-    /// readinessProbe = heartbeat accepted.
+    /// Jobs whose pod has passed readinessProbe = heartbeat accepted.
     #[serde(default)]
     pub ready_replicas: i32,
-    /// What the autoscaler WANTS. Clamped to [min, max]. May
-    /// differ from StatefulSet.spec.replicas during the
-    /// stabilization window (we want 8 but haven't patched yet).
+    /// Concurrent-Job ceiling (`spec.maxConcurrent`).
     #[serde(default)]
     pub desired_replicas: i32,
     /// Standard K8s Conditions. One type:

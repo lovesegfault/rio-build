@@ -30,8 +30,8 @@ Split the single worker type into two distinct executor kinds with separate CRDs
 |---|---|---|
 | `rio-system` | baseline | scheduler, gateway, controller, dashboard, PostgreSQL |
 | `rio-store` | baseline | store (own ns so executor NetworkPolicies can target it precisely) |
-| `rio-builders` | privileged | builder StatefulSets |
-| `rio-fetchers` | privileged | fetcher StatefulSets |
+| `rio-builders` | privileged | builder Jobs |
+| `rio-fetchers` | privileged | fetcher Jobs |
 
 `privileged` PSA narrows to the two namespaces that need `CAP_SYS_ADMIN` for FUSE. Control plane drops to `baseline`.
 

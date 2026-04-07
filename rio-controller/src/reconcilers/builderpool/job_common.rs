@@ -462,11 +462,8 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 /// SSA-patch `.status.{replicas,readyReplicas,desiredReplicas,
 /// conditions}` for a Job-mode BuilderPool.
 ///
-/// "Replicas" means "active Jobs" in Job-mode — `kubectl get wp`
-/// shows the same columns either way (STS mode fills them from
-/// `StatefulSet.status`; Job mode fills them here). The autoscaler
-/// skips Job-mode pools (`scaling.rs` checks `spec.ephemeral` and
-/// `spec.sizing`) so it won't overwrite this.
+/// "Replicas" means "active Jobs" — `kubectl get wp` columns are
+/// filled here from the Job inventory.
 ///
 /// `conditions`: `SchedulerUnreachable` reflects the reconciler's
 /// poll-phase RPC result. `scheduler_err = Some` → status="True"

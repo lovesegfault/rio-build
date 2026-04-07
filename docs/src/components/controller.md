@@ -13,13 +13,7 @@ kind: WorkerPool
 metadata:
   name: default
 spec:
-  ephemeral: false                             # default true (one Job per build); false = long-lived StatefulSet
-  replicas:
-    min: 2
-    max: 20
-  autoscaling:
-    metric: queueDepth
-    targetValue: 5                            # scale up when > 5 queued derivations per worker
+  maxConcurrent: 20                            # concurrent-Job ceiling (one Job = one build)
   resources:
     requests: { cpu: "4", memory: "8Gi" }
     limits: { cpu: "8", memory: "16Gi" }      # the build's limits — one build per pod
@@ -45,32 +39,22 @@ spec:
       value: "true"
       effect: NoSchedule
 status:
-  replicas: 5
+  replicas: 5                                  # active Jobs
   readyReplicas: 4
   desiredReplicas: 8
-  lastScaleTime: 2026-02-13T06:00:00Z
-  conditions:
-    - type: Scaling                            # single condition type; reason distinguishes state
-      status: "True"
-      lastTransitionTime: 2026-02-13T05:55:00Z
-      reason: ScaledUp                         # also: ScaledDown, UnknownMetric (status=False)
-      message: "scaled from 5 to 8"
 ```
 
-### Ephemeral WorkerPools
+### Job lifecycle
 
 r[ctrl.pool.ephemeral]
-When `WorkerPoolSpec.ephemeral: true`, the controller does NOT create a
-StatefulSet, headless Service, or PodDisruptionBudget. Instead,
-`reconcile_ephemeral` polls `AdminService.ClusterStatus` each requeue tick
-(10s, vs 5min for STS pools) and spawns K8s Jobs when
-`queued_derivations > 0` and active Jobs < `spec.replicas.max`. Each Job
-runs one rio-worker pod with `RIO_EPHEMERAL=1` → worker's main loop exits
-after one `CompletionReport` (no second event-loop iteration) → pod
-terminates → Job goes Complete → `ttlSecondsAfterFinished: 60` reaps. Job
-settings: `backoffLimit: 0` (scheduler owns retry), `restartPolicy:
-Never`, `parallelism: 1`. `spec.replicas.min` MUST be 0 (CEL-enforced);
-`spec.replicas.max` is the concurrent-Job ceiling, not a standing set.
+The reconciler polls `AdminService.ClusterStatus` each requeue tick (10s)
+and spawns K8s Jobs when `queued_derivations > 0` and active Jobs <
+`spec.maxConcurrent`. Each Job runs one rio-worker pod whose main loop
+exits after one `CompletionReport` → pod terminates → Job goes Complete →
+`ttlSecondsAfterFinished: 60` reaps. Job settings: `backoffLimit: 0`
+(scheduler owns retry), `restartPolicy: Never`, `parallelism: 1`.
+`spec.maxConcurrent` is the concurrent-Job ceiling, not a standing set;
+zero queued derivations means zero workers.
 
 **Isolation guarantee:** zero cross-build state. Fresh pod means fresh
 emptyDir for FUSE cache and overlayfs upper, fresh filesystem. Untrusted
@@ -81,29 +65,22 @@ with `hostUsers: false` + non-privileged (see `docs/src/security.md`
 
 **Cost:** per-build cold start (pod scheduling + container pull + FUSE
 mount + scheduler registration — typically 10–30s) plus one reconcile
-tick (~10s) before the Job is spawned. Locality scoring is moot (every
-ephemeral worker has an empty cache; `count_missing` returns the full
-closure for every candidate, so `best_executor` ties on locality and
-falls through to first-fit). Pod churn may require Karpenter tuning
-(consolidation policy). Long-lived (`ephemeral: false`) trades the
-isolation freshness for warm-cache locality on trusted-tenant
-workloads.
+tick (~10s) before the Job is spawned. Nodes outlive pods (Karpenter
+consolidation policy), so the node-level FSx cache survives pod churn —
+the cold-start cost is pod overhead, not refetching the closure.
 
-**Dispatch path unchanged:** from the scheduler's perspective, an
-ephemeral Job pod is indistinguishable from an STS pod — it heartbeats
-in, gets dispatched, sends CompletionReport, disconnects. The
-"ephemeral" property is purely worker-side (`RIO_EPHEMERAL` → exit
-after one build) and controller-side (Job lifecycle). The active
-mechanism is ClusterStatus polling; a push-mode RPC was considered and
-rejected (see `ephemeral.rs` § Why not a Scheduler→Controller RPC).
+**Dispatch path:** the scheduler sees a Job pod heartbeat in, dispatches
+one derivation, receives `CompletionReport`, then the pod disconnects.
+The active mechanism is ClusterStatus polling; a push-mode RPC was
+considered and rejected (see `ephemeral.rs` § Why not a
+Scheduler→Controller RPC).
 
 **RBAC:** the controller's ClusterRole grants `batch/jobs` verbs
 `[get, list, watch, create, delete]`. `delete` is required for the
-ephemeral excess-Pending reap (`r[ctrl.ephemeral.reap-excess-pending]`)
-and for manifest mode's per-bucket scale-down
-(`r[ctrl.pool.manifest-scaledown]`). `ttlSecondsAfterFinished` reaps
-Completed/Failed ephemeral Jobs; ownerRef GC handles pool-delete
-cleanup.
+excess-Pending reap (`r[ctrl.ephemeral.reap-excess-pending]`) and
+manifest mode's per-bucket scale-down (`r[ctrl.pool.manifest-scaledown]`).
+`ttlSecondsAfterFinished` reaps Completed/Failed Jobs; ownerRef GC
+handles pool-delete cleanup.
 
 r[ctrl.ephemeral.reap-excess-pending]
 When the per-class queued count drops below the count of Pending-phase
@@ -125,54 +102,45 @@ Jobs sitting until `activeDeadlineSeconds` (default 1h), and Karpenter
 keeps provisioning nodes for them.
 
 r[ctrl.ephemeral.reap-orphan-running]
-When a Running ephemeral Job (`JobStatus.ready > 0`) is older than the
-orphan grace (default 5min) AND the scheduler does not consider its
-executor busy --- either the pod's `executor_id` is absent from
-`ListExecutors`, or present with `running_builds == 0` --- the controller
-MUST delete the Job. This is the controller-side backstop for I-165: a
-builder process stuck in uninterruptible sleep (D-state FUSE wait,
-OOM-loop) cannot self-exit via the 120s `RIO_EPHEMERAL_IDLE_SECS`
-idle-timeout, never disconnects from the scheduler, and would otherwise
-sit until `activeDeadlineSeconds` (default 1h). The grace MUST exceed
-the builder's idle-timeout so the process-level exit is given first
-chance; the controller reap fires only when the process cannot act on
-its own. A Job whose executor reports `running_builds > 0` is NOT
-reaped --- the scheduler believes a build is in progress;
-`activeDeadlineSeconds` is the backstop for stuck-mid-build. The reap
-is **skipped entirely** when `ListExecutors` fails (scheduler
+When a Running Job (`JobStatus.ready > 0`) is older than the orphan
+grace (default 5min) AND the scheduler does not consider its executor
+busy --- either the pod's `executor_id` is absent from `ListExecutors`,
+or present with `running_builds == 0` --- the controller MUST delete the
+Job. This is the controller-side backstop for I-165: a builder process
+stuck in uninterruptible sleep (D-state FUSE wait, OOM-loop) cannot
+self-exit via the 120s `RIO_IDLE_SECS` idle-timeout, never disconnects
+from the scheduler, and would otherwise sit until `activeDeadlineSeconds`
+(default 1h). The grace MUST exceed the builder's idle-timeout so the
+process-level exit is given first chance; the controller reap fires only
+when the process cannot act on its own. A Job whose executor reports
+`running_builds > 0` is NOT reaped --- the scheduler believes a build is
+in progress; `activeDeadlineSeconds` is the backstop for stuck-mid-build.
+The reap is **skipped entirely** when `ListExecutors` fails (scheduler
 unreachable) --- fail-closed, same posture as
 `r[ctrl.ephemeral.reap-excess-pending]`.
 
-**Cleanup:** the finalizer's `cleanup()` branches on `spec.ephemeral` and
-returns immediately (no STS to scale to 0, no long-lived workers to
-DrainWorker). In-flight Jobs finish their one build naturally.
-
-> **Marker granularity:** This marker spans 5+ `r[impl]` sites across 3 files (controller branch / Job builder / worker single-shot gate). For finer traceability, use the sub-marker `ctrl.pool.ephemeral-deadline` — it covers the cross-cutting backstop behavior under the ephemeral umbrella.
+**Cleanup:** the finalizer's `cleanup()` returns immediately. In-flight
+Jobs finish their one build naturally; ownerRef GC removes them after
+the pool is gone.
 
 r[ctrl.pool.ephemeral-deadline]
-Ephemeral Jobs MUST set `spec.activeDeadlineSeconds` from
-`WorkerPoolSpec.ephemeralDeadlineSeconds` (default 3600). This is a
-backstop: `reconcile_ephemeral`'s spawn decision reads the
-**cluster-wide** `ClusterStatus.queued_derivations`, not pool-matching
-depth. A queue full of `x86_64-linux` work on an `aarch64-darwin`
-ephemeral pool triggers a Job spawn; the spawned worker heartbeats in,
-never matches dispatch (wrong `system`), and would hang indefinitely
-without a deadline. K8s kills the pod at deadline, `backoffLimit: 0`
-marks the Job Failed, `ttlSecondsAfterFinished` reaps. Per-pool queue
-depth (the proper fix — benefits the STS autoscaler too; see
-`scaling.rs` "per-pool wired in phase4 WorkerPoolSet") is deferred to
-phase5's ClusterStatus proto extension. CEL validation rejects
-`ephemeralDeadlineSeconds` set on non-ephemeral pools (field only makes
-sense in Job mode).
+Jobs MUST set `spec.activeDeadlineSeconds` from
+`WorkerPoolSpec.deadlineSeconds` (default 3600). This is a backstop:
+the spawn decision reads the **cluster-wide**
+`ClusterStatus.queued_derivations`, not pool-matching depth. A queue
+full of `x86_64-linux` work on an `aarch64-darwin` pool triggers a Job
+spawn; the spawned worker heartbeats in, never matches dispatch (wrong
+`system`), and would hang indefinitely without a deadline. K8s kills
+the pod at deadline, `backoffLimit: 0` marks the Job Failed,
+`ttlSecondsAfterFinished` reaps.
 
 r[ctrl.ephemeral.per-class-deadline]
 When `BuilderPoolSpec.sizeClassCutoffSecs` is set (stamped onto every
-BuilderPoolSet child from `SizeClassSpec.cutoffSecs`), the ephemeral
-Job's `activeDeadlineSeconds` MUST be `cutoffSecs * DEADLINE_MULTIPLIER`
-(5) instead of the flat 3600 default --- so a `tiny` (cutoff 30s) pod
-gets 150s, `xlarge` (cutoff 7200s) gets 36000s. An explicit
-`ephemeralDeadlineSeconds` on the pool overrides the computed value
-verbatim. Rationale (I-200): with a flat 1h deadline, a tiny-class build
+BuilderPoolSet child from `SizeClassSpec.cutoffSecs`), the Job's
+`activeDeadlineSeconds` MUST be `cutoffSecs * DEADLINE_MULTIPLIER` (5)
+instead of the flat 3600 default --- so a `tiny` (cutoff 30s) pod gets
+150s, `xlarge` (cutoff 7200s) gets 36000s. An explicit
+`deadlineSeconds` on the pool overrides the computed value verbatim. Rationale (I-200): with a flat 1h deadline, a tiny-class build
 that hangs holds a node for 3600s before the K8s deadline kills it ->
 `ExecutorDisconnected` -> `r[sched.reassign.no-promote-on-ephemeral-
 disconnect+2]` promotes; tying the deadline to the class cutoff makes
@@ -231,14 +199,12 @@ r[ctrl.pool.manifest-scaledown]
 Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-class, cpu-class)` bucket for `SCALE_DOWN_WINDOW` (600s default), the controller deletes `surplus` Jobs from that bucket. Deletion skips Jobs whose pods are mid-build (`running_builds > 0` from `ListExecutors`). Demand returning before the window elapses resets the clock.
 
 r[ctrl.pool.manifest-failed-sweep+2]
-The manifest reconciler MUST delete Failed Jobs alongside idle-surplus deletes. With `backoff_limit=0` and no TTL (`r[ctrl.pool.manifest-long-lived]`), a crash-looping pod produces up to `replicas.max` Failed Jobs per reconcile tick (the spawn pass fires `headroom` replacements, all of which may fail); the ceiling (`spec.replicas.max`) does not cap accumulation because Failed Jobs are not active supply. The sweep is bounded per-tick to `max(20, spec.replicas.max)` — the cap tracks the pool's own spawn ceiling so the sweep converges under full crash-loop (net accumulation ≤ 0 per tick). A `CrashLoopDetected` Warning event is emitted when the Failed count crosses 3.
+The manifest reconciler MUST delete Failed Jobs alongside `ttlSecondsAfterFinished` reaping. With `backoff_limit=0`, a crash-looping pod produces up to `maxConcurrent` Failed Jobs per reconcile tick (the spawn pass fires `headroom` replacements, all of which may fail); the ceiling (`spec.maxConcurrent`) does not cap accumulation because Failed Jobs are not active supply. The sweep is bounded per-tick to `max(20, spec.maxConcurrent)` — the cap tracks the pool's own spawn ceiling so the sweep converges under full crash-loop (net accumulation ≤ 0 per tick). A `CrashLoopDetected` Warning event is emitted when the Failed count crosses 3.
 
-r[ctrl.pool.manifest-long-lived]
-
-Manifest-spawned pods do NOT set `RIO_EPHEMERAL=1`. The worker's main loop does not exit after one build — it heartbeats, accepts any derivation that fits its `memory_total_bytes`, and idles. `ttlSecondsAfterFinished` is not set on the Job (the pod never self-terminates). Scale-down is entirely controller-driven.
+Manifest-spawned pods are one-shot like static-sizing pods: the worker exits after one build, the Job completes, `ttlSecondsAfterFinished` reaps. The only difference from `sizing: Static` is the per-derivation `ResourceRequirements` taken from the manifest bucket instead of `spec.resources`.
 
 r[ctrl.pool.manifest-fairness]
-When the manifest ceiling (`spec.replicas.max - active`) is less than
+When the manifest ceiling (`spec.maxConcurrent - active`) is less than
 total demand, the reconciler MUST apply per-bucket-floor truncation:
 every bucket with nonzero deficit (including cold-start) gets at least
 one spawn before any bucket gets a second. Prevents starvation under
@@ -260,40 +226,30 @@ cheaper general builder NodePools. The device resource is omitted under
 `privileged: true` (device cgroup bypassed); the nodeSelector + toleration
 are unconditional so privileged kvm pods still land on metal.
 
-r[ctrl.pool.bloom-knob]
-`WorkerPoolSpec.bloomExpectedItems` (optional) injects
-`RIO_BLOOM_EXPECTED_ITEMS` into the worker container env. Unset →
-worker uses its compile-time default (50k). Same only-inject-when-set
-semantics as `fuseThreads` and `daemonTimeoutSecs`: injecting the
-default would pin it at controller-build time, not worker-build time.
-
 ### WorkerPoolSet
 
-> **Implemented:** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`), per-class autoscaling (`r[ctrl.wps.autoscale]`), CutoffRebalancer (`r[sched.rebalancer.sita-e]`).
+> **Implemented:** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`), CutoffRebalancer (`r[sched.rebalancer.sita-e]`).
 
 r[ctrl.wps.reconcile]
 The WorkerPoolSet reconciler creates one child WorkerPool per `spec.classes[i]`, named `{wps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the WPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
 
 r[ctrl.fetcherpool.classes]
-When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler stamps one StatefulSet + headless Service per class, named `rio-fetcher-{fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; `min_replicas`/`max_replicas` override the pool-wide `spec.replicas` bounds. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), single STS at `spec.resources` --- back-compat with pre-I-170 FetcherPools.
+When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; `max_replicas` overrides the pool-wide `spec.maxConcurrent`. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
 
 r[ctrl.fetcherpool.ephemeral-per-class]
-When `FetcherPool.spec.ephemeral=true` AND `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSizeClassStatusResponse.fod_classes[class.name].queued` (in-flight FOD demand bucketed by `size_class_floor`), and spawn `spawn_count(queued, active, class.maxReplicas)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Missing class in the RPC response (scheduler `[[fetcher_size_classes]]` unconfigured or out of sync) falls back to the flat `queued_fod_derivations` count for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
+When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSizeClassStatusResponse.fod_classes[class.name].queued` (in-flight FOD demand bucketed by `size_class_floor`), and spawn `spawn_count(queued, active, class.maxReplicas)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Missing class in the RPC response (scheduler `[[fetcher_size_classes]]` unconfigured or out of sync) falls back to the flat `queued_fod_derivations` count for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
 
 r[ctrl.fetcherpool.multiarch]
-Multiple `FetcherPool` CRs MAY coexist (typically one per arch). The reconciler derives child STS/Job names as `rio-fetcher-{fp.name}-{class.name}` and the `rio.build/pool` label as `{fp.name}-{class.name}` so pools sharing a class name don't collide in the same namespace. Each pool's `spec.systems` and `spec.nodeSelector["kubernetes.io/arch"]` MUST agree (a pool advertising `x86_64-linux` MUST select `amd64` nodes). Dispatch is pool-agnostic: the scheduler scores across all registered fetchers regardless of which `FetcherPool` spawned them.
+Multiple `FetcherPool` CRs MAY coexist (typically one per arch). The reconciler derives the `rio.build/pool` label as `{fp.name}-{class.name}` so pools sharing a class name don't collide in the same namespace. Each pool's `spec.systems` and `spec.nodeSelector["kubernetes.io/arch"]` MUST agree (a pool advertising `x86_64-linux` MUST select `amd64` nodes). Dispatch is pool-agnostic: the scheduler scores across all registered fetchers regardless of which `FetcherPool` spawned them.
 
 r[ctrl.fetcherpool.spawn-builtin]
-The ephemeral spawn signal (`class_queued_for_systems`) counts `queued_by_system["builtin"]` for every `FetcherPool` regardless of whether `"builtin"` appears in `spec.systems`. Every executor unconditionally advertises `"builtin"` (`r[sched.dispatch.fod-builtin-any-arch]`), so a `system="builtin"` FOD can land on any pool; omitting it from the spawn signal would stall a cold-store bootstrap. Accept ≤N× spawn for `system="builtin"` FODs across N pools --- `reap_excess_pending` reclaims the surplus once dispatch drains the queue.
+The spawn signal (`class_queued_for_systems`) counts `queued_by_system["builtin"]` for every `FetcherPool` regardless of whether `"builtin"` appears in `spec.systems`. Every executor unconditionally advertises `"builtin"` (`r[sched.dispatch.fod-builtin-any-arch]`), so a `system="builtin"` FOD can land on any pool; omitting it from the spawn signal would stall a cold-store bootstrap. Accept ≤N× spawn for `system="builtin"` FODs across N pools --- `reap_excess_pending` reclaims the surplus once dispatch drains the queue.
 
 r[ctrl.wps.cutoff-status]
 The WPS reconciler writes per-class `effective_cutoff_secs` + `queued` to WPS status via SSA patch (field manager `rio-controller-wps-status`). Values come from the `GetSizeClassStatus` admin RPC. SSA patch body MUST include `apiVersion` + `kind`.
 
-r[ctrl.wps.autoscale]
-Per-class autoscaling: for each WPS child WorkerPool, compute `desired = clamp(queued / target_queue_per_replica, min_replicas, max_replicas)` and SSA-patch `spec.replicas` with field manager `rio-controller-wps-autoscaler` (distinct from the reconciler's field manager — SSA merges field ownership). Skip children with non-nil `deletionTimestamp`.
-
 r[ctrl.wps.prune-stale]
-The WPS reconciler prunes child WorkerPools whose `size_class` no longer appears in `spec.classes`. Prune matches by ownerRef UID (not name-prefix — robust to WPS renames); deletes are best-effort (404-tolerant, logged on other errors, non-fatal so a stuck child doesn't wedge the whole reconcile). Without prune, a removed-class child is orphaned: the standalone autoscaler skips it (has ownerRef), the per-class autoscaler skips it (not in `spec.classes` iteration) — neither scales it.
+The WPS reconciler prunes child WorkerPools whose `size_class` no longer appears in `spec.classes`. Prune matches by ownerRef UID (not name-prefix — robust to WPS renames); deletes are best-effort (404-tolerant, logged on other errors, non-fatal so a stuck child doesn't wedge the whole reconcile). Without prune, a removed-class child is orphaned: the WPS reconciler iterates `spec.classes` and won't touch it, and ownerRef GC doesn't fire while the parent still exists.
 
 For deployments with heavy-tailed build workloads, `WorkerPoolSet` defines multiple size-class worker pools with different resource allocations. The scheduler routes derivations to the appropriate pool based on estimated duration. See [ADR-015](../decisions/015-size-class-routing.md) for the design rationale.
 
@@ -307,7 +263,7 @@ spec:
     - name: small
       durationCutoff: 60s
       pool:
-        replicas: { min: 4, max: 40 }
+        maxConcurrent: 40
         resources:
           requests: { cpu: "2", memory: "4Gi" }
           limits: { cpu: "4", memory: "8Gi" }
@@ -315,7 +271,7 @@ spec:
     - name: medium
       durationCutoff: 600s
       pool:
-        replicas: { min: 2, max: 15 }
+        maxConcurrent: 15
         resources:
           requests: { cpu: "4", memory: "8Gi" }
           limits: { cpu: "8", memory: "16Gi" }
@@ -323,7 +279,7 @@ spec:
     - name: large
       durationCutoff: null           # unbounded (everything > 600s)
       pool:
-        replicas: { min: 1, max: 10 }
+        maxConcurrent: 10
         resources:
           requests: { cpu: "8", memory: "16Gi" }
           limits: { cpu: "16", memory: "32Gi" }
@@ -356,8 +312,8 @@ The existing `WorkerPool` CRD remains valid for single-pool deployments without 
 ## Reconciliation Loops
 
 r[ctrl.reconcile.owner-refs]
-- **WorkerPool reconciler**: scale worker StatefulSet based on scheduler queue depth. Create/delete pods. Manage per-worker ephemeral storage for the FUSE cache. All resources created by this reconciler carry `ownerReferences` to the WorkerPool CRD with `controller: true`, ensuring garbage collection on WorkerPool deletion.
-- **WorkerPoolSet reconciler**: manages multiple `WorkerPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `WorkerPoolSet` status. Autoscales each class independently based on per-class queue depth from the scheduler.
+- **WorkerPool reconciler**: spawn/reap worker Jobs based on scheduler queue depth. All Jobs carry `ownerReferences` to the WorkerPool CRD with `controller: true`, ensuring garbage collection on WorkerPool deletion.
+- **WorkerPoolSet reconciler**: manages multiple `WorkerPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `WorkerPoolSet` status.
 - **GC reconciler**: trigger store garbage collection on schedule.
 
 ## RBAC
@@ -368,16 +324,13 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 |---|---|---|
 | `rio.build` | workerpools | get, list, watch, create, update, patch, delete |
 | `rio.build` | workerpools/status | get, patch |
-| `apps` | statefulsets | get, list, watch, create, update, patch, delete |
-| `policy` | poddisruptionbudgets | get, list, watch, create, update, patch, delete |
 | `""` (core) | pods | get, list, watch |
-| `""` (core) | services | get, list, watch, create, update, patch, delete |
 | `""` (core) | events | create, patch |
 | `batch` | jobs | get, list, watch, create, delete |
 
 Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).
 
-> **Note:** The controller holds `policy/poddisruptionbudgets` permissions (get, list, watch, create, update, patch, delete) for per-pool PDB management. It does NOT hold permissions for `NetworkPolicies`, `ConfigMaps`, or `Leases`. NetworkPolicies are deployed as static kustomize manifests (see below).
+> **Note:** The controller does NOT hold permissions for `NetworkPolicies`, `ConfigMaps`, or `Leases`. NetworkPolicies are deployed as static manifests via the Helm chart (see below).
 
 ## NetworkPolicy
 
@@ -387,20 +340,16 @@ NetworkPolicy resources are deployed via the Helm chart (`infra/helm/rio-build/t
 - **Gateway**: ingress from external (Service type LoadBalancer/NodePort for SSH). Egress to rio-scheduler and rio-store. DNS egress to kube-system.
 - **Scheduler**: egress to PostgreSQL. DNS egress to kube-system.
 - **Store**: egress to PostgreSQL and S3. DNS egress to kube-system.
-- **Controller**: egress to rio-scheduler (gRPC, for `AdminService.ClusterStatus` autoscaling queries) and to the Kubernetes API server (for CRD watches and StatefulSet management). DNS egress to kube-system.
+- **Controller**: egress to rio-scheduler (gRPC, for `AdminService.ClusterStatus`/`GetSizeClassStatus` queue-depth queries) and to the Kubernetes API server (for CRD watches and Job management). DNS egress to kube-system.
 
 ## PodDisruptionBudget
 
-r[ctrl.pdb.workers]
-The WorkerPool reconciler creates a `PodDisruptionBudget` child for each pool with `maxUnavailable: 1`. The PDB carries `ownerReferences` to the WorkerPool (garbage-collected on pool deletion). See `build_pdb` in `rio-controller/src/reconcilers/workerpool/builders.rs`.
-
 | Component | Managed by | Policy | Rationale |
 |---|---|---|---|
-| Workers | Controller (per-pool) | `maxUnavailable: 1` | Maintain build capacity during node drain; `ownerReferences` → pool |
 | Scheduler | Static manifest | `maxUnavailable: 1` | Leader election handles failover; at most one pod unavailable |
 | Gateway | Static manifest | `minAvailable: 1` | At least one pod must remain for SSH connectivity |
 
-Scheduler and gateway PDBs remain static manifests in the Helm chart (`infra/helm/rio-build/templates/pdb.yaml`, gated on `podDisruptionBudget.enabled`) --- the controller does not deploy scheduler/store.
+Scheduler and gateway PDBs are static manifests in the Helm chart (`infra/helm/rio-build/templates/pdb.yaml`, gated on `podDisruptionBudget.enabled`). Worker pods are one-shot Jobs — a PDB on Jobs is meaningless (eviction of a Job pod just reschedules the build via `r[ctrl.drain.disruption-target]`).
 
 ## Service Definitions
 
@@ -409,7 +358,6 @@ Scheduler and gateway PDBs remain static manifests in the Helm chart (`infra/hel
 | `rio-gateway` | LoadBalancer or NodePort | SSH ingress for `nix copy` / `nix build --store ssh://` |
 | `rio-scheduler` | ClusterIP | Internal gRPC for workers, gateway, and controller |
 | `rio-store` | ClusterIP + optional Ingress | gRPC for internal components; HTTP for binary cache serving |
-| Workers (headless) | ClusterIP (headless) | Individual pod addressing; scheduler tracks workers by pod name |
 
 ## Health Probes
 
@@ -437,23 +385,10 @@ r[ctrl.drain.sigterm]
 2. Keep the `BuildExecution` stream connected (and reconnect across scheduler restart) until `BuildSlot::wait_idle()` returns — the in-flight build's completion is reported.
 3. Send `AdminService.DrainWorker` (best-effort exit deregister) and exit 0.
 
-A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The StatefulSet does NOT define a preStop.
+A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The Job pod template does NOT define a preStop.
 
 r[ctrl.drain.disruption-target]
-**Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt, PDB-mediated disruption), the watcher calls `AdminService.DrainWorker{force:true}` — the scheduler sends `CancelSignal` for the in-flight build → worker `cgroup.kill()`s → the build reassigns to a healthy worker within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for the in-flight build to complete naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.
-
-r[ctrl.autoscale.direct-patch]
-**Autoscaling:** The controller queries the scheduler's `AdminService.ClusterStatus` gRPC RPC to obtain current queue depth and worker utilization. It directly patches StatefulSet replicas based on this data. This is an internal mechanism, not HPA. The scaling logic requires stabilization windows and anti-flapping thresholds to avoid oscillation:
-
-r[ctrl.autoscale.separate-field-manager]
-The autoscaler uses **separate SSA field managers** from the reconciler (`rio-controller`): `rio-controller-autoscaler` for `StatefulSet.spec.replicas` patches, and `rio-controller-autoscaler-status` for `WorkerPool.status.{lastScaleTime,conditions}` patches. The reconciler owns `status.replicas`/`readyReplicas`/`desiredReplicas`; the autoscaler owns `status.lastScaleTime` + scaling conditions. Using the same field manager would cause 400 "conflict" on concurrent patches.
-
-r[ctrl.autoscale.skip-deleting]
-The autoscaler MUST check `metadata.deletionTimestamp` and skip pools being deleted --- otherwise it rescales the StatefulSet while the finalizer is scaling to 0, causing ping-pong.
-
-- Scale-up: react quickly (e.g., 30s window) when queue depth exceeds target.
-- Scale-down: react slowly (e.g., 10m window) to avoid killing workers that may be needed again soon.
-- Never scale below `WorkerPool.spec.replicas.min`.
+**Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt), the watcher calls `AdminService.DrainWorker{force:true}` — the scheduler sends `CancelSignal` for the in-flight build → worker `cgroup.kill()`s → the build reassigns to a healthy worker within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for the in-flight build to complete naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.
 
 ## ComponentScaler
 
@@ -503,19 +438,17 @@ delete it manually: `kubectl delete crd builds.rio.build`.
 ## Component Deployment Model
 
 The controller manages:
-- **WorkerPool** CRD → reconciles worker StatefulSet (replicas, resources, security context)
+- **WorkerPool** CRD → spawns/reaps worker Jobs (resources, security context)
 
 The controller does **NOT** manage:
 - Scheduler or store Deployments --- these are deployed via Helm/kustomize as standard Deployments
 - Rationale: scheduler and store have simple lifecycle (single replica or leader-elected); CRD management adds complexity without benefit
 
-**HPA restriction:** HPA must NOT be configured on worker StatefulSets. The controller manages scaling directly based on scheduler queue depth. Conflicting autoscalers cause oscillation.
-
 ## Key Files
 
 - `rio-crds/src/` --- CRD type definitions (separate crate; WorkerPool, WorkerPoolSet)
 - `rio-controller/src/reconcilers/` --- Reconciliation loops
-- `rio-controller/src/scaling/` --- Autoscaling logic (standalone + per-class)
+- `rio-controller/src/scaling/` --- ComponentScaler (rio-store/rio-gateway Deployment scaling)
 
 ## CRD Versioning
 
@@ -525,7 +458,7 @@ CRDs follow a `v1alpha1` → `v1beta1` → `v1` progression. The initial impleme
 
 CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constraints:
 
-- `spec.replicas.min <= spec.replicas.max`
+- `spec.maxConcurrent > 0`
 - `spec.systems` must be non-empty
 - `spec.hostNetwork: true` requires `spec.privileged: true` — Kubernetes rejects `hostUsers: false` combined with `hostNetwork: true` at pod admission; the non-privileged path sets `hostUsers: false` per ADR-012
 
@@ -533,18 +466,15 @@ r[ctrl.crd.host-users-network-exclusive]
 The controller MUST reject `WorkerPool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).
 
 r[ctrl.event.spec-degrade]
-The WorkerPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get wp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation. Emission happens before the ephemeral/STS-mode branch so both reconcile paths have identical visibility.
+The WorkerPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get wp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
 
 `spec.fuseCacheSize` is NOT a CEL rule — it is validated at reconcile time (`parse_quantity_to_gb` in `builders.rs` returns `InvalidSpec` on unparseable input, which fails the reconcile and emits an event).
 
 ## WorkerPool Finalizer
 
-r[ctrl.drain.all-then-scale]
-WorkerPool CRDs carry a `rio.build/workerpool-drain` finalizer. Before a WorkerPool is deleted, the controller's `cleanup()`:
-
-1. Lists pods by `rio.build/pool=<name>` label; sends `AdminService.DrainWorker` for each (scheduler stops assigning to them). **ALL workers must be drained BEFORE scaling to 0** --- StatefulSet `OrderedReady` terminates pods one-by-one in reverse ordinal, so if you scale before draining, pod-N gets SIGTERM while pod-0 is still receiving assignments.
-2. Patches `StatefulSet.spec.replicas = 0`.
-3. Waits for all pods to terminate (each worker's SIGTERM handler completes in-flight builds before exit — see Worker Lifecycle above).
-4. Removes the finalizer, allowing K8s GC to delete the WorkerPool CRD and its owned children (StatefulSet, Service) via `ownerReference`.
-
-The reconciler's normal `apply()` path short-circuits when `deletionTimestamp` is set (finalizer wraps it) — no need to clamp `min`/`max` to zero as a separate step.
+WorkerPool CRDs carry a `rio.build/workerpool-drain` finalizer. The
+finalizer's `cleanup()` removes the finalizer immediately; in-flight Jobs
+finish their one build naturally and ownerRef GC removes them after the
+pool is gone. The reconciler's `apply()` path short-circuits when
+`deletionTimestamp` is set (finalizer wraps it) so no new Jobs are
+spawned during deletion.

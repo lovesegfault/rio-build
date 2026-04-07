@@ -512,7 +512,7 @@ let
           print(f"reassign: assigned to {assigned.name}, killing")
 
           # SIGKILL the assigned worker. systemd restarts it (Restart=
-          # on-failure) but the scheduler sees the gRPC stream drop
+          # always) but the scheduler sees the gRPC stream drop
           # immediately → increments disconnects → requeues the build.
           assigned.succeed("systemctl kill -s KILL rio-builder.service")
 

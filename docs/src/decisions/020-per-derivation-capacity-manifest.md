@@ -1,7 +1,11 @@
 # ADR-020: Per-Derivation Capacity Manifest
 
 ## Status
-Proposed
+Accepted (sizing mechanism); amended 2026-04 (pod lifetime)
+
+## Status update (2026-04)
+
+Manifest-spawned pods are now **one-shot** like every other worker pod — they run one build and exit. Design point 4 below ("Pods are long-lived, not one-shot") and the rejected-alternative analysis of "True one-pod-per-derivation" are superseded. The concerns there (cold-start dominating short builds, FUSE cache never warming, Karpenter churn cost) are addressed by composefs (<10ms mount, zero warm upcalls), node-level FSx Lustre cache surviving pod churn, and Karpenter consolidation keeping nodes alive across pods. The per-derivation sizing mechanism (points 1–3, 5) is unchanged. `r[ctrl.pool.manifest-long-lived]` is retired.
 
 ## Context
 
@@ -49,9 +53,7 @@ Key design choices:
 - **Positive:** Karpenter does the bin-packing at node level where it has the most leverage (spot instance selection, consolidation, multi-AZ spread).
 - **Positive:** Cold-start problem has a clear answer: first build of a pname uses the floor (32c/64Gi or whatever the operator chose), reports peak on completion, second build gets a fitting pod. Same EMA learning curve as ADR-015, but the output is a pod size instead of a class name.
 - **Positive:** ADR-015's SITA-E duration isolation is preserved by construction. Short builds get small pods (provision in ~50s). Long builds get big pods. They're on different pods --- no queue contention. The ReadyQueue's critical-path priority still orders dispatch within a size.
-- **Negative:** Pod inventory is more dynamic. Where a 3-class BuilderPoolSet has 3 STS with stable names, manifest mode has a fluctuating Job set. `kubectl get pods -n rio-builders` is noisier. Mitigation: label Jobs with the rounded size so `kubectl get job -l rio.build/memory-class=48Gi` groups them.
-- **Negative:** Grace-period tuning is a new knob. Too short → churn, too long → idle waste. The existing `SCALE_DOWN_WINDOW` (600s) is a reasonable default; this ADR doesn't introduce a fundamentally new tuning problem, just moves it from per-class to per-size-bucket.
-- **Negative:** FUSE cache locality is weaker than with long-lived STS pods. A manifest pod lives for ~minutes-to-hours depending on queue shape; an STS pod lives for days. The transfer-cost scoring still routes to the warmest available pod, but the population of warm pods is smaller. Measured impact is workload-dependent; build farms with repeat builds of the same closure benefit less than farms with high package diversity.
+- **Negative:** Pod inventory is more dynamic. `kubectl get pods -n rio-builders` is noisier than a fixed-class set. Mitigation: label Jobs with the rounded size so `kubectl get job -l rio.build/memory-class=48Gi` groups them.
 
 ## Relationship to ADR-015
 
