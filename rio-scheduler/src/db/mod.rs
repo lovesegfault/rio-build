@@ -102,17 +102,23 @@ pub type BuildHistoryRow = (String, String, f64, Option<f64>, Option<f64>, i32);
 
 /// Assignment lifecycle status (assignments table).
 ///
-/// The schema also defines `acknowledged`/`failed`/`cancelled` string
-/// values, but nothing in Rust ever constructs them — the phase2c
-/// worker-ack that would have used them shipped a different design.
-/// SQL paths that reference those strings use literals directly
-/// (`'pending'`, `'acknowledged'` in `insert_assignment`'s ON CONFLICT
-/// predicate). Keeping dead variants here bloats match arms and
-/// confuses readers about what the actor actually sets.
+/// `Pending` is the insert-time value. Every CompletionReport
+/// transitions it to one of the terminal values — `Completed` on
+/// `Built`, `Failed` on any failure status, `Cancelled` when the
+/// scheduler sent a CancelSignal. I-209: leaving the row at `pending`
+/// after a derivation goes terminal blocks the tick-DELETE pruner
+/// (`NOT EXISTS (SELECT 1 FROM assignments …)`), leaking
+/// `derivations` rows unbounded.
+///
+/// The schema also defines `'acknowledged'` (the phase2c worker-ack
+/// that shipped a different design); SQL paths that reference it use
+/// the literal directly in `insert_assignment`'s ON CONFLICT predicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentStatus {
     Pending,
     Completed,
+    Failed,
+    Cancelled,
 }
 
 impl AssignmentStatus {
@@ -120,6 +126,8 @@ impl AssignmentStatus {
         match self {
             Self::Pending => "pending",
             Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }

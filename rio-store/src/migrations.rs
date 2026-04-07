@@ -569,6 +569,28 @@ pub const M_032: () = ();
 /// deploys are unaffected (empty table).
 pub const M_033: () = ();
 
+/// `migrations/034_assignments_terminal_backfill.sql`
+///
+/// I-209/I-210: only `handle_success_completion` ever called
+/// `update_assignment_status`. Every other derivation-terminal path
+/// (poison, cancel, cache-hit-at-merge, orphan recovery,
+/// FOD-from-store) left the active `assignments` row at `'pending'`.
+/// `gc_orphan_terminal_derivations`' `NOT EXISTS assignments` then
+/// matched nothing for those derivations, so they leaked unbounded —
+/// 12,609 stuck rows on terminal derivations observed in production
+/// before this migration. The Rust-side fix folds the assignment
+/// terminal into `update_derivation_status[_batch]`/`persist_poisoned`;
+/// this migration backfills the existing rows and switches the FK to
+/// `ON DELETE CASCADE` so the (now-narrowed) pruner can delete a
+/// derivation that still has terminal assignment rows.
+///
+/// Backfill maps `derivations.status` → `assignments.status` the same
+/// way `terminal_assignment_status` does (`completed`→`completed`,
+/// `cancelled`→`cancelled`, everything else → `failed`).
+/// `completed_at` falls back to `derivations.updated_at` to preserve
+/// rough timing for audit queries.
+pub const M_034: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

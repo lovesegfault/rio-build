@@ -154,7 +154,9 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     .await?;
     db.insert_build_derivation(build_id, linked_id).await?;
 
-    // (c) Terminal but referenced by assignments → KEPT (FK is RESTRICT).
+    // (c) Terminal with an ACTIVE (pending) assignment → KEPT.
+    // Recovery still needs that row to know what was dispatched; the
+    // active-status filter is the only assignment gate now.
     let assigned_id = insert_test_derivation(&db, "gc-assigned").await?;
     sqlx::query("UPDATE derivations SET status = 'completed' WHERE derivation_id = $1")
         .bind(assigned_id)
@@ -162,9 +164,25 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
         .await?;
     sqlx::query(
         "INSERT INTO assignments (derivation_id, builder_id, generation, status)
-         VALUES ($1, 'w-test', 1, 'completed')",
+         VALUES ($1, 'w-test', 1, 'pending')",
     )
     .bind(assigned_id)
+    .execute(&test_db.pool)
+    .await?;
+
+    // (c') Terminal with a TERMINAL ('completed') assignment → DELETED.
+    // I-209/I-210: terminal assignment rows no longer block; 034's
+    // CASCADE FK takes them with the derivation.
+    let cascade_id = insert_test_derivation(&db, "gc-cascade").await?;
+    sqlx::query("UPDATE derivations SET status = 'completed' WHERE derivation_id = $1")
+        .bind(cascade_id)
+        .execute(&test_db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, builder_id, generation, status)
+         VALUES ($1, 'w-test', 1, 'completed')",
+    )
+    .bind(cascade_id)
     .execute(&test_db.pool)
     .await?;
 
@@ -175,8 +193,8 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     let deleted = db.gc_orphan_terminal_derivations(1000).await?;
     assert_eq!(
         deleted,
-        orphan_ids.len() as u64,
-        "exactly the orphan-terminal set should be deleted"
+        orphan_ids.len() as u64 + 1,
+        "orphan-terminal set + cascade case deleted"
     );
 
     let remaining: Vec<Uuid> = sqlx::query_scalar("SELECT derivation_id FROM derivations")
@@ -188,9 +206,21 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     assert!(remaining.contains(&linked_id), "build-linked row kept");
     assert!(
         remaining.contains(&assigned_id),
-        "assignment-linked row kept"
+        "row with ACTIVE assignment kept"
+    );
+    assert!(
+        !remaining.contains(&cascade_id),
+        "I-209: terminal assignment row no longer blocks GC (CASCADE)"
     );
     assert!(remaining.contains(&live_id), "non-terminal row kept");
+
+    // CASCADE FK removed the assignment row too.
+    let cascade_assigns: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM assignments WHERE derivation_id = $1")
+            .bind(cascade_id)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(cascade_assigns, 0, "034: assignment row CASCADEd");
 
     // Second sweep: nothing left to delete.
     assert_eq!(db.gc_orphan_terminal_derivations(1000).await?, 0);

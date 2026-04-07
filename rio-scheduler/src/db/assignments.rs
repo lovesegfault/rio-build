@@ -62,7 +62,8 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Update an assignment status. `Completed` also stamps
+    /// Update an assignment status. Terminal statuses
+    /// (`Completed`/`Failed`/`Cancelled`) also stamp
     /// `completed_at = now()`; `Pending` leaves it alone.
     pub async fn update_assignment_status(
         &self,
@@ -70,7 +71,9 @@ impl SchedulerDb {
         status: AssignmentStatus,
     ) -> Result<(), sqlx::Error> {
         match status {
-            AssignmentStatus::Completed => {
+            AssignmentStatus::Completed
+            | AssignmentStatus::Failed
+            | AssignmentStatus::Cancelled => {
                 sqlx::query(
                     r#"
                     UPDATE assignments

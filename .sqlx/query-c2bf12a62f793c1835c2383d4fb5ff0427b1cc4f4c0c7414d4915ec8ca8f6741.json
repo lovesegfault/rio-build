@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE assignments\n                 SET status = $2, completed_at = now()\n                 WHERE derivation_id IN\n                       (SELECT derivation_id FROM derivations WHERE drv_hash = ANY($1::text[]))\n                   AND status IN ('pending', 'acknowledged')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c2bf12a62f793c1835c2383d4fb5ff0427b1cc4f4c0c7414d4915ec8ca8f6741"
+}

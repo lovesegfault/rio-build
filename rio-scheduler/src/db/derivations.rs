@@ -1,10 +1,40 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
-use super::{PoisonedDerivationRow, SchedulerDb, TERMINAL_STATUS_SQL};
+use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, TERMINAL_STATUS_SQL};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
+/// Map a terminal `DerivationStatus` to the `assignments.status` value
+/// the active row should transition to. `None` for non-terminal
+/// statuses (the assignment stays `pending` until re-dispatch
+/// overwrites it via `insert_assignment`'s ON CONFLICT, or a later
+/// terminal write closes it).
+///
+/// I-209/I-210: every terminal-status persist now closes the active
+/// assignment row in the same call, so a new terminal-transition
+/// callsite can't forget it. Before this, only
+/// `handle_success_completion` did the assignment write — every
+/// other path (poison, cancel, cache-hit-at-merge, orphan recovery,
+/// FOD-from-store) left the row at `'pending'`, the pruner's
+/// `NOT EXISTS assignments` never matched, and `derivations` leaked
+/// (12,609 stuck rows on terminal derivations observed in production).
+fn terminal_assignment_status(drv_status: DerivationStatus) -> Option<AssignmentStatus> {
+    match drv_status {
+        DerivationStatus::Completed => Some(AssignmentStatus::Completed),
+        DerivationStatus::Poisoned | DerivationStatus::DependencyFailed => {
+            Some(AssignmentStatus::Failed)
+        }
+        DerivationStatus::Cancelled | DerivationStatus::Skipped => {
+            Some(AssignmentStatus::Cancelled)
+        }
+        _ => None,
+    }
+}
+
 impl SchedulerDb {
-    /// Update a derivation's status.
+    /// Update a derivation's status. If the new status is terminal,
+    /// also closes the active `assignments` row (pending/acknowledged
+    /// → mapped terminal status, `completed_at = now()`).
+    // r[impl sched.db.assignment-terminal-on-status]
     pub async fn update_derivation_status(
         &self,
         drv_hash: &DrvHash,
@@ -23,6 +53,19 @@ impl SchedulerDb {
         )
         .execute(&self.pool)
         .await?;
+
+        if let Some(assign_status) = terminal_assignment_status(status) {
+            sqlx::query!(
+                "UPDATE assignments
+                 SET status = $2, completed_at = now()
+                 WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)
+                   AND status IN ('pending', 'acknowledged')",
+                drv_hash.as_str(),
+                assign_status.as_str(),
+            )
+            .execute(&self.pool)
+            .await?;
+        }
 
         Ok(())
     }
@@ -61,6 +104,22 @@ impl SchedulerDb {
         )
         .execute(&self.pool)
         .await?;
+
+        // r[impl sched.db.assignment-terminal-on-status]
+        if let Some(assign_status) = terminal_assignment_status(status) {
+            sqlx::query!(
+                "UPDATE assignments
+                 SET status = $2, completed_at = now()
+                 WHERE derivation_id IN
+                       (SELECT derivation_id FROM derivations WHERE drv_hash = ANY($1::text[]))
+                   AND status IN ('pending', 'acknowledged')",
+                drv_hashes as &[&str],
+                assign_status.as_str(),
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+
         Ok(result.rows_affected())
     }
 
@@ -152,8 +211,18 @@ impl SchedulerDb {
             drv_hash.as_str(),
         )
         .execute(&self.pool)
-        .await
-        .map(|_| ())
+        .await?;
+        // r[impl sched.db.assignment-terminal-on-status]
+        sqlx::query!(
+            "UPDATE assignments
+             SET status = 'failed', completed_at = now()
+             WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)
+               AND status IN ('pending', 'acknowledged')",
+            drv_hash.as_str(),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Clear poison state: NULL `poisoned_at`, empty `failed_builders`,
@@ -213,12 +282,15 @@ impl SchedulerDb {
     /// `DELETE ... LIMIT` — so a 1M-row backlog drains over many
     /// ticks instead of one long table lock.
     ///
-    /// `NOT EXISTS assignments`: the FK on `assignments.derivation_id`
-    /// is still RESTRICT (028 dropped only the edges/build_derivations
-    /// FKs). A `completed` row that ran keeps its assignment until that
-    /// table's own retention sweeps it. `dependency_failed` rows (the
-    /// 1.16M case) never dispatched → no assignment → eligible
-    /// immediately.
+    /// `NOT EXISTS … pending|acknowledged`: an ACTIVE assignment row
+    /// means the derivation may still be dispatched (assignment is the
+    /// recovery source-of-truth). Terminal assignment rows
+    /// (completed/failed/cancelled — closed by I-209's
+    /// `terminal_assignment_status` fold) don't block: 034 changed the
+    /// FK to ON DELETE CASCADE, so the DELETE removes them too. The
+    /// pre-I-209 unconditional `NOT EXISTS assignments` blocked on ANY
+    /// row, and only `handle_success_completion` ever closed one — so
+    /// every poisoned/cancelled/cache-hit derivation leaked forever.
     ///
     /// `derivation_edges` rows referencing deleted ids are left in
     /// place (FK dropped in 028). They're harmless:
@@ -232,7 +304,8 @@ impl SchedulerDb {
                    AND NOT EXISTS (SELECT 1 FROM build_derivations bd
                                    WHERE bd.derivation_id = d.derivation_id)
                    AND NOT EXISTS (SELECT 1 FROM assignments a
-                                   WHERE a.derivation_id = d.derivation_id)
+                                   WHERE a.derivation_id = d.derivation_id
+                                     AND a.status IN ('pending', 'acknowledged'))
                  LIMIT $1
              )"
         ))

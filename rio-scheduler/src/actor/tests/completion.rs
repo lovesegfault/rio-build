@@ -2425,3 +2425,89 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
 
     Ok(())
 }
+
+// r[verify sched.db.assignment-terminal-on-status]
+/// I-209: PermanentFailure MUST close the active `assignments` row
+/// (`pending` → `failed`, `completed_at` set) and record the executor
+/// in `derivations.failed_builders`. Pre-fix, only the success path
+/// did the assignment write — every poisoned/cancelled derivation
+/// kept a `pending` row, the pruner's `NOT EXISTS assignments` never
+/// matched, and `derivations` leaked.
+///
+/// Part B proves the pruner can now actually delete: drop the
+/// `build_derivations` link, run `gc_orphan_terminal_derivations`,
+/// assert the row is gone (and the assignment row CASCADEd with it).
+#[tokio::test]
+async fn permanent_failure_terminals_assignment_and_records_executor() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("i209-w", "x86_64-linux", 1).await?;
+
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "i209", PriorityClass::Scheduled).await?;
+    let _ = recv_assignment(&mut rx).await;
+    complete_failure(
+        &handle,
+        "i209-w",
+        &test_drv_path("i209"),
+        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        "deterministic compile error",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // ── Part A: PG bookkeeping ─────────────────────────────────────────
+    let (assign_status, has_completed_at): (String, bool) = sqlx::query_as(
+        "SELECT a.status, a.completed_at IS NOT NULL
+         FROM assignments a JOIN derivations d USING (derivation_id)
+         WHERE d.drv_hash = $1",
+    )
+    .bind("i209")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        assign_status, "failed",
+        "I-209: assignment row closed (pending → failed) on poison"
+    );
+    assert!(has_completed_at, "completed_at stamped on terminal");
+
+    let failed: Vec<String> =
+        sqlx::query_scalar("SELECT failed_builders FROM derivations WHERE drv_hash = $1")
+            .bind("i209")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        failed,
+        vec!["i209-w".to_string()],
+        "I-209: handle_permanent_failure records the executor"
+    );
+
+    // ── Part B: pruner is unblocked ────────────────────────────────────
+    // Drop the build_derivations link (simulates the owning build's
+    // cleanup) so the only remaining gate is the assignments row.
+    sqlx::query(
+        "DELETE FROM build_derivations WHERE derivation_id = \
+                 (SELECT derivation_id FROM derivations WHERE drv_hash = $1)",
+    )
+    .bind("i209")
+    .execute(&db.pool)
+    .await?;
+
+    let sched_db = SchedulerDb::new(db.pool.clone());
+    let deleted = sched_db.gc_orphan_terminal_derivations(10).await?;
+    assert!(
+        deleted >= 1,
+        "I-209: terminal assignment row no longer blocks the pruner"
+    );
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM assignments a JOIN derivations d USING (derivation_id) \
+         WHERE d.drv_hash = $1",
+    )
+    .bind("i209")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        remaining, 0,
+        "034: CASCADE FK removed the assignment row with the derivation"
+    );
+
+    Ok(())
+}

@@ -1099,20 +1099,12 @@ impl DagActor {
             }
         }
 
+        // I-209: persist_status(.., Completed, ..) now also closes the
+        // active assignments row (db-layer fold) — the explicit
+        // update_assignment_status that lived here is redundant.
         self.persist_status(drv_hash, DerivationStatus::Completed, None)
             .await;
         self.unpin_best_effort(drv_hash).await;
-
-        // Update assignment (non-terminal progress write: log failure, don't block)
-        if let Some(state) = self.dag.node(drv_hash)
-            && let Some(db_id) = state.db_id
-            && let Err(e) = self
-                .db
-                .update_assignment_status(db_id, crate::db::AssignmentStatus::Completed)
-                .await
-        {
-            error!(drv_hash = %drv_hash, error = %e, "failed to persist assignment completion");
-        }
 
         // Async: update build history EMA (best-effort statistics)
         if let Some(state) = self.dag.node(drv_hash)
@@ -1744,7 +1736,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         error_msg: &str,
-        _executor_id: &ExecutorId,
+        executor_id: &ExecutorId,
     ) {
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -1760,8 +1752,19 @@ impl DagActor {
             return;
         }
         state.poisoned_at = Some(Instant::now());
+        // I-209: record which builder produced the permanent failure.
+        // Diagnostics-only — `failed_builders` doesn't gate anything
+        // on the permanent path (no retry), but rio-cli/kubectl shows
+        // an empty array as "never ran" without this. Mirrors the
+        // record_failure_and_check_poison shape (in-mem first, PG
+        // best-effort).
+        state.failed_builders.insert(executor_id.clone());
 
         self.persist_poisoned(drv_hash).await;
+        if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
+            error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
+                   "failed to persist failed_worker");
+        }
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.

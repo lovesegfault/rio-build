@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE assignments\n             SET status = 'failed', completed_at = now()\n             WHERE derivation_id = (SELECT derivation_id FROM derivations WHERE drv_hash = $1)\n               AND status IN ('pending', 'acknowledged')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0764f602374895babad47bc007fd927986a99bfeb4d48b9f437945fbd41453a3"
+}
