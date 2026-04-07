@@ -90,9 +90,9 @@ pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 
 /// `ttlSecondsAfterFinished` on spawned Jobs. K8s TTL controller
 /// deletes the Job (and its pod, via ownerRef) this many seconds
-/// after it reaches Complete or Failed. 60s: long enough that an
-/// operator debugging a failed build can `kubectl logs` the pod;
-/// short enough that Job churn doesn't accumulate. The SCHEDULER
+/// after it reaches Complete or Failed. 600s (10min): long enough
+/// that an operator debugging a failed build can `kubectl logs` the
+/// pod; short enough that Job churn doesn't accumulate. The SCHEDULER
 /// has already observed the completion (worker sent CompletionReport
 /// before exiting) so there's no rio-side dependency on the Job
 /// sticking around.
