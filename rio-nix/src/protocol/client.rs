@@ -395,10 +395,11 @@ mod tests {
     #[tokio::test]
     async fn read_stderr_messages() -> anyhow::Result<()> {
         let mut buf = Vec::new();
+        let aid;
         {
             let mut w = StderrWriter::new(&mut buf);
             w.log("building foo").await?;
-            let _id = w
+            aid = w
                 .start_activity(
                     crate::protocol::stderr::ActivityType::Build,
                     "building",
@@ -407,7 +408,7 @@ mod tests {
                     &[],
                 )
                 .await?;
-            w.stop_activity(1).await?;
+            w.stop_activity(aid).await?;
             w.finish().await?;
         }
 
@@ -418,11 +419,11 @@ mod tests {
 
         // Read START_ACTIVITY
         let msg = read_stderr_message(&mut reader).await?;
-        assert!(matches!(msg, StderrMessage::StartActivity { id: 1, .. }));
+        assert!(matches!(msg, StderrMessage::StartActivity { id, .. } if id == aid));
 
         // Read STOP_ACTIVITY
         let msg = read_stderr_message(&mut reader).await?;
-        assert!(matches!(msg, StderrMessage::StopActivity { id: 1 }));
+        assert!(matches!(msg, StderrMessage::StopActivity { id } if id == aid));
 
         // Read LAST
         let msg = read_stderr_message(&mut reader).await?;

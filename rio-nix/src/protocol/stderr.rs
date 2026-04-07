@@ -171,9 +171,17 @@ pub struct StderrWriter<W> {
 
 impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     pub fn new(writer: W) -> Self {
+        // I-206: upstream nix allocates ActivityId as
+        // `nextId++ + (getPid() << 32)` (libutil/logging.cc) so daemon-
+        // originated IDs never collide with the client's own (client PID
+        // in the high bits). Starting at bare `1` puts our IDs in the
+        // same low range the client may use for `parent=0`-rooted local
+        // activities or sentinel values; nom showed completed builds as
+        // stuck at their last phase. Match upstream's convention.
+        let pid_prefix = (std::process::id() as u64) << 32;
         StderrWriter {
             writer,
-            next_activity_id: 1,
+            next_activity_id: pid_prefix + 1,
             finished: false,
             errored: false,
         }
@@ -496,8 +504,10 @@ mod tests {
         let id2 = writer
             .start_activity(ActivityType::CopyPath, "copying bar", 0, id1, &[])
             .await?;
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
+        // I-206: ids are PID-prefixed (upstream convention).
+        let base = (std::process::id() as u64) << 32;
+        assert_eq!(id1, base + 1);
+        assert_eq!(id2, base + 2);
         Ok(())
     }
 
@@ -605,11 +615,12 @@ mod tests {
                 &[],
             )
             .await?;
-        assert_eq!(id, 1);
+        let base = (std::process::id() as u64) << 32;
+        assert_eq!(id, base + 1);
 
         let mut reader = Cursor::new(&buf);
         assert_eq!(wire::read_u64(&mut reader).await?, STDERR_START_ACTIVITY);
-        assert_eq!(wire::read_u64(&mut reader).await?, 1); // id
+        assert_eq!(wire::read_u64(&mut reader).await?, base + 1); // id
         assert_eq!(wire::read_u64(&mut reader).await?, 2); // level
         assert_eq!(wire::read_u64(&mut reader).await?, 105); // type = Build
         assert_eq!(
@@ -690,8 +701,9 @@ mod tests {
         //   STDERR_START_ACTIVITY, id, level, type, text, fields, parent
         // All u64 little-endian; strings length-prefixed + zero-padded to 8.
         let mut want = Vec::new();
+        let first_id = ((std::process::id() as u64) << 32) + 1;
         wire::write_u64(&mut want, STDERR_START_ACTIVITY).await?;
-        wire::write_u64(&mut want, 1).await?; // id (first activity)
+        wire::write_u64(&mut want, first_id).await?; // id (first activity, PID-prefixed)
         wire::write_u64(&mut want, 3).await?; // lvlInfo
         wire::write_u64(&mut want, 105).await?; // actBuild
         wire::write_string(
@@ -724,7 +736,7 @@ mod tests {
                 fields,
                 parent_id,
             } => {
-                assert_eq!(id, 1);
+                assert_eq!(id, first_id);
                 assert_eq!(level, 3);
                 assert_eq!(activity_type, 105);
                 assert!(text.contains("hello-2.12.3.drv"));
