@@ -533,15 +533,13 @@
           echo "FAIL: rio-device-plugin DaemonSet rendered (both paths use base_runtime_spec)" >&2
           exit 1
         }
-        # NodeOverlay (synthetic capacity) MUST still render —
-        # rio.build/{fuse,kvm} is scheduling-signal-only (no on-node
-        # plugin; kubelet leaves NodeOverlay-declared extended
-        # resources alone — k/k#64784). Assert the rio.build/fuse key
-        # is the one declared (not a stale name).
-        yq 'select(.kind=="NodeOverlay" and .metadata.name=="rio-builder-fuse")
-            | .spec.capacity | has("rio.build/fuse")' \
-          $TMPDIR/karp-on.yaml | grep -qx true || {
-          echo "FAIL: NodeOverlay rio-builder-fuse missing or capacity key != rio.build/fuse" >&2
+        # NodeOverlay is GONE — its capacity is simulation-only
+        # (Karpenter docs explicit) so nothing wrote
+        # Node.status.capacity and kube-scheduler couldn't bind pods
+        # requesting it. Guard against it returning.
+        ! yq 'select(.kind=="NodeOverlay") | .metadata.name' \
+          $TMPDIR/karp-on.yaml | grep -q . || {
+          echo "FAIL: NodeOverlay rendered — rio.build/{fuse,kvm} extended resource was dropped" >&2
           exit 1
         }
 

@@ -143,8 +143,7 @@ builderPoolDefaults:
     limits:
       memory: "2Gi"
   # k3s escape hatch. Most scenarios don't care about pod security
-  # posture; privileged:true skips the wait for the rio.build/fuse
-  # node-status patch and the seccomp/hostUsers caveats (k3s's
+  # posture; privileged:true skips the seccomp/hostUsers caveats (k3s's
   # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN;
   # see vmtest-full-nonpriv.yaml). Production on EKS/GKE uses
   # privileged:false (the chart default).

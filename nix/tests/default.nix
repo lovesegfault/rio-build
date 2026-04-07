@@ -479,15 +479,14 @@ in
   #   hostPath /dev/fuse works) — the rw-remount and base_runtime_spec
   #   paths were never exercised until this scenario. builders.rs unit
   #   tests prove pod SHAPE renders correctly; this proves it WORKS
-  #   (rio.build/fuse advertised → worker pod Ready → cgroup/leaf
+  #   (base_runtime_spec /dev/fuse → worker pod Ready → cgroup/leaf
   #   exists + subtree_control writable → build completes over FUSE).
   vm-security-nonpriv-k3s = security.privileged-hardening-e2e {
     fixture = k3sFull {
       # Layer vmtest-full-nonpriv.yaml for workerPool.privileged:false.
       # /dev/fuse comes from k3s containerd base_runtime_spec (the
-      # containerdConfigTemplate in fixtures/k3s-full.nix); the
-      # rio.build/fuse extended resource from the node-status patch
-      # in waitReady. No extra airgap images needed.
+      # containerdConfigTemplate in fixtures/k3s-full.nix). No extra
+      # airgap images needed.
       extraValuesFiles = [
         ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
       ];

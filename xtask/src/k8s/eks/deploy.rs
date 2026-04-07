@@ -35,8 +35,8 @@ const SIZE_CLASSES_JSON: &str = r#"[
 /// Per-arch kvm sets override `classes` to a single xlarge bucket (NixOS
 /// VM tests are uniformly heavy — no point tiering) and `poolTemplate.
 /// features` to the standard nixpkgs VM-test feature triple. The
-/// controller derives the metal nodeSelector, rio.build/kvm toleration,
-/// and rio.build/kvm resource from `features:[kvm]`
+/// controller derives the metal nodeSelector + `rio.build/kvm`
+/// toleration from `features:[kvm]`
 /// (`r[ctrl.builderpool.kvm-device]`) — NOT set here.
 ///
 /// Validate end-to-end after deploy by building a derivation with
@@ -44,8 +44,8 @@ const SIZE_CLASSES_JSON: &str = r#"[
 ///   cargo xtask k8s -p eks rsb -- nix build -L --store ssh-ng://… \
 ///     'nixpkgs#nixosTests.simple'
 /// Scheduler routes it to the `{arch}-kvm-xlarge` pool; Karpenter
-/// provisions a `.metal` node; pod gets `/dev/kvm` via containerd
-/// base_runtime_spec (rio.build/kvm is scheduling-signal only).
+/// provisions a `.metal` node (nodeSelector); pod gets `/dev/kvm` via
+/// containerd base_runtime_spec.
 const BUILDER_POOL_SETS_JSON: &str = r#"[
   {"name":"x86-64","systems":["x86_64-linux"]},
   {"name":"aarch64","systems":["aarch64-linux"]},
@@ -150,15 +150,11 @@ pub async fn run(
     // CRDs first, server-side apply.
     ui::step("apply CRDs", || kube::apply_crds(&client)).await?;
 
-    // NodeOverlay CRD comes from the Karpenter chart (terraform-managed).
-    // The rio chart renders a NodeOverlay CR — helm install fails with
-    // "no matches for kind" if the CRD hasn't established yet.
-    kube::wait_crd_established(
-        &client,
-        "nodeoverlays.karpenter.sh",
-        Duration::from_secs(120),
-    )
-    .await?;
+    // Karpenter CRDs come from the karpenter-crd chart (terraform-
+    // managed). The rio chart renders NodePool + EC2NodeClass CRs —
+    // helm install fails with "no matches for kind" if the CRDs
+    // haven't established yet.
+    kube::wait_crd_established(&client, "nodepools.karpenter.sh", Duration::from_secs(120)).await?;
 
     // Namespaces first. Created here (not by the chart —
     // namespace.create=false below) because: (a) the SSH Secret must

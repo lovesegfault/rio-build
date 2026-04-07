@@ -351,23 +351,24 @@ fn seccomp_profile_json_is_valid() {
 
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
-fn job_pod_fuse_via_extended_resource_when_unprivileged() {
+fn job_pod_no_fuse_hostpath_when_unprivileged() {
     // Default (privileged=None→false): NO hostPath /dev/fuse volume.
-    // Instead, resources.limits has rio.build/fuse=1 (scheduling
-    // signal — containerd base_runtime_spec injects the device node).
-    // This is the ADR-012 production path — enables hostUsers:false
-    // (hostPath /dev/fuse is incompatible with idmap mounts).
+    // containerd base_runtime_spec injects the device node into every
+    // pod's /dev (nix/base-runtime-spec.nix), so neither a volume nor
+    // an extended-resource request is needed. This is the ADR-012
+    // production path — enables hostUsers:false (hostPath /dev/fuse
+    // is incompatible with idmap mounts).
     let wp = test_wp();
     let pod = test_pod_spec(&wp);
 
-    // No dev-fuse volume (device plugin injects, no volume needed).
+    // No dev-fuse volume (base_runtime_spec injects, no volume needed).
     assert!(
         !pod.volumes
             .as_ref()
             .unwrap()
             .iter()
             .any(|v| v.name == "dev-fuse"),
-        "non-privileged path uses device plugin, not hostPath"
+        "non-privileged path uses base_runtime_spec, not hostPath"
     );
     // No dev-fuse mount either.
     assert!(
@@ -379,34 +380,21 @@ fn job_pod_fuse_via_extended_resource_when_unprivileged() {
             .any(|m| m.name == "dev-fuse"),
     );
 
-    // resources.limits has the FUSE device resource. kubelet sees
-    // this → device plugin injects /dev/fuse + adds to device cgroup.
-    let resources = pod.containers[0]
-        .resources
-        .as_ref()
-        .expect("resources set (device plugin request)");
-    let limits = resources.limits.as_ref().expect("limits set");
-    assert_eq!(
-        limits.get("rio.build/fuse").map(|q| q.0.as_str()),
-        Some("1"),
-        "one FUSE device per worker pod"
-    );
-    // K8s treats extended-resource limits as requests too, but we
-    // set both for `kubectl get` clarity.
-    let requests = resources.requests.as_ref().expect("requests set");
-    assert_eq!(
-        requests.get("rio.build/fuse").map(|q| q.0.as_str()),
-        Some("1"),
+    // No extended-resource request. test_wp() has resources=None →
+    // container resources stay None (controller adds nothing).
+    assert!(
+        pod.containers[0].resources.is_none(),
+        "no rio.build/* extended resource — base_runtime_spec is unconditional"
     );
 }
 
-// r[verify sec.pod.fuse-device-plugin]
 #[test]
-fn job_pod_fuse_device_merges_with_operator_resources() {
-    // Operator-supplied resources (cpu/memory/ephemeral) must be
-    // PRESERVED when the builder adds the FUSE device request.
-    // A naive overwrite would drop the operator's limits → unbounded
-    // pod on a shared node (noisy neighbor).
+fn job_pod_operator_resources_pass_through() {
+    // Operator-supplied resources (cpu/memory/ephemeral) pass through
+    // to the container unchanged. Controller used to merge in
+    // rio.build/{fuse,kvm} extended resources here; that's gone (the
+    // NodeOverlay-declared capacity was simulation-only and broke EKS
+    // scheduling), so this is now a straight pass-through.
     use k8s_openapi::api::core::v1::ResourceRequirements;
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -425,45 +413,26 @@ fn job_pod_fuse_device_merges_with_operator_resources() {
     let limits = resources.limits.as_ref().unwrap();
     let requests = resources.requests.as_ref().unwrap();
 
-    // Operator's memory limit preserved.
     assert_eq!(limits.get("memory").map(|q| q.0.as_str()), Some("8Gi"));
-    // FUSE device merged in alongside.
-    assert_eq!(
-        limits.get("rio.build/fuse").map(|q| q.0.as_str()),
-        Some("1")
-    );
-    // Operator's cpu/memory requests preserved.
     assert_eq!(requests.get("cpu").map(|q| q.0.as_str()), Some("2"));
     assert_eq!(requests.get("memory").map(|q| q.0.as_str()), Some("4Gi"));
+    // Nothing the operator didn't put there.
+    assert_eq!(limits.len(), 1, "no controller-injected limits");
+    assert_eq!(requests.len(), 2, "no controller-injected requests");
 }
 
 // r[verify ctrl.builderpool.kvm-device]
 #[test]
-fn job_pod_kvm_feature_adds_device_nodeselector_toleration() {
+fn job_pod_kvm_feature_adds_nodeselector_toleration() {
     // Fixture wp has features=["kvm"]. The controller derives the
-    // device-cgroup request + metal-NodePool scheduling constraints
-    // from that one feature string — operator doesn't set them
-    // explicitly (mirrors I-098's arch derivation from systems).
+    // metal-NodePool scheduling constraints from that one feature
+    // string — operator doesn't set them explicitly (mirrors I-098's
+    // arch derivation from systems). /dev/kvm itself arrives via
+    // containerd base_runtime_spec on every pod; the nodeSelector is
+    // what makes it functional (only .metal hosts have working KVM).
     let wp = test_wp();
     assert!(wp.spec.features.iter().any(|f| f == "kvm"), "precondition");
     let pod = test_pod_spec(&wp);
-
-    // rio.build/kvm:1 in resources.{limits,requests} alongside fuse.
-    // Scheduling-only — containerd base_runtime_spec mknods /dev/kvm.
-    let resources = pod.containers[0].resources.as_ref().unwrap();
-    for map in [resources.limits.as_ref(), resources.requests.as_ref()] {
-        let m = map.expect("set");
-        assert_eq!(
-            m.get("rio.build/kvm").map(|q| q.0.as_str()),
-            Some("1"),
-            "one /dev/kvm per builder pod"
-        );
-        assert_eq!(
-            m.get("rio.build/fuse").map(|q| q.0.as_str()),
-            Some("1"),
-            "kvm request doesn't clobber fuse"
-        );
-    }
 
     // rio.build/kvm=true nodeSelector — lands on the metal NodePool.
     // The I-098 arch selector survives alongside.
@@ -489,22 +458,13 @@ fn job_pod_kvm_feature_adds_device_nodeselector_toleration() {
 #[test]
 fn job_pod_no_kvm_feature_no_kvm_wiring() {
     // The CONDITIONAL is the load-bearing part: a non-kvm pool must
-    // NOT request rio.build/kvm (would Pending forever — no non-metal
-    // node advertises it) and must NOT tolerate the metal taint (would
-    // bin-pack cheap builds onto $$ metal).
+    // NOT select rio.build/kvm (would Pending forever — only the
+    // metal NodePool carries that label) and must NOT tolerate the
+    // metal taint (would bin-pack cheap builds onto $$ metal).
     let mut wp = test_wp();
     wp.spec.features = vec!["big-parallel".into()];
     let pod = test_pod_spec(&wp);
 
-    let resources = pod.containers[0].resources.as_ref().unwrap();
-    assert!(
-        !resources
-            .limits
-            .as_ref()
-            .unwrap()
-            .contains_key("rio.build/kvm"),
-        "no kvm device request without features:[kvm]"
-    );
     assert!(
         pod.node_selector
             .as_ref()
@@ -521,22 +481,14 @@ fn job_pod_no_kvm_feature_no_kvm_wiring() {
 
 // r[verify ctrl.builderpool.kvm-device]
 #[test]
-fn job_pod_kvm_privileged_keeps_selector_drops_device() {
-    // Privileged escape hatch bypasses device cgroup → no resource
-    // request. But the pod still needs a host that HAS /dev/kvm, so
-    // nodeSelector + toleration stay.
+fn job_pod_kvm_privileged_keeps_selector() {
+    // Privileged escape hatch still needs a host that HAS working
+    // /dev/kvm — nodeSelector + toleration are unconditional wrt
+    // privileged.
     let mut wp = test_wp();
     wp.spec.privileged = Some(true);
     let pod = test_pod_spec(&wp);
 
-    let resources = pod.containers[0].resources.as_ref();
-    assert!(
-        resources.is_none_or(|r| r
-            .limits
-            .as_ref()
-            .is_none_or(|l| !l.contains_key("rio.build/kvm"))),
-        "privileged → no extended-resource request"
-    );
     assert_eq!(
         pod.node_selector
             .as_ref()
@@ -628,9 +580,9 @@ fn host_users_false_when_neither_escape_hatch() {
 // r[verify sec.pod.fuse-device-plugin]
 #[test]
 fn job_pod_privileged_escape_hatch_uses_hostpath() {
-    // privileged=true → hostPath /dev/fuse fallback. No device
-    // plugin resource, no hostUsers:false (both incompatible with
-    // privileged containers). This is the k3s/kind escape hatch.
+    // privileged=true → hostPath /dev/fuse fallback. No
+    // hostUsers:false (incompatible with privileged containers).
+    // This is the k3s/kind escape hatch.
     let mut wp = test_wp();
     wp.spec.privileged = Some(true);
     let pod = test_pod_spec(&wp);
@@ -663,13 +615,9 @@ fn job_pod_privileged_escape_hatch_uses_hostpath() {
         "privileged escape hatch skips hostUsers:false"
     );
 
-    // NO device plugin resource (privileged bypasses device cgroup).
-    // If operator set resources, pass through unchanged; here test_wp
-    // has resources=None so the container resources should be None.
-    assert!(
-        pod.containers[0].resources.is_none(),
-        "privileged path doesn't inject FUSE device resource"
-    );
+    // Resources pass through unchanged; test_wp has resources=None so
+    // the container resources stay None.
+    assert!(pod.containers[0].resources.is_none());
 }
 
 #[test]

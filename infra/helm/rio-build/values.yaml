@@ -735,33 +735,6 @@ dashboard:
       - "http://rio-dashboard.rio-system.svc.cluster.local"
 
 # ──────────────────────────────────────────────────────────────────────────
-# /dev/{fuse,kvm} extended-resource capacity
-# ──────────────────────────────────────────────────────────────────────────
-# r[impl sec.pod.fuse-device-plugin]
-# Builder/fetcher pods request `rio.build/{fuse,kvm}` via resources.
-# limits as a SCHEDULING SIGNAL only. The device nodes themselves are
-# injected by containerd `base_runtime_spec` (nix/base-runtime-spec.nix
-# linux.devices — runc mknods inside the container's /dev) on every node
-# whose containerd is so configured. No device plugin runs anywhere;
-# kubelet leaves extended resources it never saw via a plugin alone
-# (k/k#64784).
-#
-# These values set the per-node capacity advertised to the scheduler:
-#   - karpenter.enabled=true (EKS): NodeOverlay .spec.capacity
-#     (templates/karpenter.yaml).
-#   - k3s/kind VM tests: `kubectl patch node --subresource=status` in
-#     the test fixture (nix/tests/fixtures/k3s-full.nix waitReady).
-#
-# Set >= max executor pods per node (typically 1 given the resource
-# requests below, but bursty autoscaling + small nodes could pack more).
-# kvm: only metal nodes get the rio-builder-kvm NodeOverlay; a single
-# .metal box hosts many qemu-kvm guests concurrently so 100 matches
-# fuse and the binding constraint stays cpu/memory, not device count.
-deviceCapacity:
-  fuse: 100
-  kvm: 100
-
-# ──────────────────────────────────────────────────────────────────────────
 # security-profiles-operator (SeccompProfile CR distribution)
 # ──────────────────────────────────────────────────────────────────────────
 # Renders SeccompProfile CRs from files/seccomp-rio-{builder,fetcher}.json.
@@ -934,11 +907,6 @@ builderPoolDefaults:
   # lacks base_runtime_spec device injection. It disables seccomp
   # entirely (ADR-012:10) and is unacceptable for multi-tenant
   # (ADR-012:18). Production on EKS/GKE should NOT need this.
-  #
-  # EKS + Karpenter cold-start: a NodeOverlay (templates/karpenter.yaml)
-  # declares rio.build/fuse capacity synthetically so Karpenter can
-  # bin-pack from zero nodes. Requires Karpenter ≥1.7 with the
-  # nodeOverlay feature gate (infra/eks/karpenter.tf).
   #
   # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
   # seccomp profile omits pivot_root from the CAP_SYS_ADMIN allowlist. The

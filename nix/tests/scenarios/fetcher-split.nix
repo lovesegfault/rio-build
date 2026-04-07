@@ -118,10 +118,9 @@ pkgs.testers.runNixOSTest {
     # stays Pending forever. Labeling ONE node also makes the
     # fetcher-node-dedicated subtest meaningful: fetcher lands on
     # agent, builder (no nodeSelector in vmtest-full.yaml) lands
-    # wherever the scheduler puts it. Both nodes advertise
-    # rio.build/fuse (waitReady status-patch), so builder CAN land
-    # on agent too. Shape-check the toleration instead of asserting
-    # different nodes.
+    # wherever the scheduler puts it — builder CAN land on agent
+    # too. Shape-check the toleration instead of asserting different
+    # nodes.
     kubectl("label node k3s-agent rio.build/node-role=fetcher --overwrite", ns="kube-system")
 
     # ── TEST-NET-3 "public" origin on k3s-server:80 ───────────────────

@@ -69,19 +69,17 @@ r[sec.pod.fuse-device-plugin]
 <!-- rule-id is historical; mechanism is base_runtime_spec since ADR-021 §7 -->
 Worker pods MUST NOT obtain `/dev/fuse` via a hostPath volume — the kernel
 rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding), so
-hostPath is incompatible with `hostUsers: false`. Pods request
-`resources.limits["rio.build/fuse"]` as a scheduling signal; the device
-node itself is delivered by containerd's `base_runtime_spec` declaring
-`/dev/{fuse,kvm}` in OCI `linux.devices` (`nix/base-runtime-spec.nix`) —
-runc `mknod`s them inside the container's `/dev` with container-namespace
-uid/gid, so no idmap-mount rejection. The `rio.build/{fuse,kvm}` capacity
-is scheduling-only (no on-node device plugin; kubelet leaves extended
-resources it never saw via a plugin alone — k/k#64784): declared by
-Karpenter NodeOverlay on EKS ([ADR-021](./decisions/021-nixos-node-ami.md)),
-or `kubectl patch node --subresource=status` on k3s/kind. `privileged:
-true` remains an escape hatch for clusters whose containerd lacks
-`base_runtime_spec` device injection; it falls back to the hostPath
-mechanism and MUST NOT be the production default.
+hostPath is incompatible with `hostUsers: false`. The device node is
+delivered by containerd's `base_runtime_spec` declaring `/dev/{fuse,kvm}`
+in OCI `linux.devices` (`nix/base-runtime-spec.nix`) — runc `mknod`s them
+inside the container's `/dev` with container-namespace uid/gid, so no
+idmap-mount rejection. Every pod on a configured node gets both
+unconditionally; no extended resource is requested and no device plugin
+runs. kvm pods route to `.metal` via the `rio.build/kvm` nodeSelector
+(`r[ctrl.builderpool.kvm-device]`). `privileged: true` remains an escape
+hatch for clusters whose containerd lacks `base_runtime_spec` device
+injection; it falls back to the hostPath mechanism and MUST NOT be the
+production default.
 
 r[sec.psa.control-plane-restricted]
 

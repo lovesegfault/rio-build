@@ -696,23 +696,6 @@ rec {
         timeout=120,
     )
 
-    # ── rio.build/{fuse,kvm} extended-resource capacity ─────────────
-    # No device plugin runs (containerd base_runtime_spec injects the
-    # device nodes directly — see k3sContainerdConfigTmpl above). The
-    # rio.build/{fuse,kvm} resource is scheduling-signal-only; on EKS
-    # a Karpenter NodeOverlay declares it, here we patch node status
-    # directly. kubelet leaves extended resources it never saw via a
-    # plugin alone (k/k#64784), so the patch sticks. Unconditional —
-    # privileged:true scenarios don't request it (no-op), nonpriv
-    # scenarios need it BEFORE the worker pod schedules or it goes
-    # Pending on Insufficient rio.build/fuse.
-    for _n in ["k3s-server", "k3s-agent"]:
-        k3s_server.succeed(
-            "k3s kubectl patch node " + _n + " --subresource=status "
-            "--type=merge -p "
-            "'{\"status\":{\"capacity\":{\"rio.build/fuse\":\"100\",\"rio.build/kvm\":\"100\"}}}'"
-        )
-
     # ── PG Ready (everything else blocks on migrations) ─────────────
     # Bitnami's sts name pattern: <release>-postgresql. Our release
     # name is `rio` (helm template's first arg). PVC binds via local-
@@ -803,14 +786,13 @@ rec {
     # (containerd base_runtime_spec /dev/fuse injection — see
     # security.nix:privileged-hardening-e2e).
     #
-    # On timeout: dump logs + describe + node-allocatable before
+    # On timeout: dump logs + describe + containerd config before
     # re-raising. The nonpriv path (vm-security-nonpriv-k3s) has
     # several novel failure modes this exposes: containerd config
     # template not picked up (k3s template-var drift → /dev/fuse
-    # absent in container → fuser::mount2 ENOENT), node-status patch
-    # lost (Insufficient rio.build/fuse), cgroup remount EPERM under
-    # hostUsers:false. Without this dump, the test just times out
-    # at 270s with no signal.
+    # absent in container → fuser::mount2 ENOENT), cgroup remount
+    # EPERM under hostUsers:false. Without this dump, the test just
+    # times out at 270s with no signal.
     # Single kubectl wait (not wait_until_succeeds retry loop): the
     # inner --timeout=270s already retries internally. A second
     # wait_until_succeeds retry would block another 270s, pushing
@@ -836,18 +818,13 @@ rec {
             "k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 --previous 2>&1 "
             "|| k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 2>&1"
         )[1])
-        # Node allocatable + containerd config state. If
-        # allocatable[rio.build/fuse] is absent/0, the node-status
-        # patch above didn't stick (kubelet overwrote — k/k#64784
-        # regression). If the worker container has no /dev/fuse,
-        # the containerdConfigTemplate didn't render base_runtime_
-        # spec — dump the generated config.toml to see why.
-        print("--- node allocatable + containerd base_runtime_spec ---")
+        # containerd config state. If the worker container has no
+        # /dev/fuse, the containerdConfigTemplate didn't render
+        # base_runtime_spec — dump the generated config.toml to see
+        # why.
+        print("--- containerd base_runtime_spec ---")
         print(k3s_server.execute(
             "set +e; "
-            "k3s kubectl get nodes -o json | "
-            "${pkgs.jq}/bin/jq -r '.items[] | .metadata.name + \": \" + "
-            "(.status.allocatable[\"rio.build/fuse\"] // \"<unset>\")' 2>&1; "
             "echo '--- /var/lib/rancher/k3s/agent/etc/containerd/config.toml ---'; "
             "cat /var/lib/rancher/k3s/agent/etc/containerd/config.toml 2>&1; "
             "true"

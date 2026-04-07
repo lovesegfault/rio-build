@@ -55,9 +55,8 @@ locals {
 
 # Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/
 # directory on `helm upgrade` — only on first install. A version bump
-# on helm_release.karpenter below would leave stale CRDs (and skip new
-# ones like NodeOverlay, added in v1.7). The karpenter-crd chart ships
-# CRDs as templates/, which helm DOES upgrade.
+# on helm_release.karpenter below would leave stale CRDs. The
+# karpenter-crd chart ships CRDs as templates/, which helm DOES upgrade.
 resource "helm_release" "karpenter_crd" {
   name       = "karpenter-crd"
   namespace  = "kube-system"
@@ -96,16 +95,6 @@ resource "helm_release" "karpenter" {
         clusterName       = module.eks.cluster_name
         clusterEndpoint   = module.eks.cluster_endpoint
         interruptionQueue = module.karpenter.queue_name
-        # NodeOverlay (alpha, v1.7+): declare extended-resource capacity
-        # on NodePools so Karpenter can bin-pack for rio.build/fuse
-        # BEFORE a node exists. Without this, worker pods requesting the
-        # extended resource deadlock cold-start (no on-node device plugin
-        # runs; the resource is scheduling-signal-only and never appears
-        # in node status without the overlay). The NodeOverlay CR lives
-        # in the rio-build chart alongside NodePools.
-        featureGates = {
-          nodeOverlay = true
-        }
       }
       # Pin controller to system nodes — can't run Karpenter on
       # Karpenter-provisioned nodes (chicken-and-egg on first boot).

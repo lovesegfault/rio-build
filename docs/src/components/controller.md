@@ -214,18 +214,16 @@ a livelock: derivations that never build never get a `build_history`
 sample, so they never graduate out of cold-start.
 
 r[ctrl.builderpool.kvm-device]
-When `WorkerPoolSpec.features` contains `"kvm"`, the controller MUST add
-`rio.build/kvm: 1` to the builder container's `resources.{requests,
-limits}` (scheduling signal — containerd `base_runtime_spec` injects
-`/dev/kvm` into the container's device cgroup; same mechanism as
-`r[sec.pod.fuse-device-plugin]`), AND append
-`rio.build/kvm: "true"` to the pod's `nodeSelector`, AND append a
-`rio.build/kvm=true:NoSchedule` toleration. Only EC2 `.metal` instance
-types expose `/dev/kvm` (nested virt); the nodeSelector + toleration land
-kvm pods exclusively on the metal NodePool while non-kvm pods stay on the
-cheaper general builder NodePools. The device resource is omitted under
-`privileged: true` (device cgroup bypassed); the nodeSelector + toleration
-are unconditional so privileged kvm pods still land on metal.
+When `WorkerPoolSpec.features` contains `"kvm"`, the controller MUST
+append `rio.build/kvm: "true"` to the pod's `nodeSelector` AND append a
+`rio.build/kvm=true:NoSchedule` toleration. containerd `base_runtime_spec`
+injects `/dev/kvm` into every pod's `/dev` (same mechanism as
+`r[sec.pod.fuse-device-plugin]`), but only EC2 `.metal` instance types
+expose host KVM (nested virt) — on non-metal the device node ENXIOs on
+open. The nodeSelector + toleration land kvm pods exclusively on the
+metal NodePool while non-kvm pods stay on the cheaper general builder
+NodePools. The nodeSelector + toleration are unconditional wrt
+`privileged` so privileged kvm pods still land on metal.
 
 ### WorkerPoolSet
 

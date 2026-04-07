@@ -23,25 +23,13 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::error::{Error, Result};
 
-/// K8s extended-resource name for `/dev/fuse`. Scheduling-signal only:
-/// containerd `base_runtime_spec` injects the device node directly
-/// (`nix/base-runtime-spec.nix` `linux.devices` — runc `mknod`s inside
-/// the container's `/dev`), so no hostPath volume and `hostUsers: false`
-/// works (ADR-012). Capacity is declared by Karpenter NodeOverlay on
-/// EKS / a `kubectl patch node --subresource=status` in the k3s VM
-/// fixture; kubelet leaves extended resources it never saw via a
-/// device plugin alone (k/k#64784).
-const FUSE_DEVICE_RESOURCE: &str = "rio.build/fuse";
-
-/// Same mechanism for `/dev/kvm`. Only `.metal` EC2 instance types
-/// expose host KVM (nested virt); on non-metal the device node ENXIOs
-/// on open. Requested only when [`KVM_FEATURE`] is in `spec.features`.
-const KVM_DEVICE_RESOURCE: &str = "rio.build/kvm";
-
 /// Nix `system-features` string that signals "this builder runs
-/// qemu-kvm". When present in `spec.features`, the pod gets
-/// [`KVM_DEVICE_RESOURCE`] in resources + `rio.build/kvm` nodeSelector
-/// + toleration so it lands on the metal NodePool.
+/// qemu-kvm". When present in `spec.features`, the pod gets the
+/// [`KVM_NODE_LABEL`] nodeSelector + toleration so it lands on the
+/// metal NodePool. `/dev/kvm` itself is injected by containerd
+/// `base_runtime_spec` on every node (`nix/base-runtime-spec.nix`);
+/// it ENXIOs on open() on non-`.metal` hosts, so the nodeSelector is
+/// what makes kvm builds work, not the device node's presence.
 const KVM_FEATURE: &str = "kvm";
 
 /// Node label set on the metal NodePool (values.yaml `karpenter.
@@ -209,9 +197,9 @@ pub struct ExecutorPodParams {
 }
 
 impl ExecutorPodParams {
-    /// Pool advertises the `kvm` Nix system-feature → pod needs
-    /// `/dev/kvm` (device resource + metal nodeSelector + toleration).
-    /// See `r[ctrl.builderpool.kvm-device]`.
+    /// Pool advertises the `kvm` Nix system-feature → pod needs a host
+    /// with working `/dev/kvm` (metal nodeSelector + toleration). See
+    /// `r[ctrl.builderpool.kvm-device]`.
     fn wants_kvm(&self) -> bool {
         self.features.iter().any(|f| f == KVM_FEATURE)
     }
@@ -500,8 +488,8 @@ pub fn build_executor_pod_spec(
             }
             // r[impl sec.pod.fuse-device-plugin]
             // /dev/fuse: non-privileged path needs no volume —
-            // containerd base_runtime_spec mknods the device node;
-            // resources.limits[rio.build/fuse] is scheduling-only.
+            // containerd base_runtime_spec mknods the device node
+            // unconditionally on every pod (nix/base-runtime-spec.nix).
             // Privileged escape hatch uses hostPath.
             if privileged {
                 v.push(Volume {
@@ -795,28 +783,11 @@ fn build_executor_container(
             ..Default::default()
         }),
 
-        // r[impl sec.pod.fuse-device-plugin]
-        // r[impl ctrl.builderpool.kvm-device]
-        // Operator resources + rio.build/fuse scheduling signal, plus
-        // rio.build/kvm when features:[kvm]. Privileged escape hatch:
-        // no device resources (privileged bypasses device cgroup; FUSE
-        // uses hostPath, kvm relies on the rio.build/kvm nodeSelector
-        // for placement and sees /dev/kvm directly).
-        resources: if privileged {
-            p.resources.clone()
-        } else {
-            let mut r = p.resources.clone().unwrap_or_default();
-            let limits = r.limits.get_or_insert_with(BTreeMap::new);
-            let requests = r.requests.get_or_insert_with(BTreeMap::new);
-            let one = Quantity("1".into());
-            limits.insert(FUSE_DEVICE_RESOURCE.into(), one.clone());
-            requests.insert(FUSE_DEVICE_RESOURCE.into(), one.clone());
-            if p.wants_kvm() {
-                limits.insert(KVM_DEVICE_RESOURCE.into(), one.clone());
-                requests.insert(KVM_DEVICE_RESOURCE.into(), one);
-            }
-            Some(r)
-        },
+        // Operator resources only. /dev/{fuse,kvm} arrive via containerd
+        // base_runtime_spec on every pod (nix/base-runtime-spec.nix) — no
+        // extended-resource request. kvm placement is the nodeSelector +
+        // toleration above (r[ctrl.builderpool.kvm-device]).
+        resources: p.resources.clone(),
 
         ports: Some(vec![
             ContainerPort {

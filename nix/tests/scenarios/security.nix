@@ -1025,9 +1025,8 @@ in
   # ══════════════════════════════════════════════════════════════════════
   # Proves MECHANISM of the privileged:false production path:
   #   - k3s containerd config.toml.tmpl sets base_runtime_spec → runc
-  #     mknods /dev/fuse inside the container (no hostPath)
-  #   - node status patched with rio.build/fuse capacity → worker pod
-  #     requesting rio.build/fuse via resources.limits schedules
+  #     mknods /dev/fuse inside the container (no hostPath, no
+  #     extended resource — every pod gets it unconditionally)
   #   - hostUsers:false admitted (would fail with hostPath /dev/fuse)
   #   - containerd mounts /sys/fs/cgroup RO for non-privileged pods →
   #     worker's delegated_root() MS_REMOUNT|MS_BIND clears the RO flag
@@ -1208,41 +1207,13 @@ in
             ''
         }
 
-        # ── rio.build/fuse extended resource advertised ─────────────────
-        # waitReady patches node status.capacity with rio.build/fuse=100
-        # on both nodes (no device plugin runs — containerd
-        # base_runtime_spec injects /dev/fuse directly). waitReady
-        # already waited for rio-builder-x86-64-0 Ready, which
-        # TRANSITIVELY proves the patch was visible to the scheduler in
-        # time; this explicit check makes it visible in CI logs and
-        # catches a kubelet-overwrote-status regression (k/k#64784).
-        # jq path notation handles the `.` in the resource key (kubectl
-        # jsonpath `.` is a separator, so `.rio.build/fuse` would
-        # mis-parse).
-        with subtest("device-capacity: rio.build/fuse advertised on both nodes"):
-            allocatable = k3s_server.succeed(
-                "k3s kubectl get nodes -o json | "
-                "${pkgs.jq}/bin/jq -r '.items[] | .metadata.name + \"=\" + "
-                "(.status.allocatable[\"rio.build/fuse\"] // \"0\")'"
-            ).strip()
-            for line in allocatable.splitlines():
-                node, _, val = line.partition("=")
-                assert val.isdigit() and int(val) > 0, (
-                    f"node {node!r} has allocatable[rio.build/fuse]={val!r} "
-                    f"— waitReady status patch lost (kubelet overwrote?)"
-                )
-            print(
-                f"device-capacity PASS: allocatable[rio.build/fuse] = "
-                f"{allocatable!r}"
-            )
-
         # ── Worker pod security posture: non-privileged admitted ────────
         # waitReady already proved rio-builder-x86-64-0 condition=Ready.
         # Fetch the live pod spec and assert hostUsers:false + privileged
         # absent/false. If privileged:true leaked through (helm layering
         # miss, null vs false semantics), the DS check above might still
         # pass (DS runs regardless) but THIS fails — the load-bearing half.
-        with subtest("nonpriv-admitted: privileged:false + rio.build/fuse rendered and admitted"):
+        with subtest("nonpriv-admitted: privileged:false rendered and admitted"):
             pod_json = kubectl(f"get pod {wp} -o json", ns="${nsBuilders}")
             pod = json.loads(pod_json)
 
@@ -1292,17 +1263,18 @@ in
             # to bypass containerd's /proc masking for nix-daemon's
             # mountAndPidNamespacesSupported() check.
 
-            # Extended resource request present — controller auto-adds
-            # rio.build/fuse to resources.limits when !privileged.
-            limits = pod["spec"]["containers"][0].get("resources", {}).get("limits", {})
-            assert "rio.build/fuse" in limits, (
-                f"worker container should request rio.build/fuse via "
-                f"resources.limits (scheduling signal); got "
-                f"limits={limits!r}"
+            # No dev-fuse hostPath volume — base_runtime_spec injects
+            # /dev/fuse directly (the load-bearing mechanism this
+            # scenario exists to prove; see fuse-e2e subtest below for
+            # the works-end-to-end half).
+            vols = [v["name"] for v in pod["spec"].get("volumes", [])]
+            assert "dev-fuse" not in vols, (
+                f"non-privileged pod should NOT have hostPath /dev/fuse "
+                f"volume (base_runtime_spec injects it); got volumes={vols!r}"
             )
             print(
                 f"nonpriv-admitted PASS: privileged absent, "
-                f"seccomp={seccomp_type}, rio.build/fuse requested, "
+                f"seccomp={seccomp_type}, no hostPath /dev/fuse, "
                 f"hostUsers={host_users!r} (k3s opt-out)"
             )
 

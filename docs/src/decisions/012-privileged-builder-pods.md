@@ -53,11 +53,11 @@ The Phase 1a spike discovered two constraints:
 
 The controller-generated pod spec (`rio-controller/src/reconcilers/workerpool/builders.rs`) matches the recommended configuration above:
 
-- **`/dev/fuse` via containerd `base_runtime_spec`.** `nix/base-runtime-spec.nix` declares `/dev/{fuse,kvm}` in OCI `linux.devices` + `linux.resources.devices`; containerd's runc runtime is pointed at it (`nix/nixos-node/containerd-config.nix` on the NixOS AMI per [ADR-021](021-nixos-node-ami.md) §7; `services.k3s.containerdConfigTemplate` on the k3s VM fixture). The worker container requests `resources.limits["rio.build/fuse"] = 1` as a scheduling signal only — the resource capacity is declared by Karpenter NodeOverlay (EKS) or a node-status patch (k3s). No hostPath volume — `hostUsers: false` works.
+- **`/dev/fuse` via containerd `base_runtime_spec`.** `nix/base-runtime-spec.nix` declares `/dev/{fuse,kvm}` in OCI `linux.devices` + `linux.resources.devices`; containerd's runc runtime is pointed at it (`nix/nixos-node/containerd-config.nix` on the NixOS AMI per [ADR-021](021-nixos-node-ami.md) §7; `services.k3s.containerdConfigTemplate` on the k3s VM fixture). Every pod gets both unconditionally. No hostPath volume — `hostUsers: false` works.
 - **`hostUsers: false` set.** User-namespace isolation active on non-privileged pods. `CAP_SYS_ADMIN` is scoped to the user namespace; a container escape cannot use it on the host.
-- **Helm chart default is `workerPool.privileged: false`.** No device plugin runs; `values.yaml` `deviceCapacity.{fuse,kvm}` sets the per-node NodeOverlay capacity.
+- **Helm chart default is `workerPool.privileged: false`.** No device plugin runs; no extended resource is requested.
 
-The `WorkerPool` CRD exposes an optional `privileged: bool` field (`rio-crds/src/workerpool.rs`). When unset or `false` (production default), the container gets the granular `SYS_ADMIN` + `SYS_CHROOT` capabilities, `hostUsers: false`, and the `rio.build/fuse` extended-resource request. When `true`, the container runs fully privileged with the hostPath `/dev/fuse` fallback — an escape hatch for clusters whose default seccomp profiles block `mount(2)` even with `SYS_ADMIN`, or whose containerd lacks idmap-mount support. Production deployments on EKS/GKE should not need this.
+The `WorkerPool` CRD exposes an optional `privileged: bool` field (`rio-crds/src/workerpool.rs`). When unset or `false` (production default), the container gets the granular `SYS_ADMIN` + `SYS_CHROOT` capabilities and `hostUsers: false`. When `true`, the container runs fully privileged with the hostPath `/dev/fuse` fallback — an escape hatch for clusters whose default seccomp profiles block `mount(2)` even with `SYS_ADMIN`, or whose containerd lacks idmap-mount support. Production deployments on EKS/GKE should not need this.
 
 ### Seccomp Profile Distribution
 

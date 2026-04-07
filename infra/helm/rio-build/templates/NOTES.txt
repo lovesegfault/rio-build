@@ -9,21 +9,18 @@ rio-build installed to namespace {{ .Values.namespace.name }}.
 {{- if not .Values.builderPoolDefaults.privileged }}
 
 ── /dev/fuse via containerd base_runtime_spec ─────────────────────────
-Builder pods request the `rio.build/fuse` extended resource as a
-scheduling signal; the device node itself is injected by containerd's
+Builder pods get /dev/{fuse,kvm} injected by containerd's
 `base_runtime_spec` (OCI `linux.devices` — runc mknods inside the
-container's /dev). No device plugin runs.
+container's /dev). No device plugin runs; no extended resource is
+requested. kvm pods route to .metal via nodeSelector.
 
-Prerequisites:
+Prerequisite:
   • Node containerd configured with `base_runtime_spec` declaring
     /dev/{fuse,kvm} (NixOS AMI: nix/base-runtime-spec.nix; k3s VM
     fixture: services.k3s.containerdConfigTemplate).
-  • Node status.capacity advertises `rio.build/fuse` (NodeOverlay on
-    EKS; `kubectl patch node --subresource=status` elsewhere).
 
-Verify:
-  kubectl get node -o json | jq '.items[].status.allocatable["rio.build/fuse"]'
-  — should show {{ .Values.deviceCapacity.fuse }} on builder nodes.
+Verify on a builder pod:
+  kubectl -n {{ .Values.namespace.builders }} debug rio-builder-x86-64-0 -it --image=busybox -- ls -l /dev/fuse
 {{- end }}
 
 {{- if and (not .Values.builderPoolDefaults.privileged) .Values.securityProfilesOperator.enabled }}

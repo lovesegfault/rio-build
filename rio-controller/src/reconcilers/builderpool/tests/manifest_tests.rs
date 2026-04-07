@@ -536,9 +536,7 @@ fn built_job_labels_roundtrip_through_inventory() {
 }
 
 /// build_manifest_job applies the resources override to the pod.
-/// The bucket's (mem, cpu) shows up in `containers[0].resources`
-/// (plus the `rio.build/fuse` scheduling signal that
-/// `build_executor_pod_spec` always adds for non-privileged pods).
+/// The bucket's (mem, cpu) shows up in `containers[0].resources`.
 // r[verify ctrl.pool.manifest-reconcile]
 #[test]
 fn built_job_pod_has_bucket_resources() {
@@ -579,8 +577,7 @@ fn built_job_pod_has_bucket_resources() {
 
 /// Cold-start Job (`bucket: None`) falls through to `spec.resources`.
 /// test_manifest_wp has `spec.resources = None` (from the fixture),
-/// so the pod gets just the `rio.build/fuse` scheduling signal — NOT
-/// a manufactured bucket.
+/// so the pod gets no resources at all — NOT a manufactured bucket.
 #[test]
 fn cold_start_job_uses_spec_resources_floor() {
     let wp = test_manifest_wp();
@@ -603,18 +600,17 @@ fn cold_start_job_uses_spec_resources_floor() {
         Some(&FLOOR_CLASS.to_string())
     );
 
-    // Resources: no memory/cpu request (spec.resources was None,
-    // override was None → params.resources stays None → only the
-    // rio.build/fuse scheduling signal). If someone's Some-path leaks
-    // into the None-path, memory/cpu would appear.
+    // Resources: spec.resources was None, override was None →
+    // params.resources stays None → container resources None. If
+    // someone's Some-path leaks into the None-path, memory/cpu
+    // would appear.
     let pod_spec = job.spec.unwrap().template.spec.unwrap();
-    let resources = pod_spec.containers[0].resources.as_ref().unwrap();
+    let resources = pod_spec.containers[0].resources.as_ref();
     assert!(
-        resources
+        resources.is_none_or(|r| r
             .requests
             .as_ref()
-            .map(|r| !r.contains_key("memory") && !r.contains_key("cpu"))
-            .unwrap_or(true),
+            .is_none_or(|rq| !rq.contains_key("memory") && !rq.contains_key("cpu"))),
         "cold-start with spec.resources=None → no memory/cpu request"
     );
 }

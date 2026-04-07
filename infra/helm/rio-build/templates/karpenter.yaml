@@ -73,57 +73,6 @@ spec:
         encrypted: true
   tags:
     karpenter.sh/discovery: {{ $k.clusterName }}
----
-# NodeOverlay: tells Karpenter that worker-role instances provide
-# rio.build/fuse capacity. Builder pods request rio.build/fuse:1 as a
-# scheduling signal; no device plugin runs (containerd base_runtime_spec
-# injects /dev/fuse directly, nix/base-runtime-spec.nix), so this overlay
-# is the ONLY source of that extended resource — kubelet leaves
-# NodeOverlay-declared resources alone when no plugin ever registered
-# them (k/k#64784). Bin-packing from zero nodes works because the overlay
-# applies to NodeClaims, not booted nodes.
-#
-# Alpha feature — requires settings.featureGates.nodeOverlay=true on the
-# Karpenter controller (set in infra/eks/karpenter.tf).
-apiVersion: karpenter.sh/v1alpha1
-kind: NodeOverlay
-metadata:
-  name: rio-builder-fuse
-  labels:
-    app.kubernetes.io/part-of: rio-build
-spec:
-  # Match builder + fetcher NodePools via node-role. NOT rio-general:
-  # base_runtime_spec injects /dev/fuse on every AMI-booted node, but
-  # executor pods carry node-role selectors that exclude general anyway.
-  # Keeping the overlay narrow means Karpenter never provisions a
-  # rio-general node FOR a fuse-requesting pod.
-  requirements:
-    - key: rio.build/node-role
-      operator: In
-      values: [builder, fetcher]
-  capacity:
-    rio.build/fuse: {{ .Values.deviceCapacity.fuse | quote }}
----
-# NodeOverlay (kvm): synthetic rio.build/kvm capacity for the metal
-# NodePool. Same scheduling-signal-only mechanism as fuse above. Matches
-# by the rio.build/kvm label (only the metal NodePool sets it) so
-# non-metal builder nodes don't falsely advertise kvm — base_runtime_spec
-# mknods /dev/kvm everywhere but it ENXIOs on open() without host KVM, so
-# a misrouted pod would fail at runtime, not scheduling. Keeping the
-# overlay narrow fails at scheduling instead.
-apiVersion: karpenter.sh/v1alpha1
-kind: NodeOverlay
-metadata:
-  name: rio-builder-kvm
-  labels:
-    app.kubernetes.io/part-of: rio-build
-spec:
-  requirements:
-    - key: rio.build/kvm
-      operator: In
-      values: ["true"]
-  capacity:
-    rio.build/kvm: {{ .Values.deviceCapacity.kvm | quote }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1

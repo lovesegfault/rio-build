@@ -12,10 +12,9 @@
 # runc mknods these inside the container's /dev (container-namespace
 # uid/gid) — NOT a hostPath mount, so no hostUsers:false idmap-mount
 # rejection. Every pod gets both; mounting fuse still needs
-# CAP_SYS_ADMIN, and /dev/kvm ENXIOs on non-.metal. The NodeOverlay-
-# declared `rio.build/{fuse,kvm}` capacity (EKS) / kubectl-patched
-# node status (k3s) is scheduling-signal only — kubelet leaves
-# extended resources it never saw via a plugin alone (k/k#64784).
+# CAP_SYS_ADMIN, and /dev/kvm ENXIOs on non-.metal. kvm pods route to
+# .metal via the `rio.build/kvm` nodeSelector (controller-derived from
+# features:[kvm], r[ctrl.builderpool.kvm-device]).
 #
 # `base_runtime_spec` is the STARTING spec — CRI's spec opts layer on
 # top (`oci.WithSpecFromFile` then `WithProcessCwd`/`WithNamespaces`/…)
