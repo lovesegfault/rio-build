@@ -510,6 +510,7 @@ in
 
       timers.smarter-device-watchdog = lib.mkIf cfg.devicePlugin.enable {
         wantedBy = [ "timers.target" ];
+        partOf = [ "kubelet.service" ];
         timerConfig = {
           # 30 s first-fire clears the plugin's own settle+register window; 15 s steady-state thereafter.
           OnActiveSec = "30s";
