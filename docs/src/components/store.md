@@ -301,16 +301,23 @@ Supports dry-run mode via `GCRequest.dry_run`.
 r[store.gc.empty-refs-gate]
 Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the worker's reference scanner is broken.
 
-r[store.cas.upsert-inserted]
-The chunk-upsert batch INSERT returns per-row `(refcount = 1) AS inserted`
-so the caller knows which blake3 hashes need upload to backend. This
-replaces the racy re-query: previously `do_upload` re-SELECTed
-`refcount` after the upsert, but a concurrent PutPath could bump
-refcount between upsert and re-SELECT. `refcount = 1` is atomic with
-the INSERT. It is also SAFER than `xmax = 0`: a chunk at refcount=0
-(soft-deleted, awaiting GC drain) that gets resurrected by upsert has
-`xmax != 0` (CONFLICT fired) but `refcount = 1` — the `xmax` approach
-would skip upload, but S3 may have already deleted the object.
+r[store.cas.upsert-inserted+2]
+The chunk-upsert batch INSERT returns per-row `(uploaded_at IS NULL) AS
+needs_upload` so the caller knows which blake3 hashes need upload to
+backend. The predicate is atomic with the upsert (no re-query window)
+and is keyed on confirmed backend presence rather than refcount: a
+chunk whose first uploader was killed mid-PUT has refcount≥1 but
+`uploaded_at IS NULL`, so the next PutPath re-uploads instead of
+skipping into permanent data loss.
+
+r[store.cas.chunk-upload-committed]
+`chunks.uploaded_at` is non-NULL iff a `ChunkBackend::put` for that
+hash has been observed to succeed. `cas::put_chunked` MUST set it (via
+`mark_chunks_uploaded`) only after `do_upload` returns Ok, and GC paths
+MUST clear it back to NULL when they mark the chunk `deleted=true`.
+Concurrent uploaders racing on a NULL `uploaded_at` all upload (S3
+PutObject is idempotent for identical content); the first to reach
+`mark_chunks_uploaded` wins the timestamp.
 
 ## Crash-Safe S3 Deletion (`pending_s3_deletes`)
 

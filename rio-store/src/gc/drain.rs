@@ -99,18 +99,12 @@ pub async fn drain_once(
         // blocks until this tx commits or rolls back, so a
         // resurrection-between-check-and-S3-delete is impossible.
         // Without FOR UPDATE, PutPath could flip the chunk live
-        // between this SELECT and the S3 delete below: PG would
-        // say refcount≥1, S3 would no longer have the object, and
-        // subsequent PutPaths would see refcount≥2 via the upsert
-        // and skip upload — permanent data loss.
-        //
-        // The upload-skip race (X18) is now closed at insert time:
-        // chunked.rs's upsert RETURNING (refcount=1) is atomic — PG
-        // serializes the ON CONFLICT, so exactly one concurrent
-        // PutPath sees refcount=1 (→ uploads) and all others see ≥2
-        // (→ skip). No re-query window for a concurrent increment to
-        // slip through. This still_dead re-check stays as the guard
-        // for resurrection-between-sweep-and-drain (its primary job).
+        // between this SELECT and the S3 delete below: PG would say
+        // refcount≥1, S3 would no longer have the object. Post-M033
+        // a resurrecting PutPath re-uploads (uploaded_at was cleared
+        // by sweep), so the data-loss exposure is gone, but the FOR
+        // UPDATE still saves a wasted upload round-trip and keeps the
+        // resurrection-between-sweep-and-drain guard exact.
         // r[impl store.gc.pending-deletes]
         if let Some(hash) = &blake3_hash {
             let still_dead: bool = sqlx::query_scalar(

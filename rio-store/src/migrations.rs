@@ -540,6 +540,35 @@ pub const M_031: () = ();
 /// "smallest class" (same as fresh state). No backfill needed.
 pub const M_032: () = ();
 
+/// `migrations/033_chunks_uploaded_at.sql`
+///
+/// Nullable `uploaded_at TIMESTAMPTZ` on `chunks` — the commit point
+/// for backend (S3) presence. Set by [`crate::metadata::chunked::
+/// mark_chunks_uploaded`] AFTER a successful `ChunkBackend::put`;
+/// cleared back to NULL when GC marks the chunk `deleted=true`.
+///
+/// **Race this closes (observed in production 2026-04-06):** under the
+/// previous `RETURNING (refcount = 1)` heuristic, two concurrent
+/// PutPaths sharing chunk X would have exactly one (the upsert
+/// winner) attempt the S3 PUT. If that winner is SIGKILLed mid-upload
+/// — as during a helm rolling update with ≥2 store replicas under
+/// active traffic — the loser has already seen rc=2, skipped upload,
+/// and completed its manifest. The orphan reaper later cleans the
+/// winner's stale `'uploading'` row and decrements rc, but the
+/// loser's `'complete'` manifest keeps rc>0 forever. Result: PG says
+/// the chunk exists, S3 has nothing, GetPath returns DataLoss.
+///
+/// `(uploaded_at IS NULL)` instead: a chunk is skipped only when a
+/// prior writer has confirmed the S3 object. Concurrent uncommitted
+/// writers all upload (idempotent — same key, same bytes); the first
+/// to call `mark_chunks_uploaded` wins the timestamp.
+///
+/// **Backfill:** sets `uploaded_at = created_at` for all existing
+/// rows. This is a lie for chunks already stranded by the race above
+/// — those need a separate scan-and-purge (PG vs S3 diff). Greenfield
+/// deploys are unaffected (empty table).
+pub const M_033: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

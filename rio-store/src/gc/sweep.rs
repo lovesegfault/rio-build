@@ -514,7 +514,7 @@ async fn sweep_orphan_batch(
     // serializes against the PutPath UPSERT on the same blake3_hash.
     let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
-        UPDATE chunks SET deleted = TRUE
+        UPDATE chunks SET deleted = TRUE, uploaded_at = NULL
          WHERE blake3_hash = ANY($1)
            AND refcount = 0 AND deleted = FALSE
         RETURNING blake3_hash, size

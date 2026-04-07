@@ -130,22 +130,22 @@ pub async fn upgrade_manifest_to_chunked(
     // PRIMARY guard; this is defense-in-depth so `chunks` row state
     // is self-consistent (refcount>0 implies deleted=false).
     //
-    // r[impl store.cas.upsert-inserted]
-    // RETURNING (refcount = 1) AS inserted: atomic with the upsert —
-    // no re-query race. `refcount = 1` on the returned row means
-    // either (a) fresh insert, or (b) resurrection from refcount=0
-    // (soft-deleted, awaiting GC drain). BOTH need upload — for (b),
-    // S3 may have already deleted the object.
-    //
-    // Audit B1 #8: `xmax = 0` would be WRONG here. Resurrection
-    // fires the CONFLICT clause → xmax != 0 → xmax says "skip". But
-    // the chunk is NOT in S3 anymore. `refcount = 1` says "upload"
-    // in both cases. Also doesn't depend on PG system columns.
+    // r[impl store.cas.upsert-inserted+2]
+    // RETURNING (uploaded_at IS NULL) AS needs_upload: a chunk needs
+    // (re-)upload iff no prior PutPath has confirmed S3 presence via
+    // `mark_chunks_uploaded`. Contrast with the previous heuristic
+    // `(refcount = 1)`, which assumed "rc≥1 before me ⇒ someone else
+    // already uploaded" — false when that someone is mid-upload and
+    // gets SIGKILLed (helm rolling update). M_033 has the full race.
     //
     // RETURNING sees the POST-update row state (SQL standard). So:
-    //   fresh INSERT         → refcount = 1 (from UNNEST)  → inserted = true
-    //   CONFLICT, prev rc=0  → refcount = 0+1 = 1          → inserted = true
-    //   CONFLICT, prev rc≥1  → refcount = rc+1 ≥ 2         → inserted = false
+    //   fresh INSERT             → uploaded_at = NULL          → needs_upload = true
+    //   CONFLICT, uploaded_at NULL (in-flight or interrupted)  → needs_upload = true
+    //   CONFLICT, uploaded_at set (S3-confirmed)               → needs_upload = false
+    //
+    // Two concurrent PutPaths sharing a chunk now BOTH upload —
+    // S3 PutObject is idempotent (same key, same bytes), so the
+    // duplicate write is wasted bandwidth, not a correctness hazard.
     let rows: Vec<(Vec<u8>, bool)> = sqlx::query_as(
         r#"
         INSERT INTO chunks (blake3_hash, refcount, size)
@@ -153,7 +153,7 @@ pub async fn upgrade_manifest_to_chunked(
                AS t(hash, one, size)
         ON CONFLICT (blake3_hash) DO UPDATE
             SET refcount = chunks.refcount + 1, deleted = false
-        RETURNING blake3_hash, (refcount = 1) AS inserted
+        RETURNING blake3_hash, (uploaded_at IS NULL) AS needs_upload
         "#,
     )
     .bind(&chunk_hashes)
@@ -162,13 +162,42 @@ pub async fn upgrade_manifest_to_chunked(
     .fetch_all(&mut *tx)
     .await?;
 
-    let inserted: HashSet<Vec<u8>> = rows
+    let needs_upload: HashSet<Vec<u8>> = rows
         .into_iter()
-        .filter_map(|(h, ins)| ins.then_some(h))
+        .filter_map(|(h, need)| need.then_some(h))
         .collect();
 
     tx.commit().await?;
-    Ok(inserted)
+    Ok(needs_upload)
+}
+
+/// Record that the given chunk hashes are now durably present in the
+/// backend. Called by `cas::put_chunked` AFTER `do_upload` succeeds,
+/// BEFORE the manifest is flipped to `complete`.
+///
+/// `WHERE uploaded_at IS NULL` makes this idempotent: two concurrent
+/// PutPaths that both uploaded the same chunk both call here; the
+/// second one is a no-op (0 rows updated). The timestamp is the FIRST
+/// confirmed upload, not the last.
+///
+/// Hashes are sorted before binding — same lock-order discipline as
+/// every other `chunks` writer (`r[store.chunk.lock-order]`).
+// r[impl store.cas.chunk-upload-committed]
+#[instrument(skip(pool, hashes), fields(count = hashes.len()))]
+pub async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<()> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let mut sorted = hashes.to_vec();
+    sorted.sort_unstable();
+    sqlx::query(
+        "UPDATE chunks SET uploaded_at = now() \
+         WHERE blake3_hash = ANY($1) AND uploaded_at IS NULL",
+    )
+    .bind(&sorted)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Finalize a chunked upload: fill real narinfo + flip status to 'complete'.
@@ -510,14 +539,14 @@ mod tests {
     }
 
     /// Sequential upserts simulate two PutPaths: first inserts {A,B},
-    /// second inserts {A,C}. RETURNING (refcount=1) tells each which
-    /// chunks THEY freshly inserted — no re-query, no race window.
+    /// uploads, marks-uploaded; second inserts {A,C}. The needs_upload
+    /// set is driven by `uploaded_at`, not refcount.
     ///
-    /// First call: A,B both new → both in inserted set.
-    /// Second call: A already at refcount=1 → bumps to 2 → NOT in set.
-    ///              C new → in set.
+    /// First call: A,B both new (uploaded_at NULL) → both need upload.
+    /// After mark_chunks_uploaded({A,B}): A,B uploaded_at set.
+    /// Second call: A uploaded_at set → NOT in set. C new → in set.
     #[tokio::test]
-    async fn upsert_returning_sequential_inserted_set() {
+    async fn upsert_returning_sequential_needs_upload_set() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let chunk_a = vec![0xA1u8; 32];
@@ -527,7 +556,7 @@ mod tests {
         // --- First upsert: {A, B} ---
         let sph1 = vec![0x11u8; 32];
         seed_placeholder(&db.pool, &sph1).await;
-        let ins1 = upgrade_manifest_to_chunked(
+        let need1 = upgrade_manifest_to_chunked(
             &db.pool,
             &sph1,
             b"manifest-1",
@@ -537,17 +566,21 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ins1.len(), 2, "first upsert: both A and B fresh");
-        assert!(ins1.contains(&chunk_a), "A freshly inserted");
-        assert!(ins1.contains(&chunk_b), "B freshly inserted");
+        assert_eq!(need1.len(), 2, "first upsert: both A and B need upload");
+        assert!(need1.contains(&chunk_a), "A: uploaded_at NULL");
+        assert!(need1.contains(&chunk_b), "B: uploaded_at NULL");
+
+        // Simulate the S3 upload + commit point.
+        mark_chunks_uploaded(&db.pool, &[chunk_a.clone(), chunk_b.clone()])
+            .await
+            .unwrap();
 
         // --- Second upsert: {A, C} ---
-        // A is already at refcount=1; this upsert bumps it to 2.
-        // RETURNING sees refcount=2 → (refcount=1) is false → A NOT
-        // in the inserted set. C is fresh.
+        // A is at refcount=1, uploaded_at set → bumps to 2, but
+        // uploaded_at IS NOT NULL → NOT in needs_upload. C is fresh.
         let sph2 = vec![0x22u8; 32];
         seed_placeholder(&db.pool, &sph2).await;
-        let ins2 = upgrade_manifest_to_chunked(
+        let need2 = upgrade_manifest_to_chunked(
             &db.pool,
             &sph2,
             b"manifest-2",
@@ -557,12 +590,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ins2.len(), 1, "second upsert: only C is fresh");
+        assert_eq!(need2.len(), 1, "second upsert: only C needs upload");
         assert!(
-            !ins2.contains(&chunk_a),
-            "A already present (refcount 1→2) — NOT in inserted set"
+            !need2.contains(&chunk_a),
+            "A uploaded_at set — NOT in needs_upload set"
         );
-        assert!(ins2.contains(&chunk_c), "C freshly inserted");
+        assert!(need2.contains(&chunk_c), "C: uploaded_at NULL");
 
         // Ground truth: refcounts as expected.
         let rc_a: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
@@ -574,22 +607,20 @@ mod tests {
     }
 
     /// The resurrection case (Audit B1 #8): chunk at refcount=0,
-    /// deleted=true (soft-deleted by GC sweep, awaiting drain). An
-    /// upsert resurrects it — refcount goes 0→1, deleted flips false.
-    ///
-    /// This MUST show up in the inserted set: S3 may have already
-    /// deleted the object between sweep and now. `xmax = 0` would miss
-    /// this (CONFLICT fired → xmax != 0 → xmax says skip → data loss).
-    /// `refcount = 1` says upload.
+    /// deleted=true, uploaded_at NULL — the post-sweep, pre-drain
+    /// state (`decrement_and_enqueue` clears uploaded_at when it sets
+    /// deleted). An upsert resurrects it — refcount 0→1, deleted
+    /// flips false, uploaded_at stays NULL → MUST be in needs_upload.
+    /// S3 may have already deleted the object between sweep and now.
     #[tokio::test]
-    async fn upsert_returning_resurrection_is_inserted() {
+    async fn upsert_returning_resurrection_needs_upload() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let chunk = vec![0xDEu8; 32];
 
-        // Seed the chunk at refcount=0, deleted=true — the post-sweep,
-        // pre-drain state. Directly INSERT (bypassing the upsert path)
-        // to set up the exact resurrection precondition.
+        // Seed the chunk at refcount=0, deleted=true, uploaded_at NULL
+        // — the post-sweep, pre-drain state. Directly INSERT (bypassing
+        // the upsert path) to set up the exact precondition.
         sqlx::query(
             "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
              VALUES ($1, 0, 1024, true)",
@@ -599,23 +630,22 @@ mod tests {
         .await
         .unwrap();
 
-        // Precondition: confirm the seeded state. If the schema changes
-        // (e.g., deleted column removed, refcount constraint), this
-        // fails loudly here instead of making the main assertion
-        // vacuously pass.
-        let (rc0, del0): (i32, bool) =
-            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
-                .bind(&chunk)
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
+        // Precondition: confirm the seeded state.
+        let (rc0, del0, up0): (i32, bool, bool) = sqlx::query_as(
+            "SELECT refcount, deleted, (uploaded_at IS NOT NULL) FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
         assert_eq!(rc0, 0, "precondition: refcount=0 (soft-deleted)");
         assert!(del0, "precondition: deleted=true (awaiting drain)");
+        assert!(!up0, "precondition: uploaded_at NULL");
 
         // Upsert resurrects: ON CONFLICT → refcount 0+1=1, deleted=false.
         let sph = vec![0xDDu8; 32];
         seed_placeholder(&db.pool, &sph).await;
-        let ins = upgrade_manifest_to_chunked(
+        let need = upgrade_manifest_to_chunked(
             &db.pool,
             &sph,
             b"manifest-resurrect",
@@ -625,11 +655,10 @@ mod tests {
         .await
         .unwrap();
 
-        // THE KEY ASSERTION: resurrected chunk IS in the inserted set.
-        // xmax-based check would return empty here (CONFLICT fired).
+        // THE KEY ASSERTION: resurrected chunk IS in needs_upload.
         assert!(
-            ins.contains(&chunk),
-            "resurrected chunk (refcount 0→1) MUST be in inserted set \
+            need.contains(&chunk),
+            "resurrected chunk (uploaded_at NULL) MUST be in needs_upload \
              — S3 may have already deleted it"
         );
 
@@ -644,23 +673,23 @@ mod tests {
         assert!(!del, "resurrected: deleted flipped false");
     }
 
-    // r[verify store.cas.upsert-inserted]
+    // r[verify store.cas.upsert-inserted+2]
     /// True-concurrent upserts via `tokio::join!`: two PutPaths share
-    /// one chunk hash. PG serializes the ON CONFLICT — the first tx to
-    /// win sees refcount=1 (fresh INSERT), the second sees refcount=2
-    /// (CONFLICT → UPDATE from the committed first tx). Exactly one
-    /// gets the shared chunk in its inserted set.
+    /// one chunk hash. Neither has called `mark_chunks_uploaded` yet,
+    /// so BOTH see uploaded_at IS NULL → both get the shared chunk in
+    /// their needs_upload set. S3 PutObject is idempotent — both
+    /// uploading the same bytes to the same key is wasted bandwidth,
+    /// not a correctness hazard.
     ///
-    /// This is the race the RETURNING clause closes. With the old
-    /// re-query approach, both PutPaths could upsert (both increment),
-    /// then both re-SELECT and see refcount=2 → both skip upload →
-    /// chunk never hits S3. With RETURNING atomic to the upsert, PG's
-    /// ON CONFLICT serialization guarantees exactly one winner.
+    /// This is intentionally weaker than the old XOR property
+    /// (`refcount = 1` gave exactly-one-uploader). The trade is one
+    /// duplicate PUT under contention vs. surviving SIGKILL of the
+    /// first uploader — see `sigkill_race_second_uploader_covers`.
     ///
-    /// The assertion is symmetric (XOR) — which side wins depends on
-    /// PG's lock acquisition order, not test code. Both outcomes pass.
+    /// The assertion is `a_has && b_has` — both sides upload regardless
+    /// of which won the ON CONFLICT serialization.
     #[tokio::test]
-    async fn upsert_returning_concurrent_exactly_one_inserted() {
+    async fn upsert_returning_concurrent_both_need_upload() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let shared = vec![0x5Au8; 32]; // the contested chunk
@@ -688,33 +717,30 @@ mod tests {
         // cased: if tx A inserts the shared row and tx B tries to
         // insert the same PK before A commits, B BLOCKS on A's row
         // lock. Once A commits, B re-reads the committed row and runs
-        // the UPDATE clause (refcount 1→2). B's RETURNING sees
-        // refcount=2 → inserted=false. A's RETURNING saw refcount=1.
-        //
-        // If the pool has only one connection, the futures serialize
-        // at connection acquisition — same XOR outcome, just
-        // deterministic (A wins).
-        let (ins_a, ins_b) = tokio::join!(
+        // the UPDATE clause (refcount 1→2). Both see uploaded_at NULL.
+        let (need_a, need_b) = tokio::join!(
             upgrade_manifest_to_chunked(&db.pool, &sph_a, b"manifest-a", &hashes_a, &sizes_a),
             upgrade_manifest_to_chunked(&db.pool, &sph_b, b"manifest-b", &hashes_b, &sizes_b),
         );
-        let ins_a = ins_a.unwrap();
-        let ins_b = ins_b.unwrap();
+        let need_a = need_a.unwrap();
+        let need_b = need_b.unwrap();
 
         // Each side's unique chunk is always fresh.
-        assert!(ins_a.contains(&unique_a), "A's unique chunk is fresh");
-        assert!(ins_b.contains(&unique_b), "B's unique chunk is fresh");
+        assert!(need_a.contains(&unique_a), "A's unique chunk needs upload");
+        assert!(need_b.contains(&unique_b), "B's unique chunk needs upload");
 
-        // THE KEY ASSERTION: exactly one side sees the shared chunk as
-        // inserted. refcount goes 0→1→2; only the 0→1 hop yields
-        // (refcount=1)=true. XOR — we don't care which side.
-        let a_has = ins_a.contains(&shared);
-        let b_has = ins_b.contains(&shared);
+        // THE KEY ASSERTION: both sides see the shared chunk as
+        // needs_upload. Neither has called mark_chunks_uploaded yet,
+        // so uploaded_at is NULL for both reads. Idempotent S3 PUT
+        // makes the duplicate upload harmless; the alternative
+        // (exactly-one via refcount=1) loses data when the winner is
+        // SIGKILLed mid-upload.
+        let a_has = need_a.contains(&shared);
+        let b_has = need_b.contains(&shared);
         assert!(
-            a_has ^ b_has,
-            "exactly one concurrent upsert sees shared chunk as inserted \
-             (got A={a_has}, B={b_has}; both-true = race not closed, \
-             both-false = old re-query bug)"
+            a_has && b_has,
+            "both concurrent upserts see shared chunk as needs_upload \
+             (got A={a_has}, B={b_has}; either-false = M033 regression)"
         );
 
         // Ground truth: final refcount = 2.
@@ -724,6 +750,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc, 2, "shared chunk referenced by both manifests");
+    }
+
+    // r[verify store.cas.chunk-upload-committed]
+    /// The SIGKILL race that motivated `uploaded_at` (M_033):
+    ///
+    /// 1. PutPath A: upsert chunk X (rc=1, uploaded_at NULL). Starts
+    ///    upload. Process is SIGKILLed (helm rolling update) — no
+    ///    rollback runs, no mark_chunks_uploaded runs. Manifest A
+    ///    left at status='uploading'.
+    /// 2. PutPath B (different path, same chunk X): upsert (rc=2).
+    ///    Under the OLD `(refcount=1)` heuristic, B would skip upload
+    ///    here — permanent data loss (X never reaches S3, rc never
+    ///    drops to 0 once B completes). Under `uploaded_at IS NULL`,
+    ///    B uploads.
+    /// 3. B's upload succeeds → mark_chunks_uploaded → uploaded_at
+    ///    set. Manifest B completes.
+    /// 4. PutPath C (third path, same chunk X): upsert (rc=3,
+    ///    uploaded_at set) → skips upload. Correct dedup.
+    ///
+    /// We don't run a real `cas::put_chunked` for A — just the upsert
+    /// step, then nothing (the SIGKILL happens before any further PG
+    /// or S3 write, so dropping the future after the upsert tx commits
+    /// is the exact post-kill state).
+    #[tokio::test]
+    async fn sigkill_race_second_uploader_covers() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk_x = vec![0x51u8; 32];
+        let one_chunk = std::slice::from_ref(&chunk_x);
+        // Real serialized chunk_list — `reap_one` deserializes it to
+        // know which chunks to decrement. All three manifests share
+        // the same single-chunk list.
+        let chunk_list = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: chunk_x.as_slice().try_into().unwrap(),
+                size: 1024,
+            }],
+        }
+        .serialize();
+
+        // --- Step 1: PutPath A's upsert, then SIGKILL ---
+        let sph_a = vec![0xAAu8; 32];
+        seed_placeholder(&db.pool, &sph_a).await;
+        let need_a = upgrade_manifest_to_chunked(&db.pool, &sph_a, &chunk_list, one_chunk, &[1024])
+            .await
+            .unwrap();
+        assert!(need_a.contains(&chunk_x), "A: fresh insert needs upload");
+        // SIGKILL: drop here. PG state committed (rc=1, uploaded_at
+        // NULL, manifest A status='uploading'), S3 has nothing.
+
+        // --- Step 2+3: PutPath B sees needs_upload, uploads, marks ---
+        let sph_b = vec![0xBBu8; 32];
+        seed_placeholder(&db.pool, &sph_b).await;
+        let need_b = upgrade_manifest_to_chunked(&db.pool, &sph_b, &chunk_list, one_chunk, &[1024])
+            .await
+            .unwrap();
+        assert!(
+            need_b.contains(&chunk_x),
+            "B: rc=2 but uploaded_at NULL → needs upload \
+             (refcount-based heuristic would skip here → data loss)"
+        );
+        // B uploads to S3 (omitted — backend.put is idempotent), then:
+        mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
+
+        let (rc, up): (i32, bool) = sqlx::query_as(
+            "SELECT refcount, (uploaded_at IS NOT NULL) FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk_x)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rc, 2, "A leaked + B = 2");
+        assert!(up, "B's mark_chunks_uploaded set uploaded_at");
+
+        // --- Step 4: PutPath C dedups against B's confirmed upload ---
+        let sph_c = vec![0xCCu8; 32];
+        seed_placeholder(&db.pool, &sph_c).await;
+        let need_c = upgrade_manifest_to_chunked(&db.pool, &sph_c, &chunk_list, one_chunk, &[1024])
+            .await
+            .unwrap();
+        assert!(
+            !need_c.contains(&chunk_x),
+            "C: uploaded_at set → skip upload (dedup works post-commit)"
+        );
+
+        // --- Epilogue: orphan reaper cleans manifest A ---
+        // reap_one decrements rc 3→2. uploaded_at stays set (B's
+        // upload is real). A future PutPath still dedups correctly.
+        let no_backend: Option<&std::sync::Arc<dyn crate::backend::chunk::ChunkBackend>> = None;
+        let reaped = crate::gc::orphan::reap_one(&db.pool, &sph_a, None, no_backend)
+            .await
+            .unwrap();
+        assert!(reaped, "A's stale 'uploading' placeholder reaped");
+        let (rc, up): (i32, bool) = sqlx::query_as(
+            "SELECT refcount, (uploaded_at IS NOT NULL) FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(&chunk_x)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rc, 2, "reaper decremented A's leaked ref");
+        assert!(
+            up,
+            "reaper does NOT clear uploaded_at when rc>0 — B+C still reference it"
+        );
     }
 
     /// Regression: concurrent rollbacks with reverse-ordered overlapping
@@ -801,23 +932,19 @@ mod tests {
         assert_eq!(sum, 0, "both rollbacks decremented all 50 chunks to zero");
     }
 
-    /// I-040 chain: documents how the inline `delete_manifest_uploading`
-    /// on a chunked placeholder leads to upload-skip on retry.
+    /// I-040 chain, post-M033: the inline `delete_manifest_uploading`
+    /// on a chunked placeholder still leaks refcounts (it doesn't
+    /// decrement — correct for inline placeholders, wrong for chunked),
+    /// but the leak NO LONGER causes upload-skip on retry. The retry's
+    /// upsert sees `uploaded_at IS NULL` and re-uploads regardless of
+    /// the leaked refcount.
     ///
-    /// The bug WAS: substitute.rs's reclaim called the inline delete
-    /// (which leaks chunk refcounts) → next `upgrade_manifest_to_chunked`
-    /// sees `refcount ≥ 1` → `inserted=false` → `do_upload` skips. If
-    /// the prior crash was before that chunk made it to S3, the manifest
-    /// references a chunk that doesn't exist.
-    ///
-    /// This test traces the chain step-by-step on the inline delete
-    /// (still callable — it's correct for INLINE placeholders) and
-    /// asserts the upload-skip happens. The fix is at the CALL SITE
-    /// (substitute.rs uses `gc::orphan::reap_one`, which decrements);
-    /// this test pins the underlying mechanism so the chain doesn't
-    /// silently re-form via a different caller.
+    /// substitute.rs's call site still uses `gc::orphan::reap_one`
+    /// (which DOES decrement) for refcount hygiene; this test asserts
+    /// that even if a future caller gets that wrong, the data-loss
+    /// chain stays broken at the upsert level.
     #[tokio::test]
-    async fn i040_inline_delete_on_chunked_causes_upload_skip() {
+    async fn i040_inline_delete_leaked_refcount_still_reuploads() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
         let chunk = vec![0x40u8; 32];
@@ -871,19 +998,18 @@ mod tests {
         crate::metadata::insert_manifest_uploading(&db.pool, &sph, &path, &[])
             .await
             .unwrap();
-        let ins2 = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
+        let need2 = upgrade_manifest_to_chunked(&db.pool, &sph, &chunk_list, one_chunk, &[100i64])
             .await
             .unwrap();
 
-        // THE BUG'S CONSEQUENCE: refcount went 1→2, so (refcount==1) is
-        // false, so chunk is NOT in inserted set → do_upload SKIPS it.
-        // If the chunk never made it to S3 in step 1, the manifest now
-        // references a chunk that doesn't exist → GetPath fails.
+        // POST-M033: refcount went 1→2 (leak), but uploaded_at is
+        // still NULL (step 1 never reached mark_chunks_uploaded) →
+        // chunk IS in needs_upload → do_upload re-uploads. Data-loss
+        // chain broken at the upsert.
         assert!(
-            !ins2.contains(&chunk),
-            "step 3: leaked refcount → upload SKIPPED. \
-             Fix is at the call site: use gc::orphan::reap_one (decrements) \
-             instead of delete_manifest_uploading (doesn't)."
+            need2.contains(&chunk),
+            "step 3: leaked refcount but uploaded_at NULL → re-upload \
+             (data-loss chain broken regardless of call-site hygiene)"
         );
 
         let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")

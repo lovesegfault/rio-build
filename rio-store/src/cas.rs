@@ -194,12 +194,12 @@ pub async fn put_chunked(
     // missing — shouldn't happen but defensive), bail WITHOUT rollback:
     // we haven't touched refcounts yet.
     //
-    // Returns the set of hashes that need upload — atomic with the
-    // upsert (RETURNING refcount=1). This closes the race the old
-    // re-query had: a concurrent PutPath bumping refcount between our
-    // upsert and our re-SELECT would make us skip upload of a chunk
-    // neither party has uploaded yet.
-    let inserted = metadata::upgrade_manifest_to_chunked(
+    // Returns the set of hashes that need upload — `(uploaded_at IS
+    // NULL)` per chunk, atomic with the upsert. A chunk that another
+    // PutPath has already CONFIRMED in S3 (via `mark_chunks_uploaded`)
+    // is skipped; one that's merely refcounted (upload in flight or
+    // interrupted) is re-uploaded — see M_033.
+    let needs_upload = metadata::upgrade_manifest_to_chunked(
         pool,
         store_path_hash,
         &chunk_list_bytes,
@@ -216,7 +216,7 @@ pub async fn put_chunked(
         Some((pool, store_path_hash)),
         backend,
         &chunks,
-        inserted,
+        &needs_upload,
         max_concurrent,
     )
     .await
@@ -228,6 +228,18 @@ pub async fn put_chunked(
             return Err(e);
         }
     };
+
+    // --- Step 4b: Commit S3 presence ---
+    // Uploads succeeded → record `uploaded_at` so later PutPaths can
+    // safely skip these hashes. If THIS write fails the chunks are in
+    // S3 but PG says NULL — next PutPath re-uploads (idempotent), so
+    // rollback here is for refcount hygiene, not data safety.
+    let needs_upload: Vec<Vec<u8>> = needs_upload.into_iter().collect();
+    if let Err(e) = metadata::mark_chunks_uploaded(pool, &needs_upload).await {
+        warn!(error = %e, "mark_chunks_uploaded failed; rolling back");
+        rollback(pool, store_path_hash, &chunk_hashes).await;
+        return Err(e.into());
+    }
 
     // --- Step 5: Complete ---
     if let Err(e) = metadata::complete_manifest_chunked(pool, info).await {
@@ -246,7 +258,7 @@ pub async fn put_chunked(
 /// Step 3: parallel upload. Extracted so put_chunked's error handling
 /// has one call site to wrap.
 ///
-/// `inserted` is the set of hashes that need upload — computed
+/// `needs_upload` is the set of hashes that need upload — computed
 /// atomically by the upsert's RETURNING clause (chunked.rs).
 ///
 /// `heartbeat_target` is `Some((pool, store_path_hash))` in
@@ -259,15 +271,15 @@ async fn do_upload(
     heartbeat_target: Option<(&PgPool, &[u8])>,
     backend: &Arc<dyn ChunkBackend>,
     chunks: &[chunker::Chunk<'_>],
-    inserted: std::collections::HashSet<Vec<u8>>,
+    needs_upload: &std::collections::HashSet<Vec<u8>>,
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
     let total = chunks.len();
 
     debug!(
         total,
-        need_upload = inserted.len(),
-        deduped = total - inserted.len(),
+        need_upload = needs_upload.len(),
+        deduped = total - needs_upload.len(),
         max_concurrent,
         "chunk dedup check"
     );
@@ -288,7 +300,7 @@ async fn do_upload(
     // closure.
     let to_upload: Vec<([u8; 32], Bytes)> = chunks
         .iter()
-        .filter(|c| inserted.contains(c.hash.as_slice()))
+        .filter(|c| needs_upload.contains(c.hash.as_slice()))
         .map(|c| (c.hash, Bytes::copy_from_slice(c.data)))
         .collect();
     let uploaded = to_upload.len();
@@ -1044,7 +1056,7 @@ mod upload_tests {
         let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
         let (chunks, inserted) = synth_chunks(200);
 
-        let stats = do_upload(None, &backend_dyn, &chunks, inserted, 8)
+        let stats = do_upload(None, &backend_dyn, &chunks, &inserted, 8)
             .await
             .expect("do_upload should succeed");
 
@@ -1067,7 +1079,7 @@ mod upload_tests {
         let backend_dyn: Arc<dyn ChunkBackend> = backend.clone();
         let (chunks, inserted) = synth_chunks(50);
 
-        do_upload(None, &backend_dyn, &chunks, inserted, 1)
+        do_upload(None, &backend_dyn, &chunks, &inserted, 1)
             .await
             .unwrap();
 

@@ -573,11 +573,12 @@ impl Substituter {
             // I-040: this previously called the inline-only
             // `delete_manifest_uploading`, which leaks chunk
             // refcounts when the stale placeholder is CHUNKED (left
-            // by an interrupted `cas::put_chunked`). The leaked +1
-            // makes the next `upgrade_manifest_to_chunked` see
-            // `inserted=false` → skip upload → manifest references
-            // chunks that never made it to S3. `gc::orphan::reap_one`
-            // reads `manifest_data.chunk_list` and decrements.
+            // by an interrupted `cas::put_chunked`). Post-M033 a
+            // leaked refcount no longer causes upload-skip (the
+            // upsert keys on `uploaded_at`, not refcount), but
+            // `gc::orphan::reap_one` is still correct here for
+            // refcount hygiene — it reads `manifest_data.chunk_list`
+            // and decrements.
             // r[impl store.substitute.stale-reclaim]
             let threshold_secs = self.stale_threshold.as_secs() as i64;
             let reaped = crate::gc::orphan::reap_one(

@@ -594,10 +594,13 @@ pub(super) async fn decrement_and_enqueue(
         .await?;
 
     // Mark refcount=0 as deleted, return hashes + sizes for stats.
-    // Only rows we JUST touched (ANY) AND now at 0.
+    // Only rows we JUST touched (ANY) AND now at 0. `uploaded_at =
+    // NULL` so a later resurrection (PutPath upsert flips
+    // deleted→false) re-uploads — drain may have already removed the
+    // S3 object by then.
     let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         r#"
-        UPDATE chunks SET deleted = true
+        UPDATE chunks SET deleted = true, uploaded_at = NULL
          WHERE blake3_hash = ANY($1) AND refcount = 0
            AND deleted = false
         RETURNING blake3_hash, size
