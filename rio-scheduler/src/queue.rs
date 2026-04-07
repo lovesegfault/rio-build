@@ -88,16 +88,13 @@ impl ReadyQueue {
 
     /// Push a derivation with the given priority.
     ///
-    /// If `hash` is already in the queue, this RE-PUSHES with the new
-    /// priority. The old entry is lazily invalidated (removed set);
-    /// `pop()` will skip it. This is how re-prioritization works
-    /// (e.g., a new interested build raises a shared derivation's
-    /// priority).
-    ///
-    /// Different from the old `push_back`/`push_front` dedup: that
-    /// was "ignore if present". This is "update priority if present".
-    /// The critical-path machinery can change a node's priority
-    /// after it's already queued.
+    /// If `hash` is already in the queue, this pushes a duplicate
+    /// entry. `pop()` returns the higher-priority entry first and
+    /// then skips the lower one (no longer in `members`). Net effect:
+    /// re-push with **higher-or-equal** priority takes effect; re-push
+    /// with **lower** priority is silently ignored. Current callers
+    /// only ever raise priority (a new interested build raises a
+    /// shared derivation's priority via the critical-path machinery).
     pub fn push(&mut self, hash: DrvHash, priority: f64) {
         // Already-present case: just push again without touching
         // `removed`. pop() sees two entries for the same hash; the
