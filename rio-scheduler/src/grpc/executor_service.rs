@@ -12,7 +12,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 
-use rio_common::grpc::StatusExt;
 use rio_proto::ExecutorService;
 
 use crate::actor::ActorCommand;
@@ -351,30 +350,6 @@ impl ExecutorService for SchedulerGrpc {
             MAX_HEARTBEAT_RUNNING_BUILDS,
         )?;
 
-        // Bound the bloom filter. 1 MiB = 8M bits = ~800k items at 1%
-        // FPR — WAY more than any worker would realistically cache.
-        // Above this, the worker is either buggy or hostile.
-        const MAX_BLOOM_BYTES: usize = 1024 * 1024;
-
-        // Parse the bloom filter. from_wire validates algorithm/version/
-        // sizes; reject the whole heartbeat on validation failure
-        // (worker is sending garbage — don't silently drop the filter
-        // and score it as "no locality info"; that masks the bug).
-        let bloom = req
-            .local_paths
-            .map(|p| {
-                rio_common::grpc::check_bound("local_paths.data", p.data.len(), MAX_BLOOM_BYTES)?;
-                rio_common::bloom::BloomFilter::from_wire(
-                    p.data,
-                    p.hash_count,
-                    p.num_bits,
-                    p.hash_algorithm,
-                    p.version,
-                )
-                .status_invalid("invalid bloom filter")
-            })
-            .transpose()?;
-
         // size_class: empty-string in proto → None. Proto doesn't have
         // Option for strings; empty is the conventional "unset." An
         // actually-empty-named class makes no sense (operator config
@@ -394,7 +369,6 @@ impl ExecutorService for SchedulerGrpc {
             systems: req.systems,
             supported_features: req.supported_features,
             running_builds: req.running_builds,
-            bloom,
             size_class,
             resources: req.resources,
             store_degraded: req.store_degraded,

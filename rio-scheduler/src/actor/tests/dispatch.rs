@@ -56,7 +56,6 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some("small".into()),
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],
@@ -78,7 +77,6 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some("large".into()),
             executor_id: "w-large".into(),
             systems: vec!["x86_64-linux".into()],
@@ -409,9 +407,12 @@ async fn test_interactive_priority_boost() -> TestResult {
     // Strategy: complete EVERYTHING currently assigned with success until
     // prioB is completed. Then A becomes newly-ready with INTERACTIVE_BOOST,
     // and the NEXT dispatch should be A (not a leftover Q/R).
+    //
+    // One-shot workers: each completion drains the worker; connect a
+    // fresh one per iteration.
     let mut seen_paths = Vec::new();
-    for _ in 0..4 {
-        // Receive one assignment.
+    let mut wid = "prio-builder".to_string();
+    for i in 0..4 {
         let Some(msg) = worker_rx.recv().await else {
             break;
         };
@@ -420,8 +421,10 @@ async fn test_interactive_priority_boost() -> TestResult {
         };
         let path = a.drv_path.clone();
         seen_paths.push(path.clone());
-        // Complete it.
-        complete_success(&handle, "prio-builder", &path, &test_store_path("out")).await?;
+        complete_success(&handle, &wid, &path, &test_store_path("out")).await?;
+        // Fresh worker for the next dispatch.
+        wid = format!("prio-builder-{}", i + 1);
+        worker_rx = connect_executor(&handle, &wid, "x86_64-linux", 1).await?;
         // If we just completed B, the NEXT dispatch should be A (priority boost).
         if path == p_prio_b {
             let next_a = recv_assignment(&mut worker_rx).await;
@@ -548,199 +551,32 @@ async fn test_prefetch_hint_before_assignment() -> TestResult {
         other => panic!("expected Assignment for leaf child, got {other:?}"),
     }
 
-    // Complete the child so parent becomes ready.
+    // Complete the child so parent becomes ready. w1 drains; connect w2.
     complete_success_empty(&handle, "w1", "child").await?;
+    let mut rx = connect_executor(&handle, "w2", "x86_64-linux", 1).await?;
 
     // Parent has one child in the DAG (the completed "child"). Its
-    // approx_input_closure = child's expected_output_paths. Worker
-    // has no bloom → pessimistic → send all. Hint arrives FIRST.
-    let second = rx.recv().await.expect("prefetch hint");
-    let hint = match second.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => h,
-        other => panic!("expected PrefetchHint before parent's Assignment, got {other:?}"),
+    // approx_input_closure = child's expected_output_paths.
+    //
+    // A fresh worker connecting with a non-empty ready queue gets the
+    // on_worker_registered initial PrefetchHint AND the dispatch-time
+    // hint (became-idle inline dispatch races ahead of PrefetchComplete
+    // and assigns via cold-fallback). Drain ≥1 hint, then the assignment.
+    let mut got_hint = None;
+    let asgn = loop {
+        match rx.recv().await.expect("msg").msg {
+            Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => got_hint = Some(h),
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => break a,
+            other => panic!("expected Prefetch or Assignment, got {other:?}"),
+        }
     };
+    let hint = got_hint.expect("at least one PrefetchHint before Assignment");
     assert_eq!(
         hint.store_paths,
         vec![child_out],
         "hint = child's output path (parent's direct input via DAG children)"
     );
-
-    // THEN the assignment.
-    let third = rx.recv().await.expect("parent assignment");
-    match third.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => {
-            assert!(a.drv_path.contains("parent"));
-        }
-        other => panic!("expected Assignment after hint, got {other:?}"),
-    }
-
-    Ok(())
-}
-
-/// Bloom filter skips paths the worker claims to have. Scoring and
-/// hinting use the SAME approx_input_closure — so if scoring picks
-/// a warm worker (most paths cached), the hint should be SMALL
-/// (only what's actually missing). That's the optimization working
-/// together.
-///
-/// We construct a bloom that claims to have ONE of two input paths.
-/// The hint should contain only the OTHER.
-#[tokio::test]
-async fn test_prefetch_hint_bloom_filters() -> TestResult {
-    use rio_common::bloom::BloomFilter;
-
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 1).await?;
-
-    // Three-node: parent depends on child_a AND child_b. After
-    // both complete, parent dispatches with 2 input paths.
-    let out_a = rio_test_support::fixtures::test_store_path("ca-out");
-    let out_b = rio_test_support::fixtures::test_store_path("cb-out");
-    let mut child_a = make_test_node("ca", "x86_64-linux");
-    child_a.expected_output_paths = vec![out_a.clone()];
-    let mut child_b = make_test_node("cb", "x86_64-linux");
-    child_b.expected_output_paths = vec![out_b.clone()];
-    let parent = make_test_node("parent", "x86_64-linux");
-    let edges = vec![
-        make_test_edge("parent", "ca"),
-        make_test_edge("parent", "cb"),
-    ];
-
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![child_a, child_b, parent],
-        edges,
-        false,
-    )
-    .await?;
-
-    // P0537: capacity 1 → leaves dispatch serially. Drain ca (or
-    // cb — nondeterministic), complete it, then the other dispatches.
-    let leaf1 = recv_assignment(&mut rx).await;
-    let (first, second) = if leaf1.drv_path.contains("ca") {
-        ("ca", "cb")
-    } else {
-        ("cb", "ca")
-    };
-    complete_success_empty(&handle, "w1", first).await?;
-    let _leaf2 = recv_assignment(&mut rx).await;
-
-    // ORDER MATTERS: bloom heartbeat BEFORE the last completion.
-    // complete_success fires dispatch_ready internally; if parent
-    // becomes ready then, it dispatches with whatever bloom the
-    // worker had AT THAT MOMENT. Send the bloom first, so when
-    // the second completion makes parent ready, the filter is live.
-
-    // Now the bloom. Size for 10 items at 1% FPR — way bigger than
-    // needed for 1 insert, so false positives on out_b are
-    // astronomically unlikely.
-    let mut bloom = BloomFilter::new(10, 0.01);
-    bloom.insert(&out_a);
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            executor_id: "w1".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-            bloom: Some(bloom),
-            size_class: None,
-        })
-        .await?;
-
-    // NOW the second completion. Parent becomes ready → dispatch
-    // fires → send_prefetch_hint reads the bloom we just sent.
-    complete_success_empty(&handle, "w1", second).await?;
-
-    // Parent dispatches.
-    // Hint should skip out_a (bloom says worker has it), include
-    // out_b (bloom says missing).
-    let hint_msg = rx.recv().await.expect("filtered hint");
-    let hint = match hint_msg.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => h,
-        other => panic!("expected filtered PrefetchHint, got {other:?}"),
-    };
-    assert_eq!(
-        hint.store_paths,
-        vec![out_b],
-        "bloom filtered out_a (worker has it); hint only out_b. \
-         If both present: filter not applied. If only out_a: filter inverted."
-    );
-
-    Ok(())
-}
-
-/// Worker with a bloom claiming EVERYTHING → empty filtered set →
-/// no hint message at all. This is the best case: best_executor picked
-/// a fully-warm worker, nothing to prefetch. Saves one try_send.
-#[tokio::test]
-async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
-    use rio_common::bloom::BloomFilter;
-
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
-
-    let child_out = rio_test_support::fixtures::test_store_path("child-out");
-    let mut child = make_test_node("child", "x86_64-linux");
-    child.expected_output_paths = vec![child_out.clone()];
-    let parent = make_test_node("parent", "x86_64-linux");
-    let edge = make_test_edge("parent", "child");
-
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![child, parent],
-        vec![edge],
-        false,
-    )
-    .await?;
-
-    // Drain child's assignment (leaf).
-    let _ = rx.recv().await.expect("child assignment");
-
-    // Bloom BEFORE completion (same ordering as the filter test —
-    // completion fires dispatch, so bloom must be in place first).
-    let mut bloom = BloomFilter::new(10, 0.01);
-    bloom.insert(&child_out);
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            executor_id: "w1".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-            bloom: Some(bloom),
-            size_class: None,
-        })
-        .await?;
-
-    // NOW complete. Parent ready → dispatch → hint filtered → empty
-    // → not sent.
-    complete_success_empty(&handle, "w1", "child").await?;
-
-    // Parent dispatches. Hint filtered to empty → NOT sent. First
-    // message is the Assignment directly.
-    let msg = rx.recv().await.expect("parent message");
-    match msg.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => {
-            assert!(
-                a.drv_path.contains("parent"),
-                "no hint when bloom covers all inputs — straight to Assignment"
-            );
-        }
-        Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => {
-            panic!(
-                "hint sent despite bloom covering all inputs: {h:?}. \
-                 Empty-hint early-return in send_prefetch_hint not working."
-            );
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
+    assert!(asgn.drv_path.contains("parent"));
 
     Ok(())
 }
@@ -828,7 +664,9 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     assert_eq!(count, 0, "leaf drv (no inputs) should not pin anything");
 
     // Complete child → parent becomes Ready → dispatched → pinned.
+    // One-shot: w-x9 drains; connect a fresh worker for parent.
     complete_success_empty(&handle, "w-x9", "x9-child").await?;
+    let mut stream_rx = connect_executor(&handle, "w-x9-2", "x86_64-linux", 1).await?;
     // Parent dispatch sends PrefetchHint FIRST (child has expected_
     // output_paths set above), then Assignment. Drain both.
     let assignment_parent = loop {
@@ -853,7 +691,7 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     assert_eq!(count, 1, "parent dispatch should pin its 1 input path");
 
     // Complete parent → unpin.
-    complete_success_empty(&handle, "w-x9", "x9-parent").await?;
+    complete_success_empty(&handle, "w-x9-2", "x9-parent").await?;
     barrier(&handle).await;
 
     let count: i64 =
@@ -1019,6 +857,7 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
         &test_store_path("ca-child-out"),
     )
     .await?;
+    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux", 1).await?;
 
     let a2 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a2.drv_path.contains("ca-parent"));
@@ -1104,6 +943,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
         &test_store_path("ca-child-out"),
     )
     .await?;
+    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux", 1).await?;
 
     let a2 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a2.drv_path.contains("ca-parent"));
@@ -1225,6 +1065,7 @@ async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
     let a1 = recv_assignment(&mut rx).await;
     assert!(a1.drv_path.contains("noca-child"));
     complete_success_empty(&handle, "noca-w", &test_drv_path("noca-child")).await?;
+    let mut rx = connect_executor(&handle, "noca-w-2", "x86_64-linux", 1).await?;
 
     // Parent dispatches. collect_ca_inputs(parent) = [] (child is IA)
     // → ca_inputs.is_empty() gate → passthrough.
@@ -1284,7 +1125,6 @@ async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "i163-w".into(),
             systems: vec!["x86_64-linux".into()],

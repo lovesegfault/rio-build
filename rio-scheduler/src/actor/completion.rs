@@ -546,20 +546,17 @@ impl DagActor {
             // cancelled — the build is no longer "in flight" either way.
             worker.last_completed = Some(drv_hash.clone());
             // r[impl sched.ephemeral.no-redispatch-after-completion]
-            // I-188: an ephemeral (one-shot Job) executor will exit
-            // after this completion. Mark it draining NOW — before
-            // dispatch_ready below — so the freed slot isn't
-            // re-assigned a dependent that the executor will never
-            // start. Without this, the dependent goes Assigned →
-            // ExecutorDisconnected → reassign, and (pre-I-188) walked
-            // the size ladder via spurious floor promotion.
-            // running_build was just cleared so the slot IS empty;
-            // the `ephemeral` check is the gate. Non-ephemeral
-            // executors keep their freed slot as real capacity.
-            if worker.ephemeral && !worker.draining {
+            // I-188: every executor is one-shot — it exits after this
+            // completion. Mark it draining NOW, before dispatch_ready
+            // below, so the freed slot isn't re-assigned a dependent
+            // the executor will never start. Without this, the
+            // dependent goes Assigned → ExecutorDisconnected →
+            // reassign, and (pre-I-188) walked the size ladder via
+            // spurious floor promotion.
+            if !worker.draining {
                 worker.draining = true;
                 debug!(executor_id = %executor_id,
-                       "ephemeral executor completed its build; marking draining");
+                       "executor completed its build; marking draining (one-shot exit)");
             }
         }
 

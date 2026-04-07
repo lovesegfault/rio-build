@@ -66,7 +66,6 @@ impl InstantWorker {
                 systems: vec!["x86_64-linux".into()],
                 supported_features: vec![],
                 running_builds: vec![],
-                bloom: None,
                 size_class: None,
                 resources: None,
                 store_degraded: false,

@@ -499,14 +499,34 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
 
     // InfrastructureFailure → handle_infrastructure_failure →
     // reset_to_ready → re-dispatch. Proof-of-processing: a SECOND
-    // WorkAssignment arrives on the stream. If the None-result were
-    // silently dropped, the drv would stay stuck Assigned from the
-    // first dispatch and no second assignment would ever come.
+    // WorkAssignment arrives. If the None-result were silently
+    // dropped, the drv would stay stuck Assigned from the first
+    // dispatch and no second assignment would ever come.
     //
-    // InfrastructureFailure does NOT insert into failed_builders and
-    // does NOT set backoff — so the same worker is immediately
-    // re-eligible and re-dispatch is synchronous in the actor.
-    let reassignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+    // One-shot workers drain on completion (any terminal status), so
+    // re-dispatch goes to a fresh worker. Register one.
+    let (stream_tx2, stream_rx2) = mpsc::channel::<rio_proto::types::ExecutorMessage>(8);
+    stream_tx2
+        .send(rio_proto::types::ExecutorMessage {
+            msg: Some(rio_proto::types::executor_message::Msg::Register(
+                rio_proto::types::ExecutorRegister {
+                    executor_id: "none-worker-2".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound2 = tokio_stream::wrappers::ReceiverStream::new(stream_rx2);
+    let mut inbound2 = worker_client.build_execution(outbound2).await?.into_inner();
+    worker_client
+        .heartbeat(rio_proto::types::HeartbeatRequest {
+            executor_id: "none-worker-2".into(),
+            kind: rio_proto::types::ExecutorKind::Builder as i32,
+            systems: vec!["x86_64-linux".into()],
+            ..Default::default()
+        })
+        .await?;
+
+    let reassignment = tokio::time::timeout(Duration::from_secs(5), inbound2.next())
         .await
         .expect(
             "None-result completion should be synthesized as InfrastructureFailure \

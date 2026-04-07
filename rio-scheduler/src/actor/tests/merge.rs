@@ -890,17 +890,17 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     complete_success(&handle, "w-gc", &assn.drv_path, &fod_out).await?;
     barrier(&handle).await;
 
-    // app-a now dispatches (fod-dep Completed unlocked it). Drain.
+    // app-a now dispatches (fod-dep Completed unlocked it). One-shot:
+    // w-gc drained on completion; connect a fresh worker for app-a.
+    let mut worker_rx = connect_executor(&handle, "w-gc-appa", "x86_64-linux", 1).await?;
     let _assn_app_a = recv_assignment(&mut worker_rx).await;
 
     // === GC: delete fod-dep's output from the store ===
     let removed = store.paths.write().unwrap().remove(&fod_out);
     assert!(removed.is_some(), "GC sim: fod_out should have been seeded");
 
-    // P0537: second worker so fod-dep can re-dispatch while w-gc
-    // is busy with app-a (was a single 4-slot worker). Connected
-    // only NOW so Build A's serial fod-dep→app-a both routed to
-    // w-gc deterministically.
+    // Third worker so fod-dep can re-dispatch while w-gc-appa is
+    // busy with app-a.
     let mut worker_rx2 = connect_executor(&handle, "w-gc2", "x86_64-linux", 1).await?;
 
     // Build B: app-b → fod-dep. fod-dep is PRE-EXISTING (still in DAG
@@ -979,6 +979,7 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
     let assn = recv_assignment(&mut worker_rx).await;
     complete_success(&handle, "w-fo", &assn.drv_path, &fod_out).await?;
     barrier(&handle).await;
+    let mut worker_rx = connect_executor(&handle, "w-fo-2", "x86_64-linux", 1).await?;
     let _assn_app_a = recv_assignment(&mut worker_rx).await;
 
     // Store goes unreachable. The verify's FindMissingPaths will fail.

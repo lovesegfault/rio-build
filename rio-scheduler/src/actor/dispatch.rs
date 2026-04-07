@@ -702,8 +702,7 @@ impl DagActor {
         // failed. Empty config = no class filter (original behavior).
         if drv_state.is_fixed_output {
             if self.fetcher_size_classes.is_empty() {
-                let w =
-                    crate::assignment::best_executor(&self.executors, drv_state, &self.dag, None);
+                let w = crate::assignment::best_executor(&self.executors, drv_state, None);
                 return (w, None);
             }
             // Walk fetcher classes from `floor` upward. Config order is
@@ -716,12 +715,9 @@ impl DagActor {
                 .and_then(|f| self.fetcher_size_classes.iter().position(|c| c.name == f))
                 .unwrap_or(0);
             for class in &self.fetcher_size_classes[floor_idx..] {
-                if let Some(w) = crate::assignment::best_executor(
-                    &self.executors,
-                    drv_state,
-                    &self.dag,
-                    Some(&class.name),
-                ) {
+                if let Some(w) =
+                    crate::assignment::best_executor(&self.executors, drv_state, Some(&class.name))
+                {
                     return (Some(w), Some(class.name.clone()));
                 }
             }
@@ -731,7 +727,7 @@ impl DagActor {
         // No classification configured → single best_executor call with
         // no filter. Fast path for deployments without size-classes.
         let Some(target) = target_class else {
-            let w = crate::assignment::best_executor(&self.executors, drv_state, &self.dag, None);
+            let w = crate::assignment::best_executor(&self.executors, drv_state, None);
             return (w, None);
         };
 
@@ -780,7 +776,7 @@ impl DagActor {
         // Walk the chain: first class with an available worker wins.
         for (class, _) in chain {
             if let Some(w) =
-                crate::assignment::best_executor(&self.executors, drv_state, &self.dag, Some(class))
+                crate::assignment::best_executor(&self.executors, drv_state, Some(class))
             {
                 return (Some(w), Some(class.to_string()));
             }
@@ -1153,27 +1149,8 @@ impl DagActor {
             return;
         }
 
-        // Bloom filter. Same logic as count_missing: skip paths the
-        // worker claims to have. The filter is up to 10s stale
-        // (heartbeat interval) but that's fine — a stale positive
-        // means we skip hinting for a path the worker evicted
-        // since last heartbeat; the build fetches it on-demand.
         let Some(worker) = self.executors.get(executor_id.as_str()) else {
-            // Worker gone between best_executor and here? Actor is
-            // single-threaded so this shouldn't happen, but be
-            // defensive (the if-let Some(state) at the top of the
-            // caller is the same kind of guard).
             return;
-        };
-        let to_prefetch: Vec<String> = match &worker.bloom {
-            Some(bloom) => input_paths
-                .into_iter()
-                .filter(|p| !bloom.maybe_contains(p))
-                .collect(),
-            // No bloom = worker didn't send one. Pessimistic: send
-            // all. Same "incentivize sending the filter" policy as
-            // count_missing.
-            None => input_paths,
         };
 
         // Cap: bound message size. A derivation with 200 deps ×
@@ -1182,17 +1159,13 @@ impl DagActor {
         // pathological case. 100 covers the 95th percentile; the
         // rest fetch on-demand (we cap by truncating, not by
         // "pick the best 100" — that would need per-path nar_size
-        // which we don't have. Arbitrary 100 is better than
-        // nothing).
-        let mut to_prefetch = to_prefetch;
+        // which we don't have).
+        let mut to_prefetch = input_paths;
         if to_prefetch.len() > super::MAX_PREFETCH_PATHS {
             to_prefetch.truncate(super::MAX_PREFETCH_PATHS);
         }
 
         if to_prefetch.is_empty() {
-            // Everything filtered = best_executor picked a warm worker.
-            // Exactly what bloom-locality scoring is FOR. No hint
-            // message needed.
             return;
         }
 

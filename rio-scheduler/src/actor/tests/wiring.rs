@@ -300,8 +300,9 @@ async fn test_interactive_builds_pushed_to_front() -> TestResult {
     let _rx3 =
         merge_single_node(&handle, build_ifd, "hash-ifd", PriorityClass::Interactive).await?;
 
-    // Complete the first build to free worker capacity
+    // Complete the first build; one-shot worker drains, connect a fresh one.
     complete_success_empty(&handle, "test-worker", &p_normal).await?;
+    let mut stream_rx = connect_executor(&handle, "test-worker-2", "x86_64-linux", 1).await?;
 
     // The next assignment should be the IFD derivation (was pushed to front)
     let second_path = recv_assignment(&mut stream_rx).await.drv_path;

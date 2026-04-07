@@ -287,20 +287,17 @@ impl DagActor {
         // whether it was draining or not doesn't matter now.
         // I-173: capture size_class from the removed worker — the
         // reassign path's FOD floor promotion can't look it up via
-        // self.executors anymore. I-188/I-197: capture ephemeral +
-        // last_completed too — ephemeral disconnect AFTER a completion
-        // report for the running drv is the expected one-shot exit
-        // (suppress promotion); ephemeral disconnect WITHOUT one is
-        // OOMKilled mid-build (promote).
+        // self.executors anymore. I-197: capture last_completed too —
+        // disconnect AFTER a completion report for the running drv is
+        // the expected one-shot exit (suppress promotion); disconnect
+        // WITHOUT one is OOMKilled mid-build (promote).
         let lost_class = worker.size_class.clone();
-        let lost_ephemeral = worker.ephemeral;
         let lost_last_completed = worker.last_completed.clone();
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
         self.reassign_derivations(
             &to_reassign,
             Some(executor_id),
             lost_class.as_deref(),
-            lost_ephemeral,
             lost_last_completed.as_ref(),
         )
         .await;
@@ -354,16 +351,14 @@ impl DagActor {
     /// executor before calling here, so a `self.executors.get()`
     /// lookup inside would miss (I-173).
     ///
-    /// `lost_worker_ephemeral` + `lost_worker_last_completed`: the
-    /// lost worker's `ephemeral` flag and `last_completed`, captured
-    /// the same way. Floor promotion is suppressed ONLY when the
-    /// disconnect is the expected one-shot exit: `ephemeral` AND the
-    /// worker already reported completion for the drv being reassigned
-    /// (`last_completed == Some(drv_hash)` — the I-188 race). An
-    /// ephemeral worker that disconnects WITHOUT having completed its
+    /// `lost_worker_last_completed`: the lost worker's
+    /// `last_completed`, captured the same way. Floor promotion is
+    /// suppressed when the disconnect is the expected one-shot exit:
+    /// the worker already reported completion for the drv being
+    /// reassigned (`last_completed == Some(drv_hash)` — the I-188
+    /// race). A worker that disconnects WITHOUT having completed its
     /// running drv was OOMKilled mid-build (I-197) → promote per
-    /// `r[sched.builder.size-class-reactive]`. Non-ephemeral
-    /// disconnect promotes unconditionally (unexpected death).
+    /// `r[sched.builder.size-class-reactive]`.
     ///
     /// `None` for callers that don't have a specific lost worker
     /// (none currently, but keeps the signature extensible).
@@ -372,7 +367,6 @@ impl DagActor {
         drv_hashes: &[DrvHash],
         lost_worker: Option<&ExecutorId>,
         lost_worker_class: Option<&str>,
-        lost_worker_ephemeral: bool,
         lost_worker_last_completed: Option<&DrvHash>,
     ) {
         for drv_hash in drv_hashes {
@@ -411,19 +405,16 @@ impl DagActor {
                     // lookup inside record_failure_and_check_poison
                     // misses on the disconnect path.
                     //
-                    // I-188/I-197: suppress promotion ONLY when the
-                    // ephemeral worker already reported completion for
-                    // THIS drv (the I-188 race: completion → one-shot
-                    // exit, disconnect with stale running_build). An
-                    // ephemeral worker that disconnects mid-build
-                    // (last_completed != drv_hash, typically None) was
-                    // OOMKilled — that IS a size-adequacy signal.
-                    // I-188's blanket suppress made openssl OOM-loop
-                    // on `tiny` for hours with size_class_floor empty.
-                    // Non-ephemeral disconnect = unexpected death
-                    // (plausibly OOM) → promote unconditionally.
-                    let expected_oneshot_exit =
-                        lost_worker_ephemeral && lost_worker_last_completed == Some(drv_hash);
+                    // I-197: suppress promotion ONLY when the worker
+                    // already reported completion for THIS drv (the
+                    // I-188 race: completion → one-shot exit,
+                    // disconnect with stale running_build). A worker
+                    // that disconnects mid-build (last_completed !=
+                    // drv_hash, typically None) was OOMKilled — that
+                    // IS a size-adequacy signal. I-188's blanket
+                    // suppress made openssl OOM-loop on `tiny` for
+                    // hours with size_class_floor empty.
+                    let expected_oneshot_exit = lost_worker_last_completed == Some(drv_hash);
                     if !expected_oneshot_exit {
                         self.promote_size_class_floor(drv_hash, lost_worker_class)
                             .await;
@@ -544,7 +535,6 @@ impl DagActor {
             let to_reassign: Vec<DrvHash> = worker.running_build.take().into_iter().collect();
             let stream_tx = worker.stream_tx.clone();
             let lost_class = worker.size_class.clone();
-            let lost_ephemeral = worker.ephemeral;
             let lost_last_completed = worker.last_completed.clone();
 
             // Send CancelSignal for each in-flight build BEFORE
@@ -610,7 +600,6 @@ impl DagActor {
                 &to_reassign,
                 Some(executor_id),
                 lost_class.as_deref(),
-                lost_ephemeral,
                 lost_last_completed.as_ref(),
             )
             .await;
@@ -641,7 +630,6 @@ impl DagActor {
         systems: Vec<String>,
         supported_features: Vec<String>,
         running_builds: Vec<String>, // drv_paths from worker proto
-        bloom: Option<rio_common::bloom::BloomFilter>,
         size_class: Option<String>,
         resources: Option<rio_proto::types::ResourceUsage>,
         store_degraded: bool,
@@ -802,27 +790,15 @@ impl DagActor {
         worker.last_heartbeat = Instant::now();
         worker.missed_heartbeats = 0;
         worker.running_build = reconciled;
-        // Bloom: overwrite unconditionally. A heartbeat without a
-        // filter (None) clears the old one — the worker stopped
-        // sending it, maybe FUSE unmounted. Better to score it as
-        // "unknown locality" than use a stale filter that claims
-        // paths are cached when they might have been evicted.
-        worker.bloom = bloom;
-        // size_class: also overwrite unconditionally. None means the
+        // size_class: overwrite unconditionally. None means the
         // worker didn't declare one (empty string in proto) — it
-        // becomes a wildcard worker that accepts any class. Same
-        // don't-trust-stale reasoning as bloom.
+        // becomes a wildcard worker that accepts any class.
         worker.size_class = size_class;
         // kind: overwrite unconditionally. An executor that flips kind
         // mid-life is a misconfiguration, but the scheduler should
         // reflect the most recent heartbeat (not a stale default).
         // hard_filter reads this for FOD routing (ADR-019).
         worker.kind = kind;
-        // ephemeral: no longer carried on heartbeat. ExecutorState
-        // keeps the field (default false) until phase-3 collapses the
-        // branches and adapts the multi-dispatch tests. I-095's
-        // tx.is_closed() check covers the one-shot-exit race in the
-        // interim.
         // resources: DON'T clobber with None. Prost makes message
         // fields Option<T>; worker always populates, but if a future
         // proto version omits it, keep the last-known reading for
@@ -1245,16 +1221,15 @@ impl DagActor {
             // Reassign (same path as worker disconnect): reset_to_
             // ready + retry++ + failed_builders.insert (in-mem AND
             // PG via append_failed_worker) + PG status + push_ready.
-            let (lost_class, lost_ephemeral, lost_last_completed) = self
+            let (lost_class, lost_last_completed) = self
                 .executors
                 .get(executor_id)
-                .map(|e| (e.size_class.clone(), e.ephemeral, e.last_completed.clone()))
-                .unwrap_or((None, false, None));
+                .map(|e| (e.size_class.clone(), e.last_completed.clone()))
+                .unwrap_or((None, None));
             self.reassign_derivations(
                 std::slice::from_ref(drv_hash),
                 Some(executor_id),
                 lost_class.as_deref(),
-                lost_ephemeral,
                 lost_last_completed.as_ref(),
             )
             .await;

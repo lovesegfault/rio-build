@@ -1156,7 +1156,6 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some("small".into()),
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],

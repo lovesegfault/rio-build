@@ -1,31 +1,11 @@
-//! Worker scoring and selection.
+//! Worker selection.
 //!
-//! Replaces `dispatch.rs`'s first-eligible-worker FIFO with a scored
-//! selection: pick the worker that will complete this derivation
-//! FASTEST, accounting for transfer cost (inputs not yet cached) and
 // r[impl sched.classify.smallest-covering]
 // r[impl sched.classify.mem-bump]
-//! input locality.
-//!
-//! # Scoring (scheduler.md:54-61)
-//!
-//! `score = transfer_cost` — lowest wins.
-//!
-//! - **transfer_cost**: normalized count of input paths the worker
-//!   DOESN'T have cached (via bloom filter). A worker with everything
-//!   cached → 0. A worker with nothing → 1.
-//!
-//! P0537: with one build per pod, `has_capacity()` already filters busy
-//! workers, so every candidate has zero running. The old `load_fraction`
-//! term (running/max, weighted W_LOAD=0.3 vs W_LOCALITY=0.7) is moot —
-//! locality alone discriminates among idle candidates.
-//!
-//! # Closure approximation
-//!
-//! "Which inputs does this derivation need?" → children's
-//! `expected_output_paths`. Not perfect (doesn't include input SOURCES,
-//! just input DERIVATION outputs) but covers the bulk of transfer cost
-//! for typical builds.
+//! `best_executor()`: hard-filter on system/features/kind/class, then
+//! the warm-gate (prefer workers that ACKed PrefetchComplete). With
+//! one-shot pods, all candidates that pass the filter are equivalent —
+//! no per-worker locality state to discriminate on. First match wins.
 
 use std::collections::HashMap;
 
@@ -324,7 +304,6 @@ fn hard_filter(w: &ExecutorState, drv: &DerivationState, target_class: Option<&s
 pub fn best_executor(
     workers: &HashMap<ExecutorId, ExecutorState>,
     drv: &DerivationState,
-    dag: &DerivationDag,
     target_class: Option<&str>,
 ) -> Option<ExecutorId> {
     // r[impl sched.assign.warm-gate]
@@ -363,43 +342,12 @@ pub fn best_executor(
         return None;
     }
 
-    // Short-circuit: one candidate → no scoring needed. Common in
-    // small deployments or when only one worker has the right features.
-    if candidates.len() == 1 {
-        return Some(candidates[0].executor_id.clone());
-    }
-
-    // --- Closure approximation: children's expected output paths ---
-    // These are the paths this derivation NEEDS as inputs. A worker
-    // that has them cached skips the fetch.
-    //
-    // Collected into a Vec (not iterating lazily) because we scan it
-    // once per candidate. For N candidates × M paths, that's N*M bloom
-    // queries. M is typically <100; N is typically <10. Cheap.
-    let input_paths = approx_input_closure(dag, &drv.drv_hash);
-
-    // --- Score each candidate ---
-    let missing_counts: Vec<usize> = candidates
-        .iter()
-        .map(|w| count_missing(w, &input_paths))
-        .collect();
-
-    // P0537: locality is the sole discriminator (see module doc). Lowest
-    // missing-count wins. min_by_key on the integer count — no f64
-    // partial_cmp needed. Ties break by iteration order (HashMap order,
-    // random) — a tie means the workers are equally good; random is fair.
-    let best_idx = (0..candidates.len())
-        .min_by_key(|&i| missing_counts[i])
-        .expect("candidates non-empty (checked above)");
-
-    Some(candidates[best_idx].executor_id.clone())
+    // All candidates passed hard_filter + warm-gate. One-shot workers
+    // are equivalent at this point (no per-worker locality state); pick
+    // the first. HashMap iteration order is effectively random.
+    Some(candidates[0].executor_id.clone())
 }
 
-/// Count how many input paths the worker's bloom filter says are MISSING.
-///
-/// No bloom = worst case (assume missing everything). Better to
-/// over-estimate transfer cost than under-estimate — over means we
-/// might pick a less-optimal worker, under means we pick one that'll
 /// Approximate input closure: the derivation's DAG children's
 /// expected output paths.
 ///
@@ -407,17 +355,8 @@ pub fn best_executor(
 /// outputs. Not perfect (misses `input_srcs` and transitive closure),
 /// but covers the bulk of what the worker's FUSE will actually fetch.
 ///
-/// Used by:
-/// - [`best_executor`] for bloom-locality scoring (workers with these
-///   paths cached are preferred)
-/// - dispatch.rs for [`PrefetchHint`] (tell the chosen worker to
-///   warm these before the build starts)
-///
-/// Both callers want the SAME approximation — if the scoring says
-/// "w1 has most of these cached," the prefetch hint for w1 should
-/// be "the few it DOESN'T have" (bloom-filtered). Inconsistent
-/// approximations would mean scoring on one set, hinting from
-/// another. Extracting this fn guarantees they agree.
+/// Used by dispatch.rs for [`PrefetchHint`] — tell the chosen worker
+/// to warm these before the build starts.
 ///
 /// Cheap: DAG iteration only, no store RPCs, no ATerm parse. The
 /// scheduler has all this state in memory already (populated at
@@ -446,33 +385,16 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
         })
         // Filter empties: a floating-CA child that hasn't completed yet
         // has expected_output_paths=[""] and output_paths=[]. The ""
-        // would be a no-op bloom lookup and a no-op PrefetchHint entry,
-        // but cleaner to drop it here.
+        // would be a no-op PrefetchHint entry; cleaner to drop it here.
         .filter(|p| !p.is_empty())
         .cloned()
         .collect()
 }
 
-/// spend time fetching we didn't account for.
-fn count_missing(worker: &ExecutorState, input_paths: &[String]) -> usize {
-    let Some(bloom) = &worker.bloom else {
-        // No filter = everything missing. This is the pessimistic
-        // assumption — a worker that doesn't report its cache gets
-        // no locality bonus. Incentivizes workers to send the filter.
-        return input_paths.len();
-    };
-
-    input_paths
-        .iter()
-        .filter(|p| !bloom.maybe_contains(p))
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_common::bloom::BloomFilter;
-    use rio_test_support::fixtures::{make_derivation_node, make_edge};
+    use rio_test_support::fixtures::make_derivation_node;
 
     fn make_worker(id: &str, _max: u32, running: u32) -> ExecutorState {
         let mut w = ExecutorState::new(id.into());
@@ -718,8 +640,7 @@ mod tests {
     #[test]
     fn no_candidates_returns_none() {
         let workers = workers_map(vec![make_worker("full", 2, 2)]); // at capacity
-        let dag = DerivationDag::new();
-        assert_eq!(best_executor(&workers, &make_drv(), &dag, None), None);
+        assert_eq!(best_executor(&workers, &make_drv(), None), None);
     }
 
     #[test]
@@ -734,11 +655,10 @@ mod tests {
             make_worker("worker-a", 4, 0),
             make_worker("worker-b", 4, 0),
         ]);
-        let dag = DerivationDag::new();
         let mut drv = make_drv();
         drv.failed_builders.insert("worker-a".into());
 
-        let chosen = best_executor(&workers, &drv, &dag, None);
+        let chosen = best_executor(&workers, &drv, None);
         assert_eq!(
             chosen,
             Some("worker-b".into()),
@@ -750,7 +670,7 @@ mod tests {
         // handle_transient_failure poisons).
         drv.failed_builders.insert("worker-b".into());
         assert_eq!(
-            best_executor(&workers, &drv, &dag, None),
+            best_executor(&workers, &drv, None),
             None,
             "all workers in failed_builders → nobody eligible"
         );
@@ -778,7 +698,6 @@ mod tests {
             make_worker("worker-a", 4, 0),
             make_worker("worker-b", 4, 0),
         ]);
-        let dag = DerivationDag::new();
         let mut drv = make_drv();
 
         // Both workers failed. failed_builders.len() == 2 < 3 →
@@ -793,7 +712,7 @@ mod tests {
         // reachable in the dispatch loop, so the None here is never
         // observed in production.
         assert_eq!(
-            best_executor(&workers, &drv, &dag, None),
+            best_executor(&workers, &drv, None),
             None,
             "all workers in failed_builders → best_executor correctly returns \
              None; handle_transient_failure poisons upstream via \
@@ -808,7 +727,7 @@ mod tests {
         let c = make_worker("worker-c", 4, 0);
         workers3.insert(c.executor_id.clone(), c);
         assert_eq!(
-            best_executor(&workers3, &drv, &dag, None),
+            best_executor(&workers3, &drv, None),
             Some("worker-c".into()),
             "fresh worker not in failed_builders → dispatch resumes"
         );
@@ -817,47 +736,8 @@ mod tests {
     #[test]
     fn single_candidate_short_circuits() {
         let workers = workers_map(vec![make_worker("only", 4, 0)]);
-        let dag = DerivationDag::new();
-        let result = best_executor(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), None);
         assert_eq!(result.as_deref(), Some("only"));
-    }
-
-    #[test]
-    fn prefers_worker_with_inputs_cached() {
-        // Two idle workers. One has the inputs cached (bloom says
-        // yes), the other doesn't. Locality is the sole discriminator
-        // (P0537: load-fraction is gone — candidates are always idle).
-        let mut has_inputs = make_worker("has-inputs", 4, 0);
-        let mut bloom = BloomFilter::new(100, 0.01);
-        bloom.insert("/nix/store/input-a");
-        bloom.insert("/nix/store/input-b");
-        has_inputs.bloom = Some(bloom);
-
-        let no_inputs = make_worker("no-inputs", 4, 0); // bloom = None
-
-        let workers = workers_map(vec![has_inputs, no_inputs]);
-
-        // Build a DAG: drv depends on child, child has the input paths.
-        let mut dag = DerivationDag::new();
-        let child_proto = rio_proto::dag::DerivationNode {
-            expected_output_paths: vec!["/nix/store/input-a".into(), "/nix/store/input-b".into()],
-            ..make_derivation_node("child", "x86_64-linux")
-        };
-        let drv_proto = make_derivation_node("test-drv", "x86_64-linux");
-        dag.merge(
-            uuid::Uuid::new_v4(),
-            &[drv_proto.clone(), child_proto],
-            &[make_edge("test-drv", "child")],
-            "",
-        )
-        .unwrap();
-
-        let drv = DerivationState::try_from_node(&drv_proto).unwrap();
-        let result = best_executor(&workers, &drv, &dag, None);
-
-        // has-inputs: missing=0; no-inputs: missing=2 (no bloom → all
-        // missing). min_by_key picks has-inputs.
-        assert_eq!(result.as_deref(), Some("has-inputs"));
     }
 
     #[test]
@@ -868,14 +748,13 @@ mod tests {
         large.size_class = Some("large".into());
 
         let workers = workers_map(vec![small, large]);
-        let dag = DerivationDag::new();
 
         // Target=large → only large passes.
-        let result = best_executor(&workers, &make_drv(), &dag, Some("large"));
+        let result = best_executor(&workers, &make_drv(), Some("large"));
         assert_eq!(result.as_deref(), Some("large"));
 
         // Target=None → both pass (filter disabled).
-        let result = best_executor(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), None);
         assert!(result.is_some()); // either one
     }
 
@@ -889,16 +768,15 @@ mod tests {
         // never set RIO_SIZE_CLASS.
         let unclassified = make_worker("misconfigured", 4, 0); // size_class=None
         let workers = workers_map(vec![unclassified]);
-        let dag = DerivationDag::new();
 
-        let result = best_executor(&workers, &make_drv(), &dag, Some("large"));
+        let result = best_executor(&workers, &make_drv(), Some("large"));
         assert_eq!(
             result, None,
             "unclassified worker must be rejected when scheduler is classifying"
         );
 
         // Sanity: same worker IS accepted when scheduler not classifying.
-        let result = best_executor(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), None);
         assert_eq!(result.as_deref(), Some("misconfigured"));
     }
 
@@ -1027,13 +905,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_missing_no_bloom_pessimistic() {
-        let worker = make_worker("w", 4, 0); // bloom = None
-        let inputs = vec!["/a".into(), "/b".into(), "/c".into()];
-        assert_eq!(count_missing(&worker, &inputs), 3); // all missing
-    }
-
     // r[verify sched.assign.warm-gate]
     // Warm-gate: warm worker wins over cold even when cold is
     // otherwise better. With zero warm workers, falls back to cold
@@ -1048,11 +919,10 @@ mod tests {
         cold.warm = false;
 
         let workers = workers_map(vec![warm, cold]);
-        let dag = DerivationDag::new();
 
         // Warm-gate first-pass: only "warm" passes. Cold is
         // filtered out. "warm" is the ONLY candidate → picked.
-        let result = best_executor(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), None);
         assert_eq!(
             result.as_deref(),
             Some("warm"),
@@ -1076,14 +946,13 @@ mod tests {
         b.warm = false;
 
         let workers = workers_map(vec![a, b]);
-        let dag = DerivationDag::new();
 
         let before = recorder.get("rio_scheduler_warm_gate_fallback_total{}");
 
         // With zero warm candidates, fallback uses cold workers with
         // the SAME hard_filter (capacity/features) then scores.
         // "b" has lower load (0.0 vs 0.25) → wins.
-        let result = best_executor(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), None);
         assert_eq!(
             result.as_deref(),
             Some("b"),
@@ -1111,9 +980,8 @@ mod tests {
         let warm = make_worker("warm-ready", 4, 0);
 
         let workers = workers_map(vec![cold, warm]);
-        let dag = DerivationDag::new();
 
-        let result = best_executor(&workers, &make_drv(), &dag, None);
+        let result = best_executor(&workers, &make_drv(), None);
         assert_eq!(
             result.as_deref(),
             Some("warm-ready"),
@@ -1317,12 +1185,11 @@ mod tests {
     #[test]
     fn best_executor_skips_closed_stream() {
         let drv = make_drv();
-        let dag = DerivationDag::new();
 
         // Only candidate has a closed channel → no executor.
         let dead = make_worker_closed_stream("dead");
         let map = workers_map(vec![dead]);
-        assert_eq!(best_executor(&map, &drv, &dag, None), None);
+        assert_eq!(best_executor(&map, &drv, None), None);
 
         // Closed + live → live is picked. Loop to guard against
         // accidental ordering-dependence (HashMap iteration).
@@ -1330,10 +1197,7 @@ mod tests {
             let dead = make_worker_closed_stream("dead");
             let live = make_worker("live", 1, 0);
             let map = workers_map(vec![dead, live]);
-            assert_eq!(
-                best_executor(&map, &drv, &dag, None).as_deref(),
-                Some("live")
-            );
+            assert_eq!(best_executor(&map, &drv, None).as_deref(), Some("live"));
         }
     }
 

@@ -42,7 +42,6 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "drain-auth".into(),
             systems: vec!["x86_64-linux".into()],
@@ -186,7 +185,6 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "i066-a".into(),
             systems: vec!["x86_64-linux".into()],
@@ -1089,7 +1087,6 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some("tiny".into()),
             executor_id: "b-eph".into(),
             systems: vec!["x86_64-linux".into()],
@@ -1154,9 +1151,6 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
 /// dependent-redispatch race at the source so this is defense-in-
 /// depth.
 #[tokio::test]
-#[ignore = "phase-3 scheduler collapse: ephemeral becomes unconditional; \
-            heartbeat no longer carries the flag so connect_executor_ephemeral \
-            can't set it. Re-enable when completion.rs:559 is unconditional."]
 async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
@@ -1185,7 +1179,6 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some("tiny".into()),
             executor_id: "b-eph2".into(),
             systems: vec!["x86_64-linux".into()],
@@ -1218,7 +1211,6 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some("tiny".into()),
             executor_id: "b-eph2".into(),
             systems: vec!["x86_64-linux".into()],
@@ -1278,13 +1270,10 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 /// the same ProcessCompletion turn would assign child to the freed
 /// slot pre-fix. Post-fix: builder is draining, child stays Ready.
 #[tokio::test]
-#[ignore = "phase-3 scheduler collapse: ephemeral becomes unconditional; \
-            heartbeat no longer carries the flag so connect_executor_ephemeral \
-            can't set it. Re-enable when completion.rs:559 is unconditional."]
 async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    let mut rx = connect_executor_ephemeral(&handle, "eph-1", "x86_64-linux").await?;
+    let mut rx = connect_executor(&handle, "eph-1", "x86_64-linux", 1).await?;
 
     // parent → child chain. Parent dispatches first (child blocked).
     let parent = make_test_node("eph-parent", "x86_64-linux");
@@ -1347,56 +1336,6 @@ async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult 
         ),
         Err(e) => panic!("unexpected channel state: {e:?}"),
     }
-
-    Ok(())
-}
-
-// r[verify sched.ephemeral.no-redispatch-after-completion]
-/// I-188 control: a NON-ephemeral executor that completes a build is
-/// NOT marked draining; its freed slot is real capacity and the
-/// dependent dispatches to it in the same ProcessCompletion turn.
-/// Same parent→child chain as
-/// `test_ephemeral_completion_marks_draining_no_redispatch` but with
-/// `ephemeral=false` (the default `connect_executor`).
-#[tokio::test]
-async fn test_non_ephemeral_completion_allows_redispatch() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    let mut rx = connect_executor(&handle, "sts-1", "x86_64-linux", 1).await?;
-
-    let parent = make_test_node("sts-parent", "x86_64-linux");
-    let child = make_test_node("sts-child", "x86_64-linux");
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![parent, child],
-        vec![make_test_edge("sts-child", "sts-parent")],
-        false,
-    )
-    .await?;
-
-    let asgn = recv_assignment(&mut rx).await;
-    assert!(asgn.drv_path.contains("sts-parent"));
-
-    complete_success_empty(&handle, "sts-1", "sts-parent").await?;
-    barrier(&handle).await;
-
-    // NOT draining; child IS assigned to it.
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "sts-1")
-        .expect("sts-1 exists");
-    assert!(
-        !w.draining,
-        "non-ephemeral executor must NOT be draining after completion"
-    );
-
-    let asgn2 = recv_assignment(&mut rx).await;
-    assert!(
-        asgn2.drv_path.contains("sts-child"),
-        "non-ephemeral: child dispatches to freed slot in same turn"
-    );
 
     Ok(())
 }
@@ -1472,7 +1411,6 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "hb-worker".into(),
             systems: vec!["x86_64-linux".into()],
@@ -2051,7 +1989,6 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "degraded-worker".into(),
             systems: vec!["x86_64-linux".into()],
@@ -2099,7 +2036,6 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "degraded-worker".into(),
             systems: vec!["x86_64-linux".into()],
@@ -2340,7 +2276,6 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "fail-worker".into(),
             systems: vec!["x86_64-linux".into()],
@@ -2520,7 +2455,6 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "w-idle".into(),
             systems: vec!["x86_64-linux".into()],
@@ -2553,7 +2487,6 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: "w-idle".into(),
             systems: vec!["x86_64-linux".into()],

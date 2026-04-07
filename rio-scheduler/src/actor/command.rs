@@ -121,10 +121,6 @@ pub enum ActorCommand {
         supported_features: Vec<String>,
         /// drv_paths from worker proto (not hashes).
         running_builds: Vec<String>,
-        /// Parsed bloom filter from local_paths. `None` = worker didn't
-        /// send one (old worker, or FUSE not mounted). Stored on
-        /// ExecutorState for assignment scoring.
-        bloom: Option<rio_common::bloom::BloomFilter>,
         /// Size-class from worker config (e.g. "small", "large"). gRPC
         /// maps empty-string → None. Stored on ExecutorState for the
         /// classify() → best_executor() filter.

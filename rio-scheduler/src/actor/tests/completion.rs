@@ -156,6 +156,8 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     );
 
     // ─── Scenario 2: CA + mixed [match, miss] → AND-fold → false ───
+    // Fresh worker (one-shot: scenario-1's executor drained on completion).
+    let _rx2 = connect_executor(&f.actor, "ca-w2", "x86_64-linux", 1).await?;
     let mixed_modular: [u8; 32] = {
         use sha2::{Digest, Sha256};
         Sha256::digest(b"ca-fixture:ca-mixed").into()
@@ -176,7 +178,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let match_before2 = recorder.get(match_key);
     complete_ca(
         &f.actor,
-        &f.executor_id,
+        "ca-w2",
         &drv_path,
         &[
             ("out", &mixed_out, vec![0xab; 32]),
@@ -207,6 +209,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     );
 
     // ─── Scenario 3: non-CA → hook skipped ─────────────────────────
+    let _rx3 = connect_executor(&f.actor, "ca-w3", "x86_64-linux", 1).await?;
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ia-skip");
     let node = make_test_node("ia-skip", "x86_64-linux"); // is_content_addressed=false
@@ -221,7 +224,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let miss_before3 = recorder.get(miss_key);
     complete_ca(
         &f.actor,
-        &f.executor_id,
+        "ca-w3",
         &drv_path,
         &[("out", &ia_out, vec![0xef; 32])],
     )
@@ -1728,8 +1731,9 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     let assigned_path = recv_assignment(&mut stream_rx).await.drv_path;
     assert_eq!(assigned_path, p_chain_b);
 
-    // Complete B.
+    // Complete B. One-shot worker drains; connect a fresh one for A.
     complete_success_empty(&handle, "chain-worker", &p_chain_b).await?;
+    let mut stream_rx = connect_executor(&handle, "chain-worker-2", "x86_64-linux", 1).await?;
 
     // A should now transition Queued -> Ready -> Assigned (dispatched).
     let info_a = handle
@@ -1745,7 +1749,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
         info_a.status
     );
 
-    // Worker should receive A's assignment.
+    // Fresh worker should receive A's assignment.
     let assigned_path = recv_assignment(&mut stream_rx).await.drv_path;
     assert_eq!(
         assigned_path, p_chain_a,
@@ -2015,7 +2019,6 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some("small".into()),
             executor_id: "w-small".into(),
             systems: vec!["x86_64-linux".into()],

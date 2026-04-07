@@ -247,7 +247,6 @@ pub(crate) async fn connect_executor_no_ack_kind(
             draining: false,
             kind,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: executor_id.into(),
             systems: vec![system.into()],
@@ -282,7 +281,6 @@ pub(crate) async fn connect_fetcher_classed(
             draining: false,
             kind: rio_proto::types::ExecutorKind::Fetcher,
             resources: None,
-            bloom: None,
             size_class: Some(size_class.into()),
             executor_id: executor_id.into(),
             systems: vec![system.into()],
@@ -322,7 +320,6 @@ pub(crate) async fn connect_builder_classed(
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: Some(size_class.into()),
             executor_id: executor_id.into(),
             systems: vec![system.into()],
@@ -340,46 +337,7 @@ pub(crate) async fn connect_builder_classed(
 }
 
 /// I-188: connect a Builder-kind executor with `ephemeral=true`. For
-/// `r[sched.ephemeral.no-redispatch-after-completion]` tests — the
-/// scheduler marks it draining on slot-free. Includes the warm-gate
-/// ACK so callers can `recv_assignment` directly. No `size_class`
-/// (the I-188 race is independent of size-class routing).
-pub(crate) async fn connect_executor_ephemeral(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let (stream_tx, stream_rx) = mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: executor_id.into(),
-            stream_tx,
-        })
-        .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            bloom: None,
-            size_class: None,
-            executor_id: executor_id.into(),
-            systems: vec![system.into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: executor_id.into(),
-            paths_fetched: 0,
-        })
-        .await?;
-    Ok(stream_rx)
-}
-
-/// Send a default heartbeat (no bloom, no size_class, empty
+/// Send a default heartbeat (no size_class, empty
 /// running_builds, store_degraded=false), then a `Tick`. For the
 /// "extra heartbeat to trigger dispatch" pattern where the test
 /// doesn't care about heartbeat field values, only that dispatch runs.
@@ -406,7 +364,6 @@ pub(crate) async fn send_heartbeat(
             draining: false,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: executor_id.into(),
             systems: vec![system.into()],
@@ -442,7 +399,6 @@ pub(crate) async fn send_heartbeat_draining(
             draining: true,
             kind: rio_proto::types::ExecutorKind::Builder,
             resources: None,
-            bloom: None,
             size_class: None,
             executor_id: executor_id.into(),
             systems: vec![system.into()],

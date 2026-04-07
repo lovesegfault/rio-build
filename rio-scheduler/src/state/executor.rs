@@ -42,16 +42,6 @@ pub struct ExecutorState {
     pub last_heartbeat: Instant,
     /// Number of consecutive missed heartbeats.
     pub missed_heartbeats: u32,
-    /// Bloom filter of store paths this executor has cached (from heartbeat).
-    /// `None` until the first heartbeat with a filter arrives. Used by
-    /// `assignment::best_executor()` for transfer-cost scoring — an executor
-    /// that already has most of a derivation's inputs is preferred.
-    ///
-    /// Stale-by-design: updated every 10s (heartbeat interval), so the
-    /// snapshot is up to 10s behind. That's fine for a scoring HINT —
-    /// the actual fetch still happens on the executor if the filter lied
-    /// (false positive) or was stale (evicted since last heartbeat).
-    pub bloom: Option<rio_common::bloom::BloomFilter>,
     /// Size class (e.g., "small", "large") reported by the executor.
     /// `None` = executor didn't declare a class. If the scheduler has
     /// size_classes configured, best_executor() REJECTS unclassified
@@ -102,14 +92,14 @@ pub struct ExecutorState {
     /// (any terminal status). Set in `handle_completion` alongside the
     /// `running_build = None` clear. In-memory only.
     ///
-    /// I-197: refines the I-188 ephemeral-disconnect gate. An ephemeral
-    /// disconnect with `running_build == Some(X)` and `last_completed
+    /// I-197: discriminates expected one-shot exit from OOMKilled.
+    /// Disconnect with `running_build == Some(X)` and `last_completed
     /// != Some(X)` means X was mid-build when the pod died (OOMKilled)
-    /// → promote `size_class_floor`. Only when `last_completed ==
-    /// running_build` is the disconnect the expected post-completion
-    /// one-shot exit (the I-188 race) → suppress promotion. The
-    /// blanket I-188 suppress made an OOMKilled `tiny` ephemeral loop
-    /// at the same class for hours (openssl, `size_class_floor` empty).
+    /// → promote `size_class_floor`. When `last_completed ==
+    /// running_build` the disconnect is the expected post-completion
+    /// one-shot exit → suppress promotion. The pre-I-197 blanket
+    /// suppress made OOMKilled `tiny` workers loop at the same class
+    /// for hours (openssl, `size_class_floor` empty).
     pub last_completed: Option<DrvHash>,
     /// FUSE circuit breaker open on the executor — it can't fetch inputs
     /// from rio-store. Treated like `draining`: `has_capacity()` returns
@@ -137,23 +127,12 @@ pub struct ExecutorState {
     /// at registration time the scheduler flips this `true`
     /// immediately (nothing to prefetch for).
     ///
-    /// Ephemeral pools (`r[ctrl.pool.ephemeral]`): every executor
-    /// starts cold. Without this gate the first build on a fresh
-    /// Job-builder eats full-closure fetch latency on every input
-    /// path. With it, the scheduler waits for cache warm before
-    /// dispatching — adds ~prefetch-time to time-to-first-dispatch,
-    /// but the build itself runs at warm speed.
+    /// Every executor starts cold (one-shot Jobs). Without this gate
+    /// the first build on a fresh pod eats full-closure fetch latency
+    /// on every input path. With it, the scheduler waits for cache
+    /// warm before dispatching — adds ~prefetch-time to time-to-
+    /// first-dispatch, but the build itself runs at warm speed.
     pub warm: bool,
-    /// One-shot Job executor (`r[ctrl.pool.ephemeral]`): exits after
-    /// completing its single build. Reported via
-    /// `HeartbeatRequest.ephemeral`. When `true`,
-    /// `handle_process_completion` marks `draining=true` immediately
-    /// on slot-free so the same actor turn's `dispatch_ready` doesn't
-    /// re-assign to the about-to-exit slot (I-188:
-    /// `r[sched.ephemeral.no-redispatch-after-completion]`).
-    /// Wire-default `false` — pre-I-188 executors don't send it and
-    /// are treated as long-lived (their freed slot is real capacity).
-    pub ephemeral: bool,
     /// Prior heartbeat's reconcile KEPT `running_build` (still
     /// Assigned/Running in DAG) but the worker did NOT report it.
     /// One miss = TOCTOU race (assignment landed between worker
@@ -189,7 +168,6 @@ impl ExecutorState {
             stream_tx: None,
             last_heartbeat: Instant::now(),
             missed_heartbeats: 0,
-            bloom: None,
             size_class: None,
             draining: false,
             draining_hb: false,
@@ -200,7 +178,6 @@ impl ExecutorState {
             // Warm-gate: cold until PrefetchComplete (or until the
             // registration hook flips it for an empty ready-queue).
             warm: false,
-            ephemeral: false,
             phantom_suspect: None,
         }
     }
