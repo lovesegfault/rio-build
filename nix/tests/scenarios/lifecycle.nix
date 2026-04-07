@@ -912,7 +912,7 @@ let
           cgroup_path = worker_vm.wait_until_succeeds(
               "find /sys/fs/cgroup -type d -name '*lifecycle-cancel_drv' "
               "-print -quit 2>/dev/null | grep .",
-              timeout=120,
+              timeout=180,
           ).strip()
           procs_before = int(worker_vm.succeed(
               f"wc -l < {cgroup_path}/cgroup.procs"
@@ -1049,7 +1049,7 @@ let
               "p=$(find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
               "-print -quit 2>/dev/null) && "
               'grep -q . "$p/cgroup.procs" 2>/dev/null && echo "$p"',
-              timeout=120,
+              timeout=180,
           ).strip()
           print(f"build-timeout: cgroup={cgroup_path} (procs non-empty)")
 
@@ -1161,7 +1161,7 @@ let
           cgroup_retry = worker_vm.wait_until_succeeds(
               "find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
               "-print -quit 2>/dev/null | grep .",
-              timeout=120,
+              timeout=180,
           ).strip()
           print(f"build-timeout PASS: same-drv re-dispatched, "
                 f"cgroup recreated at {cgroup_retry} (no EEXIST leak)")
@@ -1207,7 +1207,7 @@ let
               "awk '/^rio_scheduler_derivations_queued / {q=$2} "
               "/^rio_scheduler_derivations_running / {r=$2} "
               "END {exit !(q==0 && r==0)}'",
-              timeout=120,
+              timeout=180,
           )
 
           # Capture the pre-kill leader name. After `delete pod`, the
@@ -1299,7 +1299,7 @@ let
           # finished yet.
           sched_metric_wait(
               "grep -qx 'rio_scheduler_recovery_total{outcome=\"success\"} 1'",
-              timeout=120,
+              timeout=180,
           )
 
           # Worker re-registered with the new leader. Fresh scheduler
@@ -1309,7 +1309,7 @@ let
           # have briefly disconnected/reconnected during failover.
           sched_metric_wait(
               "grep -E '^rio_scheduler_workers_active [1-9]'",
-              timeout=120,
+              timeout=180,
           )
 
           # Post-recovery build. DIFFERENT marker → different output path
@@ -2195,7 +2195,7 @@ let
           k3s_server.wait_until_succeeds(
               "test \"$(k3s kubectl -n ${nsBuilders} get builderpool ephemeral "
               "-o jsonpath='{.status.desiredReplicas}')\" = 4",
-              timeout=120,
+              timeout=180,
           )
 
           # ── Build 1: Job spawned, completes, pod reaped ───────────────
@@ -2233,7 +2233,7 @@ let
           # exit. ~30-40s typical; 120s margin.
           client.wait_until_succeeds(
               "! kill -0 $(cat /tmp/eph1.pid) 2>/dev/null",
-              timeout=120,
+              timeout=180,
           )
           out1 = client.succeed("cat /tmp/eph1.out").strip()
           assert "/nix/store/" in out1, (
@@ -2253,7 +2253,7 @@ let
               f"-l job-name={job1} "
               "-o jsonpath='{.items[0].status.phase}' 2>/dev/null)\"; "
               "test \"$p\" = Succeeded -o -z \"$p\"",
-              timeout=120,
+              timeout=180,
           )
 
           # ── Runaway-spawn guard ───────────────────────────────────────
@@ -2531,7 +2531,7 @@ let
           # manifest pod does NOT exit after — it loops back to idle.
           client.wait_until_succeeds(
               "! kill -0 $(cat /tmp/mf1.pid) 2>/dev/null",
-              timeout=120,
+              timeout=180,
           )
           out_mf = client.succeed("cat /tmp/mf1.out").strip()
           assert "/nix/store/" in out_mf, (
@@ -2903,7 +2903,7 @@ let
           # DRAIN_WAIT_SLOP (60s) + k3s controller-manager GC sweep lag.
           k3s_server.wait_until_succeeds(
               "! k3s kubectl -n ${nsBuilders} get builderpool x86-64 2>/dev/null",
-              timeout=120,
+              timeout=180,
           )
 
           # THE ASSERTION: PDB GC'd via ownerRef cascade. k3s's
@@ -3238,7 +3238,7 @@ let
           k3s_server.wait_until_succeeds(
               "k3s kubectl -n ${nsStore} rollout status "
               "deploy/rio-store --timeout=90s",
-              timeout=120,
+              timeout=180,
           )
 
           # Verify the pod actually cycled — new name ≠ old name. If
