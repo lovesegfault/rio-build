@@ -135,6 +135,7 @@ where
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown.cancelled() => {
                     tracing::debug!("SIGHUP reload loop: shutdown");
                     return;
