@@ -116,12 +116,13 @@ in
       default = [ ];
       description = ''
         OCI-archive tarballs to `ctr -n k8s.io image import --local`
-        before kubelet starts. Layer blobs land in containerd's content
-        store; the seed.local/…:prebaked refs are pinned so kubelet
-        image-GC and containerd content-GC can't reclaim the blobs
-        before any pod has referenced them via its real ECR ref. The
-        seed refs themselves are never pulled — they're GC roots only.
-        See r[infra.node.prebake-layer-warm].
+        via the containerd-seed-warm oneshot (runs concurrent with
+        kubelet TLS-bootstrap, not before it). Layer blobs land in
+        containerd's content store; the seed.local/…:prebaked refs are
+        pinned so kubelet image-GC and containerd content-GC can't
+        reclaim the blobs before any pod has referenced them via its
+        real ECR ref. The seed refs themselves are never pulled —
+        they're GC roots only. See r[infra.node.prebake-layer-warm].
       '';
     };
   };
@@ -279,6 +280,45 @@ in
           };
         };
 
+        # r[impl infra.node.prebake-layer-warm]
+        # Seed import runs CONCURRENT with kubelet TLS-bootstrap+register
+        # (~5–15 s), not serially before it. The ~3 s zstd unpack fits
+        # inside that window. Lose-the-race fallback: containerd resolves
+        # the ECR manifest and pulls every layer cold — degraded, not
+        # broken (same as a stale-AMI delta pull today).
+        containerd-seed-warm = lib.mkIf (cfg.seedImages != [ ]) {
+          description = "Warm containerd content store with prebaked seed layers";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "containerd.service" ];
+          requires = [ "containerd.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = pkgs.writeShellScript "seed-warm" ''
+              set -u
+              ctr='${pkgs.containerd}/bin/ctr -n k8s.io'
+              ${lib.concatMapStringsSep "\n" (seed: ''
+                # --local: containerd 2.x transfer-API path drops --label and
+                # handles multi-manifest ref.name annotations differently;
+                # --local forces the legacy client-side path which honours
+                # both (PLAN-PREBAKE Q1/Q6). Seed-import failure is degraded-
+                # but-functional, so log-warn rather than fail-hard — a
+                # corrupt seed shouldn't take the node out of the pool.
+                $ctr image import --local ${seed} \
+                  || echo "rio: seed import ${seed} failed; first-pod pull will be cold" >&2
+                # Pin both seed.local/…:prebaked refs. The label stops
+                # kubelet's CRI image-GC from deleting the IMAGE RECORD; the
+                # record's mere existence stops containerd's content-GC from
+                # deleting the LAYER BLOBS (Q8 — gc.Scheduler walks image-
+                # store refs, not labels). No content-label or lease needed.
+                for ref in seed.local/rio-builder:prebaked seed.local/rio-fetcher:prebaked; do
+                  $ctr image label "$ref" io.cri-containerd.pinned=pinned || true
+                done
+              '') cfg.seedImages}
+            '';
+          };
+        };
+
         # ── nodeadm-init: oneshot, before kubelet ─────────────────────
         # `init --skip run -d kubelet`: write kubelet config only, don't
         # systemctl-start it (nodeadm assumes AL2023 unit names; ours
@@ -356,42 +396,18 @@ in
           ];
           # AL2023 sets `iptables -P FORWARD ACCEPT` so pod↔pod traffic
           # via the vpc-cni veth pairs isn't dropped by the kernel default
-          # FORWARD=DROP. Then seed images into containerd's content store
-          # before kubelet starts.
-          # r[impl infra.node.prebake-layer-warm]
+          # FORWARD=DROP. Seed-image import is NOT here — it's the
+          # containerd-seed-warm oneshot above, concurrent with kubelet.
           preStart =
             let
               ctr = "${pkgs.containerd}/bin/ctr -n k8s.io";
             in
             ''
               ${lib.getExe' pkgs.iptables "iptables"} -P FORWARD ACCEPT -w 5
-              # pause: docker-archive, MUST land before kubelet creates its
-              # first sandbox (nodeadm pins sandbox=localhost/kubernetes/
-              # pause — there is no registry to fall back to). --label on
-              # import works for docker-archive on the legacy path.
-              ${ctr} image import --label io.cri-containerd.pinned=pinned \
-                ${pauseImage} || true
-              ${lib.concatMapStringsSep "\n" (seed: ''
-                # Layer-cache warm: import the OCI archive. --local: the
-                # containerd 2.x transfer-API path drops --label and handles
-                # multi-manifest ref.name annotations differently; --local
-                # forces the legacy client-side path which honours both
-                # (PLAN-PREBAKE Q1/Q6). Seed-import failure is degraded-but-
-                # functional (first-pod pull fetches every layer from ECR),
-                # so log-warn rather than fail-hard — a corrupt seed
-                # shouldn't take the node out of the pool.
-                ${ctr} image import --local ${seed} \
-                  || echo "rio: seed import ${seed} failed; first-pod pull will be cold" >&2
-                # Pin both seed.local/…:prebaked refs. The label stops
-                # kubelet's CRI image-GC from deleting the IMAGE RECORD;
-                # the record's mere existence stops containerd's content-GC
-                # from deleting the LAYER BLOBS (Q8 — gc.Scheduler walks
-                # image-store refs, not labels). No content-label or lease
-                # needed.
-                for ref in seed.local/rio-builder:prebaked seed.local/rio-fetcher:prebaked; do
-                  ${ctr} image label "$ref" io.cri-containerd.pinned=pinned || true
-                done
-              '') cfg.seedImages}
+              # pause MUST land before kubelet's first sandbox; no registry
+              # fallback (containerd-config.nix pins sandbox=localhost/
+              # kubernetes/pause).
+              ${ctr} image import --label io.cri-containerd.pinned=pinned ${pauseImage} || true
             ''
             + lib.optionalString (cfg.staticPods != { }) ''
               mkdir -p /etc/kubernetes/manifests

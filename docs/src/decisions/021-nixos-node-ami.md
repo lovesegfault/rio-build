@@ -56,7 +56,7 @@ There is one EC2NodeClass (`rio-default`, NixOS). Rollback to a known-good AMI i
 
 ## Prebaked executor layer cache
 
-The AMI bakes a single multi-manifest OCI archive containing the `rio-builder` and `rio-fetcher` images (deduplicated layers — they share every layer, only `config.Env` differs) and imports it into containerd's content store at kubelet `preStart`. PodSpec refs stay `<ECR>/rio-{builder,fetcher}:<git-sha>`; the seed is a content-store warm only. On first pod schedule, containerd checks each ECR-manifest layer by digest against the local store and fetches only the absent ones. Net: per-fresh-node ECR pull drops from ~400 MB to the delta since the AMI was cut (typically one ~10 MB layer).
+The AMI bakes a single multi-manifest OCI archive containing the `rio-builder` and `rio-fetcher` images (deduplicated layers — they share every layer, only `config.Env` differs) and imports it via a `containerd-seed-warm` oneshot concurrent with kubelet start. PodSpec refs stay `<ECR>/rio-{builder,fetcher}:<git-sha>`; the seed is a content-store warm only. On first pod schedule, containerd checks each ECR-manifest layer by digest against the local store and fetches only the absent ones. Net: per-fresh-node ECR pull drops from ~400 MB to the delta since the AMI was cut (typically one ~10 MB layer).
 
 **Rejected alternative — `localhost/` digest-pin:** PodSpec references the seed's local digest directly, `imagePullPolicy: Never`. Gives a fail-loud `ErrImagePull` on AMI/deploy drift and zero ECR dependency for executor pods. Rejected because every `rio-builder` code change becomes a 10–15 min AMI rebake instead of `up --push --deploy`; the layer-cache design degrades gracefully (delta-only pull) instead of failing hard.
 
