@@ -290,16 +290,3 @@ ipFamilies:
 {{- end -}}
 {{- end -}}
 {{- end -}}
-
-{{/*
-smarter-device-manager conf.yaml body — DaemonSet ConfigMap (k3s/kind
-path only, device-plugin.yaml). The EKS path injects /dev/{fuse,kvm}
-via containerd base_runtime_spec (nix/nixos-node/containerd-config.nix
-linux.devices) — no device plugin, no parity to check.
-*/}}
-{{- define "rio.devicePluginConf" -}}
-- devicematch: ^fuse$
-  nummaxdevices: {{ .Values.devicePlugin.fuseMaxDevices }}
-- devicematch: ^kvm$
-  nummaxdevices: {{ .Values.devicePlugin.kvmMaxDevices }}
-{{- end -}}

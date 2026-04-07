@@ -42,28 +42,6 @@
     arch = "amd64";
   };
 
-  # smarter-device-manager for the privileged-hardening-e2e VM test
-  # (vm-security-nonpriv-k3s, see nix/tests/scenarios/security.nix +
-  # values/vmtest-full-nonpriv.yaml). Exposes /dev/fuse as the
-  # `smarter-devices/fuse` extended resource — worker pods request it
-  # via resources.limits instead of hostPath, which makes
-  # hostUsers:false work (kernel rejects idmap mounts on device nodes).
-  #
-  # Chart default (values.yaml devicePlugin.image) is digest-pinned to
-  # the same v1.20.12 digest; nix/tests/default.nix passes the bare-tag
-  # override via extraValues DERIVED from this FOD's destNameTag passthru
-  # (containerd's airgap cache is tag-indexed, not digest-indexed). Keep
-  # imageDigest here and the chart default's @sha256 suffix in lockstep.
-  smarter-device-manager = pkgs.dockerTools.pullImage {
-    imageName = "ghcr.io/smarter-project/smarter-device-manager";
-    imageDigest = "sha256:228f7f44594a3182571559e62f2e3fe8a3f26180fb5dd7fc0cb7bf7d22a5bbcd";
-    finalImageName = "ghcr.io/smarter-project/smarter-device-manager";
-    finalImageTag = "v1.20.12";
-    hash = "sha256-Ojn8/Uaj2QekiO8qY6Fido0JeD/fM2tXF672NRJo814=";
-    os = "linux";
-    arch = "amd64";
-  };
-
   # Envoy Gateway operator (gateway-helm v1.7.1 via nixhelm). Both the
   # Deployment and the certgen Job use this image. The operator
   # reconciles Gateway/GRPCRoute/EnvoyProxy CRDs into an envoy data-

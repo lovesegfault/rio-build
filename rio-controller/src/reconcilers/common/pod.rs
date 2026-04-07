@@ -23,21 +23,20 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::error::{Error, Result};
 
-/// K8s extended-resource name for `/dev/fuse`. On EKS (NixOS AMI),
-/// declared by Karpenter NodeOverlay and injected via containerd
-/// `base_runtime_spec` (nix/nixos-node/containerd-config.nix); on
-/// k3s/kind, registered+injected by the smarter-device-manager
-/// DaemonSet (infra/helm/rio-build/templates/device-plugin.yaml).
-/// Either way: no hostPath volume, so `hostUsers: false` works (ADR-012).
-const FUSE_DEVICE_RESOURCE: &str = "smarter-devices/fuse";
+/// K8s extended-resource name for `/dev/fuse`. Scheduling-signal only:
+/// containerd `base_runtime_spec` injects the device node directly
+/// (`nix/base-runtime-spec.nix` `linux.devices` — runc `mknod`s inside
+/// the container's `/dev`), so no hostPath volume and `hostUsers: false`
+/// works (ADR-012). Capacity is declared by Karpenter NodeOverlay on
+/// EKS / a `kubectl patch node --subresource=status` in the k3s VM
+/// fixture; kubelet leaves extended resources it never saw via a
+/// device plugin alone (k/k#64784).
+const FUSE_DEVICE_RESOURCE: &str = "rio.build/fuse";
 
-/// Same mechanism for `/dev/kvm`. On EKS (NixOS AMI), declared by
-/// Karpenter NodeOverlay and injected via containerd `base_runtime_spec`;
-/// on k3s/kind, registered+injected by the smarter-device-manager
-/// DaemonSet. Only `.metal` EC2 instance types expose host KVM (nested
-/// virt); on non-metal the device node ENXIOs on open. Requested only
-/// when [`KVM_FEATURE`] is in `spec.features`.
-const KVM_DEVICE_RESOURCE: &str = "smarter-devices/kvm";
+/// Same mechanism for `/dev/kvm`. Only `.metal` EC2 instance types
+/// expose host KVM (nested virt); on non-metal the device node ENXIOs
+/// on open. Requested only when [`KVM_FEATURE`] is in `spec.features`.
+const KVM_DEVICE_RESOURCE: &str = "rio.build/kvm";
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets
@@ -500,9 +499,10 @@ pub fn build_executor_pod_spec(
                 }
             }
             // r[impl sec.pod.fuse-device-plugin]
-            // /dev/fuse: device plugin path (non-privileged) needs no
-            // volume — kubelet+plugin inject the device node via
-            // resources.limits. Privileged escape hatch uses hostPath.
+            // /dev/fuse: non-privileged path needs no volume —
+            // containerd base_runtime_spec mknods the device node;
+            // resources.limits[rio.build/fuse] is scheduling-only.
+            // Privileged escape hatch uses hostPath.
             if privileged {
                 v.push(Volume {
                     name: "dev-fuse".into(),
@@ -797,9 +797,9 @@ fn build_executor_container(
 
         // r[impl sec.pod.fuse-device-plugin]
         // r[impl ctrl.builderpool.kvm-device]
-        // Operator resources + device-plugin FUSE request, plus
-        // /dev/kvm when features:[kvm]. Privileged escape hatch: no
-        // device resources (privileged bypasses device cgroup; FUSE
+        // Operator resources + rio.build/fuse scheduling signal, plus
+        // rio.build/kvm when features:[kvm]. Privileged escape hatch:
+        // no device resources (privileged bypasses device cgroup; FUSE
         // uses hostPath, kvm relies on the rio.build/kvm nodeSelector
         // for placement and sees /dev/kvm directly).
         resources: if privileged {

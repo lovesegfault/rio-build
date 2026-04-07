@@ -74,8 +74,8 @@ in
   jwtEnabled ? false,
   # Additional values files layered after vmtest-full.yaml (Helm -f
   # last-wins). privileged-hardening-e2e passes [vmtest-full-nonpriv.
-  # yaml] to flip workerPool.privileged:false + devicePlugin.enabled
-  # without duplicating the full base values file.
+  # yaml] to flip workerPool.privileged:false without duplicating the
+  # full base values file.
   extraValuesFiles ? [ ],
   # --set (typed) overrides. bool/int values that MUST NOT be coerced
   # to string — e.g. bootstrap.enabled=true (a bool the template checks
@@ -251,12 +251,83 @@ let
   k3sCovMemBump = (if coverage then 2048 else 0) + (extraImagesBumpGiB * 1024);
 
   # ── Base config shared by server + agent ────────────────────────────
+  # ── /dev/{fuse,kvm} via containerd base_runtime_spec ────────────────
+  # Same JSON the EKS NixOS AMI uses (nix/nixos-node/containerd-config.
+  # nix). k3s reads /var/lib/rancher/k3s/agent/etc/containerd/config.
+  # toml.tmpl if present (via services.k3s.containerdConfigTemplate)
+  # and renders it INSTEAD of its built-in base. We can't use the
+  # `{{ template "base" . }}` + append pattern: the base already emits
+  # `[plugins...runtimes.runc]` so a second header would be a TOML
+  # duplicate-table error; nor can we use the config-v3.toml.d/ import
+  # glob — containerd's mergeConfig() "Replace entire sections instead
+  # of merging map's values" for Plugins (containerd/services/server/
+  # config/config.go). So we write a FULL template — k3s's v3 base
+  # (pkg/agent/templates/templates.go ContainerdConfigTemplateV3)
+  # trimmed to what an airgapped VM test needs, with base_runtime_spec
+  # spliced into the runc runtime.
+  #
+  # The Go-template `{{ . }}` interpolations are filled by k3s at
+  # agent-startup with its NodeConfig (root/state paths under /var/
+  # lib/rancher/k3s/agent, k3s-bundled pause image, CNI dirs). Nix
+  # `''${` escapes literal `${` so k3s sees them.
+  baseRuntimeSpec = import ../../base-runtime-spec.nix { inherit pkgs; };
+  k3sContainerdConfigTmpl = ''
+    version = 3
+    root = {{ printf "%q" .NodeConfig.Containerd.Root }}
+    state = {{ printf "%q" .NodeConfig.Containerd.State }}
+
+    [grpc]
+      address = {{ deschemify .NodeConfig.Containerd.Address | printf "%q" }}
+
+    [plugins.'io.containerd.internal.v1.opt']
+      path = {{ printf "%q" .NodeConfig.Containerd.Opt }}
+
+    [plugins.'io.containerd.grpc.v1.cri']
+      stream_server_address = "127.0.0.1"
+      stream_server_port = "10010"
+
+    [plugins.'io.containerd.cri.v1.runtime']
+      enable_selinux = {{ .NodeConfig.SELinux }}
+      enable_unprivileged_ports = {{ .EnableUnprivileged }}
+      enable_unprivileged_icmp = {{ .EnableUnprivileged }}
+      device_ownership_from_security_context = {{ .NonrootDevices }}
+
+    {{ with .NodeConfig.AgentConfig.Snapshotter }}
+    [plugins.'io.containerd.cri.v1.images']
+      snapshotter = "{{ . }}"
+      disable_snapshot_annotations = true
+      use_local_image_pull = true
+    {{ end }}
+
+    {{ with .NodeConfig.AgentConfig.PauseImage }}
+    [plugins.'io.containerd.cri.v1.images'.pinned_images]
+      sandbox = "{{ . }}"
+    {{ end }}
+
+    [plugins.'io.containerd.cri.v1.runtime'.cni]
+      {{ with .NodeConfig.AgentConfig.CNIBinDir }}bin_dirs = [{{ printf "%q" . }}]{{ end }}
+      {{ with .NodeConfig.AgentConfig.CNIConfDir }}conf_dir = {{ printf "%q" . }}{{ end }}
+
+    [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
+      runtime_type = "io.containerd.runc.v2"
+      base_runtime_spec = "${baseRuntimeSpec}"
+
+    [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
+      SystemdCgroup = {{ .SystemdCgroup }}
+
+    [plugins.'io.containerd.cri.v1.images'.registry]
+      config_path = {{ printf "%q" .NodeConfig.Containerd.Registry }}
+  '';
+
   # Everything except services.k3s (which differs by role). Extracted
   # so the firewall/kernel/systemd bits don't duplicate. Flannel VXLAN
   # needs 8472/udp both ways; kubelet 10250 for `kubectl exec`/logs
   # (agent → server AND server → agent for 2-node).
   k3sBase = {
-    services.k3s.package = k3sPinned;
+    services.k3s = {
+      package = k3sPinned;
+      containerdConfigTemplate = k3sContainerdConfigTmpl;
+    };
     swapDevices = [ ];
     boot.kernelModules = [ "fuse" ];
     boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
@@ -270,16 +341,17 @@ let
       allowedUDPPorts = [ 8472 ]; # flannel VXLAN
     };
 
-    # containerd needs cgroup delegation for pod cgroups. Without:
-    # ContainerCreating forever.
-    systemd.services.k3s.serviceConfig.Delegate = "yes";
-
-    # Drop the 1Hz retry spam during the ~180s airgap-import window
-    # (apiserver up, kubelet blocked on serial image import → node not
-    # yet registered). 182 lines/run pre-filter. "~" prefix = exclude
-    # matching from journal ingestion (systemd 253+) — never reaches
-    # console→serial→testlog. Other k3s logs unaffected.
-    systemd.services.k3s.serviceConfig.LogFilterPatterns = "~Unable to set control-plane role label";
+    systemd.services.k3s.serviceConfig = {
+      # containerd needs cgroup delegation for pod cgroups. Without:
+      # ContainerCreating forever.
+      Delegate = "yes";
+      # Drop the 1Hz retry spam during the ~180s airgap-import window
+      # (apiserver up, kubelet blocked on serial image import → node
+      # not yet registered). 182 lines/run pre-filter. "~" prefix =
+      # exclude matching from journal ingestion (systemd 253+) — never
+      # reaches console→serial→testlog. Other k3s logs unaffected.
+      LogFilterPatterns = "~Unable to set control-plane role label";
+    };
 
     # ── Containerd image store on tmpfs ────────────────────────────────
     # Eliminates builder-disk variance for airgap imports. Before:
@@ -619,6 +691,23 @@ rec {
         timeout=120,
     )
 
+    # ── rio.build/{fuse,kvm} extended-resource capacity ─────────────
+    # No device plugin runs (containerd base_runtime_spec injects the
+    # device nodes directly — see k3sContainerdDropIn above). The
+    # rio.build/{fuse,kvm} resource is scheduling-signal-only; on EKS
+    # a Karpenter NodeOverlay declares it, here we patch node status
+    # directly. kubelet leaves extended resources it never saw via a
+    # plugin alone (k/k#64784), so the patch sticks. Unconditional —
+    # privileged:true scenarios don't request it (no-op), nonpriv
+    # scenarios need it BEFORE the worker pod schedules or it goes
+    # Pending on Insufficient rio.build/fuse.
+    for _n in ["k3s-server", "k3s-agent"]:
+        k3s_server.succeed(
+            "k3s kubectl patch node " + _n + " --subresource=status "
+            "--type=merge -p "
+            "'{\"status\":{\"capacity\":{\"rio.build/fuse\":\"100\",\"rio.build/kvm\":\"100\"}}}'"
+        )
+
     # ── PG Ready (everything else blocks on migrations) ─────────────
     # Bitnami's sts name pattern: <release>-postgresql. Our release
     # name is `rio` (helm template's first arg). PVC binds via local-
@@ -705,28 +794,22 @@ rec {
     # scales STS to 1 immediately. vmtest-full.yaml uses the
     # privileged:true escape hatch (hostPath /dev/fuse) — the node's
     # /dev/fuse must exist (boot.kernelModules = ["fuse"] above).
-    # The default valuesFile (vmtest-full.yaml) uses privileged:true
-    # (fast path — skips device-plugin DS bring-up ~30-60s).
-    # vmtest-full-nonpriv.yaml exercises the production ADR-012 path via
-    # smarter-device-manager (see security.nix:privileged-hardening-e2e).
+    # vmtest-full-nonpriv.yaml exercises the production ADR-012 path
+    # (containerd base_runtime_spec /dev/fuse injection — see
+    # security.nix:privileged-hardening-e2e).
     #
-    # On timeout: dump logs + describe + device-plugin state before
+    # On timeout: dump logs + describe + node-allocatable before
     # re-raising. The nonpriv path (vm-security-nonpriv-k3s) has
-    # several novel failure modes this exposes: device-plugin socket
-    # path mismatch (k3s kubelet is at /var/lib/rancher/k3s/agent/
-    # kubelet, not /var/lib/kubelet → DS registers nowhere → pod
-    # Pending on Insufficient smarter-devices/fuse), cgroup remount
-    # EPERM under hostUsers:false, FUSE mount fail if device
-    # injection didn't happen. Without this dump, the test just
-    # times out at 180s with no signal.
+    # several novel failure modes this exposes: containerd config
+    # template not picked up (k3s template-var drift → /dev/fuse
+    # absent in container → fuser::mount2 ENOENT), node-status patch
+    # lost (Insufficient rio.build/fuse), cgroup remount EPERM under
+    # hostUsers:false. Without this dump, the test just times out
+    # at 270s with no signal.
     # Single kubectl wait (not wait_until_succeeds retry loop): the
     # inner --timeout=270s already retries internally. A second
     # wait_until_succeeds retry would block another 270s, pushing
-    # the diagnostic dump past most CI outer-timeouts. 270s (was
-    # 150s) gives headroom for the nonpriv DS bring-up: smarter-
-    # device-manager DaemonSet must schedule + go Ready + register
-    # the `smarter-devices/fuse` extended resource BEFORE the
-    # worker pod can leave Pending (~30-60s extra under TCG).
+    # the diagnostic dump past most CI outer-timeouts.
     rc, _ = k3s_server.execute(
         "k3s kubectl -n ${nsBuilders} wait --for=condition=Ready "
         "pod/rio-builder-x86-64-0 --timeout=270s"
@@ -748,18 +831,20 @@ rec {
             "k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 --previous 2>&1 "
             "|| k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 2>&1"
         )[1])
-        # Device-plugin state: DS rollout + node allocatable. If
-        # allocatable.smarter-devices/fuse is absent/0, the DS
-        # registered against the wrong kubelet socket (k3s path
-        # mismatch) or isn't Ready yet.
-        print("--- device-plugin DS + node allocatable ---")
+        # Node allocatable + containerd config state. If
+        # allocatable[rio.build/fuse] is absent/0, the node-status
+        # patch above didn't stick (kubelet overwrote — k/k#64784
+        # regression). If the worker container has no /dev/fuse,
+        # the containerdConfigTemplate didn't render base_runtime_
+        # spec — dump the generated config.toml to see why.
+        print("--- node allocatable + containerd base_runtime_spec ---")
         print(k3s_server.execute(
             "set +e; "
-            "k3s kubectl -n ${nsBuilders} get ds rio-device-plugin -o wide 2>&1; "
-            "k3s kubectl -n ${nsBuilders} logs ds/rio-device-plugin --tail=50 2>&1; "
-            "k3s kubectl get nodes "
-            "-o jsonpath='{range .items[*]}{.metadata.name}: "
-            "{.status.allocatable.smarter-devices/fuse}{\"\\n\"}{end}' 2>&1; "
+            "k3s kubectl get nodes -o json | "
+            "${pkgs.jq}/bin/jq -r '.items[] | .metadata.name + \": \" + "
+            "(.status.allocatable[\"rio.build/fuse\"] // \"<unset>\")' 2>&1; "
+            "echo '--- /var/lib/rancher/k3s/agent/etc/containerd/config.toml ---'; "
+            "cat /var/lib/rancher/k3s/agent/etc/containerd/config.toml 2>&1; "
             "true"
         )[1])
         # STS + controller state: if the pod was NEVER created (NotFound

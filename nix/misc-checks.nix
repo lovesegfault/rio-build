@@ -190,9 +190,6 @@
         # pinned. A floating third-party tag that doesn't exist /
         # gets deleted / gets overwritten upstream → ImagePullBackOff
         # → component-specific silent brick:
-        #   - devicePlugin: smarter-devices/fuse never registers →
-        #     worker pods Pending (a prior default pointed at a
-        #     never-published upstream tag; r[sec.pod.fuse-device-plugin])
         #   - envoyImage: gRPC-Web translation dead → dashboard loads
         #     but every RPC fails (r[dash.envoy.grpc-web-translate])
         #   - <future>: same failure mode, this loop catches it pre-merge
@@ -524,21 +521,27 @@
             exit 1
           fi
         done
-        # DaemonSet MUST NOT render with karpenter.enabled=true — the
-        # AMI injects /dev/{fuse,kvm} via containerd base_runtime_spec
-        # (containerd-config.nix linux.devices); the DS is k3s/kind only.
+        # device-plugin.yaml is GONE — both EKS and k3s now inject
+        # /dev/{fuse,kvm} via containerd base_runtime_spec
+        # (nix/base-runtime-spec.nix). Guard against it returning.
+        if [ -e templates/device-plugin.yaml ]; then
+          echo "FAIL: templates/device-plugin.yaml resurrected — both paths use base_runtime_spec now" >&2
+          exit 1
+        fi
         ! yq 'select(.kind=="DaemonSet") | .metadata.name' \
-          $TMPDIR/karp-on.yaml | grep -x rio-device-plugin >/dev/null || {
-          echo "FAIL: rio-device-plugin DaemonSet rendered with karpenter.enabled=true (AMI uses base_runtime_spec)" >&2
+          $TMPDIR/karp-on.yaml /tmp/default.yaml | grep -x rio-device-plugin >/dev/null || {
+          echo "FAIL: rio-device-plugin DaemonSet rendered (both paths use base_runtime_spec)" >&2
           exit 1
         }
         # NodeOverlay (synthetic capacity) MUST still render —
-        # smarter-devices/{fuse,kvm} is now scheduling-signal-only on
-        # EKS (no on-node plugin; kubelet leaves NodeOverlay-declared
-        # extended resources alone — k/k#64784).
-        yq 'select(.kind=="NodeOverlay") | .metadata.name' \
-          $TMPDIR/karp-on.yaml | grep -x rio-builder-fuse >/dev/null || {
-          echo "FAIL: NodeOverlay rio-builder-fuse missing with karpenter.enabled=true" >&2
+        # rio.build/{fuse,kvm} is scheduling-signal-only (no on-node
+        # plugin; kubelet leaves NodeOverlay-declared extended
+        # resources alone — k/k#64784). Assert the rio.build/fuse key
+        # is the one declared (not a stale name).
+        yq 'select(.kind=="NodeOverlay" and .metadata.name=="rio-builder-fuse")
+            | .spec.capacity | has("rio.build/fuse")' \
+          $TMPDIR/karp-on.yaml | grep -qx true || {
+          echo "FAIL: NodeOverlay rio-builder-fuse missing or capacity key != rio.build/fuse" >&2
           exit 1
         }
 

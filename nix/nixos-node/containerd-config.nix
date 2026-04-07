@@ -11,72 +11,10 @@
   pauseRef,
 }:
 let
-  baseRuntimeSpec = pkgs.writeText "base-runtime-spec.json" (
-    builtins.toJSON {
-      ociVersion = "1.1.0";
-      process.rlimits = [
-        {
-          type = "RLIMIT_NOFILE";
-          hard = 1048576;
-          soft = 65536;
-        }
-      ];
-      # r[impl sec.pod.fuse-device-plugin]
-      # runc mknods these inside the container's /dev (container-namespace
-      # uid/gid) — NOT a hostPath mount, so no hostUsers:false idmap-mount
-      # rejection. Every pod gets both; mounting fuse still needs
-      # CAP_SYS_ADMIN, and /dev/kvm ENXIOs on non-.metal. Replaces the
-      # smarter-device-manager device plugin: the NodeOverlay-declared
-      # smarter-devices/{fuse,kvm} capacity stays as a scheduling signal
-      # only — kubelet leaves extended resources it never saw via a plugin
-      # alone (k/k#64784).
-      linux = {
-        devices = [
-          {
-            path = "/dev/fuse";
-            type = "c";
-            major = 10;
-            minor = 229;
-            fileMode = 438; # 0666
-            uid = 0;
-            gid = 0;
-          }
-          {
-            path = "/dev/kvm";
-            type = "c";
-            major = 10;
-            minor = 232;
-            fileMode = 432; # 0660
-            uid = 0;
-            gid = 0;
-          }
-        ];
-        # CRI appends its default device-cgroup rules (deny-all + the
-        # /dev/{null,zero,random,tty,…} allows) AFTER loading this spec
-        # (oci.WithSpecFromFile → CRI spec opts), so this list is
-        # additive, not the full allowlist. Live check on a booted node:
-        #   crictl inspect <cid> | jq '.info.runtimeSpec.linux.resources.devices | length'
-        # — must be >2. If a containerd bump changes merge semantics,
-        # that's where it surfaces.
-        resources.devices = [
-          {
-            allow = true;
-            type = "c";
-            major = 10;
-            minor = 229;
-            access = "rwm";
-          }
-          {
-            allow = true;
-            type = "c";
-            major = 10;
-            minor = 232;
-            access = "rwm";
-          }
-        ];
-      };
-    }
-  );
+  # /dev/{fuse,kvm} injection — shared with the k3s VM-test path
+  # (nix/tests/fixtures/k3s-full.nix). r[impl sec.pod.fuse-device-plugin]
+  # marker lives on the shared file.
+  baseRuntimeSpec = import ../base-runtime-spec.nix { inherit pkgs; };
 in
 pkgs.writeText "containerd-config.toml" ''
   version = 3

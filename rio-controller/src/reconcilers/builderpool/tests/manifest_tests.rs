@@ -537,8 +537,8 @@ fn built_job_labels_roundtrip_through_inventory() {
 
 /// build_manifest_job applies the resources override to the pod.
 /// The bucket's (mem, cpu) shows up in `containers[0].resources`
-/// (plus the FUSE device-plugin request that `build_executor_pod_spec`
-/// always adds for non-privileged pods).
+/// (plus the `rio.build/fuse` scheduling signal that
+/// `build_executor_pod_spec` always adds for non-privileged pods).
 // r[verify ctrl.pool.manifest-reconcile]
 #[test]
 fn built_job_pod_has_bucket_resources() {
@@ -579,8 +579,8 @@ fn built_job_pod_has_bucket_resources() {
 
 /// Cold-start Job (`bucket: None`) falls through to `spec.resources`.
 /// test_manifest_wp has `spec.resources = None` (from the fixture),
-/// so the pod gets just the FUSE device-plugin request — NOT a
-/// manufactured bucket.
+/// so the pod gets just the `rio.build/fuse` scheduling signal — NOT
+/// a manufactured bucket.
 #[test]
 fn cold_start_job_uses_spec_resources_floor() {
     let wp = test_manifest_wp();
@@ -605,7 +605,7 @@ fn cold_start_job_uses_spec_resources_floor() {
 
     // Resources: no memory/cpu request (spec.resources was None,
     // override was None → params.resources stays None → only the
-    // FUSE device-plugin request). If someone's Some-path leaks
+    // rio.build/fuse scheduling signal). If someone's Some-path leaks
     // into the None-path, memory/cpu would appear.
     let pod_spec = job.spec.unwrap().template.spec.unwrap();
     let resources = pod_spec.containers[0].resources.as_ref().unwrap();

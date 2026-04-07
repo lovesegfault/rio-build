@@ -59,6 +59,7 @@ specs (
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs
           nix/nixos-node/**/*.nix
+          nix/base-runtime-spec.nix
           rio-dashboard/src/lib/logStream.svelte.ts
           rio-dashboard/src/lib/graphLayout.ts
           rio-dashboard/src/api/transport.ts

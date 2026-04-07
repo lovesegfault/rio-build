@@ -75,13 +75,13 @@ spec:
     karpenter.sh/discovery: {{ $k.clusterName }}
 ---
 # NodeOverlay: tells Karpenter that worker-role instances provide
-# smarter-devices/fuse capacity. Builder pods request smarter-devices/
-# fuse:1 as a scheduling signal; on EKS no device plugin runs (containerd
-# base_runtime_spec injects /dev/fuse directly, nix/nixos-node/
-# containerd-config.nix), so this overlay is the ONLY source of that
-# extended resource — kubelet leaves NodeOverlay-declared resources alone
-# when no plugin ever registered them (k/k#64784). Bin-packing from zero
-# nodes works because the overlay applies to NodeClaims, not booted nodes.
+# rio.build/fuse capacity. Builder pods request rio.build/fuse:1 as a
+# scheduling signal; no device plugin runs (containerd base_runtime_spec
+# injects /dev/fuse directly, nix/base-runtime-spec.nix), so this overlay
+# is the ONLY source of that extended resource — kubelet leaves
+# NodeOverlay-declared resources alone when no plugin ever registered
+# them (k/k#64784). Bin-packing from zero nodes works because the overlay
+# applies to NodeClaims, not booted nodes.
 #
 # Alpha feature — requires settings.featureGates.nodeOverlay=true on the
 # Karpenter controller (set in infra/eks/karpenter.tf).
@@ -102,9 +102,9 @@ spec:
       operator: In
       values: [builder, fetcher]
   capacity:
-    smarter-devices/fuse: {{ .Values.devicePlugin.fuseMaxDevices | quote }}
+    rio.build/fuse: {{ .Values.deviceCapacity.fuse | quote }}
 ---
-# NodeOverlay (kvm): synthetic smarter-devices/kvm capacity for the metal
+# NodeOverlay (kvm): synthetic rio.build/kvm capacity for the metal
 # NodePool. Same scheduling-signal-only mechanism as fuse above. Matches
 # by the rio.build/kvm label (only the metal NodePool sets it) so
 # non-metal builder nodes don't falsely advertise kvm — base_runtime_spec
@@ -123,7 +123,7 @@ spec:
       operator: In
       values: ["true"]
   capacity:
-    smarter-devices/kvm: {{ .Values.devicePlugin.kvmMaxDevices | quote }}
+    rio.build/kvm: {{ .Values.deviceCapacity.kvm | quote }}
 {{- range $k.nodePools }}
 ---
 apiVersion: karpenter.sh/v1

@@ -755,8 +755,8 @@
                 vm-le-build-k3s = 8;
                 # k3s + one extra airgap image (squid). Does builds.
                 vm-fod-proxy-k3s = 8;
-                # k3s + smarter-device-manager image. Nonpriv e2e
-                # (device-plugin + hostUsers:false + cgroup rw-remount).
+                # k3s nonpriv e2e (base_runtime_spec /dev/fuse +
+                # cgroup rw-remount).
                 vm-security-nonpriv-k3s = 8;
                 # k3s + envoy-gateway operator (+2 images). No builds.
                 vm-dashboard-gateway-k3s = 8;

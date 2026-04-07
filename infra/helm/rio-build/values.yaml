@@ -735,86 +735,31 @@ dashboard:
       - "http://rio-dashboard.rio-system.svc.cluster.local"
 
 # ──────────────────────────────────────────────────────────────────────────
-# FUSE Device Plugin
+# /dev/{fuse,kvm} extended-resource capacity
 # ──────────────────────────────────────────────────────────────────────────
-# smarter-devices/{fuse,kvm} extended resources. Builder pods request
-# them via resources.limits instead of a hostPath volume, which makes
-# hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
+# r[impl sec.pod.fuse-device-plugin]
+# Builder/fetcher pods request `rio.build/{fuse,kvm}` via resources.
+# limits as a SCHEDULING SIGNAL only. The device nodes themselves are
+# injected by containerd `base_runtime_spec` (nix/base-runtime-spec.nix
+# linux.devices — runc mknods inside the container's /dev) on every node
+# whose containerd is so configured. No device plugin runs anywhere;
+# kubelet leaves extended resources it never saw via a plugin alone
+# (k/k#64784).
 #
-# Delivery mode is keyed off karpenter.enabled:
-#   - karpenter.enabled=true  (EKS): NO device plugin runs. containerd
-#     base_runtime_spec injects /dev/{fuse,kvm} directly (nix/nixos-node/
-#     containerd-config.nix linux.devices — runc mknods inside the
-#     container's /dev). The smarter-devices/{fuse,kvm} resource is
-#     scheduling-signal-only via NodeOverlay (templates/karpenter.yaml);
-#     kubelet leaves NodeOverlay-declared extended resources alone when
-#     no plugin ever registered them (k/k#64784). fuseMaxDevices/
-#     kvmMaxDevices below set the NodeOverlay capacity.
-#   - karpenter.enabled=false (k3s/kind/VM tests): smarter-device-manager
-#     DaemonSet (device-plugin.yaml). nodeSelector/nodeAffinity/
-#     tolerations below apply to this path only.
+# These values set the per-node capacity advertised to the scheduler:
+#   - karpenter.enabled=true (EKS): NodeOverlay .spec.capacity
+#     (templates/karpenter.yaml).
+#   - k3s/kind VM tests: `kubectl patch node --subresource=status` in
+#     the test fixture (nix/tests/fixtures/k3s-full.nix waitReady).
 #
-# enabled=true by default because builderPoolDefaults.privileged=false (below)
-# depends on it. Disable on clusters where privileged:true is the escape
-# hatch (k3s/kind without node-level device-plugin support).
-devicePlugin:
-  enabled: true
-  # Upstream image. Digest-pinned — bump via `skopeo inspect docker://
-  # <repo>:<new-tag> --format '{{.Digest}}'` on upstream releases. Tag
-  # portion is cosmetic (kubelet pulls by digest). The helm-lint check
-  # enforces the pin (a prior default referenced a never-published
-  # upstream tag → ImagePullBackOff → builder pods Pending on a
-  # default-values deploy).
-  image: ghcr.io/smarter-project/smarter-device-manager:v1.20.12@sha256:228f7f44594a3182571559e62f2e3fe8a3f26180fb5dd7fc0cb7bf7d22a5bbcd
-  # Per-node ceiling on how many pods can claim /dev/fuse. Each worker
-  # pod requests 1. Set this >= max builder pods per node (which is
-  # typically 1 given the resource requests below, but bursty
-  # autoscaling + small nodes could pack more).
-  fuseMaxDevices: 100
-  # Per-node ceiling on /dev/kvm claims. Only metal nodes have /dev/kvm
-  # (the plugin advertises 0 elsewhere). A single .metal box hosts many
-  # qemu-kvm guests concurrently; 100 matches fuseMaxDevices so the
-  # binding constraint stays cpu/memory, not the device count.
-  kvmMaxDevices: 100
-  # r[impl sec.pod.fuse-device-plugin]
-  # r[impl fetcher.node.dedicated]
-  #
-  # DaemonSet-path scheduling (karpenter.enabled=false ONLY — the static-
-  # pod path ignores these; kubelet starts it on every rio-default node).
-  # Schedule on BOTH builder AND fetcher nodes. FetcherPool pods request
-  # smarter-devices/fuse:1 same as BuilderPool (both use FUSE-backed
-  # store mounts). nodeSelector is matchLabels-only (no set-based In);
-  # nodeAffinity.matchExpressions covers both node-role values.
-  # Control-plane + general nodes: no match → no DS pod.
-  nodeSelector: {}
-  nodeAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: rio.build/node-role
-              operator: In
-              values: [builder, fetcher]
-  # Tolerate BOTH executor-node taints so the DaemonSet schedules on
-  # either. Without the fetcher toleration, the fetcher NodePool's
-  # taint keeps the DS off → no smarter-devices/fuse advertised →
-  # FetcherPool pods Pending forever.
-  tolerations:
-    - key: rio.build/builder
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
-    - key: rio.build/fetcher
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
-    # Metal NodePool carries an additional rio.build/kvm taint (kvm pods
-    # only). The DS must tolerate it to advertise smarter-devices/{fuse,
-    # kvm} there — without this, kvm-feature pods Pending forever (same
-    # failure mode as the missing fetcher toleration above).
-    - key: rio.build/kvm
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
+# Set >= max executor pods per node (typically 1 given the resource
+# requests below, but bursty autoscaling + small nodes could pack more).
+# kvm: only metal nodes get the rio-builder-kvm NodeOverlay; a single
+# .metal box hosts many qemu-kvm guests concurrently so 100 matches
+# fuse and the binding constraint stays cpu/memory, not device count.
+deviceCapacity:
+  fuse: 100
+  kvm: 100
 
 # ──────────────────────────────────────────────────────────────────────────
 # security-profiles-operator (SeccompProfile CR distribution)
@@ -981,19 +926,18 @@ builderPoolDefaults:
     limits:
       memory: "8Gi"
   # Device cgroup: /dev/fuse is provided via containerd base_runtime_spec
-  # on EKS (nix/nixos-node/containerd-config.nix) or smarter-device-manager
-  # on k3s/kind (templates/device-plugin.yaml). Either way granular
-  # SYS_ADMIN+SYS_CHROOT caps suffice and hostUsers:false works (hostPath
-  # /dev/fuse breaks idmap mounts).
+  # (nix/base-runtime-spec.nix). Granular SYS_ADMIN+SYS_CHROOT caps
+  # suffice and hostUsers:false works (hostPath /dev/fuse breaks idmap
+  # mounts).
   #
-  # privileged:true is an ESCAPE HATCH for k3s/kind without the
-  # device plugin. It disables seccomp entirely (ADR-012:10) and
-  # is unacceptable for multi-tenant (ADR-012:18). Production on
-  # EKS/GKE with the device plugin deployed should NOT need this.
+  # privileged:true is an ESCAPE HATCH for clusters whose containerd
+  # lacks base_runtime_spec device injection. It disables seccomp
+  # entirely (ADR-012:10) and is unacceptable for multi-tenant
+  # (ADR-012:18). Production on EKS/GKE should NOT need this.
   #
   # EKS + Karpenter cold-start: a NodeOverlay (templates/karpenter.yaml)
-  # declares smarter-devices/fuse capacity synthetically so Karpenter
-  # can bin-pack from zero nodes. Requires Karpenter ≥1.7 with the
+  # declares rio.build/fuse capacity synthetically so Karpenter can
+  # bin-pack from zero nodes. Requires Karpenter ≥1.7 with the
   # nodeOverlay feature gate (infra/eks/karpenter.tf).
   #
   # privileged=false + seccompProfile=Localhost: containerd's RuntimeDefault
@@ -1001,8 +945,9 @@ builderPoolDefaults:
   # Localhost profile (files/seccomp-rio-builder.json, baked into the AMI
   # at /var/lib/kubelet/seccomp/operator/ via nix/nixos-node/hardening.nix)
   # is RuntimeDefault + pivot_root − {ptrace, bpf, setns, process_vm_*}.
-  # Keeps granular caps and the device-plugin /dev/fuse path while denying
-  # the syscalls a sandbox escapee with CAP_SYS_ADMIN would otherwise have.
+  # Keeps granular caps and the base_runtime_spec /dev/fuse path while
+  # denying syscalls a sandbox escapee with CAP_SYS_ADMIN would otherwise
+  # have.
   #
   # hostUsers default = true here so k3s/kind VM tests work without
   # idmap-mount support on /dev/fuse. EKS (NixOS AMI with containerd

@@ -57,11 +57,11 @@
 #
 # ── privileged-hardening-e2e (k3s fixture, vm-security-nonpriv-k3s) ────
 # Separate scenario function: proves MECHANISM of the privileged:false +
-# device-plugin + hostUsers:false production path. The standalone
-# scenario above proves auth/mTLS/tenant boundaries; this one proves
-# the worker pod security posture is actually FUNCTIONAL (not just
+# base_runtime_spec /dev/fuse + hostUsers:false production path. The
+# standalone scenario above proves auth/mTLS/tenant boundaries; this one
+# proves the worker pod security posture is actually FUNCTIONAL (not just
 # rendered correctly by the controller). Uses k3sFull fixture with the
-# vmtest-full-nonpriv.yaml overlay + smarter-device-manager airgap image.
+# vmtest-full-nonpriv.yaml overlay.
 {
   pkgs,
   common,
@@ -1021,29 +1021,30 @@ in
     };
 
   # ══════════════════════════════════════════════════════════════════════
-  # privileged-hardening-e2e — device-plugin + cgroup rw-remount e2e
+  # privileged-hardening-e2e — base_runtime_spec + cgroup rw-remount e2e
   # ══════════════════════════════════════════════════════════════════════
   # Proves MECHANISM of the privileged:false production path:
-  #   - smarter-device-manager DaemonSet registers /dev/fuse as an
-  #     extended resource → kubelet advertises node.status.allocatable
-  #   - worker pod requests smarter-devices/fuse via resources.limits
-  #     → device plugin injects the node into the container (no hostPath)
+  #   - k3s containerd config.toml.tmpl sets base_runtime_spec → runc
+  #     mknods /dev/fuse inside the container (no hostPath)
+  #   - node status patched with rio.build/fuse capacity → worker pod
+  #     requesting rio.build/fuse via resources.limits schedules
   #   - hostUsers:false admitted (would fail with hostPath /dev/fuse)
   #   - containerd mounts /sys/fs/cgroup RO for non-privileged pods →
   #     worker's delegated_root() MS_REMOUNT|MS_BIND clears the RO flag
   #     → /leaf/ creation + subtree_control write succeed
-  #   - FUSE mount via device-plugin injection works → worker registers
-  #   - build completes end-to-end
+  #   - FUSE mount via base_runtime_spec injection works → worker
+  #     registers → build completes end-to-end
   #
   # Every VM fixture before this used vmtest-full.yaml privileged:true
   # (containerd mounts /sys/fs/cgroup rw already, hostPath /dev/fuse
-  # works) so the remount and device-plugin paths were never exercised.
-  # Controller unit tests (builders.rs / tests.rs) prove the pod SHAPE is
-  # rendered correctly; this proves it WORKS.
+  # works) so the remount and base_runtime_spec paths were never
+  # exercised. Controller unit tests (builders.rs / tests.rs) prove the
+  # pod SHAPE is rendered correctly; this proves it WORKS.
   #
   # sec.pod.fuse-device-plugin — verify marker at default.nix:
   # vm-security-nonpriv-k3s (second verify site; tests.rs renders-shape
-  # is the first). Proves device-plugin injection → FUSE mount → build.
+  # is the first). Proves base_runtime_spec injection → FUSE mount →
+  # build.
   #
   # sec.pod.host-users-false — NOT verified here (see default.nix
   # comment at vm-security-nonpriv-k3s re k3s cgroup delegation).
@@ -1076,11 +1077,10 @@ in
       name = "rio-security-nonpriv";
       skipTypeCheck = true;
 
-      # k3s bring-up ~3-4min + DS Ready ~60s + worker Ready ~3min +
-      # one build ~30s + kubectl exec probes. device-plugin DaemonSet
-      # needs to register BEFORE the worker pod schedules (insufficient
-      # extended resource otherwise), which adds latency over the
-      # privileged fast-path.
+      # k3s bring-up ~3-4min + worker Ready ~3min + one build ~30s +
+      # kubectl exec probes. The node-status capacity patch in
+      # waitReady is synchronous (~1s) so no extra bring-up tax over
+      # the privileged fast-path.
       globalTimeout = 900 + common.covTimeoutHeadroom;
 
       inherit (fixture) nodes;
@@ -1208,40 +1208,32 @@ in
             ''
         }
 
-        # ── Device plugin DaemonSet Ready ───────────────────────────────
-        # smarter-device-manager DaemonSet (templates/device-plugin.yaml)
-        # must register with kubelet BEFORE the worker pod schedules —
-        # otherwise resources.limits[smarter-devices/fuse] is
-        # unschedulable ("Insufficient smarter-devices/fuse"). waitReady
-        # already waited for rio-builder-x86-64-0 Ready, which TRANSITIVELY
-        # proves the DS was up in time; this explicit check makes the
-        # ordering visible in CI logs and catches a regression where the
-        # worker pod Ready but the DS isn't (e.g., if privileged:true
-        # accidentally leaked through).
-        with subtest("device-plugin: DaemonSet Ready + extended resource advertised"):
-            kubectl("rollout status ds/rio-device-plugin --timeout=90s", ns="${nsBuilders}")
-
-            # Kubelet advertises the extended resource once the plugin
-            # registers. Must be non-zero on at least one node (the DS
-            # runs on both server+agent since nodeSelector was cleared).
-            # jsonpath `.` treats `/` literally in a key (not a
-            # separator), so `.smarter-devices/fuse` resolves the key
-            # correctly. Kubelet may lag a few seconds after DS rollout
-            # status returns (ListAndWatch → NodeStatus patch), so
-            # wait_until_succeeds with a short timeout.
-            k3s_server.wait_until_succeeds(
-                "k3s kubectl get node k3s-agent "
-                "-o jsonpath='{.status.allocatable.smarter-devices/fuse}' "
-                "| grep -qE '^[1-9]'",
-                timeout=60,
-            )
+        # ── rio.build/fuse extended resource advertised ─────────────────
+        # waitReady patches node status.capacity with rio.build/fuse=100
+        # on both nodes (no device plugin runs — containerd
+        # base_runtime_spec injects /dev/fuse directly). waitReady
+        # already waited for rio-builder-x86-64-0 Ready, which
+        # TRANSITIVELY proves the patch was visible to the scheduler in
+        # time; this explicit check makes it visible in CI logs and
+        # catches a kubelet-overwrote-status regression (k/k#64784).
+        # jq path notation handles the `.` in the resource key (kubectl
+        # jsonpath `.` is a separator, so `.rio.build/fuse` would
+        # mis-parse).
+        with subtest("device-capacity: rio.build/fuse advertised on both nodes"):
             allocatable = k3s_server.succeed(
-                "k3s kubectl get nodes "
-                "-o jsonpath='{.items[*].status.allocatable.smarter-devices/fuse}'"
+                "k3s kubectl get nodes -o json | "
+                "${pkgs.jq}/bin/jq -r '.items[] | .metadata.name + \"=\" + "
+                "(.status.allocatable[\"rio.build/fuse\"] // \"0\")'"
             ).strip()
+            for line in allocatable.splitlines():
+                node, _, val = line.partition("=")
+                assert val.isdigit() and int(val) > 0, (
+                    f"node {node!r} has allocatable[rio.build/fuse]={val!r} "
+                    f"— waitReady status patch lost (kubelet overwrote?)"
+                )
             print(
-                f"device-plugin PASS: allocatable.smarter-devices/fuse "
-                f"= {allocatable!r}"
+                f"device-capacity PASS: allocatable[rio.build/fuse] = "
+                f"{allocatable!r}"
             )
 
         # ── Worker pod security posture: non-privileged admitted ────────
@@ -1250,7 +1242,7 @@ in
         # absent/false. If privileged:true leaked through (helm layering
         # miss, null vs false semantics), the DS check above might still
         # pass (DS runs regardless) but THIS fails — the load-bearing half.
-        with subtest("nonpriv-admitted: privileged:false + device-plugin rendered and admitted"):
+        with subtest("nonpriv-admitted: privileged:false + rio.build/fuse rendered and admitted"):
             pod_json = kubectl(f"get pod {wp} -o json", ns="${nsBuilders}")
             pod = json.loads(pod_json)
 
@@ -1301,17 +1293,17 @@ in
             # mountAndPidNamespacesSupported() check.
 
             # Extended resource request present — controller auto-adds
-            # smarter-devices/fuse to resources.limits when !privileged.
+            # rio.build/fuse to resources.limits when !privileged.
             limits = pod["spec"]["containers"][0].get("resources", {}).get("limits", {})
-            assert "smarter-devices/fuse" in limits, (
-                f"worker container should request smarter-devices/fuse "
-                f"via resources.limits (device-plugin path); got "
+            assert "rio.build/fuse" in limits, (
+                f"worker container should request rio.build/fuse via "
+                f"resources.limits (scheduling signal); got "
                 f"limits={limits!r}"
             )
             print(
                 f"nonpriv-admitted PASS: privileged absent, "
-                f"seccomp={seccomp_type}, smarter-devices/fuse "
-                f"requested, hostUsers={host_users!r} (k3s opt-out)"
+                f"seccomp={seccomp_type}, rio.build/fuse requested, "
+                f"hostUsers={host_users!r} (k3s opt-out)"
             )
 
         # ── cgroup rw-remount succeeded ─────────────────────────────────
@@ -1388,10 +1380,11 @@ in
                 f"host-side leaf/ exists, subtree_control={subtree!r}"
             )
 
-        # ── Build completes: FUSE works via device-plugin injection ─────
-        # The FUSE mount is the overlay lower layer. If device-plugin
-        # injection failed (kubelet didn't inject /dev/fuse into the
-        # container's device cgroup), fuser::mount2 fails → worker never
+        # ── Build completes: FUSE works via base_runtime_spec ───────────
+        # The FUSE mount is the overlay lower layer. If base_runtime_spec
+        # injection failed (containerd didn't mknod /dev/fuse inside the
+        # container + add it to the device cgroup), fuser::mount2 fails →
+        # worker never
         # registers → waitReady's workers_active=1 wait already timed
         # out. Reaching here IS implicit proof; the build is end-to-end
         # confirmation (overlay mount + nix-daemon unshare + cgroup per-

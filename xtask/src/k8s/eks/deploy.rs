@@ -36,7 +36,7 @@ const SIZE_CLASSES_JSON: &str = r#"[
 /// VM tests are uniformly heavy — no point tiering) and `poolTemplate.
 /// features` to the standard nixpkgs VM-test feature triple. The
 /// controller derives the metal nodeSelector, rio.build/kvm toleration,
-/// and smarter-devices/kvm resource from `features:[kvm]`
+/// and rio.build/kvm resource from `features:[kvm]`
 /// (`r[ctrl.builderpool.kvm-device]`) — NOT set here.
 ///
 /// Validate end-to-end after deploy by building a derivation with
@@ -45,7 +45,7 @@ const SIZE_CLASSES_JSON: &str = r#"[
 ///     'nixpkgs#nixosTests.simple'
 /// Scheduler routes it to the `{arch}-kvm-xlarge` pool; Karpenter
 /// provisions a `.metal` node; pod gets `/dev/kvm` via containerd
-/// base_runtime_spec (smarter-devices/kvm is scheduling-signal only).
+/// base_runtime_spec (rio.build/kvm is scheduling-signal only).
 const BUILDER_POOL_SETS_JSON: &str = r#"[
   {"name":"x86-64","systems":["x86_64-linux"]},
   {"name":"aarch64","systems":["aarch64-linux"]},

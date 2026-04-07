@@ -73,7 +73,8 @@ let
   # security exports { standalone, privileged-hardening-e2e } — two
   # scenario functions sharing the same file. standalone uses the
   # systemd fixture (mTLS/HMAC/tenant/validation); e2e uses k3sFull
-  # with the nonpriv values overlay (device-plugin + cgroup remount).
+  # with the nonpriv values overlay (base_runtime_spec /dev/fuse +
+  # cgroup remount).
   security = import ./scenarios/security.nix { inherit pkgs common; };
   observability = import ./scenarios/observability.nix;
   lifecycle = import ./scenarios/lifecycle.nix;
@@ -91,7 +92,6 @@ let
   componentscaler = import ./scenarios/componentscaler.nix;
   substitute = import ./scenarios/substitute.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
-  pulled = import ../docker-pulled.nix { inherit pkgs; };
 
   # Shared fixture for both scheduling splits — identical VM topology.
   schedulingFixture = standalone {
@@ -469,40 +469,28 @@ in
   # r[verify sec.pod.fuse-device-plugin]
   # r[verify builder.cgroup.ns-root-remount]
   # r[verify sec.psa.control-plane-restricted]
-  #   Non-privileged + device-plugin VM e2e. hostUsers:false NOT
-  #   exercised here — k3s's containerd (systemd cgroup driver)
-  #   doesn't chown the pod cgroup to the userns root; worker mkdir
-  #   /sys/fs/cgroup/leaf fails EACCES → CrashLoopBackOff. The
-  #   sec.pod.host-users-false marker stays verified by the
-  #   builders.rs unit test (renders-shape check).
-  # Every other k3s fixture
-  #   uses vmtest-full.yaml privileged:true (containerd mounts
-  #   /sys/fs/cgroup rw already, hostPath /dev/fuse works) — the
-  #   rw-remount and device-plugin paths were never exercised until
-  #   this scenario. builders.rs unit tests prove pod SHAPE renders
-  #   correctly; this proves it WORKS (DS Ready → extended resource
-  #   advertised → worker pod Ready with hostUsers:false → cgroup/leaf
+  #   Non-privileged VM e2e. hostUsers:false NOT exercised here —
+  #   k3s's containerd (systemd cgroup driver) doesn't chown the pod
+  #   cgroup to the userns root; worker mkdir /sys/fs/cgroup/leaf
+  #   fails EACCES → CrashLoopBackOff. The sec.pod.host-users-false
+  #   marker stays verified by the builders.rs unit test (renders-
+  #   shape check). Every other k3s fixture uses vmtest-full.yaml
+  #   privileged:true (containerd mounts /sys/fs/cgroup rw already,
+  #   hostPath /dev/fuse works) — the rw-remount and base_runtime_spec
+  #   paths were never exercised until this scenario. builders.rs unit
+  #   tests prove pod SHAPE renders correctly; this proves it WORKS
+  #   (rio.build/fuse advertised → worker pod Ready → cgroup/leaf
   #   exists + subtree_control writable → build completes over FUSE).
   vm-security-nonpriv-k3s = security.privileged-hardening-e2e {
     fixture = k3sFull {
-      # Layer vmtest-full-nonpriv.yaml for workerPool.privileged:false +
-      # devicePlugin.enabled + nodeSelector/tolerations null. The
-      # devicePlugin.image override is passed via extraValues below
-      # (DERIVED from the preload FOD — no drift window).
+      # Layer vmtest-full-nonpriv.yaml for workerPool.privileged:false.
+      # /dev/fuse comes from k3s containerd base_runtime_spec (the
+      # containerdConfigTemplate in fixtures/k3s-full.nix); the
+      # rio.build/fuse extended resource from the node-status patch
+      # in waitReady. No extra airgap images needed.
       extraValuesFiles = [
         ../../infra/helm/rio-build/values/vmtest-full-nonpriv.yaml
       ];
-      # containerd airgap cache is tag-indexed (pullImage's finalImageTag),
-      # not digest-indexed. Chart default is digest-pinned (@sha256:…) →
-      # exact-string miss → ImagePullBackOff. destNameTag is
-      # "${finalImageName}:${finalImageTag}" — the preloaded cache key.
-      extraValues = {
-        "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
-      };
-      # smarter-device-manager is NOT in the default airgap set
-      # (only bitnami-postgresql + the rio-* seed). Without this, the DS pod
-      # goes ImagePullBackOff (airgapped, no pull).
-      extraImages = [ pulled.smarter-device-manager ];
     };
   };
 
@@ -773,7 +761,7 @@ in
   #
   # Fetcher pod needs the nonpriv path (hard-coded privileged:false +
   # Localhost seccomp at reconcilers/fetcherpool/mod.rs) — same
-  # device-plugin overlay as vm-security-nonpriv-k3s. Seccomp profile
+  # nonpriv overlay as vm-security-nonpriv-k3s. Seccomp profile
   # delivered at runtime by testScript (security-profiles-operator
   # not airgapped). fetcherPools[] enabled via extraValues with name=
   # "x86-64" + classes=[tiny] (I-170 + multiarch naming → pod
@@ -813,7 +801,6 @@ in
     fixture = k3sFull {
       extraValues = {
         "networkPolicy.enabled" = "true";
-        "devicePlugin.image" = pulled.smarter-device-manager.destNameTag;
       };
       # fetcherPools via values file (not --set-string) so hostUsers
       # stays bool true. --set-string would coerce to the STRING
@@ -846,7 +833,6 @@ in
                   limits: {memory: 512Mi}
         '')
       ];
-      extraImages = [ pulled.smarter-device-manager ];
     };
   };
 

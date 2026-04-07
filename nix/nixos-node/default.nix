@@ -53,6 +53,7 @@
 
   # TODO(P0-nixos-vm-test): nix/tests/nixos-node.nix — boot the toplevel
   # (not the disk image) under QEMU with mocked IMDS, assert nodeadm-init
-  # succeeds, kubelet starts, seccomp profiles + device-plugin conf exist,
-  # `sysctl user.max_user_namespaces` = 65536.
+  # succeeds, kubelet starts, seccomp profiles exist, containerd
+  # base_runtime_spec reflects /dev/{fuse,kvm}, `sysctl
+  # user.max_user_namespaces` = 65536.
 }

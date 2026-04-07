@@ -25,8 +25,8 @@ in
   # repeatable; last wins on key conflict). Used by the
   # privileged-hardening-e2e scenario to layer vmtest-full-nonpriv.
   # yaml on top of vmtest-full.yaml — the overlay stays minimal
-  # (only the privileged:false + devicePlugin:enabled flip) instead
-  # of duplicating the full 196-line base.
+  # (only the privileged:false flip) instead of duplicating the
+  # full base.
   extraValuesFiles ? [ ],
   # --set-string overrides. Each becomes a "--set-string key=value"
   # arg. --set-string (not --set): Helm's --set coerces "3" to int 3,

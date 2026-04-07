@@ -353,10 +353,10 @@ fn seccomp_profile_json_is_valid() {
 #[test]
 fn job_pod_fuse_via_device_plugin_when_unprivileged() {
     // Default (privileged=None→false): NO hostPath /dev/fuse volume.
-    // Instead, resources.limits has smarter-devices/fuse=1 and the
-    // kubelet+device-plugin inject the device. This is the ADR-012
-    // production path — enables hostUsers:false (hostPath /dev/fuse
-    // is incompatible with idmap mounts).
+    // Instead, resources.limits has rio.build/fuse=1 (scheduling
+    // signal — containerd base_runtime_spec injects the device node).
+    // This is the ADR-012 production path — enables hostUsers:false
+    // (hostPath /dev/fuse is incompatible with idmap mounts).
     let wp = test_wp();
     let pod = test_pod_spec(&wp);
 
@@ -387,7 +387,7 @@ fn job_pod_fuse_via_device_plugin_when_unprivileged() {
         .expect("resources set (device plugin request)");
     let limits = resources.limits.as_ref().expect("limits set");
     assert_eq!(
-        limits.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+        limits.get("rio.build/fuse").map(|q| q.0.as_str()),
         Some("1"),
         "one FUSE device per worker pod"
     );
@@ -395,7 +395,7 @@ fn job_pod_fuse_via_device_plugin_when_unprivileged() {
     // set both for `kubectl get` clarity.
     let requests = resources.requests.as_ref().expect("requests set");
     assert_eq!(
-        requests.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+        requests.get("rio.build/fuse").map(|q| q.0.as_str()),
         Some("1"),
     );
 }
@@ -429,7 +429,7 @@ fn job_pod_fuse_device_merges_with_operator_resources() {
     assert_eq!(limits.get("memory").map(|q| q.0.as_str()), Some("8Gi"));
     // FUSE device merged in alongside.
     assert_eq!(
-        limits.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+        limits.get("rio.build/fuse").map(|q| q.0.as_str()),
         Some("1")
     );
     // Operator's cpu/memory requests preserved.
@@ -448,18 +448,18 @@ fn job_pod_kvm_feature_adds_device_nodeselector_toleration() {
     assert!(wp.spec.features.iter().any(|f| f == "kvm"), "precondition");
     let pod = test_pod_spec(&wp);
 
-    // smarter-devices/kvm:1 in resources.{limits,requests} alongside
-    // fuse. kubelet → device-plugin → /dev/kvm in device cgroup.
+    // rio.build/kvm:1 in resources.{limits,requests} alongside fuse.
+    // Scheduling-only — containerd base_runtime_spec mknods /dev/kvm.
     let resources = pod.containers[0].resources.as_ref().unwrap();
     for map in [resources.limits.as_ref(), resources.requests.as_ref()] {
         let m = map.expect("set");
         assert_eq!(
-            m.get("smarter-devices/kvm").map(|q| q.0.as_str()),
+            m.get("rio.build/kvm").map(|q| q.0.as_str()),
             Some("1"),
             "one /dev/kvm per builder pod"
         );
         assert_eq!(
-            m.get("smarter-devices/fuse").map(|q| q.0.as_str()),
+            m.get("rio.build/fuse").map(|q| q.0.as_str()),
             Some("1"),
             "kvm request doesn't clobber fuse"
         );
@@ -489,9 +489,9 @@ fn job_pod_kvm_feature_adds_device_nodeselector_toleration() {
 #[test]
 fn job_pod_no_kvm_feature_no_kvm_wiring() {
     // The CONDITIONAL is the load-bearing part: a non-kvm pool must
-    // NOT request smarter-devices/kvm (would Pending forever — no
-    // non-metal node advertises it) and must NOT tolerate the metal
-    // taint (would bin-pack cheap builds onto $$ metal).
+    // NOT request rio.build/kvm (would Pending forever — no non-metal
+    // node advertises it) and must NOT tolerate the metal taint (would
+    // bin-pack cheap builds onto $$ metal).
     let mut wp = test_wp();
     wp.spec.features = vec!["big-parallel".into()];
     let pod = test_pod_spec(&wp);
@@ -502,7 +502,7 @@ fn job_pod_no_kvm_feature_no_kvm_wiring() {
             .limits
             .as_ref()
             .unwrap()
-            .contains_key("smarter-devices/kvm"),
+            .contains_key("rio.build/kvm"),
         "no kvm device request without features:[kvm]"
     );
     assert!(
@@ -534,8 +534,8 @@ fn job_pod_kvm_privileged_keeps_selector_drops_device() {
         resources.is_none_or(|r| r
             .limits
             .as_ref()
-            .is_none_or(|l| !l.contains_key("smarter-devices/kvm"))),
-        "privileged → no device-plugin request"
+            .is_none_or(|l| !l.contains_key("rio.build/kvm"))),
+        "privileged → no extended-resource request"
     );
     assert_eq!(
         pod.node_selector

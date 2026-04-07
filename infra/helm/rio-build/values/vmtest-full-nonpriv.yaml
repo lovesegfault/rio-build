@@ -1,8 +1,8 @@
-# Non-privileged + device-plugin VM fixture variant. Used ONLY by the
+# Non-privileged VM fixture variant. Used ONLY by the
 # privileged-hardening-e2e scenario (nix/tests/scenarios/security.nix →
-# vm-security-nonpriv-k3s). vmtest-full.yaml stays privileged:true (fast
-# path — most scenarios don't care about pod security posture and the
-# escape hatch avoids the device-plugin DaemonSet bring-up tax ~30-60s).
+# vm-security-nonpriv-k3s) and vm-fetcher-split-k3s. vmtest-full.yaml
+# stays privileged:true (fast path — most scenarios don't care about pod
+# security posture).
 #
 # Layered via `helm template -f vmtest-full.yaml -f vmtest-full-nonpriv.
 # yaml` (last wins). helm-render.nix's extraValuesFiles parameter feeds
@@ -12,8 +12,9 @@ builderPoolDefaults:
   # Flip the escape hatch OFF. values.yaml default is already false
   # (production); vmtest-full.yaml overrides to true. This overrides
   # BACK to false for the one scenario that proves the production path
-  # actually works: FUSE mount via device-plugin injection, cgroup
-  # rw-remount succeeds under the RO-mounted cgroupfs, build completes.
+  # actually works: FUSE mount via containerd base_runtime_spec
+  # injection, cgroup rw-remount succeeds under the RO-mounted
+  # cgroupfs, build completes.
   privileged: false
   # Opt OUT of hostUsers:false (pod userns). k3s's containerd with the
   # systemd cgroup driver doesn't chown the pod cgroup to the userns-
@@ -25,7 +26,7 @@ builderPoolDefaults:
   #    leaf in namespace root: Permission denied (os error 13)"
   #
   # This still exercises the load-bearing nonpriv paths:
-  #   - device-plugin /dev/fuse injection (not hostPath)
+  #   - containerd base_runtime_spec /dev/fuse injection (not hostPath)
   #   - cgroup remount RW under containerd's RO mount (containerd
   #     mounts /sys/fs/cgroup RO for ANY non-privileged pod,
   #     userns or not — the MS_REMOUNT|MS_BIND at cgroup.rs
@@ -68,19 +69,3 @@ builderPoolDefaults:
     # allowed iff type==Localhost). Same Helm-null-deletes-
     # key semantics as nodeSelector:null below.
     localhostProfile: null
-
-devicePlugin:
-  # vmtest-full.yaml disables this (smarter-device-manager image not in
-  # the default airgap set). This scenario passes extraImages=[pulled.
-  # smarter-device-manager], so flip it back on. The image override is
-  # passed via extraValues in nix/tests/default.nix (derived from
-  # pulled.smarter-device-manager.destNameTag — no drift window).
-  enabled: true
-  # VM nodes don't have rio.build/node-role labels or the worker taint.
-  # null clears the chart default (same Helm deep-merge semantics as
-  # builderPoolDefaults.tolerations:null in vmtest-full.yaml — indexed key removal).
-  # nodeAffinity must ALSO be cleared — the chart default uses
-  # matchExpressions In [builder,fetcher] which matches zero VM nodes.
-  nodeSelector: null
-  nodeAffinity: null
-  tolerations: null

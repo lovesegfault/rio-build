@@ -45,14 +45,6 @@ karpenter:
 networkPolicy:
   enabled: false
 
-# smarter-device-manager needs (a) its own airgap image and (b) kubelet
-# to honor hostUsers:false (containerd 1.7+ with idmap-mounts support).
-# k3s's bundled containerd version varies; for deterministic CI, use the
-# privileged:true escape hatch (builderPoolDefaults.privileged below). Production
-# on EKS/GKE leaves devicePlugin.enabled=true (the chart default).
-devicePlugin:
-  enabled: false
-
 # SPO + cert-manager images not in the airgap set + builderPoolDefaults.
 # privileged=true below disables seccomp at the runtime level anyway.
 # The nonpriv variant (vmtest-full-nonpriv.yaml) uses seccompProfile:
@@ -150,12 +142,12 @@ builderPoolDefaults:
       ephemeral-storage: "6Gi"
     limits:
       memory: "2Gi"
-  # k3s escape hatch. The device-plugin path (ADR-012, see
-  # devicePlugin.enabled above) is not wired for the airgap VM test —
-  # it would need the smarter-device-manager image + containerd with
-  # idmap-mount support for hostUsers:false. k3s's containerd default
-  # seccomp also blocks mount(2) even with CAP_SYS_ADMIN. Production
-  # on EKS/GKE uses privileged:false (the chart default).
+  # k3s escape hatch. Most scenarios don't care about pod security
+  # posture; privileged:true skips the wait for the rio.build/fuse
+  # node-status patch and the seccomp/hostUsers caveats (k3s's
+  # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN;
+  # see vmtest-full-nonpriv.yaml). Production on EKS/GKE uses
+  # privileged:false (the chart default).
   privileged: true
   # Default is 7200 (2h, for LLVM-cold-ccache builds). Test builds
   # are ≤90s sleeps. 180s covers the longest + drain overhead and

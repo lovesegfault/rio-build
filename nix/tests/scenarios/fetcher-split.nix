@@ -10,9 +10,9 @@
 # fetcher pod in the airgap VM:
 #   - seccomp profile pre-installed on both nodes via testScript mkdir+cp
 #     (security-profiles-operator + cert-manager images not in the airgap set)
-#   - device-plugin path enabled (vmtest-full-nonpriv.yaml overlay +
-#     pulled.smarter-device-manager extraImage) — same as
-#     vm-security-nonpriv-k3s
+#   - nonpriv path enabled (vmtest-full-nonpriv.yaml overlay) — same as
+#     vm-security-nonpriv-k3s; /dev/fuse via k3s containerd
+#     base_runtime_spec (fixtures/k3s-full.nix containerdConfigTemplate)
 #   - k3s-agent labeled rio.build/node-role=fetcher at runtime so the
 #     reconciler's default nodeSelector matches (also exercises
 #     fetcher.node.dedicated — fetcher lands on agent, builder on server)
@@ -75,9 +75,8 @@ pkgs.testers.runNixOSTest {
   name = "rio-fetcher-split";
   skipTypeCheck = true;
 
-  # k3s bring-up ~4min + device-plugin DS ~60s + fetcher pod ~30s +
-  # build ~60s + 6 probe subtests ~30s. nonpriv overlay adds the DS
-  # bring-up tax that privileged:true skips.
+  # k3s bring-up ~4min + fetcher pod ~30s + build ~60s + 6 probe
+  # subtests ~30s.
   globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
@@ -119,10 +118,10 @@ pkgs.testers.runNixOSTest {
     # stays Pending forever. Labeling ONE node also makes the
     # fetcher-node-dedicated subtest meaningful: fetcher lands on
     # agent, builder (no nodeSelector in vmtest-full.yaml) lands
-    # wherever the scheduler puts it — but with agent labeled
-    # fetcher, the device-plugin DS (nodeSelector: null in nonpriv
-    # overlay) runs on both, so builder CAN land on agent too.
-    # Shape-check the toleration instead of asserting different nodes.
+    # wherever the scheduler puts it. Both nodes advertise
+    # rio.build/fuse (waitReady status-patch), so builder CAN land
+    # on agent too. Shape-check the toleration instead of asserting
+    # different nodes.
     kubectl("label node k3s-agent rio.build/node-role=fetcher --overwrite", ns="kube-system")
 
     # ── TEST-NET-3 "public" origin on k3s-server:80 ───────────────────
