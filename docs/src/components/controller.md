@@ -4,12 +4,12 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 
 ## CRDs
 
-### WorkerPool
+### BuilderPool
 
-r[ctrl.crd.workerpool]
+r[ctrl.crd.builderpool]
 ```yaml
 apiVersion: rio.build/v1alpha1
-kind: WorkerPool
+kind: BuilderPool
 metadata:
   name: default
 spec:
@@ -20,12 +20,17 @@ spec:
   fuseCacheSize: 100Gi                         # local SSD cache for rio-fuse
   features: [big-parallel, kvm]               # maps to requiredSystemFeatures
   systems: [x86_64-linux]
-  image: rio-worker:dev                        # required — container image ref
+  image: rio-builder:dev                       # required — container image ref
   imagePullPolicy: IfNotPresent                # optional — K8s default if omitted
   sizeClass: small                             # maps to RIO_SIZE_CLASS env
-  tlsSecretName: rio-worker-tls                # optional — Secret with tls.crt/tls.key/ca.crt for mTLS
-  fodProxyUrl: http://fod-proxy.rio.svc:3128   # optional — injected as http(s)_proxy for FOD builds
+  tlsSecretName: rio-builder-tls               # optional — Secret with tls.crt/tls.key/ca.crt for mTLS
   hostNetwork: false                           # optional — true only for VM-test/airgap escapes; requires privileged:true (hostUsers:false incompatible with host netns)
+  hostUsers: false                             # optional — false runs in a user namespace (production default; ADR-012)
+  seccompProfile: Localhost                    # optional — RuntimeDefault | Localhost | Unconfined
+  fuseThreads: 4                               # optional — fuser worker threads (RIO_FUSE_THREADS)
+  fusePassthrough: true                        # optional — kernel passthrough mode for backed reads (RIO_FUSE_PASSTHROUGH)
+  daemonTimeoutSecs: 300                       # optional — local nix-daemon RPC timeout (RIO_DAEMON_TIMEOUT_SECS)
+  terminationGracePeriodSeconds: 7200          # optional — K8s grace; defaults to 2h to let in-flight build complete
   topologySpread: true                         # optional — add topologySpreadConstraints across zones
   # securityContext: NOT a CRD field. The controller hardcodes
   # capabilities (SYS_ADMIN + SYS_CHROOT) in build_pod_spec().
@@ -125,7 +130,7 @@ the pool is gone.
 
 r[ctrl.pool.ephemeral-deadline]
 Jobs MUST set `spec.activeDeadlineSeconds` from
-`WorkerPoolSpec.deadlineSeconds` (default 3600). This is a backstop:
+`BuilderPoolSpec.deadlineSeconds` (default 3600). This is a backstop:
 the spawn decision reads the **cluster-wide**
 `ClusterStatus.queued_derivations`, not pool-matching depth. A queue
 full of `x86_64-linux` work on an `aarch64-darwin` pool triggers a Job
@@ -214,7 +219,7 @@ a livelock: derivations that never build never get a `build_history`
 sample, so they never graduate out of cold-start.
 
 r[ctrl.builderpool.kvm-device]
-When `WorkerPoolSpec.features` contains `"kvm"`, the controller MUST
+When `BuilderPoolSpec.features` contains `"kvm"`, the controller MUST
 append `rio.build/kvm: "true"` to the pod's `nodeSelector` AND append a
 `rio.build/kvm=true:NoSchedule` toleration. containerd `base_runtime_spec`
 injects `/dev/kvm` into every pod's `/dev` (same mechanism as
@@ -225,12 +230,12 @@ metal NodePool while non-kvm pods stay on the cheaper general builder
 NodePools. The nodeSelector + toleration are unconditional wrt
 `privileged` so privileged kvm pods still land on metal.
 
-### WorkerPoolSet
+### BuilderPoolSet
 
 > **Implemented:** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`), CutoffRebalancer (`r[sched.rebalancer.sita-e]`).
 
 r[ctrl.wps.reconcile]
-The WorkerPoolSet reconciler creates one child WorkerPool per `spec.classes[i]`, named `{wps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the WPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
+The BuilderPoolSet reconciler creates one child BuilderPool per `spec.classes[i]`, named `{bps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the BPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
 
 r[ctrl.fetcherpool.classes]
 When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; `max_replicas` overrides the pool-wide `spec.maxConcurrent`. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
@@ -248,13 +253,13 @@ r[ctrl.wps.cutoff-status]
 The WPS reconciler writes per-class `effective_cutoff_secs` + `queued` to WPS status via SSA patch (field manager `rio-controller-wps-status`). Values come from the `GetSizeClassStatus` admin RPC. SSA patch body MUST include `apiVersion` + `kind`.
 
 r[ctrl.wps.prune-stale]
-The WPS reconciler prunes child WorkerPools whose `size_class` no longer appears in `spec.classes`. Prune matches by ownerRef UID (not name-prefix — robust to WPS renames); deletes are best-effort (404-tolerant, logged on other errors, non-fatal so a stuck child doesn't wedge the whole reconcile). Without prune, a removed-class child is orphaned: the WPS reconciler iterates `spec.classes` and won't touch it, and ownerRef GC doesn't fire while the parent still exists.
+The BPS reconciler prunes child BuilderPools whose `size_class` no longer appears in `spec.classes`. Prune matches by ownerRef UID (not name-prefix — robust to BPS renames); deletes are best-effort (404-tolerant, logged on other errors, non-fatal so a stuck child doesn't wedge the whole reconcile). Without prune, a removed-class child is orphaned: the BPS reconciler iterates `spec.classes` and won't touch it, and ownerRef GC doesn't fire while the parent still exists.
 
-For deployments with heavy-tailed build workloads, `WorkerPoolSet` defines multiple size-class worker pools with different resource allocations. The scheduler routes derivations to the appropriate pool based on estimated duration. See [ADR-015](../decisions/015-size-class-routing.md) for the design rationale.
+For deployments with heavy-tailed build workloads, `BuilderPoolSet` defines multiple size-class builder pools with different resource allocations. The scheduler routes derivations to the appropriate pool based on estimated duration. See [ADR-015](../decisions/015-size-class-routing.md) for the design rationale.
 
 ```yaml
 apiVersion: rio.build/v1alpha1
-kind: WorkerPoolSet
+kind: BuilderPoolSet
 metadata:
   name: default
 spec:
@@ -306,13 +311,13 @@ status:
   lastCutoffUpdate: 2026-02-13T07:00:00Z
 ```
 
-The existing `WorkerPool` CRD remains valid for single-pool deployments without size-class routing.
+The existing `BuilderPool` CRD remains valid for single-pool deployments without size-class routing.
 
 ## Reconciliation Loops
 
 r[ctrl.reconcile.owner-refs]
-- **WorkerPool reconciler**: spawn/reap worker Jobs based on scheduler queue depth. All Jobs carry `ownerReferences` to the WorkerPool CRD with `controller: true`, ensuring garbage collection on WorkerPool deletion.
-- **WorkerPoolSet reconciler**: manages multiple `WorkerPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `WorkerPoolSet` status.
+- **BuilderPool reconciler**: spawn/reap builder Jobs based on scheduler queue depth. All Jobs carry `ownerReferences` to the BuilderPool CRD with `controller: true`, ensuring garbage collection on BuilderPool deletion.
+- **BuilderPoolSet reconciler**: manages multiple `BuilderPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `BuilderPoolSet` status.
 - **GC reconciler**: trigger store garbage collection on schedule.
 
 ## RBAC
@@ -321,8 +326,8 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 
 | API Group | Resources | Verbs |
 |---|---|---|
-| `rio.build` | workerpools | get, list, watch, create, update, patch, delete |
-| `rio.build` | workerpools/status | get, patch |
+| `rio.build` | builderpools | get, list, watch, create, update, patch, delete |
+| `rio.build` | builderpools/status | get, patch |
 | `""` (core) | pods | get, list, watch |
 | `""` (core) | events | create, patch |
 | `batch` | jobs | get, list, watch, create, delete |
@@ -382,12 +387,12 @@ r[ctrl.drain.sigterm]
 
 1. Set heartbeat `draining=true` (the worker-authoritative drain source — I-063); the scheduler's `has_capacity()` reads it via `is_draining()`.
 2. Keep the `BuildExecution` stream connected (and reconnect across scheduler restart) until `BuildSlot::wait_idle()` returns — the in-flight build's completion is reported.
-3. Send `AdminService.DrainWorker` (best-effort exit deregister) and exit 0.
+3. Send `AdminService.DrainExecutor` (best-effort exit deregister) and exit 0.
 
 A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The Job pod template does NOT define a preStop.
 
 r[ctrl.drain.disruption-target]
-**Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt), the watcher calls `AdminService.DrainWorker{force:true}` — the scheduler sends `CancelSignal` for the in-flight build → worker `cgroup.kill()`s → the build reassigns to a healthy worker within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for the in-flight build to complete naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.
+**Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt), the watcher calls `AdminService.DrainExecutor{force:true}` — the scheduler sends `CancelSignal` for the in-flight build → executor `cgroup.kill()`s → the build reassigns to a healthy executor within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for the in-flight build to complete naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.
 
 ## ComponentScaler
 
@@ -437,7 +442,7 @@ delete it manually: `kubectl delete crd builds.rio.build`.
 ## Component Deployment Model
 
 The controller manages:
-- **WorkerPool** CRD → spawns/reaps worker Jobs (resources, security context)
+- **BuilderPool** CRD → spawns/reaps builder Jobs (resources, security context)
 
 The controller does **NOT** manage:
 - Scheduler or store Deployments --- these are deployed via Helm/kustomize as standard Deployments
@@ -445,7 +450,7 @@ The controller does **NOT** manage:
 
 ## Key Files
 
-- `rio-crds/src/` --- CRD type definitions (separate crate; WorkerPool, WorkerPoolSet)
+- `rio-crds/src/` --- CRD type definitions (separate crate; BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)
 - `rio-controller/src/reconcilers/` --- Reconciliation loops
 - `rio-controller/src/scaling/` --- ComponentScaler (rio-store/rio-gateway Deployment scaling)
 
@@ -462,16 +467,16 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 - `spec.hostNetwork: true` requires `spec.privileged: true` — Kubernetes rejects `hostUsers: false` combined with `hostNetwork: true` at pod admission; the non-privileged path sets `hostUsers: false` per ADR-012
 
 r[ctrl.crd.host-users-network-exclusive]
-The controller MUST reject `WorkerPool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).
+The controller MUST reject `BuilderPool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).
 
 r[ctrl.event.spec-degrade]
-The WorkerPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get wp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
+The BuilderPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get wp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
 
 `spec.fuseCacheSize` is NOT a CEL rule — it is validated at reconcile time (`parse_quantity_to_gb` in `builders.rs` returns `InvalidSpec` on unparseable input, which fails the reconcile and emits an event).
 
-## WorkerPool Finalizer
+## BuilderPool Finalizer
 
-WorkerPool CRDs carry a `rio.build/workerpool-drain` finalizer. The
+BuilderPool CRDs carry a `builderpool.rio.build/drain` finalizer. The
 finalizer's `cleanup()` removes the finalizer immediately; in-flight Jobs
 finish their one build naturally and ownerRef GC removes them after the
 pool is gone. The reconciler's `apply()` path short-circuits when

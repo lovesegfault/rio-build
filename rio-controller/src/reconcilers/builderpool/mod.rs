@@ -5,10 +5,7 @@
 //! 2. Spawn Jobs up to `spec.maxConcurrent` (see `ephemeral.rs`).
 //! 3. Reap excess Pending and orphan Running Jobs.
 //! 4. Patch BuilderPool.status from active Job count.
-// r[impl ctrl.crd.workerpool]
-// TODO: add the ctrl.builderpool.reconcile impl marker once ADR-019
-// is added to tracey spec_include (the rule is defined in
-// decisions/019 but tracey only scans components/ today).
+// r[impl ctrl.crd.builderpool]
 // r[impl ctrl.reconcile.owner-refs]
 // r[impl ctrl.drain.sigterm]
 //!
