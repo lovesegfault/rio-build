@@ -255,7 +255,7 @@ impl ChunkService for ChunkServiceImpl {
         .bind(declared_size as i64)
         .execute(&self.pool)
         .await
-        .map_err(|e| internal_error("PutChunk chunks insert", e))?;
+        .status_internal("PutChunk chunks insert")?;
 
         // Junction row. AFTER the chunks row — chunk_tenants FK
         // references chunks(blake3_hash). The chunks insert above

@@ -77,18 +77,10 @@ pub(crate) fn validate_store_path(s: &str) -> Result<(), Status> {
         .map_err(|e| Status::invalid_argument(format!("invalid store path {s:?}: {e}")))
 }
 
-/// Log the full error server-side but return a generic message to the client.
-/// Prevents leaking sqlx internals (connection strings, schema details) in
-/// gRPC responses.
-pub(crate) fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
-    error!(context, error = %e, "internal error");
-    Status::internal("storage operation failed")
-}
-
 /// Map a storage-backend anyhow error to a Status, distinguishing
 /// permanent auth/config failures from transient ones.
 ///
-/// [`internal_error`] maps everything to `Internal`, which a client
+/// [`rio_common::grpc::internal`] maps everything to `Internal`, which a client
 /// treats as retriable. For an STS AccessDenied (IRSA misconfigured,
 /// IAM policy missing s3:PutObject) that means the builder retries
 /// forever: the scheduler sees InfrastructureFailure, re-dispatches,
@@ -99,7 +91,7 @@ pub(crate) fn internal_error(context: &str, e: impl std::fmt::Display) -> Status
 /// Inspects the anyhow chain for [`BackendAuthError`] (set by
 /// `S3ChunkBackend::put` when the SDK error matches known auth
 /// signatures). If present → `FailedPrecondition` with a message that
-/// names the fix. Otherwise → same as `internal_error`.
+/// names the fix. Otherwise → same as [`rio_common::grpc::internal`].
 ///
 /// [`BackendAuthError`]: crate::backend::chunk::BackendAuthError
 pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
@@ -123,8 +115,8 @@ pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
 /// (connection/serialization/placeholder-race) get retriable codes
 /// (`unavailable`/`aborted`) so clients back off and retry; corruption
 /// (invariant/malformed/corrupt-manifest) gets non-retriable codes so
-/// clients fail fast. The old `internal_error()` everything-is-internal
-/// mapping made a transient PG hiccup look the same as a corrupt database.
+/// clients fail fast. A flat everything-is-internal mapping would make a
+/// transient PG hiccup look the same as a corrupt database.
 ///
 /// Logs the full error (including sqlx source chain) server-side; the
 /// gRPC message is a scrubbed summary.
@@ -542,7 +534,7 @@ impl StoreServiceImpl {
         };
         sub.try_substitute(tid, store_path)
             .await
-            .map_err(|e| internal_error("substitute", e))
+            .status_internal("substitute")
     }
 
     // r[impl store.substitute.tenant-sig-visibility]
@@ -600,7 +592,7 @@ impl StoreServiceImpl {
         .fetch_one(&self.pool)
         .await
         .map(|(o, a): (Option<bool>, bool)| (o.unwrap_or(false), a))
-        .map_err(|e| internal_error("sig_visibility_gate: path_tenants", e))?;
+        .status_internal("sig_visibility_gate: path_tenants")?;
 
         if owned || any_built {
             // Built path (someone `path_tenants`'d it). Not
@@ -1045,7 +1037,7 @@ impl StoreService for StoreServiceImpl {
                 store_path: String::new(),
                 info: None,
             })),
-            Err(e) => Err(internal_error("ContentLookup", e)),
+            Err(e) => Err(rio_common::grpc::internal("ContentLookup", e)),
         }
     }
 
@@ -1267,7 +1259,7 @@ impl StoreService for StoreServiceImpl {
 
         let quota = crate::gc::tenant::tenant_quota_by_name(&self.pool, &name)
             .await
-            .map_err(|e| internal_error("TenantQuota: tenant_quota_by_name", e))?
+            .status_internal("TenantQuota: tenant_quota_by_name")?
             .ok_or_else(|| Status::not_found(format!("unknown tenant: {name}")))?;
 
         let (used, limit) = quota;

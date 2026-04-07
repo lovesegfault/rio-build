@@ -240,7 +240,10 @@ impl StoreServiceImpl {
                     continue;
                 }
                 Ok(false) => {}
-                Err(e) => bail!(internal_error("PutPathBatch: check_manifest_complete", e)),
+                Err(e) => bail!(rio_common::grpc::internal(
+                    "PutPathBatch: check_manifest_complete",
+                    e
+                )),
             }
 
             // Insert placeholder. Same references-on-placeholder semantics
@@ -344,7 +347,10 @@ impl StoreServiceImpl {
         // failure.
         let mut tx = match self.pool.begin().await {
             Ok(t) => t,
-            Err(e) => bail!(internal_error("PutPathBatch: begin transaction", e)),
+            Err(e) => bail!(rio_common::grpc::internal(
+                "PutPathBatch: begin transaction",
+                e
+            )),
         };
 
         let mut created =
@@ -381,7 +387,7 @@ impl StoreServiceImpl {
         }
 
         if let Err(e) = tx.commit().await {
-            bail!(internal_error("PutPathBatch: commit", e));
+            bail!(rio_common::grpc::internal("PutPathBatch: commit", e));
         }
 
         // Content-index each created output. Same best-effort semantics as

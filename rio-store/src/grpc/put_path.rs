@@ -328,7 +328,10 @@ impl StoreServiceImpl {
             Err(e) => {
                 // Drain remaining stream messages before returning error
                 drain_stream(&mut stream).await;
-                return Err(internal_error("PutPath: check_manifest_complete", e));
+                return Err(rio_common::grpc::internal(
+                    "PutPath: check_manifest_complete",
+                    e,
+                ));
             }
         }
 
@@ -505,8 +508,8 @@ impl StoreServiceImpl {
                         )));
                     }
                     // Global byte budget. acquire_many(u32) — chunk.len() is
-                    // bounded by rio_proto::DEFAULT_MAX_MESSAGE_SIZE (32 MiB,
-                    // env-configurable via RIO_GRPC_MAX_MESSAGE_SIZE), so the
+                    // bounded by rio_common::grpc::DEFAULT_MAX_MESSAGE_SIZE
+                    // (env-configurable via RIO_GRPC_MAX_MESSAGE_SIZE), so the
                     // cast never truncates. `await` here backpressures the
                     // client: if the budget is exhausted, recv stalls,
                     // gRPC flow control propagates, client send blocks.
@@ -640,7 +643,7 @@ impl StoreServiceImpl {
                 Err(e) => {
                     // put_chunked already rolled back. Just the error metric.
                     metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
-                    // storage_error (not internal_error): distinguishes
+                    // storage_error (not status_internal): distinguishes
                     // BackendAuthError → FailedPrecondition so the
                     // builder fails fast instead of retrying forever.
                     return Err(storage_error("PutPath: put_chunked", e));

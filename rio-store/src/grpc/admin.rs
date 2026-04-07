@@ -208,7 +208,7 @@ impl StoreAdminServiceImpl {
                 .bind(store_path_hash)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| crate::grpc::internal_error("ResignPaths: mark backfilled", e))?;
+                .status_internal("ResignPaths: mark backfilled")?;
             return Ok(false);
         }
 
@@ -251,7 +251,7 @@ impl StoreAdminServiceImpl {
                 .bind(store_path_hash)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| crate::grpc::internal_error("ResignPaths: update refs+sig", e))?;
+                .status_internal("ResignPaths: update refs+sig")?;
                 // Invariant: new_sig is Some iff self.signer is Some —
                 // the `.map()` that produced new_sig above ties them.
                 // This arm only runs when signer exists, so unwrap is
@@ -269,7 +269,7 @@ impl StoreAdminServiceImpl {
                 .bind(store_path_hash)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| crate::grpc::internal_error("ResignPaths: update refs", e))?;
+                .status_internal("ResignPaths: update refs")?;
                 debug!(
                     store_path,
                     refs = new_refs.len(),
@@ -465,8 +465,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                     }))
                 } else {
                     // Log the full sqlx chain server-side; don't leak it.
-                    // Same pattern as grpc::internal_error (mod.rs).
-                    Err(crate::grpc::internal_error("PinPath: insert gc_roots", e))
+                    Err(rio_common::grpc::internal("PinPath: insert gc_roots", e))
                 }
             }
         }
@@ -489,7 +488,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             .bind(&hash)
             .execute(&self.pool)
             .await
-            .map_err(|e| crate::grpc::internal_error("UnpinPath: delete gc_roots", e))?;
+            .status_internal("UnpinPath: delete gc_roots")?;
 
         info!(path = %req.store_path, "unpinned");
         Ok(Response::new(PinPathResponse {
@@ -572,7 +571,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         .bind(batch)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| crate::grpc::internal_error("ResignPaths: select batch", e))?;
+        .status_internal("ResignPaths: select batch")?;
 
         let next_cursor = rows
             .last()
@@ -622,7 +621,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| crate::grpc::internal_error("ResignPaths: load candidate universe", e))?;
+        .status_internal("ResignPaths: load candidate universe")?;
 
         // --- Per-row body -------------------------------------------
         // Counters: processed = rows that REACHED the end (marked
@@ -1278,7 +1277,7 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
         // Close the pool: all acquires fail with PoolClosed, which is
-        // NOT a FK violation (23503), so it hits the internal_error path.
+        // NOT a FK violation (23503), so it hits the status_internal path.
         db.pool.close().await;
         let err = svc
             .pin_path(Request::new(PinPathRequest {
@@ -1299,8 +1298,8 @@ mod tests {
             "message leaked sqlx: {}",
             err.message()
         );
-        // internal_error() emits this generic string.
-        assert_eq!(err.message(), "storage operation failed");
+        // status_internal() emits the call-site context only.
+        assert_eq!(err.message(), "PinPath: insert gc_roots");
     }
 
     // --- GC empty-refs safety gate (remediation 02) ---
