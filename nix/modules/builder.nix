@@ -106,6 +106,12 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
+      # The builder is one-shot and exits cleanly per build; systemd
+      # respawns it (Restart=always below). Default StartLimitBurst=5
+      # in 10s trips under fanout (50 builds → ~13 rapid restarts per
+      # worker). Must be at the unit level — `StartLimitIntervalSec`
+      # in [Service] is silently ignored since systemd 230.
+      startLimitIntervalSec = 0;
 
       # nix-daemon --stdio must be on PATH. fuse3 provides fusermount3,
       # required by the fuser crate's MountOption::AutoUnmount.
@@ -184,11 +190,6 @@ in
         # races (scheduler not ready → connect refused → exit).
         Restart = "always";
         RestartSec = "1s";
-        # Default StartLimitBurst (5 in 10s) is too tight for startup
-        # races: worker starts before cross-VM scheduler → connect
-        # refused → exit → restart. A few of these in quick succession
-        # hits the limit and systemd gives up. 0 = unlimited restarts.
-        StartLimitIntervalSec = "0";
         # Unmount FUSE on shutdown (best-effort; the fuser background session
         # holds it, but the kernel detaches on process exit anyway).
         ExecStopPost = "-${pkgs.util-linux}/bin/umount -l ${cfg.fuseMountPoint}";

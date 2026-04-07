@@ -657,11 +657,20 @@ rec {
     # presence of status confirms the controller has seen the CR and
     # the Job-spawn loop is live. First build in each test triggers a
     # Job spawn (~10s reconcile tick + ~10s pod schedule).
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
-        "-o jsonpath='{.status}' | grep -q .",
-        timeout=60,
-    )
+    try:
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
+            "-o jsonpath='{.status}' | grep -q .",
+            timeout=60,
+        )
+    except Exception:
+        print("=== builderpool .status TIMEOUT — diagnostic dump ===")
+        print(k3s_server.execute(
+            "k3s kubectl -n ${nsBuilders} get builderpool,job,pod -o wide 2>&1; "
+            "k3s kubectl -n ${nsBuilders} describe builderpool 2>&1; "
+            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 2>&1"
+        )[1])
+        raise
   '';
 
   # ═══ DEAD: STS-mode worker-wait (phase 6 deletes) ═══════════════════

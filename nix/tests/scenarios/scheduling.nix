@@ -490,10 +490,11 @@ let
           # Find which SMALL worker got the FIRST assignment. No-pname
           # drv → estimator default → "small" class, floor=None. With
           # 2 small workers idle and 0 builds in flight, it MUST go to
-          # wsmall1 or wsmall2. If neither logs the marker within 30s,
-          # the build hung in SubmitBuild (bug).
+          # wsmall1 or wsmall2. 60s: one-shot builders may both be in
+          # the RestartSec=1s gap when the build lands; worst case is
+          # one restart cycle + heartbeat + dispatch tick.
           assigned = None
-          for _ in range(30):
+          for _ in range(60):
               for w in small_workers:
                   c = w.succeed(
                       "journalctl -u rio-builder --no-pager | "
@@ -506,7 +507,7 @@ let
                   break
               _time.sleep(1)
           assert assigned is not None, (
-              "no small worker picked up rio-test-sched-reassign within 30s"
+              "no small worker picked up rio-test-sched-reassign within 60s"
           )
           print(f"reassign: assigned to {assigned.name}, killing")
 
@@ -1155,8 +1156,11 @@ let
       # SIGINT to a worker PID and inspect aftermath from the host.
       with subtest("sigint-graceful: SIGINT → main() returns → FUSE unmounts"):
           # Baseline: mount IS present (worker running, FUSE alive).
-          # If this fails, the fixture is broken — not our bug.
-          wsmall2.succeed("mountpoint -q /var/rio/fuse-store")
+          # One-shot builder restarts between builds — wait for the
+          # next instance to be up and mounted (RestartSec=1s).
+          wsmall2.wait_until_succeeds(
+              "mountpoint -q /var/rio/fuse-store", timeout=15
+          )
 
           # Coverage-mode baseline. `ls | wc -l` prints 0 on no-match
           # (wc counts lines from ls's empty stdout); `|| echo 0`
@@ -1178,10 +1182,12 @@ let
           # Prior subtests (reassign) may have landed a sleepSecs=25 build
           # on wsmall2. SIGINT-drain waits for in-flight builds; without
           # waiting for idle first, the 30s timeout can't cover 25s+drain.
-          # Poll the worker's in-flight gauge until 0.
+          # One-shot: a fresh-restarted builder hasn't registered the
+          # gauge yet, so "absent" = idle. Invert: fail only if gauge
+          # is present AND ≥1.
           wsmall2.wait_until_succeeds(
-              "curl -sf localhost:9093/metrics | "
-              "grep -qE '^rio_builder_builds_active\\{role=\"builder\"\\} 0$'",
+              "! curl -sf localhost:9093/metrics 2>/dev/null | "
+              "grep -qE '^rio_builder_builds_active\\{role=\"builder\"\\} [1-9]'",
               timeout=60,
           )
 
@@ -1190,14 +1196,19 @@ let
           # that path already works (rio-common::signal::shutdown_signal
           # watched SIGTERM from day one). SIGINT tests the NEW code
           # at main.rs:503 (r[impl builder.shutdown.sigint]).
+          #
+          # The unit has Restart=always (one-shot builder), so the
+          # post-exit state is a ~1s blip — ExecMainCode reads 0
+          # (running) by the time we check. Temporarily disable
+          # restart via a runtime drop-in, observe the exit, then
+          # restore.
+          wsmall2.succeed(
+              "mkdir -p /run/systemd/system/rio-builder.service.d && "
+              "printf '[Service]\\nRestart=no\\n' "
+              "  > /run/systemd/system/rio-builder.service.d/norestart.conf && "
+              "systemctl daemon-reload"
+          )
           wsmall2.succeed("systemctl kill -s INT rio-builder.service")
-
-          # Unit reaches inactive when main() returns. NOT
-          # wait_for_unit (that waits for active). 30s: drain is
-          # near-instant with no in-flight builds (enforced above).
-          # `systemctl show -p ActiveState` (not `is-active | grep`):
-          # is-active exits 3 when inactive → pipefail kills the
-          # pipeline before grep runs. show always exits 0.
           wsmall2.wait_until_succeeds(
               "systemctl show rio-builder.service -p ActiveState "
               "| grep -qx ActiveState=inactive",
@@ -1223,9 +1234,8 @@ let
           print(f"sigint-graceful: {exit_info.strip()} (CLD_EXITED, "
                 f"status 0 — main() returned)")
 
-          # SECONDARY: FUSE mount gone. With Code=1 above, this
-          # confirms normal unwind → fuse_session drop → Mount::drop
-          # → fusermount -u. `! mountpoint -q` inverts the exit.
+          # SECONDARY: FUSE mount gone. Observable now (Restart=no
+          # drop-in in effect).
           wsmall2.succeed("! mountpoint -q /var/rio/fuse-store")
 
           # TERTIARY [coverage mode only]: fresh profraw appeared.
@@ -1257,10 +1267,13 @@ let
           else:
               _ = profraw_before  # silence unused in non-coverage
 
-          # Restart=always (nix/modules/builder.nix) respawns after the
-          # clean exit; explicit start is idempotent and avoids racing
-          # the 1s RestartSec window before wait_for_unit.
-          wsmall2.succeed("systemctl start rio-builder.service")
+          # Restore Restart=always (drop the runtime override) and
+          # bring the service back.
+          wsmall2.succeed(
+              "rm -f /run/systemd/system/rio-builder.service.d/norestart.conf && "
+              "systemctl daemon-reload && "
+              "systemctl start rio-builder.service"
+          )
           wsmall2.wait_for_unit("rio-builder.service")
           # Wait for FUSE remount so subsequent fragments (none
           # currently, but collectCoverage + future additions) see
@@ -1299,23 +1312,24 @@ let
       #
       # This is a post-hoc observability check — doesn't submit its own
       # build. Cheap (~0s), lives in the disrupt split after load-50drv.
-      with subtest("warm-gate: no fallback; PrefetchComplete recorded"):
-          # fallback counter: 0 (or absent — absent = never emitted =
-          # never fell back). A nonzero value here means best_worker
-          # saw no warm workers at some point, which would indicate a
-          # registration-hook bug (queue-empty → warm-true short-
-          # circuit didn't fire).
+      with subtest("warm-gate: PrefetchComplete recorded; fallback bounded"):
+          # One-shot workers re-register mid-queue during load-50drv,
+          # so the cold-fallback CAN fire (became-idle dispatch races
+          # PrefetchComplete on a fresh registration). The old
+          # invariant (fallback==0, "all workers register with empty
+          # queue at boot") no longer holds. Bound it loosely: ≪ the
+          # number of dispatches (~50) — a value near 50 would mean
+          # the warm-gate never engages.
           fallback = ${gatewayHost}.succeed(
               "curl -sf http://localhost:9091/metrics | "
               "grep '^rio_scheduler_warm_gate_fallback_total ' | "
               "awk '{print $2}' || echo 0"
-          ).strip()
-          assert fallback in ("", "0"), (
-              f"warm-gate fallback fired (expected 0): {fallback}. "
-              f"All workers register with empty queue at boot — "
-              f"on_worker_registered should have flipped warm=true "
-              f"immediately. Check scheduler journal for "
-              f"'warm-gate fallback' debug logs."
+          ).strip() or "0"
+          assert float(fallback) < 10, (
+              f"warm-gate fallback fired {fallback} times — expected "
+              f"a handful at most under one-shot churn. Warm-gate "
+              f"never engaging? Check scheduler 'warm-gate fallback' "
+              f"debug logs."
           )
 
           # PrefetchComplete histogram: the count suffix exists and is
@@ -1334,7 +1348,7 @@ let
               f"Worker handle_prefetch_hint → PrefetchComplete → "
               f"scheduler handle_prefetch_complete chain broken?"
           )
-          print(f"warm-gate: fallback=0, prefetch_complete_count={hist_count}")
+          print(f"warm-gate: fallback={fallback}, prefetch_complete_count={hist_count}")
     '';
 
   };
