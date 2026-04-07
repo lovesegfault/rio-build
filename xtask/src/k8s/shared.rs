@@ -64,6 +64,15 @@ const SUBCHARTS: &[&str] = &["postgresql"];
 /// `infra/helm/rio-build/charts/`. Gitignored.
 pub async fn chart_deps() -> Result<()> {
     let charts = repo_root().join("infra/helm/rio-build/charts");
+    // Reap before repopulate. Helm renders every entry in charts/ as a
+    // subchart regardless of Chart.yaml — a stale symlink left by a
+    // removed dependency renders with that chart's own defaults (no
+    // `condition:` gate once the Chart.yaml entry is gone).
+    if let Ok(entries) = std::fs::read_dir(&charts) {
+        for entry in entries {
+            let _ = std::fs::remove_file(entry?.path());
+        }
+    }
     std::fs::create_dir_all(&charts)?;
     for name in SUBCHARTS {
         let attr = format!(".#helm-{name}");
