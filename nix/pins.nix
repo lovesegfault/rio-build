@@ -45,14 +45,6 @@
   ecr_credential_provider_src_hash = "sha256-kCDhkwcxYNDAmYrrk+dnHkVG2Qzcw8USPcaxHKZwxzs=";
   ecr_credential_provider_vendor_hash = "sha256-eW9vsuhDaudnq34onV5LH1hY9S7Zt2jkzhL5UhbUlHY=";
 
-  # smarter-device-manager (nix/nixos-node/smarter-device-manager/).
-  # Runs as a host systemd unit on the NixOS AMI; the helm chart's
-  # devicePlugin.image (k3s DaemonSet path) tracks the same version
-  # via @sha256 digest. Bump BOTH together.
-  smarter_device_manager_version = "1.20.12";
-  smarter_device_manager_src_hash = "sha256-uACRrhlSzGctl+ZeSIM2QLI4Uwr1uFbh+m5qpg06Ahs=";
-  smarter_device_manager_vendor_hash = "sha256-hkpO1bpri0HQaWrAcZEKonuCCmEKLZKgfOQotwCS64s=";
-
   # security-profiles-operator. NOT a tofu-managed helm release: SPO
   # stopped publishing chart tarballs after v0.7.1 (only the in-repo
   # deploy/helm/ exists). The static deploy/operator.yaml is vendored

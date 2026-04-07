@@ -44,7 +44,8 @@ const SIZE_CLASSES_JSON: &str = r#"[
 ///   cargo xtask k8s -p eks rsb -- nix build -L --store ssh-ng://… \
 ///     'nixpkgs#nixosTests.simple'
 /// Scheduler routes it to the `{arch}-kvm-xlarge` pool; Karpenter
-/// provisions a `.metal` node; pod gets `/dev/kvm` via smarter-devices.
+/// provisions a `.metal` node; pod gets `/dev/kvm` via containerd
+/// base_runtime_spec (smarter-devices/kvm is scheduling-signal only).
 const BUILDER_POOL_SETS_JSON: &str = r#"[
   {"name":"x86-64","systems":["x86_64-linux"]},
   {"name":"aarch64","systems":["aarch64-linux"]},

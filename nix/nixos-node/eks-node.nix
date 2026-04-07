@@ -26,21 +26,7 @@
 let
   cfg = config.services.rio.eksNode;
   nodeadm = pkgs.callPackage ./nodeadm.nix { inherit pins; };
-  smarter-device-manager = pkgs.callPackage ./smarter-device-manager { inherit pins; };
   ecr-credential-provider = pkgs.callPackage ./ecr-credential-provider.nix { inherit pins; };
-
-  # r[impl sec.pod.fuse-device-plugin]
-  # Single source of truth for the fuse + kvm devicematch list. Mirrors
-  # _helpers.tpl `rio.devicePluginConf` (chart-side, k3s DaemonSet path)
-  # — the helm-lint `device-plugin-conf-parity` assertion diffs the two.
-  # nummaxdevices: per-node ceiling. ^kvm$ matches only on .metal; the
-  # plugin advertises 0 where /dev/kvm is absent.
-  devicePluginConf = pkgs.writeText "conf.yaml" ''
-    - devicematch: ^fuse$
-      nummaxdevices: ${toString cfg.devicePlugin.fuseMaxDevices}
-    - devicematch: ^kvm$
-      nummaxdevices: ${toString cfg.devicePlugin.kvmMaxDevices}
-  '';
 
   # containerd-config.nix pins sandbox = "localhost/kubernetes/pause" and
   # expects the AMI bake to have pre-loaded it (templates/shared/runtime/
@@ -71,32 +57,6 @@ in
         kubelet binary source. nixpkgs `kubernetes` tracks the version in
         `nix/pins.nix` `kubernetes_version` (both follow upstream minor).
       '';
-    };
-
-    devicePlugin = {
-      enable = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = ''
-          Run smarter-device-manager as a host systemd unit. Replaces the
-          Bottlerocket static-pod path: no registry pull, no kubelet-
-          schedules-its-own-dependency loop. Registers on
-          /var/lib/kubelet/device-plugins/kubelet.sock and advertises
-          smarter-devices/{fuse,kvm}. The Karpenter NodeOverlay STILL
-          declares synthetic capacity (cold-start bin-packing happens
-          before any node — and therefore this unit — exists).
-        '';
-      };
-      fuseMaxDevices = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 100;
-        description = "Per-node smarter-devices/fuse ceiling.";
-      };
-      kvmMaxDevices = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 100;
-        description = "Per-node smarter-devices/kvm ceiling (metal only).";
-      };
     };
 
     # Escape hatch: extra static-pod manifests (e.g. node-local debug
@@ -431,91 +391,6 @@ in
           };
         };
 
-        # ── smarter-device-manager (host unit, not pod) ─────────────────
-        # partOf=kubelet: a kubelet restart bounces the plugin so it re-
-        # registers on the fresh socket (the binary's fsnotify watch only
-        # covers socket DELETION, not the inode swap kubelet does on a
-        # clean restart). -config points at a store path — the conf is
-        # immutable per-AMI; no /etc indirection needed.
-        smarter-device-manager = lib.mkIf cfg.devicePlugin.enable {
-          description = "smarter-device-manager (fuse + kvm extended resources)";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "kubelet.service" ];
-          partOf = [ "kubelet.service" ];
-          # Restart=always + ExecStartPre's settle-loop means a kubelet flap
-          # can fire several quick restarts; don't let systemd's default
-          # burst limit (5/10s) wedge the unit into `failed`.
-          unitConfig.StartLimitIntervalSec = 0;
-          serviceConfig = {
-            # I-184: After=kubelet is not enough. During nodeadm bootstrap
-            # kubelet recreates /var/lib/kubelet/device-plugins/kubelet.sock
-            # several times in the first ~2s after the node goes Ready. The
-            # plugin's inotify handler restarts on every recreate; the rapid
-            # cycle (3× in 2ms observed) orphans the ListAndWatch goroutine
-            # → registered-but-zero-capacity (`smarter-devices/fuse: 0`)
-            # forever, until a manual restart. Gate startup on the sock
-            # existing AND having settled. Was 3 s; the I-184 rapid-recreate
-            # burst is ~2 ms wide, so 1 s is ample margin. The 15 s
-            # allocatable-watchdog (below) catches the residual race the
-            # settle can't.
-            ExecStartPre = pkgs.writeShellScript "wait-kubelet-device-sock" ''
-              sock=/var/lib/kubelet/device-plugins/kubelet.sock
-              while ! test -S "$sock"; do sleep 0.2; done
-              # Settle: wait for the sock's mtime to be >1s old.
-              while [ "$(( $(date +%s) - $(stat -c %Y "$sock") ))" -lt 1 ]; do sleep 0.2; done
-            '';
-            ExecStart = "${lib.getExe smarter-device-manager} -logtostderr -v=0 -config=${devicePluginConf}";
-            # Registers a Unix socket under /var/lib/kubelet/device-plugins/
-            # then serves Allocate RPCs. No state of its own; restart is
-            # cheap (kubelet re-queries ListAndWatch).
-            Restart = "always";
-            RestartSec = "2s";
-            # Host /dev access. The plugin only stat()s + advertises; the
-            # actual device-node injection into pod cgroups is kubelet's
-            # job (DevicePlugin Allocate response → CRI). No CAP_SYS_ADMIN
-            # needed here.
-            ProtectSystem = "strict";
-            ReadWritePaths = [ "/var/lib/kubelet/device-plugins" ];
-            PrivateTmp = true;
-          };
-        };
-
-        # I-184 watchdog: smarter-device-manager can wedge into "registered
-        # but ListAndWatch goroutine orphaned" → allocatable.smarter-devices/
-        # fuse stays 0 forever. Process is alive, so Restart=always never
-        # fires. Probe kubelet's device-plugin checkpoint; restart on zero.
-        smarter-device-watchdog = lib.mkIf cfg.devicePlugin.enable {
-          description = "Restart smarter-device-manager if fuse allocatable is zero";
-          after = [ "kubelet.service" ];
-          serviceConfig = {
-            Type = "oneshot";
-            ExecStart = pkgs.writeShellScript "sdm-watchdog" ''
-              set -u
-              # crictl→kubelet :10250 needs auth; the device-plugin
-              # checkpoint is kubelet-internal but readable and rewritten on
-              # every ListAndWatch. Format-change risk: jq -e returns false
-              # on parse error → restart, which is the safe direction.
-              cp=/var/lib/kubelet/device-plugins/kubelet_internal_checkpoint
-              test -f "$cp" || exit 0
-              if ! ${pkgs.jq}/bin/jq -e \
-                   '.Data.RegisteredDevices["smarter-devices/fuse"] | length > 0' \
-                   "$cp" >/dev/null 2>&1; then
-                echo "<4>rio: smarter-devices/fuse allocatable=0, bouncing plugin" >&2
-                systemctl restart smarter-device-manager.service
-              fi
-            '';
-          };
-        };
-      };
-
-      timers.smarter-device-watchdog = lib.mkIf cfg.devicePlugin.enable {
-        wantedBy = [ "timers.target" ];
-        partOf = [ "kubelet.service" ];
-        timerConfig = {
-          # 30 s first-fire clears the plugin's own settle+register window; 15 s steady-state thereafter.
-          OnActiveSec = "30s";
-          OnUnitActiveSec = "15s";
-        };
       };
 
       # ── writable dirs nodeadm/aws-node expect ───────────────────────
@@ -528,7 +403,6 @@ in
         "d /etc/cni/net.d 0755 root root -"
         "d /opt/cni/bin 0755 root root -"
         "d /var/lib/kubelet 0755 root root -"
-        "d /var/lib/kubelet/device-plugins 0755 root root -"
       ];
     };
   };

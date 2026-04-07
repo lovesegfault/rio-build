@@ -66,22 +66,21 @@ plugin) skips `hostUsers: false` — privileged containers cannot be
 user-namespaced.
 
 r[sec.pod.fuse-device-plugin]
-Worker pods MUST obtain `/dev/fuse` via a device-plugin resource request
-(`resources.limits["smarter-devices/fuse"]`), NOT a hostPath volume. The
-hostPath mechanism is incompatible with `hostUsers: false` — the kernel
-rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding). The
-device plugin adds `/dev/fuse` to the container's device cgroup allowlist
-without a hostPath volume, enabling both `hostUsers: false` and the
-non-privileged security context. On EKS (`karpenter.enabled=true`) the
-plugin runs as a host **systemd unit** baked into the NixOS AMI
-(`nix/nixos-node/eks-node.nix`, [ADR-021](./decisions/021-nixos-node-ami.md))
-— no registry pull, no kubelet-schedules-its-own-dependency loop; it
-registers on kubelet's device-plugin socket as soon as kubelet is up. On
-k3s/kind the plugin runs as a DaemonSet. Both modes share one
-`conf.yaml` (the `rio.devicePluginConf` Helm helper) covering `^fuse$` and
-`^kvm$`. `privileged: true` remains an escape hatch for clusters lacking
-the device plugin; it falls back to the hostPath mechanism and MUST NOT be
-the production default.
+Worker pods MUST NOT obtain `/dev/fuse` via a hostPath volume — the kernel
+rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding), so
+hostPath is incompatible with `hostUsers: false`. Pods request
+`resources.limits["smarter-devices/fuse"]` as a scheduling signal; the
+device node itself is delivered without hostPath. On EKS
+(`karpenter.enabled=true`, [ADR-021](./decisions/021-nixos-node-ami.md))
+containerd's `base_runtime_spec` declares `/dev/{fuse,kvm}` in OCI
+`linux.devices` (`nix/nixos-node/containerd-config.nix`) — runc `mknod`s
+them inside the container's `/dev` with container-namespace uid/gid, so no
+idmap-mount rejection; the NodeOverlay-declared `smarter-devices/{fuse,kvm}`
+capacity is scheduling-only (no on-node device plugin; kubelet leaves
+extended resources it never saw via a plugin alone). On k3s/kind the
+`smarter-device-manager` DaemonSet registers a real device plugin.
+`privileged: true` remains an escape hatch for clusters with neither; it
+falls back to the hostPath mechanism and MUST NOT be the production default.
 
 r[sec.psa.control-plane-restricted]
 

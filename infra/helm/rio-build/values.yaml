@@ -737,20 +737,22 @@ dashboard:
 # ──────────────────────────────────────────────────────────────────────────
 # FUSE Device Plugin
 # ──────────────────────────────────────────────────────────────────────────
-# smarter-device-manager: exposes /dev/fuse (and /dev/kvm on .metal) as
-# extended resources (smarter-devices/{fuse,kvm}). Builder pods request
+# smarter-devices/{fuse,kvm} extended resources. Builder pods request
 # them via resources.limits instead of a hostPath volume, which makes
 # hostUsers:false + granular caps work (ADR-012 Phase 1a spike).
 #
 # Delivery mode is keyed off karpenter.enabled:
-#   - karpenter.enabled=true  (EKS): host systemd unit baked into the
-#     NixOS AMI (nix/nixos-node/eks-node.nix smarter-device-manager).
-#     No registry pull, no kubelet-manages-its-own-dependency loop;
-#     registers as soon as kubelet's device-plugin socket is up.
-#     Updates roll via Karpenter Drift on amiTag change.
-#   - karpenter.enabled=false (k3s/kind/VM tests): DaemonSet
-#     (device-plugin.yaml). nodeSelector/nodeAffinity/tolerations below
-#     apply to this path only.
+#   - karpenter.enabled=true  (EKS): NO device plugin runs. containerd
+#     base_runtime_spec injects /dev/{fuse,kvm} directly (nix/nixos-node/
+#     containerd-config.nix linux.devices — runc mknods inside the
+#     container's /dev). The smarter-devices/{fuse,kvm} resource is
+#     scheduling-signal-only via NodeOverlay (templates/karpenter.yaml);
+#     kubelet leaves NodeOverlay-declared extended resources alone when
+#     no plugin ever registered them (k/k#64784). fuseMaxDevices/
+#     kvmMaxDevices below set the NodeOverlay capacity.
+#   - karpenter.enabled=false (k3s/kind/VM tests): smarter-device-manager
+#     DaemonSet (device-plugin.yaml). nodeSelector/nodeAffinity/
+#     tolerations below apply to this path only.
 #
 # enabled=true by default because builderPoolDefaults.privileged=false (below)
 # depends on it. Disable on clusters where privileged:true is the escape
@@ -978,10 +980,11 @@ builderPoolDefaults:
       ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
     limits:
       memory: "8Gi"
-  # Device cgroup: /dev/fuse is provided by smarter-device-manager
-  # (templates/device-plugin.yaml) via resources.limits. With the
-  # device plugin, granular SYS_ADMIN+SYS_CHROOT caps suffice and
-  # hostUsers:false works (hostPath /dev/fuse breaks idmap mounts).
+  # Device cgroup: /dev/fuse is provided via containerd base_runtime_spec
+  # on EKS (nix/nixos-node/containerd-config.nix) or smarter-device-manager
+  # on k3s/kind (templates/device-plugin.yaml). Either way granular
+  # SYS_ADMIN+SYS_CHROOT caps suffice and hostUsers:false works (hostPath
+  # /dev/fuse breaks idmap mounts).
   #
   # privileged:true is an ESCAPE HATCH for k3s/kind without the
   # device plugin. It disables seccomp entirely (ADR-012:10) and

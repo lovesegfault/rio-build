@@ -293,10 +293,9 @@ ipFamilies:
 
 {{/*
 smarter-device-manager conf.yaml body — DaemonSet ConfigMap (k3s/kind
-path, device-plugin.yaml). The EKS path renders the SAME list at AMI
-build time (nix/nixos-node/eks-node.nix devicePluginConf); the helm-lint
-device-plugin-conf-parity check diffs the two so the kvm entry — added
-in dd9a5c41 — can't drift between delivery modes.
+path only, device-plugin.yaml). The EKS path injects /dev/{fuse,kvm}
+via containerd base_runtime_spec (nix/nixos-node/containerd-config.nix
+linux.devices) — no device plugin, no parity to check.
 */}}
 {{- define "rio.devicePluginConf" -}}
 - devicematch: ^fuse$

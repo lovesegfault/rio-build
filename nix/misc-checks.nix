@@ -524,33 +524,18 @@
             exit 1
           fi
         done
-        # device-plugin-conf-parity: the chart's rio.devicePluginConf
-        # (k3s DaemonSet) and the AMI's eks-node.nix devicePluginConf
-        # MUST list the same devicematch regexes. Compare the regexes
-        # only (nummaxdevices is a chart value vs a NixOS option,
-        # both default 100 — drift there is intentional config, not
-        # a bug). /tmp/default.yaml (rendered above with karpenter.
-        # enabled=false) carries the DaemonSet ConfigMap.
-        yq 'select(.kind=="ConfigMap" and .metadata.name=="rio-device-plugin-config")
-            | .data."conf.yaml"' /tmp/default.yaml \
-            | yq '.[].devicematch' | sort > $TMPDIR/dp-conf-chart
-        grep 'devicematch:' ${./nixos-node/eks-node.nix} \
-            | sed 's/.*devicematch: //' | sort > $TMPDIR/dp-conf-ami
-        diff $TMPDIR/dp-conf-chart $TMPDIR/dp-conf-ami || {
-          echo "FAIL: device-plugin conf.yaml drift: chart vs nix/nixos-node/eks-node.nix" >&2
-          exit 1
-        }
         # DaemonSet MUST NOT render with karpenter.enabled=true — the
-        # AMI systemd unit and a DS would race to register the same
-        # kubelet socket.
+        # AMI injects /dev/{fuse,kvm} via containerd base_runtime_spec
+        # (containerd-config.nix linux.devices); the DS is k3s/kind only.
         ! yq 'select(.kind=="DaemonSet") | .metadata.name' \
           $TMPDIR/karp-on.yaml | grep -x rio-device-plugin >/dev/null || {
-          echo "FAIL: rio-device-plugin DaemonSet rendered with karpenter.enabled=true (AMI systemd unit only)" >&2
+          echo "FAIL: rio-device-plugin DaemonSet rendered with karpenter.enabled=true (AMI uses base_runtime_spec)" >&2
           exit 1
         }
         # NodeOverlay (synthetic capacity) MUST still render —
-        # Karpenter bin-packs from zero nodes, before any systemd
-        # unit can register.
+        # smarter-devices/{fuse,kvm} is now scheduling-signal-only on
+        # EKS (no on-node plugin; kubelet leaves NodeOverlay-declared
+        # extended resources alone — k/k#64784).
         yq 'select(.kind=="NodeOverlay") | .metadata.name' \
           $TMPDIR/karp-on.yaml | grep -x rio-builder-fuse >/dev/null || {
           echo "FAIL: NodeOverlay rio-builder-fuse missing with karpenter.enabled=true" >&2

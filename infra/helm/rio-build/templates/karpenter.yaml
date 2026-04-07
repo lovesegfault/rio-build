@@ -75,17 +75,13 @@ spec:
     karpenter.sh/discovery: {{ $k.clusterName }}
 ---
 # NodeOverlay: tells Karpenter that worker-role instances provide
-# smarter-devices/fuse capacity BEFORE the node exists. Solves the
-# cold-start deadlock: builder pods request smarter-devices/fuse:1, but
-# the device-plugin only advertises that resource AFTER a node boots and
-# the plugin registers with kubelet — so from zero nodes Karpenter can't
-# bin-pack and never provisions. The overlay declares the capacity
-# synthetically; once the node is up, the smarter-device-manager systemd
-# unit (baked into the AMI, nix/nixos-node/eks-node.nix) registers the
-# real capacity (same value, devicePlugin.fuseMaxDevices). Host systemd
-# starts the plugin at boot — but Karpenter's bin-packing happens before
-# ANY node exists, so the overlay is structurally required regardless of
-# how fast the plugin registers.
+# smarter-devices/fuse capacity. Builder pods request smarter-devices/
+# fuse:1 as a scheduling signal; on EKS no device plugin runs (containerd
+# base_runtime_spec injects /dev/fuse directly, nix/nixos-node/
+# containerd-config.nix), so this overlay is the ONLY source of that
+# extended resource — kubelet leaves NodeOverlay-declared resources alone
+# when no plugin ever registered them (k/k#64784). Bin-packing from zero
+# nodes works because the overlay applies to NodeClaims, not booted nodes.
 #
 # Alpha feature — requires settings.featureGates.nodeOverlay=true on the
 # Karpenter controller (set in infra/eks/karpenter.tf).
@@ -97,11 +93,10 @@ metadata:
     app.kubernetes.io/part-of: rio-build
 spec:
   # Match builder + fetcher NodePools via node-role. NOT rio-general:
-  # the systemd device-plugin DOES run there (the AMI is shared) and
-  # advertises fuse capacity at runtime, but executor pods carry node-
-  # role selectors that exclude general anyway. Keeping the overlay
-  # narrow means Karpenter never provisions a rio-general node FOR a
-  # fuse-requesting pod at cold start.
+  # base_runtime_spec injects /dev/fuse on every AMI-booted node, but
+  # executor pods carry node-role selectors that exclude general anyway.
+  # Keeping the overlay narrow means Karpenter never provisions a
+  # rio-general node FOR a fuse-requesting pod.
   requirements:
     - key: rio.build/node-role
       operator: In
@@ -110,13 +105,12 @@ spec:
     smarter-devices/fuse: {{ .Values.devicePlugin.fuseMaxDevices | quote }}
 ---
 # NodeOverlay (kvm): synthetic smarter-devices/kvm capacity for the metal
-# NodePool. Same cold-start deadlock as fuse above — a kvm-feature pod
-# requests smarter-devices/kvm:1, but no node advertises it until the
-# systemd device-plugin registers on a booted metal node. Matches by the
-# rio.build/kvm label (only the metal NodePool sets it) so non-metal
-# builder nodes don't falsely advertise kvm — the plugin would correct
-# it to 0 post-boot, but Karpenter would have already wasted a provision
-# cycle.
+# NodePool. Same scheduling-signal-only mechanism as fuse above. Matches
+# by the rio.build/kvm label (only the metal NodePool sets it) so
+# non-metal builder nodes don't falsely advertise kvm — base_runtime_spec
+# mknods /dev/kvm everywhere but it ENXIOs on open() without host KVM, so
+# a misrouted pod would fail at runtime, not scheduling. Keeping the
+# overlay narrow fails at scheduling instead.
 apiVersion: karpenter.sh/v1alpha1
 kind: NodeOverlay
 metadata:

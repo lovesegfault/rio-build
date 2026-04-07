@@ -26,7 +26,7 @@ Key choices:
 4. **Pinned kernel minor in `nix/pins.nix`**, not `linuxPackages_latest`. A nixpkgs flake-input bump can't surprise-rebuild the ~40 min kernel derivation; bump deliberately when the per-page-FUSE work needs a particular patch level.
 5. **Both arches from P1.** The NodePool requirements already span x86_64 + aarch64; a single-arch AMI would leave arm64 pods on Bottlerocket during migration with two userData formats live at once.
 6. **Seccomp profiles canonical at `nix/nixos-node/seccomp/`.** The AMI bakes them via `systemd.tmpfiles` (`hardening.nix`) — no bootstrap container, no SPO DaemonSet. The helm-chart `files/seccomp-rio-*.json` copies remain for the k3s/kind path (`.Files.Get` can't reach outside the chart dir under `cleanSource`); the `seccomp-fresh` flake check fails CI on drift.
-7. **smarter-device-manager runs as a host systemd unit.** Packaged from source (`nix/nixos-node/smarter-device-manager/`), not a static pod or DaemonSet — no registry pull, no kubelet-manages-its-own-dependency loop. Registers on `/var/lib/kubelet/device-plugins/kubelet.sock` as soon as kubelet is up. The Karpenter NodeOverlay still declares synthetic `smarter-devices/{fuse,kvm}` capacity (cold-start bin-packing happens before any node exists).
+7. **`/dev/fuse` + `/dev/kvm` via containerd `base_runtime_spec`, not a device plugin.** runc `mknod`s the device nodes inside the container's `/dev` (container-namespace uid/gid — no `hostUsers:false` idmap-mount rejection). Every pod gets both; opening `/dev/kvm` ENXIOs on non-`.metal`. The Karpenter NodeOverlay still declares synthetic `smarter-devices/{fuse,kvm}` capacity (cold-start bin-packing happens before any node exists); with no on-node device plugin, kubelet leaves that extended resource alone. Eliminates the I-184 goroutine-orphan failure mode and the watchdog it required. The k3s/kind chart path keeps its DaemonSet (gated `{{ if not .Values.karpenter.enabled }}`).
 
 ## Security posture vs Bottlerocket
 
@@ -67,7 +67,7 @@ The AMI bakes a single multi-manifest OCI archive containing the `rio-builder` a
 | Phase | Exit | Scope |
 |---|---|---|
 | P1 (landed) | `nix build .#node-ami-<arch>` produces an image; a hand-registered AMI joins the cluster and goes `Ready` | `nix/nixos-node/{default,nodeadm,eks-node,minimal}.nix`, flake targets, `xtask ami push` |
-| **P2** (this commit) | `xtask k8s eks up` produces NixOS builder/fetcher nodes; `hostUsers: false` active; Bottlerocket removed | `hardening.nix` (sysctl/seccomp), systemd device-plugin, kernel `EROFS_FS_ONDEMAND`/`CACHEFILES_ONDEMAND`, `karpenter.amiTag`, deploy.rs wiring |
+| **P2** (this commit) | `xtask k8s eks up` produces NixOS builder/fetcher nodes; `hostUsers: false` active; Bottlerocket removed | `hardening.nix` (sysctl/seccomp), `base_runtime_spec` device injection, kernel `EROFS_FS_ONDEMAND`/`CACHEFILES_ONDEMAND`, `karpenter.amiTag`, deploy.rs wiring |
 | P3 | `riofs.ko` placeholder builds; `node-kernel-config` check | `kmod/`, `packages.node-kernel` |
 
 ## References

@@ -5,12 +5,12 @@
 # instead of a hostPath volume.
 #
 # DaemonSet path is for k3s/kind ONLY (karpenter.enabled=false). On EKS
-# the plugin runs as a host systemd unit baked into the NixOS AMI
-# (nix/nixos-node/eks-node.nix) — registers as soon as kubelet's
-# device-plugin socket is up, no registry pull. Same conf.yaml shape
-# (rio.devicePluginConf helper ↔ eks-node.nix devicePluginConf, parity-
-# checked in helm-lint), same extended-resource semantics; only the
-# delivery differs.
+# (the NixOS AMI) /dev/{fuse,kvm} are injected via containerd
+# base_runtime_spec (nix/nixos-node/containerd-config.nix linux.devices)
+# — runc mknods inside the container's /dev, no device plugin at all.
+# The smarter-devices/{fuse,kvm} extended resource is scheduling-signal-
+# only there (NodeOverlay-declared; kubelet leaves it alone without a
+# plugin — k/k#64784).
 #
 # Why this matters (ADR-012):
 #   - hostPath /dev/fuse + hostUsers:false is INCOMPATIBLE — the kernel
@@ -40,9 +40,7 @@ data:
   # Regex against /dev/* entries. ^fuse$ matches exactly /dev/fuse (not
   # /dev/fuse0 or fuse-ctl). nummaxdevices is the per-node ceiling — each
   # worker pod requests 1. ^kvm$: present only on .metal instance types;
-  # smarter-device-manager advertises 0 where /dev/kvm is absent. Body
-  # comes from rio.devicePluginConf so helm-lint can parity-check it
-  # against the AMI-baked nix/nixos-node/eks-node.nix devicePluginConf.
+  # smarter-device-manager advertises 0 where /dev/kvm is absent.
   conf.yaml: |
     {{- include "rio.devicePluginConf" . | nindent 4 }}
 ---
