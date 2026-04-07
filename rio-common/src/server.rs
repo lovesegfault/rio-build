@@ -71,8 +71,11 @@ pub struct Bootstrap<C> {
 ///
 /// 1. `rustls` crypto provider install (aws-lc-rs; must precede any TLS
 ///    use — dual ring+aws-lc-rs feature activation panics otherwise)
-/// 2. figment config load (defaults → TOML → env → CLI)
-/// 3. tracing init (returns OtelGuard, held by `Bootstrap`)
+/// 2. tracing init (returns OtelGuard, held by `Bootstrap`). Runs BEFORE
+///    config load so figment errors land in structured logs — tracing
+///    reads only env vars (`RUST_LOG`, `RIO_LOG_FORMAT`,
+///    `RIO_OTEL_ENDPOINT`), no dependency on the figment-loaded config.
+/// 3. figment config load (defaults → TOML → env → CLI)
 /// 4. client TLS load + [`crate::grpc::init_client_tls`] — sets the
 ///    process-global OnceLock that `rio-proto::client::connect_*`
 ///    reads. The `info!("client mTLS enabled")` log fires here so it
@@ -102,8 +105,9 @@ where
     // happen at top-of-main, discard.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let cfg: C = crate::config::load(component, cli)?;
     let otel_guard = crate::observability::init_tracing(component)?;
+    let cfg: C = crate::config::load(component, cli)
+        .inspect_err(|e| tracing::error!(error = %e, "config load failed"))?;
 
     let client_tls = crate::tls::load_client_tls(cfg.tls())?;
     if cfg.tls().is_configured() {
