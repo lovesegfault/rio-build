@@ -19,16 +19,17 @@ service SchedulerService {
   rpc ResolveTenant(ResolveTenantRequest) returns (ResolveTenantResponse);  // name→UUID for gateway JWT mint
 }
 
-// worker.proto --- worker-facing RPCs (same server process as SchedulerService)
-service WorkerService {
+// builder.proto --- executor-facing RPCs (same server process as SchedulerService)
+// Covers BOTH builder and fetcher pods; the executor reports its role via HeartbeatRequest.kind.
+service ExecutorService {
   // Bidirectional stream: scheduler sends assignments + prefetch hints + cancel signals;
-  // worker sends log batches + completion reports + ack messages
-  rpc BuildExecution(stream WorkerMessage) returns (stream SchedulerMessage);
+  // executor sends log batches + completion reports + ack messages
+  rpc BuildExecution(stream ExecutorMessage) returns (stream SchedulerMessage);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 ```
 
-> **Worker registration:** Worker registration is implicit and two-step: (1) the worker opens a `BuildExecution` bidirectional stream, (2) the worker calls the separate `Heartbeat` unary RPC with its initial capabilities (worker_id, systems, supported_features, size_class). The scheduler creates the worker entry when it receives a heartbeat from a worker_id that also has an open `BuildExecution` stream. Periodic heartbeats update resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
+> **Executor registration:** Executor registration is implicit and two-step: (1) the executor opens a `BuildExecution` bidirectional stream, (2) the executor calls the separate `Heartbeat` unary RPC with its initial capabilities (executor_id, systems, supported_features, size_class, kind). The scheduler creates the executor entry when it receives a heartbeat from an executor_id that also has an open `BuildExecution` stream. Periodic heartbeats update resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
 
 ```protobuf
 // store.proto --- inspired by tvix castore/store protos (MIT)
@@ -72,11 +73,11 @@ service StoreAdminService {
 // gRPC-Web compatibility required for the dashboard (via tonic-web).
 service AdminService {
   rpc ClusterStatus(Empty) returns (ClusterStatusResponse);
-  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  rpc ListExecutors(ListExecutorsRequest) returns (ListExecutorsResponse);
   rpc ListBuilds(ListBuildsRequest) returns (ListBuildsResponse);
   rpc GetBuildLogs(GetBuildLogsRequest) returns (stream BuildLogChunk);
   rpc TriggerGC(GCRequest) returns (stream GCProgress);
-  rpc DrainWorker(DrainWorkerRequest) returns (DrainWorkerResponse);
+  rpc DrainExecutor(DrainExecutorRequest) returns (DrainExecutorResponse);
   rpc ClearPoison(ClearPoisonRequest) returns (ClearPoisonResponse);
   rpc ListTenants(Empty) returns (ListTenantsResponse);
   rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
@@ -99,16 +100,17 @@ The `BuildExecution` RPC replaces the previous `PullWork` + `ReportCompletion` d
 - Assignment acknowledgment: the worker confirms receipt of each assignment
 
 ```protobuf
-message WorkerMessage {
+message ExecutorMessage {
   oneof msg {
-    WorkAssignmentAck ack = 1;       // Worker confirms receipt of assignment
+    WorkAssignmentAck ack = 1;       // Executor confirms receipt of assignment
     BuildLogBatch log_batch = 2;      // Batched log lines (not per-line)
     CompletionReport completion = 3;  // Build result
     ProgressUpdate progress = 4;      // Resource usage, build phase
-    WorkerRegister register = 5;      // First message on BuildExecution stream:
-                                      //   worker_id identity. Scheduler reads this
+    ExecutorRegister register = 5;    // First message on BuildExecution stream:
+                                      //   executor_id identity. Scheduler reads this
                                       //   to associate stream + heartbeat by same ID.
     PrefetchComplete prefetch_complete = 6;  // Warm-gate ACK: FUSE cache warmed the hinted paths
+    BuildPhase phase = 7;             // Build phase change (forwarded resSetPhase)
   }
 }
 
@@ -130,7 +132,7 @@ message BuildLogBatch {
   string derivation_path = 1;    // Which derivation produced these lines
   repeated bytes lines = 2;      // Batch of log lines (raw bytes, not UTF-8)
   uint64 first_line_number = 3;  // For ordering
-  string worker_id = 4;          // For debugging
+  string executor_id = 4;        // For debugging
 }
 ```
 
@@ -157,15 +159,17 @@ Workers include inventory data in heartbeats so the scheduler can make informed 
 
 ```protobuf
 message HeartbeatRequest {
-  string worker_id = 1;
+  string executor_id = 1;
   repeated string running_builds = 2;
   ResourceUsage resources = 3;
   reserved 4;                      // was BloomFilter local_paths — locality routing dropped with persistent workers
-  repeated string systems = 5;     // Systems this worker builds for (e.g. ["x86_64-linux", "aarch64-linux"])
+  repeated string systems = 5;     // Systems this executor builds for (e.g. ["x86_64-linux", "aarch64-linux"])
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
-  reserved 7;                      // P0537: was max_builds (always 1 now)
-  string size_class = 8;           // Static size-class from worker.toml ("small"/"large"/"" = wildcard)
+  reserved 7;                      // was max_builds (always 1 now)
+  string size_class = 8;           // Static size-class from builder.toml ("small"/"large"/"" = wildcard)
   bool store_degraded = 9;         // Store-upload circuit breaker OPEN; scheduler routes away until cleared
+  ExecutorKind kind = 10;          // builder (airgapped) or fetcher (open egress, FOD-only)
+  bool draining = 11;              // executor-authoritative drain flag; scheduler stops dispatching
 }
 ```
 
@@ -282,17 +286,17 @@ message WatchBuildRequest {
 | File | Contents |
 |---|---|
 | `scheduler.proto` | `SchedulerService` --- gateway-facing RPCs (SubmitBuild, WatchBuild, QueryBuildStatus, CancelBuild, ResolveTenant) |
-| `worker.proto` | `WorkerService` --- worker-facing RPCs (BuildExecution, Heartbeat) |
+| `builder.proto` | `ExecutorService` --- executor-facing RPCs (BuildExecution, Heartbeat); covers builder + fetcher pods |
 | `store.proto` | `StoreService`, `ChunkService`, `StoreAdminService` |
 | `admin.proto` | `AdminService` --- dashboard and CLI RPCs |
-| `types.proto` | Shared primitives: `PathInfo`, `ResourceUsage`, `BuildResultStatus`, store/chunk/GC/realisation RPC messages |
+| `types.proto` | Shared primitives: `PathInfo`, `ResourceUsage`, `BuildResultStatus`, `ExecutorKind`, store/chunk/GC/realisation RPC messages |
 | `dag.proto` | DAG wire types: `DerivationNode`/`Edge`/`Event*`, `GraphNode`/`Edge`, `GetBuildGraph*` |
-| `build_types.proto` | Build lifecycle: `BuildEvent*`, `SubmitBuildRequest`, `BuildResult`, `BuildStatus`, `WorkerMessage`/`SchedulerMessage` bidi-stream types, `Heartbeat*` |
-| `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListWorkers*`/`Builds*`/`Tenants*`, `SizeClassStatus`, `DrainWorker*`, `ClearPoison*` |
+| `build_types.proto` | Build lifecycle: `BuildEvent*`, `SubmitBuildRequest`, `BuildResult`, `BuildStatus`, `ExecutorMessage`/`SchedulerMessage` bidi-stream types, `BuildPhase`, `Heartbeat*` |
+| `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListExecutors*`/`Builds*`/`Tenants*`, `SizeClassStatus`, `DrainExecutor*`, `ClearPoison*` |
 
 > **Domain split (P0376):** `types.proto` was a 1034-line / 34-plan-collision monolith. The split puts each domain's churn in its own file so plan-level collision detection tracks semantic overlap instead of the union. **All four data-type files share `package rio.types;`** — prost merges them into one `rio.types.rs`, so Rust callers see everything at `rio_proto::types::*` regardless of source file. `rio_proto::dag::*` / `rio_proto::build_types::*` are re-export modules in `lib.rs` that offer domain-scoped paths for callers that want them; both paths resolve to the same struct.
 
-Worker-facing RPCs are in a separate `WorkerService` (in `worker.proto`) to allow distinct interceptors (auth, rate-limiting), independent evolution, and potential future separation to a dedicated port. Both `SchedulerService` and `WorkerService` are served by the same scheduler binary.
+Executor-facing RPCs are in a separate `ExecutorService` (in `builder.proto`) to allow distinct interceptors (auth, rate-limiting), independent evolution, and potential future separation to a dedicated port. Both `SchedulerService` and `ExecutorService` are served by the same scheduler binary.
 
 ## gRPC Configuration
 
