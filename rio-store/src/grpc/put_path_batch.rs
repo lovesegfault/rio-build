@@ -265,7 +265,7 @@ impl StoreServiceImpl {
             // threshold check guards a live concurrent uploader.
             if !inserted {
                 let threshold = crate::substitute::SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
-                if let Ok(true) = crate::gc::orphan::reap_one(
+                match crate::gc::orphan::reap_one(
                     &self.pool,
                     &accum.store_path_hash,
                     Some(threshold),
@@ -273,15 +273,22 @@ impl StoreServiceImpl {
                 )
                 .await
                 {
-                    metrics::counter!("rio_store_putpath_stale_reclaimed_total").increment(1);
-                    inserted = metadata::insert_manifest_uploading(
-                        &self.pool,
-                        &accum.store_path_hash,
-                        info.store_path.as_str(),
-                        &refs_str,
-                    )
-                    .await
-                    .unwrap_or(false);
+                    Ok(true) => {
+                        warn!(store_path = %info.store_path,
+                              "PutPathBatch: stale 'uploading' placeholder — reclaimed");
+                        metrics::counter!("rio_store_putpath_stale_reclaimed_total").increment(1);
+                        inserted = metadata::insert_manifest_uploading(
+                            &self.pool,
+                            &accum.store_path_hash,
+                            info.store_path.as_str(),
+                            &refs_str,
+                        )
+                        .await
+                        .unwrap_or(false);
+                    }
+                    Ok(false) => {} // not stale → live concurrent uploader
+                    Err(e) => warn!(error = %e,
+                        "PutPathBatch: stale-reclaim failed (proceeding to concurrent-abort)"),
                 }
             }
 

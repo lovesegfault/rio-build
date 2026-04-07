@@ -376,6 +376,59 @@ async fn gt13_batch_rpc_atomic() -> TestResult {
     Ok(())
 }
 
+// r[verify store.put.stale-reclaim]
+/// I-207 batch path: PutPathBatch reclaims a stale `'uploading'`
+/// placeholder same as PutPath. Mirrors `test_putpath_reclaims_stale_
+/// uploading` (core.rs) — kept separate so the batch handler's reclaim
+/// has its own coverage (the verifier flagged it).
+#[tokio::test]
+async fn gt13_batch_reclaims_stale_uploading() -> TestResult {
+    let s = StoreSession::new().await?;
+    let store_path = test_store_path("i207-batch-stale");
+    let (nar, _) = make_nar(b"i207 batch stale");
+    let info = make_path_info_for_nar(&store_path, &nar);
+
+    // Stale placeholder past SUBSTITUTE_STALE_THRESHOLD (5min).
+    let sph = rio_nix::store_path::StorePath::parse(&store_path)
+        .unwrap()
+        .sha256_digest();
+    sqlx::query(
+        r#"INSERT INTO narinfo (store_path_hash, store_path, nar_hash,
+               nar_size, "references") VALUES ($1, $2, $3, 0, '{}')"#,
+    )
+    .bind(sph.as_slice())
+    .bind(&store_path)
+    .bind(&[0u8; 32] as &[u8])
+    .execute(&s.db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO manifests (store_path_hash, status, updated_at) \
+         VALUES ($1, 'uploading', now() - make_interval(secs => 600))",
+    )
+    .bind(sph.as_slice())
+    .execute(&s.db.pool)
+    .await?;
+
+    let (tx, rx) = mpsc::channel(4);
+    send_batch_output(&tx, 0, info.into(), nar).await;
+    drop(tx);
+
+    let resp = s
+        .client
+        .clone()
+        .put_path_batch(ReceiverStream::new(rx))
+        .await
+        .context("I-207: stale placeholder must be reclaimed by PutPathBatch")?
+        .into_inner();
+    assert_eq!(
+        resp.created,
+        vec![true],
+        "I-207: batch path reclaims stale placeholder → created=true"
+    );
+
+    Ok(())
+}
+
 /// Content-index parity: batch-uploaded outputs are findable by
 /// nar_hash via ContentLookup. Without T1's `content_index::insert`
 /// loop, ContentLookup returns empty for a path that only ever went
