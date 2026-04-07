@@ -229,9 +229,20 @@ in
           # vpc-cni adds policy-routing rules; don't let a re-DHCP wipe
           # the addresses/routes ipamd installed on the primary either.
           KeepConfiguration = "yes";
+          # VPC guarantees address uniqueness; kernel DAD holds the link
+          # in `configuring` for ~1–2 s, blocking network-online.target →
+          # nodeadm-init. AL2023 70-eks.network sets the same.
+          IPv6DuplicateAddressDetection = 0;
         };
+        # Cluster is ip_family=ipv6. Do NOT use RequiredFamilyForOnline=ipv4.
+        linkConfig.RequiredForOnline = "routable";
         dhcpV4Config.UseRoutes = true;
-        dhcpV6Config.UseDelegatedPrefix = false;
+        dhcpV6Config = {
+          UseDelegatedPrefix = false;
+          # Don't wait for an RA before soliciting DHCPv6 — the VPC
+          # router's RA cadence adds variable latency.
+          WithoutRA = "solicit";
+        };
       };
     };
 
