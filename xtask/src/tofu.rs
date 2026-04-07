@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 
+use crate::config::XtaskConfig;
 use crate::sh::{self, cmd, shell};
 use crate::ui;
 
@@ -144,14 +145,56 @@ impl Outputs {
     }
 }
 
+/// Lazy backend init for read-only callers ([`outputs`]). A fresh git
+/// worktree has no `infra/eks/.terraform/`, so `tofu output` fails with
+/// "Backend initialization required" even though the cluster exists in
+/// S3 state. `--ami` / `--deploy` only need to READ outputs and
+/// shouldn't require a full `--provision` (= `tofu apply`) just to wire
+/// up the backend. `-reconfigure` is safe here — it connects to the S3
+/// backend and downloads providers; no state mutation.
+///
+/// Sync sibling of [`state_bucket`]: shells `aws sts` instead of the
+/// SDK so [`outputs`] can stay sync. Keep the bucket-naming logic in
+/// lockstep with [`state_bucket`].
+fn ensure_backend_init(dir: &str) -> Result<()> {
+    if sh::repo_root().join(dir).join(".terraform").is_dir() {
+        return Ok(());
+    }
+    let cfg = XtaskConfig::load()?;
+    let bucket = match &cfg.tfstate_bucket {
+        Some(b) => b.clone(),
+        None => {
+            let sh = shell()?;
+            let account = sh::read(cmd!(
+                sh,
+                "aws sts get-caller-identity --query Account --output text"
+            ))
+            .context("resolve AWS account ID for tfstate bucket")?;
+            format!("rio-tfstate-{account}")
+        }
+    };
+    let backend = Backend {
+        bucket,
+        region: cfg.tfstate_region,
+    };
+    ui::set_message(&format!(
+        "tofu init (fresh worktree, backend s3://{})",
+        backend.bucket
+    ));
+    init(dir, &backend)
+}
+
 /// `tofu output -json` parsed into a map. ONE process spawn, one S3
 /// state read, one AWS-SDK credential resolve. Replaces N×`output -raw`
 /// which under an S3 backend hits SSO once per call — at ~10 calls in
 /// quick succession that 429s with `TooManyRequestsException` (I-087).
 ///
-/// Empty state → `{}` → `Outputs::get` bails with the standard
-/// "missing or state empty" error.
+/// Auto-runs `tofu init` if `{dir}/.terraform/` is missing (fresh
+/// worktree) so read-only phases work without `--provision`. A
+/// post-init `output` failure means state is genuinely empty → the
+/// "run --provision first" hint is then correct.
 pub fn outputs(dir: &str) -> Result<Outputs> {
+    ensure_backend_init(dir)?;
     let sh = shell()?;
     let raw = sh::read(cmd!(sh, "tofu -chdir={dir} output -no-color -json"))
         .context("tofu output -json failed — run `cargo xtask k8s -p eks up --provision` first?")?;
@@ -178,10 +221,7 @@ pub fn output(dir: &str, name: &str) -> Result<String> {
 }
 
 /// Resolve the tfstate bucket: RIO_TFSTATE_BUCKET or rio-tfstate-${account_id}.
-pub async fn state_bucket(
-    cfg: &crate::config::XtaskConfig,
-    aws: &aws_config::SdkConfig,
-) -> Result<String> {
+pub async fn state_bucket(cfg: &XtaskConfig, aws: &aws_config::SdkConfig) -> Result<String> {
     if let Some(b) = &cfg.tfstate_bucket {
         return Ok(b.clone());
     }
