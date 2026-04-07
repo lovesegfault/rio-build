@@ -58,8 +58,8 @@ pkgs.testers.runNixOSTest {
         # framework's defaults; reopen with mkOverride below mkForce.
         kernelModules = lib.mkOverride 40 [ ];
       };
-      # qemu-vm's direct-kernel boot doesn't go through GRUB; minimal.nix
-      # mkForces timeout=0 which is harmless either way. The real
+      # qemu-vm's direct-kernel boot bypasses the loader entirely; uki-
+      # boot.nix's external installHook is inert here. The real
       # interaction is the 80-ec2-primary network: its `Name = "!eth*"`
       # match excludes the test framework's eth1 vlan, so the static
       # 192.168.* address the framework assigns is the only route — the

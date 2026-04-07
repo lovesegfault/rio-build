@@ -36,10 +36,6 @@
       includeDefaultModules = false;
     };
 
-    # amazon-image.nix sets `loader.timeout = 1` with no mkDefault — the
-    # 1 s GRUB countdown is dead time on a headless ephemeral node.
-    loader.timeout = lib.mkForce 0;
-
     # systemd's status output goes to ttyS0 @ 115200 baud; the per-unit
     # "[  OK  ] Started …" lines are serial-bound. `quiet` drops them.
     # Kernel printk stays at the NixOS default loglevel=4.

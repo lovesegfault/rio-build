@@ -28,6 +28,7 @@
   imports = [
     ./minimal.nix
     ./initrd-net.nix
+    ./uki-boot.nix
     ./eks-node.nix
     ./hardening.nix
   ];
