@@ -301,8 +301,13 @@ in
             "containerd.service"
             "kubelet.service"
           ];
-          after = [ "network-online.target" ];
-          wants = [ "network-online.target" ];
+          # nodeadm's IMDS client retries with backoff (aws-sdk-go
+          # default); network.target is "networkd started", not "link
+          # routable". The ~1–2 s wait-online gap is wasted when nodeadm
+          # would just retry through it anyway. Restart=on-failure below
+          # is the belt to this suspender.
+          after = [ "network.target" ];
+          wants = [ "network.target" ];
           # nodeadm shells out to `containerd --version` / `kubelet
           # --version` for telemetry fields and probes a few AL2023 paths.
           # PATH covers the binaries; tmpfiles below covers the path probes.
