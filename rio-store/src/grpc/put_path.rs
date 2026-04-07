@@ -444,17 +444,22 @@ impl StoreServiceImpl {
         // and the next uploader for the same path got `Aborted:
         // concurrent PutPath` until the orphan scanner reaped it.
         //
-        // scopeguard can't await, so spawn the delete.
-        // `delete_manifest_uploading` filters status='uploading' so
-        // firing after an explicit `abort_upload` (or after
-        // put_chunked's own rollback) is a harmless no-op DELETE.
+        // scopeguard can't await, so spawn the cleanup. `reap_one`
+        // (chunk-aware) filters status='uploading' so firing after
+        // an explicit `abort_upload` is a harmless no-op; firing
+        // after `upgrade_manifest_to_chunked` correctly decrements
+        // the chunk refcounts the inline-only delete would leak.
         // Defused on success only — error paths take one wasted spawn.
         let placeholder_guard = {
             let pool = self.pool.clone();
             let hash = store_path_hash.clone();
+            let chunk_backend = self.chunk_backend.clone();
             scopeguard::guard((), move |()| {
                 tokio::spawn(async move {
-                    if let Err(e) = metadata::delete_manifest_uploading(&pool, &hash).await {
+                    if let Err(e) =
+                        crate::gc::orphan::reap_one(&pool, &hash, None, chunk_backend.as_ref())
+                            .await
+                    {
                         error!(error = %e, "PutPath: drop-path placeholder cleanup failed");
                     }
                 });
