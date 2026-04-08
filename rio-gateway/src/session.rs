@@ -306,7 +306,20 @@ where
             // Without this, the ? propagated straight out and the EOF arm
             // above was never reached — it only catches opcode-READ errors,
             // not handler-execution errors. P0331.
-            cancel_active_builds(ctx, "client_disconnect").await;
+            //
+            // `biased` above prefers the token arm when both are Ready on
+            // the SAME poll, but ChannelSession::Drop fires cancel() then
+            // breaks the pipe — if those land between the token-poll and
+            // the handler's synchronous BrokenPipe within ONE poll cycle,
+            // the Err arm fires with the token already cancelled. Re-check
+            // here so the reason string stays accurate regardless of which
+            // arm raced ahead.
+            let reason = if shutdown.is_cancelled() {
+                "channel_close"
+            } else {
+                "client_disconnect"
+            };
+            cancel_active_builds(ctx, reason).await;
             return Err(e);
         }
 
