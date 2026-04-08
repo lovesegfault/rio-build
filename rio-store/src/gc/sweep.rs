@@ -175,6 +175,14 @@ pub async fn sweep(
         }
         let mut tx = conn.begin().await?;
 
+        // Two-pass: pass 1 locks + re-checks every batch item and applies
+        // resurrection closure-deletes to sweep_unreachable, but does NOT
+        // delete narinfo yet. Pass 2 deletes only items still in
+        // sweep_unreachable. Without the split, batch order [Z, Y] where
+        // live P→Y→Z deletes Z before Y's resurrection closure-delete
+        // would have saved it.
+        let mut to_delete: Vec<(&Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(batch.len());
+
         for store_path_hash in batch {
             // Step 1: SELECT chunk_list FOR UPDATE. NULL for
             // inline storage. The FOR UPDATE locks the MANIFEST
@@ -295,6 +303,32 @@ pub async fn sweep(
                 .bind(store_path_hash)
                 .execute(&mut *tx)
                 .await?;
+                continue;
+            }
+            to_delete.push((store_path_hash, chunk_list));
+        }
+
+        // Pass-1 closure-deletes from a LATER item may have removed an
+        // EARLIER candidate from sweep_unreachable. One batch probe.
+        let still_unreachable: std::collections::HashSet<Vec<u8>> = if to_delete.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            let candidate_hashes: Vec<Vec<u8>> =
+                to_delete.iter().map(|(h, _)| (*h).clone()).collect();
+            sqlx::query_scalar(
+                "SELECT path_hash FROM sweep_unreachable WHERE path_hash = ANY($1::bytea[])",
+            )
+            .bind(&candidate_hashes)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect()
+        };
+
+        for (store_path_hash, chunk_list) in to_delete {
+            if !still_unreachable.contains(store_path_hash) {
+                metrics::counter!("rio_store_gc_path_resurrected_total").increment(1);
+                stats.paths_resurrected += 1;
                 continue;
             }
 
@@ -822,8 +856,8 @@ mod tests {
             .seed(&db.pool)
             .await;
 
-        // Y first so its resurrection clears Z from sweep_unreachable
-        // before Z is processed.
+        // Forward order [Y, Z]: Y's pass-1 re-check resurrects + closure-
+        // deletes Z; Z's pass-1 re-check then sees Y as live.
         let stats = sweep(
             &db.pool,
             None,
@@ -845,6 +879,59 @@ mod tests {
             .await
             .unwrap();
             assert!(exists, "{name} must survive (transitive resurrection)");
+        }
+    }
+
+    /// Same as `sweep_resurrection_is_transitive` but with batch order
+    /// reversed. Z's pass-1 re-check finds no live referrer (Y is in
+    /// sweep_unreachable, anti-join excludes it) → Z is a delete
+    /// candidate. Y's pass-1 re-check then resurrects and closure-
+    /// deletes Z from sweep_unreachable. Pass-2's filter sees Z is
+    /// gone and skips it. Single-pass would have already deleted Z.
+    #[tokio::test]
+    async fn sweep_resurrection_is_transitive_reverse_order() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let z = test_store_path("transitive-rev-z");
+        let z_hash = StoreSeed::raw_path(&z).seed(&db.pool).await;
+        let y = test_store_path("transitive-rev-y");
+        let y_hash = StoreSeed::raw_path(&y)
+            .with_refs(&[&z])
+            .seed(&db.pool)
+            .await;
+        StoreSeed::path("transitive-rev-p")
+            .with_refs(&[&y])
+            .seed(&db.pool)
+            .await;
+
+        // Z FIRST — the order the single-pass implementation got wrong.
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![z_hash.clone(), y_hash.clone()],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_deleted, 0, "neither Y nor Z deleted");
+        assert_eq!(
+            stats.paths_resurrected, 2,
+            "Y by P (pass-1); Z by filter (pass-2)"
+        );
+
+        for (h, name) in [(&y_hash, "Y"), (&z_hash, "Z")] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)",
+            )
+            .bind(h)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(
+                exists,
+                "{name} must survive (reverse-order transitive resurrection)"
+            );
         }
     }
 
