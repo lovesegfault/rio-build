@@ -82,11 +82,6 @@ pub fn describe_metrics() {
         "Autoscale patches executed. direction=up|down. \
          High rate = queue depth oscillating (check stabilization windows)."
     );
-    describe_gauge!(
-        "rio_controller_workerpool_replicas",
-        "BuilderPool replica counts. kind=actual|desired, pool=namespace/name. \
-         Gap between actual and desired = StatefulSet rollout lag or stabilization window."
-    );
     describe_counter!(
         "rio_controller_gc_runs_total",
         "GC cron runs. result=success|connect_failure|rpc_failure. \

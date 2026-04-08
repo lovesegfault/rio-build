@@ -236,7 +236,6 @@ r[obs.metric.controller]
 |--------|------|-------------|
 | `rio_controller_reconcile_duration_seconds` | Histogram | Reconcile loop latency (labeled by reconciler) |
 | `rio_controller_reconcile_errors_total` | Counter | Reconcile errors (labeled by reconciler) |
-| `rio_controller_workerpool_replicas` | Gauge | BuilderPool replica count (labeled desired vs actual). Metric name predates the BuilderPool rename. |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
 | `rio_controller_manifest_spawn_failures_total` | Counter | Manifest Job spawn failures (labeled by pool). Non-zero rate with zero `reconcile_errors_total` = warn+continue absorbing errors below threshold; sustained high rate = threshold bailing every tick (check admission webhooks/RBAC). |
 | `rio_controller_ephemeral_jobs_reaped_total` | Counter | Excess Pending ephemeral Jobs deleted (labeled by `pool`, `class`). Non-zero rate = queued dropped after spawn (user cancel, gateway disconnect); zero rate with stuck Pending pods = reap not firing (check RBAC `delete` on `batch/jobs`). |

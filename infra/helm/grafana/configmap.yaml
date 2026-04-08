@@ -175,33 +175,6 @@ data:
       },
       "panels": [
         {
-          "id": 1,
-          "type": "timeseries",
-          "title": "BuilderPool replicas (per pool)",
-          "description": "Desired vs actual replicas per BuilderPool. Labels: pool (pool name), kind (desired/actual).",
-          "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
-          "datasource": {"type": "prometheus", "uid": "${datasource}"},
-          "targets": [
-            {
-              "expr": "rio_controller_workerpool_replicas",
-              "legendFormat": "{{pool}} ({{kind}})",
-              "refId": "A"
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "short",
-              "color": {"mode": "palette-classic"},
-              "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 0, "spanNulls": false}
-            },
-            "overrides": []
-          },
-          "options": {
-            "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
-            "tooltip": {"mode": "multi", "sort": "none"}
-          }
-        },
-        {
           "id": 2,
           "type": "timeseries",
           "title": "Queue depth per class",

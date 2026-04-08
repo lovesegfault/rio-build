@@ -75,38 +75,6 @@
       }
     },
     {
-      "id": 3,
-      "type": "timeseries",
-      "title": "Pool replicas: desired vs actual",
-      "description": "rio_controller_workerpool_replicas{kind=desired|actual} per pool. Gap = pods Pending (capacity) or Terminating (drain).",
-      "gridPos": {"x": 0, "y": 8, "w": 24, "h": 9},
-      "datasource": {"type": "prometheus", "uid": "${datasource}"},
-      "targets": [
-        {
-          "expr": "rio_controller_workerpool_replicas{kind=\"desired\"}",
-          "legendFormat": "{{pool}} desired",
-          "refId": "A"
-        },
-        {
-          "expr": "rio_controller_workerpool_replicas{kind=\"actual\"}",
-          "legendFormat": "{{pool}} actual",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 10, "spanNulls": false}
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
-        "tooltip": {"mode": "multi", "sort": "desc"}
-      }
-    },
-    {
       "id": 4,
       "type": "timeseries",
       "title": "Scaling decisions",
