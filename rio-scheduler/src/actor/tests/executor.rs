@@ -139,6 +139,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
 /// B's connect-time `dispatch_ready` found Ready + B idle → assigned
 /// to B. Post-fix, A's adoption transitions DAG to Assigned, B's
 /// dispatch sees not-Ready and skips.
+// r[verify sched.heartbeat.adopt]
 #[tokio::test]
 async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -284,6 +285,7 @@ async fn test_heartbeat_before_stream_does_not_create_zombie() -> TestResult {
 /// test exercises but asserts on `has_stream`/`warm`/`kind`/`systems`
 /// instead of just `is_registered` — these are the dispatch-filter
 /// inputs that PG `last_seen` can't tell you.
+// r[verify sched.admin.debug-list-executors]
 #[tokio::test]
 async fn test_debug_query_workers_extended_fields() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -428,6 +430,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
 /// post-send, I-032 pre-d11245b4). Before this fix the slot stayed dead
 /// forever: `has_capacity()` saw 1/1 and the derivation sat Assigned with
 /// no path to Ready short of executor disconnect.
+// r[verify sched.heartbeat.phantom-drain]
 #[tokio::test]
 async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
     let (_db, handle, _task, _stream_rx) =

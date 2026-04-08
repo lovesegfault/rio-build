@@ -1618,6 +1618,7 @@ mod tests {
     // check_freeze state machine. `backdate` (from actor/mod.rs) lets us
     // construct Instants in the past without waiting or mocking the clock.
 
+    // r[verify sched.freeze-detector]
     #[test]
     fn check_freeze_starts_timer_on_first_freeze() {
         let mut since = None;

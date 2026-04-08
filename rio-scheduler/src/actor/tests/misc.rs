@@ -979,10 +979,62 @@ async fn size_class_snapshot_honors_floor() {
 
 // ---------------------------------------------------------------------------
 
+/// `handle_inspect_build_dag` cross-references derivation state
+/// against the live executor stream pool. The I-025 signal:
+/// `executor_has_stream` is true iff the assigned executor's gRPC
+/// bidi stream is present in `self.executors`.
+// r[verify sched.admin.inspect-dag]
+#[tokio::test]
+async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
+    let (_db, handle, _task, mut stream_rx) = setup_with_worker("w-idiag", "x86_64-linux").await?;
+
+    let build_id = Uuid::new_v4();
+    let node = make_test_node("idiag-drv", "x86_64-linux");
+    let _events = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    // dispatch_ready ran inside merge → drain the assignment so the
+    // worker stream stays unblocked.
+    let _ = stream_rx.try_recv();
+
+    let (diags, live) = handle
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::InspectBuildDag { build_id, reply })
+        })
+        .await?;
+    assert_eq!(diags.len(), 1, "one derivation in build");
+    let d = &diags[0];
+    assert_eq!(d.assigned_executor, "w-idiag");
+    assert!(
+        d.executor_has_stream,
+        "live worker → executor_has_stream=true"
+    );
+    assert!(live.contains(&"w-idiag".to_string()));
+
+    // Drop the executor entry (simulates dead bidi-stream;
+    // ExecutorDisconnected also resets the drv but here we only care
+    // that the cross-ref turns false for the snapshot taken BEFORE
+    // any reconciliation reassigns it).
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: "w-idiag".into(),
+        })
+        .await?;
+    let (_, live_after) = handle
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::InspectBuildDag { build_id, reply })
+        })
+        .await?;
+    assert!(
+        !live_after.contains(&"w-idiag".to_string()),
+        "executor map dropped after disconnect"
+    );
+    Ok(())
+}
+
 /// `compute_estimator_stats` walks the in-memory snapshot and
 /// classifies under effective cutoffs (I-124). One short, one long
 /// entry → "small" / "large". With size_classes unconfigured →
 /// `size_class` is None for all entries.
+// r[verify sched.admin.estimator-stats]
 #[tokio::test]
 async fn estimator_stats_classifies_under_effective_cutoffs() {
     use crate::assignment::SizeClassConfig;

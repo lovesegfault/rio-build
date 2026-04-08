@@ -610,6 +610,7 @@ async fn test_generation_single_load_within_assignment() -> TestResult {
 /// Dispatch pins input-closure paths; terminal unpins.
 /// Verifies the end-to-end pin → unpin lifecycle via scheduler_
 /// live_pins row count.
+// r[verify sched.gc.live-pins]
 #[tokio::test]
 async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     let (db, handle, _task, mut stream_rx) = setup_with_worker("w-x9", "x86_64-linux").await?;
