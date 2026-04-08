@@ -724,11 +724,11 @@ pub async fn smoke_build(tag: &str, secs: u32, out_kb: u32, store_url: &str) -> 
         // 1023 chars + echo's newline = 1024 bytes/iter. No quoting
         // needed (alphanumeric). This busybox lacks printf too.
         .replace("@CHUNK@", &"x".repeat(1023));
-    // IdentitiesOnly=yes (smoke variant — see `shared::NIX_SSHOPTS_SMOKE`):
-    // the user's deploy key (comment "default") is in authorized_keys
-    // too. Without this, ssh-agent offers that key first → gateway sees
-    // tenant "default" → scheduler rejects "unknown tenant".
-    const SSHOPTS: &str = crate::k8s::shared::NIX_SSHOPTS_SMOKE;
+    // IdentitiesOnly=yes (see `shared::NIX_SSHOPTS_BASE`): the user's
+    // deploy key (comment "default") is in authorized_keys too. Without
+    // this, ssh-agent offers that key first → gateway sees tenant
+    // "default" → scheduler rejects "unknown tenant".
+    const SSHOPTS: &str = crate::k8s::shared::NIX_SSHOPTS_BASE;
 
     // Scope each Shell to end before .await so the future stays Send
     // (Shell is !Sync — RefCell internals). sh::run converts Cmd<'_>

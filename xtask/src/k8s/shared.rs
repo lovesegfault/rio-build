@@ -48,12 +48,6 @@ pub const NIX_SSHOPTS_BASE: &str = "-o StrictHostKeyChecking=no -o UserKnownHost
      -o ControlMaster=no -o ControlPath=none \
      -o IdentityAgent=none -o IdentitiesOnly=yes";
 
-/// Smoke alias of [`NIX_SSHOPTS_BASE`]. Separate const for the
-/// distinct rationale (smoke uses `/tmp/rio-smoke-key`, IdentitiesOnly
-/// also prevents the agent offering the user's deploy key first →
-/// wrong tenant). Same value since BASE now has IdentitiesOnly.
-pub const NIX_SSHOPTS_SMOKE: &str = NIX_SSHOPTS_BASE;
-
 /// Subcharts listed in Chart.yaml's `dependencies:`. Helm validates
 /// charts/ against Chart.yaml BEFORE evaluating `condition: *.enabled`,
 /// so every entry must be symlinked even when disabled for a given
@@ -450,25 +444,21 @@ mod tests {
         panic!("grandchild {grandchild} still alive 2s after ProcessGuard drop");
     }
 
-    /// I-161 regression guard: both `NIX_SSHOPTS_*` consts carry the
-    /// I-149 ServerAlive options + ControlMaster suppression.
-    /// `concat!`-of-consts isn't stable so the SMOKE literal is a
-    /// hand-copy; this asserts it stays in sync.
+    /// I-161 regression guard: `NIX_SSHOPTS_BASE` carries the I-149
+    /// ServerAlive options + ControlMaster suppression + IdentitiesOnly.
     #[test]
     fn nix_sshopts_have_keepalive_and_no_mux() {
-        for (name, s) in [
-            ("NIX_SSHOPTS_BASE", NIX_SSHOPTS_BASE),
-            ("NIX_SSHOPTS_SMOKE", NIX_SSHOPTS_SMOKE),
+        for needle in [
+            "ServerAliveInterval=30",
+            "ServerAliveCountMax=6",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "IdentitiesOnly=yes",
         ] {
-            for needle in [
-                "ServerAliveInterval=30",
-                "ServerAliveCountMax=6",
-                "ControlMaster=no",
-                "ControlPath=none",
-            ] {
-                assert!(s.contains(needle), "{name} missing {needle:?}");
-            }
+            assert!(
+                NIX_SSHOPTS_BASE.contains(needle),
+                "NIX_SSHOPTS_BASE missing {needle:?}"
+            );
         }
-        assert!(NIX_SSHOPTS_SMOKE.contains("IdentitiesOnly=yes"));
     }
 }
