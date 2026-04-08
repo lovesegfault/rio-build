@@ -47,7 +47,7 @@ endpoint). CORS `allowOrigins` defaults to the in-cluster nginx Service hostname
 | View | Data Source | Description |
 |------|-------------|-------------|
 | Cluster | `AdminService.ClusterStatus` | Executor/build/derivation counts, entry point to GC |
-| Builds | `AdminService.ListBuilds` | Paginated list with status filter + per-build drawer; entry point to the killer journey |
+| Builds | `AdminService.ListBuilds` | Paginated list with status filter + per-build drawer; entry point to the killer journey. `/builds/:id` deep-links directly to a build's drawer (currently resolved via a one-shot `listBuilds(1000)` scan until a dedicated `GetBuild` RPC lands). |
 | Build drawer · Graph tab | `AdminService.GetBuildGraph` | Interactive DAG visualization (`@xyflow/svelte`), color-coded status, degrades to table >2000 nodes, polls 5s until all-terminal |
 | Build drawer · Logs tab | `AdminService.GetBuildLogs` (server stream) | Live-tail build output, UTF-8-lossy decode, virtualized scroller; `drvPath` filter set by Graph node click |
 | Executors | `AdminService.ListExecutors` | Busy/idle pill (one-build-per-pod ⇒ binary), kind filter (builder/fetcher), stale-heartbeat highlight, drain button |

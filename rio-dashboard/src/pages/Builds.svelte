@@ -44,8 +44,10 @@
   // never contain the target build (wrong page, different filter). We
   // issue a one-shot unfiltered fetch with the scheduler's max clamp and
   // .find() the row. If the build is past the first 1000 this silently
-  // doesn't find it — acceptable until a GetBuild(id) RPC lands (no
-  // owner plan — current workaround: broad listBuilds+find).
+  // doesn't find it.
+  //
+  // TODO: deep-link via dedicated GetBuild RPC instead of listBuilds(1000)
+  // scan — needs admin.proto + scheduler handler + GRPCRoute matcher.
   let deepLinkTried = $state(false);
 
   // The list effect tracks { statusFilter, pageIdx }. $effect re-runs
