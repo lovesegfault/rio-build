@@ -8,6 +8,8 @@
 use rio_proto::dag::{GetBuildGraphResponse, GraphEdge, GraphNode};
 use tonic::Status;
 
+use rio_common::grpc::StatusExt;
+
 use crate::db::{GraphEdgeRow, GraphNodeRow, SchedulerDb};
 
 /// Server-side node cap. The dashboard would choke on 50k-node
@@ -32,7 +34,7 @@ pub(super) async fn get_build_graph(
     let (nodes, edges, total) = db
         .load_build_graph(uuid, limit)
         .await
-        .map_err(|e| Status::internal(format!("load_build_graph: {e}")))?;
+        .status_internal("load_build_graph")?;
 
     Ok(GetBuildGraphResponse {
         nodes: nodes.into_iter().map(node_row_to_proto).collect(),

@@ -36,7 +36,8 @@ pub(crate) async fn run(
     // once the stream is open, per-message receives have no
     // deadline (an active build may go minutes between log
     // lines; that's not a hang, that's a slow build).
-    let mut stream = tokio::time::timeout(
+    let mut stream = rio_common::grpc::with_timeout(
+        "GetBuildLogs",
         RPC_TIMEOUT,
         client.get_build_logs(GetBuildLogsRequest {
             build_id: build_id.unwrap_or_default(),
@@ -44,9 +45,7 @@ pub(crate) async fn run(
             since_line: 0,
         }),
     )
-    .await
-    .map_err(|_| anyhow!("GetBuildLogs: open timed out after {RPC_TIMEOUT:?}"))?
-    .map_err(|s| anyhow!("GetBuildLogs: {} ({:?})", s.message(), s.code()))?
+    .await?
     .into_inner();
 
     // Drain. `lines` is `repeated bytes` — may be non-UTF-8

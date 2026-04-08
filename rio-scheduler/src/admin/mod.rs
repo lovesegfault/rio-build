@@ -19,6 +19,8 @@ use aws_sdk_s3::Client as S3Client;
 use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+use rio_common::grpc::StatusExt;
 use tracing::instrument;
 
 use rio_common::tenant::NormalizedName;
@@ -364,7 +366,7 @@ impl AdminService for AdminServiceImpl {
         let rows = db
             .load_poisoned_derivations()
             .await
-            .map_err(|e| Status::internal(format!("load_poisoned_derivations: {e}")))?;
+            .status_internal("load_poisoned_derivations")?;
         let derivations = rows
             .into_iter()
             .map(|r| PoisonedDerivation {

@@ -20,13 +20,12 @@ pub(crate) async fn run(
     client: &mut StoreAdminServiceClient<Channel>,
     batch_size: u32,
 ) -> anyhow::Result<()> {
-    let mut stream = tokio::time::timeout(
+    let mut stream = rio_common::grpc::with_timeout(
+        "VerifyChunks",
         RPC_TIMEOUT,
         client.verify_chunks(VerifyChunksRequest { batch_size }),
     )
-    .await
-    .map_err(|_| anyhow!("VerifyChunks: open timed out after {RPC_TIMEOUT:?}"))?
-    .map_err(|s| anyhow!("VerifyChunks: {} ({:?})", s.message(), s.code()))?
+    .await?
     .into_inner();
 
     let mut saw_done = false;

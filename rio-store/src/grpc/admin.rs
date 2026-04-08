@@ -479,8 +479,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
 /// Parse the proto's string tenant_id into a Uuid. Proto uses string
 /// (not bytes) for UUIDs; this is the one conversion point.
 fn parse_tenant_id(s: &str) -> Result<uuid::Uuid, Status> {
-    uuid::Uuid::parse_str(s)
-        .map_err(|e| Status::invalid_argument(format!("invalid tenant_id {s:?}: {e}")))
+    uuid::Uuid::parse_str(s).status_invalid(&format!("invalid tenant_id {s:?}"))
 }
 
 /// Validate a `name:base64(pubkey)` trusted-key entry. Rejects
@@ -497,7 +496,7 @@ fn validate_trusted_key(k: &str) -> Result<(), Status> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
-        .map_err(|e| Status::invalid_argument(format!("trusted_key {k:?}: bad base64: {e}")))?;
+        .status_invalid(&format!("trusted_key {k:?}: bad base64"))?;
     if bytes.len() != 32 {
         return Err(Status::invalid_argument(format!(
             "trusted_key {k:?}: pubkey must be 32 bytes (ed25519), got {}",

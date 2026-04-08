@@ -7,6 +7,8 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
+
+use rio_common::grpc::StatusExt;
 use tracing::debug;
 
 use rio_proto::types::{GcProgress, GcRequest};
@@ -104,7 +106,7 @@ pub(super) async fn trigger_gc(
     let store_stream = store_admin
         .trigger_gc(tonic_req)
         .await
-        .map_err(|e| Status::internal(format!("store TriggerGC failed: {e}")))?
+        .status_internal("store TriggerGC failed")?
         .into_inner();
 
     // Forward store's progress stream to the client. A small

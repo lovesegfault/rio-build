@@ -72,7 +72,7 @@ pub const DEFAULT_MAX_BATCH_PATHS: usize = 1_048_576;
 pub(crate) fn validate_store_path(s: &str) -> Result<(), Status> {
     rio_nix::store_path::StorePath::parse(s)
         .map(|_| ())
-        .map_err(|e| Status::invalid_argument(format!("invalid store path {s:?}: {e}")))
+        .status_invalid(&format!("invalid store path {s:?}"))
 }
 
 /// Map a storage-backend anyhow error to a Status, distinguishing

@@ -2,6 +2,7 @@
 
 use tonic::Status;
 
+use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 use rio_proto::types::{
     CreateTenantRequest, CreateTenantResponse, ListTenantsResponse, TenantInfo,
@@ -11,10 +12,7 @@ use crate::db::{SchedulerDb, TenantRow};
 
 /// Load all tenants from PG and convert to proto.
 pub(super) async fn list_tenants(db: &SchedulerDb) -> Result<ListTenantsResponse, Status> {
-    let rows = db
-        .list_tenants()
-        .await
-        .map_err(|e| Status::internal(format!("db: {e}")))?;
+    let rows = db.list_tenants().await.status_internal("list_tenants")?;
     Ok(ListTenantsResponse {
         tenants: rows.into_iter().map(tenant_row_to_proto).collect(),
     })
@@ -35,8 +33,8 @@ pub(super) async fn create_tenant(
     db: &SchedulerDb,
     req: CreateTenantRequest,
 ) -> Result<CreateTenantResponse, Status> {
-    let tenant_name = NormalizedName::new(&req.tenant_name)
-        .map_err(|e| Status::invalid_argument(format!("invalid tenant_name: {e}")))?;
+    let tenant_name =
+        NormalizedName::new(&req.tenant_name).status_invalid("invalid tenant_name")?;
     let cache_token = req.cache_token.as_deref().map(str::trim);
     if cache_token.is_some_and(str::is_empty) {
         return Err(Status::invalid_argument(
@@ -70,7 +68,7 @@ pub(super) async fn create_tenant(
             cache_token,
         )
         .await
-        .map_err(|e| Status::internal(format!("db: {e}")))?
+        .status_internal("create_tenant")?
         .ok_or_else(|| {
             Status::already_exists(format!(
                 "tenant '{tenant_name}' already exists (or cache_token collision)"

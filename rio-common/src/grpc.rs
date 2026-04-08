@@ -21,7 +21,61 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use tonic::Status;
+use tonic::metadata::MetadataMap;
 use tonic::transport::ClientTlsConfig;
+
+// ---------------------------------------------------------------------------
+// `x-rio-*` gRPC metadata header keys
+//
+// Single home so the gateway, scheduler, store, and builder all reference
+// the SAME constant — a typo in a string literal at one site silently
+// breaks header propagation with no compile-time signal. All values are
+// lowercase: tonic normalizes metadata keys per HTTP/2 header rules.
+// ---------------------------------------------------------------------------
+
+/// gRPC initial-metadata key carrying the scheduler-assigned build_id
+/// on `SubmitBuild` responses. Server-streaming RPCs send initial
+/// metadata (headers) BEFORE any stream message, so the client has
+/// `build_id` even if the stream delivers zero events (scheduler
+/// SIGTERM between MergeDag commit and first BuildEvent send).
+///
+/// Value: UUID v7 stringified (always ASCII, always a valid
+/// `MetadataValue<Ascii>`). Always set by the scheduler.
+pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
+
+/// gRPC initial-metadata key carrying the scheduler handler span's
+/// trace_id on `SubmitBuild` responses.
+///
+/// Set by the scheduler AFTER `link_parent()` so it reflects the actual
+/// trace the handler is in — which, due to the `#[instrument]` +
+/// `set_parent` ordering, is a NEW trace LINKED to the gateway's, not a
+/// child of it. Jaeger shows two traces connected by an OTel span link.
+///
+/// The gateway emits THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`)
+/// so operators grep the trace that actually spans scheduler→builder (via
+/// the `WorkAssignment.traceparent` data-carry). The gateway's own
+/// trace_id only reaches gateway spans.
+///
+/// Value: 32 lowercase-hex characters (128-bit W3C trace_id). Always
+/// ASCII. Empty/absent → legacy scheduler; gateway falls back to its
+/// own `current_trace_id_hex()`.
+pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
+
+/// gRPC metadata key for HMAC-signed assignment tokens.
+///
+/// Scheduler signs at dispatch (executor_id + drv_hash + expiry);
+/// store verifies on PutPath to gate which executor can upload which
+/// path. See [`crate::hmac`] for the token format. Value is
+/// base64-encoded bytes (always ASCII).
+pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
+
+/// gRPC metadata key the gateway sets on every outbound call in JWT mode.
+///
+/// Lowercase: tonic normalizes metadata keys (HTTP/2 header rules).
+/// Matches `rio-gateway/src/handler/build.rs` — if the gateway ever
+/// renames this, `header_name_matches_gateway_literal` in
+/// [`crate::jwt_interceptor`] tests fails.
+pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
 
 /// Default timeout for metadata gRPC calls (QueryPathInfo, FindMissingPaths, etc.).
 ///
@@ -187,6 +241,26 @@ pub async fn with_timeout_status<T>(
     tokio::time::timeout(timeout, fut).await.map_err(|_| {
         tonic::Status::deadline_exceeded(format!("'{name}' timed out after {timeout:?}"))
     })?
+}
+
+/// Insert caller-supplied `(key, value)` pairs into a request's metadata
+/// map.
+///
+/// Dedupe for the `for (k, v) in extra { req.metadata_mut().insert(...) }`
+/// loop that appears at every client wrapper that threads
+/// `x-rio-tenant-token` (or similar) onward. Values are parsed as
+/// `MetadataValue<Ascii>`; a non-ASCII value returns
+/// `Status::internal` (header values are caller-supplied, not
+/// network-supplied — a parse failure here is a bug, not client input).
+pub fn inject_metadata(md: &mut MetadataMap, extra: &[(&'static str, &str)]) -> Result<(), Status> {
+    for (k, v) in extra {
+        md.insert(
+            *k,
+            v.parse()
+                .map_err(|e| Status::internal(format!("metadata {k}: {e}")))?,
+        );
+    }
+    Ok(())
 }
 
 /// Return `InvalidArgument` if `got > max`.

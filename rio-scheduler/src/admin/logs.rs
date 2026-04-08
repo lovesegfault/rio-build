@@ -21,6 +21,8 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
+
+use rio_common::grpc::StatusExt;
 use tracing::debug;
 
 use rio_proto::types::{BuildLogChunk, GetBuildLogsRequest};
@@ -172,7 +174,7 @@ async fn try_s3(
     .bind(drv_hash)
     .fetch_optional(pool)
     .await
-    .map_err(|e| Status::internal(format!("PG query failed: {e}")))?;
+    .status_internal("PG query failed")?;
 
     let Some((s3_key, _line_count)) = row else {
         return Ok(None); // not in S3 either → truly not found
@@ -200,8 +202,8 @@ async fn try_s3(
     let chunks =
         tokio::task::spawn_blocking(move || gunzip_and_chunk(&gzipped, &drv_hash_owned, since))
             .await
-            .map_err(|e| Status::internal(format!("gunzip task panicked: {e}")))?
-            .map_err(|e| Status::internal(format!("gunzip failed: {e}")))?;
+            .status_internal("gunzip task panicked")?
+            .status_internal("gunzip failed")?;
 
     Ok(Some(chunks))
 }

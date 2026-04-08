@@ -60,12 +60,9 @@ use tonic::{Request, Status};
 use crate::jwt::{self, TenantClaims};
 use crate::signal::Token as CancellationToken;
 
-/// gRPC metadata key the gateway sets on every outbound call in JWT mode.
-///
-/// Lowercase: tonic normalizes metadata keys (HTTP/2 header rules).
-/// Matches `rio-gateway/src/handler/build.rs` — if the gateway ever
-/// renames this, `header_name_matches_gateway_literal` below fails.
-pub const TENANT_TOKEN_HEADER: &str = "x-rio-tenant-token";
+/// Re-export — canonical home is [`crate::grpc::TENANT_TOKEN_HEADER`]
+/// alongside the other `x-rio-*` header constants.
+pub use crate::grpc::TENANT_TOKEN_HEADER;
 
 /// Shared pubkey handle the interceptor reads on every intercepted call.
 ///

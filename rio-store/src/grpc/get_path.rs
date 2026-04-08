@@ -66,7 +66,7 @@ fn hint_into_manifest(
         )));
     }
     let info = rio_proto::validated::ValidatedPathInfo::try_from(raw_info)
-        .map_err(|e| Status::invalid_argument(format!("manifest_hint.info malformed: {e}")))?;
+        .status_invalid("manifest_hint.info malformed")?;
 
     let manifest = if hint.chunks.is_empty() {
         ManifestKind::Inline(Bytes::from(hint.inline_blob))

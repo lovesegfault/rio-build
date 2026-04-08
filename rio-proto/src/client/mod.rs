@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rio_common::grpc::{
-    H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW, client_tls, max_message_size,
+    H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW, client_tls, inject_metadata,
+    max_message_size, with_timeout_status,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_stream::{Stream, StreamExt};
@@ -434,25 +435,16 @@ pub async fn query_path_info_opt(
         store_path: store_path.to_string(),
     });
     crate::interceptor::inject_current(req.metadata_mut());
-    for (k, v) in extra_metadata {
-        req.metadata_mut().insert(
-            *k,
-            v.parse()
-                .map_err(|e| tonic::Status::internal(format!("metadata {k}: {e}")))?,
-        );
-    }
-    match tokio::time::timeout(timeout, client.query_path_info(req)).await {
-        Ok(Ok(resp)) => {
+    inject_metadata(req.metadata_mut(), extra_metadata)?;
+    match with_timeout_status("QueryPathInfo", timeout, client.query_path_info(req)).await {
+        Ok(resp) => {
             let validated = ValidatedPathInfo::try_from(resp.into_inner()).map_err(|e| {
                 tonic::Status::internal(format!("store returned malformed PathInfo: {e}"))
             })?;
             Ok(Some(validated))
         }
-        Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(None),
-        Ok(Err(status)) => Err(status),
-        Err(_) => Err(tonic::Status::deadline_exceeded(format!(
-            "QueryPathInfo timed out after {timeout:?}"
-        ))),
+        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+        Err(status) => Err(status),
     }
 }
 
@@ -473,20 +465,13 @@ pub async fn batch_query_path_info(
 ) -> Result<Vec<(String, Option<ValidatedPathInfo>)>, tonic::Status> {
     let mut req = tonic::Request::new(BatchQueryPathInfoRequest { store_paths });
     crate::interceptor::inject_current(req.metadata_mut());
-    for (k, v) in extra_metadata {
-        req.metadata_mut().insert(
-            *k,
-            v.parse()
-                .map_err(|e| tonic::Status::internal(format!("metadata {k}: {e}")))?,
-        );
-    }
-    let resp = tokio::time::timeout(timeout, client.batch_query_path_info(req))
-        .await
-        .map_err(|_| {
-            tonic::Status::deadline_exceeded(format!(
-                "BatchQueryPathInfo timed out after {timeout:?}"
-            ))
-        })??;
+    inject_metadata(req.metadata_mut(), extra_metadata)?;
+    let resp = with_timeout_status(
+        "BatchQueryPathInfo",
+        timeout,
+        client.batch_query_path_info(req),
+    )
+    .await?;
     resp.into_inner()
         .entries
         .into_iter()
@@ -521,13 +506,8 @@ pub async fn batch_get_manifest(
 ) -> Result<Vec<(String, Option<crate::types::ManifestHint>)>, tonic::Status> {
     let mut req = tonic::Request::new(BatchGetManifestRequest { store_paths });
     crate::interceptor::inject_current(req.metadata_mut());
-    let resp = tokio::time::timeout(timeout, client.batch_get_manifest(req))
-        .await
-        .map_err(|_| {
-            tonic::Status::deadline_exceeded(format!(
-                "BatchGetManifest timed out after {timeout:?}"
-            ))
-        })??;
+    let resp =
+        with_timeout_status("BatchGetManifest", timeout, client.batch_get_manifest(req)).await?;
     Ok(resp
         .into_inner()
         .entries
@@ -564,14 +544,7 @@ pub async fn get_path_nar(
         manifest_hint,
     });
     crate::interceptor::inject_current(req.metadata_mut());
-    for (k, v) in extra_metadata {
-        req.metadata_mut().insert(
-            *k,
-            v.parse().map_err(|e| {
-                NarCollectError::Stream(tonic::Status::internal(format!("metadata {k}: {e}")))
-            })?,
-        );
-    }
+    inject_metadata(req.metadata_mut(), extra_metadata).map_err(NarCollectError::Stream)?;
     let fut = async {
         let mut stream = match client.get_path(req).await {
             Ok(resp) => resp.into_inner(),
@@ -620,28 +593,16 @@ pub async fn get_path_nar_to_file(
         manifest_hint,
     });
     crate::interceptor::inject_current(req.metadata_mut());
-    for (k, v) in extra_metadata {
-        req.metadata_mut().insert(
-            *k,
-            v.parse().map_err(|e| {
-                NarCollectError::Stream(tonic::Status::internal(format!("metadata {k}: {e}")))
-            })?,
-        );
-    }
+    inject_metadata(req.metadata_mut(), extra_metadata).map_err(NarCollectError::Stream)?;
     // I-211: `timeout` is now an IDLE bound, not a wall-clock bound on the
     // whole fetch. It applies twice: (1) the initial RPC (covers connect +
     // server-side first-response — a hung store still trips at 60s); (2)
     // each subsequent `stream.message()` inside the collector. A 2.9 GB
     // NAR completes as long as the store yields a chunk every <`timeout`.
-    let mut stream = match tokio::time::timeout(timeout, client.get_path(req)).await {
-        Ok(Ok(resp)) => resp.into_inner(),
-        Ok(Err(status)) if status.code() == tonic::Code::NotFound => return Ok(None),
-        Ok(Err(status)) => return Err(NarCollectError::Stream(status)),
-        Err(_) => {
-            return Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
-                format!("GetPath({store_path}) initial response timed out after {timeout:?}"),
-            )));
-        }
+    let mut stream = match with_timeout_status("GetPath", timeout, client.get_path(req)).await {
+        Ok(resp) => resp.into_inner(),
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => return Err(NarCollectError::Stream(status)),
     };
     let (info, _written) =
         collect_nar_stream_to_writer(&mut stream, max_nar_size, Some(timeout), spool).await?;

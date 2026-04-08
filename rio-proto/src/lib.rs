@@ -5,41 +5,10 @@
 //! [`ValidatedPathInfo`](validated::ValidatedPathInfo) for proto→domain
 //! validation and [`interceptor`] for W3C traceparent propagation.
 
-/// gRPC initial-metadata key carrying the scheduler-assigned build_id
-/// on `SubmitBuild` responses. Server-streaming RPCs send initial
-/// metadata (headers) BEFORE any stream message, so the client has
-/// `build_id` even if the stream delivers zero events (scheduler
-/// SIGTERM between MergeDag commit and first BuildEvent send).
-///
-/// Value: UUID v7 stringified (always ASCII, always a valid
-/// `MetadataValue<Ascii>`). Always set by the scheduler.
-pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
-
-/// gRPC initial-metadata key carrying the scheduler handler span's
-/// trace_id on `SubmitBuild` responses.
-///
-/// Set by the scheduler AFTER `link_parent()` so it reflects the actual
-/// trace the handler is in — which, due to the `#[instrument]` +
-/// `set_parent` ordering, is a NEW trace LINKED to the gateway's, not a
-/// child of it. Jaeger shows two traces connected by an OTel span link.
-///
-/// The gateway emits THIS id in `STDERR_NEXT` (`rio trace_id: <32-hex>`)
-/// so operators grep the trace that actually spans scheduler→builder (via
-/// the `WorkAssignment.traceparent` data-carry). The gateway's own
-/// trace_id only reaches gateway spans.
-///
-/// Value: 32 lowercase-hex characters (128-bit W3C trace_id). Always
-/// ASCII. Empty/absent → legacy scheduler; gateway falls back to its
-/// own `current_trace_id_hex()`.
-pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
-
-/// gRPC metadata key for HMAC-signed assignment tokens.
-///
-/// Scheduler signs at dispatch (executor_id + drv_hash + expiry);
-/// store verifies on PutPath to gate which executor can upload which
-/// path. See rio-common::hmac for the token format. Value is
-/// base64-encoded bytes (always ASCII).
-pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
+// `x-rio-*` header constants live in `rio-common::grpc` (proto-agnostic).
+// Re-exported here so existing `rio_proto::BUILD_ID_HEADER` paths keep
+// resolving across the workspace.
+pub use rio_common::grpc::{ASSIGNMENT_TOKEN_HEADER, BUILD_ID_HEADER, TRACE_ID_HEADER};
 
 pub mod client;
 pub mod interceptor;

@@ -29,16 +29,15 @@ pub(crate) async fn run(
     // STREAMING — same open-timeout-only shape as `logs`. A store
     // sweep can legitimately go silent for minutes between
     // progress messages (mark phase on a large store).
-    let mut stream = tokio::time::timeout(
+    let mut stream = rio_common::grpc::with_timeout(
+        "TriggerGC",
         RPC_TIMEOUT,
         client.trigger_gc(GcRequest {
             dry_run,
             ..Default::default()
         }),
     )
-    .await
-    .map_err(|_| anyhow!("TriggerGC: open timed out after {RPC_TIMEOUT:?}"))?
-    .map_err(|s| anyhow!("TriggerGC: {} ({:?})", s.message(), s.code()))?
+    .await?
     .into_inner();
 
     // Drain progress. Print each message as it arrives so the

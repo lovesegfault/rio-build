@@ -3,6 +3,8 @@
 use base64::Engine;
 use rio_proto::types::{BuildInfo, BuildState, ListBuildsResponse};
 use tonic::Status;
+
+use rio_common::grpc::StatusExt;
 use uuid::Uuid;
 
 use crate::db::{BuildListRow, SchedulerDb};
@@ -64,7 +66,7 @@ fn encode_cursor(submitted_at_micros: i64, build_id: Uuid) -> String {
 fn decode_cursor(s: &str) -> Result<(i64, Uuid), Status> {
     let buf = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
-        .map_err(|e| Status::invalid_argument(format!("bad cursor: {e}")))?;
+        .status_invalid("bad cursor")?;
     // Version-byte first, length second: a future v2 cursor with
     // different length would get "bad cursor length" (misleading) if
     // length were checked first. Version-first enables multi-version
@@ -126,7 +128,7 @@ pub(super) async fn list_builds(
             let rows = db
                 .list_builds_keyset(status_opt, tenant_filter, limit, cursor_micros, cursor_id)
                 .await
-                .map_err(|e| Status::internal(format!("list_builds: {e}")))?;
+                .status_internal("list_builds")?;
             // Cursor page → total not recomputed. Client carries the
             // first-page total forward; 0 here signals "unchanged/unknown".
             (0, rows)
@@ -134,7 +136,7 @@ pub(super) async fn list_builds(
         None => db
             .list_builds(status_opt, tenant_filter, limit, offset as i64)
             .await
-            .map_err(|e| Status::internal(format!("list_builds: {e}")))?,
+            .status_internal("list_builds")?,
     };
 
     // next_cursor: set iff this page is FULL (len == limit). A short
