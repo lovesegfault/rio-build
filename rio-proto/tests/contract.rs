@@ -123,6 +123,12 @@ fn check_bound_exactly_at_limit_is_ok() {
 // Limits are reasonable (compile-time sanity)
 // ===========================================================================
 
+// WONTFIX: equality test against rio_common::limits — most check_bound callsites
+// reference rio_common::limits::* directly so there is no separate literal to
+// drift; the remaining local-const bounds (MAX_HEARTBEAT_SYSTEMS,
+// MAX_GC_EXTRA_ROOTS, DEFAULT_MAX_BATCH_PATHS) live in their owning crates
+// and are not covered here — rio-proto has no dep on rio-scheduler/rio-store.
+
 /// Limits are reasonable. `const { assert! }` = COMPILE-TIME check —
 /// a PR that lowers one of these below the floor won't even build,
 /// let alone reach the VM tests. The #[test] wrapper just gives it

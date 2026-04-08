@@ -98,7 +98,7 @@ Solid edges are prod dependencies; dashed are `[dev-dependencies]` only.
 Notable edges:
 
 - **`rio-proto → rio-nix`**: `ValidatedPathInfo` wraps `StorePath` from rio-nix. No cycle — rio-nix has no rio-* deps.
-- **`rio-proto → rio-common`**: `connect_channel`/`connect_with_retry` use `rio_common::backoff` and `rio_common::grpc` constants. Contract tests also check `rio_common::limits` against proto-side `check_bound` enforcement.
+- **`rio-proto → rio-common`**: `connect_channel`/`connect_with_retry` use `rio_common::backoff` and `rio_common::grpc` constants. Contract tests floor-assert `rio_common::limits` constants at compile time (e.g., `MAX_DAG_NODES >= 70_000`).
 - **`rio-scheduler → rio-nix` (prod)**: `Derivation` parsing for closure resolution and `StorePath` validation in the merge path.
 - **`rio-scheduler → rio-crds` (prod)**: lease-election reads `BuilderPoolSet` to seed size-class config at startup.
 - **`rio-scheduler → rio-store` (dev-only)**: integration tests spin up a real `StoreServiceServer` from `rio-store::grpc`.
