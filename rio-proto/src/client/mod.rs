@@ -256,29 +256,7 @@ impl NarCollectError {
     /// Retrying with the same timeout won't help, and the next retry
     /// would compound the wait on a FUSE-thread caller.
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            NarCollectError::Stream(s)
-                // I-122: ResourceExhausted = store's PG pool full. With
-                // ~400 ephemeral builders synchronously transitioning
-                // (warm→build, build→collect), output-path GetPath
-                // bursts can briefly saturate even 8×200=1600 conns.
-                // The pool drains in <1s — retry is the right answer.
-                //
-                // I-189: Aborted = store's retryable PG conflict
-                // (Serialization, Deadlock — see `rio-store::metadata`).
-                // The store says "retry" via Aborted; without it here
-                // the builder's
-                // no-manifest-hint fallback path EIOs immediately on PG
-                // contention instead of backing off.
-                if matches!(
-                    s.code(),
-                    tonic::Code::Unavailable
-                        | tonic::Code::Unknown
-                        | tonic::Code::ResourceExhausted
-                        | tonic::Code::Aborted
-                )
-        )
+        matches!(self, NarCollectError::Stream(s) if rio_common::grpc::is_transient(s.code()))
     }
 
     /// True if the server rejected the request as malformed

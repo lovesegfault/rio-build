@@ -617,7 +617,7 @@ pub(super) async fn fetch_chunks_to_spool(
                             }
                             return Ok::<_, NarCollectError>(b);
                         }
-                        Err(status) if is_transient_status(&status) => {
+                        Err(status) if rio_common::grpc::is_transient(status.code()) => {
                             attempt += 1;
                             metrics::counter!(
                                 "rio_builder_fuse_fetch_chunks_total",
@@ -740,25 +740,6 @@ async fn fetch_one_chunk(
         }
     }
     Ok(buf)
-}
-
-/// Same classification as [`NarCollectError::is_transient`] but on a
-/// raw `Status` (per-chunk closure has no `NarCollectError` yet).
-///
-/// I-189: includes `Aborted`. The store maps retryable PG conflicts
-/// (Serialization, Deadlock — see `rio-store::metadata`) to
-/// `tonic::Code::Aborted` with explicit "client should retry" intent.
-/// Without it here, the no-manifest-hint fallback path EIOs immediately
-/// on PG contention instead of backing off.
-// r[impl builder.fuse.retry-jitter]
-fn is_transient_status(s: &tonic::Status) -> bool {
-    matches!(
-        s.code(),
-        tonic::Code::Unavailable
-            | tonic::Code::Unknown
-            | tonic::Code::ResourceExhausted
-            | tonic::Code::Aborted
-    )
 }
 
 /// True when `e` from the chunk path means "this store can't serve
@@ -1073,6 +1054,9 @@ fn fetch_extract_insert_with(
                 // is stricter than ours. ENOENT flows through ensure_cached's
                 // record(true) — never trips the breaker.
                 Err(e) if e.is_invalid_argument() => return Err(Errno::ENOENT),
+                // Transient classification (incl. Aborted for retryable
+                // PG serialization conflict, I-189) lives in
+                // rio_common::grpc::is_transient.
                 Err(e) if e.is_transient() => match RETRY_BACKOFF.get(attempt) {
                     Some(&delay) => {
                         attempt += 1;
@@ -1196,21 +1180,6 @@ fn fetch_extract_insert_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// I-189 Option D: store returns `Aborted` for retryable PG
-    /// conflicts (Serialization, Deadlock). Builder must retry, not
-    /// EIO.
-    // r[verify builder.fuse.retry-jitter]
-    #[test]
-    fn test_aborted_is_transient() {
-        assert!(is_transient_status(&tonic::Status::aborted("")));
-        // Regression guard: the pre-existing transient set still holds.
-        assert!(is_transient_status(&tonic::Status::unavailable("")));
-        assert!(is_transient_status(&tonic::Status::unknown("")));
-        assert!(is_transient_status(&tonic::Status::resource_exhausted("")));
-        // And a definitely-not-transient code stays false.
-        assert!(!is_transient_status(&tonic::Status::data_loss("")));
-    }
 
     /// I-189 Option A: jitter actually varies and stays in
     /// `[0.5×base, 1.5×base)`. Under herd, lockstep retry IS the herd;

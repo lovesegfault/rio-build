@@ -244,6 +244,37 @@ pub fn internal(ctx: &str, e: impl Display) -> Status {
     Status::internal(ctx)
 }
 
+/// True if a gRPC status code represents a transient server-side
+/// condition that might succeed on retry.
+///
+/// - `Unavailable` — server explicitly down (pod restarting,
+///   follower-reject, connection refused).
+/// - `Unknown` — transport disconnect: h2 connection reset, TLS close
+///   mid-stream; what tonic surfaces when the peer goes away without a
+///   gRPC-level status.
+/// - `ResourceExhausted` — store's PG pool full (I-122). With ~400
+///   ephemeral builders synchronously transitioning, output-path bursts
+///   can briefly saturate even 8×200=1600 conns. Drains in <1s.
+/// - `Aborted` — store's retryable PG conflict (Serialization, Deadlock
+///   — see `rio-store::metadata`). The store says "retry" via Aborted
+///   (I-189); without it the builder's no-manifest-hint fallback path
+///   EIOs immediately on PG contention instead of backing off.
+///
+/// `DeadlineExceeded` is deliberately NOT transient: that's the caller's
+/// own timeout firing — the peer hung past `fetch_timeout`. Retrying
+/// with the same timeout won't help, and on a FUSE-thread caller the
+/// next retry would compound the wait.
+// r[impl builder.fuse.retry-jitter]
+pub fn is_transient(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Aborted
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +350,22 @@ mod tests {
         // Ok passes through unchanged.
         let r: Result<u32, &str> = Ok(7);
         assert_eq!(r.status_internal("unused").unwrap(), 7);
+    }
+
+    /// I-189: store returns `Aborted` for retryable PG conflicts
+    /// (Serialization, Deadlock). Callers must retry, not surface EIO.
+    // r[verify builder.fuse.retry-jitter]
+    #[test]
+    fn test_is_transient_classification() {
+        assert!(is_transient(tonic::Code::Aborted));
+        assert!(is_transient(tonic::Code::Unavailable));
+        assert!(is_transient(tonic::Code::Unknown));
+        assert!(is_transient(tonic::Code::ResourceExhausted));
+        // Non-transient: DeadlineExceeded is the caller's own timeout;
+        // DataLoss is permanent corruption.
+        assert!(!is_transient(tonic::Code::DeadlineExceeded));
+        assert!(!is_transient(tonic::Code::DataLoss));
+        assert!(!is_transient(tonic::Code::NotFound));
     }
 
     #[test]
