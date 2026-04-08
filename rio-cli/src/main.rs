@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use rio_common::grpc::with_timeout;
 
+use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
+use tonic::transport::Channel;
+
 use rio_proto::types::{
     BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest,
     DrainExecutorRequest, ExecutorInfo, ListBuildsRequest, ListBuildsResponse,
@@ -108,6 +111,27 @@ impl Default for Config {
             store_addr: "rio-store.rio-store:9002".into(),
             tls: rio_common::tls::TlsConfig::default(),
         }
+    }
+}
+
+impl Config {
+    /// Connect to the scheduler's `AdminService`. Called per-arm so a
+    /// subcommand that talks only to the store (or only to kube) never
+    /// `?`s on an unreachable scheduler — `rio-cli wps describe` must
+    /// work when the scheduler is down (e.g., to diagnose why).
+    async fn connect_admin(&self) -> anyhow::Result<AdminServiceClient<Channel>> {
+        rio_proto::client::connect_admin(&self.scheduler_addr)
+            .await
+            .map_err(|e| anyhow!("connect to scheduler at {}: {e}", self.scheduler_addr))
+    }
+
+    /// Connect to the store's `StoreAdminService`. Only `upstream` /
+    /// `verify-chunks` need this; called per-arm so scheduler-only
+    /// subcommands don't fail on an unreachable store.
+    async fn connect_store_admin(&self) -> anyhow::Result<StoreAdminServiceClient<Channel>> {
+        rio_proto::client::connect_store_admin(&self.store_addr)
+            .await
+            .map_err(|e| anyhow!("connect to store at {}: {e}", self.store_addr))
     }
 }
 
@@ -346,60 +370,41 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no subcommand given (try --help)"))?;
     let as_json = cli.json;
 
-    // kube-only subcommands — dispatched BEFORE the gRPC connect
-    // below. `wps` talks to the K8s apiserver directly (via
-    // KUBECONFIG / in-cluster config) and has no dependency on
-    // the scheduler being reachable. Running `rio-cli wps describe`
-    // when the scheduler is down (e.g., to diagnose why) must
-    // work — it would not if we'd already `?`'d on connect_admin.
-    //
-    // Single-variant match so the `other => other` fallthrough
-    // is exhaustive (adding a second kube-only subcommand = add
-    // another arm here; doesn't disturb the gRPC match below).
-    let cmd = match cmd {
-        Cmd::Wps(args) => return wps::run(as_json, args).await,
-        other => other,
-    };
-
+    // Config load + TLS init are local-only (env/file read, no network)
+    // and have working defaults, so they run unconditionally even for
+    // kube-only subcommands that ignore them. gRPC CONNECT is per-arm
+    // (see `Config::connect_admin` / `connect_store_admin`) — that's
+    // the part that must not gate `wps` / `upstream` on an unreachable
+    // scheduler.
     let cfg: Config = rio_common::config::load("cli", cli)?;
     {
         use rio_common::config::ValidateConfig as _;
         cfg.validate()?;
     }
-
     rio_common::grpc::init_client_tls(rio_common::tls::load_client_tls(&cfg.tls)?);
 
-    // Store-admin subcommands — dispatched AFTER config load (need
-    // store_addr + TLS) but BEFORE the scheduler connect. `upstream`
-    // talks only to the store; don't fail on an unreachable scheduler
-    // when the operator just wants to add a cache URL.
-    let cmd = match cmd {
+    match cmd {
+        // kube-only — talks to the K8s apiserver via KUBECONFIG /
+        // in-cluster config; no gRPC connect at all.
+        Cmd::Wps(args) => wps::run(as_json, args).await?,
+        // store-admin only — don't fail on an unreachable scheduler
+        // when the operator just wants to add a cache URL or audit
+        // chunk consistency.
         Cmd::Upstream(args) => {
-            let mut sc = rio_proto::client::connect_store_admin(&cfg.store_addr)
-                .await
-                .map_err(|e| anyhow!("connect to store at {}: {e}", cfg.store_addr))?;
-            return upstream::run(as_json, &mut sc, &cfg.scheduler_addr, args.cmd).await;
+            let mut sc = cfg.connect_store_admin().await?;
+            upstream::run(as_json, &mut sc, &cfg.scheduler_addr, args.cmd).await?;
         }
         Cmd::VerifyChunks { batch_size } => {
-            let mut sc = rio_proto::client::connect_store_admin(&cfg.store_addr)
-                .await
-                .map_err(|e| anyhow!("connect to store at {}: {e}", cfg.store_addr))?;
-            return verify_chunks::run(&mut sc, batch_size).await;
+            let mut sc = cfg.connect_store_admin().await?;
+            verify_chunks::run(&mut sc, batch_size).await?;
         }
-        other => other,
-    };
-
-    let mut client = rio_proto::client::connect_admin(&cfg.scheduler_addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect to scheduler at {}: {e}", cfg.scheduler_addr))?;
-
-    match cmd {
         Cmd::CreateTenant {
             name,
             gc_retention_hours,
             gc_max_store_bytes,
             cache_token,
         } => {
+            let mut client = cfg.connect_admin().await?;
             let resp = rpc(
                 "CreateTenant",
                 client.create_tenant(CreateTenantRequest {
@@ -420,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::ListTenants => {
+            let mut client = cfg.connect_admin().await?;
             let resp = rpc("ListTenants", client.list_tenants(())).await?;
             if as_json {
                 json(
@@ -437,12 +443,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Status => status::run(as_json, &mut client).await?,
+        Cmd::Status => status::run(as_json, &mut cfg.connect_admin().await?).await?,
         Cmd::Workers {
             status,
             actor,
             diff,
         } => {
+            let mut client = cfg.connect_admin().await?;
             // --actor and --diff delegate to the workers module; the
             // PG-only path stays inline (unchanged behavior — no
             // accidental output-format drift for existing callers).
@@ -470,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Builds { status, limit } => {
+            let mut client = cfg.connect_admin().await?;
             let resp = rpc(
                 "ListBuilds",
                 client.list_builds(ListBuildsRequest {
@@ -495,9 +503,15 @@ async fn main() -> anyhow::Result<()> {
             all_active,
             status,
             stuck,
-        } => derivations::run(as_json, &mut client, build_id, all_active, status, stuck).await?,
-        Cmd::Logs { drv_path, build_id } => logs::run(&mut client, drv_path, build_id).await?,
-        Cmd::Gc { dry_run } => gc::run(&mut client, dry_run).await?,
+        } => {
+            let mut client = cfg.connect_admin().await?;
+            derivations::run(as_json, &mut client, build_id, all_active, status, stuck).await?;
+        }
+        Cmd::Logs { drv_path, build_id } => {
+            let mut client = cfg.connect_admin().await?;
+            logs::run(&mut client, drv_path, build_id).await?;
+        }
+        Cmd::Gc { dry_run } => gc::run(&mut cfg.connect_admin().await?, dry_run).await?,
         Cmd::PoisonClear { drv_path } => {
             // Validate BEFORE the RPC. The scheduler's DAG is keyed on
             // the full store path, so a bare hash silently no-matches
@@ -509,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
                      Run `rio-cli poison-list` to find the right path."
                 );
             }
+            let mut client = cfg.connect_admin().await?;
             let resp = rpc(
                 "ClearPoison",
                 client.clear_poison(ClearPoisonRequest {
@@ -533,6 +548,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::PoisonList => {
+            let mut client = cfg.connect_admin().await?;
             let resp = rpc("ListPoisoned", client.list_poisoned(())).await?;
             if as_json {
                 #[derive(Serialize)]
@@ -603,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::DrainExecutor { executor_id, force } => {
+            let mut client = cfg.connect_admin().await?;
             // Unary — rpc() helper applies. Server returns accepted=true
             // for known workers (idempotent on already-draining) and
             // accepted=false for unknown ids (per admin/tests.rs, not
@@ -638,20 +655,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("{executor_id}: not found (nothing to drain)");
             }
         }
-        Cmd::Cutoffs => cutoffs::run(as_json, &mut client).await?,
-        Cmd::Estimator { filter } => estimator::run(as_json, filter, &mut client).await?,
-        // Dispatched above (before gRPC connect). The early match
-        // consumes the Wps variant and returns; this arm is reached
-        // only if the dispatch order is broken — fail loud.
-        //
-        // NOT splitting Cmd into KubeCmd|GrpcCmd yet: single kube-
-        // only variant, and the unreachable! fails loud on first
-        // invocation (not silent). When a SECOND kube-only
-        // subcommand lands (e.g., a BuilderPool describe that
-        // doesn't need admin RPC), reconsider the split.
-        Cmd::Wps(_) => unreachable!("Wps handled before gRPC connect"),
-        Cmd::Upstream(_) => unreachable!("Upstream handled before scheduler connect"),
-        Cmd::VerifyChunks { .. } => unreachable!("VerifyChunks handled before scheduler connect"),
+        Cmd::Cutoffs => cutoffs::run(as_json, &mut cfg.connect_admin().await?).await?,
+        Cmd::Estimator { filter } => {
+            estimator::run(as_json, filter, &mut cfg.connect_admin().await?).await?;
+        }
     }
     Ok(())
 }
