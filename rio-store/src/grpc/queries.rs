@@ -6,6 +6,22 @@
 use super::*;
 
 impl StoreServiceImpl {
+    /// DoS bound + per-path format check shared by the batch read RPCs.
+    /// Rejects the whole batch on any malformed path (client bug indicator).
+    fn validate_path_batch(&self, paths: &[String]) -> Result<(), Status> {
+        if paths.len() > self.max_batch_paths {
+            return Err(Status::invalid_argument(format!(
+                "too many paths: {} (max {}; raise RIO_MAX_BATCH_PATHS to allow larger batches)",
+                paths.len(),
+                self.max_batch_paths
+            )));
+        }
+        for p in paths {
+            validate_store_path(p)?;
+        }
+        Ok(())
+    }
+
     /// Query metadata for a single store path.
     ///
     /// Only returns paths with manifests.status='complete'.
@@ -77,17 +93,7 @@ impl StoreServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
-        // Same DoS bound as FindMissingPaths.
-        if req.store_paths.len() > self.max_batch_paths {
-            return Err(Status::invalid_argument(format!(
-                "too many paths: {} (max {}; raise RIO_MAX_BATCH_PATHS to allow larger batches)",
-                req.store_paths.len(),
-                self.max_batch_paths
-            )));
-        }
-        for p in &req.store_paths {
-            validate_store_path(p)?;
-        }
+        self.validate_path_batch(&req.store_paths)?;
 
         let entries = metadata::query_path_info_batch(&self.pool, &req.store_paths)
             .await
@@ -115,17 +121,7 @@ impl StoreServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
-        // Same DoS bound as BatchQueryPathInfo / FindMissingPaths.
-        if req.store_paths.len() > self.max_batch_paths {
-            return Err(Status::invalid_argument(format!(
-                "too many paths: {} (max {}; raise RIO_MAX_BATCH_PATHS to allow larger batches)",
-                req.store_paths.len(),
-                self.max_batch_paths
-            )));
-        }
-        for p in &req.store_paths {
-            validate_store_path(p)?;
-        }
+        self.validate_path_batch(&req.store_paths)?;
 
         let entries = metadata::get_manifest_batch(&self.pool, &req.store_paths)
             .await
@@ -170,20 +166,7 @@ impl StoreServiceImpl {
         let tenant_id = Self::request_tenant_id(&request);
         let req = request.into_inner();
 
-        // Bound request size to prevent DoS via huge path lists.
-        // Inline (not check_bound) so the message names the env var.
-        if req.store_paths.len() > self.max_batch_paths {
-            return Err(Status::invalid_argument(format!(
-                "too many paths: {} (max {}; raise RIO_MAX_BATCH_PATHS to allow larger batches)",
-                req.store_paths.len(),
-                self.max_batch_paths
-            )));
-        }
-        // Validate each path format. Reject the whole batch on any malformed
-        // path (client bug indicator).
-        for p in &req.store_paths {
-            validate_store_path(p)?;
-        }
+        self.validate_path_batch(&req.store_paths)?;
 
         let missing = metadata::find_missing_paths(&self.pool, &req.store_paths)
             .await
