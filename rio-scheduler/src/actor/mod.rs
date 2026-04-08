@@ -27,19 +27,38 @@ use crate::state::{
     HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, RetryPolicy,
 };
 
+// `impl DagActor` is sharded across these submodules by concern; each
+// file's impl block reaches into the same struct fields (single-owner
+// actor — no encapsulation boundary). Keep ALL `mod` decls here so the
+// submodule list is discoverable in one place.
+mod breaker;
+mod build;
 mod command;
-pub use command::*;
-
+mod completion;
 mod config;
-pub use config::{DagActorConfig, DagActorPlumbing};
-
+mod dispatch;
+mod executor;
+mod handle;
+mod merge;
 mod recovery;
 mod snapshot;
+
+pub(super) use breaker::CacheCheckBreaker;
+pub use command::*;
+pub use config::{DagActorConfig, DagActorPlumbing};
+#[cfg(test)]
+pub(crate) use executor::compute_initial_prefetch_paths;
+pub use handle::ActorHandle;
+#[cfg(test)]
+pub(crate) use handle::DebugDerivationInfo;
+pub(crate) use handle::DebugExecutorInfo;
 
 #[cfg(test)]
 mod debug;
 #[cfg(test)]
 use debug::backdate;
+#[cfg(test)]
+pub(crate) mod tests;
 
 /// Channel capacity for the actor command channel.
 pub(crate) const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
@@ -1063,22 +1082,3 @@ impl DagActor {
         }
     }
 }
-
-mod breaker;
-mod build;
-mod completion;
-mod dispatch;
-mod executor;
-mod handle;
-mod merge;
-
-pub(super) use breaker::CacheCheckBreaker;
-#[cfg(test)]
-pub(crate) use executor::compute_initial_prefetch_paths;
-pub use handle::ActorHandle;
-#[cfg(test)]
-pub(crate) use handle::DebugDerivationInfo;
-pub(crate) use handle::DebugExecutorInfo;
-
-#[cfg(test)]
-pub(crate) mod tests;
