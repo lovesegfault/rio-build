@@ -566,7 +566,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
 
     // output_hash: the Nix Realisation JSON doesn't carry it — fetch from
     // QueryPathInfo(outPath).nar_hash. This field is NOT on the CA-cutoff
-    // critical path (cutoff compares content_index, not realisations.output_hash);
+    // critical path (cutoff is realisation-based);
     // it's for realisation SIGNING — the signed tuple is
     // (drv_hash, output_name, output_path, nar_hash) per store.md:206.
     // Zeros would mean signing attests to nothing about the output content.

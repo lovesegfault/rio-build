@@ -213,11 +213,7 @@ impl Cache {
     /// Creates the cache directory and SQLite index if they don't exist.
     /// Must be called from within a tokio runtime (captures the current `Handle`).
     ///
-    /// `_max_size_gb` is ignored — eviction was removed (one build per pod;
-    /// the emptyDir is the bound). Kept only so callers in
-    /// `executor/inputs.rs` (owned by a separate cleanup) keep compiling
-    /// until that lands.
-    pub async fn new(cache_dir: PathBuf, _max_size_gb: u64) -> Result<Self, CacheError> {
+    pub async fn new(cache_dir: PathBuf) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
 
         let runtime = Handle::current();
@@ -436,7 +432,7 @@ mod tests {
     /// Cache sync methods use `block_on`, so tests create the cache in async
     /// context then exercise the sync methods via `spawn_blocking`.
     async fn make_cache(cache_dir: PathBuf) -> anyhow::Result<Arc<Cache>> {
-        Ok(Arc::new(Cache::new(cache_dir, 0).await?))
+        Ok(Arc::new(Cache::new(cache_dir).await?))
     }
 
     #[tokio::test]

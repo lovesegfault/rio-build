@@ -1223,7 +1223,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let cache = Arc::new(
-            crate::fuse::cache::Cache::new(dir.path().to_path_buf(), 10)
+            crate::fuse::cache::Cache::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),
         );
@@ -1291,7 +1291,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let cache = Arc::new(
-            crate::fuse::cache::Cache::new(dir.path().to_path_buf(), 10)
+            crate::fuse::cache::Cache::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),
         );
@@ -1347,7 +1347,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let cache = Arc::new(
-            crate::fuse::cache::Cache::new(dir.path().to_path_buf(), 10)
+            crate::fuse::cache::Cache::new(dir.path().to_path_buf())
                 .await
                 .unwrap(),
         );

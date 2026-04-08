@@ -332,7 +332,7 @@ pub async fn sweep(
             // r[impl store.gc.sweep-cycle-reclaim]
             //
             // Also re-check `gc_roots` and `scheduler_live_pins`: a
-            // PinPath or scheduler dispatch that landed between mark
+            // gc_roots pin or scheduler dispatch that landed between mark
             // and now is a direct root on THIS path that mark's snapshot
             // missed. Both tables key on store_path_hash (PK / first
             // index column) so each EXISTS is a point probe.
@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     /// Re-check must consult `gc_roots` and `scheduler_live_pins`: a
-    /// PinPath or scheduler dispatch between mark and sweep is a
+    /// gc_roots pin or scheduler dispatch between mark and sweep is a
     /// direct root mark's snapshot missed.
     #[tokio::test]
     async fn sweep_recheck_sees_late_pins() {

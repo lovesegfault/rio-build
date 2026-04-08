@@ -1873,9 +1873,9 @@ let
               "  imagePullPolicy: Never\n"
               # tlsSecretName: vmtest-full.yaml sets tls.enabled=true, so
               # the scheduler requires mTLS on its gRPC port. The Helm-
-              # rendered default pool gets this via `{{- if .Values.tls.
-              # enabled }} tlsSecretName: rio-builder-tls {{- end }}`
-              # (templates/builderpool.yaml:37-39); inline YAML here must
+              # rendered BuilderPoolSet poolTemplate gets this via the
+              # tls.enabled conditional in templates/builderpoolset.yaml;
+              # inline YAML here must
               # spell it out. Without it, builders.rs skips the RIO_TLS__*
               # env + tls volume → ephemeral worker connects plaintext →
               # TLS handshake fails → never heartbeats → build stuck

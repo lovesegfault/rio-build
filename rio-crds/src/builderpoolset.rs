@@ -195,8 +195,6 @@ pub struct ClassStatus {
 
     /// Builds currently queued for this class. From scheduler
     /// `ClusterStatus.queued_derivations` filtered by size_class.
-    /// The autoscaler input — `queued / target_queue_per_replica`
-    /// is the desired-replica formula.
     pub queued: u64,
 
     /// Name of the owned child BuilderPool (`{bps}-{name}`).

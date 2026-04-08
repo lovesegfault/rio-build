@@ -41,7 +41,7 @@ mod wps;
 /// ListTenants) — 30s covers a scheduler under load. Unbounded `.await?`
 /// here hangs the CLI forever when the scheduler is wedged (recovery
 /// stuck, lease contention). Observed: `vm-test-run-rio-cli` 10-min
-/// hang after remediations 01/08 shifted scheduler startup timing.
+/// hang after scheduler startup timing changes.
 ///
 /// 120s not 30s (I-163): under heavy actor saturation `ClusterSnapshot`
 /// queues behind ~9.5k mailbox commands. The actual fix is decoupling

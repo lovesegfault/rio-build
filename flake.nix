@@ -1837,8 +1837,7 @@
           // vmTests
           # Eval-time assertion: codecov.yml after_n_builds must equal the
           # coverage matrix length. Catches drift when vm-* fragments are
-          # added without bumping the Codecov gate. See
-          # docs/src/remediations/phase4a/05-coverage-session-drop.md.
+          # added without bumping the Codecov gate.
           # Linux-only because githubActions is optionalAttrs isLinux.
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             codecov-matrix-sync =

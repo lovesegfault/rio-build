@@ -1,7 +1,7 @@
-//! Job pod-spec builder coverage + quantity parsing.
+//! Job pod-spec builder coverage.
 //!
 //! Pure struct-to-struct tests — no K8s apiserver interaction.
-//! Covers what `build_pod_spec`/`parse_quantity_to_gb` PRODUCE.
+//! Covers what `build_pod_spec` PRODUCES.
 
 use super::*;
 

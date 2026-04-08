@@ -121,9 +121,9 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_chunk_orphan_swept_total",
-        "Standalone chunks (PutChunk at refcount=0, no PutPath followed) reaped \
-         by sweep_orphan_chunks after grace-TTL expired. Nonzero = workers are \
-         crashing between PutChunk and PutPath; sustained high = client bug."
+        "Chunks left at refcount=0 by an aborted PutPath/PutPathBatch (uploader \
+         crashed mid-stream) and reaped by sweep_orphan_chunks after grace-TTL. \
+         Sustained nonzero = builder upload path is crashing repeatedly."
     );
     describe_gauge!(
         "rio_store_gc_sweep_paths_remaining",

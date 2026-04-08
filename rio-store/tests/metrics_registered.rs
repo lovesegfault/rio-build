@@ -18,14 +18,7 @@ const EMITTED_METRICS: &str = include_str!(concat!(env!("OUT_DIR"), "/emitted_me
 // r[verify obs.metric.store]
 #[test]
 fn all_spec_metrics_have_describe_call() {
-    let spec_metrics: Vec<&str> = SPEC_METRICS_RAW
-        .lines()
-        .filter(|l| !l.is_empty())
-        // rio_store_chunks_total: writer (FindMissingChunks) deleted;
-        // observability.md row removal is owned by the docs cleanup.
-        // Drop this filter once that lands.
-        .filter(|l| *l != "rio_store_chunks_total")
-        .collect();
+    let spec_metrics: Vec<&str> = SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
     // Floor-check: obs.md's Store Metrics table has ≥12 rows.
     // Guards against vacuous pass if the grep path breaks.
     assert!(
