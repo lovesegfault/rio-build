@@ -259,21 +259,11 @@ impl UpOpts {
     }
 }
 
-const RENAME_HINTS: &str = "\
-RENAMED (use phase flags on `up`):
-  bootstrap   → up --bootstrap
-  provision   → up --provision
-  kubeconfig  → up --kubeconfig
-  ami push    → up --ami
-  push        → up --push
-  deploy      → up --deploy
-  envoy       → up --envoy";
-
 #[derive(Args)]
 // Allows `k8s up -p eks` (flag after subcommand) as well as
 // `k8s -p eks up`. clap won't let a global arg be required, so the
 // field is Option and validated in run().
-#[command(args_conflicts_with_subcommands = false, after_help = RENAME_HINTS)]
+#[command(args_conflicts_with_subcommands = false)]
 pub struct K8sArgs {
     /// Target cluster provider. Reads RIO_K8S_PROVIDER if not given.
     #[arg(short, long, global = true, env = "RIO_K8S_PROVIDER")]
