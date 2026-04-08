@@ -74,11 +74,7 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     let oref = fp.controller_owner_ref(&()).ok_or_else(|| {
         Error::InvalidSpec("FetcherPool has no metadata.uid (not from apiserver?)".into())
     })?;
-    let scheduler = SchedulerAddrs {
-        addr: ctx.scheduler_addr.clone(),
-        balance_host: ctx.scheduler_balance_host.clone(),
-        balance_port: ctx.scheduler_balance_port,
-    };
+    let scheduler = ctx.scheduler_addrs();
     let store = ctx.store_addrs();
 
     // ── queue signals ───────────────────────────────────────────────

@@ -33,31 +33,19 @@ use rio_crds::fetcherpool::FetcherPool;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct Config {
-    /// rio-scheduler gRPC address. AdminService + SchedulerService
-    /// on the same port. Required — no sensible default.
-    scheduler_addr: String,
-    /// Headless Service host. Used two ways:
-    ///   1. Passed to workers as `RIO_SCHEDULER_BALANCE_HOST`.
-    ///   2. Used by THIS process's autoscaler for leader-aware
-    ///      ClusterStatus polling. `None` → single-channel fallback
-    ///      via `scheduler_addr` (ClusterIP — round-robins to the
-    ///      standby ~50% of the time with replicas=2).
-    ///
-    /// In K8s: set to `rio-scheduler-headless` via env.
-    scheduler_balance_host: Option<String>,
-    scheduler_balance_port: u16,
-    /// rio-store gRPC address. Injected as `RIO_STORE_ADDR` into
-    /// worker pod containers by the BuilderPool reconciler (workers
-    /// connect to the store directly for PutPath/GetPath).
-    store_addr: String,
-    /// rio-store headless Service host. Injected as
-    /// `RIO_STORE_BALANCE_HOST` into executor pods so the
-    /// `BalancedChannel` p2c spreads load across store replicas
-    /// (I-077: a sticky single-channel meant scaling rio-store 1→4
-    /// didn't help — every builder kept hitting the original pod).
-    /// `None` (env unset) = single-channel fallback.
-    store_balance_host: Option<String>,
-    store_balance_port: u16,
+    /// rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /
+    /// `__BALANCE_HOST` / `__BALANCE_PORT`. `balance_host` used two
+    /// ways: (1) injected into worker pods as
+    /// `RIO_SCHEDULER__BALANCE_HOST`; (2) THIS process's autoscaler
+    /// uses it for leader-aware ClusterStatus polling. `None` →
+    /// single-channel via `addr` (ClusterIP — round-robins to the
+    /// standby ~50% of the time with replicas=2).
+    scheduler: rio_common::config::UpstreamAddrs,
+    /// rio-store upstream. Env: `RIO_STORE__ADDR` / `__BALANCE_HOST`
+    /// / `__BALANCE_PORT`. Injected into worker pod containers by
+    /// the BuilderPool reconciler. I-077: balance host needed so
+    /// scaling rio-store 1→4 actually spreads load.
+    store: rio_common::config::UpstreamAddrs,
     #[serde(flatten)]
     common: rio_common::config::CommonConfig,
     /// HTTP /healthz listen address. K8s livenessProbe hits this.
@@ -73,12 +61,8 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            scheduler_addr: String::new(),
-            scheduler_balance_host: None,
-            scheduler_balance_port: 9001,
-            store_addr: String::new(),
-            store_balance_host: None,
-            store_balance_port: 9002,
+            scheduler: rio_common::config::UpstreamAddrs::with_port(9001),
+            store: rio_common::config::UpstreamAddrs::with_port(9002),
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
             common: rio_common::config::CommonConfig::new(9094),
@@ -94,14 +78,6 @@ impl Default for Config {
 #[derive(Parser, Serialize, Default)]
 #[command(name = "rio-controller", about = "Kubernetes operator for rio-build")]
 struct CliArgs {
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scheduler_addr: Option<String>,
-
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store_addr: Option<String>,
-
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_addr: Option<std::net::SocketAddr>,
@@ -120,8 +96,8 @@ impl rio_common::config::ValidateConfig for Config {
     /// Every `ensure!` documents a specific crash or silent-wrong
     /// that occurs AFTER startup if the bad value gets through.
     fn validate(&self) -> anyhow::Result<()> {
-        use rio_common::config::ensure_required as required;
-        required(&self.scheduler_addr, "scheduler_addr", "controller")?;
+        self.scheduler
+            .ensure_required("scheduler.addr", "controller")?;
         Ok(())
     }
 }
@@ -143,13 +119,13 @@ async fn main() -> anyhow::Result<()> {
         root_span: _root_span,
     } = rio_common::server::bootstrap("controller", cli, rio_controller::describe_metrics)?;
 
-    // store_addr is injected into worker pod containers as
-    // RIO_STORE_ADDR. Workers with an empty store addr fail their
+    // store.addr is injected into worker pod containers as
+    // RIO_STORE__ADDR. Workers with an empty store addr fail their
     // first PutPath with a tonic malformed-URI error — deep inside
     // a spawned task, easy to miss. Warn loudly at startup.
-    if cfg.store_addr.is_empty() {
+    if cfg.store.addr.is_empty() {
         warn!(
-            "RIO_STORE_ADDR not set; worker pods will get empty RIO_STORE_ADDR \
+            "RIO_STORE__ADDR not set; worker pods will get empty RIO_STORE__ADDR \
              env (PutPath will fail with malformed URI)."
         );
     }
@@ -179,27 +155,7 @@ async fn main() -> anyhow::Result<()> {
     // the probe loop). Single-channel mode: dev/test only.
     let (admin, _balance_guard) = match rio_proto::client::connect_with_retry(
         &shutdown,
-        || async {
-            match &cfg.scheduler_balance_host {
-                None => {
-                    info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
-                    let admin = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
-                    anyhow::Ok((admin, None))
-                }
-                Some(host) => {
-                    info!(
-                        %host, port = cfg.scheduler_balance_port,
-                        "connecting to scheduler (health-aware balanced)"
-                    );
-                    let (admin, bc) = rio_proto::client::balance::connect_admin_balanced(
-                        host.clone(),
-                        cfg.scheduler_balance_port,
-                    )
-                    .await?;
-                    Ok((admin, Some(bc)))
-                }
-            }
-        },
+        || rio_proto::client::connect::<rio_proto::AdminServiceClient<_>>(&cfg.scheduler),
         None,
     )
     .await
@@ -239,12 +195,8 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         admin: admin.clone(),
-        scheduler_addr: cfg.scheduler_addr.clone(),
-        scheduler_balance_host: cfg.scheduler_balance_host.clone(),
-        scheduler_balance_port: cfg.scheduler_balance_port,
-        store_addr: cfg.store_addr.clone(),
-        store_balance_host: cfg.store_balance_host.clone(),
-        store_balance_port: cfg.store_balance_port,
+        scheduler: cfg.scheduler.clone(),
+        store: cfg.store.clone(),
         recorder: recorder.clone(),
         error_counts: Default::default(),
         manifest_idle: Default::default(),
@@ -300,12 +252,12 @@ async fn main() -> anyhow::Result<()> {
     // (controller.md — no leader election). If replicas>1 by
     // misconfig, the store's GC_LOCK_ID advisory lock serializes
     // concurrent TriggerGC calls (see gc_schedule module doc).
-    if cfg.gc_interval_hours > 0 && !cfg.store_addr.is_empty() {
+    if cfg.gc_interval_hours > 0 && !cfg.store.addr.is_empty() {
         let gc_tick = std::time::Duration::from_secs(cfg.gc_interval_hours * 3600);
         rio_common::task::spawn_monitored(
             "gc-cron",
             rio_controller::reconcilers::gc_schedule::run(
-                cfg.store_addr.clone(),
+                cfg.store.addr.clone(),
                 gc_tick,
                 shutdown.clone(),
             ),
@@ -313,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!(
             gc_interval_hours = cfg.gc_interval_hours,
-            store_addr_set = !cfg.store_addr.is_empty(),
+            store_addr_set = !cfg.store.addr.is_empty(),
             "GC cron disabled"
         );
     }
@@ -357,7 +309,7 @@ mod tests {
     #[test]
     fn config_defaults_are_stable() {
         let d = Config::default();
-        assert!(d.scheduler_addr.is_empty(), "required, no default");
+        assert!(d.scheduler.addr.is_empty(), "required, no default");
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9094");
         assert_eq!(d.health_addr.to_string(), "[::]:9194");
         assert_eq!(d.gc_interval_hours, 24, "GC cron defaults to daily");
@@ -395,7 +347,7 @@ mod tests {
 
     rio_test_support::jail_defaults!("controller", "gc_interval_hours = 24", |cfg: Config| {
         assert!(!cfg.common.tls.is_configured());
-        assert!(cfg.scheduler_balance_host.is_none());
+        assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(cfg.gc_interval_hours, 24);
     });
 
@@ -410,21 +362,18 @@ mod tests {
     /// validate_config rejects BEFORE reaching the bounds checks we
     /// want to test.
     fn test_valid_config() -> Config {
-        Config {
-            scheduler_addr: "http://localhost:9000".into(),
-            store_addr: "http://localhost:9001".into(),
-            ..Config::default()
-        }
+        let mut cfg = Config::default();
+        cfg.scheduler.addr = "http://localhost:9000".into();
+        cfg.store.addr = "http://localhost:9001".into();
+        cfg
     }
 
     #[test]
     fn config_rejects_empty_scheduler_addr() {
-        let cfg = Config {
-            scheduler_addr: String::new(),
-            ..test_valid_config()
-        };
+        let mut cfg = test_valid_config();
+        cfg.scheduler.addr = String::new();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("scheduler_addr"), "{err}");
+        assert!(err.contains("scheduler.addr"), "{err}");
     }
 
     /// Baseline: `test_valid_config()` itself passes — proves the

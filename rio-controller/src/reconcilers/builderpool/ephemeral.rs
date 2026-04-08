@@ -616,7 +616,7 @@ mod tests {
         // from-scratch pod). Check one representative.
         let env = pod_spec.containers[0].env.as_ref().unwrap();
         assert!(
-            env.iter().any(|e| e.name == "RIO_SCHEDULER_ADDR"),
+            env.iter().any(|e| e.name == "RIO_SCHEDULER__ADDR"),
             "build_pod_spec env should be preserved"
         );
     }

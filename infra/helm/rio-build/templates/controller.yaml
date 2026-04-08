@@ -45,25 +45,25 @@ spec:
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
             {{- include "rio.covEnv" . | nindent 12 }}
-            - name: RIO_SCHEDULER_ADDR
+            - name: RIO_SCHEDULER__ADDR
               value: {{ $c.schedulerAddr | quote }}
-            - name: RIO_STORE_ADDR
+            - name: RIO_STORE__ADDR
               value: {{ $c.storeAddr | quote }}
             {{- if $c.schedulerBalanceHost }}
             # Passed through to builder pods. Workers DNS-resolve the headless
             # Service, health-probe pod IPs, route to leader. Unset → workers
             # fall back to single-channel.
-            - name: RIO_SCHEDULER_BALANCE_HOST
+            - name: RIO_SCHEDULER__BALANCE_HOST
               value: {{ $c.schedulerBalanceHost | quote }}
-            - name: RIO_SCHEDULER_BALANCE_PORT
+            - name: RIO_SCHEDULER__BALANCE_PORT
               value: {{ $c.schedulerBalancePort | quote }}
             {{- end }}
             {{- if $c.storeBalanceHost }}
             # Same balance pattern for rio-store, but for load
             # distribution across replicas (no leader/standby).
-            - name: RIO_STORE_BALANCE_HOST
+            - name: RIO_STORE__BALANCE_HOST
               value: {{ $c.storeBalanceHost | quote }}
-            - name: RIO_STORE_BALANCE_PORT
+            - name: RIO_STORE__BALANCE_PORT
               value: {{ $c.storeBalancePort | quote }}
             {{- end }}
             {{- include "rio.tlsEnv" . | nindent 12 }}

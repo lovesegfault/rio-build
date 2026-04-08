@@ -28,9 +28,9 @@ impl rio_common::config::ValidateConfig for Config {
     /// with scheduler/gateway/controller/store — the validation
     /// target is the call-site, not the struct.
     fn validate(&self) -> anyhow::Result<()> {
-        use rio_common::config::ensure_required as required;
-        required(&self.scheduler_addr, "scheduler_addr", "builder")?;
-        required(&self.store_addr, "store_addr", "builder")?;
+        self.scheduler
+            .ensure_required("scheduler.addr", "builder")?;
+        self.store.ensure_required("store.addr", "builder")?;
         Ok(())
     }
 }
@@ -92,8 +92,8 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(
         %executor_id,
-        scheduler_addr = %cfg.scheduler_addr,
-        store_addr = %cfg.store_addr,
+        scheduler_addr = %cfg.scheduler.addr,
+        store_addr = %cfg.store.addr,
         systems = ?systems,
         features = ?features,
         "connected to gRPC services"
@@ -696,7 +696,7 @@ async fn main() -> anyhow::Result<()> {
     // means best-effort — log and move on.
     if tokio::time::timeout(
         Duration::from_secs(5),
-        run_drain(&cfg.scheduler_addr, &build_ctx.executor_id),
+        run_drain(&cfg.scheduler.addr, &build_ctx.executor_id),
     )
     .await
     .is_err()
@@ -1133,46 +1133,13 @@ async fn connect_upstreams(
         || async {
             // dataplane2: build StoreService + ChunkService over the SAME
             // channel so per-chunk GetChunk RPCs p2c-fan across the same
-            // SERVING replicas as GetPath. In single-channel mode (VM
-            // tests, no headless DNS) both wrap one eager channel.
-            let (store, store_guard) = match &cfg.store_balance_host {
-                None => {
-                    info!(addr = %cfg.store_addr, "store: single-channel mode");
-                    let ch = rio_proto::client::connect_channel(&cfg.store_addr).await?;
-                    (StoreClients::from_channel(ch), None)
-                }
-                Some(host) => {
-                    info!(
-                        %host, port = cfg.store_balance_port,
-                        "store: health-aware balanced mode"
-                    );
-                    let (_c, bc) = rio_proto::client::balance::connect_store_balanced(
-                        host.clone(),
-                        cfg.store_balance_port,
-                    )
+            // SERVING replicas as GetPath. `connect_raw` returns the bare
+            // Channel; StoreClients wraps it in BOTH typed clients.
+            let (ch, store_guard) =
+                rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store)
                     .await?;
-                    (StoreClients::from_channel(bc.channel()), Some(bc))
-                }
-            };
-            let (sched, sched_guard) = match &cfg.scheduler_balance_host {
-                None => {
-                    info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
-                    let c = rio_proto::client::connect_executor(&cfg.scheduler_addr).await?;
-                    (c, None)
-                }
-                Some(host) => {
-                    info!(
-                        %host, port = cfg.scheduler_balance_port,
-                        "scheduler: health-aware balanced mode"
-                    );
-                    let (c, bc) = rio_proto::client::balance::connect_executor_balanced(
-                        host.clone(),
-                        cfg.scheduler_balance_port,
-                    )
-                    .await?;
-                    (c, Some(bc))
-                }
-            };
+            let store = StoreClients::from_channel(ch);
+            let (sched, sched_guard) = rio_proto::client::connect(&cfg.scheduler).await?;
             anyhow::Ok((store, sched, (store_guard, sched_guard)))
         },
         None,
@@ -1293,11 +1260,10 @@ mod tests {
     /// Both required fields filled with placeholders. Rejection
     /// tests patch ONE field to prove that specific check fires.
     fn test_valid_config() -> Config {
-        Config {
-            scheduler_addr: "http://localhost:9000".into(),
-            store_addr: "http://localhost:9001".into(),
-            ..Config::default()
-        }
+        let mut cfg = Config::default();
+        cfg.scheduler.addr = "http://localhost:9000".into();
+        cfg.store.addr = "http://localhost:9001".into();
+        cfg
     }
 
     #[test]
@@ -1337,8 +1303,8 @@ mod tests {
     fn config_rejects_empty_addrs() {
         type Patch = fn(&mut Config);
         let cases: &[(&str, Patch)] = &[
-            ("scheduler_addr", |c| c.scheduler_addr = String::new()),
-            ("store_addr", |c| c.store_addr = String::new()),
+            ("scheduler.addr", |c| c.scheduler.addr = String::new()),
+            ("store.addr", |c| c.store.addr = String::new()),
         ];
         for (field, patch) in cases {
             let mut cfg = test_valid_config();

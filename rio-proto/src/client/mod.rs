@@ -117,12 +117,150 @@ pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     ep.connect().await.map_err(Into::into)
 }
 
+// ===========================================================================
+// Generic typed-client construction
+// ===========================================================================
+
+/// Per-client constants for the generic [`connect`] / [`BalancedChannel`]
+/// path. Implemented for each tonic-generated `XServiceClient<Channel>`;
+/// the impl supplies the `grpc.health.v1` service name (what
+/// [`BalancedChannel`] probes) and the TLS-domain override (cert SAN —
+/// what the balanced channel verifies pod-IP connections against).
+///
+/// Collapses the previous 9 near-identical `connect_X` /
+/// `connect_X_balanced` wrappers (each varying only in client type +
+/// these two strings) to one generic + 6 small impls. The
+/// `max_{en,de}coding_message_size` pair is applied ONCE in
+/// [`ProtoClient::wrap`], so per-binary connect blocks can't drift on
+/// where it's set.
+pub trait ProtoClient: Sized {
+    /// `grpc.health.v1` service name to probe. For services hosted on
+    /// the scheduler this is `rio.scheduler.SchedulerService` even for
+    /// `ExecutorServiceClient` / `AdminServiceClient` — the scheduler's
+    /// leader-toggle only flips the named SchedulerService entry, and
+    /// all three share the same port + leader gate.
+    const HEALTH_SERVICE: &'static str;
+    /// TLS domain (cert SAN) for pod-IP connections. The balanced
+    /// channel connects to `https://<pod-ip>:<port>` but verifies
+    /// against this name. Matches `dnsNames` in
+    /// `infra/helm/rio-build/templates/cert-manager.yaml`.
+    const TLS_DOMAIN: &'static str;
+    /// Construct from a `Channel` and apply [`max_message_size`]. The
+    /// generated `XServiceClient::new` doesn't share a trait, so each
+    /// impl spells the three calls out — but at least they live next
+    /// to each other instead of scattered across 9 wrapper fns.
+    fn wrap(ch: Channel) -> Self;
+}
+
+/// Macro for the repetitive [`ProtoClient`] impls: each generated
+/// client has the same `new(ch).max_decoding_….max_encoding_…` shape.
+macro_rules! proto_client {
+    ($ty:ty, $health:expr, $domain:expr) => {
+        impl ProtoClient for $ty {
+            const HEALTH_SERVICE: &'static str = $health;
+            const TLS_DOMAIN: &'static str = $domain;
+            fn wrap(ch: Channel) -> Self {
+                <$ty>::new(ch)
+                    .max_decoding_message_size(max_message_size())
+                    .max_encoding_message_size(max_message_size())
+            }
+        }
+    };
+}
+
+// Scheduler-hosted: SchedulerService, ExecutorService, AdminService all
+// share the scheduler's port + leader gate, so the same health-service
+// name + TLS domain. Store-hosted: StoreService, StoreAdminService,
+// ChunkService share the store's.
+proto_client!(
+    crate::SchedulerServiceClient<Channel>,
+    balance::SCHEDULER_HEALTH_SERVICE,
+    balance::SCHEDULER_TLS_DOMAIN
+);
+proto_client!(
+    crate::ExecutorServiceClient<Channel>,
+    balance::SCHEDULER_HEALTH_SERVICE,
+    balance::SCHEDULER_TLS_DOMAIN
+);
+proto_client!(
+    crate::AdminServiceClient<Channel>,
+    balance::SCHEDULER_HEALTH_SERVICE,
+    balance::SCHEDULER_TLS_DOMAIN
+);
+proto_client!(
+    crate::StoreServiceClient<Channel>,
+    balance::STORE_HEALTH_SERVICE,
+    balance::STORE_TLS_DOMAIN
+);
+proto_client!(
+    crate::StoreAdminServiceClient<Channel>,
+    balance::STORE_HEALTH_SERVICE,
+    balance::STORE_TLS_DOMAIN
+);
+
+/// Connect to a single-channel `addr` and wrap in a typed client.
+///
+/// For tests and non-K8s callers (rio-cli, VM-test fixtures). K8s
+/// daemons use [`connect`] which dispatches balance-vs-single from
+/// [`UpstreamAddrs`].
+pub async fn connect_single<C: ProtoClient>(addr: &str) -> anyhow::Result<C> {
+    connect_channel(addr).await.map(C::wrap)
+}
+
+/// Dispatch balance-vs-single from an [`UpstreamAddrs`] triple.
+///
+/// `balance_host = None` → eager single-channel via `addr`.
+/// `balance_host = Some(host)` → health-aware [`BalancedChannel`] over
+/// `host:balance_port`, returned as the second tuple element so the
+/// caller can hold the probe-loop guard for process lifetime.
+///
+/// Replaces the ~40L `match cfg.X_balance_host { None => connect_X,
+/// Some(h) => connect_X_balanced }` block that was open-coded in every
+/// daemon's `main()`. The balanced path applies [`max_message_size`]
+/// via [`ProtoClient::wrap`] — same as the single path — fixing the
+/// pre-consolidation drift where builder vs gateway applied it at
+/// different layers.
+pub async fn connect<C: ProtoClient>(
+    addrs: &rio_common::config::UpstreamAddrs,
+) -> anyhow::Result<(C, Option<BalancedChannel>)> {
+    let (ch, guard) = connect_raw::<C>(addrs).await?;
+    Ok((C::wrap(ch), guard))
+}
+
+/// [`connect`] but return the unwrapped `Channel`. For callers (the
+/// builder's `StoreClients`) that wrap the same channel in MULTIPLE
+/// generated clients — `connect::<StoreServiceClient>` would discard
+/// the channel inside the typed client, and tonic clients don't expose
+/// `into_inner()`. The `C` type parameter still picks the
+/// `HEALTH_SERVICE` / `TLS_DOMAIN` constants for the balanced path.
+pub async fn connect_raw<C: ProtoClient>(
+    addrs: &rio_common::config::UpstreamAddrs,
+) -> anyhow::Result<(Channel, Option<BalancedChannel>)> {
+    match &addrs.balance_host {
+        None => {
+            tracing::info!(addr = %addrs.addr, service = C::HEALTH_SERVICE, "connecting (single-channel)");
+            Ok((connect_channel(&addrs.addr).await?, None))
+        }
+        Some(host) => {
+            tracing::info!(
+                %host, port = addrs.balance_port, service = C::HEALTH_SERVICE,
+                "connecting (health-aware balanced)"
+            );
+            let bc = BalancedChannel::for_client::<C>(host.clone(), addrs.balance_port).await?;
+            Ok((bc.channel(), Some(bc)))
+        }
+    }
+}
+
+// --- Named wrappers (single-channel) ---------------------------------------
+//
+// One-liners over `connect_single::<X>`. Kept so the ~20 test call
+// sites (`connect_store(&addr.to_string())`, etc.) and ad-hoc callers
+// (rio-cli, gc_schedule, run_drain) don't need turbofish noise.
+
 /// Connect to the store service.
 pub async fn connect_store(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
-    let ch = connect_channel(addr).await?;
-    Ok(StoreServiceClient::new(ch)
-        .max_decoding_message_size(max_message_size())
-        .max_encoding_message_size(max_message_size()))
+    connect_single(addr).await
 }
 
 /// Lazy-connect store client with HTTP/2 keepalive.
@@ -159,27 +297,19 @@ pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Chann
         ep = ep.tls_config(tls)?;
     }
     let ch = ep.connect_lazy();
-    Ok(StoreServiceClient::new(ch)
-        .max_decoding_message_size(max_message_size())
-        .max_encoding_message_size(max_message_size()))
+    Ok(StoreServiceClient::wrap(ch))
 }
 
 /// Connect to the scheduler service (gateway-facing).
 pub async fn connect_scheduler(
     addr: &str,
 ) -> anyhow::Result<crate::SchedulerServiceClient<Channel>> {
-    let ch = connect_channel(addr).await?;
-    Ok(crate::SchedulerServiceClient::new(ch)
-        .max_decoding_message_size(max_message_size())
-        .max_encoding_message_size(max_message_size()))
+    connect_single(addr).await
 }
 
 /// Connect to the executor service (builder/fetcher-facing scheduler RPCs).
 pub async fn connect_executor(addr: &str) -> anyhow::Result<crate::ExecutorServiceClient<Channel>> {
-    let ch = connect_channel(addr).await?;
-    Ok(crate::ExecutorServiceClient::new(ch)
-        .max_decoding_message_size(max_message_size())
-        .max_encoding_message_size(max_message_size()))
+    connect_single(addr).await
 }
 
 /// Connect to the admin service (controller + executor preStop).
@@ -189,10 +319,7 @@ pub async fn connect_executor(addr: &str) -> anyhow::Result<crate::ExecutorServi
 /// The executor's SIGTERM handler uses this for `DrainExecutor` (step 1
 /// of preStop); the controller uses it for `ClusterStatus` autoscaling.
 pub async fn connect_admin(addr: &str) -> anyhow::Result<crate::AdminServiceClient<Channel>> {
-    let ch = connect_channel(addr).await?;
-    Ok(crate::AdminServiceClient::new(ch)
-        .max_decoding_message_size(max_message_size())
-        .max_encoding_message_size(max_message_size()))
+    connect_single(addr).await
 }
 
 /// Connect to the store admin service (scheduler's TriggerGC proxy).
@@ -204,10 +331,7 @@ pub async fn connect_admin(addr: &str) -> anyhow::Result<crate::AdminServiceClie
 pub async fn connect_store_admin(
     addr: &str,
 ) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
-    let ch = connect_channel(addr).await?;
-    Ok(crate::StoreAdminServiceClient::new(ch)
-        .max_decoding_message_size(max_message_size())
-        .max_encoding_message_size(max_message_size()))
+    connect_single(addr).await
 }
 
 // ===========================================================================

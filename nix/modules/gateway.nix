@@ -74,8 +74,8 @@ in
 
       environment = {
         RIO_LISTEN_ADDR = cfg.listenAddr;
-        RIO_SCHEDULER_ADDR = cfg.schedulerAddr;
-        RIO_STORE_ADDR = cfg.storeAddr;
+        RIO_SCHEDULER__ADDR = cfg.schedulerAddr;
+        RIO_STORE__ADDR = cfg.storeAddr;
         RIO_HOST_KEY = cfg.hostKeyPath;
         RIO_AUTHORIZED_KEYS = cfg.authorizedKeysPath;
         RIO_METRICS_ADDR = cfg.metricsAddr;

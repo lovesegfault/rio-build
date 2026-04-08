@@ -22,7 +22,11 @@ use rio_scheduler::grpc::SchedulerGrpc;
 #[serde(default)]
 struct Config {
     listen_addr: String,
-    store_addr: String,
+    /// rio-store upstream. Env: `RIO_STORE__ADDR`. Scheduler uses
+    /// `connect_store_lazy` (re-resolves on reconnect) so
+    /// `balance_host` is unused — the lazy channel follows the
+    /// ClusterIP Service's current endpoint without an explicit p2c.
+    store: rio_common::config::UpstreamAddrs,
     database_url: String,
     #[serde(flatten)]
     common: rio_common::config::CommonConfig,
@@ -124,7 +128,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: rio_common::default_listen_string(9001),
-            store_addr: String::new(),
+            store: rio_common::config::UpstreamAddrs::with_port(9002),
             database_url: String::new(),
             common: rio_common::config::CommonConfig::new(9091),
             tick_interval: std::time::Duration::from_secs(10),
@@ -158,11 +162,6 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     listen_addr: Option<String>,
-
-    /// rio-store gRPC address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store_addr: Option<String>,
 
     /// PostgreSQL connection URL
     #[arg(long)]
@@ -206,7 +205,7 @@ impl rio_common::config::ValidateConfig for Config {
     fn validate(&self) -> anyhow::Result<()> {
         let cfg = self;
         use rio_common::config::ensure_required as required;
-        required(&cfg.store_addr, "store_addr", "scheduler")?;
+        cfg.store.ensure_required("store.addr", "scheduler")?;
         required(&cfg.database_url, "database_url", "scheduler")?;
         // `tokio::time::interval(ZERO)` panics. The tick loop feeds
         // `cfg.tick_interval` straight in — `tick_interval_secs = 0`
@@ -373,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
     // exits (channel-close). event_log::spawn doesn't need a token.
 
     let (pool, db) = init_db_pool(&cfg.database_url, &shutdown).await?;
-    let store_client = connect_store_lazy(&cfg.store_addr);
+    let store_client = connect_store_lazy(&cfg.store.addr);
 
     // Shared log ring buffers. Written by the BuildExecution recv task
     // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
@@ -635,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
         admin_s3,
         pool,
         actor.clone(),
-        cfg.store_addr.clone(),
+        cfg.store.addr.clone(),
         store_size_bytes,
         is_leader_for_grpc,
         shutdown.clone(),
@@ -716,7 +715,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         listen_addr = %listen_addr,
-        store_addr = %cfg.store_addr,
+        store_addr = %cfg.store.addr,
         max_message_size,
         log_s3_bucket = ?cfg.log_s3_bucket,
         tls = server_tls.is_some(),
@@ -998,7 +997,7 @@ mod tests {
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9091");
         assert_eq!(d.tick_interval, std::time::Duration::from_secs(10));
         // Phase2a required these; no default.
-        assert!(d.store_addr.is_empty());
+        assert!(d.store.addr.is_empty());
         assert!(d.database_url.is_empty());
         // Phase2b additions — off by default.
         assert_eq!(d.log_s3_bucket, None);
@@ -1140,11 +1139,12 @@ mod tests {
     /// returned config passes validation as-is (the "happy path" baseline
     /// that each rejection test mutates).
     fn test_valid_config() -> Config {
-        Config {
-            store_addr: "http://store:9002".into(),
+        let mut cfg = Config {
             database_url: "postgres://localhost/test".into(),
             ..Config::default()
-        }
+        };
+        cfg.store.addr = "http://store:9002".into();
+        cfg
     }
 
     // r[verify sched.retry.per-worker-budget]

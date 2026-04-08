@@ -22,19 +22,18 @@ use tracing::info;
 #[serde(default)]
 struct Config {
     listen_addr: std::net::SocketAddr,
-    scheduler_addr: String,
-    /// Headless Service host for health-aware balanced routing.
-    /// `Some(host)` (K8s mode, multi-replica scheduler): DNS-
-    /// resolve `host`, probe grpc.health.v1 on each pod IP,
-    /// route to the SERVING (=leader) endpoint. `None` (env
-    /// unset): single-channel via `scheduler_addr` (VM tests,
-    /// non-K8s, single-replica scheduler).
-    ///
-    /// `scheduler_addr` is still required — it's the ClusterIP
-    /// Service, used as the TLS verify domain (the cert's SAN).
-    scheduler_balance_host: Option<String>,
-    scheduler_balance_port: u16,
-    store_addr: String,
+    /// rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /
+    /// `RIO_SCHEDULER__BALANCE_HOST` / `RIO_SCHEDULER__BALANCE_PORT`.
+    /// `balance_host = Some` (K8s, multi-replica): DNS-resolve, probe
+    /// grpc.health.v1, route to SERVING (=leader). `None` (VM tests,
+    /// single-replica): single-channel via `addr`. `addr` is still
+    /// required even with balance — it's the ClusterIP Service, used
+    /// as the TLS verify domain (the cert's SAN).
+    scheduler: rio_common::config::UpstreamAddrs,
+    /// rio-store upstream. Env: `RIO_STORE__ADDR`. Gateway connects
+    /// single-channel only (no `balance_host` — store load is
+    /// builder-driven, gateway's QueryPathInfo is light).
+    store: rio_common::config::UpstreamAddrs,
     host_key: std::path::PathBuf,
     authorized_keys: std::path::PathBuf,
     /// Shared `tls` / `metrics_addr` / `drain_grace` fields. Flattened
@@ -100,15 +99,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: rio_common::default_addr(2222),
-            // scheduler_addr/store_addr/host_key/authorized_keys have no
+            // scheduler/store addrs and host_key/authorized_keys have no
             // sensible default — they're deployment-specific. Empty here +
             // a post-load check in main() gives a clear "required" error
             // that names the field. The old /tmp/rio_* defaults were
             // footguns: silent key-generation in world-writable /tmp.
-            scheduler_addr: String::new(),
-            scheduler_balance_host: None,
-            scheduler_balance_port: 9001,
-            store_addr: String::new(),
+            scheduler: rio_common::config::UpstreamAddrs::with_port(9001),
+            store: rio_common::config::UpstreamAddrs::with_port(9002),
             host_key: std::path::PathBuf::new(),
             authorized_keys: std::path::PathBuf::new(),
             common: rio_common::config::CommonConfig::new(9090),
@@ -136,26 +133,6 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     listen_addr: Option<std::net::SocketAddr>,
-
-    /// rio-scheduler gRPC address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scheduler_addr: Option<String>,
-
-    /// Headless Service host for health-aware balanced scheduler routing
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scheduler_balance_host: Option<String>,
-
-    /// Port for balanced scheduler health probes (default 9001)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scheduler_balance_port: Option<u16>,
-
-    /// rio-store gRPC address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store_addr: Option<String>,
 
     /// SSH host key path
     #[arg(long)]
@@ -191,11 +168,10 @@ impl rio_common::config::ValidateConfig for Config {
         // Required-field checks that `#[serde(default)]` can't express
         // (figment's "missing field" error for `String` defaulting to `""`
         // is a silent success, not an error).
-        use rio_common::config::{
-            ensure_required as required, ensure_required_path as required_path,
-        };
-        required(&self.scheduler_addr, "scheduler_addr", "gateway")?;
-        required(&self.store_addr, "store_addr", "gateway")?;
+        use rio_common::config::ensure_required_path as required_path;
+        self.scheduler
+            .ensure_required("scheduler.addr", "gateway")?;
+        self.store.ensure_required("store.addr", "gateway")?;
         required_path(&self.host_key, "host_key", "gateway")?;
         required_path(&self.authorized_keys, "authorized_keys", "gateway")?;
         // jwt.required=true + key_path=None is a misconfiguration: can't
@@ -258,30 +234,8 @@ async fn main() -> anyhow::Result<()> {
         match rio_proto::client::connect_with_retry(
             &shutdown,
             || async {
-                info!(addr = %cfg.store_addr, "connecting to store service");
-                let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
-
-                let (sched, guard) = match &cfg.scheduler_balance_host {
-                    None => {
-                        info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
-                        let c =
-                            rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
-                        (c, None)
-                    }
-                    Some(host) => {
-                        info!(
-                            %host, port = cfg.scheduler_balance_port,
-                            "connecting to scheduler (health-aware balanced)"
-                        );
-                        let (c, bc) =
-                            rio_proto::client::balance::connect_scheduler_balanced(
-                                host.clone(),
-                                cfg.scheduler_balance_port,
-                            )
-                            .await?;
-                        (c, Some(bc))
-                    }
-                };
+                let (store, _) = rio_proto::client::connect(&cfg.store).await?;
+                let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
                 anyhow::Ok((store, sched, guard))
             },
             None,
@@ -419,8 +373,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         listen_addr = %cfg.listen_addr,
-        scheduler_addr = %cfg.scheduler_addr,
-        store_addr = %cfg.store_addr,
+        scheduler_addr = %cfg.scheduler.addr,
+        store_addr = %cfg.store.addr,
         "rio-gateway ready"
     );
 
@@ -533,8 +487,8 @@ mod tests {
         // All four of these are deployment-specific: empty default + a
         // post-load ensure! in main(). Non-empty default here = silent
         // wrong-value at runtime instead of a clear startup error.
-        assert!(d.scheduler_addr.is_empty());
-        assert!(d.store_addr.is_empty());
+        assert!(d.scheduler.addr.is_empty());
+        assert!(d.store.addr.is_empty());
         assert!(d.host_key.as_os_str().is_empty());
         assert!(d.authorized_keys.as_os_str().is_empty());
         assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
@@ -692,7 +646,7 @@ mod tests {
         assert!(!cfg.common.tls.is_configured());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert!(cfg.rate_limit.is_none());
-        assert!(cfg.scheduler_balance_host.is_none());
+        assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(
             cfg.max_connections,
             rio_gateway::server::DEFAULT_MAX_CONNECTIONS
@@ -712,13 +666,14 @@ mod tests {
     /// returned config passes validate_config as-is; each rejection
     /// test mutates ONE field to prove that specific check fires.
     fn test_valid_config() -> Config {
-        Config {
-            scheduler_addr: "http://localhost:9000".into(),
-            store_addr: "http://localhost:9001".into(),
+        let mut cfg = Config {
             host_key: "/tmp/host_key".into(),
             authorized_keys: "/tmp/authorized_keys".into(),
             ..Config::default()
-        }
+        };
+        cfg.scheduler.addr = "http://localhost:9000".into();
+        cfg.store.addr = "http://localhost:9001".into();
+        cfg
     }
 
     /// Each required field is independently checked — clearing any
@@ -728,8 +683,8 @@ mod tests {
     fn config_rejects_empty_required_addrs() {
         type Patch = fn(&mut Config);
         let cases: &[(&str, Patch)] = &[
-            ("scheduler_addr", |c| c.scheduler_addr = String::new()),
-            ("store_addr", |c| c.store_addr = String::new()),
+            ("scheduler.addr", |c| c.scheduler.addr = String::new()),
+            ("store.addr", |c| c.store.addr = String::new()),
             ("host_key", |c| c.host_key = std::path::PathBuf::new()),
             ("authorized_keys", |c| {
                 c.authorized_keys = std::path::PathBuf::new();

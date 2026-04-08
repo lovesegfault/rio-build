@@ -52,18 +52,15 @@ pub(crate) struct Config {
         serialize_with = "executor_kind_ser"
     )]
     pub(crate) executor_kind: ExecutorKind,
-    pub(crate) scheduler_addr: String,
-    /// Headless Service host for health-aware balanced routing.
-    /// See rio-gateway's identical field for the full story.
-    /// `None` (env unset) = single-channel fallback.
-    pub(crate) scheduler_balance_host: Option<String>,
-    pub(crate) scheduler_balance_port: u16,
-    pub(crate) store_addr: String,
-    /// rio-store headless Service host. Same balance pattern as
-    /// scheduler — but for load distribution across replicas, not
-    /// leader routing (all store pods serve). `None` = single-channel.
-    pub(crate) store_balance_host: Option<String>,
-    pub(crate) store_balance_port: u16,
+    /// rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /
+    /// `__BALANCE_HOST` / `__BALANCE_PORT`. `balance_host = Some` →
+    /// health-aware p2c (route to leader). `None` = single-channel.
+    pub(crate) scheduler: rio_common::config::UpstreamAddrs,
+    /// rio-store upstream. Env: `RIO_STORE__ADDR` / `__BALANCE_HOST` /
+    /// `__BALANCE_PORT`. Balance is for load distribution across
+    /// replicas, not leader routing (all store pods serve). I-077: a
+    /// sticky single-channel meant scaling rio-store 1→4 didn't help.
+    pub(crate) store: rio_common::config::UpstreamAddrs,
     /// Systems this builder can build for. Empty after merge →
     /// auto-detect single element via std::env::consts. Multi-
     /// element for qemu-user-static or cross-arch builders.
@@ -179,12 +176,8 @@ impl Default for Config {
         Self {
             executor_id: String::new(),
             executor_kind: ExecutorKind::Builder,
-            scheduler_addr: String::new(),
-            scheduler_balance_host: None,
-            scheduler_balance_port: 9001,
-            store_addr: String::new(),
-            store_balance_host: None,
-            store_balance_port: 9002,
+            scheduler: rio_common::config::UpstreamAddrs::with_port(9001),
+            store: rio_common::config::UpstreamAddrs::with_port(9002),
             systems: Vec::new(),
             features: Vec::new(),
             // Matches nix/modules/builder.nix. NEVER default to /nix/store:
@@ -224,16 +217,6 @@ pub(crate) struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     executor_id: Option<String>,
-
-    /// rio-scheduler gRPC address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scheduler_addr: Option<String>,
-
-    /// rio-store gRPC address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store_addr: Option<String>,
 
     /// Systems this builder builds for (repeatable: `--system
     /// x86_64-linux --system aarch64-linux`). Auto-detected if
@@ -334,8 +317,8 @@ mod tests {
             d.executor_id.is_empty(),
             "executor_id auto-detects via hostname"
         );
-        assert!(d.scheduler_addr.is_empty(), "required, no default");
-        assert!(d.store_addr.is_empty(), "required, no default");
+        assert!(d.scheduler.addr.is_empty(), "required, no default");
+        assert!(d.store.addr.is_empty(), "required, no default");
         assert!(d.systems.is_empty(), "systems auto-detect");
         assert!(d.features.is_empty(), "features empty by default");
         assert_eq!(d.fuse_mount_point, PathBuf::from("/var/rio/fuse-store"));
@@ -423,7 +406,7 @@ mod tests {
 
     rio_test_support::jail_defaults!("builder", "", |cfg: Config| {
         assert!(!cfg.common.tls.is_configured());
-        assert!(cfg.scheduler_balance_host.is_none());
+        assert!(cfg.scheduler.balance_host.is_none());
         assert_eq!(cfg.executor_kind, ExecutorKind::Builder);
         assert!(cfg.systems.is_empty());
         assert!(cfg.features.is_empty());

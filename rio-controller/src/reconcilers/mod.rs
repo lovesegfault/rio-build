@@ -61,26 +61,13 @@ pub struct Ctx {
     /// Balanced AdminServiceClient (DrainExecutor in builderpool
     /// finalizer).
     pub admin: rio_proto::AdminServiceClient<tonic::transport::Channel>,
-    /// rio-scheduler ClusterIP address (e.g., "rio-scheduler:9001").
-    /// For builder pod env injection ONLY --- reconcilers use
-    /// `admin` above.
-    pub scheduler_addr: String,
-    /// Headless Service host. Injected as `RIO_SCHEDULER_BALANCE_HOST`
-    /// into builder pods. `None` = env var NOT injected --> builders
-    /// fall back to single-channel (VM tests, single-replica).
-    pub scheduler_balance_host: Option<String>,
-    pub scheduler_balance_port: u16,
-    /// rio-store gRPC address (e.g., "rio-store:9002"). Injected
-    /// as `RIO_STORE_ADDR` into builder pod containers (builders
-    /// connect to the store directly for PutPath/GetPath).
-    pub store_addr: String,
-    /// Headless Service host for rio-store. Injected as
-    /// `RIO_STORE_BALANCE_HOST` into executor pods so the
-    /// `BalancedChannel` p2c spreads load across store replicas.
-    /// `None` = single-channel fallback (and on a single-replica
-    /// store, single-channel is fine).
-    pub store_balance_host: Option<String>,
-    pub store_balance_port: u16,
+    /// rio-scheduler addresses. For builder pod env injection ONLY
+    /// (reconcilers use `admin` above). `balance_host = None` → env
+    /// var NOT injected → builders fall back to single-channel.
+    pub scheduler: common::pod::SchedulerAddrs,
+    /// rio-store addresses. Injected into builder pod containers
+    /// (builders connect to the store directly for PutPath/GetPath).
+    pub store: common::pod::StoreAddrs,
     /// Recorder for K8s Events. Reconcilers call `ctx.publish_
     /// event(obj, ev)` to emit; events show in `kubectl describe`
     /// and `kubectl get events`. Operator visibility for "what
@@ -137,24 +124,15 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Bundle the scheduler address fields for pod-spec injection.
-    /// Every reconciler that builds an executor pod-spec calls this
-    /// instead of constructing `SchedulerAddrs` inline.
+    /// Clone the scheduler address bundle for pod-spec injection.
+    /// Every reconciler that builds an executor pod-spec calls this.
     pub fn scheduler_addrs(&self) -> common::pod::SchedulerAddrs {
-        common::pod::UpstreamAddrs {
-            addr: self.scheduler_addr.clone(),
-            balance_host: self.scheduler_balance_host.clone(),
-            balance_port: self.scheduler_balance_port,
-        }
+        self.scheduler.clone()
     }
 
-    /// Bundle the store address fields for pod-spec injection.
+    /// Clone the store address bundle for pod-spec injection.
     pub fn store_addrs(&self) -> common::pod::StoreAddrs {
-        common::pod::UpstreamAddrs {
-            addr: self.store_addr.clone(),
-            balance_host: self.store_balance_host.clone(),
-            balance_port: self.store_balance_port,
-        }
+        self.store.clone()
     }
 
     /// Publish an event scoped to a K8s object. Best-effort —

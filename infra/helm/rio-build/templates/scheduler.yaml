@@ -102,7 +102,7 @@ spec:
               value: "[::]:9101"
             - name: RIO_DRAIN_GRACE_SECS
               value: "6"  # readinessProbe.periodSeconds (5) + 1
-            - name: RIO_STORE_ADDR
+            - name: RIO_STORE__ADDR
               value: {{ $s.storeAddr | quote }}
             - name: RIO_DATABASE_URL
               valueFrom:

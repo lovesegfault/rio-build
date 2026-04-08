@@ -97,7 +97,7 @@ processes:
         condition: process_healthy
     environment:
       - RIO_DATABASE_URL=postgres://rio@127.0.0.1:5432/rio_dev
-      - RIO_STORE_ADDR=127.0.0.1:9002
+      - RIO_STORE__ADDR=127.0.0.1:9002
       - RIO_LISTEN_ADDR=127.0.0.1:9001
       - RIO_LOG_FORMAT=pretty
       - RIO_METRICS_ADDR=127.0.0.1:9091
@@ -117,8 +117,8 @@ processes:
       gateway-init:
         condition: process_completed_successfully
     environment:
-      - RIO_SCHEDULER_ADDR=127.0.0.1:9001
-      - RIO_STORE_ADDR=127.0.0.1:9002
+      - RIO_SCHEDULER__ADDR=127.0.0.1:9001
+      - RIO_STORE__ADDR=127.0.0.1:9002
       - RIO_LISTEN_ADDR=127.0.0.1:2222
       - RIO_HOST_KEY=.data/gateway/host_key
       - RIO_AUTHORIZED_KEYS=.data/gateway/authorized_keys

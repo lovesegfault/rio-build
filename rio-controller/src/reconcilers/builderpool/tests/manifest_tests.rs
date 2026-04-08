@@ -648,7 +648,7 @@ fn job_spec_load_bearing_fields() {
 
     // Sanity: build_pod_spec reuse — scheduler addr env present.
     let env = pod_spec.containers[0].env.as_ref().unwrap();
-    assert!(env.iter().any(|e| e.name == "RIO_SCHEDULER_ADDR"));
+    assert!(env.iter().any(|e| e.name == "RIO_SCHEDULER__ADDR"));
 }
 
 /// Job name format: `{pool}-mf-{mem}g-{cpu}m-{random6}`. The class

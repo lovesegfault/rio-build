@@ -301,6 +301,24 @@ impl BalancedChannel {
         })
     }
 
+    /// [`Self::new`] with `health_service`/`tls_domain` taken from a
+    /// [`ProtoClient`] impl and `probe_interval` =
+    /// [`DEFAULT_PROBE_INTERVAL`]. The generic [`super::connect`]
+    /// dispatches here when `balance_host` is set.
+    pub async fn for_client<C: super::ProtoClient>(
+        host: String,
+        port: u16,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            host,
+            port,
+            C::HEALTH_SERVICE.into(),
+            C::TLS_DOMAIN.into(),
+            DEFAULT_PROBE_INTERVAL,
+        )
+        .await
+    }
+
     /// Get a clone of the balanced channel. Cheap --- tonic
     /// Channels are Arc-backed. Wrap in service clients as usual.
     pub fn channel(&self) -> Channel {
@@ -327,58 +345,11 @@ pub(crate) const SCHEDULER_TLS_DOMAIN: &str = "rio-scheduler";
 /// missed heartbeat window.
 pub(crate) const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Connect to the scheduler via a health-aware balanced channel.
-///
-/// Returns a (SchedulerServiceClient, BalancedChannel guard). Keep
-/// the guard alive for process lifetime; dropping it stops the
-/// probe loop.
-///
-/// Use `connect_scheduler` for single-endpoint connects (tests,
-/// local dev with a single scheduler replica).
-pub async fn connect_scheduler_balanced(
-    host: String,
-    port: u16,
-) -> anyhow::Result<(crate::SchedulerServiceClient<Channel>, BalancedChannel)> {
-    let bc = BalancedChannel::new(
-        host,
-        port,
-        SCHEDULER_HEALTH_SERVICE.into(),
-        SCHEDULER_TLS_DOMAIN.into(),
-        DEFAULT_PROBE_INTERVAL,
-    )
-    .await?;
-    let client = crate::SchedulerServiceClient::new(bc.channel())
-        .max_decoding_message_size(rio_common::grpc::max_message_size())
-        .max_encoding_message_size(rio_common::grpc::max_message_size());
-    Ok((client, bc))
-}
-
-/// Like `connect_scheduler_balanced` but for `ExecutorServiceClient`.
-/// Same balance channel (same health probe, same endpoint set)
-/// but wrapped in the executor-facing client.
-pub async fn connect_executor_balanced(
-    host: String,
-    port: u16,
-) -> anyhow::Result<(crate::ExecutorServiceClient<Channel>, BalancedChannel)> {
-    let bc = BalancedChannel::new(
-        host,
-        port,
-        SCHEDULER_HEALTH_SERVICE.into(),
-        SCHEDULER_TLS_DOMAIN.into(),
-        DEFAULT_PROBE_INTERVAL,
-    )
-    .await?;
-    let client = crate::ExecutorServiceClient::new(bc.channel())
-        .max_decoding_message_size(rio_common::grpc::max_message_size())
-        .max_encoding_message_size(rio_common::grpc::max_message_size());
-    Ok((client, bc))
-}
-
 /// Health service rio-store registers via `set_serving::<StoreService
 /// Server<_>>`. Unlike the scheduler, all store replicas are
 /// equivalent (PG is the shared state) — the named-service probe is
 /// just "migrations done + listening", not leader detection.
-const STORE_HEALTH_SERVICE: &str = "rio.store.StoreService";
+pub(crate) const STORE_HEALTH_SERVICE: &str = "rio.store.StoreService";
 
 /// Default TLS domain for store connections. First SAN in
 /// `infra/helm/rio-build/templates/cert-manager.yaml`.
@@ -398,57 +369,7 @@ pub async fn connect_store_admin_at(
 ) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
     let ep = build_endpoint(addr, STORE_TLS_DOMAIN)?;
     let ch = ep.connect().await?;
-    Ok(crate::StoreAdminServiceClient::new(ch)
-        .max_decoding_message_size(rio_common::grpc::max_message_size())
-        .max_encoding_message_size(rio_common::grpc::max_message_size()))
-}
-
-/// Connect to rio-store via a health-aware balanced channel.
-///
-/// Unlike the scheduler (leader/standby), all store replicas serve;
-/// the balance is for load distribution, not leader routing. I-077: a
-/// sticky single-channel meant scaling rio-store 1→4 didn't help —
-/// every builder kept hitting the original pod, which stayed PG-pool-
-/// exhausted while 3 pods sat idle.
-pub async fn connect_store_balanced(
-    host: String,
-    port: u16,
-) -> anyhow::Result<(crate::StoreServiceClient<Channel>, BalancedChannel)> {
-    let bc = BalancedChannel::new(
-        host,
-        port,
-        STORE_HEALTH_SERVICE.into(),
-        STORE_TLS_DOMAIN.into(),
-        DEFAULT_PROBE_INTERVAL,
-    )
-    .await?;
-    let client = crate::StoreServiceClient::new(bc.channel())
-        .max_decoding_message_size(rio_common::grpc::max_message_size())
-        .max_encoding_message_size(rio_common::grpc::max_message_size());
-    Ok((client, bc))
-}
-
-/// Like `connect_scheduler_balanced` but for `AdminServiceClient`.
-/// The controller's autoscaler uses this for `ClusterStatus` polling
-/// — AdminService is on the same port and the standby rejects with
-/// UNAVAILABLE just like SchedulerService (`rio-scheduler/src/admin/
-/// mod.rs` leader guard), so the same health probe applies.
-pub async fn connect_admin_balanced(
-    host: String,
-    port: u16,
-) -> anyhow::Result<(crate::AdminServiceClient<Channel>, BalancedChannel)> {
-    let bc = BalancedChannel::new(
-        host,
-        port,
-        SCHEDULER_HEALTH_SERVICE.into(),
-        SCHEDULER_TLS_DOMAIN.into(),
-        DEFAULT_PROBE_INTERVAL,
-    )
-    .await?;
-    let client = crate::AdminServiceClient::new(bc.channel())
-        .max_decoding_message_size(rio_common::grpc::max_message_size())
-        .max_encoding_message_size(rio_common::grpc::max_message_size());
-    Ok((client, bc))
+    Ok(super::ProtoClient::wrap(ch))
 }
 
 #[cfg(test)]

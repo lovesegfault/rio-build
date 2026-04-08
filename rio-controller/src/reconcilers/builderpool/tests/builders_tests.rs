@@ -755,17 +755,17 @@ fn job_pod_env_vars() {
         .filter_map(|e| e.value.clone().map(|v| (e.name.clone(), v)))
         .collect();
 
-    assert_eq!(envs.get("RIO_SCHEDULER_ADDR"), Some(&"sched:9001".into()));
+    assert_eq!(envs.get("RIO_SCHEDULER__ADDR"), Some(&"sched:9001".into()));
     assert_eq!(
-        envs.get("RIO_STORE_ADDR"),
+        envs.get("RIO_STORE__ADDR"),
         Some(&"store:9002".into()),
-        "from ctx.store_addr (NOT derived from scheduler — \
+        "from ctx.store.addr (NOT derived from scheduler — \
          different hostnames in kustomize base)"
     );
     assert_eq!(
-        envs.get("RIO_STORE_BALANCE_HOST"),
+        envs.get("RIO_STORE__BALANCE_HOST"),
         Some(&"store-headless".into()),
-        "balance host injected when ctx.store_balance_host is Some"
+        "balance host injected when ctx.store.balance_host is Some"
     );
     assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small".into()));
     // systems + features: comma-sep strings. fixture wp has

@@ -69,13 +69,13 @@ spec:
               value: {{ $g.sessionDrainSecs | quote }}
             # Still used even with balance host — it's the TLS verify domain
             # (cert SAN is `rio-scheduler`).
-            - name: RIO_SCHEDULER_ADDR
+            - name: RIO_SCHEDULER__ADDR
               value: {{ $g.schedulerAddr | quote }}
-            - name: RIO_SCHEDULER_BALANCE_HOST
+            - name: RIO_SCHEDULER__BALANCE_HOST
               value: {{ $g.schedulerBalanceHost | quote }}
-            - name: RIO_SCHEDULER_BALANCE_PORT
+            - name: RIO_SCHEDULER__BALANCE_PORT
               value: {{ $g.schedulerBalancePort | quote }}
-            - name: RIO_STORE_ADDR
+            - name: RIO_STORE__ADDR
               value: {{ $g.storeAddr | quote }}
             - name: RIO_MAX_TRANSITIVE_INPUTS
               value: {{ $g.maxTransitiveInputs | int | quote }}

@@ -121,10 +121,10 @@ in
       ];
 
       # Env var naming: figment strips `RIO_` then lowercases to match
-      # the Config field. `RIO_STORE_ADDR` -> `store_addr`, etc.
+      # the Config field; `__` nests. `RIO_STORE__ADDR` -> `store.addr`.
       environment = {
-        RIO_SCHEDULER_ADDR = cfg.schedulerAddr;
-        RIO_STORE_ADDR = cfg.storeAddr;
+        RIO_SCHEDULER__ADDR = cfg.schedulerAddr;
+        RIO_STORE__ADDR = cfg.storeAddr;
         RIO_FUSE_MOUNT_POINT = cfg.fuseMountPoint;
         RIO_FUSE_CACHE_DIR = cfg.fuseCacheDir;
         RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;

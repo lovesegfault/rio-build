@@ -60,12 +60,14 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     Arc::new(Ctx {
         client,
         admin: rio_proto::AdminServiceClient::new(dead_ch),
-        scheduler_addr: "http://127.0.0.1:1".into(),
-        store_addr: "http://127.0.0.1:1".into(),
-        scheduler_balance_host: None,
-        scheduler_balance_port: 9001,
-        store_balance_host: None,
-        store_balance_port: 9002,
+        scheduler: rio_common::config::UpstreamAddrs {
+            addr: "http://127.0.0.1:1".into(),
+            ..rio_common::config::UpstreamAddrs::with_port(9001)
+        },
+        store: rio_common::config::UpstreamAddrs {
+            addr: "http://127.0.0.1:1".into(),
+            ..rio_common::config::UpstreamAddrs::with_port(9002)
+        },
         recorder,
         error_counts: Default::default(),
         manifest_idle: Default::default(),

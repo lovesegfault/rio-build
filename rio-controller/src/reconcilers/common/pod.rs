@@ -99,16 +99,10 @@ impl ExecutorKindExt for ExecutorKind {
 ///
 /// Type aliases (rather than two distinct structs) keep the
 /// `SchedulerAddrs` / `StoreAddrs` names at every call site without
-/// duplicating the field set.
-#[derive(Clone)]
-pub struct UpstreamAddrs {
-    /// ClusterIP Service `host:port` (`RIO_{SCHEDULER,STORE}_ADDR`).
-    pub addr: String,
-    /// Headless Service hostname. `None` = env var NOT injected →
-    /// executor falls back to single-channel.
-    pub balance_host: Option<String>,
-    pub balance_port: u16,
-}
+/// duplicating the field set. The struct itself is shared with each
+/// binary's `Config` (figment-deserialized) — see
+/// [`rio_common::config::UpstreamAddrs`].
+pub use rio_common::config::UpstreamAddrs;
 
 pub type SchedulerAddrs = UpstreamAddrs;
 pub type StoreAddrs = UpstreamAddrs;
@@ -476,8 +470,8 @@ fn build_executor_container(
         image_pull_policy: p.image_pull_policy.clone(),
         env: Some({
             let mut e = vec![
-                env("RIO_SCHEDULER_ADDR", &scheduler.addr),
-                env("RIO_STORE_ADDR", &store.addr),
+                env("RIO_SCHEDULER__ADDR", &scheduler.addr),
+                env("RIO_STORE__ADDR", &store.addr),
                 env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
                 env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
@@ -496,16 +490,16 @@ fn build_executor_container(
                 env("RIO_EXECUTOR_KIND", p.role.as_str()),
             ];
             if let Some(host) = &scheduler.balance_host {
-                e.push(env("RIO_SCHEDULER_BALANCE_HOST", host));
+                e.push(env("RIO_SCHEDULER__BALANCE_HOST", host));
                 e.push(env(
-                    "RIO_SCHEDULER_BALANCE_PORT",
+                    "RIO_SCHEDULER__BALANCE_PORT",
                     &scheduler.balance_port.to_string(),
                 ));
             }
             if let Some(host) = &store.balance_host {
-                e.push(env("RIO_STORE_BALANCE_HOST", host));
+                e.push(env("RIO_STORE__BALANCE_HOST", host));
                 e.push(env(
-                    "RIO_STORE_BALANCE_PORT",
+                    "RIO_STORE__BALANCE_PORT",
                     &store.balance_port.to_string(),
                 ));
             }

@@ -170,6 +170,67 @@ impl CommonConfig {
     }
 }
 
+/// Upstream gRPC address triple: a ClusterIP `addr` for single-channel
+/// mode plus an optional headless-Service `balance_host` for health-
+/// aware p2c. Same shape for scheduler and store; the per-upstream
+/// default `balance_port` differs (9001/9002), set via [`Self::with_port`].
+///
+/// Embed in each binary's `Config` as a nested field (NOT flattened):
+///
+/// ```ignore
+/// struct Config {
+///     scheduler: UpstreamAddrs,  // env: RIO_SCHEDULER__ADDR / __BALANCE_HOST / __BALANCE_PORT
+///     store: UpstreamAddrs,      // env: RIO_STORE__ADDR / ...
+/// }
+/// ```
+///
+/// `#[serde(default)]` is required: figment merges per-field across
+/// layers, so a TOML `[scheduler]` table with only `addr` set must NOT
+/// fail with `MissingField("balance_port")` — the unspecified fields
+/// fall through to `Default` (which `Serialized::defaults` populates
+/// from `Config::default()` in production, but bare-TOML tests need
+/// the struct-level fallback).
+///
+/// `rio-proto::client::connect` takes this to do the balance-vs-single
+/// dispatch that was previously open-coded ~40L per binary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamAddrs {
+    /// ClusterIP Service `host:port`. Required (no compiled default —
+    /// deployment-specific). Validated via [`Self::ensure_required`].
+    /// Also the TLS verify domain when `balance_host` is set (cert
+    /// SAN is the Service name, not the pod IP).
+    pub addr: String,
+    /// Headless Service hostname for health-aware p2c. `None` (env
+    /// unset) → single-channel via `addr`. `Some` → DNS-resolve,
+    /// probe `grpc.health.v1`, route to SERVING endpoints only.
+    pub balance_host: Option<String>,
+    /// gRPC port for balanced-channel pod-IP connects. Only used when
+    /// `balance_host` is `Some`.
+    pub balance_port: u16,
+}
+
+impl UpstreamAddrs {
+    /// Construct with the per-upstream default `balance_port` (9001
+    /// scheduler / 9002 store). `addr` empty, `balance_host` None —
+    /// the production override comes from env/TOML; [`ensure_required`]
+    /// in `validate()` rejects an empty `addr` at startup.
+    pub fn with_port(balance_port: u16) -> Self {
+        Self {
+            addr: String::new(),
+            balance_host: None,
+            balance_port,
+        }
+    }
+
+    /// [`ensure_required`] for `self.addr`. `field` is the nested
+    /// path (`"scheduler.addr"`) so the operator-facing error names
+    /// the right env var (`RIO_SCHEDULER__ADDR`).
+    pub fn ensure_required(&self, field: &str, component: &str) -> anyhow::Result<()> {
+        ensure_required(&self.addr, field, component)
+    }
+}
+
 /// Read an env var with a typed fallback. For the handful of
 /// bootstrap-time reads that run BEFORE [`load`] (tracing init,
 /// observability) or that live in leaf crates with no `Config` struct.
@@ -261,8 +322,10 @@ pub fn ensure_required(value: &str, field: &str, component: &str) -> anyhow::Res
     anyhow::ensure!(
         !value.trim().is_empty(),
         "{field} is required (set --{flag}, RIO_{env}, or {component}.toml)",
-        flag = field.replace('_', "-"),
-        env = field.to_uppercase(),
+        flag = field.replace(['_', '.'], "-"),
+        // `.` is figment's nesting separator → `__` in env. So
+        // `scheduler.addr` → `RIO_SCHEDULER__ADDR`.
+        env = field.replace('.', "__").to_uppercase(),
     );
     Ok(())
 }

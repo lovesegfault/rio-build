@@ -145,7 +145,7 @@ in
       # the Config field. `RIO_LISTEN_ADDR` -> `listen_addr`, etc.
       environment = {
         RIO_LISTEN_ADDR = cfg.listenAddr;
-        RIO_STORE_ADDR = cfg.storeAddr;
+        RIO_STORE__ADDR = cfg.storeAddr;
         RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_TICK_INTERVAL_SECS = toString cfg.tickIntervalSecs;
