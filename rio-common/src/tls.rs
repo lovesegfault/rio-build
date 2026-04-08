@@ -425,9 +425,9 @@ mod tests {
     }
 
     /// Valid `-----BEGIN` header but garbage body → MalformedPem.
-    /// The substring check passes; only the deep rustls_pemfile parse
-    /// catches this. Without it, the error surfaces at the first
-    /// handshake as a path-less rustls message.
+    /// The substring check passes; only `validate_pem_sections` catches
+    /// this. Without it, the error surfaces at the first handshake as a
+    /// path-less rustls message.
     #[test]
     fn corrupt_pem_body_is_malformed() {
         let corrupt = write_tmp(
@@ -456,8 +456,7 @@ mod tests {
     }
 
     /// Header present but truncated before `-----END` → MalformedPem
-    /// via the sections==0 fallback (rustls_pemfile yields nothing
-    /// rather than erroring on a missing footer).
+    /// via `validate_pem_sections`' explicit truncated-section error.
     #[test]
     fn truncated_pem_is_malformed() {
         let truncated = write_tmp("-----BEGIN CERTIFICATE-----\nMIIBIjAN\n");
