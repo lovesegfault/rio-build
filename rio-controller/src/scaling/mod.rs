@@ -8,7 +8,7 @@ pub mod component;
 
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::builderpoolset::BuilderPoolSet;
-use rio_crds::fetcherpool::FetcherPool;
+use rio_crds::common::PoolStatusCommon;
 
 /// Compute `lastTransitionTime` per K8s convention: preserve the
 /// existing timestamp if `status` is unchanged, stamp now() on
@@ -31,30 +31,25 @@ pub(crate) fn transition_time(new_status: &str, prev: Option<&serde_json::Value>
     k8s_openapi::jiff::Timestamp::now().to_string()
 }
 
-/// Find a condition by `type` in a `BuilderPool.status.conditions`
-/// array. Used to read the existing condition before a rewrite so
+/// Find a condition by `type` in a pool's `status.conditions` array.
+/// Used to read the existing condition before a rewrite so
 /// `lastTransitionTime` can be preserved on non-transitions.
+///
+/// Generic over the embedding status struct via `AsRef` so both
+/// `BuilderPoolStatus` and `FetcherPoolStatus` (which flatten
+/// [`PoolStatusCommon`]) feed into one function — previously two
+/// near-identical 6-line copies.
 ///
 /// Returns `None` if the pool has no status, no conditions, or no
 /// condition of the given type. Serializes via serde_json (the
 /// k8s_openapi Condition struct → json::Value) so the output
 /// plugs directly into `transition_time`.
-pub(crate) fn find_condition(pool: &BuilderPool, cond_type: &str) -> Option<serde_json::Value> {
-    pool.status
-        .as_ref()?
-        .conditions
-        .iter()
-        .find(|c| c.type_ == cond_type)
-        .and_then(|c| serde_json::to_value(c).ok())
-}
-
-/// FetcherPool variant of [`find_condition`]. Separate fn (not a
-/// trait) because the status field paths differ only nominally —
-/// genericizing over the two `*PoolStatus` structs would need a
-/// trait both impl, which is more code than two 6-line functions.
-pub(crate) fn find_fp_condition(pool: &FetcherPool, cond_type: &str) -> Option<serde_json::Value> {
-    pool.status
-        .as_ref()?
+pub(crate) fn find_condition<S: AsRef<PoolStatusCommon>>(
+    status: Option<&S>,
+    cond_type: &str,
+) -> Option<serde_json::Value> {
+    status?
+        .as_ref()
         .conditions
         .iter()
         .find(|c| c.type_ == cond_type)

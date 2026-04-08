@@ -234,16 +234,18 @@ mod tests {
         let mut fp = FetcherPool::new(
             "test",
             rio_crds::fetcherpool::FetcherPoolSpec {
-                deadline_seconds: None,
-                max_concurrent: max,
-                image: "rio-builder:test".into(),
-                systems: vec!["x86_64-linux".into()],
-                node_selector: None,
-                tolerations: None,
-                resources: None,
+                common: rio_crds::common::PoolSpecCommon {
+                    deadline_seconds: None,
+                    max_concurrent: max,
+                    image: "rio-builder:test".into(),
+                    systems: vec!["x86_64-linux".into()],
+                    node_selector: None,
+                    tolerations: None,
+                    resources: None,
+                    tls_secret_name: None,
+                    host_users: None,
+                },
                 classes: vec![],
-                tls_secret_name: None,
-                host_users: None,
             },
         );
         fp.metadata.namespace = Some("rio-fetchers".into());
@@ -326,14 +328,15 @@ mod tests {
     fn per_class_params_set_size_class_and_resources() {
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
         let fp = mk(8);
-        let class = FetcherSizeClass {
+        let class: FetcherSizeClass = rio_crds::common::SizeClassCommon {
             name: "small".into(),
             resources: ResourceRequirements {
                 limits: Some(BTreeMap::from([("memory".into(), Quantity("8Gi".into()))])),
                 ..Default::default()
             },
             max_concurrent: Some(4),
-        };
+        }
+        .into();
         let params = executor_params(&fp, Some(&class)).unwrap();
         // RIO_SIZE_CLASS injected via extra_env (sts.rs appends it
         // after the base env set).
@@ -373,16 +376,18 @@ mod tests {
     fn classes_produce_distinct_job_names() {
         let mut fp = mk(8);
         fp.spec.classes = vec![
-            FetcherSizeClass {
+            rio_crds::common::SizeClassCommon {
                 name: "tiny".into(),
                 resources: ResourceRequirements::default(),
                 max_concurrent: None,
-            },
-            FetcherSizeClass {
+            }
+            .into(),
+            rio_crds::common::SizeClassCommon {
                 name: "small".into(),
                 resources: ResourceRequirements::default(),
                 max_concurrent: None,
-            },
+            }
+            .into(),
         ];
         let names: Vec<_> = fp
             .spec
@@ -400,11 +405,12 @@ mod tests {
     /// them separate. Mirrors `rio-builder-{arch}-{class}`.
     #[test]
     fn multiarch_pools_distinct_job_names() {
-        let class = FetcherSizeClass {
+        let class: FetcherSizeClass = rio_crds::common::SizeClassCommon {
             name: "tiny".into(),
             resources: ResourceRequirements::default(),
             max_concurrent: None,
-        };
+        }
+        .into();
         let mut x86 = mk(8);
         x86.metadata.name = Some("x86-64".into());
         let mut arm = mk(8);

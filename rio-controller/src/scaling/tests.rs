@@ -268,10 +268,12 @@ fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> BuilderPoolSet {
     let classes = class_names
         .iter()
         .map(|n| SizeClassSpec {
-            name: (*n).to_string(),
+            common: rio_crds::common::SizeClassCommon {
+                name: (*n).to_string(),
+                max_concurrent: Some(10),
+                resources: ResourceRequirements::default(),
+            },
             cutoff_secs: 60.0,
-            max_concurrent: Some(10),
-            resources: ResourceRequirements::default(),
         })
         .collect();
     let spec = BuilderPoolSetSpec {

@@ -9,6 +9,7 @@ use kube::{Resource, ResourceExt};
 use crate::error::{Error, Result};
 use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
 use rio_crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
+use rio_crds::common::PoolSpecCommon;
 
 const DEFAULT_MAX_CONCURRENT: u32 = 10;
 
@@ -59,25 +60,33 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
     // concern)? This is the ONE production literal; test literals
     // delegate to crate::fixtures::test_builderpool_spec().
     let spec = BuilderPoolSpec {
-        // --- Per-class (SizeClassSpec) ---
-        max_concurrent,
-        resources: Some(class.resources.clone()),
+        common: PoolSpecCommon {
+            // --- Per-class (SizeClassSpec) ---
+            max_concurrent,
+            resources: Some(class.resources.clone()),
+            // --- Shared (PoolTemplate) ---
+            image: template.image.clone(),
+            systems: template.systems.clone(),
+            node_selector: template.node_selector.clone(),
+            tolerations: template.tolerations.clone(),
+            host_users: template.host_users,
+            tls_secret_name: template.tls_secret_name.clone(),
+            // None → build_job derives `cutoff × DEADLINE_MULTIPLIER`
+            // from `size_class_cutoff_secs` below (I-200, `r[ctrl.pool.
+            // per-class-deadline]`). No PoolTemplate override knob — the
+            // WPS author controls cutoff_secs which controls the deadline.
+            deadline_seconds: None,
+        },
         // `size_class` is what the scheduler matches. Setting it to
         // the class name is the contract — `r[sched.classify.*]`
         // routes by this string.
         size_class: class.name.clone(),
 
         // --- Shared (PoolTemplate) ---
-        image: template.image.clone(),
-        systems: template.systems.clone(),
         features: template.features.clone(),
-        node_selector: template.node_selector.clone(),
-        tolerations: template.tolerations.clone(),
         seccomp_profile: template.seccomp_profile.clone(),
         privileged: template.privileged,
         host_network: template.host_network,
-        host_users: template.host_users,
-        tls_secret_name: template.tls_secret_name.clone(),
 
         // --- Unset optional (use BuilderPool defaults) ---
         // WPS is inherently size-class-based (ADR-015) — that IS
@@ -85,11 +94,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         // feature (controller would poll GetCapacityManifest per-WPS).
         // Until then, WPS children are always Static.
         sizing: Sizing::Static,
-        // None → build_job derives `cutoff × DEADLINE_MULTIPLIER`
-        // from `size_class_cutoff_secs` below (I-200, `r[ctrl.pool.
-        // per-class-deadline]`). No PoolTemplate override knob — the
-        // WPS author controls cutoff_secs which controls the deadline.
-        deadline_seconds: None,
         // I-200: stamp the class cutoff so build_job can derive a
         // per-class activeDeadlineSeconds. The static spec value, NOT
         // `effective_cutoff_secs` (status-side EMA-smoothed) — the
@@ -155,14 +159,16 @@ pub(super) mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| SizeClassSpec {
-                name: (*n).to_string(),
+                common: rio_crds::common::SizeClassCommon {
+                    name: (*n).to_string(),
+                    max_concurrent: Some((i as u32 + 1) * 5),
+                    resources: ResourceRequirements::default(),
+                },
                 // Cutoffs monotonically increasing (matches the
                 // "smallest covering" classify contract, but the
                 // builder doesn't actually read cutoff_secs — it's
                 // a scheduler-side field).
                 cutoff_secs: (i as f64 + 1.0) * 60.0,
-                max_concurrent: Some((i as u32 + 1) * 5),
-                resources: ResourceRequirements::default(),
             })
             .collect();
         let spec = BuilderPoolSetSpec {

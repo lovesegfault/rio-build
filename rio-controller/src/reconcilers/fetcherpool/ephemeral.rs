@@ -316,7 +316,7 @@ async fn patch_status(
 ) -> Result<()> {
     let api: Api<FetcherPool> = Api::namespaced(ctx.client.clone(), ns);
     let ar = FetcherPool::api_resource();
-    let prev = crate::scaling::find_fp_condition(fp, "SchedulerUnreachable");
+    let prev = crate::scaling::find_condition(fp.status.as_ref(), "SchedulerUnreachable");
     let cond = scheduler_unreachable_condition(scheduler_err, prev.as_ref());
     api.patch_status(
         name,
@@ -407,16 +407,18 @@ mod tests {
     fn test_fp() -> FetcherPool {
         let spec: rio_crds::fetcherpool::FetcherPoolSpec = serde_json::from_value(
             serde_json::to_value(rio_crds::fetcherpool::FetcherPoolSpec {
-                deadline_seconds: None,
-                max_concurrent: 8,
-                image: "rio-fetcher:test".into(),
-                systems: vec!["x86_64-linux".into()],
-                node_selector: None,
-                tolerations: None,
-                resources: None,
+                common: rio_crds::common::PoolSpecCommon {
+                    deadline_seconds: None,
+                    max_concurrent: 8,
+                    image: "rio-fetcher:test".into(),
+                    systems: vec!["x86_64-linux".into()],
+                    node_selector: None,
+                    tolerations: None,
+                    resources: None,
+                    tls_secret_name: None,
+                    host_users: None,
+                },
                 classes: vec![],
-                tls_secret_name: None,
-                host_users: None,
             })
             .unwrap(),
         )
@@ -542,7 +544,7 @@ mod tests {
         use k8s_openapi::api::core::v1::ResourceRequirements;
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
         let fp = test_fp();
-        let class = FetcherSizeClass {
+        let class: FetcherSizeClass = rio_crds::common::SizeClassCommon {
             name: "small".into(),
             resources: ResourceRequirements {
                 limits: Some(std::collections::BTreeMap::from([(
@@ -552,7 +554,8 @@ mod tests {
                 ..Default::default()
             },
             max_concurrent: Some(4),
-        };
+        }
+        .into();
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(
             &fp,
@@ -610,11 +613,12 @@ mod tests {
     fn ephemeral_job_label_includes_pool() {
         let mut fp = test_fp();
         fp.metadata.name = Some("aarch64".into());
-        let class = FetcherSizeClass {
+        let class: FetcherSizeClass = rio_crds::common::SizeClassCommon {
             name: "tiny".into(),
             resources: Default::default(),
             max_concurrent: None,
-        };
+        }
+        .into();
         let oref = fp.controller_owner_ref(&()).unwrap();
         let job = build_job(
             &fp,

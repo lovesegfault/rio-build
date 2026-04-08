@@ -501,7 +501,7 @@ pub(super) async fn patch_job_pool_status(
 ) -> Result<()> {
     let wp_api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), ns);
     let ar = BuilderPool::api_resource();
-    let prev = crate::scaling::find_condition(wp, "SchedulerUnreachable");
+    let prev = crate::scaling::find_condition(wp.status.as_ref(), "SchedulerUnreachable");
     let cond = scheduler_unreachable_condition(scheduler_err, prev.as_ref());
     let status_patch = serde_json::json!({
         "apiVersion": ar.api_version,

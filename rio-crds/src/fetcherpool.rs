@@ -6,13 +6,11 @@
 //! integrity boundary: a tampered fetch produces a hash mismatch that
 //! `verify_fod_hashes()` rejects before upload. See ADR-019.
 
-use std::collections::BTreeMap;
-
-use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::common::{PoolSpecCommon, PoolStatusCommon, SizeClassCommon, impl_common_deref};
 
 /// FetcherPool spec. The reconciler labels pods `rio.build/role:
 /// fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
@@ -59,51 +57,25 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolSpec {
-    /// Backstop `activeDeadlineSeconds` on Jobs. Same field as
-    /// BuilderPool. Default 300 (`reconcilers/fetcherpool/
-    /// ephemeral.rs::FOD_DEADLINE_SECS`) — fetches are network-bound
-    /// and short; a stuck download is the failure mode, not a 90min
-    /// compile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_seconds: Option<u32>,
-
-    /// Concurrent-Job ceiling. The reconciler spawns one Job per
-    /// outstanding FOD up to this many active at once. FODs spike at
-    /// build start (40+ ready simultaneously when chains hit FOD-phase
-    /// together) but are short (~seconds each).
-    pub max_concurrent: u32,
-
-    /// Container image. Same binary as builders (`rio-builder`),
-    /// different `RIO_EXECUTOR_KIND` env baked into the pod spec.
-    pub image: String,
-
-    /// Target systems (e.g., `["x86_64-linux"]`). Fetchers still
-    /// execute the FOD's `builder` script (curl, git, etc.), so the
-    /// system must match.
-    pub systems: Vec<String>,
-
-    /// Node selector. Pairs with `rio.build/node-role: fetcher`
-    /// label on the Karpenter NodePool (spec: fetcher.node.dedicated).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_selector: Option<BTreeMap<String, String>>,
-
-    /// Tolerations. Pairs with `rio.build/fetcher=true:NoSchedule`
-    /// taint on fetcher nodes. Typed `Toleration` (not
-    /// serde_json::Value); `any_object_array` passthrough because
-    /// k8s-openapi types don't impl JsonSchema.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::any_object_array")]
-    pub tolerations: Option<Vec<Toleration>>,
-
-    /// K8s resource requests/limits for a single-size pool. Fetchers
-    /// are typically lighter than builders (network-bound) — 500m/1Gi
-    /// default. Mutually exclusive with `classes[]` (CEL-enforced):
-    /// when `classes` is non-empty, per-class resources apply and this
-    /// field MUST be unset. `any_object` passthrough — see
-    /// builderpool.rs for why.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::any_object")]
-    pub resources: Option<ResourceRequirements>,
+    /// Fields shared with `BuilderPoolSpec` (image, systems,
+    /// max_concurrent, node placement, resources, mTLS, …).
+    /// Flattened — the rendered CRD has these as top-level spec
+    /// properties. `Deref`/`DerefMut` below let call sites keep
+    /// writing `fp.spec.image`.
+    ///
+    /// Fetcher-side notes on common fields:
+    ///   * `deadline_seconds`: default 300 (`FOD_DEADLINE_SECS`) —
+    ///     fetches are network-bound and short; a stuck download is
+    ///     the failure mode, not a 90min compile.
+    ///   * `resources`: mutually exclusive with `classes[]` (CEL-
+    ///     enforced) — when `classes` is non-empty, per-class
+    ///     resources apply and this field MUST be unset.
+    ///   * `node_selector` / `tolerations`: pair with the
+    ///     `rio.build/node-role: fetcher` label and
+    ///     `rio.build/fetcher=true:NoSchedule` taint on the
+    ///     dedicated fetcher NodePool.
+    #[serde(flatten)]
+    pub common: PoolSpecCommon,
 
     /// Optional size classes (I-170). When empty (default), single
     /// Job loop at `spec.resources`. When non-empty, the reconciler
@@ -128,22 +100,6 @@ pub struct FetcherPoolSpec {
     /// per-arch autoscaling targets diverge.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub classes: Vec<FetcherSizeClass>,
-
-    /// mTLS Secret name (tls.crt/tls.key/ca.crt) for outgoing gRPC
-    /// to scheduler + store. Same cert as builders (same binary,
-    /// same client role). If unset, the fetcher runs without TLS
-    /// and the scheduler rejects the heartbeat in mTLS deployments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_secret_name: Option<String>,
-
-    /// Explicit `hostUsers` override — same semantics as BuilderPool.
-    /// `None` defaults to `hostUsers: false` (userns isolation). Set
-    /// `true` for k3s/containerd deployments that don't chown the pod
-    /// cgroup to the userns-mapped root UID (rio-builder's `mkdir
-    /// /sys/fs/cgroup/leaf` fails EACCES → CrashLoopBackOff). See
-    /// builderpool.rs's `host_users` doc for the full diagnostic.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_users: Option<bool>,
 }
 
 /// One fetcher size class. Mirrors `SizeClassSpec` minus
@@ -154,42 +110,33 @@ pub struct FetcherPoolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherSizeClass {
-    /// Class name. Becomes the Job name component
-    /// (`rio-fetcher-{pool}-{name}-*`) AND the `RIO_SIZE_CLASS` env the
-    /// executor reports in its heartbeat. Convention: "tiny" /
-    /// "small"; nothing enforces that.
-    pub name: String,
+    /// `name` / `resources` / `max_concurrent`. Flattened — wire
+    /// format unchanged.
+    #[serde(flatten)]
+    pub common: SizeClassCommon,
+}
 
-    /// K8s resource requests/limits for this class's fetcher pods.
-    /// NON-Option: distinct resource profiles are the entire point
-    /// of size classes. `any_object` passthrough — see
-    /// builderpool.rs for why.
-    #[schemars(schema_with = "crate::any_object")]
-    pub resources: ResourceRequirements,
+impl_common_deref!(FetcherSizeClass => SizeClassCommon);
 
-    /// Concurrent-Job ceiling for this class. `None` = inherit
-    /// `spec.max_concurrent`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_concurrent: Option<u32>,
+impl From<SizeClassCommon> for FetcherSizeClass {
+    fn from(common: SizeClassCommon) -> Self {
+        Self { common }
+    }
 }
 
 /// FetcherPool status. Reconciler writes; `kubectl get fp` reads.
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolStatus {
-    /// Count of active Jobs whose pod passed readinessProbe
-    /// (heartbeating to scheduler as `ExecutorKind::Fetcher`).
-    #[serde(default)]
-    pub ready_replicas: i32,
-    /// In-flight Job count the reconciler is targeting (queued FOD
-    /// demand, capped at `maxConcurrent`).
-    #[serde(default)]
-    pub desired_replicas: i32,
-    /// Standard K8s Conditions.
-    #[serde(default)]
-    #[schemars(schema_with = "crate::any_object_array")]
-    pub conditions: Vec<Condition>,
+    /// `ready_replicas` / `desired_replicas` / `conditions`.
+    /// Flattened — `kubectl` columns and the SSA status patch see
+    /// `.status.readyReplicas`, not `.status.common.readyReplicas`.
+    #[serde(flatten)]
+    pub common: PoolStatusCommon,
 }
+
+impl_common_deref!(FetcherPoolSpec => PoolSpecCommon);
+impl_common_deref!(FetcherPoolStatus => PoolStatusCommon);
 
 #[cfg(test)]
 mod tests {

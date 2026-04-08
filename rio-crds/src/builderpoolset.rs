@@ -12,12 +12,13 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
+use k8s_openapi::api::core::v1::Toleration;
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::builderpool::SeccompProfileKind;
+use crate::common::{SizeClassCommon, impl_common_deref};
 
 /// BuilderPoolSet spec. Each `classes[]` entry becomes a child
 /// BuilderPool owned by this CR (ownerReference → cascade delete).
@@ -56,11 +57,10 @@ pub struct BuilderPoolSetSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SizeClassSpec {
-    /// Class name. Becomes the child BuilderPool's name suffix
-    /// (`{bps}-{name}`) AND the `BuilderPoolSpec.size_class` value
-    /// the scheduler matches against. Convention: "small" / "medium"
-    /// / "large"; nothing enforces that.
-    pub name: String,
+    /// `name` / `resources` / `max_concurrent` (shared with
+    /// `FetcherSizeClass`). Flattened — wire format unchanged.
+    #[serde(flatten)]
+    pub common: SizeClassCommon,
 
     /// Upper bound (seconds) for builds this class handles. A
     /// build with predicted duration < cutoff_secs routes here.
@@ -68,29 +68,9 @@ pub struct SizeClassSpec {
     /// output). The LAST class's cutoff is effectively infinity
     /// (it catches everything above the previous cutoff).
     pub cutoff_secs: f64,
-
-    /// Concurrent-Job ceiling for this class. `None` = inherit.
-    /// Per-class because "large" workers have big resource requests
-    /// — capping them prevents one class from starving the cluster.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_concurrent: Option<u32>,
-
-    /// K8s resource requests/limits for this class's builder
-    /// pods. NON-Option: the entire POINT of size classes is
-    /// distinct resource profiles ("small" = 1cpu/2Gi; "large"
-    /// = 16cpu/64Gi). An inherited default defeats the purpose.
-    /// P0233's child-builder does `Some(class.resources.clone())`
-    /// straight into `Option<ResourceRequirements>`.
-    ///
-    /// `any_object` passthrough — see builderpool.rs for why.
-    /// The helper emits `nullable: true` (it was written for
-    /// Option fields); here the field is non-Option so serde
-    /// rejects `null` at deserialize regardless. Apiserver
-    /// accepts `null` → controller fails deserialize with a
-    /// clear error — acceptable (operators see it).
-    #[schemars(schema_with = "crate::any_object")]
-    pub resources: ResourceRequirements,
 }
+
+impl_common_deref!(SizeClassSpec => SizeClassCommon);
 
 /// Subset of `BuilderPoolSpec` shared across all child pools.
 /// The reconciler merges this with per-class fields when

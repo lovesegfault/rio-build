@@ -41,27 +41,29 @@ use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
 /// point; don't `#[derive(Default)]` on `BuilderPoolSpec`.
 pub fn test_builderpool_spec() -> BuilderPoolSpec {
     BuilderPoolSpec {
-        max_concurrent: 10,
+        common: rio_crds::common::PoolSpecCommon {
+            max_concurrent: 10,
+            deadline_seconds: None,
+            resources: None,
+            systems: vec!["x86_64-linux".into()],
+            image: "rio-builder:test".into(),
+            node_selector: None,
+            tolerations: None,
+            host_users: None,
+            tls_secret_name: None,
+        },
         sizing: Sizing::Static,
-        deadline_seconds: None,
         size_class_cutoff_secs: None,
-        resources: None,
         fuse_threads: None,
         fuse_passthrough: None,
         daemon_timeout_secs: None,
         features: vec!["kvm".into()],
-        systems: vec!["x86_64-linux".into()],
         size_class: "small".into(),
-        image: "rio-builder:test".into(),
         image_pull_policy: None,
-        node_selector: None,
-        tolerations: None,
         termination_grace_period_seconds: None,
         privileged: None,
         seccomp_profile: None,
         host_network: None,
-        host_users: None,
-        tls_secret_name: None,
     }
 }
 

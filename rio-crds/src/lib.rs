@@ -16,6 +16,7 @@
 
 pub mod builderpool;
 pub mod builderpoolset;
+pub mod common;
 pub mod componentscaler;
 pub mod fetcherpool;
 

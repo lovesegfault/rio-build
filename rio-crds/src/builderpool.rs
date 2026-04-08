@@ -3,12 +3,11 @@
 //! The reconciler polls `ClusterStatus.queued_derivations` and spawns
 //! Jobs (ownerReference → GC on delete) up to `spec.maxConcurrent`.
 
-use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+
+use crate::common::{PoolSpecCommon, PoolStatusCommon, impl_common_deref};
 
 /// Pod sizing mode. ADR-020.
 ///
@@ -62,6 +61,15 @@ pub enum Sizing {
         "maxConcurrent must be > 0 — it is the concurrent-Job ceiling"
     )
 )]
+// `systems` non-empty. Lives at struct level (not field-level on
+// `PoolSpecCommon.systems`) so the rule binds only to BuilderPool —
+// FetcherPool currently has no such constraint and adding one would
+// be a CRD schema change.
+#[x_kube(
+    validation = Rule::new("size(self.systems) > 0").message(
+        "systems must be non-empty — a builder pool with no target systems accepts no work"
+    )
+)]
 // r[impl ctrl.crd.host-users-network-exclusive]
 // CEL: hostNetwork:true → privileged:true. Kubernetes rejects
 // hostUsers:false + hostNetwork:true at admission (user-namespace
@@ -89,11 +97,13 @@ pub enum Sizing {
     )
 )]
 pub struct BuilderPoolSpec {
-    /// Concurrent-Job ceiling. The reconciler spawns one Job per
-    /// dispatch-need up to this many active at once. There is no
-    /// standing set — Jobs spawn when there's work, exit after one
-    /// build. CEL enforces `> 0`.
-    pub max_concurrent: u32,
+    /// Fields shared with `FetcherPoolSpec` (image, systems,
+    /// max_concurrent, node placement, mTLS, …). Flattened — the
+    /// rendered CRD has these as top-level spec properties.
+    /// `Deref`/`DerefMut` below let call sites keep writing
+    /// `wp.spec.image`.
+    #[serde(flatten)]
+    pub common: PoolSpecCommon,
 
     /// Pod sizing mode (ADR-020). `Static` = operator-set
     /// `spec.resources`. `Manifest` = controller polls
@@ -103,27 +113,17 @@ pub struct BuilderPoolSpec {
     #[serde(default)]
     pub sizing: Sizing,
 
-    /// Job `activeDeadlineSeconds` — K8s kills the pod if it doesn't
-    /// complete within this many seconds. Backstop for wrong-pool
-    /// spawns: `reconcile` spawns from the CLUSTER-WIDE
-    /// `queued_derivations` count, not pool-matching depth. A queue
-    /// full of `x86_64-linux` work on an `aarch64-darwin` pool
-    /// triggers a Job spawn; the worker heartbeats, never matches
-    /// dispatch, and would hang indefinitely without a deadline.
-    /// Default 3600 (1h): long enough that a matched dispatch + build
-    /// completes; short enough that a wrong-pool spawn doesn't leak
-    /// for the life of the cluster. Raise for pools running known-long
-    /// builds. This bounds BUILD time too — `backoffLimit: 0` means
-    /// K8s doesn't distinguish "builder idle" from "builder busy on
-    /// 90min build").
-    ///
-    /// Per-pool queue depth (the proper fix) is deferred to phase5's
-    /// ClusterStatus proto extension. See `r[ctrl.pool.ephemeral-
-    /// deadline]` in controller.md.
     // r[impl ctrl.pool.ephemeral-deadline]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_seconds: Option<u32>,
-
+    // `deadline_seconds` lives in `PoolSpecCommon`. Builder-side
+    // default is 3600 (1h): long enough that a matched dispatch +
+    // build completes; short enough that a wrong-pool spawn (queue
+    // full of `x86_64-linux` work on an `aarch64-darwin` pool —
+    // worker heartbeats, never matches dispatch) doesn't leak for
+    // the life of the cluster. This bounds BUILD time too
+    // (`backoffLimit: 0` means K8s can't tell "idle" from "busy on
+    // 90min build"). Per-pool queue depth (the proper fix) is
+    // deferred to phase5's ClusterStatus proto extension. See
+    // `r[ctrl.pool.ephemeral-deadline]` in controller.md.
     /// The class's `cutoffSecs` (upper-bound predicted build duration).
     /// Stamped onto BuilderPoolSet children from `SizeClassSpec.cutoff_
     /// secs`; standalone BuilderPools may set it directly. When set and
@@ -135,22 +135,6 @@ pub struct BuilderPoolSpec {
     /// fractional); the controller `ceil`s before casting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_class_cutoff_secs: Option<f64>,
-
-    /// K8s resource requests/limits for the worker container.
-    /// `None` = unbounded (cluster default). Operators should set
-    /// this — unbounded workers on a shared node is a noisy-
-    /// neighbor risk.
-    ///
-    /// schemars(schema_with): k8s-openapi types don't impl
-    /// JsonSchema. `any_object` emits `type: object` +
-    /// `x-kubernetes-preserve-unknown-fields: true` — the
-    /// apiserver validates against its OWN schema (it knows
-    /// ResourceRequirements), we just tell it "object, don't
-    /// strip unknowns." `serde_json::Value` emitted `{}` which
-    /// the apiserver REJECTS (`type: Required value`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::any_object")]
-    pub resources: Option<ResourceRequirements>,
 
     /// FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
     /// `None` = worker default (4). Tune up for NAR-heavy build
@@ -182,15 +166,6 @@ pub struct BuilderPoolSpec {
     #[serde(default)]
     pub features: Vec<String>,
 
-    /// Target systems (e.g., "x86_64-linux"). CEL: non-empty —
-    /// a worker that builds nothing is a config error.
-    #[x_kube(
-        validation = Rule::new("size(self) > 0").message(
-            "systems must be non-empty — a builder pool with no target systems accepts no work"
-        )
-    )]
-    pub systems: Vec<String>,
-
     /// Size class name. Maps to `RIO_SIZE_CLASS` env. Scheduler
     /// routes by this (classify() → matching-class workers).
     /// Empty = unclassified (scheduler with size_classes
@@ -203,10 +178,6 @@ pub struct BuilderPoolSpec {
     #[serde(default)]
     pub size_class: String,
 
-    /// Container image ref. Required — there's no sensible
-    /// default (depends on how operators build/tag).
-    pub image: String,
-
     /// Container imagePullPolicy. None = K8s default (IfNotPresent
     /// for tagged images, Always for `:latest`). Airgap/dev clusters
     /// (k3s with `ctr images import`) MUST set "IfNotPresent" or
@@ -217,18 +188,6 @@ pub struct BuilderPoolSpec {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_pull_policy: Option<String>,
-
-    /// Node selector for the Job pod spec. Common:
-    /// `rio.build/builder: "true"` to confine to tainted nodes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_selector: Option<BTreeMap<String, String>>,
-
-    /// Tolerations for the Job pod spec. Pairs with
-    /// node_selector: tolerate the `rio.build/builder:NoSchedule`
-    /// taint so workers (and only workers) land on those nodes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::any_object_array")]
-    pub tolerations: Option<Vec<Toleration>>,
 
     /// Pod terminationGracePeriodSeconds. SIGTERM → executor drain
     /// (DrainExecutor + wait for in-flight builds to complete). After
@@ -298,37 +257,18 @@ pub struct BuilderPoolSpec {
     /// `host-users-network-exclusive` marker in controller.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
+    // `host_users` lives in `PoolSpecCommon`. Builder-side semantics:
+    // `None` = derived (`hostUsers: false` when `!privileged &&
+    // !hostNetwork`, ADR-012). `Some(true)` = opt OUT of userns even
+    // when non-privileged. When to set `true`: containerd with the
+    // systemd cgroup driver may not chown the pod's cgroup to the
+    // userns-mapped root UID (runc `Cgroup.OwnerUID` path) → worker's
+    // `mkdir /sys/fs/cgroup/leaf` fails EACCES → CrashLoopBackOff.
+    // Observed on k3s 1.35.2 (vm-security-nonpriv-k3s). Production
+    // EKS/GKE with containerd 2.0+ and proper delegation should leave
+    // this unset. See `nix/tests/fixtures/k3s-full.nix` worker-Ready
+    // wait diagnostic.
 
-    /// Explicit `hostUsers` override. `None` (default) = derived:
-    /// `hostUsers: false` when `!privileged && !hostNetwork` (user-
-    /// namespace isolation per ADR-012). `Some(true)` = opt OUT of
-    /// userns even when non-privileged. `Some(false)` = force userns
-    /// (same as derived for the non-privileged path; no-op).
-    ///
-    /// When to set `true`: containerd with the systemd cgroup driver
-    /// may not chown the pod's cgroup to the userns-mapped root UID
-    /// (runc `Cgroup.OwnerUID` path). The worker's `mkdir /sys/fs/
-    /// cgroup/leaf` then fails EACCES → CrashLoopBackOff. Observed
-    /// on k3s 1.35.2 (vm-security-nonpriv-k3s scenario). Production
-    /// EKS/GKE with containerd 2.0+ and proper delegation should
-    /// leave this unset. See the diagnostic comment in
-    /// `nix/tests/fixtures/k3s-full.nix` worker-Ready wait.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_users: Option<bool>,
-
-    /// mTLS client cert Secret name. When set, the controller
-    /// mounts this Secret at `/etc/rio/tls/` and sets the
-    /// `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars.
-    ///
-    /// The Secret must have keys `tls.crt`, `tls.key`, `ca.crt`
-    /// (cert-manager's standard output for a Certificate with a
-    /// CA issuer). In the prod overlay, this is `rio-builder-tls`
-    /// (see cert-manager.yaml).
-    ///
-    /// Unset = plaintext gRPC (dev mode). The builder's TlsConfig
-    /// defaults to empty → load_client_tls returns None.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_secret_name: Option<String>,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers (FetcherPool) which have direct egress. The
     // Squid proxy is deleted — the FOD hash check is the integrity
@@ -393,22 +333,15 @@ pub struct BuilderPoolStatus {
     /// during cold start).
     #[serde(default)]
     pub replicas: i32,
-    /// Jobs whose pod has passed readinessProbe = heartbeat accepted.
-    #[serde(default)]
-    pub ready_replicas: i32,
-    /// Concurrent-Job ceiling (`spec.maxConcurrent`).
-    #[serde(default)]
-    pub desired_replicas: i32,
-    /// Standard K8s Conditions. One type:
-    ///   - `SchedulerUnreachable`: status=True when the
-    ///     reconciler's ClusterStatus RPC fails. Disambiguates
-    ///     "scheduler idle (queued=0)" from "scheduler down
-    ///     (queued unknown, fail-open to 0)." Written by the
-    ///     ephemeral reconciler.
-    #[serde(default)]
-    #[schemars(schema_with = "crate::any_object_array")]
-    pub conditions: Vec<Condition>,
+    /// `ready_replicas` / `desired_replicas` / `conditions`.
+    /// Flattened — `kubectl` columns and the SSA status patch see
+    /// `.status.readyReplicas`, not `.status.common.readyReplicas`.
+    #[serde(flatten)]
+    pub common: PoolStatusCommon,
 }
+
+impl_common_deref!(BuilderPoolSpec => PoolSpecCommon);
+impl_common_deref!(BuilderPoolStatus => PoolStatusCommon);
 
 #[cfg(test)]
 mod tests {
@@ -449,7 +382,7 @@ mod tests {
             "maxConcurrent>0 CEL rule missing from schema"
         );
         assert!(
-            json.contains("size(self) > 0"),
+            json.contains("size(self.systems) > 0"),
             "systems non-empty CEL rule missing"
         );
         // r[verify ctrl.crd.host-users-network-exclusive]
