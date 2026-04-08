@@ -5,6 +5,43 @@
 
 use super::*;
 
+/// Cross-phase carrier from [`DagActor::validate_and_ingest`] to
+/// [`DagActor::reconcile_merged_state`].
+///
+/// `handle_merge_dag` was a ~550-line monolith with 6 locals threaded
+/// across 8 phases and 3 early-return error paths. Splitting at the
+/// "build is now Active" boundary (step 5 → step 6) gives a clean
+/// `Result<_, ActorError>` for the validate/persist half; everything
+/// after that point is log-and-continue (build is committed). This
+/// struct carries the locals that cross that boundary.
+///
+/// `node_index` is NOT carried (it borrows from `nodes`, which would
+/// make this self-referential) — `reconcile_merged_state` rebuilds it
+/// in one pass over `nodes`.
+pub(super) struct MergeIngest {
+    pub build_id: Uuid,
+    /// Post-topdown-prune node set (may be smaller than the request's).
+    pub nodes: Vec<rio_proto::dag::DerivationNode>,
+    /// Only `edges.len()` survives past step 5 (for the total-time log);
+    /// the edges themselves are consumed by `dag.merge` + persist.
+    pub edges_len: usize,
+    pub merge_result: crate::dag::MergeResult,
+    pub event_rx: broadcast::Receiver<rio_proto::types::BuildEvent>,
+    /// Pre-existing not-done nodes that were re-probed in step 4.
+    pub existing_reprobe: HashSet<DrvHash>,
+    pub cached_hits: HashMap<DrvHash, Vec<String>>,
+    /// Threaded for `verify_preexisting_completed`'s store call.
+    pub jwt_token: Option<String>,
+}
+
+/// Output of [`DagActor::reconcile_merged_state`].
+pub(super) struct MergeReconcile {
+    pub cached_count: u32,
+    /// First Poisoned/DependencyFailed hash (newly-seeded OR
+    /// pre-existing). Caller fires `handle_derivation_failure` on it.
+    pub first_dep_failed: Option<DrvHash>,
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // MergeDag
@@ -15,6 +52,107 @@ impl DagActor {
         &mut self,
         req: MergeDagRequest,
     ) -> Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError> {
+        // I-139: per-phase timing. handle_merge_dag was >300s for a
+        // 153k-node / 837k-edge DAG with only ~22s in the batched DB
+        // phase; the rest had no logging. Each phase now self-reports
+        // so future regressions localize immediately. The two extracted
+        // phases keep their own per-step `phase!` macros; this scope
+        // tracks the inter-phase boundaries + total.
+        let t_total = Instant::now();
+        // rio_scheduler_builds_total is incremented at terminal transition
+        // (complete_build/transition_build_to_failed/handle_cancel_build)
+        // with an outcome label, so SLI queries can compute success rate.
+
+        // Phase 1: validate, merge into DAG, cache-check, persist, → Active.
+        // All early-return error paths (cycle, breaker open, persist fail,
+        // transition reject) live here. After this returns Ok the build is
+        // committed; later DB errors are log-and-continue.
+        let ingest = self.validate_and_ingest(req).await?;
+        let build_id = ingest.build_id;
+        let total_derivations = ingest.nodes.len() as u32;
+
+        // Phase 2: cached-hit transitions, critical-path, stale-reset,
+        // initial-state seed, pre-existing reconciliation.
+        let MergeReconcile {
+            cached_count,
+            first_dep_failed,
+        } = self.reconcile_merged_state(&ingest).await;
+
+        // Update build's cached count + persist initial denorm columns.
+        if let Some(build) = self.builds.get_mut(&build_id) {
+            build.cached_count = cached_count;
+        }
+        // I-103: sets completed_count from DAG ground truth + persists
+        // (total, completed, cached) to PG so list_builds is O(LIMIT).
+        self.update_build_counts(build_id).await;
+
+        // Send BuildStarted event
+        self.emit_build_event(
+            build_id,
+            rio_proto::types::build_event::Event::Started(rio_proto::types::BuildStarted {
+                total_derivations,
+                cached_derivations: cached_count,
+            }),
+        );
+
+        // If a newly merged node depends on an already-poisoned existing
+        // node, handle the failure now (fail build if !keepGoing, or sync
+        // counts + check completion if keepGoing).
+        if let Some(failed_hash) = first_dep_failed {
+            self.handle_derivation_failure(build_id, &failed_hash).await;
+            // handle_derivation_failure may have transitioned the build to
+            // Failed. If so, don't dispatch.
+            if self
+                .builds
+                .get(&build_id)
+                .is_some_and(|b| b.state().is_terminal())
+            {
+                return Ok(ingest.event_rx);
+            }
+        }
+
+        // Store cache-check is done (step 4 above, long since); signal
+        // the boundary between cache-resolution and dispatch. Gateways
+        // can surface this ("inputs resolved, N to build"). Fires even
+        // on the all-cached path — "resolved to zero work" is still
+        // resolved. P0294 ripped the Build CRD that originally wanted
+        // this as a condition; kept for gateway STDERR_NEXT.
+        self.emit_build_event(
+            build_id,
+            rio_proto::types::build_event::Event::InputsResolved(
+                rio_proto::types::BuildInputsResolved {},
+            ),
+        );
+
+        // Check if the build is already complete (all cache hits)
+        if cached_count == total_derivations {
+            self.complete_build(build_id).await?;
+        } else {
+            // Dispatch ready derivations to workers
+            self.dispatch_ready().await;
+        }
+        debug!(
+            elapsed = ?t_total.elapsed(),
+            nodes = ingest.nodes.len(),
+            edges = ingest.edges_len,
+            newly_inserted = ingest.merge_result.newly_inserted.len(),
+            "handle_merge_dag total"
+        );
+
+        Ok(ingest.event_rx)
+    }
+
+    /// Steps 0–5 of merge: top-down root prune, DB build row, in-mem DAG
+    /// merge, in-mem map inserts, cache-check, DB persist, → Active.
+    ///
+    /// All `?`-returnable error paths live here; on error any partial
+    /// in-mem/DB state is rolled back (`cleanup_failed_merge`). On Ok
+    /// the build is Active and committed — the caller's later DB writes
+    /// are log-and-continue.
+    async fn validate_and_ingest(
+        &mut self,
+        req: MergeDagRequest,
+    ) -> Result<MergeIngest, ActorError> {
         let MergeDagRequest {
             build_id,
             tenant_id,
@@ -27,11 +165,6 @@ impl DagActor {
             jti,
             jwt_token,
         } = req;
-        // I-139: per-phase timing. handle_merge_dag was >300s for a
-        // 153k-node / 837k-edge DAG with only ~22s in the batched DB
-        // phase; the rest had no logging. Each phase now self-reports
-        // so future regressions localize immediately.
-        let t_total = Instant::now();
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
@@ -39,9 +172,6 @@ impl DagActor {
                 t_phase = Instant::now();
             };
         }
-        // rio_scheduler_builds_total is incremented at terminal transition
-        // (complete_build/transition_build_to_failed/handle_cancel_build)
-        // with an outcome label, so SLI queries can compute success rate.
 
         // === Step 0: Top-down root substitution check ===============
         // r[impl sched.merge.substitute-topdown]
@@ -246,13 +376,54 @@ impl DagActor {
                 return Err(e);
             }
         }
+        let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // === Step 6: Post-Active processing ==========================
-        // From here on, DB write failures are log-and-continue (build is
-        // Active and in a valid state; DB sync will catch up on next status
-        // update or heartbeat reconciliation).
+        Ok(MergeIngest {
+            build_id,
+            edges_len: edges.len(),
+            nodes,
+            merge_result,
+            event_rx,
+            existing_reprobe,
+            cached_hits,
+            jwt_token,
+        })
+    }
 
-        let total_derivations = nodes.len() as u32;
+    /// Step 6 of merge: post-Active reconciliation. Transitions
+    /// cache-hits to Completed, recomputes critical-path priorities,
+    /// resets stale pre-existing Completed nodes, seeds initial
+    /// Ready/Queued for newly-inserted nodes, and re-walks
+    /// pre-existing nodes for cached/failed counting.
+    ///
+    /// DB write failures are log-and-continue (build is already Active;
+    /// DB sync catches up on next status update or heartbeat
+    /// reconciliation).
+    async fn reconcile_merged_state(&mut self, ingest: &MergeIngest) -> MergeReconcile {
+        let MergeIngest {
+            build_id,
+            nodes,
+            merge_result,
+            existing_reprobe,
+            cached_hits,
+            jwt_token,
+            ..
+        } = ingest;
+        let build_id = *build_id;
+        let newly_inserted = &merge_result.newly_inserted;
+        // Rebuild node_index here: it borrows from `nodes`, so it can't
+        // live in MergeIngest (self-referential). Cheap: one iter pass.
+        let node_index: HashMap<&str, &rio_proto::dag::DerivationNode> =
+            nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
+
+        let mut t_phase = Instant::now();
+        macro_rules! phase {
+            ($name:literal) => {
+                debug!(elapsed = ?t_phase.elapsed(), phase = $name, "merge phase");
+                t_phase = Instant::now();
+            };
+        }
+
         let mut cached_count = 0u32;
 
         let mut reprobe_unlocked: Vec<DrvHash> = Vec::new();
@@ -262,7 +433,7 @@ impl DagActor {
         // (Poisoned-only / tenant_id-present-only) and rare relative
         // to cached_hits.len().
         let mut completed_batch: Vec<DrvHash> = Vec::with_capacity(cached_hits.len());
-        for (drv_hash, output_paths) in &cached_hits {
+        for (drv_hash, output_paths) in cached_hits {
             let Some(node) = node_index.get(drv_hash.as_str()) else {
                 continue;
             };
@@ -393,12 +564,7 @@ impl DagActor {
         // Reset stale nodes to Ready; they re-dispatch and re-complete.
         // r[impl sched.merge.stale-completed-verify]
         let stale_reset = self
-            .verify_preexisting_completed(
-                &nodes,
-                newly_inserted,
-                &cached_hits,
-                jwt_token.as_deref(),
-            )
+            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
             .await;
         phase!("6c-verify-preexisting");
 
@@ -439,7 +605,7 @@ impl DagActor {
         // a still-poisoned derivation (within TTL, no ClearPoison yet)
         // leaves the build Active with completed=0, failed=0, total=1 —
         // check_build_completion never fires.
-        for node in &nodes {
+        for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
                 continue;
             }
@@ -487,71 +653,12 @@ impl DagActor {
             }
         }
         phase!("6f-preexisting-nodes-loop");
+        let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // Update build's cached count + persist initial denorm columns.
-        if let Some(build) = self.builds.get_mut(&build_id) {
-            build.cached_count = cached_count;
+        MergeReconcile {
+            cached_count,
+            first_dep_failed,
         }
-        // I-103: sets completed_count from DAG ground truth + persists
-        // (total, completed, cached) to PG so list_builds is O(LIMIT).
-        self.update_build_counts(build_id).await;
-
-        // Send BuildStarted event
-        self.emit_build_event(
-            build_id,
-            rio_proto::types::build_event::Event::Started(rio_proto::types::BuildStarted {
-                total_derivations,
-                cached_derivations: cached_count,
-            }),
-        );
-
-        // If a newly merged node depends on an already-poisoned existing
-        // node, handle the failure now (fail build if !keepGoing, or sync
-        // counts + check completion if keepGoing).
-        if let Some(failed_hash) = first_dep_failed {
-            self.handle_derivation_failure(build_id, &failed_hash).await;
-            // handle_derivation_failure may have transitioned the build to
-            // Failed. If so, don't dispatch.
-            if self
-                .builds
-                .get(&build_id)
-                .is_some_and(|b| b.state().is_terminal())
-            {
-                return Ok(event_rx);
-            }
-        }
-
-        // Store cache-check is done (step 4 above, long since); signal
-        // the boundary between cache-resolution and dispatch. Gateways
-        // can surface this ("inputs resolved, N to build"). Fires even
-        // on the all-cached path — "resolved to zero work" is still
-        // resolved. P0294 ripped the Build CRD that originally wanted
-        // this as a condition; kept for gateway STDERR_NEXT.
-        self.emit_build_event(
-            build_id,
-            rio_proto::types::build_event::Event::InputsResolved(
-                rio_proto::types::BuildInputsResolved {},
-            ),
-        );
-
-        // Check if the build is already complete (all cache hits)
-        if cached_count == total_derivations {
-            self.complete_build(build_id).await?;
-        } else {
-            // Dispatch ready derivations to workers
-            self.dispatch_ready().await;
-        }
-        phase!("7-dispatch");
-        let _ = &mut t_phase; // last write is intentionally unread
-        debug!(
-            elapsed = ?t_total.elapsed(),
-            nodes = nodes.len(),
-            edges = edges.len(),
-            newly_inserted = newly_inserted.len(),
-            "handle_merge_dag total"
-        );
-
-        Ok(event_rx)
     }
 
     /// Compute initial Ready/Queued/DependencyFailed for `remaining_new`
