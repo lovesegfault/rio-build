@@ -28,8 +28,7 @@ use super::*;
 /// survive chunk → manifest → backend → reassembly byte-for-byte.
 #[tokio::test(flavor = "multi_thread")]
 async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
-    let (builder, chunk_backend) = RioStackBuilder::new().with_chunked();
-    let mut stack = builder.ready().await?;
+    let (mut stack, chunk_backend) = RioStack::ready_chunked().await?;
 
     // 3 paths at 512 KiB each — well over INLINE_THRESHOLD (256 KiB),
     // chunks into ~8 pieces at FastCDC's 64 KiB normal-size. Different
@@ -136,8 +135,7 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
 /// the other write opcode. Smaller NAR (still over threshold).
 #[tokio::test(flavor = "multi_thread")]
 async fn add_single_then_nar_from_path_chunked() -> TestResult {
-    let (builder, chunk_backend) = RioStackBuilder::new().with_chunked();
-    let mut stack = builder.ready().await?;
+    let (mut stack, chunk_backend) = RioStack::ready_chunked().await?;
     let path = test_store_path("func-nar-single");
     // 300 KiB — just over INLINE_THRESHOLD. Minimum viable chunking.
     let (nar, info, _) = make_large_nar(99, 300 * 1024);

@@ -38,10 +38,8 @@ pub use rio_store::MIGRATOR;
 /// `MockStore` hides (hash verify, NAR parse, reference integrity) without
 /// the 2-5min VM cost.
 ///
-/// Construct via [`RioStackBuilder`] — scheduler is mocked. A real-
-/// `SchedulerActor` axis (leader-election stub + worker-registration
-/// mock) was scoped for tranche-2 but no plan materialized; re-add
-/// the builder seam when that work is scheduled.
+/// Construct via [`RioStack::ready()`] or [`RioStack::ready_chunked()`].
+/// Scheduler is always mocked.
 pub struct RioStack {
     /// Client-side wire stream. Write opcodes, read responses.
     pub stream: DuplexStream,
@@ -56,70 +54,31 @@ pub struct RioStack {
     handles: SessionHandles,
 }
 
-/// Builder for [`RioStack`]. Two orthogonal axes:
-/// - **chunked:** inline-only (default) vs FastCDC + [`MemoryChunkBackend`]
-/// - **ready:** bare stream vs handshake + `wopSetOptions` done
-///
-/// The chunk backend is returned from [`with_chunked()`], not stored on
-/// `RioStack` — tests that don't chunk don't carry an `Option::None`.
-///
-/// A third axis (real `SchedulerActor` vs mock) was seam-cut in P0318
-/// for a projected tranche-2 scenario suite that never materialized.
-/// The dead `with_real_scheduler()` + `unimplemented!()` branch was
-/// removed; re-add when a plan owns the work.
-///
-/// [`with_chunked()`]: Self::with_chunked
-#[derive(Default)]
-pub struct RioStackBuilder {
-    // Some(cache) iff with_chunked() was called. The backend Arc is
-    // already returned to the caller; we keep only the wrapped
-    // ChunkCache for StoreServiceImpl::with_chunk_cache.
-    chunk_cache: Option<Arc<ChunkCache>>,
-}
-
-impl RioStackBuilder {
-    pub fn new() -> Self {
-        Self::default()
+impl RioStack {
+    /// Spawn + handshake + `wopSetOptions`. Inline-only store (no chunking).
+    /// Ready for opcodes.
+    pub async fn ready() -> anyhow::Result<Self> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let service = StoreServiceImpl::new(db.pool.clone());
+        Self::build_inner(db, service).await
     }
 
-    /// Use FastCDC chunking (NARs ≥ `INLINE_THRESHOLD` go through
-    /// chunk+reassembly). Returns the backend so tests can assert
-    /// chunk counts — proving NARs round-tripped through chunk→PG
-    /// manifest→reassembly, not the inline-blob shortcut.
-    ///
-    /// Chainable: `let (builder, backend) = RioStackBuilder::new().with_chunked();`
-    pub fn with_chunked(mut self) -> (Self, Arc<MemoryChunkBackend>) {
+    /// Like [`ready()`](Self::ready) but with FastCDC chunking — NARs ≥
+    /// `INLINE_THRESHOLD` go through chunk+reassembly. Returns the backend
+    /// so tests can assert chunk counts, proving NARs round-tripped through
+    /// chunk→PG manifest→reassembly, not the inline-blob shortcut.
+    pub async fn ready_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
         let backend = Arc::new(MemoryChunkBackend::new());
         let cache = Arc::new(ChunkCache::new(
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
-        self.chunk_cache = Some(cache);
-        (self, backend)
-    }
-
-    /// Spawn the stack. Stream is BARE — caller handshakes.
-    pub async fn build(self) -> anyhow::Result<RioStack> {
         let db = TestDb::new(&MIGRATOR).await;
-        let mut service = StoreServiceImpl::new(db.pool.clone());
-        if let Some(cache) = self.chunk_cache {
-            service = service.with_chunk_cache(cache);
-        }
-        RioStack::build_inner(db, service).await
+        let service = StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(cache);
+        Ok((Self::build_inner(db, service).await?, backend))
     }
 
-    /// Spawn + handshake + `wopSetOptions`. Ready for opcodes.
-    pub async fn ready(self) -> anyhow::Result<RioStack> {
-        let mut stack = self.build().await?;
-        do_handshake(&mut stack.stream).await?;
-        send_set_options(&mut stack.stream).await?;
-        Ok(stack)
-    }
-}
-
-impl RioStack {
-    /// Shared: spawn store server + scheduler mock + `run_protocol` task.
-    /// Called by [`RioStackBuilder::build`] — the builder owns axis state
-    /// (chunked, scheduler); this owns spawn mechanics.
+    /// Shared spawn mechanics: store server + scheduler mock +
+    /// `run_protocol` task, then handshake + `wopSetOptions`.
     async fn build_inner(db: TestDb, service: StoreServiceImpl) -> anyhow::Result<Self> {
         // Idempotent — captured per-test via with_test_writer.
         // Without this, tracing::debug! in run_protocol error paths is void.
@@ -148,13 +107,16 @@ impl RioStack {
             rio_common::signal::Token::new(),
         );
 
-        Ok(Self {
+        let mut stack = Self {
             stream,
             db,
             scheduler,
             store_client,
             handles: SessionHandles::new(store_handle, sched_handle, server_task),
-        })
+        };
+        do_handshake(&mut stack.stream).await?;
+        send_set_options(&mut stack.stream).await?;
+        Ok(stack)
     }
 
     /// Finish the session: drop the client stream (EOF), await server task.
