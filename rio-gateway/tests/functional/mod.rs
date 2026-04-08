@@ -9,15 +9,15 @@
 //! `rio-store` dev-depends on `rio-test-support`, so
 //! `rio-test-support → rio-store` would cycle.
 //!
-//! Mirrors `GatewaySession` at [`rio-gateway/tests/common/mod.rs`] for the
-//! DuplexStream + `run_protocol` wiring, and `StoreSession` at
-//! [`rio-store/tests/grpc/main.rs`] for the real-store spawn.
+//! Shares `DuplexStream` + `run_protocol` wiring with `GatewaySession` via
+//! [`super::common::spawn_session_task`] / [`super::common::SessionHandles`];
+//! mirrors `StoreSession` at [`rio-store/tests/grpc/main.rs`] for the
+//! real-store spawn.
 
 #![allow(dead_code)] // helpers used by sibling test modules; Cargo compiles each separately
 
 use std::sync::Arc;
 
-use rio_gateway::session;
 use rio_proto::{StoreServiceClient, StoreServiceServer};
 use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
 use rio_store::cas::ChunkCache;
@@ -27,6 +27,8 @@ use rio_test_support::grpc::{MockScheduler, spawn_grpc_server, spawn_mock_schedu
 use rio_test_support::wire::{do_handshake, send_set_options};
 use tokio::io::DuplexStream;
 use tonic::transport::{Channel, Server};
+
+use super::common::{SessionHandles, spawn_session_task};
 
 // rio-store's MIGRATOR is cfg(test) in lib.rs (the rio-store/fuzz/
 // workspace's source filter excludes migrations/, and sqlx::migrate!
@@ -56,9 +58,7 @@ pub struct RioStack {
     /// Direct store gRPC client — bypass the wire protocol for setup
     /// (seed paths) or for assertions gateway doesn't expose.
     pub store_client: StoreServiceClient<Channel>,
-    store_handle: tokio::task::JoinHandle<()>,
-    sched_handle: tokio::task::JoinHandle<()>,
-    server_task: tokio::task::JoinHandle<()>,
+    handles: SessionHandles,
 }
 
 /// Builder for [`RioStack`]. Two orthogonal axes:
@@ -148,78 +148,36 @@ impl RioStack {
         let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
         let sched_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
 
-        let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
-        let mut sc = store_client.clone();
-        let mut scc = sched_client.clone();
-        // Fire-and-forget: aborted in Drop. Same EOF-is-clean /
-        // error-is-logged-not-panicked discipline as GatewaySession.
-        // Error-path opcode tests deliberately trigger STDERR_ERROR,
-        // after which the handler returns Err — the test's real
-        // assertion is the client-side drain_stderr_expecting_error.
-        let server_task = tokio::spawn(async move {
-            let (mut r, mut w) = tokio::io::split(server_stream);
-            // Functional tests don't exercise the shutdown-signal path —
-            // that's a wire_opcodes concern. Never-cancelled token.
-            let shutdown = rio_common::signal::Token::new();
-            if let Err(e) = session::run_protocol(
-                &mut r,
-                &mut w,
-                &mut sc,
-                &mut scc,
-                None, // single-tenant mode (functional tests don't exercise tenant flow)
-                None,
-                rio_gateway::TenantLimiter::disabled(),
-                rio_gateway::QuotaCache::new(),
-                shutdown,
-            )
-            .await
-            {
-                let is_eof = e
-                    .downcast_ref::<rio_nix::protocol::wire::WireError>()
-                    .is_some_and(|we| {
-                        matches!(we, rio_nix::protocol::wire::WireError::Io(io)
-                            if io.kind() == std::io::ErrorKind::UnexpectedEof)
-                    });
-                if !is_eof {
-                    tracing::debug!(error = %e, "run_protocol returned error (expected for error-path tests)");
-                }
-            }
-        });
+        // Functional tests don't exercise the shutdown-signal or tenant
+        // paths — those are wire_opcodes concerns. Never-cancelled token,
+        // single-tenant mode.
+        let (stream, server_task) = spawn_session_task(
+            store_client.clone(),
+            sched_client,
+            None,
+            rio_common::signal::Token::new(),
+        );
 
         Ok(Self {
-            stream: client_stream,
+            stream,
             db,
             scheduler,
             store_client,
-            store_handle,
-            sched_handle,
-            server_task,
+            handles: SessionHandles::new(store_handle, sched_handle, server_task),
         })
     }
 
     /// Finish the session: drop the client stream (EOF), await server task.
     ///
-    /// Consuming variant for the standard test teardown. `Drop` is a
-    /// fallback (abort-only) for tests that return early via `?`.
+    /// Consuming variant for the standard test teardown.
+    /// [`SessionHandles`]'s `Drop` is the abort-only fallback for tests
+    /// that return early via `?`. `TestDb`'s `Drop` drops the PG database
+    /// after `server_task` has joined — no store-query-on-dead-db race.
     pub async fn finish(mut self) {
-        // Drop the client stream to trigger EOF on the server side.
-        // Struct has a Drop impl so can't `drop(self.stream)` directly;
-        // replace with a dangling endpoint.
+        // Drop the client stream to trigger EOF on the server side
+        // (replace with a dangling endpoint — can't move out of a field).
         self.stream = tokio::io::duplex(1).0;
-        // Take the server_task out (Drop will abort a no-op dummy).
-        let task = std::mem::replace(&mut self.server_task, tokio::spawn(async {}));
-        task.await.expect("server task should not panic");
-        // Drop runs here: aborts gRPC handles (TestDb's Drop drops the
-        // PG database — happens after server_task joined, so no
-        // store-query-on-dead-db race).
-    }
-}
-
-impl Drop for RioStack {
-    fn drop(&mut self) {
-        self.store_handle.abort();
-        self.sched_handle.abort();
-        self.server_task.abort();
+        self.handles.join_server().await;
     }
 }
 

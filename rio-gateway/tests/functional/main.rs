@@ -23,6 +23,8 @@
 // tests/functional/mod.rs — RioStack fixture. Rust's `mod fixture;`
 // searches `fixture.rs` or `fixture/mod.rs` — not a sibling `mod.rs`.
 // #[path] reaches it, same pattern as wire_opcodes/main.rs → ../common/mod.rs.
+#[path = "../common/mod.rs"]
+mod common;
 #[path = "mod.rs"]
 mod fixture;
 
