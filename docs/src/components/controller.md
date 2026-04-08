@@ -446,7 +446,7 @@ spec:
   targetRef:                         # required
     kind: Deployment                 #   CEL: must be "Deployment"
     name: rio-store                  #   same-namespace
-  signal: scheduler-builders         # scheduler-builders|self-reported, default scheduler-builders
+  signal: scheduler-builders         # scheduler-builders (default)
   replicas:                          # required
     min: 2                           #   i32; CEL: min <= max
     max: 14                          #   i32 — for store: Aurora max_connections / pgMaxConnections
