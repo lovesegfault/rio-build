@@ -151,7 +151,7 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
 ///
 /// Then: store recovers → 7th merge succeeds (half-open probe closes).
 /// This proves both the open transition AND the close-on-recovery path.
-// r[verify sched.breaker.cache-check]
+// r[verify sched.breaker.cache-check+2]
 #[tokio::test]
 async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
     use rio_test_support::grpc::spawn_mock_store_with_client;

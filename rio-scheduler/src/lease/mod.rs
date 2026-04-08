@@ -538,6 +538,7 @@ pub async fn run_lease_loop(
 /// mocks cause spurious deadline-exceeded; see lang-gotchas).
 ///
 /// Returns `true` if the fence fired (for test assertions).
+// r[impl sched.lease.self-fence]
 fn maybe_self_fence(
     state: &LeaderState,
     was_leading: &mut bool,

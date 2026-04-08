@@ -603,7 +603,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // Process remaining events, with reconnect on stream error.
     // Scheduler failover/restart drops the stream; we reconnect
     // via WatchBuild(build_id, since_sequence=last_seen) with
-    // backoff (1s/2s/4s/8s/16s, max 5). The scheduler replays
+    // backoff (1s/2s/4s/8s/16s cap, max 10). The scheduler replays
     // events from build_event_log past that sequence.
     //
     // Without reconnect: scheduler restart mid-build → client's

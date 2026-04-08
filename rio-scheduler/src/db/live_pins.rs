@@ -4,6 +4,7 @@
 //! directly to scheduler_live_pins; store's gc/mark.rs seeds from it.
 //! Best-effort: PG failure during pin/unpin logs + continues (24h grace
 //! period is the fallback safety net).
+// r[impl sched.gc.live-pins]
 
 use uuid::Uuid;
 
