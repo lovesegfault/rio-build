@@ -10,21 +10,7 @@ use crate::crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
 use crate::crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use crate::error::{Error, Result};
 
-/// Default replica floor when a SizeClassSpec leaves `min_replicas`
-/// unset. 0 = scale-to-zero; the autoscaler (P0234) raises it when
-/// queue depth warrants. Matches BuilderPool's semantics where
-/// `replicas.min` is an explicit operator decision, not a magic
-/// floor.
-#[allow(dead_code)]
-const DEFAULT_MIN_REPLICAS: i32 = 0;
 const DEFAULT_MAX_CONCURRENT: u32 = 10;
-
-/// Default replica ceiling when `max_replicas` is unset. 10 is a
-/// conservative cap — large enough that a class won't starve under
-/// normal load, small enough that a misconfigured WPS on a shared
-/// cluster won't burn through it.
-#[allow(dead_code)]
-const DEFAULT_MAX_REPLICAS: i32 = 10;
 
 /// Child BuilderPool name: `{wps}-{class.name}`. The scheduler
 /// routes by `size_class` (which equals `class.name`), not pool
