@@ -35,7 +35,7 @@ Key design choices:
 
 4. **Pods are long-lived, not one-shot.** A manifest-spawned pod does NOT exit after one build. It heartbeats its `memory_total_bytes` (already reported, [rio-builder/src/cgroup.rs:667](../../rio-builder/src/cgroup.rs)), takes any derivation that fits, and idles until either work arrives or a grace period expires. The grace period is the existing `SCALE_DOWN_WINDOW` applied per-pod: the controller's manifest diff sees "48Gi pod idle, no 48Gi demand for 10min" → delete the Job. This preserves FUSE cache warming within a pod's lifetime and amortizes the ~50-80s node provision cost across multiple builds of similar size.
 
-5. **Placement by resource fit, not class match.** `assign_to_worker` replaces its `size_class` string match with `worker.memory_total_bytes >= drv.est_memory_bytes`. Overflow routing is natural: a 16Gi derivation can run on a 64Gi pod if that's what's idle. The transfer-cost and locality scoring ([rio-scheduler/src/assignment.rs:296](../../rio-scheduler/src/assignment.rs)) already prefer the best-fit idle worker; resource fit is a hard filter preceding that scoring, same position as `has_capacity` today.
+5. **Placement by resource fit, not class match.** `assign_to_worker` replaces its `size_class` string match with `worker.memory_total_bytes >= drv.est_memory_bytes`. Overflow routing is natural: a 16Gi derivation can run on a 64Gi pod if that's what's idle. Resource fit is a hard-filter clause in [`hard_filter()`](../../rio-scheduler/src/assignment.rs), same position as `has_capacity` today; with one-shot pods the first executor that passes the filter wins.
 
 ## Alternatives Considered
 

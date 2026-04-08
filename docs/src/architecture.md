@@ -35,8 +35,8 @@
 │  Global build DAG  │  │  ┌─────────────────────────────────┐       │
 │  Critical-path     │◄►│  │ Metadata (PostgreSQL)            │       │
 │  scheduling        │  │  │ narinfo, references, manifests   │       │
-│  Transfer-cost     │  │  │ CA content index (SHA-256)       │       │
-│  locality scoring  │  │  └─────────────────────────────────┘       │
+│  Resource-fit      │  │  │ CA content index (SHA-256)       │       │
+│  hard-filter       │  │  └─────────────────────────────────┘       │
 │  Streaming builder  │  │  ┌─────────────────────────────────┐       │
 │  assignment        │  │  │ Blobs (S3-compatible)            │       │
 │  State: PostgreSQL │  │  │ Deduplicated chunks (BLAKE3)     │       │

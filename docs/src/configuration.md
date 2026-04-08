@@ -22,15 +22,14 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 |-----------|------|---------|-------------|
 | `listen_addr` | string | `0.0.0.0:9001` | gRPC listen address |
 | `database_url` | string | (required) | PostgreSQL connection string |
-| `w_locality` | const | 0.7 | Weight for transfer-cost locality scoring (compile-time const, not configurable) |
-| `w_load` | const | 0.3 | Weight for executor load scoring (compile-time const, not configurable) |
-| `default_duration_estimate` | Duration | 30s | Fallback build duration estimate |
 | `ema_alpha` | f64 | 0.3 | EMA smoothing factor for duration estimates |
 | `poison_threshold` | u32 | 3 | Failures across different executors before poisoning |
 | `poison_ttl` | Duration | 24h | Time before poison state expires |
 | `max_retries` | u32 | 2 | Maximum retry attempts per derivation |
 | `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token signing. Env: `RIO_HMAC_KEY_PATH`. Same file must be configured on the store. |
 | `store_admin_addr` | string | (unset) | Store admin gRPC endpoint (for `TriggerGC` proxy). If unset, `AdminService.TriggerGC` returns UNIMPLEMENTED. |
+
+> **Compile-time constants (not configurable):** `DEFAULT_DURATION_SECS = 30.0` --- fallback build-duration estimate when no `build_history` row exists.
 
 ## Store
 

@@ -14,7 +14,7 @@ rio-build fills this gap by implementing Nix's own remote protocols (`ssh-ng://`
 ## Key Innovations
 
 1. **Protocol-native** --- speaks Nix's own wire protocol, zero custom client tooling needed
-2. **DAG-aware scheduling** with critical-path analysis and transfer-cost-weighted closure-locality affinity
+2. **DAG-aware scheduling** with critical-path analysis and per-derivation resource-fit placement on ephemeral one-shot executors
 3. **Chunked content-addressable store** with cross-build deduplication (FastCDC + BLAKE3), with inline fast-path for small NARs
 4. **CA-ready design** --- store schema and scheduler support content-addressed derivations from day one; early cutoff optimization with per-edge tracking
 5. **FUSE-backed builder stores** with lazy on-demand fetching from CAS, local SSD caching, and per-build overlay isolation with synthetic SQLite DB
