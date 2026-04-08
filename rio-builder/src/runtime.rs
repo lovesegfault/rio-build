@@ -473,39 +473,20 @@ pub async fn spawn_build_task(
     // intent, Cancelled status) from "executor failed" (infra issue,
     // InfrastructureFailure status).
     let build_id = executor::sanitize_build_id(&drv_path);
-    let cgroup_path = ctx.cgroup_parent.join(&build_id);
+    let build_cgroup_path = ctx.cgroup_parent.join(&build_id);
     let cancelled = Arc::new(AtomicBool::new(false));
-    // Cloned for the resource tick sampler before moving into the
-    // slot's cancel target. Same deterministic path execute_build creates.
-    let build_cgroup_path = cgroup_path.clone();
     ctx.slot
-        .set_cancel_target(cgroup_path, Arc::clone(&cancelled));
+        .set_cancel_target(build_cgroup_path.clone(), Arc::clone(&cancelled));
 
-    // Clone state needed by spawned tasks ('static lifetime).
-    let mut build_store_client = ctx.store_clients.store.clone();
-    let build_tx = ctx.stream_tx.clone();
-    let build_drv_path = drv_path.clone();
-    let build_cancelled = cancelled;
-    let build_env = executor::ExecutorEnv {
-        fuse_mount_point: ctx.fuse_mount_point.clone(),
-        overlay_base_dir: ctx.overlay_base_dir.clone(),
-        executor_id: ctx.executor_id.clone(),
-        log_limits: ctx.log_limits,
-        daemon_timeout: ctx.daemon_timeout,
-        max_silent_time: ctx.max_silent_time,
-        cgroup_parent: ctx.cgroup_parent.clone(),
-        executor_kind: ctx.executor_kind,
-        fuse_cache: Some(Arc::clone(&ctx.fuse_cache)),
-        fuse_fetch_timeout: ctx.fuse_fetch_timeout,
-        // Same Arc as the registry entry and `build_cancelled` below.
-        // execute_build polls it during the pre-cgroup phase (I-166).
-        cancelled: Arc::clone(&build_cancelled),
-    };
-
-    // Clone for the panic handler before moving into the task.
+    // Clone for the panic handler before moving ctx into the task.
     let panic_tx = ctx.stream_tx.clone();
     let panic_drv_path = drv_path.clone();
     let panic_token = assignment_token.clone();
+
+    // The spawned task needs 'static; clone the whole context once and
+    // move it in. ExecutorEnv is built INSIDE the task from the owned
+    // ctx fields (no per-field clone boilerplate).
+    let ctx = ctx.clone();
 
     // r[impl sched.trace.assignment-traceparent]
     // Parent the spawned task's span by the traceparent from the assignment.
@@ -517,6 +498,23 @@ pub async fn spawn_build_task(
         // (success, failure, panic, cancellation) clears slot.running
         // and slot.cancel, and wakes wait_idle().
         let _slot_guard = guard;
+
+        let mut store_client = ctx.store_clients.store.clone();
+        let build_env = executor::ExecutorEnv {
+            fuse_mount_point: ctx.fuse_mount_point,
+            overlay_base_dir: ctx.overlay_base_dir,
+            executor_id: ctx.executor_id,
+            log_limits: ctx.log_limits,
+            daemon_timeout: ctx.daemon_timeout,
+            max_silent_time: ctx.max_silent_time,
+            cgroup_parent: ctx.cgroup_parent,
+            executor_kind: ctx.executor_kind,
+            fuse_cache: Some(ctx.fuse_cache),
+            fuse_fetch_timeout: ctx.fuse_fetch_timeout,
+            // Same Arc as the slot's cancel target. execute_build polls
+            // it during the pre-cgroup phase (I-166).
+            cancelled: Arc::clone(&cancelled),
+        };
 
         // Proactive-ema wrap: 10s memory.peak samples flow to the
         // scheduler while the build runs. execute_build is the polled
@@ -539,15 +537,10 @@ pub async fn spawn_build_task(
         let mut attempt = 0u32;
         let result = loop {
             let r = run_with_resource_tick(
-                executor::execute_build(
-                    &assignment,
-                    &build_env,
-                    &mut build_store_client,
-                    &build_tx,
-                ),
+                executor::execute_build(&assignment, &build_env, &mut store_client, &ctx.stream_tx),
                 &build_cgroup_path,
-                &build_drv_path,
-                &build_tx,
+                &drv_path,
+                &ctx.stream_tx,
             )
             .await;
 
@@ -555,7 +548,7 @@ pub async fn spawn_build_task(
                 Err(e)
                     if e.is_daemon_transient()
                         && attempt < executor::DAEMON_RETRY_MAX
-                        && !build_cancelled.load(std::sync::atomic::Ordering::Acquire) =>
+                        && !cancelled.load(std::sync::atomic::Ordering::Acquire) =>
                 {
                     let delay = executor::DAEMON_RETRY_BACKOFF.duration(attempt);
                     attempt += 1;
@@ -592,7 +585,7 @@ pub async fn spawn_build_task(
                 // Acquire pairs with try_cancel_build's Release — not
                 // strictly needed (no other state to synchronize) but
                 // cheap and documents the pairing.
-                let was_cancelled = build_cancelled.load(std::sync::atomic::Ordering::Acquire);
+                let was_cancelled = cancelled.load(std::sync::atomic::Ordering::Acquire);
                 let (status, log_level) = if was_cancelled {
                     // Expected outcome of CancelBuild / DrainExecutor(force).
                     // Not an error — info, not error. Scheduler's
@@ -677,7 +670,7 @@ pub async fn spawn_build_task(
         let msg = ExecutorMessage {
             msg: Some(executor_message::Msg::Completion(completion)),
         };
-        if let Err(e) = build_tx.send(msg).await {
+        if let Err(e) = ctx.stream_tx.send(msg).await {
             tracing::error!(error = %e, "failed to send completion report");
         }
     };
