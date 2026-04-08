@@ -3,7 +3,6 @@
 
 use std::path::Path;
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tonic::transport::Channel;
 use tracing::instrument;
 
@@ -12,7 +11,7 @@ use rio_proto::StoreServiceClient;
 
 use crate::synth_db::SynthPathInfo;
 
-use super::{ExecutorError, MAX_PARALLEL_FETCHES};
+use super::ExecutorError;
 
 /// Hash algorithm for FOD output verification. Maps from Nix's
 /// `outputHashAlgo` string (sha1, sha256, sha512; recursive variants
@@ -185,8 +184,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// `prefetch_path_blocking` — same code that decides hit-vs-miss, so
 /// the map drains as JIT lookups fire with no leak.
 ///
-/// Backward compat: `Unimplemented` (store predates I-110c) and any
-/// other error degrade to a no-op — each per-path `GetPath` then
+/// Any error degrades to a no-op — each per-path `GetPath` then
 /// queries PG as before. Prefetch is an optimization; it never fails
 /// the build.
 #[instrument(skip_all, fields(input_count = input_paths.len()))]
@@ -222,16 +220,10 @@ pub(super) async fn prefetch_manifests(
             fuse_cache.prime_manifest_hints(hints);
             tracing::debug!(paths = input_paths.len(), "manifest prefetch primed");
         }
-        Err(status) if status.code() == tonic::Code::Unimplemented => {
-            tracing::debug!(
-                "store does not support BatchGetManifest; falling back to per-path \
-                 GetPath PG lookup for JIT FUSE fetch (I-110c)"
-            );
-        }
         Err(status) => {
-            // Any other failure (Unavailable, DeadlineExceeded, …) —
-            // log and continue. The per-path JIT GetPath has its own
-            // retry; this is a best-effort optimization.
+            // Any failure (Unavailable, DeadlineExceeded, …) — log and
+            // continue. The per-path JIT GetPath has its own retry;
+            // this is a best-effort optimization.
             tracing::warn!(
                 error = %status,
                 "BatchGetManifest failed; per-path GetPath will query PG"
@@ -327,7 +319,6 @@ pub(super) async fn compute_input_closure(
     let mut closure: HashSet<String> = HashSet::new();
     let mut metadata: Vec<SynthPathInfo> = Vec::new();
     let mut frontier: Vec<String> = Vec::new();
-    let mut use_batch = true;
 
     // Seed: the .drv itself, input_drv paths (so nix-daemon can read them),
     // and resolved_input_srcs (input_srcs ∪ input_drv OUTPUTS — the caller
@@ -354,13 +345,8 @@ pub(super) async fn compute_input_closure(
         // SynthPathInfo (kept for the caller — I-106) or None on
         // not-found. References for the next layer come from
         // SynthPathInfo.references (already String).
-        //
-        // Backward compat: an older store returns Unimplemented for
-        // the batch RPC; fall back to the per-path loop. `use_batch`
-        // latches to false after the first Unimplemented so we don't
-        // retry the batch every layer.
         let results: Vec<(String, Option<SynthPathInfo>)> =
-            query_layer(store_client, batch, &mut use_batch).await?;
+            query_layer(store_client, batch).await?;
 
         // Add found paths to closure, collect their refs for next layer.
         for (path, info) in results {
@@ -383,75 +369,35 @@ pub(super) async fn compute_input_closure(
     Ok(metadata)
 }
 
-/// Fetch one BFS layer's metadata. Tries `BatchQueryPathInfo` first
-/// (one RPC for the whole layer); on `Unimplemented` (older store
-/// binary) latches `use_batch=false` and falls back to N concurrent
-/// `QueryPathInfo` calls — the pre-I-110 behaviour.
+/// Fetch one BFS layer's metadata via `BatchQueryPathInfo` (one RPC
+/// for the whole layer — I-110).
 async fn query_layer(
     store_client: &StoreServiceClient<Channel>,
     batch: Vec<String>,
-    use_batch: &mut bool,
 ) -> Result<Vec<(String, Option<SynthPathInfo>)>, ExecutorError> {
-    if *use_batch {
-        let mut client = store_client.clone();
-        match rio_proto::client::batch_query_path_info(
-            &mut client,
-            batch.clone(),
-            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            &[],
-        )
-        .await
-        {
-            Ok(entries) => {
-                return Ok(entries
-                    .into_iter()
-                    .map(|(p, info)| (p, info.map(SynthPathInfo::from)))
-                    .collect());
-            }
-            Err(status) if status.code() == tonic::Code::Unimplemented => {
-                tracing::warn!(
-                    "store does not support BatchQueryPathInfo; falling back to per-path \
-                     QueryPathInfo for closure BFS (I-110)"
-                );
-                *use_batch = false;
-                // fall through to per-path loop
-            }
-            Err(status) => {
-                // Real error (Unavailable, DeadlineExceeded, …) — propagate
-                // with a representative path. The original status code is
-                // preserved (test_compute_input_closure_grpc_error_preserves_code).
-                return Err(ExecutorError::MetadataFetch {
-                    path: batch.into_iter().next().unwrap_or_default(),
-                    source: status,
-                });
-            }
+    let mut client = store_client.clone();
+    match rio_proto::client::batch_query_path_info(
+        &mut client,
+        batch.clone(),
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        &[],
+    )
+    .await
+    {
+        Ok(entries) => Ok(entries
+            .into_iter()
+            .map(|(p, info)| (p, info.map(SynthPathInfo::from)))
+            .collect()),
+        Err(status) => {
+            // Real error (Unavailable, DeadlineExceeded, …) — propagate
+            // with a representative path. The original status code is
+            // preserved (test_compute_input_closure_grpc_error_preserves_code).
+            Err(ExecutorError::MetadataFetch {
+                path: batch.into_iter().next().unwrap_or_default(),
+                source: status,
+            })
         }
     }
-
-    // Per-path fallback: pre-I-110 behaviour (N concurrent QueryPathInfo).
-    stream::iter(batch)
-        .map(|path| {
-            let mut client = store_client.clone();
-            async move {
-                match rio_proto::client::query_path_info_opt(
-                    &mut client,
-                    &path,
-                    rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                    &[],
-                )
-                .await
-                {
-                    Ok(info) => Ok((path, info.map(SynthPathInfo::from))),
-                    Err(e) => Err(ExecutorError::MetadataFetch {
-                        path: path.clone(),
-                        source: e,
-                    }),
-                }
-            }
-        })
-        .buffer_unordered(MAX_PARALLEL_FETCHES)
-        .try_collect()
-        .await
 }
 
 // r[verify builder.fod.verify-hash]
@@ -869,38 +815,6 @@ mod tests {
         Ok(())
     }
 
-    /// I-110 backward compat: store returns Unimplemented for the
-    /// batch RPC → builder falls back to per-path QueryPathInfo and
-    /// still produces the correct closure.
-    #[tokio::test]
-    async fn test_compute_input_closure_fallback_on_unimplemented() -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering;
-        let (store, client) = spawn_and_connect().await?;
-        store.batch_qpi_unimplemented.store(true, Ordering::SeqCst);
-
-        let (p_drv, p_a, p_b) = (tp("test.drv"), tp("lib"), tp("dep"));
-        seed_with_refs(&store, &p_drv, &[]);
-        seed_with_refs(&store, &p_a, std::slice::from_ref(&p_b));
-        seed_with_refs(&store, &p_b, &[]);
-
-        let drv = drv_with_srcs(std::slice::from_ref(&p_a));
-        let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
-
-        let set = paths_of(closure);
-        assert_eq!(set.len(), 3, "fallback path produces same closure");
-        assert!(set.contains(&p_b), "transitive dep reached via fallback");
-        assert_eq!(
-            store.batch_qpi_calls.load(Ordering::SeqCst),
-            0,
-            "batch handler returns Unimplemented BEFORE incrementing"
-        );
-        assert!(
-            !store.qpi_calls.read().unwrap().is_empty(),
-            "fallback issued per-path QueryPathInfo calls"
-        );
-        Ok(())
-    }
-
     /// I-110c: `prefetch_manifests` issues ONE BatchGetManifest then
     /// primes the FUSE cache's hint map (keyed by basename), and
     /// `fetch_extract_insert`'s GetPath carries the hint.
@@ -943,36 +857,6 @@ mod tests {
         // deleted the warm path, this test's scope is the
         // BatchGetManifest → hint-map prime, asserted above.
         let _ = (store, client);
-        Ok(())
-    }
-
-    /// I-110c backward compat: store returns Unimplemented for
-    /// BatchGetManifest → prefetch is a silent no-op (cache stays
-    /// empty), JIT per-path GetPath queries PG as before.
-    #[tokio::test]
-    async fn test_prefetch_manifests_unimplemented_is_noop() -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering;
-        let (store, client) = spawn_and_connect().await?;
-        store
-            .batch_manifest_unimplemented
-            .store(true, Ordering::SeqCst);
-        let p = tp("hint-old-store");
-        seed_with_refs(&store, &p, &[]);
-
-        let dir = tempfile::tempdir()?;
-        let cache = crate::fuse::cache::Cache::new(dir.path().join("c"), 1).await?;
-
-        // Must NOT panic / error.
-        prefetch_manifests(&client, &cache, std::slice::from_ref(&p)).await;
-
-        let b = p.strip_prefix(rio_nix::store_path::STORE_PREFIX).unwrap();
-        assert!(
-            cache.take_manifest_hint(b).is_none(),
-            "Unimplemented → nothing primed"
-        );
-        // Empty input → no RPC at all.
-        prefetch_manifests(&client, &cache, &[]).await;
-        assert_eq!(store.batch_manifest_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
