@@ -11,7 +11,7 @@
 //! `gc.rs`/`status.rs`/`wps.rs`: keep `main.rs` deltas to enum
 //! variant + match arm + mod decl only.
 
-use clap::{Args, Subcommand};
+use clap::Subcommand;
 use serde::Serialize;
 use tonic::transport::Channel;
 
@@ -102,12 +102,6 @@ async fn resolve_tenant(tenant: String, scheduler_addr: &str) -> anyhow::Result<
         .find(|t| t.tenant_name == tenant)
         .map(|t| t.tenant_id)
         .ok_or_else(|| anyhow::anyhow!("no tenant named '{tenant}' (try `rio-cli list-tenants`)"))
-}
-
-#[derive(Args, Clone)]
-pub struct UpstreamArgs {
-    #[command(subcommand)]
-    pub cmd: UpstreamCmd,
 }
 
 // r[impl store.substitute.upstream]

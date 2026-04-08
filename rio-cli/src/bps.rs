@@ -1,35 +1,29 @@
-//! `rio-cli wps get|describe` — BuilderPoolSet inspection.
+//! `rio-cli bps get|describe` — BuilderPoolSet inspection.
 //!
 //! Unlike every other subcommand in rio-cli, this talks to the
 //! Kubernetes apiserver directly (kube-rs `Api<T>`), not to the
-//! scheduler's gRPC AdminService. `kubectl get wps` already works
+//! scheduler's gRPC AdminService. `kubectl get bps` already works
 //! (the CRD has printcolumns); this adds the cross-join that
 //! kubectl can't do — fetch each child BuilderPool's live replica
-//! status alongside the parent WPS spec, so `wps describe` shows
+//! status alongside the parent BPS spec, so `bps describe` shows
 //! the spec→child→replica chain in one place.
 //!
 //! Separate module (not inline in `main.rs`) — same convention as
 //! `cutoffs.rs`: keep `main.rs` deltas to enum variant + match arm
 //! + mod decl.
 
-use clap::{Args, Subcommand};
+use clap::Subcommand;
 use kube::{Api, Client, ResourceExt};
 use serde::Serialize;
 
 use rio_crds::builderpool::{BuilderPool, BuilderPoolStatus};
 use rio_crds::builderpoolset::{BuilderPoolSet, ClassStatus, SizeClassSpec};
 
-#[derive(Args, Clone)]
-pub struct WpsArgs {
-    #[command(subcommand)]
-    pub cmd: WpsCmd,
-}
-
 #[derive(Subcommand, Clone)]
-pub enum WpsCmd {
+pub enum BpsCmd {
     /// List BuilderPoolSets in a namespace.
     ///
-    /// `kubectl get wps` shows the same thing (the CRD has printer
+    /// `kubectl get bps` shows the same thing (the CRD has printer
     /// columns) — this variant exists for completeness and so `--json`
     /// gives a stable machine-readable shape that doesn't change when
     /// the CRD's printcolumns do.
@@ -42,11 +36,11 @@ pub enum WpsCmd {
         namespace: String,
     },
     /// Describe one BuilderPoolSet: spec classes + live child BuilderPool
-    /// replica counts + WPS status (effective cutoffs, queue depth).
+    /// replica counts + BPS status (effective cutoffs, queue depth).
     ///
-    /// The cross-join is the value-add over `kubectl get wps <name>
+    /// The cross-join is the value-add over `kubectl get bps <name>
     /// -o yaml`: this fetches each child `BuilderPool` by derived name
-    /// (`{wps}-{class.name}`) and shows its `.status.{replicas,
+    /// (`{bps}-{class.name}`) and shows its `.status.{replicas,
     /// readyReplicas}` inline — the spec→child→replica chain without
     /// the operator having to know the child-naming convention.
     Describe {
@@ -57,11 +51,11 @@ pub enum WpsCmd {
     },
 }
 
-/// Run the `wps` subcommand. Called from `main.rs` BEFORE the gRPC
+/// Run the `bps` subcommand. Called from `main.rs` BEFORE the gRPC
 /// admin client connect — this subcommand doesn't touch the scheduler,
 /// so it must work even when the scheduler is down (e.g., operator
 /// diagnosing why no workers are Ready).
-pub(crate) async fn run(as_json: bool, args: WpsArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(as_json: bool, cmd: BpsCmd) -> anyhow::Result<()> {
     // try_default reads in-cluster config (service account token at
     // /var/run/secrets/kubernetes.io/serviceaccount/) or KUBECONFIG
     // for local dev — same precedence kubectl uses. `?` — no kube
@@ -71,9 +65,9 @@ pub(crate) async fn run(as_json: bool, args: WpsArgs) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("kube client: {e}"))?;
 
-    match args.cmd {
-        WpsCmd::Get { namespace } => get(as_json, client, &namespace).await,
-        WpsCmd::Describe { name, namespace } => describe(as_json, client, &namespace, &name).await,
+    match cmd {
+        BpsCmd::Get { namespace } => get(as_json, client, &namespace).await,
+        BpsCmd::Describe { name, namespace } => describe(as_json, client, &namespace, &name).await,
     }
 }
 
@@ -96,15 +90,15 @@ async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
 
     // Header always prints — exit criterion says "empty with headers
     // if none", so operators see the table frame even when the
-    // namespace is wrong / no WPS applied yet (distinguishes "no
+    // namespace is wrong / no BPS applied yet (distinguishes "no
     // output = tool failed" from "no output = nothing to show").
     println!("{:<24} {:<8} CHILDREN", "NAME", "CLASSES");
     for wps in &list.items {
         let name = wps.name_any();
         // Child names derived, not fetched from status — status may
-        // not exist yet (fresh WPS, reconciler hasn't populated
+        // not exist yet (fresh BPS, reconciler hasn't populated
         // .status.classes[].child_pool). The naming convention
-        // (`{wps}-{class.name}`) is canonical (P0233's reconciler
+        // (`{bps}-{class.name}`) is canonical (P0233's reconciler
         // uses it; builderpoolset.rs ClassStatus.child_pool just
         // memoizes the same formula).
         let children: Vec<String> = wps
@@ -124,7 +118,7 @@ async fn get(as_json: bool, client: Client, ns: &str) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// describe — one WPS + child BuilderPool replica counts + status
+// describe — one BPS + child BuilderPool replica counts + status
 // ---------------------------------------------------------------------------
 
 async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow::Result<()> {
@@ -136,7 +130,7 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
         .await
         .map_err(|e| anyhow::anyhow!("get BuilderPoolSet {ns}/{name}: {e}"))?;
 
-    // Per-class child fetch. Sequential (not join_all) — a WPS has
+    // Per-class child fetch. Sequential (not join_all) — a BPS has
     // ~2-4 classes in practice (small/medium/large + maybe huge);
     // concurrent fetch would save milliseconds at the cost of error
     // interleaving. Each class's child is fetched separately so a
@@ -148,7 +142,7 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
         let child_name = format!("{}-{}", wps.name_any(), class.name);
         // `get_opt` — child may not exist yet (Ok(None) → -/-);
         // 403 → warn to stderr but still render the row (RBAC
-        // misconfig is per-verb, the WPS get above already worked);
+        // misconfig is per-verb, the BPS get above already worked);
         // 500/network → bail (apiserver degraded means all remaining
         // rows would be equally misleading).
         //
@@ -161,7 +155,7 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
             Ok(Some(wp)) => wp.status,
             Ok(None) => {
                 // Child not created yet — reconciler lag, or the
-                // child create failed (check WPS .status.conditions
+                // child create failed (check BPS .status.conditions
                 // for the latter). Render as -/-.
                 None
             }
@@ -301,7 +295,7 @@ struct DescribeJson<'a> {
     name: &'a str,
     namespace: &'a str,
     classes: Vec<ClassJson<'a>>,
-    /// `None` = WPS has no `.status` yet (reconciler not caught up).
+    /// `None` = BPS has no `.status` yet (reconciler not caught up).
     /// `Some([])` would mean status exists but with zero classes —
     /// distinct from `None` so `jq '.status == null'` works as the
     /// reconciler-liveness check.

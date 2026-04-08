@@ -76,7 +76,7 @@ fn top_level_help_lists_all_subcommands() {
         "cancel-build",
         "drain-executor",
         "cutoffs",
-        "wps",
+        "bps",
         "upstream",
     ] {
         assert!(help.contains(sub), "--help missing {sub}:\n{help}");
@@ -103,11 +103,11 @@ fn per_subcommand_help_renders() {
         let out = run_cli(&[sub, "--help"]);
         assert!(out.status.success(), "{sub} --help: {:?}", out.status);
     }
-    // wps has nested subcommands — check both levels.
+    // bps has nested subcommands — check both levels.
     for sub in [
-        &["wps", "--help"][..],
-        &["wps", "get", "--help"],
-        &["wps", "describe", "--help"],
+        &["bps", "--help"][..],
+        &["bps", "get", "--help"],
+        &["bps", "describe", "--help"],
     ] {
         let out = run_cli(sub);
         assert!(out.status.success(), "{sub:?}: {:?}", out.status);
@@ -201,15 +201,15 @@ fn drain_worker_positional_and_force() {
 }
 
 #[test]
-fn wps_nested_subcommands() {
-    // wps get has a default namespace.
-    assert_parsed(&["wps", "get"]);
-    assert_parsed(&["wps", "get", "-n", "rio-system"]);
-    // wps describe needs a name.
-    assert_parsed(&["wps", "describe", "my-wps"]);
-    assert_rejected(&["wps", "describe"]);
-    // bare `wps` with no subcommand is a clap error.
-    assert_rejected(&["wps"]);
+fn bps_nested_subcommands() {
+    // bps get has a default namespace.
+    assert_parsed(&["bps", "get"]);
+    assert_parsed(&["bps", "get", "-n", "rio-system"]);
+    // bps describe needs a name.
+    assert_parsed(&["bps", "describe", "my-bps"]);
+    assert_rejected(&["bps", "describe"]);
+    // bare `bps` with no subcommand is a clap error.
+    assert_rejected(&["bps"]);
 }
 
 // r[verify store.substitute.upstream]

@@ -18,7 +18,9 @@
 use std::collections::BTreeSet;
 
 use rio_proto::AdminServiceClient;
-use rio_proto::types::{DebugExecutorState, ExecutorInfo, ExecutorKind, ListExecutorsRequest};
+use rio_proto::types::{
+    DebugExecutorState, DrainExecutorRequest, ExecutorInfo, ExecutorKind, ListExecutorsRequest,
+};
 use serde::Serialize;
 use tonic::transport::Channel;
 
@@ -284,4 +286,109 @@ fn kind_str(w: &DebugExecutorState) -> &'static str {
 
 fn yn(b: bool) -> &'static str {
     if b { "Y" } else { "N" }
+}
+
+/// PG-backed worker list (`ListExecutors`). Default `rio-cli workers`
+/// path — `--actor`/`--diff` use [`run_actor`]/[`run_diff`] instead.
+pub(crate) async fn run_pg(
+    as_json: bool,
+    client: &mut AdminServiceClient<Channel>,
+    status: Option<String>,
+) -> anyhow::Result<()> {
+    let req = ListExecutorsRequest {
+        status_filter: status.unwrap_or_default(),
+    };
+    let resp = rpc("ListExecutors", async || {
+        client.list_executors(req.clone()).await
+    })
+    .await?;
+    if as_json {
+        json(&resp)?;
+    } else if resp.executors.is_empty() {
+        println!("(no executors)");
+    } else {
+        for w in &resp.executors {
+            print_worker(w);
+        }
+    }
+    Ok(())
+}
+
+/// `rio-cli drain-executor` — mark a worker draining. Same RPC the
+/// controller fires on SIGTERM/eviction; this is the manual operator
+/// lever for the same path.
+pub(crate) async fn run_drain(
+    as_json: bool,
+    client: &mut AdminServiceClient<Channel>,
+    executor_id: String,
+    force: bool,
+) -> anyhow::Result<()> {
+    // Unary — rpc() helper applies. Server returns accepted=true
+    // for known workers (idempotent on already-draining) and
+    // accepted=false for unknown ids (per admin/tests.rs, not
+    // an error — just a no-op). Empty id is InvalidArgument.
+    let req = DrainExecutorRequest {
+        executor_id: executor_id.clone(),
+        force,
+    };
+    let resp = rpc("DrainExecutor", async || {
+        client.drain_executor(req.clone()).await
+    })
+    .await?;
+    if as_json {
+        #[derive(Serialize)]
+        struct DrainJson<'a> {
+            executor_id: &'a str,
+            accepted: bool,
+            running_builds: u32,
+        }
+        json(&DrainJson {
+            executor_id: &executor_id,
+            accepted: resp.accepted,
+            running_builds: resp.running_builds,
+        })?;
+    } else if resp.accepted {
+        let action = if force { "reassigned" } else { "in flight" };
+        if resp.running_builds > 0 {
+            println!("draining {executor_id} (build {action})");
+        } else {
+            println!("draining {executor_id} (idle)");
+        }
+    } else {
+        println!("{executor_id}: not found (nothing to drain)");
+    }
+    Ok(())
+}
+
+/// Detailed per-worker view for `rio-cli workers`. `Status` prints a
+/// compact one-liner; this is the "show me everything" form for
+/// debugging a specific worker's registration or feature advertisement.
+fn print_worker(w: &ExecutorInfo) {
+    println!("worker {} [{}]", w.executor_id, w.status);
+    println!(
+        "  state:    {}",
+        if w.running_builds > 0 { "busy" } else { "idle" }
+    );
+    println!(
+        "  hb:       {}   up: {}",
+        crate::fmt_ts_ago(w.last_heartbeat.as_ref().map(|t| t.seconds)),
+        crate::fmt_ts_ago(w.connected_since.as_ref().map(|t| t.seconds))
+    );
+    println!("  systems:  {}", w.systems.join(", "));
+    if !w.supported_features.is_empty() {
+        println!("  features: {}", w.supported_features.join(", "));
+    }
+    if !w.size_class.is_empty() {
+        println!("  size:     {}", w.size_class);
+    }
+    if let Some(r) = &w.resources {
+        println!(
+            "  cpu={:.2}  mem={}/{}  disk={}/{}",
+            r.cpu_fraction,
+            r.memory_used_bytes,
+            r.memory_total_bytes,
+            r.disk_used_bytes,
+            r.disk_total_bytes
+        );
+    }
 }

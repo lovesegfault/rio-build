@@ -23,21 +23,19 @@ use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
 use tonic::Code;
 use tonic::transport::Channel;
 
-use rio_proto::types::{
-    BuildInfo, ClearPoisonRequest, CreateTenantRequest, DrainExecutorRequest, ExecutorInfo,
-    ListBuildsRequest, ListExecutorsRequest, TenantInfo,
-};
-
+mod bps;
+mod builds;
 mod cutoffs;
 mod derivations;
 mod estimator;
 mod gc;
 mod logs;
+mod poison;
 mod status;
+mod tenants;
 mod upstream;
 mod verify_chunks;
 mod workers;
-mod wps;
 
 /// Per-RPC deadline. AdminService RPCs used by rio-cli are all unary
 /// and cheap (ClusterStatus, ListExecutors, ListBuilds, CreateTenant,
@@ -146,7 +144,7 @@ impl Default for Config {
 impl Config {
     /// Connect to the scheduler's `AdminService`. Called per-arm so a
     /// subcommand that talks only to the store (or only to kube) never
-    /// `?`s on an unreachable scheduler — `rio-cli wps describe` must
+    /// `?`s on an unreachable scheduler — `rio-cli bps describe` must
     /// work when the scheduler is down (e.g., to diagnose why).
     async fn connect_admin(&self) -> anyhow::Result<AdminServiceClient<Channel>> {
         rio_proto::client::connect_admin(&self.scheduler_addr)
@@ -383,10 +381,13 @@ enum Cmd {
         filter: Option<String>,
     },
     /// Inspect BuilderPoolSet CRs via the K8s apiserver (not gRPC).
-    /// `get` lists WPSes; `describe` joins spec classes with live
+    /// `get` lists BPSes; `describe` joins spec classes with live
     /// child BuilderPool replica counts + effective-cutoff status —
     /// the spec→child→replica chain kubectl can't show in one place.
-    Wps(wps::WpsArgs),
+    Bps {
+        #[command(subcommand)]
+        cmd: bps::BpsCmd,
+    },
     /// PG↔backend chunk consistency audit. HeadObject every non-deleted
     /// chunk; report PG-says-exists-but-S3-says-no. Missing hashes go
     /// to stdout (one hex BLAKE3 per line, pipeable); progress to stderr.
@@ -400,9 +401,11 @@ enum Cmd {
     /// Manage per-tenant upstream binary-cache substitution config.
     /// Talks to StoreAdminService directly (not scheduler-proxied) —
     /// `--store-addr` or `RIO_STORE_ADDR` must reach the store.
-    Upstream(upstream::UpstreamArgs),
+    Upstream {
+        #[command(subcommand)]
+        cmd: upstream::UpstreamCmd,
+    },
 }
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -418,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
     // and have working defaults, so they run unconditionally even for
     // kube-only subcommands that ignore them. gRPC CONNECT is per-arm
     // (see `Config::connect_admin` / `connect_store_admin`) — that's
-    // the part that must not gate `wps` / `upstream` on an unreachable
+    // the part that must not gate `bps` / `upstream` on an unreachable
     // scheduler.
     let cfg: Config = rio_common::config::load("cli", cli)?;
     {
@@ -430,13 +433,13 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         // kube-only — talks to the K8s apiserver via KUBECONFIG /
         // in-cluster config; no gRPC connect at all.
-        Cmd::Wps(args) => wps::run(as_json, args).await?,
+        Cmd::Bps { cmd } => bps::run(as_json, cmd).await?,
         // store-admin only — don't fail on an unreachable scheduler
         // when the operator just wants to add a cache URL or audit
         // chunk consistency.
-        Cmd::Upstream(args) => {
+        Cmd::Upstream { cmd } => {
             let mut sc = cfg.connect_store_admin().await?;
-            upstream::run(as_json, &mut sc, &cfg.scheduler_addr, args.cmd).await?;
+            upstream::run(as_json, &mut sc, &cfg.scheduler_addr, cmd).await?;
         }
         Cmd::VerifyChunks { batch_size } => {
             let mut sc = cfg.connect_store_admin().await?;
@@ -449,37 +452,18 @@ async fn main() -> anyhow::Result<()> {
             cache_token,
         } => {
             let mut client = cfg.connect_admin().await?;
-            let req = CreateTenantRequest {
-                tenant_name: name,
+            tenants::run_create(
+                as_json,
+                &mut client,
+                name,
                 gc_retention_hours,
                 gc_max_store_bytes,
                 cache_token,
-            };
-            let resp = rpc("CreateTenant", async || {
-                client.create_tenant(req.clone()).await
-            })
+            )
             .await?;
-            let t = resp
-                .tenant
-                .ok_or_else(|| anyhow!("CreateTenant returned no TenantInfo"))?;
-            if as_json {
-                json(&t)?;
-            } else {
-                print_tenant(&t);
-            }
         }
         Cmd::ListTenants => {
-            let mut client = cfg.connect_admin().await?;
-            let resp = rpc("ListTenants", async || client.list_tenants(()).await).await?;
-            if as_json {
-                json(&resp.tenants)?;
-            } else if resp.tenants.is_empty() {
-                println!("(no tenants)");
-            } else {
-                for t in &resp.tenants {
-                    print_tenant(t);
-                }
-            }
+            tenants::run_list(as_json, &mut cfg.connect_admin().await?).await?;
         }
         Cmd::Status => status::run(as_json, &mut cfg.connect_admin().await?).await?,
         Cmd::Workers {
@@ -488,30 +472,12 @@ async fn main() -> anyhow::Result<()> {
             diff,
         } => {
             let mut client = cfg.connect_admin().await?;
-            // --actor and --diff delegate to the workers module; the
-            // PG-only path stays inline (unchanged behavior — no
-            // accidental output-format drift for existing callers).
             if actor {
                 workers::run_actor(as_json, &mut client).await?;
             } else if diff {
                 workers::run_diff(as_json, &mut client).await?;
             } else {
-                let req = ListExecutorsRequest {
-                    status_filter: status.unwrap_or_default(),
-                };
-                let resp = rpc("ListExecutors", async || {
-                    client.list_executors(req.clone()).await
-                })
-                .await?;
-                if as_json {
-                    json(&resp)?;
-                } else if resp.executors.is_empty() {
-                    println!("(no executors)");
-                } else {
-                    for w in &resp.executors {
-                        print_worker(w);
-                    }
-                }
+                workers::run_pg(as_json, &mut client, status).await?;
             }
         }
         Cmd::Builds {
@@ -519,27 +485,14 @@ async fn main() -> anyhow::Result<()> {
             limit,
             cursor,
         } => {
-            let mut client = cfg.connect_admin().await?;
-            let req = ListBuildsRequest {
-                status_filter: status.unwrap_or_default(),
+            builds::run_list(
+                as_json,
+                &mut cfg.connect_admin().await?,
+                status,
                 limit,
                 cursor,
-                ..Default::default()
-            };
-            let resp = rpc("ListBuilds", async || client.list_builds(req.clone()).await).await?;
-            if as_json {
-                json(&resp)?;
-            } else if resp.builds.is_empty() {
-                println!("(no builds — {} total matching filter)", resp.total_count);
-            } else {
-                println!("{} builds ({} total):", resp.builds.len(), resp.total_count);
-                for b in &resp.builds {
-                    print_build(b);
-                }
-                if let Some(c) = &resp.next_cursor {
-                    println!("(next page: --cursor {c})");
-                }
-            }
+            )
+            .await?;
         }
         Cmd::Derivations {
             build_id,
@@ -559,147 +512,17 @@ async fn main() -> anyhow::Result<()> {
             grace_hours,
         } => gc::run(&mut cfg.connect_admin().await?, dry_run, grace_hours).await?,
         Cmd::PoisonClear { drv_path } => {
-            // Validate BEFORE the RPC. The scheduler's DAG is keyed on
-            // the full store path, so a bare hash silently no-matches
-            // and cleared=false looks like "not poisoned" when it's
-            // actually "you gave me the wrong key".
-            if !drv_path.starts_with("/nix/store/") || !drv_path.ends_with(".drv") {
-                anyhow::bail!(
-                    "expected full .drv store path (e.g. /nix/store/abc...-foo.drv), got '{drv_path}'.\n\
-                     Run `rio-cli poison-list` to find the right path."
-                );
-            }
-            let mut client = cfg.connect_admin().await?;
-            let req = ClearPoisonRequest {
-                derivation_hash: drv_path.clone(),
-            };
-            let resp = rpc("ClearPoison", async || {
-                client.clear_poison(req.clone()).await
-            })
-            .await?;
-            if as_json {
-                #[derive(Serialize)]
-                struct ClearedJson<'a> {
-                    drv_path: &'a str,
-                    cleared: bool,
-                }
-                json(&ClearedJson {
-                    drv_path: &drv_path,
-                    cleared: resp.cleared,
-                })?;
-            } else if resp.cleared {
-                println!("cleared poison for {drv_path}");
-            } else {
-                println!("{drv_path}: not poisoned (nothing to clear)");
-            }
+            poison::run_clear(as_json, &mut cfg.connect_admin().await?, drv_path).await?;
         }
         Cmd::PoisonList => {
-            let mut client = cfg.connect_admin().await?;
-            let resp = rpc("ListPoisoned", async || client.list_poisoned(()).await).await?;
-            if as_json {
-                #[derive(Serialize)]
-                struct Row<'a> {
-                    drv_path: &'a str,
-                    failed_executors: &'a [String],
-                    poisoned_secs_ago: u64,
-                }
-                json(
-                    &resp
-                        .derivations
-                        .iter()
-                        .map(|d| Row {
-                            drv_path: &d.drv_path,
-                            failed_executors: &d.failed_executors,
-                            poisoned_secs_ago: d.poisoned_secs_ago,
-                        })
-                        .collect::<Vec<_>>(),
-                )?;
-            } else if resp.derivations.is_empty() {
-                println!("no poisoned derivations");
-            } else {
-                for d in &resp.derivations {
-                    let age_h = d.poisoned_secs_ago / 3600;
-                    let age_m = (d.poisoned_secs_ago % 3600) / 60;
-                    println!(
-                        "{}\n  failed on: {}\n  poisoned:  {age_h}h{age_m}m ago (TTL 24h)",
-                        d.drv_path,
-                        d.failed_executors.join(", ")
-                    );
-                }
-            }
+            poison::run_list(as_json, &mut cfg.connect_admin().await?).await?;
         }
         Cmd::CancelBuild { build_id, reason } => {
-            // CancelBuild lives on SchedulerService, not AdminService —
-            // it's the same RPC the gateway calls on client disconnect.
-            // Same address (scheduler hosts both services on one port),
-            // separate client. Unary — rpc() helper applies.
-            let mut sched = rio_proto::client::connect_scheduler(&cfg.scheduler_addr)
-                .await
-                .map_err(|e| anyhow!("connect to scheduler at {}: {e}", cfg.scheduler_addr))?;
-            let req = rio_proto::types::CancelBuildRequest {
-                build_id: build_id.clone(),
-                reason,
-            };
-            let resp = rpc("CancelBuild", async || {
-                sched.cancel_build(req.clone()).await
-            })
-            .await?;
-            if as_json {
-                #[derive(Serialize)]
-                struct CancelJson<'a> {
-                    build_id: &'a str,
-                    cancelled: bool,
-                }
-                json(&CancelJson {
-                    build_id: &build_id,
-                    cancelled: resp.cancelled,
-                })?;
-            } else if resp.cancelled {
-                println!("cancelled build {build_id}");
-            } else {
-                // Server returns false for already-terminal AND
-                // BuildNotFound (the latter as a tonic NotFound error,
-                // which `rpc()` would have surfaced above — so false
-                // here means "found but already terminal").
-                println!("{build_id}: already terminal (nothing to cancel)");
-            }
+            builds::run_cancel(as_json, &cfg.scheduler_addr, build_id, reason).await?;
         }
         Cmd::DrainExecutor { executor_id, force } => {
-            let mut client = cfg.connect_admin().await?;
-            // Unary — rpc() helper applies. Server returns accepted=true
-            // for known workers (idempotent on already-draining) and
-            // accepted=false for unknown ids (per admin/tests.rs, not
-            // an error — just a no-op). Empty id is InvalidArgument.
-            let req = DrainExecutorRequest {
-                executor_id: executor_id.clone(),
-                force,
-            };
-            let resp = rpc("DrainExecutor", async || {
-                client.drain_executor(req.clone()).await
-            })
-            .await?;
-            if as_json {
-                #[derive(Serialize)]
-                struct DrainJson<'a> {
-                    executor_id: &'a str,
-                    accepted: bool,
-                    running_builds: u32,
-                }
-                json(&DrainJson {
-                    executor_id: &executor_id,
-                    accepted: resp.accepted,
-                    running_builds: resp.running_builds,
-                })?;
-            } else if resp.accepted {
-                let action = if force { "reassigned" } else { "in flight" };
-                if resp.running_builds > 0 {
-                    println!("draining {executor_id} (build {action})");
-                } else {
-                    println!("draining {executor_id} (idle)");
-                }
-            } else {
-                println!("{executor_id}: not found (nothing to drain)");
-            }
+            workers::run_drain(as_json, &mut cfg.connect_admin().await?, executor_id, force)
+                .await?;
         }
         Cmd::Cutoffs => cutoffs::run(as_json, &mut cfg.connect_admin().await?).await?,
         Cmd::Estimator { filter } => {
@@ -729,32 +552,12 @@ pub(crate) fn json<T: Serialize>(v: &T) -> anyhow::Result<()> {
 }
 
 // ===========================================================================
-// Human-readable output
+// Human-readable output helpers
 // ===========================================================================
 
-fn print_tenant(t: &TenantInfo) {
-    println!(
-        "tenant {} ({})  gc_retention={}h  max_store={}  cache_token={}",
-        t.tenant_name,
-        t.tenant_id,
-        t.gc_retention_hours,
-        t.gc_max_store_bytes
-            .map(|b| format!("{b}B"))
-            .unwrap_or_else(|| "unlimited".into()),
-        if t.has_cache_token { "yes" } else { "no" }
-    );
-}
-
-/// Unix-epoch seconds → human "Nh Nm ago" relative to now.
-fn fmt_ts_ago(epoch_secs: Option<i64>) -> String {
-    let Some(secs) = epoch_secs else {
-        return "—".into();
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let ago = (now - secs).max(0) as u64;
+/// Human "Nh Nm ago" from a seconds-ago delta. Shared by `PoisonList`
+/// (server returns `poisoned_secs_ago`) and [`fmt_ts_ago`] (epoch input).
+pub(crate) fn fmt_secs_ago(ago: u64) -> String {
     if ago < 60 {
         format!("{ago}s ago")
     } else if ago < 3600 {
@@ -764,51 +567,14 @@ fn fmt_ts_ago(epoch_secs: Option<i64>) -> String {
     }
 }
 
-/// Detailed per-worker view for `rio-cli workers`. `Status` prints a
-/// compact one-liner; this is the "show me everything" form for
-/// debugging a specific worker's registration or feature advertisement.
-fn print_worker(w: &ExecutorInfo) {
-    println!("worker {} [{}]", w.executor_id, w.status);
-    println!(
-        "  state:    {}",
-        if w.running_builds > 0 { "busy" } else { "idle" }
-    );
-    println!(
-        "  hb:       {}   up: {}",
-        fmt_ts_ago(w.last_heartbeat.as_ref().map(|t| t.seconds)),
-        fmt_ts_ago(w.connected_since.as_ref().map(|t| t.seconds))
-    );
-    println!("  systems:  {}", w.systems.join(", "));
-    if !w.supported_features.is_empty() {
-        println!("  features: {}", w.supported_features.join(", "));
-    }
-    if !w.size_class.is_empty() {
-        println!("  size:     {}", w.size_class);
-    }
-    if let Some(r) = &w.resources {
-        println!(
-            "  cpu={:.2}  mem={}/{}  disk={}/{}",
-            r.cpu_fraction,
-            r.memory_used_bytes,
-            r.memory_total_bytes,
-            r.disk_used_bytes,
-            r.disk_total_bytes
-        );
-    }
-}
-
-fn print_build(b: &BuildInfo) {
-    println!(
-        "  build {} [{:?}] {}/{} drv ({} cached) tenant={} prio={}",
-        b.build_id,
-        b.state(),
-        b.completed_derivations,
-        b.total_derivations,
-        b.cached_derivations,
-        b.tenant_id,
-        b.priority_class,
-    );
-    if !b.error_summary.is_empty() {
-        println!("    error: {}", b.error_summary);
-    }
+/// Unix-epoch seconds → human "Nh Nm ago" relative to now.
+pub(crate) fn fmt_ts_ago(epoch_secs: Option<i64>) -> String {
+    let Some(secs) = epoch_secs else {
+        return "—".into();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    fmt_secs_ago((now - secs).max(0) as u64)
 }
