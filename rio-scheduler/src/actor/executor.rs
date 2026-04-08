@@ -23,8 +23,7 @@ const MAX_READY_TO_SCAN: usize = 32;
 /// loop is prohibitive — each needs a connect/assign/complete round-trip).
 ///
 /// Sort Ready nodes by fan-in (`interested_builds.len()`) descending.
-/// Highest fan-in = most likely to be dispatched first (the existing
-/// `best_executor` scoring already favors high-fan-in). Their closures
+/// Highest fan-in = most likely to be dispatched first. Their closures
 /// are the paths a warm cache wants preloaded. Deterministic: sort key
 /// is stable across restarts for the same queue state (same Ready set,
 /// same `interested_builds`).
@@ -221,8 +220,8 @@ impl DagActor {
     ///
     /// Hint contents: see [`compute_initial_prefetch_paths`] — union
     /// of top-fan-in Ready derivations' input closures (same
-    /// `approx_input_closure` as best_executor scoring and the
-    /// per-assignment hint at dispatch.rs:520), capped at 100 paths.
+    /// `approx_input_closure` as the per-assignment hint in
+    /// dispatch.rs), capped at 100 paths.
     fn on_worker_registered(&mut self, executor_id: &ExecutorId) {
         let paths = compute_initial_prefetch_paths(&self.dag);
 

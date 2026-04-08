@@ -398,7 +398,7 @@ pub struct DerivationState {
     pub size_class_floor: Option<String>,
     /// Bucketed memory estimate for the resource-fit placement filter
     /// (ADR-020 §5). `hard_filter` checks `worker.memory_total_bytes
-    /// >= est` as a hard filter preceding transfer-cost scoring.
+    /// >= est`.
     ///
     /// Populated at DISPATCH time (`dispatch_ready`, same block as
     /// `classify()`), not merge time — the estimator refreshes on Tick,

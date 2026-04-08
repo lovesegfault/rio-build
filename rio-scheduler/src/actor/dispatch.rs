@@ -876,10 +876,9 @@ impl DagActor {
 
         // Auto-pin: write input-closure paths to scheduler_live_pins
         // so GC's mark CTE protects them. Same closure
-        // approximation as send_prefetch_hint and best_executor
-        // scoring (approx_input_closure). Best-effort: PG failure
-        // logs + continues; 24h grace period is the fallback.
-        // Empty for leaf derivations → no-op.
+        // approximation as send_prefetch_hint (approx_input_closure).
+        // Best-effort: PG failure logs + continues; 24h grace period
+        // is the fallback. Empty for leaf derivations → no-op.
         {
             let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
             if !input_paths.is_empty()
@@ -1475,8 +1474,8 @@ impl DagActor {
     /// IA output paths are deterministic — the gateway computed them
     /// at submit time from the parsed `.drv` and plumbed them via
     /// `DerivationNode.expected_output_paths`. No store RPC needed.
-    /// This is the same field [`approx_input_closure`] reads for
-    /// prefetch scoring, so the data is already live.
+    /// This is the same field [`approx_input_closure`] reads for the
+    /// prefetch hint, so the data is already live.
     ///
     /// Children with empty `expected_output_paths` (recovered state
     /// where the paths weren't persisted, or a proto without the
