@@ -123,8 +123,8 @@ pub struct ExecutorPodParams {
     /// `securityContext.readOnlyRootFilesystem` on the executor
     /// container. Fetchers: `true` (overlay upperdir is a tmpfs
     /// emptyDir; rootfs tampering blocked). Builders: `false`.
-    // TODO(P0455): add the fetcher.sandbox.strict-seccomp impl
-    // marker here once ADR-019 is in tracey spec_include.
+    /// Fetcher hardening anchor lives at
+    /// `fetcherpool::executor_params`.
     pub read_only_root_fs: bool,
     /// Extra env vars appended after the base set. Builders pass
     /// their tuning knobs (daemon_timeout, fuse_passthrough,

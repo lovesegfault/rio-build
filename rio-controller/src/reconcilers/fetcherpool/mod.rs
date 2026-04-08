@@ -96,13 +96,12 @@ fn executor_params(
     fp: &FetcherPool,
     class: Option<&FetcherSizeClass>,
 ) -> Result<ExecutorPodParams> {
+    // r[impl fetcher.node.dedicated]
     // ADR-019 §Node isolation: fetchers land on dedicated nodes via
     // the `rio.build/fetcher=true:NoSchedule` taint + matching
     // selector. If the operator supplies their own, honor those
     // instead — lets them override for dev clusters without
     // dedicated node pools.
-    // TODO(P0455): add the fetcher.node.dedicated impl marker here
-    // once ADR-019 is in tracey spec_include.
     let node_selector = fp.spec.node_selector.clone().or_else(|| {
         Some(BTreeMap::from([(
             "rio.build/node-role".into(),
@@ -120,12 +119,11 @@ fn executor_params(
 
     Ok(ExecutorPodParams {
         role: ExecutorKind::Fetcher,
+        // r[impl fetcher.sandbox.strict-seccomp]
         // ADR-019 §Sandbox hardening: rootfs tampering blocked. The
         // overlay upperdir (tmpfs emptyDir in common/pod.rs) stays
-        // writable so build outputs still land.
-        // TODO(P0455): add the fetcher.sandbox.strict-seccomp impl
-        // marker here (readOnlyRootFilesystem half) once ADR-019 is
-        // in tracey spec_include.
+        // writable so build outputs still land. Seccomp half below
+        // at `seccomp_profile`.
         read_only_root_fs: true,
         // r[impl ctrl.fetcherpool.classes]
         // RIO_SIZE_CLASS: same env builders use (common/pod.rs reads
