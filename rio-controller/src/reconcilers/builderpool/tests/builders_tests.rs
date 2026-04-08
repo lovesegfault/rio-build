@@ -456,8 +456,8 @@ fn host_users_false_when_neither_escape_hatch() {
     // would incorrectly suppress. Also catches a regression where
     // the !privileged check gets removed.
     //
-    // Distinct from statefulset_host_users_false_when_unprivileged
-    // above: that uses test_wp() defaults (host_network=None); this
+    // Distinct from job_pod_host_users_false_when_unprivileged above:
+    // that uses test_wp() defaults (host_network=None); this
     // explicitly exercises Some(false) to prove the gate is
     // value-sensitive not presence-sensitive.
     let mut wp = test_wp();

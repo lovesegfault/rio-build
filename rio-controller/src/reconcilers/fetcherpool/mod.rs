@@ -315,8 +315,8 @@ mod tests {
         }
         .into();
         let params = executor_params(&fp, Some(&class)).unwrap();
-        // RIO_SIZE_CLASS injected via extra_env (sts.rs appends it
-        // after the base env set).
+        // RIO_SIZE_CLASS injected via extra_env (appended after the
+        // base env set in the Job pod spec).
         let env: BTreeMap<_, _> = params
             .extra_env
             .iter()
