@@ -73,10 +73,6 @@ pub struct MockStoreCalls {
     /// I-110c: lets tests assert the FUSE fetch carried the primed
     /// hint.
     pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
-    /// Number of `GetChunk` calls received. For dataplane2 tests
-    /// proving the builder uses the parallel chunk path (≥1) and
-    /// fan-out hits this for every chunk in the manifest.
-    pub get_chunk_calls: Arc<AtomicU32>,
 }
 
 /// Fault injection knobs. All default to "no fault"; tests flip them
@@ -116,10 +112,6 @@ pub struct MockStoreFaults {
     /// completes; `delay > idle_timeout` proves the per-chunk timeout
     /// trips on the first stalled chunk.
     pub get_path_chunk_delay_ms: Arc<AtomicU64>,
-    /// If true, `GetChunk` returns Unimplemented (simulates an old
-    /// store binary). For dataplane2 fallback tests — builder MUST
-    /// fall back to `GetPath`.
-    pub get_chunk_unimplemented: Arc<AtomicBool>,
 }
 
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
@@ -212,10 +204,6 @@ impl ChunkService for MockStore {
         &self,
         request: Request<types::GetChunkRequest>,
     ) -> Result<Response<Self::GetChunkStream>, Status> {
-        self.calls.get_chunk_calls.fetch_add(1, Ordering::SeqCst);
-        if self.faults.get_chunk_unimplemented.load(Ordering::SeqCst) {
-            return Err(Status::unimplemented("mock: GetChunk disabled"));
-        }
         let digest = request.into_inner().digest;
         let data = self
             .state

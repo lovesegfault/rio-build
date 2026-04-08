@@ -57,19 +57,16 @@ pub struct NixStoreFs {
     open_files: RwLock<HashMap<u64, File>>,
     /// Passthrough failure count.
     passthrough_failures: AtomicU64,
-    /// LRU cache on local SSD.
+    /// Ephemeral local-disk cache.
     ///
     /// `Arc` so main.rs can clone a handle BEFORE moving into
     /// `mount_fuse_background`. The clone goes to the PrefetchHint
-    /// handler. All Cache
-    /// methods use `runtime.block_on` internally — they're SYNC,
-    /// designed for FUSE callbacks (dedicated blocking threads).
-    /// The prefetch handler calls them via `spawn_blocking` to
-    /// avoid nested-runtime panic. Auto-deref through Arc means
+    /// handler. All Cache methods are sync (`Mutex<HashSet>` and
+    /// `RwLock` ops), designed for FUSE callbacks on dedicated
+    /// blocking threads. Auto-deref through Arc means
     /// `self.cache.foo()` call sites are unchanged.
     cache: Arc<Cache>,
-    /// gRPC clients for remote store (`StoreService` + `ChunkService`
-    /// over the same balanced channel — see [`fetch::StoreClients`]).
+    /// gRPC client for remote store — see [`fetch::StoreClients`].
     clients: fetch::StoreClients,
     /// Tokio runtime handle for async-in-sync bridging.
     runtime: Handle,

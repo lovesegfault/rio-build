@@ -194,11 +194,10 @@ pub(super) async fn prefetch_manifests(
     if input_paths.is_empty() {
         return;
     }
-    // No local-cache filter: `Cache::contains` is `#[cfg(test)]` +
-    // block_on (would nested-runtime panic from async). Instead,
-    // already-cached paths get their unused hint dropped by the
-    // cache-hit fast path in `ensure_cached` / `prefetch_path_blocking`
-    // — same code that decides hit-vs-miss, so no leak and no race.
+    // No local-cache filter: already-cached paths get their unused
+    // hint dropped by the cache-hit fast path in `ensure_cached` /
+    // `prefetch_path_blocking` — same code that decides hit-vs-miss,
+    // so no leak and no race.
 
     let mut client = store_client.clone();
     match rio_proto::client::batch_get_manifest(

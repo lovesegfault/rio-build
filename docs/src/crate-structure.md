@@ -474,7 +474,7 @@ r[ts.mock.store-chunk]
 `MockStore` implements both `StoreService` AND `ChunkService` against a single in-memory state, mirroring the real store which serves both on one port. `spawn_mock_store` registers both service servers on the same router; tests that never touch chunk RPCs are unaffected.
 
 r[ts.mock.store-faults]
-`MockStoreFaults` carries the full fault-injection knob set: `fail_next_puts`/`abort_next_puts` (decrement-and-fail), `fail_find_missing`/`fail_query_path_info`/`fail_get_path` (toggle), `get_path_garbage` (non-NAR bytes), `get_path_gate`/`get_path_gate_armed` (Notify hold-then-release for concurrency tests), `get_path_chunk_delay_ms` (per-chunk delay for progress-timeout tests), and `get_chunk_unimplemented` (dataplane2 fallback). Call recorders live in `MockStoreCalls`.
+`MockStoreFaults` carries the full fault-injection knob set: `fail_next_puts`/`abort_next_puts` (decrement-and-fail), `fail_find_missing`/`fail_query_path_info`/`fail_get_path` (toggle), `get_path_garbage` (non-NAR bytes), `get_path_gate`/`get_path_gate_armed` (Notify hold-then-release for concurrency tests), and `get_path_chunk_delay_ms` (per-chunk delay for progress-timeout tests). Call recorders live in `MockStoreCalls`.
 
 r[ts.mock.store-put-validate]
 `MockStore::put_path` mirrors the real store's stream validation: rejects non-empty `metadata.nar_hash` (hash-upfront removed pre-phase3a), independently SHA-256-hashes NAR chunks and verifies against the trailer, and rejects a stream that closes without a trailer. This keeps mock-passing tests honest against `rio-store`.

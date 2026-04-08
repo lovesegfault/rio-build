@@ -158,11 +158,6 @@ pub struct Config {
     /// `RIO_IDLE_SECS`. Default 120.
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
     pub idle_timeout: std::time::Duration,
-    /// FUSE fetch transport (`getpath` | `getchunk`). Env:
-    /// `RIO_FETCH_TRANSPORT`. Default `getpath` — chunk fan-out is
-    /// opt-in until A/B'd live (see `r[builder.fuse.fetch-chunk-
-    /// fanout]`).
-    pub fetch_transport: crate::fuse::fetch::FetchTransport,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -197,7 +192,6 @@ impl Default for Config {
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
-            fetch_transport: crate::fuse::fetch::FetchTransport::GetPath,
         }
     }
 }
@@ -396,7 +390,6 @@ mod tests {
         r#"
         fuse_passthrough = false
         fuse_fetch_timeout_secs = 222
-        fetch_transport = "getchunk"
         systems = ["x86_64-linux", "aarch64-linux"]
 
         [tls]
@@ -408,10 +401,6 @@ mod tests {
                 "TOML scalar must override the non-serde-bool default of true"
             );
             assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(222));
-            assert_eq!(
-                cfg.fetch_transport,
-                crate::fuse::fetch::FetchTransport::GetChunk
-            );
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
                 cfg.common.tls.cert_path.as_deref(),

@@ -4,25 +4,22 @@
 //! as NAR blobs). On cache miss the worker fetches the NAR via `GetPath` and
 //! extracts it to disk via [`rio_nix::nar::restore_path_streaming`].
 //!
-//! A lightweight in-memory SQLite index tracks which paths are cached. There
-//! is no eviction: builders are ephemeral (one build per pod), so the cache
-//! lives exactly as long as the input closure it holds and is discarded with
-//! the pod's emptyDir.
+//! A `Mutex<HashSet>` tracks which paths are cached. There is no eviction:
+//! builders are ephemeral (one build per pod), so the cache lives exactly as
+//! long as the input closure it holds and is discarded with the pod's
+//! emptyDir.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use tokio::runtime::Handle;
-
-/// Errors from cache operations.
+/// Errors from cache operations. Only [`Cache::new`] is fallible (directory
+/// creation); index ops (`get_path`/`insert`/`remove_stale`/`contains`) are
+/// pure `HashSet` accesses and cannot fail — they keep `Result` return types
+/// for caller compatibility only.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -140,18 +137,18 @@ impl Drop for FetchPermit<'_> {
     }
 }
 
-/// Local cache manager backed by the pod's emptyDir with an in-memory
-/// SQLite index.
+/// Local cache manager backed by the pod's emptyDir.
 ///
-/// Thread-safe: uses a connection pool for concurrent access. FUSE callbacks
-/// are synchronous, so all DB ops are bridged via `Handle::block_on`.
+/// Thread-safe: index ops are short `Mutex<HashSet>` critical sections
+/// (called from FUSE callback threads), no async bridging needed.
 pub struct Cache {
     /// Root directory where cached paths are materialized.
     cache_dir: PathBuf,
-    /// SQLite metadata index (async pool, bridged via block_on).
-    pool: SqlitePool,
-    /// Tokio runtime handle for block_on bridging.
-    runtime: Handle,
+    /// In-memory set of store basenames present on disk under `cache_dir`.
+    /// Populated by [`Self::insert`] after a successful extract; consulted
+    /// by [`Self::get_path`] on every FUSE lookup.
+    // r[impl builder.fuse.cache-ephemeral-memory]
+    cached: Mutex<HashSet<String>>,
     /// In-flight fetches with per-path condition variables for waiter notification.
     inflight: Mutex<HashMap<String, Arc<InflightEntry>>>,
     /// I-110c: per-path manifest hints, keyed by store basename.
@@ -210,46 +207,18 @@ pub enum JitClass {
 impl Cache {
     /// Create a new cache rooted at `cache_dir`.
     ///
-    /// Creates the cache directory and SQLite index if they don't exist.
-    /// Must be called from within a tokio runtime (captures the current `Handle`).
+    /// Creates the cache directory if it doesn't exist. The index is a
+    /// process-local `HashSet` — builders are ephemeral (one build per
+    /// pod), so persisting it would only add I/O for a file nobody reads
+    /// (I-141: the previous on-disk index cost ~10s/build under load).
     ///
+    /// `async` for caller compatibility only (no awaits inside).
+    #[allow(clippy::unused_async)]
     pub async fn new(cache_dir: PathBuf) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
-
-        let runtime = Handle::current();
-
-        // The pod's emptyDir filesystem is discarded at exit, so the
-        // cache index lives only in memory — persisting it on tiny-class
-        // node storage cost >1s per write under load (I-141: ~10s wasted
-        // per build).
-        //
-        // r[impl builder.fuse.cache-ephemeral-memory]
-        // :memory: with a pool: each pooled connection would be a
-        // SEPARATE in-memory DB. Pin to one connection and disable
-        // idle/lifetime reaping (closing it would drop the DB and lose
-        // the index mid-build). Single-connection serialization is fine
-        // — in-memory SQLite ops are µs-scale and FUSE already
-        // serializes on the inflight map for the hot path.
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .idle_timeout(None)
-            .max_lifetime(None)
-            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
-            .await?;
-
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS cached_paths (
-                store_path TEXT PRIMARY KEY NOT NULL
-            )"#,
-        )
-        .execute(&pool)
-        .await?;
-
         Ok(Self {
             cache_dir,
-            pool,
-            runtime,
+            cached: Mutex::new(HashSet::new()),
             inflight: Mutex::new(HashMap::new()),
             manifest_hints: Mutex::new(HashMap::new()),
             known_inputs: RwLock::new(None),
@@ -329,69 +298,47 @@ impl Cache {
     }
 
     /// Check if a store path is cached.
-    ///
-    /// Propagates SQLite errors so callers can distinguish "not cached"
-    /// from "index query failed". Treating DB errors as not-cached would
-    /// trigger re-fetches for every FUSE op during a SQLite hiccup,
-    /// saturating store bandwidth and masking the root cause.
     #[cfg(test)]
+    #[allow(clippy::unnecessary_wraps)]
     pub fn contains(&self, store_path: &str) -> Result<bool, CacheError> {
-        let pool = &self.pool;
-        self.runtime.block_on(async {
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM cached_paths WHERE store_path = ?1")
-                    .bind(store_path)
-                    .fetch_one(pool)
-                    .await?;
-            Ok(count > 0)
-        })
+        Ok(self
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(store_path))
     }
 
     /// Get the full filesystem path for a cached store path.
     ///
-    /// Returns `Ok(None)` if the path is not cached, `Err` on index failure.
+    /// Returns `Ok(None)` if the path is not cached. Infallible — `Result`
+    /// kept for caller compatibility.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn get_path(&self, store_path: &str) -> Result<Option<PathBuf>, CacheError> {
-        let pool = &self.pool;
-        let present: bool = self.runtime.block_on(async {
-            let row = sqlx::query("SELECT 1 FROM cached_paths WHERE store_path = ?1")
-                .bind(store_path)
-                .fetch_optional(pool)
-                .await?;
-            Ok::<_, CacheError>(row.is_some())
-        })?;
+        let present = self
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(store_path);
         Ok(present.then(|| self.cache_dir.join(store_path)))
     }
 
-    /// Remove a stale index row. Called when the index says "present" but
-    /// the file is gone from disk (external rm, interrupted eviction).
-    /// Best-effort: logs on failure but doesn't propagate — if the DELETE
-    /// fails, the next fetch will `INSERT OR REPLACE` over it anyway.
+    /// Remove a stale index entry. Called when the index says "present"
+    /// but the file is gone from disk (external rm, interrupted extract).
     pub fn remove_stale(&self, store_path: &str) {
-        let pool = &self.pool;
-        if let Err(e) = self.runtime.block_on(async {
-            sqlx::query("DELETE FROM cached_paths WHERE store_path = ?1")
-                .bind(store_path)
-                .execute(pool)
-                .await
-        }) {
-            tracing::warn!(
-                store_path,
-                error = %e,
-                "failed to remove stale index row (will be overwritten on re-fetch)"
-            );
-        }
+        self.cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(store_path);
     }
 
-    /// Record a store path as cached after extraction.
+    /// Record a store path as cached after extraction. Infallible —
+    /// `Result` kept for caller compatibility.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn insert(&self, store_path: &str) -> Result<(), CacheError> {
-        let pool = &self.pool;
-        self.runtime.block_on(async {
-            sqlx::query("INSERT OR REPLACE INTO cached_paths (store_path) VALUES (?1)")
-                .bind(store_path)
-                .execute(pool)
-                .await?;
-            Ok::<_, sqlx::Error>(())
-        })?;
+        self.cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(store_path.to_owned());
         Ok(())
     }
 
@@ -430,8 +377,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// Cache sync methods use `block_on`, so tests create the cache in async
-    /// context then exercise the sync methods via `spawn_blocking`.
     async fn make_cache(cache_dir: PathBuf) -> anyhow::Result<Arc<Cache>> {
         Ok(Arc::new(Cache::new(cache_dir).await?))
     }
@@ -442,16 +387,14 @@ mod tests {
         let cache_dir = dir.path().join("cache");
 
         let cache = make_cache(cache_dir.clone()).await?;
-        // cache_dir is created (NAR trees land here); the SQLite index
-        // is in :memory: only.
+        // cache_dir is created (NAR trees land here); the index is a
+        // process-local HashSet, never persisted.
         assert!(cache_dir.exists());
         assert!(
             !cache_dir.join("cache_index.sqlite").exists(),
             "index must be in-memory, not on disk"
         );
-
-        let present = tokio::task::spawn_blocking(move || cache.contains("nope")).await??;
-        assert!(!present);
+        assert!(!cache.contains("nope")?);
         Ok(())
     }
 
@@ -498,23 +441,16 @@ mod tests {
         Ok(())
     }
 
-    /// Index round-trips across the pinned single :memory: connection.
-    /// Guards against a future refactor that lets the pool open a second
-    /// :memory: connection (which would be a separate, empty DB).
+    /// Index round-trip: insert is observed by contains/get_path.
     // r[verify builder.fuse.cache-ephemeral-memory]
     #[tokio::test]
     async fn test_cache_insert_and_contains() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cache = make_cache(dir.path().join("cache")).await?;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            assert!(!cache.contains("abc-hello-1.0")?);
-
-            cache.insert("abc-hello-1.0")?;
-            assert!(cache.contains("abc-hello-1.0")?);
-            Ok(())
-        })
-        .await??;
+        assert!(!cache.contains("abc-hello-1.0")?);
+        cache.insert("abc-hello-1.0")?;
+        assert!(cache.contains("abc-hello-1.0")?);
         Ok(())
     }
 
@@ -524,46 +460,22 @@ mod tests {
         let cache_dir = dir.path().join("cache");
         let cache = make_cache(cache_dir.clone()).await?;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            assert!(cache.get_path("abc-hello-1.0")?.is_none());
-
-            cache.insert("abc-hello-1.0")?;
-            let path = cache.get_path("abc-hello-1.0")?.expect("just inserted");
-            assert_eq!(path, cache_dir.join("abc-hello-1.0"));
-            Ok(())
-        })
-        .await??;
+        assert!(cache.get_path("abc-hello-1.0")?.is_none());
+        cache.insert("abc-hello-1.0")?;
+        let path = cache.get_path("abc-hello-1.0")?.expect("just inserted");
+        assert_eq!(path, cache_dir.join("abc-hello-1.0"));
         Ok(())
     }
 
-    /// DB errors from contains()/get_path() must propagate, not be treated
-    /// as "not cached". Otherwise a SQLite hiccup would trigger re-fetches
-    /// for every FUSE op, saturating store bandwidth and masking root cause.
+    /// remove_stale drops the index entry so the next get_path is a miss.
     #[tokio::test]
-    async fn test_cache_db_error_propagates() -> anyhow::Result<()> {
+    async fn test_cache_remove_stale() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cache = make_cache(dir.path().join("cache")).await?;
-
-        // Close the pool to force DB errors on all subsequent queries.
-        let pool = cache.pool.clone();
-        pool.close().await;
-
-        tokio::task::spawn_blocking(move || {
-            // contains() must return Err, not false.
-            let result = cache.contains("some-path");
-            assert!(
-                matches!(result, Err(CacheError::Sqlite(_))),
-                "contains() on closed pool should return Err, got {result:?}"
-            );
-
-            // get_path() must return Err, not None.
-            let result = cache.get_path("some-path");
-            assert!(
-                matches!(result, Err(CacheError::Sqlite(_))),
-                "get_path() on closed pool should return Err, got {result:?}"
-            );
-        })
-        .await?;
+        cache.insert("abc-hello-1.0")?;
+        assert!(cache.get_path("abc-hello-1.0")?.is_some());
+        cache.remove_stale("abc-hello-1.0");
+        assert!(cache.get_path("abc-hello-1.0")?.is_none());
         Ok(())
     }
 

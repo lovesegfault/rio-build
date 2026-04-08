@@ -204,6 +204,9 @@ impl LogBatcher {
     }
 
     /// Whether there are any buffered lines.
+    ///
+    /// Used by `executor/daemon/stderr_loop.rs` to decide whether to
+    /// `flush()` before sending the final batch on stream close.
     pub fn has_pending(&self) -> bool {
         !self.lines.is_empty()
     }

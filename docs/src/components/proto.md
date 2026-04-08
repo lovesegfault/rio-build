@@ -75,8 +75,8 @@ r[proto.store.batch-rpc]
 `BatchQueryPathInfo` and `BatchGetManifest` are **local-only** batch lookups: unlike `QueryPathInfo`/`GetPath` they do NOT do per-path upstream substitution or signature-visibility gating (both would re-introduce N round-trips). Callers needing those semantics use the singular RPCs. The batch RPCs exist because the builder's input-closure BFS + FUSE-warm stat loop were issuing ~800 singular RPCs per build — at 246 concurrent ephemeral builders that saturated the store's PG pool (acquire times → 11s → FUSE breaker → EIO). One batch call per BFS layer backed by `WHERE store_path_hash = ANY($1)` reduced it ~130×.
 
 ```protobuf
-// Server-side chunking only — PutPath chunks via cas::put_chunked; the
-// builder fans out GetChunk to reassemble NARs from their manifests.
+// Server-side chunking only — PutPath chunks via cas::put_chunked;
+// callers fan out GetChunk to reassemble NARs from their manifests.
 service ChunkService {
   rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
 }

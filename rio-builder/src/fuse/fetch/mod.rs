@@ -16,7 +16,7 @@ mod client;
 #[cfg(test)]
 mod tests;
 
-pub use client::{FetchTransport, StoreClients};
+pub use client::StoreClients;
 
 use std::io;
 use std::io::BufReader;
@@ -24,33 +24,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fuser::Errno;
-use futures_util::stream::{self, StreamExt};
-use tokio::io::AsyncWriteExt;
 use tokio::runtime::Handle;
-use tonic::transport::Channel;
 use tracing::instrument;
-
-use rio_proto::client::NarCollectError;
-use rio_proto::store::chunk_service_client::ChunkServiceClient;
-use rio_proto::types::{ChunkRef, GetChunkRequest};
 
 use super::NixStoreFs;
 use super::cache::{Cache, FetchClaim, InflightEntry};
-
-/// In-flight `GetChunk` RPCs per fetch. K=32 → at 256 KiB avg chunks,
-/// 50 ms cold S3 TTFB ≈ 160 MB/s; warm-moka (~1 ms in-cluster RTT) is
-/// NIC-limited. tonic's p2c picks per call so 32 in-flight spread
-/// across all SERVING store replicas — adding replicas adds bandwidth
-/// without builder code change.
-///
-/// TODO(dataplane2): promote to a config field once A/B numbers are in.
-pub const CHUNK_FETCH_CONCURRENCY: usize = 32;
-
-/// Per-chunk transient retry attempts (inside the `.map` closure, before
-/// failing the whole stream). Separate from `RETRY_BACKOFF` — chunk
-/// retries are tight (no sleep; the buffered stream provides natural
-/// spacing) and cheap (one chunk, not a whole NAR re-spool).
-const CHUNK_RETRY_ATTEMPTS: usize = 2;
 
 /// `AsyncWrite` adapter over a sync `std::fs::File` — does BLOCKING disk
 /// I/O directly in `poll_write`.
@@ -496,195 +474,6 @@ pub fn prefetch_path_blocking(
     }
 }
 
-/// Fetch a chunked NAR via parallel `GetChunk` and write it to `spool`
-/// in chunk order. Returns bytes written.
-///
-/// `buffered(concurrency)` (NOT `buffer_unordered`): chunks must
-/// reassemble in manifest order, but the underlying RPCs run K-at-a-time
-/// — `buffered` polls up to K futures concurrently and yields results in
-/// submission order. Each `GetChunk` is an independent unary-ish RPC so
-/// tonic's p2c balancer picks a (possibly different) replica per call.
-///
-/// Per-chunk transient errors (`Unavailable`/`Unknown`/`ResourceExhausted`)
-/// retry `CHUNK_RETRY_ATTEMPTS` times in the closure; non-transient
-/// errors (`NotFound`/`Unimplemented`/`InvalidArgument`) bubble up
-/// immediately so the caller can fall back to `GetPath`.
-///
-/// `max_size` enforced cumulatively (same semantics as
-/// [`rio_proto::client::collect_nar_stream_to_writer`]).
-// r[impl builder.fuse.fetch-chunk-fanout]
-pub(super) async fn fetch_chunks_to_spool(
-    chunk_client: &ChunkServiceClient<Channel>,
-    chunks: Vec<ChunkRef>,
-    concurrency: usize,
-    timeout: Duration,
-    max_size: u64,
-    spool: &mut (impl tokio::io::AsyncWrite + Unpin),
-) -> Result<u64, NarCollectError> {
-    let concurrency = concurrency.max(1);
-    let fut = async {
-        // Per-chunk fetch (with transient retry) as a closure so the
-        // priming loop and the refill below produce the same future type
-        // for `FuturesOrdered`.
-        let fetch = |cr: ChunkRef| {
-            let mut c = chunk_client.clone();
-            async move {
-                let mut attempt = 0usize;
-                loop {
-                    match fetch_one_chunk(&mut c, &cr.hash).await {
-                        Ok(b) => {
-                            if attempt > 0 {
-                                metrics::counter!(
-                                    "rio_builder_fuse_fetch_chunks_total",
-                                    "outcome" => "retry_ok"
-                                )
-                                .increment(1);
-                            }
-                            return Ok::<_, NarCollectError>(b);
-                        }
-                        Err(status) if rio_common::grpc::is_transient(status.code()) => {
-                            attempt += 1;
-                            metrics::counter!(
-                                "rio_builder_fuse_fetch_chunks_total",
-                                "outcome" => "retry"
-                            )
-                            .increment(1);
-                            if attempt > CHUNK_RETRY_ATTEMPTS {
-                                return Err(NarCollectError::Stream(status));
-                            }
-                            // No sleep: K-1 other chunks are in flight;
-                            // by the time this future is polled again the
-                            // transient (replica restart, brief PG-pool
-                            // saturation) has likely cleared. The outer
-                            // RETRY_BACKOFF in fetch_extract_insert
-                            // handles the "everything is down" case.
-                        }
-                        Err(status) => return Err(NarCollectError::Stream(status)),
-                    }
-                }
-            }
-        };
-
-        // Manual `FuturesOrdered` window (semantically `.buffered(K)`)
-        // so that on the first error we can STOP refilling but DRAIN
-        // the ≤K-1 already-in-flight RPCs to completion instead of
-        // dropping them. Dropping a `buffered` stream sends one
-        // RST_STREAM per in-flight h2 stream; with K=CHUNK_FETCH_
-        // CONCURRENCY=32 that exceeds h2's `max_pending_accept_reset_
-        // streams` guard (default 20) → server replies GOAWAY(PROTOCOL_
-        // ERROR) → the SHARED channel (StoreClients::from_channel) is
-        // torn down → the immediately-following GetPath fallback fails
-        // Internal/Cancelled → EIO. Draining costs at most K-1 already-
-        // started RPCs (the iterator below is not advanced past the
-        // error), so an Unimplemented store wastes ≤31 cheap error
-        // round-trips, not the whole manifest.
-        let mut chunks = chunks.into_iter();
-        let mut in_flight = stream::FuturesOrdered::new();
-        for cr in chunks.by_ref().take(concurrency) {
-            in_flight.push_back(fetch(cr));
-        }
-
-        let mut written: u64 = 0;
-        let mut first_err: Option<NarCollectError> = None;
-        // r[impl builder.fuse.fetch-progress-timeout]
-        // I-211: `timeout` bounds the gap between chunk completions, not
-        // the whole fan-out. With K=CHUNK_FETCH_CONCURRENCY in flight, "no
-        // chunk completed in `timeout`" means all K stalled — same
-        // store-health signal the wall-clock bound was meant to detect,
-        // without aborting healthy multi-GB fetches mid-stream.
-        loop {
-            let r = match tokio::time::timeout(timeout, in_flight.next()).await {
-                Ok(Some(r)) => r,
-                Ok(None) => break,
-                Err(_) => {
-                    return Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
-                        format!("GetChunk fan-out idle for {timeout:?} (no chunk completed)"),
-                    )));
-                }
-            };
-            match r {
-                Ok(bytes) if first_err.is_none() => {
-                    let new_len = written.saturating_add(bytes.len() as u64);
-                    if new_len > max_size {
-                        first_err = Some(NarCollectError::SizeExceeded {
-                            got: new_len,
-                            limit: max_size,
-                        });
-                        continue; // drain in-flight, don't refill
-                    }
-                    spool.write_all(&bytes).await?;
-                    written = new_len;
-                    metrics::counter!(
-                        "rio_builder_fuse_fetch_chunks_total",
-                        "outcome" => "ok"
-                    )
-                    .increment(1);
-                    if let Some(cr) = chunks.next() {
-                        in_flight.push_back(fetch(cr));
-                    }
-                }
-                // Already errored: discard late-arriving Ok bytes (the
-                // spool will be reset by the caller anyway). Don't refill.
-                Ok(_) => {}
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                    // Don't refill — let remaining in-flight complete.
-                }
-            }
-        }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
-        spool.flush().await?;
-        Ok::<_, NarCollectError>(written)
-    };
-    fut.await
-}
-
-/// Drain one `GetChunk` server-stream into a `Vec<u8>`. The store sends
-/// one message (chunks ≤ CHUNK_MAX), but drain defensively in case a
-/// future store splits.
-async fn fetch_one_chunk(
-    c: &mut ChunkServiceClient<Channel>,
-    digest: &[u8],
-) -> Result<Vec<u8>, tonic::Status> {
-    let mut s = c
-        .get_chunk(GetChunkRequest {
-            digest: digest.to_vec(),
-        })
-        .await?
-        .into_inner();
-    let mut buf = Vec::new();
-    while let Some(m) = s.message().await? {
-        if buf.is_empty() {
-            buf = m.data; // common case: one message — avoid copy.
-        } else {
-            buf.extend_from_slice(&m.data);
-        }
-    }
-    Ok(buf)
-}
-
-/// True when `e` from the chunk path means "this store can't serve
-/// `GetChunk` for this manifest" — fall back to `GetPath` rather than
-/// surface EIO. `NotFound` (chunk GC'd / manifest stale),
-/// `Unimplemented` (old store binary), `FailedPrecondition` (store is
-/// inline-only — `ChunkServiceImpl::require_cache`).
-fn should_fallback_to_getpath(e: &NarCollectError) -> bool {
-    matches!(
-        e,
-        NarCollectError::Stream(s)
-            if matches!(
-                s.code(),
-                tonic::Code::NotFound
-                    | tonic::Code::Unimplemented
-                    | tonic::Code::FailedPrecondition
-            )
-    )
-}
-
 /// The actual fetch: gRPC → NAR parse → extract to tmp → rename →
 /// cache.insert. Shared by ensure_cached and prefetch.
 ///
@@ -704,28 +493,6 @@ fn fetch_extract_insert(
     runtime: &Handle,
     fetch_timeout: Duration,
     store_basename: &str,
-) -> Result<PathBuf, Errno> {
-    fetch_extract_insert_with(
-        cache,
-        clients,
-        runtime,
-        fetch_timeout,
-        store_basename,
-        FetchTransport::current(),
-    )
-}
-
-/// [`fetch_extract_insert`] with explicit transport. Split out so tests
-/// can drive the chunk path without touching the process-global
-/// `OnceLock` (first test to read it wins).
-#[instrument(level = "debug", skip(cache, clients, runtime), fields(store_basename = %store_basename, ?transport))]
-fn fetch_extract_insert_with(
-    cache: &Cache,
-    clients: &StoreClients,
-    runtime: &Handle,
-    fetch_timeout: Duration,
-    store_basename: &str,
-    transport: FetchTransport,
 ) -> Result<PathBuf, Errno> {
     // Increment on miss (entry to this function), not on fetch success:
     // failed fetches (store outage, NAR parse error) are still cache
@@ -811,23 +578,19 @@ fn fetch_extract_insert_with(
     })?);
 
     let fetch_start = std::time::Instant::now();
-    let (info, transport_label) = stream_nar_to_spool(
+    let info = stream_nar_to_spool(
         cache,
         clients,
         runtime,
         fetch_timeout,
         &store_path,
         store_basename,
-        transport,
         &spool_path,
         &mut spool,
     )?;
     drop(spool);
-    metrics::histogram!(
-        "rio_builder_fuse_fetch_duration_seconds",
-        "transport" => transport_label
-    )
-    .record(fetch_start.elapsed().as_secs_f64());
+    metrics::histogram!("rio_builder_fuse_fetch_duration_seconds")
+        .record(fetch_start.elapsed().as_secs_f64());
     metrics::counter!("rio_builder_fuse_fetch_bytes_total").increment(info.nar_size);
 
     commit_to_cache(cache, &spool_path, &local_path, &store_path, store_basename)?;
@@ -835,13 +598,9 @@ fn fetch_extract_insert_with(
     Ok(local_path)
 }
 
-/// Stream the NAR for `store_path` into `spool`, retrying transient
-/// store-gRPC errors per [`RETRY_BACKOFF`].
-///
-/// Tries the chunk-fanout path first when `transport == GetChunk` and a
-/// chunked manifest hint is primed; otherwise (or on fallback) drives
-/// `GetPath`. Returns the `PathInfo` (from the manifest hint or the
-/// `GetPath` `Info` frame) plus a static label for the duration metric.
+/// Stream the NAR for `store_path` into `spool` via `GetPath`, retrying
+/// transient store-gRPC errors per [`RETRY_BACKOFF`]. Returns the
+/// `PathInfo` from the `GetPath` `Info` frame.
 ///
 /// SYNC with internal `block_on` — same caller contract as
 /// `fetch_extract_insert`.
@@ -853,140 +612,26 @@ fn stream_nar_to_spool(
     fetch_timeout: Duration,
     store_path: &str,
     store_basename: &str,
-    transport: FetchTransport,
     spool_path: &Path,
     spool: &mut SyncSpool,
-) -> Result<(rio_proto::validated::ValidatedPathInfo, &'static str), Errno> {
-    // I-110c: take (not clone) — taken once before the retry loop now so
-    // the chunk-fanout branch can inspect `chunks`. On transient failure
-    // the hint is consumed; retries (and the GetPath fallback) go to the
-    // store with `manifest_hint=None`, which re-queries PG. Deliberate: a
-    // transient mid-stream means the hint may be stale.
+) -> Result<rio_proto::validated::ValidatedPathInfo, Errno> {
+    // I-110c: take (not clone) — taken once before the retry loop. On
+    // transient failure the hint is consumed; retries go to the store with
+    // `manifest_hint=None`, which re-queries PG. Deliberate: a transient
+    // mid-stream means the hint may be stale.
     let hint = cache.take_manifest_hint(store_basename);
-
-    // Only use the chunk path if we HAVE a chunked manifest. inline-blob
-    // hints (chunks empty) and absent hints fall through to GetPath —
-    // dataplane2's "if None: fall back to GetPath" arm.
-    let mut chunk_plan = match (transport, &hint) {
-        (FetchTransport::GetChunk, Some(h)) if !h.chunks.is_empty() => {
-            Some((h.chunks.clone(), h.info.clone()))
-        }
-        _ => None,
-    };
-    let transport_label: &'static str = if chunk_plan.is_some() {
-        "getchunk"
-    } else {
-        "getpath"
-    };
 
     let info = runtime.block_on(async {
         let mut store_client = clients.store.clone();
         let mut attempt = 0;
         loop {
-            // dataplane2: chunk-fanout arm. Tried at most once per
-            // fetch_extract_insert call — on any non-transient failure
-            // (NotFound/Unimplemented/FailedPrecondition) we clear
-            // `chunk_plan` and fall through to GetPath in THIS iteration;
-            // on transient, the outer retry loop re-spools via GetPath
-            // (chunk_plan stays None after first take).
-            if let Some((chunks, raw_info)) = chunk_plan.take() {
-                let n = chunks.len();
-                match fetch_chunks_to_spool(
-                    &clients.chunk,
-                    chunks,
-                    CHUNK_FETCH_CONCURRENCY,
-                    fetch_timeout,
-                    rio_common::limits::MAX_NAR_SIZE,
-                    &mut *spool,
-                )
-                .await
-                {
-                    Ok(written) => {
-                        tracing::debug!(
-                            store_path = %store_path,
-                            chunks = n,
-                            bytes = written,
-                            "GetChunk fan-out complete"
-                        );
-                        // PathInfo came from the manifest hint (no Info
-                        // frame on the chunk path). Validate it the same
-                        // way `get_path_nar_to_file` does. Missing →
-                        // treat as not-found (hint was malformed).
-                        return match raw_info {
-                            Some(raw) => rio_proto::validated::ValidatedPathInfo::try_from(raw)
-                                .map_err(|e| {
-                                    tracing::warn!(error = %e, "manifest hint PathInfo invalid");
-                                    Errno::EIO
-                                }),
-                            None => Err(Errno::ENOENT),
-                        };
-                    }
-                    Err(e) if should_fallback_to_getpath(&e) => {
-                        tracing::warn!(
-                            store_path = %store_path,
-                            error = %e,
-                            "GetChunk unsupported/missing; falling back to GetPath"
-                        );
-                        metrics::counter!(
-                            "rio_builder_fuse_fetch_chunks_total",
-                            "outcome" => "fallback"
-                        )
-                        .increment(1);
-                        if let Err(e) = spool.reset() {
-                            tracing::error!(spool = %spool_path.display(), error = %e, "spool truncate failed on fallback");
-                            return Err(Errno::EIO);
-                        }
-                        // fall through to GetPath below (same iteration)
-                    }
-                    Err(NarCollectError::SizeExceeded { got, limit }) => {
-                        tracing::error!(store_path = %store_path, size = got, limit, "NAR exceeds MAX_NAR_SIZE (chunk path)");
-                        return Err(Errno::EFBIG);
-                    }
-                    Err(e) if e.is_transient() => {
-                        // Per-chunk retries already exhausted. Reset
-                        // spool, back off, and retry the whole fetch
-                        // via GetPath (chunk_plan is None now).
-                        if let Err(reset_e) = spool.reset() {
-                            tracing::error!(spool = %spool_path.display(), error = %reset_e, "spool truncate failed");
-                            return Err(Errno::EIO);
-                        }
-                        match RETRY_BACKOFF.get(attempt) {
-                            Some(&delay) => {
-                                attempt += 1;
-                                tracing::warn!(
-                                    store_path = %store_path, attempt, error = %e,
-                                    "GetChunk transient; retrying via GetPath"
-                                );
-                                tokio::time::sleep(jitter(delay)).await;
-                                continue;
-                            }
-                            None => {
-                                // I-189: error! (not warn!) — this is the
-                                // terminal failure that surfaces as EIO to
-                                // nix-daemon. Operators grepping for ERROR
-                                // need the underlying gRPC status on the
-                                // same line as the EIO, not on a separate
-                                // warn-level line they have to correlate.
-                                tracing::error!(store_path = %store_path, error = %e, "GetChunk transient — retries exhausted → EIO");
-                                return Err(Errno::EIO);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(store_path = %store_path, error = %e, "GetChunk failed → EIO");
-                        return Err(Errno::EIO);
-                    }
-                }
-            }
-
             match rio_proto::client::get_path_nar_to_file(
                 &mut store_client,
                 store_path,
                 fetch_timeout,
                 rio_common::limits::MAX_NAR_SIZE,
-                // Hint consumed above. On attempt 0 we still have the
-                // original (cloned) hint to send; on retries it's None
-                // — same staleness rationale as before.
+                // Hint consumed above. Only send on attempt 0; on retries
+                // it's None — same staleness rationale as the take above.
                 if attempt == 0 { hint.clone() } else { None },
                 &[],
                 &mut *spool,
@@ -1082,7 +727,7 @@ fn stream_nar_to_spool(
             }
         }
     })?;
-    Ok((info, transport_label))
+    Ok(info)
 }
 
 /// Extract `spool_path` → temp sibling tree → atomic rename into

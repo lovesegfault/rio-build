@@ -64,11 +64,11 @@ fn test_jit_fetch_timeout_scales_with_nar_size() {
 // fetch_extract_insert is module-private; we test it through
 // prefetch_path_blocking (its public caller). prefetch is SYNC with
 // internal block_on — it MUST be called from spawn_blocking to avoid
-// nested-runtime panic (Cache methods use Handle::block_on internally).
+// nested-runtime panic.
 //
 // Multi-thread runtime required: spawn_blocking runs the closure on a
 // separate thread pool; that thread's block_on needs a worker thread
-// free on the main runtime to actually process the SQL/gRPC futures.
+// free on the main runtime to actually process the gRPC futures.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -82,8 +82,6 @@ const TEST_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Harness: spawn MockStore + Cache in a tempdir. Returns everything the
 /// tests need, including the runtime handle for prefetch's block_on calls.
-/// `StoreClients` (not just `StoreServiceClient`) so the chunk-fanout
-/// path is exercisable; `MockStore` serves both services on one port.
 async fn setup_fetch_harness() -> (
     Arc<Cache>,
     StoreClients,
@@ -548,170 +546,6 @@ async fn test_prefetch_already_cached_skip() {
         matches!(second, Ok(Some(PrefetchSkip::AlreadyCached))),
         "second fetch: {second:?}"
     );
-}
-
-// ========================================================================
-// dataplane2: chunk-fanout transport
-// ========================================================================
-
-/// Seed MockStore with a chunked NAR (fixed 8-byte chunks → multiple
-/// `GetChunk` calls), prime the manifest hint, drive
-/// `fetch_extract_insert_with(transport=GetChunk)`. Asserts:
-/// - extracted file matches input bytes (order-preserving reassembly)
-/// - `GetChunk` was called once per chunk (fan-out happened)
-/// - `GetPath` was NOT called (chunk path took it)
-/// - spool cleaned up
-// r[verify builder.fuse.fetch-chunk-fanout]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_fetch_via_chunks_reassembles_correctly() {
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
-
-    // 80 bytes / 8-byte chunks = 10 GetChunk RPCs. Non-repeating
-    // payload so an out-of-order reassembly would be detectable.
-    let payload: Vec<u8> = (0u8..80).collect();
-    let basename = test_store_basename("chunk-fanout");
-    let store_path = format!("/nix/store/{basename}");
-    let (nar, hash) = make_nar(&payload);
-    let info = make_path_info(&store_path, &nar, hash);
-    let chunk_refs = store.seed_chunked(info.clone(), nar.clone(), 8);
-    assert!(chunk_refs.len() >= 10, "want multiple chunks");
-
-    // Prime the hint cache (what prefetch_manifests does in prod).
-    cache.prime_manifest_hints([(
-        basename.clone(),
-        rio_proto::types::ManifestHint {
-            info: Some(info.clone().into()),
-            chunks: chunk_refs.clone(),
-            inline_blob: Vec::new(),
-        },
-    )]);
-
-    let cache_cl = Arc::clone(&cache);
-    let clients_cl = clients.clone();
-    let basename_cl = basename.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // Explicit transport — bypasses the OnceLock'd env read.
-        fetch_extract_insert_with(
-            &cache_cl,
-            &clients_cl,
-            &rt,
-            TEST_FETCH_TIMEOUT,
-            &basename_cl,
-            FetchTransport::GetChunk,
-        )
-    })
-    .await
-    .expect("join");
-    assert!(result.is_ok(), "expected Ok(path), got: {result:?}");
-
-    // Reassembly: extracted file = original payload.
-    let local = dir.path().join(&basename);
-    let content = std::fs::read(&local).expect("read extracted");
-    assert_eq!(content, payload, "chunk reassembly must preserve order");
-
-    // Fan-out: one GetChunk per manifest entry; no GetPath.
-    assert_eq!(
-        store.calls.get_chunk_calls.load(Ordering::SeqCst) as usize,
-        chunk_refs.len(),
-        "one GetChunk per chunk"
-    );
-    assert!(
-        store.calls.get_path_hints.read().unwrap().is_empty(),
-        "GetPath must not be called when chunk path succeeds"
-    );
-
-    // Spool cleaned up (same invariant as the GetPath test).
-    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_str().is_some_and(|n| n.contains(".nar-")))
-        .collect();
-    assert!(leftovers.is_empty(), "spool leaked: {leftovers:?}");
-}
-
-/// Store returns Unimplemented for `GetChunk` → fetch falls back to
-/// `GetPath` and still succeeds. Covers the "old store binary" arm.
-///
-/// Flake-fix strategy (structural, prod bug): `chunk_size=4` over
-/// the ~128-byte NAR yields ~30 chunks → all CHUNK_FETCH_CONCURRENCY
-/// =32 slots fire at once. With the old `.buffered()`+`?` fan-out,
-/// the first Unimplemented dropped the stream → ~29 RST_STREAMs →
-/// h2's rapid-reset guard (`max_pending_accept_reset_streams`=20)
-/// sent GOAWAY(PROTOCOL_ERROR) on the shared channel → the GetPath
-/// fallback hit Internal/Cancelled → EIO ~15-20% of runs. Fixed in
-/// `fetch_chunks_to_spool` by draining in-flight on error instead of
-/// dropping. Retry/widen rejected: this was a real prod fallback-path
-/// bug (StoreClients shares one Channel — main.rs), not test noise;
-/// the small chunk size is kept deliberately as the regression guard.
-// r[verify builder.fuse.fetch-chunk-fanout]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_fetch_via_chunks_unimplemented_falls_back_to_getpath() {
-    let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
-    store
-        .faults
-        .get_chunk_unimplemented
-        .store(true, Ordering::SeqCst);
-
-    let basename = test_store_basename("chunk-fallback");
-    let store_path = format!("/nix/store/{basename}");
-    let (nar, hash) = make_nar(b"fallback-body");
-    let info = make_path_info(&store_path, &nar, hash);
-    // chunk_size=4 ⇒ ~30 chunks ⇒ fan-out saturates concurrency.
-    // Do NOT raise this — see doc comment above.
-    let chunk_refs = store.seed_chunked(info.clone(), nar.clone(), 4);
-    assert!(
-        chunk_refs.len() > CHUNK_FETCH_CONCURRENCY.min(20),
-        "want enough chunks to saturate the fan-out window"
-    );
-    cache.prime_manifest_hints([(
-        basename.clone(),
-        rio_proto::types::ManifestHint {
-            info: Some(info.into()),
-            chunks: chunk_refs,
-            inline_blob: Vec::new(),
-        },
-    )]);
-
-    let (cache_cl, clients_cl, basename_cl) =
-        (Arc::clone(&cache), clients.clone(), basename.clone());
-    let result = tokio::task::spawn_blocking(move || {
-        fetch_extract_insert_with(
-            &cache_cl,
-            &clients_cl,
-            &rt,
-            TEST_FETCH_TIMEOUT,
-            &basename_cl,
-            FetchTransport::GetChunk,
-        )
-    })
-    .await
-    .expect("join");
-    assert!(
-        result.is_ok(),
-        "fallback to GetPath should succeed: {result:?}"
-    );
-
-    let content = std::fs::read(dir.path().join(&basename)).expect("read extracted");
-    assert_eq!(content, b"fallback-body");
-    assert!(
-        store.calls.get_chunk_calls.load(Ordering::SeqCst) >= 1,
-        "chunk path was attempted"
-    );
-    assert_eq!(
-        store.calls.get_path_hints.read().unwrap().len(),
-        1,
-        "GetPath fallback fired exactly once"
-    );
-}
-
-/// `FetchTransport` default + Eq. The figment env layer
-/// (`RIO_FETCH_TRANSPORT=getchunk`) goes through serde's
-/// `rename_all = "lowercase"` derive — exercised by the
-/// `jail_roundtrip!` test in config.rs.
-#[test]
-fn test_fetch_transport_default() {
-    assert_eq!(FetchTransport::default(), FetchTransport::GetPath);
-    assert_ne!(FetchTransport::GetPath, FetchTransport::GetChunk);
 }
 
 // ========================================================================

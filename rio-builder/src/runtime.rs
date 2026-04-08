@@ -1054,9 +1054,6 @@ pub async fn setup(
     // FUSE is the build-critical path; a stalled fetch blocks a fuser
     // thread. See config.rs fuse_fetch_timeout for the full rationale.
     let fuse_fetch_timeout = cfg.fuse_fetch_timeout;
-    // Process-global FUSE fetch transport — read by FUSE callbacks
-    // that have no Config handle. Set once, before mount.
-    crate::fuse::fetch::FetchTransport::init(cfg.fetch_transport);
 
     // ─── Startup rootfs writes (readOnlyRootFilesystem audit) ─────
     //

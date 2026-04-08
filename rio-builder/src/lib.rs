@@ -16,7 +16,7 @@
 //! |   +-- Mount /nix/store via fuser 0.17
 //! |   +-- lookup/getattr -> StoreService.QueryPathInfo
 //! |   +-- read/readdir -> SSD cache or StoreService.GetPath
-//! |   +-- LRU cache on local SSD (cache.rs)
+//! |   +-- Ephemeral local-disk cache (cache.rs)
 //! +-- Build executor (executor.rs)
 //! |   +-- Overlay management (overlay.rs)
 //! |   +-- Synthetic DB generation (synth_db.rs)
@@ -81,13 +81,6 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_uploads_total",
         "Output uploads (labeled by status: success/exhausted)"
-    );
-    describe_counter!(
-        "rio_builder_fuse_fetch_chunks_total",
-        "Per-chunk GetChunk fetch outcomes when RIO_FETCH_TRANSPORT=\
-         getchunk (labeled by outcome: ok/retry/retry_ok/fallback). \
-         `fallback` = store returned NotFound/Unimplemented; the fetch \
-         re-spooled via GetPath. Absent under the default getpath transport."
     );
     describe_histogram!(
         "rio_builder_build_duration_seconds",
@@ -181,8 +174,8 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_fuse_index_divergence_total",
         "FUSE cache index/disk divergences detected and self-healed. Nonzero \
-         means something rm'd cache files out from under the SQLite index \
-         (manual debugging, disk cleanup scripts, interrupted eviction). \
+         means something rm'd cache files out from under the in-memory index \
+         (manual debugging, disk cleanup scripts, interrupted extract). \
          The path is purged and re-fetched; investigate if sustained."
     );
     describe_gauge!(
