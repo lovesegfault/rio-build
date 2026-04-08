@@ -897,7 +897,10 @@ mod tests {
             );
             // Unspecified sub-field defaults via #[serde(default)]
             // on the sub-struct (partial table must work).
-            assert_eq!(cfg.jwt.resolve_timeout_ms, 500);
+            assert_eq!(
+                cfg.jwt.resolve_timeout,
+                std::time::Duration::from_millis(500)
+            );
         }
     );
 

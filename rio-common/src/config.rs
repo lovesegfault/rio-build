@@ -419,12 +419,16 @@ pub struct JwtConfig {
     /// overhead, short enough that a stuck scheduler doesn't make
     /// SSH auth hang noticeably. On timeout: `required=false` →
     /// degrade; `required=true` → reject.
-    #[serde(default = "default_resolve_timeout_ms")]
-    pub resolve_timeout_ms: u64,
+    #[serde(
+        rename = "resolve_timeout_ms",
+        with = "crate::config::millis",
+        default = "default_resolve_timeout"
+    )]
+    pub resolve_timeout: std::time::Duration,
 }
 
-fn default_resolve_timeout_ms() -> u64 {
-    500
+fn default_resolve_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
 }
 
 impl Default for JwtConfig {
@@ -438,7 +442,7 @@ impl Default for JwtConfig {
         Self {
             required: false,
             key_path: None,
-            resolve_timeout_ms: default_resolve_timeout_ms(),
+            resolve_timeout: default_resolve_timeout(),
         }
     }
 }
@@ -934,7 +938,10 @@ mod tests {
             let cfg: JwtHost = load("rio-test-jwt", NoCli::default()).unwrap();
             assert!(!cfg.jwt.required, "default: not required (permissive)");
             assert!(cfg.jwt.key_path.is_none(), "default: no key → JWT off");
-            assert_eq!(cfg.jwt.resolve_timeout_ms, 500);
+            assert_eq!(
+                cfg.jwt.resolve_timeout,
+                std::time::Duration::from_millis(500)
+            );
             Ok(())
         });
     }
@@ -953,7 +960,10 @@ mod tests {
                 cfg.jwt.key_path.as_deref(),
                 Some(std::path::Path::new("/etc/rio/jwt/seed"))
             );
-            assert_eq!(cfg.jwt.resolve_timeout_ms, 1000);
+            assert_eq!(
+                cfg.jwt.resolve_timeout,
+                std::time::Duration::from_millis(1000)
+            );
             Ok(())
         });
     }

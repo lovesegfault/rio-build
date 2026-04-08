@@ -499,7 +499,7 @@ mod tests {
         // mounted) keep working via the SSH-comment fallback path.
         assert!(!d.jwt.required);
         assert!(d.jwt.key_path.is_none());
-        assert_eq!(d.jwt.resolve_timeout_ms, 500);
+        assert_eq!(d.jwt.resolve_timeout, std::time::Duration::from_millis(500));
         // Rate limiting disabled by default — no compiled-in quota
         // (the right value is workload-dependent).
         assert!(d.rate_limit.is_none());
@@ -634,7 +634,10 @@ mod tests {
             );
             // Unspecified sub-field defaults via #[serde(default)]
             // on the sub-struct (partial table must work).
-            assert_eq!(cfg.jwt.resolve_timeout_ms, 500);
+            assert_eq!(
+                cfg.jwt.resolve_timeout,
+                std::time::Duration::from_millis(500)
+            );
             let rl = cfg
                 .rate_limit
                 .expect("[rate_limit] table must deserialize to Some");

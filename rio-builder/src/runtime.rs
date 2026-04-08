@@ -219,7 +219,7 @@ pub struct BuildSpawnContext {
     pub log_limits: log_stream::LogLimits,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
     pub daemon_timeout: std::time::Duration,
-    /// Silence timeout default (from `Config.max_silent_time_secs`).
+    /// Silence timeout default (from `Config.max_silent_time`).
     /// Used when WorkAssignment's BuildOptions.max_silent_time is 0.
     /// 0 = disabled.
     pub max_silent_time: u64,
@@ -1217,7 +1217,7 @@ pub async fn setup(
             total_bytes: cfg.log_size_limit,
         },
         daemon_timeout: cfg.daemon_timeout,
-        max_silent_time: cfg.max_silent_time_secs,
+        max_silent_time: cfg.max_silent_time.as_secs(),
         cgroup_parent,
         executor_kind: cfg.executor_kind,
         // I-110c: same Arc as prefetch_cache / the FUSE mount —

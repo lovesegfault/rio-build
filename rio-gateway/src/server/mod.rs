@@ -587,7 +587,7 @@ impl ConnectionHandler {
     ) -> anyhow::Result<(String, jwt::TenantClaims)> {
         use rio_proto::scheduler::ResolveTenantRequest;
 
-        let timeout = std::time::Duration::from_millis(self.jwt_config.resolve_timeout_ms);
+        let timeout = self.jwt_config.resolve_timeout;
         let req = tonic::Request::new(ResolveTenantRequest {
             tenant_name: tenant_name.to_string(),
         });

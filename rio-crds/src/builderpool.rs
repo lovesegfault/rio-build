@@ -159,6 +159,13 @@ pub struct BuilderPoolSpec {
     /// Maps to `RIO_DAEMON_TIMEOUT_SECS`. `None` = worker default
     /// (7200 = 2h). Raise for pools running known-long builds
     /// (LLVM, chromium, full NixOS closure from cold cache).
+    // WONTFIX: kept as `Option<u64>` rather than `Option<Duration>` —
+    // schemars derives Duration as a `{secs,nanos}` object, breaking the
+    // CRD OpenAPI schema (and existing CRs) unless paired with both an
+    // Option-aware serde adapter and `#[schemars(with = "Option<u64>")]`.
+    // The only consumer string-formats this into the env var anyway
+    // (rio-controller builderpool::builders), so it's never used as a
+    // Duration value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_timeout_secs: Option<u64>,
 

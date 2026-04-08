@@ -149,7 +149,8 @@ pub struct Config {
     /// Upstream fix 32827b9fb adds selective ssh-ng forwarding but requires
     /// the daemon to advertise `set-options-map-only`, which rio-gateway does
     /// not — tracked under WONTFIX(P0310).
-    pub max_silent_time_secs: u64,
+    #[serde(rename = "max_silent_time_secs", with = "rio_common::config::secs")]
+    pub max_silent_time: std::time::Duration,
     /// I-116 idle timeout: exit if no assignment arrives for this
     /// long. Controller spawns N Jobs based on queue depth; if the
     /// queue drains before all Jobs receive work, the unlucky ones
@@ -194,7 +195,7 @@ impl Default for Config {
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
-            max_silent_time_secs: 0,
+            max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
             fetch_transport: crate::fuse::fetch::FetchTransport::GetPath,
         }
