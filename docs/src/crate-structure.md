@@ -1,6 +1,6 @@
 # Crate Structure
 
-## Workspace Layout (12 crates)
+## Workspace Layout (14 crates)
 
 ```
 rio-build/
@@ -8,15 +8,17 @@ rio-build/
 ├── rio-common/          # Shared utilities (no rio-* deps — leaf)
 ├── rio-nix/             # Nix protocol types and wire format (no rio-* deps — leaf)
 ├── rio-proto/           # Protobuf/gRPC definitions
-├── rio-crds/            # Kubernetes CRD types (BuilderPool, BuilderPoolSet — derive-macro structs)
+├── rio-crds/            # Kubernetes CRD types (BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)
 ├── rio-test-support/    # Test harness (ephemeral PG, mock gRPC, wire helpers)
 ├── rio-gateway/         # SSH server + Nix worker protocol frontend
 ├── rio-scheduler/       # DAG-aware build scheduler
 ├── rio-store/           # NAR content-addressable store
-├── rio-builder/          # Build executor + FUSE store
+├── rio-builder/         # Build executor + FUSE store
 ├── rio-controller/      # Kubernetes operator (reconciler, autoscaler)
 ├── rio-cli/             # Operator CLI (AdminService client)
-├── rio-bench/           # Criterion benches
+├── rio-bench/           # Criterion benches (perf regression gates)
+├── xtask/               # Dev/ops tooling (k8s up/down, AMI build, codegen)
+├── workspace-hack/      # cargo-hakari unification crate (no source, dep-only)
 └── rio-dashboard/       # Svelte 5 SPA — NOT a Rust crate; built by nix/dashboard.nix (pnpm+Vite)
 ```
 
@@ -134,7 +136,7 @@ src/
 ├── nar.rs             # NAR streaming read/write/extract
 ├── narinfo.rs         # NarInfo parse/serialize + fingerprint()
 ├── refscan.rs         # Reference scanner: Aho-Corasick over nixbase32 store-path hashes
-└── hash.rs            # NixHash (SHA-256, SHA-512, BLAKE2)
+└── hash.rs            # NixHash (SHA-256, SHA-512, SHA-1)
 ```
 
 Fuzz targets for the parsers live in `rio-nix/fuzz/` (separate workspace, own `Cargo.lock`). A second fuzz workspace at `rio-store/fuzz/` covers the manifest parser. Both are excluded from the main workspace — when a fuzzed crate's deps change, run `cd <crate>/fuzz && cargo update -p <crate>` to sync the independent lockfile.
@@ -155,7 +157,8 @@ src/
 ├── lib.rs             # tonic::include_proto! + domain re-export modules
 ├── client/
 │   ├── mod.rs         # connect_{store,scheduler,executor,admin}, get_path_nar, collect_nar_stream,
-│   │                  #   chunk_nar_for_put (lazy PutPath stream), query_path_info_opt (NotFound→None)
+│   │                  #   chunk_nar_for_put (lazy PutPath stream), query_path_info_opt (NotFound→None),
+│   │                  #   client_handshake (version negotiation, magic bytes)
 │   ├── balance.rs     # Client-side health-probe balancer (scheduler leader discovery)
 │   └── retry.rs       # Shutdown-aware connect retry with exponential backoff (cold-start loop)
 ├── interceptor.rs     # W3C traceparent inject/extract for tonic
@@ -314,7 +317,7 @@ src/
 src/
 ├── lib.rs
 ├── main.rs
-├── config.rs          # figment-layered Config: CLI/env/worker.toml + comma_vec deserialize helper
+├── config.rs          # figment-layered Config: CLI/env/builder.toml + comma_vec deserialize helper
 ├── health.rs          # HTTP /healthz + /readyz via axum (builder has no gRPC server — it's a client)
 ├── cgroup.rs          # cgroup v2 per-build subtree setup + memory.peak/cpu.stat readers
 ├── runtime.rs         # Builder runtime loop: poll scheduler → execute → report
@@ -347,26 +350,35 @@ src/
 ├── lib.rs
 ├── main.rs            # rustls CryptoProvider::install_default() + controller watch loop
 ├── bin/
-│   └── crdgen.rs      # Emit BuilderPool/BuilderPoolSet CRD YAML (serde_yml, write-only)
+│   └── crdgen.rs      # Emit BuilderPool/BuilderPoolSet/FetcherPool/ComponentScaler CRD YAML
 ├── error.rs           # ControllerError + finalizer::Error<Self> boxed recursion
 ├── fixtures.rs        # Test fixtures: fake kube::Client via tower-test mock::pair()
 ├── scaling/
-│   ├── mod.rs         # Autoscaler entry: queue-depth poll + STS replica patch
-│   ├── standalone.rs  # Single-BuilderPool autoscaler (separate field-manager, skip deletionTimestamp)
-│   ├── per_class.rs   # BuilderPoolSet per-class autoscaler (y-join across child pools)
+│   ├── mod.rs
+│   ├── component.rs   # ComponentScaler: predictive Σ(queued+running) → Deployment /scale patch
 │   └── tests.rs
 └── reconcilers/
     ├── mod.rs         # Controller::new() + error_policy + requeue intervals
     ├── gc_schedule.rs # GC cron interval loop (not a CRD reconciler) → store TriggerGC RPC
+    ├── common/
+    │   ├── mod.rs     # Shared reconcile helpers (SSA apply, ownerRef, labels)
+    │   └── pod.rs     # Pod-spec builders shared by builder/fetcher (security context, volumes)
     ├── builderpool/
-    │   ├── mod.rs     # BuilderPool reconcile: ensure STS/SVC/CM + drain finalizer
-    │   ├── builders.rs # STS/Service/ConfigMap object builders (labels, volumes, envFrom)
-    │   ├── disruption.rs # PodDisruptionBudget builder + minAvailable computation
-    │   ├── ephemeral.rs  # Ephemeral-volume sizing + StorageClass selection
-    │   └── tests/     # apply, builders, disruption
-    └── builderpoolset/
-        ├── mod.rs     # BuilderPoolSet reconcile: child BuilderPool fan-out + status aggregate
-        └── builders.rs # Child-BuilderPool spec builders (per-class overrides)
+    │   ├── mod.rs     # BuilderPool reconcile: spawn/reap Jobs + drain finalizer
+    │   ├── builders.rs   # Job/ConfigMap object builders (labels, volumes, envFrom)
+    │   ├── disruption.rs # DisruptionTarget Pod watcher → DrainExecutor{force:true}
+    │   ├── ephemeral.rs  # Static-sizing Job spawn/reap (queue-depth poll, excess-Pending reap)
+    │   ├── job_common.rs # spawn_count, reap_excess_pending, reap_orphan_running shared helpers
+    │   ├── manifest.rs   # Manifest-sizing Job spawn (per-derivation ResourceRequirements buckets)
+    │   └── tests/
+    ├── builderpoolset/
+    │   ├── mod.rs     # BuilderPoolSet reconcile: child BuilderPool fan-out + status aggregate
+    │   └── builders.rs # Child-BuilderPool spec builders (poolTemplate + per-class overrides)
+    ├── componentscaler/
+    │   └── mod.rs     # ComponentScaler reconcile: learnedRatio EMA + /scale patch
+    └── fetcherpool/
+        ├── mod.rs     # FetcherPool reconcile: per-class Job spawn (FOD-only executors)
+        └── ephemeral.rs # Per-class spawn count from GetSizeClassStatus.fod_classes
 ```
 
 ### rio-test-support — Test harness
@@ -374,12 +386,13 @@ src/
 ```
 src/
 ├── lib.rs             # TestDb re-export, TestResult alias
+├── config.rs          # Test config builders (figment-layered, env override helpers)
 ├── pg.rs              # Ephemeral PostgreSQL (initdb + postgres via PG_BIN)
 ├── wire.rs            # wire_bytes! macro, handshake/setOptions/stderr helpers
 ├── grpc.rs            # MockStore, MockScheduler, server spawn helpers
 ├── kube_mock.rs       # Fake kube::Client via tower-test mock::pair() + apiserver response helpers
 ├── metrics.rs         # In-process metrics recorder + snapshot-for-assert
-├── metrics_grep.rs    # Parse Prometheus text-format for VM-test metric assertions
+├── metrics_grep.rs    # Build-time metric-name source scanner (asserts emit-site exists for spec'd names)
 └── fixtures.rs        # test_store_path, test_drv_path, NAR builders
 ```
 
@@ -388,8 +401,10 @@ src/
 ```
 src/
 ├── lib.rs             # schema_with=any_object for k8s-openapi fields (avoid {} schema)
-├── builderpool.rs      # BuilderPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
-└── builderpoolset.rs   # BuilderPoolSet CRD spec/status (per-class child-pool fan-out)
+├── builderpool.rs     # BuilderPool CRD spec/status + #[derive(CustomResource, KubeSchema)]
+├── builderpoolset.rs  # BuilderPoolSet CRD spec/status (per-class child-pool fan-out)
+├── fetcherpool.rs     # FetcherPool CRD spec/status (FOD-only executors, open egress)
+└── componentscaler.rs # ComponentScaler CRD spec/status (predictive Deployment /scale)
 ```
 
 ### rio-cli — Operator CLI
@@ -398,8 +413,12 @@ src/
 src/
 ├── main.rs            # clap CLI entry + AdminService client wiring
 ├── cutoffs.rs         # `rio cutoffs` — size-class cutoff table (GetSizeClassStatus)
+├── estimator.rs       # `rio estimate` — duration/memory estimate for a (pname, system)
 ├── gc.rs              # `rio gc` — trigger store GC sweep (AdminService.TriggerGC, server-streaming)
 ├── logs.rs            # `rio logs` — stream build logs for a derivation (GetBuildLogs)
 ├── status.rs          # `rio status` — cluster summary + executor/build rollup
-└── wps.rs             # `rio wps get|describe` — BuilderPoolSet inspection (kube-rs, not gRPC)
+├── upstream.rs        # `rio upstream` — upstream binary-cache config inspect/probe
+├── verify_chunks.rs   # `rio verify-chunks` — sample-probe S3 chunks vs PG manifests (integrity check)
+├── workers.rs         # `rio executors` — ListExecutors table + per-executor drain
+└── wps.rs             # `rio bps get|describe` — BuilderPoolSet inspection (kube-rs, not gRPC)
 ```
