@@ -646,9 +646,9 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
 /// "unknown ceiling"; it won't compute a fraction from 0).
 ///
 /// Disk fields: statvfs on `overlay_base_dir`. This is where per-build
-/// overlay upper dirs accumulate — the relevant quota for "can this
-/// worker accept another build." Not the FUSE cache dir (that's LRU-
-/// bounded separately; see `r[builder.fuse.cache-lru]`).
+/// overlay upper dirs accumulate — the relevant quota for "is there room
+/// for build outputs." Not the FUSE cache dir (that's the input closure;
+/// emptyDir-bounded, discarded with the pod).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResourceSnapshot {
     pub cpu_fraction: f64,

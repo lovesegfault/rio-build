@@ -99,6 +99,9 @@ pub fn describe_metrics() {
          nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder \
          throughput; lower the floor."
     );
+    // TODO: no longer emitted (LRU eviction removed; ephemeral pods).
+    // Described-only until observability.md's Worker Metrics table drops
+    // the row — that file is outside this crate's ownership.
     describe_gauge!(
         "rio_builder_fuse_cache_size_bytes",
         "FUSE SSD cache usage in bytes"
@@ -130,7 +133,7 @@ pub fn describe_metrics() {
         "PrefetchHint paths skipped by the I-212 filter, by reason. \
          reason=not_input: JIT allowlist armed and path is not a declared \
          input (build can never read it). reason=size_cap: warm-gate batch \
-         (allowlist NotArmed) and QueryPathInfo.nar_size exceeds the cap — \
+         (allowlist not yet armed) and QueryPathInfo.nar_size exceeds the cap — \
          scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); \
          the build fetches it on-demand via JIT lookup if it turns out to be \
          a real input."

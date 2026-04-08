@@ -5,7 +5,6 @@
 //! assembles capability/resource data; `spawn_build_task` wraps
 //! `executor::execute_build` with ACK + CompletionReport + panic-catcher.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,17 +23,6 @@ use tracing::{Instrument, instrument};
 use crate::{executor, fuse, log_stream};
 
 use crate::cgroup::ResourceSnapshotHandle;
-
-/// Per-build cancel registration: cgroup path (for cgroup.kill) +
-/// cancelled flag (for spawn_build_task to distinguish Cancelled
-/// from InfrastructureFailure when execute_build returns Err).
-///
-/// Type alias appeases `clippy::type_complexity` for the nested
-/// `Arc<RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>>` on
-/// `BuildSpawnContext.cancel_registry`. The inner types ARE the
-/// right shape — extracting a struct for `(PathBuf, Arc<AtomicBool>)`
-/// would be more indirection for two fields read once each.
-pub type CancelRegistry = std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>;
 
 /// Generation fence: should this assignment be rejected as stale?
 ///
@@ -66,6 +54,16 @@ pub struct BuildSlot {
     /// watcher and the build-done watcher may both be parked at once
     /// (SIGTERM during the build).
     idle: Notify,
+    /// Cancel target for the running build: (cgroup path for
+    /// `cgroup.kill`, cancelled flag). Populated by `spawn_build_task`
+    /// PREDICTIVELY (before the cgroup is created); read by
+    /// [`try_cancel_build`]. The flag is the same `Arc` threaded into
+    /// `ExecutorEnv.cancelled` and the spawned task's Err-classifier.
+    ///
+    /// `Mutex` like `running`: the Cancel handler reads once;
+    /// `spawn_build_task` writes once. Cleared by `BuildSlotGuard::drop`
+    /// (same lifetime as `running`).
+    cancel: std::sync::Mutex<Option<(PathBuf, Arc<AtomicBool>)>>,
 }
 
 impl BuildSlot {
@@ -90,6 +88,11 @@ impl BuildSlot {
 
     pub fn is_busy(&self) -> bool {
         self.running().is_some()
+    }
+
+    /// Record the cancel target for the running build. See field doc.
+    pub fn set_cancel_target(&self, cgroup_path: PathBuf, cancelled: Arc<AtomicBool>) {
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some((cgroup_path, cancelled));
     }
 
     /// Park until the slot is idle. Missed-notification-safe: the
@@ -119,6 +122,7 @@ pub struct BuildSlotGuard(Arc<BuildSlot>);
 impl Drop for BuildSlotGuard {
     fn drop(&mut self) {
         *self.0.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.0.cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.0.idle.notify_waiters();
     }
 }
@@ -231,24 +235,6 @@ pub struct BuildSpawnContext {
     /// Builder or Fetcher (from `Config.executor_kind`). Threaded into
     /// each spawned task's `ExecutorEnv` for the wrong-kind gate.
     pub executor_kind: rio_proto::types::ExecutorKind,
-    /// drv_path → (cgroup path, cancel flag). Populated by
-    /// execute_build after the BuildCgroup is created; removed by
-    /// the scopeguard at the end of spawn_build_task (same lifetime
-    /// as running_builds). The Cancel handler in main.rs looks up
-    /// by drv_path, writes the cgroup.kill pseudo-file, AND sets
-    /// the flag so spawn_build_task knows to report Cancelled (not
-    /// InfrastructureFailure) when execute_build returns Err.
-    ///
-    /// The AtomicBool is the handshake: cgroup.kill SIGKILLs the
-    /// daemon → run_daemon_build sees stdout EOF → returns Err →
-    /// execute_build returns Err → WITHOUT the flag, spawn_build_
-    /// task would report InfrastructureFailure. With it: Cancelled.
-    ///
-    /// std::sync::RwLock not tokio::sync::RwLock: writes are rare
-    /// (once per build start/end, once per cancel), reads are
-    /// cancel-only. std::sync is simpler and the critical sections
-    /// are short (HashMap insert/remove/get — no await inside).
-    pub cancel_registry: Arc<CancelRegistry>,
     /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
     /// the executor can `register_inputs` (JIT allowlist) and
     /// `prefetch_manifests` (I-110c) before daemon spawn.
@@ -260,31 +246,38 @@ pub struct BuildSpawnContext {
     pub fuse_fetch_timeout: Duration,
 }
 
-/// Attempt to cancel a build by drv_path. Looks up the cgroup
-/// in the registry, writes cgroup.kill, sets the cancel flag.
+/// Attempt to cancel the running build. Checks the slot's running
+/// drv_path matches, sets the cancel flag, writes cgroup.kill.
 ///
 /// Returns `true` if the build was found and kill was attempted
 /// (kill may still fail if the cgroup was already removed — we
 /// log and consider it "cancelled anyway"). `false` if not found
-/// (build already finished, or never started).
+/// (build already finished, or the cancel is for a different drv —
+/// stale CancelSignal from a previous scheduler generation).
 ///
 /// Called from main.rs's `Msg::Cancel` handler. Fire-and-forget:
 /// the scheduler doesn't wait for confirmation (it's already
 /// transitioned the derivation to Cancelled on its side — this
 /// is just cleanup).
-pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
-    // Read lock: we only need to look up. The cgroup.kill write
-    // doesn't mutate our data structure. The AtomicBool store
-    // doesn't need a write lock either.
-    let guard = registry.read().unwrap_or_else(|e| e.into_inner());
-    let Some((cgroup_path, cancelled)) = guard.get(drv_path) else {
-        // Not found: build finished between the scheduler sending
-        // CancelSignal and us receiving it, OR it never started
-        // (assignment dropped due to permit-acquire failure). Either
-        // way: nothing to cancel.
+pub fn try_cancel_build(slot: &BuildSlot, drv_path: &str) -> bool {
+    // drv_path match: with one build per pod the slot holds 0-or-1
+    // entry; the drv_path check guards against a stale CancelSignal
+    // (scheduler restarted and re-sent for a build this pod never had).
+    if slot.running().as_deref() != Some(drv_path) {
         tracing::debug!(
             drv_path,
-            "cancel: build not in registry (finished or never started)"
+            "cancel: build not in slot (finished or never started)"
+        );
+        return false;
+    }
+    let guard = slot.cancel.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((cgroup_path, cancelled)) = guard.as_ref() else {
+        // Slot claimed but cancel target not yet set — spawn_build_task
+        // hasn't reached set_cancel_target. Same as ENOENT below: return
+        // false; the scheduler will re-send.
+        tracing::debug!(
+            drv_path,
+            "cancel: slot claimed but cancel target not yet set"
         );
         return false;
     };
@@ -468,14 +461,14 @@ pub async fn spawn_build_task(
         return; // Guard drops, no build spawned.
     }
 
-    // Register in the cancel registry. We know the cgroup path
+    // Record the cancel target on the slot. We know the cgroup path
     // deterministically: cgroup_parent/sanitize_build_id(drv_path).
     // execute_build creates this AFTER spawning the daemon (needs
-    // PID); we register PREDICTIVELY here so a Cancel arriving
-    // early still finds the entry. If Cancel arrives BEFORE the
-    // cgroup exists, cgroup.kill → ENOENT → try_cancel_build leaves
-    // the flag SET; execute_build polls it during prefetch+warm and
-    // aborts pre-daemon-spawn (I-166).
+    // PID); we record PREDICTIVELY here so a Cancel arriving early
+    // still finds it. If Cancel arrives BEFORE the cgroup exists,
+    // cgroup.kill → ENOENT → try_cancel_build leaves the flag SET;
+    // execute_build polls it during prefetch+warm and aborts
+    // pre-daemon-spawn (I-166).
     //
     // The cancelled flag: set by try_cancel_build BEFORE killing.
     // Read below in the Err arm to distinguish "cancelled" (user
@@ -485,18 +478,15 @@ pub async fn spawn_build_task(
     let cgroup_path = ctx.cgroup_parent.join(&build_id);
     let cancelled = Arc::new(AtomicBool::new(false));
     // Cloned for the resource tick sampler before moving into the
-    // cancel registry. Same deterministic path execute_build creates.
+    // slot's cancel target. Same deterministic path execute_build creates.
     let build_cgroup_path = cgroup_path.clone();
-    ctx.cancel_registry
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(drv_path.clone(), (cgroup_path, Arc::clone(&cancelled)));
+    ctx.slot
+        .set_cancel_target(cgroup_path, Arc::clone(&cancelled));
 
     // Clone state needed by spawned tasks ('static lifetime).
     let mut build_store_client = ctx.store_clients.store.clone();
     let build_tx = ctx.stream_tx.clone();
     let build_drv_path = drv_path.clone();
-    let build_cancel_registry = Arc::clone(&ctx.cancel_registry);
     let build_cancelled = cancelled;
     let build_env = executor::ExecutorEnv {
         fuse_mount_point: ctx.fuse_mount_point.clone(),
@@ -527,18 +517,8 @@ pub async fn spawn_build_task(
     let executor_future = async move {
         // Hold the slot until build completes — drop on any exit
         // (success, failure, panic, cancellation) clears slot.running
-        // and wakes wait_idle().
+        // and slot.cancel, and wakes wait_idle().
         let _slot_guard = guard;
-
-        // Remove from cancel_registry on task exit. Same lifetime as
-        // the slot guard — both track "this build is in-flight."
-        let cleanup_drv_path = build_drv_path.clone();
-        let _cancel_guard = scopeguard::guard((), move |()| {
-            build_cancel_registry
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&cleanup_drv_path);
-        });
 
         // Proactive-ema wrap: 10s memory.peak samples flow to the
         // scheduler while the build runs. execute_build is the polled
@@ -745,10 +725,10 @@ pub async fn spawn_build_task(
 }
 
 /// I-212: warm-gate size cap. PrefetchHint paths whose `nar_size`
-/// exceeds this are skipped when the JIT allowlist is `NotArmed` (i.e.,
-/// during the initial warm-gate batch, before any assignment, when the
-/// builder can't tell declared inputs from over-included sibling
-/// outputs). The scheduler's `approx_input_closure` sends ALL outputs of
+/// exceeds this are skipped when the JIT allowlist is not yet armed
+/// (i.e., during the initial warm-gate batch, before any assignment,
+/// when the builder can't tell declared inputs from over-included
+/// sibling outputs). The scheduler's `approx_input_closure` sends ALL outputs of
 /// each input drv — a 2.9 GB `clang-debug` arrives alongside the
 /// `clang-out` the build actually needs. Declared inputs the build DOES
 /// need and that exceed the cap are fetched on-demand by JIT lookup
@@ -844,7 +824,7 @@ pub fn handle_prefetch_hint(
             };
 
             // I-212 filter, BEFORE spawn_blocking: jit_classify is a
-            // cheap RwLock read; QueryPathInfo (NotArmed arm) is a
+            // cheap RwLock read; QueryPathInfo (warm-gate arm) is a
             // single async RPC. Both belong in the async half so the
             // blocking pool only sees work that's actually going to
             // fetch.
@@ -995,10 +975,10 @@ mod tests {
 
     // ---- try_cancel_build ----
 
-    /// Entry in registry + cgroup.kill file exists → kill written,
+    /// Slot running + cgroup.kill file exists → kill written,
     /// flag set, returns true.
     #[test]
-    fn cancel_build_found_in_registry() {
+    fn cancel_build_found_in_slot() {
         // Use a tmpdir as a fake cgroup. cgroup.kill is a write-
         // once pseudo-file in a real cgroup2fs; in tmpfs it's just
         // a regular file that gets the "1" written. Good enough
@@ -1008,13 +988,12 @@ mod tests {
         let cgroup_path = tmpdir.path().to_path_buf();
         let cancelled = Arc::new(AtomicBool::new(false));
 
-        let registry = std::sync::RwLock::new(HashMap::from([(
-            "/nix/store/test.drv".to_string(),
-            (cgroup_path.clone(), Arc::clone(&cancelled)),
-        )]));
+        let slot = Arc::new(BuildSlot::default());
+        let _g = slot.try_claim("/nix/store/test.drv").unwrap();
+        slot.set_cancel_target(cgroup_path.clone(), Arc::clone(&cancelled));
 
-        let found = try_cancel_build(&registry, "/nix/store/test.drv");
-        assert!(found, "entry in registry → true");
+        let found = try_cancel_build(&slot, "/nix/store/test.drv");
+        assert!(found, "running drv in slot → true");
         assert!(
             cancelled.load(std::sync::atomic::Ordering::Acquire),
             "flag set — spawn_build_task reads this to report Cancelled"
@@ -1026,14 +1005,20 @@ mod tests {
         );
     }
 
-    /// Not in registry → returns false, nothing written.
+    /// Slot idle, or running a different drv → returns false.
     #[test]
     fn cancel_build_not_found() {
-        let registry = std::sync::RwLock::new(HashMap::new());
-        let found = try_cancel_build(&registry, "/nix/store/absent.drv");
+        let slot = Arc::new(BuildSlot::default());
         assert!(
-            !found,
-            "not in registry → false (build finished or never started)"
+            !try_cancel_build(&slot, "/nix/store/absent.drv"),
+            "idle slot → false"
+        );
+
+        let _g = slot.try_claim("/nix/store/other.drv").unwrap();
+        slot.set_cancel_target(PathBuf::from("/nope"), Arc::new(AtomicBool::new(false)));
+        assert!(
+            !try_cancel_build(&slot, "/nix/store/absent.drv"),
+            "drv mismatch → false (stale CancelSignal guard)"
         );
     }
 
@@ -1059,12 +1044,12 @@ mod tests {
         // sandbox may not have cgroup v2).
         let tmp = tempfile::tempdir().unwrap();
         let fake_cgroup = tmp.path().join("not-created-yet");
-        let registry = std::sync::RwLock::new(HashMap::from([(
-            "/nix/store/test.drv".to_string(),
-            (fake_cgroup, Arc::clone(&cancelled)),
-        )]));
 
-        let got = try_cancel_build(&registry, "/nix/store/test.drv");
+        let slot = Arc::new(BuildSlot::default());
+        let _g = slot.try_claim("/nix/store/test.drv").unwrap();
+        slot.set_cancel_target(fake_cgroup, Arc::clone(&cancelled));
+
+        let got = try_cancel_build(&slot, "/nix/store/test.drv");
 
         // Kill was a no-op (ENOENT) but the cancel INTENT is recorded.
         // true: the entry was found and the flag is set; the executor's

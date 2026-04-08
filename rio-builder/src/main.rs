@@ -121,8 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up FUSE cache and mount. Arc so we can clone for the
     // prefetch handler before moving into mount_fuse_background.
-    let cache =
-        Arc::new(fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?);
+    let cache = Arc::new(fuse::cache::Cache::new(cfg.fuse_cache_dir, 0).await?);
     // Clone for prefetch. Cache methods use runtime.block_on
     // internally (sync, designed for FUSE callbacks on dedicated
     // threads). The prefetch handler will call them via
@@ -299,14 +298,6 @@ async fn main() -> anyhow::Result<()> {
         client: scheduler_client.clone(),
     });
 
-    // Cancel registry: drv_path → (cgroup path, cancelled flag).
-    // Populated by spawn_build_task after cgroup creation; the
-    // Cancel handler below looks up and writes cgroup.kill.
-    let cancel_registry = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
-        String,
-        (std::path::PathBuf, Arc<std::sync::atomic::AtomicBool>),
-    >::new()));
-
     // Shared context for spawning build tasks (clones done once per assignment
     // inside spawn_build_task, not here).
     let build_ctx = BuildSpawnContext {
@@ -326,7 +317,6 @@ async fn main() -> anyhow::Result<()> {
         max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
         executor_kind: cfg.executor_kind,
-        cancel_registry: Arc::clone(&cancel_registry),
         // I-110c: same Arc as prefetch_cache / the FUSE mount —
         // executor primes manifest hints + JIT allowlist, FUSE threads
         // consume them.
@@ -631,10 +621,7 @@ async fn main() -> anyhow::Result<()> {
                                 reason = %cancel.reason,
                                 "received cancel signal"
                             );
-                            rio_builder::runtime::try_cancel_build(
-                                &cancel_registry,
-                                &cancel.drv_path,
-                            );
+                            rio_builder::runtime::try_cancel_build(&slot, &cancel.drv_path);
                         }
                         Some(scheduler_message::Msg::Prefetch(prefetch)) => {
                             tracing::debug!(

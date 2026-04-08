@@ -80,7 +80,6 @@ pub(crate) struct Config {
     pub(crate) features: Vec<String>,
     pub(crate) fuse_mount_point: PathBuf,
     pub(crate) fuse_cache_dir: PathBuf,
-    pub(crate) fuse_cache_size_gb: u64,
     pub(crate) fuse_threads: u32,
     /// Defaults to `true`. NOT the serde bool default — see `default_true`.
     /// A drift here (`false`) would silently disable kernel passthrough,
@@ -176,7 +175,6 @@ impl Default for Config {
             // process on the machine (including the builder itself).
             fuse_mount_point: "/var/rio/fuse-store".into(),
             fuse_cache_dir: "/var/rio/cache".into(),
-            fuse_cache_size_gb: 50,
             fuse_threads: 4,
             fuse_passthrough: true,
             fuse_fetch_timeout_secs: 60,
@@ -240,11 +238,6 @@ pub(crate) struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     fuse_cache_dir: Option<PathBuf>,
-
-    /// FUSE cache size limit in GB
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_cache_size_gb: Option<u64>,
 
     /// Number of FUSE threads
     #[arg(long)]
@@ -328,7 +321,6 @@ mod tests {
         assert!(d.features.is_empty(), "features empty by default");
         assert_eq!(d.fuse_mount_point, PathBuf::from("/var/rio/fuse-store"));
         assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
-        assert_eq!(d.fuse_cache_size_gb, 50);
         assert_eq!(d.fuse_threads, 4);
         assert_eq!(
             d.fuse_fetch_timeout_secs, 60,

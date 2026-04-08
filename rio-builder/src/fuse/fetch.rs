@@ -11,10 +11,9 @@
 //!
 //! Both delegate to `fetch_extract_insert` for the actual work.
 
-use std::fs;
 use std::io;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use fuser::Errno;
@@ -781,7 +780,7 @@ fn should_fallback_to_getpath(e: &NarCollectError) -> bool {
 }
 
 /// The actual fetch: gRPC → NAR parse → extract to tmp → rename →
-/// cache.insert → evict. Shared by ensure_cached and prefetch.
+/// cache.insert. Shared by ensure_cached and prefetch.
 ///
 /// Free fn (not a method on NixStoreFs) so prefetch can call it
 /// without a NixStoreFs (which is consumed by fuser::spawn_mount2).
@@ -1181,8 +1180,7 @@ fn fetch_extract_insert_with(
     // the NAR, creating an infinite re-fetch loop under DB failure.
     // Fail loudly (EIO) so the build surfaces the real problem instead
     // of silently amplifying network traffic.
-    let size = dir_size(&local_path);
-    if let Err(e) = cache.insert(store_basename, size) {
+    if let Err(e) = cache.insert(store_basename) {
         tracing::error!(
             store_path = %store_basename,
             local_path = %local_path.display(),
@@ -1192,48 +1190,7 @@ fn fetch_extract_insert_with(
         return Err(Errno::EIO);
     }
 
-    // Evict old entries if needed (best-effort)
-    if let Err(e) = cache.evict_if_needed() {
-        tracing::warn!(error = %e, "cache eviction failed");
-    }
-
     Ok(local_path)
-}
-
-/// Recursively compute the size of a directory tree.
-///
-/// Returns 0 and logs on I/O error. A silent 0 on error means the cache
-/// index records size=0 for a large NAR — eviction never selects it (it
-/// "takes no space"), and the cache can fill past its limit. The warn!
-/// makes this visible.
-pub(super) fn dir_size(path: &Path) -> u64 {
-    match dir_size_inner(path) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "dir_size failed; recording 0 (cache accounting will drift)"
-            );
-            0
-        }
-    }
-}
-
-fn dir_size_inner(path: &Path) -> io::Result<u64> {
-    let meta = path.symlink_metadata()?;
-    if meta.is_file() {
-        return Ok(meta.len());
-    }
-    if !meta.is_dir() {
-        // symlink, fifo, etc. — 0 contribution
-        return Ok(0);
-    }
-    let mut total = 0u64;
-    for entry in fs::read_dir(path)? {
-        total += dir_size_inner(&entry?.path())?;
-    }
-    Ok(total)
 }
 
 #[cfg(test)]
@@ -1279,33 +1236,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dir_size() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        fs::write(dir.path().join("a.txt"), "hello")?;
-        fs::write(dir.path().join("b.txt"), "world!")?;
-        fs::create_dir(dir.path().join("sub"))?;
-        fs::write(dir.path().join("sub/c.txt"), "nested")?;
-
-        let size = dir_size(dir.path());
-        // 5 + 6 + 6 = 17 bytes of file content
-        assert_eq!(size, 17);
-        Ok(())
-    }
-
-    /// Symlinks contribute 0 (they're not regular files, not dirs).
-    /// Covers the `!meta.is_dir() → Ok(0)` branch.
-    #[test]
-    fn test_dir_size_symlink_contributes_zero() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        fs::write(dir.path().join("real.txt"), "hello")?; // 5 bytes
-        std::os::unix::fs::symlink("real.txt", dir.path().join("link"))?;
-
-        // 5 bytes from real.txt; link contributes 0.
-        assert_eq!(dir_size(dir.path()), 5);
-        Ok(())
-    }
-
     /// I-178: per-path JIT fetch timeout = max(base, nar_size /
     /// MIN_THROUGHPUT). A 2 GB NAR at 15 MiB/s ≈ 128 s; the base 60 s
     /// would have aborted it mid-stream → daemon ENOENT →
@@ -1337,14 +1267,6 @@ mod tests {
             i178 > base,
             "I-178's 1.9 GB input must exceed the 60 s base that poisoned it"
         );
-    }
-
-    /// Nonexistent path → 0 (logged at warn!, not panic). Covers the Err arm
-    /// in the outer dir_size wrapper.
-    #[test]
-    fn test_dir_size_nonexistent_path_returns_zero() {
-        let size = dir_size(Path::new("/nonexistent/rio-test-dir-size-xyz"));
-        assert_eq!(size, 0);
     }
 
     // ========================================================================
@@ -2162,8 +2084,6 @@ mod tests {
     /// detects the divergence, purges the row, re-fetches, and succeeds.
     /// Before the self-heal fix, this returned Ok(path-that-doesn't-exist)
     /// forever — every subsequent lookup would ENOENT in the caller's stat.
-    ///
-    // r[verify builder.fuse.cache-lru]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ensure_cached_self_heals_index_disk_divergence() {
         let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;

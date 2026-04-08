@@ -20,7 +20,7 @@ pub mod read;
 
 pub mod fetch;
 
-pub use fetch::{FetchTransport, StoreClients};
+pub use fetch::StoreClients;
 mod inode;
 mod ops;
 
