@@ -89,9 +89,7 @@ async fn test_bridge_build_events_lagged_keeps_receiver_alive() {
 /// not the RFC's intra-ms counter edge case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _actor_task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
 
     let mk_req = |tag: &str| rio_proto::types::SubmitBuildRequest {
         tenant_name: String::new(),

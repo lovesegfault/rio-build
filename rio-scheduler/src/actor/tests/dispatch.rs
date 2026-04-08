@@ -781,11 +781,7 @@ fn ca_on_ca_fixture() -> (
 ///      path, not the placeholder.
 #[tokio::test]
 async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let (child, parent, parent_aterm, placeholder, child_modular, realized_path) =
         ca_on_ca_fixture();
@@ -822,7 +818,7 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
     .bind(child_modular.as_slice())
     .bind(&realized_path)
     .bind([0u8; 32].as_slice())
-    .execute(&test_db.pool)
+    .execute(&_db.pool)
     .await?;
 
     // Clear parent's drv_content BEFORE completing child — actor
@@ -873,11 +869,7 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
 /// `fail_get_path` knob instead (closer to a real store outage).
 #[tokio::test]
 async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let (child, parent, _parent_aterm, _placeholder, child_modular, _realized_path) =
         ca_on_ca_fixture();
@@ -908,7 +900,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
     .bind(child_modular.as_slice())
     .bind(test_store_path("irrelevant"))
     .bind([0u8; 32].as_slice())
-    .execute(&test_db.pool)
+    .execute(&_db.pool)
     .await?;
 
     // Clear parent's drv_content AND make GetPath fail. Order matters:
@@ -1129,12 +1121,9 @@ async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
 /// batch). Pre-fix would be 1 + 5 = 6.
 #[tokio::test]
 async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Builder, not fetcher: FODs route to fetchers (ADR-019), so all
     // 5 defer in the drain loop — that's the I-163 hot path.
@@ -1179,12 +1168,9 @@ async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
 /// fallback.
 #[tokio::test]
 async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     let _rx = connect_executor(&handle, "i163-fo-b", "x86_64-linux").await?;
 
     let mut n = make_test_node("i163-fo-fod", "x86_64-linux");

@@ -23,11 +23,8 @@ use tokio_stream::StreamExt;
 /// stream, sends CompletionReport, verifies build completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _actor_task) = setup_actor(db.pool.clone());
-
     // Spin up in-process gRPC server (SchedulerService + ExecutorService).
-    let grpc = SchedulerGrpc::new_for_tests(handle.clone());
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
     let router = tonic::transport::Server::builder()
         .add_service(SchedulerServiceServer::new(grpc.clone()))
         .add_service(ExecutorServiceServer::new(grpc));
@@ -173,11 +170,8 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
 /// prevented by cfg(test) on new_for_tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _actor_task) = setup_actor(db.pool.clone());
-
     // In-process gRPC server. Same setup as test_build_execution_stream_end_to_end.
-    let grpc = SchedulerGrpc::new_for_tests(handle.clone());
+    let (_db, grpc, _handle, _actor_task) = setup_grpc().await;
     // Grab the ring buffers BEFORE the server moves grpc — we assert on
     // them after sending the LogBatch.
     let log_buffers = grpc.log_buffers();
@@ -292,9 +286,7 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
 /// would stall the actor event loop with no backpressure signal.
 #[tokio::test]
 async fn test_heartbeat_rejects_too_many_running_builds() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     let too_many: Vec<String> = (0..1001).map(|i| format!("/nix/store/{i}.drv")).collect();
 
@@ -337,10 +329,7 @@ async fn setup_worker_svc() -> anyhow::Result<(
     tokio::task::JoinHandle<()>, // actor guard
     TestDb,
 )> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, actor_task) = setup_actor(db.pool.clone());
-
-    let grpc = SchedulerGrpc::new_for_tests(handle.clone());
+    let (db, grpc, handle, actor_task) = setup_grpc().await;
     let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 

@@ -13,9 +13,7 @@ use rio_store::test_helpers::seed_tenant;
 /// would become a DAG primary key).
 #[tokio::test]
 async fn test_submit_build_rejects_empty_drv_hash() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_hash = String::new(); // empty!
@@ -40,9 +38,7 @@ async fn test_submit_build_rejects_empty_drv_hash() {
 /// SubmitBuild with an empty drv_path should be rejected.
 #[tokio::test]
 async fn test_submit_build_rejects_empty_drv_path() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_path = String::new(); // empty!
@@ -63,9 +59,7 @@ async fn test_submit_build_rejects_empty_drv_path() {
 /// derivation would sit in Ready forever with no feedback.
 #[tokio::test]
 async fn test_submit_build_rejects_empty_system() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.system = String::new(); // empty!
@@ -92,9 +86,7 @@ async fn test_submit_build_rejects_empty_system() {
 /// that — this is the defensive bound.
 #[tokio::test]
 async fn test_submit_build_rejects_oversized_drv_content() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     // 256 KB + 1 byte → over limit.
@@ -123,9 +115,7 @@ async fn test_submit_build_rejects_oversized_drv_content() {
 /// in Status::internal.
 #[tokio::test]
 async fn test_submit_build_rejects_invalid_priority_class() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
@@ -151,9 +141,7 @@ async fn test_submit_build_rejects_invalid_priority_class() {
 /// scheduler resolves to UUID via PG lookup.
 #[tokio::test]
 async fn test_submit_build_rejects_unknown_tenant() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+    let (_db, grpc, _handle, _task) = setup_grpc_with_pool().await;
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
@@ -182,9 +170,7 @@ async fn test_submit_build_rejects_unknown_tenant() {
 /// to the UUID and the build is submitted successfully.
 #[tokio::test]
 async fn test_submit_build_resolves_known_tenant() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
 
     // Seed the tenants table.
     let tenant_uuid = seed_tenant(&db.pool, "team-alpha").await;
@@ -238,9 +224,7 @@ async fn test_submit_build_sets_trace_id_header() {
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     // Synthesize a W3C traceparent with a known trace_id. Format:
     // 00-{32-hex trace_id}-{16-hex span_id}-{2-hex flags}. Use non-zero
@@ -295,9 +279,7 @@ async fn test_submit_build_sets_trace_id_header() {
 /// header, not a junk "invalid" string).
 #[tokio::test]
 async fn test_submit_build_no_otel_no_trace_id_header() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("no-otel-drv", "x86_64-linux")],
@@ -323,10 +305,8 @@ async fn test_submit_build_no_otel_no_trace_id_header() {
 /// This is the common case and must work even without a pool.
 #[tokio::test]
 async fn test_submit_build_empty_tenant_is_none() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
     // Intentionally pool-less to assert no PG hit for empty tenant_name.
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (db, grpc, _handle, _task) = setup_grpc().await;
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("no-tenant-drv", "x86_64-linux")],
@@ -358,9 +338,7 @@ async fn test_submit_build_empty_tenant_is_none() {
 /// rejects empty; SubmitBuild treats it as single-tenant Ok(None)).
 #[tokio::test]
 async fn test_resolve_tenant_rpc() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
 
     // Seed one tenant so we know the ground-truth UUID.
     let expected = seed_tenant(&db.pool, "team-resolve").await;
@@ -420,9 +398,7 @@ async fn test_resolve_tenant_rpc() {
 /// state (bad for the gateway).
 #[tokio::test]
 async fn test_resolve_tenant_works_on_standby() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
 
     // Flip to standby. Internal field access (same-module test).
     grpc.is_leader
@@ -447,9 +423,7 @@ async fn test_resolve_tenant_works_on_standby() {
 /// (DoS prevention: O(edges) merge loop).
 #[tokio::test]
 async fn test_submit_build_rejects_too_many_edges() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
 
     // Construct MAX_DAG_EDGES+1 edges. Content doesn't matter — rejection
     // happens before any path validation.
@@ -532,12 +506,10 @@ fn valid_request_with_claims(jti: &str) -> Request<rio_proto::types::SubmitBuild
 /// rio-store/src/nar_roundtrip.rs:85.
 #[tokio::test]
 async fn revoked_jti_rejected_by_scheduler() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    // with_pool — the revocation check NEEDS the pool. new_for_tests
+    // with_pool — the revocation check NEEDS the pool. setup_grpc()
     // (pool=None) would hit the failed_precondition branch instead,
     // testing the wrong thing.
-    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
 
     let jti = "revoked-session-abc123";
     let inserted = sqlx::query("INSERT INTO jwt_revoked (jti, reason) VALUES ($1, $2)")
@@ -578,9 +550,7 @@ async fn revoked_jti_rejected_by_scheduler() {
 /// submit_build entirely.
 #[tokio::test]
 async fn unrevoked_jti_passes_through() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
 
     // Stronger self-precondition than "don't insert": populate
     // jwt_revoked with OTHER jtis, then assert OURS isn't among
@@ -639,9 +609,7 @@ async fn unrevoked_jti_passes_through() {
 /// it — dev mode would be bricked.
 #[tokio::test]
 async fn no_claims_skips_revocation_check() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
 
     // Populate jwt_revoked so we know a stray lookup WOULD find
     // something. If the handler somehow invented a jti out of

@@ -74,10 +74,7 @@ fn test_parse_build_id_valid() {
 /// No actor interaction — the guard fires before `check_actor_alive`.
 #[tokio::test]
 async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _actor_task) = setup_actor(db.pool.clone());
-
-    let mut grpc = SchedulerGrpc::new_for_tests(handle);
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
     // Flip to standby. The test constructor defaults to true;
     // this reaches in and swaps the Arc. `Arc::new(false)` would
     // leave the original true-Arc orphaned, which is fine —

@@ -122,13 +122,10 @@ async fn test_merge_db_failure_rolls_back_memory() -> TestResult {
 /// empty-set result (everything assumed uncached).
 #[tokio::test]
 async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     store.faults.fail_find_missing.store(true, Ordering::SeqCst);
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     // Merge with expected_output_paths set so check_cached_outputs runs.
     let build_id = Uuid::new_v4();
@@ -154,13 +151,10 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
 // r[verify sched.breaker.cache-check+2]
 #[tokio::test]
 async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     store.faults.fail_find_missing.store(true, Ordering::SeqCst);
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     // Helper: merge a single-node DAG. Each call MUST use a unique tag —
     // make_test_node derives drv_hash from tag, and merging the SAME node
@@ -264,13 +258,10 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
 /// defense-in-depth.
 #[tokio::test]
 async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     store.faults.fail_find_missing.store(true, Ordering::SeqCst);
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     let mut seq = 0u32;
     let mut do_merge = |label: &str| {
@@ -321,7 +312,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
     let tripped_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM builds WHERE build_id = $1)")
             .bind(trip_id)
-            .fetch_one(&test_db.pool)
+            .fetch_one(&_db.pool)
             .await?;
     assert!(
         !tripped_exists,
@@ -331,7 +322,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
     let reject_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM builds WHERE build_id = $1)")
             .bind(reject_id)
-            .fetch_one(&test_db.pool)
+            .fetch_one(&_db.pool)
             .await?;
     assert!(
         !reject_exists,
@@ -343,7 +334,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
         "SELECT count(*)::bigint FROM build_derivations WHERE build_id = ANY($1)",
     )
     .bind(&[trip_id, reject_id][..])
-    .fetch_one(&test_db.pool)
+    .fetch_one(&_db.pool)
     .await?;
     assert_eq!(
         orphan_bd, 0,
@@ -430,11 +421,7 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
 /// realisation is filtered → the node proceeds to Ready.
 #[tokio::test]
 async fn test_ca_cache_miss_stale_realisation() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     let modular_hash = [0x55u8; 32];
     let stale_path = test_store_path("ca-gcd-out");
@@ -442,14 +429,8 @@ async fn test_ca_cache_miss_stale_realisation() -> TestResult {
     // Realisation exists (a prior build registered it), but the path is
     // NOT in MockStore.paths (GC'd). The CA cache-check should find the
     // realisation, then the store-existence verify should reject it.
-    crate::ca::insert_realisation(
-        &test_db.pool,
-        &modular_hash,
-        "out",
-        &stale_path,
-        &[0x22u8; 32],
-    )
-    .await?;
+    crate::ca::insert_realisation(&_db.pool, &modular_hash, "out", &stale_path, &[0x22u8; 32])
+        .await?;
 
     let mut node = make_test_node("ca-stale-real", "x86_64-linux");
     node.is_content_addressed = true;
@@ -486,11 +467,7 @@ async fn test_ca_cache_miss_stale_realisation() -> TestResult {
 /// → hit the (dead) origin URL.
 #[tokio::test]
 async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let fod_out = test_store_path("chromium-buildtools-source");
     store
@@ -537,11 +514,7 @@ async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
 /// proceeds to Ready and dispatches to a fetcher.
 #[tokio::test]
 async fn test_fixed_ca_fod_not_substitutable_dispatches() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     // FOD ⇒ Fetcher pool, not Builder.
     let mut fetcher_rx =
@@ -615,11 +588,7 @@ async fn test_ca_cache_miss_no_realisation() -> TestResult {
 /// never fetched them → builder ENOENT on FUSE access.
 #[tokio::test]
 async fn test_substitutable_path_is_cache_hit() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Seed: path is NOT in MockStore.paths (→ missing) but IS in
     // MockStore.substitutable (→ substitutable_paths in response).
@@ -667,11 +636,7 @@ async fn test_substitutable_path_is_cache_hit() -> TestResult {
 /// instead of being marked completed against a phantom hit.
 #[tokio::test]
 async fn test_substitutable_fetch_failure_demotes_to_miss() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let sub_path = test_store_path("fetch-fails");
     store
@@ -715,11 +680,7 @@ async fn test_substitutable_fetch_failure_demotes_to_miss() -> TestResult {
 /// substitutable. Only paths the store's HEAD probe confirmed count.
 #[tokio::test]
 async fn test_missing_non_substitutable_stays_missing() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (_store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     // No seeding: path is missing AND not substitutable.
     let mut node = make_test_node("truly-missing", "x86_64-linux");
@@ -752,11 +713,7 @@ async fn test_missing_non_substitutable_stays_missing() -> TestResult {
 /// just the root NAR, prune deps from the DAG.
 #[tokio::test]
 async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Seed: root output substitutable. Dep outputs NOT seeded (not
     // needed — top-down should never check them).
@@ -826,11 +783,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
 /// full bottom-up check. All nodes merged, deps processed normally.
 #[tokio::test]
 async fn test_topdown_root_missing_falls_through() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Seed: dep output substitutable, root NOT. Top-down sees root
     // missing → falls through → bottom-up finds glibc substitutable.
@@ -887,11 +840,7 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
 /// that actually need the dep NAR.
 #[tokio::test]
 async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let hello_out = test_store_path("hello-shared");
     let glibc_out = test_store_path("glibc-shared");
@@ -982,11 +931,7 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
 /// the dependent.
 #[tokio::test]
 async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let mut worker_rx = connect_executor(&handle, "w-gc", "x86_64-linux").await?;
 
@@ -1091,11 +1036,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
 /// including FOD sources with dead origin URLs — re-dispatched.
 #[tokio::test]
 async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let mut worker_rx = connect_executor(&handle, "w-sub", "x86_64-linux").await?;
 
@@ -1184,12 +1125,9 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
 /// to reset-to-Ready — same as if it were never substitutable.
 #[tokio::test]
 async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let mut worker_rx = connect_executor(&handle, "w-sf", "x86_64-linux").await?;
 
@@ -1262,12 +1200,9 @@ async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> T
 /// would be worse than the original bug.
 #[tokio::test]
 async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let mut worker_rx = connect_executor(&handle, "w-fo", "x86_64-linux").await?;
 
@@ -1331,11 +1266,7 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
 /// is Active waiting for a worker.
 #[tokio::test]
 async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let path = test_store_path("reprobe-ready");
     let mut node = make_test_node("reprobe-ready", "x86_64-linux");
@@ -1396,11 +1327,7 @@ async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
 /// first_dep_failed → build #2 fails fast.
 #[tokio::test]
 async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
-
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let path = test_store_path("reprobe-poison");
     let mut node = make_test_node("reprobe-poison", "x86_64-linux");

@@ -523,12 +523,9 @@ async fn test_keep_going_false_cancels_remaining() -> TestResult {
 /// attribution. upsert_path_tenants must fire.
 #[tokio::test]
 async fn test_upsert_at_merge_cache_hit() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store_with_client;
     use sha2::Digest;
 
-    let db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "cache-tenant").await;
 

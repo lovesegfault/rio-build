@@ -517,12 +517,9 @@ async fn ca_compare_no_prior_counts_as_miss() -> TestResult {
 /// Mutation check: `|_| true` → C goes Skipped too → `assert_ne` fails.
 #[tokio::test]
 async fn cascade_only_skips_verified_candidates() -> TestResult {
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, store_client, _store_h) =
-        rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let pool = test_db.pool.clone();
-    let _db = test_db;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let pool = db.pool.clone();
+    let _db = db;
 
     // Current build's modular hashes (simulate gateway's
     // populate_ca_modular_hashes).
@@ -722,11 +719,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (_store, store_client, _store_h) =
-        rio_test_support::grpc::spawn_mock_store_with_client().await?;
-    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _db = test_db;
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     let _rx = connect_executor(&handle, "sc-worker", "x86_64-linux").await?;
 

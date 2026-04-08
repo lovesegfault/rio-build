@@ -215,6 +215,31 @@ pub(crate) async fn setup_with_worker(
     Ok((db, handle, task, rx))
 }
 
+/// Bootstrap PG + [`MockStore`](rio_test_support::grpc::MockStore) +
+/// actor wired with the store client. Absorbs the `TestDb::new` →
+/// `spawn_mock_store_with_client` → `setup_actor_with_store` preamble
+/// repeated across cache-check / CA / FOD-substitution tests.
+///
+/// The actor is spawned BEFORE the caller can arm fault flags or seed
+/// store paths — that's fine: the actor only talks to the store when a
+/// command drives it (`MergeDag` / `Tick`), so callers arm
+/// `store.faults.*` or seed `store.paths` after this returns.
+///
+/// The two background task guards (store server + actor loop) are
+/// returned bundled — bind as `_tasks` to keep both alive.
+pub(crate) async fn setup_with_mock_store() -> anyhow::Result<(
+    TestDb,
+    rio_test_support::grpc::MockStore,
+    ActorHandle,
+    (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+)> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
+    Ok((db, store, handle, (store_task, actor_task)))
+}
+
 /// Overridable fields of an `ActorCommand::Heartbeat` for
 /// [`send_heartbeat_with`]. `executor_id` and `systems` are NOT here —
 /// every caller passes those explicitly. `Default` is "idle builder,

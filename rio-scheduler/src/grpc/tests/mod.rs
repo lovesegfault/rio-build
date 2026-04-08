@@ -8,8 +8,7 @@
 //!   - `bridge_tests` → `bridge_build_events` (replay + dedup)
 //!   - `guards_tests` → `actor_guards.rs` (error-map + leader-gate)
 //!
-//! No per-test helpers are shared across ≥2 clusters, so this file
-//! holds only the common `use` block. Submodules pull it in via
+//! Submodules pull the common `use` block + setup helpers in via
 //! `use super::*;` (transitive import — the P0386 pattern).
 
 use super::*;
@@ -22,6 +21,41 @@ use crate::actor::tests::{make_test_node, setup_actor};
 use rio_proto::SchedulerService;
 use rio_test_support::TestDb;
 use tonic::Request;
+
+/// Bootstrap PG + actor + pool-less [`SchedulerGrpc`]. Absorbs the
+/// `TestDb::new` → `setup_actor` → `SchedulerGrpc::new_for_tests`
+/// preamble shared by every submodule. Pool-less means WatchBuild
+/// replay and tenant resolution are unavailable — use
+/// [`setup_grpc_with_pool`] for tests that exercise those.
+///
+/// Returns the [`ActorHandle`] separately for tests that drive the
+/// actor directly alongside the gRPC surface (e.g. in-process server
+/// setups in `stream_tests`).
+pub(super) async fn setup_grpc() -> (
+    TestDb,
+    SchedulerGrpc,
+    ActorHandle,
+    tokio::task::JoinHandle<()>,
+) {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests(handle.clone());
+    (db, grpc, handle, task)
+}
+
+/// Like [`setup_grpc`] but wires the PG pool into [`SchedulerGrpc`] so
+/// WatchBuild replay / tenant resolution / jti revocation work.
+pub(super) async fn setup_grpc_with_pool() -> (
+    TestDb,
+    SchedulerGrpc,
+    ActorHandle,
+    tokio::task::JoinHandle<()>,
+) {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle.clone(), db.pool.clone());
+    (db, grpc, handle, task)
+}
 
 mod bridge_tests;
 mod guards_tests;
