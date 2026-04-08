@@ -1444,7 +1444,7 @@ mod tests {
     async fn test_prefetch_invalid_basename_enoent_no_grpc() {
         let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
         // Arm Unavailable: if we DO call GetPath, we get retry→EIO not ENOENT.
-        store.fail_get_path.store(true, Ordering::SeqCst);
+        store.faults.fail_get_path.store(true, Ordering::SeqCst);
 
         // The actual nixpkgs bootstrap placeholder. 32 `e`s — every byte
         // outside nixbase32's alphabet.
@@ -1503,7 +1503,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_prefetch_store_unavailable_returns_eio() {
         let (cache, clients, store, _dir, rt, _srv) = setup_fetch_harness().await;
-        store.fail_get_path.store(true, Ordering::SeqCst);
+        store.faults.fail_get_path.store(true, Ordering::SeqCst);
 
         let basename = test_store_basename("unavail");
         let start = std::time::Instant::now();
@@ -1544,7 +1544,7 @@ mod tests {
 
         // Store starts "down". The first attempt + RETRY_BACKOFF[0] (10ms)
         // backoff + second attempt all hit Unavailable.
-        store.fail_get_path.store(true, Ordering::SeqCst);
+        store.faults.fail_get_path.store(true, Ordering::SeqCst);
 
         let cache_cl = Arc::clone(&cache);
         let clients_cl = clients.clone();
@@ -1563,7 +1563,7 @@ mod tests {
         // least two retries land on the failing store, then "restart" it.
         // The third attempt (after 200ms backoff) sees the recovered store.
         tokio::time::sleep(RETRY_BACKOFF[0] + RETRY_BACKOFF[1] + Duration::from_millis(20)).await;
-        store.fail_get_path.store(false, Ordering::SeqCst);
+        store.faults.fail_get_path.store(false, Ordering::SeqCst);
 
         let result = task.await.expect("spawn_blocking join");
         assert!(
@@ -1590,7 +1590,7 @@ mod tests {
         let store_path = format!("/nix/store/{basename}");
         let (nar, hash) = make_nar(b"real");
         store.seed(make_path_info(&store_path, &nar, hash), nar);
-        store.get_path_garbage.store(true, Ordering::SeqCst);
+        store.faults.get_path_garbage.store(true, Ordering::SeqCst);
 
         let result = tokio::task::spawn_blocking(move || {
             prefetch_path_blocking(&cache, &clients, &rt, TEST_FETCH_TIMEOUT, &basename)
@@ -1617,7 +1617,10 @@ mod tests {
         let store_path = format!("/nix/store/{basename}");
         let (nar, hash) = make_nar(&payload);
         store.seed(make_path_info(&store_path, &nar, hash), nar);
-        store.get_path_chunk_delay_ms.store(200, Ordering::SeqCst);
+        store
+            .faults
+            .get_path_chunk_delay_ms
+            .store(200, Ordering::SeqCst);
 
         let idle = Duration::from_millis(500);
         let started = std::time::Instant::now();
@@ -1656,7 +1659,10 @@ mod tests {
         let (nar, hash) = make_nar(&vec![0xcd; 128 * 1024]);
         store.seed(make_path_info(&store_path, &nar, hash), nar);
         // 800ms gap > 300ms idle bound → first NarChunk after Info trips.
-        store.get_path_chunk_delay_ms.store(800, Ordering::SeqCst);
+        store
+            .faults
+            .get_path_chunk_delay_ms
+            .store(800, Ordering::SeqCst);
 
         let idle = Duration::from_millis(300);
         let started = std::time::Instant::now();
@@ -1777,12 +1783,12 @@ mod tests {
 
         // Fan-out: one GetChunk per manifest entry; no GetPath.
         assert_eq!(
-            store.get_chunk_calls.load(Ordering::SeqCst) as usize,
+            store.calls.get_chunk_calls.load(Ordering::SeqCst) as usize,
             chunk_refs.len(),
             "one GetChunk per chunk"
         );
         assert!(
-            store.get_path_hints.read().unwrap().is_empty(),
+            store.calls.get_path_hints.read().unwrap().is_empty(),
             "GetPath must not be called when chunk path succeeds"
         );
 
@@ -1813,7 +1819,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fetch_via_chunks_unimplemented_falls_back_to_getpath() {
         let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
-        store.get_chunk_unimplemented.store(true, Ordering::SeqCst);
+        store
+            .faults
+            .get_chunk_unimplemented
+            .store(true, Ordering::SeqCst);
 
         let basename = test_store_basename("chunk-fallback");
         let store_path = format!("/nix/store/{basename}");
@@ -1857,11 +1866,11 @@ mod tests {
         let content = std::fs::read(dir.path().join(&basename)).expect("read extracted");
         assert_eq!(content, b"fallback-body");
         assert!(
-            store.get_chunk_calls.load(Ordering::SeqCst) >= 1,
+            store.calls.get_chunk_calls.load(Ordering::SeqCst) >= 1,
             "chunk path was attempted"
         );
         assert_eq!(
-            store.get_path_hints.read().unwrap().len(),
+            store.calls.get_path_hints.read().unwrap().len(),
             1,
             "GetPath fallback fired exactly once"
         );
@@ -1925,7 +1934,10 @@ mod tests {
         let store_path = format!("/nix/store/{basename}");
         let (nar, hash) = make_nar(b"slow-payload");
         store.seed(make_path_info(&store_path, &nar, hash), nar);
-        store.get_path_gate_armed.store(true, Ordering::SeqCst);
+        store
+            .faults
+            .get_path_gate_armed
+            .store(true, Ordering::SeqCst);
 
         // N=5 concurrent ensure_cached. One wins Fetch, four get WaitFor.
         // fuse_threads=N → permits = N-1 = 4 ≥ 1 fetcher, so the semaphore
@@ -1946,7 +1958,7 @@ mod tests {
         tokio::time::sleep(WAIT_SLICE * 2 + std::time::Duration::from_millis(100)).await;
 
         // Release the fetcher.
-        store.get_path_gate.notify_waiters();
+        store.faults.get_path_gate.notify_waiters();
 
         // All N must succeed with the same path. Zero EAGAIN.
         let mut paths = Vec::with_capacity(N);

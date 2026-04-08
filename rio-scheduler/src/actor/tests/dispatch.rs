@@ -915,6 +915,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
     let cleared = handle.debug_clear_drv_content("ca-parent").await?;
     assert!(cleared);
     store
+        .faults
         .fail_get_path
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -1153,14 +1154,14 @@ async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
     // RPC). Reset the baseline; the assertion is on the NEXT
     // dispatch_ready in isolation.
     barrier(&handle).await;
-    store.find_missing_calls.store(0, Ordering::SeqCst);
+    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
 
     // Drive one dispatch_ready: Heartbeat (dirty) + Tick (drain).
     // send_heartbeat already chains the Tick.
     send_heartbeat(&handle, "i163-builder", "x86_64-linux").await?;
     barrier(&handle).await;
 
-    let calls = store.find_missing_calls.load(Ordering::SeqCst);
+    let calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
     assert_eq!(
         calls, 1,
         "one dispatch_ready over 5 deferred FODs must issue exactly the batch \
@@ -1191,8 +1192,8 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
     barrier(&handle).await;
 
-    store.fail_find_missing.store(true, Ordering::SeqCst);
-    store.find_missing_calls.store(0, Ordering::SeqCst);
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
+    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
 
     send_heartbeat(&handle, "i163-fo-b", "x86_64-linux").await?;
     barrier(&handle).await;
@@ -1200,7 +1201,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     // Batch (1, fails) + per-FOD fallback (1). Both count — the
     // counter increments before the fail-injection bail. Exactly 2
     // proves the fallback still runs when the batch returns empty.
-    assert_eq!(store.find_missing_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(store.calls.find_missing_calls.load(Ordering::SeqCst), 2);
     Ok(())
 }
 

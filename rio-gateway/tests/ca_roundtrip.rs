@@ -82,7 +82,7 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
     // not just the wire parse). Gateway parsed JSON → gRPC → store.
     let drv_hash_bytes = hex::decode(&drv_hash_hex)?;
     {
-        let realisations = sess.store.realisations.read().unwrap();
+        let realisations = sess.store.state.realisations.read().unwrap();
         let stored = realisations
             .get(&(drv_hash_bytes.clone(), "out".into()))
             .expect("realisation should be stored via gRPC");

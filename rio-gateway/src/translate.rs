@@ -1469,6 +1469,7 @@ mod tests {
 
         // Inject query_path_info failure.
         store
+            .faults
             .fail_query_path_info
             .store(true, std::sync::atomic::Ordering::SeqCst);
 

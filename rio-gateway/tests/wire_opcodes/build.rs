@@ -1921,7 +1921,7 @@ async fn over_quota_sends_stderr_error() -> anyhow::Result<()> {
 
     // Seed MockStore: 200 MiB used, 100 MiB limit → Over. The mock's
     // TenantQuota RPC reads this map directly.
-    h.store.tenant_quotas.write().unwrap().insert(
+    h.store.state.tenant_quotas.write().unwrap().insert(
         "team-quota".to_string(),
         (200 * 1024 * 1024, Some(100 * 1024 * 1024)),
     );
@@ -1984,6 +1984,7 @@ async fn under_quota_passes_through() -> anyhow::Result<()> {
 
     // 50 used, 100 limit → Under.
     h.store
+        .state
         .tenant_quotas
         .write()
         .unwrap()

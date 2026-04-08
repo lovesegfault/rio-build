@@ -127,7 +127,7 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
 
     let test_db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    store.fail_find_missing.store(true, Ordering::SeqCst);
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     // Merge with expected_output_paths set so check_cached_outputs runs.
@@ -158,7 +158,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
 
     let test_db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    store.fail_find_missing.store(true, Ordering::SeqCst);
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     // Helper: merge a single-node DAG. Each call MUST use a unique tag —
@@ -229,7 +229,10 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
     );
 
     // === Store recovers ===
-    store.fail_find_missing.store(false, Ordering::SeqCst);
+    store
+        .faults
+        .fail_find_missing
+        .store(false, Ordering::SeqCst);
 
     // Merge 7: half-open probe succeeds. record_success() closes the breaker.
     // The merge proceeds normally (empty cache-hit set because nothing's
@@ -265,7 +268,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
 
     let test_db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
-    store.fail_find_missing.store(true, Ordering::SeqCst);
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     let mut seq = 0u32;
@@ -489,7 +492,12 @@ async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     let fod_out = test_store_path("chromium-buildtools-source");
-    store.substitutable.write().unwrap().push(fod_out.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(fod_out.clone());
 
     // Production shape: FOD ⇒ is_content_addressed + 32-byte modular
     // hash + known expected_output_path. NO realisation row in PG.
@@ -513,7 +521,7 @@ async fn test_fixed_ca_fod_substitutable_is_cache_hit() -> TestResult {
     );
     assert_eq!(status.cached_derivations, 1);
 
-    let qpi = store.qpi_calls.read().unwrap();
+    let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
         qpi.contains(&fod_out),
         "path-based lane should eager-fetch substitutable FOD output; \
@@ -615,7 +623,12 @@ async fn test_substitutable_path_is_cache_hit() -> TestResult {
     // Seed: path is NOT in MockStore.paths (→ missing) but IS in
     // MockStore.substitutable (→ substitutable_paths in response).
     let sub_path = test_store_path("hello-2.12.3");
-    store.substitutable.write().unwrap().push(sub_path.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(sub_path.clone());
 
     let mut node = make_test_node("sub-probe", "x86_64-linux");
     node.expected_output_paths = vec![sub_path.clone()];
@@ -637,7 +650,7 @@ async fn test_substitutable_path_is_cache_hit() -> TestResult {
 
     // Eager fetch: scheduler MUST have fired QueryPathInfo for the
     // substitutable path. MockStore records every QPI call.
-    let qpi = store.qpi_calls.read().unwrap();
+    let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
         qpi.contains(&sub_path),
         "scheduler should eager-fetch substitutable path via QueryPathInfo; \
@@ -660,10 +673,16 @@ async fn test_substitutable_fetch_failure_demotes_to_miss() -> TestResult {
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     let sub_path = test_store_path("fetch-fails");
-    store.substitutable.write().unwrap().push(sub_path.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(sub_path.clone());
     // Inject QPI failure: FindMissingPaths reports substitutable, but
     // the eager fetch errors → path must drop from the cache-hit set.
     store
+        .faults
         .fail_query_path_info
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -741,7 +760,12 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     // Seed: root output substitutable. Dep outputs NOT seeded (not
     // needed — top-down should never check them).
     let root_out = test_store_path("hello-2.12.3");
-    store.substitutable.write().unwrap().push(root_out.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
 
     // DAG: hello (root) → glibc, gcc, stdenv (deps).
     let mut root = make_test_node("hello", "x86_64-linux");
@@ -774,7 +798,7 @@ async fn test_topdown_root_substitutable_prunes_deps() -> TestResult {
     );
 
     // ONLY the root fetched. Deps never queried.
-    let qpi = store.qpi_calls.read().unwrap();
+    let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
         qpi.contains(&root_out),
         "root NAR should be eager-fetched; qpi_calls={qpi:?}"
@@ -810,7 +834,12 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     // Seed: dep output substitutable, root NOT. Top-down sees root
     // missing → falls through → bottom-up finds glibc substitutable.
     let glibc_out = test_store_path("glibc-fallthru");
-    store.substitutable.write().unwrap().push(glibc_out.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(glibc_out.clone());
 
     let mut root = make_test_node("app", "x86_64-linux");
     root.expected_output_paths = vec![test_store_path("app-out")];
@@ -839,7 +868,7 @@ async fn test_topdown_root_missing_falls_through() -> TestResult {
     );
 
     // Bottom-up still fires: glibc fetched via check_cached_outputs.
-    let qpi = store.qpi_calls.read().unwrap();
+    let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
         qpi.contains(&glibc_out),
         "bottom-up should fetch substitutable dep on fall-through; qpi_calls={qpi:?}"
@@ -865,8 +894,18 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
 
     let hello_out = test_store_path("hello-shared");
     let glibc_out = test_store_path("glibc-shared");
-    store.substitutable.write().unwrap().push(hello_out.clone());
-    store.substitutable.write().unwrap().push(glibc_out.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(hello_out.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(glibc_out.clone());
 
     // Build A: hello → glibc. hello substitutable → glibc pruned.
     let mut hello = make_test_node("hello-a", "x86_64-linux");
@@ -892,7 +931,7 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
     );
 
     // Clear QPI tracking between builds.
-    store.qpi_calls.write().unwrap().clear();
+    store.calls.qpi_calls.write().unwrap().clear();
 
     // Build B: app → glibc. app NOT substitutable → falls through
     // → full merge → glibc is newly_inserted (NOT pre-existing from
@@ -915,7 +954,7 @@ async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
 
     // glibc fetched by Build B's bottom-up — proves it wasn't
     // stuck as phantom-Completed from Build A's prune.
-    let qpi = store.qpi_calls.read().unwrap();
+    let qpi = store.calls.qpi_calls.read().unwrap();
     assert!(
         qpi.contains(&glibc_out),
         "Build B should fetch glibc (pruned from A, newly-inserted in B); \
@@ -987,7 +1026,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     let _assn_app_a = recv_assignment(&mut worker_rx).await;
 
     // === GC: delete fod-dep's output from the store ===
-    let removed = store.paths.write().unwrap().remove(&fod_out);
+    let removed = store.state.paths.write().unwrap().remove(&fod_out);
     assert!(removed.is_some(), "GC sim: fod_out should have been seeded");
 
     // Third worker so fod-dep can re-dispatch while w-gc-appa is
@@ -1085,8 +1124,13 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
     let _assn_app_a = recv_assignment(&mut worker_appa).await;
 
     // GC removes the output from rio-store, BUT cache.nixos.org has it.
-    store.paths.write().unwrap().remove(&fod_out);
-    store.substitutable.write().unwrap().push(fod_out.clone());
+    store.state.paths.write().unwrap().remove(&fod_out);
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(fod_out.clone());
 
     // Spare worker — should stay IDLE because fod-dep doesn't reset.
     let mut worker_spare = connect_executor(&handle, "w-sub-spare", "x86_64-linux").await?;
@@ -1106,7 +1150,7 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
     barrier(&handle).await;
 
     // Eager-fetch fired: QueryPathInfo called for fod_out.
-    let qpi = store.qpi_calls.read().unwrap().clone();
+    let qpi = store.calls.qpi_calls.read().unwrap().clone();
     assert!(
         qpi.contains(&fod_out),
         "stale-completed verify should eager-fetch the substitutable output; \
@@ -1170,9 +1214,17 @@ async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> T
     let _assn_app_a = recv_assignment(&mut worker_appa).await;
 
     // GC; substitutable; but QPI is broken → eager-fetch fails.
-    store.paths.write().unwrap().remove(&fod_out);
-    store.substitutable.write().unwrap().push(fod_out.clone());
-    store.fail_query_path_info.store(true, Ordering::SeqCst);
+    store.state.paths.write().unwrap().remove(&fod_out);
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(fod_out.clone());
+    store
+        .faults
+        .fail_query_path_info
+        .store(true, Ordering::SeqCst);
 
     let mut worker_spare = connect_executor(&handle, "w-sf-spare", "x86_64-linux").await?;
 
@@ -1238,7 +1290,7 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
     let _assn_app_a = recv_assignment(&mut worker_rx).await;
 
     // Store goes unreachable. The verify's FindMissingPaths will fail.
-    store.fail_find_missing.store(true, Ordering::SeqCst);
+    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
 
     let build_b = Uuid::new_v4();
     merge_dag(
@@ -1303,7 +1355,12 @@ async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
     );
 
     // Upstream cache now has the path.
-    store.substitutable.write().unwrap().push(path.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(path.clone());
 
     // Build #2: re-probe should find A in upstream → Completed.
     let build2 = Uuid::new_v4();
@@ -1379,7 +1436,12 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
     );
 
     // Upstream cache now has the path.
-    store.substitutable.write().unwrap().push(path.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(path.clone());
 
     // Build #2: re-probe should find A in upstream → unpoisoned + Completed.
     let build2 = Uuid::new_v4();

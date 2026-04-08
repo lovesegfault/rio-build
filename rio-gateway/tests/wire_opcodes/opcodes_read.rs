@@ -324,7 +324,7 @@ async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
     let out_path_wire = "11111111111111111111111111111111-ca-hit";
 
     // Seed MockStore's realisations map directly.
-    h.store.realisations.write().unwrap().insert(
+    h.store.state.realisations.write().unwrap().insert(
         (drv_hash.clone(), "out".into()),
         rio_proto::types::Realisation {
             drv_hash,
@@ -453,6 +453,7 @@ async fn test_query_missing_reports_will_substitute() -> anyhow::Result<()> {
     // Upstream has sub_out. The handler should query FindMissingPaths
     // with [sub_out, build_out] — NOT [sub_drv, build_drv].
     h.store
+        .state
         .substitutable
         .write()
         .unwrap()

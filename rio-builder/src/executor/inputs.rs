@@ -696,6 +696,7 @@ mod tests {
         seed_with_refs(&store, &p, &[]);
         // Inject Unavailable on query_path_info.
         store
+            .faults
             .fail_query_path_info
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -801,14 +802,14 @@ mod tests {
         let closure = compute_input_closure(&client, &drv, &p_drv, &srcs_of(&drv)).await?;
         assert_eq!(closure.len(), 4);
 
-        let batch_calls = store.batch_qpi_calls.load(Ordering::SeqCst);
+        let batch_calls = store.calls.batch_qpi_calls.load(Ordering::SeqCst);
         assert!(
             (1..=4).contains(&batch_calls),
             "one batch RPC per BFS layer (got {batch_calls}); \
              pre-I-110 would be 0 batch + 4 per-path"
         );
         assert!(
-            store.qpi_calls.read().unwrap().is_empty(),
+            store.calls.qpi_calls.read().unwrap().is_empty(),
             "per-path QueryPathInfo should NOT be called when batch is available"
         );
         Ok(())
@@ -831,7 +832,7 @@ mod tests {
         prefetch_manifests(&client, &cache, &[p_a.clone(), p_b.clone()]).await;
 
         assert_eq!(
-            store.batch_manifest_calls.load(Ordering::SeqCst),
+            store.calls.batch_manifest_calls.load(Ordering::SeqCst),
             1,
             "one BatchGetManifest for the whole closure"
         );

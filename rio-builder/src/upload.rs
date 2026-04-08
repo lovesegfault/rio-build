@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(result.nar_size, expected_nar.len() as u64);
 
         // MockStore should have recorded exactly one PutPath call.
-        let puts = store.put_calls.read().unwrap();
+        let puts = store.calls.put_calls.read().unwrap();
         assert_eq!(puts.len(), 1);
         assert_eq!(puts[0].store_path, format!("/nix/store/{basename}"));
         Ok(())
@@ -1117,7 +1117,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_retries_then_succeeds() -> anyhow::Result<()> {
         let (store, mut client) = spawn_mock_store_inproc().await?;
-        store.fail_next_puts.store(2, Ordering::SeqCst);
+        store.faults.fail_next_puts.store(2, Ordering::SeqCst);
         let basename = test_store_basename("retry");
         let (_tmp, store_dir) = make_output_file(&basename, b"retry me")?;
 
@@ -1127,9 +1127,9 @@ mod tests {
 
         assert_eq!(result.store_path, format!("/nix/store/{basename}"));
         // Only the successful attempt records the put.
-        assert_eq!(store.put_calls.read().unwrap().len(), 1);
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 1);
         // All injected failures should have been consumed.
-        assert_eq!(store.fail_next_puts.load(Ordering::SeqCst), 0);
+        assert_eq!(store.faults.fail_next_puts.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -1138,6 +1138,7 @@ mod tests {
     async fn test_upload_output_exhausts_retries() -> anyhow::Result<()> {
         let (store, mut client) = spawn_mock_store_inproc().await?;
         store
+            .faults
             .fail_next_puts
             .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
         let basename = test_store_basename("exhaust");
@@ -1152,7 +1153,7 @@ mod tests {
             "expected UploadExhausted, got {err:?}"
         );
         // No successful PutPath recorded.
-        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
     }
 
@@ -1163,7 +1164,10 @@ mod tests {
     async fn test_upload_output_adopts_concurrent_uploader_result() -> anyhow::Result<()> {
         let (store, mut client) = spawn_mock_store_inproc().await?;
         // Every PutPath attempt aborts — proves we never re-upload.
-        store.abort_next_puts.store(u32::MAX, Ordering::SeqCst);
+        store
+            .faults
+            .abort_next_puts
+            .store(u32::MAX, Ordering::SeqCst);
 
         let basename = test_store_basename("adopt");
         let store_path = format!("/nix/store/{basename}");
@@ -1186,10 +1190,11 @@ mod tests {
         assert_eq!(result.nar_hash, nar_hash);
         assert_eq!(result.nar_size, nar.len() as u64);
         // No successful PutPath landed (all attempts aborted).
-        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         // QueryPathInfo was polled.
         assert!(
             store
+                .calls
                 .qpi_calls
                 .read()
                 .unwrap()
@@ -1207,7 +1212,7 @@ mod tests {
     async fn test_upload_output_retries_after_concurrent_put_clears() -> anyhow::Result<()> {
         let (store, mut client) = spawn_mock_store_inproc().await?;
         // First PutPath aborts; second succeeds (lock released).
-        store.abort_next_puts.store(1, Ordering::SeqCst);
+        store.faults.abort_next_puts.store(1, Ordering::SeqCst);
 
         let basename = test_store_basename("clears");
         let (_tmp, store_dir) = make_output_file(&basename, b"clears eventually")?;
@@ -1218,10 +1223,10 @@ mod tests {
 
         assert_eq!(result.store_path, format!("/nix/store/{basename}"));
         // Second attempt landed.
-        assert_eq!(store.put_calls.read().unwrap().len(), 1);
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 1);
         // Polled CONCURRENT_PUT_POLL_ATTEMPTS times, all NotFound.
         assert_eq!(
-            store.qpi_calls.read().unwrap().len(),
+            store.calls.qpi_calls.read().unwrap().len(),
             CONCURRENT_PUT_POLL_ATTEMPTS as usize
         );
         Ok(())
@@ -1272,7 +1277,7 @@ mod tests {
         assert!(paths.contains(&format!("/nix/store/{b1}")));
         assert!(paths.contains(&format!("/nix/store/{b2}")));
         assert!(paths.contains(&format!("/nix/store/{b3}")));
-        assert_eq!(store.put_calls.read().unwrap().len(), 3);
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 3);
         Ok(())
     }
 
@@ -1359,7 +1364,7 @@ mod tests {
         let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
         assert_eq!(result.nar_hash, expected_hash, "worker's hash");
 
-        let puts = store.put_calls.read().unwrap();
+        let puts = store.calls.put_calls.read().unwrap();
         assert_eq!(puts.len(), 1);
         assert_eq!(
             puts[0].nar_hash,
@@ -1419,7 +1424,7 @@ mod tests {
 
         // MockStore recorded the PathInfo WITH references + deriver. This is
         // the actual fix — pre-fix, both were always empty (upload.rs:223-224).
-        let puts = store.put_calls.read().unwrap();
+        let puts = store.calls.put_calls.read().unwrap();
         assert_eq!(puts.len(), 1);
         assert_eq!(
             puts[0].references,
@@ -1449,7 +1454,7 @@ mod tests {
             upload_output(&mut client, &store_dir, &basename, "", &deriver, candidates).await?;
 
         assert!(result.references.is_empty(), "no refs in output contents");
-        let puts = store.put_calls.read().unwrap();
+        let puts = store.calls.put_calls.read().unwrap();
         assert!(puts[0].references.is_empty());
         assert_eq!(
             puts[0].deriver, deriver,
@@ -1504,7 +1509,7 @@ mod tests {
         assert_eq!(refs(r2), vec![dep_b], "out2 refs itself only");
 
         // All MockStore PathInfos carry the deriver.
-        let puts = store.put_calls.read().unwrap();
+        let puts = store.calls.put_calls.read().unwrap();
         assert_eq!(puts.len(), 2);
         for p in puts.iter() {
             assert_eq!(p.deriver, deriver);
@@ -1593,7 +1598,7 @@ mod tests {
 
         // Zero PutPath calls — the skip fired.
         assert_eq!(
-            store.put_calls.read().unwrap().len(),
+            store.calls.put_calls.read().unwrap().len(),
             0,
             "pre-check should skip already-present path; zero PutPath calls"
         );
@@ -1629,7 +1634,7 @@ mod tests {
         let results = upload_all_outputs(&client, &store_dir, "", "", &[]).await?;
 
         // Exactly one PutPath: the missing output.
-        let puts = store.put_calls.read().unwrap();
+        let puts = store.calls.put_calls.read().unwrap();
         assert_eq!(puts.len(), 1, "only the missing output hits PutPath");
         assert_eq!(puts[0].store_path, path_missing);
 
@@ -1659,7 +1664,7 @@ mod tests {
     #[tokio::test]
     async fn test_upload_all_outputs_find_missing_error_falls_back() -> anyhow::Result<()> {
         let (store, client, _h) = spawn_mock_store_with_client().await?;
-        store.fail_find_missing.store(true, Ordering::SeqCst);
+        store.faults.fail_find_missing.store(true, Ordering::SeqCst);
 
         let basename = format!("{DEP_HASH_A}-fallback");
         let store_path = format!("/nix/store/{basename}");
@@ -1679,7 +1684,7 @@ mod tests {
         // it happily overwrites. Real store would no-op. We're testing
         // the WORKER's fail-open, not the store's idempotency.)
         assert_eq!(
-            store.put_calls.read().unwrap().len(),
+            store.calls.put_calls.read().unwrap().len(),
             1,
             "FindMissingPaths error → fall back to upload (fail-open)"
         );
@@ -1702,7 +1707,7 @@ mod tests {
         // Arm the failure: if FindMissingPaths were called, the test
         // would still pass (fail-open), but the empty check should
         // short-circuit BEFORE the RPC.
-        store.fail_find_missing.store(true, Ordering::SeqCst);
+        store.faults.fail_find_missing.store(true, Ordering::SeqCst);
         // MockStore doesn't expose call-count for find_missing_paths.
         // Just assert empty result + zero PutPath. The is_empty() guard
         // is simple enough that existence-in-code is the real assurance.
@@ -1712,7 +1717,7 @@ mod tests {
         let results =
             upload_all_outputs(&client, &tmp.path().join("nonexistent"), "", "", &[]).await?;
         assert!(results.is_empty());
-        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        assert_eq!(store.calls.put_calls.read().unwrap().len(), 0);
         Ok(())
     }
 }

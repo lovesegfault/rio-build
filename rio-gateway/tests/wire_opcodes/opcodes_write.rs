@@ -38,7 +38,7 @@ async fn test_add_to_store_nar_accepts_valid() -> anyhow::Result<()> {
     // AddToStoreNar has no result data after STDERR_LAST.
 
     // Verify the mock store received the PutPath call.
-    let calls = h.store.put_calls.read().unwrap().clone();
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 1, "store should receive one PutPath call");
     assert_eq!(calls[0].store_path, TEST_PATH_A);
     assert_eq!(calls[0].nar_hash, hash.to_vec());
@@ -80,7 +80,7 @@ async fn test_add_to_store_nar_passes_declared_hash() -> anyhow::Result<()> {
     drain_stderr_until_last(&mut h.stream).await?;
 
     // Verify the declared hash was passed to the store unchanged.
-    let calls = h.store.put_calls.read().unwrap().clone();
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(
         calls[0].nar_hash,
@@ -146,7 +146,7 @@ async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
 
     drain_stderr_until_last(&mut h.stream).await?;
 
-    let calls = h.store.put_calls.read().unwrap().clone();
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 2, "store should receive 2 PutPath calls");
     let paths: Vec<&str> = calls.iter().map(|c| c.store_path.as_str()).collect();
     assert!(paths.contains(&TEST_PATH_A));
@@ -169,6 +169,7 @@ async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
 async fn test_add_multiple_retries_store_aborted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.store
+        .faults
         .abort_next_puts
         .store(2, std::sync::atomic::Ordering::SeqCst);
 
@@ -195,7 +196,7 @@ async fn test_add_multiple_retries_store_aborted() -> anyhow::Result<()> {
 
     drain_stderr_until_last(&mut h.stream).await?;
 
-    let calls = h.store.put_calls.read().unwrap().clone();
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
     assert_eq!(
         calls.len(),
         1,
@@ -204,6 +205,7 @@ async fn test_add_multiple_retries_store_aborted() -> anyhow::Result<()> {
     assert_eq!(calls[0].store_path, TEST_PATH_A);
     assert_eq!(
         h.store
+            .faults
             .abort_next_puts
             .load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -222,6 +224,7 @@ async fn test_add_multiple_aborted_exhausts_budget() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     // Well over PUT_PATH_ABORTED_MAX_ATTEMPTS — every attempt aborts.
     h.store
+        .faults
         .abort_next_puts
         .store(100, std::sync::atomic::Ordering::SeqCst);
 
@@ -252,7 +255,7 @@ async fn test_add_multiple_aborted_exhausts_budget() -> anyhow::Result<()> {
         "client should see the store's Aborted message, got: {err:?}"
     );
     assert!(
-        h.store.put_calls.read().unwrap().is_empty(),
+        h.store.calls.put_calls.read().unwrap().is_empty(),
         "no attempt should have reached the store's success path"
     );
 
@@ -351,7 +354,7 @@ async fn test_add_multiple_to_store_mixed_drv_and_streaming() -> anyhow::Result<
 
     drain_stderr_until_last(&mut h.stream).await?;
 
-    let calls = h.store.put_calls.read().unwrap().clone();
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 2, "both entries should reach the store");
     let paths: Vec<&str> = calls.iter().map(|c| c.store_path.as_str()).collect();
     assert!(
@@ -411,7 +414,7 @@ async fn test_add_multiple_to_store_trailing_data() -> anyhow::Result<()> {
 
     // The one valid entry SHOULD have been uploaded before the trailing-data
     // check (streaming processes entries as they arrive).
-    assert_eq!(h.store.put_calls.read().unwrap().len(), 1);
+    assert_eq!(h.store.calls.put_calls.read().unwrap().len(), 1);
     Ok(())
 }
 
@@ -438,6 +441,7 @@ async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()>
     // Verify MockStore actually recorded the sigs (not just the wire parse).
     let stored_sigs = h
         .store
+        .state
         .paths
         .read()
         .unwrap()
@@ -506,7 +510,14 @@ async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
     // Verify MockStore recorded it (not just the wire parse).
     let drv_hash = hex::decode(&drv_hash_hex)?;
     let key = (drv_hash, "out".to_string());
-    let stored = h.store.realisations.read().unwrap().get(&key).cloned();
+    let stored = h
+        .store
+        .state
+        .realisations
+        .read()
+        .unwrap()
+        .get(&key)
+        .cloned();
     let stored = stored.expect("MockStore should have the realisation");
     // Sent basename, MockStore got full path — gateway's prepend is working.
     assert_eq!(
@@ -533,7 +544,7 @@ async fn test_register_drv_output_malformed_json_soft_fails() -> anyhow::Result<
     // STDERR_LAST, no error. Session continues.
     drain_stderr_until_last(&mut h.stream).await?;
     assert!(
-        h.store.realisations.read().unwrap().is_empty(),
+        h.store.state.realisations.read().unwrap().is_empty(),
         "malformed JSON should not reach MockStore"
     );
 
@@ -554,7 +565,7 @@ async fn test_register_drv_output_malformed_id_soft_fails() -> anyhow::Result<()
     );
 
     drain_stderr_until_last(&mut h.stream).await?;
-    assert!(h.store.realisations.read().unwrap().is_empty());
+    assert!(h.store.state.realisations.read().unwrap().is_empty());
 
     h.finish().await;
     Ok(())
@@ -579,7 +590,7 @@ async fn test_add_text_to_store() -> anyhow::Result<()> {
     );
 
     // Verify store received the upload.
-    let calls = h.store.put_calls.read().unwrap().clone();
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].store_path, path);
 
@@ -625,7 +636,7 @@ async fn test_add_to_store_text_method() -> anyhow::Result<()> {
     );
 
     // Verify store received the upload at the computed path.
-    let calls = h.store.put_calls.read().unwrap().clone();
+    let calls = h.store.calls.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].store_path, path);
 
