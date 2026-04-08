@@ -72,58 +72,20 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
     jwt_token: Option<&str>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
-    let path_str = wire::read_string(reader).await?;
-    let deriver_str = wire::read_string(reader).await?;
-    let nar_hash_str = wire::read_string(reader).await?;
-    let references = wire::read_strings(reader).await?;
-    let registration_time = wire::read_u64(reader).await?;
-    let nar_size = wire::read_u64(reader).await?;
-    let ultimate = wire::read_bool(reader).await?;
-    let sigs = wire::read_strings(reader).await?;
-    let ca_str = wire::read_string(reader).await?;
+    let EntryHead {
+        path,
+        path_str,
+        info,
+        nar_size,
+        nar_hash_bytes,
+    } = match read_entry_head(reader).await {
+        Ok(h) => h,
+        Err(e) => stderr_err!(stderr, "wopAddToStoreNar: {e}"),
+    };
     let _repair = wire::read_bool(reader).await?;
     let _dont_check_sigs = wire::read_bool(reader).await?;
     tracing::Span::current().record("path", path_str.as_str());
-
-    debug!(path = %path_str, nar_size = nar_size, "wopAddToStoreNar");
-
-    if nar_size > rio_common::limits::MAX_NAR_SIZE {
-        stderr_err!(stderr, "nar_size {nar_size} exceeds maximum for {path_str}");
-    }
-
-    let path = match StorePath::parse(&path_str) {
-        Ok(p) => p,
-        Err(e) => stderr_err!(stderr, "invalid store path '{path_str}': {e}"),
-    };
-
-    let nar_hash_bytes = match hex::decode(&nar_hash_str) {
-        Ok(b) => b,
-        Err(e) => stderr_err!(stderr, "invalid narHash hex '{nar_hash_str}': {e}"),
-    };
-
-    // Build raw PathInfo and validate via TryFrom. This catches:
-    //   - bad reference paths (wire gives us unvalidated strings)
-    //   - nar_hash wrong length (hex-decode succeeded but result isn't 32 bytes)
-    // We already parsed `path` above (it's a valid StorePath), so the
-    // store_path field can't fail — we pass the string form and re-parse
-    // inside TryFrom for code uniformity rather than constructing
-    // ValidatedPathInfo piecewise here.
-    let raw_info = types::PathInfo {
-        store_path: path_str.clone(),
-        store_path_hash: Vec::new(),
-        deriver: deriver_str,
-        nar_hash: nar_hash_bytes.clone(),
-        nar_size,
-        references,
-        registration_time,
-        ultimate,
-        signatures: sigs,
-        content_address: ca_str,
-    };
-    let info = match ValidatedPathInfo::try_from(raw_info) {
-        Ok(v) => v,
-        Err(e) => stderr_err!(stderr, "wopAddToStoreNar for '{path_str}': {e}"),
-    };
+    debug!(path = %path_str, nar_size, "wopAddToStoreNar");
 
     // Wrap reader in FramedStreamReader for the NAR bytes. max_total =
     // nar_size (client-declared). MAX_FRAMED_TOTAL == MAX_NAR_SIZE, so
@@ -234,7 +196,7 @@ async fn read_entry_head<R: AsyncRead + Unpin>(framed: &mut R) -> anyhow::Result
     let sigs = wire::read_strings(framed).await?;
     let ca_str = wire::read_string(framed).await?;
 
-    debug!(path = %path_str, nar_size, "wopAddMultipleToStore entry");
+    debug!(path = %path_str, nar_size, "read PathInfo wire head");
 
     let path = StorePath::parse(&path_str).map_err(|e| GatewayError::InvalidStorePath {
         path: path_str.clone(),
