@@ -30,6 +30,17 @@ use std::sync::{Arc, Mutex};
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 
+/// Render a `metrics::Key` as `name{k=v,k2=v2}` with labels sorted.
+/// Shared by [`CountingRecorder`] and [`GaugeValues`] for map keying.
+fn render_key(key: &Key) -> String {
+    let mut labels: Vec<_> = key
+        .labels()
+        .map(|l| format!("{}={}", l.key(), l.value()))
+        .collect();
+    labels.sort();
+    format!("{}{{{}}}", key.name(), labels.join(","))
+}
+
 // ===========================================================================
 // DescribedNames — captures describe_*! names
 // ===========================================================================
@@ -143,15 +154,6 @@ pub struct CountingRecorder {
 }
 
 impl CountingRecorder {
-    fn counter_key(key: &Key) -> String {
-        let mut labels: Vec<_> = key
-            .labels()
-            .map(|l| format!("{}={}", l.key(), l.value()))
-            .collect();
-        labels.sort();
-        format!("{}{{{}}}", key.name(), labels.join(","))
-    }
-
     /// Returns the current value for `rendered_key`, or 0 if never
     /// incremented. Keys are rendered as `name{k1=v1,k2=v2}` with
     /// labels sorted; a counter with no labels has key `"name{}"`.
@@ -203,7 +205,7 @@ impl Recorder for CountingRecorder {
     fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
     fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
-        let rendered = Self::counter_key(key);
+        let rendered = render_key(key);
         let atomic = self
             .counters
             .lock()
@@ -245,15 +247,6 @@ pub struct GaugeValues {
 }
 
 impl GaugeValues {
-    fn key(k: &Key) -> String {
-        let mut labels: Vec<_> = k
-            .labels()
-            .map(|l| format!("{}={}", l.key(), l.value()))
-            .collect();
-        labels.sort();
-        format!("{}{{{}}}", k.name(), labels.join(","))
-    }
-
     /// Returns the last value set for `rendered_key` (rendered as
     /// `name{k=v}` with sorted labels), or `None` if never touched.
     pub fn get(&self, rendered_key: &str) -> Option<f64> {
@@ -274,7 +267,7 @@ impl Recorder for GaugeValues {
         Counter::noop()
     }
     fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
-        let rendered = Self::key(key);
+        let rendered = render_key(key);
         let atomic = self
             .gauges
             .lock()
