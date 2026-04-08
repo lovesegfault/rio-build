@@ -349,7 +349,9 @@ impl RetryPolicy {
     pub fn backoff_duration(&self, attempt: u32) -> std::time::Duration {
         use rio_common::backoff::{Backoff, Jitter};
         Backoff {
-            base: std::time::Duration::from_secs_f64(self.backoff_base_secs.max(0.0)),
+            base: std::time::Duration::from_secs_f64(
+                self.backoff_base_secs.clamp(0.0, 365.0 * 86400.0),
+            ),
             mult: self.backoff_multiplier,
             cap: std::time::Duration::from_secs_f64(
                 // from_secs_f64 panics on inf/NaN; clamp here so a
