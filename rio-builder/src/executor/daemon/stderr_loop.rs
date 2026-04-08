@@ -201,6 +201,7 @@ async fn handle_log_line(
                 ))))
             }
         }
+        // r[impl builder.log-limit]
         AddLineResult::LimitExceeded { reason } => {
             // Flush what's buffered so client sees output up to
             // the limit. Best-effort: channel-closed is moot,

@@ -272,6 +272,7 @@ impl Cache {
     /// `None` → not armed (warm-gate prefetch window). Armed + present →
     /// block-and-fetch with size-aware timeout. Armed + absent → fast
     /// ENOENT.
+    // r[impl builder.warmgate.filter]
     pub fn jit_classify(&self, basename: &str) -> JitClass {
         match &*self.known_inputs.read().unwrap_or_else(|e| e.into_inner()) {
             None => JitClass::NotArmed,

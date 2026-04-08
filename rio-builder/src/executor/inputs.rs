@@ -186,6 +186,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 /// Any error degrades to a no-op — each per-path `GetPath` then
 /// queries PG as before. Prefetch is an optimization; it never fails
 /// the build.
+// r[impl builder.warmgate.manifest-prime]
 #[instrument(skip_all, fields(input_count = input_paths.len()))]
 pub(super) async fn prefetch_manifests(
     store_client: &StoreServiceClient<Channel>,

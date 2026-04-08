@@ -233,6 +233,7 @@ impl ExecutorError {
     /// scheduler's retry policy handles re-dispatch with backoff), or
     /// `Overlay`/`SynthDb`/`NixConf` (deterministic setup failures —
     /// same inputs, same failure).
+    // r[impl builder.retry.daemon-transient]
     pub fn is_daemon_transient(&self) -> bool {
         match self {
             ExecutorError::DaemonSpawn(_) => true,
@@ -1257,6 +1258,7 @@ async fn prepare_sandbox(
     // Success path is unaffected: builder wrote `$out` → upper has it →
     // overlay resolves immediately, FUSE never probed.
     //
+    // r[impl builder.fod.output-whiteout]
     // The whiteout fix: mknod a char device 0/0 for each output path
     // DIRECTLY IN THE UPPER DIR — bypassing overlay semantics entirely.
     //
@@ -1472,6 +1474,7 @@ async fn collect_outputs(
             // Build DID run (FOD verification is post-build). Caller
             // already has peak_memory_bytes/peak_cpu_cores from the
             // cgroup; they're meaningful even though we reject output.
+            // r[impl fetcher.upload.hash-verify-before]
             return Ok(BuildOutputs {
                 proto_result: ProtoBuildResult {
                     status: BuildResultStatus::OutputRejected.into(),
@@ -1913,6 +1916,7 @@ mod tests {
     }
 
     #[test]
+    // r[verify builder.retry.daemon-transient]
     fn test_is_daemon_transient() {
         use rio_nix::protocol::wire::WireError;
         use std::io::{Error as IoError, ErrorKind};

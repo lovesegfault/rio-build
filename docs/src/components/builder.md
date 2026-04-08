@@ -76,6 +76,17 @@ C++ reference (`archive.cc` `parseDump`). The rejection happens in
 base. A crafted NAR from a compromised store could otherwise write
 arbitrary files on builder nodes via the FUSE fetch path.
 
+### Prefetch Warm-Gate
+
+r[builder.warmgate.handshake]
+On receipt of a `PrefetchHint` from the scheduler, the builder spawns one fire-and-forget fetch task per hinted path (bounded by a semaphore), then a joiner task that awaits ALL of them and sends `PrefetchComplete{paths_fetched, paths_cached}` on the BuildExecution stream. The scheduler gates the first assignment on receipt of this ACK (`r[sched.assign.warm-gate]`), so the build starts with a warm cache. An empty hint sends the ACK immediately. The hint handler MUST NOT block the BuildExecution event loop --- per-path tasks queue in tokio's scheduler and only enter the blocking pool once a permit is acquired. Per-path outcomes are recorded in `rio_builder_prefetch_total{result}`.
+
+r[builder.warmgate.filter]
+Each `PrefetchHint` path is classified BEFORE entering the blocking pool: (a) JIT allowlist armed AND path NOT a declared input → skip (`reason=not_input`; FUSE lookup would ENOENT it anyway); (b) JIT allowlist NOT armed (initial warm-gate batch, before any assignment) AND `QueryPathInfo.nar_size > 256 MiB` → skip (`reason=size_cap`); (c) declared input OR under cap → fetch. The size cap stops the warm-gate from speculatively pulling multi-GB sibling outputs the scheduler over-includes (I-212: `approx_input_closure` sends ALL outputs of each input drv, e.g., a 2.9 GB `clang-debug` alongside the `clang-out` the build actually needs). Declared inputs that exceed the cap are still fetched on-demand by JIT lookup, so the filter never blocks a correct build. Filtered paths increment `rio_builder_prefetch_filtered_total{reason}`.
+
+r[builder.warmgate.manifest-prime]
+After computing the input closure and before daemon spawn, the executor issues ONE `BatchGetManifest` for the full closure and primes the FUSE cache's manifest-hint map (basename → `ManifestHint`). Each subsequent JIT `GetPath` carries the primed hint so the store skips its two PG lookups (`r[store.get.manifest-hint]`); the fan-out path (`r[builder.fuse.fetch-chunk-fanout]`) needs the chunk list to fan out at all. Any `BatchGetManifest` error degrades to a no-op --- per-path `GetPath` then queries PG as before. I-110c: ~1600 PG hits per builder collapse to ≤2.
+
 ### FUSE Implementation
 
 r[builder.fuse.fetch-bounded-memory]
@@ -196,7 +207,7 @@ Each builder advertises two capability lists in its heartbeat so the scheduler c
 ## rio-nix Client Protocol
 
 r[builder.daemon.stdio-client]
-Workers invoke `nix-daemon --stdio` and must speak the Nix worker protocol as a *client*. The `rio-nix` crate implements both server-side (gateway: responds to opcodes from Nix clients) and client-side (worker: sends `wopBuildDerivation` to the local daemon and receives `BuildResult`) protocol handling.
+Builders invoke `nix-daemon --stdio` and must speak the Nix worker protocol as a *client*. The `rio-nix` crate implements both server-side (gateway: responds to opcodes from Nix clients) and client-side (builder: sends `wopBuildDerivation` to the local daemon and receives `BuildResult`) protocol handling.
 
 r[builder.daemon.no-unwrap-stdio]
 When spawning `nix-daemon --stdio`, never `.unwrap()` on `daemon.stdin.take()` / `daemon.stdout.take()` --- use `.ok_or_else()`.
@@ -206,6 +217,9 @@ Wrap all daemon communication in `tokio::time::timeout` (default: 2h, configurab
 
 r[builder.daemon.kill-both-paths]
 Always `daemon.kill().await` in both success and error paths, and set `kill_on_drop` on the Command to guard against early-exit leaks.
+
+r[builder.retry.daemon-transient]
+The build-spawn loop retries `execute_build` locally when the failure is daemon-transient: `DaemonSpawn` (nix-daemon failed to exec), `Handshake` (daemon died before protocol negotiation), or `Wire(Io(UnexpectedEof))` (daemon crashed mid-conversation --- core dump, OOM-kill, SIGABRT). Up to `DAEMON_RETRY_MAX=3` attempts with backoff `500ms/1s/2s` (no jitter --- one daemon per pod, no herd). After exhaustion the error propagates as `InfrastructureFailure` and the scheduler's own retry policy takes over. The retry MUST short-circuit if the build's cancelled flag is set. `BuildFailed`, network-side errors (`Upload`/`Grpc`/`MetadataFetch`), and deterministic setup failures (`Overlay`/`SynthDb`/`NixConf`) are NOT retried locally. Rationale: a scheduler round-trip re-dispatches + re-fetches closure + re-generates synth DB; without the local retry a hot-loop daemon crash flooded the scheduler with 800+ `InfrastructureFailure` reports in <10min.
 
 r[builder.silence.timeout-kill]
 `maxSilentTime` (seconds, forwarded from client `--option
@@ -225,6 +239,9 @@ Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, 
 
 r[builder.stderr.forward-set-phase]
 The builder's stderr loop forwards the daemon's `STDERR_RESULT{SetPhase}` (result type 104) as a `BuildPhase{derivation_path, phase}` `ExecutorMessage`. Phase is a state edge, not log content --- it is sent unbatched and does not reset the max-silent-time deadline.
+
+r[builder.log-limit]
+The log batcher enforces per-build `LogLimits`: `rate_lines_per_sec` (1-second tumbling window, monotonic `Instant`) and `total_bytes` (cumulative across flushed batches). Both check the PROSPECTIVE total before buffering --- a line that would exceed the limit is rejected, not half-accepted. Either limit set to `0` means unlimited. On trip, `add_line` returns `LimitExceeded{reason}`; the stderr loop flushes any already-buffered lines (so the client sees output right up to the limit) and breaks with `BuildStatus::LogLimitExceeded` --- terminal, non-retryable (the same build on a different executor spews the same logs). Maps to `rio_builder_builds_total{outcome="log_limit"}`.
 
 ## Overlay Store Architecture
 
@@ -274,11 +291,15 @@ r[builder.upload.deriver-populated]
 
 > **Pre-scan cost:** the scan is a separate disk read before the first upload attempt. Retries do NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan over the restricted nixbase32 alphabet does ~memcpy speed on binary sections (skips ~31/32 bytes); a 4 GiB output adds ~4s wall time on NVMe. If this becomes measurable, the escape hatch is a trailer-refs protocol extension (send refs in `PutPathTrailer` instead of the first `PathInfo` message) --- deferred to a later phase.
 
+r[builder.upload.batch]
 For **multi-output derivations (≥2 outputs)**, the builder uses `PutPathBatch`: all outputs stream serially on one RPC, the store commits them in ONE database transaction. If any output fails validation, zero outputs are registered --- atomic per `r[store.atomic.multi-output]`. The v1 batch handler is inline-only; if any output is ≥ `INLINE_THRESHOLD` (256 KiB NAR) it returns `FailedPrecondition` and the builder falls back to independent `PutPath` calls (pre-P0267 behavior: `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity).
 
 For **single-output derivations**, the builder uses independent `PutPath` directly (atomicity is vacuous for one output).
 
 **Upload failure handling:** If the upload to rio-store fails (S3 unavailable, network timeout), the builder retries the upload with exponential backoff (up to 3 attempts). If all upload retries are exhausted, the builder reports an `InfrastructureFailure` to the scheduler. The scheduler may reassign the derivation to a different builder, which must rebuild from scratch --- there is no mechanism to transfer the completed output from the original builder's local overlay. This is a known limitation; the completed output on the original builder is lost when the overlay is discarded.
+
+r[builder.upload.aborted-poll]
+When `PutPath` returns `Aborted` with message containing `"concurrent PutPath"`, the builder polls `QueryPathInfo` with backoff (1s, 2s, 4s, 8s, 16s ≈ 31s total) before falling back to a fresh upload attempt. If the path appears, the builder adopts the store's `PathInfo` as its upload result (`rio_builder_uploads_total{status="adopted"}`) --- output paths are derivation-addressed, so the contending uploader's content is identical. If the poll exhausts, the contending placeholder has likely been released by the store's drop-path cleanup (`r[store.put.drop-cleanup]`) and the next upload attempt succeeds. `QueryPathInfo` errors during the poll are treated as not-found (logged, keep polling). Other `Aborted` reasons (GC mark serialization, admin cancel) keep the plain retry without polling. I-125b.
 
 ## Store Database Management
 
@@ -354,8 +375,11 @@ Fixed-output derivations (FODs) have a known output hash declared in `outputHash
 
 1. **Detection**: A derivation is a FOD if its `outputHash` attribute is non-empty.
 2. **Network access**: Unlike regular derivations, FODs are allowed network access inside the sandbox. This is handled by `nix-daemon` internally — when it sees `outputHash` set on a derivation via `wopBuildDerivation`, it automatically relaxes network namespace isolation for that build. `sandbox = true` in `nix.conf` is sufficient (Nix's sandbox is FOD-aware). Network egress is governed at the pod level by the fetcher NetworkPolicy (`r[fetcher.netpol.egress-open]`).
-3. **Output verification**: After the build completes, the executor computes the hash of the output and verifies it matches the declared `outputHash`. A mismatch is a build failure.
+3. **Output verification**: After the build completes, the executor computes the hash of the output and verifies it matches the declared `outputHash`. A mismatch is reported as `BuildResultStatus::OutputRejected` (NOT `BuildFailed`) and the output is discarded locally without entering the store.
 4. **Caching**: FODs are cached by their output hash, not their derivation hash. Two FODs with different `src` attributes but the same `outputHash` share the same cached output.
+
+r[builder.fod.output-whiteout]
+For each declared FOD output path, sandbox-populate `mknod`s a char device `0/0` (the overlayfs whiteout signature) at `{upper_store}/{basename}` BEFORE daemon spawn. Through the merged view this presents as `ENOENT`: the daemon's pre-build `deletePath(output)` `lstat` returns ENOENT (skips); the builder's `creat()`/`open(O_CREAT)` of `$out` replaces the whiteout with a real file in upper; on builder failure with no `$out` created, the whiteout remains and post-build cleanup is a no-op. Rationale: overlayfs only writes a whiteout on unlink when `ovl_lower_positive()` is true (the lower's `lookup` returned a real entry), but the FUSE lower returns ENOENT for output paths (they're not in the input closure) --- so a daemon-issued unlink takes the `ovl_remove_upper` path with no whiteout, and a stale lower-positive could shadow the upper. Known limit: `mkdir()` onto a whiteout returns `EIO` (verified Linux 6.12) and the whiteout survives --- non-FOD outputs (which are never whiteouted) and FODs that produce a single regular file are unaffected.
 
 ## Namespace Ordering
 
@@ -487,10 +511,18 @@ The executor MUST register the build's input closure (basename → nar_size, the
 r[builder.fuse.jit-lookup]
 Top-level FUSE `lookup` for a name in the registered input set MUST block on `ensure_cached` with a per-path timeout of at least `nar_size / JIT_MIN_THROUGHPUT_BPS` (size-scaled, floored at `fuse_fetch_timeout`; I-178: a flat 60 s aborted a 1.9 GB input mid-fetch). On any fetch failure it MUST return `EIO` (NEVER `ENOENT`) --- overlayfs `ovl_lookup` propagates a lower's non-ENOENT error to the caller without caching a negative dentry; an `ENOENT` would be negative-cached and the daemon's retry would never re-ask FUSE → `MiscFailure` → `PermanentFailure` poison (the I-043 failure mode). For a name NOT in the registered set (and not already on local disk), `lookup` MUST return `ENOENT` immediately without contacting the store --- daemon `.lock`/`.chroot`/`.check` probes, output-path pre-checks, and `.links` all land here. This is a pure allowlist: builds cannot read store paths outside their declared input closure (hermeticity).
 
+## Stream Relay & Reconnect
+
+r[builder.relay.reconnect]
+Running builds send `CompletionReport`/`BuildLogBatch`/`PrefetchComplete` to a process-lifetime `mpsc::channel(256)` (the permanent sink), NOT to the gRPC outbound channel directly. A `relay_loop` task pumps the sink into whichever gRPC outbound channel is currently live, tracked via `watch::channel<Option<Sender>>`. On `BuildExecution` stream close/error the reconnect loop swaps the watch to `None` (relay blocks on `changed()`, sink buffers in its 256-slot backlog --- ~25s at typical 100ms-batch log rates), sleeps ~1s, opens a fresh stream, and swaps the new gRPC channel in. The relay recovers the one in-transit message lost on transition (`mpsc::error::SendError<T>` holds it). The pump loop MUST `select!` `biased;` on `target.changed()` BEFORE `sink_rx.recv()` --- `grpc_tx.send()` may keep succeeding into a zombie tonic `ReceiverStream` that outlived its network stream (I-032: completions silently lost for ~20min after scheduler failover). Why a permanent sink: `stderr_loop` breaks the build with `MiscFailure` if its log send fails; handing build tasks the gRPC channel directly would kill every running build on scheduler failover.
+
 r[builder.result.input-enoent-is-infra+2]
 When the nix-daemon returns `MiscFailure` with an error message indicating a missing input path (`getting attributes of path '<p>'`) and `<p>`'s basename matches an entry in the build's computed input closure, the builder MUST report `BuildResultStatus::InfrastructureFailure` (not `PermanentFailure`). The input was verified present in rio-store by `compute_input_closure`; its absence at sandbox-setup time is a worker-local materialization failure (JIT fetch EIO, overlay negative-dentry race), not a build defect. I-178b: the matcher MUST strip ANSI SGR escapes before parsing (the daemon colors the path) and MUST match by basename only — the daemon reports the overlay path (`/var/rio/overlays/<build_id>/nix/store/<hash>-<name>`), not the bare store path the closure holds. The errno suffix is NOT load-bearing: both `No such file or directory` and `Input/output error` (I-179) are materialization failures.
 
 ## Shutdown
+
+r[builder.idle-exit]
+The reconnect loop's `select!` has a `tokio::time::sleep_until(last_activity + idle_timeout)` arm guarded by `!slot.is_busy()`. `last_activity` is bumped on every received scheduler message (Assignment, Cancel, Prefetch). If `idle_timeout` elapses with the slot still idle, the builder logs `"idle timeout (no assignment); exiting"` and breaks the loop with the same `BuildComplete` exit path as a finished build (heartbeat abort → `run_drain()` → FUSE abort → return from `main()`). The arm is `biased;` after the build-done arm so a coinciding completion wins. I-116: a Karpenter-scaled pod that the scheduler never dispatches to (size-class mismatch, drained pool) exits cleanly instead of idling to `activeDeadlineSeconds`.
 
 r[builder.shutdown.sigint]
 The builder handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path. Returning from `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit handlers fire (LLVM profraw flush).

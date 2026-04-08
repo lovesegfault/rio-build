@@ -28,7 +28,7 @@ See [ADR-019](../decisions/019-builder-fetcher-split.md) for the full rationale 
 
 r[fetcher.upload.hash-verify-before]
 
-The fetcher MUST verify the FOD output hash **before** initiating upload to rio-store. A hash mismatch is reported as `BuildFailure` and the output is discarded locally — it never reaches the store. This is the integrity boundary that makes the egress-open NetworkPolicy safe: an attacker who compromises an upstream mirror or intercepts the fetch can at worst waste fetcher CPU; they cannot inject content into the store.
+The fetcher MUST verify the FOD output hash **before** initiating upload to rio-store. A hash mismatch is reported as `BuildResultStatus::OutputRejected` and the output is discarded locally — it never reaches the store. This is the integrity boundary that makes the egress-open NetworkPolicy safe: an attacker who compromises an upstream mirror or intercepts the fetch can at worst waste fetcher CPU; they cannot inject content into the store.
 
 The verification uses `verify_fod_hashes()` (shared with the builder binary) against the `outputHash` the scheduler included in the assignment. The scheduler knows the expected hash before dispatch; the fetcher re-derives `is_fod` from the `.drv` itself and cross-checks (`r[builder.executor.kind-gate]`).
 

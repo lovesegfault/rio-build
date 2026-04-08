@@ -289,6 +289,7 @@ async fn upload_output(
                     deriver,
                 ));
             }
+            // r[impl builder.upload.aborted-poll]
             Err(e) if is_concurrent_put_path(&e) => {
                 // I-125b: another uploader holds the placeholder for
                 // this path. Two non-error outcomes are likely:
@@ -858,6 +859,7 @@ async fn partition_by_presence(
     (to_upload, skipped)
 }
 
+// r[impl builder.upload.batch]
 /// Batch upload: all outputs in one `PutPathBatch` stream, committed
 /// atomically server-side.
 ///
@@ -1157,6 +1159,7 @@ mod tests {
         Ok(())
     }
 
+    // r[verify builder.upload.aborted-poll]
     /// I-125b: PutPath returns `Aborted: concurrent PutPath` and the
     /// path then APPEARS in the store (another builder uploaded it) →
     /// upload_output adopts the store's result instead of failing.

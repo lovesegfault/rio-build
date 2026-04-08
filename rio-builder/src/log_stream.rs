@@ -121,6 +121,7 @@ impl LogBatcher {
     ///
     /// Limit checks happen BEFORE buffering — a line that would exceed the
     /// size limit is rejected, not half-accepted.
+    // r[impl builder.log-limit]
     pub fn add_line(&mut self, line: Vec<u8>) -> AddLineResult {
         // --- Size limit ---
         // Check the PROSPECTIVE total, not the current one. A 100 MiB limit
@@ -308,6 +309,7 @@ mod tests {
     // Rate limiting
     // -----------------------------------------------------------------------
 
+    // r[verify builder.log-limit]
     #[test]
     fn rate_limit_trips_at_threshold() {
         let mut batcher = mk(LogLimits {

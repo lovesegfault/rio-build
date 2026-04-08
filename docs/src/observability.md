@@ -204,7 +204,8 @@ r[obs.metric.builder]
 | `rio_builder_fuse_fallback_reads_total` | Counter | Successful userspace `read()` callbacks. Near-zero when passthrough is on (kernel handles reads directly); nonzero when `fuse_passthrough=false` or passthrough failed for specific files. |
 | `rio_builder_fuse_index_divergence_total` | Counter | FUSE cache index/disk divergences self-healed. Nonzero = something rm'd cache files under the SQLite index (debugging, interrupted eviction). Investigate if sustained. |
 | `rio_builder_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on executor. |
-| `rio_builder_prefetch_total` | Counter | PrefetchHint outcomes (labeled by `result`: `fetched`/`already_cached`/`already_in_flight`/`error`/`malformed`/`panic`). |
+| `rio_builder_prefetch_total` | Counter | PrefetchHint outcomes (labeled by `result`: `fetched`/`already_cached`/`already_in_flight`/`not_input`/`size_cap`/`error`/`malformed`/`panic`). |
+| `rio_builder_prefetch_filtered_total` | Counter | PrefetchHint paths skipped before fetch by the warm-gate filter (labeled by `reason`: `not_input` = JIT allowlist armed and path not declared; `size_cap` = unarmed warm-gate batch and `nar_size > 256 MiB`). I-212: stops speculative pull of multi-GB sibling outputs the scheduler over-includes. |
 | `rio_builder_upload_bytes_total` | Counter | Bytes uploaded to store via PutPath (nar_size on success) |
 | `rio_builder_upload_skipped_idempotent_total` | Counter | Outputs skipped before upload because `FindMissingPaths` reports them already-present in the store. Idempotency short-circuit — nonzero is healthy (repeat builds of cached paths). |
 | `rio_builder_fuse_circuit_open` | Gauge | FUSE circuit-breaker open state (1 = open/tripped, 0 = closed/healthy). Set to 1 when store fetch error rate exceeds threshold; FUSE ops return EIO instead of blocking. Reset to 0 on successful probe. Alert if sustained 1. |

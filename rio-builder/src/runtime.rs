@@ -529,6 +529,7 @@ pub async fn spawn_build_task(
         // daemon caused 800+ retries in <10min (scheduler re-dispatches
         // InfrastructureFailure immediately, no backoff). The retry
         // budget is small (DAEMON_RETRY_MAX=3, exponential backoff
+        // r[impl builder.retry.daemon-transient]
         // 0.5/1/2s); after exhaustion the error propagates as
         // InfrastructureFailure and the scheduler's own retry policy
         // takes over. Cancelled builds short-circuit the loop — the
@@ -725,6 +726,7 @@ pub async fn spawn_build_task(
 /// 256 MiB: large enough to cover the common-set inputs the warm-gate is
 /// for (glibc ~40 MB, gcc-unwrapped ~200 MB), small enough to exclude
 /// debug outputs (clang-debug 2.9 GB, llvm-debug ~1.5 GB).
+// r[impl builder.warmgate.filter]
 const PREFETCH_WARM_SIZE_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Handle a PrefetchHint from the scheduler: spawn one fire-and-forget
@@ -892,6 +894,7 @@ pub fn handle_prefetch_hint(
     }
 
     // r[impl sched.assign.warm-gate]
+    // r[impl builder.warmgate.handshake]
     // Joiner: wait for ALL path-fetch tasks to return, then send the
     // PrefetchComplete ACK. spawn_monitored so a panic in the joiner
     // logs with task=prefetch-complete instead of vanishing. Does NOT
@@ -1151,6 +1154,7 @@ pub async fn setup(
     // (mpsc::error::SendError<T> holds the unsent message) and
     // blocks on watch.changed() until the reconnect loop swaps
     // in a fresh gRPC channel.
+    // r[impl builder.relay.reconnect]
     let (sink_tx, sink_rx) = mpsc::channel::<ExecutorMessage>(256);
 
     // Relay target: Some(grpc_tx) while connected, None during
@@ -1423,6 +1427,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 // biased; ordering: AFTER build_done (a completed
                 // build's exit wins over an idle-timeout that happens
                 // to coincide).
+                // r[impl builder.idle-exit]
                 _ = tokio::time::sleep_until(last_activity + rt.idle_timeout),
                     if !rt.slot.is_busy() => {
                     info!(
@@ -1857,6 +1862,7 @@ enum StreamEnd {
 ///
 /// Exits only when the permanent sink closes (all `sink_tx` clones
 /// dropped — process shutdown).
+// r[impl builder.relay.reconnect]
 async fn relay_loop(
     mut sink_rx: mpsc::Receiver<ExecutorMessage>,
     mut target: watch::Receiver<Option<mpsc::Sender<ExecutorMessage>>>,
@@ -2541,6 +2547,7 @@ mod tests {
     /// FUSE/gRPC entanglement — so this reproduces the two arms that
     /// matter under paused time).
     #[tokio::test(start_paused = true)]
+    // r[verify builder.idle-exit]
     async fn idle_timeout_fires_with_no_assignment() {
         let slot = Arc::new(BuildSlot::default());
         let idle_timeout = Duration::from_secs(120);
