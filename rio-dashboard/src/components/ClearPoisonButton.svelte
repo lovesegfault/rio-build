@@ -1,4 +1,5 @@
 <script lang="ts">
+  // r[impl dash.clear-poison]
   // ClearPoison write action. Embedded in DrvNode.svelte's right-click
   // context menu; composable from anywhere that knows a
   // `derivationHash` and a `poisoned` boolean.

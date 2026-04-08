@@ -6,6 +6,7 @@
   // Scrolling back within a small threshold of the bottom re-engages
   // the follow.
   //
+  // r[impl dash.log.virtualize]
   // Virtualization: rendering one <pre> per line means 10K+ DOM nodes
   // for a long build — every scroll recomputes layout for all of them,
   // and the follow-tail $effect's `scrollHeight` read forces layout on

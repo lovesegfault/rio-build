@@ -13,6 +13,7 @@
 import { admin } from '../api/admin';
 
 // r[impl dash.stream.log-tail]
+// r[impl dash.log.cap]
 // R8: build output is raw bytes and can be non-UTF-8 (compiler locale
 // garbage, a stray binary cat'd by a builder script). {fatal: false}
 // makes decode() substitute U+FFFD rather than throwing — a single bad

@@ -7,6 +7,7 @@
   // look at its pod" signal.
   //
   // r[impl builder.executor.kind-gate]
+  // r[impl dash.executors.kind-filter]
   // The kind filter is the dashboard surface for the ADR-019 builder/
   // fetcher split — lets the operator narrow to just the airgapped
   // builders or just the open-egress fetchers when diagnosing.

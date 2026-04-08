@@ -104,6 +104,7 @@
   // (the poll is a single logical stream).
   let inflight = false;
 
+  // r[impl dash.graph.auto-stop]
   // Set once every node hits a terminal status (graphLayout.TERMINAL
   // mirrors is_terminal() in the scheduler). A finished build's drawer
   // can sit open indefinitely — no point polling GetBuildGraph every 5s

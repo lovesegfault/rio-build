@@ -72,6 +72,8 @@ spec:
     {{- include "rio.dashboard.corsCommon" . | nindent 4 }}
 {{- end }}
 ---
+# r[impl dash.stream.idle-timeout]
+#   (documentary — tracey does not scan yaml; nginx counterpart is in nix/docker.nix)
 # Streaming timeout: GetBuildLogs / WatchBuild are long-lived server-
 # streams. Envoy's default stream_idle_timeout (5m) would cut a
 # quiet-but-open log stream (a build that prints nothing for 5

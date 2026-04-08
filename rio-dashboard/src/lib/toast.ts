@@ -6,6 +6,7 @@
 // svelte/store (not runes-in-module) because the queue is shared
 // process-wide, read from exactly one portal, and a plain writable<T[]>
 // is the smallest surface that does that.
+// r[impl dash.toast]
 import { writable } from 'svelte/store';
 
 export type ToastKind = 'info' | 'error';

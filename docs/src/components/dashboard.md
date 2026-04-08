@@ -44,14 +44,17 @@ endpoint). CORS `allowOrigins` defaults to the in-cluster nginx Service hostname
 
 ## Key Views
 
-| Page | Data Source | Description |
+| View | Data Source | Description |
 |------|-------------|-------------|
 | Cluster | `AdminService.ClusterStatus` | Executor/build/derivation counts, entry point to GC |
 | Builds | `AdminService.ListBuilds` | Paginated list with status filter + per-build drawer; entry point to the killer journey |
-| Graph | `AdminService.GetBuildGraph` | Interactive DAG visualization (`@xyflow/svelte`), color-coded status, degrades to table >2000 nodes |
+| Build drawer · Graph tab | `AdminService.GetBuildGraph` | Interactive DAG visualization (`@xyflow/svelte`), color-coded status, degrades to table >2000 nodes, polls 5s until all-terminal |
+| Build drawer · Logs tab | `AdminService.GetBuildLogs` (server stream) | Live-tail build output, UTF-8-lossy decode, virtualized scroller; `drvPath` filter set by Graph node click |
 | Executors | `AdminService.ListExecutors` | Busy/idle pill (one-build-per-pod ⇒ binary), kind filter (builder/fetcher), stale-heartbeat highlight, drain button |
-| GC | `AdminService.TriggerGC` (server stream) | Dry-run toggle, grace-period slider, live sweep progress |
-| Log viewer | `AdminService.GetBuildLogs` (server stream) | Live-tail build output, UTF-8-lossy decode, embedded in the build drawer |
+| GC | `AdminService.TriggerGC` (server stream) | Dry-run toggle, grace-period number input (hours), live sweep progress, cancel via `AbortController` |
+| Toast portal | — | Single `<Toast/>` mounted in `App.svelte`; any component imports `toast.{info,error}` to push, auto-dismiss 4s |
+
+There is no standalone "Graph page" — the DAG and the log viewer are **drawer tabs** under Builds. `BuildDrawer` keeps `focusedDrv` state across tab switches so a Graph→DrvNode click survives the tab flip and filters the log stream.
 
 Executor utilization time-series and cache hit-rate analytics are **NOT** dashboard
 scope — they live in the Grafana dashboards (`infra/helm/rio-build/dashboards/`). The
@@ -67,10 +70,31 @@ r[dash.auth.method-gate+2]
 The `GRPCRoute` splits `AdminService` methods by impact: read-only methods (`ClusterStatus`, `ListExecutors`, `ListPoisoned`, `ListBuilds`, `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSizeClassStatus`) route unconditionally; mutating methods (`ClearPoison`, `DrainExecutor`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods` is true (default false). Until dashboard-native authz lands, mutating operations go through `rio-cli` with an mTLS client certificate. CORS `allowOrigins` defaults to the in-cluster nginx Service hostname, not wildcard.
 
 r[dash.journey.build-to-logs]
-The killer journey: click build (Builds page) → DAG renders (Graph page) → click running node (DrvNode) → log stream renders (LogViewer). The nginx→Envoy Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
+The killer journey: click build (Builds page) → drawer opens, DAG renders (Graph tab) → click running node (DrvNode) → log stream renders (Logs tab). The nginx→Envoy Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
 
 r[dash.graph.degrade-threshold]
 Graph rendering MUST degrade to a sortable table when the node count exceeds 2000. dagre layout on >2000 nodes freezes the main thread. Above 500 nodes, dagre runs in a Web Worker. The server separately caps responses at 5000 nodes (`GetBuildGraphResponse.truncated`).
 
 r[dash.stream.log-tail]
 `GetBuildLogs` server-stream consumption MUST use `TextDecoder('utf-8', {fatal: false})` — build output can contain non-UTF-8 bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx `proxy_buffering off` is required or the stream buffers entirely before reaching the browser.
+
+r[dash.stream.idle-timeout]
+The streaming chain MUST tolerate ≥1h of silence on an open `GetBuildLogs`/`WatchBuild` stream (a build that prints nothing for 5 minutes is normal under LLVM-cold-ccache). Envoy `ClientTrafficPolicy.timeout.http.streamIdleTimeout` and nginx `proxy_read_timeout` are BOTH set to 1h — Envoy's default `stream_idle_timeout` is 5m and nginx's default `proxy_read_timeout` is 60s; either left at default cuts the stream first. The 1h ceiling is intentional (a stream truly quiet for an hour means the build is stuck).
+
+r[dash.log.cap]
+The log stream's reactive line buffer MUST be capped client-side. At `MAX_LINES = 50_000` the store splices the oldest `lines.length - (MAX_LINES - DROP_LINES)` lines (where `DROP_LINES = 10_000`), flips `truncated = true`, and accumulates `droppedLines` for the banner. The hysteresis gap means the splice fires once per ~10k lines instead of every chunk near the cap. 50k lines × ~100 bytes ≈ 5MB of strings — generous for a tab, small enough V8 GC keeps up. Per-chunk append is loop-push (NOT spread-push: a 100k-line backfill chunk would hit V8's ~65k-argument `RangeError`).
+
+r[dash.log.virtualize]
+`LogViewer` MUST render a windowed slice, not one DOM node per line. Fixed `line-height` (measured from `getComputedStyle`, fallback 20px under jsdom) makes the visible range arithmetic from `scrollTop`; spacer `<div>`s above/below fill the off-screen height so `scrollHeight` stays synthetically equal to `lines.length × lineH` and follow-tail's `scrollTop = scrollHeight` lands at the bottom. Lines clip with `text-overflow: ellipsis` (NOT `white-space: pre-wrap` — wrapped lines would desync the spacer math). Trade: losing wrap on 200-char lines for O(viewport) DOM under 100k-line builds.
+
+r[dash.graph.auto-stop]
+The Graph tab's 5s `GetBuildGraph` poll MUST stop once every node is in a terminal status (per `graphLayout.TERMINAL`, which mirrors `is_terminal()` scheduler-side). The check is gated on `!truncated && nodes.length > 0` — an empty response (build not yet populated) and a truncated response (visible-terminal ≠ all-terminal under insertion-order truncation) MUST NOT stop polling. The poll is also serialized by an `inflight` re-entrancy gate so a slow fetch + slow worker layout don't overlap and last-write-wins with stale statuses.
+
+r[dash.executors.kind-filter]
+The Executors page exposes a `kind` `<select>` filtering on `ExecutorInfo.kind` (raw wire integers `0`=builder, `1`=fetcher). Surfaces the ADR-019 builder/fetcher split for "narrow to airgapped builders only" diagnostics.
+
+r[dash.clear-poison]
+`ClearPoisonButton` is embedded in `DrvNode`'s right-click context menu (rendered only when `poisoned`). It calls `AdminService.ClearPoison({derivationHash})` after a `confirm()` and pushes a toast — `cleared=false` (race with a successful retry) is an info toast, not an error. No optimistic mutation; the next 5s graph poll picks up the `poisoned→queued` transition. Subject to `r[dash.auth.method-gate+2]` (mutating method).
+
+r[dash.toast]
+A single `<Toast/>` portal is mounted in `App.svelte`. Any component imports `toast.{info,error}` from `lib/toast` (a plain `writable<ToastMsg[]>`, not runes-in-module) to push without prop-drilling; messages auto-dismiss after 4s. Write-action surfaces (`DrainButton`, `ClearPoisonButton`, GC stream errors) MUST report via toast — the alternative (`alert()`) blocks the event loop and breaks server-stream consumption.
