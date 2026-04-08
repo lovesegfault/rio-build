@@ -144,7 +144,6 @@ pub fn refresh_session_jwt<'a>(
 #[cfg(test)]
 mod jwt_issuance_tests {
     use super::*;
-    use std::sync::Arc;
 
     /// Fixed-seed key. Same pattern as rio-common/src/jwt.rs tests —
     /// SigningKey::generate needs rand_core 0.6 but the workspace is
@@ -240,41 +239,6 @@ mod jwt_issuance_tests {
             claims.iat, mint_now,
             "iat and exp must derive from the same `now` snapshot"
         );
-    }
-
-    /// No jwt_signing_key → with_jwt_signing_key never called →
-    /// ConnectionHandler.jwt_token stays None → SessionContext gets
-    /// None → no header injection. This is the default state when
-    /// `cfg.jwt.key_path` is unset (dev mode / no K8s Secret mount).
-    /// Tested at the GatewayServer level because that's where the
-    /// `None` default lives (the field initializer in `::new()`).
-    ///
-    /// Field-level access only; spinning up a real
-    /// StoreServiceClient/SchedulerServiceClient needs a listening
-    /// socket, which is way too heavy for "assert default is None".
-    /// The field is private, so this test relies on same-module
-    /// access. If GatewayServer moves to its own module, this test
-    /// moves with it.
-    #[test]
-    fn signing_key_defaults_none() {
-        // Can't construct GatewayServer without real clients (no
-        // Default impl, no mock-friendly constructor). Instead,
-        // assert structurally on with_jwt_signing_key's contract:
-        // it takes an owned SigningKey and wraps it in Some(Arc).
-        // The `None` default in `::new()` is trivially verified by
-        // reading the source — this test proves the OTHER half:
-        // that calling the builder actually flips it to Some.
-        //
-        // This is weaker than a full construction test, but the
-        // alternative (mock clients or a test-only constructor)
-        // is scope creep for a 3-line field initializer. The
-        // security.nix VM test covers the full flow.
-        let key = test_key(0xAB);
-        let arc = Arc::new(key);
-        // Structural: Arc<SigningKey> is what the Some variant holds.
-        // If someone changes the field type (e.g., to Box), this
-        // fails to compile — which is the signal we want.
-        let _: Option<Arc<SigningKey>> = Some(arc);
     }
 
     // r[verify gw.jwt.refresh-on-expiry]
