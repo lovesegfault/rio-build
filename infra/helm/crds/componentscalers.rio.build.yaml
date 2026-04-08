@@ -82,20 +82,18 @@ spec:
                 description: "Replica bounds. The reconciler clamps to `[min, max]`.\n\
                   `max` for rio-store should be `Aurora max_connections /\npgMaxConnections`\
                   \ \u2014 at 16ACU\u22482800 / 200, that's 14. The\n`min <= max`\
-                  \ CEL rule is inherited from `Replicas`."
+                  \ CEL rule is on [`Replicas`]."
                 properties:
                   max:
-                    description: "Ceiling. Cost control \u2014 don't burn through\
-                      \ the cluster\nunder a pathological burst."
+                    description: "Ceiling. For rio-store: `Aurora max_connections\
+                      \ /\npgMaxConnections` \u2014 over-provisioning past this is\
+                      \ wasted\npods that can't open a PG connection."
                     format: int32
                     type: integer
                   min:
-                    description: 'Floor. Autoscaler never scales below this, even
-                      with empty
-
-                      queue. Keeps a warm pool for fast dispatch when builds
-
-                      arrive (cold start = minutes of pod scheduling + FUSE warm).'
+                    description: "Floor. The reconciler never scales below this even\
+                      \ at zero\nbuilders. For rio-store: at least 2 (PDB `maxUnavailable:\
+                      \ 1`\nneeds \u22652 to survive a node drain)."
                     format: int32
                     type: integer
                 required:

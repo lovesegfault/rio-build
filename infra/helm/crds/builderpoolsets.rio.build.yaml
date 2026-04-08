@@ -92,68 +92,12 @@ spec:
                       nullable: true
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
-                    targetQueuePerReplica:
-                      default: 5
-                      description: "Queued-builds-per-replica target for this class's\n\
-                        autoscaler. `compute_desired` (P0234) scales to\n`queued /\
-                        \ target`. Default 5 (one replica per 5 queued).\nLower =\
-                        \ more aggressive scaling = lower queue latency\n= higher\
-                        \ pod churn. \"small\" class probably wants lower\n(fast builds\
-                        \ \u2192 operators notice queue lag); \"large\"\ntolerates\
-                        \ higher (hours-long builds don't care about\na few extra\
-                        \ minutes queued)."
-                      format: uint32
-                      minimum: 0.0
-                      nullable: true
-                      type: integer
                   required:
                   - cutoffSecs
                   - name
                   - resources
                   type: object
                 type: array
-              cutoffLearning:
-                description: "Cutoff learning config. `None` = static cutoffs (whatever\n\
-                  `classes[].cutoff_secs` says). `Some(..)` enables the EMA\nrebalancer\
-                  \ \u2014 it watches build-time histograms and shifts\n`status.classes[].effective_cutoff_secs`\
-                  \ to balance queue\nload across classes."
-                nullable: true
-                properties:
-                  emaAlpha:
-                    default: 0.3
-                    description: 'EMA smoothing factor. `new = alpha*obs + (1-alpha)*old`.
-
-                      0.3 means ~3 observation cycles to converge on a new
-
-                      distribution (forgets old data in ~10 cycles). Lower =
-
-                      smoother but slower to adapt; higher = responsive but
-
-                      can oscillate on bursty workloads.'
-                    format: double
-                    type: number
-                  enabled:
-                    description: 'Master switch. `false` = `effective_cutoff_secs`
-                      stays
-
-                      pinned to `spec.classes[].cutoff_secs`. Lets operators
-
-                      keep the config present (for quick re-enable) without
-
-                      the rebalancer acting.'
-                    type: boolean
-                  minSamples:
-                    default: 100
-                    description: "Minimum observed builds before the rebalancer acts.\n\
-                      Below this, the sample is too small \u2014 the EMA would\nchase\
-                      \ noise. 100 is a rough \"one busy hour\" default;\ncold clusters\
-                      \ should raise this."
-                    format: uint64
-                    minimum: 0.0
-                    type: integer
-                required:
-                - enabled
-                type: object
               poolTemplate:
                 description: 'Template merged into each child BuilderPool''s spec.
                   Per-

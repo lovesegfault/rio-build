@@ -87,23 +87,6 @@ spec:
                 items:
                   type: string
                 type: array
-              fuseCacheSize:
-                default: 50Gi
-                description: 'FUSE cache size as a K8s Quantity string (e.g., "100Gi").
-
-                  Maps to an emptyDir sizeLimit + parsed to bytes for
-
-                  `RIO_FUSE_CACHE_SIZE_GB` env. String because Quantity is
-
-                  standard K8s (operators know "50Gi" syntax); the reconciler
-
-                  parses it.
-
-
-                  Why not u64 bytes directly: operators write "100Gi" in
-
-                  kustomize; making them write 107374182400 is hostile.'
-                type: string
               fusePassthrough:
                 description: "FUSE passthrough mode (kernel handles reads directly,\
                   \ no\nuserspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =\n\
@@ -359,18 +342,6 @@ spec:
                   x-kubernetes-preserve-unknown-fields: true
                 nullable: true
                 type: array
-              topologySpread:
-                description: "Spread builder pods across nodes. `None`/`Some(true)`\
-                  \ (the\ndefault) sets `topologySpreadConstraints` with `maxSkew:\
-                  \ 1`\non `kubernetes.io/hostname` (soft \u2014 `whenUnsatisfiable:\n\
-                  ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =\nno spread\
-                  \ (all pods can land on one node; useful for\nsingle-node dev clusters\
-                  \ where spread would just be noise).\n\nSoft (not hard) because\
-                  \ a node drain evicting all but one\nwould temporarily make hard-spread\
-                  \ unsatisfiable \u2192 pods\nstuck Pending. Soft lets them schedule\
-                  \ then re-spread on\nthe next autoscaler action."
-                nullable: true
-                type: boolean
             required:
             - image
             - maxConcurrent
