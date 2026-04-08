@@ -121,6 +121,7 @@ pub const AUTHORIZED_KEYS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// all-invalid, or transiently unreadable mid-swap, log WARN and
 /// retry next tick. Never swap to an empty set (would lock everyone
 /// out until the next successful reload).
+// r[impl gw.keys.hot-reload]
 pub fn spawn_authorized_keys_watcher(
     keys: AuthorizedKeys,
     path: PathBuf,

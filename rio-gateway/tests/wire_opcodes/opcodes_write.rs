@@ -747,7 +747,7 @@ async fn test_add_to_store_nar_invalid_path_returns_error() -> anyhow::Result<()
 /// MAX_NAR_SIZE (enforced by const assert in opcodes_write.rs), so
 /// this gate is the effective limit — the framed reader clamp never
 /// fires for a size the handler accepted.
-// r[verify gw.wire.framed-max-total]
+// r[verify gw.wire.framed-max-total+2]
 #[tokio::test]
 async fn test_add_to_store_nar_oversized_returns_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;

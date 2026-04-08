@@ -81,6 +81,7 @@ const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Back
 /// `nar_data` is held as `Arc<[u8]>` so each retry rebuilds the request
 /// stream without copying the buffer. `info` is `Clone` (cheap — strings
 /// and Vecs already heap-allocated).
+// r[impl gw.put.aborted-retry]
 pub(super) async fn grpc_put_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,

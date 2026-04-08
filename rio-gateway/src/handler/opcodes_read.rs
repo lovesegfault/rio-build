@@ -14,6 +14,7 @@ use super::*;
 ///
 /// Output paths (everything that isn't a `.drv`) keep tenant-scoped
 /// visibility — `r[store.tenant.narinfo-filter]` applies there.
+// r[impl gw.jwt.anon-drv-lookup]
 fn jwt_unless_drv<'a>(jwt_token: Option<&'a str>, path: &StorePath) -> Option<&'a str> {
     if path.is_derivation() {
         None

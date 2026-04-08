@@ -417,7 +417,7 @@ in
         globalTimeout = 900;
       };
 
-  # r[verify gw.jwt.dual-mode]
+  # r[verify gw.jwt.dual-mode+2]
   # r[verify sec.boundary.grpc-hmac]
   # r[verify store.tenant.narinfo-filter]
   # r[verify gw.reject.nochroot]

@@ -40,7 +40,7 @@ use crate::translate;
 const PROGRAM_NAME: &str = "rio-gateway";
 
 // r[impl gw.jwt.issue]
-// r[impl gw.jwt.dual-mode]
+// r[impl gw.jwt.dual-mode+2]
 /// Wrap a request body in `tonic::Request`, injecting trace-context and
 /// the session JWT as `x-rio-tenant-token` metadata.
 ///

@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 // T2a — config field assertions (keepalive, nodelay, methods)
 // ===========================================================================
 
-// r[verify gw.conn.keepalive]
+// r[verify gw.conn.keepalive+2]
 // r[verify gw.conn.nodelay]
 /// `build_ssh_config` sets all the hardened fields. russh's `Config`
 /// defaults (server/mod.rs:102-128) leave keepalive off, Nagle on, and

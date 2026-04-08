@@ -498,7 +498,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // by the interceptor, read once by the handler; see
     // r[gw.jwt.issue]). When token is None, header is absent →
     // scheduler falls back to SubmitBuildRequest.tenant_name per
-    // r[gw.jwt.dual-mode].
+    // r[gw.jwt.dual-mode+2].
     //
     // try_from on a JWT can't actually fail — jsonwebtoken emits
     // base64url.base64url.base64url (pure ASCII, no control chars,
@@ -793,7 +793,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
 // r[impl gw.opcode.build-derivation]
 // r[impl gw.hook.single-node-dag]
-// r[impl gw.hook.ifd-detection]
+// r[impl gw.hook.ifd-detection+2]
 /// wopBuildDerivation (36): Build a derivation via scheduler.
 ///
 /// Receives an inline BasicDerivation (no inputDrvs). Recovers the full

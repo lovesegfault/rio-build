@@ -181,7 +181,7 @@ pub(crate) fn spawn_pubkey_reload(
 /// // ... later ...
 /// .layer(InterceptorLayer::new(jwt_interceptor(jwt_pubkey)))
 /// ```
-// r[impl gw.jwt.dual-mode]
+// r[impl gw.jwt.dual-mode+2]
 pub fn load_and_wire_jwt(
     key_path: Option<&Path>,
     shutdown: CancellationToken,

@@ -40,7 +40,7 @@ See `rio-builder/src/executor/mod.rs` for the mapping implementation.
 |------------|--------|-------------|
 | `HmacError` | `rio-common/src/hmac.rs` | Token verification failures: I/O reading key file, empty key, malformed token (wrong part count, bad base64/JSON), signature mismatch, expiry in the past. Surfaced to clients as `PERMISSION_DENIED`. |
 | `TlsError` | `rio-common/src/tls.rs` | TLS config load failures: I/O reading PEM files, empty cert/key, PEM parse errors. These are **startup** errors (fail-fast), not runtime. |
-| `StreamProcessError` | `rio-gateway/src/handler/build.rs` | Gateway-internal enum distinguishing `Transport` (scheduler connection dropped — **retried** with 5× backoff 1/2/4/8/16s), `EofWithoutTerminal` (stream ended without terminal BuildEvent — **not retried**, build state lost), and `Wire` (protocol parse error — **not retried**). Only `Transport` triggers the WatchBuild reconnect loop. |
+| `StreamProcessError` | `rio-gateway/src/handler/build.rs` | Gateway-internal enum distinguishing `Transport` (scheduler connection dropped) and `EofWithoutTerminal` (stream closed cleanly without terminal BuildEvent — leader-failover signature) — **both retried** up to 10× with backoff 1/2/4/8/16 s capped at 16 s — and `Wire` (protocol parse error — **not retried**). `Transport` and `EofWithoutTerminal` trigger the WatchBuild reconnect loop. |
 
 ### FUSE/Overlay Failures
 
@@ -104,6 +104,6 @@ Poisoned derivations:
 | Executor OOM-killed | Build retried on another executor. Client sees continued STDERR streaming. If all retries exhausted: `TransientFailure`. |
 | S3 unavailable | Upload retried with backoff. If persistent: `TransientFailure` for the derivation, reassigned. |
 | PostgreSQL down | Gateway returns `STDERR_ERROR("build service temporarily unavailable")`. Client can retry. |
-| Scheduler failover | Gateway's `BuildEvent` stream breaks with a `Transport` error. Gateway transparently reconnects via `WatchBuild(since_sequence)` up to 5× with backoff (1/2/4/8/16s); scheduler replays from `build_event_log`. If reconnect budget exhausted → `MiscFailure` to client. |
+| Scheduler failover | Gateway's `BuildEvent` stream breaks with a `Transport` or `EofWithoutTerminal` error. Gateway transparently reconnects via `WatchBuild(since_sequence)` up to 10× with backoff (1/2/4/8/16 s, capped at 16 s); scheduler replays from `build_event_log`. If reconnect budget exhausted → `MiscFailure` to client. |
 | Gateway crash | SSH connection drops. Client reconnects; build reattaches via DAG-merge cache hits (stored outputs are instant-hit). Logs between crash and reconnect are lost unless log persistence is configured. |
 | Derivation poisoned | `CachedFailure` with message identifying the poisoned derivation and the failure history. |

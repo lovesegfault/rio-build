@@ -6,7 +6,7 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-// r[impl gw.wire.framed-max-total]
+// r[impl gw.wire.framed-max-total+2]
 // Guard against future drift: if MAX_NAR_SIZE is bumped without
 // raising MAX_FRAMED_TOTAL, compilation fails. The wopAddToStoreNar
 // handler gates on nar_size ≤ MAX_NAR_SIZE before constructing the

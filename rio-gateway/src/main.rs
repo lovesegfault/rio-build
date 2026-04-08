@@ -217,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
     // rio-scheduler Services have endpoints. Pod stays not-Ready
     // (health server below hasn't spawned yet) while retrying.
     //
+    // r[impl gw.sched.balanced]
     // Both connects in ONE closure body: partial success (store OK,
     // scheduler refused) reconnects store on next attempt rather than
     // leaking a half-configured state.
@@ -378,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
         "rio-gateway ready"
     );
 
+    // r[impl gw.drain.three-stage]
     // Three-stage shutdown (I-064):
     //
     //   SIGTERM ─► spawn_drain_task: NotServing ─► sleep(drain_grace) ─► serve_shutdown

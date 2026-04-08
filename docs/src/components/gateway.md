@@ -383,15 +383,17 @@ Collections: `u64(count) + elements`. **Every** count-prefixed loop MUST enforce
 r[gw.wire.framed-no-padding]
 Framed data (for NARs): sequence of `u64(chunk_len) + chunk_data` terminated by `u64(0)` --- chunk data is NOT padded (unlike strings).
 
-r[gw.wire.framed-max-total]
-`MAX_FRAMED_TOTAL` MUST equal `MAX_NAR_SIZE`. The gateway's
+r[gw.wire.framed-max-total+2]
+`MAX_FRAMED_TOTAL` MUST be `>= MAX_NAR_SIZE`. The gateway's
 `wopAddToStoreNar` handler gates on `nar_size ≤ MAX_NAR_SIZE` before
 constructing the `FramedStreamReader`; if `MAX_FRAMED_TOTAL <
 MAX_NAR_SIZE`, the reader's internal clamp silently shrinks the
 effective limit, causing NARs between the two bounds to fail
 mid-stream with a confusing framed-total error instead of the upfront
-size-gate message. A `const_assert!` enforces the inequality at
-compile time.
+size-gate message. A `const_assert!(MAX_FRAMED_TOTAL >= MAX_NAR_SIZE)`
+enforces the inequality at compile time. (The two are currently equal
+at 4 GiB, but the assertion is `>=` so raising `MAX_FRAMED_TOTAL`
+alone is permitted.)
 
 r[gw.wire.narhash-hex]
 `narHash` fields on the wire are hex-encoded SHA-256 digests with **no algorithm prefix and no nixbase32**. Use `hex::decode` + `NixHash::new`, not `NixHash::parse_colon`. The `sha256:nixbase32` format appears in narinfo text, not on the wire.
@@ -463,8 +465,8 @@ Multiple clients require multiple SSH channels or connections. The gateway multi
 
 ## DAG Reconstruction
 
-r[gw.dag.reconstruct]
-When the gateway receives `wopBuildDerivation` or `wopBuildPathsWithResults`, it must reconstruct the full derivation DAG to send to the scheduler via `SubmitBuild`. The algorithm:
+r[gw.dag.reconstruct+2]
+When the gateway receives `wopBuildDerivation`, `wopBuildPaths`, or `wopBuildPathsWithResults`, it reconstructs the full derivation DAG to send to the scheduler via `SubmitBuild`. `wopBuildDerivation` (build-hook path) attempts the same full-DAG walk: it resolves the `.drv` from the session cache or the store and runs `reconstruct_dag`; only if resolution fails does it fall back to a single-node DAG built from the inline `BasicDerivation` (see `r[gw.hook.single-node-dag]`). The algorithm:
 
 1. **During store uploads:** The gateway intercepts each uploaded path. If the path ends in `.drv`, the gateway extracts the `.drv` file from the NAR, parses the ATerm-format derivation, and caches the parsed result in per-session memory (keyed by store path). This applies to all upload opcodes: `wopAddToStore` (7), `wopAddTextToStore` (8), `wopAddToStoreNar` (39), and `wopAddMultipleToStore` (44). For `wopAddToStoreNar` and `wopAddMultipleToStore`, the handler branches on the path name: `.drv` paths (small --- typically <10KB, capped at `DRV_NAR_BUFFER_LIMIT` = 16MiB) are buffered and parsed via `try_cache_drv`; non-`.drv` paths stream directly to the store via `grpc_put_path_streaming` without buffering. `wopAddToStore` and `wopAddTextToStore` still buffer (they compute the store path from the content hash, so need the full bytes before `PutPath` metadata). A `.drv` NAR exceeding `DRV_NAR_BUFFER_LIMIT` is streamed without caching --- `resolve_derivation` fetches it from the store later during DAG reconstruction.
 2. **On `wopBuildDerivation`/`wopBuildPathsWithResults`:** The gateway identifies all requested derivation paths. For each, it looks up the parsed derivation from the session cache (step 1). If a `.drv` was not uploaded in the current session (e.g., it was uploaded in a previous session and already exists in the store), the gateway fetches it from rio-store via `GetPath`, unpacks the NAR, and parses the ATerm.
@@ -477,12 +479,12 @@ The gateway MUST reject any derivation (at SubmitBuild time) whose env contains 
 
 ### Inline .drv Optimization
 
-After DAG construction, the gateway optionally inlines the ATerm content of `.drv` files into the `drv_content` field of each `DerivationNode`. This saves one worker -> store round-trip per dispatched derivation (the `GetPath` fetch). The optimization:
+After DAG construction, the gateway optionally inlines the ATerm content of `.drv` files into the `drv_content` field of each `DerivationNode`. This saves one executor -> store round-trip per dispatched derivation (the `GetPath` fetch). The optimization:
 
 - Is **gated by a single batched `FindMissingPaths` call** over all expected output paths. Only nodes with at least one missing output (i.e., nodes that will actually dispatch) are inlined. Cache-hit nodes stay empty — the scheduler short-circuits them to `Completed` and they never dispatch.
-- Applies a **per-node cap of 64 KB** (`MAX_INLINE_DRV_BYTES`). Larger `.drv` files (e.g., flake inputs serialized into `env`) fall back to worker-fetch.
-- Applies a **total budget of 16 MB** (`INLINE_BUDGET_BYTES`) across all inlined nodes. Once the budget is exhausted, remaining nodes fall back to worker-fetch.
-- Is **best-effort**: on any error (`FindMissingPaths` timeout, store unreachable), inlining is skipped entirely and all nodes fall back to worker-fetch. This is an optimization, not a correctness requirement.
+- Applies a **per-node cap of 64 KB** (`MAX_INLINE_DRV_BYTES`). Larger `.drv` files (e.g., flake inputs serialized into `env`) fall back to executor-fetch.
+- Applies a **total budget of 16 MB** (`INLINE_BUDGET_BYTES`) across all inlined nodes. Once the budget is exhausted, remaining nodes fall back to executor-fetch.
+- Is **best-effort**: on any error (`FindMissingPaths` timeout, store unreachable), inlining is skipped entirely and all nodes fall back to executor-fetch. This is an optimization, not a correctness requirement.
 
 > **Session state:** Although the gateway is described as "stateless beyond the lifetime of a single SSH connection," each SSH channel does accumulate per-session state: the parsed `.drv` cache and the `wopSetOptions` configuration. `wopAddTempRoot` is acknowledged as a no-op (rio's GC is store-side with explicit pins; a gateway-session-scoped set would be invisible to it). This state is connection-scoped and discarded when the SSH channel closes.
 
@@ -490,6 +492,9 @@ After DAG construction, the gateway optionally inlines the ATerm content of `.dr
 
 r[gw.auth.tenant-from-key-comment]
 The tenant name lives in the **server-side `authorized_keys` entry's comment field**, not the client's key (SSH key authentication sends raw key data only). During `auth_publickey`, the gateway matches the client's presented key against its loaded entries via `.find()`, then reads `.comment()` from the **matched entry** to get the tenant name. This is stored on the connection and passed through to `SubmitBuildRequest.tenant_name`. Empty comment = single-tenant mode (tenant name is empty string → scheduler treats as `None`).
+
+r[gw.keys.hot-reload]
+`authorized_keys` is hot-reloaded by a background watcher that polls the file's mtime every `AUTHORIZED_KEYS_POLL_INTERVAL` (10s). On change, the file is re-parsed and atomically swapped into the shared `ArcSwap<Vec<PublicKey>>`; in-flight SSH handshakes see the new set on their next `auth_publickey_offered` call (each `.load()` reads the current `Arc`). **mtime polling, not inotify**: kubelet refreshes Secret mounts via a `..data` symlink swap that an `IN_MODIFY` watch on the file path never sees; `std::fs::metadata` follows symlinks so the swap surfaces as a changed mtime. **Reload failures keep the old set**: an empty/all-invalid/transiently-unreadable file logs WARN and retries next tick — never swap to an empty set (would lock everyone out). I-109: prior to this, rotating a tenant key required a pod restart.
 
 r[gw.jwt.claims]
 JWT claims: `sub` = tenant_id UUID (server-resolved at mint time), `iat`, `exp` (SSH session duration + grace), `jti` (unique token ID for revocation). Signed ed25519, public key distributed via ConfigMap.
@@ -503,8 +508,11 @@ The gateway MUST re-mint the session JWT before injecting it on a new channel if
 r[gw.jwt.verify]
 The tonic interceptor on scheduler and store MUST extract `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request extensions, and reject invalid tokens with `Status::unauthenticated`. (Controller has no gRPC ingress — kube reconcile loop + raw-TCP /healthz only.) The scheduler ADDITIONALLY checks `jti NOT IN jwt_revoked` (PG lookup — gateway stays PG-free).
 
-r[gw.jwt.dual-mode]
-Gateway auth is two-branched PERMANENTLY: `x-rio-tenant-token` header present → JWT verify; absent → SSH-comment fallback. Operator selects the deployment posture via `jwt.key_path` and `jwt.required` in `gateway.toml`: `key_path` absent → comment-fallback only (no JWT minting); `key_path` set with `required=false` → mint-with-degrade (JWT minted on auth, downstream falls back to comment if verify fails); `key_path` set with `required=true` → mint-or-reject. Both paths stay maintained. (Does NOT bump `r[gw.auth.tenant-from-key-comment]`.)
+r[gw.jwt.dual-mode+2]
+Gateway auth is two-branched PERMANENTLY: `x-rio-tenant-token` header present → JWT verify; absent → SSH-comment fallback. Operator selects the deployment posture via the **two `[jwt]` knobs in `gateway.toml`** — `key_path` and `required` (there is no separate `auth_mode` enum): `key_path` absent → comment-fallback only (no JWT minting); `key_path` set with `required=false` → mint-with-degrade (JWT minted on auth, downstream falls back to comment if verify fails); `key_path` set with `required=true` → mint-or-reject. Both paths stay maintained. (Does NOT bump `r[gw.auth.tenant-from-key-comment]`.)
+
+r[gw.jwt.anon-drv-lookup]
+Read-path opcodes (`wopIsValidPath`, `wopEnsurePath`, `wopQueryPathInfo`, `wopQueryValidPaths`) MUST send the JWT to the store **except for `.drv` paths**, which are looked up anonymously (`jwt_unless_drv`). `.drv` files are build INPUTS, not tenant-owned OUTPUTS: a `.drv` uploaded under one identity then queried under another has no `path_tenants` row for the querying tenant, so a tenant-filtered `QueryPathInfo` would return NotFound for a `.drv` the client just uploaded. Output paths keep tenant-scoped visibility (`r[store.tenant.narinfo-filter]`); only the `.drv` lookup is exempt.
 
 ## Connection Lifecycle
 
@@ -542,7 +550,7 @@ selects on and runs the same cancel loop; (3) `OPCODE_IDLE_TIMEOUT`
 expiry — `session.rs` idle-timer fires after 600s with no opcode, runs
 the same cancel loop before returning. All three paths MUST complete the
 cancel loop before the protocol task exits; hard `abort()` on the task
-handle defeats this. Builds not cancelled leak a worker slot until
+handle defeats this. Builds not cancelled leak an executor slot until
 `r[sched.backstop.timeout]`.
 
 r[gw.conn.channel-limit]
@@ -551,10 +559,15 @@ A single SSH connection may open at most `MAX_CHANNELS_PER_CONNECTION`
 requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`. The limit matches Nix's
 default `max-jobs`.
 
-r[gw.conn.keepalive]
+r[gw.conn.keepalive+2]
 The gateway sends SSH keepalive requests every 30 seconds. After 9
-consecutive unanswered keepalives (~270 s), the connection is closed.
-This detects half-open TCP that kernel-level keepalive would not.
+consecutive unanswered keepalives (~300 s — russh increments then
+compares with `>`, so the drop fires at `interval × (max+1)`), the
+connection is closed. This detects half-open TCP that kernel-level
+keepalive would not. I-161: `keepalive_max` was 3 (=120 s), which
+fired during a client's cold-eval idle window over the SSM-tunnel
+path; raised so direct `nix --store ssh-ng://` clients without
+`ServerAliveInterval` get a 5-minute budget.
 
 r[gw.conn.nodelay]
 TCP_NODELAY is set on all accepted sockets. The worker protocol's
@@ -575,6 +588,19 @@ sessions to close on their own before exiting. Stopping the accept loop
 must not disconnect already-established sessions — `nix build --store
 ssh-ng://` clients with builds in flight stay connected until their
 build completes or the session-drain timeout expires.
+
+r[gw.drain.three-stage]
+Shutdown is three-staged: (1) `spawn_drain_task` flips health
+`NOT_SERVING`, sleeps `drain_grace_secs`, then fires `serve_shutdown` →
+the SSH accept loop returns but spawned per-connection tasks continue;
+(2) `wait_for_session_drain` polls `active_conns` until 0 OR
+`session_drain_secs` elapses; (3) on drain timeout it fires
+`sessions_shutdown` (every protocol task selects on this and runs
+`cancel_active_builds`), then waits a final `CANCEL_GRACE` (5 s) for the
+`CancelBuild` RPCs to land before process exit. I-081: without stage 3,
+process exit Drops the proto tasks mid-flight and the scheduler never
+hears `CancelBuild`. `terminationGracePeriodSeconds` in helm must be ≥
+`drain_grace_secs + session_drain_secs + CANCEL_GRACE` + slack.
 
 ## STDERR Message Types
 
@@ -696,7 +722,7 @@ When a Nix client uses `--builders` (build hook mode) instead of `--store ssh-ng
 
 **What the gateway does:**
 - Receives `wopAddToStoreNar` for the derivation's inputs, then `wopBuildDerivation` for the target derivation
-- Creates a **single-node "DAG"** for each hook invocation (no edges, no DAG context)
+- **Attempts full-DAG reconstruction** (`r[gw.dag.reconstruct]`) by resolving the `.drv` from the session cache or store and walking `inputDrvs`. If the `.drv` cannot be resolved, falls back to a **single-node "DAG"** built from the inline `BasicDerivation` (no edges, no DAG context). DAG-reconstruction errors (transitive-input cap exceeded, child-`.drv` resolve failure mid-BFS) are surfaced to the client — degrading to single-node would dispatch an input-addressed root with missing inputs.
 - Submits to the scheduler via `SubmitBuild` as usual
 
 **Scheduling optimizations lost in build hook mode:**
@@ -704,8 +730,8 @@ When a Nix client uses `--builders` (build hook mode) instead of `--store ssh-ng
 - **No multi-build DAG merging** --- shared derivations between concurrent builds cannot be deduplicated at the scheduling level
 - **No CA early cutoff** --- without the full DAG, the scheduler cannot propagate cutoffs to downstream nodes
 
-r[gw.hook.ifd-detection]
-**IFD detection:** When a `wopBuildDerivation` call arrives without a preceding `wopBuildPathsWithResults` on the same session, the gateway sets `is_ifd_hint = true`, and the scheduler assigns `priority_class = "interactive"` regardless of the build's configured priority.
+r[gw.hook.ifd-detection+2]
+**IFD detection:** When a `wopBuildDerivation` call arrives without a preceding `wopBuildPathsWithResults` on the same session, the gateway sets `SubmitBuildRequest.priority_class = "interactive"` (otherwise `"ci"`). There is no dedicated `is_ifd_hint` proto field — the hint is encoded entirely in the `priority_class` string and the gateway, not the scheduler, makes the assignment.
 
 > **Recommendation:** Prefer `ssh-ng://` (remote store mode) over `--builders` (build hook mode) for better scheduling. The build hook path exists for compatibility with existing `nix.conf` setups, but delivers worse throughput and scheduling quality for large builds.
 
@@ -738,7 +764,13 @@ handler's `conn_permit` is `None`, and the first `auth_*` callback
 returns `Err` to tear down the connection before any channel work.
 russh's `handle_session_error` logs the reject.
 
+r[gw.put.aborted-retry]
+The buffered `grpc_put_path` helper (used by `wopAddToStore`, `wopAddTextToStore`, and the `.drv`-buffered branch of `wopAddToStoreNar`/`wopAddMultipleToStore`) MUST retry on store `Code::Aborted` up to `PUT_PATH_ABORTED_MAX_ATTEMPTS` (8) with full-jitter exponential backoff (50 ms base, ×2, 2 s cap → ≤ ~6 s total budget). The store returns `Aborted` when another upload holds the placeholder row for the same path (I-068) or on PG serialization conflicts. Each retry rebuilds the request stream from the `Arc<[u8]>`-held NAR without copying. Emits `rio_gateway_putpath_aborted_retries_total{attempt}` per retry. The streaming `grpc_put_path_streaming` helper is **not** retried on `Aborted` — its reader is consumed and the bytes were forwarded as they arrived, so there is nothing to replay; in practice that path only fires for oversize non-`.drv` entries where the I-068 collision case does not apply.
+
 ## High Availability
+
+r[gw.sched.balanced]
+The gateway connects to the scheduler in one of two modes selected by `scheduler.balance_host` in `gateway.toml`: **balanced** (K8s, multi-replica) — DNS-resolve the headless Service, probe `grpc.health.v1/Check` on each pod IP, and route to the SERVING (= leader) endpoint via `BalancedChannel`; or **single** (VM tests, single-replica) — plain connect to `scheduler.addr`. In balanced mode, `scheduler.addr` is still required: it is the ClusterIP Service, used as the TLS-verify domain (the cert's SAN). The `BalancedChannel` guard is held for process lifetime — dropping it stops the probe loop. The store connection is single-channel only (no `balance_host`; store load is builder-driven, the gateway's `QueryPathInfo` traffic is light).
 
 - Multiple gateway replicas sit behind a TCP load balancer (NLB on EKS with idle timeout ≥ 3600s).
 - Session state is connection-scoped --- the gateway is stateless beyond the lifetime of a single SSH connection.
@@ -747,9 +779,9 @@ russh's `handle_session_error` logs the reject.
 
 r[gw.reconnect.backoff]
 **WatchBuild reconnect:** When the `SubmitBuild` / `WatchBuild` response stream breaks (scheduler failover, transient network), the gateway's `process_stream` distinguishes error classes via `StreamProcessError`:
-- `Transport` (scheduler connection dropped) and `EofWithoutTerminal` (stream closed without a terminal `BuildCompleted`/`Failed`/`Cancelled` event — typical leader-failover signature) → retried up to **10 times** with exponential backoff (**1s/2s/4s/…/512s**). The scheduler replays `BuildEvent`s from `build_event_log` starting at `since_sequence`.
+- `Transport` (scheduler connection dropped) and `EofWithoutTerminal` (stream closed cleanly without a terminal `BuildCompleted`/`Failed`/`Cancelled` event — typical leader-failover signature: SIGTERM → graceful shutdown → TCP FIN → `Ok(None)`) → retried up to **10 times** with exponential backoff **1 s/2 s/4 s/8 s/16 s, capped at 16 s for attempts 6–10**. The scheduler replays `BuildEvent`s from `build_event_log` starting at `since_sequence`.
 - `Wire` → **not** retried; the gateway returns `MiscFailure` to the Nix client immediately. This indicates a protocol bug, not a transient connectivity issue.
-The reconnect counter resets on the first successful `BuildEvent` received after a reconnect.
+The reconnect counter resets on the first successful `BuildEvent` received after a reconnect (NOT on `WatchBuild` returning `Ok` — accepting the RPC doesn't prove the stream will yield events).
 
 r[gw.reconnect.since-seq]
 The gateway MUST track the sequence number of the first peeked `BuildEvent` and use it as the initial `since_sequence` for reconnect, not hardcode `0`. The scheduler never emits `sequence=0` (it's the `WatchBuildRequest`-side "from start" sentinel); hardcoding `0` causes every first-event reconnect to replay one extra event.

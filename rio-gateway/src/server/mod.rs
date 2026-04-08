@@ -313,7 +313,7 @@ fn log_session_end(error: &anyhow::Error) {
 pub fn build_ssh_config(host_key: PrivateKey) -> russh::server::Config {
     russh::server::Config {
         keys: vec![host_key],
-        // r[impl gw.conn.keepalive]
+        // r[impl gw.conn.keepalive+2]
         // russh increments `alive_timeouts` THEN compares with `>`
         // (server/session.rs:553-554), so the drop happens at
         // `interval × (max+1)`. 30s × (9+1) = 300s. I-161: max was 3
@@ -811,7 +811,7 @@ impl Handler for ConnectionHandler {
             self.tenant_name =
                 normalize_key_comment(matched.comment(), &matched.fingerprint(Default::default()));
 
-            // r[impl gw.jwt.dual-mode]
+            // r[impl gw.jwt.dual-mode+2]
             //
             // Dual-mode PERMANENT. Two branches maintained forever:
             //

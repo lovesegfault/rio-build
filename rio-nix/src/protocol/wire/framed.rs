@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 /// `rio_common::limits::MAX_NAR_SIZE` so the gateway's `wopAddToStoreNar`
 /// size check is the effective gate, not this clamp. Enforced by a
 /// compile-time `const` assertion in `rio-gateway`.
-// r[impl gw.wire.framed-max-total]
+// r[impl gw.wire.framed-max-total+2]
 pub const MAX_FRAMED_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Maximum single frame size (64 MiB).
