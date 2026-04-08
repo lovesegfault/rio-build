@@ -937,8 +937,9 @@ use sha2::Digest as _;
 mod tests {
     use super::*;
     use crate::signing::Signer;
+    use crate::test_helpers::seed_tenant;
     use rio_nix::narinfo::fingerprint;
-    use rio_test_support::{TestDb, seed_tenant};
+    use rio_test_support::TestDb;
     use std::net::SocketAddr;
 
     // — test fixture: an in-process upstream cache —

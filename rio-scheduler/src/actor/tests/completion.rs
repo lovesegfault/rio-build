@@ -2424,8 +2424,8 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
 
     // ── Seed 2 tenants. FK path_tenants→tenants ON DELETE CASCADE
     // means these rows MUST exist before the upsert. ─────────────────
-    let tenant_a = rio_test_support::seed_tenant(&db.pool, "pt-tenant-a").await;
-    let tenant_b = rio_test_support::seed_tenant(&db.pool, "pt-tenant-b").await;
+    let tenant_a = rio_store::test_helpers::seed_tenant(&db.pool, "pt-tenant-a").await;
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "pt-tenant-b").await;
 
     // ── Part A: actor flow — 2 builds share 1 derivation → dedup ────
     // Both builds submit the same node (same drv_hash "pt-drv"). The

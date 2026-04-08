@@ -21,8 +21,9 @@ use rio_proto::{
 use rio_store::grpc::{StoreAdminServiceImpl, StoreServiceImpl};
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
+use rio_store::test_helpers::seed_tenant;
 use rio_test_support::fixtures::{make_nar, test_store_path};
-use rio_test_support::{TestDb, TestResult, seed_tenant};
+use rio_test_support::{TestDb, TestResult};
 
 use rio_store::MIGRATOR;
 

@@ -685,9 +685,10 @@ pub fn spawn_orphan_chunk_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::TenantSeed;
     use crate::test_helpers::{ChunkSeed, StoreSeed, path_hash};
+    use rio_test_support::TestDb;
     use rio_test_support::fixtures::test_store_path;
-    use rio_test_support::{TenantSeed, TestDb};
 
     /// Never-cancelled token for sweep tests that don't exercise
     /// the shutdown path.

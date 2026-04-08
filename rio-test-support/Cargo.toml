@@ -26,7 +26,6 @@ hex = { workspace = true }
 # MockStore::seed_chunked: fixed-size chunk content addressing for the
 # in-memory ChunkService.GetChunk impl (dataplane2).
 blake3 = { workspace = true }
-uuid = { workspace = true }
 # spawn_mock_store_inproc: in-process duplex transport so
 # `#[tokio::test(start_paused = true)]` doesn't auto-advance timeouts
 # while real TCP is pending.

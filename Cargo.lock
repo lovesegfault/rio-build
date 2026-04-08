@@ -6752,7 +6752,6 @@ dependencies = [
  "tower-test",
  "tracing",
  "tracing-subscriber",
- "uuid",
  "workspace-hack",
 ]
 

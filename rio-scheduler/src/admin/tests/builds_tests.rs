@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use super::*;
-use rio_test_support::seed_tenant;
+use rio_store::test_helpers::seed_tenant;
 
 // r[verify sched.admin.list-builds]
 #[tokio::test]

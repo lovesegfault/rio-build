@@ -897,7 +897,7 @@ mod tests {
     async fn add_list_remove_upstream_roundtrip() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-        let tid = rio_test_support::seed_tenant(&db.pool, "ups-rpc").await;
+        let tid = crate::test_helpers::seed_tenant(&db.pool, "ups-rpc").await;
 
         // Add.
         let added = svc
@@ -949,7 +949,7 @@ mod tests {
     async fn add_upstream_validates_inputs() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-        let tid = rio_test_support::seed_tenant(&db.pool, "ups-val").await;
+        let tid = crate::test_helpers::seed_tenant(&db.pool, "ups-val").await;
 
         // Bad sig_mode.
         let err = svc
@@ -1012,7 +1012,7 @@ mod tests {
     async fn add_upstream_defaults() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-        let tid = rio_test_support::seed_tenant(&db.pool, "ups-def").await;
+        let tid = crate::test_helpers::seed_tenant(&db.pool, "ups-def").await;
 
         // Empty sig_mode + priority=0 → keep + 50.
         let added = svc

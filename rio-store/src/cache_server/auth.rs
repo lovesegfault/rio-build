@@ -181,8 +181,9 @@ fn unauthorized(msg: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::TenantSeed;
     use axum::{Router, body::Body, http::Request as HttpRequest, routing::get};
-    use rio_test_support::{TenantSeed, TestDb};
+    use rio_test_support::TestDb;
     use tower::ServiceExt;
 
     use crate::MIGRATOR;

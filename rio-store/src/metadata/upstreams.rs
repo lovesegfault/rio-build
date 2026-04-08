@@ -157,7 +157,8 @@ pub async fn delete(pool: &PgPool, tenant_id: Uuid, url: &str) -> Result<u64, Me
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_test_support::{TestDb, seed_tenant};
+    use crate::test_helpers::seed_tenant;
+    use rio_test_support::TestDb;
 
     #[test]
     fn sig_mode_parse() {

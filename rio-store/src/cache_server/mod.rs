@@ -460,9 +460,10 @@ mod tests {
     use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
     use crate::grpc::StoreServiceImpl;
     use crate::signing::Signer;
+    use crate::test_helpers::TenantSeed;
     use axum::body::Body;
     use axum::http::Request;
-    use rio_test_support::{TenantSeed, TestDb};
+    use rio_test_support::TestDb;
     use tower::ServiceExt;
 
     /// Build a Router backed by real PG + memory chunk backend.

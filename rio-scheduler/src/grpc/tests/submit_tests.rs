@@ -6,7 +6,7 @@
 //! tenant name→UUID resolve, trace-id metadata, jti revocation.
 
 use super::*;
-use rio_test_support::seed_tenant;
+use rio_store::test_helpers::seed_tenant;
 
 /// SubmitBuild with an empty drv_hash in a node should be rejected at
 /// the gRPC boundary (proto types have no validation; an empty hash

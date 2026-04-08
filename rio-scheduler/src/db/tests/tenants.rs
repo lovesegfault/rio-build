@@ -1,6 +1,7 @@
 //! Tenant CRUD integration tests.
 
-use rio_test_support::{TenantSeed, TestDb, seed_tenant};
+use rio_store::test_helpers::{TenantSeed, seed_tenant};
+use rio_test_support::TestDb;
 
 /// TenantSeed: columns not `.with_*()`'d take their schema default.
 /// Proves the Option-bind plumbing — `gc_retention_hours` is `NOT

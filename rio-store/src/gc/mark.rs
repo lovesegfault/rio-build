@@ -151,8 +151,9 @@ pub async fn compute_unreachable(
 mod tests {
     use super::*;
     use crate::test_helpers::{StoreSeed, path_hash};
+    use crate::test_helpers::{TenantSeed, seed_tenant};
+    use rio_test_support::TestDb;
     use rio_test_support::fixtures::test_store_path;
-    use rio_test_support::{TenantSeed, TestDb, seed_tenant};
 
     /// Thin wrapper: mark tests seed paths with (refs, created_at)
     /// to verify the CTE walks correctly.

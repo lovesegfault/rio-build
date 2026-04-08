@@ -529,8 +529,9 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
 mod tests {
     use super::*;
     use crate::test_helpers::StoreSeed;
+    use crate::test_helpers::seed_tenant;
+    use rio_test_support::TestDb;
     use rio_test_support::fixtures::test_store_path;
-    use rio_test_support::{TestDb, seed_tenant};
     use sqlx::PgPool;
 
     /// Seed a complete path (narinfo + manifests status='complete').

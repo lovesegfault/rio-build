@@ -669,7 +669,7 @@ mod tests {
         key_name: &str,
         seed: &[u8; 32],
     ) -> uuid::Uuid {
-        rio_test_support::TenantSeed::new(tenant_name)
+        crate::test_helpers::TenantSeed::new(tenant_name)
             .with_ed25519_key(*seed)
             .with_key_name(key_name)
             .seed(pool)
@@ -731,7 +731,7 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
 
         // Tenant exists but has NO tenant_keys row.
-        let tid = rio_test_support::seed_tenant(&db.pool, "ts-no-key").await;
+        let tid = crate::test_helpers::seed_tenant(&db.pool, "ts-no-key").await;
 
         let ts = TenantSigner::new(
             Signer::from_seed("cluster-1", &CLUSTER_SEED),
@@ -833,7 +833,7 @@ mod tests {
         let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
 
         // Tenant with NO key (fallback path #2).
-        let tid = rio_test_support::seed_tenant(&db.pool, "ro-no-key").await;
+        let tid = crate::test_helpers::seed_tenant(&db.pool, "ro-no-key").await;
 
         let ts = TenantSigner::new(
             Signer::from_seed("cluster-1", &CLUSTER_SEED),

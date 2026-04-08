@@ -56,7 +56,8 @@ pub async fn get_active_signer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_test_support::{TestDb, seed_tenant};
+    use crate::test_helpers::seed_tenant;
+    use rio_test_support::TestDb;
 
     async fn seed_key(pool: &PgPool, tenant_id: Uuid, key_name: &str, seed: &[u8]) {
         sqlx::query(

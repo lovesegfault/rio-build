@@ -530,7 +530,7 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
 
-    let tenant = rio_test_support::seed_tenant(&db.pool, "cache-tenant").await;
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "cache-tenant").await;
 
     // Seed the store so FindMissingPaths returns empty (= cache hit).
     let out_path = test_store_path("cached-out");
@@ -581,8 +581,8 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
 
     let (db, handle, _task, _rx) = setup_with_worker("pre-w", "x86_64-linux").await?;
 
-    let tenant_a = rio_test_support::seed_tenant(&db.pool, "pre-tenant-a").await;
-    let tenant_b = rio_test_support::seed_tenant(&db.pool, "pre-tenant-b").await;
+    let tenant_a = rio_store::test_helpers::seed_tenant(&db.pool, "pre-tenant-a").await;
+    let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "pre-tenant-b").await;
 
     // Build A completes the drv.
     let build_a = Uuid::new_v4();

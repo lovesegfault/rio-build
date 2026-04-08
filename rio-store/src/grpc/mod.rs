@@ -1350,7 +1350,8 @@ mod tests {
     #[tokio::test]
     async fn sig_visibility_gate_cross_tenant() {
         use crate::signing::Signer;
-        use rio_test_support::{TestDb, seed_tenant};
+        use crate::test_helpers::seed_tenant;
+        use rio_test_support::TestDb;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
         // Gate only applies with substituter wired (`.is_none()`
@@ -1493,7 +1494,8 @@ mod tests {
     #[tokio::test]
     async fn sig_gate_survives_cluster_key_rotation_with_cascaded_tenant() {
         use crate::signing::{Signer, TenantSigner};
-        use rio_test_support::{TestDb, seed_tenant};
+        use crate::test_helpers::seed_tenant;
+        use rio_test_support::TestDb;
 
         let db = TestDb::new(&crate::MIGRATOR).await;
         let sub = Arc::new(Substituter::new(db.pool.clone(), None));
