@@ -147,9 +147,7 @@ impl ActorHandle {
     ///
     /// Returns the `Default` snapshot (all zeros) until the first Tick
     /// fires — same observable behavior as a fresh actor with an empty
-    /// DAG. The actor-routed `ActorCommand::ClusterSnapshot` is kept
-    /// for callers that need a synchronous-with-mailbox read (none at
-    /// present; cheap to keep).
+    /// DAG.
     // r[impl sched.admin.snapshot-cached]
     pub fn cluster_snapshot_cached(&self) -> Arc<ClusterSnapshot> {
         self.snapshot_rx.borrow().clone()

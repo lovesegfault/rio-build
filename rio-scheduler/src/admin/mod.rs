@@ -189,8 +189,7 @@ impl AdminService for AdminServiceImpl {
         self.ensure_leader()?;
         self.check_actor_alive()?;
 
-        // I-163: read the watch-cached snapshot instead of round-
-        // tripping `ActorCommand::ClusterSnapshot` through the mailbox.
+        // I-163: read the watch-cached snapshot (no mailbox round-trip).
         // The autoscaler MUST get a reading under saturation —
         // `send_unchecked` bypassed backpressure but still queued
         // behind 9.5k commands (~47s wait for a 37µs handler). The

@@ -341,10 +341,10 @@ pub struct DagActor {
     /// Last [`ClusterSnapshot`] published by `handle_tick`. The
     /// AdminService `cluster_status` handler reads `snapshot_tx.
     /// subscribe().borrow()` via [`ActorHandle::cluster_snapshot_cached`]
-    /// instead of round-tripping `ActorCommand::ClusterSnapshot` through
-    /// the mailbox — so `xtask status` / autoscaler polls stay alive
-    /// regardless of mailbox depth (I-163: 30s timeouts when 9.5k
-    /// commands queued ahead of a 37µs handler). Up to one Tick stale.
+    /// — a watch-channel cache, not a mailbox round-trip — so `xtask
+    /// status` / autoscaler polls stay alive regardless of mailbox
+    /// depth (I-163: 30s timeouts when 9.5k commands queued ahead of a
+    /// 37µs handler). Up to one Tick stale.
     // r[impl sched.admin.snapshot-cached]
     snapshot_tx: watch::Sender<Arc<ClusterSnapshot>>,
     /// Test-only: oneshot pair for deterministic interleaving in

@@ -427,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // The generation Arc is constructed HERE (not inside the
     // actor) so both the actor and the lease task share the same
-    // instance. spawn_with_leader injects it into the actor,
+    // instance. spawn injects it into the actor via DagActorPlumbing,
     // REPLACING the actor's default Arc(1) — same init value,
     // shared reference.
     let lease_cfg = rio_scheduler::lease::LeaseConfig::from_parts(
@@ -595,7 +595,7 @@ async fn main() -> anyhow::Result<()> {
     // 30d > rebalancer's 7d query window (P0229) with margin.
     //
     // Fresh SchedulerDb from pool.clone() — `db` was moved into the
-    // actor at ActorHandle::spawn_with_leader above. PgPool is
+    // actor at ActorHandle::spawn above. PgPool is
     // Arc-backed; SchedulerDb::new is just { pool }, so this is a
     // 1-pointer clone. Placed before AdminServiceImpl::new which
     // terminally moves `pool`.
