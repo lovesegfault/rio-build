@@ -248,13 +248,13 @@ const BACKOFF_CAP: Duration = Duration::from_secs(300);
 ///
 /// n=1 → 5s, n=2 → 10s, n=3 → 20s, … n=7+ → 300s (cap).
 pub(crate) fn transient_backoff(n: u32) -> Duration {
-    // 2^(n-1) with saturation. n=0 shouldn't happen (caller
-    // increments first) but treat as n=1. Shift cap at 63 to
-    // avoid overflow (irrelevant — cap trips long before).
-    let mult = 1u64 << (n.saturating_sub(1)).min(63);
-    BACKOFF_BASE
-        .saturating_mul(mult.min(u32::MAX as u64) as u32)
-        .min(BACKOFF_CAP)
+    rio_common::backoff::Backoff {
+        base: BACKOFF_BASE,
+        mult: 2.0,
+        cap: BACKOFF_CAP,
+        jitter: rio_common::backoff::Jitter::None,
+    }
+    .duration(n.saturating_sub(1))
 }
 
 /// Build the error-count key for a namespaced K8s object.
