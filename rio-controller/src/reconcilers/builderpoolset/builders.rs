@@ -185,7 +185,6 @@ pub(super) mod tests {
                 // a scheduler-side field).
                 cutoff_secs: (i as f64 + 1.0) * 60.0,
                 max_concurrent: Some((i as u32 + 1) * 5),
-                target_queue_per_replica: Some(5),
                 resources: ResourceRequirements::default(),
             })
             .collect();
@@ -203,7 +202,6 @@ pub(super) mod tests {
                 host_users: None,
                 tls_secret_name: None,
             },
-            cutoff_learning: None,
         };
         let mut wps = BuilderPoolSet::new("test-wps", spec);
         // controller_owner_ref needs uid + name. Apiserver sets

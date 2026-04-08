@@ -271,7 +271,6 @@ fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> BuilderPoolSet {
             name: (*n).to_string(),
             cutoff_secs: 60.0,
             max_concurrent: Some(10),
-            target_queue_per_replica: Some(5),
             resources: ResourceRequirements::default(),
         })
         .collect();
@@ -282,7 +281,6 @@ fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> BuilderPoolSet {
             systems: vec!["x86_64-linux".into()],
             ..Default::default()
         },
-        cutoff_learning: None,
     };
     let mut wps = BuilderPoolSet::new(name, spec);
     wps.metadata.uid = Some(format!("{name}-uid"));

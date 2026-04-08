@@ -30,9 +30,6 @@ spec:
       {{- with .maxConcurrent }}
       maxConcurrent: {{ . }}
       {{- end }}
-      {{- with .targetQueuePerReplica }}
-      targetQueuePerReplica: {{ . }}
-      {{- end }}
       resources:
         {{- toYaml .resources | nindent 8 }}
     {{- end }}

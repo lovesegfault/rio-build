@@ -49,14 +49,6 @@ pub struct BuilderPoolSetSpec {
     /// class fields (resources, cutoff) override; template fields
     /// (image, node_selector, seccomp) apply uniformly.
     pub pool_template: PoolTemplate,
-
-    /// Cutoff learning config. `None` = static cutoffs (whatever
-    /// `classes[].cutoff_secs` says). `Some(..)` enables the EMA
-    /// rebalancer — it watches build-time histograms and shifts
-    /// `status.classes[].effective_cutoff_secs` to balance queue
-    /// load across classes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cutoff_learning: Option<CutoffLearningConfig>,
 }
 
 /// One size class. The scheduler's classify() maps a derivation's
@@ -83,20 +75,6 @@ pub struct SizeClassSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
 
-    /// Queued-builds-per-replica target for this class's
-    /// autoscaler. `compute_desired` (P0234) scales to
-    /// `queued / target`. Default 5 (one replica per 5 queued).
-    /// Lower = more aggressive scaling = lower queue latency
-    /// = higher pod churn. "small" class probably wants lower
-    /// (fast builds → operators notice queue lag); "large"
-    /// tolerates higher (hours-long builds don't care about
-    /// a few extra minutes queued).
-    #[serde(
-        default = "default_target_queue",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub target_queue_per_replica: Option<u32>,
-
     /// K8s resource requests/limits for this class's builder
     /// pods. NON-Option: the entire POINT of size classes is
     /// distinct resource profiles ("small" = 1cpu/2Gi; "large"
@@ -112,10 +90,6 @@ pub struct SizeClassSpec {
     /// clear error — acceptable (operators see it).
     #[schemars(schema_with = "crate::any_object")]
     pub resources: ResourceRequirements,
-}
-
-fn default_target_queue() -> Option<u32> {
-    Some(5)
 }
 
 /// Subset of `BuilderPoolSpec` shared across all child pools.
@@ -192,42 +166,6 @@ pub struct PoolTemplate {
     pub tls_secret_name: Option<String>,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to FetcherPools which have direct egress. Squid is gone.
-}
-
-/// Cutoff rebalancer config. The controller observes per-class
-/// build-time histograms (from scheduler metrics) and shifts
-/// effective cutoffs toward the actual distribution.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CutoffLearningConfig {
-    /// Master switch. `false` = `effective_cutoff_secs` stays
-    /// pinned to `spec.classes[].cutoff_secs`. Lets operators
-    /// keep the config present (for quick re-enable) without
-    /// the rebalancer acting.
-    pub enabled: bool,
-
-    /// Minimum observed builds before the rebalancer acts.
-    /// Below this, the sample is too small — the EMA would
-    /// chase noise. 100 is a rough "one busy hour" default;
-    /// cold clusters should raise this.
-    #[serde(default = "default_min_samples")]
-    pub min_samples: u64,
-
-    /// EMA smoothing factor. `new = alpha*obs + (1-alpha)*old`.
-    /// 0.3 means ~3 observation cycles to converge on a new
-    /// distribution (forgets old data in ~10 cycles). Lower =
-    /// smoother but slower to adapt; higher = responsive but
-    /// can oscillate on bursty workloads.
-    #[serde(default = "default_ema_alpha")]
-    pub ema_alpha: f64,
-}
-
-fn default_min_samples() -> u64 {
-    100
-}
-
-fn default_ema_alpha() -> f64 {
-    0.3
 }
 
 /// BuilderPoolSet status. Reconciler writes; `kubectl get bps`
@@ -310,20 +248,15 @@ mod tests {
         let json = serde_json::to_string(&crd).expect("serializes");
         // BuilderPoolSetSpec
         assert!(json.contains("poolTemplate"));
-        assert!(json.contains("cutoffLearning"));
         // SizeClassSpec
         assert!(json.contains("cutoffSecs"));
         assert!(json.contains("maxConcurrent"));
-        assert!(json.contains("targetQueuePerReplica"));
         // PoolTemplate
         assert!(json.contains("nodeSelector"));
         assert!(json.contains("seccompProfile"));
         assert!(json.contains("hostNetwork"));
         assert!(json.contains("hostUsers"));
         assert!(json.contains("tlsSecretName"));
-        // CutoffLearningConfig
-        assert!(json.contains("minSamples"));
-        assert!(json.contains("emaAlpha"));
         // ClassStatus
         assert!(json.contains("effectiveCutoffSecs"));
         assert!(json.contains("childPool"));
