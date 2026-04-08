@@ -46,7 +46,6 @@ fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) ->
         namespace: wp.namespace().unwrap_or_default(),
         node_selector: wp.spec.node_selector.clone(),
         tolerations: wp.spec.tolerations.clone(),
-        topology_spread: wp.spec.topology_spread,
         image: wp.spec.image.clone(),
         image_pull_policy: wp.spec.image_pull_policy.clone(),
         systems: wp.spec.systems.clone(),

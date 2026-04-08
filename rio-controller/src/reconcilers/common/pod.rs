@@ -10,15 +10,12 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Affinity, Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource,
-    EnvVar, EnvVarSource, HTTPGetAction, HostPathVolumeSource, ObjectFieldSelector,
-    PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, Probe, ResourceRequirements,
-    SeccompProfile, SecretVolumeSource, SecurityContext, Toleration, TopologySpreadConstraint,
-    Volume, VolumeMount, WeightedPodAffinityTerm,
+    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
+    EnvVarSource, HostPathVolumeSource, ObjectFieldSelector, PodSecurityContext, PodSpec,
+    ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext, Toleration, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::error::{Error, Result};
@@ -148,8 +145,6 @@ pub struct ExecutorPodParams {
     // ── scheduling ───────────────────────────────────────────────
     pub node_selector: Option<BTreeMap<String, String>>,
     pub tolerations: Option<Vec<Toleration>>,
-    /// Soft topology spread on hostname. `None` → true.
-    pub topology_spread: Option<bool>,
 
     // ── image ────────────────────────────────────────────────────
     pub image: String,
@@ -257,8 +252,6 @@ pub fn build_executor_pod_spec(
     // namespaced mount is RW — no hostPath needed, and a hostPath
     // would clobber host systemd.
 
-    let labels = executor_labels(p);
-    let spread_enabled = p.topology_spread.unwrap_or(true);
     let privileged = p.privileged;
     // Localhost seccomp: profile lives on node disk, written by
     // systemd-tmpfiles BEFORE kubelet starts on every supported target
@@ -315,41 +308,6 @@ pub fn build_executor_pod_spec(
         } else {
             None
         },
-
-        // Soft topology spread + anti-affinity. Node drain can make
-        // hard spread unsatisfiable; soft lets pods schedule then
-        // re-spread later.
-        topology_spread_constraints: spread_enabled.then(|| {
-            vec![TopologySpreadConstraint {
-                max_skew: 1,
-                topology_key: "kubernetes.io/hostname".into(),
-                when_unsatisfiable: "ScheduleAnyway".into(),
-                label_selector: Some(LabelSelector {
-                    match_labels: Some(labels.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }]
-        }),
-        affinity: spread_enabled.then(|| Affinity {
-            pod_anti_affinity: Some(PodAntiAffinity {
-                preferred_during_scheduling_ignored_during_execution: Some(vec![
-                    WeightedPodAffinityTerm {
-                        weight: 100,
-                        pod_affinity_term: PodAffinityTerm {
-                            label_selector: Some(LabelSelector {
-                                match_labels: Some(labels.clone()),
-                                ..Default::default()
-                            }),
-                            topology_key: "kubernetes.io/hostname".into(),
-                            ..Default::default()
-                        },
-                    },
-                ]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
 
         volumes: Some({
             let mut v = vec![
@@ -692,10 +650,12 @@ fn build_executor_container(
             },
         ]),
 
-        liveness_probe: Some(http_probe("/healthz", 9193, 10, 3)),
-        readiness_probe: Some(http_probe("/readyz", 9193, 5, 3)),
-        startup_probe: Some(http_probe("/healthz", 9193, 4, 30)),
-
+        // No liveness/readiness/startup probes: executor pods are
+        // one-shot Jobs. activeDeadlineSeconds bounds hangs; nothing
+        // routes via Service (no readiness gate); and a CPU-pegged
+        // build would fail a 1s-timeout liveness probe → kubelet
+        // SIGKILL mid-build → FUSE/overlay torn down → nix-daemon EIO
+        // (I-114).
         ..Default::default()
     }
 }
@@ -742,19 +702,6 @@ pub fn env_from_field(name: &str, field_path: &str) -> EnvVar {
             }),
             ..Default::default()
         }),
-        ..Default::default()
-    }
-}
-
-fn http_probe(path: &str, port: i32, period: i32, failure_threshold: i32) -> Probe {
-    Probe {
-        http_get: Some(HTTPGetAction {
-            path: Some(path.into()),
-            port: IntOrString::Int(port),
-            ..Default::default()
-        }),
-        period_seconds: Some(period),
-        failure_threshold: Some(failure_threshold),
         ..Default::default()
     }
 }

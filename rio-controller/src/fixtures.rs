@@ -63,7 +63,6 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
         host_network: None,
         host_users: None,
         tls_secret_name: None,
-        topology_spread: None,
     }
 }
 

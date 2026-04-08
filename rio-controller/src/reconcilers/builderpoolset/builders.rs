@@ -124,7 +124,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         fuse_passthrough: None,
         daemon_timeout_secs: None,
         termination_grace_period_seconds: None,
-        topology_spread: None,
     };
 
     let name = child_name(wps, class);

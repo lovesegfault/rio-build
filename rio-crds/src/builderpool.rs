@@ -340,20 +340,6 @@ pub struct BuilderPoolSpec {
     /// defaults to empty → load_client_tls returns None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_secret_name: Option<String>,
-
-    /// Spread builder pods across nodes. `None`/`Some(true)` (the
-    /// default) sets `topologySpreadConstraints` with `maxSkew: 1`
-    /// on `kubernetes.io/hostname` (soft — `whenUnsatisfiable:
-    /// ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =
-    /// no spread (all pods can land on one node; useful for
-    /// single-node dev clusters where spread would just be noise).
-    ///
-    /// Soft (not hard) because a node drain evicting all but one
-    /// would temporarily make hard-spread unsatisfiable → pods
-    /// stuck Pending. Soft lets them schedule then re-spread on
-    /// the next autoscaler action.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topology_spread: Option<bool>,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers (FetcherPool) which have direct egress. The
     // Squid proxy is deleted — the FOD hash check is the integrity

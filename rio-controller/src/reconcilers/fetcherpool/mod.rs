@@ -168,7 +168,6 @@ fn executor_params(
             .ok_or_else(|| Error::InvalidSpec("FetcherPool has no namespace".into()))?,
         node_selector,
         tolerations,
-        topology_spread: Some(true),
         image: fp.spec.image.clone(),
         image_pull_policy: None,
         systems: fp.spec.systems.clone(),
