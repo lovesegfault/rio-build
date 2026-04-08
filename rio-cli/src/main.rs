@@ -199,7 +199,8 @@ struct CliArgs {
 }
 
 // TODO: rio keys subcommand — blocked on rio-store signing-key admin RPCs
-// (Add/List/Retire/RotateClusterKey); see r[store.key.admin-cli]
+// (Add/List/Retire/RotateClusterKey); see docs/src/components/store.md "Signing keys" future-work note
+// and the paired TODO in rio-store/src/grpc/admin.rs
 // TODO: rio submit — server-side .drv parse approach pending; cli-A03
 // dependency-surface tension (rio-cli must not depend on rio-nix derivation parser)
 #[derive(Subcommand, Clone)]

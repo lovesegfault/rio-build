@@ -26,7 +26,7 @@ Unary admin RPCs are wrapped in a 120s deadline.
 r[cli.rpc-retry]
 
 Unary admin RPCs retry up to twice on `UNAVAILABLE` (1s/2s backoff) before surfacing the error — covers a standby-replica hit or leader-election flip without masking a genuinely-down scheduler.
-All unary admin RPCs go through `rpc()` which wraps `with_timeout("Name", RPC_TIMEOUT, fut)`. `RPC_TIMEOUT` is 120s — NOT 30s — because actor-routed RPCs (`InspectBuildDag`, `ClusterSnapshot`) queue behind the actor mailbox, and the operator needs the dump precisely when the actor is saturated (I-163: ~9.5k mailbox commands under load). `connect_admin` has a separate 10s connect timeout (TCP/handshake bound). Streaming RPCs (`TriggerGC`, `GetBuildLogs`, `VerifyChunks`) wrap only the initial call; per-message progress drains without a whole-call deadline.
+All unary admin RPCs go through `rpc()` which applies the retry above and a per-attempt `RPC_TIMEOUT` deadline. `RPC_TIMEOUT` is 120s — NOT 30s — because actor-routed RPCs (`InspectBuildDag`, `ClusterSnapshot`) queue behind the actor mailbox, and the operator needs the dump precisely when the actor is saturated (I-163: ~9.5k mailbox commands under load). `connect_admin` has a separate 10s connect timeout (TCP/handshake bound). Streaming RPCs (`TriggerGC`, `GetBuildLogs`, `VerifyChunks`) wrap only the initial call; per-message progress drains without a whole-call deadline.
 
 ## Subcommands
 
