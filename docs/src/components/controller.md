@@ -54,12 +54,13 @@ status:
 r[ctrl.pool.ephemeral]
 The reconciler polls `AdminService.ClusterStatus` each requeue tick (10s)
 and spawns K8s Jobs when `queued_derivations > 0` and active Jobs <
-`spec.maxConcurrent`. Each Job runs one rio-worker pod whose main loop
+`spec.maxConcurrent`. Each Job runs one rio-builder pod whose main loop
 exits after one `CompletionReport` → pod terminates → Job goes Complete →
-`ttlSecondsAfterFinished: 60` reaps. Job settings: `backoffLimit: 0`
-(scheduler owns retry), `restartPolicy: Never`, `parallelism: 1`.
-`spec.maxConcurrent` is the concurrent-Job ceiling, not a standing set;
-zero queued derivations means zero workers.
+`ttlSecondsAfterFinished: 600` reaps (10min postmortem window for `kubectl
+logs` on failed builders). Job settings: `backoffLimit: 0` (scheduler owns
+retry), `restartPolicy: Never`, `parallelism: 1`. `spec.maxConcurrent` is
+the concurrent-Job ceiling, not a standing set; zero queued derivations
+means zero pods.
 
 **Isolation guarantee:** zero cross-build state. Fresh pod means fresh
 emptyDir for FUSE cache and overlayfs upper, fresh filesystem. Untrusted
