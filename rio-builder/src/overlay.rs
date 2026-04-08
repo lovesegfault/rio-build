@@ -213,6 +213,11 @@ pub fn setup_overlay(
     mkdir_all(&store_upper)?;
     mkdir_all(&work)?;
     mkdir_all(&merged)?;
+    // Any `?` from here until the mount succeeds would leave build_dir on
+    // disk with no OverlayMount to Drop it. Defused on success below.
+    let cleanup = scopeguard::guard(build_dir.clone(), |d| {
+        let _ = fs::remove_dir_all(d);
+    });
     // nix's `LocalStore` refuses to open a chroot store if any ancestor
     // of the root is world-writable (S_IWOTH), to prevent symlink-swap
     // attacks. The k8s emptyDir mounted at `base_dir` is 0777 by
@@ -293,6 +298,7 @@ pub fn setup_overlay(
     )
     .map_err(|source| OverlayError::Mount { mount_data, source })?;
 
+    scopeguard::ScopeGuard::into_inner(cleanup);
     Ok(OverlayMount {
         build_dir,
         upper,
@@ -422,29 +428,27 @@ mod tests {
         Ok(())
     }
 
-    /// Verify that setup_overlay creates `{upper}/nix/store/` as the overlayfs
-    /// upperdir (so build outputs land where upload.rs expects them).
-    /// Uses the same-filesystem rejection path to test dir creation without
-    /// needing CAP_SYS_ADMIN for the actual mount.
+    /// Early-return after mkdir (e.g. SameFilesystem) must not leak the
+    /// build_dir tree — the scopeguard removes it. base_dir itself survives.
     #[test]
-    fn test_setup_overlay_creates_store_upper() -> anyhow::Result<()> {
+    fn test_setup_overlay_cleans_build_dir_on_error() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let lower = dir.path().join("lower");
         let base = dir.path().join("base");
         std::fs::create_dir_all(&lower)?;
 
         // Fails at st_dev check (post-mkdir, pre-mount).
-        let _ = setup_overlay(&lower, &base, "test-build");
+        let Err(e) = setup_overlay(&lower, &base, "test-build") else {
+            panic!("expected SameFilesystem error");
+        };
+        assert!(matches!(e, OverlayError::SameFilesystem { .. }));
 
-        // Overlayfs upperdir should have been created at upper/nix/store/,
-        // NOT just upper/. This is critical for upload.rs which scans
-        // `upper_store()` for build outputs.
-        let store_upper = base.join("test-build/upper/nix/store");
+        let build_dir = base.join("test-build");
         assert!(
-            store_upper.exists(),
-            "overlayfs upperdir {store_upper:?} should be created"
+            !build_dir.exists(),
+            "build_dir {build_dir:?} must be removed on early-error return"
         );
-        assert!(store_upper.is_dir());
+        assert!(base.exists(), "base_dir itself must survive cleanup");
         Ok(())
     }
 }
