@@ -9,7 +9,7 @@ use tracing::{error, info};
 use rio_proto::ChunkServiceServer;
 use rio_proto::StoreAdminServiceServer;
 use rio_proto::StoreServiceServer;
-use rio_store::backend::chunk::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
+use rio_store::backend::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
 use rio_store::cache_server::{self, CacheServerState};
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};

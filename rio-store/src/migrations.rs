@@ -605,6 +605,20 @@ pub const M_034: () = ();
 /// explicit drop documents intent and survives a reorder).
 pub const M_035: () = ();
 
+/// `migrations/036_drop_gc_roots.sql`
+///
+/// Drops the `gc_roots` explicit-pin table created in 005. It was
+/// reserved as an "operator pin" extension point but never gained a
+/// production writer (no `AddGcRoot` RPC, no `rio-cli` subcommand, no
+/// controller reconciler). Mark/sweep paid a JOIN + per-swept-path
+/// EXISTS subquery against a permanently-empty table on every GC.
+///
+/// Operator pinning, if needed, goes through `extra_roots` (scheduler
+/// `ActorCommand::GcRoots`) or `scheduler_live_pins`; the grace window
+/// covers transient cases. Per project posture (no dev-phase reserved
+/// knobs without users), the table is dropped rather than wired.
+pub const M_036: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

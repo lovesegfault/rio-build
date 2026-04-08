@@ -7,7 +7,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use tracing::{debug, warn};
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 
 /// Batch size: how many pending rows to process per drain iteration.
 /// Small enough that a slow S3 DeleteObject for one doesn't block
@@ -206,7 +206,7 @@ pub fn spawn_drain_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::chunk::MemoryChunkBackend;
+    use crate::backend::MemoryChunkBackend;
     use rio_test_support::TestDb;
 
     #[tokio::test]

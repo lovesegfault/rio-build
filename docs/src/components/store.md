@@ -283,7 +283,7 @@ r[store.put.stale-reclaim]
 ## Two-Phase Garbage Collection
 
 r[store.gc.two-phase]
-- **Phase 1 (Mark):** Identify paths unreachable from GC roots via a recursive CTE over `narinfo."references"`. GC root seeds: explicit pins in the `gc_roots` table, auto-pinned live-build inputs in the `scheduler_live_pins` table, manifests with `status='uploading'` (in-flight PutPath), paths with `created_at > now() - grace_hours` (recent uploads), and `extra_roots` passed from the scheduler's live-build output paths (`ActorCommand::GcRoots`). Mark takes NO lock against PutPath (I-192); PutPath runs freely throughout. The CTE's MVCC snapshot is a point-in-time view — placeholders that commit after it are caught by sweep's re-check.
+- **Phase 1 (Mark):** Identify paths unreachable from GC roots via a recursive CTE over `narinfo."references"`. GC root seeds: auto-pinned live-build inputs in the `scheduler_live_pins` table, manifests with `status='uploading'` (in-flight PutPath), paths with `created_at > now() - grace_hours` (recent uploads), per-tenant retention windows, and `extra_roots` passed from the scheduler's live-build output paths (`ActorCommand::GcRoots`). Mark takes NO lock against PutPath (I-192); PutPath runs freely throughout. The CTE's MVCC snapshot is a point-in-time view — placeholders that commit after it are caught by sweep's re-check.
 - **Grace period:** Configurable per-invocation via `GcRequest.grace_period_hours` (default **2h**). Protects paths uploaded shortly before GC that builds haven't referenced yet.
 - **Phase 2 (Sweep):** Re-read chunk refcounts at sweep time (NOT from a mark-phase snapshot). Per unreachable path, in batched transactions: `SELECT chunk_list ... FOR UPDATE OF m` locks the **manifest** row (not chunk rows), then sweep **re-checks references** (`r[store.gc.sweep-recheck]`). DELETE narinfo (CASCADE), decrement chunk refcounts, mark `refcount=0` chunks deleted, enqueue S3 keys to `pending_s3_deletes` --- all in the same PG transaction.
 
@@ -457,15 +457,9 @@ CREATE TABLE realisations (
 CREATE INDEX realisations_output_idx ON realisations (output_path);
 ```
 
-> GC tables (`gc_roots`, `scheduler_live_pins`, `pending_s3_deletes`) are added by `migrations/006_gc_safety.sql`. See the `rio-store/src/gc/` module for the mark/sweep/drain implementation.
+> GC tables (`scheduler_live_pins`, `pending_s3_deletes`) are added by `migrations/006_gc_safety.sql`. See the `rio-store/src/gc/` module for the mark/sweep/drain implementation. The `gc_roots` explicit-pin table was created in 005 but never gained a production writer; dropped in 036.
 
 ```sql
-CREATE TABLE gc_roots (
-    store_path_hash  BYTEA PRIMARY KEY
-                     REFERENCES narinfo(store_path_hash),
-    source           TEXT NOT NULL,               -- 'admin' / 'test' / etc
-    pinned_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
 -- Scheduler auto-pins input closures of dispatched derivations.
 -- Unpinned on completion. NOT FK'd to narinfo (input paths may not
@@ -522,7 +516,7 @@ CREATE INDEX idx_pending_s3_deletes_drain
 ## GC Files
 
 - `rio-store/src/gc/mod.rs` --- GC lock constant (`GC_LOCK_ID`), `GcStats`, `run_gc` orchestration
-- `rio-store/src/gc/mark.rs` --- `compute_unreachable` recursive CTE (seeds: gc_roots, scheduler_live_pins, uploading manifests, grace-period, extra_roots)
+- `rio-store/src/gc/mark.rs` --- `compute_unreachable` recursive CTE (seeds: scheduler_live_pins, uploading manifests, grace-period, extra_roots, tenant retention)
 - `rio-store/src/gc/sweep.rs` --- Per-path batched delete with `FOR UPDATE OF m` + reference re-check
 - `rio-store/src/gc/drain.rs` --- Background S3 delete drain (30s interval, blake3_hash re-check)
 - `rio-store/src/gc/orphan.rs` --- Stale `'uploading'` manifest cleanup

@@ -18,7 +18,7 @@ use rio_proto::types::{
 };
 use rio_proto::validated::ValidatedPathInfo;
 use rio_store::MIGRATOR;
-use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+use rio_store::backend::{ChunkBackend, MemoryChunkBackend};
 use rio_store::grpc::StoreServiceImpl;
 // Re-export the shared helpers under their existing names so the test
 // submodules' `use super::*;` keeps working unchanged.

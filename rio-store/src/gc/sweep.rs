@@ -7,7 +7,7 @@ use std::time::Duration;
 use sqlx::{Connection, PgPool, Postgres, Transaction};
 use tracing::{info, instrument, warn};
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 
 use super::{GcStats, decrement_and_enqueue};
 
@@ -75,9 +75,9 @@ const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Re-check whether `store_path_hash` has a referrer outside the
-/// `sweep_unreachable` temp table, or a direct `gc_roots` /
-/// `scheduler_live_pins` entry. See the call-site comment in
-/// [`sweep`] for the GIN/anti-join rationale.
+/// `sweep_unreachable` temp table, or a direct `scheduler_live_pins`
+/// entry. See the call-site comment in [`sweep`] for the GIN/anti-join
+/// rationale.
 async fn recheck_has_live_referrer(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
@@ -96,7 +96,6 @@ async fn recheck_has_live_referrer(
                )
              LIMIT 1
           )
-          OR EXISTS (SELECT 1 FROM gc_roots WHERE store_path_hash = $1)
           OR EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
         "#,
     )
@@ -331,11 +330,11 @@ pub async fn sweep(
             // `batch`) — a cycle may span SWEEP_BATCH_SIZE boundaries.
             // r[impl store.gc.sweep-cycle-reclaim]
             //
-            // Also re-check `gc_roots` and `scheduler_live_pins`: a
-            // gc_roots pin or scheduler dispatch that landed between mark
-            // and now is a direct root on THIS path that mark's snapshot
-            // missed. Both tables key on store_path_hash (PK / first
-            // index column) so each EXISTS is a point probe.
+            // Also re-check `scheduler_live_pins`: a scheduler dispatch
+            // that landed between mark and now is a direct root on THIS
+            // path that mark's snapshot missed. The table keys on
+            // store_path_hash (first index column) so the EXISTS is a
+            // point probe.
             if recheck_has_live_referrer(&mut tx, store_path_hash).await? {
                 tracing::debug!(
                     store_path_hash = %hex::encode(store_path_hash),
@@ -1009,20 +1008,11 @@ mod tests {
         }
     }
 
-    /// Re-check must consult `gc_roots` and `scheduler_live_pins`: a
-    /// gc_roots pin or scheduler dispatch between mark and sweep is a
-    /// direct root mark's snapshot missed.
+    /// Re-check must consult `scheduler_live_pins`: a scheduler dispatch
+    /// between mark and sweep is a direct root mark's snapshot missed.
     #[tokio::test]
     async fn sweep_recheck_sees_late_pins() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-
-        // P: pinned via gc_roots after mark.
-        let p_hash = StoreSeed::path("late-gc-root").seed(&db.pool).await;
-        sqlx::query("INSERT INTO gc_roots (store_path_hash, source) VALUES ($1, 'test')")
-            .bind(&p_hash)
-            .execute(&db.pool)
-            .await
-            .unwrap();
 
         // Q: pinned via scheduler_live_pins after mark.
         let q_hash = StoreSeed::path("late-live-pin").seed(&db.pool).await;
@@ -1034,23 +1024,29 @@ mod tests {
         .await
         .unwrap();
 
+        // R: NOT pinned — control. Sweep should delete it.
+        let r_hash = StoreSeed::path("unpinned").seed(&db.pool).await;
+
         let stats = sweep(
             &db.pool,
             None,
-            vec![p_hash.clone(), q_hash.clone()],
+            vec![q_hash.clone(), r_hash.clone()],
             false,
             &no_shutdown(),
         )
         .await
         .unwrap();
-        assert_eq!(stats.paths_deleted, 0);
-        assert_eq!(stats.paths_resurrected, 2);
+        assert_eq!(stats.paths_deleted, 1);
+        assert_eq!(stats.paths_resurrected, 1);
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo")
+        let survivor: Vec<u8> = sqlx::query_scalar("SELECT store_path_hash FROM narinfo")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 2, "both pinned paths survive");
+        assert_eq!(
+            survivor, q_hash,
+            "live-pinned path survives; unpinned swept"
+        );
     }
 
     /// Sweep must DELETE path_tenants rows for swept paths.
@@ -1168,7 +1164,7 @@ mod tests {
     /// NO chunk_list — this is the chunked-storage path.
     #[tokio::test]
     async fn sweep_chunked_path_decrements_and_enqueues() {
-        use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+        use crate::backend::{ChunkBackend, MemoryChunkBackend};
         use crate::manifest::{Manifest, ManifestEntry};
         use std::sync::Arc;
 
@@ -1280,7 +1276,7 @@ mod tests {
     /// so the survivals MEAN something.
     #[tokio::test]
     async fn orphan_chunk_grace_ttl_partitions_correctly() {
-        use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+        use crate::backend::{ChunkBackend, MemoryChunkBackend};
         let db = TestDb::new(&crate::MIGRATOR).await;
         let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
 

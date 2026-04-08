@@ -29,7 +29,7 @@ use rio_proto::types::{
     VerifyChunksProgress, VerifyChunksRequest,
 };
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 use crate::gc;
 use crate::metadata;
 
@@ -1049,7 +1049,7 @@ mod tests {
     /// is observable.
     #[tokio::test]
     async fn verify_chunks_reports_missing() {
-        use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+        use crate::backend::{ChunkBackend, MemoryChunkBackend};
         use crate::test_helpers::ChunkSeed;
 
         let db = TestDb::new(&crate::MIGRATOR).await;

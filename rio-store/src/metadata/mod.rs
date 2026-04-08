@@ -382,6 +382,64 @@ pub(super) async fn update_narinfo_complete(
     .map(|r| r.rows_affected())
 }
 
+/// Shared body of [`inline::complete_manifest_inline_in_tx`] and
+/// [`chunked::complete_manifest_chunked_in_tx`]: narinfo UPDATE, then
+/// flip `manifests.status = 'complete'` (binding `inline_blob` iff
+/// `Some`). Both callers were ~90% identical; the only divergence is
+/// the inline-blob bind.
+pub(super) async fn complete_manifest_in_conn(
+    conn: &mut sqlx::PgConnection,
+    info: &ValidatedPathInfo,
+    inline_blob: Option<&[u8]>,
+) -> Result<()> {
+    if update_narinfo_complete(conn, info).await? == 0 {
+        // insert_manifest_uploading MUST have run first. If rows_affected
+        // is 0, delete_manifest_uploading raced us and won. The caller's
+        // placeholder is gone; bailing here prevents a half-complete write.
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: info.store_path.to_string(),
+        });
+    }
+    // Flip status. inline_blob stays NULL in the chunked case — that's
+    // what makes get_manifest() return Chunked instead of Inline.
+    let manifest_result = match inline_blob {
+        Some(blob) => {
+            sqlx::query(
+                r#"
+                UPDATE manifests SET
+                    status      = 'complete',
+                    inline_blob = $2,
+                    updated_at  = now()
+                WHERE store_path_hash = $1
+                "#,
+            )
+            .bind(&info.store_path_hash)
+            .bind(blob)
+            .execute(&mut *conn)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                r#"
+                UPDATE manifests SET
+                    status     = 'complete',
+                    updated_at = now()
+                WHERE store_path_hash = $1
+                "#,
+            )
+            .bind(&info.store_path_hash)
+            .execute(&mut *conn)
+            .await?
+        }
+    };
+    if manifest_result.rows_affected() == 0 {
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: info.store_path.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

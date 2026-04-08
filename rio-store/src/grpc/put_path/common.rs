@@ -207,8 +207,7 @@ pub(in crate::grpc) fn verify_nar(
     info: &ValidatedPathInfo,
     ctx_label: &str,
 ) -> Result<(), Status> {
-    let digest = crate::validate::NarDigest::from_bytes(nar_data);
-    validate_nar_digest(&digest, &info.nar_hash, info.nar_size).map_err(|e| {
+    validate_nar_digest(nar_data, &info.nar_hash, info.nar_size).map_err(|e| {
         warn!(store_path = %info.store_path, error = %e, "{ctx_label}: NAR validation failed");
         Status::invalid_argument(format!("{ctx_label}: NAR validation failed: {e}"))
     })
@@ -489,10 +488,7 @@ impl StoreServiceImpl {
         nar_data: Vec<u8>,
         ctx_label: &str,
     ) -> Result<bool, Status> {
-        let use_chunked = self.chunk_backend.is_some() && nar_data.len() >= cas::INLINE_THRESHOLD;
-
-        if use_chunked {
-            let backend = self.chunk_backend.as_ref().expect("checked is_some above");
+        if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
             match cas::put_chunked(
                 &self.pool,
                 backend,
@@ -544,10 +540,7 @@ impl StoreServiceImpl {
         info: &ValidatedPathInfo,
         nar_data: Vec<u8>,
     ) -> Result<NarPersist, Status> {
-        let use_chunked = self.chunk_backend.is_some() && nar_data.len() >= cas::INLINE_THRESHOLD;
-
-        if use_chunked {
-            let backend = self.chunk_backend.as_ref().expect("checked is_some above");
+        if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
             let stats = cas::stage_chunked(
                 &self.pool,
                 backend,

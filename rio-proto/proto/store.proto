@@ -114,8 +114,9 @@ service ChunkService {
 // builds. Separate service from StoreService so it can have separate
 // RBAC/TLS (admin ops are more privileged than PutPath/GetPath).
 service StoreAdminService {
-  // Run garbage collection: mark reachable paths (from gc_roots +
-  // uploading manifests + grace period + extra_roots), sweep
+  // Run garbage collection: mark reachable paths (seeded from
+  // scheduler_live_pins + uploading manifests + grace period +
+  // extra_roots), sweep
   // unreachable complete manifests (DELETE CASCADE + chunk decrement
   // + pending_s3_deletes enqueue). Streams GCProgress updates.
   //

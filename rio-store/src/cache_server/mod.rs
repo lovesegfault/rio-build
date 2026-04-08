@@ -435,7 +435,7 @@ fn nar_chunk_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+    use crate::backend::{ChunkBackend, MemoryChunkBackend};
     use crate::signing::Signer;
     use crate::test_helpers::TenantSeed;
     use axum::body::Body;

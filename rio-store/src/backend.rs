@@ -118,15 +118,6 @@ pub trait ChunkBackend: Send + Sync {
     /// the PG `chunks` table instead for dedup — one RTT vs N HeadObject calls.)
     async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>>;
 
-    /// Delete a chunk. Used by the GC drain task (pending_s3_deletes).
-    ///
-    /// `Err` on I/O failure (S3 down, permission denied). "Already gone"
-    /// is `Ok` — idempotent, the drain might retry a partially-processed
-    /// batch. The drain task increments `attempts` on Err and retries
-    /// with backoff; after max attempts it stops (alert-worthy but not
-    /// a process crash — S3 objects leak, PG state is correct).
-    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()>;
-
     /// Compute the storage key for a hash without doing I/O. Used by
     /// GC sweep to enqueue the key to `pending_s3_deletes` in the SAME
     /// PG transaction as the refcount decrement (two-phase commit for
@@ -137,12 +128,16 @@ pub trait ChunkBackend: Send + Sync {
     /// drain task passes this back to `delete_by_key`.
     fn key_for(&self, hash: &[u8; 32]) -> String;
 
-    /// Delete by storage key (as returned by `key_for`). Used by the
-    /// drain task which stores keys (not hashes) in pending_s3_deletes.
+    /// Delete by storage key (as returned by `key_for`). Used by the GC
+    /// drain task, which stores string keys (not hashes) in
+    /// `pending_s3_deletes` so it never needs to re-parse them back to
+    /// `[u8; 32]`.
     ///
-    /// Separate from `delete(hash)` because the drain reads string keys
-    /// from PG; re-parsing them back to `[u8; 32]` would be pointless
-    /// indirection.
+    /// `Err` on I/O failure (S3 down, permission denied). "Already gone"
+    /// is `Ok` — idempotent, the drain might retry a partially-processed
+    /// batch. The drain task increments `attempts` on Err and retries
+    /// with backoff; after max attempts it stops (alert-worthy but not
+    /// a process crash — S3 objects leak, PG state is correct).
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()>;
 }
 
@@ -248,14 +243,6 @@ impl ChunkBackend for MemoryChunkBackend {
         Ok(hashes.iter().map(|h| inner.contains_key(h)).collect())
     }
 
-    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()> {
-        self.inner
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(hash);
-        Ok(())
-    }
-
     fn key_for(&self, hash: &[u8; 32]) -> String {
         // Memory backend doesn't have real keys; use hex for the
         // pending_s3_deletes table (drain task just needs A key,
@@ -272,7 +259,11 @@ impl ChunkBackend for MemoryChunkBackend {
         let hash: [u8; 32] = bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("key {key:?} is not 32 bytes"))?;
-        self.delete(&hash).await
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&hash);
+        Ok(())
     }
 }
 
@@ -374,16 +365,6 @@ impl ChunkBackend for FilesystemChunkBackend {
             result.push(tokio::fs::try_exists(&path).await?);
         }
         Ok(result)
-    }
-
-    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()> {
-        let path = self.chunk_path(hash);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            // ENOENT = already gone. Idempotent.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
     }
 
     fn key_for(&self, hash: &[u8; 32]) -> String {
@@ -582,10 +563,6 @@ impl ChunkBackend for S3ChunkBackend {
         }
 
         Ok(results)
-    }
-
-    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()> {
-        self.delete_by_key(&self.s3_key(hash)).await
     }
 
     fn key_for(&self, hash: &[u8; 32]) -> String {

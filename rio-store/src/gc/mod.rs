@@ -19,16 +19,15 @@
 //!
 //! # Root seeds
 //!
-//! - `gc_roots` table (explicit operator pins — currently no
-//!   production writer; reserved extension point)
 //! - `manifests WHERE status='uploading'` (in-flight PutPath —
 //!   don't delete what's being written)
 //! - `narinfo WHERE created_at > now() - grace_hours` (recent
 //!   paths — don't GC something that JUST arrived before a build
 //!   can reference it)
 //! - `extra_roots` param (scheduler's live-build output paths —
-//!   passed from `ActorCommand::GcRoots`, may not be in narinfo
-//!   yet so can't use FK'd gc_roots)
+//!   passed from `ActorCommand::GcRoots`, may not be in narinfo yet)
+//! - `scheduler_live_pins` (scheduler auto-pinned live-build inputs)
+//! - per-tenant retention windows (path_tenants × tenants.retention)
 //!
 //! # Two-phase S3 commit
 //!
@@ -73,7 +72,7 @@ use tracing::{info, warn};
 
 use rio_proto::types::GcProgress;
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 use crate::manifest::Manifest;
 
 /// Summary stats from a GC run.
@@ -122,7 +121,8 @@ pub struct GcParams {
 /// Ceiling on `grace_hours` before the `as i32` bind. u32 > i32::MAX
 /// wraps negative → `make_interval(hours => negative)` → grace covers
 /// nothing → everything sweepable. One year is the practical max;
-/// "infinite grace" is a `gc_roots` pin, not a huge grace window.
+/// "infinite grace" is a `scheduler_live_pins` entry or `extra_roots`
+/// pass, not a huge grace window.
 pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
 
 /// Default threshold for the empty-refs safety gate. 10% is
@@ -606,7 +606,7 @@ pub(super) async fn decrement_and_enqueue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::chunk::MemoryChunkBackend;
+    use crate::backend::MemoryChunkBackend;
     use crate::manifest::{Manifest, ManifestEntry};
     use crate::test_helpers::ChunkSeed;
     use rio_test_support::TestDb;

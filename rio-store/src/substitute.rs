@@ -29,7 +29,7 @@ use rio_nix::narinfo::NarInfo;
 use rio_nix::store_path::StorePath;
 use rio_proto::validated::ValidatedPathInfo;
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 use crate::cas;
 use crate::metadata::{self, SigMode, Upstream};
 use crate::signing::TenantSigner;
@@ -609,9 +609,9 @@ impl Substituter {
         }
 
         // Inline vs chunked. Same threshold as PutPath.
-        let use_chunked = self.chunk_backend.is_some() && nar_bytes.len() >= cas::INLINE_THRESHOLD;
-        let result = if use_chunked {
-            let backend = self.chunk_backend.as_ref().unwrap();
+        let result = if let Some(backend) =
+            cas::should_chunk(self.chunk_backend.as_ref(), nar_bytes.len())
+        {
             cas::put_chunked(
                 &self.pool,
                 backend,

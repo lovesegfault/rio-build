@@ -44,7 +44,7 @@ use rio_common::grpc::StatusExt;
 use rio_common::limits::MAX_NAR_SIZE;
 use rio_common::tenant::NormalizedName;
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 use crate::cas::{self, ChunkCache};
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
@@ -98,12 +98,12 @@ pub(crate) fn validate_store_path(s: &str) -> Result<(), Status> {
 /// signatures). If present → `FailedPrecondition` with a message that
 /// names the fix. Otherwise → same as [`rio_common::grpc::internal`].
 ///
-/// [`BackendAuthError`]: crate::backend::chunk::BackendAuthError
+/// [`BackendAuthError`]: crate::backend::BackendAuthError
 pub(crate) fn storage_error(context: &str, e: anyhow::Error) -> Status {
     error!(context, error = %e, "storage backend error");
     // downcast_ref checks the innermost source; BackendAuthError is
     // always the root (anyhow::Error::new(BackendAuthError).context(...)).
-    if e.downcast_ref::<crate::backend::chunk::BackendAuthError>()
+    if e.downcast_ref::<crate::backend::BackendAuthError>()
         .is_some()
     {
         Status::failed_precondition(
@@ -560,7 +560,7 @@ mod tests {
     /// (`FailedPrecondition`).
     #[test]
     fn storage_error_auth_maps_to_failed_precondition() {
-        use crate::backend::chunk::BackendAuthError;
+        use crate::backend::BackendAuthError;
 
         // The shape S3ChunkBackend::put() produces: marker at the root,
         // detailed message as context.

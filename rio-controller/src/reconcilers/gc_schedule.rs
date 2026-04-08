@@ -157,9 +157,8 @@ pub(crate) async fn run_loop<F, Fut>(
 /// `extra_roots=vec![]`. The cron has no visibility into live-
 /// build output paths (that's the scheduler's `GcRoots` actor,
 /// and it proxies via `AdminService.TriggerGC`, not us). For
-/// background GC, the default roots (gc_roots table + uploading
-/// manifests + grace window + scheduler_live_pins + tenant
-/// retention) are sufficient.
+/// background GC, the default roots (uploading manifests + grace
+/// window + scheduler_live_pins + tenant retention) are sufficient.
 async fn tick_once(store_addr: &str) -> TickResult {
     // Connect with timeout. The inner connect_single has a 10s
     // connect_timeout on the Channel builder, but wrap again:

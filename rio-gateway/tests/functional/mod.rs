@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use rio_proto::StoreServiceClient;
-use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+use rio_store::backend::{ChunkBackend, MemoryChunkBackend};
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::StoreServiceImpl;
 use rio_store::test_helpers::spawn_store_service;

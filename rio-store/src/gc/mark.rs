@@ -6,7 +6,6 @@ use sqlx::PgPool;
 ///
 /// A path is REACHABLE if it's reachable via `narinfo."references"`
 /// from any of:
-/// - `gc_roots` (explicit pins)
 /// - uploading manifests (in-flight PutPath)
 /// - recently-created paths (grace period)
 /// - `extra_roots` (scheduler live-build outputs)
@@ -24,8 +23,8 @@ use sqlx::PgPool;
 ///
 /// Seeds are ALL store_path TEXT (not hash) because the CTE joins
 /// on `narinfo.store_path = reachable.store_path` (the references
-/// array contains paths, not hashes). `gc_roots` keys on hash
-/// (BYTEA PK) so we JOIN to narinfo to get the path.
+/// array contains paths, not hashes). `scheduler_live_pins` keys on
+/// hash (BYTEA) so we JOIN to narinfo to get the path.
 ///
 /// `extra_roots` might contain paths NOT in narinfo yet (in-flight
 /// build outputs). That's fine — the CTE's unnest of a non-existent
@@ -53,11 +52,6 @@ use sqlx::PgPool;
 // via (c) regardless of tenant state.
 const COMPUTE_UNREACHABLE_SQL: &str = r#"
 WITH RECURSIVE reachable(store_path) AS (
-    -- Seed (a): explicit pins
-    SELECT n.store_path
-      FROM gc_roots g
-      JOIN narinfo n USING (store_path_hash)
-    UNION
     -- Seed (b): in-flight uploads
     SELECT n.store_path
       FROM manifests m
@@ -114,8 +108,7 @@ pub async fn compute_unreachable(
     // The CTE. Walking through the query:
     //
     // `reachable` recursive CTE:
-    //   - Anchor (UNION of six seeds, all producing store_path TEXT):
-    //     a) gc_roots JOIN narinfo on hash → get path
+    //   - Anchor (UNION of five seeds, all producing store_path TEXT):
     //     b) uploading manifests JOIN narinfo on hash → get path
     //     c) narinfo created_at > now - grace → path directly
     //     d) unnest($2) extra_roots (already paths)
@@ -225,16 +218,10 @@ mod tests {
         let root = test_store_path("root");
         let _leaf = seed_path(&db.pool, &leaf, &[], 48).await;
         let _middle = seed_path(&db.pool, &middle, &[&leaf], 48).await;
-        let root_hash = seed_path(&db.pool, &root, &[&middle], 48).await;
+        let _root_hash = seed_path(&db.pool, &root, &[&middle], 48).await;
 
-        // Pin the root.
-        sqlx::query("INSERT INTO gc_roots (store_path_hash, source) VALUES ($1, 'test')")
-            .bind(&root_hash)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-
-        let unreachable = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        // Pin the root via extra_roots (scheduler live-build path).
+        let unreachable = compute_unreachable(&db.pool, 2, &[root]).await.unwrap();
         assert!(
             unreachable.is_empty(),
             "transitive references from pinned root → all reachable"
@@ -244,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_live_pins_protect() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        // Old path, no gc_roots, not in extra_roots → would be
+        // Old path, not in extra_roots → would be
         // unreachable. But scheduler has it pinned as a live-build
         // input → protected via seed (e).
         let hash = seed_path(&db.pool, &test_store_path("live-input"), &[], 48).await;

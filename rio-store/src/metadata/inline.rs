@@ -116,38 +116,7 @@ pub async fn complete_manifest_inline_in_tx(
     info: &ValidatedPathInfo,
     nar_data: Bytes,
 ) -> Result<()> {
-    if update_narinfo_complete(conn, info).await? == 0 {
-        // insert_manifest_uploading MUST have run first. If rows_affected
-        // is 0, delete_manifest_uploading raced us and won. The caller's
-        // placeholder is gone; bailing here prevents a half-complete write.
-        return Err(MetadataError::PlaceholderMissing {
-            store_path: info.store_path.to_string(),
-        });
-    }
-
-    // Store NAR + flip status. nar_data is Bytes (Arc-refcounted); sqlx binds
-    // &[u8], so .as_ref() — no copy.
-    let manifest_result = sqlx::query(
-        r#"
-        UPDATE manifests SET
-            status      = 'complete',
-            inline_blob = $2,
-            updated_at  = now()
-        WHERE store_path_hash = $1
-        "#,
-    )
-    .bind(&info.store_path_hash)
-    .bind(nar_data.as_ref())
-    .execute(&mut *conn)
-    .await?;
-
-    if manifest_result.rows_affected() == 0 {
-        return Err(MetadataError::PlaceholderMissing {
-            store_path: info.store_path.to_string(),
-        });
-    }
-
-    Ok(())
+    super::complete_manifest_in_conn(conn, info, Some(nar_data.as_ref())).await
 }
 
 /// Age of an existing `'uploading'` placeholder, or `None` if no such

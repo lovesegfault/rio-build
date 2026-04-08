@@ -20,7 +20,7 @@ use tracing::{debug, instrument, warn};
 
 use rio_proto::validated::ValidatedPathInfo;
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 use crate::chunker;
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::metadata;
@@ -32,6 +32,19 @@ use crate::metadata;
 /// bookkeeping for no dedup benefit. The `.drv` files that dominate nixpkgs
 /// closures by count are typically <10 KiB — all of those stay inline.
 pub const INLINE_THRESHOLD: usize = 256 * 1024;
+
+/// Decide whether a NAR should go through the chunked CAS.
+///
+/// Returns `Some(backend)` when a chunk backend is configured AND the
+/// NAR is at least [`INLINE_THRESHOLD`] bytes; `None` means take the
+/// inline path. Centralises the predicate so a per-tenant override or
+/// composefs-mode preference only needs touching here.
+pub fn should_chunk(
+    backend: Option<&Arc<dyn ChunkBackend>>,
+    nar_len: usize,
+) -> Option<&Arc<dyn ChunkBackend>> {
+    backend.filter(|_| nar_len >= INLINE_THRESHOLD)
+}
 
 /// Default max concurrent S3 chunk uploads per `put_chunked` call.
 ///
@@ -723,7 +736,7 @@ impl ChunkCache {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
-    use crate::backend::chunk::MemoryChunkBackend;
+    use crate::backend::MemoryChunkBackend;
 
     /// Real hash/data pair: the BLAKE3 of "hello chunk cache".
     /// `get_verified` hashes the data and compares, so these must match.
@@ -1051,9 +1064,6 @@ mod upload_tests {
             unimplemented!("upload test uses put only")
         }
         async fn exists_batch(&self, _: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
-            unimplemented!()
-        }
-        async fn delete(&self, _: &[u8; 32]) -> anyhow::Result<()> {
             unimplemented!()
         }
         fn key_for(&self, _: &[u8; 32]) -> String {

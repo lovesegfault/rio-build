@@ -432,19 +432,24 @@ let
             f"-d '{payload}' localhost:19001 {method} 2>&1"
         )
 
-    def pin_gc_root(out_path, source):
-        """Insert a gc_roots row for out_path. Looks up store_path_hash
-        via narinfo (gc_roots PK is the BYTEA hash, not the text path)."""
+    def pin_live(out_path, tag):
+        """Insert a scheduler_live_pins row for out_path so the GC mark
+        phase treats it as a root (seed (e) in gc/mark.rs). Looks up
+        store_path_hash via narinfo (PK is the BYTEA hash, not the text
+        path). `tag` fills drv_hash — the table's real writer (scheduler
+        dispatch) puts a derivation hash there; for test pins it's an
+        arbitrary label so unpin/count assertions can scope to rows WE
+        inserted, isolated from any scheduler-written rows."""
         psql_k8s(k3s_server,
-            f"INSERT INTO gc_roots (store_path_hash, source) "
-            f"SELECT store_path_hash, '{source}' FROM narinfo "
+            f"INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) "
+            f"SELECT store_path_hash, '{tag}' FROM narinfo "
             f"WHERE store_path = '{out_path}'"
         )
 
-    def unpin_gc_root(out_path):
+    def unpin_live(out_path, tag):
         psql_k8s(k3s_server,
-            f"DELETE FROM gc_roots WHERE store_path_hash = "
-            f"(SELECT store_path_hash FROM narinfo "
+            f"DELETE FROM scheduler_live_pins WHERE drv_hash = '{tag}' "
+            f"AND store_path_hash = (SELECT store_path_hash FROM narinfo "
             f" WHERE store_path = '{out_path}')"
         )
 
@@ -1326,21 +1331,21 @@ let
           out_victim = build("${gcVictimDrv}", capture_stderr=False).strip()
           assert out_victim.startswith("/nix/store/"), f"victim build: {out_victim!r}"
 
-          # Baseline BEFORE pin. The prior absolute-==1 check would
-          # confusingly fail if anything earlier (fixture, controller
-          # startup) inserts a gc_roots row, AND ==1 PASSES a no-op
-          # insert if nothing else ever inserts either. Delta is robust.
-          gc_roots_base = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
-
-          # Pin out_pin via direct gc_roots insert (the table is the
-          # mark-phase seed; an operator-facing pin RPC is a future
-          # extension point). pin_gc_root looks up store_path_hash via
-          # narinfo so we needn't compute the BYTEA hash here.
-          pin_gc_root(out_pin, "vm-lifecycle")
-          pin_after = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
-          assert pin_after == gc_roots_base + 1, (
-              f"pin should add exactly 1 gc_roots row; "
-              f"before={gc_roots_base}, after={pin_after}"
+          # Pin out_pin via scheduler_live_pins (mark-phase seed (e);
+          # the dedicated explicit-pin table was dropped in migration
+          # 036). pin_live looks up store_path_hash via narinfo so we
+          # needn't compute the BYTEA hash here. Count is scoped to
+          # drv_hash='vm-lifecycle' — the scheduler may concurrently
+          # write/delete rows for real builds under other drv_hash
+          # values; an unscoped count would be racy.
+          pin_live(out_pin, "vm-lifecycle")
+          pin_after = int(psql_k8s(k3s_server,
+              "SELECT COUNT(*) FROM scheduler_live_pins "
+              "WHERE drv_hash = 'vm-lifecycle'"
+          ))
+          assert pin_after == 1, (
+              f"pin should add exactly 1 scheduler_live_pins row "
+              f"tagged 'vm-lifecycle'; got {pin_after}"
           )
 
           # Backdate out_victim past grace. This is the path sweep will
@@ -1395,15 +1400,16 @@ let
               f"nix path-info --store 'ssh-ng://k3s-server' {out_pin}"
           )
 
-          # Unpin round-trip.
-          unpin_gc_root(out_pin)
-          unpin_after = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
-          # Back to baseline — pin row is gone. ==gc_roots_base NOT ==0:
-          # if anything else ever pins, ==0 is wrong; if pin was a no-op
-          # AND unpin was a no-op, ==0 passes (both broke).
-          assert unpin_after == gc_roots_base, (
-              f"unpin should restore gc_roots to baseline; "
-              f"base={gc_roots_base}, now={unpin_after}"
+          # Unpin round-trip. ==0 is safe because the count is scoped
+          # to drv_hash='vm-lifecycle' — only WE write that tag.
+          unpin_live(out_pin, "vm-lifecycle")
+          unpin_after = int(psql_k8s(k3s_server,
+              "SELECT COUNT(*) FROM scheduler_live_pins "
+              "WHERE drv_hash = 'vm-lifecycle'"
+          ))
+          assert unpin_after == 0, (
+              f"unpin should remove the 'vm-lifecycle' pin row; "
+              f"{unpin_after} remain"
           )
           # ── path_tenants end-to-end: tenant-key build → upsert fires ──
           # Proves the completion hook (completion.rs r[impl sched.gc.
@@ -1710,7 +1716,7 @@ let
               "UPDATE narinfo SET created_at = now() - interval '25 hours' "
               f"WHERE store_path IN ('{out_dep}', '{out_consumer}')"
           )
-          pin_gc_root(out_consumer, "vm-refs-e2e")
+          pin_live(out_consumer, "vm-refs-e2e")
           # force=true: dep is sweep-eligible (past grace, unpinned, and
           # unreachable from any root EXCEPT via consumer's refs) and dep
           # has refs=[] (its output is plain text with zero store paths).
@@ -1755,7 +1761,7 @@ let
           # is unreachable). Sweep should collect EXACTLY these two —
           # every other path in PG (out_pin from gc-sweep, busybox seed,
           # earlier subtest outputs) is still in-grace.
-          unpin_gc_root(out_consumer)
+          unpin_live(out_consumer, "vm-refs-e2e")
           result = sched_grpc(
               '{"dry_run": false, "grace_period_hours": 24, "force": true}',
               "rio.admin.AdminService/TriggerGC",

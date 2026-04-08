@@ -20,7 +20,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
-use crate::backend::chunk::ChunkBackend;
+use crate::backend::ChunkBackend;
 
 /// How old an 'uploading' manifest must be before we reap it.
 ///

@@ -227,33 +227,7 @@ pub async fn complete_manifest_chunked_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     info: &ValidatedPathInfo,
 ) -> Result<()> {
-    if update_narinfo_complete(tx, info).await? == 0 {
-        return Err(MetadataError::PlaceholderMissing {
-            store_path: info.store_path.to_string(),
-        });
-    }
-
-    // Flip status. inline_blob stays NULL — that's what makes get_manifest()
-    // return Chunked instead of Inline.
-    let manifest_result = sqlx::query(
-        r#"
-        UPDATE manifests SET
-            status     = 'complete',
-            updated_at = now()
-        WHERE store_path_hash = $1
-        "#,
-    )
-    .bind(&info.store_path_hash)
-    .execute(&mut **tx)
-    .await?;
-
-    if manifest_result.rows_affected() == 0 {
-        return Err(MetadataError::PlaceholderMissing {
-            store_path: info.store_path.to_string(),
-        });
-    }
-
-    Ok(())
+    super::complete_manifest_in_conn(&mut *tx, info, None).await
 }
 
 /// Reclaim a failed chunked upload: decrement refcounts + delete rows.
@@ -747,7 +721,7 @@ mod tests {
         // --- Epilogue: orphan reaper cleans manifest A ---
         // reap_one decrements rc 3→2. uploaded_at stays set (B's
         // upload is real). A future PutPath still dedups correctly.
-        let no_backend: Option<&std::sync::Arc<dyn crate::backend::chunk::ChunkBackend>> = None;
+        let no_backend: Option<&std::sync::Arc<dyn crate::backend::ChunkBackend>> = None;
         let reaped = crate::gc::orphan::reap_one(&db.pool, &sph_a, None, no_backend)
             .await
             .unwrap();
