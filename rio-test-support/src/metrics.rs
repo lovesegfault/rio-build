@@ -393,6 +393,7 @@ macro_rules! metrics_suite {
 /// `describe_fn` is the crate's `pub fn describe_metrics()` — passed
 /// as a fn pointer so this helper stays crate-agnostic. `crate_name`
 /// is for the error message only.
+// r[impl ts.metrics.asserts]
 pub fn assert_spec_metrics_described(spec_metrics: &[&str], describe_fn: fn(), crate_name: &str) {
     let recorder = DescribedNames::default();
     metrics::with_local_recorder(&recorder, describe_fn);

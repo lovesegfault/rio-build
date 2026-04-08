@@ -29,6 +29,7 @@ pub use rio_nix::store_path::nixbase32::CHARS as NIXBASE32;
 /// scheduler DAG dedupes on `drv_hash`; collisions short-circuit the
 /// merge path). Use [`TEST_HASH`] / [`test_store_path`] when
 /// determinism matters (most unit tests).
+// r[impl ts.fixtures.builders]
 pub fn rand_store_hash() -> String {
     use rand::RngExt;
     let mut rng = rand::rng();
@@ -61,6 +62,7 @@ pub fn test_drv_path(name: &str) -> String {
 /// `drv_hash` is set to `tag` (scheduler tests key on the hash string).
 ///
 /// `pname` is hardcoded to `"test-pkg"` — no scheduler test asserts on it.
+// r[impl ts.fixtures.builders]
 pub fn make_derivation_node(tag: &str, system: &str) -> DerivationNode {
     DerivationNode {
         drv_hash: tag.into(),
@@ -175,6 +177,7 @@ pub fn make_path_info_for_nar(store_path: &str, nar: &[u8]) -> ValidatedPathInfo
 ///
 /// Shared between rio-builder's FOD verification tests and upload tests
 /// (both need a file in a fake overlay-upper's nix/store).
+// r[impl ts.fixtures.builders]
 pub fn seed_store_output(
     basename: &str,
     content: &[u8],

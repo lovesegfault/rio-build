@@ -44,6 +44,9 @@ specs (
       docs/src/observability.md
       docs/src/security.md
       docs/src/deployment.md
+      docs/src/crate-structure.md
+      docs/src/verification.md
+      docs/src/capacity-planning.md
       docs/src/decisions/019-builder-fetcher-split.md
     )
     impls (
@@ -60,6 +63,9 @@ specs (
           rio-proto/src/**/*.rs
           rio-common/src/**/*.rs
           rio-cli/src/**/*.rs
+          rio-test-support/src/**/*.rs
+          rio-bench/src/**/*.rs
+          rio-bench/benches/**/*.rs
           nix/nixos-node/**/*.nix
           nix/base-runtime-spec.nix
           rio-dashboard/src/lib/logStream.svelte.ts

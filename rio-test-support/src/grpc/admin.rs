@@ -19,6 +19,7 @@ use super::spawn::spawn_grpc_server;
 ///
 /// Streaming RPCs (GetBuildLogs, TriggerGC) return a stream with a
 /// single terminal message so the client's drain loop exits cleanly.
+// r[impl ts.mock.admin]
 #[derive(Clone, Default)]
 pub struct MockAdmin {
     /// Every ClearPoison drv_hash received. For asserting the CLI

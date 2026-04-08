@@ -21,6 +21,7 @@
 /// include!("../rio-test-support/src/metrics_grep.rs");
 /// fn main() { metrics_build_main("rio_X_"); }
 /// ```
+// r[impl ts.metrics.grep]
 #[allow(dead_code)]
 fn metrics_build_main(prefix: &str) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();

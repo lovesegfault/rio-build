@@ -81,6 +81,7 @@ pub struct MockStoreCalls {
 
 /// Fault injection knobs. All default to "no fault"; tests flip them
 /// to exercise error paths.
+// r[impl ts.mock.store-faults]
 #[derive(Clone, Default)]
 pub struct MockStoreFaults {
     /// If > 0, put_path decrements and returns Unavailable. For retry tests.
@@ -201,6 +202,7 @@ impl MockStore {
     }
 }
 
+// r[impl ts.mock.store-chunk]
 #[tonic::async_trait]
 impl ChunkService for MockStore {
     type GetChunkStream =
@@ -273,6 +275,7 @@ impl StoreService for MockStore {
                 .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo"))?,
             _ => return Err(Status::invalid_argument("first message must be metadata")),
         };
+        // r[impl ts.mock.store-put-validate]
         // Mirror real store (put_path.rs:206-211): hash-upfront was removed
         // pre-phase3a. A non-empty metadata.nar_hash means an un-updated
         // client. The real store rejects it; the mock must too, or a

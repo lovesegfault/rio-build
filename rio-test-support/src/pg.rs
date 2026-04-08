@@ -27,6 +27,7 @@ static PG: OnceLock<PgServer> = OnceLock::new();
 
 /// Process-global ephemeral postgres. Public so xtask's `regen sqlx`
 /// can reuse the same bootstrap instead of duplicating it in bash.
+// r[impl ts.pg.server]
 pub enum PgServer {
     /// Ephemeral server we bootstrapped ourselves. The child process dies
     /// when the test binary exits (PR_SET_PDEATHSIG on Linux). The tempdir
@@ -244,6 +245,7 @@ fn find_pg_bin() -> PathBuf {
 ///
 /// Races with concurrent scanners are benign: `remove_dir_all` on an
 /// already-removed dir just returns ENOENT, which we ignore.
+// r[impl ts.pg.server]
 fn gc_stale_dirs() {
     let Ok(entries) = std::fs::read_dir("/tmp") else {
         return;
@@ -368,6 +370,7 @@ impl TestDb {
         let server = PgServer::get();
         let admin_url = server.admin_url().to_string();
 
+        // r[impl ts.pg.db-name]
         // Nanos alone isn't unique under raw-libtest (thread-per-test):
         // two parallel threads can hit the same nanosecond. Append a
         // process-global counter to guarantee uniqueness.

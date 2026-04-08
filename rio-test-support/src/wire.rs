@@ -14,6 +14,7 @@ use tokio::io::DuplexStream;
 /// Sends magic1 + version, reads magic2 + server version, exchanges features,
 /// sends obsolete-affinity/reserve-space placeholders, reads version-string +
 /// trusted flag + STDERR_LAST.
+// r[impl ts.wire.helpers]
 pub async fn do_handshake(s: &mut DuplexStream) -> anyhow::Result<()> {
     crate::wire_send!(s; u64: WORKER_MAGIC_1, u64: PROTOCOL_VERSION);
 
@@ -71,6 +72,7 @@ pub struct PathInfoWire {
 
 /// Read the `wopQueryPathInfo` response body (everything after `valid: bool`).
 /// Caller MUST read `valid` first — this reads deriver onwards.
+// r[impl ts.wire.helpers]
 pub async fn read_path_info(s: &mut DuplexStream) -> anyhow::Result<PathInfoWire> {
     Ok(PathInfoWire {
         deriver: wire::read_string(s).await?,
@@ -102,6 +104,7 @@ pub async fn drain_stderr_until_last(s: &mut DuplexStream) -> anyhow::Result<Vec
 
 /// Drain STDERR messages expecting STDERR_ERROR. Returns the error.
 /// Panics if STDERR_LAST is received first.
+// r[impl ts.wire.helpers]
 pub async fn drain_stderr_expecting_error(s: &mut DuplexStream) -> anyhow::Result<StderrError> {
     loop {
         match read_stderr_message(s).await? {
@@ -170,6 +173,7 @@ macro_rules! wire_bytes {
 /// ```ignore
 /// wire_send!(&mut h.stream; u64: 39, string: path, bool: true);
 /// ```
+// r[impl ts.wire.macros]
 #[macro_export]
 macro_rules! wire_send {
     ($stream:expr; $( $kind:ident : $val:expr ),* $(,)?) => {{

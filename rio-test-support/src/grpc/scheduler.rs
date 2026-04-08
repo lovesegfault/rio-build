@@ -13,6 +13,7 @@ use rio_proto::{SchedulerService, SchedulerServiceServer};
 use super::spawn::spawn_grpc_server;
 
 /// Configurable scheduler behavior for a single SubmitBuild stream.
+// r[impl ts.mock.scheduler-outcome]
 #[derive(Clone, Default)]
 pub struct MockSchedulerOutcome {
     /// If set, SubmitBuild immediately fails with this status code.

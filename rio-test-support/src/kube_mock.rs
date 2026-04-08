@@ -71,6 +71,7 @@ impl Scenario {
     ///     403, "Forbidden", "jobs.batch is forbidden: exceeded quota",
     /// );
     /// ```
+    // r[impl ts.kube.verifier-guard]
     pub fn k8s_error(
         method: http::Method,
         path_contains: &'static str,
@@ -106,6 +107,7 @@ impl Scenario {
 ///
 /// Disarming via `ManuallyDrop` is deliberately not exposed — the only
 /// way to disarm is to actually verify.
+// r[impl ts.kube.verifier-guard]
 #[must_use = "call .verified().await or the verifier panics on drop"]
 pub struct VerifierGuard {
     handle: JoinHandle<()>,

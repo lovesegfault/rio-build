@@ -61,6 +61,7 @@ pub async fn spawn_grpc_server(
 /// inference carries them from the `.layer(...)` call site. If tonic's
 /// bound changes in a minor bump, this compile-fails loudly rather than
 /// silently diverging.
+// r[impl ts.spawn.layered]
 ///
 /// The non-generic [`spawn_grpc_server`] (≈ `L = Identity`) is kept as a
 /// separate fn: Rust's default type parameters on functions are unstable,
@@ -103,6 +104,7 @@ where
 }
 
 /// Spawn a MockStore on an ephemeral port. Returns `(store, addr, handle)`.
+// r[impl ts.spawn.layered]
 pub async fn spawn_mock_store()
 -> anyhow::Result<(MockStore, SocketAddr, tokio::task::JoinHandle<()>)> {
     let store = MockStore::new();

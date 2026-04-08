@@ -153,6 +153,21 @@ NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgrou
 | MinIO | S3 backend tests (VM tests use `services.minio`; unit tests use filesystem backend) |
 | k3s | Kubernetes integration tests (bootstrapped in `vm-phase3a` VM; no external cluster needed) |
 
+r[ts.pg.server]
+`PgServer` is the process-global ephemeral postgres handle. `PgServer::get()` lazily bootstraps via `initdb` + spawn `postgres` (Unix-socket-only, `fsync=off`, `max_connections=500`) on first call and is also the public entry point `xtask regen sqlx` reuses. `gc_stale_dirs` runs before every bootstrap to reclaim `/tmp/rio-pg-*` dirs left by dead test processes (the `PG` static never drops, so `TempDir::drop` never fires); a dir is stale iff its `owner.pid` PID is dead — missing/unparseable `owner.pid` is treated as a live concurrent bootstrap and left alone. `TestDb::new_empty` creates the isolated DB without running migrations (for tests exercising the migrator itself); `TestDb::new` is `new_empty` + `migrator.run`.
+
+r[ts.pg.db-name]
+`TestDb` database names are `rio_test_{nanos}_{counter}` — nanos alone is not unique under raw-libtest's thread-per-test (two threads can hit the same nanosecond), so a process-global atomic counter is appended.
+
+r[ts.wire.macros]
+`wire_bytes!` builds a `Vec<u8>` from `kind: value` pairs (`u64`, `string`, `strings`, `bool`, `bytes`, `framed`, `raw`); `wire_send!` writes the same primitives directly to a stream and flushes. Both expand to `wire::write_<kind>(..)?` calls, so callers must be in async context with a `Result` return.
+
+r[ts.wire.helpers]
+`do_handshake` sends the client side of the worker-protocol handshake against a `DuplexStream` (not `client_handshake` — that's the production driver in `rio-nix::protocol::client`). `read_path_info` reads the 8-field `wopQueryPathInfo` body so callsites don't repeat the discard sequence. `drain_stderr_until_last` panics on `STDERR_ERROR`; `drain_stderr_expecting_error` is the inverse for error-path tests.
+
+r[ts.metrics.grep]
+`metrics_grep.rs` is `include!()`-ed by per-crate `build.rs` files (NOT compiled as a test-support module). `metrics_build_main(prefix)` greps the calling crate's `src/` for `metrics::{counter,gauge,histogram}!("...")` literals → `OUT_DIR/emitted_metrics.txt`, and greps `docs/src/observability.md` table rows for `prefix` → `OUT_DIR/spec_metrics.txt`. The grep operates on **source text**, not on a Prometheus scrape — it catches an undescribed metric at build time without running the binary.
+
 ## Benchmarks
 
 | Metric | Description | Target |
