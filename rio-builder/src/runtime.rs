@@ -749,7 +749,6 @@ const PREFETCH_WARM_SIZE_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// dir (see fetch_extract_insert) which cache init cleans up on next
 /// start. The joiner task also aborts; no ACK is sent — that's fine,
 /// we're shutting down.
-#[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(count = prefetch.store_paths.len()))]
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
@@ -758,7 +757,6 @@ pub fn handle_prefetch_hint(
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
-    test_ack_delay: std::time::Duration,
     stream_tx: mpsc::Sender<ExecutorMessage>,
 ) {
     // Collect JoinHandles for the ACK-joiner task. A typical hint
@@ -924,15 +922,6 @@ pub fn handle_prefetch_hint(
             }
         }
 
-        // TODO(P0311): ordering-proof VM scenario uses this hook.
-        // Test hook: `Config.test_prefetch_delay` injects a delay AFTER
-        // all fetches complete but BEFORE the ACK. The VM warm-gate
-        // scenario uses it to prove the scheduler waits for the ACK
-        // (assert assigned_at - registered_at >= delay).
-        if !test_ack_delay.is_zero() {
-            tokio::time::sleep(test_ack_delay).await;
-        }
-
         // send().await not try_send(): the ACK MUST land. If the
         // permanent-sink relay is backpressured (256 cap filled by
         // log batches during a chatty build), we block here until a
@@ -992,7 +981,6 @@ pub struct BuilderRuntime {
     /// [`handle_prefetch_hint`] without 7 loose fields.
     prefetch: PrefetchDeps,
     idle_timeout: Duration,
-    test_prefetch_delay: Duration,
     /// Probe-loop guards for both balanced channels. Held for process
     /// lifetime (dropping a `BalancedChannel` stops its probe loop).
     _balance_guard: BalanceGuards,
@@ -1267,7 +1255,6 @@ pub async fn setup(
             fetch_timeout: fuse_fetch_timeout,
         },
         idle_timeout: cfg.idle_timeout,
-        test_prefetch_delay: cfg.test_prefetch_delay,
         _balance_guard,
     }))
 }
@@ -1476,7 +1463,6 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                                 rt.prefetch.runtime.clone(),
                                 Arc::clone(&rt.prefetch.sem),
                                 rt.prefetch.fetch_timeout,
-                                rt.test_prefetch_delay,
                                 // Warm-gate ACK goes through the
                                 // permanent sink (same as completions
                                 // and log batches) — survives stream
@@ -2926,7 +2912,6 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
-            Duration::ZERO,
             tx,
         );
 
@@ -2992,7 +2977,6 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
-            Duration::ZERO,
             tx,
         );
 
@@ -3054,7 +3038,6 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
-            Duration::ZERO,
             tx,
         );
 

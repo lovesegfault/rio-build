@@ -162,11 +162,6 @@ pub struct Config {
     /// opt-in until A/B'd live (see `r[builder.fuse.fetch-chunk-
     /// fanout]`).
     pub fetch_transport: crate::fuse::fetch::FetchTransport,
-    /// Test hook (VM warm-gate ordering proof): inject a delay
-    /// between prefetch completion and the `PrefetchComplete` ACK.
-    /// Env: `RIO_TEST_PREFETCH_DELAY_MS`. Default 0 (no delay).
-    #[serde(rename = "test_prefetch_delay_ms", with = "rio_common::config::millis")]
-    pub test_prefetch_delay: std::time::Duration,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -202,7 +197,6 @@ impl Default for Config {
             max_silent_time_secs: 0,
             idle_timeout: std::time::Duration::from_secs(120),
             fetch_transport: crate::fuse::fetch::FetchTransport::GetPath,
-            test_prefetch_delay: std::time::Duration::ZERO,
         }
     }
 }
