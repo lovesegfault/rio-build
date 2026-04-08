@@ -50,7 +50,7 @@ const MANUAL_METHODS: &[&str] = &[
 ];
 
 fn main() {
-    let manifest = env!("CARGO_MANIFEST_DIR");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let proto_dir = format!("{manifest}/../rio-proto/proto");
     let proto_file = format!("{proto_dir}/admin.proto");
     println!("cargo:rerun-if-changed={proto_file}");
