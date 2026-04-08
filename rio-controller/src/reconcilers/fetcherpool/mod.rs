@@ -230,13 +230,12 @@ mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::ResourceRequirements;
 
-    fn mk(min: i32, max: i32) -> FetcherPool {
-        let _ = min;
+    fn mk(max: u32) -> FetcherPool {
         let mut fp = FetcherPool::new(
             "test",
             crate::crds::fetcherpool::FetcherPoolSpec {
                 deadline_seconds: None,
-                max_concurrent: max as u32,
+                max_concurrent: max,
                 image: "rio-builder:test".into(),
                 systems: vec!["x86_64-linux".into()],
                 node_selector: None,
@@ -256,7 +255,7 @@ mod tests {
     /// target this.
     #[test]
     fn labels_include_fetcher_role() {
-        let fp = mk(2, 8);
+        let fp = mk(8);
         let params = executor_params(&fp, None).unwrap();
         let labels = pod::executor_labels(&params);
         assert_eq!(labels.get("rio.build/role"), Some(&"fetcher".into()));
@@ -267,7 +266,7 @@ mod tests {
     /// `rio-fetcher.json`. ADR-019 §Sandbox hardening.
     #[test]
     fn security_posture_is_strict() {
-        let fp = mk(1, 1);
+        let fp = mk(1);
         let params = executor_params(&fp, None).unwrap();
         assert!(params.read_only_root_fs);
         assert!(!params.privileged);
@@ -283,7 +282,7 @@ mod tests {
     /// fetcher node pool. ADR-019 §Node isolation.
     #[test]
     fn node_placement_defaults_to_fetcher_pool() {
-        let fp = mk(1, 1);
+        let fp = mk(1);
         let params = executor_params(&fp, None).unwrap();
         assert_eq!(
             params
@@ -302,7 +301,7 @@ mod tests {
     /// defaults — dev clusters without dedicated pools.
     #[test]
     fn operator_placement_overrides_default() {
-        let mut fp = mk(1, 1);
+        let mut fp = mk(1);
         fp.spec.node_selector = Some(BTreeMap::from([("custom".into(), "yes".into())]));
         let params = executor_params(&fp, None).unwrap();
         assert_eq!(
@@ -326,7 +325,7 @@ mod tests {
     #[test]
     fn per_class_params_set_size_class_and_resources() {
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-        let fp = mk(2, 8);
+        let fp = mk(8);
         let class = FetcherSizeClass {
             name: "small".into(),
             resources: ResourceRequirements {
@@ -372,7 +371,7 @@ mod tests {
     /// iterates `spec.classes` and spawns one Job loop per class.
     #[test]
     fn classes_produce_distinct_job_names() {
-        let mut fp = mk(2, 8);
+        let mut fp = mk(8);
         fp.spec.classes = vec![
             FetcherSizeClass {
                 name: "tiny".into(),
@@ -406,9 +405,9 @@ mod tests {
             resources: ResourceRequirements::default(),
             max_concurrent: None,
         };
-        let mut x86 = mk(2, 8);
+        let mut x86 = mk(8);
         x86.metadata.name = Some("x86-64".into());
-        let mut arm = mk(2, 8);
+        let mut arm = mk(8);
         arm.metadata.name = Some("aarch64".into());
 
         let n = |fp: &FetcherPool| executor_params(fp, Some(&class)).unwrap().pool_name;
@@ -424,7 +423,7 @@ mod tests {
     /// pool_name. Back-compat with pre-I-170 FetcherPools.
     #[test]
     fn unclassed_params_no_size_class_env() {
-        let fp = mk(2, 8);
+        let fp = mk(8);
         let params = executor_params(&fp, None).unwrap();
         assert!(
             params.extra_env.is_empty(),
