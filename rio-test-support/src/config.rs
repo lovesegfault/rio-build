@@ -62,7 +62,7 @@
 ///     [tls]
 ///     cert_path = "/etc/tls/cert.pem"
 /// "#, |cfg: Config| {
-///     assert_eq!(cfg.tls.cert_path.as_deref(),
+///     assert_eq!(cfg.common.tls.cert_path.as_deref(),
 ///                Some(Path::new("/etc/tls/cert.pem")));
 /// });
 /// ```
@@ -94,7 +94,7 @@ macro_rules! jail_roundtrip {
 ///
 /// ```ignore
 /// jail_defaults!("gateway", "drain_grace_secs = 6", |cfg: Config| {
-///     assert!(!cfg.tls.is_configured());
+///     assert!(!cfg.common.tls.is_configured());
 ///     assert!(cfg.rate_limit.is_none());
 /// });
 /// ```

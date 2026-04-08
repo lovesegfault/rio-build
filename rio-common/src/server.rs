@@ -323,7 +323,7 @@ pub fn spawn_health_plaintext<T: Health>(
 /// rio_common::server::spawn_drain_task(
 ///     shutdown.clone(),
 ///     serve_shutdown.clone(),
-///     std::time::Duration::from_secs(cfg.drain_grace_secs),
+///     cfg.common.drain_grace,
 ///     move || async move {
 ///         reporter.set_not_serving::<SchedulerServiceServer<_>>().await
 ///     },
