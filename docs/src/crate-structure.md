@@ -149,10 +149,31 @@ src/
 │   └── derived_path.rs # DerivedPath string parser
 ├── store_path.rs      # StorePath + nixbase32
 ├── nar.rs             # NAR streaming read/write/extract
-├── narinfo.rs         # NarInfo parse/serialize + fingerprint()
+├── narinfo.rs         # NarInfo parse/serialize + fingerprint() + verify_sig()
 ├── refscan.rs         # Reference scanner: Aho-Corasick over nixbase32 store-path hashes
-└── hash.rs            # NixHash (SHA-256, SHA-512, SHA-1)
+└── hash.rs            # NixHash + HashAlgo (SHA-256, SHA-512, SHA-1); colon + SRI parse/serialize
 ```
+
+r[nix.hash.algos]
+`HashAlgo` is `{SHA256, SHA512, SHA1}` — the set Nix accepts for `outputHashAlgo` and store-path computation. SHA-1 is included for legacy fixed-output derivations (`fetchgit` historically defaulted to it). BLAKE3 is used internally by rio-build for chunk addressing but is NOT a `HashAlgo` variant — it never crosses the Nix-facing protocol boundary.
+
+r[nix.hash.sri]
+`NixHash::parse_sri`/`to_sri` handle the SRI form (`sha256-BASE64=`); `parse_colon`/`to_colon` handle the Nix colon form (`sha256:nixbase32`). `NixHash::parse` auto-detects by separator.
+
+r[nix.narinfo.verify-sig]
+`NarInfo::verify_sig` checks each `Sig:` line against a list of trusted `name:base64(ed25519-pubkey)` keys. The fingerprint is reconstructed from `store_path`/`nar_hash`/`nar_size`/`references` (basenames re-prefixed with the store dir, sorted). Malformed keys or sigs are treated as non-matching, never errors. Returns the first matching key name or `None`.
+
+r[nix.client.set-options]
+`client_set_options` sends `wopSetOptions` to a `nix-daemon --stdio` process. Only `max_silent_time` and `build_cores` are caller-supplied; all other fields (`keepFailed`, `keepGoing`, `verbosity`, `maxBuildJobs=1`, obsolete fields) are hardwired. The daemon sets `NIX_BUILD_CORES` inside the sandbox from this value — setting the env var on the daemon process is ignored.
+
+r[nix.stderr.pid-activity-id]
+`StderrWriter` allocates activity IDs as `(getpid() << 32) + counter` to match upstream Nix's `libutil/logging.cc` convention. Starting at bare `1` would put server-allocated IDs in the same low range a client may use for its own activities (I-206: nom showed completed builds as stuck at their last phase).
+
+r[nix.drv.like-trait]
+`DerivationLike` is the shared predicate trait over `Derivation` and `BasicDerivation`: `outputs()`/`platform()`/`env()` accessors plus the default-method predicates `is_fixed_output`, `has_ca_floating_outputs`, `is_content_addressed`. Inherent accessor methods are kept alongside so existing callers don't need a trait import; callers of the predicate methods must `use DerivationLike`.
+
+r[nix.drv.parse-from-nar]
+`Derivation::parse_from_nar` extracts the single regular file from a NAR, UTF-8-decodes it, and runs the ATerm parser — the convenience path for `.drv` blobs that arrive NAR-wrapped over the wire.
 
 Fuzz targets for the parsers live in `rio-nix/fuzz/` (separate workspace, own `Cargo.lock`). A second fuzz workspace at `rio-store/fuzz/` covers the manifest parser. Both are excluded from the main workspace — when a fuzzed crate's deps change, run `cd <crate>/fuzz && cargo update -p <crate>` to sync the independent lockfile.
 

@@ -144,6 +144,7 @@ impl DerivationOutput {
 /// becomes the *single* source of the predicate implementations;
 /// callers of `is_fixed_output()` / `has_ca_floating_outputs()` must
 /// `use DerivationLike`.
+// r[impl nix.drv.like-trait]
 pub trait DerivationLike {
     /// Output definitions.
     fn outputs(&self) -> &[DerivationOutput];
@@ -228,6 +229,7 @@ impl Derivation {
     /// Parse a derivation from NAR bytes containing a single `.drv` file.
     ///
     /// Equivalent to: `extract_single_file(nar)` → UTF-8 decode → [`Derivation::parse`].
+    // r[impl nix.drv.parse-from-nar]
     pub fn parse_from_nar(nar_data: &[u8]) -> Result<Self, DerivationError> {
         let drv_bytes = crate::nar::extract_single_file(nar_data)?;
         let drv_text = String::from_utf8(drv_bytes)?;

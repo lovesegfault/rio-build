@@ -261,6 +261,7 @@ impl NarInfo {
     /// who can inject a malformed `Sig:` line shouldn't be able to
     /// make verification crash — they just don't verify.
     // r[impl store.signing.fingerprint]
+    // r[impl nix.narinfo.verify-sig]
     pub fn verify_sig(&self, trusted_keys: &[String]) -> Option<String> {
         use base64::Engine as _;
         use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};

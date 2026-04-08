@@ -35,6 +35,7 @@ pub enum HashError {
 
 /// Supported hash algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// r[impl nix.hash.algos]
 pub enum HashAlgo {
     SHA256,
     SHA512,
@@ -126,6 +127,7 @@ impl NixHash {
     }
 
     /// Parse SRI format: `"sha256-AAAA...="` where the digest is base64-encoded.
+    // r[impl nix.hash.sri]
     pub fn parse_sri(s: &str) -> Result<Self, HashError> {
         let (algo_str, digest_str) = s
             .split_once('-')
@@ -167,6 +169,7 @@ impl NixHash {
     }
 
     /// Render in SRI format: `sha256-AAAA...=` (base64 digest).
+    // r[impl nix.hash.sri]
     pub fn to_sri(&self) -> String {
         use base64::Engine;
         format!(

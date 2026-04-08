@@ -171,6 +171,7 @@ pub struct StderrWriter<W> {
 
 impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     pub fn new(writer: W) -> Self {
+        // r[impl nix.stderr.pid-activity-id]
         // I-206: upstream nix allocates ActivityId as
         // `nextId++ + (getPid() << 32)` (libutil/logging.cc) so daemon-
         // originated IDs never collide with the client's own (client PID

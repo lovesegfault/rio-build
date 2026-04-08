@@ -275,6 +275,7 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// `--cores`. The daemon sets this env var inside the builder's
 /// sandbox namespace; setting `NIX_BUILD_CORES` on the daemon
 /// PROCESS would be ignored — `wopSetOptions` is the correct channel.
+// r[impl nix.client.set-options]
 pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
