@@ -1,11 +1,9 @@
 //! `xtask k8s metrics` — one-shot Prometheus scrape of key gauges.
 //!
-//! Stress sessions I-128→I-148 were debugged via log-grep and ad-hoc
-//! `cli builds` polls. Every component emits `rio_*` on :9091/:9092
-//! but until P0539a lands no Prometheus scrapes them. This subcommand
-//! is the stop-gap: port-forward (in-process, kube-rs) to the
-//! scheduler leader + each store replica, GET /metrics, pretty-print
-//! the handful of gauges that answer "is the actor wedged?".
+//! Fast CLI scrape complementing Grafana: port-forward (in-process,
+//! kube-rs) to the scheduler leader + each store replica, GET /metrics,
+//! pretty-print the handful of gauges that answer "is the actor
+//! wedged?". Handy when you don't want to open a browser.
 //!
 //! Targets <5s wall-clock — one scrape per pod, no polling.
 
@@ -36,8 +34,6 @@ const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Scheduler gauges to print as-is (name → display label). Labelled
 /// gauges (per-pool, per-class) print every series; scalars print one.
-/// `actor_mailbox_depth` lands in P0539c — absent until then, rendered
-/// as `-`.
 const SCHED_GAUGES: &[(&str, &str)] = &[
     ("rio_scheduler_actor_mailbox_depth", "mailbox_depth"),
     ("rio_scheduler_derivations_queued", "derivations_queued"),
@@ -204,7 +200,7 @@ fn print_gauge(scrape: &Scrape, metric: &str, label: &str) {
 /// `actor_cmd_seconds` is a histogram; the cheap "p99-ish" without a
 /// real quantile is sum/count per `cmd` label — i.e. mean latency.
 /// Good enough to spot the one cmd that's 100× the rest (the I-139
-/// signature). Real p99 lands with P0539a's Prometheus.
+/// signature). For real p99, use Grafana.
 #[allow(clippy::print_stderr)]
 fn print_actor_cmd_means(scrape: &Scrape) {
     let sums = scrape.labelled("rio_scheduler_actor_cmd_seconds_sum");
