@@ -34,14 +34,11 @@
   # --ignore-filename-regex for llvm-cov export on VM-test profraws.
   # Dep paths like `/tokio-1.50.0/...` get filtered by the final
   # `lcov --extract 'rio-*'` step; this regex catches common build
-  # artifacts that --extract misses. `target/.*build` covers both
-  # crane's target/release/build/ and crate2nix's target/build/
-  # (buildRustCrate puts generated proto code at target/build/
-  # <crate>.out/, genhtml can't resolve it against commonSrc).
+  # artifacts that --extract misses. `target/.*build` covers
+  # crate2nix's target/build/ (buildRustCrate puts generated proto
+  # code at target/build/<crate>.out/, genhtml can't resolve it
+  # against commonSrc).
   ignoreRegex ? "\\.cargo/registry|\\.cargo/git|/rustc/|/nix/store/.*-vendor|target/.*build",
-  # Name suffix for derivations. Kept for callers that want
-  # multiple coverage pipelines side by side.
-  nameSuffix ? "",
 }:
 let
   inherit (pkgs) lib;
@@ -73,7 +70,7 @@ let
   # inputs gracefully (warns, continues).
   mkPerTestLcov =
     name: vmTest:
-    pkgs.runCommand "rio-cov-${name}${nameSuffix}" { } ''
+    pkgs.runCommand "rio-cov-${name}" { } ''
       mkdir -p $TMPDIR/raw
       for tarball in $(find ${vmTest}/coverage -name profraw.tar.gz 2>/dev/null); do
         # --skip-old-files: in case two nodes have the same
@@ -122,7 +119,7 @@ let
 
   # Union all per-test lcovs. `lcov -a` is additive — a line hit
   # in ANY VM test is hit in the union.
-  vmLcov = pkgs.runCommand "rio-cov-vm-total${nameSuffix}" { nativeBuildInputs = [ pkgs.lcov ]; } ''
+  vmLcov = pkgs.runCommand "rio-cov-vm-total" { nativeBuildInputs = [ pkgs.lcov ]; } ''
     args=""
     ${lib.concatMapStringsSep "\n" (p: ''
       # Skip empty lcovs (guard above emitted touch $out).
@@ -142,13 +139,11 @@ let
   # --ignore-errors unused: crate2nix's unit lcov is already
   # repo-relative (nix/checks.nix does `lcov --substitute 's|^/||'`)
   # so this pattern may not match — harmless, skip the error.
-  unitLcov =
-    pkgs.runCommand "rio-cov-unit-clean${nameSuffix}" { nativeBuildInputs = [ pkgs.lcov ]; }
-      ''
-        lcov --ignore-errors unused \
-          --substitute '${stripPrefix}' \
-          -a ${unitCoverage}/lcov.info -o $out
-      '';
+  unitLcov = pkgs.runCommand "rio-cov-unit-clean" { nativeBuildInputs = [ pkgs.lcov ]; } ''
+    lcov --ignore-errors unused \
+      --substitute '${stripPrefix}' \
+      -a ${unitCoverage}/lcov.info -o $out
+  '';
   # Smoke scenario for the cov-smoke gate. Picked for broadest
   # coverage-infrastructure surface per minute: protocol-warm
   # exercises store+scheduler+gateway together in ~5min at 3 vCPU
@@ -173,7 +168,7 @@ in
     let
       lcov = perTestLcov.${smokeScenario};
     in
-    pkgs.runCommand "rio-cov-smoke${nameSuffix}" { nativeBuildInputs = [ pkgs.lcov ]; } ''
+    pkgs.runCommand "rio-cov-smoke" { nativeBuildInputs = [ pkgs.lcov ]; } ''
       # mkPerTestLcov emits `touch $out` (empty file) on zero
       # profraws — that's a WARNING for the merge pipeline but a
       # FAILURE for smoke: empty = coverage infra didn't collect.
@@ -199,7 +194,7 @@ in
   # workspace crates. result/html/ = genhtml. result/per-test/ =
   # individual breakdowns.
   full =
-    pkgs.runCommand "rio-coverage-full${nameSuffix}"
+    pkgs.runCommand "rio-coverage-full"
       {
         nativeBuildInputs = [ pkgs.lcov ];
       }
@@ -226,9 +221,9 @@ in
         # --remove filters out generated build artifacts that
         # --extract let through (rio-proto/target/build/... matches
         # 'rio-*' but the generated .rs doesn't exist in commonSrc).
-        # crate2nix puts tonic-prost-build output at target/build/
-        # (crane used target/release/build/); genhtml can't resolve
-        # either against commonSrc. unused: don't error if pattern
+        # crate2nix puts tonic-prost-build output at target/build/;
+        # genhtml can't resolve it against commonSrc. unused: don't
+        # error if pattern
         # doesn't match (clean unit-only runs may not have these).
         lcov --ignore-errors unused \
           --remove $TMPDIR/extracted.lcov '*/target/*' -o $out/lcov.info

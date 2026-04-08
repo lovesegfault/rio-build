@@ -10,7 +10,7 @@
       description = ''
         The rio-build workspace package providing all binaries
         (rio-store, rio-scheduler, rio-gateway, rio-builder).
-        Typically the flake's `packages.default` (Crane-built workspace).
+        Typically the flake's `packages.default` (crate2nix-built workspace).
       '';
     };
 

@@ -15,8 +15,8 @@
 { pkgs }:
 let
   # Scoped to rio-dashboard/ (not repo root). cleanSource NOT cleanCargoSource
-  # — crane's cargo filter drops .ts/.svelte/.json. In flake context, git-
-  # untracked files (node_modules/, dist/) are already filtered by the flake
+  # — a cargo-oriented filter would drop .ts/.svelte/.json. In flake context,
+  # git-untracked files (node_modules/, dist/) are already filtered by the flake
   # store-path mechanism; cleanSource additionally strips editor-backup cruft.
   #
   # Scoping to the subdirectory means Rust-only commits don't invalidate

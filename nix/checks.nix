@@ -38,19 +38,18 @@
   # Used to produce test binaries that emit .profraw files at runtime.
   # null → coverage targets not exposed.
   crateBuildCov ? null,
-  # Runtime inputs for test execution (PG, nix-cli, openssh). Mirrors
-  # crane's cargoNextest nativeCheckInputs.
+  # Runtime inputs for test execution (PG, nix-cli, openssh).
   runtimeTestInputs ? [ ],
-  # Env vars set on all test-runner derivations. Mirrors crane's
-  # RIO_GOLDEN_* / RIO_GOLDEN_FORCE_HERMETIC env injection.
+  # Env vars set on all test-runner derivations (RIO_GOLDEN_* /
+  # RIO_GOLDEN_FORCE_HERMETIC injection).
   testEnv ? { },
   # Workspace source tree for nextest — needs Cargo.toml per member
   # (for cargo-metadata) and .config/nextest.toml (profile, test
   # groups, overrides). Fileset-filtered to avoid rebuilds on .claude/
   # or doc churn. Required when nextest targets are used.
   workspaceSrc ? null,
-  # Extra args appended to `cargo-nextest run`. The crane pipeline
-  # uses `--profile ci --no-tests=warn`; callers can match that.
+  # Extra args appended to `cargo-nextest run`. Callers typically
+  # pass `--profile ci --no-tests=warn`.
   nextestExtraArgs ? [ ],
 }:
 let
@@ -133,16 +132,15 @@ let
   '';
 
   # Lint flags for workspace members. Together with clippyTestMember
-  # below, matches crane's `cargo clippy --all-targets -- --deny
-  # warnings`: clippyMember lints lib/bin, clippyTestMember lints
-  # #[cfg(test)] and tests/*.rs. The workspace Cargo.toml [lints]
+  # below, matches `cargo clippy --all-targets -- --deny warnings`:
+  # clippyMember lints lib/bin, clippyTestMember lints #[cfg(test)]
+  # and tests/*.rs. The workspace Cargo.toml [lints]
   # table is NOT read by buildRustCrate (cargo construct); lints must
   # be passed as rustc flags directly.
   #
   # -Dwarnings promotes all warn-level lints to errors. clippy::all is
   # the default lint group (style, complexity, correctness, perf,
-  # suspicious). We don't enable pedantic/nursery — those are
-  # advisory-only in the crane check too.
+  # suspicious). pedantic/nursery stay advisory-only.
   clippyFlags = [
     "-Dwarnings"
     "-Wclippy::all"
@@ -324,7 +322,7 @@ let
   # Clippy check on TEST targets: same driver as clippyMember, but
   # buildTests=true so #[cfg(test)] blocks and tests/*.rs are
   # compiled. dev-deps appended same as testMember. This is the half
-  # of crane's `--all-targets` that clippyMember alone misses.
+  # of `--all-targets` that clippyMember alone misses.
   clippyTestMember =
     name: base:
     (base.override (old: {
@@ -457,9 +455,9 @@ let
           nativeBuildInputs = runtimeTestInputs;
           RUST_BACKTRACE = "1";
           # Remote builders can under-provision (one run got 3.2GB —
-          # postgres + 16 tokio test threads OOM'd). Lower than
-          # crane's 64/65536 workspace-wide pin — per-crate test
-          # runs are lighter.
+          # postgres + 16 tokio test threads OOM'd). Per-crate test
+          # runs are lighter than a workspace-wide nextest, so this
+          # is below the 64/65536 the latter would need.
           NIXBUILDNET_MIN_CPU = "16";
           NIXBUILDNET_MIN_MEM = "16384";
         }
@@ -484,8 +482,8 @@ let
         # gets SIGTERM. Subsequent tests see the socket gone →
         # "failed to connect: NotFound".
         #
-        # crane's cargoNextest avoids this structurally — nextest
-        # runs each test in its OWN process, so each test
+        # nextest avoids this structurally — it runs each test in
+        # its OWN process, so each test
         # bootstraps its own PG and the spawning process outlives
         # the test (nextest's worker is the spawner, not the test
         # thread). Direct libtest harness execution has no such
@@ -578,7 +576,7 @@ let
   #   - Per-test-process isolation (fixes the PR_SET_PDEATHSIG/libtest
   #     thread-exit race; no wrapper-level PG bootstrap required).
   #   - Test groups, retry-on-flake, slow-timeout from
-  #     `.config/nextest.toml` — all the knobs the crane pipeline has.
+  #     `.config/nextest.toml`.
   #   - The characteristic `PASS [  Xs] crate::test` output format
   #     that log-parsers expect.
   #
@@ -935,9 +933,9 @@ let
   # Merge + export: all profraws → single profdata → lcov. Object
   # files (--object) are the test binaries themselves — llvm-cov
   # reads the __llvm_covfun/__llvm_covmap sections embedded at
-  # compile time. Unlike crane's coverage (which reads the main
-  # binaries), here we read the TEST binaries directly since they
-  # contain both the library code (via --test) and test-only code.
+  # compile time. We read the TEST binaries (not the main binaries)
+  # since they contain both the library code (via --test) and
+  # test-only code.
   coverageLcov = pkgs.runCommand "rio-coverage-lcov" { } ''
     set -euo pipefail
     mkdir -p $TMPDIR/raw $out
@@ -978,9 +976,9 @@ let
       2>/dev/null > $TMPDIR/raw.lcov
 
     # Strip leading slash so paths are repo-relative
-    # (`rio-common/src/lib.rs` not `/rio-common/src/lib.rs`) — same
-    # convention as crane's coverage output. Then extract only
-    # workspace-crate paths (rio-*/...). --ignore-errors unused:
+    # (`rio-common/src/lib.rs` not `/rio-common/src/lib.rs`) — what
+    # codecov expects. Then extract only workspace-crate paths
+    # (rio-*/...). --ignore-errors unused:
     # lcov 2.x treats an unmatched --substitute pattern as an error
     # by default; we don't know ahead of time whether every pattern
     # fires (depends on which crates' tests ran).

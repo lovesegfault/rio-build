@@ -343,8 +343,8 @@ let
   # supplies cmake for aws-lc-sys.
   defaultCrateOverrides = pkgs.defaultCrateOverrides // {
     # pkg-config + system lib + env-var escape hatch. All three drawn
-    # from sysCrateEnv.crates.<name> — same libs crane links, same env
-    # vars devShell sets. Changing sysCrateEnv (e.g. sqlite →
+    # from sysCrateEnv.crates.<name> — same libs the devShell links,
+    # same env vars it sets. Changing sysCrateEnv (e.g. sqlite →
     # sqlite_3_45) propagates here automatically.
     fuser = _: {
       nativeBuildInputs = [ pkgs.pkg-config ];

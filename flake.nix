@@ -1470,7 +1470,6 @@
                   p.hashicorp_null # transitive: terraform-aws-modules/eks
                 ]))
                 kubectl
-                kind # cargo xtask k8s -p kind — fast-iteration local cluster
                 skopeo # cargo xtask k8s push -p eks — docker-archive → ECR
                 manifest-tool # cargo xtask k8s push -p eks — multi-arch OCI index
                 kubernetes-helm
