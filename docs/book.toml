@@ -7,6 +7,7 @@ src = "src"
 
 [build]
 build-dir = "book"
+create-missing = false
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

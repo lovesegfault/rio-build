@@ -679,7 +679,7 @@ r[gw.stderr.activity+2]
 | 111 | BuildWaiting | Build waiting for a lock |
 | 112 | FetchTree | Fetching a flake input tree |
 
-Note: values 1--99 are unused. The enum starts at 0 (Unknown) then jumps to 100. For `Build` (105) the `fields` array is `[drvPath, machineName, curRound, nrRounds]`; nom and `--log-format bar` read `fields[0]` as the derivation name and `fields[1]` as the "on <machine>" suffix.
+Note: values 1--99 are unused. The enum starts at 0 (Unknown) then jumps to 100. For `Build` (105) the `fields` array is `[drvPath, machineName, curRound, nrRounds]`; nom and `--log-format bar` read `fields[0]` as the derivation name and `fields[1]` as the "on `<machine>`" suffix.
 
 ### STDERR_RESULT BuildEvent mapping
 

@@ -82,6 +82,30 @@
     '';
   };
 
+  # Design-book build. mdbook exits non-zero on broken
+  # SUMMARY.md links, malformed front-matter, or a failing
+  # preprocessor (mdbook-mermaid). rustdoc (`doc` check) only
+  # covers code docs — without this, docs/src/ breakage is
+  # invisible until someone runs `mdbook serve` locally.
+  #
+  # Source is scoped to docs/ so unrelated edits don't rebuild.
+  # Output is the rendered HTML (browsable via `result/index.html`).
+  mdbook =
+    pkgs.runCommand "rio-mdbook"
+      {
+        src = pkgs.lib.fileset.toSource {
+          root = ../docs;
+          fileset = ../docs;
+        };
+        nativeBuildInputs = with pkgs; [
+          mdbook
+          mdbook-mermaid
+        ];
+      }
+      ''
+        mdbook build $src -d $out
+      '';
+
   # Spec-coverage validation: fails on broken r[...]
   # references, duplicate requirement IDs, or unparseable
   # include files. Does NOT fail on uncovered/untested — those

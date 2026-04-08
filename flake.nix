@@ -1134,6 +1134,7 @@
                 inherit (miscChecks)
                   deny
                   tracey-validate
+                  mdbook
                   helm-lint
                   crds-drift
                   tfvars-fresh
