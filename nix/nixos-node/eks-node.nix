@@ -43,22 +43,20 @@ let
   };
 
   pauseRef = "localhost/kubernetes/pause:latest";
-  # r[impl sec.pod.host-users-false]
-  containerdConfig = import ./containerd-config.nix { inherit lib pkgs pauseRef; };
 
   # /dev/{fuse,kvm} OCI base spec — both variants baked into the AMI;
-  # containerd's ExecStartPre below picks based on host /dev/kvm
-  # presence and symlinks to /run/base-runtime-spec.json (the path
-  # containerd-config.nix points base_runtime_spec at). Non-.metal
-  # nodes get the fuse-only spec, so pods don't see a dead /dev/kvm
-  # mknod that fools `test -c /dev/kvm` probes.
-  baseRuntimeSpecFuse = import ../base-runtime-spec.nix {
-    inherit pkgs;
-    withKvm = false;
-  };
-  baseRuntimeSpecKvm = import ../base-runtime-spec.nix {
-    inherit pkgs;
-    withKvm = true;
+  # containerd's ExecStartPre below (baseRuntimeSpec.pickExecStartPre)
+  # picks based on host /dev/kvm presence and symlinks to
+  # baseRuntimeSpec.runtimePath (the path containerd-config.nix points
+  # base_runtime_spec at). Non-.metal nodes get the fuse-only spec, so
+  # pods don't see a dead /dev/kvm mknod that fools `test -c /dev/kvm`
+  # probes.
+  baseRuntimeSpec = import ../base-runtime-spec.nix { inherit pkgs; };
+
+  # r[impl sec.pod.host-users-false]
+  containerdConfig = import ./containerd-config.nix {
+    inherit lib pkgs pauseRef;
+    runtimeSpecPath = baseRuntimeSpec.runtimePath;
   };
 in
 {
@@ -241,13 +239,7 @@ in
           ];
           serviceConfig = {
             Slice = "runtime.slice";
-            ExecStartPre = [
-              (pkgs.writeShellScript "pick-base-runtime-spec" ''
-                spec=${baseRuntimeSpecFuse}
-                test -c /dev/kvm && spec=${baseRuntimeSpecKvm}
-                ln -sfn "$spec" /run/base-runtime-spec.json
-              '')
-            ];
+            ExecStartPre = [ baseRuntimeSpec.pickExecStartPre ];
             ExecStart = "${pkgs.containerd}/bin/containerd --config ${containerdConfig}";
             Type = "notify";
             Delegate = "yes";

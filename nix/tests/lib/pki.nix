@@ -34,34 +34,29 @@
   ],
 }:
 let
-  sanExt =
-    "subjectAltName=" + pkgs.lib.concatMapStringsSep "," (s: "DNS:${s}") serverSans + ",IP:127.0.0.1";
+  inherit (import ./pki-common.nix { inherit (pkgs) lib; }) mkCa mkLeaf;
+  sanList = pkgs.lib.concatMapStringsSep "," (s: "DNS:${s}") serverSans + ",IP:127.0.0.1";
 in
 pkgs.runCommand "rio-test-pki" { buildInputs = [ pkgs.openssl ]; } ''
   mkdir -p $out
 
   # ── Self-signed root CA ─────────────────────────────────────
-  openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout $out/ca.key -out $out/ca.crt \
-    -days 3650 -subj "/CN=rio-test-ca"
+  ${mkCa}
 
   # ── Server cert (SANs parameterized) ────────────────────────
-  # -addext works on openssl 1.1.1+. nixpkgs openssl is 3.x.
-  openssl req -newkey rsa:2048 -nodes \
-    -keyout $out/server.key -out server.csr \
-    -subj "/CN=${builtins.head serverSans}"
-  openssl x509 -req -in server.csr \
-    -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-    -out $out/server.crt -days 3650 \
-    -extfile <(printf '${sanExt}')
+  ${mkLeaf {
+    keyOut = "$out/server.key";
+    crtOut = "$out/server.crt";
+    cn = builtins.head serverSans;
+    sans = sanList;
+  }}
 
   # ── Client cert (worker mTLS identity) ──────────────────────
-  openssl req -newkey rsa:2048 -nodes \
-    -keyout $out/client.key -out client.csr \
-    -subj "/CN=rio-builder"
-  openssl x509 -req -in client.csr \
-    -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-    -out $out/client.crt -days 3650
+  ${mkLeaf {
+    keyOut = "$out/client.key";
+    crtOut = "$out/client.crt";
+    cn = "rio-builder";
+  }}
 
   # ── Gateway client cert (CN=rio-gateway for HMAC bypass) ────
   # Store's PutPath HMAC bypass requires CN=rio-gateway. The
@@ -69,12 +64,11 @@ pkgs.runCommand "rio-test-pki" { buildInputs = [ pkgs.openssl ]; } ''
   # ServerTlsConfig with client_ca_root verifies this cert).
   # Without CN=rio-gateway, PutPath rejects with "assignment
   # token required (CN=... is not rio-gateway)".
-  openssl req -newkey rsa:2048 -nodes \
-    -keyout $out/gateway.key -out gateway.csr \
-    -subj "/CN=rio-gateway"
-  openssl x509 -req -in gateway.csr \
-    -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-    -out $out/gateway.crt -days 3650
+  ${mkLeaf {
+    keyOut = "$out/gateway.key";
+    crtOut = "$out/gateway.crt";
+    cn = "rio-gateway";
+  }}
 
   # ── HMAC key (shared scheduler ↔ store secret) ──────────────
   # -hex emits lowercase hex + newline. load_key strips the

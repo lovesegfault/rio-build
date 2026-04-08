@@ -13,13 +13,13 @@
 # uid/gid) — NOT a hostPath mount, so no hostUsers:false idmap-mount
 # rejection. Every pod gets /dev/fuse; mounting fuse still needs
 # CAP_SYS_ADMIN. /dev/kvm is included only when withKvm=true — both
-# delivery paths build BOTH variants and pick at boot via `test -c
-# /dev/kvm` → `ln -sfn … /run/base-runtime-spec.json`, so on
-# non-.metal the node never appears in the container at all (instead
-# of mknod-ing a dead 10:232 that fools `test -c /dev/kvm` probes
-# then ENXIOs on open). kvm pods route to .metal via the
-# `rio.build/kvm` nodeSelector (controller-derived from
-# features:[kvm], r[ctrl.builderpool.kvm-device]).
+# delivery paths reference `pickExecStartPre` below, which symlinks
+# the host-appropriate variant to `runtimePath` at boot via
+# `test -c /dev/kvm`, so on non-.metal the node never appears in the
+# container at all (instead of mknod-ing a dead 10:232 that fools
+# `test -c /dev/kvm` probes then ENXIOs on open). kvm pods route to
+# .metal via the `rio.build/kvm` nodeSelector (controller-derived
+# from features:[kvm], r[ctrl.builderpool.kvm-device]).
 #
 # `base_runtime_spec` is the STARTING spec — CRI's spec opts layer on
 # top (`oci.WithSpecFromFile` then `WithProcessCwd`/`WithNamespaces`/…)
@@ -30,11 +30,10 @@
 # without a private MNT namespace"). Hence: start from `ctr oci spec`
 # (containerd's full default) and merge our additions, instead of
 # hand-writing a minimal JSON.
-{
-  pkgs,
-  withKvm ? false,
-}:
+{ pkgs }:
 let
+  inherit (pkgs) lib;
+
   fuseDev = {
     path = "/dev/fuse";
     type = "c";
@@ -58,57 +57,81 @@ let
     inherit (d) type major minor;
     access = "rwm";
   };
-  devs = [ fuseDev ] ++ pkgs.lib.optional withKvm kvmDev;
-  rioAdditions = builtins.toJSON {
-    process.rlimits = [
+
+  mkSpec =
+    withKvm:
+    let
+      devs = [ fuseDev ] ++ lib.optional withKvm kvmDev;
+      rioAdditions = builtins.toJSON {
+        process.rlimits = [
+          {
+            type = "RLIMIT_NOFILE";
+            hard = 1048576;
+            soft = 65536;
+          }
+        ];
+        linux = {
+          devices = devs;
+          # This is NOT the full cgroup allowlist. With base_runtime_spec
+          # set, CRI does NOT append default devices — `crictl inspect`
+          # shows exactly these entries in BOTH linux.devices and
+          # linux.resources.devices (verified by the base-runtime-spec-
+          # passthrough subtest in nix/tests/scenarios/security.nix,
+          # vm-security-nonpriv-k3s). runc's libcontainer (specconv
+          # AllowedDevices + CreateCgroupConfig) appends /dev/{null,zero,
+          # full,tty,urandom,random} nodes AND the deny-all + standard
+          # cgroup allows when converting OCI spec → libcontainer config
+          # — below crictl-inspect visibility. The CI subtest gates that
+          # our entries SURVIVE to the OCI spec; runc's append is proven
+          # functionally by build-completes (would fail without /dev/null).
+          resources.devices = map cgroupAllow devs;
+        };
+      };
+    in
+    # `ctr oci spec` emits containerd's compiled-in default (the same spec
+    # CRI would build with no base_runtime_spec set). jq `*` is recursive
+    # object merge: rioAdditions wins on leaf collisions, arrays REPLACE
+    # (not append) — fine here since the default spec has no linux.devices
+    # and process.rlimits we want to override anyway.
+    pkgs.runCommand "base-runtime-spec${lib.optionalString withKvm "-kvm"}.json"
       {
-        type = "RLIMIT_NOFILE";
-        hard = 1048576;
-        soft = 65536;
+        nativeBuildInputs = [
+          pkgs.containerd
+          pkgs.jq
+        ];
+        inherit rioAdditions;
+        passAsFile = [ "rioAdditions" ];
       }
-    ];
-    linux = {
-      devices = devs;
-      # This is NOT the full cgroup allowlist. With base_runtime_spec
-      # set, CRI does NOT append default devices — `crictl inspect`
-      # shows exactly these entries in BOTH linux.devices and
-      # linux.resources.devices (verified by the base-runtime-spec-
-      # passthrough subtest in nix/tests/scenarios/security.nix,
-      # vm-security-nonpriv-k3s). runc's libcontainer (specconv
-      # AllowedDevices + CreateCgroupConfig) appends /dev/{null,zero,
-      # full,tty,urandom,random} nodes AND the deny-all + standard
-      # cgroup allows when converting OCI spec → libcontainer config
-      # — below crictl-inspect visibility. The CI subtest gates that
-      # our entries SURVIVE to the OCI spec; runc's append is proven
-      # functionally by build-completes (would fail without /dev/null).
-      resources.devices = map cgroupAllow devs;
-    };
-  };
+      ''
+        ctr oci spec | jq -S --slurpfile add "$rioAdditionsPath" '. * $add[0]' > $out
+        # Sanity: the merge produced what we expect AND kept the
+        # load-bearing defaults runc needs. kvm presence is asserted
+        # to MATCH withKvm (present iff true).
+        jq -e '
+          .process.cwd != null and .process.cwd != ""
+          and (.linux.namespaces | length) > 0
+          and (.linux.devices | map(.path) | contains(["/dev/fuse"]))
+          and ((.linux.devices | map(.path) | contains(["/dev/kvm"])) == ${lib.boolToString withKvm})
+          and (.process.rlimits[0].type == "RLIMIT_NOFILE")
+        ' $out >/dev/null
+      '';
 in
-# `ctr oci spec` emits containerd's compiled-in default (the same spec
-# CRI would build with no base_runtime_spec set). jq `*` is recursive
-# object merge: rioAdditions wins on leaf collisions, arrays REPLACE
-# (not append) — fine here since the default spec has no linux.devices
-# and process.rlimits we want to override anyway.
-pkgs.runCommand "base-runtime-spec${pkgs.lib.optionalString withKvm "-kvm"}.json"
-  {
-    nativeBuildInputs = [
-      pkgs.containerd
-      pkgs.jq
-    ];
-    inherit rioAdditions;
-    passAsFile = [ "rioAdditions" ];
-  }
-  ''
-    ctr oci spec | jq -S --slurpfile add "$rioAdditionsPath" '. * $add[0]' > $out
-    # Sanity: the merge produced what we expect AND kept the
-    # load-bearing defaults runc needs. kvm presence is asserted
-    # to MATCH withKvm (present iff true).
-    jq -e '
-      .process.cwd != null and .process.cwd != ""
-      and (.linux.namespaces | length) > 0
-      and (.linux.devices | map(.path) | contains(["/dev/fuse"]))
-      and ((.linux.devices | map(.path) | contains(["/dev/kvm"])) == ${pkgs.lib.boolToString withKvm})
-      and (.process.rlimits[0].type == "RLIMIT_NOFILE")
-    ' $out >/dev/null
-  ''
+rec {
+  fuseSpec = mkSpec false;
+  kvmSpec = mkSpec true;
+
+  # containerd `base_runtime_spec` value. Both delivery paths point
+  # their runc runtime at this; pickExecStartPre symlinks it.
+  runtimePath = "/run/base-runtime-spec.json";
+
+  # ExecStartPre for the unit that owns containerd (containerd.service
+  # on EKS, k3s.service in VM tests). Picks fuse-only vs fuse+kvm by
+  # host /dev/kvm presence so non-.metal pods never see a dead mknod.
+  # nix/tests/nixos-node.nix T7f checks the symlink target's drv name
+  # suffix (`-kvm.json` iff host has kvm) — keep mkSpec's name pattern.
+  pickExecStartPre = pkgs.writeShellScript "pick-base-runtime-spec" ''
+    spec=${fuseSpec}
+    test -c /dev/kvm && spec=${kvmSpec}
+    ln -sfn "$spec" ${runtimePath}
+  '';
+}

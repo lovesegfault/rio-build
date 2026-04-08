@@ -8,11 +8,10 @@
 # Output: a store path with per-component cert dirs + a k8s manifest
 # (tls-secrets.yaml) ready for services.k3s.manifests.
 #
-# Why not reuse pki.nix: that one is tuned for the standalone
-# fixture (SANs = control/localhost hostnames). Here SANs must be k8s
-# Service DNS names (rio-scheduler, rio-store, etc.) — tonic derives
-# SNI from the URL :authority, and values/vmtest-full.yaml uses
-# Service names in scheduler_addr/store_addr.
+# pki.nix vs this: same openssl flow (pki-common.nix); differs in SAN
+# set (k8s Service DNS names — tonic derives SNI from URL :authority,
+# vmtest-full.yaml uses Service names) and output layout (per-component
+# dirs + k8s Secret manifest vs flat files).
 { pkgs }:
 {
   ns ? "rio-system",
@@ -28,6 +27,8 @@
   extraComponents ? [ ],
 }:
 let
+  inherit (import ./pki-common.nix { inherit (pkgs) lib; }) mkCa mkLeaf;
+
   # Per-component target namespace. ADR-019: store moved to rio-store,
   # builder/fetcher pods live in rio-builders/rio-fetchers. Secrets
   # are ns-scoped — a store pod in rio-store can't mount a Secret from
@@ -75,54 +76,41 @@ let
   # (scheduler only checks CA-signed).
   workerSans = "DNS:rio-builder,DNS:*.${ns}.svc.cluster.local";
 
-  # RSA (not ECDSA): pki.nix uses RSA + PKCS#1, rustls accepts both.
-  # cert-manager uses ECDSA+PKCS8 but RSA is simpler with openssl
-  # CLI (no -pkeyopt dance). rustls parses either — the PKCS8 note
-  # in cert-manager.yaml is about the EC-specific legacy header,
-  # not RSA.
-  pki =
-    pkgs.runCommand "rio-k8s-pki"
-      {
-        buildInputs = [ pkgs.openssl ];
-      }
-      ''
-        mkdir -p $out
+  # RSA + PKCS#1 — see pki-common.nix for the algo rationale.
+  pki = pkgs.runCommand "rio-k8s-pki" { buildInputs = [ pkgs.openssl ]; } ''
+    mkdir -p $out
 
-        # ── Root CA ─────────────────────────────────────────────────
-        openssl req -x509 -newkey rsa:2048 -nodes \
-          -keyout $out/ca.key -out $out/ca.crt \
-          -days 3650 -subj "/CN=rio-test-ca"
+    # ── Root CA ─────────────────────────────────────────────────
+    ${mkCa}
 
-        # ── Per-component leaf certs ────────────────────────────────
-        ${pkgs.lib.concatMapStringsSep "\n" (c: ''
-          mkdir -p $out/rio-${c}
-          openssl req -newkey rsa:2048 -nodes \
-            -keyout $out/rio-${c}/tls.key -out /tmp/${c}.csr \
-            -subj "/CN=rio-${c}"
-          openssl x509 -req -in /tmp/${c}.csr \
-            -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-            -out $out/rio-${c}/tls.crt -days 3650 \
-            -extfile <(printf 'subjectAltName=${mkSans c}')
-          cp $out/ca.crt $out/rio-${c}/ca.crt
-        '') components}
+    # ── Per-component leaf certs ────────────────────────────────
+    ${pkgs.lib.concatMapStringsSep "\n" (c: ''
+      mkdir -p $out/rio-${c}
+      ${mkLeaf {
+        keyOut = "$out/rio-${c}/tls.key";
+        crtOut = "$out/rio-${c}/tls.crt";
+        cn = "rio-${c}";
+        sans = mkSans c;
+      }}
+      cp $out/ca.crt $out/rio-${c}/ca.crt
+    '') components}
 
-        # ── Worker cert ─────────────────────────────────────────────
-        mkdir -p $out/rio-builder
-        openssl req -newkey rsa:2048 -nodes \
-          -keyout $out/rio-builder/tls.key -out /tmp/worker.csr \
-          -subj "/CN=rio-builder"
-        openssl x509 -req -in /tmp/worker.csr \
-          -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-          -out $out/rio-builder/tls.crt -days 3650 \
-          -extfile <(printf 'subjectAltName=${workerSans}')
-        cp $out/ca.crt $out/rio-builder/ca.crt
+    # ── Worker cert ─────────────────────────────────────────────
+    mkdir -p $out/rio-builder
+    ${mkLeaf {
+      keyOut = "$out/rio-builder/tls.key";
+      crtOut = "$out/rio-builder/tls.crt";
+      cn = "rio-builder";
+      sans = workerSans;
+    }}
+    cp $out/ca.crt $out/rio-builder/ca.crt
 
-        # ── Fetcher cert ────────────────────────────────────────────
-        # Same binary, same mTLS client role as builder — reuse the
-        # cert. Separate directory so secretTargets can emit a
-        # rio-fetcher-tls Secret matching fetcherpool.yaml:24.
-        cp -r $out/rio-builder $out/rio-fetcher
-      '';
+    # ── Fetcher cert ────────────────────────────────────────────
+    # Same binary, same mTLS client role as builder — reuse the
+    # cert. Separate directory so secretTargets can emit a
+    # rio-fetcher-tls Secret matching fetcherpool.yaml:24.
+    cp -r $out/rio-builder $out/rio-fetcher
+  '';
 
   # Secret-name → target-namespace pairs. ADR-019: store/builder
   # Secrets land in their own namespaces so pods can mount them.
