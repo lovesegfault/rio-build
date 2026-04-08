@@ -143,9 +143,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
 
         let is_recursive = output.hash_algo().starts_with("r:");
 
-        let store_basename = output
-            .path()
-            .strip_prefix(rio_nix::store_path::STORE_PREFIX)
+        let store_basename = rio_nix::store_path::basename(output.path())
             .with_context(|| format!("invalid output path: {}", output.path()))?;
         let fs_path = upper_store.join(store_basename);
 
@@ -212,9 +210,7 @@ pub(super) async fn prefetch_manifests(
     {
         Ok(entries) => {
             let hints = entries.into_iter().filter_map(|(path, hint)| {
-                let basename = path
-                    .strip_prefix(rio_nix::store_path::STORE_PREFIX)?
-                    .to_owned();
+                let basename = rio_nix::store_path::basename(&path)?.to_owned();
                 Some((basename, hint?))
             });
             fuse_cache.prime_manifest_hints(hints);
@@ -837,8 +833,8 @@ mod tests {
             1,
             "one BatchGetManifest for the whole closure"
         );
-        let b_a = p_a.strip_prefix(rio_nix::store_path::STORE_PREFIX).unwrap();
-        let b_b = p_b.strip_prefix(rio_nix::store_path::STORE_PREFIX).unwrap();
+        let b_a = rio_nix::store_path::basename(&p_a).unwrap();
+        let b_b = rio_nix::store_path::basename(&p_b).unwrap();
         let hint_a = cache.take_manifest_hint(b_a).expect("hint primed for a");
         assert_eq!(
             hint_a.info.as_ref().map(|i| i.store_path.as_str()),

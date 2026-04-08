@@ -317,7 +317,5 @@ pub(super) fn err_stream<T: Send + 'static>(status: Status) -> ReceiverStream<Re
 /// `/nix/store/{32-char-hash}-{name}.drv` → `{32-char-hash}-{name}.drv`
 /// Already-hash-shaped input → unchanged.
 pub(super) fn extract_drv_hash(s: &str) -> String {
-    s.strip_prefix(rio_nix::store_path::STORE_PREFIX)
-        .unwrap_or(s)
-        .to_string()
+    rio_nix::store_path::basename(s).unwrap_or(s).to_string()
 }

@@ -8,9 +8,18 @@ use thiserror::Error;
 pub const STORE_DIR: &str = "/nix/store";
 
 /// The Nix store directory with trailing slash — the prefix to strip when
-/// extracting a basename from a raw `&str` path. Prefer [`StorePath::basename`]
-/// when you have a parsed `StorePath`.
+/// extracting a basename from a raw `&str` path. Prefer [`basename`] (or the
+/// infallible [`StorePath::basename`] on a parsed path) over open-coding
+/// `strip_prefix(STORE_PREFIX)`.
 pub const STORE_PREFIX: &str = "/nix/store/";
+
+/// Strip the `/nix/store/` prefix from a raw path string, returning the
+/// basename (`{hash}-{name}`). Returns `None` if `s` doesn't start with
+/// [`STORE_PREFIX`]. Prefer the infallible [`StorePath::basename`] when you
+/// already hold a parsed [`StorePath`].
+pub fn basename(s: &str) -> Option<&str> {
+    s.strip_prefix(STORE_PREFIX)
+}
 
 /// Length of the nixbase32-encoded hash part in a store path (32 chars = 20 bytes).
 pub const HASH_CHARS: usize = 32;
@@ -511,6 +520,9 @@ mod tests {
         );
         // Invariant: as_str() = STORE_PREFIX + basename()
         assert_eq!(sp.as_str(), format!("{STORE_PREFIX}{}", sp.basename()));
+        // Free fn agrees with the method, and rejects non-store paths.
+        assert_eq!(basename(sp.as_str()), Some(sp.basename()));
+        assert_eq!(basename("/tmp/foo"), None);
         Ok(())
     }
 

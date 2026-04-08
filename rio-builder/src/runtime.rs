@@ -777,7 +777,7 @@ pub fn handle_prefetch_hint(
         // prefix) → skip with debug log. Don't
         // fail the loop — one bad path in a
         // batch shouldn't poison the rest.
-        let Some(basename) = store_path.strip_prefix("/nix/store/") else {
+        let Some(basename) = rio_nix::store_path::basename(&store_path) else {
             tracing::debug!(
                 path = %store_path,
                 "prefetch: malformed path (no /nix/store/ prefix), skipping"

@@ -485,11 +485,7 @@ pub async fn execute_build(
     if let Some(cache) = &env.fuse_cache {
         // r[impl builder.fuse.jit-register]
         cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
-            Some((
-                p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?
-                    .to_owned(),
-                *sz,
-            ))
+            Some((rio_nix::store_path::basename(p)?.to_owned(), *sz))
         }));
         metrics::gauge!("rio_builder_jit_inputs_registered").set(cache.known_inputs_len() as f64);
         // I-110c: prime manifest hints so each JIT fetch's `GetPath`
@@ -1311,10 +1307,8 @@ async fn prepare_sandbox(
             // Output paths are always absolute store paths. An empty
             // path (CA derivations with unknown output paths) can't be
             // whitedout — skip and let the daemon's own logic handle it.
-            let Some(basename) = out
-                .path()
-                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
-                .filter(|b| !b.is_empty())
+            let Some(basename) =
+                rio_nix::store_path::basename(out.path()).filter(|b| !b.is_empty())
             else {
                 continue;
             };
