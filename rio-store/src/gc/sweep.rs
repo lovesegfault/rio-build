@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::{Connection, PgPool};
+use sqlx::{Connection, PgPool, Postgres, Transaction};
 use tracing::{info, instrument, warn};
 
 use crate::backend::chunk::ChunkBackend;
@@ -33,7 +33,10 @@ impl From<sqlx::Error> for SweepAbort {
 /// N narinfo DELETEs + chunk refcount decrements + pending_s3_deletes
 /// INSERTs. Small enough that a batch-rollback on conflict doesn't
 /// waste much; large enough to amortize tx overhead.
+#[cfg(not(test))]
 const SWEEP_BATCH_SIZE: usize = 100;
+#[cfg(test)]
+const SWEEP_BATCH_SIZE: usize = 2;
 
 /// Grace period before a standalone chunk (refcount=0, written by
 /// `PutChunk`) becomes GC-eligible.
@@ -104,6 +107,66 @@ const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 /// already committed (previous iteration), the next batch never
 /// starts. Safe point: no transaction open, no locks held other than
 /// the caller's advisory GC lock (which the caller releases).
+/// Re-check whether `store_path_hash` has a referrer outside the
+/// `sweep_unreachable` temp table, or a direct `gc_roots` /
+/// `scheduler_live_pins` entry. See the call-site comment in
+/// [`sweep`] for the GIN/anti-join rationale.
+async fn recheck_has_live_referrer(
+    tx: &mut Transaction<'_, Postgres>,
+    store_path_hash: &[u8],
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT
+          EXISTS (
+            SELECT 1 FROM narinfo n
+             WHERE n."references" @> ARRAY[
+                     (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
+                   ]
+               AND NOT EXISTS (
+                 SELECT 1 FROM sweep_unreachable su
+                  WHERE su.path_hash = n.store_path_hash
+               )
+             LIMIT 1
+          )
+          OR EXISTS (SELECT 1 FROM gc_roots WHERE store_path_hash = $1)
+          OR EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
+        "#,
+    )
+    .bind(store_path_hash)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Walk `store_path_hash`'s reference closure within
+/// `sweep_unreachable` and DELETE all closure members from the temp
+/// table. Bounded to nodes already in the table (the JOIN), so
+/// terminates and stays ≤ |unreachable|.
+async fn closure_remove_from_unreachable(
+    tx: &mut Transaction<'_, Postgres>,
+    store_path_hash: &[u8],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        WITH RECURSIVE closure(path_hash) AS (
+            SELECT $1::bytea
+          UNION
+            SELECT dep.store_path_hash
+              FROM closure c
+              JOIN narinfo n ON n.store_path_hash = c.path_hash
+              JOIN narinfo dep ON dep.store_path = ANY(n."references")
+              JOIN sweep_unreachable su ON su.path_hash = dep.store_path_hash
+        )
+        DELETE FROM sweep_unreachable
+         WHERE path_hash IN (SELECT path_hash FROM closure)
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn sweep(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
@@ -148,6 +211,38 @@ pub async fn sweep(
         .execute(&mut *conn)
         .await?;
 
+    // Pass 1 (whole-sweep): drain resurrections from sweep_unreachable.
+    // For each candidate, re-check for a live referrer; if found,
+    // closure-delete the candidate and its reference tree from the temp
+    // table. After this pass, sweep_unreachable is settled w.r.t.
+    // uploads that landed before pass-1 started — so the delete loop
+    // below cannot commit Z-in-batch-N before observing that
+    // Y-in-batch-N+1 (Y→Z) was resurrected. The delete loop re-runs
+    // the same re-check under FOR UPDATE; that remains the
+    // LOAD-BEARING guard for uploads landing DURING the sweep.
+    for batch in unreachable.chunks(SWEEP_BATCH_SIZE) {
+        if shutdown.is_cancelled() {
+            return Err(SweepAbort::Shutdown);
+        }
+        let mut tx = conn.begin().await?;
+        for store_path_hash in batch {
+            // Cheap PK probe: skip items an earlier closure-delete
+            // already removed (avoids the heavier referrer query).
+            let still_in: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM sweep_unreachable WHERE path_hash = $1)",
+            )
+            .bind(store_path_hash)
+            .fetch_one(&mut *tx)
+            .await?;
+            if still_in && recheck_has_live_referrer(&mut tx, store_path_hash).await? {
+                closure_remove_from_unreachable(&mut tx, store_path_hash).await?;
+            }
+        }
+        // Only the temp table changed. Always commit (even dry-run)
+        // so the delete loop sees the settled state.
+        tx.commit().await?;
+    }
+
     let total = unreachable.len();
     for (i, batch) in unreachable.chunks(SWEEP_BATCH_SIZE).enumerate() {
         // Progress gauge: paths NOT yet processed (including this batch).
@@ -175,12 +270,12 @@ pub async fn sweep(
         }
         let mut tx = conn.begin().await?;
 
-        // Two-pass: pass 1 locks + re-checks every batch item and applies
-        // resurrection closure-deletes to sweep_unreachable, but does NOT
-        // delete narinfo yet. Pass 2 deletes only items still in
-        // sweep_unreachable. Without the split, batch order [Z, Y] where
-        // live P→Y→Z deletes Z before Y's resurrection closure-delete
-        // would have saved it.
+        // Within-batch two-pass: lock + re-check every batch item before
+        // any narinfo DELETE. The whole-sweep resurrection drain above
+        // settled sweep_unreachable for uploads that landed BEFORE the
+        // sweep; this remaining split + the still_unreachable filter
+        // below catch a PutPath landing DURING this delete loop where
+        // the resurrecting path is later in the same batch.
         let mut to_delete: Vec<(&Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(batch.len());
 
         for store_path_hash in batch {
@@ -250,28 +345,7 @@ pub async fn sweep(
             // and now is a direct root on THIS path that mark's snapshot
             // missed. Both tables key on store_path_hash (PK / first
             // index column) so each EXISTS is a point probe.
-            let has_referrer: bool = sqlx::query_scalar(
-                r#"
-                SELECT
-                  EXISTS (
-                    SELECT 1 FROM narinfo n
-                     WHERE n."references" @> ARRAY[
-                             (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
-                           ]
-                       AND NOT EXISTS (
-                         SELECT 1 FROM sweep_unreachable su
-                          WHERE su.path_hash = n.store_path_hash
-                       )
-                     LIMIT 1
-                  )
-                  OR EXISTS (SELECT 1 FROM gc_roots WHERE store_path_hash = $1)
-                  OR EXISTS (SELECT 1 FROM scheduler_live_pins WHERE store_path_hash = $1)
-                "#,
-            )
-            .bind(store_path_hash)
-            .fetch_one(&mut *tx)
-            .await?;
-            if has_referrer {
+            if recheck_has_live_referrer(&mut tx, store_path_hash).await? {
                 tracing::debug!(
                     store_path_hash = %hex::encode(store_path_hash),
                     "GC sweep: path resurrected (new referrer after mark), skipping"
@@ -281,35 +355,16 @@ pub async fn sweep(
                 // Transitive resurrection: this path is now live, so
                 // its own references (and theirs, recursively) must
                 // not be excluded by the anti-join above when later
-                // batch entries are checked. Walk the closure within
-                // sweep_unreachable and remove it. The recursion is
-                // bounded to nodes in the temp table, so it terminates
-                // and stays small (≤ |unreachable|).
-                sqlx::query(
-                    r#"
-                    WITH RECURSIVE closure(path_hash) AS (
-                        SELECT $1::bytea
-                      UNION
-                        SELECT dep.store_path_hash
-                          FROM closure c
-                          JOIN narinfo n ON n.store_path_hash = c.path_hash
-                          JOIN narinfo dep ON dep.store_path = ANY(n."references")
-                          JOIN sweep_unreachable su ON su.path_hash = dep.store_path_hash
-                    )
-                    DELETE FROM sweep_unreachable
-                     WHERE path_hash IN (SELECT path_hash FROM closure)
-                    "#,
-                )
-                .bind(store_path_hash)
-                .execute(&mut *tx)
-                .await?;
+                // batch entries are checked.
+                closure_remove_from_unreachable(&mut tx, store_path_hash).await?;
                 continue;
             }
             to_delete.push((store_path_hash, chunk_list));
         }
 
-        // Pass-1 closure-deletes from a LATER item may have removed an
-        // EARLIER candidate from sweep_unreachable. One batch probe.
+        // A closure-delete from a LATER item in the lock loop above may
+        // have removed an EARLIER candidate from sweep_unreachable.
+        // One batch probe.
         let still_unreachable: std::collections::HashSet<Vec<u8>> = if to_delete.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -932,6 +987,53 @@ mod tests {
                 exists,
                 "{name} must survive (reverse-order transitive resurrection)"
             );
+        }
+    }
+
+    /// Cross-batch reverse order: Z in batch 1, Y in batch 2 (forced
+    /// via a filler item with cfg(test) SWEEP_BATCH_SIZE=2). Without
+    /// the whole-sweep resurrection drain, batch 1's tx commits Z
+    /// deleted before batch 2 ever observes P→Y→Z.
+    #[tokio::test]
+    async fn sweep_resurrection_is_transitive_cross_batch() {
+        const _: () = assert!(SWEEP_BATCH_SIZE == 2, "test assumes batch size 2");
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let z = test_store_path("xbatch-z");
+        let z_hash = StoreSeed::raw_path(&z).seed(&db.pool).await;
+        let filler_hash = StoreSeed::path("xbatch-filler").seed(&db.pool).await;
+        let y = test_store_path("xbatch-y");
+        let y_hash = StoreSeed::raw_path(&y)
+            .with_refs(&[&z])
+            .seed(&db.pool)
+            .await;
+        StoreSeed::path("xbatch-p")
+            .with_refs(&[&y])
+            .seed(&db.pool)
+            .await;
+
+        // [Z, filler] = batch 1; [Y] = batch 2.
+        let stats = sweep(
+            &db.pool,
+            None,
+            vec![z_hash.clone(), filler_hash, y_hash.clone()],
+            false,
+            &no_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.paths_deleted, 1, "only filler deleted");
+        assert_eq!(stats.paths_resurrected, 2, "Y by P; Z by Y");
+
+        for (h, name) in [(&y_hash, "Y"), (&z_hash, "Z")] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)",
+            )
+            .bind(h)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(exists, "{name} must survive (cross-batch resurrection)");
         }
     }
 
