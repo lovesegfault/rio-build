@@ -1,11 +1,8 @@
 //! Scaling helpers — queue-depth lookups, condition utilities,
 //! BPS ownership predicates, and the [`component`] scaler.
 //!
-//! The worker autoscaler loops (standalone/per_class StatefulSet
-//! replica patching) were removed when worker pools became
-//! Job-only: the reconciler's queue-poll IS the autoscaler now.
-//! What remains here is the shared surface the Job reconcilers
-//! and the ComponentScaler both consume.
+//! Shared surface the Job reconcilers and the ComponentScaler
+//! both consume.
 
 pub mod component;
 

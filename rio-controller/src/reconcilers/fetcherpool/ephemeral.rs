@@ -1,4 +1,4 @@
-//! Ephemeral FetcherPool: Job-per-FOD instead of StatefulSet.
+//! FetcherPool Job-per-FOD reconciler.
 //!
 //! Same Job lifecycle as `builderpool/ephemeral.rs` (see that
 //! module's header for the full design rationale — push-vs-poll,
@@ -186,9 +186,8 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     )
     .await?;
 
-    // I-086: parity with STS-mode (mod.rs `reconciled FetcherPool`) and
-    // builderpool/mod.rs:481. Without this, an idle ephemeral pool is
-    // invisible at INFO and indistinguishable from a stuck reconciler.
+    // I-086: without this, an idle pool is invisible at INFO and
+    // indistinguishable from a stuck reconciler.
     info!(
         pool = %name, queued = total_queued, active = total_active,
         spawned = total_spawned, reaped = total_reaped,

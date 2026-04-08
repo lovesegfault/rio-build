@@ -59,10 +59,8 @@ pub const RATIO_FLOOR: f64 = 1.0;
 
 /// Scale-down stabilization. `desired < current` is held at
 /// `current` until this much time has passed since the last
-/// scale-UP. Same anti-flap rationale as the BuilderPool autoscaler
-/// (`ScalingTiming::scale_down_window`), but shorter (5m vs 10m):
-/// store pods are stateless and cold-start in seconds, builders take
-/// minutes (FUSE warm).
+/// scale-UP. Anti-flap: store pods are stateless and cold-start in
+/// seconds, so 5m is enough to ride out an inter-burst lull.
 pub const SCALE_DOWN_STABILIZATION: Duration = Duration::from_secs(300);
 
 /// Max scale-down step per tick. With a 10s tick this is −1 every
@@ -144,8 +142,7 @@ pub fn decide(
 
     // Predictive: ceil(builders / ratio). f64 ceil is fine here —
     // builders fits in f64's 53-bit mantissa for any realistic count
-    // (a u64 > 2^53 builders is not a thing). i32 saturate same as
-    // scaling::compute_desired.
+    // (a u64 > 2^53 builders is not a thing).
     let predicted = ((builders as f64) / ratio_in).ceil();
     let predicted = predicted.min(i32::MAX as f64).max(0.0) as i32;
 
@@ -179,9 +176,8 @@ pub fn decide(
         None => (predicted, ratio_in, status.low_load_ticks),
     };
 
-    // Clamp. Same defensive min>max swap as scaling::compute_desired
-    // (CEL enforces, but a pre-CEL CRD or --validate=false bypass
-    // would panic on i32::clamp).
+    // Clamp. Defensive min>max swap (CEL enforces, but a pre-CEL CRD
+    // or --validate=false bypass would panic on i32::clamp).
     let (min, max) = if spec.replicas.min > spec.replicas.max {
         (spec.replicas.max, spec.replicas.min)
     } else {

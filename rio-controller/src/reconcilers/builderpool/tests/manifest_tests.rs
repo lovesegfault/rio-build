@@ -45,7 +45,7 @@ fn test_manifest_wp() -> BuilderPool {
     wp
 }
 
-/// Default scale-down window (matches `ScalingTiming::default`).
+/// Default scale-down window (matches `Ctx::scale_down_window`).
 const WINDOW: Duration = Duration::from_secs(600);
 
 /// Minimal Job with manifest labels. Status unset → "active"

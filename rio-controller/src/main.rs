@@ -1,9 +1,8 @@
 //! rio-controller binary.
 //!
-//! Two concurrent things: the BuilderPool Controller::run (event-
-//! driven reconcile) and the Autoscaler::run (30s poll loop).
-//! The Controller terminates on SIGTERM via graceful_shutdown_on;
-//! the Autoscaler is spawn_monitored with its own shutdown token.
+//! Runs one Controller::run loop per CRD (BuilderPool, FetcherPool,
+//! BuilderPoolSet, ComponentScaler) plus the disruption watcher and
+//! GC schedule. All terminate on SIGTERM via graceful_shutdown_on.
 //!
 // r[impl sec.psa.control-plane-restricted]
 //! rio-controller (and scheduler/gateway/store) run under PSA

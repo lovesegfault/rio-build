@@ -3,7 +3,7 @@
 //! Two distinct clusters that share the mock-apiserver fixtures:
 //!
 //! - figment::Jail env-propagation tests — prove
-//!   `build_statefulset` injects `LLVM_PROFILE_FILE`/`RUST_LOG`
+//!   `build_pod_spec` injects `LLVM_PROFILE_FILE`/`RUST_LOG`
 //!   from the controller's own env (coverage-mode passthrough)
 //! - P0365's `warn_on_spec_degrades` event-reason tests — prove the
 //!   helper fires BEFORE the ephemeral early-return in `apply()`
