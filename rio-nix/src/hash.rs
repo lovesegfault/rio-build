@@ -189,25 +189,6 @@ impl NixHash {
 
         Self::new(algo, digest).expect("crypto library returned wrong digest length")
     }
-
-    /// Truncate to 20 bytes for store path hash computation.
-    /// This is used for store path fingerprinting (compress-hash in Nix).
-    ///
-    /// Only valid for SHA-256 hashes. Returns an error for other algorithms.
-    #[cfg(test)]
-    pub fn truncate_for_store_path(&self) -> Result<[u8; 20], HashError> {
-        if self.algo != HashAlgo::SHA256 {
-            return Err(HashError::InvalidFormat(
-                "only SHA-256 can be truncated for store paths".into(),
-            ));
-        }
-        let mut out = [0u8; 20];
-        // Nix compresses by XOR-folding: fold the 32-byte digest into 20 bytes
-        for (i, &byte) in self.digest.iter().enumerate() {
-            out[i % 20] ^= byte;
-        }
-        Ok(out)
-    }
 }
 
 impl std::fmt::Display for NixHash {
@@ -279,32 +260,6 @@ mod tests {
         let parsed = NixHash::parse_sri(&sri)?;
         assert_eq!(parsed, hash);
         Ok(())
-    }
-
-    #[test]
-    fn test_truncate_for_store_path() -> anyhow::Result<()> {
-        let hash = NixHash::compute(HashAlgo::SHA256, b"test");
-        let truncated = hash.truncate_for_store_path()?;
-        assert_eq!(truncated.len(), 20);
-        // Verify XOR fold: bytes[0] ^ bytes[20], bytes[1] ^ bytes[21], etc.
-        let digest = hash.digest();
-        for (i, &actual) in truncated.iter().enumerate() {
-            let mut expected = 0u8;
-            for j in (0..32).filter(|j| j % 20 == i) {
-                expected ^= digest[j];
-            }
-            assert_eq!(actual, expected);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_truncate_rejects_non_sha256() {
-        let hash = NixHash::compute(HashAlgo::SHA512, b"test");
-        assert!(hash.truncate_for_store_path().is_err());
-
-        let hash = NixHash::compute(HashAlgo::SHA1, b"test");
-        assert!(hash.truncate_for_store_path().is_err());
     }
 
     #[test]
