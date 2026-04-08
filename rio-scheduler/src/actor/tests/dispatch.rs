@@ -131,7 +131,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
 async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
     // Only x86_64 worker registered.
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("x86-only-worker", "x86_64-linux", 2).await?;
+        setup_with_worker("x86-only-worker", "x86_64-linux").await?;
 
     // Merge aarch64 derivation FIRST (goes to queue head), then x86_64.
     // With the old `None => break`, the aarch64 drv at head would block
@@ -176,7 +176,7 @@ async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
 #[tokio::test]
 async fn test_build_options_propagated_to_worker() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("options-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("options-worker", "x86_64-linux").await?;
 
     // Submit with build_timeout=300, max_silent_time=60.
     let build_id = Uuid::new_v4();
@@ -229,7 +229,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
 #[tokio::test]
 async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("trace-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("trace-worker", "x86_64-linux").await?;
 
     // Known traceparent (W3C format: version-trace_id-span_id-flags).
     // The exact bytes don't matter for this test — we just verify it
@@ -296,7 +296,7 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     let _ = merge_dag_req(&handle, merge_with_tp(tp_second)).await?;
 
     // Now give capacity: connect worker → dispatch fires.
-    let mut stream_rx = connect_executor(&handle, "dedup-worker", "x86_64-linux", 1).await?;
+    let mut stream_rx = connect_executor(&handle, "dedup-worker", "x86_64-linux").await?;
 
     let assignment = recv_assignment(&mut stream_rx).await;
     assert_eq!(
@@ -338,7 +338,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     let _ = merge_dag_req(&handle, merge_with_tp(live_tp)).await?;
 
     // Give capacity: connect worker → dispatch.
-    let mut stream_rx = connect_executor(&handle, "upgrade-worker", "x86_64-linux", 1).await?;
+    let mut stream_rx = connect_executor(&handle, "upgrade-worker", "x86_64-linux").await?;
 
     let assignment = recv_assignment(&mut stream_rx).await;
     assert_eq!(
@@ -359,7 +359,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
 async fn test_interactive_priority_boost() -> TestResult {
     // Worker with 1 slot so dispatch order is observable.
     let (_db, handle, _task, mut worker_rx) =
-        setup_with_worker("prio-builder", "x86_64-linux", 1).await?;
+        setup_with_worker("prio-builder", "x86_64-linux").await?;
 
     // Build 1: Scheduled, 2 independent leaves (Q, R). Both queue immediately.
     // Only 1 dispatches (worker has 1 slot); the other stays queued.
@@ -424,7 +424,7 @@ async fn test_interactive_priority_boost() -> TestResult {
         complete_success(&handle, &wid, &path, &test_store_path("out")).await?;
         // Fresh worker for the next dispatch.
         wid = format!("prio-builder-{}", i + 1);
-        worker_rx = connect_executor(&handle, &wid, "x86_64-linux", 1).await?;
+        worker_rx = connect_executor(&handle, &wid, "x86_64-linux").await?;
         // If we just completed B, the NEXT dispatch should be A (priority boost).
         if path == p_prio_b {
             let next_a = recv_assignment(&mut worker_rx).await;
@@ -453,7 +453,7 @@ async fn test_interactive_priority_boost() -> TestResult {
 /// sources (one hardcoded, one from actor state), this test fails.
 #[tokio::test]
 async fn test_generation_consistent_between_heartbeat_and_assignment() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux").await?;
 
     let _ev = merge_single_node(&handle, Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
     let assignment = recv_assignment(&mut rx).await;
@@ -514,7 +514,7 @@ async fn test_generation_starts_at_one_not_zero() -> TestResult {
 /// message for it IS the assignment).
 #[tokio::test]
 async fn test_prefetch_hint_before_assignment() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux").await?;
 
     // Two-node chain: child (leaf) → parent (depends on child).
     // merge_dag edges point parent→child (parent's input is child's output).
@@ -553,7 +553,7 @@ async fn test_prefetch_hint_before_assignment() -> TestResult {
 
     // Complete the child so parent becomes ready. w1 drains; connect w2.
     complete_success_empty(&handle, "w1", "child").await?;
-    let mut rx = connect_executor(&handle, "w2", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "w2", "x86_64-linux").await?;
 
     // Parent has one child in the DAG (the completed "child"). Its
     // approx_input_closure = child's expected_output_paths.
@@ -594,8 +594,8 @@ async fn test_prefetch_hint_before_assignment() -> TestResult {
 async fn test_generation_single_load_within_assignment() -> TestResult {
     // P0537: two workers so the same dispatch_ready pass produces two
     // assignments (was one 4-slot worker).
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 1).await?;
-    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
 
     // Two independent derivations in the same dispatch pass.
     let _ev1 = merge_single_node(&handle, Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
@@ -630,7 +630,7 @@ async fn test_generation_single_load_within_assignment() -> TestResult {
 /// live_pins row count.
 #[tokio::test]
 async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
-    let (db, handle, _task, mut stream_rx) = setup_with_worker("w-x9", "x86_64-linux", 2).await?;
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("w-x9", "x86_64-linux").await?;
 
     // Two-node chain: child (leaf, no inputs) + parent (depends
     // on child). Parent's approx_input_closure = child's
@@ -666,7 +666,7 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     // Complete child → parent becomes Ready → dispatched → pinned.
     // One-shot: w-x9 drains; connect a fresh worker for parent.
     complete_success_empty(&handle, "w-x9", "x9-child").await?;
-    let mut stream_rx = connect_executor(&handle, "w-x9-2", "x86_64-linux", 1).await?;
+    let mut stream_rx = connect_executor(&handle, "w-x9-2", "x86_64-linux").await?;
     // Parent dispatch sends PrefetchHint FIRST (child has expected_
     // output_paths set above), then Assignment. Drain both.
     let assignment_parent = loop {
@@ -811,7 +811,7 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
     // at its .drv store path. `seed_with_content` does the NAR wrap.
     store.seed_with_content(&parent.drv_path, parent_aterm.as_bytes());
 
-    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux", 2).await?;
+    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux").await?;
 
     // Merge: child + parent, edge parent → child.
     let _ev = merge_dag(
@@ -857,7 +857,7 @@ async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
         &test_store_path("ca-child-out"),
     )
     .await?;
-    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux").await?;
 
     let a2 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a2.drv_path.contains("ca-parent"));
@@ -899,7 +899,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
     let (child, parent, _parent_aterm, _placeholder, child_modular, _realized_path) =
         ca_on_ca_fixture();
 
-    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux", 2).await?;
+    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux").await?;
 
     let _ev = merge_dag(
         &handle,
@@ -943,7 +943,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
         &test_store_path("ca-child-out"),
     )
     .await?;
-    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux").await?;
 
     let a2 = recv_assignment_skip_prefetch(&mut rx).await;
     assert!(a2.drv_path.contains("ca-parent"));
@@ -970,7 +970,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 /// every IA-with-IA-inputs dispatch takes it.
 #[tokio::test]
 async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("ia-w", "x86_64-linux", 2).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("ia-w", "x86_64-linux").await?;
 
     let original_content = b"dummy-ia-aterm-content".to_vec();
     let mut node = make_test_node("ia-drv", "x86_64-linux");
@@ -1004,7 +1004,6 @@ async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
         &handle,
         "fod-w",
         "x86_64-linux",
-        2,
         rio_proto::types::ExecutorKind::Fetcher,
     )
     .await?;
@@ -1040,7 +1039,7 @@ async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
 /// in the ATerm because all input paths were known at eval time.
 #[tokio::test]
 async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("noca-w", "x86_64-linux", 2).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("noca-w", "x86_64-linux").await?;
 
     let original_content = b"floating-ca-with-ia-deps".to_vec();
     let mut parent = make_test_node("noca-parent", "x86_64-linux");
@@ -1065,7 +1064,7 @@ async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
     let a1 = recv_assignment(&mut rx).await;
     assert!(a1.drv_path.contains("noca-child"));
     complete_success_empty(&handle, "noca-w", &test_drv_path("noca-child")).await?;
-    let mut rx = connect_executor(&handle, "noca-w-2", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "noca-w-2", "x86_64-linux").await?;
 
     // Parent dispatches. collect_ca_inputs(parent) = [] (child is IA)
     // → ca_inputs.is_empty() gate → passthrough.
@@ -1105,7 +1104,7 @@ async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
     // edge → became_idle=true → inline dispatch_ready. Cold-fallback
     // places the node on the freshly-registered worker (warm-gate
     // sent a PrefetchHint but cold-fallback ignores warm).
-    let mut rx = connect_executor_no_ack(&handle, "i163-w", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor_no_ack(&handle, "i163-w", "x86_64-linux").await?;
     let a = recv_assignment(&mut rx).await;
     assert!(
         a.drv_path.contains("i163-hb"),
@@ -1164,7 +1163,7 @@ async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
 
     // Builder, not fetcher: FODs route to fetchers (ADR-019), so all
     // 5 defer in the drain loop — that's the I-163 hot path.
-    let _rx = connect_executor(&handle, "i163-builder", "x86_64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "i163-builder", "x86_64-linux").await?;
 
     let nodes: Vec<_> = (0..5)
         .map(|i| {
@@ -1185,7 +1184,7 @@ async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
 
     // Drive one dispatch_ready: Heartbeat (dirty) + Tick (drain).
     // send_heartbeat already chains the Tick.
-    send_heartbeat(&handle, "i163-builder", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "i163-builder", "x86_64-linux").await?;
     barrier(&handle).await;
 
     let calls = store.find_missing_calls.load(Ordering::SeqCst);
@@ -1211,7 +1210,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     let test_db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
-    let _rx = connect_executor(&handle, "i163-fo-b", "x86_64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "i163-fo-b", "x86_64-linux").await?;
 
     let mut n = make_test_node("i163-fo-fod", "x86_64-linux");
     n.is_fixed_output = true;
@@ -1222,7 +1221,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     store.fail_find_missing.store(true, Ordering::SeqCst);
     store.find_missing_calls.store(0, Ordering::SeqCst);
 
-    send_heartbeat(&handle, "i163-fo-b", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "i163-fo-b", "x86_64-linux").await?;
     barrier(&handle).await;
 
     // Batch (1, fails) + per-FOD fallback (1). Both count — the
@@ -1241,7 +1240,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
 #[tokio::test]
 async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     let (_db, handle, _task) = setup().await;
-    let _rx = connect_executor(&handle, "i163-snap-w", "x86_64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "i163-snap-w", "x86_64-linux").await?;
     let _ev = merge_single_node(
         &handle,
         Uuid::new_v4(),
@@ -1417,7 +1416,6 @@ async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
         &handle,
         "f-unclassed",
         "x86_64-linux",
-        1,
         rio_proto::types::ExecutorKind::Fetcher,
     )
     .await?;

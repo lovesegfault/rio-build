@@ -25,7 +25,7 @@ async fn test_stale_completion_dropped() -> TestResult {
     // Merge a single node. Connect worker A, dispatch to A.
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "stale-drv", PriorityClass::Scheduled).await?;
-    let mut rx_a = connect_executor(&handle, "stale-a", "x86_64-linux", 1).await?;
+    let mut rx_a = connect_executor(&handle, "stale-a", "x86_64-linux").await?;
     let asgn = recv_assignment(&mut rx_a).await;
     assert!(asgn.drv_path.contains("stale-drv"));
 
@@ -36,7 +36,7 @@ async fn test_stale_completion_dropped() -> TestResult {
         })
         .await?;
     drop(rx_a);
-    let mut rx_b = connect_executor(&handle, "stale-b", "x86_64-linux", 1).await?;
+    let mut rx_b = connect_executor(&handle, "stale-b", "x86_64-linux").await?;
     let asgn_b = recv_assignment(&mut rx_b).await;
     assert!(asgn_b.drv_path.contains("stale-drv"));
 
@@ -95,7 +95,7 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
 
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "nobump-drv", PriorityClass::Scheduled).await?;
-    let mut rx = connect_executor(&handle, "nobump-w", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "nobump-w", "x86_64-linux").await?;
     let _asgn = recv_assignment(&mut rx).await;
 
     // Precondition: Assigned, never Running.
@@ -179,9 +179,9 @@ async fn test_starvation_intersects_live() -> TestResult {
     // B fails. failed={A,B}, len=2<3. Live={B,C}.
     // Old starvation check: len==2 >= live_count==2 → POISON.
     // New intersection check: C∉{A,B} → NOT all live failed → no poison.
-    let mut rx_a = connect_executor(&handle, "starv-a", "x86_64-linux", 1).await?;
-    let _rx_b = connect_executor(&handle, "starv-b", "x86_64-linux", 1).await?;
-    let _rx_c = connect_executor(&handle, "starv-c", "x86_64-linux", 1).await?;
+    let mut rx_a = connect_executor(&handle, "starv-a", "x86_64-linux").await?;
+    let _rx_b = connect_executor(&handle, "starv-b", "x86_64-linux").await?;
+    let _rx_c = connect_executor(&handle, "starv-c", "x86_64-linux").await?;
     let _asgn = recv_assignment(&mut rx_a).await;
 
     let ok = handle.debug_force_assign("starv-drv", "starv-a").await?;
@@ -246,7 +246,7 @@ async fn test_starvation_intersects_live() -> TestResult {
 /// get handle_derivation_failure.
 #[tokio::test]
 async fn test_cascade_notifies_merged_builds() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("casc-w", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("casc-w", "x86_64-linux").await?;
 
     // Build X: just leaf. Build Y: parent → leaf (shared).
     // X.interested = {leaf}. Y.interested = {leaf, parent}.
@@ -329,7 +329,7 @@ async fn test_cascade_notifies_merged_builds() -> TestResult {
 /// Old code: notify trigger's set {X} → Y hangs. New: union {X,Y}.
 #[tokio::test]
 async fn test_cascade_notifies_union_across_chain() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("chain-w", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("chain-w", "x86_64-linux").await?;
 
     // Build X: A→B→C.
     let build_x = Uuid::new_v4();
@@ -459,8 +459,8 @@ async fn test_cancel_transitions_queued() -> TestResult {
 async fn test_keep_going_false_cancels_remaining() -> TestResult {
     // P0537: two workers for two concurrent assignments (was one
     // 4-slot worker).
-    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w", "x86_64-linux", 1).await?;
-    let mut rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux").await?;
 
     // Two independent nodes, keep_going=false. Dispatch one-per-worker.
     let build_id = Uuid::new_v4();
@@ -579,7 +579,7 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
 async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
     use sha2::Digest;
 
-    let (db, handle, _task, _rx) = setup_with_worker("pre-w", "x86_64-linux", 1).await?;
+    let (db, handle, _task, _rx) = setup_with_worker("pre-w", "x86_64-linux").await?;
 
     let tenant_a = rio_test_support::seed_tenant(&db.pool, "pre-tenant-a").await;
     let tenant_b = rio_test_support::seed_tenant(&db.pool, "pre-tenant-b").await;
@@ -645,7 +645,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
 /// node with no tenant-resolved builds → no upsert (empty tenant_ids).
 #[tokio::test]
 async fn test_upsert_skips_no_tenant() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("nt-w", "x86_64-linux", 1).await?;
+    let (db, handle, _task, _rx) = setup_with_worker("nt-w", "x86_64-linux").await?;
 
     // No tenant_id on the build (None = single-tenant mode).
     let build_id = Uuid::new_v4();
@@ -682,8 +682,8 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
 #[tokio::test]
 async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
     // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("ttl-w", "x86_64-linux", 1).await?;
-    let mut rx2 = connect_executor(&handle, "ttl-w2", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("ttl-w", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "ttl-w2", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
@@ -758,8 +758,8 @@ async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
 #[tokio::test]
 async fn test_admin_clear_poison_keep_going_completes() -> TestResult {
     // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("clr-w", "x86_64-linux", 1).await?;
-    let mut rx2 = connect_executor(&handle, "clr-w2", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("clr-w", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "clr-w2", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(

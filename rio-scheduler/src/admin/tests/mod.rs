@@ -227,7 +227,7 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
         .await?;
 
     // Fully registered worker (stream + heartbeat) → active.
-    let _rx2 = connect_executor(&actor, "full", "x86_64-linux", 4).await?;
+    let _rx2 = connect_executor(&actor, "full", "x86_64-linux").await?;
 
     let resp = cluster_status_now(&svc, &actor).await?;
 
@@ -247,9 +247,9 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
-    // Worker with max_builds=1: will accept exactly one assignment,
-    // leaving the second derivation in ready_queue.
-    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux", 1).await?;
+    // One-shot worker: will accept exactly one assignment, leaving
+    // the second derivation in ready_queue.
+    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux").await?;
 
     // Two independent single-node DAGs. First dispatches (worker has
     // capacity 1), second stays queued.
@@ -283,7 +283,7 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
     assert_eq!(resp.pending_builds, 0);
     assert_eq!(
         resp.queued_derivations, 1,
-        "second drv waiting for capacity (worker max_builds=1 full)"
+        "second drv waiting for capacity (one-shot worker is busy)"
     );
     assert_eq!(
         resp.running_derivations, 1,
@@ -350,7 +350,6 @@ async fn cluster_status_queued_fod_includes_assigned() -> anyhow::Result<()> {
         &actor,
         "f0",
         "x86_64-linux",
-        1,
         rio_proto::types::ExecutorKind::Fetcher,
     )
     .await?;
@@ -463,8 +462,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
-    // Worker with max_builds=4: plenty of capacity.
-    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux", 4).await?;
+    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux").await?;
 
     // First drv: dispatches normally.
     let _ev1 =
@@ -527,14 +525,14 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
 
     // Two workers: w1 gets the first dispatch, then we force-drain it.
     // The reassigned drv should go to w2 on the next dispatch.
-    let mut rx1 = connect_executor(&actor, "w1", "x86_64-linux", 2).await?;
-    let mut rx2 = connect_executor(&actor, "w2", "x86_64-linux", 2).await?;
+    let mut rx1 = connect_executor(&actor, "w1", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&actor, "w2", "x86_64-linux").await?;
 
     let _ev =
         merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
 
-    // ONE of them got it. With two equal-score workers (both 0/2
-    // load), best_executor's tiebreak is HashMap iteration order →
+    // ONE of them got it. With two idle one-shot workers,
+    // best_executor picks the first HashMap-iteration entry →
     // nondeterministic. Poll both with try_recv to find which.
     let (first_worker, other_rx) = if let Ok(msg) = rx1.try_recv() {
         assert!(matches!(
@@ -572,7 +570,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     // isn't called from handle_drain_executor — it fires on the NEXT
     // Tick/merge/completion. Heartbeat sets dispatch_dirty, Tick
     // drains it (I-163).
-    crate::actor::tests::send_heartbeat(&actor, first_worker, "x86_64-linux", 1).await?;
+    crate::actor::tests::send_heartbeat(&actor, first_worker, "x86_64-linux").await?;
 
     // The OTHER worker should now get the reassigned drv.
     let msg = crate::actor::tests::recv_assignment(other_rx).await;
@@ -606,7 +604,7 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, db) = setup_svc_default().await;
-    let mut worker_rx = connect_executor(&actor, "poison-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&actor, "poison-w", "x86_64-linux").await?;
 
     // Merge → dispatches to worker.
     let _ev = merge_single_node(
@@ -698,7 +696,7 @@ async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyho
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, db) = setup_svc_default().await;
-    let mut worker_rx = connect_executor(&actor, "pg-blip-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&actor, "pg-blip-w", "x86_64-linux").await?;
 
     let _ev = merge_single_node(
         &actor,

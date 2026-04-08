@@ -20,7 +20,7 @@ use super::*;
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_completion_db_fault_build_history_logged() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("fault-worker", "x86_64-linux", 1).await?;
+    let (db, handle, _task, _rx) = setup_with_worker("fault-worker", "x86_64-linux").await?;
 
     // Use a node with pname so update_build_history is called.
     let build_id = Uuid::new_v4();
@@ -77,10 +77,10 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux", 1).await?;
+    let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux").await?;
     // Pad worker so the all-workers-failed clamp doesn't poison after
     // a single failure — we need the retry-persist branch, not poison.
-    let _pad = connect_executor(&handle, "tfault-pad", "aarch64-linux", 1).await?;
+    let _pad = connect_executor(&handle, "tfault-pad", "aarch64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _evt_rx =
@@ -114,7 +114,7 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("nrfault-worker", "x86_64-linux", 1).await?;
+    let (db, handle, _task, _rx) = setup_with_worker("nrfault-worker", "x86_64-linux").await?;
 
     // A depends on B (edge parent=A, child=B — B must complete first).
     let build_id = Uuid::new_v4();

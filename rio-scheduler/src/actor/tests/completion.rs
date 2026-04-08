@@ -157,7 +157,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
 
     // ─── Scenario 2: CA + mixed [match, miss] → AND-fold → false ───
     // Fresh worker (one-shot: scenario-1's executor drained on completion).
-    let _rx2 = connect_executor(&f.actor, "ca-w2", "x86_64-linux", 1).await?;
+    let _rx2 = connect_executor(&f.actor, "ca-w2", "x86_64-linux").await?;
     let mixed_modular: [u8; 32] = {
         use sha2::{Digest, Sha256};
         Sha256::digest(b"ca-fixture:ca-mixed").into()
@@ -209,7 +209,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     );
 
     // ─── Scenario 3: non-CA → hook skipped ─────────────────────────
-    let _rx3 = connect_executor(&f.actor, "ca-w3", "x86_64-linux", 1).await?;
+    let _rx3 = connect_executor(&f.actor, "ca-w3", "x86_64-linux").await?;
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ia-skip");
     let node = make_test_node("ia-skip", "x86_64-linux"); // is_content_addressed=false
@@ -552,7 +552,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     node_c.ca_modular_hash = c_modular.to_vec();
     node_c.pname = "verify-c".into();
 
-    let _rx = connect_executor(&handle, "verify-worker", "x86_64-linux", 4).await?;
+    let _rx = connect_executor(&handle, "verify-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
@@ -728,7 +728,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
     let _db = test_db;
 
-    let _rx = connect_executor(&handle, "sc-worker", "x86_64-linux", 4).await?;
+    let _rx = connect_executor(&handle, "sc-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("ca-shortcircuit");
@@ -793,8 +793,8 @@ async fn test_transient_retry_different_worker() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Register two workers
-    let _rx1 = connect_executor(&handle, "worker-a", "x86_64-linux", 1).await?;
-    let _rx2 = connect_executor(&handle, "worker-b", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "worker-a", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "worker-b", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let p_retry = test_drv_path("retry-hash");
@@ -871,13 +871,13 @@ async fn test_transient_retry_different_worker() -> TestResult {
 /// test the completion handler's max_retries logic, not dispatch.
 #[tokio::test]
 async fn test_transient_failure_max_retries_poisons() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux").await?;
     // Pad workers (non-matching system) so the all-workers-failed
     // clamp doesn't fire before max_retries — we're testing the
     // max_retries branch specifically, worker_count must exceed
     // threshold=3.
-    let _rx2 = connect_executor(&handle, "mr-pad2", "aarch64-linux", 1).await?;
-    let _rx3 = connect_executor(&handle, "mr-pad3", "aarch64-linux", 1).await?;
+    let _rx2 = connect_executor(&handle, "mr-pad2", "aarch64-linux").await?;
+    let _rx3 = connect_executor(&handle, "mr-pad3", "aarch64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let p_maxretry = test_drv_path("maxretry-hash");
@@ -1032,10 +1032,10 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Register 4 workers so the derivation can be re-dispatched after each failure.
-    let _rx1 = connect_executor(&handle, "poison-w1", "x86_64-linux", 1).await?;
-    let _rx2 = connect_executor(&handle, "poison-w2", "x86_64-linux", 1).await?;
-    let _rx3 = connect_executor(&handle, "poison-w3", "x86_64-linux", 1).await?;
-    let _rx4 = connect_executor(&handle, "poison-w4", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "poison-w1", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "poison-w2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "poison-w3", "x86_64-linux").await?;
+    let _rx4 = connect_executor(&handle, "poison-w4", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "poison-drv";
@@ -1105,8 +1105,8 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
     let _db = db;
 
     // Exactly 2 workers — below PoisonConfig::default().threshold (3).
-    let _rx1 = connect_executor(&handle, "starve-w1", "x86_64-linux", 1).await?;
-    let _rx2 = connect_executor(&handle, "starve-w2", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "starve-w1", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "starve-w2", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "starve-drv";
@@ -1169,13 +1169,12 @@ async fn test_fleet_exhaustion_is_kind_aware() -> TestResult {
     // pre-I-065 check: `executors.keys().all(in failed_builders)` was
     // false because the fetcher isn't in failed_builders, even though
     // the BUILDER fleet is exhausted.
-    let _b1 = connect_executor(&handle, "exhaust-b1", "x86_64-linux", 1).await?;
-    let _b2 = connect_executor(&handle, "exhaust-b2", "x86_64-linux", 1).await?;
+    let _b1 = connect_executor(&handle, "exhaust-b1", "x86_64-linux").await?;
+    let _b2 = connect_executor(&handle, "exhaust-b2", "x86_64-linux").await?;
     let _f1 = connect_executor_no_ack_kind(
         &handle,
         "exhaust-f1",
         "builtin",
-        1,
         rio_proto::types::ExecutorKind::Fetcher,
     )
     .await?;
@@ -1225,10 +1224,10 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     let (_db, handle, _task) = setup().await;
 
     // 4 workers so re-dispatch always has a candidate.
-    let _rx1 = connect_executor(&handle, "infra-w1", "x86_64-linux", 1).await?;
-    let _rx2 = connect_executor(&handle, "infra-w2", "x86_64-linux", 1).await?;
-    let _rx3 = connect_executor(&handle, "infra-w3", "x86_64-linux", 1).await?;
-    let _rx4 = connect_executor(&handle, "infra-w4", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "infra-w1", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "infra-w2", "x86_64-linux").await?;
+    let _rx3 = connect_executor(&handle, "infra-w3", "x86_64-linux").await?;
+    let _rx4 = connect_executor(&handle, "infra-w4", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-drv";
@@ -1497,7 +1496,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
 /// doesn't match `assigned_executor`).
 #[tokio::test]
 async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("infra-cap-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("infra-cap-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-cap-drv";
@@ -1585,7 +1584,7 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
 /// `infra_retry_count` does NOT increment, no matter how many times.
 #[tokio::test]
 async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("putpath-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("putpath-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "putpath-drv";
@@ -1676,9 +1675,9 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
     // worker_count)) doesn't fire before we reach failure_count=3.
     // Pad workers use a non-matching system so dispatch stays on
     // solo-worker — they're just padding for worker_count >= threshold.
-    let _rx = connect_executor(&handle, "solo-worker", "x86_64-linux", 1).await?;
-    let _rx2 = connect_executor(&handle, "pad-w2", "aarch64-linux", 1).await?;
-    let _rx3 = connect_executor(&handle, "pad-w3", "aarch64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "solo-worker", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "pad-w2", "aarch64-linux").await?;
+    let _rx3 = connect_executor(&handle, "pad-w3", "aarch64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "nondistinct-drv";
@@ -1762,9 +1761,9 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
     // we're isolating the distinct-vs-nondistinct counting, not
     // the worker_count guard. Pad workers use a non-matching
     // system so dispatch stays on ctrl-worker.
-    let _rx = connect_executor(&handle, "ctrl-worker", "x86_64-linux", 1).await?;
-    let _rx2 = connect_executor(&handle, "ctrl-pad2", "aarch64-linux", 1).await?;
-    let _rx3 = connect_executor(&handle, "ctrl-pad3", "aarch64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "ctrl-worker", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "ctrl-pad2", "aarch64-linux").await?;
+    let _rx3 = connect_executor(&handle, "ctrl-pad3", "aarch64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "ctrl-drv";
@@ -1807,7 +1806,7 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
 #[tokio::test]
 async fn test_dependency_chain_releases_parent() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("chain-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("chain-worker", "x86_64-linux").await?;
 
     // A depends on B. B is Ready (leaf), A is Queued.
     let build_id = Uuid::new_v4();
@@ -1838,7 +1837,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
 
     // Complete B. One-shot worker drains; connect a fresh one for A.
     complete_success_empty(&handle, "chain-worker", &p_chain_b).await?;
-    let mut stream_rx = connect_executor(&handle, "chain-worker-2", "x86_64-linux", 1).await?;
+    let mut stream_rx = connect_executor(&handle, "chain-worker-2", "x86_64-linux").await?;
 
     // A should now transition Queued -> Ready -> Assigned (dispatched).
     let info_a = handle
@@ -1866,8 +1865,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
 /// Duplicate ProcessCompletion is an idempotent no-op.
 #[tokio::test]
 async fn test_duplicate_completion_idempotent() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("idem-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("idem-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "idem-hash";
@@ -1983,7 +1981,7 @@ async fn test_completion_for_non_running_state_ignored() -> TestResult {
 #[tokio::test]
 #[traced_test]
 async fn test_unknown_build_status_treated_as_transient() -> TestResult {
-    let (_db, handle, _task, mut _rx) = setup_with_worker("unk-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut _rx) = setup_with_worker("unk-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("unk-status");
@@ -2024,7 +2022,7 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
 #[tokio::test]
 #[traced_test]
 async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
-    let (_db, handle, _task, mut _rx) = setup_with_worker("cancel-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut _rx) = setup_with_worker("cancel-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_path = test_drv_path("cancel-drv");
@@ -2223,8 +2221,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
 /// complete_success_empty() helper (no timestamps) silently skips.
 #[tokio::test]
 async fn test_completion_writes_build_sample() -> TestResult {
-    let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("bs-worker", "x86_64-linux", 1).await?;
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("bs-worker", "x86_64-linux").await?;
 
     // Merge with a distinct pname — make_test_node defaults to
     // "test-pkg", which is fine, but a unique pname makes the
@@ -2319,8 +2316,7 @@ async fn test_completion_writes_build_sample() -> TestResult {
 /// (spurious 0.0s samples would poison the rebalancer's percentiles).
 #[tokio::test]
 async fn test_completion_no_timestamps_no_sample() -> TestResult {
-    let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("nt-worker", "x86_64-linux", 1).await?;
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("nt-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "nt-drv", PriorityClass::Scheduled).await?;
@@ -2363,7 +2359,7 @@ async fn test_completion_no_timestamps_no_sample() -> TestResult {
 #[tokio::test]
 async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
     let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("clamp-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("clamp-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let mut node = make_test_node("clamp-drv", "x86_64-linux");
@@ -2433,8 +2429,7 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
 async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
     use sha2::Digest;
 
-    let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("pt-worker", "x86_64-linux", 1).await?;
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("pt-worker", "x86_64-linux").await?;
 
     // ── Seed 2 tenants. FK path_tenants→tenants ON DELETE CASCADE
     // means these rows MUST exist before the upsert. ─────────────────
@@ -2547,7 +2542,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
 /// assert the row is gone (and the assignment row CASCADEd with it).
 #[tokio::test]
 async fn permanent_failure_terminals_assignment_and_records_executor() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("i209-w", "x86_64-linux", 1).await?;
+    let (db, handle, _task, mut rx) = setup_with_worker("i209-w", "x86_64-linux").await?;
 
     let _ev = merge_single_node(&handle, Uuid::new_v4(), "i209", PriorityClass::Scheduled).await?;
     let _ = recv_assignment(&mut rx).await;

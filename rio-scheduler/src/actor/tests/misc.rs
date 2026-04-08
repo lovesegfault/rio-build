@@ -33,11 +33,11 @@ async fn test_not_leader_does_not_dispatch() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), false, true);
 
-    let mut rx = connect_executor(&handle, "nl-worker", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "nl-worker", "x86_64-linux").await?;
     merge_single_node(&handle, Uuid::new_v4(), "nl-drv", PriorityClass::Scheduled).await?;
 
     // Extra heartbeat to trigger dispatch_ready.
-    send_heartbeat(&handle, "nl-worker", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "nl-worker", "x86_64-linux").await?;
     barrier(&handle).await;
 
     // No assignment — dispatch gated by !is_leader.
@@ -111,10 +111,10 @@ async fn test_recovery_not_complete_does_not_dispatch() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), true, false);
 
-    let mut rx = connect_executor(&handle, "rc-worker", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "rc-worker", "x86_64-linux").await?;
     merge_single_node(&handle, Uuid::new_v4(), "rc-drv", PriorityClass::Scheduled).await?;
 
-    send_heartbeat(&handle, "rc-worker", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "rc-worker", "x86_64-linux").await?;
     barrier(&handle).await;
 
     assert!(
@@ -144,7 +144,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
         a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
     });
 
-    let mut worker_rx = connect_executor(&handle, "hmac-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "hmac-w", "x86_64-linux").await?;
 
     // Merge a node WITH expected_output_paths set — the token's
     // claims must include them.
@@ -198,7 +198,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
         a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
     });
 
-    let mut worker_rx = connect_executor(&handle, "clamp-w", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "clamp-w", "x86_64-linux").await?;
 
     // Merge with build_timeout = u64::MAX.
     let _ = merge_dag_req(
@@ -436,7 +436,7 @@ async fn test_shutdown_token_drains_workers() -> TestResult {
     // processed (same mpsc queue, FIFO), so the stream_tx is in
     // self.executors when we cancel — the test exercises workers.clear()
     // specifically, not just "rx drops when the loop breaks".
-    let mut stream_rx = connect_executor(&handle, "sd-worker", "x86_64-linux", 1).await?;
+    let mut stream_rx = connect_executor(&handle, "sd-worker", "x86_64-linux").await?;
     let workers = handle.debug_query_workers().await?;
     assert_eq!(workers.len(), 1, "worker should be registered");
 
@@ -1485,7 +1485,7 @@ async fn test_dispatch_wait_recorded_on_assignment() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
 
-    let mut rx = connect_executor(&handle, "dw-worker", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "dw-worker", "x86_64-linux").await?;
     merge_single_node(&handle, Uuid::new_v4(), "dw-drv", PriorityClass::Scheduled).await?;
 
     // MergeDag's reply is sent AFTER dispatch_ready runs inline

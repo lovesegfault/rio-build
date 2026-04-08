@@ -23,7 +23,7 @@ use super::*;
 async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    let _rx1 = connect_executor(&handle, "drain-auth", "x86_64-linux", 1).await?;
+    let _rx1 = connect_executor(&handle, "drain-auth", "x86_64-linux").await?;
 
     // Set both sources: admin drain (DrainExecutor) + worker drain
     // (heartbeat) + store_degraded.
@@ -93,7 +93,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     // I-056a's original scenario — it's a fresh process that was
     // never draining). `draining_hb` clears; admin `draining` was
     // already cleared by reconnect → effective false.
-    send_heartbeat(&handle, "drain-auth", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "drain-auth", "x86_64-linux").await?;
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
@@ -117,7 +117,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
         })
         .await?;
     assert!(reply_rx.await?.accepted);
-    send_heartbeat(&handle, "drain-auth", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "drain-auth", "x86_64-linux").await?;
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
@@ -226,7 +226,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
     // Worker B connects idle. Its registration triggers dispatch_ready.
     // The drv is Assigned (adopted) → not in the Ready filter → B
     // gets nothing. Pre-I-066: drv was still Ready, B would receive it.
-    let _stream_rx_b = connect_executor(&handle, "i066-b", "x86_64-linux", 1).await?;
+    let _stream_rx_b = connect_executor(&handle, "i066-b", "x86_64-linux").await?;
     let workers = handle.debug_query_workers().await?;
     let b = workers
         .iter()
@@ -267,7 +267,7 @@ async fn test_heartbeat_before_stream_does_not_create_zombie() -> TestResult {
     // Heartbeat for an executor that never opened a stream. Pre-fix:
     // `entry().or_insert_with()` created a zombie. Post-fix: WARN +
     // drop, no entry.
-    send_heartbeat(&handle, "zombie-candidate", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "zombie-candidate", "x86_64-linux").await?;
 
     let workers = handle.debug_query_workers().await?;
     assert!(
@@ -281,7 +281,7 @@ async fn test_heartbeat_before_stream_does_not_create_zombie() -> TestResult {
     // normal lifecycle and must still work — proves the fix doesn't
     // break the happy path. connect_executor sends ExecutorConnected
     // (creates entry, sets stream_tx) followed by Heartbeat (updates).
-    let _rx = connect_executor(&handle, "zombie-candidate", "x86_64-linux", 1).await?;
+    let _rx = connect_executor(&handle, "zombie-candidate", "x86_64-linux").await?;
 
     let workers = handle.debug_query_workers().await?;
     let w = workers
@@ -306,7 +306,7 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
 
     // Stage 1: stream connected, no heartbeat. has_stream=true,
     // is_registered=false (systems empty), warm=false.
-    let _rx = connect_executor_no_ack(&handle, "ext-builder", "x86_64-linux", 4).await?;
+    let _rx = connect_executor_no_ack(&handle, "ext-builder", "x86_64-linux").await?;
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
@@ -353,7 +353,6 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
         &handle,
         "ext-fetcher",
         "x86_64-linux",
-        2,
         rio_proto::types::ExecutorKind::Fetcher,
     )
     .await?;
@@ -392,7 +391,7 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
 async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // Register worker (initial heartbeat has empty running_builds).
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("toctou-worker", "x86_64-linux", 2).await?;
+        setup_with_worker("toctou-worker", "x86_64-linux").await?;
 
     // Merge a derivation. Scheduler will assign it to the worker and
     // insert it into worker.running_builds.
@@ -421,7 +420,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // Send a STALE heartbeat with empty running_builds. This mimics the
     // race: worker sent heartbeat before receiving/acking the assignment.
     // send_heartbeat's running_builds=[] is the stale value under test.
-    send_heartbeat(&handle, "toctou-worker", "x86_64-linux", 2).await?;
+    send_heartbeat(&handle, "toctou-worker", "x86_64-linux").await?;
 
     // Assignment must still be tracked. Before the fix, running_builds
     // would be wholesale replaced with the empty set, orphaning the
@@ -448,7 +447,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
 #[tokio::test]
 async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("phantom-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("phantom-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "phantom-drv-hash";
@@ -473,7 +472,7 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
     );
 
     // First miss: TOCTOU keep — same outcome as the test above.
-    send_heartbeat(&handle, "phantom-worker", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "phantom-worker", "x86_64-linux").await?;
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
@@ -495,7 +494,7 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
 
     // Second miss: phantom confirmed. Drain → reset_to_ready →
     // dispatch_ready re-assigns to the (now-free) same worker.
-    send_heartbeat(&handle, "phantom-worker", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "phantom-worker", "x86_64-linux").await?;
     let info = handle
         .debug_query_derivation(drv_hash)
         .await?
@@ -547,8 +546,8 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
 #[tokio::test]
 async fn test_completion_after_poison_frees_running_builds() -> TestResult {
     // Two workers so dispatch can re-assign after worker-1's failure.
-    let (_db, handle, _task, _rx1) = setup_with_worker("i042-w1", "x86_64-linux", 1).await?;
-    let _rx2 = connect_executor(&handle, "i042-w2", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx1) = setup_with_worker("i042-w1", "x86_64-linux").await?;
+    let _rx2 = connect_executor(&handle, "i042-w2", "x86_64-linux").await?;
 
     // Merge + dispatch. drv goes to one of the workers (deterministic
     // by HashMap iteration order — doesn't matter which for this test).
@@ -636,7 +635,7 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
 /// side cleanup regresses.
 #[tokio::test]
 async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("i042-hb-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("i042-hb-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "i042-hb-drv";
@@ -672,7 +671,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestR
     // the two-worker race; here we just assert the reconcile filter
     // logic by checking the slot stays clear after a heartbeat (it
     // was already clear from the completion-side fix).
-    send_heartbeat(&handle, "i042-hb-w", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "i042-hb-w", "x86_64-linux").await?;
     let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
@@ -703,8 +702,7 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
     // heartbeat does NOT remove the worker (negative test), and the
     // timeout-removal path is exercised directly via ExecutorDisconnected
     // in test_worker_disconnect_running_derivation.
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("tick-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("tick-worker", "x86_64-linux").await?;
 
     // Send several Ticks. Worker has fresh heartbeat, should NOT be removed.
     for _ in 0..MAX_MISSED_HEARTBEATS + 1 {
@@ -729,8 +727,7 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
 /// with full proto fields via `compute_initial_states`.
 #[tokio::test]
 async fn test_tick_expires_poisoned_derivation() -> TestResult {
-    let (_db, handle, _task, _rx) =
-        setup_with_worker("poison-ttl-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("poison-ttl-worker", "x86_64-linux").await?;
 
     // Merge, dispatch, poison via PermanentFailure.
     let build_id = Uuid::new_v4();
@@ -787,7 +784,7 @@ async fn test_three_running_disconnects_poisons() -> TestResult {
 
     for i in 0..3 {
         let executor_id = format!("w-x6-{i}");
-        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux", 1).await?;
+        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux").await?;
         let assignment = recv_assignment(&mut rx).await;
         assert!(
             assignment.drv_path.contains("x6-drv"),
@@ -941,7 +938,7 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
 
     for i in 0..3 {
         let executor_id = format!("w-x7-{i}");
-        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux", 1).await?;
+        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux").await?;
         let assignment = recv_assignment(&mut rx).await;
         assert!(assignment.drv_path.contains("x7-drv"));
 
@@ -973,7 +970,7 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
 
     // Sensitivity: a 4th worker DOES get it (proves Ready is real,
     // not stuck-Ready-with-excluded-workers).
-    let mut rx4 = connect_executor(&handle, "w-x7-3", "x86_64-linux", 1).await?;
+    let mut rx4 = connect_executor(&handle, "w-x7-3", "x86_64-linux").await?;
     let assignment = recv_assignment(&mut rx4).await;
     assert!(
         assignment.drv_path.contains("x7-drv"),
@@ -1376,7 +1373,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    let mut rx = connect_executor(&handle, "eph-1", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "eph-1", "x86_64-linux").await?;
 
     // parent → child chain. Parent dispatches first (child blocked).
     let parent = make_test_node("eph-parent", "x86_64-linux");
@@ -1562,7 +1559,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
 /// empty, the CancelSignal loop does 0 iterations.
 #[tokio::test]
 async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("idle-worker", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("idle-worker", "x86_64-linux").await?;
 
     // Worker is idle (no builds assigned). Force-drain.
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -1605,7 +1602,7 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
 /// `if force { ... }` body with a non-empty to_reassign).
 #[tokio::test]
 async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("busy-worker", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("busy-worker", "x86_64-linux").await?;
 
     // Merge + dispatch → Assigned to busy-worker. running_builds={drv}.
     let build_id = Uuid::new_v4();
@@ -1703,7 +1700,7 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let (_db, handle, _task, mut rx) =
-        setup_with_worker("metric-drain-worker", "x86_64-linux", 4).await?;
+        setup_with_worker("metric-drain-worker", "x86_64-linux").await?;
 
     // Assign one build so to_reassign is non-empty (the increment at
     // worker.rs:255 is gated on `if !to_reassign.is_empty()`).
@@ -1762,7 +1759,7 @@ async fn test_force_drain_increments_cancel_signals_total_metric() -> TestResult
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("bs-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("bs-worker", "x86_64-linux").await?;
 
     // Merge + dispatch → Assigned.
     let build_id = Uuid::new_v4();
@@ -2079,8 +2076,7 @@ async fn test_per_build_timeout_zero_means_unlimited() -> TestResult {
 async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     // Register worker the normal way (store_degraded=false via
     // connect_executor). It's healthy and eligible.
-    let (_db, handle, _task, mut rx) =
-        setup_with_worker("degraded-worker", "x86_64-linux", 4).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("degraded-worker", "x86_64-linux").await?;
 
     // Mark it degraded BEFORE merging any work. The heartbeat also
     // triggers dispatch_ready (actor/mod.rs:432) but the ready queue
@@ -2210,7 +2206,7 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     // Bootstrap: connect a throwaway worker to complete B so A
     // becomes Ready. Use the auto-ACK connect_executor helper
     // (we're not testing THIS worker's warm-gate).
-    let mut boot_rx = connect_executor(&handle, "boot-w", "x86_64-linux", 1).await?;
+    let mut boot_rx = connect_executor(&handle, "boot-w", "x86_64-linux").await?;
     let boot_asgn = recv_assignment(&mut boot_rx).await;
     assert_eq!(boot_asgn.drv_path, test_drv_path("warm-b"));
     complete_success_empty(&handle, "boot-w", &test_drv_path("warm-b")).await?;
@@ -2241,7 +2237,7 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     // THEN connect the REAL worker — WITHOUT auto-ACK. Registration
     // hook sees Ready queue non-empty, A's closure = B's output →
     // sends PrefetchHint.
-    let mut rx = connect_executor_no_ack(&handle, "warm-worker", "x86_64-linux", 4).await?;
+    let mut rx = connect_executor_no_ack(&handle, "warm-worker", "x86_64-linux").await?;
     barrier(&handle).await;
 
     // First message: PrefetchHint (NOT Assignment). The hint arrives
@@ -2287,7 +2283,7 @@ async fn on_worker_registered_empty_queue_flips_warm_immediately() -> TestResult
 
     // Connect FIRST — ready queue is empty. on_worker_registered's
     // short-circuit flips warm=true without sending a hint.
-    let mut rx = connect_executor_no_ack(&handle, "empty-worker", "x86_64-linux", 4).await?;
+    let mut rx = connect_executor_no_ack(&handle, "empty-worker", "x86_64-linux").await?;
     barrier(&handle).await;
 
     // No PrefetchHint on the stream (nothing to hint for).
@@ -2350,7 +2346,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
         false,
     )
     .await?;
-    let mut boot_rx = connect_executor(&handle, "boot-f", "x86_64-linux", 1).await?;
+    let mut boot_rx = connect_executor(&handle, "boot-f", "x86_64-linux").await?;
     let _ = recv_assignment(&mut boot_rx).await;
     complete_success_empty(&handle, "boot-f", &test_drv_path("fail-b")).await?;
     handle
@@ -2549,7 +2545,7 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
 
     // (1) Register + warm. Queue empty → on_worker_registered flips
     // warm=true immediately (no PrefetchHint round-trip needed).
-    let mut rx = connect_executor(&handle, "w-idle", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "w-idle", "x86_64-linux").await?;
 
     // (2) Degrade → capacity 1→0. Raw Heartbeat (no trailing Tick).
     handle

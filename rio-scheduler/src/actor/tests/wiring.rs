@@ -11,7 +11,7 @@ use tracing_test::traced_test;
 #[tokio::test]
 async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker-1", "x86_64-linux", 2).await?;
+        setup_with_worker("test-worker-1", "x86_64-linux").await?;
 
     let workers = handle.debug_query_workers().await?;
     assert_eq!(workers.len(), 1);
@@ -32,8 +32,7 @@ async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
 /// and the build stays Active forever.
 #[tokio::test]
 async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 2).await?;
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
 
     // Merge a single-node DAG
     let build_id = Uuid::new_v4();
@@ -79,7 +78,7 @@ async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
 #[tokio::test]
 async fn test_worker_disconnect_running_derivation() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("test-worker", "x86_64-linux").await?;
 
     // Merge a single-node DAG (worker will get it assigned)
     let build_id = Uuid::new_v4();
@@ -151,8 +150,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
 #[tokio::test]
 #[traced_test]
 async fn test_completion_infrastructure_failure_handled() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-fail-hash";
@@ -206,8 +204,7 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
 /// not panic the actor with integer overflow in the EMA duration computation.
 #[tokio::test]
 async fn test_completion_with_extreme_timestamps() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "extreme-ts-hash";
@@ -267,7 +264,7 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
 async fn test_interactive_builds_pushed_to_front() -> TestResult {
     // Worker with capacity for 1 build at a time
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("test-worker", "x86_64-linux").await?;
 
     // Merge a "scheduled" build first (should go to back of queue)
     let build_normal = Uuid::new_v4();
@@ -302,7 +299,7 @@ async fn test_interactive_builds_pushed_to_front() -> TestResult {
 
     // Complete the first build; one-shot worker drains, connect a fresh one.
     complete_success_empty(&handle, "test-worker", &p_normal).await?;
-    let mut stream_rx = connect_executor(&handle, "test-worker-2", "x86_64-linux", 1).await?;
+    let mut stream_rx = connect_executor(&handle, "test-worker-2", "x86_64-linux").await?;
 
     // The next assignment should be the IFD derivation (was pushed to front)
     let second_path = recv_assignment(&mut stream_rx).await.drv_path;

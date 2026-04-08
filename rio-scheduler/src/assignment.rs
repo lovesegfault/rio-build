@@ -500,11 +500,9 @@ mod tests {
         assert!(builder_class_order(&[]).is_empty());
     }
 
-    fn make_worker(id: &str, _max: u32, running: u32) -> ExecutorState {
+    fn make_worker(id: &str, running: u32) -> ExecutorState {
         let mut w = ExecutorState::new(id.into());
         w.systems = vec!["x86_64-linux".into()];
-        // P0537 stage 1: max param ignored (always-1). Kept so ~40
-        // callers don't churn here. With stage 4's Option semantics,
         // running>0 → Some (busy), running==0 → None (idle).
         w.running_build = (running > 0).then(|| "run-0".into());
         // Tests default to warm — warm-gate coverage lives in the
@@ -552,7 +550,7 @@ mod tests {
     #[test]
     fn hard_filter_kind_matrix() {
         let mk_worker = |kind| {
-            let mut w = make_worker("e", 4, 0);
+            let mut w = make_worker("e", 0);
             w.kind = kind;
             w
         };
@@ -593,7 +591,7 @@ mod tests {
     #[test]
     fn hard_filter_builtin_matches_any_fetcher() {
         let mk_fetcher = |systems: &[&str]| {
-            let mut w = make_worker("f", 4, 0);
+            let mut w = make_worker("f", 0);
             w.kind = ExecutorKind::Fetcher;
             w.systems = systems.iter().map(|s| s.to_string()).collect();
             w
@@ -626,14 +624,14 @@ mod tests {
     /// doesn't silently accept FODs on an idle misconfigured builder.
     #[test]
     fn hard_filter_kind_check_precedes_capacity() {
-        let mut fetcher_full = make_worker("f", 1, 1); // at capacity
+        let mut fetcher_full = make_worker("f", 1); // at capacity
         fetcher_full.kind = ExecutorKind::Fetcher;
         let mut fod = make_drv();
         fod.is_fixed_output = true;
         // Kind matches → falls through to capacity check → fails there.
         assert!(!hard_filter(&fetcher_full, &fod, None));
 
-        let mut builder_idle = make_worker("b", 4, 0); // idle
+        let mut builder_idle = make_worker("b", 0); // idle
         builder_idle.kind = ExecutorKind::Builder;
         // Kind mismatch → rejected regardless of idle capacity.
         assert!(!hard_filter(&builder_idle, &fod, None));
@@ -648,12 +646,12 @@ mod tests {
         let drv = make_drv();
 
         // Baseline: idle builder, non-FOD drv, system match → ACCEPT.
-        let w = make_worker("w", 1, 0);
+        let w = make_worker("w", 0);
         assert_eq!(rejection_reason(&w, &drv, None), None);
         assert!(hard_filter(&w, &drv, None));
 
         // kind-mismatch
-        let mut fetcher = make_worker("w", 1, 0);
+        let mut fetcher = make_worker("w", 0);
         fetcher.kind = ExecutorKind::Fetcher;
         assert_eq!(
             rejection_reason(&fetcher, &drv, None),
@@ -662,18 +660,18 @@ mod tests {
 
         // draining (admin) — checked before capacity, so a busy
         // draining worker reports "draining", not "at-capacity".
-        let mut draining = make_worker("w", 1, 1);
+        let mut draining = make_worker("w", 1);
         draining.draining = true;
         assert_eq!(rejection_reason(&draining, &drv, None), Some("draining"));
 
         // draining_hb (worker SIGTERM via heartbeat) — same gate via
         // is_draining()'s OR.
-        let mut draining_hb = make_worker("w", 1, 0);
+        let mut draining_hb = make_worker("w", 0);
         draining_hb.draining_hb = true;
         assert_eq!(rejection_reason(&draining_hb, &drv, None), Some("draining"));
 
         // store-degraded
-        let mut degraded = make_worker("w", 1, 0);
+        let mut degraded = make_worker("w", 0);
         degraded.store_degraded = true;
         assert_eq!(
             rejection_reason(&degraded, &drv, None),
@@ -681,7 +679,7 @@ mod tests {
         );
 
         // not-registered (no stream)
-        let mut no_stream = make_worker("w", 1, 0);
+        let mut no_stream = make_worker("w", 0);
         no_stream.stream_tx = None;
         assert_eq!(
             rejection_reason(&no_stream, &drv, None),
@@ -698,7 +696,7 @@ mod tests {
         assert!(!hard_filter(&closed, &drv, None));
 
         // at-capacity
-        let busy = make_worker("w", 1, 1);
+        let busy = make_worker("w", 1);
         assert_eq!(rejection_reason(&busy, &drv, None), Some("at-capacity"));
 
         // system-mismatch
@@ -723,7 +721,7 @@ mod tests {
         assert_eq!(rejection_reason(&w, &failed_drv, None), Some("failed-on"));
 
         // resource-fit
-        let mut tight = make_worker("w", 1, 0);
+        let mut tight = make_worker("w", 0);
         tight.last_resources = Some(rio_proto::types::ResourceUsage {
             memory_total_bytes: 4 << 30,
             ..Default::default()
@@ -743,7 +741,7 @@ mod tests {
 
     #[test]
     fn no_candidates_returns_none() {
-        let workers = workers_map(vec![make_worker("full", 2, 2)]); // at capacity
+        let workers = workers_map(vec![make_worker("full", 2)]); // at capacity
         assert_eq!(best_executor(&workers, &make_drv(), None), None);
     }
 
@@ -755,10 +753,7 @@ mod tests {
         // would oscillate: fail → reassign to same worker → fail
         // → ... until poison threshold. With exclusion: second
         // attempt goes to worker-b, succeeds.
-        let workers = workers_map(vec![
-            make_worker("worker-a", 4, 0),
-            make_worker("worker-b", 4, 0),
-        ]);
+        let workers = workers_map(vec![make_worker("worker-a", 0), make_worker("worker-b", 0)]);
         let mut drv = make_drv();
         drv.failed_builders.insert("worker-a".into());
 
@@ -798,10 +793,7 @@ mod tests {
     #[test]
     fn all_workers_failed_below_threshold_poisons_upstream() {
         // 2-worker cluster — below the default poison_threshold of 3.
-        let workers = workers_map(vec![
-            make_worker("worker-a", 4, 0),
-            make_worker("worker-b", 4, 0),
-        ]);
+        let workers = workers_map(vec![make_worker("worker-a", 0), make_worker("worker-b", 0)]);
         let mut drv = make_drv();
 
         // Both workers failed. failed_builders.len() == 2 < 3 →
@@ -828,7 +820,7 @@ mod tests {
         // (relevant for the case where a fresh worker connects BEFORE
         // the 2nd failure lands — no poison, dispatch resumes).
         let mut workers3 = workers;
-        let c = make_worker("worker-c", 4, 0);
+        let c = make_worker("worker-c", 0);
         workers3.insert(c.executor_id.clone(), c);
         assert_eq!(
             best_executor(&workers3, &drv, None),
@@ -839,16 +831,16 @@ mod tests {
 
     #[test]
     fn single_candidate_short_circuits() {
-        let workers = workers_map(vec![make_worker("only", 4, 0)]);
+        let workers = workers_map(vec![make_worker("only", 0)]);
         let result = best_executor(&workers, &make_drv(), None);
         assert_eq!(result.as_deref(), Some("only"));
     }
 
     #[test]
     fn size_class_filter() {
-        let mut small = make_worker("small", 4, 0);
+        let mut small = make_worker("small", 0);
         small.size_class = Some("small".into());
-        let mut large = make_worker("large", 4, 0);
+        let mut large = make_worker("large", 0);
         large.size_class = Some("large".into());
 
         let workers = workers_map(vec![small, large]);
@@ -870,7 +862,7 @@ mod tests {
         // wildcarding — the old (Some(_), None) => true behavior could
         // route a 10-hour "large" build to a spot instance that just
         // never set RIO_SIZE_CLASS.
-        let unclassified = make_worker("misconfigured", 4, 0); // size_class=None
+        let unclassified = make_worker("misconfigured", 0); // size_class=None
         let workers = workers_map(vec![unclassified]);
 
         let result = best_executor(&workers, &make_drv(), Some("large"));
@@ -887,8 +879,8 @@ mod tests {
     // r[verify sched.assign.resource-fit]
     // ADR-020 §5: worker.memory_total_bytes >= drv.est_memory_bytes
     // as a hard filter. Uses `hard_filter` directly (not
-    // `best_executor`) to isolate the resource-fit arm from warm-
-    // gate/scoring — the filter's pass/fail is what's under test.
+    // `best_executor`) to isolate the resource-fit arm from the
+    // warm-gate — the filter's pass/fail is what's under test.
     #[test]
     fn resource_fit_filter() {
         const GIB: u64 = 1 << 30;
@@ -896,7 +888,7 @@ mod tests {
         // Plan T3 case matrix. Worker memory via last_resources;
         // drv estimate via est_memory_bytes.
         let mk_worker = |mem_total: u64| {
-            let mut w = make_worker("w", 4, 0);
+            let mut w = make_worker("w", 0);
             w.last_resources = Some(rio_proto::types::ResourceUsage {
                 memory_total_bytes: mem_total,
                 ..Default::default()
@@ -954,7 +946,7 @@ mod tests {
     // always-fits, but via different match arms.
     #[test]
     fn resource_fit_no_heartbeat_resources_fits() {
-        let w = make_worker("fresh", 4, 0); // last_resources defaults to None
+        let w = make_worker("fresh", 0); // last_resources defaults to None
         assert!(w.last_resources.is_none(), "precondition: no resources");
         let mut d = make_drv();
         d.est_memory_bytes = Some(128 << 30); // 128Gi
@@ -970,12 +962,12 @@ mod tests {
     // worker that passes size-class but fails resource-fit → reject.
     // A worker that passes resource-fit but fails size-class → reject.
     // Proves the filter slots in the same position as has_capacity
-    // (hard filter preceding scoring) without disrupting Static mode.
+    // without disrupting Static mode.
     #[test]
     fn resource_fit_composes_with_size_class() {
         const GIB: u64 = 1 << 30;
 
-        let mut small_8gi = make_worker("small-8gi", 4, 0);
+        let mut small_8gi = make_worker("small-8gi", 0);
         small_8gi.size_class = Some("small".into());
         small_8gi.last_resources = Some(rio_proto::types::ResourceUsage {
             memory_total_bytes: 8 * GIB,
@@ -1017,9 +1009,9 @@ mod tests {
     fn warm_gate_prefers_warm_worker() {
         // P0537: both idle (single-build). Warm-gate must pick warm
         // even when cold is otherwise indistinguishable.
-        let mut warm = make_worker("warm", 4, 0);
+        let mut warm = make_worker("warm", 0);
         warm.warm = true;
-        let mut cold = make_worker("cold", 4, 0);
+        let mut cold = make_worker("cold", 0);
         cold.warm = false;
 
         let workers = workers_map(vec![warm, cold]);
@@ -1044,9 +1036,9 @@ mod tests {
 
         // All-cold cluster (fresh scale-up or single-worker). The gate
         // MUST fall back — the scheduler can't deadlock.
-        let mut a = make_worker("a", 4, 1);
+        let mut a = make_worker("a", 1);
         a.warm = false;
-        let mut b = make_worker("b", 4, 0);
+        let mut b = make_worker("b", 0);
         b.warm = false;
 
         let workers = workers_map(vec![a, b]);
@@ -1079,9 +1071,9 @@ mod tests {
         // first is still warming does not delay builds the second
         // (already warm) worker can take. Prove: cold+warm both
         // eligible → warm wins, cold is NOT blocking dispatch.
-        let mut cold = make_worker("cold-still-warming", 4, 0);
+        let mut cold = make_worker("cold-still-warming", 0);
         cold.warm = false;
-        let warm = make_worker("warm-ready", 4, 0);
+        let warm = make_worker("warm-ready", 0);
 
         let workers = workers_map(vec![cold, warm]);
 
@@ -1299,7 +1291,7 @@ mod tests {
         // accidental ordering-dependence (HashMap iteration).
         for _ in 0..10 {
             let dead = make_worker_closed_stream("dead");
-            let live = make_worker("live", 1, 0);
+            let live = make_worker("live", 0);
             let map = workers_map(vec![dead, live]);
             assert_eq!(best_executor(&map, &drv, None).as_deref(), Some("live"));
         }

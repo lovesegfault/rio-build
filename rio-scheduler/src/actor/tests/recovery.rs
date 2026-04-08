@@ -258,8 +258,8 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     // a single failure (worker_count=1 would clamp threshold to 1).
     let (handle, _task, mut stream_rx) = {
         let (h, t) = setup_actor(db.pool.clone());
-        let rx = connect_executor(&h, "w-x4", "x86_64-linux", 2).await?;
-        let _pad = connect_executor(&h, "w-x4-pad", "aarch64-linux", 1).await?;
+        let rx = connect_executor(&h, "w-x4", "x86_64-linux").await?;
+        let _pad = connect_executor(&h, "w-x4-pad", "aarch64-linux").await?;
         (h, t, rx)
     };
     let build_id = Uuid::new_v4();
@@ -699,7 +699,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // Worker reconnects: BuildExecution stream + heartbeat with
     // EMPTY running_builds (because it never actually got the
     // assignment — the try_send never happened).
-    let _worker_rx = connect_executor(&handle, "phantom-w1", "x86_64-linux", 4).await?;
+    let _worker_rx = connect_executor(&handle, "phantom-w1", "x86_64-linux").await?;
     // Second worker so the post-reconcile dispatch has somewhere to go.
     // I-065: reconcile records w1 in failed_builders (phantom counts as
     // a failed attempt on that worker's infra); with a single-worker
@@ -707,7 +707,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // this test's intent (verify phantom RECONCILES) without hitting
     // the exhaustion case, which test_fleet_exhaustion_is_kind_aware
     // covers separately.
-    let _worker_rx2 = connect_executor(&handle, "phantom-w2", "x86_64-linux", 4).await?;
+    let _worker_rx2 = connect_executor(&handle, "phantom-w2", "x86_64-linux").await?;
     barrier(&handle).await;
 
     // LeaderAcquired → recover_from_pg loads Assigned drv.
@@ -1053,7 +1053,7 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
     // --- Phase 1: actor A poisons a derivation ---
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "poison-rec-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "poison-rec-w", "x86_64-linux").await?;
         let _ev = merge_single_node(
             &handle,
             Uuid::new_v4(),
@@ -1129,7 +1129,7 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
     // --- Phase 1: actor A poisons a derivation, then we backdate PG ---
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "exp-poison-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "exp-poison-w", "x86_64-linux").await?;
         let _ev = merge_single_node(
             &handle,
             Uuid::new_v4(),
@@ -1210,7 +1210,7 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
     // --- Phase 1: actor A poisons a derivation ---
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "zombie-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "zombie-w", "x86_64-linux").await?;
         let _ev = merge_single_node(
             &handle,
             Uuid::new_v4(),
@@ -1235,7 +1235,7 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
     // --- Phase 2: fresh actor B recovers, operator clears poison,
     //     user resubmits ---
     let (handle, _task) = setup_actor(db.pool.clone());
-    let mut worker_rx = connect_executor(&handle, "zombie-w2", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "zombie-w2", "x86_64-linux").await?;
 
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
@@ -1317,7 +1317,7 @@ async fn test_recovery_poisoned_orphan_build_fails_not_succeeds() -> TestResult 
     // crash-window PG state and kill actor A.
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "r1-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "r1-w", "x86_64-linux").await?;
         let _ev = merge_dag(
             &handle,
             build_id,
@@ -1397,7 +1397,7 @@ async fn test_recovery_poisoned_orphan_build_fails_keep_going_false() -> TestRes
     // the crash-window PG state and kill actor A.
     {
         let (handle, task) = setup_actor(db.pool.clone());
-        let mut worker_rx = connect_executor(&handle, "r1f-w", "x86_64-linux", 1).await?;
+        let mut worker_rx = connect_executor(&handle, "r1f-w", "x86_64-linux").await?;
         let _ev = merge_dag(
             &handle,
             build_id,

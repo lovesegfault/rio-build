@@ -114,7 +114,7 @@ pub(crate) async fn setup_ca_fixture_configured(
         setup_actor_configured(db.pool.clone(), Some(store_client), configure);
 
     let executor_id = format!("w-{key}");
-    let rx = connect_executor(&actor, &executor_id, "x86_64-linux", 4).await?;
+    let rx = connect_executor(&actor, &executor_id, "x86_64-linux").await?;
 
     // Deterministic modular_hash per key — the CA-compare gate
     // requires `state.ca_modular_hash.is_some()`. Real flow: the
@@ -188,7 +188,6 @@ pub(crate) async fn setup() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>
 pub(crate) async fn setup_with_worker(
     executor_id: &str,
     system: &str,
-    max_builds: u32,
 ) -> anyhow::Result<(
     TestDb,
     ActorHandle,
@@ -196,7 +195,7 @@ pub(crate) async fn setup_with_worker(
     mpsc::Receiver<rio_proto::types::SchedulerMessage>,
 )> {
     let (db, handle, task) = setup().await;
-    let rx = connect_executor(&handle, executor_id, system, max_builds).await?;
+    let rx = connect_executor(&handle, executor_id, system).await?;
     Ok((db, handle, task, rx))
 }
 
@@ -209,13 +208,11 @@ pub(crate) async fn connect_executor_no_ack(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    max_builds: u32,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     connect_executor_no_ack_kind(
         handle,
         executor_id,
         system,
-        max_builds,
         rio_proto::types::ExecutorKind::Builder,
     )
     .await
@@ -229,9 +226,6 @@ pub(crate) async fn connect_executor_no_ack_kind(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    // P0537 stage 1: ignored (always-1). Kept so 60+ callers don't
-    // churn in this commit; stage 3 deletes it.
-    _max_builds: u32,
     kind: rio_proto::types::ExecutorKind,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     let (stream_tx, stream_rx) = mpsc::channel(256);
@@ -355,8 +349,6 @@ pub(crate) async fn send_heartbeat(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    // P0537 stage 1: ignored (always-1). Stage 3 deletes it.
-    _max_builds: u32,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -391,7 +383,6 @@ pub(crate) async fn send_heartbeat_draining(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    _max_builds: u32,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -434,9 +425,8 @@ pub(crate) async fn connect_executor(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
-    max_builds: u32,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let stream_rx = connect_executor_no_ack(handle, executor_id, system, max_builds).await?;
+    let stream_rx = connect_executor_no_ack(handle, executor_id, system).await?;
     // Warm-gate: unconditionally ACK so the worker flips warm=true
     // regardless of whether on_worker_registered sent an initial
     // PrefetchHint (it only does so when the ready queue is non-

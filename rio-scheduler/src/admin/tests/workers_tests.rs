@@ -17,10 +17,10 @@ async fn test_list_workers_with_filter() -> anyhow::Result<()> {
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Fully registered worker.
-    let _rx1 = connect_executor(&actor, "alive-worker", "x86_64-linux", 4).await?;
+    let _rx1 = connect_executor(&actor, "alive-worker", "x86_64-linux").await?;
 
     // Drain a second worker.
-    let _rx2 = connect_executor(&actor, "drain-worker", "aarch64-linux", 2).await?;
+    let _rx2 = connect_executor(&actor, "drain-worker", "aarch64-linux").await?;
     let (tx, rx) = oneshot::channel();
     actor
         .send_unchecked(ActorCommand::DrainExecutor {

@@ -7,8 +7,8 @@ use super::*;
 #[tokio::test]
 async fn test_keepgoing_false_fails_fast() -> TestResult {
     // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
-    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux").await?;
 
     // Merge a two-node DAG with keepGoing=false
     let build_id = Uuid::new_v4();
@@ -57,8 +57,8 @@ async fn test_keepgoing_false_fails_fast() -> TestResult {
 #[tokio::test]
 async fn test_keepgoing_true_waits_all() -> TestResult {
     // P0537: two workers for two concurrent assignments.
-    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
-    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, mut rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
+    let mut rx2 = connect_executor(&handle, "test-worker2", "x86_64-linux").await?;
 
     // Merge a two-node DAG with keepGoing=true
     let build_id = Uuid::new_v4();
@@ -122,7 +122,7 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
 async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
     // Worker with capacity 1: only the leaf gets dispatched initially.
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("cascade-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("cascade-worker", "x86_64-linux").await?;
 
     // Chain: A depends on B depends on C. C is the leaf.
     let build_id = Uuid::new_v4();
@@ -207,7 +207,7 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
 #[tokio::test]
 async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("poison-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("poison-worker", "x86_64-linux").await?;
 
     // Build 1: single leaf, poisoned via PermanentFailure.
     let build1 = Uuid::new_v4();
@@ -283,7 +283,7 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
 #[tokio::test]
 async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("resub-poison-w", "x86_64-linux", 1).await?;
+        setup_with_worker("resub-poison-w", "x86_64-linux").await?;
 
     // Build 1: poison the leaf.
     let build1 = Uuid::new_v4();

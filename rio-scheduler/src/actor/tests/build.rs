@@ -10,7 +10,7 @@ use super::*;
 #[tokio::test]
 async fn test_watch_build_after_completion_receives_terminal_event() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("watch-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("watch-worker", "x86_64-linux").await?;
 
     // Submit a build, complete it, then drop the original subscriber.
     let build_id = Uuid::new_v4();
@@ -59,7 +59,7 @@ async fn test_watch_build_after_completion_receives_terminal_event() -> TestResu
 #[tokio::test]
 async fn test_terminal_build_cleanup_after_delay() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("cleanup-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("cleanup-worker", "x86_64-linux").await?;
 
     // Complete a build.
     let build_id = Uuid::new_v4();
@@ -161,7 +161,7 @@ async fn test_cancel_build_active_drains_derivations() -> TestResult {
 #[tokio::test]
 async fn test_watch_build_receives_events() -> TestResult {
     let (_db, handle, _task, _rx) =
-        setup_with_worker("watch-events-worker", "x86_64-linux", 1).await?;
+        setup_with_worker("watch-events-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _original = merge_single_node(
@@ -391,7 +391,7 @@ async fn test_query_unknown_build_returns_not_found() -> TestResult {
 /// the terminal event (not just Succeeded).
 #[tokio::test]
 async fn test_watch_build_after_failure_replays_failed() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("fail-watch-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("fail-watch-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _original_rx =
@@ -447,7 +447,7 @@ async fn test_watch_build_after_failure_replays_failed() -> TestResult {
 async fn test_inputs_resolved_fires_between_started_and_dispatch() -> TestResult {
     use rio_proto::types::build_event::Event;
 
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("inputs-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("inputs-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let mut events =
@@ -558,7 +558,7 @@ async fn test_inputs_resolved_fires_without_worker() -> TestResult {
 /// Same for Cancelled.
 #[tokio::test]
 async fn test_watch_build_after_cancel_replays_cancelled() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("cancel-watch-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("cancel-watch-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let _original_rx =
@@ -613,7 +613,7 @@ async fn test_watch_build_after_cancel_replays_cancelled() -> TestResult {
 async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
     use rio_proto::types::build_event::Event;
 
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("prog-w", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _stream_rx) = setup_with_worker("prog-w", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let mut events =
@@ -694,7 +694,7 @@ async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
     // longer expressible.
     let mut rxs = Vec::with_capacity(N);
     for i in 0..N {
-        rxs.push(connect_executor(&handle, &format!("batch-w-{i:03}"), "x86_64-linux", 1).await?);
+        rxs.push(connect_executor(&handle, &format!("batch-w-{i:03}"), "x86_64-linux").await?);
     }
 
     // 100 independent nodes (no edges) — all become Ready on merge
@@ -729,7 +729,7 @@ async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
     // the actor — both would time out if the actor were still stuck
     // in a 200-await PG loop.
     tokio::time::timeout(Duration::from_secs(5), async {
-        send_heartbeat(&handle, "batch-w-000", "x86_64-linux", 1).await?;
+        send_heartbeat(&handle, "batch-w-000", "x86_64-linux").await?;
         let status = query_status(&handle, build_id).await?;
         assert_eq!(status.state, rio_proto::types::BuildState::Cancelled as i32);
         anyhow::Ok(())

@@ -64,7 +64,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
 
     // Connect a 1-slot worker. Heartbeat/PrefetchComplete triggers
     // dispatch_ready, which pops the highest-priority node.
-    let mut rx = connect_executor(&handle, "prio-w", "x86_64-linux", 1).await?;
+    let mut rx = connect_executor(&handle, "prio-w", "x86_64-linux").await?;
 
     // First assignment MUST be shared-x: it carries INTERACTIVE_BOOST
     // (via build_hi's interest), filler-y does not. Without the bump,
@@ -948,7 +948,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
-    let mut worker_rx = connect_executor(&handle, "w-gc", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "w-gc", "x86_64-linux").await?;
 
     // Build A: app-a → fod-dep. fod-dep is the FOD-like leaf that
     // will complete and then have its output GC'd. app-a stays Ready
@@ -983,7 +983,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
 
     // app-a now dispatches (fod-dep Completed unlocked it). One-shot:
     // w-gc drained on completion; connect a fresh worker for app-a.
-    let mut worker_rx = connect_executor(&handle, "w-gc-appa", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "w-gc-appa", "x86_64-linux").await?;
     let _assn_app_a = recv_assignment(&mut worker_rx).await;
 
     // === GC: delete fod-dep's output from the store ===
@@ -992,7 +992,7 @@ async fn test_preexisting_completed_with_gcd_output_resets_to_ready() -> TestRes
 
     // Third worker so fod-dep can re-dispatch while w-gc-appa is
     // busy with app-a.
-    let mut worker_rx2 = connect_executor(&handle, "w-gc2", "x86_64-linux", 1).await?;
+    let mut worker_rx2 = connect_executor(&handle, "w-gc2", "x86_64-linux").await?;
 
     // Build B: app-b → fod-dep. fod-dep is PRE-EXISTING (still in DAG
     // via Build A's interest, status Completed). The verify must catch
@@ -1057,7 +1057,7 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
-    let mut worker_rx = connect_executor(&handle, "w-sub", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "w-sub", "x86_64-linux").await?;
 
     let fod_out = test_store_path("fod-substitutable");
     let build_a = Uuid::new_v4();
@@ -1081,7 +1081,7 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
 
     // Hold app-a Running so Build A stays Active and fod-dep stays in
     // the global DAG (pre-existing for Build B).
-    let mut worker_appa = connect_executor(&handle, "w-sub-appa", "x86_64-linux", 1).await?;
+    let mut worker_appa = connect_executor(&handle, "w-sub-appa", "x86_64-linux").await?;
     let _assn_app_a = recv_assignment(&mut worker_appa).await;
 
     // GC removes the output from rio-store, BUT cache.nixos.org has it.
@@ -1089,7 +1089,7 @@ async fn test_preexisting_completed_gcd_but_substitutable_stays_completed() -> T
     store.substitutable.write().unwrap().push(fod_out.clone());
 
     // Spare worker — should stay IDLE because fod-dep doesn't reset.
-    let mut worker_spare = connect_executor(&handle, "w-sub-spare", "x86_64-linux", 1).await?;
+    let mut worker_spare = connect_executor(&handle, "w-sub-spare", "x86_64-linux").await?;
 
     let build_b = Uuid::new_v4();
     merge_dag(
@@ -1146,7 +1146,7 @@ async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> T
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
-    let mut worker_rx = connect_executor(&handle, "w-sf", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "w-sf", "x86_64-linux").await?;
 
     let fod_out = test_store_path("fod-sub-fail");
     let build_a = Uuid::new_v4();
@@ -1166,7 +1166,7 @@ async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> T
     store.seed_with_content(&fod_out, b"fod-contents");
     complete_success(&handle, "w-sf", &assn.drv_path, &fod_out).await?;
     barrier(&handle).await;
-    let mut worker_appa = connect_executor(&handle, "w-sf-appa", "x86_64-linux", 1).await?;
+    let mut worker_appa = connect_executor(&handle, "w-sf-appa", "x86_64-linux").await?;
     let _assn_app_a = recv_assignment(&mut worker_appa).await;
 
     // GC; substitutable; but QPI is broken → eager-fetch fails.
@@ -1174,7 +1174,7 @@ async fn test_preexisting_completed_substitute_fetch_fail_resets_to_ready() -> T
     store.substitutable.write().unwrap().push(fod_out.clone());
     store.fail_query_path_info.store(true, Ordering::SeqCst);
 
-    let mut worker_spare = connect_executor(&handle, "w-sf-spare", "x86_64-linux", 1).await?;
+    let mut worker_spare = connect_executor(&handle, "w-sf-spare", "x86_64-linux").await?;
 
     let build_b = Uuid::new_v4();
     merge_dag(
@@ -1216,7 +1216,7 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
     let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
-    let mut worker_rx = connect_executor(&handle, "w-fo", "x86_64-linux", 4).await?;
+    let mut worker_rx = connect_executor(&handle, "w-fo", "x86_64-linux").await?;
 
     let fod_out = test_store_path("fail-open-out");
     let build_a = Uuid::new_v4();
@@ -1234,7 +1234,7 @@ async fn test_preexisting_completed_verify_fail_open_on_store_error() -> TestRes
     let assn = recv_assignment(&mut worker_rx).await;
     complete_success(&handle, "w-fo", &assn.drv_path, &fod_out).await?;
     barrier(&handle).await;
-    let mut worker_rx = connect_executor(&handle, "w-fo-2", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "w-fo-2", "x86_64-linux").await?;
     let _assn_app_a = recv_assignment(&mut worker_rx).await;
 
     // Store goes unreachable. The verify's FindMissingPaths will fail.
@@ -1349,7 +1349,7 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
     node.expected_output_paths = vec![path.clone()];
 
     // Build #1 + worker: assign → PermanentFailure → Poisoned.
-    let mut worker_rx = connect_executor(&handle, "rp-worker", "x86_64-linux", 1).await?;
+    let mut worker_rx = connect_executor(&handle, "rp-worker", "x86_64-linux").await?;
     let build1 = Uuid::new_v4();
     merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
     let _ = worker_rx.recv().await.expect("assignment");
@@ -1675,7 +1675,7 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
     // rest. The point is the drain-loop cost when ready_queue >> workers.
     let xact_before = xact_commit(&db.pool).await;
     let t = std::time::Instant::now();
-    let mut wrx = connect_executor(&handle, "w0", "x86_64-linux", 1).await?;
+    let mut wrx = connect_executor(&handle, "w0", "x86_64-linux").await?;
     let assignment = recv_assignment(&mut wrx).await;
     barrier(&handle).await;
     let dispatch_elapsed = t.elapsed();
@@ -1707,7 +1707,7 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
     // in prod: builder connects, heartbeats, gets nothing for 120s.
     let xact_before = xact_commit(&db.pool).await;
     let t = std::time::Instant::now();
-    let mut wrx2 = connect_executor(&handle, "w1", "x86_64-linux", 1).await?;
+    let mut wrx2 = connect_executor(&handle, "w1", "x86_64-linux").await?;
     let assignment2 = recv_assignment(&mut wrx2).await;
     barrier(&handle).await;
     let redispatch_elapsed = t.elapsed();
@@ -1805,7 +1805,7 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     // --- wave: connect W → dispatch W → complete W → disconnect W ----
     let mut rxs = Vec::with_capacity(W);
     for w in 0..W {
-        rxs.push(connect_executor(&handle, &format!("w{w}"), "x86_64-linux", 1).await?);
+        rxs.push(connect_executor(&handle, &format!("w{w}"), "x86_64-linux").await?);
     }
     let mut assigned = Vec::with_capacity(W);
     for rx in &mut rxs {

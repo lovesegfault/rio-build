@@ -124,7 +124,7 @@ async fn test_scheduler_cache_check_skips_build() -> TestResult {
 #[tokio::test]
 async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
     // No store client — setup() uses setup_actor(pool, None).
-    let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+    let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
     let mut node = make_test_node("uncached-hash", "x86_64-linux");
@@ -159,7 +159,7 @@ async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn test_db_failure_during_completion_logged() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
+    let (db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
     let build_id = Uuid::new_v4();
     let drv_hash = "db-fault-hash";
     let drv_path = test_drv_path(drv_hash);
@@ -359,7 +359,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
             stream_tx,
         })
         .await?;
-    send_heartbeat(&handle, "tight-worker", "x86_64-linux", 1).await?;
+    send_heartbeat(&handle, "tight-worker", "x86_64-linux").await?;
     drop(stream_rx);
 
     // Merge 1 leaf derivation. Dispatch picks tight-worker, try_send
@@ -408,7 +408,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
 
     // A fresh worker picks it up — proves it's actually re-dispatchable,
     // not stuck.
-    let mut stream_rx2 = connect_executor(&handle, "fresh-worker", "x86_64-linux", 1).await?;
+    let mut stream_rx2 = connect_executor(&handle, "fresh-worker", "x86_64-linux").await?;
     let assignment = recv_assignment(&mut stream_rx2).await;
     assert!(assignment.drv_path.contains("drvA"));
     Ok(())
