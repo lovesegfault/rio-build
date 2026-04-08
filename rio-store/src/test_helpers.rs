@@ -134,8 +134,8 @@ pub fn path_hash(path: &str) -> Vec<u8> {
 /// name. Covers the majority of call sites — tests that only need a
 /// tenant to exist for FK purposes.
 ///
-/// For tests that need `gc_retention_hours`, `gc_max_store_bytes`, or
-/// `cache_token`, use [`TenantSeed`] instead.
+/// For tests that need `gc_retention_hours` or `cache_token`, use
+/// [`TenantSeed`] instead.
 pub async fn seed_tenant(pool: &PgPool, name: &str) -> uuid::Uuid {
     sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
         .bind(name)
@@ -160,7 +160,6 @@ pub async fn seed_tenant(pool: &PgPool, name: &str) -> uuid::Uuid {
 pub struct TenantSeed {
     name: String,
     gc_retention_hours: Option<i32>,
-    gc_max_store_bytes: Option<i64>,
     cache_token: Option<String>,
     ed25519_seed: Option<[u8; 32]>,
     key_name: Option<String>,
@@ -171,7 +170,6 @@ impl TenantSeed {
         Self {
             name: name.into(),
             gc_retention_hours: None,
-            gc_max_store_bytes: None,
             cache_token: None,
             ed25519_seed: None,
             key_name: None,
@@ -180,11 +178,6 @@ impl TenantSeed {
 
     pub fn with_retention_hours(mut self, hours: i32) -> Self {
         self.gc_retention_hours = Some(hours);
-        self
-    }
-
-    pub fn with_max_store_bytes(mut self, bytes: i64) -> Self {
-        self.gc_max_store_bytes = Some(bytes);
         self
     }
 
@@ -222,12 +215,11 @@ impl TenantSeed {
     pub async fn seed(self, pool: &PgPool) -> uuid::Uuid {
         let tid: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO tenants \
-             (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token) \
-             VALUES ($1, COALESCE($2, 168), $3, $4) RETURNING tenant_id",
+             (tenant_name, gc_retention_hours, cache_token) \
+             VALUES ($1, COALESCE($2, 168), $3) RETURNING tenant_id",
         )
         .bind(&self.name)
         .bind(self.gc_retention_hours)
-        .bind(self.gc_max_store_bytes)
         .bind(&self.cache_token)
         .fetch_one(pool)
         .await
