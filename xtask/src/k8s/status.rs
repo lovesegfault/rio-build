@@ -676,6 +676,11 @@ fn glyph(ok: bool) -> console::StyledObject<&'static str> {
     }
 }
 
+/// Max length of `f(x)` over `xs`, for column alignment in tabular output.
+fn col_width<T>(xs: &[T], f: impl Fn(&T) -> &str) -> usize {
+    xs.iter().map(|x| f(x).len()).max().unwrap_or(0)
+}
+
 #[allow(clippy::print_stderr)]
 fn header(s: &str) {
     eprintln!("{} {}", style("▸").blue(), style(s).bold());
@@ -712,12 +717,7 @@ fn render_human(r: &Report) {
         }
         eprintln!();
         header(&format!("Namespace {}", ns.name));
-        let w = ns
-            .deployments
-            .iter()
-            .map(|d| d.name.len())
-            .max()
-            .unwrap_or(0);
+        let w = col_width(&ns.deployments, |d| &d.name);
         for d in &ns.deployments {
             eprintln!(
                 "  {} {:w$}  {}/{} ready  {} updated",
@@ -728,12 +728,7 @@ fn render_human(r: &Report) {
                 d.updated
             );
         }
-        let w = ns
-            .daemonsets
-            .iter()
-            .map(|d| d.name.len())
-            .max()
-            .unwrap_or(0);
+        let w = col_width(&ns.daemonsets, |d| &d.name);
         for d in &ns.daemonsets {
             eprintln!(
                 "  {} {:w$}  {}/{} ready  {} scheduled",
@@ -762,12 +757,7 @@ fn render_human(r: &Report) {
     if r.builder_pools.is_empty() {
         eprintln!("  {} none", style("·").dim());
     }
-    let w = r
-        .builder_pools
-        .iter()
-        .map(|p| p.name.len())
-        .max()
-        .unwrap_or(0);
+    let w = col_width(&r.builder_pools, |p| &p.name);
     for p in &r.builder_pools {
         let ok = p.ready == p.desired && !p.scheduler_unreachable;
         let reason = p.reason.as_deref().unwrap_or("-");
@@ -793,12 +783,7 @@ fn render_human(r: &Report) {
     if r.fetcher_pools.is_empty() {
         eprintln!("  {} none", style("·").dim());
     }
-    let w = r
-        .fetcher_pools
-        .iter()
-        .map(|p| p.name.len())
-        .max()
-        .unwrap_or(0);
+    let w = col_width(&r.fetcher_pools, |p| &p.name);
     for p in &r.fetcher_pools {
         let ok = p.ready == p.desired;
         eprintln!(
@@ -814,7 +799,7 @@ fn render_human(r: &Report) {
     if let Some(subnets) = &r.subnets {
         eprintln!();
         header("Subnets (EKS)");
-        let w = subnets.iter().map(|s| s.az.len()).max().unwrap_or(0);
+        let w = col_width(subnets, |s| &s.az);
         for s in subnets {
             let ok = s.available_ips > 20 && !s.possibly_fragmented;
             let frag = if s.possibly_fragmented {
@@ -837,12 +822,7 @@ fn render_human(r: &Report) {
     if !r.stuck_nodeclaims.is_empty() {
         eprintln!();
         header("Stuck NodeClaims");
-        let w = r
-            .stuck_nodeclaims
-            .iter()
-            .map(|n| n.name.len())
-            .max()
-            .unwrap_or(0);
+        let w = col_width(&r.stuck_nodeclaims, |n| &n.name);
         for n in &r.stuck_nodeclaims {
             eprintln!(
                 "  {} {:w$}  {}  {}s  pool={}",
