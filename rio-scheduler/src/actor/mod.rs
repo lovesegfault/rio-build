@@ -42,7 +42,7 @@ mod debug;
 use debug::backdate;
 
 /// Channel capacity for the actor command channel.
-pub const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
+pub(crate) const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
 
 /// Max store paths per `PrefetchHint`. Shared between the initial-warm
 /// hint in `worker.rs` (`on_worker_registered`) and the per-dispatch
@@ -1075,9 +1075,10 @@ mod merge;
 pub(super) use breaker::CacheCheckBreaker;
 #[cfg(test)]
 pub(crate) use executor::compute_initial_prefetch_paths;
+pub use handle::ActorHandle;
 #[cfg(test)]
 pub(crate) use handle::DebugDerivationInfo;
-pub use handle::{ActorHandle, DebugExecutorInfo};
+pub(crate) use handle::DebugExecutorInfo;
 
 #[cfg(test)]
 pub(crate) mod tests;

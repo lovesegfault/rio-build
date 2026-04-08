@@ -33,8 +33,8 @@ pub mod health;
 pub mod log_stream;
 pub mod overlay;
 pub mod runtime;
-pub mod synth_db;
-pub mod upload;
+pub(crate) mod synth_db;
+pub(crate) mod upload;
 
 /// Register `# HELP` descriptions for all worker metrics.
 ///

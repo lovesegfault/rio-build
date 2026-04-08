@@ -32,7 +32,7 @@ mod tests;
 // Free fn — see `recovery.rs` for definition. Re-exported here so
 // callers (grpc/mod.rs, grpc/tests/bridge_tests.rs) keep using
 // `crate::db::read_event_log` without knowing the internal layout.
-pub use recovery::read_event_log;
+pub(crate) use recovery::read_event_log;
 
 // r[impl sched.db.partial-index-literal]
 /// Terminal statuses as a SQL `NOT IN` literal fragment.

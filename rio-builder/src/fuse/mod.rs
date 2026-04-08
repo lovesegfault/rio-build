@@ -15,12 +15,12 @@
 
 pub mod cache;
 pub mod circuit;
-pub mod lookup;
-pub mod read;
+mod lookup;
+mod read;
 
-pub mod fetch;
+pub(crate) mod fetch;
 
-pub use fetch::StoreClients;
+pub(crate) use fetch::StoreClients;
 mod inode;
 mod ops;
 

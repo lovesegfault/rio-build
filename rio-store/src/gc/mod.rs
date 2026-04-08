@@ -2,7 +2,7 @@
 //!
 //! # Phases
 //!
-//! 1. **Mark** ([`mark::compute_unreachable`]): recursive CTE over
+//! 1. **Mark** (`mark::compute_unreachable`): recursive CTE over
 //!    `narinfo."references"` from root seeds. Returns `store_path_hash`
 //!    for paths NOT reachable from any root.
 //!
@@ -39,7 +39,7 @@
 //! dangling chunk ref → GetPath fails).
 
 pub mod drain;
-pub mod mark;
+mod mark;
 pub mod orphan;
 pub mod sweep;
 pub mod tenant;
