@@ -21,7 +21,7 @@ use super::*;
 pub(super) struct MergeIngest {
     pub build_id: Uuid,
     /// Post-topdown-prune node set (may be smaller than the request's).
-    pub nodes: Vec<rio_proto::dag::DerivationNode>,
+    pub nodes: Vec<rio_proto::types::DerivationNode>,
     /// Only `edges.len()` survives past step 5 (for the total-time log);
     /// the edges themselves are consumed by `dag.merge` + persist.
     pub edges_len: usize,
@@ -413,7 +413,7 @@ impl DagActor {
         let newly_inserted = &merge_result.newly_inserted;
         // Rebuild node_index here: it borrows from `nodes`, so it can't
         // live in MergeIngest (self-referential). Cheap: one iter pass.
-        let node_index: HashMap<&str, &rio_proto::dag::DerivationNode> =
+        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         let mut t_phase = Instant::now();
