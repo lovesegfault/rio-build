@@ -30,9 +30,7 @@ Nix evaluation may block on build results. The gateway must handle this graceful
 
 Workers need a functional `/nix/store`. The FUSE + overlay approach introduces complexity:
 
-- The FUSE daemon must handle concurrent file access from multiple builds efficiently
-- Upper layer cleanup between builds must be deterministic (unique per-build directories, never reused)
-- The FUSE SSD cache requires LRU eviction and disk pressure monitoring
+- Upper layer cleanup must be deterministic (unique per-build directory, discarded with the pod)
 - The namespace ordering (FUSE mount → overlayfs → nix sandbox) must be correct; see [builder.md](components/builder.md)
 
 **Decided approach:** Each worker runs a FUSE filesystem (`rio-fuse`) that lazily fetches store paths from rio-store. Each build gets a per-build overlayfs with **stacked lowers** (host `/nix/store` first so nix-daemon and its dependencies are reachable, FUSE mount second for lazily-fetched paths) and a per-build synthetic SQLite database in the upper layer. This avoids shared mutable state, eliminates shared PV infrastructure, and provides local-disk performance via SSD caching. See [builder.md](components/builder.md) for full details.
@@ -95,7 +93,6 @@ When rio-store is overloaded or degraded, FUSE cache misses on workers become sl
 - **FUSE fetch timeout:** `fetch_extract_insert` wraps the entire gRPC-fetch-plus-stream-drain in `GRPC_STREAM_TIMEOUT` (300s). A stalled store returns `EIO` to the build rather than blocking a FUSE thread forever. Concurrent-fetch waiters (threads that hit the same path while a fetch is already in flight) time out after 30s and return `EAGAIN` (retryable) --- the wait is defensive, since the fetcher's Drop-guard fires even on panic.
 - **Scheduler cache-check circuit breaker:** the scheduler's `FindMissingPaths` cache-check trips open after 5 consecutive failures (`CacheCheckBreaker`). While open, SubmitBuild is rejected with `StoreUnavailable` instead of queueing every derivation as a cache miss. Half-open probe closes the breaker on the first success; auto-closes after 30s even without a probe.
 - **Scheduler backpressure:** actor-queue-depth hysteresis (80% activate, 60% deactivate) refuses new submissions when the actor is overloaded. Not store-health-aware --- it responds to actor congestion regardless of cause.
-- **Worker leaked-mount refusal:** the worker tracks overlay mounts that failed teardown (`max_leaked_mounts`, default 3) and refuses new builds above the threshold. This bounds FUSE-failure blast radius but does not directly signal store unavailability.
 - **Worker FUSE circuit breaker:** the worker tracks consecutive store-fetch failures; when the breaker opens, `HeartbeatRequest.store_degraded` is set and the scheduler excludes the worker from assignment via `has_capacity()`. See `r[builder.fuse.circuit-breaker]` + `r[builder.heartbeat.store-degraded]`.
 
 ## 12. Scheduler In-Memory DAG Scalability
@@ -114,11 +111,10 @@ The scheduler maintains the entire global DAG in memory via a single-owner actor
 
 ## 13. FUSE Local I/O Performance
 
-The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. Under heavy concurrent file I/O from multiple builds on the same worker, FUSE context switches between kernel and userspace could become a latency bottleneck --- even when the SSD cache is warm. This is a different risk from Challenge 11 (rio-store overload); this is about the local I/O path.
+The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. FUSE context switches between kernel and userspace could become a latency bottleneck --- even when the SSD cache is warm. This is a different risk from Challenge 11 (rio-store overload); this is about the local I/O path.
 
 **Concerns:**
 - Each file `read()` from the build sandbox crosses kernel → userspace → kernel. For builds that read thousands of small files (e.g., header-heavy C++ compilations), the overhead accumulates.
-- Multiple concurrent builds share the same FUSE daemon. Lock contention on the cache index could serialize reads.
 
 **Mitigations:**
 - Benchmark FUSE read latency (p50, p99) during the Phase 1a spike under concurrent load

@@ -73,7 +73,6 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `features` | list\<string\> | `[]` | `requiredSystemFeatures` this builder supports (all-match). Same env/TOML format as `systems`. |
 | `fuse_mount_point` | path | `/var/rio/fuse-store` | FUSE mount point. **Never** `/nix/store` --- that would shadow the host store. |
 | `fuse_cache_dir` | path | `/var/rio/cache` | Local SSD cache directory for rio-fuse |
-| `fuse_cache_size_gb` | u64 | 50 | Maximum FUSE cache size in GB (LRU eviction above this) |
 | `fuse_threads` | u32 | 4 | Number of FUSE daemon threads |
 | `fuse_passthrough` | bool | true | Enable kernel passthrough (Linux 6.9+). Disable only for debugging. |
 | `overlay_base_dir` | path | `/var/rio/overlays` | Base directory for per-build overlay upper/work layers |
@@ -82,7 +81,6 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `log_rate_limit` | u64 | 10000 | Maximum log lines per second per build (0 = unlimited) |
 | `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build (0 = unlimited) |
 | `size_class` | string | `""` | Size-class label (e.g., `small`, `large`). If the scheduler has `size_classes` configured, builders with an empty `size_class` are **rejected**. |
-| `max_leaked_mounts` | usize | 3 | After this many overlay-teardown (`umount2`) failures, the builder refuses new builds with `InfrastructureFailure`. |
 | `daemon_timeout_secs` | u64 | 7200 (2h) | Timeout for the local `nix-daemon --stdio` subprocess when the client didn't set `build_timeout`. |
 | `executor_kind` | enum | `builder` | `builder` (airgapped, regular derivations) or `fetcher` (egress-open, FODs only). Set via `RIO_EXECUTOR_KIND`. See [ADR-019](./decisions/019-builder-fetcher-split.md). |
 
@@ -126,18 +124,6 @@ Observability is configured via **environment variables only** (not figment/TOML
 
 The OTel service name is auto-set per component (not user-configurable). See [observability.md](./observability.md) for trace structure and metric details.
 
-## Retry Policy
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `retry_backoff_base` | Duration | 5s | Initial retry backoff duration |
-| `retry_backoff_multiplier` | f64 | 2.0 | Exponential backoff multiplier |
-| `retry_backoff_max` | Duration | 300s | Maximum backoff duration cap |
-| `retry_backoff_jitter` | f64 | 0.2 | Random jitter factor (0.0–1.0) added to backoff |
-| `retry_on_different_executor` | bool | true | Retry failed derivations on a different executor |
-
-Configured on the scheduler. See [errors.md](./errors.md) for retry semantics and failure classification.
-
 ## Multi-Tenancy Quotas
 
 | Parameter | Type | Default | Description |
@@ -155,15 +141,7 @@ The scheduler and store share a PostgreSQL cluster (separate schemas). This sect
 
 ### Connection Pooling
 
-All components use connection pooling via `sqlx`'s built-in pool. Key settings:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `database_pool_min` | u32 | 2 | Minimum idle connections per component |
-| `database_pool_max` | u32 | 10 | Maximum connections per component |
-| `database_acquire_timeout` | Duration | 30s | Timeout for acquiring a connection from the pool |
-
-For production deployments with many builder pods, deploy PgBouncer between components and PostgreSQL to multiplex connections. Use transaction-mode pooling (not session-mode) since rio-build does not use prepared statements across transaction boundaries.
+All components use connection pooling via `sqlx`'s built-in pool. For production deployments with many builder pods, deploy PgBouncer between components and PostgreSQL to multiplex connections. Use transaction-mode pooling (not session-mode) since rio-build does not use prepared statements across transaction boundaries.
 
 > **Note:** The scheduler's leader election uses a **Kubernetes Lease** (`coordination.k8s.io/v1`), not PostgreSQL. PgBouncer mode has no effect on leader election. See [scheduler: Leader Election](./components/scheduler.md#leader-election) for details.
 
@@ -179,7 +157,6 @@ Environment variable: `RIO_GRPC_MAX_MESSAGE_SIZE`
 
 - **Development:** Single PostgreSQL instance is sufficient.
 - **Production:** Use a managed HA service (RDS Multi-AZ, Cloud SQL HA, or Patroni on self-hosted). The store and scheduler tolerate brief leader failovers (connection retry with backoff).
-- **Read replicas:** Dashboard queries via `AdminService` can be directed to read replicas. Configure via `database_read_url` (optional; defaults to `database_url`).
 
 ### Schema Migration
 
@@ -187,7 +164,7 @@ Migrations are managed via `sqlx migrate` with numbered migration files in each 
 
 - **Forward-compatible:** New columns use `ADD COLUMN ... DEFAULT` so old code tolerates new schema.
 - **Blue-green safe:** During rolling deployments, both old and new code versions may run simultaneously. Migrations must be compatible with both.
-- **Rollback scripts:** Each migration has a corresponding `down.sql` for rollback. Tested in CI.
+- **Forward-only:** Migrations have no `down.sql`. Rollback is by deploying the previous binary version (it ignores unknown columns/tables).
 - **Migration on startup:** Each component runs pending migrations on startup (with an advisory lock to prevent concurrent migration).
 
 ## Configuration via CRD (Runtime)
