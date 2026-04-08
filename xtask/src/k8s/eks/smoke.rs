@@ -533,24 +533,37 @@ pub async fn ssh_banner(port: u16) -> Option<()> {
     buf.starts_with(b"SSH-2.0-").then_some(())
 }
 
+/// Poll until a namespaced CR exists and its `.status` subresource is set.
+async fn wait_cr_status<K>(client: &kube::Client, ns: &str, name: &'static str) -> Result<()>
+where
+    K: ::kube::Resource<Scope = ::kube::core::NamespaceResourceScope>
+        + ::kube::core::object::HasStatus
+        + Clone
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+    K::DynamicType: Default,
+{
+    let api: Api<K> = Api::namespaced(client.clone(), ns);
+    ui::poll_in(Duration::from_secs(5), 12, || {
+        let api = api.clone();
+        async move {
+            Ok(api
+                .get_opt(name)
+                .await?
+                .filter(|r| r.status().is_some())
+                .map(|_| ()))
+        }
+    })
+    .await
+}
+
 pub async fn step_builderpoolset_reconciled(client: &kube::Client) -> Result<()> {
     use rio_crds::builderpoolset::BuilderPoolSet;
     // The chart creates a BuilderPoolSet (not a BuilderPool); the
     // controller stamps out {set}-{class} child BuilderPools from it.
     // Polling the set's status is sufficient: the controller writes
     // status.classes[] only after all child pools are reconciled.
-    let api: Api<BuilderPoolSet> = Api::namespaced(client.clone(), NS_BUILDERS);
-    ui::poll_in(Duration::from_secs(5), 12, || {
-        let api = api.clone();
-        async move {
-            Ok(api
-                .get_opt(BUILDER_POOL_SET)
-                .await?
-                .and_then(|wp| wp.status)
-                .map(|_| ()))
-        }
-    })
-    .await
+    wait_cr_status::<BuilderPoolSet>(client, NS_BUILDERS, BUILDER_POOL_SET).await
 }
 
 pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
@@ -559,18 +572,7 @@ pub async fn step_fetcherpool_reconciled(client: &kube::Client) -> Result<()> {
     // poll the x86-64 one (smoke runs from x86 host).
     // SMOKE_EXPR's builtin:fetchurl FOD queues forever without a
     // reconciled fetcher (P0452 hard-split: FODs never go to builders).
-    let api: Api<FetcherPool> = Api::namespaced(client.clone(), NS_FETCHERS);
-    ui::poll_in(Duration::from_secs(5), 12, || {
-        let api = api.clone();
-        async move {
-            Ok(api
-                .get_opt(FETCHER_POOL)
-                .await?
-                .and_then(|fp| fp.status)
-                .map(|_| ()))
-        }
-    })
-    .await
+    wait_cr_status::<FetcherPool>(client, NS_FETCHERS, FETCHER_POOL).await
 }
 
 pub async fn step_status(cli: &CliCtx) -> Result<()> {
