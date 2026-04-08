@@ -436,7 +436,6 @@ fn nar_chunk_stream(
 mod tests {
     use super::*;
     use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
-    use crate::grpc::StoreServiceImpl;
     use crate::signing::Signer;
     use crate::test_helpers::TenantSeed;
     use axum::body::Body;
@@ -466,63 +465,40 @@ mod tests {
         (router(state), db, backend)
     }
 
-    /// Upload a path via the store gRPC layer (reuses the same PG).
-    /// Returns (store_path, nar_hash, nar_bytes) for assertions.
+    /// Seed narinfo + inline-manifest rows directly via metadata fns.
+    /// Bypasses the gRPC layer but produces the same DB state the
+    /// cache server reads. Returns (store_path, nar_hash, nar_bytes).
     async fn seed_path(
         pool: &PgPool,
-        backend: Arc<MemoryChunkBackend>,
         name: &str,
         signer: Option<Signer>,
     ) -> (StorePath, [u8; 32], Vec<u8>) {
         use rio_test_support::fixtures::{make_nar, make_path_info_for_nar, test_store_path};
 
-        // Direct seeding via metadata functions — bypasses the gRPC
-        // layer but produces the SAME DB state the cache server reads.
-        // Constructing a tonic Streaming without a real transport is
-        // awkward; this is simpler and tests what matters (the HTTP
-        // side reads the right DB state).
-        let _ = (StoreServiceImpl::new, backend); // silence unused-import; kept for doc context
         let store_path = StorePath::parse(&test_store_path(name)).unwrap();
         let (nar, _) = make_nar(name.as_bytes());
-        let info = make_path_info_for_nar(store_path.as_str(), &nar);
-        let nar_hash = info.nar_hash;
-
-        let store_path_hash = store_path.sha256_digest().to_vec();
+        let mut info = make_path_info_for_nar(store_path.as_str(), &nar);
+        info.store_path_hash = store_path.sha256_digest().to_vec();
 
         // Signature computed manually (same as maybe_sign would do).
-        let mut sigs = Vec::new();
         if let Some(ref s) = signer {
             let fp = rio_nix::narinfo::fingerprint(
                 store_path.as_str(),
-                &nar_hash,
+                &info.nar_hash,
                 nar.len() as u64,
                 &[],
             );
-            sigs.push(s.sign(&fp));
+            info.signatures.push(s.sign(&fp));
         }
-        let _ = signer;
 
-        metadata::insert_manifest_uploading(pool, &store_path_hash, store_path.as_str(), &[])
+        metadata::insert_manifest_uploading(pool, &info.store_path_hash, store_path.as_str(), &[])
+            .await
+            .unwrap();
+        metadata::complete_manifest_inline(pool, &info, Bytes::from(nar.clone()))
             .await
             .unwrap();
 
-        let validated = rio_proto::validated::ValidatedPathInfo {
-            store_path: store_path.clone(),
-            store_path_hash,
-            deriver: None,
-            nar_hash,
-            nar_size: nar.len() as u64,
-            references: vec![],
-            registration_time: 0,
-            ultimate: false,
-            signatures: sigs,
-            content_address: None,
-        };
-        metadata::complete_manifest_inline(pool, &validated, Bytes::from(nar.clone()))
-            .await
-            .unwrap();
-
-        (store_path, nar_hash, nar)
+        (store_path, info.nar_hash, nar)
     }
 
     // ------------------------------------------------------------------------
@@ -625,8 +601,8 @@ mod tests {
 
     #[tokio::test]
     async fn narinfo_found() {
-        let (app, db, backend) = setup().await;
-        let (store_path, nar_hash, _) = seed_path(&db.pool, backend, "narinfo-test", None).await;
+        let (app, db, _backend) = setup().await;
+        let (store_path, nar_hash, _) = seed_path(&db.pool, "narinfo-test", None).await;
         let hash_part = store_path.hash_part();
 
         let resp = app
@@ -671,13 +647,13 @@ mod tests {
 
     #[tokio::test]
     async fn narinfo_includes_signature() {
-        let (app, db, backend) = setup().await;
+        let (app, db, _backend) = setup().await;
         use base64::Engine;
         let seed = [0x55u8; 32];
         let b64 = base64::engine::general_purpose::STANDARD.encode(seed);
         let signer = Signer::parse(&format!("test-cache:{b64}")).unwrap();
 
-        let (store_path, _, _) = seed_path(&db.pool, backend, "narinfo-signed", Some(signer)).await;
+        let (store_path, _, _) = seed_path(&db.pool, "narinfo-signed", Some(signer)).await;
         let hash_part = store_path.hash_part();
 
         let resp = app
@@ -766,8 +742,7 @@ mod tests {
         // Seed a path. seed_path writes narinfo + manifest (both
         // status=complete). No path_tenants row yet — neither tenant
         // owns it.
-        let (store_path, _, _) =
-            seed_path(&db.pool, Arc::clone(&backend), "tenant-scoped", None).await;
+        let (store_path, _, _) = seed_path(&db.pool, "tenant-scoped", None).await;
         let hash_part = store_path.hash_part();
         // Keying for path_tenants matches scheduler's upsert
         // (db.rs:661 — sha2::Sha256 of the full path string).
@@ -864,10 +839,10 @@ mod tests {
     /// applied here, it would 404.
     #[tokio::test]
     async fn narinfo_anonymous_unfiltered() {
-        let (app, db, backend) = setup().await;
+        let (app, db, _backend) = setup().await;
         // seed_path writes narinfo but NOT path_tenants. setup() uses
         // allow_unauthenticated=true → tenant_id=None → unfiltered query.
-        let (store_path, _, _) = seed_path(&db.pool, backend, "anon-unfiltered", None).await;
+        let (store_path, _, _) = seed_path(&db.pool, "anon-unfiltered", None).await;
         let hash_part = store_path.hash_part();
 
         // Precondition: confirm no path_tenants row — otherwise this
@@ -899,8 +874,8 @@ mod tests {
 
     #[tokio::test]
     async fn nar_roundtrip_decompresses() {
-        let (app, db, backend) = setup().await;
-        let (_, nar_hash, original_nar) = seed_path(&db.pool, backend, "nar-roundtrip", None).await;
+        let (app, db, _backend) = setup().await;
+        let (_, nar_hash, original_nar) = seed_path(&db.pool, "nar-roundtrip", None).await;
 
         let hash_b32 = nixbase32::encode(&nar_hash);
         let resp = app
@@ -975,8 +950,8 @@ mod tests {
     /// don't need the length.
     #[tokio::test]
     async fn nar_streaming_no_content_length() {
-        let (app, db, backend) = setup().await;
-        let (_, nar_hash, _) = seed_path(&db.pool, backend, "streaming", None).await;
+        let (app, db, _backend) = setup().await;
+        let (_, nar_hash, _) = seed_path(&db.pool, "streaming", None).await;
 
         let hash_b32 = nixbase32::encode(&nar_hash);
         let resp = app
