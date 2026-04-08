@@ -354,6 +354,7 @@ in
           # r[verify builder.fuse.lookup-caches+2]
           # r[verify builder.fuse.jit-lookup]
           # r[verify builder.fuse.jit-register]
+          # r[verify builder.fuse.passthrough]
           "fanout"
           "fuse-direct"
           "overlay-readdir"
