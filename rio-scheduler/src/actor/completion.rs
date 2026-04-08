@@ -764,6 +764,102 @@ impl DagActor {
                 .collect();
         }
 
+        let skipped_interested = self
+            .complete_ca_bookkeeping(drv_hash, &result.built_outputs)
+            .await;
+
+        // I-209: persist_status(.., Completed, ..) now also closes the
+        // active assignments row (db-layer fold) — the explicit
+        // update_assignment_status that lived here is redundant.
+        self.persist_status(drv_hash, DerivationStatus::Completed, None)
+            .await;
+        self.unpin_best_effort(drv_hash).await;
+
+        self.record_build_history(
+            drv_hash,
+            result,
+            (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
+        )
+        .await;
+
+        // Emit derivation completed event
+        let output_paths: Vec<String> = self
+            .dag
+            .node(drv_hash)
+            .map(|s| s.output_paths.clone())
+            .unwrap_or_default();
+
+        let interested_builds = self.get_interested_builds(drv_hash);
+        for build_id in &interested_builds {
+            self.emit_build_event(
+                *build_id,
+                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
+                    derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                    status: Some(rio_proto::dag::derivation_event::Status::Completed(
+                        rio_proto::dag::DerivationCompleted {
+                            output_paths: output_paths.clone(),
+                        },
+                    )),
+                }),
+            );
+        }
+
+        // Trigger log flush AFTER the Completed event has gone out. By the
+        // time the gateway sees Completed, the ring buffer still has the full
+        // log (flusher hasn't drained yet — it's async on a separate task).
+        // So AdminService.GetBuildLogs can serve from the ring buffer in the
+        // gap between Completed and the S3 upload landing.
+        self.trigger_log_flush(drv_hash, interested_builds.clone());
+
+        // r[impl sched.gc.path-tenants-upsert]
+        self.upsert_path_tenants_for(drv_hash).await;
+
+        // Update ancestor priorities: this node is now terminal, so it
+        // no longer contributes to its parents' max-child-priority.
+        // Done BEFORE releasing downstream because the newly-ready
+        // nodes will be pushed to the queue by priority, and their
+        // priority is already correct from compute_initial at merge
+        // time. The ancestors that change are NOT newly-ready (they
+        // were already in the queue or beyond) — the queue's lazy
+        // invalidation handles re-pushing them if needed.
+        //
+        // Also emit the accuracy metric: how close was our estimate?
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.sched.est_duration > 0.0
+            && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
+        {
+            let actual_secs = stop.seconds.saturating_sub(start.seconds) as f64;
+            if actual_secs > 0.0 {
+                metrics::histogram!("rio_scheduler_critical_path_accuracy")
+                    .record(actual_secs / state.sched.est_duration);
+            }
+        }
+        crate::critical_path::update_ancestors(&mut self.dag, drv_hash);
+        phase!("4-update-ancestors");
+
+        self.release_downstream(drv_hash, &interested_builds, skipped_interested)
+            .await;
+        phase!("5-newly-ready+per-build-counts");
+        let _ = &mut t_phase;
+        let total = t_total.elapsed();
+        if total >= std::time::Duration::from_secs(1) {
+            debug!(elapsed = ?total, drv_hash = %drv_hash, "handle_success_completion total");
+        }
+    }
+
+    /// Phases 2-5 of success completion for content-addressed
+    /// derivations: realisation insert, cutoff-compare, cutoff-
+    /// propagate cascade, realisation_deps insert. All four are
+    /// no-ops for IA derivations (each block gates on `state.ca.is_ca`
+    /// / `state.ca.modular_hash` internally). Returns the union of
+    /// `interested_builds` over all cascade-skipped nodes — the caller
+    /// folds these into its `check_build_completion` loop so a merged
+    /// build the trigger does NOT belong to still terminates.
+    async fn complete_ca_bookkeeping(
+        &mut self,
+        drv_hash: &DrvHash,
+        built_outputs: &[rio_proto::build_types::BuiltOutput],
+    ) -> HashSet<Uuid> {
         // r[impl sched.ca.resolve+2]
         // Realisation insert: for a CA derivation, write
         // `(modular_hash, output_name) → (output_path, output_hash)`
@@ -797,10 +893,10 @@ impl DagActor {
             // maskOutputs env-masking gap was one such divergence).
             info!(
                 drv_hash = %hex::encode(modular_hash),
-                outputs = result.built_outputs.len(),
+                outputs = built_outputs.len(),
                 "insert_realisation: CA build complete, writing realisations"
             );
-            for output in &result.built_outputs {
+            for output in built_outputs {
                 let Ok(output_hash): Result<[u8; 32], _> = output.output_hash.as_slice().try_into()
                 else {
                     debug!(
@@ -867,8 +963,8 @@ impl DagActor {
             && state.ca.is_ca
             && let Some(modular_hash) = state.ca.modular_hash
         {
-            let mut all_matched = !result.built_outputs.is_empty();
-            for (i, output) in result.built_outputs.iter().enumerate() {
+            let mut all_matched = !built_outputs.is_empty();
+            for (i, output) in built_outputs.iter().enumerate() {
                 if output.output_path.is_empty() {
                     debug!(
                         drv_hash = %drv_hash,
@@ -933,7 +1029,7 @@ impl DagActor {
                 // fold semantics). Remaining lookups can't flip
                 // `all_matched` back to true.
                 if !matched {
-                    let skipped = result.built_outputs.len() - i - 1;
+                    let skipped = built_outputs.len() - i - 1;
                     if skipped > 0 {
                         metrics::counter!(
                             "rio_scheduler_ca_hash_compares_total",
@@ -1107,8 +1203,7 @@ impl DagActor {
             && !state.ca.pending_realisation_deps.is_empty()
         {
             let lookups = std::mem::take(&mut state.ca.pending_realisation_deps);
-            let output_names: Vec<String> = result
-                .built_outputs
+            let output_names: Vec<String> = built_outputs
                 .iter()
                 .map(|o| o.output_name.clone())
                 .collect();
@@ -1129,14 +1224,18 @@ impl DagActor {
             }
         }
 
-        // I-209: persist_status(.., Completed, ..) now also closes the
-        // active assignments row (db-layer fold) — the explicit
-        // update_assignment_status that lived here is redundant.
-        self.persist_status(drv_hash, DerivationStatus::Completed, None)
-            .await;
-        self.unpin_best_effort(drv_hash).await;
+        skipped_interested
+    }
 
-        // Async: update build history EMA (best-effort statistics)
+    /// Phase 7 of success completion: build_history EMA update,
+    /// build_samples insert (rebalancer feed), and misclassification
+    /// penalty. All best-effort statistics — never fails completion.
+    async fn record_build_history(
+        &mut self,
+        drv_hash: &DrvHash,
+        result: &rio_proto::build_types::BuildResult,
+        (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
+    ) {
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(pname) = &state.pname
             && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
@@ -1296,67 +1395,19 @@ impl DagActor {
                 }
             }
         }
+    }
 
-        // Emit derivation completed event
-        let output_paths: Vec<String> = self
-            .dag
-            .node(drv_hash)
-            .map(|s| s.output_paths.clone())
-            .unwrap_or_default();
-
-        let interested_builds = self.get_interested_builds(drv_hash);
-        for build_id in &interested_builds {
-            self.emit_build_event(
-                *build_id,
-                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
-                    derivation_path: self.drv_path_or_hash_fallback(drv_hash),
-                    status: Some(rio_proto::dag::derivation_event::Status::Completed(
-                        rio_proto::dag::DerivationCompleted {
-                            output_paths: output_paths.clone(),
-                        },
-                    )),
-                }),
-            );
-        }
-
-        // Trigger log flush AFTER the Completed event has gone out. By the
-        // time the gateway sees Completed, the ring buffer still has the full
-        // log (flusher hasn't drained yet — it's async on a separate task).
-        // So AdminService.GetBuildLogs can serve from the ring buffer in the
-        // gap between Completed and the S3 upload landing.
-        self.trigger_log_flush(drv_hash, interested_builds.clone());
-
-        // r[impl sched.gc.path-tenants-upsert]
-        self.upsert_path_tenants_for(drv_hash).await;
-
-        // Update ancestor priorities: this node is now terminal, so it
-        // no longer contributes to its parents' max-child-priority.
-        // Parents' priorities DROP. Propagates up until unchanged
-        // (dirty-flag stop).
-        //
-        // Done BEFORE releasing downstream because the newly-ready
-        // nodes will be pushed to the queue by priority, and their
-        // priority is already correct from compute_initial at merge
-        // time. The ancestors that change are NOT newly-ready (they
-        // were already in the queue or beyond) — the queue's lazy
-        // invalidation handles re-pushing them if needed.
-        //
-        // Also emit the accuracy metric: how close was our estimate?
-        // Histogram of actual/estimated. 1.0 = perfect, >1.0 = took
-        // longer than expected. Helps tune the estimator.
-        if let Some(state) = self.dag.node(drv_hash)
-            && state.sched.est_duration > 0.0
-            && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
-        {
-            let actual_secs = stop.seconds.saturating_sub(start.seconds) as f64;
-            if actual_secs > 0.0 {
-                metrics::histogram!("rio_scheduler_critical_path_accuracy")
-                    .record(actual_secs / state.sched.est_duration);
-            }
-        }
-        crate::critical_path::update_ancestors(&mut self.dag, drv_hash);
-        phase!("4-update-ancestors");
-
+    /// Final phases of success completion: release newly-ready
+    /// dependents (find_newly_ready → push_ready) and per-build
+    /// completion check. `interested_builds` is the trigger's set;
+    /// `skipped_interested` (from CA cutoff cascade) is unioned in so a
+    /// merged build the trigger does NOT belong to still terminates.
+    async fn release_downstream(
+        &mut self,
+        drv_hash: &DrvHash,
+        interested_builds: &[Uuid],
+        skipped_interested: HashSet<Uuid>,
+    ) {
         // Release downstream: find newly ready derivations.
         // push_ready handles interactive boost via priority.
         let newly_ready = self.dag.find_newly_ready(drv_hash);
@@ -1369,7 +1420,6 @@ impl DagActor {
                 self.push_ready(ready_hash);
             }
         }
-        phase!("5-newly-ready");
 
         // Update build completion status. Union the trigger's
         // interested_builds with skipped nodes' — a CA-cutoff-skipped
@@ -1392,12 +1442,6 @@ impl DagActor {
             // user-visible state change, and the scan is already paid.
             self.emit_progress_with(build_id, &summary);
             self.check_build_completion(build_id).await;
-        }
-        phase!("6-per-build-counts");
-        let _ = &mut t_phase;
-        let total = t_total.elapsed();
-        if total >= std::time::Duration::from_secs(1) {
-            debug!(elapsed = ?total, drv_hash = %drv_hash, "handle_success_completion total");
         }
     }
 
