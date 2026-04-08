@@ -329,13 +329,12 @@ spec:
               terminationGracePeriodSeconds:
                 description: "Pod terminationGracePeriodSeconds. SIGTERM \u2192 executor\
                   \ drain\n(DrainExecutor + wait for in-flight builds to complete).\
-                  \ After\nthis many seconds: SIGKILL, builds lost. Also bounds the\n\
-                  finalizer's cleanup() wait (grace + 60s slop for kubelet/STS\nstatus\
-                  \ observation).\n\nDefault 7200 (2h) \u2014 nix builds can legitimately\
-                  \ take that\nlong (LLVM from cold ccache, full NixOS closure). Clusters\n\
-                  with known-shorter builds (e.g., VM test fixtures with \u226490s\n\
-                  sleeps) should set this lower so BuilderPool deletion doesn't\n\
-                  stall on a stuck/never-Ready pod for 2h."
+                  \ After\nthis many seconds: SIGKILL, builds lost.\n\nDefault 7200\
+                  \ (2h) \u2014 nix builds can legitimately take that\nlong (LLVM\
+                  \ from cold ccache, full NixOS closure). Clusters\nwith known-shorter\
+                  \ builds (e.g., VM test fixtures with \u226490s\nsleeps) should\
+                  \ set this lower so BuilderPool deletion doesn't\nstall on a stuck/never-Ready\
+                  \ pod for 2h."
                 format: int64
                 nullable: true
                 type: integer

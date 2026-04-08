@@ -243,9 +243,7 @@ pub struct BuilderPoolSpec {
 
     /// Pod terminationGracePeriodSeconds. SIGTERM → executor drain
     /// (DrainExecutor + wait for in-flight builds to complete). After
-    /// this many seconds: SIGKILL, builds lost. Also bounds the
-    /// finalizer's cleanup() wait (grace + 60s slop for kubelet/STS
-    /// status observation).
+    /// this many seconds: SIGKILL, builds lost.
     ///
     /// Default 7200 (2h) — nix builds can legitimately take that
     /// long (LLVM from cold ccache, full NixOS closure). Clusters

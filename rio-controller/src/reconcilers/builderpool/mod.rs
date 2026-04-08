@@ -13,9 +13,10 @@
 //! rio-controller`, K8s merges. Idempotent — same patch twice is
 //! a no-op. No GET-modify-PUT race.
 //!
-//! Finalizer wraps everything: delete → cleanup (DrainExecutor +
-//! scale STS to 0 + wait for pods gone) → finalizer removed →
-//! K8s GC's the children via ownerReference.
+//! Finalizer wraps everything: delete → cleanup() is a no-op (Jobs
+//! carry an ownerReference to the BuilderPool) → finalizer removed →
+//! K8s ownerRef-GC cascades to the Jobs → their pods get SIGTERM and
+//! drain at the executor level.
 
 use std::sync::Arc;
 use std::time::Duration;
