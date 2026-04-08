@@ -10,11 +10,10 @@
 //!      build → pod terminates → `ttlSecondsAfterFinished`
 //!      ([`JOB_TTL_SECS`]) reaps the Job.
 //!
-//! From the scheduler's perspective, an ephemeral Job pod is
-//! indistinguishable from an STS pod: it heartbeats in, gets a
-//! dispatch, sends CompletionReport, disconnects. No scheduler-side
-//! changes needed. The "ephemeral" property is purely worker-side
-//! (exit after one build) + controller-side (Job lifecycle, not STS).
+//! From the scheduler's perspective the Job pod is just an executor:
+//! it heartbeats in, gets a dispatch, sends CompletionReport,
+//! disconnects. The "ephemeral" property is purely executor-side
+//! (exit after one build) + controller-side (Job lifecycle).
 //!
 //! # Why not a Scheduler→Controller RPC
 //!
@@ -26,9 +25,9 @@
 //!
 //! Polling ClusterStatus achieves the same outcome (Job spawned when
 //! work exists) with existing infrastructure. Latency is one
-//! reconciler requeue interval (~10s for ephemeral pools vs 5min for
-//! STS pools). For the "untrusted multi-tenant" use case where
-//! isolation > throughput, 10s added latency is acceptable. If
+//! reconciler requeue interval ([`EPHEMERAL_REQUEUE`], ~10s). For
+//! the "untrusted multi-tenant" use case where isolation >
+//! throughput, 10s added latency is acceptable. If
 //! sub-second dispatch later becomes a hard requirement, an RPC
 //! path can be reintroduced WITH an implementer — don't land
 //! declaration-only proto (the previous speculative
@@ -73,19 +72,17 @@ use super::job_common::{
     reap_excess_pending, reap_orphan_running, spawn_prerequisites, try_spawn_job,
 };
 
-/// Requeue interval for ephemeral pools. Shorter than the STS path's
-/// 5min because Job spawning is reactive to queue depth, not just
-/// spec drift. 10s: one queue-depth poll per tick. Shorter would
-/// mean more `ClusterStatus` RPCs to the scheduler (cheap, but noise)
-/// and more `kubectl get jobs` calls (apiserver load). Longer
-/// lengthens dispatch latency.
+/// Requeue interval. Job spawning is reactive to queue depth, so the
+/// tick rate is the dispatch-latency floor. 10s: one queue-depth
+/// poll per tick. Shorter → more `ClusterStatus` RPCs to the
+/// scheduler (cheap, but noise) and more `kubectl get jobs` calls
+/// (apiserver load). Longer lengthens dispatch latency.
 ///
-/// This is the PRIMARY latency cost of ephemeral vs STS: an STS
-/// worker is already heartbeating when the derivation arrives
-/// (dispatch latency ~ms); an ephemeral worker needs one requeue
-/// interval + pod scheduling + container pull + FUSE mount +
-/// heartbeat (~10s + 10-30s). For "isolation > throughput" this
-/// is the tradeoff.
+/// Cold-start cost: a queued derivation waits one requeue interval
+/// plus pod scheduling, container pull, FUSE mount, and first
+/// heartbeat (~10s + 10-30s) before the scheduler can dispatch to
+/// it. That is the isolation > throughput tradeoff inherent to
+/// one-pod-per-build.
 pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
 
 /// `ttlSecondsAfterFinished` on spawned Jobs. K8s TTL controller
@@ -296,7 +293,7 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     reap_orphan_running(&jobs_api, &jobs.items, ctx, &name, &wp.spec.size_class).await;
 
     // ---- Status patch ----
-    // Repurpose the STS-oriented fields. `replicas` = active Jobs;
+    // Status field names predate Jobs-only: `replicas` = active Jobs;
     // `readyReplicas` = same (a Job pod is "ready" when it's running;
     // we don't probe individual Job pods from here). `desiredReplicas`
     // = ceiling. SchedulerUnreachable condition reflects the poll
@@ -345,12 +342,12 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
 /// acceptable; the resource waste is not.
 ///
 /// Global-Q caveat: for unclassified pools, `queued` is cluster-
-/// wide (per-system filtered). With mixed STS+ephemeral pools,
-/// some queued derivations will go to STS workers. This formula
-/// over-counts need in that case — but headroom caps it, and the
-/// STS workers draining Q on the next tick self-corrects. Pools
-/// with `size_class` set use per-class depth (see
-/// [`queued_for_pool`]) so this caveat doesn't apply to them.
+/// wide (per-system filtered). Multiple unclassified pools each
+/// see the same global depth and over-count need collectively —
+/// but per-pool headroom caps it, and the next tick after dispatch
+/// drains Q self-corrects. Pools with `size_class` set use
+/// per-class depth (see [`queued_for_pool`]) so this caveat
+/// doesn't apply to them.
 pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
     queued.saturating_sub(active).min(headroom)
 }
@@ -446,10 +443,9 @@ pub(super) fn build_job(
     let pool = wp.name_any();
     let labels = builders::labels(wp);
 
-    // Same cache-size parse as build_statefulset. Ephemeral workers
-    // still get a FUSE cache (emptyDir) — it's just wiped when the
-    // pod terminates. The RIO_FUSE_CACHE_SIZE_GB env is still needed
-    // for the worker's internal LRU bookkeeping.
+    // FUSE cache (emptyDir) is wiped when the pod terminates.
+    // RIO_FUSE_CACHE_SIZE_GB env is still needed for the executor's
+    // internal LRU bookkeeping.
     let cache_quantity = Quantity(wp.spec.fuse_cache_size.clone());
     let cache_gb = builders::parse_quantity_to_gb(&wp.spec.fuse_cache_size)?;
 
@@ -459,8 +455,8 @@ pub(super) fn build_job(
     // restartPolicy: Never is REQUIRED by K8s for Jobs with
     // backoffLimit=0. "Always" (the PodSpec default) is rejected.
     pod_spec.restart_policy = Some("Never".into());
-    // I-090: ephemeral Jobs bin-pack — STS-mode spread is for HA of
-    // long-lived pods, wasteful here (one node per Job).
+    // I-090: bin-pack — anti-affinity/spread is for HA of long-lived
+    // pods, wasteful for one-shot Jobs (one node per Job).
     pod_spec.affinity = None;
     pod_spec.topology_spread_constraints = None;
     // I-114: liveness probe (1s timeout, 3 fails → kill) can fire
@@ -471,17 +467,18 @@ pub(super) fn build_job(
     pod_spec.containers[0].liveness_probe = None;
     pod_spec.containers[0].readiness_probe = None;
     pod_spec.containers[0].startup_probe = None;
-    // I-120: 7200s grace is for STS-mode drain (let in-flight build
-    // finish). Ephemeral pods do ONE build; on SIGTERM they should
-    // exit fast. 30s covers FUSE unmount + completion report.
+    // I-120: the spec's 7200s grace default is for letting in-flight
+    // builds finish on drain; one-shot Job pods do ONE build, so on
+    // SIGTERM they should exit fast. 30s covers FUSE unmount +
+    // completion report.
     pod_spec.termination_grace_period_seconds = Some(30);
 
     // Random suffix: 6 lowercase alphanumeric. Not crypto; just
     // avoiding collisions. The executor_id downward-API pattern
-    // from common/sts.rs means each pod's RIO_EXECUTOR_ID is the
+    // from common/pod.rs means each pod's RIO_EXECUTOR_ID is the
     // Job's pod name (also random-suffixed by K8s on top of our
-    // suffix) — unique per ephemeral pod, which is what the
-    // scheduler needs for its executors map.
+    // suffix) — unique per pod, which is what the scheduler needs
+    // for its executors map.
     // K8s name limit: 63 chars. `rio-builder-{pool}-{6}` = pool+19.
     // Pool names are short (<20 chars); a 49+ char pool gets a
     // clear K8s rejection — no silent truncation.
@@ -818,15 +815,10 @@ mod tests {
     /// This isn't a controller bug — `build_job → build_pod_spec →
     /// executor_params` reads `wp.spec.tls_secret_name` correctly.
     /// The `None` at the build_pod_spec call site is `resources_
-    /// override`, not TLS. But the STS path has `statefulset_tls_
-    /// secret_mounted_when_set` and the ephemeral path didn't have
-    /// the equivalent — so when the live pod was missing TLS, "is
+    /// override`, not TLS. When the live pod was missing TLS, "is
     /// build_job dropping it?" was an open question. This pins it
-    /// shut.
-    ///
-    /// Mirrors `tests/builders_tests.rs::statefulset_tls_secret_
-    /// mounted_when_set` — same volume/mount/env trio, sourced from
-    /// the same `common/sts.rs::build_executor_pod_spec`.
+    /// shut: same volume/mount/env trio, sourced from
+    /// `common/pod.rs::build_executor_pod_spec`.
     #[test]
     fn job_tls_secret_mounted_when_set() {
         let mut wp = test_wp();

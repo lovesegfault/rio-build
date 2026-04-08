@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 /// Pod sizing mode. ADR-020.
 ///
-/// `Static`: operator sets `spec.resources`, controller creates STS
-/// with those resources. ADR-015 behavior. Default.
+/// `Static`: operator sets `spec.resources`, controller spawns Jobs
+/// at those resources. ADR-015 behavior. Default.
 ///
 /// `Manifest`: controller polls `GetCapacityManifest` and spawns Jobs
 /// with per-derivation resources (P0503). `spec.resources` becomes the

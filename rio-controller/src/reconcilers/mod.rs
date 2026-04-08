@@ -3,8 +3,8 @@
 //! Each reconciler is a `fn(Arc<CR>, Arc<Ctx>) -> Result<Action>`.
 //! `Controller::new().owns().run()` calls it whenever the CR or an
 //! owned child changes. The reconcile fn makes the world match the
-//! spec: ensure StatefulSet exists with the right shape, patch
-//! status to reflect observed state.
+//! spec: spawn/reap Jobs to track demand, patch status to reflect
+//! observed state.
 //!
 //! Idempotent by construction: every reconcile starts from
 //! scratch, reads current state, computes desired, applies the
@@ -122,12 +122,9 @@ pub struct Ctx {
     /// provisioning) — acceptable. `learnedRatio` (the durable
     /// bit) stays in `.status`.
     pub component_low_ticks: Mutex<HashMap<String, u32>>,
-    /// Scale-down stabilization window. Shared between the
-    /// autoscaler (STS mode) and the manifest reconciler's per-
-    /// bucket idle grace. Same 600s default / env-tunable as
-    /// `ScalingTiming::scale_down_window` — the same anti-flap
-    /// rationale (don't kill workers right before the next burst)
-    /// applies per-bucket.
+    /// Scale-down stabilization window for the manifest reconciler's
+    /// per-bucket idle grace. 600s default / env-tunable — anti-flap:
+    /// don't reap surplus Jobs right before the next burst.
     pub scale_down_window: Duration,
 }
 

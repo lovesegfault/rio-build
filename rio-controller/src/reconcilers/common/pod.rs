@@ -140,9 +140,9 @@ pub struct ExecutorPodParams {
     pub extra_env: Vec<EnvVar>,
 
     // ── metadata ─────────────────────────────────────────────────
-    /// Pool CR name. STS name becomes `{pool_name}-{role}s`.
+    /// Pool CR name. Feeds [`job_name`] (`rio-{role}-{pool_name}-…`).
     pub pool_name: String,
-    /// Pool CR namespace. STS + pods live here.
+    /// Pool CR namespace. Jobs + pods live here.
     pub namespace: String,
 
     // ── scheduling ───────────────────────────────────────────────
@@ -195,8 +195,8 @@ impl ExecutorPodParams {
     }
 }
 
-/// Labels for the StatefulSet, headless Service, pod template, and
-/// PDB selector. Includes the ADR-019 `rio.build/role` label so
+/// Labels for Job + pod template. Includes the ADR-019
+/// `rio.build/role` label so
 /// NetworkPolicies and `kubectl get pods -l rio.build/role=fetcher`
 /// can target by role.
 pub fn executor_labels(p: &ExecutorPodParams) -> BTreeMap<String, String> {
@@ -237,7 +237,6 @@ pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str
 /// is the disambiguating SUFFIX (typically arch: `x86-64`, `aarch64`).
 const NAME_PREFIX: &str = "rio";
 
-/// STS name for a given pool. `rio-{role}-{pool_name}` — e.g. pool
 /// Job name. `rio-{role}-{pool_name}-{6-char-suffix}` — logs/metrics
 /// group naturally by role+pool prefix.
 pub fn job_name(pool_name: &str, role: ExecutorRole, suffix: &str) -> String {
@@ -530,8 +529,8 @@ fn build_executor_container(
                 env("RIO_FEATURES", &p.features.join(",")),
                 // Executor self-identification. figment reads
                 // `executor_id` → prefix RIO_ → `RIO_EXECUTOR_ID`.
-                // StatefulSet pods are `<sts-name>-<ordinal>` —
-                // unique, stable.
+                // Job pods are `<job-name>-<suffix>` — unique per
+                // pod (one build, one id).
                 env_from_field("RIO_EXECUTOR_ID", "metadata.name"),
                 // Role discriminator. rio-builder's `RIO_EXECUTOR_
                 // KIND` gates the FOD-vs-non-FOD refusal (ADR-019

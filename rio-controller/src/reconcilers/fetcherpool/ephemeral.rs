@@ -1,4 +1,4 @@
-//! Ephemeral FetcherPool: Job-per-FOD instead of StatefulSet.
+//! FetcherPool Job-per-FOD reconciler.
 //!
 //! Same Job lifecycle as `builderpool/ephemeral.rs` (see that
 //! module's header for the full design rationale — push-vs-poll,
@@ -186,8 +186,8 @@ pub(super) async fn reconcile_ephemeral(fp: &FetcherPool, ctx: &Ctx) -> Result<A
     )
     .await?;
 
-    // I-086: parity with STS-mode (mod.rs `reconciled FetcherPool`) and
-    // builderpool/mod.rs:481. Without this, an idle ephemeral pool is
+    // I-086: parity with builderpool's per-tick `reconciled` log line.
+    // Without this, an idle pool is
     // invisible at INFO and indistinguishable from a stuck reconciler.
     info!(
         pool = %name, queued = total_queued, active = total_active,
@@ -357,9 +357,9 @@ pub(super) fn build_job(
 
     let mut pod_spec = pod::build_executor_pod_spec(&params, scheduler, store);
     pod_spec.restart_policy = Some("Never".into());
-    // I-090: ephemeral Jobs are short-lived single-FOD downloads — the
-    // STS-mode anti-affinity/spread (HA for long-lived pods) makes
-    // karpenter provision one node per Job. Bin-pack instead.
+    // I-090: short-lived single-FOD Jobs — anti-affinity/spread
+    // (HA for long-lived pods) makes karpenter provision one node
+    // per Job. Bin-pack instead.
     pod_spec.affinity = None;
     pod_spec.topology_spread_constraints = None;
     // I-114: same as builderpool — drop liveness/readiness for one-shot Jobs.

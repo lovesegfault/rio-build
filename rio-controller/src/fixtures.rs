@@ -3,12 +3,12 @@
 //! The generic scenario-driven mock apiserver lives in
 //! `rio-test-support::kube_mock` (shared with rio-scheduler's
 //! lease election tests). This module keeps the rio-controller-
-//! specific scenario builders that know about BuilderPool/
-//! StatefulSet/Service/PDB shapes.
+//! specific scenario builders that know about BuilderPool/Job/
+//! PodSpec shapes.
 //!
 //! This tests the WIRING, not the business logic — that's what
-//! the pure unit tests on `build_statefulset` etc are for. Here
-//! we prove: apply() patches Service then StatefulSet then
+//! the pure unit tests on `build_executor_pod_spec` etc are for.
+//! Here we prove: apply() spawns Jobs then patches
 //! BuilderPool/status, in that order, with server-side-apply
 //! params. Get the order wrong → test fails.
 //!

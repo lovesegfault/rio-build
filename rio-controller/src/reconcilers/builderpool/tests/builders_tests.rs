@@ -819,13 +819,13 @@ fn job_pod_env_vars() {
             .unwrap()
             .field_path,
         "metadata.name",
-        "downward API: pod name (StatefulSet ordinal, unique)"
+        "downward API: pod name (unique per Job pod)"
     );
 }
 
 /// Worker tuning knobs: when set in the spec, they ARE injected.
-/// Complements the `statefulset_env_vars` assertions above (which
-/// check the unset → not-injected case).
+/// Complements the env-var assertions above (which check the
+/// unset → not-injected case).
 #[test]
 fn job_pod_worker_knobs_injected_when_set() {
     let mut wp = test_wp();

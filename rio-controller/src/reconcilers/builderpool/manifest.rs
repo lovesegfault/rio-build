@@ -31,7 +31,7 @@
 //!      supply)`. Over-provisioned (supply > demand) → zero spawns.
 //!   5. **Diff DOWN**: per bucket, `surplus = supply.saturating_sub(
 //!      demand)`. A bucket surplus for `scale_down_window` (600s
-//!      default, same as STS autoscaler anti-flap) → delete surplus
+//!      default — anti-flap) → delete surplus
 //!      Jobs. Skips Jobs whose pods are mid-build (`running_builds
 //!      > 0` via `ListExecutors`).
 //!   6. **Cold-start floor**: `queued_derivations - manifest.len()`
@@ -1013,7 +1013,7 @@ fn bucket_to_resources(bucket: Bucket) -> ResourceRequirements {
 /// REUSES `build_pod_spec` (same as ephemeral's `build_job`) with
 /// `resources_override: Some(bucket_to_resources(bucket))` when
 /// `bucket` is Some; `None` when cold-start (→ `spec.resources`
-/// floor, same as the STS path).
+/// floor).
 ///
 /// Differences from `ephemeral::build_job`:
 ///   - Per-bucket `ResourceRequirements` override

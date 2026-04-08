@@ -138,10 +138,10 @@ async fn reconcile_inner(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> 
 /// handles pre-CEL specs that the apiserver already accepted, but the
 /// OPERATOR doesn't know their spec is stale unless we surface it.
 ///
-/// Runs BEFORE the ephemeral branch in [`apply`] so both paths
-/// (STS-mode + ephemeral) get visibility. `build_pod_spec` is shared
-/// by both (ephemeral calls it via `build_job`), so any builder-side
-/// degrade applies to both; the Warning should too.
+/// Runs BEFORE the sizing branch in [`apply`] so both paths
+/// (Static + Manifest) get visibility — `build_pod_spec` is shared
+/// by both, so any builder-side degrade applies to both; the
+/// Warning should too.
 ///
 /// K8s Event reason for hostNetwork + !privileged spec-degrade.
 /// Referenced by disruption_tests.rs event-reason reachability tests.

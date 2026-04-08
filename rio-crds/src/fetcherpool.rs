@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 // CEL: classes[] and resources are mutually exclusive. When classes is
 // non-empty, per-class resources apply; the top-level field would be
 // ambiguous (which class does it size?). When classes is empty, the
-// single STS uses top-level resources — current behavior, back-compat.
+// single-size pool uses top-level resources.
 #[x_kube(
     validation = Rule::new(
         "size(self.classes) == 0 || !has(self.resources)"

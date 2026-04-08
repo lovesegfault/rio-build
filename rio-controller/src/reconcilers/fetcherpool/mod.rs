@@ -82,9 +82,9 @@ async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
     ephemeral::reconcile_ephemeral(&fp, ctx).await
 }
 
-/// Cleanup: ownerRef GC handles the STS + Service. Fetches are
-/// short-lived so there's no long terminationGracePeriod to wait
-/// through — just let GC proceed.
+/// Cleanup: ownerRef GC handles the Jobs. Fetches are short-lived
+/// so there's no long terminationGracePeriod to wait through —
+/// just let GC proceed.
 async fn cleanup(fp: Arc<FetcherPool>, _ctx: &Ctx) -> Result<Action> {
     info!(pool = %fp.name_any(), "FetcherPool deleted; ownerRef GC will clean up");
     Ok(Action::await_change())
@@ -130,15 +130,15 @@ fn executor_params(
     Ok(ExecutorPodParams {
         role: ExecutorRole::Fetcher,
         // ADR-019 §Sandbox hardening: rootfs tampering blocked. The
-        // overlay upperdir (tmpfs emptyDir in common/sts.rs) stays
+        // overlay upperdir (tmpfs emptyDir in common/pod.rs) stays
         // writable so build outputs still land.
         // TODO(P0455): add the fetcher.sandbox.strict-seccomp impl
         // marker here (readOnlyRootFilesystem half) once ADR-019 is
         // in tracey spec_include.
         read_only_root_fs: true,
         // r[impl ctrl.fetcherpool.classes]
-        // RIO_SIZE_CLASS: same env builders use (sts.rs:710 reads it
-        // from extra_env). The executor copies this into
+        // RIO_SIZE_CLASS: same env builders use (common/pod.rs reads
+        // it from extra_env). The executor copies this into
         // HeartbeatRequest.size_class → ExecutorState.size_class →
         // hard_filter's size-class match clause. Unclassed pool
         // (`class=None`) leaves it empty → executor reports
@@ -147,7 +147,8 @@ fn executor_params(
             .map(|c| vec![pod::env("RIO_SIZE_CLASS", &c.name)])
             .unwrap_or_default(),
         // r[impl ctrl.fetcherpool.multiarch]
-        // Per-class pool_name → STS name `rio-fetcher-{fp}-{class}`.
+        // Per-class pool_name → Job-name prefix
+        // `rio-fetcher-{fp}-{class}`.
         // P0556 had dropped the fp-name segment ("fetchers are a
         // single pool by convention"); multi-arch FetcherPools break
         // that — two pools `x86-64` and `aarch64` with the same
@@ -254,9 +255,9 @@ mod tests {
         fp
     }
 
-    /// The generated STS carries `rio.build/role: fetcher` on
-    /// both pod template labels and selector — NetworkPolicies
-    /// and `kubectl get -l` target this.
+    /// Generated Job pods carry `rio.build/role: fetcher` on the
+    /// pod template labels — NetworkPolicies and `kubectl get -l`
+    /// target this.
     #[test]
     fn labels_include_fetcher_role() {
         let fp = mk(2, 8);
@@ -323,9 +324,9 @@ mod tests {
 
     // r[verify ctrl.fetcherpool.classes]
     /// I-170: per-class params carry `RIO_SIZE_CLASS=<name>`, the
-    /// per-class resources, and a `{pool}-{class}` pool_name (→ STS
-    /// name `rio-fetcher-{pool}-{class}`). Security posture is
-    /// identical to the unclassed path.
+    /// per-class resources, and a `{pool}-{class}` pool_name
+    /// (→ Job-name prefix `rio-fetcher-{pool}-{class}`). Security
+    /// posture is identical to the unclassed path.
     #[test]
     fn per_class_params_set_size_class_and_resources() {
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
