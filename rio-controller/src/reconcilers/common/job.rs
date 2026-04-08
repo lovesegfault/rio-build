@@ -1,13 +1,18 @@
-//! Shared plumbing for the two Job-mode reconcilers (`manifest.rs`,
-//! `ephemeral.rs`). Both follow the same skeleton: list Jobs by label,
-//! filter active, diff against demand, spawn deficit, patch status.
-//! The diff is different (per-bucket vs flat-ceiling); the plumbing
-//! around it is the same.
+//! Shared plumbing for the Job-mode reconcilers (`builderpool::
+//! {ephemeral,manifest}` and `fetcherpool::ephemeral`). All follow the
+//! same skeleton: list Jobs by label, filter active, diff against
+//! demand, spawn deficit, reap excess, patch status. The diff is
+//! different (per-bucket vs flat-ceiling); the plumbing around it is
+//! the same.
 //!
 //! Extracted (P0513) after the mc=60 consolidator pass found 4
 //! byte-identical-or-near segments (~50L) plus two `super::ephemeral::`
 //! cross-refs from `manifest.rs` reaching into a sibling for helpers
-//! that belong in neither.
+//! that belong in neither. Moved from `builderpool/` to `common/` once
+//! `fetcherpool::ephemeral` started importing through the sibling
+//! reconciler.
+
+use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -19,8 +24,73 @@ use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::builderpool::BuilderPool;
 
-use super::MANAGER;
-use super::builders::{SchedulerAddrs, StoreAddrs};
+use super::pod::{SchedulerAddrs, StoreAddrs};
+
+/// Field manager for server-side apply on Job-mode pool resources
+/// (BuilderPool/FetcherPool status, owned Jobs). K8s tracks which
+/// fields each manager owns; conflicting managers get a 409 unless
+/// `force`. We use `force: true` — this controller is authoritative
+/// for what it manages. Shared by both pool reconcilers so a Job's
+/// SSA history shows one consistent manager regardless of which
+/// reconciler touched it.
+pub(crate) const MANAGER: &str = "rio-controller";
+
+/// Requeue interval for Job-mode reconcilers. Job spawning is reactive
+/// to queue depth, not just spec drift. 10s: one queue-depth poll per
+/// tick. Shorter would mean more `ClusterStatus` RPCs to the scheduler
+/// (cheap, but noise) and more `kubectl get jobs` calls (apiserver
+/// load). Longer lengthens dispatch latency: a worker needs one
+/// requeue interval + pod scheduling + container pull + FUSE mount +
+/// heartbeat (~10s + 10-30s) before the scheduler sees it.
+pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
+
+/// `ttlSecondsAfterFinished` on spawned Jobs. K8s TTL controller
+/// deletes the Job (and its pod, via ownerRef) this many seconds
+/// after it reaches Complete or Failed. 600s (10min): long enough
+/// that an operator debugging a failed build can `kubectl logs` the
+/// pod; short enough that Job churn doesn't accumulate. The SCHEDULER
+/// has already observed the completion (worker sent CompletionReport
+/// before exiting) so there's no rio-side dependency on the Job
+/// sticking around.
+pub(crate) const JOB_TTL_SECS: i32 = 600;
+
+/// Compute how many Jobs to spawn this tick.
+///
+/// `(queued - active).min(headroom)` — each active Job is treated as
+/// already claiming one queued derivation. This prevents the runaway
+/// where a single queued derivation triggers a fresh Job every 10s
+/// tick until the ceiling is hit:
+///
+///   - t=0:  queued=1, active=0 → spawn Job-A
+///   - t=10: queued=1, active=1 → old formula spawned Job-B (wrong);
+///     new formula: 1-1=0 → no spawn
+///   - t=20: Job-A's pod heartbeats, dispatch fires, queued→0
+///
+/// `queued_derivations` is `ready_queue.len()` on the scheduler side
+/// (actor/mod.rs compute_cluster_snapshot). A derivation stays in the
+/// ready_queue until a worker heartbeats and `dispatch_ready` pops it
+/// — NOT when we spawn the Job. Pod startup (schedule + pull + FUSE
+/// mount + first heartbeat) is ~10-30s; with a 10s requeue interval
+/// the old `queued.min(headroom)` formula fired 2-4 extra Jobs per
+/// build before the first pod came online.
+///
+/// Conservative bias: if some active Jobs are already busy (dispatched
+/// work, not starting), subtracting them under-spawns by that count.
+/// Next tick after those Jobs succeed corrects it. Under-spawn = one
+/// requeue interval of latency; over-spawn = wasted pod starts +
+/// idle workers heartbeating for work that doesn't exist. For the
+/// "isolation > throughput" ephemeral use case, the latency cost is
+/// acceptable; the resource waste is not.
+///
+/// Global-Q caveat: for unclassified pools, `queued` is cluster-
+/// wide (per-system filtered). With multiple unclassified pools,
+/// each over-counts need by what the others will claim — but
+/// headroom caps it, and the others draining Q on the next tick
+/// self-corrects. Pools with `size_class` set use per-class depth
+/// so this caveat doesn't apply to them.
+pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
+    queued.saturating_sub(active).min(headroom)
+}
 
 /// `(est_memory_bytes, est_cpu_millicores)` — manifest-mode bucket key.
 /// Shared between the manifest reconciler's internal maps and
@@ -59,7 +129,7 @@ pub(crate) fn is_active_job(j: &Job) -> bool {
 /// neither active nor failed. The manifest sweep cares only about
 /// the Failed dimension — Succeeded Jobs are reaped by
 /// `ttlSecondsAfterFinished`.
-pub(super) fn is_failed_job(j: &Job) -> bool {
+pub(crate) fn is_failed_job(j: &Job) -> bool {
     j.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0
 }
 
@@ -104,7 +174,7 @@ pub(crate) fn is_running_job(j: &Job) -> bool {
 /// well before this fires. The reap targets pods that CANNOT
 /// self-exit (I-165: D-state FUSE wait, OOM-loop) and would otherwise
 /// burn `activeDeadlineSeconds` (default 1h) holding a node.
-pub(crate) const ORPHAN_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(300);
 
 /// Minimum age before a Pending Job is reapable. `JobStatus.ready` is
 /// set by the K8s Job controller AFTER it observes pod readiness — a
@@ -114,7 +184,7 @@ pub(crate) const ORPHAN_REAP_GRACE: std::time::Duration = std::time::Duration::f
 /// requeue tick of grace makes the false-positive window negligible
 /// without materially delaying the I-183 reap (the bug is Jobs sitting
 /// for an HOUR; 10s grace is noise).
-pub(crate) const REAP_PENDING_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const REAP_PENDING_GRACE: Duration = Duration::from_secs(10);
 
 /// Pending Jobs in excess of `queued`, oldest-first — the reap set
 /// for `r[ctrl.ephemeral.reap-excess-pending]`.
@@ -131,7 +201,7 @@ pub(crate) const REAP_PENDING_GRACE: std::time::Duration = std::time::Duration::
 /// [`REAP_PENDING_GRACE`]. Passing `Duration::ZERO` disables the
 /// grace (tests).
 ///
-/// Oldest-first: same ordering as [`select_failed_jobs`]. The oldest
+/// Oldest-first: same ordering as `manifest::select_failed_jobs`. The oldest
 /// Pending Job has waited longest for a node; if Karpenter hasn't
 /// provisioned one by now it's likely the most stuck. Newest-first
 /// would reap the Job that's closest to scheduling.
@@ -140,11 +210,7 @@ pub(crate) const REAP_PENDING_GRACE: std::time::Duration = std::time::Duration::
 /// them. A Running pod may already hold an assignment; the scheduler's
 /// cancel-on-disconnect handles those when the gateway session that
 /// queued the work closes.
-pub(crate) fn select_excess_pending(
-    jobs: &[Job],
-    queued: u32,
-    min_age: std::time::Duration,
-) -> Vec<&Job> {
+pub(crate) fn select_excess_pending(jobs: &[Job], queued: u32, min_age: Duration) -> Vec<&Job> {
     let mut pending: Vec<&Job> = jobs
         .iter()
         .filter(|j| is_pending_job(j) && job_older_than(j, min_age))
@@ -244,7 +310,7 @@ pub(crate) async fn reap_excess_pending(
 /// `creation_timestamp` strictly before `now - min_age`. `None` →
 /// not-old-enough (conservative; same posture as
 /// [`select_excess_pending`]).
-fn job_older_than(j: &Job, min_age: std::time::Duration) -> bool {
+fn job_older_than(j: &Job, min_age: Duration) -> bool {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     let cutoff = Time(
         k8s_openapi::jiff::Timestamp::now()
@@ -280,7 +346,7 @@ fn job_older_than(j: &Job, min_age: std::time::Duration) -> bool {
 pub(crate) fn select_orphan_running<'a>(
     jobs: &'a [Job],
     executors: &[rio_proto::types::ExecutorInfo],
-    min_age: std::time::Duration,
+    min_age: Duration,
 ) -> Vec<&'a Job> {
     jobs.iter()
         .filter(|j| is_running_job(j) && job_older_than(j, min_age))
@@ -401,7 +467,7 @@ pub(crate) async fn reap_orphan_running(
 /// namespace-missing case is `InvalidSpec` not `NotFound` — a
 /// BuilderPool without `.metadata.namespace` is a cluster-scoped
 /// apply error (the CRD is `Namespaced`), not a transient condition.
-pub(super) fn job_reconcile_prologue(
+pub(crate) fn job_reconcile_prologue(
     wp: &BuilderPool,
     ctx: &Ctx,
 ) -> Result<(String, String, Api<Job>)> {
@@ -418,7 +484,7 @@ pub(super) fn job_reconcile_prologue(
 /// owner_ref` error (no `.metadata.uid`) only happens on a
 /// BuilderPool not read from the apiserver — tests that construct
 /// one in memory forget this; production reconcile always has it.
-pub(super) fn spawn_prerequisites(
+pub(crate) fn spawn_prerequisites(
     wp: &BuilderPool,
     ctx: &Ctx,
 ) -> Result<(OwnerReference, SchedulerAddrs, StoreAddrs)> {
@@ -489,7 +555,7 @@ pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcom
 /// persist. The autoscaler's `Scaling` condition lives under a
 /// different field manager; SSA keeps them separate.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn patch_job_pool_status(
+pub(crate) async fn patch_job_pool_status(
     ctx: &Ctx,
     wp: &BuilderPool,
     ns: &str,
@@ -732,7 +798,49 @@ mod tests {
         assert!(!is_pending_job(&terminating));
     }
 
-    const NO_GRACE: std::time::Duration = std::time::Duration::ZERO;
+    const NO_GRACE: Duration = Duration::ZERO;
+
+    /// Spawn-count formula: active Jobs claim queued derivations.
+    ///
+    /// Regression for the KVM-speed runaway: under the old formula
+    /// `queued.min(headroom)`, a single queued derivation spawned a
+    /// fresh Job every 10s tick until the ceiling. With pod startup
+    /// ~10-30s and ceiling=4, one build produced 3-4 Jobs; two
+    /// sequential builds produced 9+ (lifecycle.nix ephemeral-pool
+    /// subtest observed this under KVM).
+    ///
+    /// Mutation check: revert to `queued.min(headroom)` → the
+    /// `q1_a1_no_spawn` case fails (expects 0, gets 1).
+    #[test]
+    fn spawn_count_subtracts_active() {
+        // The bug case: 1 queued, 1 Job already in flight (pod
+        // starting, hasn't heartbeated). Old formula: min(1,3)=1
+        // → runaway. New: 1-1=0 → wait for the in-flight Job.
+        assert_eq!(spawn_count(1, 1, 3), 0, "q1_a1_no_spawn");
+
+        // Cold start: nothing active, spawn up to queued.
+        assert_eq!(spawn_count(1, 0, 4), 1, "cold start single");
+        assert_eq!(spawn_count(3, 0, 4), 3, "cold start multi");
+
+        // Ceiling clamp: 10 queued, 0 active, ceiling 4 → spawn 4.
+        assert_eq!(spawn_count(10, 0, 4), 4, "headroom caps");
+
+        // Steady state at ceiling: headroom=0 → no spawn regardless.
+        assert_eq!(spawn_count(10, 4, 0), 0, "ceiling reached");
+
+        // Recovery after a Job completes: 5 queued, 3 active (one
+        // succeeded and dropped out of the filter), headroom=1.
+        // Need = 5-3=2, but headroom caps at 1.
+        assert_eq!(spawn_count(5, 3, 1), 1, "post-complete refill");
+
+        // Saturating: active > queued (some Jobs are running
+        // dispatched work, Q already drained). Don't underflow.
+        assert_eq!(spawn_count(0, 3, 1), 0, "drained queue");
+        assert_eq!(spawn_count(1, 3, 1), 0, "more active than queued");
+
+        // Empty everything.
+        assert_eq!(spawn_count(0, 0, 4), 0, "idle");
+    }
 
     // r[verify ctrl.ephemeral.reap-excess-pending]
     /// I-183 scenario A: 3 Pending Jobs for class=medium, queued=1 →

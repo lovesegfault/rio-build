@@ -3,10 +3,10 @@
 //! Sibling to `manifest_tests::spawn_loop_no_early_return_on_error`
 //! (P0516): ephemeral.rs had the exact same `Err(e) => return
 //! Err(e.into())` bail at :226 that P0516 removed from manifest.rs.
-//! Both were rewritten together over job_common at ea64f7f2; manifest
-//! got the fix, ephemeral didn't. T1 of P0526 extracted the common
-//! match into `job_common::try_spawn_job` + `SpawnOutcome` so both
-//! reconcilers share warn+continue.
+//! Both were rewritten together over `common::job` at ea64f7f2;
+//! manifest got the fix, ephemeral didn't. T1 of P0526 extracted the
+//! common match into `common::job::try_spawn_job` + `SpawnOutcome` so
+//! both reconcilers share warn+continue.
 //!
 //! The structural guard here proves the bail is gone from the spawn
 //! block — no early return between `---- Spawn decision ----` and
@@ -18,9 +18,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
-use crate::reconcilers::builderpool::job_common::{
-    SpawnOutcome, reap_excess_pending, try_spawn_job,
-};
+use crate::reconcilers::common::job::{SpawnOutcome, reap_excess_pending, try_spawn_job};
 
 // r[verify ctrl.pool.ephemeral]
 #[test]

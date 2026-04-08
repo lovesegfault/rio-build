@@ -50,8 +50,6 @@
 //! untrusted tenant CANNOT leave poisoned cache entries for the
 //! next build — there is no "next build" on that pod.
 
-use std::time::Duration;
-
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -62,33 +60,15 @@ use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
+use crate::reconcilers::common::job::{
+    EPHEMERAL_REQUEUE, JOB_TTL_SECS, SpawnOutcome, is_active_job, job_reconcile_prologue,
+    patch_job_pool_status, random_suffix, reap_excess_pending, reap_orphan_running, spawn_count,
+    spawn_prerequisites, try_spawn_job,
+};
 use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
 
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
-use super::job_common::{
-    SpawnOutcome, is_active_job, job_reconcile_prologue, patch_job_pool_status, random_suffix,
-    reap_excess_pending, reap_orphan_running, spawn_prerequisites, try_spawn_job,
-};
-
-/// Requeue interval. Job spawning is reactive to queue depth, not
-/// just spec drift. 10s: one queue-depth poll per tick. Shorter would
-/// mean more `ClusterStatus` RPCs to the scheduler (cheap, but noise)
-/// and more `kubectl get jobs` calls (apiserver load). Longer
-/// lengthens dispatch latency: a worker needs one requeue interval +
-/// pod scheduling + container pull + FUSE mount + heartbeat
-/// (~10s + 10-30s) before the scheduler sees it.
-pub(crate) const EPHEMERAL_REQUEUE: Duration = Duration::from_secs(10);
-
-/// `ttlSecondsAfterFinished` on spawned Jobs. K8s TTL controller
-/// deletes the Job (and its pod, via ownerRef) this many seconds
-/// after it reaches Complete or Failed. 600s (10min): long enough
-/// that an operator debugging a failed build can `kubectl logs` the
-/// pod; short enough that Job churn doesn't accumulate. The SCHEDULER
-/// has already observed the completion (worker sent CompletionReport
-/// before exiting) so there's no rio-side dependency on the Job
-/// sticking around.
-pub(crate) const JOB_TTL_SECS: i32 = 600;
 
 /// Fallback `activeDeadlineSeconds` when neither `ephemeral_deadline_
 /// seconds` nor `size_class_cutoff_secs` is set (standalone unclassed
@@ -307,44 +287,6 @@ pub(super) async fn reconcile_ephemeral(wp: &BuilderPool, ctx: &Ctx) -> Result<A
     Ok(Action::requeue(EPHEMERAL_REQUEUE))
 }
 
-/// Compute how many Jobs to spawn this tick.
-///
-/// `(queued - active).min(headroom)` — each active Job is treated as
-/// already claiming one queued derivation. This prevents the runaway
-/// where a single queued derivation triggers a fresh Job every 10s
-/// tick until the ceiling is hit:
-///
-///   - t=0:  queued=1, active=0 → spawn Job-A
-///   - t=10: queued=1, active=1 → old formula spawned Job-B (wrong);
-///     new formula: 1-1=0 → no spawn
-///   - t=20: Job-A's pod heartbeats, dispatch fires, queued→0
-///
-/// `queued_derivations` is `ready_queue.len()` on the scheduler side
-/// (actor/mod.rs compute_cluster_snapshot). A derivation stays in the
-/// ready_queue until a worker heartbeats and `dispatch_ready` pops it
-/// — NOT when we spawn the Job. Pod startup (schedule + pull + FUSE
-/// mount + first heartbeat) is ~10-30s; with a 10s requeue interval
-/// the old `queued.min(headroom)` formula fired 2-4 extra Jobs per
-/// build before the first pod came online.
-///
-/// Conservative bias: if some active Jobs are already busy (dispatched
-/// work, not starting), subtracting them under-spawns by that count.
-/// Next tick after those Jobs succeed corrects it. Under-spawn = one
-/// requeue interval of latency; over-spawn = wasted pod starts +
-/// idle workers heartbeating for work that doesn't exist. For the
-/// "isolation > throughput" ephemeral use case, the latency cost is
-/// acceptable; the resource waste is not.
-///
-/// Global-Q caveat: for unclassified pools, `queued` is cluster-
-/// wide (per-system filtered). With multiple unclassified pools,
-/// each over-counts need by what the others will claim — but
-/// headroom caps it, and the others draining Q on the next tick
-/// self-corrects. Pools with `size_class` set use per-class depth
-/// (see [`queued_for_pool`]) so this caveat doesn't apply to them.
-pub(crate) fn spawn_count(queued: u32, active: u32, headroom: u32) -> u32 {
-    queued.saturating_sub(active).min(headroom)
-}
-
 /// Queue depth relevant to THIS ephemeral pool.
 ///
 /// Two cases:
@@ -512,7 +454,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{test_sched_addrs, test_store_addrs};
     // `controller_owner_ref` comes from `kube::Resource`. Module-
-    // level import moved to job_common with spawn_prerequisites;
+    // level import moved to common::job with spawn_prerequisites;
     // tests still build Jobs directly, so import here.
     use kube::Resource;
 
@@ -649,48 +591,6 @@ mod tests {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
             "suffix must be lowercase alnum (K8s DNS-1123): {suffix}"
         );
-    }
-
-    /// Spawn-count formula: active Jobs claim queued derivations.
-    ///
-    /// Regression for the KVM-speed runaway: under the old formula
-    /// `queued.min(headroom)`, a single queued derivation spawned a
-    /// fresh Job every 10s tick until the ceiling. With pod startup
-    /// ~10-30s and ceiling=4, one build produced 3-4 Jobs; two
-    /// sequential builds produced 9+ (lifecycle.nix ephemeral-pool
-    /// subtest observed this under KVM).
-    ///
-    /// Mutation check: revert to `queued.min(headroom)` → the
-    /// `q1_a1_no_spawn` case fails (expects 0, gets 1).
-    #[test]
-    fn spawn_count_subtracts_active() {
-        // The bug case: 1 queued, 1 Job already in flight (pod
-        // starting, hasn't heartbeated). Old formula: min(1,3)=1
-        // → runaway. New: 1-1=0 → wait for the in-flight Job.
-        assert_eq!(spawn_count(1, 1, 3), 0, "q1_a1_no_spawn");
-
-        // Cold start: nothing active, spawn up to queued.
-        assert_eq!(spawn_count(1, 0, 4), 1, "cold start single");
-        assert_eq!(spawn_count(3, 0, 4), 3, "cold start multi");
-
-        // Ceiling clamp: 10 queued, 0 active, ceiling 4 → spawn 4.
-        assert_eq!(spawn_count(10, 0, 4), 4, "headroom caps");
-
-        // Steady state at ceiling: headroom=0 → no spawn regardless.
-        assert_eq!(spawn_count(10, 4, 0), 0, "ceiling reached");
-
-        // Recovery after a Job completes: 5 queued, 3 active (one
-        // succeeded and dropped out of the filter), headroom=1.
-        // Need = 5-3=2, but headroom caps at 1.
-        assert_eq!(spawn_count(5, 3, 1), 1, "post-complete refill");
-
-        // Saturating: active > queued (some Jobs are running
-        // dispatched work, Q already drained). Don't underflow.
-        assert_eq!(spawn_count(0, 3, 1), 0, "drained queue");
-        assert_eq!(spawn_count(1, 3, 1), 0, "more active than queued");
-
-        // Empty everything.
-        assert_eq!(spawn_count(0, 0, 4), 0, "idle");
     }
 
     // r[verify ctrl.pool.ephemeral-deadline]
@@ -841,6 +741,7 @@ mod tests {
         assert_eq!(envs.get("RIO_TLS__CA_PATH"), Some(&"/etc/rio/tls/ca.crt"));
     }
 
-    // scheduler_unreachable_condition_shape + random_suffix_valid_
-    // dns1123 moved to job_common::tests alongside their functions.
+    // scheduler_unreachable_condition_shape, random_suffix_valid_
+    // dns1123, spawn_count_subtracts_active moved to common::job::
+    // tests alongside their functions.
 }

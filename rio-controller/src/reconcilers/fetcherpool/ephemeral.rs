@@ -17,10 +17,10 @@
 //! The pure helpers (`is_active_job`, `try_spawn_job`,
 //! `random_suffix`, `scheduler_unreachable_condition`,
 //! `spawn_count`, `EPHEMERAL_REQUEUE`, `JOB_TTL_SECS`) are reused
-//! from the builderpool path. The CR-typed glue (status patch, Job
-//! build) is reproduced — the two `*PoolStatus` shapes and
-//! `executor_params` signatures differ nominally but a trait would
-//! be more code than the ~40 lines duplicated.
+//! from `common::job`. The CR-typed glue (status patch, Job build)
+//! is reproduced — the two `*PoolStatus` shapes and `executor_params`
+//! signatures differ nominally but a trait would be more code than
+//! the ~40 lines duplicated.
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
@@ -31,10 +31,10 @@ use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
-use crate::reconcilers::builderpool::ephemeral::{EPHEMERAL_REQUEUE, JOB_TTL_SECS, spawn_count};
-use crate::reconcilers::builderpool::job_common::{
-    SpawnOutcome, is_active_job, random_suffix, reap_excess_pending, reap_orphan_running,
-    scheduler_unreachable_condition, try_spawn_job,
+use crate::reconcilers::common::job::{
+    EPHEMERAL_REQUEUE, JOB_TTL_SECS, SpawnOutcome, is_active_job, random_suffix,
+    reap_excess_pending, reap_orphan_running, scheduler_unreachable_condition, spawn_count,
+    try_spawn_job,
 };
 use crate::reconcilers::common::pod::{self, ExecutorKind, POOL_LABEL, SchedulerAddrs};
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
@@ -298,7 +298,7 @@ async fn fetch_queue_signals(ctx: &Ctx, fp: &FetcherPool) -> (QueueSignals, Opti
 }
 
 /// SSA-patch `.status` for a Job-mode FetcherPool. Same shape as
-/// `builderpool/job_common::patch_job_pool_status` but FetcherPool-
+/// `common::job::patch_job_pool_status` but FetcherPool-
 /// typed (no `replicas` field on FetcherPoolStatus — only
 /// ready/desired).
 async fn patch_status(

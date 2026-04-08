@@ -70,14 +70,13 @@ use rio_crds::builderpool::BuilderPool;
 
 use super::POOL_LABEL;
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
-/// Re-export: `Bucket` now lives in [`super::job_common`] so
-/// `reconcilers::mod` can see the same alias `pub(crate)`. Re-
-/// exported here so `manifest_tests.rs`'s `use ...::manifest::Bucket`
-/// stays intact.
-pub(super) use super::job_common::Bucket;
-use super::job_common::{
-    SpawnOutcome, is_active_job, is_failed_job, job_reconcile_prologue, patch_job_pool_status,
-    random_suffix, spawn_prerequisites, try_spawn_job,
+/// Re-export: `Bucket` lives in `common::job` so `reconcilers::mod`
+/// can see the same alias `pub(crate)`. Re-exported here so
+/// `manifest_tests.rs`'s `use ...::manifest::Bucket` stays intact.
+pub(super) use crate::reconcilers::common::job::Bucket;
+use crate::reconcilers::common::job::{
+    JOB_TTL_SECS, SpawnOutcome, is_active_job, is_failed_job, job_reconcile_prologue,
+    patch_job_pool_status, random_suffix, spawn_prerequisites, try_spawn_job,
 };
 
 /// Requeue interval. Same as ephemeral (~10s) — manifest is demand-
@@ -1078,7 +1077,7 @@ pub(super) fn build_manifest_job(
             // Manifest pods are one-shot (same as static-sizing
             // Jobs); ttlSecondsAfterFinished reaps the completed
             // Job, activeDeadlineSeconds caps a hung build.
-            ttl_seconds_after_finished: Some(super::ephemeral::JOB_TTL_SECS),
+            ttl_seconds_after_finished: Some(JOB_TTL_SECS),
             active_deadline_seconds: wp.spec.deadline_seconds.map(i64::from),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {

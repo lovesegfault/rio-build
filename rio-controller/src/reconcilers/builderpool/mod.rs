@@ -40,7 +40,6 @@ use rio_crds::builderpool::{BuilderPool, Sizing};
 mod builders;
 pub mod disruption;
 pub(super) mod ephemeral;
-pub(super) mod job_common;
 mod manifest;
 // pub(crate) so fixtures.rs (at crate root) can see it. Gated
 // on test: production code in this module pulls it via the glob
@@ -57,12 +56,6 @@ pub(super) mod tests;
 /// suffix describes WHAT the finalizer gates. K8s stores this in
 /// `metadata.finalizers`; delete blocks until we remove it.
 const FINALIZER: &str = "builderpool.rio.build/drain";
-
-/// Field manager for server-side apply. K8s tracks which fields
-/// each manager owns; conflicting managers get a 409 unless
-/// `force`. We use `force: true` — this controller is
-/// authoritative for what it manages.
-const MANAGER: &str = "rio-controller";
 
 /// Label every BuilderPool-owned pod carries. `builders::labels()`
 /// sets it; `disruption::run` filters on it; `ephemeral` + cleanup

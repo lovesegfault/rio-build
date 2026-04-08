@@ -31,8 +31,8 @@ use crate::error::{Error, Result, error_kind};
 /// KubeErrorExt` without naming rio-crds directly.
 pub use rio_crds::{KubeErrorExt, KubeResultExt};
 
-/// Per-pool manifest idle-tracking state: `builderpool::job_common::
-/// Bucket` → when it first went surplus. See `builderpool::manifest::
+/// Per-pool manifest idle-tracking state: `common::job::Bucket` →
+/// when it first went surplus. See `builderpool::manifest::
 /// update_idle_and_reapable`. Type alias for `Ctx::manifest_idle`'s
 /// inner map (clippy::type_complexity).
 ///
@@ -41,7 +41,7 @@ pub use rio_crds::{KubeErrorExt, KubeResultExt};
 /// docs link resolver). `ManifestIdleState` is `pub` only because
 /// `Ctx` (also `pub`) names it in a field type — neither is part of
 /// the external API.
-pub type ManifestIdleState = BTreeMap<builderpool::job_common::Bucket, Instant>;
+pub type ManifestIdleState = BTreeMap<common::job::Bucket, Instant>;
 
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
@@ -88,7 +88,7 @@ pub struct Ctx {
     /// Per-pool per-bucket idle-since timestamp for manifest-mode
     /// scale-down (`r[ctrl.pool.manifest-scaledown]`). Outer key:
     /// pool `{namespace}/{name}`. Inner key: `(est_memory_bytes,
-    /// est_cpu_millicores)` — same as `builderpool::job_common::Bucket`.
+    /// est_cpu_millicores)` — same as `common::job::Bucket`.
     /// Value: the Instant the bucket FIRST went surplus
     /// (`supply > demand`). Cleared when demand returns. A bucket
     /// idle for `scale_down_window` is eligible for Job deletion.

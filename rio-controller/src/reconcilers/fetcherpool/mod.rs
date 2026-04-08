@@ -34,8 +34,10 @@ mod ephemeral;
 /// Finalizer name. Kubebuilder convention: `{kind}.{group}/{suffix}`.
 const FINALIZER: &str = "fetcherpool.rio.build/drain";
 
-/// Field manager for server-side apply.
-const MANAGER: &str = "rio-controller";
+/// Field manager for server-side apply. Shared with the builderpool
+/// reconciler — re-exported from `common::job` so both pool
+/// reconcilers stamp the same SSA manager.
+pub(super) use crate::reconcilers::common::job::MANAGER;
 
 /// Default FUSE cache size for fetchers. FODs are typically small
 /// (source tarballs, git clones) — 10Gi is plenty. BuilderPool

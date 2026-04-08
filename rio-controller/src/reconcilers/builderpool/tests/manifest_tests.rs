@@ -639,7 +639,7 @@ fn job_spec_load_bearing_fields() {
     assert_eq!(spec.parallelism, Some(1));
     assert_eq!(
         spec.ttl_seconds_after_finished,
-        Some(crate::reconcilers::builderpool::ephemeral::JOB_TTL_SECS),
+        Some(crate::reconcilers::common::job::JOB_TTL_SECS),
         "one-shot manifest pods → TTL reaps completed Jobs"
     );
 
