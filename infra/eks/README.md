@@ -12,7 +12,7 @@ nix-built images pushed to ECR, helm chart applied, smoke-test verified.
 | Karpenter | helm_release + Pod Identity + SQS | provisions worker nodes on-demand (c6a/c7a preferred, m/r fallback) |
 | Aurora PG | Serverless v2, 0.5-2 ACU | shared by scheduler + store, password in Secrets Manager |
 | S3 bucket | NAR chunk storage | name: `<cluster_name>-chunks-<random>` |
-| ECR repos | 7 (gateway/scheduler/store/controller/worker/fod-proxy/bootstrap) | immutable tags, keep-last-10 lifecycle |
+| ECR repos | 8 (gateway/scheduler/store/controller/builder/fetcher/bootstrap/dashboard) | immutable tags, keep-last-30 lifecycle |
 | cert-manager | helm_release | issues mTLS certs for intra-cluster gRPC |
 | aws-load-balancer-controller | helm_release + IRSA | provisions the gateway NLB |
 | SSM bastion | t3.micro, private subnet | tunnel to the internal NLB — no inbound SG rules |
@@ -88,12 +88,12 @@ cargo xtask k8s -p eks up --push --deploy
 
 Two layers, chained:
 
-1. **Pod layer** (`rio-controller/src/scaling.rs`): polls scheduler queue depth every 30s, SSA-patches the BuilderPool StatefulSet replica count between `spec.replicas.{min,max}`. Scale-up is immediate; scale-down requires 10 minutes of quiet (`SCALE_DOWN_WINDOW`).
-2. **Node layer** (Karpenter): watches for Pending pods that can't schedule, provisions an EC2 instance that fits (~30-60s boot). When pods scale to zero, empty nodes are consolidated after `consolidateAfter` (30s for workers, 5m for general).
+1. **Pod layer** (`rio-controller`): builders are ephemeral one-shot Jobs — one pod per derivation, spawned on dispatch, deleted on completion. The controller gates spawn rate against each BuilderPool's `spec.maxConcurrent`; there is no replica count to scale.
+2. **Node layer** (Karpenter): watches for Pending pods that can't schedule, provisions an EC2 instance that fits (~30-60s boot). When builds complete and pods exit, empty nodes are consolidated after `consolidateAfter` (30s for builders, 5m for general).
 
-The chain: build submitted → queue depth > 0 → rio-controller scales STS to N → N pods Pending (no worker nodes exist) → Karpenter provisions node(s) → pods Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a worker mid-build — only consolidates after rio-controller has scaled the pods away.
+The chain: build submitted → scheduler dispatches → controller creates a Job → pod Pending (no builder node exists) → Karpenter provisions a node → pod Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a builder mid-build — only consolidates after the Job has exited.
 
-Three NodePools (weighted priority): `rio-worker-preferred` (c6a/c7a, weight 100), `rio-worker-fallback` (m/r-category, weight 10), `rio-general` (untainted, for future gateway/scheduler HPA overflow). One shared EC2NodeClass. Configured in `infra/helm/rio-build/values.yaml` under `karpenter.nodePools`.
+Five NodePools (weighted priority): `rio-builder-preferred` (c6a/c7a, weight 100), `rio-builder-fallback` (m/r-category, weight 10), `rio-builder-metal` (bare-metal for KVM builds), `rio-fetcher` (FOD-only executors), `rio-general` (untainted, for future gateway/scheduler HPA overflow). One shared EC2NodeClass. Configured in `infra/helm/rio-build/values.yaml` under `karpenter.nodePools`.
 
 ## Cost (us-east-2, on-demand)
 
@@ -107,7 +107,7 @@ Three NodePools (weighted priority): `rio-worker-preferred` (c6a/c7a, weight 100
 | t3.micro bastion | ~$8 |
 | **Total (idle, no builds)** | **~$370/mo** |
 
-Worker cost scales with build load. rio-controller's 10-min scale-down + Karpenter consolidation means an hour of intermittent builds ≈ 1h of node time. Aurora at 2 ACU adds ~$130/mo.
+Worker cost scales with build load. Ephemeral Jobs exit on completion + Karpenter consolidation means an hour of intermittent builds ≈ 1h of node time. Aurora at 2 ACU adds ~$130/mo.
 
 ## Teardown
 

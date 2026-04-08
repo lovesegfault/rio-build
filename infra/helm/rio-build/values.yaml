@@ -485,11 +485,11 @@ karpenter:
   dataVolumeIops: 16000
   dataVolumeThroughputMiBps: 1000
 
-  # Three NodePools, one EC2NodeClass. Weighted priority: Karpenter tries
+  # Five NodePools, one EC2NodeClass. Weighted priority: Karpenter tries
   # high-weight first, falls through if pod doesn't fit or capacity is
-  # unavailable. Forward-compat with phase 4c: BuilderPoolSet creates pools
-  # with different resources → Karpenter bin-packs across the size range
-  # the NodePool requirements allow. No NodePool rework needed.
+  # unavailable. BuilderPoolSet creates pools with different resources →
+  # Karpenter bin-packs across the size range the NodePool requirements
+  # allow.
   nodePools:
     # Worker preferred: c6a/c7a (AMD EPYC compute-optimized). Tainted so
     # ONLY builder pods (with the matching toleration) land here.

@@ -213,10 +213,10 @@ module "eks" {
   }
 
   # Managed node groups. System only — worker nodes are
-  # Karpenter-provisioned (karpenter.tf). rio-controller scales the
-  # BuilderPool STS by queue depth; Karpenter provisions nodes for
-  # Pending pods. Scale-to-zero: rio-controller's 10-min
-  # SCALE_DOWN_WINDOW → pods to 0 → Karpenter consolidates.
+  # Karpenter-provisioned (karpenter.tf). rio-controller spawns one
+  # ephemeral Job per dispatched derivation (gated by BuilderPool
+  # maxConcurrent); Karpenter provisions nodes for Pending pods.
+  # Scale-to-zero: Jobs exit on completion → Karpenter consolidates.
   eks_managed_node_groups = {
     system = {
       instance_types = [var.system_instance_type]
