@@ -144,6 +144,51 @@ pub async fn put_chunked(
     nar_data: &[u8],
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
+    let stats = stage_chunked(pool, backend, info, nar_data, max_concurrent).await?;
+
+    // --- Step 5: Complete ---
+    if let Err(e) = metadata::complete_manifest_chunked(pool, info).await {
+        warn!(error = %e, "complete_manifest_chunked failed; rolling back");
+        // Chunks are uploaded to S3. reap_one decrements refcounts →
+        // GC-eligible. We DON'T delete from S3 — GC sweep's job.
+        // Deleting now races with a concurrent uploader that just
+        // incremented the same chunk.
+        if let Err(e2) =
+            crate::gc::orphan::reap_one(pool, &info.store_path_hash, None, Some(backend)).await
+        {
+            warn!(error = %e2, "rollback after complete failure also failed; orphan scanner will clean up");
+        }
+        return Err(e.into());
+    }
+
+    Ok(stats)
+}
+
+/// Steps 1–4b of [`put_chunked`]: chunk, upgrade-manifest, S3 upload,
+/// mark-uploaded. Does NOT flip status to `'complete'` — caller does
+/// that (via `metadata::complete_manifest_chunked` or its `_in_tx`
+/// variant).
+///
+/// On internal error this rolls back its OWN refcount increments + the
+/// caller's `'uploading'` placeholder (same rollback contract as
+/// [`put_chunked`] — caller doesn't clean up).
+///
+/// PutPathBatch calls this per-output BEFORE its atomic completion tx
+/// so the visibility flip for N outputs (inline + chunked) commits
+/// together. On batch-tx failure, `abort_batch` → `reap_one` (chunk-
+/// aware) decrements the staged refcounts; S3 blobs orphan and GC
+/// sweeps them.
+#[instrument(skip(pool, backend, info, nar_data), fields(
+    store_path = %info.store_path.as_str(),
+    nar_size = nar_data.len(),
+))]
+pub async fn stage_chunked(
+    pool: &PgPool,
+    backend: &Arc<dyn ChunkBackend>,
+    info: &ValidatedPathInfo,
+    nar_data: &[u8],
+    max_concurrent: usize,
+) -> anyhow::Result<PutChunkedStats> {
     let store_path_hash = &info.store_path_hash;
 
     // --- Step 1: Chunk ---
@@ -237,17 +282,6 @@ pub async fn put_chunked(
     let needs_upload: Vec<Vec<u8>> = needs_upload.into_iter().collect();
     if let Err(e) = metadata::mark_chunks_uploaded(pool, &needs_upload).await {
         warn!(error = %e, "mark_chunks_uploaded failed; rolling back");
-        rollback(pool, store_path_hash, &chunk_hashes).await;
-        return Err(e.into());
-    }
-
-    // --- Step 5: Complete ---
-    if let Err(e) = metadata::complete_manifest_chunked(pool, info).await {
-        warn!(error = %e, "complete_manifest_chunked failed; rolling back");
-        // Chunks are uploaded to S3. Rollback decrements refcounts →
-        // GC-eligible. We DON'T delete from S3 — GC sweep's job (future
-        // phase). Deleting now races with a concurrent uploader that
-        // just incremented the same chunk.
         rollback(pool, store_path_hash, &chunk_hashes).await;
         return Err(e.into());
     }

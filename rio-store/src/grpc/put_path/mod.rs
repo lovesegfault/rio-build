@@ -17,6 +17,9 @@
 
 use super::*;
 
+pub(super) mod common;
+pub(super) use common::{PlaceholderClaim, apply_trailer, validate_put_metadata};
+
 /// Drain remaining messages from a streaming request.
 ///
 /// Must be called before returning early from PutPath to avoid leaving
@@ -315,124 +318,46 @@ impl StoreServiceImpl {
             "PutPath: received metadata"
         );
 
-        // Step 2: Check idempotency — if path already complete, return success
-        match metadata::check_manifest_complete(&self.pool, &store_path_hash).await {
-            Ok(true) => {
-                debug!(store_path = %info.store_path.as_str(), "PutPath: path already complete, returning success");
-                // Drain remaining stream messages (protocol contract)
+        // Steps 2+3: idempotency + placeholder insert + stale-reclaim.
+        // See `claim_placeholder` for the full commentary (shared with
+        // PutPathBatch). The Concurrent branch re-checks completeness
+        // here (PutPath-specific): if the racing uploader won between
+        // the check and the insert, return `created=false` instead of
+        // bouncing the client.
+        let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+        let claim = self
+            .claim_placeholder(
+                &store_path_hash,
+                info.store_path.as_str(),
+                &refs_str,
+                "PutPath",
+            )
+            .await;
+        match claim {
+            Ok(PlaceholderClaim::Owned) => {}
+            Ok(PlaceholderClaim::AlreadyComplete) => {
+                debug!(store_path = %info.store_path.as_str(), "PutPath: path already complete");
                 drain_stream(&mut stream).await;
-                metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
                 return Ok(Response::new(PutPathResponse { created: false }));
             }
-            Ok(false) => {} // Not yet complete, proceed
-            Err(e) => {
-                // Drain remaining stream messages before returning error
+            Ok(PlaceholderClaim::Concurrent) => {
                 drain_stream(&mut stream).await;
-                return Err(rio_common::grpc::internal(
-                    "PutPath: check_manifest_complete",
-                    e,
-                ));
-            }
-        }
-
-        // Step 3: Insert manifest placeholder with status='uploading'.
-        // Returns false (ON CONFLICT DO NOTHING no-op) if another uploader
-        // already holds a placeholder. In that case we must NOT proceed: if
-        // we do and later fail validation, the drop-path reap would delete
-        // the OTHER uploader's placeholder, losing their valid upload.
-        //
-        // STRUCTURAL: insert_manifest_uploading now takes references and
-        // writes them into the placeholder narinfo. Mark's CTE walks them
-        // from commit → the closure is GC-protected without holding a
-        // session lock for the full upload. The lock is transaction-scoped
-        // (pg_try_advisory_xact_lock_shared inside the tx, ~ms). On lock
-        // contention (mark running), returns MetadataError::Serialization
-        // → metadata_status maps to Status::aborted. Worker retries
-        // (upload.rs:143-188, 3 attempts); gateway does NOT retry —
-        // `nix copy` during mark (~1s window) gets STDERR_ERROR and the
-        // client may re-issue. Blocking variant would deadlock if the pool
-        // saturated during concurrent mark wait.
-        //
-        // References stringified: ValidatedPathInfo holds Vec<StorePath>;
-        // the narinfo column is text[]. These are the same values that
-        // update_narinfo_complete will write at completion (references
-        // don't change between metadata arrival and trailer).
-        let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-        let mut inserted = match metadata::insert_manifest_uploading(
-            &self.pool,
-            &store_path_hash,
-            &info.store_path,
-            &refs_str,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                drain_stream(&mut stream).await;
-                return Err(putpath_metadata_status(
-                    "PutPath: insert_manifest_uploading",
-                    e,
-                ));
-            }
-        };
-        // r[impl store.put.stale-reclaim]
-        // I-207: a fetcher that died mid-upload (storage eviction, OOM)
-        // leaves a placeholder this insert ON CONFLICT DO NOTHING'd
-        // against. The orphan scanner reaps it in 15min, but the
-        // scheduler retries within seconds — the next fetcher hits
-        // Aborted below and the FOD loops until the sweep. Same
-        // hot-path reclaim as `r[store.substitute.stale-reclaim]`:
-        // reap_one's threshold check guards a LIVE concurrent uploader
-        // (heartbeat keeps its updated_at fresh).
-        if !inserted {
-            let threshold = crate::substitute::SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
-            match crate::gc::orphan::reap_one(
-                &self.pool,
-                &store_path_hash,
-                Some(threshold),
-                self.chunk_backend.as_ref(),
-            )
-            .await
-            {
-                Ok(true) => {
-                    warn!(store_path = %info.store_path,
-                          "PutPath: stale 'uploading' placeholder — reclaimed");
-                    metrics::counter!("rio_store_putpath_stale_reclaimed_total").increment(1);
-                    inserted = metadata::insert_manifest_uploading(
-                        &self.pool,
-                        &store_path_hash,
-                        &info.store_path,
-                        &refs_str,
-                    )
-                    .await
-                    .unwrap_or(false);
-                }
-                Ok(false) => {} // not stale → live concurrent uploader
-                Err(e) => warn!(error = %e,
-                    "PutPath: stale-reclaim failed (proceeding to concurrent-abort)"),
-            }
-        }
-        if !inserted {
-            // Another upload is in progress (or just completed in the window
-            // between check_manifest_complete above and now). Re-check: if
-            // it flipped to complete, return success; else tell client retry.
-            drain_stream(&mut stream).await;
-            match metadata::check_manifest_complete(&self.pool, &store_path_hash).await {
-                Ok(true) => {
+                if let Ok(true) =
+                    metadata::check_manifest_complete(&self.pool, &store_path_hash).await
+                {
                     debug!(store_path = %info.store_path, "PutPath: concurrent upload won the race");
                     metrics::counter!("rio_store_put_path_total", "result" => "exists")
                         .increment(1);
                     return Ok(Response::new(PutPathResponse { created: false }));
                 }
-                _ => {
-                    debug!(store_path = %info.store_path, "PutPath: concurrent upload in progress, aborting");
-                    metrics::counter!("rio_store_putpath_retries_total",
-                        "reason" => "concurrent_upload")
-                    .increment(1);
-                    return Err(Status::aborted(
-                        "concurrent PutPath in progress for this path; retry",
-                    ));
-                }
+                debug!(store_path = %info.store_path, "PutPath: concurrent upload in progress, aborting");
+                return Err(Status::aborted(
+                    "concurrent PutPath in progress for this path; retry",
+                ));
+            }
+            Err(e) => {
+                drain_stream(&mut stream).await;
+                return Err(putpath_metadata_status("PutPath: claim_placeholder", e));
             }
         }
 
@@ -606,68 +531,16 @@ impl StoreServiceImpl {
         // as long as the old pubkey is in trusted-public-keys.
         self.maybe_sign(tenant_id, &mut full_info).await;
 
-        // Size gate: small NARs inline, large NARs chunked (if backend
-        // configured). `None` backend forces inline always — test
-        // harnesses rely on this.
-        //
-        // The gate is on `nar_data.len()`, not `info.nar_size`. They should
-        // match (validate_nar_digest above checks) but nar_data.len() is
-        // what we actually have in hand — no chance of a drift where
-        // info.nar_size says 200KB but we chunk 300KB.
-        let use_chunked = self.chunk_backend.is_some() && nar_data.len() >= cas::INLINE_THRESHOLD;
-
-        if use_chunked {
-            // Chunked path: FastCDC + S3 + refcounts. cas::put_chunked
-            // handles the whole write-ahead flow INCLUDING rollback on
-            // its own errors. It consumed our step-3 placeholder; we
-            // don't call abort_upload() on failure (that'd delete
-            // a placeholder that no longer exists, or worse, one that
-            // put_chunked's rollback just cleaned up).
-            let backend = self.chunk_backend.as_ref().expect("checked is_some above");
-            match cas::put_chunked(
-                &self.pool,
-                backend,
-                &full_info,
-                &nar_data,
-                self.chunk_upload_max_concurrent,
-            )
-            .await
-            {
-                Ok(stats) => {
-                    debug!(
-                        store_path = %full_info.store_path.as_str(),
-                        total_chunks = stats.total_chunks,
-                        deduped = stats.deduped_chunks,
-                        ratio = stats.dedup_ratio(),
-                        "PutPath: chunked upload completed"
-                    );
-                    // The milestone metric. Gauge (per-upload ratio, not a
-                    // running average — Prometheus rate() handles that).
-                    metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-                }
-                Err(e) => {
-                    // put_chunked already rolled back. Just the error metric.
-                    metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
-                    // storage_error (not status_internal): distinguishes
-                    // BackendAuthError → FailedPrecondition so the
-                    // builder fails fast instead of retrying forever.
-                    return Err(storage_error("PutPath: put_chunked", e));
-                }
-            }
-        } else {
-            // Inline path: single-tx NAR-in-inline_blob. Atomic — no
-            // orphan cleanup needed (unlike the chunked path's two-step).
-            if let Err(e) =
-                metadata::complete_manifest_inline(&self.pool, &full_info, Bytes::from(nar_data))
-                    .await
-            {
-                self.abort_upload(&full_info.store_path_hash).await;
-                return Err(putpath_metadata_status(
-                    "PutPath: complete_manifest_inline",
-                    e,
-                ));
-            }
-            debug!(store_path = %full_info.store_path.as_str(), "PutPath: inline upload completed");
+        // Size gate + persist: small NARs inline, large NARs chunked
+        // (if backend configured). On chunked error put_chunked already
+        // rolled back our step-3 placeholder; on inline error we still
+        // own it. abort_upload's reap_one filters status='uploading' so
+        // calling it unconditionally is a harmless no-op on the
+        // already-rolled-back chunked path — simpler than threading
+        // which-branch-failed back out.
+        if let Err(e) = self.persist_nar(&full_info, nar_data, "PutPath").await {
+            self.abort_upload(&full_info.store_path_hash).await;
+            return Err(e);
         }
 
         // Defuse: placeholder is now status='complete'; nothing to clean up.

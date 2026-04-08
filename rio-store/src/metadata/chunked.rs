@@ -210,8 +210,24 @@ pub async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<(
 #[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
 pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) -> Result<()> {
     let mut tx = pool.begin().await?;
+    complete_manifest_chunked_in_tx(&mut tx, info).await?;
+    tx.commit().await?;
+    debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
+    Ok(())
+}
 
-    if update_narinfo_complete(&mut tx, info).await? == 0 {
+/// Transaction-body variant of [`complete_manifest_chunked`]: runs the
+/// narinfo UPDATE + status flip inside a caller-owned tx. PutPathBatch
+/// uses this to flip N chunked outputs to `'complete'` in the same
+/// transaction as inline outputs (`r[store.atomic.multi-output]`). The
+/// chunks themselves were already uploaded + refcounted by
+/// [`crate::cas::stage_chunked`] outside the tx; only the visibility
+/// flip is atomic.
+pub async fn complete_manifest_chunked_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    info: &ValidatedPathInfo,
+) -> Result<()> {
+    if update_narinfo_complete(tx, info).await? == 0 {
         return Err(MetadataError::PlaceholderMissing {
             store_path: info.store_path.to_string(),
         });
@@ -228,7 +244,7 @@ pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) 
         "#,
     )
     .bind(&info.store_path_hash)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     if manifest_result.rows_affected() == 0 {
@@ -237,8 +253,6 @@ pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) 
         });
     }
 
-    tx.commit().await?;
-    debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
     Ok(())
 }
 

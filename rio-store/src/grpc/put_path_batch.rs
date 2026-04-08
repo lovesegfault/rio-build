@@ -11,19 +11,21 @@
 //! Any failure → rollback → zero rows. That's the atomicity the spec
 //! requires (`r[store.atomic.multi-output]`).
 //!
-//! ## Inline-only (v1 bound)
+//! ## Chunked staging
 //!
-//! Multi-output derivations typically split into small pieces — `out`
-//! has the binaries, `dev` has headers (~MB), `doc`/`man` are small.
-//! The chunked path's S3 uploads can't live inside a DB transaction
-//! anyway (the spec says "blob-store writes are NOT rolled back"). If
-//! a multi-output output is ≥ `INLINE_THRESHOLD`, this handler rejects
-//! it with `FAILED_PRECONDITION` and the client falls back to
-//! independent `PutPath`.
+//! S3 uploads can't live inside a DB transaction (the spec says
+//! "blob-store writes are NOT rolled back"). Outputs ≥
+//! `INLINE_THRESHOLD` are staged via [`cas::stage_chunked`] BEFORE the
+//! atomic tx (chunks uploaded + refcounted, manifest still
+//! `status='uploading'`); the tx then flips inline AND chunked outputs
+//! to `'complete'` together. On batch failure the staged chunks orphan
+//! (refcount-zero after `abort_batch`'s `reap_one`, GC-eligible).
+//! Bound: ≤1 NAR-size of orphaned blob per failed output.
 // r[impl store.atomic.multi-output]
 
 use std::collections::BTreeMap;
 
+use super::put_path::common::NarPersist;
 use super::*;
 use rio_common::limits::MAX_BATCH_OUTPUTS;
 use rio_proto::types::{PutPathBatchRequest, PutPathBatchResponse, PutPathTrailer};
@@ -46,6 +48,10 @@ struct OutputAccum {
     /// we started. No placeholder, no commit for it — just
     /// `created=false` in the response.
     already_complete: bool,
+    /// Phase-2 staging result. `None` until phase 2 ran; then either
+    /// inline bytes (for `complete_manifest_inline_in_tx`) or
+    /// `ChunkedStaged` (for `complete_manifest_chunked_in_tx`).
+    staged: Option<NarPersist>,
 }
 
 impl StoreServiceImpl {
@@ -220,92 +226,52 @@ impl StoreServiceImpl {
                 )));
             }
 
-            // v1 bound: inline only. See module doc.
-            if accum.nar_data.len() >= cas::INLINE_THRESHOLD {
-                bail!(Status::failed_precondition(format!(
-                    "output {idx}: NAR size {} >= INLINE_THRESHOLD ({}); \
-                     PutPathBatch v1 is inline-only — use independent PutPath calls",
-                    accum.nar_data.len(),
-                    cas::INLINE_THRESHOLD
-                )));
-            }
-
-            // Idempotency: if already complete, skip placeholder + commit
-            // for this output. Other outputs proceed normally.
-            match metadata::check_manifest_complete(&self.pool, &accum.store_path_hash).await {
-                Ok(true) => {
-                    accum.already_complete = true;
-                    metrics::counter!("rio_store_put_path_total", "result" => "exists")
-                        .increment(1);
-                    continue;
-                }
-                Ok(false) => {}
-                Err(e) => bail!(rio_common::grpc::internal(
-                    "PutPathBatch: check_manifest_complete",
-                    e
-                )),
-            }
-
-            // Insert placeholder. Same references-on-placeholder semantics
-            // as PutPath (GC mark protection from the instant this commits).
+            // Idempotency + placeholder + stale-reclaim. Shared with
+            // PutPath — see `claim_placeholder` for the full commentary.
             let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-            let mut inserted = match metadata::insert_manifest_uploading(
-                &self.pool,
-                &accum.store_path_hash,
-                info.store_path.as_str(),
-                &refs_str,
-            )
-            .await
-            {
-                Ok(i) => i,
-                Err(e) => bail!(putpath_metadata_status(
-                    "PutPathBatch: insert_manifest_uploading",
-                    e
-                )),
-            };
-            // r[impl store.put.stale-reclaim]
-            // Same hot-path reclaim as PutPath (I-207). reap_one's
-            // threshold check guards a live concurrent uploader.
-            if !inserted {
-                let threshold = crate::substitute::SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
-                match crate::gc::orphan::reap_one(
-                    &self.pool,
+            match self
+                .claim_placeholder(
                     &accum.store_path_hash,
-                    Some(threshold),
-                    self.chunk_backend.as_ref(),
+                    info.store_path.as_str(),
+                    &refs_str,
+                    "PutPathBatch",
                 )
                 .await
-                {
-                    Ok(true) => {
-                        warn!(store_path = %info.store_path,
-                              "PutPathBatch: stale 'uploading' placeholder — reclaimed");
-                        metrics::counter!("rio_store_putpath_stale_reclaimed_total").increment(1);
-                        inserted = metadata::insert_manifest_uploading(
-                            &self.pool,
-                            &accum.store_path_hash,
-                            info.store_path.as_str(),
-                            &refs_str,
-                        )
-                        .await
-                        .unwrap_or(false);
-                    }
-                    Ok(false) => {} // not stale → live concurrent uploader
-                    Err(e) => warn!(error = %e,
-                        "PutPathBatch: stale-reclaim failed (proceeding to concurrent-abort)"),
+            {
+                Ok(PlaceholderClaim::AlreadyComplete) => {
+                    accum.already_complete = true;
+                    continue;
                 }
+                Ok(PlaceholderClaim::Owned) => {
+                    owned_placeholders.push(accum.store_path_hash.clone());
+                }
+                Ok(PlaceholderClaim::Concurrent) => {
+                    // For a batch we can't partially proceed — bail the
+                    // whole batch. Retriable.
+                    bail!(Status::aborted(format!(
+                        "output {idx}: concurrent upload in progress; retry"
+                    )));
+                }
+                Err(e) => bail!(putpath_metadata_status(
+                    "PutPathBatch: claim_placeholder",
+                    e
+                )),
             }
 
-            if !inserted {
-                // Concurrent uploader owns the slot. For a batch, we can't
-                // partially proceed — bail the whole batch. Retriable.
-                metrics::counter!("rio_store_putpath_retries_total",
-                    "reason" => "concurrent_upload")
-                .increment(1);
-                bail!(Status::aborted(format!(
-                    "output {idx}: concurrent upload in progress; retry"
-                )));
+            // Stage: chunked outputs upload to S3 + bump refcounts now
+            // (outside the atomic tx); inline outputs just carry their
+            // bytes forward. info.store_path_hash must be set for
+            // stage_chunked's manifest write.
+            info.store_path_hash = accum.store_path_hash.clone();
+            let nar_data = std::mem::take(&mut accum.nar_data);
+            match self.stage_nar_for_batch(info, nar_data).await {
+                Ok(p) => accum.staged = Some(p),
+                // stage_chunked rolled back this output's placeholder on
+                // its own; abort_batch's reap_one for it is a harmless
+                // no-op (status='uploading' filter). Other outputs'
+                // placeholders are still owned and DO need cleanup.
+                Err(e) => bail!(e),
             }
-            owned_placeholders.push(accum.store_path_hash.clone());
         }
 
         // Resolve the tenant's signer ONCE. All outputs in the batch
@@ -362,7 +328,7 @@ impl StoreServiceImpl {
             }
             // Clone (not take) — the post-commit content-index loop needs
             // info.nar_hash + store_path_hash again. Both are 32 bytes;
-            // cheap to clone. nar_data stays the move-optimized take.
+            // cheap to clone. staged stays the move-optimized take.
             let mut info = accum.info.clone().expect("validated in phase 2");
             info.store_path_hash = accum.store_path_hash.clone();
             // Sign with the pre-resolved signer (see resolve_once above).
@@ -371,15 +337,22 @@ impl StoreServiceImpl {
                 self.sign_with_resolved(signer, *was_tenant, &mut info);
             }
 
-            let nar_data = Bytes::from(std::mem::take(&mut accum.nar_data));
-            if let Err(e) = metadata::complete_manifest_inline_in_tx(&mut tx, &info, nar_data).await
-            {
-                // tx drops here → auto-rollback. Placeholders still need
-                // explicit cleanup (they were committed in phase 2's
-                // separate per-placeholder txs).
+            let result = match accum.staged.take().expect("staged in phase 2") {
+                NarPersist::Inline(nar_data) => {
+                    metadata::complete_manifest_inline_in_tx(&mut tx, &info, nar_data).await
+                }
+                NarPersist::ChunkedStaged => {
+                    metadata::complete_manifest_chunked_in_tx(&mut tx, &info).await
+                }
+            };
+            if let Err(e) = result {
+                // tx drops here → auto-rollback. Placeholders (and any
+                // staged chunk refcounts) still need explicit cleanup —
+                // they were committed in phase 2's separate per-output
+                // txs. abort_batch's reap_one is chunk-aware.
                 drop(tx);
                 bail!(putpath_metadata_status(
-                    "PutPathBatch: complete_manifest_inline",
+                    "PutPathBatch: complete_manifest",
                     e
                 ));
             }
