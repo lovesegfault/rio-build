@@ -30,7 +30,7 @@ use std::sync::RwLock;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use bytes::Bytes;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Marker error: backend rejected the request due to auth/config, not a
 /// transient fault. When this is in an anyhow chain, the grpc layer maps
@@ -419,11 +419,6 @@ pub struct S3ChunkBackend {
     client: Client,
     bucket: String,
     prefix: String,
-    /// The pre-normalize prefix, retained ONLY if normalization
-    /// changed it. `get()` falls back to this on NoSuchKey to read
-    /// data written before the I-007 prefix-normalize fix landed.
-    /// See [`get`](S3ChunkBackend::get) for the I-040 chain.
-    legacy_prefix: Option<String>,
 }
 
 impl S3ChunkBackend {
@@ -439,21 +434,11 @@ impl S3ChunkBackend {
         // them. Stripping leading slashes too would be surprising (a
         // prefix of "/foo" is unusual but intentional); trailing is
         // almost always a config mistake.
-        //
-        // I-040 hardening: keep the un-normalized prefix iff trim
-        // changed it. `get()` falls back to the legacy key on 404 so
-        // data written before this fix deployed isn't stranded. The
-        // pre-fix key scheme was self-consistent (writes AND reads
-        // used the double-slash); the fix made BOTH use single-slash,
-        // orphaning the old objects. The fallback bridges the gap
-        // until an `aws s3 sync` migrates them.
         let normalized = prefix.trim_end_matches('/').to_string();
-        let legacy_prefix = (normalized != prefix).then_some(prefix);
         Self {
             client,
             bucket,
             prefix: normalized,
-            legacy_prefix,
         }
     }
 
@@ -464,16 +449,6 @@ impl S3ChunkBackend {
         } else {
             format!("{}/chunks/{key}", self.prefix)
         }
-    }
-
-    /// The pre-normalize key for `hash`, or `None` if normalization
-    /// was a no-op. Uses the same `format!("{prefix}/chunks/{key}")`
-    /// formula as [`s3_key`](Self::s3_key) but with the un-trimmed
-    /// prefix — `legacy_prefix` is never empty (an empty input prefix
-    /// trims to itself, so `(normalized != prefix)` is false → None).
-    fn legacy_s3_key(&self, hash: &[u8; 32]) -> Option<String> {
-        let legacy = self.legacy_prefix.as_ref()?;
-        Some(format!("{legacy}/chunks/{}", chunk_key(hash)))
     }
 }
 
@@ -536,66 +511,15 @@ impl ChunkBackend for S3ChunkBackend {
             }
             Err(err) => {
                 let service_err = err.into_service_error();
-                if !service_err.is_no_such_key() {
+                if service_err.is_no_such_key() {
+                    Ok(None)
+                } else {
                     // Transient error — propagate. Conflating this with
                     // Ok(None) makes every S3 blip look like data loss,
                     // which is the opposite problem.
-                    return Err(anyhow::anyhow!(
+                    Err(anyhow::anyhow!(
                         "S3 GetObject failed for {key}: {service_err}"
-                    ));
-                }
-                // NoSuchKey at the normalized key. If the prefix was
-                // trimmed at construction (I-007 normalize), also try
-                // the pre-normalize key — data written before the fix
-                // landed lives there. I-040: 3465 objects stranded at
-                // `chunks//chunks/` after the Helm chart's `prefix =
-                // "chunks/"` was normalized; PG had refcount=1, S3
-                // 404'd. The fallback isn't free (one extra GetObject
-                // per genuine miss) but genuine misses on the read
-                // path mean the manifest is corrupt anyway — the
-                // common case is a hit on one key or the other.
-                let Some(legacy_key) = self.legacy_s3_key(hash) else {
-                    return Ok(None);
-                };
-                metrics::counter!(
-                    "rio_store_s3_requests_total", "operation" => "get_object_legacy"
-                )
-                .increment(1);
-                match self
-                    .client
-                    .get_object()
-                    .bucket(&self.bucket)
-                    .key(&legacy_key)
-                    .send()
-                    .await
-                {
-                    Ok(output) => {
-                        // WARN per hit — operator signal to run the
-                        // migration sync. The metric counts; the WARN
-                        // names the key for spot-checking.
-                        warn!(
-                            bucket = %self.bucket,
-                            key = %key,
-                            legacy_key = %legacy_key,
-                            "S3 chunk found at pre-normalize key only — \
-                             run `aws s3 sync` to migrate stranded objects"
-                        );
-                        let data = output.body.collect().await.map_err(|e| {
-                            anyhow::anyhow!("S3 body read failed for {legacy_key}: {e}")
-                        })?;
-                        Ok(Some(data.into_bytes()))
-                    }
-                    Err(err) => {
-                        let service_err = err.into_service_error();
-                        if service_err.is_no_such_key() {
-                            // Genuinely missing at both keys.
-                            Ok(None)
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "S3 GetObject failed for {legacy_key}: {service_err}"
-                            ))
-                        }
-                    }
+                    ))
                 }
             }
         }
@@ -924,16 +848,6 @@ mod tests {
             "trailing slash in prefix must not produce double-slash key"
         );
         assert!(!trailing.s3_key(&HASH_C).contains("//"));
-        // The bare prefix didn't get trimmed → no legacy key.
-        assert_eq!(bare.legacy_s3_key(&HASH_C), None);
-        // The trailing-slash prefix DID get trimmed → legacy key
-        // captures the pre-normalize double-slash form. This is what
-        // get() falls back to on 404.
-        assert_eq!(
-            trailing.legacy_s3_key(&HASH_C),
-            Some(format!("chunks//chunks/ab/{}", "ab".repeat(32))),
-            "legacy key reproduces the pre-I-007 double-slash form"
-        );
 
         // Multiple trailing slashes also stripped.
         let multi_trailing = S3ChunkBackend::new(client.clone(), "b".into(), "prod///".into());
@@ -967,8 +881,6 @@ mod tests {
 
     /// NoSuchKey → Ok(None), not Err. "Not there" vs "can't tell" are
     /// different — callers need to distinguish miss from transient error.
-    /// `make_s3_backend` uses prefix `"test-prefix"` (no trailing slash)
-    /// → no legacy key → no fallback GetObject. One mock rule suffices.
     #[tokio::test]
     async fn s3_get_nosuchkey_none() -> anyhow::Result<()> {
         let rule = mock!(Client::get_object)
@@ -979,60 +891,6 @@ mod tests {
         let got = backend.get(&HASH_A).await?;
         assert!(got.is_none());
         Ok(())
-    }
-
-    /// I-040 fallback: 404 at the normalized key, hit at the legacy
-    /// (pre-normalize, double-slash) key. Rule order matters under
-    /// `RuleMode::Sequential` — first GetObject is the normalized
-    /// key, second is the legacy fallback.
-    #[tokio::test]
-    async fn s3_get_legacy_fallback_hit() -> anyhow::Result<()> {
-        let r_norm = mock!(Client::get_object)
-            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
-        let r_legacy = mock!(Client::get_object).then_output(|| {
-            GetObjectOutput::builder()
-                .body(ByteStream::from_static(b"stranded chunk"))
-                .build()
-        });
-        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&r_norm, &r_legacy]);
-        // Trailing-slash prefix → legacy fallback armed.
-        let backend = S3ChunkBackend::new(client, "test-bucket".into(), "chunks/".into());
-
-        let got = backend.get(&HASH_A).await?.expect("legacy hit");
-        assert_eq!(got.as_ref(), b"stranded chunk");
-        Ok(())
-    }
-
-    /// 404 at BOTH keys → Ok(None). Genuinely missing.
-    #[tokio::test]
-    async fn s3_get_legacy_fallback_miss() -> anyhow::Result<()> {
-        let r_norm = mock!(Client::get_object)
-            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
-        let r_legacy = mock!(Client::get_object)
-            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
-        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&r_norm, &r_legacy]);
-        let backend = S3ChunkBackend::new(client, "test-bucket".into(), "chunks/".into());
-
-        let got = backend.get(&HASH_A).await?;
-        assert!(got.is_none(), "miss at both keys → genuine None");
-        Ok(())
-    }
-
-    /// Transient error at the LEGACY key propagates — same
-    /// "Err vs Ok(None)" distinction as the primary key. A 500
-    /// during fallback shouldn't masquerade as a clean miss.
-    #[tokio::test]
-    async fn s3_get_legacy_fallback_transient_error() {
-        use aws_sdk_s3::error::ErrorMetadata;
-        let r_norm = mock!(Client::get_object)
-            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
-        let r_legacy = mock!(Client::get_object).then_error(|| {
-            GetObjectError::generic(ErrorMetadata::builder().code("InternalError").build())
-        });
-        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&r_norm, &r_legacy]);
-        let backend = S3ChunkBackend::new(client, "test-bucket".into(), "chunks/".into());
-
-        assert!(backend.get(&HASH_A).await.is_err());
     }
 
     /// Transient server error → Err, NOT Ok(None). Conflating these makes
