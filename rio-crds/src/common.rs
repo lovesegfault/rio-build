@@ -15,7 +15,7 @@
 //! Each embedding struct also implements `Deref`/`DerefMut` →
 //! `*Common` so call sites keep writing `wp.spec.image` /
 //! `pool.status.ready_replicas` instead of `.common.image`. The
-//! [`impl_common_deref!`] macro stamps out those impls.
+//! `impl_common_deref!` macro stamps out those impls.
 
 use std::collections::BTreeMap;
 
@@ -89,7 +89,7 @@ pub struct PoolSpecCommon {
     pub tolerations: Option<Vec<Toleration>>,
 
     /// K8s resource requests/limits for the executor container.
-    /// `any_object` passthrough — see [`crate::any_object`] for why.
+    /// `any_object` passthrough — see `crate::any_object` for why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<ResourceRequirements>,
@@ -124,7 +124,7 @@ pub struct SizeClassCommon {
     /// K8s resource requests/limits for this class's pods.
     /// NON-Option: distinct resource profiles are the entire point
     /// of size classes. `any_object` passthrough — see
-    /// [`crate::any_object`] for why.
+    /// `crate::any_object` for why.
     #[schemars(schema_with = "crate::any_object")]
     pub resources: ResourceRequirements,
 
