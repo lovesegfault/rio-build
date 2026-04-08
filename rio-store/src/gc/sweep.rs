@@ -514,7 +514,7 @@ pub async fn sweep_orphan_chunks(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
     grace_secs: i64,
-) -> Result<(u64, u64), sqlx::Error> {
+) -> crate::metadata::Result<(u64, u64)> {
     // Outer SELECT: candidates. refcount=0 + not-yet-deleted + old
     // enough. This is EXACTLY the `idx_chunks_gc` partial index
     // predicate (`refcount = 0 AND deleted = FALSE`) with an extra
@@ -556,32 +556,12 @@ pub async fn sweep_orphan_chunks(
         // (delete_manifest_chunked_uploading) sorts ITS input. If we
         // don't sort here, sweep locks in SELECT order while rollback
         // locks in sort order — overlapping sets → circular wait →
-        // 40P01. Sorting here makes lock-acquisition order match.
-        //
-        // Inline sort+retry instead of with_sorted_retry: this fn
-        // returns sqlx::Error, not MetadataError, and the conversion
-        // back would be lossy. The pattern is identical — sort once,
-        // retry once on 40P01.
-        let mut hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.clone()).collect();
-        hashes.sort_unstable();
-
-        let mut attempt = 0;
-        let (zd, bf) = loop {
-            match sweep_orphan_batch(pool, &hashes, chunk_backend).await {
-                // 40P01 deadlock_detected. This module returns
-                // sqlx::Error (not MetadataError), so inline the
-                // SQLSTATE check instead of matching the Deadlock
-                // variant. Single retry — see with_sorted_retry doc.
-                Err(sqlx::Error::Database(db))
-                    if db.code().as_deref() == Some("40P01") && attempt == 0 =>
-                {
-                    warn!(error = %db, "40P01 on orphan-chunk sweep batch; retrying once");
-                    tokio::time::sleep(crate::metadata::jitter()).await;
-                    attempt += 1;
-                }
-                r => break r?,
-            }
-        };
+        // 40P01. Sorting + single retry via the shared helper.
+        let hashes: Vec<Vec<u8>> = batch.iter().map(|(h, _)| h.clone()).collect();
+        let (zd, bf) = crate::metadata::with_sorted_retry(hashes, |sorted| async move {
+            sweep_orphan_batch(pool, &sorted, chunk_backend).await
+        })
+        .await?;
         chunks_deleted += zd;
         bytes_freed += bf;
     }
@@ -610,7 +590,7 @@ async fn sweep_orphan_batch(
     pool: &PgPool,
     hashes: &[Vec<u8>],
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
-) -> Result<(u64, u64), sqlx::Error> {
+) -> crate::metadata::Result<(u64, u64)> {
     let mut tx = pool.begin().await?;
 
     // Inner UPDATE: re-check refcount=0 + deleted=FALSE at execution
