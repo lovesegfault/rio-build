@@ -343,14 +343,6 @@ pub async fn execute_build(
     store_client: &mut StoreServiceClient<Channel>,
     log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<ExecutionResult, ExecutorError> {
-    // Destructure for ergonomics — the body was written with these as
-    // params, and rewriting every `fuse_mount_point` to `env.fuse_mount_point`
-    // would be noise. The compiler inlines this away.
-    let fuse_mount_point: &Path = &env.fuse_mount_point;
-    let overlay_base_dir: &Path = &env.overlay_base_dir;
-    let executor_id: &str = &env.executor_id;
-    let log_limits = env.log_limits;
-
     let drv_path = &assignment.drv_path;
     let build_id = sanitize_build_id(drv_path);
 
@@ -428,8 +420,8 @@ pub async fn execute_build(
     // overlayfs mount syscall); run on the blocking pool so a slow mount
     // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
     // worker thread and block the heartbeat loop.
-    let fuse_mp = fuse_mount_point.to_path_buf();
-    let overlay_base = overlay_base_dir.to_path_buf();
+    let fuse_mp = env.fuse_mount_point.clone();
+    let overlay_base = env.overlay_base_dir.clone();
     let build_id_owned = build_id.clone();
     let overlay_mount = tokio::task::spawn_blocking(move || {
         overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned)
@@ -519,12 +511,90 @@ pub async fn execute_build(
     // (I-060) can't shadow it. nix's nested sandbox bind-mounts inputs
     // from realStoreDir (`{build_dir}/nix/store/...`) to the build's
     // canonical `/nix/store/...`.
-    // Extract BuildOptions. The scheduler computes these per-derivation
-    // from the intersecting builds' options (actor/build.rs min_nonzero
-    // for timeouts, max for cores). `None` → daemon defaults: unbounded
-    // silence, nproc cores. 0 → 0 on the wire = unbounded/all-cores to
-    // the daemon — the scheduler's min_nonzero already handles the
-    // 0-means-unset semantics; we pass through verbatim.
+    let opts = resolve_build_opts(assignment, env, effective_cores);
+
+    let DaemonOutcome {
+        build_result,
+        peak_memory_bytes,
+        peak_cpu_cores,
+    } = run_daemon_lifecycle(
+        &overlay_mount,
+        env,
+        &build_id,
+        drv_path,
+        &basic_drv,
+        opts,
+        log_tx,
+    )
+    .await?;
+
+    // Propagate any daemon error AFTER cgroup teardown ran inside
+    // run_daemon_lifecycle.
+    let build_result = build_result?;
+
+    // 10. Collect outputs: FOD verify, upload, map to proto BuildResult.
+    let BuildOutputs {
+        proto_result,
+        output_size_bytes,
+    } = collect_outputs(
+        &build_result,
+        store_client,
+        &overlay_mount,
+        &drv,
+        drv_path,
+        is_fod,
+        &input_paths,
+        &assignment.assignment_token,
+    )
+    .await?;
+
+    // 11. Tear down overlay (explicit, before Drop).
+    // We don't override a successful build result just because its own
+    // teardown fails. Teardown failure increments
+    // `rio_builder_overlay_unmount_failures_total` (in OverlayMount::Drop,
+    // centralized so ?-early-returns and panics also count); with one build
+    // per pod a leaked mount is reclaimed when the pod is discarded.
+    let merged_path = overlay_mount.merged_dir().to_path_buf();
+    if let Err(e) = overlay::teardown_overlay(overlay_mount) {
+        tracing::error!(
+            error = %e,
+            merged = %merged_path.display(),
+            "overlay teardown failed; mount leaked"
+        );
+        // Metric incremented in Drop (see overlay.rs).
+    }
+
+    Ok(ExecutionResult {
+        drv_path: drv_path.clone(),
+        result: proto_result,
+        assignment_token: assignment.assignment_token.clone(),
+        peak_memory_bytes,
+        output_size_bytes,
+        peak_cpu_cores,
+    })
+}
+
+/// Effective per-build option triple after applying assignment →
+/// worker-config → cgroup-clamp precedence.
+struct BuildOpts {
+    timeout: Duration,
+    max_silent_time: u64,
+    build_cores: u64,
+}
+
+/// Compute the effective build options for this assignment.
+///
+/// The scheduler computes `BuildOptions` per-derivation from the
+/// intersecting builds' options (`actor/build.rs` `min_nonzero` for
+/// timeouts, max for cores). `None` → daemon defaults: unbounded
+/// silence, nproc cores. 0 → 0 on the wire = unbounded/all-cores to
+/// the daemon — the scheduler's `min_nonzero` already handles the
+/// 0-means-unset semantics; we pass through verbatim.
+fn resolve_build_opts(
+    assignment: &WorkAssignment,
+    env: &ExecutorEnv,
+    effective_cores: u32,
+) -> BuildOpts {
     let opts = assignment.build_options.as_ref();
     let timeout = opts
         .and_then(|o| (o.build_timeout > 0).then(|| Duration::from_secs(o.build_timeout)))
@@ -547,7 +617,7 @@ pub async fn execute_build(
     // (I-197: pools set limits.cpu == requests.cpu so cpu.max is
     // always a real quota), and cap any client-requested value at the
     // same ceiling — a client asking for --cores 64 on a 2-core pod
-    // gets 2. Computed once above (also written to nix.conf in
+    // gets 2. Computed once in the caller (also written to nix.conf in
     // prepare_sandbox as defense-in-depth).
     let effective_cores = u64::from(effective_cores);
     let build_cores = match opts.map(|o| o.build_cores).filter(|&c| c > 0) {
@@ -560,9 +630,42 @@ pub async fn execute_build(
         client_requested = opts.map(|o| o.build_cores),
         "build_cores clamped to cgroup cpu.max"
     );
+    BuildOpts {
+        timeout,
+        max_silent_time,
+        build_cores,
+    }
+}
 
+/// Result of [`run_daemon_lifecycle`]: the inner build result (NOT yet
+/// `?`-propagated — cgroup teardown must run regardless) plus the
+/// resource samples read from the per-build cgroup before it was dropped.
+struct DaemonOutcome {
+    build_result: Result<rio_nix::protocol::build::BuildResult, ExecutorError>,
+    peak_memory_bytes: u64,
+    peak_cpu_cores: f64,
+}
+
+/// Spawn `nix-daemon`, attach it to a per-build cgroup, run the build,
+/// then unconditionally kill + drain the cgroup.
+///
+/// Returns `Err` only for setup failures BEFORE the cgroup kill-guard is
+/// in place (daemon spawn, cgroup create/add — `kill_on_drop` covers the
+/// daemon for those). Any error from `run_daemon_build` itself is carried
+/// in `DaemonOutcome.build_result` so the caller can propagate it AFTER
+/// the cgroup has been torn down.
+#[instrument(skip_all, fields(drv_path = %drv_path))]
+async fn run_daemon_lifecycle(
+    overlay_mount: &overlay::OverlayMount,
+    env: &ExecutorEnv,
+    build_id: &str,
+    drv_path: &str,
+    basic_drv: &rio_nix::derivation::BasicDerivation,
+    opts: BuildOpts,
+    log_tx: &mpsc::Sender<ExecutorMessage>,
+) -> Result<DaemonOutcome, ExecutorError> {
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
-    let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;
+    let mut daemon = spawn_daemon_in_namespace(overlay_mount).await?;
     tracing::info!(drv_path = %drv_path, pid = ?daemon.id(), "nix-daemon spawned; starting handshake");
 
     // Per-build cgroup. Created AFTER spawn (we need the PID) but
@@ -585,7 +688,7 @@ pub async fn execute_build(
     // [A-Za-z0-9_-] to '_' (drv names can carry `?id=...`, `+`, etc. —
     // see I-167). Same name as the overlay directory — easy to
     // correlate in debugging.
-    let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, &build_id)
+    let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, build_id)
         .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
     let daemon_pid = daemon
         .id()
@@ -608,24 +711,148 @@ pub async fn execute_build(
         let _ = std::fs::write(p.join("cgroup.kill"), "1");
     });
 
-    // CPU polling task. Runs concurrently with run_daemon_build
-    // below (which awaits). Samples cpu.stat usage_usec every second,
-    // computes instantaneous cores = delta_usec/elapsed_usec, tracks
-    // max. The cgroup's usage_usec is tree-cumulative, so this
-    // captures the builder's CPU too.
+    let monitors = spawn_cgroup_monitors(&build_cgroup, &env.cgroup_parent);
+
+    // All daemon I/O is in a helper so we can ALWAYS kill on error.
+    // The cgroup setup above (create/add_process)
+    // is NOT inside this helper — its `?` paths rely on the
+    // kill_on_drop set in spawn_daemon_in_namespace as a safety
+    // net. The explicit kill below remains the primary cleanup
+    // (graceful, bounded wait for reap); kill_on_drop covers early
+    // returns between spawn and here.
+    let batcher = LogBatcher::new(drv_path.to_owned(), env.executor_id.clone(), env.log_limits);
+    let build_result = run_daemon_build(
+        &mut daemon,
+        drv_path,
+        basic_drv,
+        opts.timeout,
+        opts.max_silent_time,
+        opts.build_cores,
+        batcher,
+        log_tx,
+    )
+    .await;
+
+    // Stop both monitors and read their results. The last CPU sample
+    // is up to 1s stale; good enough (peak CPU doesn't change in the
+    // last second of a multi-minute build). The scopeguards inside
+    // `monitors` also abort on drop; this explicit stop is the happy-
+    // path fast stop (guard fires redundantly after, which is a no-op
+    // on an already-aborted handle).
+    let (peak_cpu_cores, oom_detected) = monitors.stop();
+
+    // OOM override: if the watcher fired, run_daemon_build returned
+    // some Err (Wire(UnexpectedEof) from the cgroup.kill, or possibly
+    // a daemon-reported MiscFailure if the daemon caught the child
+    // death first). Replace it with CgroupOom so runtime.rs reports
+    // InfrastructureFailure with the size-class hint, NOT a transient-
+    // retry (UnexpectedEof would hit `is_daemon_transient` → 3× local
+    // retry → 3× more OOM-loops) and NOT BuildFailed (drv isn't broken).
+    let build_result = if oom_detected {
+        metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
+        Err(ExecutorError::CgroupOom)
+    } else {
+        build_result
+    };
+
+    // Read cgroup memory.peak. Kernel-tracked lifetime max of the
+    // WHOLE TREE — daemon + builder + every child. One read, no
+    // polling. This FIXES the phase2c bug: VmHWM on daemon.id()
+    // measured ~10MB (daemon's own RSS) because the builder was a
+    // FORKED child, not exec'd — the builder's memory never showed
+    // in daemon's /proc.
     //
-    // Stores max as f64 bits in an AtomicU64 — there's no AtomicF64.
-    // compare_exchange loop for max (fetch_max on u64 bits would
-    // compare BIT PATTERNS, not float values — 2.0_f64.to_bits() >
-    // 8.0_f64.to_bits() is NOT guaranteed). Standard f64-atomic
-    // pattern.
+    // 0 on None (file missing would mean memory controller not
+    // enabled, but enable_subtree_controllers at startup would have
+    // caught that — this is a belt-and-suspenders default).
+    let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
+
+    // ALWAYS kill the daemon, regardless of success/failure.
+    if let Err(e) = daemon.kill().await {
+        tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
+    }
+    // Reap the zombie (bounded wait).
+    match tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "daemon.wait() failed after kill"),
+        Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
+    }
+
+    drain_build_cgroup(build_cgroup).await;
+
+    // Defuse: explicit kill+drain above already ran; guard is redundant.
+    scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+
+    // (Final log flush happens inside read_build_stderr_loop — it owns
+    // the batcher by-value.)
+
+    Ok(DaemonOutcome {
+        build_result,
+        peak_memory_bytes,
+        peak_cpu_cores,
+    })
+}
+
+/// Handles to the per-build cgroup monitor tasks. `stop()` aborts both
+/// and reads their accumulated state; `Drop` aborts as a safety net so
+/// an early `?` in the caller doesn't leak 1Hz pollers.
+struct CgroupMonitors {
+    cpu_poll: tokio::task::JoinHandle<()>,
+    oom_watch: tokio::task::JoinHandle<()>,
+    peak_cpu: Arc<std::sync::atomic::AtomicU64>,
+    oom_detected: Arc<AtomicBool>,
+}
+
+impl CgroupMonitors {
+    /// Abort both monitor tasks and return `(peak_cpu_cores, oom_detected)`.
+    /// `abort()` doesn't wait — both tasks are pure read, no cleanup needed.
+    fn stop(self) -> (f64, bool) {
+        self.cpu_poll.abort();
+        self.oom_watch.abort();
+        (
+            f64::from_bits(self.peak_cpu.load(Ordering::Acquire)),
+            self.oom_detected.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl Drop for CgroupMonitors {
+    fn drop(&mut self) {
+        // Abort guard: if run_daemon_build panics (or any `?` between
+        // spawn and the explicit `stop()` early-returns), the pollers
+        // would leak as 1Hz tasks reading a dead cgroup path forever.
+        // `.abort()` on a completed/already-aborted handle is a no-op,
+        // so the explicit `stop()` above is harmless redundancy.
+        self.cpu_poll.abort();
+        self.oom_watch.abort();
+    }
+}
+
+/// Spawn the per-build cgroup CPU poller and OOM watcher.
+///
+/// Both run concurrently with `run_daemon_build` (which awaits). The
+/// returned [`CgroupMonitors`] aborts them on `Drop`; the caller should
+/// call `.stop()` after the build completes to read peak CPU + OOM flag.
+///
+/// Clones the cgroup PATH (not the `BuildCgroup` — moving it would put
+/// `Drop` in the task, which we don't want; `Drop` must run after
+/// `daemon.wait()` in the caller).
+fn spawn_cgroup_monitors(
+    build_cgroup: &crate::cgroup::BuildCgroup,
+    cgroup_parent: &Path,
+) -> CgroupMonitors {
+    // CPU polling task: samples `cpu.stat usage_usec` every second,
+    // computes instantaneous cores = `delta_usec/elapsed_usec`, tracks
+    // max. The cgroup's `usage_usec` is tree-cumulative, so this captures
+    // the builder's CPU too.
     //
-    // Clone the cgroup PATH (not the BuildCgroup — moving it would
-    // put Drop in the task, which we don't want; Drop must run after
-    // daemon.wait() below).
-    let peak_cpu_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Stores max as f64 bits in an `AtomicU64` — there's no `AtomicF64`.
+    // compare_exchange loop for max (`fetch_max` on u64 bits would compare
+    // BIT PATTERNS, not float values — `2.0_f64.to_bits() > 8.0_f64.to_bits()`
+    // is NOT guaranteed). Standard f64-atomic pattern.
+    let peak_cpu = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cpu_poll_path = build_cgroup.path().to_path_buf();
-    let cpu_poll_peak = Arc::clone(&peak_cpu_atomic);
+    let cpu_poll_peak = Arc::clone(&peak_cpu);
     let cpu_poll = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         // First tick fires immediately — skip it, we want a 1s baseline.
@@ -672,14 +899,6 @@ pub async fn execute_build(
         }
     });
 
-    // Abort guard: if run_daemon_build panics (or any `?` between here
-    // and the explicit abort below early-returns), cpu_poll would leak
-    // as a 1Hz polling task reading a dead cgroup path forever. Same
-    // pattern as stderr_loop.rs:285. `.abort()` on a completed task is
-    // a no-op, so the explicit abort below is harmless redundancy.
-    let cpu_poll_abort = cpu_poll.abort_handle();
-    let _cpu_poll_guard = scopeguard::guard((), move |()| cpu_poll_abort.abort());
-
     // r[impl builder.oom.cgroup-watch]
     // OOM watcher (I-196 defense-in-depth). Polls the POD-level
     // `memory.events` (delegated root — where k8s set memory.max; the
@@ -694,11 +913,11 @@ pub async fn execute_build(
     // Baseline captured at spawn: a prior build's OOM (or the FUSE
     // warm getting killed) shouldn't count. `None` baseline (file
     // unreadable — memory controller off, or non-k8s test env) → the
-    // task idles harmlessly; the build_cores clamp above is the
-    // primary fix anyway.
+    // task idles harmlessly; the build_cores clamp is the primary fix
+    // anyway.
     let oom_detected = Arc::new(AtomicBool::new(false));
     let oom_watch = {
-        let parent = env.cgroup_parent.clone();
+        let parent = cgroup_parent.to_path_buf();
         let kill_path = build_cgroup.path().to_path_buf();
         let flag = Arc::clone(&oom_detected);
         let baseline = crate::cgroup::read_oom_kill(&parent);
@@ -721,7 +940,7 @@ pub async fn execute_build(
                     );
                     flag.store(true, Ordering::SeqCst);
                     // Break the make-respawn loop. run_daemon_build
-                    // sees daemon EOF; the flag check below converts
+                    // sees daemon EOF; the caller's flag check converts
                     // that into CgroupOom.
                     let _ = std::fs::write(kill_path.join("cgroup.kill"), "1");
                     return;
@@ -729,90 +948,30 @@ pub async fn execute_build(
             }
         })
     };
-    let oom_watch_abort = oom_watch.abort_handle();
-    let _oom_watch_guard = scopeguard::guard((), move |()| oom_watch_abort.abort());
 
-    // All daemon I/O is in a helper so we can ALWAYS kill on error.
-    // The cgroup setup above (create/add_process)
-    // is NOT inside this helper — its `?` paths rely on the
-    // kill_on_drop set in spawn_daemon_in_namespace as a safety
-    // net. The explicit kill below remains the primary cleanup
-    // (graceful, bounded wait for reap); kill_on_drop covers early
-    // returns between spawn and here.
-    let batcher = LogBatcher::new(drv_path.clone(), executor_id.to_string(), log_limits);
-    let build_result = run_daemon_build(
-        &mut daemon,
-        drv_path,
-        &basic_drv,
-        timeout,
-        max_silent_time,
-        build_cores,
-        batcher,
-        log_tx,
-    )
-    .await;
-
-    // Stop CPU polling. The last sample is up to 1s stale; good
-    // enough (peak CPU doesn't change in the last second of a
-    // multi-minute build). abort() doesn't wait — the task is
-    // pure read, no cleanup needed. The scopeguard above also
-    // aborts on scope exit; this explicit call is the happy-path
-    // fast stop (guard fires redundantly after, which is a no-op
-    // on an already-aborted handle).
-    cpu_poll.abort();
-    oom_watch.abort();
-    let peak_cpu_cores = f64::from_bits(peak_cpu_atomic.load(Ordering::Acquire));
-
-    // OOM override: if the watcher fired, run_daemon_build returned
-    // some Err (Wire(UnexpectedEof) from the cgroup.kill, or possibly
-    // a daemon-reported MiscFailure if the daemon caught the child
-    // death first). Replace it with CgroupOom so runtime.rs reports
-    // InfrastructureFailure with the size-class hint, NOT a transient-
-    // retry (UnexpectedEof would hit `is_daemon_transient` → 3× local
-    // retry → 3× more OOM-loops) and NOT BuildFailed (drv isn't broken).
-    let build_result = if oom_detected.load(Ordering::SeqCst) {
-        metrics::counter!("rio_builder_cgroup_oom_total").increment(1);
-        Err(ExecutorError::CgroupOom)
-    } else {
-        build_result
-    };
-
-    // Read cgroup memory.peak. Kernel-tracked lifetime max of the
-    // WHOLE TREE — daemon + builder + every child. One read, no
-    // polling. This FIXES the phase2c bug: VmHWM on daemon.id()
-    // measured ~10MB (daemon's own RSS) because the builder was a
-    // FORKED child, not exec'd — the builder's memory never showed
-    // in daemon's /proc.
-    //
-    // 0 on None (file missing would mean memory controller not
-    // enabled, but enable_subtree_controllers at startup would have
-    // caught that — this is a belt-and-suspenders default).
-    let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
-
-    // ALWAYS kill the daemon, regardless of success/failure.
-    if let Err(e) = daemon.kill().await {
-        tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
+    CgroupMonitors {
+        cpu_poll,
+        oom_watch,
+        peak_cpu,
+        oom_detected,
     }
-    // Reap the zombie (bounded wait).
-    match tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "daemon.wait() failed after kill"),
-        Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
-    }
+}
 
-    // daemon.kill() above SIGKILLs the nix-daemon process only. The
-    // builder is a GRANDCHILD (forked by the daemon during wopBuildDerivation)
-    // and is not in the daemon's process group — it lives on in the
-    // cgroup. On the success path the builder has already exited (build
-    // finished → daemon sent STDERR_LAST → we got here); on the timeout/
-    // error path it's still running a `sleep 3600` or a stuck compiler.
-    //
-    // cgroup.kill walks the tree: SIGKILLs everything, including sub-
-    // cgroups the daemon may have created. Idempotent — writing "1" to
-    // an empty cgroup is a no-op — so we call it unconditionally rather
-    // than branching on build_result.is_err().
-    //
-    // r[impl builder.cgroup.kill-on-teardown]
+/// Kill the per-build cgroup tree, wait for it to drain, then drop.
+///
+/// `daemon.kill()` in the caller SIGKILLs the nix-daemon process only.
+/// The builder is a GRANDCHILD (forked by the daemon during
+/// `wopBuildDerivation`) and is not in the daemon's process group — it
+/// lives on in the cgroup. On the success path the builder has already
+/// exited (build finished → daemon sent `STDERR_LAST`); on the timeout/
+/// error path it's still running a `sleep 3600` or a stuck compiler.
+///
+/// `cgroup.kill` walks the tree: SIGKILLs everything, including sub-
+/// cgroups the daemon may have created. Idempotent — writing "1" to an
+/// empty cgroup is a no-op — so we call it unconditionally rather than
+/// branching on `build_result.is_err()`.
+// r[impl builder.cgroup.kill-on-teardown]
+async fn drain_build_cgroup(build_cgroup: crate::cgroup::BuildCgroup) {
     if let Err(e) = build_cgroup.kill() {
         // ENOENT shouldn't happen (we hold the BuildCgroup, Drop hasn't
         // run); EACCES would mean delegation is broken. Log and fall
@@ -821,10 +980,10 @@ pub async fn execute_build(
         tracing::warn!(error = %e, "build_cgroup.kill() failed");
     }
     // cgroup.kill is async: write returns before procs are gone. Poll
-    // cgroup.procs until empty or 2s elapsed (same budget as daemon.wait
-    // above; SIGKILL → exit is ~ms, 2s is vast headroom for a zombie-
-    // reparented tree). Sync read on blocking pool — 200 iterations of
-    // a single-line procfs read, negligible.
+    // cgroup.procs until empty or 2s elapsed (same budget as daemon.wait;
+    // SIGKILL → exit is ~ms, 2s is vast headroom for a zombie-reparented
+    // tree). Sync read on blocking pool — 200 iterations of a single-line
+    // procfs read, negligible.
     let cgroup_path_for_poll = build_cgroup.path().to_path_buf();
     let drained = tokio::task::spawn_blocking(move || {
         for _ in 0..200 {
@@ -846,59 +1005,8 @@ pub async fn execute_build(
             "cgroup still has processes 2s after cgroup.kill; rmdir will EBUSY"
         );
     }
-
-    // Defuse: explicit kill+drain above already ran; guard is redundant.
-    scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
     // build_cgroup drops here. rmdir succeeds if the drain above emptied
     // it; otherwise Drop warns EBUSY + leaks (cleared on pod restart).
-    drop(build_cgroup);
-
-    // (Final log flush happens inside read_build_stderr_loop — it owns
-    // the batcher by-value.)
-
-    // NOW propagate any daemon error (after kill).
-    let build_result = build_result?;
-
-    // 10. Collect outputs: FOD verify, upload, map to proto BuildResult.
-    let BuildOutputs {
-        proto_result,
-        output_size_bytes,
-    } = collect_outputs(
-        &build_result,
-        store_client,
-        &overlay_mount,
-        &drv,
-        drv_path,
-        is_fod,
-        &input_paths,
-        &assignment.assignment_token,
-    )
-    .await?;
-
-    // 11. Tear down overlay (explicit, before Drop).
-    // We don't override a successful build result just because its own
-    // teardown fails. Teardown failure increments
-    // `rio_builder_overlay_unmount_failures_total` (in OverlayMount::Drop,
-    // centralized so ?-early-returns and panics also count); with one build
-    // per pod a leaked mount is reclaimed when the pod is discarded.
-    let merged_path = overlay_mount.merged_dir().to_path_buf();
-    if let Err(e) = overlay::teardown_overlay(overlay_mount) {
-        tracing::error!(
-            error = %e,
-            merged = %merged_path.display(),
-            "overlay teardown failed; mount leaked"
-        );
-        // Metric incremented in Drop (see overlay.rs).
-    }
-
-    Ok(ExecutionResult {
-        drv_path: drv_path.clone(),
-        result: proto_result,
-        assignment_token: assignment.assignment_token.clone(),
-        peak_memory_bytes,
-        output_size_bytes,
-        peak_cpu_cores,
-    })
 }
 
 /// Resolved build inputs: the BasicDerivation (inputDrvs collapsed into
