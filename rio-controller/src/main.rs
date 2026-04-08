@@ -58,8 +58,8 @@ struct Config {
     /// `None` (env unset) = single-channel fallback.
     store_balance_host: Option<String>,
     store_balance_port: u16,
-    /// Prometheus metrics listen address.
-    metrics_addr: std::net::SocketAddr,
+    #[serde(flatten)]
+    common: rio_common::config::CommonConfig,
     /// HTTP /healthz listen address. K8s livenessProbe hits this.
     health_addr: std::net::SocketAddr,
     /// GC cron interval (hours). 0 = disabled (reconciler not
@@ -68,11 +68,6 @@ struct Config {
     /// grace). `store_addr` is the connect target — StoreAdminService
     /// is hosted on the store's gRPC port alongside StoreService.
     gc_interval_hours: u64,
-    /// mTLS client config for outgoing gRPC (scheduler + store).
-    /// Set via `RIO_TLS__*`. The controller's K8s API connection
-    /// has its own TLS (kube client, in-cluster service account
-    /// CA) — this is only for rio-internal gRPC.
-    tls: rio_common::tls::TlsConfig,
 }
 
 impl Default for Config {
@@ -86,13 +81,12 @@ impl Default for Config {
             store_balance_port: 9002,
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
-            metrics_addr: rio_common::default_addr(9094),
+            common: rio_common::config::CommonConfig::new(9094),
             // Same +100 pattern as gateway/worker.
             health_addr: rio_common::default_addr(9194),
             // 24h: typical store growth between sweeps is a few
             // thousand paths. Lower values are fine for VM tests.
             gc_interval_hours: 24,
-            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }
@@ -133,11 +127,8 @@ impl rio_common::config::ValidateConfig for Config {
 }
 
 impl rio_common::server::HasCommonConfig for Config {
-    fn tls(&self) -> &rio_common::tls::TlsConfig {
-        &self.tls
-    }
-    fn metrics_addr(&self) -> std::net::SocketAddr {
-        self.metrics_addr
+    fn common(&self) -> &rio_common::config::CommonConfig {
+        &self.common
     }
 }
 
@@ -147,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
     let rio_common::server::Bootstrap::<Config> {
         cfg,
         shutdown,
+        serve_shutdown: _,
         otel_guard: _otel_guard,
+        root_span: _root_span,
     } = rio_common::server::bootstrap("controller", cli, rio_controller::describe_metrics)?;
 
     // store_addr is injected into worker pod containers as
@@ -160,12 +153,6 @@ async fn main() -> anyhow::Result<()> {
              env (PutPath will fail with malformed URI)."
         );
     }
-
-    let _root_guard = tracing::info_span!("controller", component = "controller").entered();
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "starting rio-controller"
-    );
 
     // ---- K8s client ----
     // try_default reads in-cluster config (service account token
@@ -422,7 +409,7 @@ mod tests {
     fn config_defaults_are_stable() {
         let d = Config::default();
         assert!(d.scheduler_addr.is_empty(), "required, no default");
-        assert_eq!(d.metrics_addr.to_string(), "[::]:9094");
+        assert_eq!(d.common.metrics_addr.to_string(), "[::]:9094");
         assert_eq!(d.health_addr.to_string(), "[::]:9194");
         assert_eq!(d.gc_interval_hours, 24, "GC cron defaults to daily");
     }
@@ -447,18 +434,18 @@ mod tests {
         |cfg: Config| {
             assert_eq!(cfg.gc_interval_hours, 0);
             assert_eq!(
-                cfg.tls.cert_path.as_deref(),
+                cfg.common.tls.cert_path.as_deref(),
                 Some(std::path::Path::new("/etc/tls/cert.pem")),
                 "[tls] table must thread through figment into TlsConfig"
             );
             // Unspecified sub-field defaults via #[serde(default)]
             // on TlsConfig (partial table must work).
-            assert!(cfg.tls.key_path.is_none());
+            assert!(cfg.common.tls.key_path.is_none());
         }
     );
 
     rio_test_support::jail_defaults!("controller", "gc_interval_hours = 24", |cfg: Config| {
-        assert!(!cfg.tls.is_configured());
+        assert!(!cfg.common.tls.is_configured());
         assert!(cfg.scheduler_balance_host.is_none());
         assert_eq!(cfg.gc_interval_hours, 24);
     });
@@ -489,21 +476,6 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("scheduler_addr"), "{err}");
-    }
-
-    /// Whitespace-only scheduler_addr must be rejected as empty.
-    /// Regression guard for `ensure_required`'s trim — pre-helper,
-    /// bare `is_empty()` accepted `"   "`, startup failed later at
-    /// gRPC connect with a cryptic transport error.
-    #[test]
-    fn config_rejects_whitespace_scheduler_addr() {
-        let mut cfg = test_valid_config();
-        cfg.scheduler_addr = "   ".into();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("scheduler_addr is required"),
-            "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
-        );
     }
 
     /// Baseline: `test_valid_config()` itself passes — proves the

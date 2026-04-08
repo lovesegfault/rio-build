@@ -20,12 +20,11 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use tonic_health::pb::health_server::{Health, HealthServer};
 
-use crate::config::ValidateConfig;
+use crate::config::{CommonConfig, ValidateConfig};
 use crate::grpc::{H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW};
 use crate::observability::OtelGuard;
 use crate::signal::Token;
 use crate::task::spawn_monitored;
-use crate::tls::TlsConfig;
 
 /// `tonic::transport::Server::builder()` with h2 flow-control window
 /// tuning applied. Use this for every component's main gRPC server
@@ -46,16 +45,24 @@ pub fn tonic_builder() -> tonic::transport::Server {
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
 
-/// Accessor trait for the two config fields [`bootstrap`] needs. All 5
-/// binary `Config` structs already have `tls: TlsConfig` and
-/// `metrics_addr: SocketAddr` — this trait names that shape so
-/// `bootstrap()` can be generic over the crate-local `Config` type.
+/// Projects the crate-local `Config` to its embedded
+/// [`CommonConfig`]. Every binary's `Config` carries
+/// `#[serde(flatten)] common: CommonConfig`; this trait names that
+/// field so [`bootstrap`] (which loads the full `Config` via figment)
+/// can read the shared `tls` / `metrics_addr` / `drain_grace` without
+/// knowing the concrete type.
+///
+/// `metric_labels` is a method (not a `CommonConfig` field) because
+/// it's derived at runtime from other config — rio-builder computes
+/// `role={builder,fetcher}` from `executor_kind`. All other binaries
+/// take the default empty.
 pub trait HasCommonConfig {
-    fn tls(&self) -> &TlsConfig;
-    fn metrics_addr(&self) -> SocketAddr;
+    /// The embedded [`CommonConfig`]. Always `&self.common`.
+    fn common(&self) -> &CommonConfig;
     /// Global labels attached to every metric this binary exports.
-    /// Default empty. rio-builder overrides to add `role={builder,fetcher}`
-    /// so fetcher pods are distinguishable despite sharing the binary.
+    /// Default empty. rio-builder overrides to add
+    /// `role={builder,fetcher}` so fetcher pods are distinguishable
+    /// despite sharing the binary.
     fn metric_labels(&self) -> Vec<(&'static str, String)> {
         vec![]
     }
@@ -79,11 +86,23 @@ pub trait HasCommonConfig {
 #[must_use = "Bootstrap holds the OtelGuard — dropping it tears down tracing"]
 pub struct Bootstrap<C> {
     pub cfg: C,
+    /// Process-wide cancellation token. Fires on SIGTERM/SIGINT.
+    /// Clone for every background loop and pass `.cancelled_owned()`
+    /// to tonic/axum graceful-shutdown.
     pub shutdown: Token,
+    /// Independent token for the main listener's `serve_with_shutdown`.
+    /// NOT a child of `shutdown` — see [`spawn_drain_task`] for why.
+    /// Binaries without a tonic listener (controller, builder) ignore
+    /// this.
+    pub serve_shutdown: Token,
     /// Must be kept alive for the duration of `main()` — destructuring
     /// with `..` will drop it immediately and tear down the OTLP
     /// exporter. Bind explicitly: `otel_guard: _otel_guard`.
     pub otel_guard: OtelGuard,
+    /// The component root span, entered. Every subsequent log/span in
+    /// `main()` parents under this. Bind to a `_`-prefixed local; it
+    /// drops at end-of-main.
+    pub root_span: tracing::span::EnteredSpan,
 }
 
 /// The 6-step cold-start prologue every rio binary runs before its own
@@ -105,9 +124,12 @@ pub struct Bootstrap<C> {
 ///    more actionable; a missing `scheduler_addr` often masks "wrong
 ///    ConfigMap mounted")
 /// 6. shutdown signal + metrics exporter + `describe_metrics` callback
+/// 7. root span (`component = {component}`) + version `info!`
 ///
-/// Returns before the root span / version `info!` — worker's root span
-/// carries `executor_id`, others don't, so that stays at the call site.
+/// The root span is created with `component` as its only field.
+/// rio-builder records `executor_id` separately after resolving it
+/// (root-span fields can't be added post-creation, but a child span /
+/// log field is observably equivalent for the JSON log line).
 pub fn bootstrap<C, A>(
     component: &'static str,
     cli: A,
@@ -129,8 +151,9 @@ where
     let cfg: C = crate::config::load(component, cli)
         .inspect_err(|e| tracing::error!(error = %e, "config load failed"))?;
 
-    let client_tls = crate::tls::load_client_tls(cfg.tls())?;
-    if cfg.tls().is_configured() {
+    let common = cfg.common();
+    let client_tls = crate::tls::load_client_tls(&common.tls)?;
+    if common.tls.is_configured() {
         tracing::info!("client mTLS enabled for outgoing gRPC");
     }
     crate::grpc::init_client_tls(client_tls);
@@ -138,13 +161,24 @@ where
     cfg.validate()?;
 
     let shutdown = crate::signal::shutdown_signal();
-    crate::observability::init_metrics(cfg.metrics_addr(), &cfg.metric_labels())?;
+    crate::observability::init_metrics(common.metrics_addr, &cfg.metric_labels())?;
     describe_metrics();
+
+    // Span name is the static "rio" with `component` as a field —
+    // `info_span!` requires a literal name, and the field is what
+    // log queries / OTel filter on anyway.
+    let root_span = tracing::info_span!("rio", component).entered();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "starting rio-{component}"
+    );
 
     Ok(Bootstrap {
         cfg,
         shutdown,
+        serve_shutdown: Token::new(),
         otel_guard,
+        root_span,
     })
 }
 

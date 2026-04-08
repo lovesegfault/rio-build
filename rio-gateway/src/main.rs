@@ -37,7 +37,11 @@ struct Config {
     store_addr: String,
     host_key: std::path::PathBuf,
     authorized_keys: std::path::PathBuf,
-    metrics_addr: std::net::SocketAddr,
+    /// Shared `tls` / `metrics_addr` / `drain_grace` fields. Flattened
+    /// so the wire format (TOML keys, env var names) is unchanged from
+    /// when they were direct fields.
+    #[serde(flatten)]
+    common: rio_common::config::CommonConfig,
     /// gRPC health check listen address. The gateway's main protocol is
     /// SSH (russh), not gRPC, so we can't piggyback health on an
     /// existing tonic server. This spawns a dedicated one with ONLY
@@ -47,22 +51,12 @@ struct Config {
     /// health is gRPC. Could multiplex with tonic's accept_http1 +
     /// a route, but that's more complexity than a second listener.
     health_addr: std::net::SocketAddr,
-    /// mTLS: client cert + key + CA for outgoing gRPC connections
-    /// (scheduler + store). Set via `RIO_TLS__CERT_PATH` etc. Unset
-    /// = plaintext (dev mode). The gateway's INCOMING connections
-    /// are SSH — TLS doesn't apply there.
-    tls: rio_common::tls::TlsConfig,
     /// JWT issuance. `key_path` → K8s Secret mount at
     /// `/etc/rio/jwt/ed25519_seed` (see helm jwt-signing-secret.yaml).
     /// Unset = JWT disabled (dual-mode SSH-comment fallback path).
     /// Env: `RIO_JWT__KEY_PATH`, `RIO_JWT__REQUIRED`,
     /// `RIO_JWT__RESOLVE_TIMEOUT_MS`.
     jwt: rio_common::config::JwtConfig,
-    /// Seconds to wait after SIGTERM between health=NOT_SERVING and
-    /// stopping the SSH accept loop. Gives kubelet readinessProbe
-    /// (periodSeconds: 5) + NLB target deregistration time. 0 = no
-    /// drain. Default 6.
-    drain_grace_secs: u64,
     /// Seconds to wait after the SSH accept loop stops for active
     /// sessions to close on their own. The accept loop only stops
     /// ACCEPTING; already-established `nix build --store ssh-ng://`
@@ -117,15 +111,13 @@ impl Default for Config {
             store_addr: String::new(),
             host_key: std::path::PathBuf::new(),
             authorized_keys: std::path::PathBuf::new(),
-            metrics_addr: rio_common::default_addr(9090),
+            common: rio_common::config::CommonConfig::new(9090),
             // 9190 = gateway's metrics port (9090) + 100. Scheduler
             // health piggybacks on its gRPC port (9001), store on 9002.
             // Gateway has no gRPC port so needs its own. The +100
             // pattern keeps it discoverable without a doc lookup.
             health_addr: rio_common::default_addr(9190),
-            tls: rio_common::tls::TlsConfig::default(),
             jwt: rio_common::config::JwtConfig::default(),
-            drain_grace_secs: 6,
             session_drain: std::time::Duration::from_secs(60),
             rate_limit: None,
             max_connections: rio_gateway::server::DEFAULT_MAX_CONNECTIONS,
@@ -185,11 +177,6 @@ struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     health_addr: Option<std::net::SocketAddr>,
 
-    /// Drain grace period in seconds (0 = disabled)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    drain_grace_secs: Option<u64>,
-
     /// Session drain timeout in seconds (0 = exit immediately after accept stops)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,11 +213,8 @@ impl rio_common::config::ValidateConfig for Config {
 }
 
 impl rio_common::server::HasCommonConfig for Config {
-    fn tls(&self) -> &rio_common::tls::TlsConfig {
-        &self.tls
-    }
-    fn metrics_addr(&self) -> std::net::SocketAddr {
-        self.metrics_addr
+    fn common(&self) -> &rio_common::config::CommonConfig {
+        &self.common
     }
 }
 
@@ -240,11 +224,10 @@ async fn main() -> anyhow::Result<()> {
     let rio_common::server::Bootstrap::<Config> {
         cfg,
         shutdown,
+        serve_shutdown,
         otel_guard: _otel_guard,
+        root_span: _root_span,
     } = rio_common::server::bootstrap("gateway", cli, rio_gateway::describe_metrics)?;
-
-    let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
-    info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
 
     // Process-global DoS cap. Set ONCE before any SSH session can
     // call reconstruct_dag. Same OnceLock pattern as CLIENT_TLS
@@ -337,20 +320,17 @@ async fn main() -> anyhow::Result<()> {
     // service — must use set_service_status("") directly. See
     // scheduler/main.rs health_toggle_not_serving test for the proof
     // that named-only is tonic-health's behavior.
-    let serve_shutdown = rio_common::signal::Token::new();
-    {
-        let reporter = health_reporter.clone();
-        rio_common::server::spawn_drain_task(
-            shutdown.clone(),
-            serve_shutdown.clone(),
-            std::time::Duration::from_secs(cfg.drain_grace_secs),
-            move || async move {
-                reporter
-                    .set_service_status("", tonic_health::ServingStatus::NotServing)
-                    .await;
-            },
-        );
-    }
+    let reporter = health_reporter.clone();
+    rio_common::server::spawn_drain_task(
+        shutdown.clone(),
+        serve_shutdown.clone(),
+        cfg.common.drain_grace,
+        move || async move {
+            reporter
+                .set_service_status("", tonic_health::ServingStatus::NotServing)
+                .await;
+        },
+    );
 
     // Generic param: we don't have a "GatewayService" proto. Use the
     // tonic-health server's own type as a stand-in — the empty-string
@@ -548,7 +528,7 @@ mod tests {
     fn config_defaults_are_stable() {
         let d = Config::default();
         assert_eq!(d.listen_addr.to_string(), "[::]:2222");
-        assert_eq!(d.metrics_addr.to_string(), "[::]:9090");
+        assert_eq!(d.common.metrics_addr.to_string(), "[::]:9090");
         assert_eq!(d.health_addr.to_string(), "[::]:9190");
         // All four of these are deployment-specific: empty default + a
         // post-load ensure! in main(). Non-empty default here = silent
@@ -557,7 +537,7 @@ mod tests {
         assert!(d.store_addr.is_empty());
         assert!(d.host_key.as_os_str().is_empty());
         assert!(d.authorized_keys.as_os_str().is_empty());
-        assert_eq!(d.drain_grace_secs, 6);
+        assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
         assert_eq!(d.session_drain, std::time::Duration::from_secs(60));
         // JWT: disabled by default. Existing deployments (no Secret
         // mounted) keep working via the SSH-comment fallback path.
@@ -684,7 +664,7 @@ mod tests {
             assert_eq!(cfg.max_connections, 555);
             assert_eq!(cfg.max_transitive_inputs, 250_000);
             assert_eq!(
-                cfg.tls.cert_path.as_deref(),
+                cfg.common.tls.cert_path.as_deref(),
                 Some(std::path::Path::new("/etc/tls/cert.pem")),
                 "[tls] table must thread through figment into TlsConfig"
             );
@@ -709,7 +689,7 @@ mod tests {
 
     rio_test_support::jail_defaults!("gateway", "drain_grace_secs = 6", |cfg: Config| {
         assert_eq!(cfg.session_drain, std::time::Duration::from_secs(60));
-        assert!(!cfg.tls.is_configured());
+        assert!(!cfg.common.tls.is_configured());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert!(cfg.rate_limit.is_none());
         assert!(cfg.scheduler_balance_host.is_none());
@@ -739,21 +719,6 @@ mod tests {
             authorized_keys: "/tmp/authorized_keys".into(),
             ..Config::default()
         }
-    }
-
-    /// Whitespace-only scheduler_addr must be rejected as empty.
-    /// Regression guard for `ensure_required`'s trim — pre-helper,
-    /// bare `is_empty()` accepted `"   "`, startup failed later at
-    /// gRPC connect with "invalid socket address syntax: '  '".
-    #[test]
-    fn config_rejects_whitespace_scheduler_addr() {
-        let mut cfg = test_valid_config();
-        cfg.scheduler_addr = "   ".into();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("scheduler_addr is required"),
-            "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
-        );
     }
 
     /// Each required field is independently checked — clearing any

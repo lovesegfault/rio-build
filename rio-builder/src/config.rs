@@ -104,7 +104,8 @@ pub(crate) struct Config {
     #[serde(rename = "fuse_fetch_timeout_secs", with = "rio_common::config::secs")]
     pub(crate) fuse_fetch_timeout: std::time::Duration,
     pub(crate) overlay_base_dir: PathBuf,
-    pub(crate) metrics_addr: std::net::SocketAddr,
+    #[serde(flatten)]
+    pub(crate) common: rio_common::config::CommonConfig,
     /// HTTP /healthz + /readyz listen address. Builder has no gRPC
     /// server so tonic-health doesn't fit — plain HTTP via axum.
     /// K8s readinessProbe hits /readyz (200 after first accepted
@@ -152,9 +153,6 @@ pub(crate) struct Config {
     /// the daemon to advertise `set-options-map-only`, which rio-gateway does
     /// not — tracked under WONTFIX(P0310).
     pub(crate) max_silent_time_secs: u64,
-    /// mTLS for outgoing gRPC (scheduler + store). Env: `RIO_TLS__*`.
-    /// Unset = plaintext.
-    pub(crate) tls: rio_common::tls::TlsConfig,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -181,7 +179,7 @@ impl Default for Config {
             fuse_passthrough: true,
             fuse_fetch_timeout: std::time::Duration::from_secs(60),
             overlay_base_dir: "/var/rio/overlays".into(),
-            metrics_addr: rio_common::default_addr(9093),
+            common: rio_common::config::CommonConfig::new(9093),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
             // gateway (9090→9190). Scheduler/store piggyback health
             // on their gRPC ports; builder+gateway have no gRPC server.
@@ -192,7 +190,6 @@ impl Default for Config {
             size_class: String::new(),
             daemon_timeout: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time_secs: 0,
-            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }
@@ -343,7 +340,7 @@ mod tests {
              serde's bool default is false so this needs explicit handling"
         );
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
-        assert_eq!(d.metrics_addr.to_string(), "[::]:9093");
+        assert_eq!(d.common.metrics_addr.to_string(), "[::]:9093");
         assert_eq!(d.health_addr.to_string(), "[::]:9193");
         // Spec values from configuration.md:68-69.
         assert_eq!(d.log_rate_limit, 10_000);
@@ -389,18 +386,18 @@ mod tests {
             assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(222));
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
-                cfg.tls.cert_path.as_deref(),
+                cfg.common.tls.cert_path.as_deref(),
                 Some(std::path::Path::new("/etc/tls/cert.pem")),
                 "[tls] table must thread through figment into TlsConfig"
             );
             // Unspecified sub-field defaults via #[serde(default)]
             // on TlsConfig (partial table must work).
-            assert!(cfg.tls.key_path.is_none());
+            assert!(cfg.common.tls.key_path.is_none());
         }
     );
 
     rio_test_support::jail_defaults!("builder", "", |cfg: Config| {
-        assert!(!cfg.tls.is_configured());
+        assert!(!cfg.common.tls.is_configured());
         assert!(cfg.scheduler_balance_host.is_none());
         assert_eq!(cfg.executor_kind, ExecutorKind::Builder);
         assert!(cfg.systems.is_empty());

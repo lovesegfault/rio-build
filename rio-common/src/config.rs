@@ -96,6 +96,80 @@ pub mod millis {
     }
 }
 
+/// Configuration fields shared by every rio-* binary's `Config`.
+///
+/// Embed via `#[serde(flatten)]` so the wire format stays flat:
+/// `metrics_addr` / `drain_grace_secs` are top-level TOML keys (env
+/// `RIO_METRICS_ADDR`, `RIO_DRAIN_GRACE_SECS`); `tls` is the nested
+/// `[tls]` table (env `RIO_TLS__*`). Flattening the struct doesn't
+/// flatten `tls` — it appears at the same nesting level it had as a
+/// direct `Config.tls` field, so existing deployments are unaffected.
+///
+/// ```ignore
+/// #[derive(Serialize, Deserialize)]
+/// #[serde(default)]
+/// struct Config {
+///     listen_addr: String,
+///     #[serde(flatten)]
+///     common: rio_common::config::CommonConfig,
+///     // ...
+/// }
+/// ```
+///
+/// Replaces the per-binary `tls` / `metrics_addr` / `drain_grace_secs`
+/// fields and the byte-identical 8-line `HasCommonConfig` impl that
+/// projected them. [`crate::server::bootstrap`] reads this via the
+/// one-method [`crate::server::HasCommonConfig`] trait.
+///
+/// `#[serde(default)]` is required: `flatten` bypasses the outer
+/// struct's `#[serde(default)]`, so a TOML that sets only crate-
+/// specific fields would otherwise fail with `MissingField("tls")`.
+/// In production [`load`] always layers `Serialized::defaults`
+/// first so this never fires there, but tests that parse a bare
+/// TOML snippet (and figment's own internal re-deserialize during
+/// merge) need it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommonConfig {
+    /// mTLS client (and, where applicable, server) config. Nested
+    /// `[tls]` table; env `RIO_TLS__CERT_PATH` etc.
+    pub tls: crate::tls::TlsConfig,
+    /// Prometheus exporter listen address. Per-binary defaults differ
+    /// (gateway 9090, scheduler 9091, …) so each `Config::default()`
+    /// sets this explicitly via [`CommonConfig::new`].
+    pub metrics_addr: std::net::SocketAddr,
+    /// SIGTERM → NOT_SERVING → exit drain window. Gives kubelet
+    /// readiness probe (periodSeconds: 5) + endpoint propagation time
+    /// to observe before the listener stops. 0 = no drain. Only the
+    /// three tonic-serving binaries (scheduler/store/gateway) consume
+    /// this; controller and builder ignore it.
+    #[serde(rename = "drain_grace_secs", with = "secs")]
+    pub drain_grace: std::time::Duration,
+}
+
+impl Default for CommonConfig {
+    /// Placeholder `metrics_addr` (port 0) — every binary's
+    /// `Config::default()` overrides via [`CommonConfig::new`] with
+    /// its real port. This impl exists only so `#[serde(default)]`
+    /// has something to fill in when a flattened field is absent.
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl CommonConfig {
+    /// Construct with the per-binary metrics port. `tls` defaults to
+    /// unconfigured (plaintext); `drain_grace` to 6s (= probe
+    /// periodSeconds 5 + 1s propagation).
+    pub fn new(metrics_port: u16) -> Self {
+        Self {
+            tls: crate::tls::TlsConfig::default(),
+            metrics_addr: crate::default_addr(metrics_port),
+            drain_grace: std::time::Duration::from_secs(6),
+        }
+    }
+}
+
 /// Read an env var with a typed fallback. For the handful of
 /// bootstrap-time reads that run BEFORE [`load`] (tracing init,
 /// observability) or that live in leaf crates with no `Config` struct.

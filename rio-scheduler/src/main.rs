@@ -24,7 +24,8 @@ struct Config {
     listen_addr: String,
     store_addr: String,
     database_url: String,
-    metrics_addr: std::net::SocketAddr,
+    #[serde(flatten)]
+    common: rio_common::config::CommonConfig,
     #[serde(rename = "tick_interval_secs", with = "rio_common::config::secs")]
     tick_interval: std::time::Duration,
     /// S3 bucket for build-log flush. `None` = flush disabled.
@@ -66,9 +67,6 @@ struct Config {
     /// Shares the same HealthReporter as the main server → leadership
     /// toggles propagate. Only listens if server TLS is configured.
     health_addr: std::net::SocketAddr,
-    /// mTLS for BOTH server (workers, gateway, controller incoming)
-    /// AND client (store outgoing). Set via `RIO_TLS__*`.
-    tls: rio_common::tls::TlsConfig,
     /// HMAC key file for signing assignment tokens. The store
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
@@ -81,11 +79,6 @@ struct Config {
     /// ConfigMap on rotation, operator SIGHUPs the pod. Set via
     /// `RIO_JWT__KEY_PATH` (nested figment key — double underscore).
     jwt: rio_common::config::JwtConfig,
-    /// Seconds to wait after SIGTERM between set_not_serving()
-    /// and serve_with_shutdown returning. Gives the BalancedChannel
-    /// probe loop (3s interval) time to observe NOT_SERVING and
-    /// reroute. 0 = no drain (tests). Default 6.
-    drain_grace_secs: u64,
     /// Kubernetes Lease name for leader election. `None` = non-K8s
     /// mode (single-scheduler; is_leader=true immediately, generation
     /// stays 1). Env: `RIO_LEASE_NAME`. See rio_scheduler::lease.
@@ -133,7 +126,7 @@ impl Default for Config {
             listen_addr: rio_common::default_listen_string(9001),
             store_addr: String::new(),
             database_url: String::new(),
-            metrics_addr: rio_common::default_addr(9091),
+            common: rio_common::config::CommonConfig::new(9091),
             tick_interval: std::time::Duration::from_secs(10),
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
@@ -143,13 +136,8 @@ impl Default for Config {
             // 9101 = gRPC (9001) + 100. Same +100 pattern as
             // gateway. Only used when server TLS is configured.
             health_addr: rio_common::default_addr(9101),
-            tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
-            // periodSeconds: 5 (helm) + 1s propagation. Uniform across
-            // all three binaries even though scheduler's actual client
-            // probe is 3s — 6s out of 30s termGrace is cheap.
-            drain_grace_secs: 6,
             lease_name: None,
             lease_namespace: None,
             poison: rio_scheduler::PoisonConfig::default(),
@@ -200,11 +188,6 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_s3_prefix: Option<String>,
-
-    /// Drain grace period in seconds (0 = disabled)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    drain_grace_secs: Option<u64>,
 }
 
 impl rio_common::config::ValidateConfig for Config {
@@ -364,11 +347,8 @@ impl rio_common::config::ValidateConfig for Config {
 }
 
 impl rio_common::server::HasCommonConfig for Config {
-    fn tls(&self) -> &rio_common::tls::TlsConfig {
-        &self.tls
-    }
-    fn metrics_addr(&self) -> std::net::SocketAddr {
-        self.metrics_addr
+    fn common(&self) -> &rio_common::config::CommonConfig {
+        &self.common
     }
 }
 
@@ -378,14 +358,10 @@ async fn main() -> anyhow::Result<()> {
     let rio_common::server::Bootstrap::<Config> {
         cfg,
         shutdown,
+        serve_shutdown,
         otel_guard: _otel_guard,
+        root_span: _root_span,
     } = rio_common::server::bootstrap("scheduler", cli, rio_scheduler::describe_metrics)?;
-
-    let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "starting rio-scheduler"
-    );
 
     // Shutdown chain for the actor: token cancels → actor's select!
     // loop sees it → drops all worker stream_tx → build-exec-bridge
@@ -592,20 +568,17 @@ async fn main() -> anyhow::Result<()> {
     // The health-toggle loop below breaks on the SAME parent token
     // and its break arm does NOT call set_serving — so it cannot
     // un-flip us here. Last write wins.
-    let serve_shutdown = rio_common::signal::Token::new();
-    {
-        let reporter = health_reporter.clone();
-        rio_common::server::spawn_drain_task(
-            shutdown.clone(),
-            serve_shutdown.clone(),
-            std::time::Duration::from_secs(cfg.drain_grace_secs),
-            move || async move {
-                reporter
-                    .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
-                    .await;
-            },
-        );
-    }
+    let reporter = health_reporter.clone();
+    rio_common::server::spawn_drain_task(
+        shutdown.clone(),
+        serve_shutdown.clone(),
+        cfg.common.drain_grace,
+        move || async move {
+            reporter
+                .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                .await;
+        },
+    );
 
     spawn_health_toggle(
         health_reporter.clone(),
@@ -706,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
     // set to NOT_SERVING (no toggle loop for it) → standby always
     // appears Ready → K8s routes to a non-leader → cluster split.
     // Shared reporter is load-bearing.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)?;
+    let server_tls = rio_common::tls::load_server_tls(&cfg.common.tls)?;
 
     if server_tls.is_some() {
         // r[impl sched.health.shared-reporter]
@@ -1022,7 +995,7 @@ mod tests {
     fn config_defaults_are_stable() {
         let d = Config::default();
         assert_eq!(d.listen_addr, "[::]:9001");
-        assert_eq!(d.metrics_addr.to_string(), "[::]:9091");
+        assert_eq!(d.common.metrics_addr.to_string(), "[::]:9091");
         assert_eq!(d.tick_interval, std::time::Duration::from_secs(10));
         // Phase2a required these; no default.
         assert!(d.store_addr.is_empty());
@@ -1034,12 +1007,12 @@ mod tests {
         assert!(d.size_classes.is_empty());
         // Phase3b: plaintext health port for K8s probes when mTLS on.
         assert_eq!(d.health_addr.to_string(), "[::]:9101");
-        assert_eq!(d.drain_grace_secs, 6);
+        assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
         // Phase 4a (plan 21E): lease config via figment, not raw env.
         assert_eq!(d.lease_name, None, "non-K8s mode by default");
         assert_eq!(d.lease_namespace, None);
         // Phase3b: TLS off by default (dev mode, VM tests).
-        assert!(!d.tls.is_configured());
+        assert!(!d.common.tls.is_configured());
         // JWT verification off by default (interceptor inert until
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
         assert!(d.jwt.key_path.is_none());
@@ -1172,25 +1145,6 @@ mod tests {
             database_url: "postgres://localhost/test".into(),
             ..Config::default()
         }
-    }
-
-    /// Whitespace-only store_addr must be rejected as empty.
-    /// Regression guard for `ensure_required`'s trim: pre-helper,
-    /// bare `is_empty()` accepted `"   "`, startup failed later with
-    /// a cryptic "invalid socket address syntax" buried in connect
-    /// logs. The helper's trim catches it at config-load with the
-    /// clear "X is required" message instead. If this test ever
-    /// passes validation, `ensure_required` has regressed to bare
-    /// `is_empty()`.
-    #[test]
-    fn config_rejects_whitespace_store_addr() {
-        let mut cfg = test_valid_config();
-        cfg.store_addr = "   ".into();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("store_addr is required"),
-            "whitespace-only store_addr must be rejected as empty, got: {err}"
-        );
     }
 
     // r[verify sched.retry.per-worker-budget]

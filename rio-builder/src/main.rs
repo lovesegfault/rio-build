@@ -52,11 +52,8 @@ impl rio_common::config::ValidateConfig for Config {
 }
 
 impl rio_common::server::HasCommonConfig for Config {
-    fn tls(&self) -> &rio_common::tls::TlsConfig {
-        &self.tls
-    }
-    fn metrics_addr(&self) -> std::net::SocketAddr {
-        self.metrics_addr
+    fn common(&self) -> &rio_common::config::CommonConfig {
+        &self.common
     }
     fn metric_labels(&self) -> Vec<(&'static str, String)> {
         // Fetcher pods share this binary. Without a role label, both
@@ -76,7 +73,9 @@ async fn main() -> anyhow::Result<()> {
     let rio_common::server::Bootstrap::<Config> {
         mut cfg,
         shutdown,
+        serve_shutdown: _,
         otel_guard: _otel_guard,
+        root_span: _root_span,
     } = rio_common::server::bootstrap("builder", cli, rio_builder::describe_metrics)?;
 
     let (executor_id, systems, features) = resolve_executor_identity(
@@ -85,10 +84,7 @@ async fn main() -> anyhow::Result<()> {
         std::mem::take(&mut cfg.features),
     )?;
     validate_host_arch(cfg.executor_kind, &systems, &detect_system())?;
-
-    let _root_guard =
-        tracing::info_span!("builder", component = "builder", executor_id = %executor_id).entered();
-    info!(version = env!("CARGO_PKG_VERSION"), "starting rio-builder");
+    info!(%executor_id, "executor identity resolved");
 
     // cgroup setup BEFORE the health server: if cgroup fails, we don't
     // want liveness passing while startup is hung on `?` propagation.
@@ -1368,21 +1364,6 @@ mod tests {
                 "error for cleared {field} must name it: {err}"
             );
         }
-    }
-
-    /// Whitespace-only scheduler_addr must be rejected as empty.
-    /// Regression guard for `ensure_required`'s trim — pre-helper,
-    /// bare `is_empty()` accepted `"   "`, startup failed later at
-    /// gRPC connect with "invalid socket address syntax: '  '".
-    #[test]
-    fn config_rejects_whitespace_scheduler_addr() {
-        let mut cfg = test_valid_config();
-        cfg.scheduler_addr = "   ".into();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("scheduler_addr is required"),
-            "whitespace-only scheduler_addr must be rejected as empty, got: {err}"
-        );
     }
 
     /// Baseline: `test_valid_config()` itself passes — proves

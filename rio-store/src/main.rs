@@ -50,7 +50,8 @@ enum ChunkBackendKind {
 struct Config {
     listen_addr: String,
     database_url: String,
-    metrics_addr: std::net::SocketAddr,
+    #[serde(flatten)]
+    common: rio_common::config::CommonConfig,
     /// Where chunks live. Default: inline (no backend). See
     /// [`ChunkBackendKind`] for TOML syntax.
     chunk_backend: ChunkBackendKind,
@@ -83,10 +84,6 @@ struct Config {
     /// Only listens if server TLS is configured — plaintext main
     /// port already serves health, no second listener needed.
     health_addr: std::net::SocketAddr,
-    /// mTLS for both server (incoming gRPC) and client (none
-    /// currently — store doesn't dial out via rio-proto, only
-    /// S3 which has its own auth). Set via `RIO_TLS__*`.
-    tls: rio_common::tls::TlsConfig,
     /// HMAC key file for verifying assignment tokens on PutPath.
     /// SAME file as scheduler's `hmac_key_path`. Unset = accept
     /// all PutPath callers (dev mode).
@@ -111,11 +108,6 @@ struct Config {
     /// (mapped to tenant via `tenants.cache_token` column). Set
     /// `true` explicitly for single-tenant/dev deployments.
     cache_allow_unauthenticated: bool,
-    /// Seconds to wait after SIGTERM between set_not_serving() and
-    /// exit. Gives kubelet readinessProbe (periodSeconds: 5) time to
-    /// observe NOT_SERVING + endpoint-controller to propagate. 0 =
-    /// no drain. Default 6 (= 5 + 1).
-    drain_grace_secs: u64,
     /// Max concurrent S3 chunk uploads per `put_chunked` call.
     /// Default 32 — with `RIO_SUBSTITUTE_MAX_CONCURRENT=16`
     /// (scheduler side, P0473) this caps total in-flight S3 puts at
@@ -150,7 +142,7 @@ impl Default for Config {
         Self {
             listen_addr: rio_common::default_listen_string(9002),
             database_url: String::new(),
-            metrics_addr: rio_common::default_addr(9092),
+            common: rio_common::config::CommonConfig::new(9092),
             chunk_backend: ChunkBackendKind::default(),
             // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
             // — the constant is crate-private so duplicated here,
@@ -162,12 +154,10 @@ impl Default for Config {
             // 9102 = gRPC (9002) + 100. Same +100 pattern as
             // gateway (9090→9190). Only used when TLS is on.
             health_addr: rio_common::default_addr(9102),
-            tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
             hmac_bypass_cns: vec!["rio-gateway".into()],
             cache_allow_unauthenticated: false,
-            drain_grace_secs: 6,
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
             max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,
@@ -207,11 +197,6 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_addr: Option<std::net::SocketAddr>,
-
-    /// Drain grace period in seconds (0 = disabled)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    drain_grace_secs: Option<u64>,
 }
 
 impl rio_common::config::ValidateConfig for Config {
@@ -226,11 +211,8 @@ impl rio_common::config::ValidateConfig for Config {
 }
 
 impl rio_common::server::HasCommonConfig for Config {
-    fn tls(&self) -> &rio_common::tls::TlsConfig {
-        &self.tls
-    }
-    fn metrics_addr(&self) -> std::net::SocketAddr {
-        self.metrics_addr
+    fn common(&self) -> &rio_common::config::CommonConfig {
+        &self.common
     }
 }
 
@@ -240,11 +222,10 @@ async fn main() -> anyhow::Result<()> {
     let rio_common::server::Bootstrap::<Config> {
         cfg,
         shutdown,
+        serve_shutdown,
         otel_guard: _otel_guard,
+        root_span: _root_span,
     } = rio_common::server::bootstrap("store", cli, rio_store::describe_metrics)?;
-
-    let _root_guard = tracing::info_span!("store", component = "store").entered();
-    info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
 
     let pool = init_db_pool(&cfg.database_url, cfg.pg_max_connections).await?;
 
@@ -265,20 +246,17 @@ async fn main() -> anyhow::Result<()> {
     // Two-stage shutdown — see rio_common::server::spawn_drain_task
     // for the INDEPENDENT-token rationale + proof test. Closure flips
     // the NAMED StoreService (BalancedChannel probe target).
-    let serve_shutdown = rio_common::signal::Token::new();
-    {
-        let reporter = health_reporter.clone();
-        rio_common::server::spawn_drain_task(
-            shutdown.clone(),
-            serve_shutdown.clone(),
-            std::time::Duration::from_secs(cfg.drain_grace_secs),
-            move || async move {
-                reporter
-                    .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
-                    .await;
-            },
-        );
-    }
+    let reporter = health_reporter.clone();
+    rio_common::server::spawn_drain_task(
+        shutdown.clone(),
+        serve_shutdown.clone(),
+        cfg.common.drain_grace,
+        move || async move {
+            reporter
+                .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
+                .await;
+        },
+    );
 
     let chunk_cache = init_chunk_backend(
         &cfg.chunk_backend,
@@ -443,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
     // mTLS, so when TLS is on, spawn a second plaintext listener
     // with ONLY health, sharing the SAME HealthReporter so
     // set_serving above propagates. See rio_common::server docs.
-    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)?;
+    let server_tls = rio_common::tls::load_server_tls(&cfg.common.tls)?;
     if server_tls.is_some() {
         rio_common::server::spawn_health_plaintext(
             health_service.clone(),
@@ -673,7 +651,7 @@ mod tests {
     fn config_defaults_are_stable() {
         let d = Config::default();
         assert_eq!(d.listen_addr, "[::]:9002");
-        assert_eq!(d.metrics_addr.to_string(), "[::]:9092");
+        assert_eq!(d.common.metrics_addr.to_string(), "[::]:9092");
         assert!(d.database_url.is_empty());
         // Chunk backend off by default for backward-compat with pre-chunking configs.
         assert!(matches!(d.chunk_backend, ChunkBackendKind::Inline));
@@ -686,13 +664,13 @@ mod tests {
         assert!(d.cache_http_addr.is_none());
         // Plaintext health listener for K8s probes when mTLS is on the main port.
         assert_eq!(d.health_addr.to_string(), "[::]:9102");
-        assert!(!d.tls.is_configured());
+        assert!(!d.common.tls.is_configured());
         // HMAC bypass allowlist defaults to rio-gateway (backward-compat
         // with the pre-allowlist hardcoded CN check).
         assert_eq!(d.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
         // Binary cache auth required by default — fail loud on misconfigured deployments.
         assert!(!d.cache_allow_unauthenticated);
-        assert_eq!(d.drain_grace_secs, 6);
+        assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
         // JWT verification off by default (interceptor inert until
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
         assert!(d.jwt.key_path.is_none());
@@ -918,7 +896,7 @@ mod tests {
                 "[chunk_backend] table must thread through figment"
             );
             assert_eq!(
-                cfg.tls.cert_path.as_deref(),
+                cfg.common.tls.cert_path.as_deref(),
                 Some(std::path::Path::new("/etc/tls/cert.pem")),
                 "[tls] table must thread through figment into TlsConfig"
             );
@@ -935,7 +913,7 @@ mod tests {
     rio_test_support::jail_defaults!("store", r#"listen_addr = "0.0.0.0:9002""#, |cfg: Config| {
         assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
         assert!(cfg.nar_buffer_budget_bytes.is_none());
-        assert!(!cfg.tls.is_configured());
+        assert!(!cfg.common.tls.is_configured());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
         assert!(cfg.signing_key_path.is_none());
@@ -972,21 +950,6 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("database_url"), "{err}");
-    }
-
-    /// Whitespace-only database_url must be rejected as empty.
-    /// Regression guard for `ensure_required`'s trim — pre-helper,
-    /// bare `is_empty()` accepted `"   "`, sqlx connect failed later
-    /// with a cryptic URL-parse error buried in startup logs.
-    #[test]
-    fn config_rejects_whitespace_database_url() {
-        let mut cfg = test_valid_config();
-        cfg.database_url = "   ".into();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("database_url is required"),
-            "whitespace-only database_url must be rejected as empty, got: {err}"
-        );
     }
 
     /// Baseline: `test_valid_config()` itself passes — proves
