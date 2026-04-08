@@ -107,15 +107,6 @@ pub fn describe_metrics() {
          kind=fod|builder). Reactive upsize: a derivation that fails on class N retries on \
          class N+1. Frequent firing for one pname = raise the default tiny class's memory limit."
     );
-    // TODO: drop alongside the docs/src/observability.md row — the
-    // spec-metric test (tests/metrics_registered.rs) greps that table
-    // and asserts every name is described. Emit was removed; this is
-    // describe-only so the HELP line keeps the test green.
-    describe_counter!(
-        "rio_scheduler_fod_size_class_promotions_total",
-        "DEPRECATED alias of rio_scheduler_size_class_promotions_total{kind=\"fod\"}. \
-         No longer emitted; remove with the observability.md row."
-    );
     describe_counter!(
         "rio_scheduler_poison_fleet_exhausted_total",
         "Derivations poisoned because failed_builders excluded every registered worker \
