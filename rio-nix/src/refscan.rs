@@ -79,16 +79,8 @@ impl RefScanSink {
         self.found
     }
 
-    /// Fast path: all candidates already found → subsequent writes are
-    /// no-ops. Callers driving the sink manually (rather than via a
-    /// single `dump_path_streaming` call) can check this to skip the
-    /// scan entirely once the (typically small) candidate set is
-    /// exhausted. The internal `search()` already short-circuits on
-    /// empty `remaining`, so this is an optimization for callers that
-    /// want to skip the write syscall itself.
-    #[inline]
-    #[must_use]
-    pub fn is_exhausted(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_exhausted(&self) -> bool {
         self.remaining.is_empty()
     }
 
