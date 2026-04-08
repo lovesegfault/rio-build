@@ -18,11 +18,13 @@ use tracing::instrument;
 
 use rio_nix::nar;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
+use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
     FindMissingPathsRequest, PathInfo, PutPathBatchRequest, PutPathMetadata, PutPathRequest,
     PutPathTrailer, put_path_request,
 };
+use rio_proto::validated::ValidatedPathInfo;
 
 /// Maximum number of upload retry attempts.
 const MAX_UPLOAD_RETRIES: u32 = 3;
@@ -49,23 +51,37 @@ const MAX_PARALLEL_UPLOADS: usize = 4;
 /// without blocking either side for long.
 const STREAM_CHANNEL_BUF: usize = 4;
 
-/// Result of uploading a single output path.
-#[derive(Debug)]
-pub struct UploadResult {
-    /// The store path that was uploaded.
-    pub store_path: String,
-    /// SHA-256 digest of the NAR. Always 32 bytes — `[u8; 32]` instead of
-    /// `Vec<u8>` so the type system enforces it (no `hash.len() == 32` check
-    /// at every consumer). The source (`do_upload_streaming`) already returns
-    /// `[u8; 32]`; the old `.to_vec()` was a gratuitous heap allocation.
-    pub nar_hash: [u8; 32],
-    /// Size of the NAR in bytes.
-    pub nar_size: u64,
-    /// Store paths this output references (runtime deps). Sorted, full
-    /// `/nix/store/...` paths. Populated by the pre-scan pass in
-    /// `upload_output`. Empty for outputs with no runtime deps (legal for
-    /// CA paths like fetchurl; suspicious for non-CA).
-    pub references: Vec<String>,
+/// Construct a `ValidatedPathInfo` for a freshly-uploaded output.
+///
+/// `references` are full `/nix/store/...` paths from the ref-scan
+/// candidate set, which was built from already-validated input-closure
+/// paths plus declared output paths — `StorePath::parse` cannot fail on
+/// them (defensively dropped if it somehow does). `deriver` may be empty
+/// (dev mode), which maps to `None`. Fields not known at upload time
+/// (`registration_time`, `signatures`, `content_address`, …) are left
+/// default; the store fills them server-side.
+fn uploaded_info(
+    store_path: StorePath,
+    nar_hash: [u8; 32],
+    nar_size: u64,
+    references: Vec<String>,
+    deriver: &str,
+) -> ValidatedPathInfo {
+    ValidatedPathInfo {
+        store_path,
+        store_path_hash: Vec::new(),
+        deriver: StorePath::parse(deriver).ok(),
+        nar_hash,
+        nar_size,
+        references: references
+            .into_iter()
+            .filter_map(|r| StorePath::parse(&r).ok())
+            .collect(),
+        registration_time: 0,
+        ultimate: false,
+        signatures: Vec::new(),
+        content_address: None,
+    }
 }
 
 /// Errors from upload operations.
@@ -147,21 +163,19 @@ async fn upload_output(
     assignment_token: &str,
     deriver: &str,
     candidates: Arc<CandidateSet>,
-) -> Result<UploadResult, UploadError> {
+) -> Result<ValidatedPathInfo, UploadError> {
     let output_path = upper_store.join(output_basename);
     let store_path = format!("/nix/store/{output_basename}");
 
     // Validate the store path ONCE, before the retry loop. A malformed
-    // path (overlay setup bug) won't fix itself on retry. Discard the
-    // parsed value — do_upload_streaming sends the string form raw; the
-    // store re-parses server-side.
-    let _ = rio_nix::store_path::StorePath::parse(&store_path).map_err(|e| {
-        UploadError::UploadExhausted {
-            path: store_path.clone(),
-            source: tonic::Status::invalid_argument(format!(
-                "output store path {store_path:?} from overlay upper is malformed: {e}"
-            )),
-        }
+    // path (overlay setup bug) won't fix itself on retry.
+    // do_upload_streaming sends the string form raw; the store
+    // re-parses server-side.
+    let parsed_path = StorePath::parse(&store_path).map_err(|e| UploadError::UploadExhausted {
+        path: store_path.clone(),
+        source: tonic::Status::invalid_argument(format!(
+            "output store path {store_path:?} from overlay upper is malformed: {e}"
+        )),
     })?;
 
     // --- Pre-scan for references -------------------------------------
@@ -246,12 +260,13 @@ async fn upload_output(
                     nar_hash = %hex::encode(nar_hash),
                     "upload complete"
                 );
-                return Ok(UploadResult {
-                    store_path,
+                return Ok(uploaded_info(
+                    parsed_path,
                     nar_hash,
                     nar_size,
                     references,
-                });
+                    deriver,
+                ));
             }
             Err(e) if is_concurrent_put_path(&e) => {
                 // I-125b: another uploader holds the placeholder for
@@ -278,12 +293,7 @@ async fn upload_output(
                         nar_size = info.nar_size,
                         "concurrent uploader won; adopting store result"
                     );
-                    return Ok(UploadResult {
-                        store_path,
-                        nar_hash: info.nar_hash,
-                        nar_size: info.nar_size,
-                        references,
-                    });
+                    return Ok(info);
                 }
                 tracing::warn!(
                     store_path = %store_path,
@@ -333,7 +343,7 @@ fn is_concurrent_put_path(status: &tonic::Status) -> bool {
 async fn wait_for_concurrent_put(
     store_client: &mut StoreServiceClient<Channel>,
     store_path: &str,
-) -> Option<rio_proto::validated::ValidatedPathInfo> {
+) -> Option<ValidatedPathInfo> {
     for poll in 0..CONCURRENT_PUT_POLL_ATTEMPTS {
         let delay = RETRY_BASE_DELAY * 2u32.pow(poll);
         tokio::time::sleep(delay).await;
@@ -607,7 +617,8 @@ impl Write for HashingChannelWriter {
 /// Pipeline:
 /// 1. **Idempotency pre-check** (`r[builder.upload.idempotent-precheck]`):
 ///    `FindMissingPaths` filters out outputs the store already has. Skipped
-///    outputs get their `UploadResult` from `QueryPathInfo` — zero disk reads.
+///    outputs get their `ValidatedPathInfo` from `QueryPathInfo` — zero disk
+///    reads.
 /// 2. **≥2 remaining → `PutPathBatch`** for cross-output atomicity
 ///    (`r[store.atomic.multi-output]`). On `FailedPrecondition` (an output
 ///    ≥ INLINE_THRESHOLD, which the v1 batch handler rejects), falls through
@@ -616,8 +627,8 @@ impl Write for HashingChannelWriter {
 ///    `buffer_unordered(MAX_PARALLEL_UPLOADS)`.
 ///
 /// Result order is **not** guaranteed. Callers must not assume results
-/// correspond positionally to any input list; use `UploadResult.store_path`
-/// to identify outputs.
+/// correspond positionally to any input list; use `.store_path` to
+/// identify outputs.
 #[instrument(skip_all)]
 pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
@@ -625,7 +636,7 @@ pub async fn upload_all_outputs(
     assignment_token: &str,
     deriver: &str,
     ref_candidates: &[String],
-) -> Result<Vec<UploadResult>, UploadError> {
+) -> Result<Vec<ValidatedPathInfo>, UploadError> {
     let outputs = scan_new_outputs(upper_store)?;
     if outputs.is_empty() {
         return Ok(Vec::new());
@@ -715,7 +726,7 @@ pub async fn upload_all_outputs(
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
     let deriver = deriver.to_string();
-    let results: Vec<Result<UploadResult, UploadError>> = stream::iter(to_upload)
+    let results: Vec<Result<ValidatedPathInfo, UploadError>> = stream::iter(to_upload)
         .map(|output| {
             let mut client = store_client.clone();
             let upper_store = upper_store.clone();
@@ -738,18 +749,19 @@ pub async fn upload_all_outputs(
         .collect()
         .await;
 
-    let mut uploaded: Vec<UploadResult> = results.into_iter().collect::<Result<_, _>>()?;
+    let mut uploaded: Vec<ValidatedPathInfo> = results.into_iter().collect::<Result<_, _>>()?;
     uploaded.append(&mut skipped_results);
     Ok(uploaded)
 }
 
 /// Batch `FindMissingPaths` → partition outputs into (upload, skip).
 ///
-/// For already-present outputs, `QueryPathInfo` fetches `nar_hash`/`nar_size`
-/// from the store so callers get a complete `UploadResult` without any disk
-/// read. `references` is empty — the store already has the authoritative
-/// reference set (from whoever originally uploaded), and no caller reads
-/// `UploadResult.references` anyway (it's only sent TO the store via PutPath).
+/// For already-present outputs, `QueryPathInfo` fetches the full
+/// `ValidatedPathInfo` from the store so callers get a complete result
+/// without any disk read. The store already has the authoritative
+/// reference set (from whoever originally uploaded); no caller reads
+/// `.references` on the returned info (it's only sent TO the store via
+/// PutPath).
 ///
 /// Fail-open: any error (FindMissingPaths unavailable, QueryPathInfo returned
 /// None for a supposedly-present path) → fall back to uploading. The store's
@@ -759,7 +771,7 @@ async fn partition_by_presence(
     store_client: &StoreServiceClient<Channel>,
     basenames: &[String],
     store_paths: Vec<String>,
-) -> (Vec<String>, Vec<UploadResult>) {
+) -> (Vec<String>, Vec<ValidatedPathInfo>) {
     let mut client = store_client.clone();
     let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
     rio_proto::interceptor::inject_current(req.metadata_mut());
@@ -808,12 +820,7 @@ async fn partition_by_presence(
                     nar_size = info.nar_size,
                     "output already in store; skipping upload"
                 );
-                skipped.push(UploadResult {
-                    store_path,
-                    nar_hash: info.nar_hash,
-                    nar_size: info.nar_size,
-                    references: Vec::new(),
-                });
+                skipped.push(info);
             }
             // Present per FindMissingPaths but QueryPathInfo disagrees
             // (TOCTOU — sub-second window, effectively impossible; or
@@ -853,12 +860,12 @@ async fn upload_outputs_batch(
     assignment_token: &str,
     deriver: &str,
     candidates: &Arc<CandidateSet>,
-) -> Result<Vec<UploadResult>, UploadError> {
+) -> Result<Vec<ValidatedPathInfo>, UploadError> {
     let (tx, rx) = mpsc::channel::<PutPathBatchRequest>(STREAM_CHANNEL_BUF);
 
     // Producer task: for each output, pre-scan refs → send tagged metadata →
     // spawn_blocking dump into an inner channel → forward inner messages
-    // tagged with output_index. Returns the Vec<UploadResult> on success.
+    // tagged with output_index. Returns the Vec<ValidatedPathInfo> on success.
     //
     // Cloned inputs for the `spawn`ed task (it needs 'static). The outputs
     // list is cloned once (basenames, small).
@@ -868,14 +875,14 @@ async fn upload_outputs_batch(
     let candidates = Arc::clone(candidates);
 
     let producer = tokio::spawn(async move {
-        let mut results: Vec<UploadResult> = Vec::with_capacity(outputs_owned.len());
+        let mut results: Vec<ValidatedPathInfo> = Vec::with_capacity(outputs_owned.len());
         for (idx, basename) in outputs_owned.iter().enumerate() {
             let output_path = upper_store.join(basename);
             let store_path = format!("/nix/store/{basename}");
             let idx = idx as u32;
 
             // Validate store path format (same guard as `upload_output`).
-            let _ = rio_nix::store_path::StorePath::parse(&store_path).map_err(|e| {
+            let parsed_path = StorePath::parse(&store_path).map_err(|e| {
                 tonic::Status::invalid_argument(format!(
                     "output {idx}: store path {store_path:?} malformed: {e}"
                 ))
@@ -943,12 +950,13 @@ async fn upload_outputs_batch(
                 .await
                 .map_err(|e| tonic::Status::internal(format!("dump task panicked: {e}")))??;
 
-            results.push(UploadResult {
-                store_path,
+            results.push(uploaded_info(
+                parsed_path,
                 nar_hash,
                 nar_size,
                 references,
-            });
+                &deriver_owned,
+            ));
         }
         // tx drops here → batch stream closes → server enters commit phase.
         Ok::<_, tonic::Status>(results)
@@ -1240,7 +1248,7 @@ mod tests {
         assert_eq!(results.len(), 3);
         // Result order is NOT guaranteed (buffer_unordered). Collect to set.
         let paths: std::collections::HashSet<_> =
-            results.iter().map(|r| r.store_path.clone()).collect();
+            results.iter().map(|r| r.store_path.to_string()).collect();
         assert!(paths.contains(&format!("/nix/store/{b1}")));
         assert!(paths.contains(&format!("/nix/store/{b2}")));
         assert!(paths.contains(&format!("/nix/store/{b3}")));
@@ -1380,10 +1388,11 @@ mod tests {
         let result =
             upload_output(&mut client, &store_dir, &basename, "", &deriver, candidates).await?;
 
-        // UploadResult carries the scanned refs. Sorted: /nix/store/7rjj...
+        // Result carries the scanned refs. Sorted: /nix/store/7rjj...
         // < /nix/store/aaaa... (self). dep-B absent.
+        let refs: Vec<String> = result.references.iter().map(|r| r.to_string()).collect();
         assert_eq!(
-            result.references,
+            refs,
             vec![dep_a.clone(), self_path.clone()],
             "scanned refs: dep-A + self, sorted, no dep-B"
         );
@@ -1462,14 +1471,17 @@ mod tests {
         // Find by store_path (buffer_unordered → result order is not guaranteed).
         let r1 = results
             .iter()
-            .find(|r| r.store_path.ends_with("-out1"))
+            .find(|r| r.store_path.as_str().ends_with("-out1"))
             .expect("out1 result");
         let r2 = results
             .iter()
-            .find(|r| r.store_path.ends_with("-out2"))
+            .find(|r| r.store_path.as_str().ends_with("-out2"))
             .expect("out2 result");
-        assert_eq!(r1.references, vec![dep_a], "out1 refs itself only");
-        assert_eq!(r2.references, vec![dep_b], "out2 refs itself only");
+        let refs = |r: &ValidatedPathInfo| -> Vec<String> {
+            r.references.iter().map(|p| p.to_string()).collect()
+        };
+        assert_eq!(refs(r1), vec![dep_a], "out1 refs itself only");
+        assert_eq!(refs(r2), vec![dep_b], "out2 refs itself only");
 
         // All MockStore PathInfos carry the deriver.
         let puts = store.put_calls.read().unwrap();
@@ -1523,9 +1535,9 @@ mod tests {
 
     /// r[verify builder.upload.idempotent-precheck]
     ///
-    /// Output already in store → zero PutPath calls, UploadResult carries
-    /// the STORE's nar_hash (not a freshly-computed one). This is the
-    /// exit criterion: "second identical-NAR upload → zero chunks".
+    /// Output already in store → zero PutPath calls, result carries the
+    /// STORE's nar_hash (not a freshly-computed one). This is the exit
+    /// criterion: "second identical-NAR upload → zero chunks".
     ///
     /// Disk contents are deliberately DIFFERENT from what's seeded in the
     /// store: the test asserts the returned nar_hash matches the SEEDED
@@ -1567,14 +1579,11 @@ mod tests {
         );
         // One result, carrying the STORE's hash (not disk's).
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].store_path, store_path);
+        assert_eq!(results[0].store_path.as_str(), store_path);
         assert_eq!(
             results[0].nar_hash, seeded_hash,
-            "skipped path's UploadResult carries the store's nar_hash, not disk's"
+            "skipped path's result carries the store's nar_hash, not disk's"
         );
-        // references empty for skipped paths (store already has the
-        // authoritative set; nobody reads UploadResult.references).
-        assert!(results[0].references.is_empty());
         Ok(())
     }
 
@@ -1608,11 +1617,11 @@ mod tests {
         assert_eq!(results.len(), 2);
         let r_present = results
             .iter()
-            .find(|r| r.store_path == path_present)
+            .find(|r| r.store_path.as_str() == path_present)
             .expect("present output in results");
         let r_missing = results
             .iter()
-            .find(|r| r.store_path == path_missing)
+            .find(|r| r.store_path.as_str() == path_missing)
             .expect("missing output in results");
 
         // Present: store's hash. Missing: freshly computed.
@@ -1655,7 +1664,7 @@ mod tests {
             "FindMissingPaths error → fall back to upload (fail-open)"
         );
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].store_path, store_path);
+        assert_eq!(results[0].store_path.as_str(), store_path);
         // Hash is the disk NAR's (we uploaded, didn't skip).
         let disk_nar = nar::dump_path(&store_dir.join(&basename))?;
         let disk_hash: [u8; 32] = Sha256::digest(&disk_nar).into();

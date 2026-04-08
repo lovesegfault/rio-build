@@ -7,7 +7,7 @@ pub mod daemon;
 
 use std::io::Cursor;
 
-use rio_nix::hash::NixHash;
+use rio_proto::validated::ValidatedPathInfo;
 use rio_test_support::grpc::MockStore;
 use rio_test_support::wire_bytes;
 
@@ -18,48 +18,13 @@ pub struct ResponseField {
     pub bytes: Vec<u8>,
 }
 
-/// A store path entry used to populate the mock gRPC store for conformance tests.
-#[derive(serde::Deserialize)]
-pub struct StorePathEntry {
-    pub path: String,
-    pub deriver: Option<String>,
-    /// SRI-format hash (e.g. "sha256-base64...")
-    pub nar_hash: String,
-    pub references: Vec<String>,
-    pub registration_time: u64,
-    pub nar_size: u64,
-    pub ultimate: bool,
-    pub sigs: Vec<String>,
-    pub ca: Option<String>,
-}
-
-/// Seed a `MockStore` with the given store path entries.
+/// Seed a `MockStore` with the given path-info entries.
 ///
-/// Seeds the gRPC `MockStore`. NAR data is fetched via `nix-store --dump`
-/// for each entry.
-pub fn seed_mock_store_from(store: &MockStore, entries: &[StorePathEntry]) {
+/// NAR data is fetched via `nix-store --dump` for each entry.
+pub fn seed_mock_store_from(store: &MockStore, entries: &[ValidatedPathInfo]) {
     for entry in entries {
-        let nar_hash = NixHash::parse(&entry.nar_hash)
-            .unwrap_or_else(|e| panic!("invalid nar_hash '{}': {e}", entry.nar_hash));
-        let nar_data = daemon::dump_nar(&entry.path);
-
-        // Golden fixtures are real nix paths, so TryFrom should always succeed.
-        // If it doesn't, the fixture is corrupt — panic loudly.
-        let raw = rio_proto::types::PathInfo {
-            store_path: entry.path.clone(),
-            store_path_hash: vec![],
-            deriver: entry.deriver.clone().unwrap_or_default(),
-            nar_hash: nar_hash.digest().to_vec(),
-            nar_size: entry.nar_size,
-            references: entry.references.clone(),
-            registration_time: entry.registration_time,
-            ultimate: entry.ultimate,
-            signatures: entry.sigs.clone(),
-            content_address: entry.ca.clone().unwrap_or_default(),
-        };
-        let info = rio_proto::validated::ValidatedPathInfo::try_from(raw)
-            .unwrap_or_else(|e| panic!("golden fixture {} is malformed: {e}", entry.path));
-        store.seed(info, nar_data);
+        let nar_data = daemon::dump_nar(entry.store_path.as_str());
+        store.seed(entry.clone(), nar_data);
     }
 }
 

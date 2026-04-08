@@ -30,10 +30,11 @@ use rio_proto::types::{
     BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, ExecutorMessage,
     WorkAssignment,
 };
+use rio_proto::validated::ValidatedPathInfo;
 
 use crate::log_stream::{LogBatcher, LogLimits};
 use crate::overlay;
-use crate::synth_db::{self, SynthDrvOutput, SynthPathInfo};
+use crate::synth_db::{self, SynthDrvOutput};
 use crate::upload;
 
 mod daemon;
@@ -914,7 +915,7 @@ struct ResolvedInputs {
     /// PathInfo for every closure path, captured during the BFS so the
     /// synth DB ValidPaths table can be built without a second
     /// QueryPathInfo pass (I-106).
-    input_metadata: Vec<SynthPathInfo>,
+    input_metadata: Vec<ValidatedPathInfo>,
 }
 
 /// Resolve inputDrvs → BasicDerivation + compute full input closure.
@@ -1043,16 +1044,19 @@ async fn resolve_inputs(
     // via stdenv-the-output) never reached.
     let input_metadata =
         compute_input_closure(store_client, drv, drv_path, &resolved_input_srcs).await?;
-    let input_paths: Vec<String> = input_metadata.iter().map(|m| m.path.clone()).collect();
+    let input_paths: Vec<String> = input_metadata
+        .iter()
+        .map(|m| m.store_path.to_string())
+        .collect();
     // I-178: project (path, nar_size) for the JIT FUSE allowlist
-    // (`register_inputs`). SynthPathInfo already has nar_size from
+    // (`register_inputs`). ValidatedPathInfo already has nar_size from
     // BatchQueryPathInfo (authoritative; the ManifestHint.info.nar_size
     // is best-effort). Two projections from input_metadata is cheaper
     // than passing &input_metadata around — the other consumers
     // (prefetch_manifests, ref-scan) want plain &[String].
     let input_sized: Vec<(String, u64)> = input_metadata
         .iter()
-        .map(|m| (m.path.clone(), m.nar_size))
+        .map(|m| (m.store_path.to_string(), m.nar_size))
         .collect();
 
     Ok(ResolvedInputs {
@@ -1082,7 +1086,7 @@ async fn prepare_sandbox(
     overlay_mount: &overlay::OverlayMount,
     drv: &Derivation,
     drv_path: &str,
-    synth_paths: Vec<SynthPathInfo>,
+    synth_paths: Vec<ValidatedPathInfo>,
     is_fod: bool,
     effective_cores: u32,
 ) -> Result<(), ExecutorError> {
@@ -1475,7 +1479,7 @@ async fn collect_outputs(
                         })?;
                     Ok::<_, ExecutorError>(BuiltOutput {
                         output_name,
-                        output_path: result.store_path.clone(),
+                        output_path: result.store_path.to_string(),
                         output_hash: result.nar_hash.to_vec(),
                     })
                 })

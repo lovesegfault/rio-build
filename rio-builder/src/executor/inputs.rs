@@ -8,8 +8,7 @@ use tracing::instrument;
 
 use rio_nix::derivation::Derivation;
 use rio_proto::StoreServiceClient;
-
-use crate::synth_db::SynthPathInfo;
+use rio_proto::validated::ValidatedPathInfo;
 
 use super::ExecutorError;
 
@@ -308,7 +307,7 @@ pub(super) async fn compute_input_closure(
     drv: &Derivation,
     drv_path: &str,
     resolved_input_srcs: &std::collections::BTreeSet<String>,
-) -> Result<Vec<SynthPathInfo>, ExecutorError> {
+) -> Result<Vec<ValidatedPathInfo>, ExecutorError> {
     use std::collections::HashSet;
 
     // I-106: keep the full PathInfo from each BFS query so callers
@@ -317,7 +316,7 @@ pub(super) async fn compute_input_closure(
     // pass was a ~800 × N-builders QueryPathInfo burst that exhausted
     // the store's PG pool.
     let mut closure: HashSet<String> = HashSet::new();
-    let mut metadata: Vec<SynthPathInfo> = Vec::new();
+    let mut metadata: Vec<ValidatedPathInfo> = Vec::new();
     let mut frontier: Vec<String> = Vec::new();
 
     // Seed: the .drv itself, input_drv paths (so nix-daemon can read them),
@@ -342,10 +341,10 @@ pub(super) async fn compute_input_closure(
         }
 
         // Fetch this layer in ONE batch RPC. Each result is the full
-        // SynthPathInfo (kept for the caller — I-106) or None on
+        // ValidatedPathInfo (kept for the caller — I-106) or None on
         // not-found. References for the next layer come from
-        // SynthPathInfo.references (already String).
-        let results: Vec<(String, Option<SynthPathInfo>)> =
+        // info.references.
+        let results: Vec<(String, Option<ValidatedPathInfo>)> =
             query_layer(store_client, batch).await?;
 
         // Add found paths to closure, collect their refs for next layer.
@@ -357,11 +356,11 @@ pub(super) async fn compute_input_closure(
                 continue;
             };
             for r in &info.references {
-                if !closure.contains(r) {
-                    frontier.push(r.clone());
+                if !closure.contains(r.as_str()) {
+                    frontier.push(r.to_string());
                 }
             }
-            closure.insert(info.path.clone());
+            closure.insert(info.store_path.to_string());
             metadata.push(info);
         }
     }
@@ -374,7 +373,7 @@ pub(super) async fn compute_input_closure(
 async fn query_layer(
     store_client: &StoreServiceClient<Channel>,
     batch: Vec<String>,
-) -> Result<Vec<(String, Option<SynthPathInfo>)>, ExecutorError> {
+) -> Result<Vec<(String, Option<ValidatedPathInfo>)>, ExecutorError> {
     let mut client = store_client.clone();
     match rio_proto::client::batch_query_path_info(
         &mut client,
@@ -384,10 +383,7 @@ async fn query_layer(
     )
     .await
     {
-        Ok(entries) => Ok(entries
-            .into_iter()
-            .map(|(p, info)| (p, info.map(SynthPathInfo::from)))
-            .collect()),
+        Ok(entries) => Ok(entries),
         Err(status) => {
             // Real error (Unavailable, DeadlineExceeded, …) — propagate
             // with a representative path. The original status code is
@@ -656,11 +652,14 @@ mod tests {
     }
 
     /// Project closure metadata to a path set for membership assertions.
-    fn paths_of(closure: Vec<SynthPathInfo>) -> std::collections::HashSet<String> {
-        closure.into_iter().map(|m| m.path).collect()
+    fn paths_of(closure: Vec<ValidatedPathInfo>) -> std::collections::HashSet<String> {
+        closure
+            .into_iter()
+            .map(|m| m.store_path.to_string())
+            .collect()
     }
 
-    /// I-106: compute_input_closure now returns the full SynthPathInfo
+    /// I-106: compute_input_closure now returns the full ValidatedPathInfo
     /// captured during BFS, eliminating the second QueryPathInfo pass that
     /// fetch_input_metadata used to do. This test verifies the metadata
     /// fields are populated (not just path), proving the synth_db
@@ -677,11 +676,11 @@ mod tests {
 
         let lib = closure
             .iter()
-            .find(|m| m.path == p_a)
+            .find(|m| m.store_path.as_str() == p_a)
             .expect("p_a in closure");
         assert!(
-            lib.nar_hash.starts_with("sha256:"),
-            "nar_hash populated (synth_db needs this) — proves we kept the \
+            lib.nar_size > 0,
+            "nar_size populated (synth_db needs this) — proves we kept the \
              full PathInfo, not just the path string"
         );
         Ok(())
@@ -975,7 +974,7 @@ mod tests {
         );
 
         // --- mod.rs step 2: input_paths derived from closure metadata ---
-        // (resolve_inputs maps SynthPathInfo.path; resolved_input_srcs are
+        // (resolve_inputs maps store_path; resolved_input_srcs are
         // already in the closure since they seed the BFS.)
         let resolved_input_srcs: Vec<String> = drv.input_srcs().iter().cloned().collect();
         let input_paths: Vec<String> = closure_set.into_iter().collect();

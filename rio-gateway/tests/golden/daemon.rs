@@ -14,7 +14,8 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use super::StorePathEntry;
+use rio_nix::store_path::StorePath;
+use rio_proto::validated::ValidatedPathInfo;
 
 /// Default timeout for reading trailing data after STDERR_LAST.
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -695,17 +696,20 @@ fn build_ca_test_path_uncached() -> String {
 /// does. The daemon is always given a fresh hermetic db (see
 /// [`start_local_daemon`]), so there is no host-db fallback to reconcile
 /// with — both sides are computed from the NAR.
-pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
+pub fn query_path_info_json(store_path: &str) -> ValidatedPathInfo {
     use rio_nix::hash::{HashAlgo, NixHash};
 
     let nar = dump_nar(store_path);
-    let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar).to_sri();
+    let nar_hash: [u8; 32] = NixHash::compute(HashAlgo::SHA256, &nar)
+        .digest()
+        .try_into()
+        .expect("SHA256 digest is 32 bytes");
     let nar_size = nar.len() as u64;
 
     // For the FOD fixture (build_ca_test_path), ca = "fixed:sha256:<nixbase32>"
     // of the flat file content. For the writeText fixture (build_test_path),
     // Nix registers no ca (it's derivation-built, not CA-addressed).
-    let ca = if store_path == build_ca_test_path() {
+    let content_address = if store_path == build_ca_test_path() {
         let content = std::fs::read(store_path).expect("read ca fixture content");
         let flat_hash = NixHash::compute(HashAlgo::SHA256, &content);
         Some(format!("fixed:{}", flat_hash.to_colon()))
@@ -713,8 +717,10 @@ pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
         None
     };
 
-    StorePathEntry {
-        path: store_path.to_string(),
+    ValidatedPathInfo {
+        store_path: StorePath::parse(store_path)
+            .unwrap_or_else(|e| panic!("golden fixture {store_path} is malformed: {e}")),
+        store_path_hash: vec![],
         deriver: None,
         nar_hash,
         references: vec![],
@@ -722,8 +728,8 @@ pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
         registration_time: 0,
         nar_size,
         ultimate: false,
-        sigs: vec![],
-        ca,
+        signatures: vec![],
+        content_address,
     }
 }
 
