@@ -683,17 +683,52 @@ impl DagActor {
     /// running — normal handling resumes.
     #[instrument(skip(self))]
     pub(super) async fn handle_reconcile_assignments(&mut self) {
-        // Collect (drv_hash, assigned_executor, expected_outputs)
-        // for Assigned/Running with unknown workers. Clone before
-        // mutating (node_mut borrow).
-        //
-        // executor_id is Option: Assigned/Running with assigned_executor
-        // =None is inconsistent state (shouldn't happen, but recovery
-        // loads from PG which could have drifted). We still reconcile
-        // it (check store for outputs → Completed, else Ready) rather
-        // than silently skipping and leaving it stuck forever.
-        let orphaned: Vec<(DrvHash, Option<ExecutorId>, Vec<String>)> = self
-            .dag
+        let orphaned = self.collect_orphaned_assignments();
+
+        if orphaned.is_empty() {
+            debug!("reconcile: all assigned/running derivations have live workers");
+            return;
+        }
+        info!(
+            count = orphaned.len(),
+            "reconciling orphaned assignments (worker didn't reconnect)"
+        );
+
+        for (drv_hash, executor_id, expected_outputs) in orphaned {
+            // Query store: did the build complete while the scheduler
+            // was down (orphan completion)? Else the worker died
+            // mid-build → reset to Ready for retry.
+            if self
+                .outputs_present_in_store(&drv_hash, &expected_outputs)
+                .await
+            {
+                self.adopt_orphan_completion(&drv_hash, &executor_id, expected_outputs)
+                    .await;
+            } else {
+                self.reset_orphan_to_ready(&drv_hash, &executor_id).await;
+            }
+        }
+
+        // After reconcile, dispatch anything newly Ready.
+        self.dispatch_ready().await;
+    }
+
+    /// Collect `(drv_hash, assigned_executor, expected_outputs)` for
+    /// every Assigned/Running derivation whose worker is no longer
+    /// live — the liveness-check input set for
+    /// [`handle_reconcile_assignments`](Self::handle_reconcile_assignments).
+    ///
+    /// Cloned out of the DAG before any mutation (the per-row
+    /// reset/adopt path takes `node_mut`).
+    ///
+    /// `executor_id` is `Option`: Assigned/Running with
+    /// `assigned_executor=None` is inconsistent state (shouldn't
+    /// happen, but recovery loads from PG which could have drifted).
+    /// We still reconcile it (check store for outputs → Completed,
+    /// else Ready) rather than silently skipping and leaving it stuck
+    /// forever.
+    fn collect_orphaned_assignments(&self) -> Vec<(DrvHash, Option<ExecutorId>, Vec<String>)> {
+        self.dag
             .iter_nodes()
             .filter(|(_, s)| {
                 matches!(
@@ -736,162 +771,163 @@ impl DagActor {
                     Some((h.into(), None, s.expected_output_paths.clone()))
                 }
             })
-            .collect();
+            .collect()
+    }
 
-        if orphaned.is_empty() {
-            debug!("reconcile: all assigned/running derivations have live workers");
-            return;
+    /// `FindMissingPaths` against `expected_outputs`: store returns
+    /// paths NOT in its index, so empty response = all present.
+    /// Conservative `false` for empty `expected_outputs` (can't verify
+    /// orphan completion), no store client (tests), or RPC error.
+    async fn outputs_present_in_store(
+        &mut self,
+        drv_hash: &DrvHash,
+        expected_outputs: &[String],
+    ) -> bool {
+        if expected_outputs.is_empty() {
+            return false;
         }
-        info!(
-            count = orphaned.len(),
-            "reconciling orphaned assignments (worker didn't reconnect)"
-        );
-
-        for (drv_hash, executor_id, expected_outputs) in orphaned {
-            // Query store: are all outputs present? If so, the
-            // build completed while the scheduler was down —
-            // transition Completed (orphan completion). Else, the
-            // worker died mid-build → reset to Ready for retry.
-            //
-            // FindMissingPaths: store returns paths NOT in its
-            // index. Empty response = all present.
-            let all_present = if expected_outputs.is_empty() {
-                // No expected outputs = can't verify orphan
-                // completion. Conservative: treat as incomplete.
+        let Some(client) = &mut self.store_client else {
+            return false;
+        };
+        let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths: expected_outputs.to_vec(),
+        });
+        rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
+        match client.find_missing_paths(fmp_req).await {
+            Ok(resp) => resp.into_inner().missing_paths.is_empty(),
+            Err(e) => {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "reconcile: FindMissingPaths failed, assuming incomplete");
                 false
-            } else if let Some(client) = &mut self.store_client {
-                let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
-                    store_paths: expected_outputs.clone(),
-                });
-                rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
-                match client.find_missing_paths(fmp_req).await {
-                    Ok(resp) => resp.into_inner().missing_paths.is_empty(),
-                    Err(e) => {
-                        warn!(drv_hash = %drv_hash, error = %e,
-                              "reconcile: FindMissingPaths failed, assuming incomplete");
-                        false
-                    }
-                }
-            } else {
-                // No store client (tests). Conservative.
-                false
-            };
+            }
+        }
+    }
 
-            if all_present {
-                // Orphan completion: transition Completed.
-                info!(drv_hash = %drv_hash, executor_id = ?executor_id,
-                      "reconcile: orphan completion (outputs found in store)");
-                // Capture interested_builds BEFORE transitioning —
-                // check_build_completion (below) needs to know which
-                // builds care. Must read before node_mut (borrow).
-                let interested: Vec<Uuid> = self
-                    .dag
-                    .node(&drv_hash)
-                    .map(|s| s.interested_builds.iter().copied().collect())
-                    .unwrap_or_default();
+    /// Reconcile path for an orphaned assignment whose outputs ARE in
+    /// the store: the build completed while the scheduler was down.
+    /// Transition Completed, persist, attribute tenants, unpin,
+    /// release parents, and fire `check_build_completion` for
+    /// interested builds. Partial re-implementation of
+    /// `handle_success_completion` — DON'T emit BuildEvent (the build
+    /// is recovered, subscribers are gone), DON'T update build_history
+    /// (no timing data for an orphan), DON'T update ancestor
+    /// priorities (full_sweep on next tick does it anyway).
+    async fn adopt_orphan_completion(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor_id: &Option<ExecutorId>,
+        expected_outputs: Vec<String>,
+    ) {
+        info!(drv_hash = %drv_hash, executor_id = ?executor_id,
+              "reconcile: orphan completion (outputs found in store)");
+        // Capture interested_builds BEFORE transitioning —
+        // check_build_completion (below) needs to know which
+        // builds care. Must read before node_mut (borrow).
+        let interested: Vec<Uuid> = self
+            .dag
+            .node(drv_hash)
+            .map(|s| s.interested_builds.iter().copied().collect())
+            .unwrap_or_default();
 
-                if let Some(state) = self.dag.node_mut(&drv_hash) {
-                    // Assigned → Running first if needed (state
-                    // machine doesn't allow Assigned → Completed).
-                    if state.status() == DerivationStatus::Assigned
-                        && let Err(e) = state.transition(DerivationStatus::Running)
-                    {
-                        warn!(drv_hash = %drv_hash, error = %e,
-                              "orphan completion Assigned→Running transition failed");
-                        continue;
-                    }
-                    if let Err(e) = state.transition(DerivationStatus::Completed) {
-                        warn!(drv_hash = %drv_hash, error = %e,
-                              "orphan completion transition failed");
-                        continue;
-                    }
-                    state.output_paths = expected_outputs;
-                    state.assigned_executor = None;
-                }
-                self.persist_status(&drv_hash, DerivationStatus::Completed, None)
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            // Assigned → Running first if needed (state
+            // machine doesn't allow Assigned → Completed).
+            if state.status() == DerivationStatus::Assigned
+                && let Err(e) = state.transition(DerivationStatus::Running)
+            {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "orphan completion Assigned→Running transition failed");
+                return;
+            }
+            if let Err(e) = state.transition(DerivationStatus::Completed) {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "orphan completion transition failed");
+                return;
+            }
+            state.output_paths = expected_outputs;
+            state.assigned_executor = None;
+        }
+        self.persist_status(drv_hash, DerivationStatus::Completed, None)
+            .await;
+        // r[impl sched.gc.path-tenants-upsert]
+        // Orphan completion during recovery: derivation was
+        // Running at crash, completed during downtime. The
+        // normal completion path (handle_success_completion)
+        // never fired → no tenant attribution → GC
+        // under-retains. output_paths was just set above
+        // (= expected_outputs, verified present in store).
+        self.upsert_path_tenants_for(drv_hash).await;
+        // Terminal → unpin. Without this, the pins
+        // (written at original dispatch before the crash)
+        // leak until next restart's sweep_stale_live_pins.
+        // sweep_stale_live_pins ran BEFORE reconcile (the
+        // drv was Assigned/Running in PG then — kept), so
+        // it won't catch this one.
+        self.unpin_best_effort(drv_hash).await;
+        let newly_ready = self.dag.find_newly_ready(drv_hash);
+        for ready_hash in newly_ready {
+            if let Some(s) = self.dag.node_mut(&ready_hash)
+                && s.transition(DerivationStatus::Ready).is_ok()
+            {
+                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
                     .await;
-                // r[impl sched.gc.path-tenants-upsert]
-                // Orphan completion during recovery: derivation was
-                // Running at crash, completed during downtime. The
-                // normal completion path (handle_success_completion)
-                // never fired → no tenant attribution → GC
-                // under-retains. output_paths was just set above
-                // (= expected_outputs, verified present in store).
-                self.upsert_path_tenants_for(&drv_hash).await;
-                // Terminal → unpin. Without this, the pins
-                // (written at original dispatch before the crash)
-                // leak until next restart's sweep_stale_live_pins.
-                // sweep_stale_live_pins ran BEFORE reconcile (the
-                // drv was Assigned/Running in PG then — kept), so
-                // it won't catch this one.
-                self.unpin_best_effort(&drv_hash).await;
-                // Release parents (same find_newly_ready pattern as
-                // handle_success_completion). Partial re-implementation:
-                // DON'T emit BuildEvent (the build is recovered,
-                // subscribers are gone), DON'T update build_history
-                // (no timing data for an orphan), DON'T update
-                // ancestor priorities (full_sweep on next tick does
-                // it anyway).
-                let newly_ready = self.dag.find_newly_ready(&drv_hash);
-                for ready_hash in newly_ready {
-                    if let Some(s) = self.dag.node_mut(&ready_hash)
-                        && s.transition(DerivationStatus::Ready).is_ok()
-                    {
-                        self.persist_status(&ready_hash, DerivationStatus::Ready, None)
-                            .await;
-                        self.push_ready(ready_hash);
-                    }
-                }
-
-                // Fire build completion check (same as
-                // handle_success_completion does). Without this,
-                // if the orphan-completed drv was the LAST
-                // outstanding one, the build stays Active forever
-                // — no other completion will trigger the check.
-                for build_id in &interested {
-                    self.update_build_counts(*build_id).await;
-                    self.check_build_completion(*build_id).await;
-                }
-            } else {
-                // Worker died mid-build. Record the failure (in-mem
-                // + PG) + check poison threshold (same helper as
-                // reassign_derivations).
-                let should_poison = if let Some(w) = &executor_id {
-                    self.record_failure_and_check_poison(&drv_hash, w, false)
-                        .await
-                        .reached_poison
-                } else {
-                    self.dag
-                        .node(&drv_hash)
-                        .map(|s| self.poison_config.is_poisoned(s))
-                        .unwrap_or(false)
-                };
-                if should_poison {
-                    info!(drv_hash = %drv_hash, executor_id = ?executor_id,
-                          "reconcile: poison threshold reached, poisoning");
-                    self.poison_and_cascade(&drv_hash).await;
-                    continue;
-                }
-
-                info!(drv_hash = %drv_hash, executor_id = ?executor_id,
-                      "reconcile: worker didn't reconnect, resetting to Ready");
-                if let Some(state) = self.dag.node_mut(&drv_hash) {
-                    if let Err(e) = state.reset_to_ready() {
-                        warn!(drv_hash = %drv_hash, error = %e, "reset_to_ready failed");
-                        continue;
-                    }
-                    state.retry.count += 1;
-                    self.push_ready(drv_hash.clone());
-                }
-                if let Err(e) = self.db.increment_retry_count(&drv_hash).await {
-                    error!(drv_hash = %drv_hash, error = %e, "failed to persist retry++");
-                }
-                self.persist_status(&drv_hash, DerivationStatus::Ready, None)
-                    .await;
+                self.push_ready(ready_hash);
             }
         }
 
-        // After reconcile, dispatch anything newly Ready.
-        self.dispatch_ready().await;
+        // Fire build completion check (same as
+        // handle_success_completion does). Without this,
+        // if the orphan-completed drv was the LAST
+        // outstanding one, the build stays Active forever
+        // — no other completion will trigger the check.
+        for build_id in &interested {
+            self.update_build_counts(*build_id).await;
+            self.check_build_completion(*build_id).await;
+        }
+    }
+
+    /// Reconcile path for an orphaned assignment whose outputs are NOT
+    /// in the store: worker died mid-build. Record the failure (in-mem +
+    /// PG) and check poison threshold (same
+    /// [`record_failure_and_check_poison`](Self::record_failure_and_check_poison)
+    /// helper as `reassign_derivations`); if not poisoned,
+    /// `reset_to_ready` + retry++ + re-queue.
+    async fn reset_orphan_to_ready(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor_id: &Option<ExecutorId>,
+    ) {
+        let should_poison = if let Some(w) = executor_id {
+            self.record_failure_and_check_poison(drv_hash, w, false)
+                .await
+                .reached_poison
+        } else {
+            self.dag
+                .node(drv_hash)
+                .map(|s| self.poison_config.is_poisoned(s))
+                .unwrap_or(false)
+        };
+        if should_poison {
+            info!(drv_hash = %drv_hash, executor_id = ?executor_id,
+                  "reconcile: poison threshold reached, poisoning");
+            self.poison_and_cascade(drv_hash).await;
+            return;
+        }
+
+        info!(drv_hash = %drv_hash, executor_id = ?executor_id,
+              "reconcile: worker didn't reconnect, resetting to Ready");
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            if let Err(e) = state.reset_to_ready() {
+                warn!(drv_hash = %drv_hash, error = %e, "reset_to_ready failed");
+                return;
+            }
+            state.retry.count += 1;
+            self.push_ready(drv_hash.clone());
+        }
+        if let Err(e) = self.db.increment_retry_count(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist retry++");
+        }
+        self.persist_status(drv_hash, DerivationStatus::Ready, None)
+            .await;
     }
 }
