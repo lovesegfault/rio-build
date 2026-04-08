@@ -264,10 +264,9 @@ spec:
                       description: Matches `spec.classes[].name`.
                       type: string
                     queued:
-                      description: "Builds currently queued for this class. From scheduler\n\
-                        `ClusterStatus.queued_derivations` filtered by size_class.\n\
-                        The autoscaler input \u2014 `queued / target_queue_per_replica`\n\
-                        is the desired-replica formula."
+                      description: 'Builds currently queued for this class. From scheduler
+
+                        `ClusterStatus.queued_derivations` filtered by size_class.'
                       format: uint64
                       minimum: 0.0
                       type: integer
