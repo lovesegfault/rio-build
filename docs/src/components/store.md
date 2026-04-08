@@ -91,16 +91,10 @@ r[store.chunk.refcount-txn]
 **Refcount increment:** In the same PostgreSQL transaction that writes `manifest_data` (step 2 of PutPath). Uses `INSERT ... ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1` — a single UPSERT over the full chunk list via `UNNEST`. PostgreSQL's conflict resolution serializes INSERT vs UPDATE per-row, so concurrent `PutPath` calls with overlapping chunk lists both increment correctly without explicit locking.
 
 r[store.chunk.lock-order]
-All batch row-locking statements keyed on `blake3_hash` (`UPDATE chunks ... WHERE blake3_hash = ANY($1)`, `DELETE FROM chunk_tenants WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash arrays) MUST bind a sorted input array. PostgreSQL acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets across concurrent transactions create circular lock-wait → SQLSTATE 40P01. Sorting makes lock-acquisition order deterministic across all writers. Note: a RETURNING set is NOT in input-array order — re-sort before passing to downstream ANY() statements. A single defensive retry on 40P01 is permitted (index-page splits can still deadlock under extreme contention); unbounded retry is NOT permitted (masks real lock-order bugs).
-
-r[store.chunk.put-standalone]
-The `PutChunk` RPC MUST accept chunks independent of any NAR manifest. A chunk with no manifest reference is held for the grace-TTL before GC eligibility. (Sibling to `r[store.chunk.refcount-txn]`.)
+All batch row-locking statements keyed on `blake3_hash` (`UPDATE chunks ... WHERE blake3_hash = ANY($1)`, `INSERT ... ON CONFLICT` with UNNEST over hash arrays) MUST bind a sorted input array. PostgreSQL acquires row locks in ANY()/UNNEST scan order; unsorted overlapping sets across concurrent transactions create circular lock-wait → SQLSTATE 40P01. Sorting makes lock-acquisition order deterministic across all writers. Note: a RETURNING set is NOT in input-array order — re-sort before passing to downstream ANY() statements. A single defensive retry on 40P01 is permitted (index-page splits can still deadlock under extreme contention); unbounded retry is NOT permitted (masks real lock-order bugs).
 
 r[store.chunk.grace-ttl]
-Chunks with zero manifest references AND `created_at < now() - grace_seconds` are GC-eligible. The grace period prevents a race where an executor's `PutChunk` arrives before its `PutPath` manifest. (Sibling to `r[store.chunk.refcount-txn]`.)
-
-r[store.chunk.tenant-scoped]
-`FindMissingChunks` is tenant-scoped via the `chunk_tenants` junction: a chunk is reported present to tenant X IFF a `(blake3_hash, tenant_id=X)` row exists. GC MUST delete junction rows in the same transaction as chunk soft-delete (the `chunks.blake3_hash` FK has `ON DELETE CASCADE`, but chunks are soft-deleted — `UPDATE SET deleted=TRUE`, never `DELETE` — so CASCADE never fires). A stale junction row for a tombstoned chunk would report false-present, causing the executor to skip `PutChunk` for a chunk whose S3 object is already deleted.
+Chunks with zero manifest references AND `created_at < now() - grace_seconds` are GC-eligible. The grace period covers transient refcount-zero windows inside the server-side `PutPath` flow — e.g., a failed upload's rollback (`reap_one`) decrements a chunk to zero while a concurrent `PutPath` that already saw the chunk as present and skipped re-upload has not yet committed its increment. (Sibling to `r[store.chunk.refcount-txn]`.)
 
 **Refcount decrement:** In the same PostgreSQL transaction that deletes a manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of unreachable `'complete'` manifests). Uses `UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)` — atomic batch decrement.
 
