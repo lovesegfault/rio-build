@@ -795,32 +795,32 @@ builderPoolSetDefaults:
     - name: tiny
       cutoffSecs: 30
       maxConcurrent: 200
-      resources:
+      resources: &res-tiny
         # I-118: hello-class builds need <500MB FUSE cache + overlay.
         requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "1300Mi"}
         limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "2Gi"}
     - name: small
       cutoffSecs: 120
       maxConcurrent: 200
-      resources:
+      resources: &res-small
         requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "2600Mi"}
         limits: {cpu: "8", memory: "16Gi", ephemeral-storage: "4Gi"}
     - name: medium
       cutoffSecs: 600
       maxConcurrent: 100
-      resources:
+      resources: &res-medium
         requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "21Gi"}
         limits: {cpu: "32", memory: "64Gi", ephemeral-storage: "32Gi"}
     - name: large
       cutoffSecs: 1800
       maxConcurrent: 50
-      resources:
+      resources: &res-large
         requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "42Gi"}
         limits: {cpu: "64", memory: "128Gi", ephemeral-storage: "64Gi"}
     - name: xlarge
       cutoffSecs: 7200
       maxConcurrent: 20
-      resources:
+      resources: &res-xlarge
         requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "62Gi"}
         limits: {cpu: "128", memory: "256Gi", ephemeral-storage: "96Gi"}
   # poolTemplate fields layer over builderPoolDefaults (deep-merge), so
@@ -930,9 +930,9 @@ fetcherPoolDefaults:
   # I-170/I-208: fetchers run arbitrary code (the FOD's `builder`
   # script — fetchgit delta resolution, fetchCargoVendor parallel
   # pulls, repack steps), so the cpu/mem axis isn't flat. Mirror
-  # builderPoolSetDefaults.classes EXACTLY (same five names, same
-  # resources) so the size_class_floor promotion ladder is identical
-  # for both kinds and there's one resource table to maintain. No
+  # builderPoolSetDefaults.classes via the &res-* anchors above (same
+  # five names, identical resources by reference) so the
+  # size_class_floor promotion ladder is identical for both kinds. No
   # a-priori sizing — routing stays reactive (FOD fails on N → retry
   # on N+1). Out-of-disk on a tier is handled the same as OOM:
   # eviction → disconnect → I-177 floor promotion → next tier.
@@ -948,29 +948,19 @@ fetcherPoolDefaults:
   # for a single-size pool at the legacy `resources:` field.
   classes:
     - name: tiny
-      resources:
-        requests: {cpu: "2", memory: "2Gi", ephemeral-storage: "1300Mi"}
-        limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "2Gi"}
+      resources: *res-tiny
     - name: small
       maxConcurrent: 16
-      resources:
-        requests: {cpu: "8", memory: "8Gi", ephemeral-storage: "2600Mi"}
-        limits: {cpu: "8", memory: "16Gi", ephemeral-storage: "4Gi"}
+      resources: *res-small
     - name: medium
       maxConcurrent: 8
-      resources:
-        requests: {cpu: "32", memory: "32Gi", ephemeral-storage: "21Gi"}
-        limits: {cpu: "32", memory: "64Gi", ephemeral-storage: "32Gi"}
+      resources: *res-medium
     - name: large
       maxConcurrent: 4
-      resources:
-        requests: {cpu: "64", memory: "64Gi", ephemeral-storage: "42Gi"}
-        limits: {cpu: "64", memory: "128Gi", ephemeral-storage: "64Gi"}
+      resources: *res-large
     - name: xlarge
       maxConcurrent: 2
-      resources:
-        requests: {cpu: "128", memory: "128Gi", ephemeral-storage: "62Gi"}
-        limits: {cpu: "128", memory: "256Gi", ephemeral-storage: "96Gi"}
+      resources: *res-xlarge
   tolerations:
     - key: rio.build/fetcher
       operator: Equal
