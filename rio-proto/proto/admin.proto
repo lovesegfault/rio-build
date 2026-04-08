@@ -42,6 +42,8 @@ service AdminService {
   // List currently-poisoned derivations (the roots that cascade DependencyFailed).
   rpc ListPoisoned(google.protobuf.Empty) returns (rio.types.ListPoisonedResponse);
 
+  // r[impl proto.admin.diag-rpc]
+
   // Actor in-memory DAG snapshot for a build. Unlike GetBuildGraph (reads
   // PG, works for completed builds), this queries the live actor — the
   // exact view dispatch_ready() sees. The executor_has_stream field is

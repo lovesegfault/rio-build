@@ -19,6 +19,7 @@ import "types.proto"; // HeartbeatRequest → ResourceUsage;
 // Executor kind (ADR-019 builder/fetcher split)
 // ───────────────────────────────────────────────────────────────────────────
 
+// r[impl proto.executor.kind]
 // What role an executor pod plays. Builders run arbitrary derivation code
 // and are airgapped (no internet egress). Fetchers run FOD-only (hash-check
 // bounded) and have open internet egress. Same rio-builder binary, different
@@ -315,6 +316,7 @@ message ProgressUpdate {
 // Heartbeat
 // ───────────────────────────────────────────────────────────────────────────
 
+// r[impl proto.heartbeat.capability-fields]
 // Executor heartbeat sent periodically to the scheduler.
 message HeartbeatRequest {
   string executor_id = 1;

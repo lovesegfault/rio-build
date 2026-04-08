@@ -31,6 +31,7 @@
 //! fail-fast `?` out of `main()`.
 
 // r[impl sched.grpc.leader-guard]
+// r[impl proto.client.balanced]
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

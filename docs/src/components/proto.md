@@ -7,6 +7,26 @@ Internal gRPC APIs between components + external API for tooling.
 r[proto.h2.adaptive-window]
 All gRPC channels (client `Endpoint` builders and server `Server::builder()`) MUST enable `http2_adaptive_window` and set an initial per-stream window of at least 1 MiB (h2 default is 65 535 bytes). At cross-AZ RTT (~2-3 ms) the default 64 KiB window caps a `GetPath` NAR stream at ~20-30 MB/s regardless of link bandwidth — each 256 KiB chunk needs ~4 `WINDOW_UPDATE` round-trips before the next can flow. Adaptive-window BDP probing auto-tunes upward from the 1 MiB floor.
 
+## gRPC Metadata Keys
+
+`x-rio-*` header constants live in `rio_common::grpc` (proto-agnostic, lowercase per HTTP/2 header rules) and are re-exported at `rio_proto::*` so all callers reference one path. A typo in a string literal at one site silently breaks header propagation with no compile-time signal — using the constant is mandatory.
+
+| Constant | Header | Direction | Carries |
+|---|---|---|---|
+| `BUILD_ID_HEADER` | `x-rio-build-id` | scheduler → gateway (response initial-metadata) | UUIDv7 build_id, set BEFORE first stream message so the gateway has it even on zero-event streams |
+| `TRACE_ID_HEADER` | `x-rio-trace-id` | scheduler → gateway (response initial-metadata) | 32-hex W3C trace_id of the scheduler handler span — see `r[obs.trace.scheduler-id-in-metadata]` |
+| `ASSIGNMENT_TOKEN_HEADER` | `x-rio-assignment-token` | executor → store (request metadata on `PutPath`/`PutPathBatch`) | HMAC-SHA256 token signed by scheduler; store verifies (executor_id, drv_hash, expected_outputs, expiry) |
+| `TENANT_TOKEN_HEADER` | `x-rio-tenant-token` | gateway → scheduler/store (request metadata) | ed25519 JWT; missing header is pass-through (single-tenant mode), present-but-invalid is `Unauthenticated` |
+
+r[proto.metadata.build-id]
+`x-rio-build-id` MUST be set by the scheduler on `SubmitBuild` response **initial** metadata. Server-streaming RPCs send headers before any stream message, so the gateway can record the build_id even if the scheduler dies between MergeDag commit and the first `BuildEvent`.
+
+r[proto.metadata.assignment-token]
+`x-rio-assignment-token` is the **only** input the store trusts when authorizing `PutPath`. The token is minted scheduler-side at dispatch (HMAC over executor_id + drv_hash + expected_outputs + expiry) and carried through the executor verbatim. The store MUST reject uploads with a missing, expired, or mismatched-output token. Builder pods are airgapped and untrusted — builder-supplied data MUST NOT drive authorization; the token is the cryptographic link back to a scheduler decision.
+
+r[proto.metadata.tenant-token]
+`x-rio-tenant-token` is set by the gateway on every outbound RPC in JWT mode. Server-side (`rio_common::jwt_interceptor`): missing header is pass-through (dual-mode / single-tenant), present-but-unverifiable is `Unauthenticated`. Verified claims populate request extensions; handlers read tenant identity from extensions, never from request body fields.
+
 ## Services
 
 ```protobuf
@@ -38,8 +58,9 @@ service StoreService {
   rpc PutPathBatch(stream PutPathBatchRequest) returns (PutPathBatchResponse); // all-or-nothing multi-output upload
   rpc GetPath(GetPathRequest) returns (stream GetPathResponse);
   rpc QueryPathInfo(QueryPathInfoRequest) returns (PathInfo);
+  rpc BatchQueryPathInfo(BatchQueryPathInfoRequest) returns (BatchQueryPathInfoResponse);  // I-110 batch: one ANY(...) PG query per BFS layer
+  rpc BatchGetManifest(BatchGetManifestRequest) returns (BatchGetManifestResponse);        // I-110c batch: prime FUSE-warm hint cache
   rpc FindMissingPaths(FindMissingPathsRequest) returns (FindMissingPathsResponse);
-  rpc ContentLookup(ContentLookupRequest) returns (ContentLookupResponse);
   rpc QueryPathFromHashPart(QueryPathFromHashPartRequest) returns (PathInfo);  // wopQueryPathFromHashPart (29)
   rpc AddSignatures(AddSignaturesRequest) returns (AddSignaturesResponse);     // wopAddSignatures (37)
   rpc RegisterRealisation(RegisterRealisationRequest) returns (RegisterRealisationResponse);  // wopRegisterDrvOutput (42)
@@ -50,11 +71,14 @@ service StoreService {
 
 > **PutPath stream shape:** `metadata` (1) → `nar_chunk` (0+) → `trailer` (1, mandatory). The `nar_hash` / `nar_size` go in the **trailer**, NOT the metadata — `metadata.info.nar_hash` MUST be empty (store rejects non-empty as a protocol violation). This enables single-pass streaming: the executor's `HashingChannelWriter` tee reads the file once, hashing + uploading simultaneously (~256 KiB peak memory, down from 8 GiB pre-phase2b).
 
+r[proto.store.batch-rpc]
+`BatchQueryPathInfo` and `BatchGetManifest` are **local-only** batch lookups: unlike `QueryPathInfo`/`GetPath` they do NOT do per-path upstream substitution or signature-visibility gating (both would re-introduce N round-trips). Callers needing those semantics use the singular RPCs. The batch RPCs exist because the builder's input-closure BFS + FUSE-warm stat loop were issuing ~800 singular RPCs per build — at 246 concurrent ephemeral builders that saturated the store's PG pool (acquire times → 11s → FUSE breaker → EIO). One batch call per BFS layer backed by `WHERE store_path_hash = ANY($1)` reduced it ~130×.
+
 ```protobuf
+// Server-side chunking only — PutPath chunks via cas::put_chunked; the
+// builder fans out GetChunk to reassemble NARs from their manifests.
 service ChunkService {
-  rpc PutChunk(stream PutChunkRequest) returns (PutChunkResponse);  // UNIMPLEMENTED — server-side chunking only
   rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
-  rpc FindMissingChunks(FindMissingChunksRequest) returns (FindMissingChunksResponse);
 }
 
 // store.proto — administrative RPCs. Separate service from StoreService
@@ -62,10 +86,12 @@ service ChunkService {
 // PutPath/GetPath). The scheduler's AdminService.TriggerGC proxies to
 // this after populating extra_roots from live builds.
 service StoreAdminService {
-  rpc TriggerGC(GCRequest) returns (stream GCProgress);  // mark/sweep; dry_run rolls back
-  rpc PinPath(PinPathRequest) returns (PinPathResponse);   // add to gc_roots
-  rpc UnpinPath(PinPathRequest) returns (PinPathResponse); // remove from gc_roots
-  rpc ResignPaths(ResignPathsRequest) returns (ResignPathsResponse);  // cursor-paginated NAR re-scan + re-sign backfill
+  rpc TriggerGC(GCRequest) returns (stream GCProgress);             // mark/sweep; dry_run rolls back
+  rpc VerifyChunks(VerifyChunksRequest) returns (stream VerifyChunksProgress);  // PG↔backend consistency audit (I-040 diag)
+  rpc ListUpstreams(ListUpstreamsRequest) returns (ListUpstreamsResponse);      // per-tenant upstream cache CRUD
+  rpc AddUpstream(AddUpstreamRequest) returns (UpstreamInfo);                   //   (r[store.substitute.upstream])
+  rpc RemoveUpstream(RemoveUpstreamRequest) returns (Empty);
+  rpc GetLoad(GetLoadRequest) returns (GetLoadResponse);            // per-replica pg_pool_utilization for ComponentScaler
 }
 
 // admin.proto — implemented by the rio-scheduler process (co-located with
@@ -83,8 +109,16 @@ service AdminService {
   rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
   rpc GetBuildGraph(GetBuildGraphRequest) returns (GetBuildGraphResponse);  // PG-backed DAG + live status colors (dashboard polls 5s)
   rpc GetSizeClassStatus(GetSizeClassStatusRequest) returns (GetSizeClassStatusResponse);  // SITA-E cutoffs + per-class queued/running
+  rpc ListPoisoned(Empty) returns (ListPoisonedResponse);
+  rpc InspectBuildDag(InspectBuildDagRequest) returns (InspectBuildDagResponse);  // actor in-memory DAG snapshot (I-025 diag)
+  rpc DebugListExecutors(Empty) returns (DebugListExecutorsResponse);             // actor in-memory executor map (I-048b/c diag)
+  rpc GetCapacityManifest(GetCapacityManifestRequest) returns (GetCapacityManifestResponse);  // queued-ready per-drv resource estimates (ADR-020 Manifest sizing)
+  rpc GetEstimatorStats(GetEstimatorStatsRequest) returns (GetEstimatorStatsResponse);        // build_history EMA snapshot (I-124 diag)
 }
 ```
+
+r[proto.admin.diag-rpc]
+`InspectBuildDag` and `DebugListExecutors` query the scheduler actor's **in-memory** state — what `dispatch_ready()` sees — NOT PostgreSQL. `GetBuildGraph`/`ListExecutors` read PG (work for completed builds, survive actor restart); the diagnostic pair surface live dispatch-filter inputs that PG can't show: `executor_has_stream` (assigned to a dead-stream executor = stuck forever, I-025) and `has_stream`/`warm`/`draining`/`store_degraded` per executor (PG `last_seen` says alive but actor map empty = bidi stream stuck on TCP keepalive to old leader, I-048b/c). `DebugListExecutors` is NOT leader-gated — a standby's empty map is itself diagnostic.
 
 > **TriggerGC layering:** `AdminService.TriggerGC` (scheduler) proxies to `StoreAdminService.TriggerGC` (store). The scheduler populates `GCRequest.extra_roots` with expected output paths from all non-terminal derivations before forwarding — this protects in-flight build outputs that the executor hasn't uploaded yet. Calling `StoreAdminService.TriggerGC` directly bypasses this protection.
 
@@ -123,6 +157,15 @@ message SchedulerMessage {
 }
 ```
 
+### ExecutorKind
+
+r[proto.executor.kind]
+`ExecutorKind` (in `build_types.proto`) is a two-value enum: `EXECUTOR_KIND_BUILDER = 0` (airgapped, runs arbitrary derivation code) and `EXECUTOR_KIND_FETCHER = 1` (open egress, FOD-only, hash-check bounded). Same `rio-builder` binary, different `RIO_EXECUTOR_KIND` env. The executor reports its kind in `HeartbeatRequest.kind`; the scheduler routes FODs to fetchers only and non-FODs to builders only — no fallback across kinds. Default is `BUILDER` (wire-compatible: old executors don't send field 10, scheduler reads zero).
+
+### BuildPhase
+
+`BuildPhase` carries a per-derivation phase change forwarded from the daemon's `STDERR_RESULT{SetPhase}` (e.g. `"unpackPhase"`, `"buildPhase"`). It is its **own** `oneof` arm on both `ExecutorMessage` and `BuildEvent` — NOT piggybacked on `BuildLogBatch` — so the scheduler relay stays a pure pass-through (no inspection of batch contents) and a phase edge isn't subject to the batcher's 100ms / 64-line buffering.
+
 ### BuildLogBatch
 
 Log lines are **batched** for efficiency rather than sent per-line. The executor buffers up to 64 lines or 100ms (whichever comes first) and sends a batch. Use `bytes` (not `string`) for log content since build output may contain non-UTF-8 data.
@@ -155,7 +198,8 @@ message CompletionReport {
 
 ### HeartbeatRequest
 
-Executors include inventory data in heartbeats so the scheduler can make informed placement decisions:
+r[proto.heartbeat.capability-fields]
+Executors include inventory data in heartbeats so the scheduler can make informed placement decisions. Fields 8–11 are the **dispatch-filter capability set** the scheduler reads on every heartbeat: `size_class` (static, from `builder.toml`; empty = wildcard; fetchers always empty), `store_degraded` (FUSE breaker open → `has_capacity()` returns false), `kind` (builder/fetcher routing), `draining` (executor-authoritative — the executor knows whether it received SIGTERM; scheduler sets `worker.draining` from this field, NOT from `DrainExecutor` RPC or reconnect inference). All four default to zero/false (wire-compatible with old executors).
 
 ```protobuf
 message HeartbeatRequest {
@@ -309,3 +353,12 @@ Executor-facing RPCs are in a separate `ExecutorService` (in `builder.proto`) to
 - Gateway -> Store (`GetPath` responses for large NARs use streaming, so unaffected)
 - Executor -> Scheduler (`BuildExecution` stream messages are individually small)
 - Executor -> Store (`PutPath` uses streaming, so unaffected)
+
+## Client Helpers
+
+`rio_proto::client` provides typed connection helpers so daemons don't open-code `Endpoint` construction. The `ProtoClient` trait associates each generated `XServiceClient<Channel>` with its `grpc.health.v1` service name and TLS-domain override; `ProtoClient::wrap` applies `max_message_size` once so per-binary connect blocks can't drift on where it's set.
+
+r[proto.client.balanced]
+K8s daemons MUST use `rio_proto::client::connect<C>(addrs)` (dispatches single-channel vs. health-aware balanced from `UpstreamAddrs`). When `balance_host` is set, `BalancedChannel` DNS-resolves the headless Service, probes each pod IP via `grpc.health.v1/Check` with the **named** service (e.g. `rio.scheduler.SchedulerService` — NOT empty string), and feeds `Change::Insert` for `SERVING` / `Change::Remove` for `NOT_SERVING` into tonic's p2c balancer. The scheduler runs `replicas=2`; only the leader serves RPCs (the standby returns `Unavailable` from leader-gated handlers). p2c only ejects on connection-level failure, so without the out-of-band health probe it would keep routing ~50% of calls to the standby. `BalancedChannel::new` blocks until the first probe cycle finds ≥1 `SERVING` endpoint. The TLS domain override (`ClientTlsConfig::domain_name`) decouples SAN verification from the connect URI so pod-IP connections verify against the Service-name cert. The h2 keepalive (30s PING + 10s PONG timeout) is NOT optional: `Change::Remove` drops the endpoint from selection but doesn't close existing TCP connections — without keepalive, a SIGKILLed peer (no FIN) leaves in-flight bidi streams pinned for kernel-TCP-keepalive (~2h). Named single-channel wrappers (`connect_store`, `connect_scheduler`, `connect_executor`, `connect_admin`, `connect_store_admin`) remain for tests, rio-cli, and ad-hoc callers.
+
+**`current_traceparent()`** (in `rio_proto::interceptor`) returns the current span's W3C traceparent as a string for embedding in non-gRPC payloads — `WorkAssignment.traceparent` is the load-bearing case (ssh-ng has no metadata channel; see `r[sched.trace.assignment-traceparent]`). Pairs with `span_from_traceparent()` on the receiving side.

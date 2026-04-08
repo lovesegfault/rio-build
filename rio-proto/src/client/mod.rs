@@ -207,6 +207,7 @@ pub async fn connect_single<C: ProtoClient>(addr: &str) -> anyhow::Result<C> {
     connect_channel(addr).await.map(C::wrap)
 }
 
+// r[impl proto.client.balanced]
 /// Dispatch balance-vs-single from an
 /// [`UpstreamAddrs`](rio_common::config::UpstreamAddrs) triple.
 ///

@@ -31,6 +31,7 @@ service StoreService {
   // reduces it to ~10 RPCs (one per BFS layer), each backed by ONE
   // `WHERE store_path_hash = ANY(...)` query.
   //
+  // r[impl proto.store.batch-rpc]
   // Local-only: unlike QueryPathInfo this does NOT do per-path upstream
   // substitution or sig-visibility gating — both would re-introduce N
   // round-trips. Callers that need those semantics use QueryPathInfo.
