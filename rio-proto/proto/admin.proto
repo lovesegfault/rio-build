@@ -17,10 +17,6 @@ import "admin_types.proto"; // ClusterStatus*, ListExecutors*, ListBuilds*, etc.
 // file, so adding a unary RPC needs zero Rust changes. Streaming RPCs
 // and methods needing custom behavior go in MANUAL_METHODS (build.rs)
 // plus a hand-written body in grpc.rs.
-//
-// TypeScript (rio-dashboard/src/test-support/admin-mock.ts): the
-// admin-mock.test.ts parity check fails until the stub lands. Run
-// `cargo xtask regen mocks` for a JSON list of the expected names.
 service AdminService {
   // Get overall cluster status (executor count, queue depth, etc.).
   rpc ClusterStatus(google.protobuf.Empty) returns (rio.types.ClusterStatusResponse);

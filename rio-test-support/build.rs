@@ -93,15 +93,13 @@ fn main() {
         .find(|s| s.name() == "AdminService")
         .expect("AdminService in descriptor set");
 
-    let mut all_methods = Vec::new();
     let mut generated_body = String::new();
 
     for m in &service.method {
         let proto_name = m.name();
-        all_methods.push(proto_name.to_string());
 
         if MANUAL_METHODS.contains(&proto_name) {
-            // Hand-written in grpc.rs — skip codegen but keep in METHODS.
+            // Hand-written in grpc.rs — skip codegen.
             continue;
         }
 
@@ -159,20 +157,9 @@ fn main() {
     }
 
     assert!(
-        !all_methods.is_empty(),
-        "descriptor set has zero methods for AdminService — protoc/proto_dir wrong?"
+        !generated_body.is_empty(),
+        "descriptor set has zero generated methods for AdminService — protoc/proto_dir wrong?"
     );
-
-    // METHODS: proto-canonical PascalCase names. Covers ALL RPCs (manual
-    // + generated) so xtask regen mocks sees the full list. Consumers
-    // convert per-target: heck snake_case for Rust trait-method names,
-    // lowercase-first-char for connect-es localName (NOT heck
-    // lowerCamelCase — TriggerGC → triggerGC, not triggerGc).
-    let methods_lit = all_methods
-        .iter()
-        .map(|m| format!("{m:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
 
     std::fs::write(
         format!("{out_dir}/mock_admin_generated.rs"),
@@ -188,16 +175,6 @@ fn main() {
              \x20   () => {{\n\
              {generated_body}\
              \x20   }};\n\
-             }}\n\
-             \n\
-             impl MockAdmin {{\n\
-             \x20   /// Proto-canonical PascalCase RPC names from `admin.proto`.\n\
-             \x20   /// Covers ALL AdminService methods (manual + generated).\n\
-             \x20   ///\n\
-             \x20   /// `cargo xtask regen mocks` reads this and writes\n\
-             \x20   /// `rio-dashboard/src/test-support/admin-methods.json`\n\
-             \x20   /// with connect-es lowerCamelCase names.\n\
-             \x20   pub const METHODS: &[&str] = &[{methods_lit}];\n\
              }}\n"
         ),
     )
