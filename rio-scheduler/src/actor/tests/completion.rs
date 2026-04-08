@@ -1922,7 +1922,6 @@ async fn test_completion_unknown_drv_key_ignored() -> TestResult {
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;
@@ -1993,7 +1992,6 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;
@@ -2042,7 +2040,6 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;
@@ -2151,7 +2148,6 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;
@@ -2256,7 +2252,6 @@ async fn test_completion_writes_build_sample() -> TestResult {
                 ..Default::default()
             },
             peak_memory_bytes: 8 * 1024 * 1024,
-            output_size_bytes: 4096,
             peak_cpu_cores: 1.5,
         })
         .await?;
@@ -2375,7 +2370,6 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
             // The pathological input: u64::MAX from a misbehaving worker.
             // Unclamped cast wraps to -1i64.
             peak_memory_bytes: u64::MAX,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;

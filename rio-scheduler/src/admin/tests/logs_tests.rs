@@ -100,14 +100,13 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
 
     // Seed the PG row the flusher would have written.
     sqlx::query(
-        "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, byte_size, is_complete)
-         VALUES ($1, $2, $3, $4, $5, true)",
+        "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, is_complete)
+         VALUES ($1, $2, $3, $4, true)",
     )
     .bind(build_id)
     .bind("abc-test.drv")
     .bind(format!("logs/{build_id}/abc-test.drv.log.gz"))
     .bind(3_i64)
-    .bind(gzipped.len() as i64)
     .execute(&db.pool)
     .await?;
 

@@ -236,7 +236,6 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;

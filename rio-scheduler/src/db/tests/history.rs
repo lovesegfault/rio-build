@@ -13,7 +13,7 @@ async fn test_update_build_history_ema_accumulates() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
-    db.update_build_history("hello", "x86_64-linux", 10.0, None, None, None)
+    db.update_build_history("hello", "x86_64-linux", 10.0, None, None)
         .await?;
     let (ema1, count1): (f64, i32) = sqlx::query_as(
         "SELECT ema_duration_secs, sample_count FROM build_history \
@@ -24,7 +24,7 @@ async fn test_update_build_history_ema_accumulates() -> anyhow::Result<()> {
     assert!((ema1 - 10.0).abs() < 0.001, "first insert: ema={ema1}");
     assert_eq!(count1, 1);
 
-    db.update_build_history("hello", "x86_64-linux", 20.0, None, None, None)
+    db.update_build_history("hello", "x86_64-linux", 20.0, None, None)
         .await?;
     let (ema2, count2): (f64, i32) = sqlx::query_as(
         "SELECT ema_duration_secs, sample_count FROM build_history \
@@ -52,7 +52,7 @@ async fn test_update_build_history_memory_ema_none_is_no_signal() -> anyhow::Res
 
     let fetch = || async {
         sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
-            "SELECT ema_peak_memory_bytes, ema_output_size_bytes \
+            "SELECT ema_peak_memory_bytes, ema_peak_cpu_cores \
              FROM build_history WHERE pname = 'mem' AND system = 'x86_64-linux'",
         )
         .fetch_one(&test_db.pool)
@@ -60,91 +60,77 @@ async fn test_update_build_history_memory_ema_none_is_no_signal() -> anyhow::Res
     };
 
     // 1. old=None, new=None → stays None.
-    db.update_build_history("mem", "x86_64-linux", 1.0, None, None, None)
+    db.update_build_history("mem", "x86_64-linux", 1.0, None, None)
         .await?;
-    let (mem, out) = fetch().await?;
+    let (mem, cpu) = fetch().await?;
     assert_eq!(mem, None, "None×None: mem should stay NULL");
-    assert_eq!(out, None, "None×None: out should stay NULL");
+    assert_eq!(cpu, None, "None×None: cpu should stay NULL");
 
     // 2. old=None, new=Some → initializes (blend is NULL, falls
     //    to $new).
-    db.update_build_history(
-        "mem",
-        "x86_64-linux",
-        1.0,
-        Some(100_000_000),
-        Some(5000),
-        None,
-    )
-    .await?;
-    let (mem, out) = fetch().await?;
+    db.update_build_history("mem", "x86_64-linux", 1.0, Some(100_000_000), Some(2.0))
+        .await?;
+    let (mem, cpu) = fetch().await?;
     assert!(
         mem.is_some_and(|m| (m - 100_000_000.0).abs() < 0.001),
         "None×Some: mem should initialize to 100M, got {mem:?}"
     );
     assert!(
-        out.is_some_and(|o| (o - 5000.0).abs() < 0.001),
-        "None×Some: out should initialize to 5000, got {out:?}"
+        cpu.is_some_and(|c| (c - 2.0).abs() < 0.001),
+        "None×Some: cpu should initialize to 2.0, got {cpu:?}"
     );
 
     // 3. old=Some, new=None → KEEPS old (the important case — no
     //    signal doesn't drag). blend is NULL (x+NULL), falls to
     //    $new=NULL, falls to old.
-    db.update_build_history("mem", "x86_64-linux", 1.0, None, None, None)
+    db.update_build_history("mem", "x86_64-linux", 1.0, None, None)
         .await?;
-    let (mem, out) = fetch().await?;
+    let (mem, cpu) = fetch().await?;
     assert!(
         mem.is_some_and(|m| (m - 100_000_000.0).abs() < 0.001),
         "Some×None: mem should be UNCHANGED at 100M (no drag), got {mem:?}"
     );
     assert!(
-        out.is_some_and(|o| (o - 5000.0).abs() < 0.001),
-        "Some×None: out should be UNCHANGED at 5000 (no drag), got {out:?}"
+        cpu.is_some_and(|c| (c - 2.0).abs() < 0.001),
+        "Some×None: cpu should be UNCHANGED at 2.0 (no drag), got {cpu:?}"
     );
 
     // 4. old=Some, new=Some → normal EMA blend.
-    db.update_build_history(
-        "mem",
-        "x86_64-linux",
-        1.0,
-        Some(200_000_000),
-        Some(10_000),
-        None,
-    )
-    .await?;
-    let (mem, out) = fetch().await?;
+    db.update_build_history("mem", "x86_64-linux", 1.0, Some(200_000_000), Some(4.0))
+        .await?;
+    let (mem, cpu) = fetch().await?;
     let expect_mem = 100_000_000.0 * (1.0 - EMA_ALPHA) + 200_000_000.0 * EMA_ALPHA;
-    let expect_out = 5000.0 * (1.0 - EMA_ALPHA) + 10_000.0 * EMA_ALPHA;
+    let expect_cpu = 2.0 * (1.0 - EMA_ALPHA) + 4.0 * EMA_ALPHA;
     assert!(
         mem.is_some_and(|m| (m - expect_mem).abs() < 0.001),
         "Some×Some: mem should blend to {expect_mem}, got {mem:?}"
     );
     assert!(
-        out.is_some_and(|o| (o - expect_out).abs() < 0.001),
-        "Some×Some: out should blend to {expect_out}, got {out:?}"
+        cpu.is_some_and(|c| (c - expect_cpu).abs() < 0.001),
+        "Some×Some: cpu should blend to {expect_cpu}, got {cpu:?}"
     );
 
     Ok(())
 }
 
-/// Misclassification penalty: overwrites EMA (not blends), bumps count.
-/// Harsh correction so the next classify() picks the right class after
-/// ONE bad route, not several.
+/// Misclassification penalty: overwrites EMA (not blends). Harsh
+/// correction so the next classify() picks the right class after ONE
+/// bad route, not several.
 #[tokio::test]
 async fn test_update_build_history_misclassified_overwrites() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
     // Seed: EMA at 10s (would classify as "small").
-    db.update_build_history("slowpoke", "x86_64-linux", 10.0, None, None, None)
+    db.update_build_history("slowpoke", "x86_64-linux", 10.0, None, None)
         .await?;
 
     // Actual took 200s. Penalty write.
     db.update_build_history_misclassified("slowpoke", "x86_64-linux", 200.0)
         .await?;
 
-    let (ema, miscount): (f64, i32) = sqlx::query_as(
-        "SELECT ema_duration_secs, misclassification_count FROM build_history \
+    let ema: f64 = sqlx::query_scalar(
+        "SELECT ema_duration_secs FROM build_history \
          WHERE pname = 'slowpoke' AND system = 'x86_64-linux'",
     )
     .fetch_one(&test_db.pool)
@@ -156,19 +142,15 @@ async fn test_update_build_history_misclassified_overwrites() -> anyhow::Result<
         (ema - 200.0).abs() < 0.001,
         "penalty overwrites (not blends): expected 200, got {ema}"
     );
-    assert_eq!(miscount, 1, "misclassification counter bumped");
 
-    // Second penalty: counter increments, EMA overwritten again.
+    // Second penalty: EMA overwritten again.
     db.update_build_history_misclassified("slowpoke", "x86_64-linux", 180.0)
         .await?;
-    let (ema2, miscount2): (f64, i32) = sqlx::query_as(
-        "SELECT ema_duration_secs, misclassification_count FROM build_history \
-         WHERE pname = 'slowpoke'",
-    )
-    .fetch_one(&test_db.pool)
-    .await?;
+    let ema2: f64 =
+        sqlx::query_scalar("SELECT ema_duration_secs FROM build_history WHERE pname = 'slowpoke'")
+            .fetch_one(&test_db.pool)
+            .await?;
     assert!((ema2 - 180.0).abs() < 0.001);
-    assert_eq!(miscount2, 2);
 
     Ok(())
 }
@@ -218,7 +200,7 @@ async fn test_mid_build_resource_sample_updates_ema() -> anyhow::Result<()> {
     assert!(!updated, "no build_history row → no-op");
 
     // --- Seed build_history: prior completion left EMA at 1 GB.
-    db.update_build_history("test-pkg", "x86_64-linux", 60.0, Some(GB), None, None)
+    db.update_build_history("test-pkg", "x86_64-linux", 60.0, Some(GB), None)
         .await?;
     let seed = fetch_ema().await?;
     assert!(
@@ -294,7 +276,7 @@ async fn test_mid_build_sample_initializes_null_ema() -> anyhow::Result<()> {
 
     // Seed: duration EMA exists, memory EMA is NULL (None in the
     // update_build_history call).
-    db.update_build_history("test-pkg", "x86_64-linux", 30.0, None, None, None)
+    db.update_build_history("test-pkg", "x86_64-linux", 30.0, None, None)
         .await?;
     let before: Option<f64> = sqlx::query_scalar(
         "SELECT ema_peak_memory_bytes FROM build_history WHERE pname = 'test-pkg'",
@@ -332,7 +314,6 @@ async fn test_build_history_memory_roundtrip_read() -> anyhow::Result<()> {
         "aarch64-linux",
         42.0,
         Some(1_073_741_824),
-        None,
         Some(4.5), // peak_cpu_cores
     )
     .await?;
@@ -381,12 +362,12 @@ async fn test_update_build_history_cpu_cores_coalesce() -> anyhow::Result<()> {
     };
 
     // First: None (short build, no samples) → column stays NULL.
-    db.update_build_history("cpu", "x86_64-linux", 0.5, None, None, None)
+    db.update_build_history("cpu", "x86_64-linux", 0.5, None, None)
         .await?;
     assert_eq!(fetch_cpu().await?, None, "None initializes to NULL");
 
     // Second: Some(4.0) → initializes.
-    db.update_build_history("cpu", "x86_64-linux", 120.0, None, None, Some(4.0))
+    db.update_build_history("cpu", "x86_64-linux", 120.0, None, Some(4.0))
         .await?;
     let cpu = fetch_cpu().await?;
     assert!(
@@ -398,7 +379,7 @@ async fn test_update_build_history_cpu_cores_coalesce() -> anyhow::Result<()> {
     // This is the bug-catcher: if COALESCE is missing from the
     // UPSERT for this column, NULL*0.7 + NULL*0.3 = NULL would
     // clobber the good data.
-    db.update_build_history("cpu", "x86_64-linux", 0.5, None, None, None)
+    db.update_build_history("cpu", "x86_64-linux", 0.5, None, None)
         .await?;
     let cpu = fetch_cpu().await?;
     assert!(
@@ -408,7 +389,7 @@ async fn test_update_build_history_cpu_cores_coalesce() -> anyhow::Result<()> {
     );
 
     // Fourth: Some(8.0) → blends: 4.0*0.7 + 8.0*0.3 = 5.2.
-    db.update_build_history("cpu", "x86_64-linux", 300.0, None, None, Some(8.0))
+    db.update_build_history("cpu", "x86_64-linux", 300.0, None, Some(8.0))
         .await?;
     let cpu = fetch_cpu().await?;
     let expected = 4.0 * (1.0 - EMA_ALPHA) + 8.0 * EMA_ALPHA;

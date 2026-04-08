@@ -285,15 +285,11 @@ If no size classes are configured (empty `[[size_classes]]`), classification is 
 ### Misclassification Handling
 
 r[sched.classify.penalty-overwrite]
-Nix builds are non-preemptible --- a running build cannot be checkpointed or migrated. If a **completed** build's actual duration exceeds 2x its assigned-class cutoff, the scheduler (in the success-completion handler):
-
-1. Marks the derivation as **misclassified** in the `build_history` table
-2. Applies a **penalty** to the EMA: sets `ema_duration_secs = actual_duration` (replaces the smoothed estimate with the observed value, ignoring the usual alpha blending)
-3. Increments `misclassification_count` for the `(pname, system)` key
+Nix builds are non-preemptible --- a running build cannot be checkpointed or migrated. If a **completed** build's actual duration exceeds 2x its assigned-class cutoff, the scheduler (in the success-completion handler) applies a **penalty** to the EMA: sets `ema_duration_secs = actual_duration` (replaces the smoothed estimate with the observed value, ignoring the usual alpha blending).
 
 Penalty-overwrite detection happens post-completion; proactive EMA updates (`r[sched.classify.proactive-ema]`) may fire mid-run from executor Progress reports.
 
-Future instances of the same `(pname, system)` are routed to a larger class by virtue of the penalty-overwritten EMA: the next `classify()` call reads the updated `ema_duration_secs` and selects the appropriate cutoff. The `misclassification_count` column is incremented but not read by the classifier --- it is input to the `CutoffRebalancer` for detecting systematically-wrong cutoffs. Penalty-overwrite alone drives per-derivation routing correction; the rebalancer handles aggregate drift.
+Future instances of the same `(pname, system)` are routed to a larger class by virtue of the penalty-overwritten EMA: the next `classify()` call reads the updated `ema_duration_secs` and selects the appropriate cutoff. Penalty-overwrite alone drives per-derivation routing correction; the `CutoffRebalancer` handles aggregate drift.
 
 r[sched.classify.proactive-ema]
 When an executor reports `memory_used_bytes > 0` in a `Progress` update, the scheduler proactively updates `ema_peak_memory` for the running derivation's `(pname, system)` key. This gives the classifier fresher data for subsequent submissions of the same package even before the current build completes --- useful for long-running builds where waiting for completion (or OOM) delays class-correction by hours. The proactive update uses penalty-overwrite semantics (not blending --- a blend would need multiple mid-build samples to converge, defeating "proactive"). Self-correcting: if the peak was a spike, the completion's normal EMA blend pulls it back down. Recorded via `rio_scheduler_ema_proactive_updates_total`.
@@ -623,7 +619,7 @@ Normal processing resumes when the queue depth drops below 60% (hysteresis to pr
 
 | Table | Contents |
 |-------|----------|
-| `builds` | Build requests, status, timing, requestor, tenant_id |
+| `builds` | Build requests, status, timing, tenant_id |
 | `derivations` | Derivation metadata, scheduling state, tenant_id |
 | `derivation_edges` | DAG edges (parent_id, child_id) as a separate join table for concurrent merge safety |
 | `assignments` | Derivation -> executor mapping, status, assignment generation counter |
@@ -658,7 +654,6 @@ r[sched.db.clear-poison-batch]
 CREATE TABLE builds (
     build_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id       UUID REFERENCES tenants(tenant_id) ON DELETE SET NULL,  -- nullable; single-tenant mode leaves NULL
-    requestor       TEXT NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'succeeded', 'failed', 'cancelled')),
     priority_class  TEXT NOT NULL DEFAULT 'scheduled' CHECK (priority_class IN ('ci', 'interactive', 'scheduled')),
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -722,9 +717,6 @@ CREATE TABLE build_history (
     last_updated            TIMESTAMPTZ NOT NULL DEFAULT now(),
     ema_peak_memory_bytes   DOUBLE PRECISION,       -- nullable: executor may not report cgroup memory.peak
     ema_peak_cpu_cores      DOUBLE PRECISION,       -- nullable: polled executor-side from cgroup cpu.stat
-    ema_output_size_bytes   DOUBLE PRECISION,       -- nullable: NAR size of built outputs
-    size_class              TEXT,                   -- currently unused (DerivationState.assigned_size_class populated in-memory but not persisted)
-    misclassification_count INTEGER NOT NULL DEFAULT 0,  -- CutoffRebalancer drift signal
     PRIMARY KEY (pname, system)
 );
 ```

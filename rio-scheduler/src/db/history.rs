@@ -35,10 +35,10 @@ impl SchedulerDb {
 
     /// Update the build history EMA for a (pname, system) pair.
     ///
-    /// `peak_memory_bytes`/`output_size_bytes`/`peak_cpu_cores`:
-    /// None means the worker had no signal (build failed before cgroup
-    /// populated, or exited in <1s before CPU poll sampled). Must NOT
-    /// drag the EMA toward zero — None → column unchanged.
+    /// `peak_memory_bytes`/`peak_cpu_cores`: None means the worker had
+    /// no signal (build failed before cgroup populated, or exited in
+    /// <1s before CPU poll sampled). Must NOT drag the EMA toward zero
+    /// — None → column unchanged.
     ///
     /// The COALESCE(blend, new, old) pattern handles all four
     /// old×new nullability combinations:
@@ -63,35 +63,28 @@ impl SchedulerDb {
         system: &str,
         actual_duration_secs: f64,
         peak_memory_bytes: Option<u64>,
-        output_size_bytes: Option<u64>,
         peak_cpu_cores: Option<f64>,
     ) -> Result<(), sqlx::Error> {
         // u64 → f64 for DOUBLE PRECISION binding. Precision loss at
         // ~2^53 bytes (~9 PB) is not a concern. cpu is already f64.
         let peak_mem = peak_memory_bytes.map(|b| b as f64);
-        let out_size = output_size_bytes.map(|b| b as f64);
 
         sqlx::query(
             r#"
             INSERT INTO build_history
               (pname, system, ema_duration_secs,
-               ema_peak_memory_bytes, ema_output_size_bytes,
-               ema_peak_cpu_cores,
+               ema_peak_memory_bytes, ema_peak_cpu_cores,
                sample_count, last_updated)
-            VALUES ($1, $2, $3, $5, $6, $7, 1, now())
+            VALUES ($1, $2, $3, $5, $6, 1, now())
             ON CONFLICT (pname, system) DO UPDATE SET
                 ema_duration_secs = build_history.ema_duration_secs * (1.0 - $4) + $3 * $4,
                 ema_peak_memory_bytes = COALESCE(
                     build_history.ema_peak_memory_bytes * (1.0 - $4) + $5 * $4,
                     $5,
                     build_history.ema_peak_memory_bytes),
-                ema_output_size_bytes = COALESCE(
-                    build_history.ema_output_size_bytes * (1.0 - $4) + $6 * $4,
-                    $6,
-                    build_history.ema_output_size_bytes),
                 ema_peak_cpu_cores = COALESCE(
-                    build_history.ema_peak_cpu_cores * (1.0 - $4) + $7 * $4,
-                    $7,
+                    build_history.ema_peak_cpu_cores * (1.0 - $4) + $6 * $4,
+                    $6,
                     build_history.ema_peak_cpu_cores),
                 sample_count = build_history.sample_count + 1,
                 last_updated = now()
@@ -102,7 +95,6 @@ impl SchedulerDb {
         .bind(actual_duration_secs)
         .bind(EMA_ALPHA)
         .bind(peak_mem)
-        .bind(out_size)
         .bind(peak_cpu_cores)
         .execute(&self.pool)
         .await?;
@@ -114,7 +106,7 @@ impl SchedulerDb {
     /// its class cutoff was routed wrong. Overwrite the EMA with the
     /// actual duration (NOT blend — a blend would take multiple
     /// overruns to correct) so the NEXT classify() picks a larger
-    /// class. Also bump the counter for dashboard/alerting.
+    /// class.
     ///
     /// This is intentionally harsh: one bad classification is enough
     /// to fix the estimate. If the build was a fluke (transient slow
@@ -130,7 +122,6 @@ impl SchedulerDb {
             r#"
             UPDATE build_history
             SET ema_duration_secs = $3,
-                misclassification_count = misclassification_count + 1,
                 last_updated = now()
             WHERE pname = $1 AND system = $2
             "#,

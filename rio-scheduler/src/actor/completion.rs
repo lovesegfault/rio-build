@@ -508,10 +508,10 @@ impl DagActor {
         // (build failed before cgroup populated). Converted to None
         // before the DB write so the EMA isn't dragged toward zero.
         //
-        // Tuple to stay under clippy's 7-arg limit. All three are
+        // Tuple to stay under clippy's 7-arg limit. Both are
         // "resource measurements from the cgroup" with identical
         // zero-means-no-signal semantics; unpacked immediately.
-        (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
+        (peak_memory_bytes, peak_cpu_cores): (u64, f64),
     ) {
         let status =
             rio_proto::types::BuildResultStatus::try_from(result.status).unwrap_or_else(|_| {
@@ -653,7 +653,7 @@ impl DagActor {
                     drv_hash,
                     &result,
                     executor_id,
-                    (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
+                    (peak_memory_bytes, peak_cpu_cores),
                 )
                 .await;
             }
@@ -725,7 +725,7 @@ impl DagActor {
         result: &rio_proto::types::BuildResult,
         executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
-        (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
+        (peak_memory_bytes, peak_cpu_cores): (u64, f64),
     ) {
         // I-140: per-phase timing. Same pattern as merge.rs phase!().
         let t_total = std::time::Instant::now();
@@ -775,12 +775,8 @@ impl DagActor {
             .await;
         self.unpin_best_effort(drv_hash).await;
 
-        self.record_build_history(
-            drv_hash,
-            result,
-            (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
-        )
-        .await;
+        self.record_build_history(drv_hash, result, (peak_memory_bytes, peak_cpu_cores))
+            .await;
 
         // Emit derivation completed event
         let output_paths: Vec<String> = self
@@ -1236,7 +1232,7 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         result: &rio_proto::types::BuildResult,
-        (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
+        (peak_memory_bytes, peak_cpu_cores): (u64, f64),
     ) {
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(pname) = &state.pname
@@ -1265,18 +1261,10 @@ impl DagActor {
                 // EMA alpha=0.3 → 0.7^10 ≈ 2.8% old value after 10
                 // completions. No migration; time heals.
                 let peak_mem = (peak_memory_bytes > 0).then_some(peak_memory_bytes);
-                let out_size = (output_size_bytes > 0).then_some(output_size_bytes);
                 let peak_cpu = (peak_cpu_cores > 0.0).then_some(peak_cpu_cores);
                 if let Err(e) = self
                     .db
-                    .update_build_history(
-                        pname,
-                        &state.system,
-                        duration_secs,
-                        peak_mem,
-                        out_size,
-                        peak_cpu,
-                    )
+                    .update_build_history(pname, &state.system, duration_secs, peak_mem, peak_cpu)
                     .await
                 {
                     error!(drv_hash = %drv_hash, error = %e, "failed to update build history EMA");

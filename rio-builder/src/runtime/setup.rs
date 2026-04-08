@@ -451,10 +451,9 @@ async fn connect_upstreams(
     rio_proto::client::connect_with_retry(
         shutdown,
         || async {
-            // dataplane2: build StoreService + ChunkService over the SAME
-            // channel so per-chunk GetChunk RPCs p2c-fan across the same
-            // SERVING replicas as GetPath. `connect_raw` returns the bare
-            // Channel; StoreClients wraps it in BOTH typed clients.
+            // `connect_raw` returns the bare Channel; StoreClients wraps it
+            // in the typed StoreService client with the standard message-size
+            // headroom.
             let (ch, store_guard) =
                 rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store)
                     .await?;

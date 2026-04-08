@@ -634,7 +634,6 @@ pub(crate) async fn complete_success(
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;
@@ -680,7 +679,6 @@ pub(crate) async fn complete_ca(
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;
@@ -703,7 +701,6 @@ pub(crate) async fn complete_success_empty(
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;
@@ -728,7 +725,6 @@ pub(crate) async fn complete_failure(
                 ..Default::default()
             },
             peak_memory_bytes: 0,
-            output_size_bytes: 0,
             peak_cpu_cores: 0.0,
         })
         .await?;

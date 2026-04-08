@@ -200,8 +200,9 @@ message CompletionReport {
   uint64 peak_memory_bytes = 4;
 
   // Total bytes uploaded to the store (sum of NAR sizes across all outputs).
-  // Feeds build_history.ema_output_size_bytes. Not used for routing decisions
-  // yet — informational for dashboards / capacity planning.
+  // Builder still measures and sends this; scheduler does NOT persist it
+  // (build_history.ema_output_size_bytes was dropped — never read by
+  // routing or dashboards). Field kept for wire compatibility.
   uint64 output_size_bytes = 5;
 
   // Peak CPU usage in cores-equivalent, sampled 1Hz from the

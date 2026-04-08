@@ -61,4 +61,4 @@ The scheduler-side subset landed early; the Kubernetes control plane followed vi
 The following remain **deferred**:
 
 - **SITA-E adaptive cutoffs:** Cutoffs are static, read from `scheduler.toml` (`size_classes` table). There is no `CutoffRebalancer` task adjusting boundaries from historical data. Operators set cutoffs manually. The WPS `.status.classes[].effective_cutoff_secs` surfaces the current value; it does not yet drift from the configured value.
-- **CPU and output-size class bumping:** `ema_peak_cpu_cores` and `ema_output_size_bytes` are tracked in `build_history`, but only memory is consulted when bumping a derivation's size class. cgroup CPU polling was completed in Phase 3a; CPU and output-size bumping simply have no classifier wiring yet.
+- **CPU class bumping:** `ema_peak_cpu_cores` is tracked in `build_history`, but only memory is consulted when bumping a derivation's size class. cgroup CPU polling was completed in Phase 3a; CPU bumping simply has no classifier wiring yet. Output-size bumping was dropped — `ema_output_size_bytes` was a write-only column and was removed in migration 037.

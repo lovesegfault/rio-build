@@ -559,14 +559,13 @@ impl DagActor {
                     drv_key,
                     result,
                     peak_memory_bytes,
-                    output_size_bytes,
                     peak_cpu_cores,
                 } => {
                     self.handle_completion(
                         &executor_id,
                         &drv_key,
                         result,
-                        (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
+                        (peak_memory_bytes, peak_cpu_cores),
                     )
                     .await;
                 }

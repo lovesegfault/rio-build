@@ -619,6 +619,30 @@ pub const M_035: () = ();
 /// knobs without users), the table is dropped rather than wired.
 pub const M_036: () = ();
 
+/// `migrations/037_drop_write_only_cols.sql`
+///
+/// Drops five write-only/never-written columns surfaced by the dead-code
+/// audit:
+///
+/// - `build_history.{ema_output_size_bytes, size_class,
+///   misclassification_count}` — `size_class` was never written (the
+///   001 comment said "informational for dashboards"; rio-dashboard
+///   never grew a `build_history` view). The other two were written by
+///   `update_build_history[_misclassified]` and never read back —
+///   `read_build_history` SELECTs only the duration/mem/cpu EMAs the
+///   estimator actually uses. The misclassification penalty's live
+///   effect is the `ema_duration_secs` overwrite, which stays.
+/// - `builds.requestor` — bound to `''` on every INSERT, never SELECTed.
+///   The audit-trail role is served by `jwt_jti` (migration 016).
+/// - `build_logs.byte_size` — gzipped S3 object size, written by the
+///   log flusher and never read. Dashboard log views resolve via
+///   `s3_key` + `is_complete` + `line_count`.
+///
+/// `CompletionReport.output_size_bytes` (proto field 5) is kept for
+/// wire compatibility — the builder still measures and sends it; the
+/// scheduler simply stops persisting it.
+pub const M_037: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

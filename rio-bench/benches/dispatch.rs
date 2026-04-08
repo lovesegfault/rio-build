@@ -132,7 +132,6 @@ impl InstantWorker {
                     drv_key: a.drv_path,
                     result,
                     peak_memory_bytes: 0,
-                    output_size_bytes: 0,
                     peak_cpu_cores: 0.0,
                 })
                 .await

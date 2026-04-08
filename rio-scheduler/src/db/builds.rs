@@ -165,9 +165,9 @@ impl SchedulerDb {
         sqlx::query(
             r#"
             INSERT INTO builds
-                (build_id, tenant_id, requestor, status, priority_class,
+                (build_id, tenant_id, status, priority_class,
                  keep_going, options_json, jwt_jti)
-            VALUES ($1, $2, '', 'pending', $3, $4, $5, $6)
+            VALUES ($1, $2, 'pending', $3, $4, $5, $6)
             "#,
         )
         .bind(build_id)

@@ -173,7 +173,6 @@ impl ExecutorService for SchedulerGrpc {
                                     drv_key: drv_path,
                                     result,
                                     peak_memory_bytes: report.peak_memory_bytes,
-                                    output_size_bytes: report.output_size_bytes,
                                     peak_cpu_cores: report.peak_cpu_cores,
                                 })
                                 .await

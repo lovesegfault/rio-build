@@ -1529,9 +1529,7 @@ async fn collect_outputs(
     .await
     {
         Ok(upload_results) => {
-            // Sum NAR sizes for the CompletionReport. Feeds
-            // build_history.ema_output_size_bytes — not used for
-            // routing yet but useful for dashboards / capacity.
+            // Sum NAR sizes for the CompletionReport.
             let output_size_bytes: u64 = upload_results.iter().map(|r| r.nar_size).sum();
 
             // Map store_path → output_name. Upload results are

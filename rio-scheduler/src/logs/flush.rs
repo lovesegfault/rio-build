@@ -307,7 +307,6 @@ impl LogFlusher {
                 &req.drv_hash,
                 &s3_key,
                 line_count,
-                gzipped_size,
                 is_final,
             )
             .await
@@ -348,19 +347,17 @@ async fn insert_log_rows(
     drv_hash: &DrvHash,
     s3_key: &str,
     line_count: u64,
-    byte_size: u64,
     is_complete: bool,
 ) -> sqlx::Result<()> {
     // One query per build. Could be a bulk UNNEST, but N is typically 1-2
     // and the S3 PUT above already dominates latency.
     for bid in build_ids {
         sqlx::query(
-            "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, byte_size, is_complete)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO build_logs (build_id, drv_hash, s3_key, line_count, is_complete)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (build_id, drv_hash) DO UPDATE SET
                  s3_key = EXCLUDED.s3_key,
                  line_count = EXCLUDED.line_count,
-                 byte_size = EXCLUDED.byte_size,
                  is_complete = EXCLUDED.is_complete,
                  created_at = now()",
         )
@@ -368,7 +365,6 @@ async fn insert_log_rows(
         .bind(drv_hash.as_str())
         .bind(s3_key)
         .bind(line_count as i64)
-        .bind(byte_size as i64)
         .bind(is_complete)
         .execute(pool)
         .await?;
@@ -619,8 +615,8 @@ mod tests {
         seed_build(&db.pool, build_id).await?;
 
         let hash = DrvHash::from("hash");
-        insert_log_rows(&db.pool, &[build_id], &hash, "key-v1", 10, 100, false).await?;
-        insert_log_rows(&db.pool, &[build_id], &hash, "key-v2", 50, 500, true).await?;
+        insert_log_rows(&db.pool, &[build_id], &hash, "key-v1", 10, false).await?;
+        insert_log_rows(&db.pool, &[build_id], &hash, "key-v2", 50, true).await?;
 
         let row: (String, i64, bool) = sqlx::query_as(
             "SELECT s3_key, line_count, is_complete FROM build_logs

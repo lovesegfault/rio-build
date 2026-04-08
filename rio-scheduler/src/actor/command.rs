@@ -116,9 +116,6 @@ pub enum ActorCommand {
         /// `build_history.ema_peak_memory_bytes` for size-class
         /// memory-bump.
         peak_memory_bytes: u64,
-        /// Sum of uploaded NAR sizes. 0 = no signal (build failed, no
-        /// outputs). Dashboards-only today; column exists so EMA it now.
-        output_size_bytes: u64,
         /// Peak CPU cores-equivalent, polled 1Hz from cgroup
         /// `cpu.stat`. 0.0 = no signal (exited before first sample).
         /// Feeds `build_history.ema_peak_cpu_cores` — not used for
