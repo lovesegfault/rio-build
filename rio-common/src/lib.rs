@@ -25,6 +25,7 @@ pub mod tls;
 /// One socket, both families. P0542: builders may run on v6-only pod
 /// CIDR (I-073/I-079 IPv4 subnet exhaustion); the in-cluster services
 /// they dial bind here and answer on whichever family the Service routes.
+// r[impl common.helpers]
 pub fn default_addr(port: u16) -> std::net::SocketAddr {
     (std::net::Ipv6Addr::UNSPECIFIED, port).into()
 }

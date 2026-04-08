@@ -38,6 +38,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// [`crate::jwt::TenantClaims`] — both appear together in PutPath
 /// handlers, and `hmac::Claims` vs `jwt::Claims` was a recurring
 /// source of confusion.
+// r[impl common.hmac.claims]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssignmentClaims {
     /// Worker the assignment was for. Not checked on verify (the store

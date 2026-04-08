@@ -387,6 +387,7 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
 /// buckets (`[0.005..10.0]`) are tuned for HTTP request latencies and are
 /// useless for build durations that span seconds to hours. See
 /// `observability.md` for the full bucket table.
+// r[impl common.helpers]
 pub fn init_metrics(
     addr: std::net::SocketAddr,
     global_labels: &[(&'static str, String)],

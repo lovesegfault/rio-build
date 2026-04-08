@@ -33,7 +33,9 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 - **Threat**: Compromised pod impersonating another component
 - **Mitigations**: mTLS with per-service certificates, NetworkPolicy restricting pod-to-pod communication
 - **Authorization**: mTLS authenticates component identity. Application-level authorization uses assignment-scoped tokens for sensitive RPCs:
-  - The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(Claims)).base64url(hmac_sha256(key, claims_json))`. The `Claims` struct has exactly five fields: `executor_id` (string, audit only), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `is_ca` (bool, skips the membership check for floating-CA derivations whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds, replay prevention).
+
+r[common.hmac.claims]
+The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`. `AssignmentClaims` has exactly five fields: `executor_id` (string, audit only — the store doesn't know which executor is calling), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `is_ca` (bool, skips the membership check for floating-CA derivations whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds, replay prevention).
   - Executors present the assignment token in the `x-rio-assignment-token` gRPC metadata header when calling `PutPath` on the store. The store verifies the token signature, checks `now < expiry_unix`, and rejects with `PERMISSION_DENIED` if the uploaded `store_path ∉ expected_outputs`.
   - This prevents a compromised executor from writing to store paths it was never assigned to build.
   - Token lifetime is scoped to the build assignment; tokens expire after a configurable TTL (default: 2× the build timeout).

@@ -110,22 +110,32 @@ Notable edges:
 
 ```
 src/
-├── lib.rs
+├── lib.rs             # default_addr / default_listen_string ([::] dual-stack bind)
 ├── backoff.rs         # Exponential backoff with jitter + shutdown-aware retry loop
-├── config.rs          # figment-based config layering helpers
-├── grpc.rs            # gRPC timeouts, message-size constants
-├── hmac.rs            # HMAC-SHA256 for PutPath metadata integrity
+├── config.rs          # figment-based config layering; CommonConfig, ValidateConfig, JwtConfig
+├── grpc.rs            # gRPC timeouts, message-size constants, x-rio-* metadata keys, h2 window tuning
+├── hmac.rs            # HMAC-SHA256 assignment tokens (AssignmentClaims sign/verify)
 ├── jwt.rs             # JWT encode/decode primitives (ed25519)
 ├── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
-├── limits.rs          # MAX_NAR_SIZE, MAX_COLLECTION_COUNT, etc.
-├── observability.rs   # Tracing init, describe!() metric registration
-├── server.rs          # bootstrap(): 6-step cold-start prologue (crypto, tracing, config, signal, metrics);
-│                      #   tonic server builder helpers (drain, graceful-shutdown)
-├── signal.rs          # SIGTERM/SIGINT → CancellationToken
+├── limits.rs          # MAX_NAR_SIZE, MAX_DAG_NODES/EDGES, heartbeat constants
+├── observability.rs   # Tracing/OTel init (OtelGuard), init_metrics (global_labels, DEFAULT_BUCKETS,
+│                      #   HISTOGRAM_BUCKET_MAP)
+├── server.rs          # bootstrap(): 6-step cold-start prologue (crypto, tracing, config, TLS, signal,
+│                      #   metrics); Bootstrap<C>/HasCommonConfig; tonic_builder; drain helpers
+├── signal.rs          # SIGTERM/SIGINT → CancellationToken; sighup_reload (hot-reload loop)
 ├── task.rs            # spawn_monitored task wrapper
 ├── tenant.rs          # NormalizedName tenant ID newtype
-└── tls.rs             # mTLS config load + tonic channel TLS
+└── tls.rs             # mTLS config load + tonic channel TLS (anyhow::Error, not a typed TlsError)
 ```
+
+r[common.bootstrap]
+`bootstrap<C, A>(component, cli, describe_metrics)` is the cold-start prologue every binary calls from `main()`: install rustls crypto provider → `init_tracing` (returns `OtelGuard`) → figment `load` → `load_client_tls` + `init_client_tls` → `ValidateConfig::validate` → `shutdown_signal` + `init_metrics` + `describe_metrics()` → enter root `component` span. Returns `Bootstrap<C>{ cfg, shutdown, serve_shutdown, otel_guard, root_span }` — `otel_guard` and `root_span` MUST be bound (not destructured with `..`) or OTel teardown / span exit happens immediately. `HasCommonConfig` projects each binary's `Config` to its flattened `CommonConfig` so `bootstrap` can read `tls`/`metrics_addr`/`metric_labels` without knowing the concrete type.
+
+r[common.signal.sighup-reload]
+`sighup_reload(shutdown, reload)` spawns a SIGHUP listener that runs the async `reload` closure on each signal, looping until `shutdown` fires. A failed reload is logged and the loop continues — old state stays active. Used for JWT pubkey rotation (re-read ConfigMap mount → swap `Arc<RwLock<VerifyingKey>>`).
+
+r[common.helpers]
+`default_addr`/`default_listen_string` produce `[::]` dual-stack bind addresses (Linux `bindv6only=0`: one socket answers both v4-mapped and native v6). `grpc.rs` is the proto-agnostic tonic helper layer (timeout wrappers, `StatusExt`, `check_bound`, h2 window constants, `x-rio-*` metadata keys); anything naming a generated proto type lives in `rio-proto::client` instead. `ValidateConfig::validate` is the post-load bounds check; `JwtConfig` carries the dual-mode `required`/`key_path` switch. `init_metrics` applies `global_labels` and a global `DEFAULT_BUCKETS` (so unmapped histograms still emit `_bucket` series), then per-metric `HISTOGRAM_BUCKET_MAP` overrides.
 
 ### rio-nix — Nix protocol and data types
 

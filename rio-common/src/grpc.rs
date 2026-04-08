@@ -9,6 +9,7 @@
 //! in `rio-proto::client`. `rio-proto` depends on this crate, not the
 //! other way round, so `rio-controller` can take a backoff helper without
 //! pulling in the whole proto crate.
+// r[impl common.helpers]
 //!
 //! Missing timeouts on gRPC calls are a systemic footgun in a distributed
 //! system: a hung store/scheduler causes cascading hangs in gateway sessions,

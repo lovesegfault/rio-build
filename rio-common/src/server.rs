@@ -133,6 +133,7 @@ pub struct Bootstrap<C> {
 /// rio-builder records `executor_id` separately after resolving it
 /// (root-span fields can't be added post-creation, but a child span /
 /// log field is observably equivalent for the JSON log line).
+// r[impl common.bootstrap]
 pub fn bootstrap<C, A>(
     component: &'static str,
     cli: A,

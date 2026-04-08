@@ -365,6 +365,7 @@ pub fn ensure_required_path(
 /// Pair with [`ensure_required`] / [`ensure_required_path`] for the
 /// `#[serde(default)]` string fields that have no sensible compiled
 /// default (deployment-specific addrs, paths).
+// r[impl common.helpers]
 pub trait ValidateConfig {
     /// Run all bounds / required-field checks. Called immediately after
     /// [`load`] in each binary's `main()`.
