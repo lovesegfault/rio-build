@@ -2,7 +2,7 @@
 //! mode (`RIO_EXECUTOR_KIND=fetcher`), with the stricter security
 //! posture from ADR-019 §Sandbox hardening.
 //!
-//! Optionally size-classed via `spec.classes[]` (I-170): one Job
+//! Size-classed via `spec.classes[]` (CEL-enforced non-empty, I-170): one Job
 //! loop per class, each registering `RIO_SIZE_CLASS=name` so the
 //! scheduler can route by `size_class_floor`. Simpler than
 //! [`builderpool`](super::builderpool): no manifest mode, no

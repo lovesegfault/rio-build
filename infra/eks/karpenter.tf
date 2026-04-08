@@ -46,13 +46,6 @@ module "karpenter" {
   create_pod_identity_association = true
 }
 
-locals {
-  # Sourced from nix/pins.nix via generated.auto.tfvars.json. Kept as a
-  # local (not inlined) because both helm_release.karpenter_crd and
-  # helm_release.karpenter reference it — single point of truth within TF.
-  karpenter_version = var.karpenter_version
-}
-
 # Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/
 # directory on `helm upgrade` — only on first install. A version bump
 # on helm_release.karpenter below would leave stale CRDs. The
@@ -62,7 +55,7 @@ resource "helm_release" "karpenter_crd" {
   namespace  = "kube-system"
   repository = "oci://public.ecr.aws/karpenter"
   chart      = "karpenter-crd"
-  version    = local.karpenter_version
+  version    = var.karpenter_version
 
   # aws_lbc dep: webhook-ordering only — see addons.tf cert_manager.
   depends_on = [module.eks, helm_release.aws_lbc]
@@ -78,7 +71,7 @@ resource "helm_release" "karpenter" {
   # by a prior run) instead of the fresh one terraform fetches.
   repository = "oci://public.ecr.aws/karpenter"
   chart      = "karpenter"
-  version    = local.karpenter_version
+  version    = var.karpenter_version
 
   # CRDs come from helm_release.karpenter_crd — skip the baked-in
   # crds/ dir to avoid dual ownership.

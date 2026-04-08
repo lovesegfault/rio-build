@@ -52,6 +52,7 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
             host_users: None,
             tls_secret_name: None,
         },
+        resources: None,
         sizing: Sizing::Static,
         size_class_cutoff_secs: None,
         fuse_threads: None,
