@@ -327,8 +327,8 @@ spec:
                     \ target systems accepts no work"
                   rule: size(self) > 0
               terminationGracePeriodSeconds:
-                description: "Pod terminationGracePeriodSeconds. SIGTERM \u2192 worker\
-                  \ drain\n(DrainWorker + wait for in-flight builds to complete).\
+                description: "Pod terminationGracePeriodSeconds. SIGTERM \u2192 executor\
+                  \ drain\n(DrainExecutor + wait for in-flight builds to complete).\
                   \ After\nthis many seconds: SIGKILL, builds lost. Also bounds the\n\
                   finalizer's cleanup() wait (grace + 60s slop for kubelet/STS\nstatus\
                   \ observation).\n\nDefault 7200 (2h) \u2014 nix builds can legitimately\

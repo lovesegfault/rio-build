@@ -176,7 +176,7 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch]
-  # `kubectl describe workerpool` shows events. create/patch for
+  # `kubectl describe builderpool` shows events. create/patch for
   # aggregation (K8s dedups by key). events.k8s.io (NOT core "")
   # — kube-runtime's Recorder uses the events.k8s.io/v1 API. K8s
   # mirrors events to core/v1 automatically for kubectl describe.

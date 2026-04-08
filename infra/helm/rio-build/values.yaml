@@ -726,7 +726,7 @@ dashboard:
   # checks tag match.
   envoyImage: docker.io/envoyproxy/envoy:distroless-v1.37.1@sha256:4d9226b9fd4d1449887de7cde785beb24b12e47d6e79021dec3c79e362609432
   # ── Method-level authz (r[dash.auth.method-gate]) ─────────────────────
-  # Expose ClearPoison/DrainWorker/CreateTenant/TriggerGC via the
+  # Expose ClearPoison/DrainExecutor/CreateTenant/TriggerGC via the
   # dashboard gateway. Default false — the GRPCRoute for mutating
   # methods is NOT rendered, so envoy returns 404 on those paths.
   # Use rio-cli with an mTLS client cert for admin operations until

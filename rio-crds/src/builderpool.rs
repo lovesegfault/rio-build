@@ -241,8 +241,8 @@ pub struct BuilderPoolSpec {
     #[schemars(schema_with = "crate::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
-    /// Pod terminationGracePeriodSeconds. SIGTERM → worker drain
-    /// (DrainWorker + wait for in-flight builds to complete). After
+    /// Pod terminationGracePeriodSeconds. SIGTERM → executor drain
+    /// (DrainExecutor + wait for in-flight builds to complete). After
     /// this many seconds: SIGKILL, builds lost. Also bounds the
     /// finalizer's cleanup() wait (grace + 60s slop for kubelet/STS
     /// status observation).
