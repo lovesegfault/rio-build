@@ -223,8 +223,5 @@ impl GatewaySession {
 
 /// Initialize test logging (idempotent).
 pub fn init_test_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("rio_gateway=debug,rio_nix=debug")
-        .with_test_writer()
-        .try_init();
+    rio_test_support::init_test_logging("rio_gateway=debug,rio_nix=debug");
 }

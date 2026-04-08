@@ -306,6 +306,80 @@ impl Recorder for GaugeValues {
 }
 
 // ===========================================================================
+// metrics_suite! — generates the 3-test metrics_registered.rs body
+// ===========================================================================
+
+/// Expand to the three `metrics_registered.rs` tests
+/// (spec→describe, emit→describe, describe→buckets) plus the two
+/// `include_str!(OUT_DIR/…)` consts they consume.
+///
+/// Invoked once per crate at `tests/metrics_registered.rs`. The
+/// `// r[verify obs.metric.X]` tracey marker goes ABOVE the macro
+/// invocation in the source file (tracey reads source text, not
+/// macro expansions).
+///
+/// Parameters:
+/// - `describe_fn`: path to the crate's `pub fn describe_metrics()`
+/// - `crate_name`: human-readable name for error messages
+/// - `spec_floor`: min rows expected in the obs.md table (vacuity guard)
+/// - `emit_floor`: min `metrics::*!` literals expected in src/ (regex-health guard)
+/// - `default_buckets_ok`: histograms deliberately on `[0.005..10.0]` defaults
+///
+/// `::rio_common::observability::HISTOGRAM_BUCKET_MAP` is referenced at
+/// the call site — every caller already depends on `rio-common`.
+#[macro_export]
+macro_rules! metrics_suite {
+    (
+        describe_fn: $describe_fn:path,
+        crate_name: $crate_name:literal,
+        spec_floor: $spec_floor:literal,
+        emit_floor: $emit_floor:literal,
+        default_buckets_ok: [$($ok:literal),* $(,)?] $(,)?
+    ) => {
+        const SPEC_METRICS_RAW: &str =
+            include_str!(concat!(env!("OUT_DIR"), "/spec_metrics.txt"));
+        const EMITTED_METRICS: &str =
+            include_str!(concat!(env!("OUT_DIR"), "/emitted_metrics.txt"));
+
+        #[test]
+        fn all_spec_metrics_have_describe_call() {
+            let spec_metrics: ::std::vec::Vec<&str> =
+                SPEC_METRICS_RAW.lines().filter(|l| !l.is_empty()).collect();
+            assert!(
+                spec_metrics.len() >= $spec_floor,
+                "spec_metrics.txt has only {} entries — build.rs grep broken?",
+                spec_metrics.len()
+            );
+            $crate::metrics::assert_spec_metrics_described(
+                &spec_metrics,
+                $describe_fn,
+                $crate_name,
+            );
+        }
+
+        #[test]
+        fn all_emitted_metrics_are_described() {
+            $crate::metrics::assert_emitted_metrics_described(
+                EMITTED_METRICS,
+                $emit_floor,
+                $describe_fn,
+                $crate_name,
+            );
+        }
+
+        #[test]
+        fn all_histograms_have_bucket_config() {
+            $crate::metrics::assert_histograms_have_buckets(
+                $describe_fn,
+                ::rio_common::observability::HISTOGRAM_BUCKET_MAP,
+                &[$($ok),*],
+                $crate_name,
+            );
+        }
+    };
+}
+
+// ===========================================================================
 // Assertion helpers — extracted from 5× metrics_registered.rs test bodies
 // ===========================================================================
 

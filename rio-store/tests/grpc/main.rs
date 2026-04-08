@@ -25,7 +25,9 @@ use rio_store::grpc::StoreServiceImpl;
 pub use rio_store::test_helpers::{
     put_path, put_path_raw, spawn_store_service as spawn_store_server,
 };
-use rio_test_support::fixtures::{make_nar, make_path_info_for_nar, test_store_path};
+use rio_test_support::fixtures::{
+    make_large_nar, make_nar, make_path_info_for_nar, pseudo_random_bytes, test_store_path,
+};
 use rio_test_support::{TestDb, TestResult};
 
 use std::sync::Arc;
@@ -144,28 +146,6 @@ pub async fn put_path_with_token(
     );
     let response = client.put_path(req).await?;
     Ok(response.into_inner().created)
-}
-
-/// Build a NAR of roughly `payload_size` bytes. Content is pseudo-random
-/// enough for FastCDC to find boundaries but deterministic for
-/// reproducible tests.
-///
-/// Used by `chunked`, `reassembly`, and `chunk_service` — hence shared
-/// in main.rs. NOT using make_nar (that wraps a tiny payload in NAR
-/// framing). We want a big payload. The NAR framing adds ~100 bytes;
-/// payload dominates.
-fn make_large_nar(seed: u8, payload_size: usize) -> (Vec<u8>, ValidatedPathInfo, String) {
-    // Deterministic pseudo-random payload. seed varies per test so two
-    // NARs with different seeds share SOME chunks (dedup test) but not all.
-    let payload: Vec<u8> = (0u64..payload_size as u64)
-        .map(|i| (i.wrapping_mul(7919).wrapping_add(seed as u64) % 251) as u8)
-        .collect();
-
-    // Wrap in a NAR via the fixture helper (single-file NAR).
-    let (nar, _hash) = make_nar(&payload);
-    let store_path = test_store_path(&format!("large-nar-{seed}"));
-    let info = make_path_info_for_nar(&store_path, &nar);
-    (nar, info, store_path)
 }
 
 // ===========================================================================

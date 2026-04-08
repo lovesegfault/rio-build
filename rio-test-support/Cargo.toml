@@ -14,6 +14,9 @@ sqlx = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }
+# init_test_logging(): with_test_writer()+EnvFilter so per-test
+# tracing output is captured by libtest and shown only on failure.
+tracing-subscriber = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 tonic = { workspace = true }

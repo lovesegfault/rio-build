@@ -31,3 +31,18 @@ pub use pg::{TenantSeed, seed_tenant};
 /// Standard return type for `#[test]` / `#[tokio::test]` bodies.
 /// Lets tests use `?` instead of `.unwrap()`.
 pub type TestResult = anyhow::Result<()>;
+
+/// Idempotent tracing init for tests. `with_test_writer` routes spans
+/// through libtest's capture so output only shows on failure;
+/// `try_init` swallows the "already set" error so every test (or
+/// fixture ctor) can call this without coordination.
+///
+/// `filter` is an `EnvFilter` directive string (e.g.,
+/// `"rio_gateway=debug,rio_nix=debug"`). Without this, `tracing::debug!`
+/// in error paths is void and failure logs are useless.
+pub fn init_test_logging(filter: &str) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_test_writer()
+        .try_init();
+}

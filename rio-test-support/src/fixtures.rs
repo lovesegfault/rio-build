@@ -90,6 +90,43 @@ pub fn make_edge(parent_tag: &str, child_tag: &str) -> DerivationEdge {
     }
 }
 
+/// Deterministic pseudo-random bytes: `(i * 7919 + seed) % 251`.
+///
+/// Varied enough that FastCDC finds chunk boundaries (zeros or a
+/// repeating short pattern would not), but reproducible so test
+/// failures replay. 7919 is prime; 251 is the largest prime under 256
+/// so the sequence cycles slowly. `seed` shifts the sequence — two
+/// blobs with different seeds share SOME chunks (the dedup property
+/// tests rely on this) but not all.
+///
+/// `u64` index range: at `len = 1 MiB`, `i * 7919 ≈ 8e9` overflows
+/// `i32` (the default for an untyped `0..N` literal). The explicit
+/// `u64` cast and `wrapping_mul` make the overflow defined.
+pub fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    (0u64..len as u64)
+        .map(|i| (i.wrapping_mul(7919).wrapping_add(seed) % 251) as u8)
+        .collect()
+}
+
+/// Build a NAR of roughly `payload_size` bytes, large enough to
+/// trigger FastCDC chunking (> 256 KiB `INLINE_THRESHOLD`).
+///
+/// Payload is [`pseudo_random_bytes`]`(seed, payload_size)` wrapped in
+/// single-file NAR framing (~100 bytes overhead; payload dominates).
+/// Returns `(nar, path_info, store_path)` — the rich superset; callers
+/// that only need the NAR hash use `info.nar_hash`. `store_path` is
+/// `test_store_path("large-nar-{seed}")` so distinct seeds get
+/// distinct paths.
+///
+/// At 64 KiB average chunk size, a 512 KiB NAR chunks into ~8 pieces.
+pub fn make_large_nar(seed: u8, payload_size: usize) -> (Vec<u8>, ValidatedPathInfo, String) {
+    let payload = pseudo_random_bytes(seed as u64, payload_size);
+    let (nar, _hash) = make_nar(&payload);
+    let store_path = test_store_path(&format!("large-nar-{seed}"));
+    let info = make_path_info_for_nar(&store_path, &nar);
+    (nar, info, store_path)
+}
+
 /// Build a minimal NAR (single regular file) from raw contents.
 /// Returns `(nar_bytes, sha256_digest)`.
 pub fn make_nar(contents: &[u8]) -> (Vec<u8>, [u8; 32]) {

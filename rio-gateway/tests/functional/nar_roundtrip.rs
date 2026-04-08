@@ -37,8 +37,12 @@ async fn add_multiple_then_nar_from_path_byte_identical() -> TestResult {
     // generator means they share SOME chunks — incidental dedup).
     let paths: Vec<(String, Vec<u8>, [u8; 32])> = (0..3)
         .map(|i| {
-            let (nar, hash) = make_large_nar(i, 512 * 1024);
-            (test_store_path(&format!("func-nar-{i}")), nar, hash)
+            let (nar, info, _) = make_large_nar(i, 512 * 1024);
+            (
+                test_store_path(&format!("func-nar-{i}")),
+                nar,
+                info.nar_hash,
+            )
         })
         .collect();
 
@@ -136,9 +140,9 @@ async fn add_single_then_nar_from_path_chunked() -> TestResult {
     let mut stack = builder.ready().await?;
     let path = test_store_path("func-nar-single");
     // 300 KiB — just over INLINE_THRESHOLD. Minimum viable chunking.
-    let (nar, hash) = make_large_nar(99, 300 * 1024);
+    let (nar, info, _) = make_large_nar(99, 300 * 1024);
 
-    add_to_store_nar(&mut stack.stream, &path, &nar, hash, &[]).await?;
+    add_to_store_nar(&mut stack.stream, &path, &nar, info.nar_hash, &[]).await?;
 
     assert!(
         !chunk_backend.is_empty(),

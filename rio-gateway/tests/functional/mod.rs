@@ -121,12 +121,9 @@ impl RioStack {
     /// Called by [`RioStackBuilder::build`] — the builder owns axis state
     /// (chunked, scheduler); this owns spawn mechanics.
     async fn build_inner(db: TestDb, service: StoreServiceImpl) -> anyhow::Result<Self> {
-        // Idempotent (try_init) — captured per-test via with_test_writer.
+        // Idempotent — captured per-test via with_test_writer.
         // Without this, tracing::debug! in run_protocol error paths is void.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("rio_gateway=debug,rio_nix=debug,rio_store=debug")
-            .with_test_writer()
-            .try_init();
+        rio_test_support::init_test_logging("rio_gateway=debug,rio_nix=debug,rio_store=debug");
         // Real store on ephemeral TCP (tonic has no in-process transport
         // for Server::builder — TcpListenerStream on 127.0.0.1:0 is the
         // standard pattern, same as spawn_mock_store).
@@ -211,16 +208,4 @@ pub async fn add_to_store_nar(
     Ok(())
 }
 
-/// Build a NAR large enough to trigger FastCDC chunking (> 256 KiB
-/// `INLINE_THRESHOLD`). Content is pseudo-random-enough for FastCDC
-/// to find boundaries but deterministic for reproducible tests.
-///
-/// Same generator as `rio-store/tests/grpc/main.rs::make_large_nar` —
-/// a 7919 (prime) multiplicative sequence mod 251. At 64 KiB average
-/// chunk size, a 512 KiB NAR chunks into ~8 pieces.
-pub fn make_large_nar(seed: u8, payload_size: usize) -> (Vec<u8>, [u8; 32]) {
-    let payload: Vec<u8> = (0u64..payload_size as u64)
-        .map(|i| (i.wrapping_mul(7919).wrapping_add(seed as u64) % 251) as u8)
-        .collect();
-    rio_test_support::fixtures::make_nar(&payload)
-}
+pub use rio_test_support::fixtures::make_large_nar;

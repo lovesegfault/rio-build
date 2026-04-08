@@ -114,10 +114,7 @@ async fn test_chunked_dedup_across_uploads() -> TestResult {
 
     // Second NAR: same seed = same payload = same chunks.
     // Different store_path (different name arg) so it's a fresh PutPath.
-    let payload: Vec<u8> = (0u64..1024 * 1024)
-        .map(|i| (i.wrapping_mul(7919).wrapping_add(5) % 251) as u8)
-        .collect();
-    let (nar_b, _) = make_nar(&payload);
+    let (nar_b, _) = make_nar(&pseudo_random_bytes(5, 1024 * 1024));
     let path_b = test_store_path("large-nar-5-dup");
     let info_b = make_path_info_for_nar(&path_b, &nar_b);
 

@@ -91,6 +91,7 @@ pub fn chunk_nar(nar: &[u8]) -> Vec<Chunk<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_test_support::fixtures::pseudo_random_bytes;
 
     #[test]
     fn empty_input_empty_output() {
@@ -116,12 +117,7 @@ mod tests {
         // 1 MiB of pseudo-random-ish data. Not truly random (determinism
         // makes test failures reproducible) but varied enough that FastCDC
         // finds multiple boundaries.
-        //
-        // u64 range: i * 7919 at i=1M is ~8e9 — overflows i32 (the
-        // default for untyped integer range literals).
-        let data: Vec<u8> = (0u64..1024 * 1024)
-            .map(|i| (i.wrapping_mul(7919) % 251) as u8)
-            .collect();
+        let data = pseudo_random_bytes(0, 1024 * 1024);
         let chunks = chunk_nar(&data);
 
         // Multiple chunks expected (1 MiB / 64 KiB avg ≈ 16).
@@ -191,9 +187,7 @@ mod tests {
     #[test]
     fn shared_prefix_shares_chunks() {
         // Two 1 MiB blobs that differ only in their last 1 KiB.
-        let base: Vec<u8> = (0u64..1024 * 1024)
-            .map(|i| (i.wrapping_mul(7919) % 251) as u8)
-            .collect();
+        let base = pseudo_random_bytes(0, 1024 * 1024);
         let mut modified = base.clone();
         let tail_start = base.len() - 1024;
         for b in &mut modified[tail_start..] {

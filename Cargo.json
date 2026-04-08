@@ -21722,6 +21722,10 @@
           "packageId": "tracing"
         },
         {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        },
+        {
           "name": "uuid",
           "packageId": "uuid"
         },

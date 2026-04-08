@@ -10,6 +10,29 @@
 // (where it WOULD be dead, and clippy --deny warnings would break
 // the build).
 
+/// Standard `build.rs` body for crates with a `tests/metrics_registered.rs`.
+///
+/// Reads `CARGO_MANIFEST_DIR`/`OUT_DIR` from the build-script env,
+/// writes `emitted_metrics.txt` (grep of `metrics::*!` literals in
+/// src/) and `spec_metrics.txt` (grep of the obs.md table for `prefix`).
+/// Crate `build.rs` becomes:
+///
+/// ```ignore
+/// include!("../rio-test-support/src/metrics_grep.rs");
+/// fn main() { metrics_build_main("rio_X_"); }
+/// ```
+#[allow(dead_code)]
+fn metrics_build_main(prefix: &str) {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out = std::env::var("OUT_DIR").unwrap();
+    emit_metrics_grep(&manifest, &out);
+    emit_spec_metrics_grep(
+        &format!("{manifest}/../docs/src/observability.md"),
+        &out,
+        prefix,
+    );
+}
+
 #[allow(dead_code)]
 fn emit_metrics_grep(manifest_dir: &str, out_dir: &str) {
     use std::{collections::BTreeSet, fs, path::Path};
