@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 use super::builders::*;
 use super::*;
 use crate::fixtures::{ApiServerVerifier, Scenario, test_sched_addrs, test_store_addrs};
-use k8s_openapi::api::core::v1::PodSpec;
+use k8s_openapi::api::core::v1::{Pod, PodSpec};
+use kube::Resource;
 use rio_crds::builderpool::SeccompProfileKind;
 
 mod builders_tests;

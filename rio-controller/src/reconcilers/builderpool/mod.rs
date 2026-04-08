@@ -21,12 +21,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-// Pod + Resource are used by the tests/ submodule via `use super::*`;
-// lib code only needs ResourceExt.
-#[allow(unused_imports)]
-use k8s_openapi::api::core::v1::Pod;
-#[allow(unused_imports)]
-use kube::Resource;
 use kube::ResourceExt;
 use kube::api::Api;
 use kube::runtime::controller::Action;
@@ -41,12 +35,6 @@ mod builders;
 pub mod disruption;
 pub(super) mod ephemeral;
 mod manifest;
-// pub(crate) so fixtures.rs (at crate root) can see it. Gated
-// on test: production code in this module pulls it via the glob
-// below; only the cfg(test) fixtures module needs the wider
-// visibility.
-#[allow(unused_imports)]
-use builders::*;
 
 #[cfg(test)]
 pub(super) mod tests;
