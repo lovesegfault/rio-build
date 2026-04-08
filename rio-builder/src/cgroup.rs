@@ -635,51 +635,27 @@ fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
     }
 }
 
-/// Snapshot of the worker's whole-tree resource usage, published by
-/// [`utilization_reporter_loop_with_shutdown`] and read by the
+/// Shared handle to the worker's whole-tree resource usage, published
+/// by [`utilization_reporter_loop_with_shutdown`] and read by the
 /// heartbeat loop.
 ///
 /// `cpu_fraction` is cores-equivalent (1.0 = one core fully busy; >1.0
-/// on multi-core). `memory_max_bytes` is the cgroup `memory.max` limit
-/// — `None` means unbounded ("max"), in which case the proto
-/// `memory_total_bytes` is sent as 0 (the scheduler treats 0 as
-/// "unknown ceiling"; it won't compute a fraction from 0).
+/// on multi-core). `memory_total_bytes` is the cgroup `memory.max`
+/// limit — 0 means unbounded ("max"); the scheduler treats 0 as
+/// "unknown ceiling" and won't compute a fraction from it.
+/// `running_builds` is left 0 by the sampler — the heartbeat caller
+/// overwrites it (it has the running set; the cgroup sampler doesn't).
 ///
 /// Disk fields: statvfs on `overlay_base_dir`. This is where per-build
 /// overlay upper dirs accumulate — the relevant quota for "is there room
 /// for build outputs." Not the FUSE cache dir (that's the input closure;
 /// emptyDir-bounded, discarded with the pod).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ResourceSnapshot {
-    pub cpu_fraction: f64,
-    pub memory_current_bytes: u64,
-    pub memory_max_bytes: Option<u64>,
-    pub disk_used_bytes: u64,
-    pub disk_total_bytes: u64,
-}
-
-impl ResourceSnapshot {
-    /// Convert to the proto `ResourceUsage`. `running_builds` is zero
-    /// here — the heartbeat caller overwrites it (it has the running
-    /// set; the cgroup sampler doesn't).
-    pub fn to_proto(self) -> rio_proto::types::ResourceUsage {
-        rio_proto::types::ResourceUsage {
-            cpu_fraction: self.cpu_fraction,
-            memory_used_bytes: self.memory_current_bytes,
-            memory_total_bytes: self.memory_max_bytes.unwrap_or(0),
-            disk_used_bytes: self.disk_used_bytes,
-            disk_total_bytes: self.disk_total_bytes,
-            running_builds: 0,
-        }
-    }
-}
-
-/// Shared handle: heartbeat loop reads, sampler writes. `std::sync::RwLock`
-/// — no async needed, reads are non-blocking and the critical section is
-/// a `Copy` struct store. Poisoned lock (panic inside sampler while
-/// holding write) → `into_inner()` recovers; the snapshot is Copy so a
-/// torn write can't happen.
-pub type ResourceSnapshotHandle = std::sync::Arc<std::sync::RwLock<ResourceSnapshot>>;
+///
+/// `std::sync::RwLock` — no async needed; the critical section is a
+/// small struct store. Poisoned lock (panic inside sampler while
+/// holding write) → `into_inner()` recovers.
+pub type ResourceSnapshotHandle =
+    std::sync::Arc<std::sync::RwLock<rio_proto::types::ResourceUsage>>;
 
 /// statvfs on the overlay base dir. `f_blocks * f_frsize` = total;
 /// `(f_blocks - f_bavail) * f_frsize` = used. `f_bavail` (not
@@ -713,7 +689,8 @@ fn sample_disk(overlay_base: &Path) -> (u64, u64) {
 /// Background task that polls the worker's parent cgroup for CPU and
 /// memory utilization, emitting `rio_builder_cpu_fraction` and
 /// `rio_builder_memory_fraction` gauges every 10s, and publishes a
-/// [`ResourceSnapshot`] for the heartbeat loop's `ResourceUsage`.
+/// [`ResourceUsage`](rio_proto::types::ResourceUsage) snapshot for the
+/// heartbeat loop.
 ///
 /// `root` is the PARENT cgroup (what `delegated_root()` returns) —
 /// this captures the whole worker's tree: rio-builder process + all
@@ -805,12 +782,13 @@ pub async fn utilization_reporter_loop_with_shutdown(
         // behind reality (up to 10s stale), which is fine for placement.
         // unwrap_or_else(into_inner): a poisoned RwLock here means the
         // sampler itself panicked previously — recover and keep writing.
-        *snapshot.write().unwrap_or_else(|e| e.into_inner()) = ResourceSnapshot {
+        *snapshot.write().unwrap_or_else(|e| e.into_inner()) = rio_proto::types::ResourceUsage {
             cpu_fraction: cpu_frac,
-            memory_current_bytes: mem_current.unwrap_or(0),
-            memory_max_bytes: mem_max,
+            memory_used_bytes: mem_current.unwrap_or(0),
+            memory_total_bytes: mem_max.unwrap_or(0),
             disk_used_bytes: disk_used,
             disk_total_bytes: disk_total,
+            running_builds: 0,
         };
     }
 }

@@ -24,7 +24,7 @@ use kube::runtime::finalizer::{Event, finalizer};
 use tracing::{info, warn};
 
 use crate::error::{Error, Result, error_kind};
-use crate::reconcilers::common::pod::{self, ExecutorPodParams, ExecutorRole};
+use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
 use crate::reconcilers::{Ctx, error_key};
 use rio_crds::builderpool::SeccompProfileKind;
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
@@ -126,7 +126,7 @@ fn executor_params(
     });
 
     Ok(ExecutorPodParams {
-        role: ExecutorRole::Fetcher,
+        role: ExecutorKind::Fetcher,
         // ADR-019 §Sandbox hardening: rootfs tampering blocked. The
         // overlay upperdir (tmpfs emptyDir in common/pod.rs) stays
         // writable so build outputs still land.
@@ -347,7 +347,7 @@ mod tests {
         // don't collide (multiarch_pools_distinct_job_names below).
         assert_eq!(params.pool_name, "test-small");
         assert_eq!(
-            pod::job_name(&params.pool_name, ExecutorRole::Fetcher, "abc123"),
+            pod::job_name(&params.pool_name, ExecutorKind::Fetcher, "abc123"),
             "rio-fetcher-test-small-abc123"
         );
         // Per-class resources, NOT spec.resources (which is None).
@@ -416,7 +416,7 @@ mod tests {
         assert_ne!(n(&x86), n(&arm), "per-arch pools must not collide");
         // Max length headroom: job_name `rio-fetcher-aarch64-small-abcdef`
         // = 32 chars; RFC 1123 limit is 63.
-        assert!(pod::job_name(&n(&arm), ExecutorRole::Fetcher, "abcdef").len() < 63);
+        assert!(pod::job_name(&n(&arm), ExecutorKind::Fetcher, "abcdef").len() < 63);
     }
 
     /// Unclassed path: `class=None` → no RIO_SIZE_CLASS env, bare
@@ -437,11 +437,11 @@ mod tests {
     #[test]
     fn job_name_has_role_then_pool_then_suffix() {
         assert_eq!(
-            pod::job_name("default", ExecutorRole::Fetcher, "abc"),
+            pod::job_name("default", ExecutorKind::Fetcher, "abc"),
             "rio-fetcher-default-abc"
         );
         assert_eq!(
-            pod::job_name("x86-64", ExecutorRole::Builder, "abc"),
+            pod::job_name("x86-64", ExecutorKind::Builder, "abc"),
             "rio-builder-x86-64-abc"
         );
     }

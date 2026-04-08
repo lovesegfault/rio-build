@@ -28,9 +28,9 @@ use crate::estimator::{BucketedEstimate, Estimator};
 use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
-    BuildInfo, BuildOptions, BuildState, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
-    HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, PriorityClass,
-    RetryPolicy,
+    BuildInfo, BuildOptions, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId,
+    ExecutorState, HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig,
+    PriorityClass, RetryPolicy,
 };
 
 mod command;
@@ -1381,8 +1381,12 @@ impl DagActor {
                 BuildState::Active => active_builds += 1,
                 // Terminal builds stay in the map until CleanupTerminalBuild
                 // (delayed ~30s). Don't count them — they're not "active"
-                // in any autoscaling sense.
-                BuildState::Succeeded | BuildState::Failed | BuildState::Cancelled => {}
+                // in any autoscaling sense. Unspecified never appears
+                // (proto3 default-0; scheduler always sets a real state).
+                BuildState::Succeeded
+                | BuildState::Failed
+                | BuildState::Cancelled
+                | BuildState::Unspecified => {}
             }
         }
 

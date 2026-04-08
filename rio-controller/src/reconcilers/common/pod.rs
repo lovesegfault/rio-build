@@ -68,19 +68,22 @@ const READ_ONLY_ROOT_MOUNTS: &[(&str, &str, Option<&str>, Option<&str>)] = &[
 
 /// Executor role. Determines the `rio.build/role` label value and
 /// gates role-specific pod-spec tweaks (readOnlyRootFilesystem,
-/// seccomp profile name, RIO_EXECUTOR_KIND env).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ExecutorRole {
-    /// Airgapped, arbitrary-code builds. `rio-builders` namespace.
-    Builder,
-    /// Internet-facing, hash-checked FOD fetches. `rio-fetchers`
-    /// namespace. Stricter seccomp + readOnlyRootFilesystem.
-    Fetcher,
+/// seccomp profile name, RIO_EXECUTOR_KIND env). This IS the proto
+/// enum — `Builder` (airgapped, arbitrary-code; `rio-builders`
+/// namespace) or `Fetcher` (internet-facing, hash-checked FODs;
+/// `rio-fetchers` namespace, stricter seccomp + readOnlyRootFilesystem).
+pub use rio_proto::types::ExecutorKind;
+
+/// Lowercase string repr for the `rio.build/role` label and
+/// `RIO_EXECUTOR_KIND` env (matches the deserializer in
+/// `rio-builder/src/config.rs`). Distinct from prost's
+/// `as_str_name()` (SCREAMING_SNAKE).
+pub trait ExecutorKindExt {
+    fn as_str(&self) -> &'static str;
 }
 
-impl ExecutorRole {
-    /// Value for the `rio.build/role` label and `RIO_EXECUTOR_KIND` env.
-    pub fn as_str(&self) -> &'static str {
+impl ExecutorKindExt for ExecutorKind {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Builder => "builder",
             Self::Fetcher => "fetcher",
@@ -122,7 +125,7 @@ pub struct ExecutorPodParams {
     // ── role-varying knobs (the ADR-019 diff) ────────────────────
     /// Builder or Fetcher. Sets the `rio.build/role` label and
     /// `RIO_EXECUTOR_KIND` env.
-    pub role: ExecutorRole,
+    pub role: ExecutorKind,
     /// `securityContext.readOnlyRootFilesystem` on the executor
     /// container. Fetchers: `true` (overlay upperdir is a tmpfs
     /// emptyDir; rootfs tampering blocked). Builders: `false`.
@@ -231,7 +234,7 @@ const NAME_PREFIX: &str = "rio";
 
 /// Job name. `rio-{role}-{pool_name}-{6-char-suffix}` — logs/metrics
 /// group naturally by role+pool prefix.
-pub fn job_name(pool_name: &str, role: ExecutorRole, suffix: &str) -> String {
+pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
     format!("{NAME_PREFIX}-{}-{pool_name}-{suffix}", role.as_str())
 }
 
@@ -419,7 +422,7 @@ pub fn build_executor_pod_spec(
             // Builder-only: fetchers run `builtin` (arch-agnostic) and
             // benefit from cheaper Graviton; rio-builder's startup arch
             // check is the safety net for builders that slip through.
-            if p.role == ExecutorRole::Builder
+            if p.role == ExecutorKind::Builder
                 && let Some(arch) = nix_systems_to_k8s_arch(&p.systems)
             {
                 ns.entry("kubernetes.io/arch".into()).or_insert(arch.into());

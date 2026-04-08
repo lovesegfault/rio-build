@@ -241,17 +241,9 @@ impl DagActor {
 
         let summary = self.dag.build_summary(build_id);
 
-        let proto_state = match build.state() {
-            BuildState::Pending => rio_proto::types::BuildState::Pending,
-            BuildState::Active => rio_proto::types::BuildState::Active,
-            BuildState::Succeeded => rio_proto::types::BuildState::Succeeded,
-            BuildState::Failed => rio_proto::types::BuildState::Failed,
-            BuildState::Cancelled => rio_proto::types::BuildState::Cancelled,
-        };
-
         Ok(rio_proto::types::BuildStatus {
             build_id: build_id.to_string(),
-            state: proto_state.into(),
+            state: build.state().into(),
             // I-111: summary.{total,completed} are DAG-relative; after
             // recovery the DAG only holds non-terminal-at-recovery drvs.
             total_derivations: build.total_count,

@@ -62,7 +62,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
-use crate::reconcilers::common::pod::{self, ExecutorRole};
+use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
 
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
@@ -454,7 +454,7 @@ pub(super) fn build_job(
     // K8s name limit: 63 chars. `rio-builder-{pool}-{6}` = pool+19.
     // Pool names are short (<20 chars); a 49+ char pool gets a
     // clear K8s rejection — no silent truncation.
-    let job_name = pod::job_name(&pool, ExecutorRole::Builder, &random_suffix());
+    let job_name = pod::job_name(&pool, ExecutorKind::Builder, &random_suffix());
 
     Ok(Job {
         metadata: ObjectMeta {

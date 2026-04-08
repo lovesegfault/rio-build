@@ -11,22 +11,33 @@ use uuid::Uuid;
 
 use super::{DrvHash, PriorityClass, TransitionError};
 
-/// State of a build request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BuildState {
-    Pending,
-    Active,
-    Succeeded,
-    Failed,
-    Cancelled,
+/// State of a build request. Re-export of the proto enum so the scheduler
+/// uses the wire type directly; behavior (transitions, DB string repr)
+/// lives on [`BuildStateExt`].
+pub use rio_proto::types::BuildState;
+
+/// Extension trait adding the scheduler's state-machine semantics and
+/// PG string repr to the proto [`BuildState`]. The proto type carries
+/// an `Unspecified` variant (proto3 default-0) that never appears in
+/// scheduler-produced state — it falls through `validate_transition`'s
+/// catch-all and round-trips as `"unspecified"` for diagnostics.
+pub trait BuildStateExt: Sized + Copy {
+    fn is_terminal(&self) -> bool;
+    fn validate_transition(self, to: Self) -> Result<(), TransitionError>;
+    /// Lowercase string repr written to / read from the `builds.status`
+    /// column. Distinct from prost's `as_str_name()` (SCREAMING_SNAKE).
+    fn as_str(&self) -> &'static str;
+    /// Inverse of [`as_str`](Self::as_str). Replaces the `FromStr` impl
+    /// (orphan rules: can't impl `FromStr` for a foreign type here).
+    fn parse_db(s: &str) -> Result<Self, TransitionError>;
 }
 
-impl BuildState {
-    pub fn is_terminal(self) -> bool {
+impl BuildStateExt for BuildState {
+    fn is_terminal(&self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 
-    pub fn validate_transition(self, to: Self) -> Result<(), TransitionError> {
+    fn validate_transition(self, to: Self) -> Result<(), TransitionError> {
         if self == to {
             return Err(TransitionError::InvalidBuild { from: self, to });
         }
@@ -51,26 +62,18 @@ impl BuildState {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Active => "active",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Unspecified => "unspecified",
         }
     }
-}
 
-impl std::fmt::Display for BuildState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for BuildState {
-    type Err = TransitionError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn parse_db(s: &str) -> Result<Self, TransitionError> {
         match s {
             "pending" => Ok(Self::Pending),
             "active" => Ok(Self::Active),
@@ -78,18 +81,6 @@ impl std::str::FromStr for BuildState {
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             other => Err(TransitionError::UnknownBuildState(other.to_string())),
-        }
-    }
-}
-
-impl From<BuildState> for rio_proto::types::BuildState {
-    fn from(s: BuildState) -> Self {
-        match s {
-            BuildState::Pending => Self::Pending,
-            BuildState::Active => Self::Active,
-            BuildState::Succeeded => Self::Succeeded,
-            BuildState::Failed => Self::Failed,
-            BuildState::Cancelled => Self::Cancelled,
         }
     }
 }

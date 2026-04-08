@@ -11,7 +11,7 @@ use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
 
-use crate::reconcilers::common::pod::{self, ExecutorPodParams, ExecutorRole};
+use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
 use rio_crds::builderpool::BuilderPool;
 
 // Re-exports for ephemeral.rs + tests.
@@ -44,7 +44,7 @@ fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
     }
 
     ExecutorPodParams {
-        role: ExecutorRole::Builder,
+        role: ExecutorKind::Builder,
         read_only_root_fs: false,
         extra_env,
         pool_name: wp.name_any(),

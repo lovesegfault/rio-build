@@ -150,17 +150,15 @@ pub async fn build_heartbeat_request(
 ) -> HeartbeatRequest {
     let current: Vec<String> = slot.running().into_iter().collect();
 
-    // Snapshot is Copy; the read lock is held for one struct load.
-    // First heartbeat (before first 10s poll) sends zeros — same
-    // as the old ResourceUsage::default(), converges after one tick.
-    // Override running_builds here: the cgroup sampler doesn't know
-    // the running set. Redundant with the top-level HeartbeatRequest
-    // field but filling it keeps the ResourceUsage message self-
-    // contained for ListExecutors consumers.
+    // Read lock held for one struct clone. First heartbeat (before
+    // first 10s poll) sends zeros — same as ResourceUsage::default(),
+    // converges after one tick. Override running_builds here: the
+    // cgroup sampler doesn't know the running set. Redundant with the
+    // top-level HeartbeatRequest field but filling it keeps the
+    // ResourceUsage message self-contained for ListExecutors consumers.
     let running_count = current.len() as u32;
     let resources = {
-        let snap = *resources.read().unwrap_or_else(|e| e.into_inner());
-        let mut ru = snap.to_proto();
+        let mut ru = *resources.read().unwrap_or_else(|e| e.into_inner());
         ru.running_builds = running_count;
         ru
     };

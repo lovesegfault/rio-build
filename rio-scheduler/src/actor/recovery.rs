@@ -219,7 +219,7 @@ impl DagActor {
 
         // --- Build BuildInfo + broadcast channels ---
         for row in build_rows {
-            let Ok(state) = row.status.parse::<BuildState>() else {
+            let Ok(state) = BuildState::parse_db(&row.status) else {
                 warn!(build_id = %row.build_id, status = %row.status,
                       "unknown build status in PG, skipping");
                 continue;

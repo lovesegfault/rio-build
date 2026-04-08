@@ -167,15 +167,12 @@ fn clamp_u32(v: i64, field: &'static str) -> u32 {
 }
 
 fn row_to_proto(r: BuildListRow) -> BuildInfo {
-    let state = r
-        .status
-        .parse::<crate::state::BuildState>()
-        .map(BuildState::from)
-        .unwrap_or_else(|_| {
-            tracing::warn!(status = %r.status, build_id = %r.build_id,
+    use crate::state::BuildStateExt;
+    let state = BuildState::parse_db(&r.status).unwrap_or_else(|_| {
+        tracing::warn!(status = %r.status, build_id = %r.build_id,
                 "unknown build status from PG — rendering as Pending");
-            BuildState::Pending
-        }) as i32;
+        BuildState::Pending
+    }) as i32;
     BuildInfo {
         build_id: r.build_id.to_string(),
         tenant_id: r.tenant_id.unwrap_or_default(),

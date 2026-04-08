@@ -36,7 +36,7 @@ use crate::reconcilers::builderpool::job_common::{
     SpawnOutcome, is_active_job, random_suffix, reap_excess_pending, reap_orphan_running,
     scheduler_unreachable_condition, try_spawn_job,
 };
-use crate::reconcilers::common::pod::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs};
+use crate::reconcilers::common::pod::{self, ExecutorKind, POOL_LABEL, SchedulerAddrs};
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
 use super::{MANAGER, executor_params};
@@ -358,7 +358,7 @@ pub(super) fn build_job(
     pod_spec.restart_policy = Some("Never".into());
     pod_spec.termination_grace_period_seconds = Some(30);
 
-    let job_name = pod::job_name(&pool, ExecutorRole::Fetcher, &random_suffix());
+    let job_name = pod::job_name(&pool, ExecutorKind::Fetcher, &random_suffix());
 
     Ok(Job {
         metadata: ObjectMeta {

@@ -103,10 +103,10 @@ pub enum TransitionError {
     #[error("unknown derivation status: {0}")]
     UnknownStatus(String),
 
-    #[error("invalid build state transition {from} -> {to}")]
+    #[error("invalid build state transition {from:?} -> {to:?}")]
     InvalidBuild { from: BuildState, to: BuildState },
 
-    #[error("cannot transition from terminal build state {from} to {to}")]
+    #[error("cannot transition from terminal build state {from:?} to {to:?}")]
     TerminalBuild { from: BuildState, to: BuildState },
 
     #[error("unknown build state: {0}")]

@@ -7,7 +7,7 @@
 use uuid::Uuid;
 
 use super::*;
-use crate::state::{BuildState, DerivationStatus};
+use crate::state::{BuildState, BuildStateExt, DerivationStatus};
 
 mod assignments;
 mod batch;
@@ -90,7 +90,7 @@ fn test_build_state_roundtrip() -> anyhow::Result<()> {
         BuildState::Cancelled,
     ] {
         let s = state.as_str();
-        let parsed: BuildState = s.parse()?;
+        let parsed = BuildState::parse_db(s)?;
         assert_eq!(parsed, state);
     }
     Ok(())

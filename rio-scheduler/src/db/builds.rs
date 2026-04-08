@@ -7,7 +7,7 @@
 use uuid::Uuid;
 
 use super::{BuildListRow, LIST_BUILDS_SELECT, SchedulerDb};
-use crate::state::BuildState;
+use crate::state::{BuildState, BuildStateExt};
 
 impl SchedulerDb {
     /// List builds with optional status/tenant filters + offset pagination
@@ -212,7 +212,7 @@ impl SchedulerDb {
         let now_col = match status {
             BuildState::Active => "started_at",
             BuildState::Succeeded | BuildState::Failed | BuildState::Cancelled => "finished_at",
-            BuildState::Pending => "",
+            BuildState::Pending | BuildState::Unspecified => "",
         };
 
         if now_col.is_empty() {
