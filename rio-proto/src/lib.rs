@@ -27,6 +27,11 @@ pub mod validated;
 /// `build_types.proto` (build lifecycle, executor stream, heartbeat), and
 /// `admin_types.proto` (admin RPC data types). All four share
 /// `package rio.types;`, so prost merges them into ONE module here.
+// r[impl proto.executor.kind]
+// r[impl proto.heartbeat.capability-fields]
+// (Tracey doesn't scan .proto — the documentary annotations live in
+// build_types.proto next to the wire definitions; these markers are the
+// scannable anchors at the Rust point-of-generation.)
 pub mod types {
     tonic::include_proto!("rio.types");
 }
@@ -53,11 +58,13 @@ pub mod builder {
 /// only production caller (the builder's reassembly loop) reaches it
 /// via the deep codegen path
 /// `store::chunk_service_client::ChunkServiceClient`.
+// r[impl proto.store.batch-rpc]
 pub mod store {
     tonic::include_proto!("rio.store");
 }
 
 /// Admin service: dashboard and CLI RPCs.
+// r[impl proto.admin.diag-rpc]
 pub mod admin {
     tonic::include_proto!("rio.admin");
 }

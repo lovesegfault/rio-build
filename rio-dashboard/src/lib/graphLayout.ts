@@ -64,6 +64,7 @@ export function statusClass(status: string): 'green' | 'yellow' | 'red' | 'gray'
   return STATUS_CLASS[status] ?? 'gray';
 }
 
+// r[impl dash.graph.auto-stop]
 // Terminal states: no further status transitions without external reset.
 // Mirrors rio-scheduler/src/state/derivation.rs DerivationStatus::
 // is_terminal() — note `failed` is NOT terminal (retriable: failed→ready

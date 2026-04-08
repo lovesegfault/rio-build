@@ -26,6 +26,14 @@
 // test_include). Dashboard .ts files carrying r[impl ...] are listed
 // by explicit filename; the __tests__ directories get test_include
 // entries per-directory so vitest specs contribute verify coverage.
+//
+// Unscanned extensions: tracey's SUPPORTED_EXTENSIONS (tracey-core
+// sources.rs) does NOT include .proto/.svelte/.yaml — files with those
+// extensions are skipped even if globbed. Annotations there are
+// documentary; the scannable r[impl] anchors live in the nearest
+// .rs/.ts/.nix at the point-of-use (rio-proto/src/lib.rs for proto
+// types, rio-dashboard/src/api/*.ts for .svelte pages, the consuming
+// .rs Config for Helm-YAML netpol/timeout knobs).
 
 specs (
   {
@@ -68,6 +76,7 @@ specs (
           rio-bench/benches/**/*.rs
           nix/nixos-node/**/*.nix
           nix/base-runtime-spec.nix
+          nix/docker.nix
           rio-dashboard/src/lib/logStream.svelte.ts
           rio-dashboard/src/lib/graphLayout.ts
           rio-dashboard/src/lib/toast.ts

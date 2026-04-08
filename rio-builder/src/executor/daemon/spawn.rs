@@ -65,9 +65,14 @@ use crate::overlay;
 pub(in crate::executor) async fn spawn_daemon_in_namespace(
     overlay_mount: &overlay::OverlayMount,
 ) -> Result<tokio::process::Child, ExecutorError> {
+    // r[impl builder.netpol.airgap]
+    // r[impl fetcher.netpol.egress-open]
     // fod_proxy param removed per ADR-019: builders are airgapped
     // (no proxy needed — no internet); fetchers have direct egress
-    // (no proxy needed — hash check is the integrity boundary).
+    // (no proxy needed — hash check is the integrity boundary). The
+    // NetworkPolicy enforcement is in infra/helm/rio-build/templates/
+    // networkpolicy.yaml (tracey doesn't scan YAML; this is the scannable
+    // anchor at the spawn site whose proxy plumbing the netpol obsoleted).
     //
     // build-dir explicit: nix ≥2.30 defaults to `{stateDir}/builds`
     // (not /tmp) so this is a no-op pin today — but it documents the

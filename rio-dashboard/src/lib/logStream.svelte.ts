@@ -14,6 +14,11 @@ import { admin } from '../api/admin';
 
 // r[impl dash.stream.log-tail]
 // r[impl dash.log.cap]
+// r[impl dash.log.virtualize]
+// (Virtualization itself lives in LogViewer.svelte — windowed slice over
+// this store's `lines` with spacer divs. Tracey doesn't scan .svelte; this
+// is the scannable anchor at the data source the viewer renders.)
+//
 // R8: build output is raw bytes and can be non-UTF-8 (compiler locale
 // garbage, a stray binary cat'd by a builder script). {fatal: false}
 // makes decode() substitute U+FFFD rather than throwing — a single bad

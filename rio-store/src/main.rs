@@ -45,6 +45,12 @@ enum ChunkBackendKind {
     S3 { bucket: String, prefix: String },
 }
 
+// r[impl store.netpol.egress]
+// Egress targets are exactly what's configured here: postgres
+// (`database_url`) and the chunk backend (S3 or filesystem). The
+// `store-egress` NetworkPolicy in infra/helm/rio-build/templates/
+// networkpolicy.yaml allows CoreDNS + RFC1918:5432 + S3-VPC-endpoint:443
+// only — tracey doesn't scan YAML; this Config is the scannable anchor.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct Config {
