@@ -42,7 +42,25 @@
 //! resets the annotation; PG's high-water mark persists).
 
 use super::*;
+use crate::db::RecoveryBuildRow;
 use crate::state::DerivationState;
+
+/// Cross-phase carrier for [`DagActor::recover_from_pg`]: PG row sets
+/// loaded by [`DagActor::load_dag_from_rows`] that the later phases
+/// (`restore_builds`, `finalize_recovered_builds`) need.
+///
+/// `id_to_hash` is internal to `load_dag_from_rows` (resolves edge +
+/// bd_row UUIDs to hashes) and doesn't cross.
+struct RecoveryLoad {
+    build_rows: Vec<RecoveryBuildRow>,
+    build_ids: Vec<Uuid>,
+    /// Flat (build_id, derivation_id) link rows. `restore_builds` only
+    /// needs the per-build hash sets (`build_drv_hashes` below);
+    /// `finalize_recovered_builds` needs the raw rows again to count
+    /// per-build links for the orphan guard.
+    bd_rows: Vec<(Uuid, Uuid)>,
+    build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
+}
 
 impl DagActor {
     /// Rebuild DAG + build state from PG. Called by LeaderAcquired.
@@ -76,6 +94,41 @@ impl DagActor {
         // worker connected to the standby is still connected.
         self.clear_persisted_state();
 
+        let RecoveryLoad {
+            build_rows,
+            build_ids,
+            bd_rows,
+            build_drv_hashes,
+        } = self.load_dag_from_rows().await?;
+
+        self.restore_builds(build_rows, &build_ids, build_drv_hashes)
+            .await?;
+
+        // --- Fetch PG generation high-water mark (caller seeds) ---
+        // NOT applied here: the caller (handle_leader_acquired) does
+        // fetch_max AFTER the TOCTOU gen-snapshot check. Writing to
+        // self.generation here would false-positive that check.
+        let pg_max_gen = self.db.max_assignment_generation().await?;
+
+        self.seed_ready_queue();
+
+        self.finalize_recovered_builds(&bd_rows).await;
+
+        info!(
+            builds = self.builds.len(),
+            derivations = self.dag.iter_nodes().count(),
+            ready_queue = self.ready_queue.len(),
+            "state recovery complete"
+        );
+
+        Ok(pg_max_gen)
+    }
+
+    /// Load builds + derivations + poisoned + edges + build_derivations
+    /// from PG into `self.dag`. Returns the row sets the later phases
+    /// need (`restore_builds` for BuildInfo construction;
+    /// `finalize_recovered_builds` for the orphan guard).
+    async fn load_dag_from_rows(&mut self) -> Result<RecoveryLoad, ActorError> {
         // --- Load builds ---
         let build_rows = self.db.load_nonterminal_builds().await?;
         let build_ids: Vec<Uuid> = build_rows.iter().map(|r| r.build_id).collect();
@@ -217,6 +270,24 @@ impl DagActor {
                 .insert(hash.clone());
         }
 
+        Ok(RecoveryLoad {
+            build_rows,
+            build_ids,
+            bd_rows,
+            build_drv_hashes,
+        })
+    }
+
+    /// Reconstruct `BuildInfo` + broadcast channels + `build_sequences`
+    /// from the loaded rows. Lossy on Instants (submitted_at → now);
+    /// total/completed/cached counts are seeded from PG denorm columns
+    /// (I-111).
+    async fn restore_builds(
+        &mut self,
+        build_rows: Vec<RecoveryBuildRow>,
+        build_ids: &[Uuid],
+        mut build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
+    ) -> Result<(), ActorError> {
         // --- Build BuildInfo + broadcast channels ---
         for row in build_rows {
             let Ok(state) = BuildState::parse_db(&row.status) else {
@@ -279,18 +350,19 @@ impl DagActor {
         }
 
         // --- Seed build_sequences from event_log high-water marks ---
-        let seq_rows = self.db.max_sequence_per_build(&build_ids).await?;
+        let seq_rows = self.db.max_sequence_per_build(build_ids).await?;
         for (build_id, max_seq) in seq_rows {
             // i64 → u64: sequences are always positive.
             self.build_sequences.insert(build_id, max_seq as u64);
         }
 
-        // --- Fetch PG generation high-water mark (caller seeds) ---
-        // NOT applied here: the caller (handle_leader_acquired) does
-        // fetch_max AFTER the TOCTOU gen-snapshot check. Writing to
-        // self.generation here would false-positive that check.
-        let pg_max_gen = self.db.max_assignment_generation().await?;
+        Ok(())
+    }
 
+    /// Critical-path sweep + I-058 Created/Queued recompute, then push
+    /// every Ready node into `self.ready_queue`. Reads only from
+    /// `self.dag` (already populated by `load_dag_from_rows`).
+    fn seed_ready_queue(&mut self) {
         // --- Recompute priorities (critical-path sweep) ---
         // est_duration is recomputed from the estimator (build_
         // history was already loaded on first tick). full_sweep
@@ -397,7 +469,16 @@ impl DagActor {
         for hash in ready {
             self.push_ready(hash);
         }
+    }
 
+    /// Per-build completion sweep + orphan guard. A crash between
+    /// "last drv → Completed" and "build → Succeeded" leaves the
+    /// build Active with all derivations terminal; this fires
+    /// `check_build_completion` for it. A crash mid-merge BEFORE
+    /// `persist_merge_to_db` leaves an Active build with ZERO
+    /// `build_derivations` rows; this skips it (orphan guard) so it
+    /// doesn't emit a spurious BuildCompleted with empty outputs.
+    async fn finalize_recovered_builds(&mut self, bd_rows: &[(Uuid, Uuid)]) {
         // --- Check for all-complete builds ---
         // A crash between "last drv → Completed" and "build →
         // Succeeded" leaves the build Active in PG with all its
@@ -419,7 +500,7 @@ impl DagActor {
         // out in load_nonterminal_derivations. bd_rows is the flat
         // list from PG; count per-build to distinguish.
         let mut bd_counts: HashMap<Uuid, usize> = HashMap::new();
-        for (build_id, _) in &bd_rows {
+        for (build_id, _) in bd_rows {
             *bd_counts.entry(*build_id).or_insert(0) += 1;
         }
 
@@ -440,15 +521,6 @@ impl DagActor {
             self.update_build_counts(build_id).await;
             self.check_build_completion(build_id).await;
         }
-
-        info!(
-            builds = self.builds.len(),
-            derivations = self.dag.iter_nodes().count(),
-            ready_queue = self.ready_queue.len(),
-            "state recovery complete"
-        );
-
-        Ok(pg_max_gen)
     }
 
     /// Handle `LeaderAcquired`: run recovery, then set the
