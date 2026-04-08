@@ -1412,6 +1412,7 @@ impl DagActor {
             Ok(Err(e)) => {
                 warn!(error = %e, "store FindMissingPaths failed");
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
+                // r[impl sched.breaker.cache-check+2]
                 // record_failure() returns true if this trips the breaker
                 // open (or it was already open from a prior trip).
                 if self.cache_breaker.record_failure() {

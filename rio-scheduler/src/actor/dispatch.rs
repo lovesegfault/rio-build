@@ -921,6 +921,7 @@ impl DagActor {
             worker.running_build = Some(drv_hash.clone());
         }
 
+        // r[impl sched.gc.live-pins]
         // Auto-pin: write input-closure paths to scheduler_live_pins
         // so GC's mark CTE protects them. Same closure
         // approximation as send_prefetch_hint (approx_input_closure).

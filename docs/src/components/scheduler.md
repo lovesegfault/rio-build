@@ -188,13 +188,13 @@ r[sched.admin.estimator-stats]
 `AdminService.GetEstimatorStats` dumps the in-memory `build_history` snapshot — every `(pname, system)` EMA — joined with `classify()` under the current effective cutoffs. Reflects the last Tick refresh (~60s stale at worst), NOT a live PG read: this is "what the scheduler SEES".
 
 r[sched.admin.inspect-dag]
-`AdminService.InspectBuildDag` returns the actor's in-memory snapshot of a build's derivations cross-referenced with the live executor stream pool. `executor_has_stream=false` for an Assigned derivation means its assigned executor's gRPC bidi stream is gone from the actor's map — dispatch can never complete. PG may still show the executor as alive; only the actor knows the stream is dead.
+`AdminService.InspectBuildDag` returns the actor's in-memory snapshot of a build's derivations cross-referenced with the live executor stream pool. Each derivation row includes `rejection_reason` — the last hard-filter veto string from `dispatch_ready()` (e.g. `no-warm-executor`, `class-mismatch`, `breaker-open`) — so a stuck-Ready node is directly diagnosable without log diving. `executor_has_stream=false` for an Assigned derivation means its assigned executor's gRPC bidi stream is gone from the actor's map — dispatch can never complete. PG may still show the executor as alive; only the actor knows the stream is dead.
 
 r[sched.admin.debug-list-executors]
-`AdminService.DebugListExecutors` snapshots the in-memory executor map (`has_stream`, `warm`, `kind` per entry) — what `dispatch_ready()` filters on, not what PG `last_seen` claims.
+`AdminService.DebugListExecutors` snapshots the in-memory executor map (`has_stream`, `warm`, `kind` per entry) — what `dispatch_ready()` filters on, not what PG `last_seen` claims. This RPC is **exempt from the leader-guard** by design: a stuck or partitioned standby replica can be queried directly to compare its view against the leader's.
 
 r[sched.gc.live-pins]
-`AdminQuery::GcRoots` returns `expected_output_paths ∪ output_paths` for all non-terminal derivations. Passed as extra roots to the store's GC mark phase to protect in-flight build outputs that may not be in narinfo yet (executor hasn't uploaded).
+On dispatch, the scheduler writes the assigned derivation's input-closure paths to the `scheduler_live_pins` PG table; on completion (success or failure) it deletes those rows; a periodic stale-sweep clears rows older than the grace period to bound leakage from crashed schedulers. rio-store's GC mark CTE reads `scheduler_live_pins` directly as additional roots, so an in-flight build's inputs survive a concurrent sweep even if no narinfo references them yet. The complementary output side is `AdminQuery::GcRoots`, which returns `expected_output_paths ∪ output_paths` for all non-terminal derivations as extra mark-phase roots covering outputs the executor hasn't uploaded.
 
 r[sched.heartbeat.adopt]
 A heartbeat-reported running build the scheduler doesn't have on record for that executor is adopted into BOTH `executor.running_build` (so dispatch sees at-capacity) AND the DAG node (so dispatch_ready won't re-pop it). Expected after scheduler restart: recovery's reconcile may have reset the assignment to Ready while the executor still has it in-flight.
@@ -203,7 +203,7 @@ r[sched.heartbeat.phantom-drain]
 If the scheduler-kept running build is missing from the executor's heartbeat report across two consecutive heartbeats (past the ~10s race window), the scheduler drains the phantom assignment: the derivation is reset to Ready and re-queued.
 
 r[sched.breaker.cache-check+2]
-The merge-time `FindMissingPaths` cache check goes through a circuit breaker that opens after 5 consecutive store-side failures and auto-closes after 30 s. While open, each `SubmitBuild` still attempts the cache check as a half-open probe; on probe failure the scheduler **rejects `SubmitBuild` with `UNAVAILABLE`** rather than queueing a 100%-miss DAG. A successful probe closes the breaker immediately and uses the result. Under threshold (failures 1–4): proceed as if the cache check missed.
+The merge-time `FindMissingPaths` cache check goes through a circuit breaker that opens after 5 consecutive store-side failures and auto-closes after 30 s. While open, each `SubmitBuild` still attempts the cache check as a half-open probe; on probe failure the scheduler **rejects `SubmitBuild` with `UNAVAILABLE`** rather than queueing a 100%-miss DAG. A successful probe closes the breaker immediately and uses the result. Under threshold (failures 1–4): proceed as if the cache check missed. This fail-**closed** policy applies only to new submissions at merge time; the in-flight stale-completed re-verify path (`r[sched.merge.stale-completed-verify]`) remains fail-**open** so an already-admitted DAG is never retroactively rejected by a transient store outage.
 
 r[sched.freeze-detector]
 `dispatch_ready` WARNs once per minute when `fod_deferred > 0 && fetcher_streams == 0` (or `class_deferred > 0 && builder_streams == 0`) holds for ≥60s. The scheduler already surfaces the freeze via gauges, but a WARN lands in `kubectl logs` without a port-forward.
