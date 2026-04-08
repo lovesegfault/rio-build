@@ -4,6 +4,7 @@
 rio_test_support::metrics_suite! {
     describe_fn: rio_gateway::describe_metrics,
     crate_name: "rio-gateway",
+    histogram_buckets: rio_gateway::HISTOGRAM_BUCKETS,
     spec_floor: 8,
     emit_floor: 5,
     default_buckets_ok: [

@@ -79,23 +79,6 @@ pub mod secs {
     }
 }
 
-/// Serde adapter: `Duration` ⇄ integer milliseconds. Same shape as
-/// [`secs`]; use for sub-second knobs (`*_ms` fields).
-pub mod millis {
-    use std::time::Duration;
-
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        u64::try_from(d.as_millis())
-            .map_err(serde::ser::Error::custom)?
-            .serialize(s)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        u64::deserialize(d).map(Duration::from_millis)
-    }
-}
-
 /// Configuration fields shared by every rio-* binary's `Config`.
 ///
 /// Embed via `#[serde(flatten)]` so the wire format stays flat:
@@ -390,7 +373,7 @@ pub trait ValidateConfig {
 /// for workers/health probes regardless). A handler that needs strict
 /// JWT reads `required` from its own config and checks for Claims
 /// extension presence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JwtConfig {
     /// true = JWT mint/verify failure → reject. false (default) =
@@ -410,41 +393,6 @@ pub struct JwtConfig {
     /// `Option<Arc<RwLock<VerifyingKey>>>` pattern in jwt.rs /
     /// jwt_interceptor.rs).
     pub key_path: Option<PathBuf>,
-
-    /// ResolveTenant RPC timeout (gateway only). The round-trip to
-    /// the scheduler happens in the SSH auth hot path — every
-    /// connect, once. If the scheduler is slow (PG under load) or
-    /// unreachable, this bounds the auth-time latency penalty.
-    /// Default 500ms: long enough for a warm PG lookup + RPC
-    /// overhead, short enough that a stuck scheduler doesn't make
-    /// SSH auth hang noticeably. On timeout: `required=false` →
-    /// degrade; `required=true` → reject.
-    #[serde(
-        rename = "resolve_timeout_ms",
-        with = "crate::config::millis",
-        default = "default_resolve_timeout"
-    )]
-    pub resolve_timeout: std::time::Duration,
-}
-
-fn default_resolve_timeout() -> std::time::Duration {
-    std::time::Duration::from_millis(500)
-}
-
-impl Default for JwtConfig {
-    /// Must match the `#[serde(default = ...)]` attrs above. figment's
-    /// `load()` starts from `Serialized::defaults(C::default())` — if
-    /// this impl and serde's field-defaults diverge, the BASE layer
-    /// (used when no TOML/env/CLI) disagrees with the partial-override
-    /// layer (used when some fields are set). The `jwt_config_defaults`
-    /// test pins both paths at once.
-    fn default() -> Self {
-        Self {
-            required: false,
-            key_path: None,
-            resolve_timeout: default_resolve_timeout(),
-        }
-    }
 }
 
 /// Deserialize `Vec<String>` from EITHER a comma-separated string
@@ -927,7 +875,7 @@ mod tests {
         jwt: super::JwtConfig,
     }
 
-    /// Default: required=false, key_path=None, resolve_timeout_ms=500.
+    /// Default: required=false, key_path=None.
     /// These defaults are load-bearing: false→ existing deployments
     /// keep working without JWT config; None→ JWT disabled until
     /// operator mounts the Secret; 500ms→ the plan doc's recommended
@@ -938,10 +886,6 @@ mod tests {
             let cfg: JwtHost = load("rio-test-jwt", NoCli::default()).unwrap();
             assert!(!cfg.jwt.required, "default: not required (permissive)");
             assert!(cfg.jwt.key_path.is_none(), "default: no key → JWT off");
-            assert_eq!(
-                cfg.jwt.resolve_timeout,
-                std::time::Duration::from_millis(500)
-            );
             Ok(())
         });
     }
@@ -953,16 +897,11 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.set_env("RIO_JWT__REQUIRED", "true");
             jail.set_env("RIO_JWT__KEY_PATH", "/etc/rio/jwt/seed");
-            jail.set_env("RIO_JWT__RESOLVE_TIMEOUT_MS", "1000");
             let cfg: JwtHost = load("rio-test-jwt", NoCli::default()).unwrap();
             assert!(cfg.jwt.required);
             assert_eq!(
                 cfg.jwt.key_path.as_deref(),
                 Some(std::path::Path::new("/etc/rio/jwt/seed"))
-            );
-            assert_eq!(
-                cfg.jwt.resolve_timeout,
-                std::time::Duration::from_millis(1000)
             );
             Ok(())
         });
@@ -1030,18 +969,15 @@ mod tests {
     struct DurCfg {
         #[serde(rename = "tick_secs", with = "secs")]
         tick: std::time::Duration,
-        #[serde(rename = "timeout_ms", with = "millis")]
-        timeout: std::time::Duration,
     }
 
-    /// `secs`/`millis` round-trip via figment's `Serialized` provider —
-    /// the same path `load()` uses for the base layer. Proves the
-    /// adapters compose with figment, not just raw serde.
+    /// `secs` round-trip via figment's `Serialized` provider — the same
+    /// path `load()` uses for the base layer. Proves the adapter
+    /// composes with figment, not just raw serde.
     #[test]
     fn duration_adapters_roundtrip_via_figment() {
         let original = DurCfg {
             tick: std::time::Duration::from_secs(7),
-            timeout: std::time::Duration::from_millis(250),
         };
         let extracted: DurCfg = Figment::from(Serialized::defaults(&original))
             .extract()
@@ -1052,7 +988,6 @@ mod tests {
         // = 7` both work via figment's existing layers).
         let json = serde_json::to_value(&original).unwrap();
         assert_eq!(json["tick_secs"], 7);
-        assert_eq!(json["timeout_ms"], 250);
     }
 
     #[test]

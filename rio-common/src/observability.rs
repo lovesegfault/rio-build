@@ -216,7 +216,7 @@ where
 ///
 /// `metrics-exporter-prometheus` renders histograms as **summaries**
 /// (quantile series, no `_bucket`) unless buckets are configured. The
-/// per-metric `Matcher::Full` entries in [`HISTOGRAM_BUCKET_MAP`] cover the
+/// per-metric `Matcher::Full` entries from each crate's `HISTOGRAM_BUCKETS` cover the
 /// metrics that need custom ranges; this global makes every OTHER histogram
 /// emit `_bucket` series instead of summary quantiles, so
 /// `histogram_quantile()` works. I-156: without this, every "exempt" metric
@@ -231,135 +231,13 @@ const DEFAULT_BUCKETS: &[f64] = &[
 /// Default Prometheus buckets top out at 10s — useless for Nix builds that
 /// routinely run 1–60 minutes. These span 1s..2h with denser coverage in the
 /// 1–10min range where most builds land.
-const BUILD_DURATION_BUCKETS: &[f64] = &[
+///
+/// Shared by `rio_scheduler_build_duration_seconds` and
+/// `rio_builder_build_duration_seconds` — the only bucket set that is
+/// genuinely cross-crate. Per-crate consts live next to each crate's
+/// `HISTOGRAM_BUCKETS` table.
+pub const BUILD_DURATION_BUCKETS: &[f64] = &[
     1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0,
-];
-
-/// Histogram bucket boundaries for `rio_scheduler_critical_path_accuracy`.
-///
-/// Ratio of actual/estimated build duration. `1.0` = perfect prediction,
-/// values above `1.0` = underestimate (build took longer than predicted).
-/// Bucket edges are chosen to give resolution around `1.0` and capture
-/// long tails on both sides.
-const CRITICAL_PATH_ACCURACY_BUCKETS: &[f64] = &[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0];
-
-/// Histogram bucket boundaries for controller reconcile latency (seconds).
-///
-/// Reconciles are mostly K8s API round-trips — expect 10–500ms normally,
-/// seconds only under API-server stress. Default Prometheus buckets
-/// actually work here but the low end (5ms) is wasted; this set trades
-/// that for a 10s top bucket.
-const RECONCILE_DURATION_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
-
-/// Histogram bucket boundaries for scheduler assignment latency (seconds).
-///
-/// Time from a derivation becoming Ready to being assigned to a worker.
-/// With a warm static fleet this is sub-second. With ephemeral builders the
-/// latency is dominated by node-provision (~60–180s on EKS), so the original
-/// `[0.001..5.0]` set put every sample in `+Inf` (I-124). These span
-/// 100ms..10min: low buckets catch the warm-fleet path, the 30s..600s range
-/// gives resolution across cold-node provision.
-const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[
-    0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0,
-];
-
-/// Histogram bucket boundaries for `rio_scheduler_build_graph_edges`.
-///
-/// Edge COUNT (not seconds) per GetBuildGraph response — first count-type
-/// histogram in this file. Range is 0..~20K (induced subgraph over the
-/// 5000-node cap at realistic 4× edge density). Default Prometheus buckets
-/// `[0.005..10.0]` are useless here — every sample lands in `+Inf`. These
-/// match the suggested buckets in observability.md's Histogram Buckets table.
-const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
-
-/// Histogram bucket boundaries for `rio_builder_upload_references_count`.
-///
-/// Reference COUNT (not seconds) per output upload — `references.len()`
-/// after NAR scan. Typical leaf derivation: 0–5 refs. glibc-class: ~40.
-/// Toolchains: 100–300. Default Prometheus buckets `[0.005..10.0]` are
-/// useless here — every output with >10 refs lands in `+Inf`. Second
-/// count-type histogram after [`GRAPH_EDGES_BUCKETS`] above; per-path,
-/// so the top bucket is 500, not 20K.
-const REFERENCES_COUNT_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0];
-
-/// Histogram bucket boundaries for `rio_store_substitute_duration_seconds`.
-///
-/// narinfo fetch (~50ms) + NAR download + ingest. A 500MB toolchain at
-/// 50MB/s is ~10s download + ~10s ingest; cache.nixos.org's largest paths
-/// (chromium, llvm) are ~1-2GB → 60s+. The default 10s top would lose all
-/// of those in `+Inf`. RECONCILE-style low end (10ms) for narinfo-only
-/// short-circuits; 120s top for the largest paths.
-const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
-    &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
-
-/// Histogram bucket boundaries for `rio_scheduler_warm_prefetch_paths`.
-///
-/// Path COUNT (not seconds) per `PrefetchComplete` ACK — how many paths
-/// the worker actually fetched for a warm-gate hint. Hard-capped at 100
-/// (scheduler-side `MAX_PREFETCH_PATHS`). 0 = already warm (all cache
-/// hits). Small-leaf closures: 1–10. Fat stdenv closures: 30–80.
-/// Third count-type histogram; sub-100 range since hint is capped.
-const WARM_PREFETCH_PATHS_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0];
-
-/// Every histogram that needs non-default bucket boundaries.
-///
-/// The `metrics-exporter-prometheus` default `[0.005..10.0]` only works for
-/// HTTP-latency-shaped metrics. Everything rio emits is seconds-to-hours
-/// (builds), sub-second-to-seconds (reconciles, assignment), dimensionless
-/// ratio (critical-path accuracy), or counts (graph edges) — none fit.
-///
-/// Kept as a `pub const` so the per-crate `metrics_registered` tests can
-/// assert every `describe_histogram!` has an entry here OR is in that crate's
-/// `DEFAULT_BUCKETS_OK` exemption list. Missing entry → the metric falls
-/// through to `DEFAULT_BUCKETS` (the global `set_buckets()` in
-/// [`init_metrics`]). I-156: before the global existed, missing entry meant
-/// **summary mode** (no `_bucket` series at all), not "default buckets" —
-/// `rio_store_put_path_duration_seconds` shipped that way and dashboard
-/// `histogram_quantile()` panels showed "No data".
-///
-/// Histograms deliberately on `DEFAULT_BUCKETS` (per-crate exemption lists):
-///
-/// - `rio_scheduler_recovery_duration_seconds`: cold-start PG scan, typical
-///   10ms–10s range fits the default. The occasional 30s PG-timeout outlier
-///   lands in `+Inf`, which is fine — the `outcome` label already separates
-///   that case, and the happy-path distribution is what matters here.
-pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
-    (
-        "rio_scheduler_build_duration_seconds",
-        BUILD_DURATION_BUCKETS,
-    ),
-    ("rio_builder_build_duration_seconds", BUILD_DURATION_BUCKETS),
-    (
-        "rio_scheduler_critical_path_accuracy",
-        CRITICAL_PATH_ACCURACY_BUCKETS,
-    ),
-    (
-        "rio_controller_reconcile_duration_seconds",
-        RECONCILE_DURATION_BUCKETS,
-    ),
-    (
-        "rio_scheduler_assignment_latency_seconds",
-        ASSIGNMENT_LATENCY_BUCKETS,
-    ),
-    (
-        // Same buckets as assignment_latency_seconds — same measurement
-        // (Ready→Assigned), dashboard-facing alias (P0539c).
-        "rio_scheduler_dispatch_wait_seconds",
-        ASSIGNMENT_LATENCY_BUCKETS,
-    ),
-    ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
-    (
-        "rio_builder_upload_references_count",
-        REFERENCES_COUNT_BUCKETS,
-    ),
-    (
-        "rio_scheduler_warm_prefetch_paths",
-        WARM_PREFETCH_PATHS_BUCKETS,
-    ),
-    (
-        "rio_store_substitute_duration_seconds",
-        SUBSTITUTE_DURATION_BUCKETS,
-    ),
 ];
 
 /// Initialize Prometheus metrics exporter.
@@ -367,14 +245,24 @@ pub const HISTOGRAM_BUCKET_MAP: &[(&str, &[f64])] = &[
 /// This starts an HTTP server on the given address that serves `/metrics`.
 ///
 /// Installs custom histogram bucket boundaries for every entry in
-/// [`HISTOGRAM_BUCKET_MAP`] — the `metrics-exporter-prometheus` default
-/// buckets (`[0.005..10.0]`) are tuned for HTTP request latencies and are
-/// useless for build durations that span seconds to hours. See
+/// `histogram_buckets` (each crate passes its own table via
+/// [`crate::server::bootstrap`]) — the `metrics-exporter-prometheus`
+/// default buckets (`[0.005..10.0]`) are tuned for HTTP request latencies
+/// and are useless for build durations that span seconds to hours. See
 /// `observability.md` for the full bucket table.
+///
+/// Per-crate `metrics_registered` tests assert every `describe_histogram!`
+/// has an entry in that crate's `HISTOGRAM_BUCKETS` OR is in its
+/// `DEFAULT_BUCKETS_OK` exemption list. Missing entry → the metric falls
+/// through to `DEFAULT_BUCKETS`. I-156: before the global default
+/// existed, a missing entry meant **summary mode** (no `_bucket` series at
+/// all) — `rio_store_put_path_duration_seconds` shipped that way and
+/// dashboard `histogram_quantile()` panels showed "No data".
 // r[impl common.helpers]
 pub fn init_metrics(
     addr: std::net::SocketAddr,
     global_labels: &[(&'static str, String)],
+    histogram_buckets: &[(&'static str, &'static [f64])],
 ) -> anyhow::Result<()> {
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
@@ -383,13 +271,13 @@ pub fn init_metrics(
     // for the non-empty const slices above. Propagate anyway to keep the
     // error surface uniform.
     //
-    // Global default first: without it, histograms NOT in HISTOGRAM_BUCKET_MAP
+    // Global default first: without it, histograms NOT in `histogram_buckets`
     // render as **summaries** (quantile series, no `_bucket`). I-156: every
     // per-crate `DEFAULT_BUCKETS_OK` exemption was silently a summary, and
     // dashboard `histogram_quantile()` panels showed "No data". Per-metric
     // `Matcher::Full` overrides the global for entries in the map.
     let mut builder = PrometheusBuilder::new().set_buckets(DEFAULT_BUCKETS)?;
-    for (name, buckets) in HISTOGRAM_BUCKET_MAP {
+    for (name, buckets) in histogram_buckets {
         builder = builder.set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)?;
     }
     for (k, v) in global_labels {

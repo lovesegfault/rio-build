@@ -53,6 +53,74 @@ pub use estimator::DEFAULT_HEADROOM_MULTIPLIER;
 /// rio-store's MIGRATOR for rationale — same pattern.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
+/// Histogram bucket boundaries for `rio_scheduler_critical_path_accuracy`.
+///
+/// Ratio of actual/estimated build duration. `1.0` = perfect prediction,
+/// values above `1.0` = underestimate (build took longer than predicted).
+/// Bucket edges are chosen to give resolution around `1.0` and capture
+/// long tails on both sides.
+const CRITICAL_PATH_ACCURACY_BUCKETS: &[f64] = &[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0];
+
+/// Histogram bucket boundaries for scheduler assignment latency (seconds).
+///
+/// Time from a derivation becoming Ready to being assigned to a worker.
+/// With a warm static fleet this is sub-second. With ephemeral builders the
+/// latency is dominated by node-provision (~60–180s on EKS), so the original
+/// `[0.001..5.0]` set put every sample in `+Inf` (I-124). These span
+/// 100ms..10min: low buckets catch the warm-fleet path, the 30s..600s range
+/// gives resolution across cold-node provision.
+const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[
+    0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0,
+];
+
+/// Histogram bucket boundaries for `rio_scheduler_build_graph_edges`.
+///
+/// Edge COUNT (not seconds) per GetBuildGraph response. Range is 0..~20K
+/// (induced subgraph over the 5000-node cap at realistic 4× edge density).
+/// Default Prometheus buckets `[0.005..10.0]` are useless here — every
+/// sample lands in `+Inf`. These match the suggested buckets in
+/// observability.md's Histogram Buckets table.
+const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
+
+/// Histogram bucket boundaries for `rio_scheduler_warm_prefetch_paths`.
+///
+/// Path COUNT (not seconds) per `PrefetchComplete` ACK — how many paths
+/// the worker actually fetched for a warm-gate hint. Hard-capped at 100
+/// (scheduler-side `MAX_PREFETCH_PATHS`). 0 = already warm (all cache
+/// hits). Small-leaf closures: 1–10. Fat stdenv closures: 30–80.
+const WARM_PREFETCH_PATHS_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0];
+
+/// Per-crate histogram bucket overrides, passed to
+/// `rio_common::server::bootstrap` → `init_metrics`. Every
+/// `describe_histogram!` in this crate must have an entry here OR be in
+/// the `DEFAULT_BUCKETS_OK` exemption list (`tests/metrics_registered.rs`);
+/// histograms not listed fall through to the global `[0.005..10.0]` default.
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    (
+        "rio_scheduler_build_duration_seconds",
+        rio_common::observability::BUILD_DURATION_BUCKETS,
+    ),
+    (
+        "rio_scheduler_critical_path_accuracy",
+        CRITICAL_PATH_ACCURACY_BUCKETS,
+    ),
+    (
+        "rio_scheduler_assignment_latency_seconds",
+        ASSIGNMENT_LATENCY_BUCKETS,
+    ),
+    (
+        // Same buckets as assignment_latency_seconds — same measurement
+        // (Ready→Assigned), dashboard-facing alias (P0539c).
+        "rio_scheduler_dispatch_wait_seconds",
+        ASSIGNMENT_LATENCY_BUCKETS,
+    ),
+    ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
+    (
+        "rio_scheduler_warm_prefetch_paths",
+        WARM_PREFETCH_PATHS_BUCKETS,
+    ),
+];
+
 /// Register `# HELP` descriptions for all scheduler metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Descriptions

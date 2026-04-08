@@ -109,8 +109,10 @@ pub struct ConnectionHandler {
     /// connection handler.
     pub(super) jwt_signing_key: Option<Arc<SigningKey>>,
     /// JWT policy. `required` → whether mint failure rejects auth.
-    /// `resolve_timeout_ms` → ResolveTenant RPC timeout.
     pub(super) jwt_config: JwtConfig,
+    /// ResolveTenant RPC timeout — gateway-only knob, lives here rather
+    /// than on `JwtConfig` (scheduler/store never read it).
+    pub(super) resolve_timeout: std::time::Duration,
     /// Per-tenant rate limiter, cloned from `GatewayServer`. Passed
     /// through to every spawned protocol session. Clones share the
     /// underlying `dashmap` — the bucket for `tenant_name` "foo" is
@@ -209,7 +211,7 @@ impl ConnectionHandler {
     ) -> anyhow::Result<(String, jwt::TenantClaims)> {
         use rio_proto::scheduler::ResolveTenantRequest;
 
-        let timeout = self.jwt_config.resolve_timeout;
+        let timeout = self.resolve_timeout;
         let req = tonic::Request::new(ResolveTenantRequest {
             tenant_name: tenant_name.to_string(),
         });

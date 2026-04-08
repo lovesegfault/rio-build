@@ -40,6 +40,26 @@ pub(crate) mod validate;
 #[cfg(any(test, feature = "test-utils"))]
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
+/// Histogram bucket boundaries for `rio_store_substitute_duration_seconds`.
+///
+/// narinfo fetch (~50ms) + NAR download + ingest. A 500MB toolchain at
+/// 50MB/s is ~10s download + ~10s ingest; cache.nixos.org's largest paths
+/// (chromium, llvm) are ~1-2GB → 60s+. The default 10s top would lose all
+/// of those in `+Inf`. 10ms low end for narinfo-only short-circuits; 120s
+/// top for the largest paths.
+const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
+    &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
+
+/// Per-crate histogram bucket overrides, passed to
+/// `rio_common::server::bootstrap` → `init_metrics`. Every
+/// `describe_histogram!` in this crate must have an entry here OR be in
+/// the `DEFAULT_BUCKETS_OK` exemption list (`tests/metrics_registered.rs`);
+/// histograms not listed fall through to the global `[0.005..10.0]` default.
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[(
+    "rio_store_substitute_duration_seconds",
+    SUBSTITUTE_DURATION_BUCKETS,
+)];
+
 /// Register `# HELP` descriptions for all store metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Descriptions

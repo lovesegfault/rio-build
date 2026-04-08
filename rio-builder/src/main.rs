@@ -16,7 +16,12 @@ async fn main() -> anyhow::Result<()> {
         serve_shutdown: _,
         otel_guard: _otel_guard,
         root_span: _root_span,
-    } = rio_common::server::bootstrap("builder", cli, rio_builder::describe_metrics)?;
+    } = rio_common::server::bootstrap(
+        "builder",
+        cli,
+        rio_builder::describe_metrics,
+        rio_builder::HISTOGRAM_BUCKETS,
+    )?;
 
     match rio_builder::runtime::setup(cfg, shutdown).await? {
         Some(rt) => rio_builder::runtime::run(rt).await,

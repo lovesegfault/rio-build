@@ -53,9 +53,17 @@ struct Config {
     /// JWT issuance. `key_path` → K8s Secret mount at
     /// `/etc/rio/jwt/ed25519_seed` (see helm jwt-signing-secret.yaml).
     /// Unset = JWT disabled (dual-mode SSH-comment fallback path).
-    /// Env: `RIO_JWT__KEY_PATH`, `RIO_JWT__REQUIRED`,
-    /// `RIO_JWT__RESOLVE_TIMEOUT_MS`.
+    /// Env: `RIO_JWT__KEY_PATH`, `RIO_JWT__REQUIRED`.
     jwt: rio_common::config::JwtConfig,
+    /// ResolveTenant RPC timeout in milliseconds (env:
+    /// `RIO_RESOLVE_TIMEOUT_MS`). The round-trip to the
+    /// scheduler happens in the SSH auth hot path — every connect, once.
+    /// Bounds the auth-time latency penalty when the scheduler is slow or
+    /// unreachable. Default 500ms: long enough for a warm PG lookup + RPC
+    /// overhead, short enough that a stuck scheduler doesn't make SSH auth
+    /// hang noticeably. On timeout: `jwt.required=false` → degrade to
+    /// tenant_name-only; `jwt.required=true` → reject.
+    resolve_timeout_ms: u64,
     /// Seconds to wait after the SSH accept loop stops for active
     /// sessions to close on their own. The accept loop only stops
     /// ACCEPTING; already-established `nix build --store ssh-ng://`
@@ -115,6 +123,7 @@ impl Default for Config {
             // pattern keeps it discoverable without a doc lookup.
             health_addr: rio_common::default_addr(9190),
             jwt: rio_common::config::JwtConfig::default(),
+            resolve_timeout_ms: 500,
             session_drain: std::time::Duration::from_secs(60),
             rate_limit: None,
             max_connections: rio_gateway::server::DEFAULT_MAX_CONNECTIONS,
@@ -203,7 +212,12 @@ async fn main() -> anyhow::Result<()> {
         serve_shutdown,
         otel_guard: _otel_guard,
         root_span: _root_span,
-    } = rio_common::server::bootstrap("gateway", cli, rio_gateway::describe_metrics)?;
+    } = rio_common::server::bootstrap(
+        "gateway",
+        cli,
+        rio_gateway::describe_metrics,
+        rio_gateway::HISTOGRAM_BUCKETS,
+    )?;
 
     // Process-global DoS cap. Set ONCE before any SSH session can
     // call reconstruct_dag. Same OnceLock pattern as CLIENT_TLS
@@ -329,7 +343,8 @@ async fn main() -> anyhow::Result<()> {
 
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
         .with_rate_limiter(limiter)
-        .with_max_connections(cfg.max_connections);
+        .with_max_connections(cfg.max_connections)
+        .with_resolve_timeout(std::time::Duration::from_millis(cfg.resolve_timeout_ms));
     // I-109: hot-reload the key set when the Secret mount refreshes.
     // Tied to serve_shutdown so the watcher exits with the accept loop;
     // the JoinHandle is dropped (detached) — nothing to await on exit.
@@ -499,7 +514,7 @@ mod tests {
         // mounted) keep working via the SSH-comment fallback path.
         assert!(!d.jwt.required);
         assert!(d.jwt.key_path.is_none());
-        assert_eq!(d.jwt.resolve_timeout, std::time::Duration::from_millis(500));
+        assert_eq!(d.resolve_timeout_ms, 500);
         // Rate limiting disabled by default — no compiled-in quota
         // (the right value is workload-dependent).
         assert!(d.rate_limit.is_none());
@@ -632,12 +647,9 @@ mod tests {
                 cfg.jwt.key_path.as_deref(),
                 Some(std::path::Path::new("/etc/rio/jwt/ed25519_seed"))
             );
-            // Unspecified sub-field defaults via #[serde(default)]
-            // on the sub-struct (partial table must work).
-            assert_eq!(
-                cfg.jwt.resolve_timeout,
-                std::time::Duration::from_millis(500)
-            );
+            // Top-level resolve_timeout_ms defaults via #[serde(default)]
+            // when absent from TOML.
+            assert_eq!(cfg.resolve_timeout_ms, 500);
             let rl = cfg
                 .rate_limit
                 .expect("[rate_limit] table must deserialize to Some");

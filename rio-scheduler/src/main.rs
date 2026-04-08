@@ -21,7 +21,7 @@ use rio_scheduler::grpc::SchedulerGrpc;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct Config {
-    listen_addr: String,
+    listen_addr: std::net::SocketAddr,
     /// rio-store upstream. Env: `RIO_STORE__ADDR`. Scheduler uses
     /// `connect_store_lazy` (re-resolves on reconnect) so
     /// `balance_host` is unused — the lazy channel follows the
@@ -124,7 +124,7 @@ fn default_headroom_multiplier() -> f64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: rio_common::default_listen_string(9001),
+            listen_addr: rio_common::default_addr(9001),
             store: rio_common::config::UpstreamAddrs::with_port(9002),
             database_url: String::new(),
             common: rio_common::config::CommonConfig::new(9091),
@@ -158,7 +158,7 @@ struct CliArgs {
     /// gRPC listen address for SchedulerService + ExecutorService
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    listen_addr: Option<String>,
+    listen_addr: Option<std::net::SocketAddr>,
 
     /// PostgreSQL connection URL
     #[arg(long)]
@@ -357,7 +357,12 @@ async fn main() -> anyhow::Result<()> {
         serve_shutdown,
         otel_guard: _otel_guard,
         root_span: _root_span,
-    } = rio_common::server::bootstrap("scheduler", cli, rio_scheduler::describe_metrics)?;
+    } = rio_common::server::bootstrap(
+        "scheduler",
+        cli,
+        rio_scheduler::describe_metrics,
+        rio_scheduler::HISTOGRAM_BUCKETS,
+    )?;
 
     // Shutdown chain for the actor: token cancels → actor's select!
     // loop sees it → drops all worker stream_tx → build-exec-bridge
@@ -650,7 +655,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Start gRPC server
-    let listen_addr: std::net::SocketAddr = cfg.listen_addr.parse()?;
+    let listen_addr = cfg.listen_addr;
     let max_message_size = rio_common::grpc::max_message_size();
 
     // Server TLS: if configured, the main port requires client certs.
@@ -979,7 +984,7 @@ mod tests {
     #[test]
     fn config_defaults_are_stable() {
         let d = Config::default();
-        assert_eq!(d.listen_addr, "[::]:9001");
+        assert_eq!(d.listen_addr.to_string(), "[::]:9001");
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9091");
         assert_eq!(d.tick_interval, std::time::Duration::from_secs(10));
         // Phase2a required these; no default.

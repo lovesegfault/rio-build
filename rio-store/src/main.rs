@@ -54,7 +54,7 @@ enum ChunkBackendKind {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct Config {
-    listen_addr: String,
+    listen_addr: std::net::SocketAddr,
     database_url: String,
     #[serde(flatten)]
     common: rio_common::config::CommonConfig,
@@ -146,7 +146,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: rio_common::default_listen_string(9002),
+            listen_addr: rio_common::default_addr(9002),
             database_url: String::new(),
             common: rio_common::config::CommonConfig::new(9092),
             chunk_backend: ChunkBackendKind::default(),
@@ -192,7 +192,7 @@ struct CliArgs {
     /// gRPC listen address
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    listen_addr: Option<String>,
+    listen_addr: Option<std::net::SocketAddr>,
 
     /// PostgreSQL connection URL
     #[arg(long)]
@@ -231,7 +231,12 @@ async fn main() -> anyhow::Result<()> {
         serve_shutdown,
         otel_guard: _otel_guard,
         root_span: _root_span,
-    } = rio_common::server::bootstrap("store", cli, rio_store::describe_metrics)?;
+    } = rio_common::server::bootstrap(
+        "store",
+        cli,
+        rio_store::describe_metrics,
+        rio_store::HISTOGRAM_BUCKETS,
+    )?;
 
     let pool = init_db_pool(&cfg.database_url, cfg.pg_max_connections).await?;
 
@@ -405,7 +410,7 @@ async fn main() -> anyhow::Result<()> {
 
     let max_msg_size = rio_common::grpc::max_message_size();
 
-    let addr = cfg.listen_addr.parse()?;
+    let addr = cfg.listen_addr;
 
     // PG is connected, migrations applied, services constructed.
     // Everything that can fail-fast has. SERVING.
@@ -641,7 +646,7 @@ mod tests {
     #[test]
     fn config_defaults_are_stable() {
         let d = Config::default();
-        assert_eq!(d.listen_addr, "[::]:9002");
+        assert_eq!(d.listen_addr.to_string(), "[::]:9002");
         assert_eq!(d.common.metrics_addr.to_string(), "[::]:9092");
         assert!(d.database_url.is_empty());
         // Chunk backend off by default for backward-compat with pre-chunking configs.
@@ -897,10 +902,6 @@ mod tests {
             );
             // Unspecified sub-field defaults via #[serde(default)]
             // on the sub-struct (partial table must work).
-            assert_eq!(
-                cfg.jwt.resolve_timeout,
-                std::time::Duration::from_millis(500)
-            );
         }
     );
 

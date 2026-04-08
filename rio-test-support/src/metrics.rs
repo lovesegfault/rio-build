@@ -298,17 +298,19 @@ impl Recorder for GaugeValues {
 /// Parameters:
 /// - `describe_fn`: path to the crate's `pub fn describe_metrics()`
 /// - `crate_name`: human-readable name for error messages
+/// - `histogram_buckets`: the crate's `pub const HISTOGRAM_BUCKETS` table
 /// - `spec_floor`: min rows expected in the obs.md table (vacuity guard)
 /// - `emit_floor`: min `metrics::*!` literals expected in src/ (regex-health guard)
 /// - `default_buckets_ok`: histograms deliberately on `[0.005..10.0]` defaults
 ///
-/// `::rio_common::observability::HISTOGRAM_BUCKET_MAP` is referenced at
+/// The per-crate `HISTOGRAM_BUCKETS` table is passed at
 /// the call site — every caller already depends on `rio-common`.
 #[macro_export]
 macro_rules! metrics_suite {
     (
         describe_fn: $describe_fn:path,
         crate_name: $crate_name:literal,
+        histogram_buckets: $histogram_buckets:expr,
         spec_floor: $spec_floor:literal,
         emit_floor: $emit_floor:literal,
         default_buckets_ok: [$($ok:literal),* $(,)?] $(,)?
@@ -348,7 +350,7 @@ macro_rules! metrics_suite {
         fn all_histograms_have_bucket_config() {
             $crate::metrics::assert_histograms_have_buckets(
                 $describe_fn,
-                ::rio_common::observability::HISTOGRAM_BUCKET_MAP,
+                $histogram_buckets,
                 &[$($ok),*],
                 $crate_name,
             );
@@ -454,7 +456,7 @@ pub fn assert_emitted_metrics_described(
 /// `rio_scheduler_build_graph_edges` shipped in exactly this state (P0321).
 ///
 /// `bucket_map` is the crate-agnostic view of
-/// `rio_common::observability::HISTOGRAM_BUCKET_MAP` — pass it through so
+/// the per-crate `HISTOGRAM_BUCKETS` table — pass it through so
 /// this crate stays leaf (no `rio-common` dep). `exempt` names histograms
 /// deliberately kept on default buckets (e.g., recovery_duration_seconds
 /// — cold-start PG scan, 10ms–10s fits default).
@@ -487,12 +489,11 @@ pub fn assert_histograms_have_buckets(
     assert!(
         missing.is_empty(),
         "histogram(s) in {crate_name}::describe_metrics() with no \
-         HISTOGRAM_BUCKET_MAP entry:\n  {missing:#?}\n\
+         HISTOGRAM_BUCKETS entry:\n  {missing:#?}\n\
          \n\
          Every sample will land in the default +Inf bucket and p99 is \
-         unusable. Either add an entry in rio-common/src/observability.rs \
-         HISTOGRAM_BUCKET_MAP, or add to the exempt list if [0.005..10.0] \
-         genuinely fits.\n\
+         unusable. Either add an entry in {crate_name}::HISTOGRAM_BUCKETS, \
+         or add to the exempt list if [0.005..10.0] genuinely fits.\n\
          \n\
          configured: {configured:?}\n\
          exempt: {exempt:?}"

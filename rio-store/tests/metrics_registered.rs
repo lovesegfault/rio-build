@@ -6,7 +6,7 @@
 //! described, so they pass. Not a false positive.
 //!
 //! Histogram-bucket check: I-156 — `rio_store_put_path_duration_seconds`
-//! shipped without a `HISTOGRAM_BUCKET_MAP` entry. Before `init_metrics`
+//! shipped without a `HISTOGRAM_BUCKETS` entry. Before `init_metrics`
 //! installed a global `set_buckets()` default, that meant SUMMARY mode
 //! (no `_bucket` series), and the dashboard's `histogram_quantile()`
 //! PutPath p99 panel showed "No data".
@@ -15,6 +15,7 @@
 rio_test_support::metrics_suite! {
     describe_fn: rio_store::describe_metrics,
     crate_name: "rio-store",
+    histogram_buckets: rio_store::HISTOGRAM_BUCKETS,
     spec_floor: 12,
     emit_floor: 15,
     default_buckets_ok: [

@@ -117,7 +117,12 @@ async fn main() -> anyhow::Result<()> {
         serve_shutdown: _,
         otel_guard: _otel_guard,
         root_span: _root_span,
-    } = rio_common::server::bootstrap("controller", cli, rio_controller::describe_metrics)?;
+    } = rio_common::server::bootstrap(
+        "controller",
+        cli,
+        rio_controller::describe_metrics,
+        rio_controller::HISTOGRAM_BUCKETS,
+    )?;
 
     // store.addr is injected into worker pod containers as
     // RIO_STORE__ADDR. Workers with an empty store addr fail their

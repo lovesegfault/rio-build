@@ -47,6 +47,24 @@ pub(crate) mod fixtures;
 pub mod reconcilers;
 pub(crate) mod scaling;
 
+/// Histogram bucket boundaries for controller reconcile latency (seconds).
+///
+/// Reconciles are mostly K8s API round-trips — expect 10–500ms normally,
+/// seconds only under API-server stress. Default Prometheus buckets
+/// actually work here but the low end (5ms) is wasted; this set trades
+/// that for a 10s top bucket.
+const RECONCILE_DURATION_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
+/// Per-crate histogram bucket overrides, passed to
+/// `rio_common::server::bootstrap` → `init_metrics`. Every
+/// `describe_histogram!` in this crate must have an entry here OR be in
+/// the `DEFAULT_BUCKETS_OK` exemption list (`tests/metrics_registered.rs`);
+/// histograms not listed fall through to the global `[0.005..10.0]` default.
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[(
+    "rio_controller_reconcile_duration_seconds",
+    RECONCILE_DURATION_BUCKETS,
+)];
+
 /// Register `# HELP` descriptions for all controller metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Descriptions

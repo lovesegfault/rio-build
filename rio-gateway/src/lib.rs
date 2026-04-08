@@ -18,6 +18,13 @@ pub use server::{
     spawn_authorized_keys_watcher,
 };
 
+/// Per-crate histogram bucket overrides, passed to
+/// `rio_common::server::bootstrap` → `init_metrics`.
+///
+/// Gateway has no histograms needing custom buckets — all are
+/// HTTP/SSH-latency-shaped and fit the global `[0.005..10.0]` default.
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[];
+
 /// Register `# HELP` descriptions for all gateway metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Without this,

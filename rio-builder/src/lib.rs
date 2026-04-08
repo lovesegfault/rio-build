@@ -36,6 +36,31 @@ pub mod runtime;
 pub(crate) mod synth_db;
 pub(crate) mod upload;
 
+/// Histogram bucket boundaries for `rio_builder_upload_references_count`.
+///
+/// Reference COUNT (not seconds) per output upload — `references.len()`
+/// after NAR scan. Typical leaf derivation: 0–5 refs. glibc-class: ~40.
+/// Toolchains: 100–300. Default Prometheus buckets `[0.005..10.0]` are
+/// useless here — every output with >10 refs lands in `+Inf`. Per-path,
+/// so the top bucket is 500, not 20K.
+const REFERENCES_COUNT_BUCKETS: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0];
+
+/// Per-crate histogram bucket overrides, passed to
+/// `rio_common::server::bootstrap` → `init_metrics`. Every
+/// `describe_histogram!` in this crate must have an entry here OR be in
+/// the `DEFAULT_BUCKETS_OK` exemption list (`tests/metrics_registered.rs`);
+/// histograms not listed fall through to the global `[0.005..10.0]` default.
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    (
+        "rio_builder_build_duration_seconds",
+        rio_common::observability::BUILD_DURATION_BUCKETS,
+    ),
+    (
+        "rio_builder_upload_references_count",
+        REFERENCES_COUNT_BUCKETS,
+    ),
+];
+
 /// Register `# HELP` descriptions for all worker metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Descriptions

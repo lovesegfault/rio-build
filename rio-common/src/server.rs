@@ -78,6 +78,7 @@ pub trait HasCommonConfig {
 ///     rio_common::server::bootstrap(
 ///         "gateway", cli,
 ///         rio_gateway::describe_metrics,
+///         rio_gateway::HISTOGRAM_BUCKETS,
 ///     )?;
 /// ```
 ///
@@ -126,7 +127,8 @@ pub struct Bootstrap<C> {
 ///    TLS path surfaces BEFORE a bad required-field — TLS errors are
 ///    more actionable; a missing `scheduler_addr` often masks "wrong
 ///    ConfigMap mounted")
-/// 6. shutdown signal + metrics exporter + `describe_metrics` callback
+/// 6. shutdown signal + metrics exporter (with per-crate `histogram_buckets`
+///    overrides) + `describe_metrics` callback
 /// 7. root span (`component = {component}`) + version `info!`
 ///
 /// The root span is created with `component` as its only field.
@@ -138,6 +140,7 @@ pub fn bootstrap<C, A>(
     component: &'static str,
     cli: A,
     describe_metrics: fn(),
+    histogram_buckets: &'static [(&'static str, &'static [f64])],
 ) -> anyhow::Result<Bootstrap<C>>
 where
     C: DeserializeOwned + Default + Serialize + ValidateConfig + HasCommonConfig,
@@ -165,7 +168,11 @@ where
     cfg.validate()?;
 
     let shutdown = crate::signal::shutdown_signal();
-    crate::observability::init_metrics(common.metrics_addr, &cfg.metric_labels())?;
+    crate::observability::init_metrics(
+        common.metrics_addr,
+        &cfg.metric_labels(),
+        histogram_buckets,
+    )?;
     describe_metrics();
 
     // Span name is the static "rio" with `component` as a field —

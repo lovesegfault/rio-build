@@ -59,9 +59,11 @@ pub struct GatewayServer {
     jwt_signing_key: Option<Arc<SigningKey>>,
     /// JWT policy — `required` controls whether mint failure is fatal
     /// (reject SSH auth) or degradable (fall back to tenant_name).
-    /// `resolve_timeout_ms` bounds the ResolveTenant RPC. Cloned
-    /// into every ConnectionHandler.
+    /// Cloned into every ConnectionHandler.
     jwt_config: JwtConfig,
+    /// ResolveTenant RPC timeout — gateway-only knob, lives here rather
+    /// than on `JwtConfig` (scheduler/store never read it).
+    resolve_timeout: std::time::Duration,
     /// Per-tenant build-submit rate limiter keyed on `tenant_name`
     /// (authorized_keys comment). Disabled by default. Clones share
     /// state (inner `Arc`), so the tenant's bucket is counted across
@@ -121,6 +123,7 @@ impl GatewayServer {
             authorized_keys: Arc::new(ArcSwap::from_pointee(authorized_keys)),
             jwt_signing_key: None,
             jwt_config: JwtConfig::default(),
+            resolve_timeout: std::time::Duration::from_millis(500),
             limiter: TenantLimiter::disabled(),
             quota_cache: QuotaCache::new(),
             conn_sem: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
@@ -169,6 +172,15 @@ impl GatewayServer {
     /// (there are none before `run()`).
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.conn_sem = Arc::new(Semaphore::new(max));
+        self
+    }
+
+    /// Set the ResolveTenant RPC timeout. Bounds the auth-time latency
+    /// penalty when the scheduler is slow or unreachable — the RPC sits
+    /// in the SSH auth hot path (every connect, once). Default 500ms.
+    /// Builder-style so main.rs composes alongside `with_jwt_signing_key`.
+    pub fn with_resolve_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.resolve_timeout = timeout;
         self
     }
 
@@ -394,6 +406,9 @@ impl russh::server::Server for GatewayServer {
             authorized_keys: Arc::clone(&self.authorized_keys),
             jwt_signing_key: self.jwt_signing_key.clone(),
             jwt_config: self.jwt_config.clone(),
+            resolve_timeout: self.resolve_timeout,
+            // ^ threaded separately from jwt_config since JwtConfig is shared
+            // with scheduler/store which never need it.
             limiter: self.limiter.clone(),
             quota_cache: self.quota_cache.clone(),
             sessions: HashMap::new(),

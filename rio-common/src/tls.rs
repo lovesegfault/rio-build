@@ -177,6 +177,29 @@ fn validate_pem_sections(contents: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Load `(Identity, CA-Certificate)` from a [`TlsConfig`].
+///
+/// Shared validation/IO scaffolding for [`load_server_tls`] and
+/// [`load_client_tls`]: returns `Ok(None)` when TLS is entirely
+/// unconfigured (all three paths `None`), `Err(TlsError::Incomplete)`
+/// when partially configured, and `Ok(Some((identity, ca)))` on a full
+/// valid config. Callers map the `Some` case to their tonic builder.
+fn load_identity_and_ca(cfg: &TlsConfig) -> Result<Option<(Identity, Certificate)>, TlsError> {
+    match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
+        (None, None, None) => Ok(None),
+        (Some(cert), Some(key), Some(ca)) => {
+            let identity = Identity::from_pem(read_pem(cert)?, read_pem(key)?);
+            let ca = Certificate::from_pem(read_pem(ca)?);
+            Ok(Some((identity, ca)))
+        }
+        (c, k, a) => Err(TlsError::Incomplete {
+            cert: c.is_some(),
+            key: k.is_some(),
+            ca: a.is_some(),
+        }),
+    }
+}
+
 /// Build a server-side TLS config.
 ///
 /// Returns `Ok(None)` if TLS is entirely unconfigured (all paths
@@ -189,21 +212,8 @@ fn validate_pem_sections(contents: &str) -> Result<(), String> {
 /// Without that call, the server would accept any client (TLS for
 /// encryption only, not authentication) — not the mTLS we want.
 pub fn load_server_tls(cfg: &TlsConfig) -> Result<Option<ServerTlsConfig>, TlsError> {
-    match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
-        (None, None, None) => Ok(None),
-        (Some(cert), Some(key), Some(ca)) => {
-            let identity = Identity::from_pem(read_pem(cert)?, read_pem(key)?);
-            let ca = Certificate::from_pem(read_pem(ca)?);
-            Ok(Some(
-                ServerTlsConfig::new().identity(identity).client_ca_root(ca),
-            ))
-        }
-        (c, k, a) => Err(TlsError::Incomplete {
-            cert: c.is_some(),
-            key: k.is_some(),
-            ca: a.is_some(),
-        }),
-    }
+    Ok(load_identity_and_ca(cfg)?
+        .map(|(identity, ca)| ServerTlsConfig::new().identity(identity).client_ca_root(ca)))
 }
 
 /// Build a client-side TLS config.
@@ -217,21 +227,8 @@ pub fn load_server_tls(cfg: &TlsConfig) -> Result<Option<ServerTlsConfig>, TlsEr
 /// Like [`load_server_tls`], returns `Ok(None)` for unconfigured,
 /// `Err` for partial, `Ok(Some)` for valid.
 pub fn load_client_tls(cfg: &TlsConfig) -> Result<Option<ClientTlsConfig>, TlsError> {
-    match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
-        (None, None, None) => Ok(None),
-        (Some(cert), Some(key), Some(ca)) => {
-            let identity = Identity::from_pem(read_pem(cert)?, read_pem(key)?);
-            let ca = Certificate::from_pem(read_pem(ca)?);
-            Ok(Some(
-                ClientTlsConfig::new().identity(identity).ca_certificate(ca),
-            ))
-        }
-        (c, k, a) => Err(TlsError::Incomplete {
-            cert: c.is_some(),
-            key: k.is_some(),
-            ca: a.is_some(),
-        }),
-    }
+    Ok(load_identity_and_ca(cfg)?
+        .map(|(identity, ca)| ClientTlsConfig::new().identity(identity).ca_certificate(ca)))
 }
 
 #[cfg(test)]
