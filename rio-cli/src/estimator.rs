@@ -20,12 +20,12 @@ pub(crate) async fn run(
     filter: Option<String>,
     client: &mut AdminServiceClient<Channel>,
 ) -> anyhow::Result<()> {
-    let resp = crate::rpc(
-        "GetEstimatorStats",
-        client.get_estimator_stats(GetEstimatorStatsRequest {
-            drv_name_filter: filter,
-        }),
-    )
+    let req = GetEstimatorStatsRequest {
+        drv_name_filter: filter,
+    };
+    let resp = crate::rpc("GetEstimatorStats", async || {
+        client.get_estimator_stats(req.clone()).await
+    })
     .await?;
 
     if as_json {

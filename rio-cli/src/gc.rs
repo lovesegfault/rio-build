@@ -25,6 +25,7 @@ use crate::RPC_TIMEOUT;
 pub(crate) async fn run(
     client: &mut AdminServiceClient<Channel>,
     dry_run: bool,
+    grace_hours: Option<u32>,
 ) -> anyhow::Result<()> {
     // STREAMING — same open-timeout-only shape as `logs`. A store
     // sweep can legitimately go silent for minutes between
@@ -34,6 +35,7 @@ pub(crate) async fn run(
         RPC_TIMEOUT,
         client.trigger_gc(GcRequest {
             dry_run,
+            grace_period_hours: grace_hours,
             ..Default::default()
         }),
     )

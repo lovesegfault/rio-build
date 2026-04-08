@@ -20,6 +20,65 @@ use rio_proto::types::{AddUpstreamRequest, ListUpstreamsRequest, RemoveUpstreamR
 
 use crate::{json, rpc};
 
+/// Validate a `name:base64pubkey` entry in nix `trusted-public-keys`
+/// shape. Format-only check: a 32-byte ed25519 key base64-encodes to 44
+/// chars (with `=` pad) or 43 (without). Full decode happens
+/// server-side; this catches the common typos (missing colon,
+/// truncated paste) before the RPC so the operator sees the error
+/// immediately instead of every future substitution silently failing.
+fn validate_pubkey_entry(entry: &str) -> anyhow::Result<()> {
+    let (name, b64) = entry.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "trusted-key '{entry}': expected `name:base64pubkey` \
+             (e.g. `cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=`)"
+        )
+    })?;
+    if name.is_empty() {
+        anyhow::bail!("trusted-key '{entry}': empty key name before ':'");
+    }
+    let b64 = b64.trim();
+    if !matches!(b64.len(), 43 | 44) {
+        anyhow::bail!(
+            "trusted-key '{name}': pubkey part is {} chars, expected 43–44 \
+             (32-byte ed25519 key, base64). Check for truncation.",
+            b64.len()
+        );
+    }
+    if let Some(bad) = b64
+        .bytes()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=')))
+    {
+        anyhow::bail!("trusted-key '{name}': non-base64 byte {bad:#04x} in pubkey part");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_pubkey_entry;
+
+    #[test]
+    fn pubkey_valid_nixos_org() {
+        validate_pubkey_entry("cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=")
+            .unwrap();
+    }
+
+    #[test]
+    fn pubkey_rejects_missing_colon() {
+        assert!(validate_pubkey_entry("cache.nixos.org-1").is_err());
+    }
+
+    #[test]
+    fn pubkey_rejects_truncated() {
+        assert!(validate_pubkey_entry("foo:6NCHdD59X431").is_err());
+    }
+
+    #[test]
+    fn pubkey_rejects_non_base64() {
+        assert!(validate_pubkey_entry("foo:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDS!jY=").is_err());
+    }
+}
+
 /// I-093: accept either a tenant name or a UUID. UUID is passed through
 /// unchanged (no scheduler dependency). A non-UUID is resolved against
 /// `AdminService::ListTenants` — keeps the store-only fast path
@@ -37,7 +96,7 @@ async fn resolve_tenant(tenant: String, scheduler_addr: &str) -> anyhow::Result<
                  {scheduler_addr}: {e}"
             )
         })?;
-    let resp = rpc("ListTenants", ac.list_tenants(())).await?;
+    let resp = rpc("ListTenants", async || ac.list_tenants(()).await).await?;
     resp.tenants
         .into_iter()
         .find(|t| t.tenant_name == tenant)
@@ -116,10 +175,10 @@ pub(crate) async fn run(
     match cmd {
         UpstreamCmd::List { tenant } => {
             let tenant = resolve_tenant(tenant, scheduler_addr).await?;
-            let resp = rpc(
-                "ListUpstreams",
-                client.list_upstreams(ListUpstreamsRequest { tenant_id: tenant }),
-            )
+            let req = ListUpstreamsRequest { tenant_id: tenant };
+            let resp = rpc("ListUpstreams", async || {
+                client.list_upstreams(req.clone()).await
+            })
             .await?;
             if as_json {
                 json(&resp.upstreams)?;
@@ -148,17 +207,20 @@ pub(crate) async fn run(
             trusted_keys,
             sig_mode,
         } => {
+            for k in &trusted_keys {
+                validate_pubkey_entry(k)?;
+            }
             let tenant = resolve_tenant(tenant, scheduler_addr).await?;
-            let info = rpc(
-                "AddUpstream",
-                client.add_upstream(AddUpstreamRequest {
-                    tenant_id: tenant,
-                    url,
-                    priority,
-                    trusted_keys,
-                    sig_mode,
-                }),
-            )
+            let req = AddUpstreamRequest {
+                tenant_id: tenant,
+                url,
+                priority,
+                trusted_keys,
+                sig_mode,
+            };
+            let info = rpc("AddUpstream", async || {
+                client.add_upstream(req.clone()).await
+            })
             .await?;
             if as_json {
                 json(&info)?;
@@ -180,13 +242,13 @@ pub(crate) async fn run(
         }
         UpstreamCmd::Remove { tenant, url } => {
             let tenant = resolve_tenant(tenant, scheduler_addr).await?;
-            rpc(
-                "RemoveUpstream",
-                client.remove_upstream(RemoveUpstreamRequest {
-                    tenant_id: tenant,
-                    url: url.clone(),
-                }),
-            )
+            let req = RemoveUpstreamRequest {
+                tenant_id: tenant,
+                url: url.clone(),
+            };
+            rpc("RemoveUpstream", async || {
+                client.remove_upstream(req.clone()).await
+            })
             .await?;
             if as_json {
                 #[derive(Serialize)]

@@ -29,14 +29,14 @@ pub(crate) async fn run(
 ) -> anyhow::Result<()> {
     // Resolve build_id(s): either the one given, or all active.
     let build_ids: Vec<String> = if all_active {
-        rpc(
-            "ListBuilds",
-            client.list_builds(ListBuildsRequest {
-                status_filter: "active".into(),
-                limit: 50,
-                ..Default::default()
-            }),
-        )
+        let lb_req = ListBuildsRequest {
+            status_filter: "active".into(),
+            limit: 50,
+            ..Default::default()
+        };
+        rpc("ListBuilds", async || {
+            client.list_builds(lb_req.clone()).await
+        })
         .await?
         .builds
         .into_iter()
@@ -60,13 +60,13 @@ pub(crate) async fn run(
     let mut json_out: Vec<Out<'_>> = Vec::with_capacity(build_ids.len());
     let mut resps = Vec::with_capacity(build_ids.len());
     for id in &build_ids {
+        let req = InspectBuildDagRequest {
+            build_id: id.clone(),
+        };
         resps.push(
-            rpc(
-                "InspectBuildDag",
-                client.inspect_build_dag(InspectBuildDagRequest {
-                    build_id: id.clone(),
-                }),
-            )
+            rpc("InspectBuildDag", async || {
+                client.inspect_build_dag(req.clone()).await
+            })
             .await?,
         );
     }

@@ -11,16 +11,16 @@
 //! and every runtime dep (jq for `--json`, column for tables, …). See
 //! `r[sec.image.control-plane-minimal]`.
 
-use std::future::Future;
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use rio_common::grpc::with_timeout;
+use rio_common::backoff::{Backoff, Jitter};
 
 use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
+use tonic::Code;
 use tonic::transport::Channel;
 
 use rio_proto::types::{
@@ -60,23 +60,52 @@ mod wps;
 // r[impl cli.rpc-timeout]
 pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Wrap an AdminService RPC call with timeout + error context.
+/// Bounded retry on `UNAVAILABLE`: standby scheduler replica returns
+/// it (leader-only RPCs), as does a leader mid-recovery. Three tries
+/// with 1s/2s backoff covers a leader-election flip without making a
+/// genuinely-down scheduler hang the CLI for minutes.
+// r[impl cli.rpc-retry]
+const RPC_RETRY_ATTEMPTS: u32 = 3;
+const RPC_RETRY_BACKOFF: Backoff = Backoff {
+    base: Duration::from_secs(1),
+    mult: 2.0,
+    cap: Duration::from_secs(4),
+    jitter: Jitter::None,
+};
+
+/// Wrap an AdminService RPC call with timeout, `UNAVAILABLE` retry,
+/// and error context.
 ///
-/// Thin wrapper over [`rio_common::grpc::with_timeout`] that hoists
-/// `.into_inner()` so callers get `T` directly. The common helper
-/// handles the RPC deadline (`RPC_TIMEOUT`) and tonic::Status → anyhow
-/// conversion with the RPC name in the error.
+/// Takes a closure so the call can be re-issued on transient
+/// `UNAVAILABLE` (standby replica, leader mid-recovery). Each attempt
+/// gets the full `RPC_TIMEOUT`; non-`UNAVAILABLE` status and deadline-
+/// exceeded surface immediately.
 ///
 /// NOT used for streaming AdminService RPCs (TriggerGC, GetBuildLogs)
 /// — those need per-message progress, not a whole-call deadline. If
 /// a future subcommand adds one, wrap the stream-drain loop instead.
 pub(crate) async fn rpc<T>(
     what: &'static str,
-    fut: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    mut op: impl AsyncFnMut() -> Result<tonic::Response<T>, tonic::Status>,
 ) -> anyhow::Result<T> {
-    with_timeout(what, RPC_TIMEOUT, fut)
-        .await
-        .map(tonic::Response::into_inner)
+    let mut attempt = 0u32;
+    loop {
+        match tokio::time::timeout(RPC_TIMEOUT, op()).await {
+            Err(_) => bail!("{what}: deadline exceeded after {RPC_TIMEOUT:?}"),
+            Ok(Ok(r)) => return Ok(r.into_inner()),
+            Ok(Err(s)) if s.code() == Code::Unavailable && attempt + 1 < RPC_RETRY_ATTEMPTS => {
+                eprintln!(
+                    "{what}: UNAVAILABLE ({}); retry {}/{}",
+                    s.message(),
+                    attempt + 1,
+                    RPC_RETRY_ATTEMPTS - 1
+                );
+                tokio::time::sleep(RPC_RETRY_BACKOFF.duration(attempt)).await;
+                attempt += 1;
+            }
+            Ok(Err(s)) => bail!("{what}: {} ({:?})", s.message(), s.code()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,6 +198,10 @@ struct CliArgs {
     cmd: Option<Cmd>,
 }
 
+// TODO: rio keys subcommand — blocked on rio-store signing-key admin RPCs
+// (Add/List/Retire/RotateClusterKey); see r[store.key.admin-cli]
+// TODO: rio submit — server-side .drv parse approach pending; cli-A03
+// dependency-surface tension (rio-cli must not depend on rio-nix derivation parser)
 #[derive(Subcommand, Clone)]
 enum Cmd {
     /// Create a tenant. The name maps to the SSH authorized_keys comment
@@ -230,6 +263,10 @@ enum Cmd {
         /// Max results (server capped).
         #[arg(long, default_value = "50")]
         limit: u32,
+        /// Opaque keyset cursor from a prior page's `next_cursor`.
+        /// Stable under concurrent inserts, unlike offset.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Actor in-memory DAG snapshot for a build. Unlike builds (PG
     /// summary) or GetBuildGraph (PG graph), this queries the LIVE
@@ -276,6 +313,11 @@ enum Cmd {
         /// Report what would be collected without deleting anything.
         #[arg(long)]
         dry_run: bool,
+        /// Override the per-tenant retention floor for this sweep.
+        /// Paths younger than this are protected even if otherwise
+        /// unreachable. Unset = use each tenant's configured retention.
+        #[arg(long)]
+        grace_hours: Option<u32>,
     },
     /// Clear poison state for a derivation so it can be re-scheduled.
     /// Idempotent: exits 0 on a non-poisoned path (cleared=false),
@@ -406,15 +448,15 @@ async fn main() -> anyhow::Result<()> {
             cache_token,
         } => {
             let mut client = cfg.connect_admin().await?;
-            let resp = rpc(
-                "CreateTenant",
-                client.create_tenant(CreateTenantRequest {
-                    tenant_name: name,
-                    gc_retention_hours,
-                    gc_max_store_bytes,
-                    cache_token,
-                }),
-            )
+            let req = CreateTenantRequest {
+                tenant_name: name,
+                gc_retention_hours,
+                gc_max_store_bytes,
+                cache_token,
+            };
+            let resp = rpc("CreateTenant", async || {
+                client.create_tenant(req.clone()).await
+            })
             .await?;
             let t = resp
                 .tenant
@@ -427,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::ListTenants => {
             let mut client = cfg.connect_admin().await?;
-            let resp = rpc("ListTenants", client.list_tenants(())).await?;
+            let resp = rpc("ListTenants", async || client.list_tenants(()).await).await?;
             if as_json {
                 json(&resp.tenants)?;
             } else if resp.tenants.is_empty() {
@@ -453,12 +495,12 @@ async fn main() -> anyhow::Result<()> {
             } else if diff {
                 workers::run_diff(as_json, &mut client).await?;
             } else {
-                let resp = rpc(
-                    "ListExecutors",
-                    client.list_executors(ListExecutorsRequest {
-                        status_filter: status.unwrap_or_default(),
-                    }),
-                )
+                let req = ListExecutorsRequest {
+                    status_filter: status.unwrap_or_default(),
+                };
+                let resp = rpc("ListExecutors", async || {
+                    client.list_executors(req.clone()).await
+                })
                 .await?;
                 if as_json {
                     json(&resp)?;
@@ -471,17 +513,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Builds { status, limit } => {
+        Cmd::Builds {
+            status,
+            limit,
+            cursor,
+        } => {
             let mut client = cfg.connect_admin().await?;
-            let resp = rpc(
-                "ListBuilds",
-                client.list_builds(ListBuildsRequest {
-                    status_filter: status.unwrap_or_default(),
-                    limit,
-                    ..Default::default()
-                }),
-            )
-            .await?;
+            let req = ListBuildsRequest {
+                status_filter: status.unwrap_or_default(),
+                limit,
+                cursor,
+                ..Default::default()
+            };
+            let resp = rpc("ListBuilds", async || client.list_builds(req.clone()).await).await?;
             if as_json {
                 json(&resp)?;
             } else if resp.builds.is_empty() {
@@ -490,6 +534,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("{} builds ({} total):", resp.builds.len(), resp.total_count);
                 for b in &resp.builds {
                     print_build(b);
+                }
+                if let Some(c) = &resp.next_cursor {
+                    println!("(next page: --cursor {c})");
                 }
             }
         }
@@ -506,7 +553,10 @@ async fn main() -> anyhow::Result<()> {
             let mut client = cfg.connect_admin().await?;
             logs::run(&mut client, drv_path, build_id).await?;
         }
-        Cmd::Gc { dry_run } => gc::run(&mut cfg.connect_admin().await?, dry_run).await?,
+        Cmd::Gc {
+            dry_run,
+            grace_hours,
+        } => gc::run(&mut cfg.connect_admin().await?, dry_run, grace_hours).await?,
         Cmd::PoisonClear { drv_path } => {
             // Validate BEFORE the RPC. The scheduler's DAG is keyed on
             // the full store path, so a bare hash silently no-matches
@@ -519,12 +569,12 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let mut client = cfg.connect_admin().await?;
-            let resp = rpc(
-                "ClearPoison",
-                client.clear_poison(ClearPoisonRequest {
-                    derivation_hash: drv_path.clone(),
-                }),
-            )
+            let req = ClearPoisonRequest {
+                derivation_hash: drv_path.clone(),
+            };
+            let resp = rpc("ClearPoison", async || {
+                client.clear_poison(req.clone()).await
+            })
             .await?;
             if as_json {
                 #[derive(Serialize)]
@@ -544,7 +594,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::PoisonList => {
             let mut client = cfg.connect_admin().await?;
-            let resp = rpc("ListPoisoned", client.list_poisoned(())).await?;
+            let resp = rpc("ListPoisoned", async || client.list_poisoned(()).await).await?;
             if as_json {
                 #[derive(Serialize)]
                 struct Row<'a> {
@@ -585,13 +635,13 @@ async fn main() -> anyhow::Result<()> {
             let mut sched = rio_proto::client::connect_scheduler(&cfg.scheduler_addr)
                 .await
                 .map_err(|e| anyhow!("connect to scheduler at {}: {e}", cfg.scheduler_addr))?;
-            let resp = rpc(
-                "CancelBuild",
-                sched.cancel_build(rio_proto::types::CancelBuildRequest {
-                    build_id: build_id.clone(),
-                    reason,
-                }),
-            )
+            let req = rio_proto::types::CancelBuildRequest {
+                build_id: build_id.clone(),
+                reason,
+            };
+            let resp = rpc("CancelBuild", async || {
+                sched.cancel_build(req.clone()).await
+            })
             .await?;
             if as_json {
                 #[derive(Serialize)]
@@ -619,13 +669,13 @@ async fn main() -> anyhow::Result<()> {
             // for known workers (idempotent on already-draining) and
             // accepted=false for unknown ids (per admin/tests.rs, not
             // an error — just a no-op). Empty id is InvalidArgument.
-            let resp = rpc(
-                "DrainExecutor",
-                client.drain_executor(DrainExecutorRequest {
-                    executor_id: executor_id.clone(),
-                    force,
-                }),
-            )
+            let req = DrainExecutorRequest {
+                executor_id: executor_id.clone(),
+                force,
+            };
+            let resp = rpc("DrainExecutor", async || {
+                client.drain_executor(req.clone()).await
+            })
             .await?;
             if as_json {
                 #[derive(Serialize)]
@@ -694,6 +744,25 @@ fn print_tenant(t: &TenantInfo) {
     );
 }
 
+/// Unix-epoch seconds → human "Nh Nm ago" relative to now.
+fn fmt_ts_ago(epoch_secs: Option<i64>) -> String {
+    let Some(secs) = epoch_secs else {
+        return "—".into();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let ago = (now - secs).max(0) as u64;
+    if ago < 60 {
+        format!("{ago}s ago")
+    } else if ago < 3600 {
+        format!("{}m {}s ago", ago / 60, ago % 60)
+    } else {
+        format!("{}h {}m ago", ago / 3600, (ago % 3600) / 60)
+    }
+}
+
 /// Detailed per-worker view for `rio-cli workers`. `Status` prints a
 /// compact one-liner; this is the "show me everything" form for
 /// debugging a specific worker's registration or feature advertisement.
@@ -702,6 +771,11 @@ fn print_worker(w: &ExecutorInfo) {
     println!(
         "  state:    {}",
         if w.running_builds > 0 { "busy" } else { "idle" }
+    );
+    println!(
+        "  hb:       {}   up: {}",
+        fmt_ts_ago(w.last_heartbeat.as_ref().map(|t| t.seconds)),
+        fmt_ts_ago(w.connected_since.as_ref().map(|t| t.seconds))
     );
     println!("  systems:  {}", w.systems.join(", "));
     if !w.supported_features.is_empty() {

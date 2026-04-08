@@ -30,7 +30,10 @@ pub(crate) async fn run_actor(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
 ) -> anyhow::Result<()> {
-    let resp = rpc("DebugListExecutors", client.debug_list_executors(())).await?;
+    let resp = rpc("DebugListExecutors", async || {
+        client.debug_list_executors(()).await
+    })
+    .await?;
     if as_json {
         return json(&resp);
     }
@@ -51,12 +54,14 @@ pub(crate) async fn run_diff(
 ) -> anyhow::Result<()> {
     // Gather both views before printing — same all-or-nothing
     // discipline as status::run.
-    let pg = rpc(
-        "ListExecutors",
-        client.list_executors(ListExecutorsRequest::default()),
-    )
+    let pg = rpc("ListExecutors", async || {
+        client.list_executors(ListExecutorsRequest::default()).await
+    })
     .await?;
-    let actor = rpc("DebugListExecutors", client.debug_list_executors(())).await?;
+    let actor = rpc("DebugListExecutors", async || {
+        client.debug_list_executors(()).await
+    })
+    .await?;
 
     // Index by executor_id. BTreeSet for stable output order.
     let pg_ids: BTreeSet<&str> = pg

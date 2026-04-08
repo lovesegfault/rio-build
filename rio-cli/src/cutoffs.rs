@@ -20,10 +20,11 @@ pub(crate) async fn run(
     as_json: bool,
     client: &mut AdminServiceClient<Channel>,
 ) -> anyhow::Result<()> {
-    let resp = crate::rpc(
-        "GetSizeClassStatus",
-        client.get_size_class_status(GetSizeClassStatusRequest::default()),
-    )
+    let resp = crate::rpc("GetSizeClassStatus", async || {
+        client
+            .get_size_class_status(GetSizeClassStatusRequest::default())
+            .await
+    })
     .await?;
 
     if as_json {

@@ -30,19 +30,18 @@ pub(crate) async fn run(
     // rather than failed. `?` on each gather is fine: nothing
     // has been printed yet, so the error message is the only
     // output.
-    let cs = rpc("ClusterStatus", client.cluster_status(())).await?;
-    let workers = rpc(
-        "ListExecutors",
-        client.list_executors(ListExecutorsRequest::default()),
-    )
+    let cs = rpc("ClusterStatus", async || client.cluster_status(()).await).await?;
+    let workers = rpc("ListExecutors", async || {
+        client.list_executors(ListExecutorsRequest::default()).await
+    })
     .await?;
-    let builds = rpc(
-        "ListBuilds",
-        client.list_builds(ListBuildsRequest {
-            limit: 10,
-            ..Default::default()
-        }),
-    )
+    let builds_req = ListBuildsRequest {
+        limit: 10,
+        ..Default::default()
+    };
+    let builds = rpc("ListBuilds", async || {
+        client.list_builds(builds_req.clone()).await
+    })
     .await?;
 
     // All data in hand — now print. No `?` below this line in
