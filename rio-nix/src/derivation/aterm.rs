@@ -9,7 +9,7 @@ use super::{BasicDerivation, Derivation, DerivationError, DerivationOutput, MAX_
 // ---------------------------------------------------------------------------
 
 /// Write an ATerm-escaped string (with surrounding quotes) to the output.
-pub fn write_aterm_string(out: &mut String, s: &str) {
+pub(super) fn write_aterm_string(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
         match ch {
@@ -289,23 +289,7 @@ impl Derivation {
         let mut out = String::new();
         out.push_str("Derive(");
 
-        // outputs
-        out.push('[');
-        for (i, o) in self.outputs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('(');
-            write_aterm_string(&mut out, &o.name);
-            out.push(',');
-            write_aterm_string(&mut out, &o.path);
-            out.push(',');
-            write_aterm_string(&mut out, &o.hash_algo);
-            out.push(',');
-            write_aterm_string(&mut out, &o.hash);
-            out.push(')');
-        }
-        out.push(']');
+        write_aterm_outputs(&mut out, &self.outputs, false);
         out.push(',');
 
         // inputDrvs
@@ -368,27 +352,7 @@ impl Derivation {
         let mut out = String::new();
         out.push_str("Derive(");
 
-        // outputs (optionally mask paths)
-        out.push('[');
-        for (i, o) in self.outputs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('(');
-            write_aterm_string(&mut out, &o.name);
-            out.push(',');
-            if mask_outputs {
-                write_aterm_string(&mut out, "");
-            } else {
-                write_aterm_string(&mut out, &o.path);
-            }
-            out.push(',');
-            write_aterm_string(&mut out, &o.hash_algo);
-            out.push(',');
-            write_aterm_string(&mut out, &o.hash);
-            out.push(')');
-        }
-        out.push(']');
+        write_aterm_outputs(&mut out, &self.outputs, mask_outputs);
         out.push(',');
 
         // inputDrvs -- re-sorted by replacement keys
@@ -455,23 +419,7 @@ impl BasicDerivation {
         let mut out = String::with_capacity(2048);
         out.push_str("Derive(");
 
-        // outputs
-        out.push('[');
-        for (i, o) in self.outputs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('(');
-            write_aterm_string(&mut out, &o.name);
-            out.push(',');
-            write_aterm_string(&mut out, &o.path);
-            out.push(',');
-            write_aterm_string(&mut out, &o.hash_algo);
-            out.push(',');
-            write_aterm_string(&mut out, &o.hash);
-            out.push(')');
-        }
-        out.push(']');
+        write_aterm_outputs(&mut out, &self.outputs, false);
         out.push(',');
 
         // inputDrvs — ALWAYS empty for BasicDerivation.
@@ -489,6 +437,29 @@ impl BasicDerivation {
         );
         out
     }
+}
+
+/// Write the `[outputs]` head of a `Derive(...)` term.
+///
+/// `mask_paths`: replace each output path with `""` (used by
+/// [`Derivation::to_aterm_modulo`] for CA-floating hashing).
+fn write_aterm_outputs(out: &mut String, outputs: &[DerivationOutput], mask_paths: bool) {
+    out.push('[');
+    for (i, o) in outputs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('(');
+        write_aterm_string(out, &o.name);
+        out.push(',');
+        write_aterm_string(out, if mask_paths { "" } else { &o.path });
+        out.push(',');
+        write_aterm_string(out, &o.hash_algo);
+        out.push(',');
+        write_aterm_string(out, &o.hash);
+        out.push(')');
+    }
+    out.push(']');
 }
 
 /// Write the shared tail of a `Derive(...)` term: inputSrcs, platform,
