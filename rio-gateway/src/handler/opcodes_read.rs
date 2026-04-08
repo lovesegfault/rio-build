@@ -41,7 +41,7 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
             let jwt = jwt_unless_drv(jwt_token, &path);
             match grpc_is_valid_path(store_client, jwt, &path).await {
                 Ok(v) => v,
-                Err(e) => return send_store_error(stderr, e).await,
+                Err(e) => stderr_err!(stderr, "store error: {e}"),
             }
         }
         Err(e) => {
@@ -79,11 +79,7 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
             }
             Err(e) => {
                 error!(path = %path_str, error = %e, "wopEnsurePath: store error");
-                return send_store_error(
-                    stderr,
-                    GatewayError::Store(format!("error checking '{path_str}': {e}")).into(),
-                )
-                .await;
+                stderr_err!(stderr, "store error: error checking '{path_str}': {e}");
             }
         }
     }
@@ -124,7 +120,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
     let jwt = jwt_unless_drv(jwt_token, &path);
     let info = match grpc_query_path_info(store_client, jwt, path.as_str()).await {
         Ok(info) => info,
-        Err(e) => return send_store_error(stderr, e).await,
+        Err(e) => stderr_err!(stderr, "store error: {e}"),
     };
 
     stderr.finish().await?;
@@ -184,7 +180,7 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
 
     let missing_set: HashSet<String> = match resp {
         Ok(r) => r.into_inner().missing_paths.into_iter().collect(),
-        Err(e) => return send_store_error(stderr, e).await,
+        Err(e) => stderr_err!(stderr, "store error: {e}"),
     };
 
     let valid_strs: Vec<String> = path_strs
@@ -241,26 +237,29 @@ pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + U
 ///
 /// UNREACHABLE VIA ssh-ng:// — Nix SSHStore overrides setOptions() with an
 /// empty body (ssh-store.cc since 088ef8175, 2018). This handler fires only
-/// for unix:// daemon-socket clients. See the [`ClientOptions`] struct doc
-/// and the setoptions-unreachable VM subtest in scheduling.nix.
+/// for unix:// daemon-socket clients. The wire payload MUST still be drained
+/// to keep the stream in sync (golden-conformance requirement); the values
+/// are logged for diagnostics but otherwise discarded — `SubmitBuildRequest`
+/// build options are reachable only via the gRPC path (rio-cli), not
+/// `nix-build --option`. See the setoptions-unreachable VM subtest in
+/// scheduling.nix.
 #[instrument(skip_all)]
 pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    options: &mut Option<ClientOptions>,
 ) -> anyhow::Result<()> {
-    let keep_failed = wire::read_bool(reader).await?;
-    let keep_going = wire::read_bool(reader).await?;
-    let try_fallback = wire::read_bool(reader).await?;
+    let _keep_failed = wire::read_bool(reader).await?;
+    let _keep_going = wire::read_bool(reader).await?;
+    let _try_fallback = wire::read_bool(reader).await?;
     let verbosity = wire::read_u64(reader).await?;
     let max_build_jobs = wire::read_u64(reader).await?;
     let max_silent_time = wire::read_u64(reader).await?;
     let _obsolete_use_build_hook = wire::read_u64(reader).await?;
-    let verbose_build = wire::read_bool(reader).await?;
+    let _verbose_build = wire::read_bool(reader).await?;
     let _obsolete_log_type = wire::read_u64(reader).await?;
     let _obsolete_print_build_trace = wire::read_u64(reader).await?;
     let build_cores = wire::read_u64(reader).await?;
-    let use_substitutes = wire::read_bool(reader).await?;
+    let _use_substitutes = wire::read_bool(reader).await?;
 
     let overrides = wire::read_string_pairs(reader).await?;
 
@@ -278,19 +277,6 @@ pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         overrides_head = ?overrides.iter().take(8).collect::<Vec<_>>(),
         "wopSetOptions"
     );
-
-    *options = Some(ClientOptions {
-        keep_failed,
-        keep_going,
-        try_fallback,
-        verbosity,
-        max_build_jobs,
-        max_silent_time,
-        verbose_build,
-        build_cores,
-        use_substitutes,
-        overrides,
-    });
 
     stderr.finish().await?;
     Ok(())
@@ -404,7 +390,7 @@ pub(super) async fn handle_query_path_from_hash_part<
         {
             String::new()
         }
-        Err(e) => return send_store_error(stderr, e).await,
+        Err(e) => stderr_err!(stderr, "store error: {e}"),
     };
 
     stderr.finish().await?;
@@ -447,7 +433,7 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
     )
     .await
     {
-        return send_store_error(stderr, e).await;
+        stderr_err!(stderr, "store error: {e}");
     }
 
     stderr.finish().await?;
@@ -622,7 +608,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
     )
     .await
     {
-        return send_store_error(stderr, e).await;
+        stderr_err!(stderr, "store error: {e}");
     }
 
     stderr.finish().await?;
@@ -939,7 +925,7 @@ pub(super) async fn handle_query_derivation_output_map<
 
     let drv = match resolve_derivation(&drv_path, store_client, drv_cache).await {
         Ok(d) => d,
-        Err(e) => return send_store_error(stderr, e).await,
+        Err(e) => stderr_err!(stderr, "store error: {e}"),
     };
 
     // Floating-CA: .drv has path="" — resolve via Realisations. Same

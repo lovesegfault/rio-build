@@ -697,7 +697,7 @@ pub async fn filter_and_inline_drv(
 ///
 /// Build-option fields (`max_silent_time`/`build_timeout`/`build_cores`/
 /// `keep_going`) are hardcoded to defaults: ssh-ng clients never send
-/// `wopSetOptions` (see [`crate::handler::ClientOptions`]), so the only
+/// `wopSetOptions` (see [`handle_set_options`](crate::handler)), so the only
 /// way to set these is via the gRPC path (rio-cli), which constructs
 /// `SubmitBuildRequest` directly without going through this helper.
 pub fn build_submit_request(

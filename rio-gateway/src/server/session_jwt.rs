@@ -4,8 +4,7 @@
 //! constants are pure (no russh, no gRPC) and ~280 lines including
 //! tests. `ConnectionHandler` calls in via [`mint_session_jwt`] (after
 //! `auth_publickey` resolves the tenant UUID) and [`refresh_session_jwt`]
-//! (on every `exec_request`). Re-exported from `server/mod.rs` so
-//! external paths are unchanged.
+//! (on every `exec_request`).
 
 use std::time::SystemTime;
 
@@ -62,7 +61,7 @@ const JWT_REFRESH_SLACK_SECS: i64 = 300;
 /// Returns `(token, claims)` so callers that want to log `jti`
 /// without re-parsing the token can read it directly. The token is
 /// opaque to the gateway after this — it's just a string to inject.
-pub fn mint_session_jwt(
+pub(super) fn mint_session_jwt(
     tenant_id: uuid::Uuid,
     signing_key: &SigningKey,
 ) -> Result<(String, jwt::TenantClaims), jwt::JwtError> {
@@ -100,7 +99,7 @@ pub fn mint_session_jwt(
 /// unchanged and a warning logged. The store will reject it with a
 /// clear `ExpiredSignature`; that surfaces the problem instead of
 /// silently degrading to the `tenant_name` fallback mid-connection.
-pub fn refresh_session_jwt<'a>(
+pub(super) fn refresh_session_jwt<'a>(
     cached: &'a mut Option<(String, jwt::TenantClaims)>,
     signing_key: Option<&SigningKey>,
 ) -> Option<&'a str> {
