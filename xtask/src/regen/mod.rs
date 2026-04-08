@@ -9,9 +9,7 @@ use crate::ui;
 mod cargo_json;
 mod crds;
 mod fuzz_lock;
-mod grafana;
 mod hakari;
-mod mocks;
 mod seccomp;
 mod sqlx;
 
@@ -21,17 +19,12 @@ pub enum RegenCmd {
     Sqlx,
     /// Regenerate infra/helm/crds/ from the crdgen binary.
     Crds,
-    /// Regenerate infra/helm/grafana/configmap.yaml from dashboard JSONs.
-    Grafana,
     /// Regenerate Cargo.json via crate2nix.
     CargoJson,
     /// Regenerate the workspace-hack crate (feature unification).
     Hakari,
     /// Sync fuzz workspace lockfiles with the main workspace.
     FuzzLock,
-    /// Regenerate rio-dashboard/src/test-support/admin-methods.json
-    /// from MockAdmin::METHODS (build.rs-generated from admin.proto).
-    Mocks,
     /// Diff the worker seccomp profile against upstream moby (human review).
     Seccomp {
         /// moby git tag to fetch default.json from.
@@ -44,11 +37,9 @@ pub async fn run(which: Option<RegenCmd>, _cfg: &XtaskConfig) -> Result<()> {
     match which {
         Some(RegenCmd::Sqlx) => sqlx::run().await,
         Some(RegenCmd::Crds) => crds::run().await,
-        Some(RegenCmd::Grafana) => grafana::run(),
         Some(RegenCmd::CargoJson) => cargo_json::run().await,
         Some(RegenCmd::Hakari) => hakari::run().await,
         Some(RegenCmd::FuzzLock) => fuzz_lock::run().await,
-        Some(RegenCmd::Mocks) => mocks::run().await,
         Some(RegenCmd::Seccomp { tag }) => seccomp::run(&tag).await,
         None => {
             // Umbrella: run the idempotent regenerators (not seccomp —
@@ -57,9 +48,7 @@ pub async fn run(which: Option<RegenCmd>, _cfg: &XtaskConfig) -> Result<()> {
                 ui::step("hakari", hakari::run).await?;
                 ui::step("sqlx", sqlx::run).await?;
                 ui::step("crds", crds::run).await?;
-                ui::step("grafana", || async { grafana::run() }).await?;
                 ui::step("fuzz-lock", fuzz_lock::run).await?;
-                ui::step("mocks", mocks::run).await?;
                 ui::step("cargo-json", cargo_json::run).await
             })
             .await
