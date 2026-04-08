@@ -24,9 +24,7 @@ use rio_store::substitute::Substituter;
 use rio_test_support::fixtures::{make_nar, test_store_path};
 use rio_test_support::{TestDb, TestResult, seed_tenant};
 
-// Can't use rio_store::MIGRATOR — cfg(test) in lib.rs. Same workaround
-// as tests/grpc/main.rs.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+use rio_store::MIGRATOR;
 
 /// Fake interceptor that sets `TenantClaims.sub` per-request from a
 /// shared `Arc<RwLock>`. The test flips the lock between tenant IDs

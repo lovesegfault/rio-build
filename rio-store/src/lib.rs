@@ -24,22 +24,21 @@ pub mod migrations;
 pub(crate) mod realisations;
 pub mod signing;
 pub mod substitute;
-#[cfg(test)]
-pub(crate) mod test_helpers;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_helpers;
 pub(crate) mod validate;
 
 /// Shared sqlx migrator for the `migrations/` directory. Embeds
 /// migration SQL at compile time via `sqlx::migrate!`.
 ///
-/// `#[cfg(test)]` (not `pub`) — the rio-store/fuzz/ workspace compiles
-/// this lib as a dep, and its source filter doesn't include migrations/.
-/// sqlx::migrate! reads files at COMPILE time, so even an unused static
-/// breaks the fuzz build. cfg(test) means the macro only expands when
-/// building the lib's own unit tests (not as a dep). Integration tests
-/// in tests/grpc/ keep their own copy — they compile the lib WITHOUT
-/// cfg(test), so they can't see this one.
-#[cfg(test)]
-pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+/// Gated on `test`/`test-utils` — the rio-store/fuzz/ workspace compiles
+/// this lib as a dep without the feature, and its source filter may
+/// exclude migrations/. sqlx::migrate! reads files at COMPILE time, so
+/// even an unused static can break the fuzz build. The cfg-gate means
+/// the macro only expands for unit tests or downstream test fixtures
+/// (which enable `test-utils` and have migrations/ in scope).
+#[cfg(any(test, feature = "test-utils"))]
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
 /// Register `# HELP` descriptions for all store metrics.
 ///

@@ -18,25 +18,20 @@
 
 use std::sync::Arc;
 
-use rio_proto::{StoreServiceClient, StoreServiceServer};
+use rio_proto::StoreServiceClient;
 use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::StoreServiceImpl;
+use rio_store::test_helpers::spawn_store_service;
 use rio_test_support::TestDb;
-use rio_test_support::grpc::{MockScheduler, spawn_grpc_server, spawn_mock_scheduler};
+use rio_test_support::grpc::{MockScheduler, spawn_mock_scheduler};
 use rio_test_support::wire::{do_handshake, send_set_options};
 use tokio::io::DuplexStream;
-use tonic::transport::{Channel, Server};
+use tonic::transport::Channel;
 
 use super::common::{SessionHandles, spawn_session_task};
 
-// rio-store's MIGRATOR is cfg(test) in lib.rs (the rio-store/fuzz/
-// workspace's source filter excludes migrations/, and sqlx::migrate!
-// reads files at compile time). Integration tests compile the lib
-// without cfg(test), so we keep our own copy. Same migrations dir
-// (workspace root), same embedded SQL. Mirrors rio-store/tests/grpc/main.rs:31.
-// Path is relative to CARGO_MANIFEST_DIR (rio-gateway/).
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+pub use rio_store::MIGRATOR;
 
 /// Gateway wire protocol backed by REAL `rio-store` (ephemeral PG,
 /// `StoreServiceImpl`) + `MockScheduler`. Functional-tier: catches bugs
@@ -135,17 +130,15 @@ impl RioStack {
         // Real store on ephemeral TCP (tonic has no in-process transport
         // for Server::builder — TcpListenerStream on 127.0.0.1:0 is the
         // standard pattern, same as spawn_mock_store).
-        let router = Server::builder().add_service(StoreServiceServer::new(service));
-        let (store_addr, store_handle) = spawn_grpc_server(router).await;
-
+        //
         // `?` on the next 3 lines detaches store_handle (JoinHandle::drop
         // doesn't abort). Test-only + connect-to-127.0.0.1-just-spawned
         // rarely fails + process-exit reaps. If mass-connect-failures ever
         // exhaust ephemeral ports: scopeguard::guard or AbortOnDrop wrapper.
         // Same pattern at rio-test-support/src/grpc.rs spawn_mock_store_with_client.
+        let (store_client, store_handle) = spawn_store_service(service).await?;
         let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
-        let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
         let sched_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
 
         // Functional tests don't exercise the shutdown-signal or tenant

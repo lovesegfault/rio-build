@@ -1,5 +1,8 @@
 use super::*;
 
+use rio_store::grpc::StoreServiceImpl;
+use rio_store::test_helpers::{put_path, spawn_store_service};
+
 // -----------------------------------------------------------------------
 // Scheduler-side cache check (TOCTOU fix)
 // -----------------------------------------------------------------------
@@ -8,18 +11,8 @@ use super::*;
 pub(super) async fn setup_inproc_store(
     pool: sqlx::PgPool,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    use rio_proto::StoreServiceServer;
-    use rio_store::grpc::StoreServiceImpl;
-
     // Inline storage in manifests.inline_blob (no chunk backend needed).
-    let service = StoreServiceImpl::new(pool);
-    let router = tonic::transport::Server::builder().add_service(StoreServiceServer::new(service));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
-
-    let channel = Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-    Ok((StoreServiceClient::new(channel), server))
+    spawn_store_service(StoreServiceImpl::new(pool)).await
 }
 
 /// Build a minimal single-file NAR and upload it to the store (trailer mode).
@@ -27,48 +20,9 @@ pub(super) async fn put_test_path(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
 ) -> anyhow::Result<()> {
-    use rio_proto::types::{
-        PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
-    };
-    use sha2::{Digest, Sha256};
-
-    let node = rio_nix::nar::NarNode::Regular {
-        executable: false,
-        contents: b"hello".to_vec(),
-    };
-    let mut nar = Vec::new();
-    rio_nix::nar::serialize(&mut nar, &node)?;
-
-    let nar_hash = Sha256::digest(&nar).to_vec();
-    let nar_size = nar.len() as u64;
-    // nar_hash/nar_size MUST be empty in metadata; real values go in trailer.
-    let info = PathInfo {
-        store_path: store_path.to_string(),
-        ..Default::default()
-    };
-
-    let (tx, rx) = mpsc::channel(4);
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info),
-        })),
-    })
-    .await?;
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::NarChunk(nar)),
-    })
-    .await?;
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::Trailer(PutPathTrailer {
-            nar_hash,
-            nar_size,
-        })),
-    })
-    .await?;
-    drop(tx);
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    client.put_path(stream).await?;
+    let (nar, _hash) = rio_test_support::fixtures::make_nar(b"hello");
+    let info = rio_test_support::fixtures::make_path_info_for_nar(store_path, &nar);
+    put_path(client, info, nar).await?;
     Ok(())
 }
 

@@ -21483,6 +21483,10 @@
           "packageId": "rio-proto"
         },
         {
+          "name": "rio-test-support",
+          "packageId": "rio-test-support"
+        },
+        {
           "name": "scopeguard",
           "packageId": "scopeguard"
         },
@@ -21567,6 +21571,10 @@
           "packageId": "rcgen"
         },
         {
+          "name": "rio-store",
+          "packageId": "rio-store"
+        },
+        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         },
@@ -21594,6 +21602,9 @@
           "name": "zstd",
           "packageId": "zstd"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "test-utils"
       ],
       "crateBin": [
         {

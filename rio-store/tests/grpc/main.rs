@@ -17,19 +17,18 @@ use rio_proto::types::{
     QueryPathInfoRequest, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
+use rio_store::MIGRATOR;
 use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
 use rio_store::grpc::StoreServiceImpl;
+// Re-export the shared helpers under their existing names so the test
+// submodules' `use super::*;` keeps working unchanged.
+pub use rio_store::test_helpers::{
+    put_path, put_path_raw, spawn_store_service as spawn_store_server,
+};
 use rio_test_support::fixtures::{make_nar, make_path_info_for_nar, test_store_path};
 use rio_test_support::{TestDb, TestResult};
 
 use std::sync::Arc;
-
-// Can't use rio_store::MIGRATOR — it's cfg(test) in lib.rs (the
-// rio-store/fuzz/ workspace's source filter excludes migrations/,
-// and sqlx::migrate! reads files at compile time). Integration tests
-// compile the lib without cfg(test), so we keep our own copy. Same
-// migrations dir, same embedded SQL.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
 /// Test harness bundling the three things every gRPC integration test
 /// needs: an ephemeral PG, a connected client, and a server handle.
@@ -102,84 +101,6 @@ impl Drop for StoreSession {
     fn drop(&mut self) {
         self.server.abort();
     }
-}
-
-/// Shared: spawn server + connect client.
-async fn spawn_store_server(
-    service: StoreServiceImpl,
-) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    let router = Server::builder().add_service(StoreServiceServer::new(service));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
-
-    let channel = Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-    Ok((StoreServiceClient::new(channel), server))
-}
-
-/// Helper: upload a path via PutPath, sending metadata + one nar_chunk.
-///
-/// Takes `ValidatedPathInfo` (the common case from `make_path_info_for_nar`)
-/// and converts to raw `PathInfo` internally. For tests that need to send
-/// DELIBERATELY INVALID data (bad references, etc.) to exercise server-side
-/// validation, use [`put_path_raw`] instead.
-pub async fn put_path(
-    client: &mut StoreServiceClient<Channel>,
-    info: ValidatedPathInfo,
-    nar: Vec<u8>,
-) -> Result<bool, tonic::Status> {
-    put_path_raw(client, info.into(), nar).await
-}
-
-/// Raw variant: takes unvalidated `PathInfo` directly. Use this to test
-/// server-side rejection of malformed input (e.g., bad reference strings).
-///
-/// Trailer-mode: extracts `nar_hash`/`nar_size` from `info`, zeroes them
-/// in the metadata, and sends them in a `PutPathTrailer`. (Hash-upfront
-/// was deleted — store rejects non-empty metadata nar_hash.)
-pub async fn put_path_raw(
-    client: &mut StoreServiceClient<Channel>,
-    mut info: PathInfo,
-    nar: Vec<u8>,
-) -> Result<bool, tonic::Status> {
-    let (tx, rx) = mpsc::channel(8);
-
-    // Extract hash/size for trailer, zero them in metadata.
-    let trailer = PutPathTrailer {
-        nar_hash: std::mem::take(&mut info.nar_hash),
-        nar_size: std::mem::take(&mut info.nar_size),
-    };
-
-    // Send metadata first. Fresh channel, buffer=8, receiver alive:
-    // these sends cannot fail.
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info),
-        })),
-    })
-    .await
-    .expect("fresh channel");
-
-    // Send NAR data as one chunk
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::NarChunk(nar)),
-    })
-    .await
-    .expect("fresh channel");
-
-    // Send trailer
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::Trailer(trailer)),
-    })
-    .await
-    .expect("fresh channel");
-
-    // Close the stream
-    drop(tx);
-
-    let outbound = ReceiverStream::new(rx);
-    let response = client.put_path(outbound).await?;
-    Ok(response.into_inner().created)
 }
 
 /// Like [`put_path`] but sets the `x-rio-assignment-token` metadata

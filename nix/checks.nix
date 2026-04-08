@@ -261,7 +261,15 @@ let
     let
       packageId = cnix.resolved.workspaceMembers.${name};
       crateInfo = cnix.resolved.crates.${packageId};
-      devDepRecords = crateInfo.devDependencies or [ ];
+      # Drop self-referencing dev-deps (e.g. `rio-store = { path = ".",
+      # features = ["test-utils"] }`). Cargo uses these purely for
+      # feature activation on the crate's own lib when building
+      # integration tests. crate2nix already propagates the activated
+      # feature via `--cfg feature=…` on the in-derivation lib build,
+      # so the only effect of keeping the entry here is a SECOND
+      # `--extern rio_store=…` flag pointing at a different rlib →
+      # rustc E0464 "multiple candidates".
+      devDepRecords = builtins.filter (d: d.packageId != packageId) (crateInfo.devDependencies or [ ]);
     in
     map (d: cnix.builtCrates.crates.${d.packageId}) devDepRecords;
   devDepsFor = mkDevDepsFor cargoNix;

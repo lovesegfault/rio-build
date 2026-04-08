@@ -15,6 +15,107 @@
 use rio_test_support::fixtures::test_store_path;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Channel, Server};
+
+use rio_proto::types::{
+    PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
+};
+use rio_proto::validated::ValidatedPathInfo;
+use rio_proto::{StoreServiceClient, StoreServiceServer};
+
+use crate::grpc::StoreServiceImpl;
+
+// ---------------------------------------------------------------------------
+// In-process gRPC server + PutPath stream helpers
+// ---------------------------------------------------------------------------
+
+/// Spawn an in-process [`StoreServiceImpl`] on an ephemeral TCP port and
+/// return a connected client + the server's `JoinHandle`.
+///
+/// Consolidates the `Server::builder().add_service(StoreServiceServer::new(_))`
+/// → `spawn_grpc_server` → `Channel::from_shared(...).connect()` →
+/// `StoreServiceClient::new` chain that was duplicated across
+/// `rio-store/tests/grpc/`, `rio-gateway/tests/functional/`, and
+/// `rio-scheduler/src/actor/tests/integration.rs`.
+///
+/// Uses [`rio_proto::client::connect_store`] (which sets
+/// `max_decoding_message_size`) so large-NAR tests don't hit tonic's
+/// 4 MiB default. Tests that don't init `client_tls()` get plaintext.
+pub async fn spawn_store_service(
+    service: StoreServiceImpl,
+) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
+    let router = Server::builder().add_service(StoreServiceServer::new(service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let client = rio_proto::client::connect_store(&addr.to_string()).await?;
+    Ok((client, server))
+}
+
+/// Upload a path via `PutPath`, sending metadata + one nar_chunk + trailer.
+///
+/// Takes `ValidatedPathInfo` (the common case from `make_path_info_for_nar`)
+/// and converts to raw `PathInfo` internally. For tests that need to send
+/// DELIBERATELY INVALID data (bad references, etc.) to exercise server-side
+/// validation, use [`put_path_raw`] instead.
+pub async fn put_path(
+    client: &mut StoreServiceClient<Channel>,
+    info: ValidatedPathInfo,
+    nar: Vec<u8>,
+) -> Result<bool, tonic::Status> {
+    put_path_raw(client, info.into(), nar).await
+}
+
+/// Raw variant: takes unvalidated `PathInfo` directly. Use this to test
+/// server-side rejection of malformed input (e.g., bad reference strings).
+///
+/// Trailer-mode: extracts `nar_hash`/`nar_size` from `info`, zeroes them
+/// in the metadata, and sends them in a `PutPathTrailer`. (Hash-upfront
+/// was deleted — store rejects non-empty metadata `nar_hash`.)
+pub async fn put_path_raw(
+    client: &mut StoreServiceClient<Channel>,
+    mut info: PathInfo,
+    nar: Vec<u8>,
+) -> Result<bool, tonic::Status> {
+    let (tx, rx) = mpsc::channel(8);
+
+    // Extract hash/size for trailer, zero them in metadata.
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+
+    // Send metadata first. Fresh channel, buffer=8, receiver alive:
+    // these sends cannot fail.
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info),
+        })),
+    })
+    .await
+    .expect("fresh channel");
+
+    // Send NAR data as one chunk
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .expect("fresh channel");
+
+    // Send trailer
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
+    })
+    .await
+    .expect("fresh channel");
+
+    // Close the stream
+    drop(tx);
+
+    let outbound = ReceiverStream::new(rx);
+    let response = client.put_path(outbound).await?;
+    Ok(response.into_inner().created)
+}
 
 /// `sha2::Sha256::digest(path) → Vec<u8>`. The store-path-hash function
 /// every `seed_*` helper was copy-pasting. Matches

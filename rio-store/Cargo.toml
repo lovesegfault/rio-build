@@ -12,10 +12,23 @@ description = "NAR content-addressable store for rio-build"
 name = "rio-store"
 path = "src/main.rs"
 
+[features]
+# Exposes `test_helpers` (StoreSeed/ChunkSeed builders, spawn_store_service,
+# put_path) and `MIGRATOR` to downstream crates' tests. Without this, every
+# crate that needs a real StoreServiceImpl in its test fixture re-implements
+# spawn + Channel::connect + the PutPath mpsc-stream dance (4× duplication
+# before this feature existed). Not in `default` — pulls in rio-test-support
+# (initdb spawn machinery) which production builds don't want.
+test-utils = ["dep:rio-test-support"]
+
 [dependencies]
 rio-common = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
+# Optional: only when test-utils feature is on. Also a dev-dep below so
+# rio-store's own `cargo test` (which doesn't enable test-utils) still
+# sees it for the cfg(test) arm of test_helpers.rs.
+rio-test-support = { workspace = true, optional = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -104,6 +117,10 @@ serde = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# Self-reference to enable `test-utils` for integration tests under
+# tests/ — those compile the lib as a dep WITHOUT cfg(test), so the
+# feature is the only way they see `test_helpers` / `MIGRATOR`.
+rio-store = { path = ".", features = ["test-utils"] }
 rio-test-support = { workspace = true }
 # Sync decode_all for cache_server round-trip tests — verify the
 # async-compression stream produces valid zstd.

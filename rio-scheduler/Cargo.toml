@@ -76,7 +76,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-rio-store = { workspace = true }
+rio-store = { workspace = true, features = ["test-utils"] }
 rio-test-support = { workspace = true }
 tracing-test = { workspace = true }
 aws-smithy-mocks = { workspace = true }

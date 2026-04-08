@@ -6694,6 +6694,7 @@ dependencies = [
  "rio-common",
  "rio-nix",
  "rio-proto",
+ "rio-store",
  "rio-test-support",
  "scopeguard",
  "serde",
