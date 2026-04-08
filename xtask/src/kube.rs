@@ -10,11 +10,10 @@ use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::ResourceExt;
-use kube::api::{Api, AttachParams, ListParams, Patch, PatchParams};
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use serde::Serialize;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::io::AsyncReadExt;
 
 use crate::sh::repo_root;
 use crate::ui;
@@ -193,30 +192,6 @@ pub async fn scheduler_leader(client: &Client, ns: &str) -> Result<String> {
         .spec
         .and_then(|s| s.holder_identity)
         .context("scheduler lease has no holder")
-}
-
-/// Run a command in the scheduler leader pod and return combined
-/// stdout+stderr. Fails if no leader or pod attachment denied.
-///
-/// **For rio-cli, use [`crate::k8s::with_cli_tunnel`] or
-/// `CliCtx` instead** — running rio-cli
-/// in-pod forces the scheduler image to bundle it (and jq, column,
-/// whatever pipes through), widening the control-plane attack surface.
-/// This helper stays for non-rio-cli debugging (`ps`, `ls /proc`, …).
-#[allow(dead_code)] // intentionally kept — see doc-comment
-pub async fn run_in_scheduler(client: &Client, ns: &str, cmd: &[&str]) -> Result<String> {
-    let leader = scheduler_leader(client, ns).await?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
-    let params = AttachParams::default().stdout(true).stderr(true);
-    let mut attached = Api::exec(&pods, &leader, cmd.iter().copied(), &params).await?;
-    let mut stdout = attached.stdout().context("no stdout")?;
-    let mut stderr = attached.stderr().context("no stderr")?;
-    let mut out = String::new();
-    let mut err = String::new();
-    stdout.read_to_string(&mut out).await?;
-    stderr.read_to_string(&mut err).await?;
-    attached.join().await?;
-    Ok(out + &err)
 }
 
 /// Rollout-restart a Deployment (patch restartedAt annotation).

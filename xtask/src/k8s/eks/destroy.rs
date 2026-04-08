@@ -40,8 +40,6 @@
 //! recovery window on their own when re-created with the same name);
 //! the tfstate bucket (xtask `bootstrap` owns that lifecycle).
 
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
@@ -410,30 +408,6 @@ async fn tofu_destroy() -> Result<()> {
             // captured + last-line tailed at default verbosity). 20-40
             // minutes for an EKS+RDS+NAT teardown is normal.
             tofu::destroy(TF_DIR)
-        },
-    )
-    .await
-}
-
-/// Poll for `kubectl get nodeclaim` to be empty. Unused — `kubectl
-/// delete --wait` handles this — but kept as a typed escape hatch in
-/// case Karpenter's finalizer wedges (drop to `--wait=false` above and
-/// call this with a longer timeout).
-#[allow(dead_code)]
-async fn wait_nodeclaims_gone(timeout: Duration) -> Result<()> {
-    ui::poll(
-        "NodeClaims terminated",
-        Duration::from_secs(10),
-        (timeout.as_secs() / 10) as u32,
-        || async {
-            let sh = shell()?;
-            // try_read: error message — not stderr dump — on failure.
-            let out = sh::try_read(cmd!(
-                sh,
-                "kubectl get nodeclaim --no-headers --ignore-not-found"
-            ))
-            .unwrap_or_default();
-            Ok(out.trim().is_empty().then_some(()))
         },
     )
     .await
