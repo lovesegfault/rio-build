@@ -1,13 +1,13 @@
 //! Build + register the NixOS node AMI (ADR-021).
 //!
-//!   1. nix build .#node-ami-<arch>  → result/ with disk image +
+//!   1. `nix build .#node-ami-<arch>`  → result/ with disk image +
 //!      nix-support/image-info.json
-//!   2. coldsnap upload <image>      → EBS snapshot (EBS Direct API,
+//!   2. `coldsnap upload <image>`      → EBS snapshot (EBS Direct API,
 //!      no S3 / VM-Import round-trip)
-//!   3. aws ec2 register-image       → AMI ID
-//!   4. aws ec2 create-tags          → rio.build/ami=<tag>,
-//!      rio.build/git-sha=<sha>, kubernetes.io/arch=<arch>,
-//!      karpenter.sh/discovery=<cluster>
+//!   3. `aws ec2 register-image`       → AMI ID
+//!   4. `aws ec2 create-tags`          → `rio.build/ami=<tag>`,
+//!      `rio.build/git-sha=<sha>`, `kubernetes.io/arch=<arch>`,
+//!      `karpenter.sh/discovery=<cluster>`
 //!
 //! Idempotent (I-182): the `rio.build/ami` tag value is the first 12
 //! hex of `sha256(drvPath_x86_64 ++ drvPath_aarch64)` — content-
