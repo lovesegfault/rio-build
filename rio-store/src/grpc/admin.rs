@@ -4,6 +4,15 @@
 //! populating `extra_roots` from live builds (via GcRoots actor
 //! command). Separate service from StoreService so admin ops can
 //! have separate RBAC (more privileged than PutPath).
+//
+// WONTFIX: GCStatus RPC — TriggerGC's streaming GCProgress already
+// surfaces last_swept/resurrected/in_progress; no separate snapshot
+// RPC needed.
+//
+// TODO: signing-key admin RPCs (AddTenantKey/ListTenantKeys/
+// RetireTenantKey/RotateClusterKey) — manual psql is the current
+// workflow; see the "Signing keys" section of
+// docs/src/components/store.md.
 
 use std::sync::Arc;
 

@@ -290,7 +290,7 @@ src/
 │   ├── mod.rs         # AdminService impl dispatch
 │   ├── builds.rs      # ListBuilds / GetBuild / CancelBuild
 │   ├── estimator.rs   # GetEstimatorStats: per-drv-name EMA snapshot dump
-│   ├── gc.rs          # TriggerGC / GCStatus
+│   ├── gc.rs          # TriggerGC
 │   ├── graph.rs       # GetBuildGraph (induced-subgraph walk, node cap)
 │   ├── logs.rs        # GetBuildLogs (ring buffer + S3 replay)
 │   ├── manifest.rs    # GetCapacityManifest: per-ready-derivation bucketed resource manifest
@@ -334,7 +334,7 @@ src/
 │   └── chunk.rs       # S3-compatible chunk backend
 ├── grpc/
 │   ├── mod.rs         # StoreService + ChunkService skeleton
-│   ├── admin.rs       # Store AdminService (GCStatus, TriggerGC, tenant-key mgmt, upstream CRUD)
+│   ├── admin.rs       # Store AdminService (TriggerGC, VerifyChunks, upstream CRUD, GetLoad)
 │   ├── put_path/
 │   │   ├── mod.rs     # PutPath streaming handler
 │   │   └── common.rs  # Shared PutPath/PutPathBatch write-ahead state machine steps

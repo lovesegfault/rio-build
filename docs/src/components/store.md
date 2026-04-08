@@ -42,13 +42,10 @@ Two hash algorithms are used, in strictly separated domains:
 | NAR hash in narinfo | SHA-256 | `sha256:1b3a...` |
 | Store path computation | SHA-256 | `/nix/store/{hash}-name` |
 | narinfo signature | SHA-256 | signed over fingerprint |
-| CA output hash | SHA-256 | `ContentLookup` key |
+| CA output hash | SHA-256 | `realisations.output_hash` |
 | Chunk storage key | BLAKE3 | `chunks/a3/a3f7...` |
 
-`ContentLookupRequest` takes a SHA-256 NAR hash, never BLAKE3. These domains must never be confused. Inline blobs are not separately keyed — they are stored by `store_path_hash` in the `manifests` table alongside their narinfo.
-
-r[store.content.self-exclude]
-The `ContentLookup` RPC MUST accept an optional `exclude_store_path` filter. When set, the lookup returns a match ONLY if the content exists under a DIFFERENT store path. This prevents a just-uploaded output from matching its own `content_index` row during the CA cutoff-compare (which would falsely report "seen before" on the first-ever build, cascading `Skipped` to downstream builds that should run).
+These domains must never be confused. Inline blobs are not separately keyed — they are stored by `store_path_hash` in the `manifests` table alongside their narinfo.
 
 ## Content Integrity Verification
 
@@ -113,7 +110,6 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 | `QueryPathFromHashPart(hash_part)` | Resolve full store path from 32-char nixbase32 hash prefix (`r[store.api.hash-part]`) |
 | `AddSignatures(store_path, sigs)` | Append ed25519 signatures to existing narinfo (`r[store.api.add-signatures]`) |
 | `RegisterRealisation` / `QueryRealisation` | CA derivation output mapping (`r[store.realisation.register]`, `r[store.realisation.query]`) |
-| `ContentLookup(content_hash)` | Find existing store path with matching content (CA cutoff) |
 
 ### Batch Query RPCs
 
@@ -246,8 +242,7 @@ Authenticated narinfo requests MUST filter results by `path_tenants.tenant_id = 
 r[store.key.rotation-cluster-history]
 The cluster signing key MAY be rotated. Prior cluster public keys MUST remain in the trusted set for `sig_visibility_gate` verification until the grace period expires — otherwise paths signed under the old key become invisible to cross-tenant reads when `path_tenants` row count hits zero (CASCADE on tenant deletion). Prior keys are loaded from `cluster_key_history` alongside the active `Signer`.
 
-r[store.key.admin-cli]
-Cluster key rotation history and per-tenant signing keys MUST be manageable via `rio-cli keys`. The CLI validates pubkey entry format (`name:base64(32-byte-ed25519-pubkey)`) before INSERT — malformed entries are rejected with a specific reason (missing separator, bad base64, wrong length, invalid curve point). Retirement sets `retired_at`, preserving the audit trail; deletion is not exposed. Manual `psql` remains possible but bypasses validation — load-time checks (`r[store.key.rotation-cluster-history]`) catch malformed rows regardless.
+> **Future work:** cluster key rotation history and per-tenant signing keys are intended to be manageable via a `rio-cli keys` subcommand (validating `name:base64(32-byte-ed25519-pubkey)` format before INSERT; retirement sets `retired_at` to preserve the audit trail). Until that lands, manual `psql` is the workflow — load-time checks (`r[store.key.rotation-cluster-history]`) catch malformed rows regardless. See `// TODO:` in `rio-store/src/grpc/admin.rs`.
 
 ### Realisations
 
@@ -448,17 +443,6 @@ CREATE TABLE chunks (
 CREATE INDEX idx_chunks_gc ON chunks (blake3_hash)
     WHERE refcount = 0 AND deleted = FALSE;
 
--- Per-tenant path visibility is in the path_tenants junction (migration 012),
--- not a per-column tenant_id. content_index.tenant_id remains nullable and
--- unused (migration 002 predates the junction-table design).
-CREATE TABLE content_index (
-    content_hash     BYTEA NOT NULL,           -- SHA-256 output content hash
-    store_path_hash  BYTEA NOT NULL
-                     REFERENCES narinfo(store_path_hash) ON DELETE CASCADE,
-    tenant_id        UUID,
-    PRIMARY KEY (content_hash, store_path_hash)
-);
-
 -- CA derivation realisations (populated on CA build completion)
 CREATE TABLE realisations (
     drv_hash         BYTEA NOT NULL,              -- modular derivation hash
@@ -531,7 +515,6 @@ CREATE INDEX idx_pending_s3_deletes_drain
 - `rio-store/src/cas.rs` --- put_chunked orchestration, ChunkCache (moka LRU + singleflight + BLAKE3 verify)
 - `rio-store/src/chunker.rs` --- FastCDC wrapper (16K/64K/256K min/avg/max)
 - `rio-store/src/manifest.rs` --- Chunk manifest (de)serialization, versioned binary format
-- `rio-store/src/content_index.rs` --- nar_hash → store_path reverse index (CA ContentLookup)
 - `rio-store/src/realisations.rs` --- CA (drv_hash, output_name) → output_path mapping
 - `rio-store/src/cache_server/` --- axum binary cache HTTP (narinfo + nar.zst routes)
 - `rio-store/src/signing.rs` --- ed25519 narinfo signing at PutPath time
