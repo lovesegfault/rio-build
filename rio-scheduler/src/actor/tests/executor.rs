@@ -820,19 +820,17 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
     use crate::assignment::SizeClassConfig;
     let db = TestDb::new(&MIGRATOR).await;
     let classes = ["tiny", "small", "medium", "large", "xlarge"];
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(
-            classes
-                .iter()
-                .enumerate()
-                .map(|(i, n)| SizeClassConfig {
-                    name: (*n).into(),
-                    cutoff_secs: 30.0 * (i + 1) as f64,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                })
-                .collect(),
-        )
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = classes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| SizeClassConfig {
+                name: (*n).into(),
+                cutoff_secs: 30.0 * (i + 1) as f64,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            })
+            .collect();
     });
 
     let _ev = merge_single_node(
@@ -982,15 +980,15 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
     use crate::assignment::FetcherSizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_fetcher_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.fetcher_size_classes = vec![
             FetcherSizeClassConfig {
                 name: "tiny".into(),
             },
             FetcherSizeClassConfig {
                 name: "small".into(),
             },
-        ])
+        ];
     });
 
     let mut rx = connect_fetcher_classed(&handle, "f-tiny", "x86_64-linux", "tiny").await?;
@@ -1055,8 +1053,8 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "tiny".into(),
                 cutoff_secs: 30.0,
@@ -1069,7 +1067,7 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
 
     let mut rx = connect_builder_classed(&handle, "b-tiny", "x86_64-linux", "tiny").await?;
@@ -1144,8 +1142,8 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "tiny".into(),
                 cutoff_secs: 30.0,
@@ -1158,7 +1156,7 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
 
     // Ephemeral builder, classed "tiny". connect_builder_classed +
@@ -1230,8 +1228,8 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "tiny".into(),
                 cutoff_secs: 30.0,
@@ -1244,7 +1242,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
 
     let mut rx = connect_builder_classed(&handle, "b-eph2", "x86_64-linux", "tiny").await?;

@@ -450,12 +450,10 @@ async fn main() -> anyhow::Result<()> {
             rio_scheduler::lease::LeaderState::always_leader(Arc::clone(&generation))
         }
     };
-    // Clone for the health toggle loop + lease loop BEFORE
-    // moving into spawn. Both need the same shared Arcs the actor
-    // gets; spawn_with_leader consumes the LeaderState.
-    let is_leader_for_health = Arc::clone(&leader.is_leader);
-    let is_leader_for_grpc = Arc::clone(&leader.is_leader);
-    let recovery_complete_for_lease = Arc::clone(&leader.recovery_complete);
+    // Clone for the health toggle loop + gRPC layer. The actor and
+    // lease task each get a `LeaderState` clone (cheap triple-Arc).
+    let is_leader_for_health = leader.is_leader_arc();
+    let is_leader_for_grpc = leader.is_leader_arc();
 
     // Spawn the event-log persister. Bounded mpsc + single drain
     // task → FIFO write ordering (fire-and-forget spawns would
@@ -474,30 +472,30 @@ async fn main() -> anyhow::Result<()> {
         info!("HMAC assignment token signing enabled");
     }
 
-    // Spawn the DAG actor — now with the shared leader state.
-    //
-    // Poison + retry: P0219 shipped PoisonConfig/RetryPolicy and
-    // the builders; spawn_with_leader chains .with_poison_config
-    // + .with_retry_policy internally. We pass the `[poison]` and
-    // `[retry]` tables loaded from scheduler.toml (or their
-    // defaults via `#[serde(default)]` if absent). Grouped with
-    // size_classes: all three are structural deploy config, no
-    // CLI override.
-    let actor = ActorHandle::spawn_with_leader(
+    // Spawn the DAG actor with the shared leader state. Poison +
+    // retry + size_classes come from scheduler.toml (or
+    // `#[serde(default)]` if absent — same behavior unless the
+    // operator writes a `[poison]` / `[retry]` table).
+    let actor = ActorHandle::spawn(
         db,
-        store_client,
-        log_flush_tx,
-        cfg.size_classes,
-        cfg.fetcher_size_classes,
-        cfg.soft_features,
-        cfg.poison,
-        cfg.retry,
-        cfg.substitute_max_concurrent,
-        cfg.headroom_multiplier,
-        Some(leader),
-        Some(event_persist_tx),
-        hmac_signer,
-        shutdown.clone(),
+        rio_scheduler::actor::DagActorConfig {
+            size_classes: cfg.size_classes,
+            fetcher_size_classes: cfg.fetcher_size_classes,
+            soft_features: cfg.soft_features,
+            poison: cfg.poison,
+            retry_policy: cfg.retry,
+            substitute_max_concurrent: cfg.substitute_max_concurrent,
+            headroom_mult: cfg.headroom_multiplier,
+            ..Default::default()
+        },
+        rio_scheduler::actor::DagActorPlumbing {
+            store_client,
+            log_flush_tx,
+            event_persist_tx: Some(event_persist_tx),
+            hmac_signer: hmac_signer.map(Arc::new),
+            leader: leader.clone(),
+            shutdown: shutdown.clone(),
+        },
     );
     info!("DAG actor spawned");
 
@@ -510,15 +508,6 @@ async fn main() -> anyhow::Result<()> {
     // drop the handle and let main() race to exit, the process
     // dies before the PATCH lands and we're back to TTL expiry.
     let lease_loop = lease_cfg.map(|lease_cfg| {
-        // Reconstruct LeaderState from the SAME Arcs. We moved
-        // the original into spawn_with_leader; clone the
-        // underlying atomics back out. (They're Arc<Atomic*>;
-        // clone is cheap and shares the instance.)
-        let lease_state = rio_scheduler::lease::LeaderState {
-            generation,
-            is_leader: Arc::clone(&is_leader_for_health),
-            recovery_complete: recovery_complete_for_lease,
-        };
         // Pass actor.clone() for fire-and-forget LeaderAcquired.
         // The lease loop does NOT block on recovery — it keeps
         // renewing while the actor handles LeaderAcquired.
@@ -526,7 +515,7 @@ async fn main() -> anyhow::Result<()> {
             "lease-loop",
             rio_scheduler::lease::run_lease_loop(
                 lease_cfg,
-                lease_state,
+                leader,
                 actor.clone(),
                 shutdown.clone(),
             ),

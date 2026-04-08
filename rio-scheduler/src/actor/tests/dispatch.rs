@@ -24,8 +24,8 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "small".into(),
                 cutoff_secs: 30.0,
@@ -38,7 +38,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
 
     // Connect TWO workers: one small (will NOT get the big build),
@@ -1256,21 +1256,21 @@ async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
     use crate::assignment::FetcherSizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_fetcher_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.fetcher_size_classes = vec![
             FetcherSizeClassConfig {
                 name: "tiny".into(),
             },
             FetcherSizeClassConfig {
                 name: "small".into(),
             },
-        ])
+        ];
         // Zero backoff so the retry redispatches on the next Tick
         // (default is 5s exponential — test would need to sleep).
-        .with_retry_policy(crate::RetryPolicy {
+        c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
             ..Default::default()
-        })
+        };
     });
 
     // Two tiny fetchers, one small. With floor=None the FOD would
@@ -1428,8 +1428,8 @@ async fn builder_size_class_floor_skips_smaller() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "tiny".into(),
                 cutoff_secs: 30.0,
@@ -1442,13 +1442,13 @@ async fn builder_size_class_floor_skips_smaller() -> TestResult {
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
         // Zero backoff so the retry redispatches on the next Tick
         // (default is 5s exponential — test would need to sleep).
-        .with_retry_policy(crate::RetryPolicy {
+        c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
             ..Default::default()
-        })
+        };
     });
 
     // Two tiny builders, one small. With floor=None and est_dur=30s

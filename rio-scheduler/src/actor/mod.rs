@@ -24,7 +24,7 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
-use crate::estimator::{BucketedEstimate, Estimator};
+use crate::estimator::Estimator;
 use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
@@ -36,7 +36,16 @@ use crate::state::{
 mod command;
 pub use command::*;
 
+mod config;
+pub use config::{DagActorConfig, DagActorPlumbing};
+
 mod recovery;
+mod snapshot;
+
+#[cfg(test)]
+mod debug;
+#[cfg(test)]
+use debug::backdate;
 
 /// Channel capacity for the actor command channel.
 pub const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
@@ -97,18 +106,6 @@ const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_se
 const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_secs(45);
 #[cfg(test)]
 const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Backdate an Instant by `secs_ago` seconds. `checked_sub` is used
-/// defensively: if `secs_ago` is absurd (e.g. `u64::MAX`) and
-/// `Instant::now()` can't represent that far back, clamp to "now"
-/// (effectively 0 elapsed). Tokio paused time can't mock `Instant`
-/// — this is why the DebugBackdate* handlers exist at all.
-#[cfg(test)]
-fn backdate(secs_ago: u64) -> Instant {
-    Instant::now()
-        .checked_sub(std::time::Duration::from_secs(secs_ago))
-        .unwrap_or_else(Instant::now)
-}
 
 /// The DAG actor state.
 pub struct DagActor {
@@ -361,148 +358,79 @@ pub struct DagActor {
 }
 
 impl DagActor {
-    /// Create a new actor with the given database handle and optional store client.
+    /// Create a new actor.
     ///
-    /// `store_client` is used for the scheduler-side cache check (closes the
-    /// TOCTOU window between the gateway's FindMissingPaths and DAG merge).
-    /// Pass `None` to skip this check (tests, or if the store is unavailable).
-    pub fn new(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
+    /// `cfg` holds operator deploy config (scheduler.toml / env);
+    /// `plumbing` holds runtime channels and shared leader state. Both
+    /// are `Default`-able — tests / non-K8s spawns can
+    /// `..Default::default()` and override one or two fields.
+    pub fn new(db: SchedulerDb, cfg: DagActorConfig, plumbing: DagActorPlumbing) -> Self {
+        // Snapshot the as-loaded cutoffs BEFORE the rebalancer sees
+        // them. GetSizeClassSnapshot reports both: effective (mutated
+        // hourly) vs configured (this snapshot) for drift visibility.
+        let configured_cutoffs = cfg
+            .size_classes
+            .iter()
+            .map(|c| (c.name.clone(), c.cutoff_secs))
+            .collect();
+        let size_classes = Arc::new(parking_lot::RwLock::new(cfg.size_classes));
+        // I-204: soft-feature stripping is configured on the DAG. Stored
+        // on the actor (not just the DAG) because `clear_persisted_state`
+        // replaces `self.dag` on every leader transition — the actor copy
+        // is what survives. The class-order snapshot (for I-213 floor-hint
+        // comparison) is derived from the SAME size_classes the rebalancer
+        // shares, so soft_features always sees the right order.
+        let mut dag = DerivationDag::new();
+        let order = crate::assignment::builder_class_order(&size_classes.read());
+        dag.set_soft_features(cfg.soft_features.clone(), order);
+
         Self {
-            dag: DerivationDag::new(),
+            dag,
             ready_queue: ReadyQueue::new(),
             builds: HashMap::new(),
             build_events: HashMap::new(),
             build_sequences: HashMap::new(),
             build_progress_at: HashMap::new(),
             executors: HashMap::new(),
-            retry_policy: RetryPolicy::default(),
-            poison_config: PoisonConfig::default(),
+            retry_policy: cfg.retry_policy,
+            poison_config: cfg.poison,
             db,
-            store_client,
-            grpc_timeout: rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            substitute_max_concurrent: DEFAULT_SUBSTITUTE_CONCURRENCY,
+            store_client: plumbing.store_client,
+            grpc_timeout: cfg.grpc_timeout,
+            substitute_max_concurrent: cfg.substitute_max_concurrent,
             cache_breaker: CacheCheckBreaker::default(),
             estimator: Estimator::default(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
-            // 1 not 0: proto-default is 0. gen=0 tells workers "field
-            // unset" (old scheduler); gen=1 is the real first generation.
-            generation: Arc::new(AtomicU64::new(1)),
+            generation: plumbing.leader.generation_arc(),
             self_tx: None,
-            size_classes: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            fetcher_size_classes: Vec::new(),
-            soft_features: Vec::new(),
-            headroom_mult: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER,
-            configured_cutoffs: Vec::new(),
-            log_flush_tx: None,
-            // Default true: non-K8s mode, always leader.
-            // with_leader_flag() overrides for K8s deployments.
-            is_leader: Arc::new(AtomicBool::new(true)),
-            // Default true: non-K8s mode has no lease acquire →
-            // no recovery trigger. DAG starts empty (as before).
-            // with_leader_flag() sets this to the shared Arc from
-            // LeaderState (initialized false there) so K8s
-            // deployments gate on recovery.
-            recovery_complete: Arc::new(AtomicBool::new(true)),
-            event_persist_tx: None,
-            hmac_signer: None,
-            shutdown: rio_common::signal::Token::new(),
+            size_classes,
+            fetcher_size_classes: cfg.fetcher_size_classes,
+            soft_features: cfg.soft_features,
+            headroom_mult: cfg.headroom_mult,
+            configured_cutoffs,
+            log_flush_tx: plumbing.log_flush_tx,
+            is_leader: plumbing.leader.is_leader_arc(),
+            recovery_complete: plumbing.leader.recovery_complete_arc(),
+            event_persist_tx: plumbing.event_persist_tx,
+            hmac_signer: plumbing.hmac_signer,
+            shutdown: plumbing.shutdown,
             fod_freeze_since: None,
             builder_freeze_since: None,
             dispatch_dirty: false,
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
-            recovery_toctou_gate: None,
+            recovery_toctou_gate: plumbing.recovery_toctou_gate,
         }
     }
 
     /// Receiver for the cached [`ClusterSnapshot`]. Called once by
-    /// `ActorHandle::spawn_with_leader` (and the test helper) before
+    /// `ActorHandle::spawn` (and the test helper) before
     /// `run_with_self_tx` — same pattern as `backpressure_flag` /
     /// `generation_reader`. Additional subscribers are fine
     /// (`watch::Sender::subscribe` is cheap, single-slot).
     pub fn snapshot_receiver(&self) -> watch::Receiver<Arc<ClusterSnapshot>> {
         self.snapshot_tx.subscribe()
-    }
-
-    /// Enable HMAC signing for assignment tokens. Builder-style.
-    /// Key loaded by main.rs from `hmac_key_path` config.
-    pub fn with_hmac_signer(mut self, signer: rio_common::hmac::HmacSigner) -> Self {
-        self.hmac_signer = Some(Arc::new(signer));
-        self
-    }
-
-    /// Inject the event-log persister channel. Call before
-    /// `run_with_self_tx`. Separate from `new()` (same rationale as
-    /// `with_log_flusher`): tests without PG leave it None →
-    /// emit_build_event skips the try_send, broadcast still works.
-    pub fn with_event_persister(
-        mut self,
-        tx: mpsc::Sender<crate::event_log::EventLogEntry>,
-    ) -> Self {
-        self.event_persist_tx = Some(tx);
-        self
-    }
-
-    /// Inject the log flusher channel. Call before `run_with_self_tx`.
-    /// Separate from `new()` because tests don't have S3 and the None default
-    /// there keeps `new()`'s signature stable.
-    pub fn with_log_flusher(mut self, tx: mpsc::Sender<crate::logs::FlushRequest>) -> Self {
-        self.log_flush_tx = Some(tx);
-        self
-    }
-
-    /// Inject size-class config. Empty vec (the default) = no
-    /// classification → all workers are candidates for all builds.
-    /// Separate from `new()` for the same reason as `with_log_flusher`:
-    /// tests don't need it, and deployments without size-class routing
-    /// (VM tests phase1a/1b/2a/2b) leave size_classes unconfigured.
-    pub fn with_size_classes(mut self, classes: Vec<crate::assignment::SizeClassConfig>) -> Self {
-        // Snapshot the as-loaded cutoffs BEFORE the rebalancer sees
-        // them. GetSizeClassSnapshot reports both: effective (mutated
-        // hourly) vs configured (this snapshot) for drift visibility.
-        self.configured_cutoffs = classes
-            .iter()
-            .map(|c| (c.name.clone(), c.cutoff_secs))
-            .collect();
-        self.size_classes = Arc::new(parking_lot::RwLock::new(classes));
-        self
-    }
-
-    /// Inject fetcher size-class config (I-170). Empty vec (the
-    /// default) = no fetcher class filter → FODs route to any
-    /// fetcher (original behavior). Separate from `with_size_classes`:
-    /// builder classes carry `cutoff_secs` and feed the rebalancer;
-    /// fetcher classes are just an ordered name list for reactive
-    /// promotion.
-    pub fn with_fetcher_size_classes(
-        mut self,
-        classes: Vec<crate::assignment::FetcherSizeClassConfig>,
-    ) -> Self {
-        self.fetcher_size_classes = classes;
-        self
-    }
-
-    /// Inject soft-feature config (I-204). `requiredSystemFeatures`
-    /// values listed here are stripped from each derivation's
-    /// `required_features` at DAG insertion, so neither spawn-snapshot
-    /// nor dispatch treat them as hardware gates. Empty (the default)
-    /// preserves pre-I-204 behavior — every feature is a gate.
-    ///
-    /// Stored on the actor (not just the DAG) because
-    /// `clear_persisted_state` replaces `self.dag` on every leader
-    /// transition — the actor copy is what survives.
-    ///
-    /// MUST be called after [`Self::with_size_classes`]: the DAG
-    /// snapshot of class-order (for I-213 floor-hint comparison) is
-    /// computed here. main.rs's `validate()` asserts the call-order
-    /// invariant indirectly (every `floor_hint` must name a known
-    /// class), and `handle.rs` wires them in the right order.
-    pub fn with_soft_features(mut self, soft: Vec<crate::assignment::SoftFeature>) -> Self {
-        let order = crate::assignment::builder_class_order(&self.size_classes.read());
-        self.dag.set_soft_features(soft.clone(), order);
-        self.soft_features = soft;
-        self
     }
 
     /// Reset DAG + per-build maps to empty. Called on leader-acquire,
@@ -522,56 +450,6 @@ impl DagActor {
         self.builds.clear();
         self.build_events.clear();
         self.build_sequences.clear();
-    }
-
-    /// Inject poison-detection config. Default (3 distinct workers)
-    /// matches prior `POISON_THRESHOLD` const behavior. Overriding
-    /// `require_distinct_workers=false` lets single-worker dev
-    /// deployments poison after N failures on the same worker.
-    pub fn with_poison_config(mut self, config: PoisonConfig) -> Self {
-        self.poison_config = config;
-        self
-    }
-
-    /// Inject retry backoff policy. Default: 2 retries, 5s→300s
-    /// exponential with 20% jitter. Same builder pattern as
-    /// `with_poison_config` — main.rs loads both from scheduler.toml
-    /// and threads them through `spawn_with_leader`.
-    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
-        self.retry_policy = policy;
-        self
-    }
-
-    /// Override the store-RPC timeout. Production leaves the default
-    /// (30s); slow-store regression tests set 3s so the wrapper-exists
-    /// proof costs ~3s wall-clock instead of ~30s. See the
-    /// [`grpc_timeout`](Self#structfield.grpc_timeout) field doc for why
-    /// this is plumbed rather than `cfg(test)`-gated.
-    pub fn with_grpc_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.grpc_timeout = timeout;
-        self
-    }
-
-    /// Inject the ADR-020 headroom multiplier. main.rs threads
-    /// `cfg.headroom_multiplier` through so dispatch-time resource-fit
-    /// and the manifest RPC both see the same operator-configured
-    /// value. Default [`DEFAULT_HEADROOM_MULTIPLIER`] (1.25). Same
-    /// builder-style optionality as `with_size_classes`.
-    ///
-    /// [`DEFAULT_HEADROOM_MULTIPLIER`]: crate::estimator::DEFAULT_HEADROOM_MULTIPLIER
-    pub fn with_headroom_mult(mut self, mult: f64) -> Self {
-        self.headroom_mult = mult;
-        self
-    }
-
-    /// Override the eager-substitute-fetch concurrency cap. Production
-    /// sets via `RIO_SUBSTITUTE_MAX_CONCURRENT`; tests leave the
-    /// default. See the
-    /// [`substitute_max_concurrent`](Self#structfield.substitute_max_concurrent)
-    /// field doc.
-    pub fn with_substitute_concurrency(mut self, n: usize) -> Self {
-        self.substitute_max_concurrent = n;
-        self
     }
 
     /// Run the actor with a weak clone of its own sender for scheduling
@@ -905,25 +783,6 @@ impl DagActor {
     // Dispatch-arm handlers extracted from run_inner
     // -----------------------------------------------------------------------
 
-    fn handle_list_executors(&self) -> Vec<command::ExecutorSnapshot> {
-        self.executors
-            .values()
-            .map(|w| command::ExecutorSnapshot {
-                executor_id: w.executor_id.clone(),
-                kind: w.kind,
-                systems: w.systems.clone(),
-                supported_features: w.supported_features.clone(),
-                running_builds: u32::from(w.running_build.is_some()),
-                draining: w.is_draining(),
-                store_degraded: w.store_degraded,
-                size_class: w.size_class.clone(),
-                connected_since: w.connected_since,
-                last_heartbeat: w.last_heartbeat,
-                last_resources: w.last_resources,
-            })
-            .collect()
-    }
-
     /// Resolve drv_path → drv_hash → interested_builds, then emit
     /// `BuildEvent::Log` on each build's broadcast channel. The gateway
     /// already handles Event::Log (handler/build.rs:27-32) — it
@@ -1023,230 +882,6 @@ impl DagActor {
         });
     }
 
-    /// Actor in-memory snapshot of a build's derivations cross-referenced
-    /// with the live stream pool. I-025 diagnostic: `executor_has_stream`
-    /// is false when a derivation is Assigned to an executor whose gRPC
-    /// bidi stream is gone from `self.executors` — dispatch can never
-    /// complete. PG (`rio-cli workers`) may still show the executor as
-    /// alive; only the actor's HashMap knows the stream is dead.
-    fn handle_inspect_build_dag(
-        &self,
-        build_id: Uuid,
-    ) -> (Vec<rio_proto::types::DerivationDiagnostic>, Vec<String>) {
-        let now = std::time::Instant::now();
-        let derivations = self
-            .dag
-            .iter_nodes()
-            .filter(|(_, s)| s.interested_builds.contains(&build_id))
-            .map(|(_, s)| {
-                let assigned_executor = s
-                    .assigned_executor
-                    .as_ref()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default();
-                // THE I-025 signal.
-                let executor_has_stream = s
-                    .assigned_executor
-                    .as_ref()
-                    .is_some_and(|e| self.executors.contains_key(e));
-                let backoff_remaining_secs = s
-                    .retry
-                    .backoff_until
-                    .and_then(|deadline| deadline.checked_duration_since(now))
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                // I-062: for Ready derivations, simulate hard_filter
-                // against every executor and name the first rejecting
-                // clause. O(ready × executors) per RPC — fine for a
-                // debug call. Non-Ready get an empty vec (the question
-                // doesn't apply).
-                let rejections = if s.status() == DerivationStatus::Ready {
-                    self.executors
-                        .values()
-                        .map(|w| rio_proto::types::ExecutorRejection {
-                            executor_id: w.executor_id.to_string(),
-                            reason: crate::assignment::rejection_reason(w, s, None)
-                                .unwrap_or("ACCEPT")
-                                .to_string(),
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                rio_proto::types::DerivationDiagnostic {
-                    drv_path: s.drv_path().to_string(),
-                    drv_hash: s.drv_hash.to_string(),
-                    status: format!("{:?}", s.status()),
-                    is_fod: s.is_fixed_output,
-                    assigned_executor,
-                    executor_has_stream,
-                    retry_count: s.retry.count,
-                    infra_retry_count: s.retry.infra_count,
-                    backoff_remaining_secs,
-                    interested_build_count: s.interested_builds.len() as u32,
-                    system: s.system.clone(),
-                    required_features: s.required_features.clone(),
-                    failed_builders: s
-                        .retry
-                        .failed_builders
-                        .iter()
-                        .map(|e| e.to_string())
-                        .collect(),
-                    rejections,
-                }
-            })
-            .collect();
-        let live_executor_ids = self.executors.keys().map(|e| e.to_string()).collect();
-        (derivations, live_executor_ids)
-    }
-
-    /// Snapshot the in-memory executor map. Backs both unit-test
-    /// assertions and the `DebugListExecutors` RPC (`rio-cli workers
-    /// --actor`). The fields beyond the original four are the I-048b/c
-    /// post-mortem additions: `has_stream` and `kind` together would
-    /// have collapsed that investigation into one look — PG showed
-    /// fetchers `[alive]`, but the actor map had zero fetcher-kind
-    /// entries with `has_stream=true`.
-    fn handle_debug_query_workers(&self) -> Vec<DebugExecutorInfo> {
-        self.executors
-            .values()
-            .map(|w| DebugExecutorInfo {
-                executor_id: w.executor_id.to_string(),
-                has_stream: w.stream_tx.is_some(),
-                is_registered: w.is_registered(),
-                warm: w.warm,
-                kind: w.kind,
-                systems: w.systems.clone(),
-                last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
-                running_count: usize::from(w.running_build.is_some()),
-                running_builds: w.running_build.iter().map(|h| h.to_string()).collect(),
-                draining: w.is_draining(),
-                store_degraded: w.store_degraded,
-            })
-            .collect()
-    }
-
-    // ----- cfg(test) debug handlers ----------------------------------
-
-    #[cfg(test)]
-    fn handle_debug_query_derivation(&self, drv_hash: &str) -> Option<DebugDerivationInfo> {
-        self.dag.node(drv_hash).map(|s| DebugDerivationInfo {
-            status: s.status(),
-            assigned_executor: s.assigned_executor.as_ref().map(|w| w.to_string()),
-            output_paths: s.output_paths.clone(),
-            retry: s.retry.clone(),
-            ca: s.ca.clone(),
-            sched: s.sched.clone(),
-        })
-    }
-
-    /// Force Ready→Assigned (or Failed→Ready→Assigned) bypassing
-    /// backoff + failed_builders exclusion. For retry/poison tests
-    /// that need to drive multiple completion cycles without waiting
-    /// for real backoff. Clears `backoff_until`.
-    #[cfg(test)]
-    fn handle_debug_force_assign(&mut self, drv_hash: &str, executor_id: &ExecutorId) -> bool {
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return false;
-        };
-        // If not already Ready, try to get there. Assigned/Running →
-        // reset_to_ready, Failed → transition Ready, Ready → no-op.
-        let prepped = match state.status() {
-            DerivationStatus::Ready => true,
-            DerivationStatus::Assigned | DerivationStatus::Running => {
-                state.reset_to_ready().is_ok()
-            }
-            DerivationStatus::Failed => state.transition(DerivationStatus::Ready).is_ok(),
-            _ => false, // terminal or pre-Ready: can't force
-        };
-        if !prepped {
-            return false;
-        }
-        state.retry.backoff_until = None;
-        state.assigned_executor = Some(executor_id.clone());
-        let assigned = state.transition(DerivationStatus::Assigned).is_ok();
-        // Set worker's running build so subsequent complete_failure
-        // finds a consistent state.
-        if let Some(w) = self.executors.get_mut(executor_id) {
-            w.running_build = Some(drv_hash.into());
-        }
-        assigned
-    }
-
-    /// Force to Running with `running_since` backdated. Used by
-    /// backstop-timeout tests (`handle_tick` checks Running +
-    /// `running_since > threshold`). The cfg(test) backstop floor is
-    /// 0s so any `secs_ago > 0` triggers the backstop on Tick.
-    #[cfg(test)]
-    fn handle_debug_backdate_running(&mut self, drv_hash: &str, secs_ago: u64) -> bool {
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return false;
-        };
-        // Transition to Running if not already there. Assigned →
-        // Running is a valid transition; Ready/Created would fail
-        // (need Assigned first). DebugForceAssign → Assigned, then
-        // this → Running is the typical test sequence.
-        let running = match state.status() {
-            DerivationStatus::Running => true,
-            DerivationStatus::Assigned => state.transition(DerivationStatus::Running).is_ok(),
-            _ => false,
-        };
-        if running {
-            state.running_since = Some(backdate(secs_ago));
-        }
-        running
-    }
-
-    /// Backdate `submitted_at` for per-build-timeout tests.
-    /// `handle_tick`'s `r[sched.timeout.per-build]` check uses
-    /// `submitted_at.elapsed()` — a `std::time::Instant`, which tokio
-    /// paused time cannot mock (and paused time breaks PG pool
-    /// timeouts anyway).
-    #[cfg(test)]
-    fn handle_debug_backdate_submitted(&mut self, build_id: Uuid, secs_ago: u64) -> bool {
-        let Some(build) = self.builds.get_mut(&build_id) else {
-            return false;
-        };
-        build.submitted_at = backdate(secs_ago);
-        true
-    }
-
-    /// Force a derivation into `Poisoned` with the given `retry_count`.
-    /// For the I-169 resubmit-bound tests.
-    #[cfg(test)]
-    fn handle_debug_force_poisoned(&mut self, drv_hash: &str, retry_count: u32) -> bool {
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return false;
-        };
-        state.set_status_for_test(DerivationStatus::Poisoned);
-        state.retry.count = retry_count;
-        state.retry.poisoned_at = Some(std::time::Instant::now());
-        true
-    }
-
-    /// Clear `drv_content` to simulate post-recovery state (DAG
-    /// reloaded from PG, drv_content not persisted). For CA
-    /// recovery-fetch tests.
-    #[cfg(test)]
-    fn handle_debug_clear_drv_content(&mut self, drv_hash: &str) -> bool {
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return false;
-        };
-        state.drv_content.clear();
-        true
-    }
-
-    /// Trip the cache-check circuit breaker directly. For CA
-    /// cutoff-compare breaker-gate tests — bypasses the
-    /// N-failing-SubmitBuild dance.
-    #[cfg(test)]
-    fn handle_debug_trip_breaker(&mut self, n: u32) -> bool {
-        for _ in 0..n {
-            let _ = self.cache_breaker.record_failure();
-        }
-        self.cache_breaker.is_open()
-    }
-
     // -----------------------------------------------------------------------
     // Backpressure
     // -----------------------------------------------------------------------
@@ -1289,634 +924,6 @@ impl DagActor {
     /// handle consumers can't accidentally increment.
     pub(crate) fn generation_reader(&self) -> GenerationReader {
         GenerationReader::new(Arc::clone(&self.generation))
-    }
-
-    /// Inject the shared `is_leader` flag. The lease task writes;
-    /// `dispatch_ready` reads. Builder-style — call before
-    /// `run_with_self_tx`. Default (no call) is `true` (non-K8s
-    /// mode: always leader).
-    pub fn with_leader_flag(mut self, is_leader: Arc<AtomicBool>) -> Self {
-        self.is_leader = is_leader;
-        self
-    }
-
-    /// Inject the shared generation Arc. The lease task writes
-    /// via `fetch_add`; dispatch reads for WorkAssignment;
-    /// ActorHandle reads for HeartbeatResponse. REPLACES the
-    /// default `Arc::new(AtomicU64::new(1))` — caller initializes
-    /// to 1 too so behavior is identical, but now shared.
-    ///
-    /// Paired with `with_leader_flag` — both come from the same
-    /// `LeaderState`. spawn_with_leader calls both.
-    pub fn with_generation(mut self, generation: Arc<AtomicU64>) -> Self {
-        self.generation = generation;
-        self
-    }
-
-    /// Inject the shared recovery_complete flag. The actor's
-    /// `handle_leader_acquired` sets it; the lease loop clears it
-    /// on lose. dispatch_ready gates on it. REPLACES the default
-    /// `Arc::new(true)` (non-K8s mode: no recovery needed).
-    ///
-    /// Triad with `with_leader_flag` + `with_generation` — all
-    /// three come from the same `LeaderState`.
-    pub fn with_recovery_flag(mut self, recovery_complete: Arc<AtomicBool>) -> Self {
-        self.recovery_complete = recovery_complete;
-        self
-    }
-
-    /// Test-only: install a oneshot gate pair for deterministic
-    /// interleaving in `handle_leader_acquired`. See the field doc.
-    #[cfg(test)]
-    pub fn with_recovery_toctou_gate(
-        mut self,
-        reached_tx: oneshot::Sender<()>,
-        release_rx: oneshot::Receiver<()>,
-    ) -> Self {
-        self.recovery_toctou_gate = Some((reached_tx, release_rx));
-        self
-    }
-
-    /// Inject the shutdown token from `shutdown_signal()`. The run
-    /// loop `select!`s on `token.cancelled()` with `biased` ordering
-    /// so SIGTERM drains workers immediately. REPLACES the default
-    /// never-cancelled token from `new()`. Only `spawn_with_leader`
-    /// (production path) calls this; test actors keep the default.
-    pub fn with_shutdown_token(mut self, token: rio_common::signal::Token) -> Self {
-        self.shutdown = token;
-        self
-    }
-
-    /// Compute counts for `AdminService.ClusterStatus`.
-    ///
-    /// O(workers + builds + dag_nodes) per call. The autoscaler polls
-    /// every 30s; even with 10k active derivations that's ~300μs/call —
-    /// not worth maintaining incremental counters. Revisit if dashboards
-    /// start polling at 1Hz.
-    ///
-    /// `as u32` casts: if any collection exceeds 4B entries, truncation
-    /// is the LEAST of our problems. The `ready_queue.len()` is bounded
-    /// by `ACTOR_CHANNEL_CAPACITY × derivations_per_submit` anyway (you
-    /// can't enqueue what you can't merge).
-    fn compute_cluster_snapshot(&self) -> ClusterSnapshot {
-        let mut active_executors = 0u32;
-        let mut draining_executors = 0u32;
-        // Single pass: registered ∧ ¬draining → active. draining →
-        // draining (regardless of registered — a draining worker that
-        // lost its stream mid-drain is still "draining" for the
-        // controller's "how many pods are shutting down" question).
-        for w in self.executors.values() {
-            if w.is_draining() {
-                draining_executors += 1;
-            } else if w.is_registered() {
-                active_executors += 1;
-            }
-        }
-
-        let mut pending_builds = 0u32;
-        let mut active_builds = 0u32;
-        for b in self.builds.values() {
-            match b.state() {
-                BuildState::Pending => pending_builds += 1,
-                BuildState::Active => active_builds += 1,
-                // Terminal builds stay in the map until CleanupTerminalBuild
-                // (delayed ~30s). Don't count them — they're not "active"
-                // in any autoscaling sense. Unspecified never appears
-                // (proto3 default-0; scheduler always sets a real state).
-                BuildState::Succeeded
-                | BuildState::Failed
-                | BuildState::Cancelled
-                | BuildState::Unspecified => {}
-            }
-        }
-
-        // Running = Assigned | Running. Both mean "a worker slot is taken."
-        // Assigned hasn't acked yet but the slot is reserved; for "how
-        // busy are workers" they're equivalent.
-        //
-        // Queued-FOD: total in-flight FOD demand (Ready | Assigned |
-        // Running). This is the FetcherPool autoscaler signal. Ready-only
-        // (the pre-P0541 definition) undercounts: with N fetchers, the
-        // first N FODs go Ready→Assigned within one dispatch tick (~10s),
-        // so a 30s controller poll sees Ready=0 and never scales past N.
-        // Including Assigned+Running makes the signal match "pods I want"
-        // — same shape as `queued_derivations + running_derivations` for
-        // the BuilderPool scaler. The DAG iteration is the source —
-        // `ready_queue` is hash+priority only, no FOD bit.
-        let mut running_derivations = 0u32;
-        let mut queued_fod_derivations = 0u32;
-        let mut queued_by_system: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        for (_, s) in self.dag.iter_nodes() {
-            match s.status() {
-                DerivationStatus::Assigned | DerivationStatus::Running => {
-                    running_derivations += 1;
-                    if s.is_fixed_output {
-                        queued_fod_derivations += 1;
-                    }
-                }
-                DerivationStatus::Ready => {
-                    // I-107: per-system queued breakdown so per-arch
-                    // BuilderPools scale on their own backlog. Ready-only
-                    // to match `queued_derivations` (= ready_queue.len())
-                    // semantics — sum across keys equals the scalar.
-                    *queued_by_system.entry(s.system.clone()).or_default() += 1;
-                    if s.is_fixed_output {
-                        queued_fod_derivations += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        ClusterSnapshot {
-            total_executors: self.executors.len() as u32,
-            active_executors,
-            draining_executors,
-            pending_builds,
-            active_builds,
-            queued_derivations: self.ready_queue.len() as u32,
-            running_derivations,
-            queued_fod_derivations,
-            queued_by_system,
-        }
-    }
-
-    /// Compute per-size-class snapshot for `GetSizeClassStatus`.
-    ///
-    /// Three passes:
-    /// 1. `size_classes.read()` → effective cutoffs (post-rebalancer)
-    /// 2. `configured_cutoffs` lookup → static TOML cutoffs
-    /// 3. Single `iter_nodes()` pass: for each derivation, increment
-    ///    the appropriate class's `queued` or `running` counter.
-    ///
-    /// For **queued**: Ready-status derivations. They haven't been
-    /// dispatched yet so `assigned_size_class` is None. We call
-    /// `classify()` with the SAME inputs dispatch would use
-    /// (est_duration + estimator peaks) — this is a forecast, not a
-    /// fact. If the rebalancer shifts cutoffs between this call and
-    /// actual dispatch, the class may differ. Acceptable for an
-    /// operator view.
-    ///
-    /// For **running**: Assigned/Running derivations. Use
-    /// `assigned_size_class` directly — that's the class we ACTUALLY
-    /// routed to (may be larger than classify() would give if we
-    /// overflowed due to no capacity in the target class).
-    ///
-    /// O(dag_nodes + n_classes) per call. The classify() inside the
-    /// loop is O(n_classes) but n_classes is ~3-5. Total cost is
-    /// dominated by the node iteration, same as `compute_cluster_snapshot`.
-    ///
-    /// `pool_features`: I-176 feature filter. `None` = unfiltered.
-    /// `Some(f)` = only count Ready derivations whose
-    /// `required_features ⊆ f` — the same subset check
-    /// `rejection_reason()`'s `feature-missing` clause applies. The
-    /// controller passes `BuilderPool.spec.features` here so each
-    /// pool's spawn decision sees only derivations its workers could
-    /// accept.
-    // pub(crate) for the configured-vs-effective test (tests/misc.rs)
-    // which exercises it on a bare (unspawned) actor so it can mutate
-    // size_classes directly to simulate a rebalancer pass.
-    pub(crate) fn compute_size_class_snapshot(
-        &self,
-        pool_features: Option<&[String]>,
-    ) -> Vec<SizeClassSnapshot> {
-        // Take a read lock for the whole computation. Rebalancer
-        // writes hourly; contention is near-zero. Dropped at end of
-        // scope (no await in this fn).
-        let classes = self.size_classes.read();
-        if classes.is_empty() {
-            // Feature off — return empty. Handler maps to empty
-            // response which the CLI can render as "size-class
-            // routing disabled."
-            return Vec::new();
-        }
-
-        // name → index into `snapshots`. classify() and
-        // assigned_size_class both return names, not indices.
-        let mut index: HashMap<String, usize> = HashMap::with_capacity(classes.len());
-        // I-146: index of the smallest-cutoff class. Fallback bucket
-        // for any Ready non-FOD that classify() somehow doesn't place
-        // — every dispatchable derivation MUST count in some class so
-        // the controller never sees queued=0 across all pools while
-        // ready_queue is non-empty (which would scale every pool to 0
-        // and deadlock dispatch). With the current classify() contract
-        // (always Some when classes non-empty) the fallback is
-        // unreachable; it's defensive against future classify changes
-        // and makes the "sum(queued) == Ready non-FOD count" invariant
-        // structural rather than incidental.
-        let mut smallest_idx = 0usize;
-        let mut snapshots: Vec<SizeClassSnapshot> = classes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                index.insert(c.name.clone(), i);
-                if c.cutoff_secs < classes[smallest_idx].cutoff_secs {
-                    smallest_idx = i;
-                }
-                // configured_cutoffs lookup: linear scan is fine for
-                // ~3-5 classes. Falls back to effective if not found
-                // (shouldn't happen — both populated from the same
-                // config in with_size_classes, but defensive against
-                // a future config-reload path that forgets one).
-                let configured = self
-                    .configured_cutoffs
-                    .iter()
-                    .find(|(n, _)| n == &c.name)
-                    .map(|(_, cut)| *cut)
-                    .unwrap_or(c.cutoff_secs);
-                SizeClassSnapshot {
-                    name: c.name.clone(),
-                    effective_cutoff_secs: c.cutoff_secs,
-                    configured_cutoff_secs: configured,
-                    queued: 0,
-                    running: 0,
-                    queued_by_system: HashMap::new(),
-                    running_by_system: HashMap::new(),
-                }
-            })
-            .collect();
-
-        // Single pass: classify or look up per derivation.
-        for (_, state) in self.dag.iter_nodes() {
-            match state.status() {
-                DerivationStatus::Ready => {
-                    // I-146: FODs dispatch to fetchers, NOT size-class
-                    // builders (find_executor_with_overflow skips the
-                    // overflow chain entirely for is_fixed_output —
-                    // ADR-019). Counting them here would inflate
-                    // builder-pool demand for work those builders will
-                    // never receive. The Running arm already excludes
-                    // FODs implicitly (assigned_size_class=None for FOD
-                    // dispatch); this makes Ready symmetric. FOD demand
-                    // is reported via ClusterSnapshot.queued_fod_
-                    // derivations → FetcherPool autoscaler.
-                    if state.is_fixed_output {
-                        continue;
-                    }
-                    // r[impl sched.sizeclass.feature-filter+2]
-                    // I-176: skip derivations a worker with
-                    // `pool_features` couldn't build. Mirrors the
-                    // `feature-missing` clause in rejection_reason()
-                    // — a kvm derivation never counts toward a
-                    // featureless pool's spawn decision (it would
-                    // spawn a builder that hard_filter rejects), and
-                    // a kvm pool sees kvm-required work even when
-                    // classify() buckets it into a class no kvm pool
-                    // owns. `None` = no filter (CLI, status display).
-                    if let Some(pf) = pool_features {
-                        // I-181: feature-gated pools (non-empty pf)
-                        // don't count featureless work — ∅ ⊆ anything
-                        // would over-spawn; the featureless pool owns
-                        // it. dispatch_ready's overflow walk tries the
-                        // cheapest pool first, so a kvm builder spawned
-                        // for ∅-feature work would idle until
-                        // activeDeadlineSeconds.
-                        if !pf.is_empty() && state.required_features.is_empty() {
-                            continue;
-                        }
-                        // I-176: subset check. Derivation needs a
-                        // feature this pool lacks → skip. ∅-pf
-                        // (featureless pool) passes only ∅-feature
-                        // derivations (all() over empty is vacuously
-                        // true, contains() over non-empty fails).
-                        if !state.required_features.iter().all(|f| pf.contains(f)) {
-                            continue;
-                        }
-                    }
-                    // Forecast: what class WOULD dispatch pick?
-                    // Same inputs as dispatch.rs — est_duration stored
-                    // on the state at merge time; peak_memory /
-                    // peak_cpu from the estimator. classify() is
-                    // contractually Some when classes is non-empty
-                    // (checked above), so the .and_then chain resolves;
-                    // .unwrap_or(smallest_idx) is the I-146 belt: if a
-                    // future classify() change introduces a None path,
-                    // the derivation lands in the smallest class
-                    // (matching dispatch's "any worker" semantics for
-                    // target_class=None) rather than vanishing from
-                    // every pool's queued count.
-                    let classify_idx = crate::assignment::classify(
-                        state.sched.est_duration,
-                        self.estimator
-                            .peak_memory(state.pname.as_deref(), &state.system),
-                        self.estimator
-                            .peak_cpu(state.pname.as_deref(), &state.system),
-                        &classes,
-                    )
-                    .and_then(|c| index.get(&c).copied())
-                    .unwrap_or(smallest_idx);
-                    // r[impl sched.sizeclass.snapshot-honors-floor]
-                    // I-187: clamp at `size_class_floor` — the same
-                    // `max(target_cutoff, floor_cutoff)` dispatch.rs
-                    // applies in `find_executor_with_overflow`. A
-                    // derivation promoted tiny→small via I-177 still
-                    // classifies as tiny (EMA is success-only); without
-                    // this clamp the snapshot reports `tiny.queued=1`,
-                    // controller spawns tiny, dispatch rejects
-                    // (floor>tiny), tiny idles 120s → disconnects →
-                    // I-173 bumps floor again → spawn loop. A floor
-                    // not in the current config (stale) degrades to
-                    // no-clamp via `index.get()=None` — same fallback
-                    // as dispatch's `cutoff_for()=None`.
-                    let i = state
-                        .sched
-                        .size_class_floor
-                        .as_deref()
-                        .and_then(|f| index.get(f).copied())
-                        .filter(|&fi| classes[fi].cutoff_secs > classes[classify_idx].cutoff_secs)
-                        .unwrap_or(classify_idx);
-                    snapshots[i].queued += 1;
-                    // I-143: per-system breakdown so per-arch
-                    // size-class pools scale on their own backlog.
-                    *snapshots[i]
-                        .queued_by_system
-                        .entry(state.system.clone())
-                        .or_default() += 1;
-                }
-                DerivationStatus::Assigned | DerivationStatus::Running => {
-                    // Fact: what class DID we dispatch to?
-                    // assigned_size_class reflects overflow — if the
-                    // target was "small" but only "large" had
-                    // capacity, this says "large". That's the
-                    // operator-relevant answer for "where are my
-                    // workers busy?"
-                    if let Some(class) = &state.sched.assigned_size_class
-                        && let Some(&i) = index.get(class)
-                    {
-                        snapshots[i].running += 1;
-                        *snapshots[i]
-                            .running_by_system
-                            .entry(state.system.clone())
-                            .or_default() += 1;
-                    }
-                }
-                // Terminal + pre-Ready: neither queued nor running.
-                _ => {}
-            }
-        }
-
-        // Sort by effective cutoff ascending — smallest class first.
-        // The proto doc says "sorted by effective_cutoff_secs";
-        // consumers (P0236's CLI table, P0234's autoscaler) can rely
-        // on this order. total_cmp for NaN-safety (same defense as
-        // assignment.rs:106).
-        snapshots.sort_by(|a, b| a.effective_cutoff_secs.total_cmp(&b.effective_cutoff_secs));
-        snapshots
-    }
-
-    /// Per-FOD-class snapshot for `GetSizeClassStatus.fod_classes`
-    /// (P0556). Buckets in-flight FODs by `size_class_floor` so the
-    /// ephemeral FetcherPool reconciler can spawn per-class Jobs
-    /// instead of stamping the smallest class only.
-    ///
-    /// Unlike [`compute_size_class_snapshot`] there is no `classify()`
-    /// forecast: FODs have no a-priori size signal (ADR-019), so the
-    /// floor IS the routing decision. `floor=None` (never failed —
-    /// the cold-start majority) buckets to `fetcher_size_classes[0]`.
-    /// An unknown floor name (config drift: scheduler restarted with
-    /// fewer classes) also buckets to `[0]` — same conservative
-    /// fallback as I-146 for builder classes.
-    ///
-    /// `queued` here is **in-flight demand** (Ready+Assigned+Running),
-    /// matching [`ClusterSnapshot::queued_fod_derivations`] semantics
-    /// so `Σ fod_classes[i].queued == queued_fod_derivations`. The
-    /// controller's `spawn_count(queued, active, headroom)` subtracts
-    /// per-class active Jobs, so including Assigned/Running is the
-    /// right shape (an Assigned FOD has a Job; spawn_count won't
-    /// double-spawn for it). `running` is the Assigned+Running subset
-    /// — informational for operators/dashboards.
-    ///
-    /// Preserves `fetcher_size_classes` config order (smallest→largest);
-    /// no sort step (no cutoffs to sort by).
-    // r[impl sched.fod.size-class-reactive]
-    pub(crate) fn compute_fod_size_class_snapshot(&self) -> Vec<SizeClassSnapshot> {
-        if self.fetcher_size_classes.is_empty() {
-            return Vec::new();
-        }
-        let mut index: HashMap<String, usize> =
-            HashMap::with_capacity(self.fetcher_size_classes.len());
-        let mut snapshots: Vec<SizeClassSnapshot> = self
-            .fetcher_size_classes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                index.insert(c.name.clone(), i);
-                SizeClassSnapshot {
-                    name: c.name.clone(),
-                    // No duration cutoffs for fetcher classes — routing
-                    // is reactive-only. Zeroed; proto consumers ignore
-                    // these for fod_classes.
-                    effective_cutoff_secs: 0.0,
-                    configured_cutoff_secs: 0.0,
-                    queued: 0,
-                    running: 0,
-                    queued_by_system: HashMap::new(),
-                    running_by_system: HashMap::new(),
-                }
-            })
-            .collect();
-
-        for (_, state) in self.dag.iter_nodes() {
-            if !state.is_fixed_output {
-                continue;
-            }
-            let in_flight = matches!(
-                state.status(),
-                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
-            );
-            if !in_flight {
-                continue;
-            }
-            // floor=None → smallest (index 0, config-order convention).
-            // Unknown floor (config drift) → also smallest.
-            let i = state
-                .sched
-                .size_class_floor
-                .as_ref()
-                .and_then(|f| index.get(f).copied())
-                .unwrap_or(0);
-            snapshots[i].queued += 1;
-            *snapshots[i]
-                .queued_by_system
-                .entry(state.system.clone())
-                .or_default() += 1;
-            if matches!(
-                state.status(),
-                DerivationStatus::Assigned | DerivationStatus::Running
-            ) {
-                snapshots[i].running += 1;
-                *snapshots[i]
-                    .running_by_system
-                    .entry(state.system.clone())
-                    .or_default() += 1;
-            }
-        }
-        snapshots
-    }
-
-    /// Bucketed resource estimates for `GetCapacityManifest` (ADR-020).
-    ///
-    /// Iterates DAG nodes filtered to `Ready` status — same set
-    /// `ready_queue.len()` counts for `queued_derivations`. For each:
-    /// look up `(pname, system)` in the estimator, apply headroom,
-    /// bucket to 4GiB/2000mcore.
-    ///
-    /// Omissions (controller uses its operator-configured floor for
-    /// each missing estimate):
-    /// - `pname` is `None`: no key for `build_history` lookup
-    /// - No history entry: cold start (never built before)
-    /// - No memory sample: `bucketed_estimate` returns `None`
-    pub(crate) fn compute_capacity_manifest(&self) -> Vec<BucketedEstimate> {
-        let mut out = Vec::new();
-        for (_, state) in self.dag.iter_nodes() {
-            if state.status() != DerivationStatus::Ready {
-                continue;
-            }
-            let Some(pname) = state.pname.as_deref() else {
-                continue;
-            };
-            let Some(entry) = self.estimator.lookup_entry(pname, &state.system) else {
-                continue;
-            };
-            if let Some(b) = Estimator::bucketed_estimate(&entry, self.headroom_mult) {
-                out.push(b);
-            }
-        }
-        out
-    }
-
-    /// Per-`(pname, system)` estimator dump for `GetEstimatorStats`
-    /// (I-124). Walks the in-memory `build_history` snapshot and
-    /// classifies each entry under the CURRENT effective cutoffs —
-    /// the same `self.size_classes.read()` dispatch uses, post-
-    /// rebalancer drift. Filtering + sorting happen handler-side
-    /// (admin/estimator.rs); this returns the full set.
-    pub(crate) fn compute_estimator_stats(&self) -> Vec<EstimatorStatsEntry> {
-        let classes = self.size_classes.read();
-        self.estimator
-            .iter_history()
-            .map(|((pname, system), entry)| EstimatorStatsEntry {
-                pname: pname.clone(),
-                system: system.clone(),
-                sample_count: entry.sample_count,
-                ema_duration_secs: entry.ema_duration_secs,
-                ema_peak_memory_bytes: entry.ema_peak_memory_bytes,
-                size_class: crate::assignment::classify(
-                    entry.ema_duration_secs,
-                    entry.ema_peak_memory_bytes,
-                    entry.ema_peak_cpu_cores,
-                    &classes,
-                ),
-            })
-            .collect()
-    }
-
-    /// Test-only: inject a derivation directly into the DAG at `Ready`
-    /// status. Bypasses MergeDag + PG persist. For populating
-    /// `compute_capacity_manifest` preconditions without the full
-    /// merge-proto-node dance.
-    #[cfg(test)]
-    pub(crate) fn test_inject_ready(&mut self, hash: &str, pname: Option<&str>, system: &str) {
-        self.test_inject_ready_with_features(hash, pname, system, &[]);
-    }
-
-    /// [`Self::test_inject_ready`] with `required_features` populated.
-    /// For the I-176 feature-filter snapshot tests.
-    #[cfg(test)]
-    pub(crate) fn test_inject_ready_with_features(
-        &mut self,
-        hash: &str,
-        pname: Option<&str>,
-        system: &str,
-        required_features: &[&str],
-    ) {
-        let row = crate::db::RecoveryDerivationRow {
-            derivation_id: uuid::Uuid::new_v4(),
-            drv_hash: hash.to_string(),
-            drv_path: rio_test_support::fixtures::test_drv_path(hash),
-            pname: pname.map(String::from),
-            system: system.to_string(),
-            status: "ready".into(),
-            required_features: required_features.iter().map(|s| s.to_string()).collect(),
-            assigned_builder_id: None,
-            retry_count: 0,
-            expected_output_paths: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            is_ca: false,
-            failed_builders: vec![],
-            size_class_floor: None,
-        };
-        let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
-            .expect("test_drv_path generates valid StorePath");
-        self.dag.insert_recovered_node(state);
-    }
-
-    /// Inject a Ready non-FOD with a given `size_class_floor`. For the
-    /// I-187 snapshot-honors-floor test — bypasses the
-    /// disconnect→`promote_size_class_floor` dance.
-    #[cfg(test)]
-    pub(crate) fn test_inject_ready_with_floor(
-        &mut self,
-        hash: &str,
-        system: &str,
-        floor: Option<&str>,
-    ) {
-        let row = crate::db::RecoveryDerivationRow {
-            derivation_id: uuid::Uuid::new_v4(),
-            drv_hash: hash.to_string(),
-            drv_path: rio_test_support::fixtures::test_drv_path(hash),
-            pname: None,
-            system: system.to_string(),
-            status: "ready".into(),
-            required_features: vec![],
-            assigned_builder_id: None,
-            retry_count: 0,
-            expected_output_paths: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            is_ca: false,
-            failed_builders: vec![],
-            size_class_floor: floor.map(String::from),
-        };
-        let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
-            .expect("test_drv_path generates valid StorePath");
-        self.dag.insert_recovered_node(state);
-    }
-
-    /// Inject a Ready FOD with a given `size_class_floor` directly
-    /// into the DAG. For `compute_fod_size_class_snapshot` tests
-    /// (P0556) — bypasses the merge+fail-to-promote dance.
-    #[cfg(test)]
-    pub(crate) fn test_inject_ready_fod(&mut self, hash: &str, system: &str, floor: Option<&str>) {
-        let row = crate::db::RecoveryDerivationRow {
-            derivation_id: uuid::Uuid::new_v4(),
-            drv_hash: hash.to_string(),
-            drv_path: rio_test_support::fixtures::test_drv_path(hash),
-            pname: None,
-            system: system.to_string(),
-            status: "ready".into(),
-            required_features: vec![],
-            assigned_builder_id: None,
-            retry_count: 0,
-            expected_output_paths: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: true,
-            is_ca: false,
-            failed_builders: vec![],
-            size_class_floor: floor.map(String::from),
-        };
-        let state = crate::state::DerivationState::from_recovery_row(row, DerivationStatus::Ready)
-            .expect("test_drv_path generates valid StorePath");
-        self.dag.insert_recovered_node(state);
-    }
-
-    /// Test-only: seed the Estimator directly, bypassing the Tick
-    /// refresh path. Pairs with [`Self::test_inject_ready`].
-    #[cfg(test)]
-    pub(crate) fn test_refresh_estimator(&mut self, rows: Vec<crate::db::BuildHistoryRow>) {
-        self.estimator.refresh(rows);
     }
 
     // -----------------------------------------------------------------------

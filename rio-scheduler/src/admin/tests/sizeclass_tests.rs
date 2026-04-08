@@ -40,15 +40,15 @@ async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> 
     use crate::assignment::FetcherSizeClassConfig;
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
-    let (actor, task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_fetcher_size_classes(vec![
+    let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.fetcher_size_classes = vec![
             FetcherSizeClassConfig {
                 name: "tiny".into(),
             },
             FetcherSizeClassConfig {
                 name: "small".into(),
             },
-        ])
+        ];
     });
     let svc = AdminServiceImpl::new(
         Arc::new(LogBuffers::new()),
@@ -92,8 +92,8 @@ async fn test_get_size_class_status_reports_configured_classes() -> anyhow::Resu
     use crate::assignment::SizeClassConfig;
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
-    let (actor, task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "small".into(),
                 cutoff_secs: 60.0,
@@ -106,7 +106,7 @@ async fn test_get_size_class_status_reports_configured_classes() -> anyhow::Resu
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
     let svc = AdminServiceImpl::new(
         Arc::new(LogBuffers::new()),

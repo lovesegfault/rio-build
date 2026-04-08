@@ -216,7 +216,7 @@ impl BenchHarness {
         // without it, which is fine for the ready-scan isolation the
         // dispatch bench wants).
         let sched_db = SchedulerDb::new(pool.clone());
-        let actor = ActorHandle::spawn(sched_db, None, None, vec![]);
+        let actor = ActorHandle::spawn(sched_db, Default::default(), Default::default());
 
         // Production constructor: shared LogBuffers + pool + leader
         // flag. is_leader hardwired true — there's no lease loop in

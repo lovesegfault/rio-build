@@ -231,7 +231,14 @@ async fn test_emit_build_event_filters_log_from_persister() -> TestResult {
     // Small channel (not the production 1000) — 3 events expected,
     // 10 gives headroom if the filter breaks.
     let (tx, mut rx) = mpsc::channel::<crate::event_log::EventLogEntry>(10);
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_event_persister(tx);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            event_persist_tx: Some(tx),
+            ..Default::default()
+        },
+    );
 
     let build_id = Uuid::new_v4();
 
@@ -298,7 +305,14 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     // Dummy channel — just needs is_some() for the gate. Never read.
     let (tx, _rx) = mpsc::channel::<crate::event_log::EventLogEntry>(1);
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_event_persister(tx);
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(),
+        DagActorPlumbing {
+            event_persist_tx: Some(tx),
+            ..Default::default()
+        },
+    );
 
     let build_id = Uuid::new_v4();
     let other_build = Uuid::new_v4();

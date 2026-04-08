@@ -148,22 +148,20 @@ impl LeaseConfig {
 /// [`on_lose`](Self::on_lose) rather than raw field stores — these
 /// encapsulate the multi-field update order.
 ///
-/// Public fields remain for main.rs compat (it clones out the Arcs
-/// for the health-toggle polling loop and reconstructs the struct
-/// literal for the lease task). Readers holding bare `Arc<AtomicBool>`
-/// clones should use SeqCst loads; a one-pass lag on a single flag
-/// is still harmless (idempotency, see module doc) but the ordering
-/// between the three flags is now correct.
+/// `Clone` is a cheap triple-Arc clone; main.rs clones once for the
+/// lease loop, once for the actor, and uses the per-field accessors for
+/// the health-toggle polling loop.
+#[derive(Clone)]
 pub struct LeaderState {
     /// Generation counter. Incremented on each acquisition via
     /// [`on_acquire`](Self::on_acquire). Same Arc as
     /// DagActor.generation (see `generation_arc()` — this IS that
     /// Arc, cloned).
-    pub generation: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
     /// Whether we currently hold the lease. dispatch_ready early-
     /// returns if false (standby schedulers merge DAGs but don't
     /// dispatch — state warm for fast takeover).
-    pub is_leader: Arc<AtomicBool>,
+    is_leader: Arc<AtomicBool>,
     /// Whether recovery has completed. dispatch_ready gates on
     /// BOTH is_leader AND this. Set by handle_leader_acquired
     /// AFTER recover_from_pg finishes. Cleared by
@@ -174,10 +172,50 @@ pub struct LeaderState {
     /// is_leader IMMEDIATELY (non-blocking — must keep renewing),
     /// then fire-and-forgets LeaderAcquired. Recovery may take
     /// seconds; dispatch waits.
-    pub recovery_complete: Arc<AtomicBool>,
+    recovery_complete: Arc<AtomicBool>,
+}
+
+impl Default for LeaderState {
+    /// Non-K8s/test default: leader immediately, generation = 1,
+    /// recovery_complete = true. Same as
+    /// `always_leader(Arc::new(AtomicU64::new(1)))`.
+    fn default() -> Self {
+        Self::always_leader(Arc::new(AtomicU64::new(1)))
+    }
 }
 
 impl LeaderState {
+    /// Shared `is_leader` Arc. SeqCst loads only; writes go through
+    /// [`on_acquire`](Self::on_acquire)/[`on_lose`](Self::on_lose).
+    pub fn is_leader_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_leader)
+    }
+
+    /// Shared `generation` Arc.
+    pub fn generation_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.generation)
+    }
+
+    /// Shared `recovery_complete` Arc.
+    pub fn recovery_complete_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.recovery_complete)
+    }
+
+    /// Construct from pre-existing shared Arcs (test fixtures that need
+    /// to drive the flags from outside the lease loop).
+    #[cfg(test)]
+    pub fn from_parts(
+        generation: Arc<AtomicU64>,
+        is_leader: Arc<AtomicBool>,
+        recovery_complete: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            generation,
+            is_leader,
+            recovery_complete,
+        }
+    }
+
     /// Non-K8s mode: leader immediately, generation stays at 1.
     /// This is what VM tests and single-scheduler deployments see.
     ///

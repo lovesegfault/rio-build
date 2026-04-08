@@ -342,7 +342,7 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
 /// processing must be fast when PG is healthy.
 #[tokio::test]
 async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
-    let f = setup_ca_fixture_configured("ca-slow", |a| a.with_grpc_timeout(Duration::from_secs(3)))
+    let f = setup_ca_fixture_configured("ca-slow", |c, _| c.grpc_timeout = Duration::from_secs(3))
         .await?;
 
     complete_ca(
@@ -933,28 +933,26 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     use crate::assignment::SizeClassConfig;
     let db = TestDb::new(&MIGRATOR).await;
     let classes = ["tiny", "small", "medium", "large", "xlarge"];
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(
-            classes
-                .iter()
-                .enumerate()
-                .map(|(i, n)| SizeClassConfig {
-                    name: (*n).into(),
-                    cutoff_secs: 30.0 * (i + 1) as f64,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                })
-                .collect(),
-        )
-        .with_retry_policy(crate::RetryPolicy {
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = classes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| SizeClassConfig {
+                name: (*n).into(),
+                cutoff_secs: 30.0 * (i + 1) as f64,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            })
+            .collect();
+        c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
             ..Default::default()
-        })
+        };
         // Disable distinct-worker poison so we test ONLY max_retries.
-        .with_poison_config(crate::PoisonConfig {
+        c.poison = crate::PoisonConfig {
             threshold: 99,
             ..Default::default()
-        })
+        };
     });
     let mut rxs = Vec::new();
     for c in classes {
@@ -1098,9 +1096,8 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
     // Raise max_retries so we hit the worker_count clamp, not the
     // max_retries branch (default max_retries=2 would poison on the
     // 2nd failure via retry_count anyway — masking the clamp).
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |mut a| {
-        a.retry_policy.max_retries = 10;
-        a
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.max_retries = 10;
     });
     let _db = db;
 
@@ -1159,9 +1156,8 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
 #[tokio::test]
 async fn test_fleet_exhaustion_is_kind_aware() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |mut a| {
-        a.retry_policy.max_retries = 10;
-        a
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.max_retries = 10;
     });
     let _db = db;
 
@@ -1337,8 +1333,8 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "tiny".into(),
                 cutoff_secs: 30.0,
@@ -1357,13 +1353,13 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
-        .with_retry_policy(crate::RetryPolicy {
+        ];
+        c.retry_policy = crate::RetryPolicy {
             // 2 retries → walks tiny→small, small→medium, then
             // terminal on the 3rd TimedOut.
             max_timeout_retries: 2,
             ..Default::default()
-        })
+        };
     });
 
     // Three classed builders. promote_size_class_floor reads the
@@ -1663,11 +1659,11 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
     // Also max_retries = 5 so we hit the poison-threshold branch,
     // not the max_retries branch (default max_retries=2 would
     // poison at retry_count>=2, masking what we're testing).
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_poison_config(PoisonConfig {
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.poison = PoisonConfig {
             threshold: 3,
             require_distinct_workers: false,
-        })
+        };
     });
     let _db = db;
 
@@ -1751,9 +1747,8 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
     // max_retries so we can observe 3 same-worker failures WITHOUT
     // hitting max_retries. This is the control for the non-distinct
     // test above: same inputs, opposite config, opposite outcome.
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |mut a| {
-        a.retry_policy.max_retries = 10;
-        a
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.retry_policy.max_retries = 10;
     });
     let _db = db;
 
@@ -2096,8 +2091,8 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             SizeClassConfig {
                 name: "small".into(),
                 cutoff_secs: 30.0,
@@ -2110,7 +2105,7 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
 
     // Small worker. No EMA pre-seed → classify() defaults to 30s →

@@ -244,6 +244,31 @@ pub struct RecoveryDerivationRow {
     pub size_class_floor: Option<String>,
 }
 
+#[cfg(test)]
+impl RecoveryDerivationRow {
+    /// Minimal Ready row for `DagActor::test_inject_ready_row`. Callers
+    /// override fields via struct-update.
+    pub fn test_default(hash: &str, system: &str) -> Self {
+        Self {
+            derivation_id: Uuid::new_v4(),
+            drv_hash: hash.to_string(),
+            drv_path: rio_test_support::fixtures::test_drv_path(hash),
+            pname: None,
+            system: system.to_string(),
+            status: "ready".into(),
+            required_features: vec![],
+            assigned_builder_id: None,
+            retry_count: 0,
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            is_ca: false,
+            failed_builders: vec![],
+            size_class_floor: None,
+        }
+    }
+}
+
 /// Row from `load_build_graph` nodes query. Thin — ~200B.
 /// Mirrors proto `GraphNode` (NOT `DerivationNode`, which carries
 /// ≤64KB `drv_content`). `pname` and `assigned_builder_id` are COALESCE'd

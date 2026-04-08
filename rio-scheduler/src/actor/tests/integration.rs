@@ -226,7 +226,11 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
 async fn test_backpressure_hysteresis() {
     let db = TestDb::new(&MIGRATOR).await;
     let scheduler_db = SchedulerDb::new(db.pool.clone());
-    let mut actor = DagActor::new(scheduler_db, None);
+    let mut actor = DagActor::new(
+        scheduler_db,
+        DagActorConfig::default(),
+        DagActorPlumbing::default(),
+    );
     let flag = actor.backpressure_flag();
 
     // Simulate queue at 50% — below high watermark, not active.

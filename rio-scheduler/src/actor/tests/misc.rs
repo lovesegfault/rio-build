@@ -19,9 +19,12 @@ fn spawn_actor_with_flags(
 ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
     let leader_flag = Arc::new(AtomicBool::new(is_leader));
     let recovery_flag = Arc::new(AtomicBool::new(recovery_complete));
-    setup_actor_configured(pool, None, |a| {
-        a.with_leader_flag(leader_flag)
-            .with_recovery_flag(recovery_flag)
+    setup_actor_configured(pool, None, |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            Arc::new(AtomicU64::new(1)),
+            leader_flag,
+            recovery_flag,
+        );
     })
 }
 
@@ -140,8 +143,8 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
 
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
     });
 
     let mut worker_rx = connect_executor(&handle, "hmac-w", "x86_64-linux").await?;
@@ -194,8 +197,8 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let test_key = b"test-clamp-key-at-least-32-bytes!!".to_vec();
 
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
     });
 
     let mut worker_rx = connect_executor(&handle, "clamp-w", "x86_64-linux").await?;
@@ -378,9 +381,8 @@ async fn test_backpressure_hysteresis() -> TestResult {
     // tokio runtime. The method doesn't query — SchedulerDb::new
     // just stores the pool.
     let db = TestDb::new(&MIGRATOR).await;
-    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let mut actor = bare_actor(db.pool.clone());
     let reader = actor.backpressure_flag();
-    let mut actor = actor;
 
     // Start: inactive.
     assert!(!reader.is_active(), "initial: inactive");
@@ -428,7 +430,7 @@ async fn test_shutdown_token_drains_workers() -> TestResult {
     let token = rio_common::signal::Token::new();
     let (handle, task) = setup_actor_configured(db.pool.clone(), None, {
         let token = token.clone();
-        |a| a.with_shutdown_token(token)
+        |_, p| p.shutdown = token
     });
 
     // Connect a worker — gives the actor a stream_tx to drop. Then
@@ -481,20 +483,26 @@ async fn size_class_snapshot_preserves_configured_after_rebalance() {
 
     // Build actor directly (no spawn) so we can call
     // compute_size_class_snapshot and mutate size_classes.
-    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
-        crate::assignment::SizeClassConfig {
-            name: "small".into(),
-            cutoff_secs: 60.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
+    let actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: vec![
+                crate::assignment::SizeClassConfig {
+                    name: "small".into(),
+                    cutoff_secs: 60.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+                crate::assignment::SizeClassConfig {
+                    name: "large".into(),
+                    cutoff_secs: 1800.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+            ],
+            ..Default::default()
         },
-        crate::assignment::SizeClassConfig {
-            name: "large".into(),
-            cutoff_secs: 1800.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
-        },
-    ]);
+    );
 
     // Simulate a rebalancer pass: mutate effective cutoffs in-place.
     {
@@ -529,7 +537,7 @@ async fn size_class_snapshot_preserves_configured_after_rebalance() {
 #[tokio::test]
 async fn size_class_snapshot_empty_when_unconfigured() {
     let db = TestDb::new(&MIGRATOR).await;
-    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let actor = bare_actor(db.pool.clone());
     let snap = actor.compute_size_class_snapshot(None);
     assert!(
         snap.is_empty(),
@@ -556,20 +564,26 @@ async fn size_class_snapshot_empty_when_unconfigured() {
 #[tokio::test]
 async fn size_class_snapshot_feature_filter() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
-        crate::assignment::SizeClassConfig {
-            name: "tiny".into(),
-            cutoff_secs: 60.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: vec![
+                crate::assignment::SizeClassConfig {
+                    name: "tiny".into(),
+                    cutoff_secs: 60.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+                crate::assignment::SizeClassConfig {
+                    name: "xlarge".into(),
+                    cutoff_secs: 3600.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+            ],
+            ..Default::default()
         },
-        crate::assignment::SizeClassConfig {
-            name: "xlarge".into(),
-            cutoff_secs: 3600.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
-        },
-    ]);
+    );
 
     // 3 Ready derivations, all classify as `tiny` (no estimator
     // samples → est_duration=None → smallest class):
@@ -647,14 +661,18 @@ async fn size_class_snapshot_feature_filter() {
 #[tokio::test]
 async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
-        crate::assignment::SizeClassConfig {
-            name: "medium".into(),
-            cutoff_secs: 600.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: vec![crate::assignment::SizeClassConfig {
+                name: "medium".into(),
+                cutoff_secs: 600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            }],
+            ..Default::default()
         },
-    ]);
+    );
 
     // Single Ready derivation, required_features = ∅ (e.g., hello).
     actor.test_inject_ready("hello", None, "x86_64-linux");
@@ -698,17 +716,22 @@ async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
 #[tokio::test]
 async fn size_class_snapshot_soft_features_strip() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
-        .with_size_classes(vec![crate::assignment::SizeClassConfig {
-            name: "medium".into(),
-            cutoff_secs: 600.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
-        }])
-        .with_soft_features(vec![crate::assignment::SoftFeature {
-            name: "big-parallel".into(),
-            floor_hint: None,
-        }]);
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: vec![crate::assignment::SizeClassConfig {
+                name: "medium".into(),
+                cutoff_secs: 600.0,
+                mem_limit_bytes: u64::MAX,
+                cpu_limit_cores: None,
+            }],
+            soft_features: vec![crate::assignment::SoftFeature {
+                name: "big-parallel".into(),
+                floor_hint: None,
+            }],
+            ..Default::default()
+        },
+    );
 
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
     actor.test_inject_ready_with_features("vm", None, "x86_64-linux", &["kvm", "big-parallel"]);
@@ -767,24 +790,29 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
             })
             .collect::<Vec<_>>()
     };
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
-        .with_size_classes(classes(&[
-            ("tiny", 30.0),
-            ("small", 120.0),
-            ("medium", 600.0),
-            ("large", 3600.0),
-            ("xlarge", 36000.0),
-        ]))
-        .with_soft_features(vec![
-            SoftFeature {
-                name: "big-parallel".into(),
-                floor_hint: Some("xlarge".into()),
-            },
-            SoftFeature {
-                name: "benchmark".into(),
-                floor_hint: None,
-            },
-        ]);
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: classes(&[
+                ("tiny", 30.0),
+                ("small", 120.0),
+                ("medium", 600.0),
+                ("large", 3600.0),
+                ("xlarge", 36000.0),
+            ]),
+            soft_features: vec![
+                SoftFeature {
+                    name: "big-parallel".into(),
+                    floor_hint: Some("xlarge".into()),
+                },
+                SoftFeature {
+                    name: "benchmark".into(),
+                    floor_hint: None,
+                },
+            ],
+            ..Default::default()
+        },
+    );
 
     // big-parallel → stripped + floor=xlarge.
     actor.test_inject_ready_with_features("ff", None, "x86_64-linux", &["big-parallel"]);
@@ -814,12 +842,17 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
     // even if a lower-hint feature is stripped. Exercise via a node
     // whose persisted floor (medium) is BELOW the hint (xlarge) →
     // raised; and one whose persisted floor would be ABOVE a lower hint.
-    let mut actor2 = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
-        .with_size_classes(classes(&[("tiny", 30.0), ("xlarge", 36000.0)]))
-        .with_soft_features(vec![SoftFeature {
-            name: "big-parallel".into(),
-            floor_hint: Some("tiny".into()),
-        }]);
+    let mut actor2 = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: classes(&[("tiny", 30.0), ("xlarge", 36000.0)]),
+            soft_features: vec![SoftFeature {
+                name: "big-parallel".into(),
+                floor_hint: Some("tiny".into()),
+            }],
+            ..Default::default()
+        },
+    );
     let row = crate::db::RecoveryDerivationRow {
         derivation_id: uuid::Uuid::new_v4(),
         drv_hash: "persisted".into(),
@@ -881,20 +914,26 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
 #[tokio::test]
 async fn size_class_snapshot_honors_floor() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
-        crate::assignment::SizeClassConfig {
-            name: "tiny".into(),
-            cutoff_secs: 60.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: vec![
+                crate::assignment::SizeClassConfig {
+                    name: "tiny".into(),
+                    cutoff_secs: 60.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+                crate::assignment::SizeClassConfig {
+                    name: "small".into(),
+                    cutoff_secs: 600.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+            ],
+            ..Default::default()
         },
-        crate::assignment::SizeClassConfig {
-            name: "small".into(),
-            cutoff_secs: 600.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
-        },
-    ]);
+    );
 
     // 1 Ready non-FOD: classify()=tiny (no estimator sample → smallest),
     // floor=small (set by I-177 promote_size_class_floor on a prior
@@ -949,20 +988,26 @@ async fn estimator_stats_classifies_under_effective_cutoffs() {
     use crate::assignment::SizeClassConfig;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
-        SizeClassConfig {
-            name: "small".into(),
-            cutoff_secs: 60.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            size_classes: vec![
+                SizeClassConfig {
+                    name: "small".into(),
+                    cutoff_secs: 60.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+                SizeClassConfig {
+                    name: "large".into(),
+                    cutoff_secs: 3600.0,
+                    mem_limit_bytes: u64::MAX,
+                    cpu_limit_cores: None,
+                },
+            ],
+            ..Default::default()
         },
-        SizeClassConfig {
-            name: "large".into(),
-            cutoff_secs: 3600.0,
-            mem_limit_bytes: u64::MAX,
-            cpu_limit_cores: None,
-        },
-    ]);
+    );
 
     actor.test_refresh_estimator(vec![
         ("hello".into(), "x86_64-linux".into(), 5.0, None, None, 12),
@@ -989,7 +1034,7 @@ async fn estimator_stats_classifies_under_effective_cutoffs() {
     assert_eq!(chromium.sample_count, 3);
 
     // Feature off → size_class None for every entry.
-    let mut actor_off = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let mut actor_off = bare_actor(db.pool.clone());
     actor_off.test_refresh_estimator(vec![(
         "hello".into(),
         "x86_64-linux".into(),
@@ -1018,7 +1063,7 @@ async fn capacity_manifest_omits_cold_start() {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let mut actor = bare_actor(db.pool.clone());
 
     actor.test_inject_ready("warm-a", Some("pkg-a"), "x86_64-linux");
     actor.test_inject_ready("warm-b", Some("pkg-b"), "x86_64-linux");
@@ -1070,7 +1115,7 @@ async fn capacity_manifest_omits_cold_start() {
 #[tokio::test]
 async fn capacity_manifest_omits_no_pname() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let mut actor = bare_actor(db.pool.clone());
 
     actor.test_inject_ready("has-name", Some("pkg-named"), "x86_64-linux");
     actor.test_inject_ready("no-name", None, "x86_64-linux");
@@ -1096,7 +1141,7 @@ async fn capacity_manifest_omits_no_pname() {
 #[tokio::test]
 async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let mut actor = bare_actor(db.pool.clone());
 
     // 3 Ready x86_64, 1 Ready aarch64. test_inject_ready only puts the
     // node in the DAG; push_ready() also adds it to ready_queue so the
@@ -1132,15 +1177,20 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
 #[tokio::test]
 async fn fod_size_class_snapshot_buckets_by_floor() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
-        .with_fetcher_size_classes(vec![
-            crate::assignment::FetcherSizeClassConfig {
-                name: "tiny".into(),
-            },
-            crate::assignment::FetcherSizeClassConfig {
-                name: "small".into(),
-            },
-        ]);
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            fetcher_size_classes: vec![
+                crate::assignment::FetcherSizeClassConfig {
+                    name: "tiny".into(),
+                },
+                crate::assignment::FetcherSizeClassConfig {
+                    name: "small".into(),
+                },
+            ],
+            ..Default::default()
+        },
+    );
 
     // 5 FODs: 3 floor=None → tiny; 2 floor=small → small.
     for h in ["f1", "f2", "f3"] {
@@ -1175,7 +1225,7 @@ async fn fod_size_class_snapshot_buckets_by_floor() {
     );
 
     // Feature off → empty.
-    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let actor = bare_actor(db.pool.clone());
     assert!(actor.compute_fod_size_class_snapshot().is_empty());
 }
 
@@ -1184,7 +1234,7 @@ async fn fod_size_class_snapshot_buckets_by_floor() {
 #[tokio::test]
 async fn capacity_manifest_ready_only() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None);
+    let mut actor = bare_actor(db.pool.clone());
 
     // Inject one Ready, then one more and force it to a non-Ready
     // status. Both have the same pname → same history entry applies
@@ -1231,7 +1281,13 @@ async fn dispatch_and_manifest_use_same_headroom() {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_headroom_mult(1.5);
+    let mut actor = bare_actor_cfg(
+        db.pool.clone(),
+        DagActorConfig {
+            headroom_mult: 1.5,
+            ..Default::default()
+        },
+    );
 
     actor.test_inject_ready("drv", Some("pkg"), "x86_64-linux");
     actor.test_refresh_estimator(vec![(
@@ -1277,8 +1333,8 @@ async fn dispatch_and_manifest_use_same_headroom() {
 #[tokio::test]
 async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
-        a.with_size_classes(vec![
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
+        c.size_classes = vec![
             crate::assignment::SizeClassConfig {
                 name: "small".into(),
                 // est_duration defaults to 0.0 (no build_history
@@ -1294,7 +1350,7 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
 
     // Merge 3 single-node DAGs. All three → Ready immediately (no
@@ -1376,10 +1432,10 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
 #[tokio::test]
 async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         // Classes deliberately UNSORTED so the smallest-class fallback
         // can't accidentally rely on index 0 being smallest.
-        a.with_size_classes(vec![
+        c.size_classes = vec![
             crate::assignment::SizeClassConfig {
                 name: "large".into(),
                 cutoff_secs: 3600.0,
@@ -1392,7 +1448,7 @@ async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> Te
                 mem_limit_bytes: u64::MAX,
                 cpu_limit_cores: None,
             },
-        ])
+        ];
     });
 
     // Two non-FOD nodes with pnames the (empty) estimator has never

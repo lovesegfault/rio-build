@@ -27,7 +27,7 @@ pub(crate) fn setup_actor_with_store(
     pool: sqlx::PgPool,
     store_client: Option<StoreServiceClient<Channel>>,
 ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
-    setup_actor_configured(pool, store_client, |a| a)
+    setup_actor_configured(pool, store_client, |_, _| {})
 }
 
 /// Bundle of handles for CA-compare test scenarios. See [`setup_ca_fixture`].
@@ -94,18 +94,17 @@ pub(crate) async fn seed_realisation(
 /// AFTER this returns and BEFORE calling [`complete_ca`]. Verified by
 /// `setup_ca_fixture_does_not_race_past_ca_compare`.
 ///
-/// Tests that need a configured actor (e.g. `with_grpc_timeout`) should
-/// use [`setup_ca_fixture_configured`].
+/// Tests that need a configured actor (e.g. `grpc_timeout`) should use
+/// [`setup_ca_fixture_configured`].
 pub(crate) async fn setup_ca_fixture(key: &str) -> anyhow::Result<CaFixture> {
-    setup_ca_fixture_configured(key, |a| a).await
+    setup_ca_fixture_configured(key, |_, _| {}).await
 }
 
-/// Like [`setup_ca_fixture`] but applies a configurator closure to the
-/// actor before spawn — for tests that need `.with_grpc_timeout()` or
-/// other `DagActor` builder methods.
+/// Like [`setup_ca_fixture`] but lets the caller mutate
+/// `DagActorConfig`/`DagActorPlumbing` before spawn.
 pub(crate) async fn setup_ca_fixture_configured(
     key: &str,
-    configure: impl FnOnce(DagActor) -> DagActor,
+    configure: impl FnOnce(&mut DagActorConfig, &mut DagActorPlumbing),
 ) -> anyhow::Result<CaFixture> {
     let db = TestDb::new(&MIGRATOR).await;
     let (store, store_client, store_task) =
@@ -147,17 +146,24 @@ pub(crate) async fn setup_ca_fixture_configured(
     })
 }
 
-/// Set up an actor with a configurator closure applied before spawn.
-/// For tests that need `.with_size_classes()` / `.with_event_persister()`
-/// etc — avoids reimplementing the full spawn boilerplate inline.
+/// Set up an actor with a configurator closure that mutates
+/// `DagActorConfig`/`DagActorPlumbing` before spawn. For tests that
+/// need custom `size_classes`, `retry_policy`, `event_persist_tx`,
+/// `leader`, etc.
 pub(crate) fn setup_actor_configured(
     pool: sqlx::PgPool,
     store_client: Option<StoreServiceClient<Channel>>,
-    configure: impl FnOnce(DagActor) -> DagActor,
+    configure: impl FnOnce(&mut DagActorConfig, &mut DagActorPlumbing),
 ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
     let db = SchedulerDb::new(pool);
     let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let actor = configure(DagActor::new(db, store_client));
+    let mut cfg = DagActorConfig::default();
+    let mut plumbing = DagActorPlumbing {
+        store_client,
+        ..Default::default()
+    };
+    configure(&mut cfg, &mut plumbing);
+    let actor = DagActor::new(db, cfg, plumbing);
     let backpressure = actor.backpressure_flag();
     let generation = actor.generation_reader();
     let snapshot_rx = actor.snapshot_receiver();
@@ -172,6 +178,16 @@ pub(crate) fn setup_actor_configured(
         },
         task,
     )
+}
+
+/// Construct a bare (unspawned) actor for tests that exercise `&self`
+/// snapshot methods directly.
+pub(crate) fn bare_actor(pool: sqlx::PgPool) -> DagActor {
+    bare_actor_cfg(pool, DagActorConfig::default())
+}
+
+pub(crate) fn bare_actor_cfg(pool: sqlx::PgPool, cfg: DagActorConfig) -> DagActor {
+    DagActor::new(SchedulerDb::new(pool), cfg, DagActorPlumbing::default())
 }
 
 /// Bootstrap an ephemeral PG + actor. The returned `TestDb` MUST be held

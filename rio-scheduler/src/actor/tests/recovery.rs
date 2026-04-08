@@ -1491,10 +1491,13 @@ async fn test_recovery_toctou_gen_bump_discards() -> TestResult {
 
     let gen_for_actor = Arc::clone(&generation);
     let rc_for_actor = Arc::clone(&recovery_complete);
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |a| {
-        a.with_generation(gen_for_actor)
-            .with_recovery_flag(rc_for_actor)
-            .with_recovery_toctou_gate(reached_tx, release_rx)
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            gen_for_actor,
+            Arc::new(AtomicBool::new(true)),
+            rc_for_actor,
+        );
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
     });
 
     // Trigger recovery.
@@ -1552,10 +1555,13 @@ async fn test_recovery_toctou_no_bump_completes() -> TestResult {
 
     let gen_for_actor = Arc::clone(&generation);
     let rc_for_actor = Arc::clone(&recovery_complete);
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |a| {
-        a.with_generation(gen_for_actor)
-            .with_recovery_flag(rc_for_actor)
-            .with_recovery_toctou_gate(reached_tx, release_rx)
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_, p| {
+        p.leader = crate::lease::LeaderState::from_parts(
+            gen_for_actor,
+            Arc::new(AtomicBool::new(true)),
+            rc_for_actor,
+        );
+        p.recovery_toctou_gate = Some((reached_tx, release_rx));
     });
 
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
