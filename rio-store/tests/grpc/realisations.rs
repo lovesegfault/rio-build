@@ -1,81 +1,11 @@
-//! gRPC-level tests for ContentLookup, RegisterRealisation, QueryRealisation.
+//! gRPC-level tests for RegisterRealisation, QueryRealisation.
 //!
-//! The underlying `content_index::lookup` and `realisations::*` are
-//! unit-tested directly; these tests cover the gRPC wrapper's input
-//! validation branches (hash length, empty output_name, missing fields).
+//! The underlying `realisations::*` are unit-tested directly; these
+//! tests cover the gRPC wrapper's input validation branches (hash
+//! length, empty output_name, missing fields).
 
 use super::*;
-use rio_proto::types::{
-    ContentLookupRequest, QueryRealisationRequest, Realisation, RegisterRealisationRequest,
-};
-
-// ---------------------------------------------------------------------------
-// ContentLookup
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn content_lookup_invalid_hash_length() -> TestResult {
-    let mut s = StoreSession::new().await?;
-
-    let err = s
-        .client
-        .content_lookup(ContentLookupRequest {
-            content_hash: vec![0xAA; 16], // != 32
-            exclude_store_path: String::new(),
-        })
-        .await
-        .expect_err("short hash → invalid");
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn content_lookup_not_found_returns_empty_path() -> TestResult {
-    let mut s = StoreSession::new().await?;
-
-    // Proto convention: not-found is empty store_path (not Status::NotFound).
-    let resp = s
-        .client
-        .content_lookup(ContentLookupRequest {
-            content_hash: vec![0xFF; 32],
-            exclude_store_path: String::new(),
-        })
-        .await?
-        .into_inner();
-    assert!(resp.store_path.is_empty(), "miss → empty store_path");
-    assert!(resp.info.is_none());
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn content_lookup_found_after_put_path() -> TestResult {
-    let mut s = StoreSession::new().await?;
-
-    // PutPath writes content_index on completion (store.md:118).
-    // The content_hash IS the nar_hash.
-    let path = test_store_path("content-lookup-hit");
-    let (nar, _h) = make_nar(b"lookup content");
-    let info = make_path_info_for_nar(&path, &nar);
-    let nar_hash = info.nar_hash;
-    put_path(&mut s.client, info, nar)
-        .await
-        .context("put_path")?;
-
-    let resp = s
-        .client
-        .content_lookup(ContentLookupRequest {
-            content_hash: nar_hash.to_vec(),
-            exclude_store_path: String::new(),
-        })
-        .await?
-        .into_inner();
-    assert_eq!(resp.store_path, path);
-    assert!(resp.info.is_some(), "found → info populated");
-
-    Ok(())
-}
+use rio_proto::types::{QueryRealisationRequest, Realisation, RegisterRealisationRequest};
 
 // ---------------------------------------------------------------------------
 // RegisterRealisation — validation branches

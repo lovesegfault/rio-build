@@ -38,33 +38,25 @@ const SWEEP_BATCH_SIZE: usize = 100;
 #[cfg(test)]
 const SWEEP_BATCH_SIZE: usize = 2;
 
-/// Grace period before a standalone chunk (refcount=0, written by
-/// `PutChunk`) becomes GC-eligible.
+/// Grace period before a standalone chunk (refcount=0) becomes
+/// GC-eligible.
 ///
 /// # Why a grace window exists
 ///
-/// Client-side chunking sends PutChunk (per chunk) then PutPath
-/// (manifest). In between, the chunk exists at refcount=0 — no
-/// manifest references it yet. Without a grace window, a GC sweep
-/// running in that gap would see `refcount=0 AND deleted=FALSE`,
-/// reap the chunk, and the subsequent PutPath would bump refcount
-/// to 1 on a chunk whose S3 object is already gone (or queued for
-/// deletion — drain.rs's re-check would save it, but that's the
-/// LAST line of defense, not the first).
+/// `cas::put_chunked` upserts the `chunks` row BEFORE uploading to
+/// S3 (write-ahead). If the upload crashes, the row sits at
+/// refcount=0 with `uploaded_at IS NULL`. A retry of the same
+/// PutPath bumps refcount and clears `deleted`; the grace window
+/// gives that retry time to land before the orphan reaper fires.
 ///
 /// # Why 300s
 ///
-/// Long enough to cover the worst-case PutChunk → PutPath gap: a
-/// worker streaming a 1000-chunk manifest at one-PutChunk-per-RTT
-/// over a 200ms-latency WAN link takes ~200s. 300s gives headroom.
-/// Short enough that a genuinely abandoned chunk (worker crashed
-/// between PutChunk and PutPath) leaks storage for only 5 minutes
-/// before the next sweep reaps it.
-///
-/// Compare `orphan::STALE_THRESHOLD` (2h) — that's for stale
-/// `uploading` manifests, which are rarer (only on crash) and
-/// whose false-positive reaping is costlier (a whole NAR
-/// re-upload). Orphan chunks are cheap to re-PutChunk.
+/// Long enough to cover a stalled-then-retried PutPath; short
+/// enough that a genuinely abandoned chunk leaks storage for only
+/// 5 minutes before the next sweep reaps it. Compare
+/// `orphan::STALE_THRESHOLD` (2h) — that's for stale `uploading`
+/// manifests, whose false-positive reaping is costlier (a whole
+/// NAR re-upload).
 ///
 /// `i64` to match the bind pattern in `orphan.rs` (`make_interval(
 /// secs => $1)` accepts a bigint bind — PG casts it to double
@@ -72,11 +64,11 @@ const SWEEP_BATCH_SIZE: usize = 2;
 pub const CHUNK_GRACE_SECS: i64 = 300;
 
 /// Sweep interval for the orphan-chunk reaper. 1h: orphan chunks
-/// only accumulate on worker crashes between PutChunk and PutPath
-/// (rare), and a chunk leaked for an extra hour costs only its
-/// storage footprint. 15min (matching `orphan::SCAN_INTERVAL`)
-/// would be harmless but wasteful — the partial-index scan is
-/// cheap, but not free.
+/// only accumulate on crashes mid-`cas::put_chunked` (rare), and
+/// a chunk leaked for an extra hour costs only its storage
+/// footprint. 15min (matching `orphan::SCAN_INTERVAL`) would be
+/// harmless but wasteful — the partial-index scan is cheap, but
+/// not free.
 #[cfg(not(test))]
 const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[cfg(test)]
@@ -147,8 +139,7 @@ async fn closure_remove_from_unreachable(
 ///    incrementing a refcount we're about to decrement)
 /// 2. `DELETE realisations` for this path (NO FK to narinfo —
 ///    explicit delete prevents dangling wopQueryRealisation rows)
-/// 3. `DELETE narinfo` (CASCADE → manifests/manifest_data/
-///    content_index)
+/// 3. `DELETE narinfo` (CASCADE → manifests/manifest_data)
 /// 4. `UPDATE chunks SET refcount = refcount - 1`
 /// 5. `UPDATE chunks SET deleted = true WHERE refcount = 0 RETURNING`
 /// 6. `INSERT INTO pending_s3_deletes` for each returned chunk
@@ -419,8 +410,7 @@ pub async fn sweep(
                 .await?;
 
             // Step 2b: DELETE narinfo. CASCADE takes manifests,
-            // manifest_data, content_index (but NOT realisations —
-            // see step 2a above).
+            // manifest_data (but NOT realisations — see step 2a above).
             let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
                 .bind(store_path_hash)
                 .execute(&mut *tx)
@@ -485,9 +475,9 @@ pub async fn sweep(
 /// Sweep standalone chunks: `refcount=0` rows whose grace window
 /// has expired.
 ///
-/// These are chunks written by `PutChunk` that no subsequent
-/// `PutPath` ever claimed. The main [`sweep`] above only touches
-/// chunks as a SIDE EFFECT of path deletion (it decrements
+/// These are chunks left by an interrupted `cas::put_chunked` that
+/// no subsequent retry ever claimed. The main [`sweep`] above only
+/// touches chunks as a SIDE EFFECT of path deletion (it decrements
 /// refcounts for the swept path's chunk_list, then reaps whatever
 /// hit zero). A chunk that STARTED at zero — never referenced by
 /// any manifest — is invisible to that flow. This sweep finds them.
@@ -555,9 +545,9 @@ pub async fn sweep_orphan_chunks(
 
     // Batched transactions. Same SWEEP_BATCH_SIZE rationale as the
     // main sweep: small enough to roll back cheaply, large enough
-    // to amortize. A future pathological case (a worker firing
-    // thousands of PutChunk calls then crashing) produces a large
-    // candidate set; batching keeps each tx bounded.
+    // to amortize. A pathological crash mid-upload of a many-chunk
+    // NAR produces a large candidate set; batching keeps each tx
+    // bounded.
     for batch in candidates.chunks(SWEEP_BATCH_SIZE) {
         // r[impl store.chunk.lock-order]
         // Sort before binding to ANY($1): the outer SELECT returns rows
@@ -651,10 +641,9 @@ async fn sweep_orphan_batch(
     let bf = zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
 
     // Enqueue S3 keys for zeroed chunks. If chunk_backend is None
-    // (inline-only store), there are no S3 keys to delete — but an
-    // inline-only store also has no PutChunk clients (require_cache()
-    // returns FAILED_PRECONDITION), so `zeroed` is empty and this is
-    // a no-op. The Option-check inside the helper is belt-and-suspenders.
+    // (inline-only store), there are no S3 keys to delete — `zeroed`
+    // is empty (no chunked uploads ever happened) and this is a
+    // no-op. The Option-check inside the helper is belt-and-suspenders.
     super::enqueue_chunk_deletes(&mut tx, &zeroed, chunk_backend).await?;
 
     tx.commit().await?;
@@ -1300,7 +1289,7 @@ mod tests {
     /// | old   | 0        | past         | reaped   |
     /// | live  | 1        | past         | survives |
     ///
-    /// A broken grace check would reap `young` (PutChunk/PutPath gap
+    /// A broken grace check would reap `young` (interrupted-upload
     /// race). A broken refcount check would reap `live` (data loss).
     /// We assert both negatives in one test because a single-axis
     /// test ("young survives") would pass trivially if the function

@@ -82,21 +82,6 @@ pub struct MockStore {
     /// completes; `delay > idle_timeout` proves the per-chunk timeout
     /// trips on the first stalled chunk.
     pub get_path_chunk_delay_ms: Arc<AtomicU64>,
-    /// If true, `content_lookup` hangs indefinitely (awaits a Notify
-    /// that never fires). For scheduler CA-compare timeout tests:
-    /// proves the `tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, ...)`
-    /// wrapper is load-bearing — without it, a slow/hung store blocks
-    /// the scheduler's completion path forever.
-    pub content_lookup_hang: Arc<AtomicBool>,
-    /// If true, `content_lookup` returns Unavailable. For scheduler
-    /// CA-compare error-path tests (`Err(Status)` arm — counts as
-    /// miss, doesn't block completion).
-    pub fail_content_lookup: Arc<AtomicBool>,
-    /// Number of `content_lookup` calls received (success, fail, or
-    /// hang — incremented on entry). For scheduler CA-compare
-    /// short-circuit tests: prove the loop broke after N calls
-    /// instead of iterating all outputs.
-    pub content_lookup_calls: Arc<AtomicU32>,
     /// CA realisations: (drv_hash, output_name) -> Realisation.
     /// Used by gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
@@ -112,18 +97,10 @@ pub struct MockStore {
     /// Records every `query_path_info` call's requested path. For
     /// verifying r[sched.merge.substitute-fetch]'s eager-fetch loop.
     pub qpi_calls: Arc<RwLock<Vec<String>>>,
-    /// If true, `batch_query_path_info` returns Unimplemented. For
-    /// I-110 fallback tests (older store binary → builder falls back
-    /// to per-path QueryPathInfo).
-    pub batch_qpi_unimplemented: Arc<AtomicBool>,
     /// Number of `batch_query_path_info` calls received. For I-110
     /// tests proving the builder uses one batch RPC per BFS layer
     /// (not N per-path RPCs).
     pub batch_qpi_calls: Arc<AtomicU32>,
-    /// If true, `batch_get_manifest` returns Unimplemented. For
-    /// I-110c fallback tests (older store → builder skips prefetch,
-    /// per-path GetPath queries PG as before).
-    pub batch_manifest_unimplemented: Arc<AtomicBool>,
     /// Number of `batch_get_manifest` calls received. For I-110c
     /// tests proving the builder calls it once before the warm loop.
     pub batch_manifest_calls: Arc<AtomicU32>,
@@ -163,17 +140,12 @@ impl Default for MockStore {
             get_path_gate: Arc::new(tokio::sync::Notify::new()),
             get_path_gate_armed: Arc::default(),
             get_path_chunk_delay_ms: Arc::default(),
-            content_lookup_hang: Arc::default(),
-            fail_content_lookup: Arc::default(),
-            content_lookup_calls: Arc::default(),
             find_missing_calls: Arc::default(),
             realisations: Arc::default(),
             tenant_quotas: Arc::default(),
             substitutable: Arc::default(),
             qpi_calls: Arc::default(),
-            batch_qpi_unimplemented: Arc::default(),
             batch_qpi_calls: Arc::default(),
-            batch_manifest_unimplemented: Arc::default(),
             batch_manifest_calls: Arc::default(),
             get_path_hints: Arc::default(),
             chunks: Arc::default(),
@@ -273,20 +245,6 @@ impl ChunkService for MockStore {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
-    }
-
-    async fn put_chunk(
-        &self,
-        _request: Request<Streaming<types::PutChunkRequest>>,
-    ) -> Result<Response<types::PutChunkResponse>, Status> {
-        Err(Status::unimplemented("mock: PutChunk"))
-    }
-
-    async fn find_missing_chunks(
-        &self,
-        _request: Request<types::FindMissingChunksRequest>,
-    ) -> Result<Response<types::FindMissingChunksResponse>, Status> {
-        Err(Status::unimplemented("mock: FindMissingChunks"))
     }
 }
 
@@ -607,9 +565,6 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::BatchQueryPathInfoRequest>,
     ) -> Result<Response<types::BatchQueryPathInfoResponse>, Status> {
-        if self.batch_qpi_unimplemented.load(Ordering::SeqCst) {
-            return Err(Status::unimplemented("mock: batch RPC disabled"));
-        }
         // Reuse fail_query_path_info: a store that's Unavailable for
         // single-path QPI is Unavailable for batch QPI too. Keeps the
         // existing error-propagation tests valid for the batch path.
@@ -636,9 +591,6 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::BatchGetManifestRequest>,
     ) -> Result<Response<types::BatchGetManifestResponse>, Status> {
-        if self.batch_manifest_unimplemented.load(Ordering::SeqCst) {
-            return Err(Status::unimplemented("mock: batch manifest disabled"));
-        }
         self.batch_manifest_calls.fetch_add(1, Ordering::SeqCst);
         let paths = self.paths.read().unwrap();
         let entries = request
@@ -688,49 +640,6 @@ impl StoreService for MockStore {
         Ok(Response::new(types::FindMissingPathsResponse {
             missing_paths: missing,
             substitutable_paths: substitutable,
-        }))
-    }
-
-    async fn content_lookup(
-        &self,
-        request: Request<types::ContentLookupRequest>,
-    ) -> Result<Response<types::ContentLookupResponse>, Status> {
-        self.content_lookup_calls.fetch_add(1, Ordering::SeqCst);
-        if self.content_lookup_hang.load(Ordering::SeqCst) {
-            // Hang forever. Scheduler CA-compare tests use this to
-            // prove the DEFAULT_GRPC_TIMEOUT wrapper is load-bearing.
-            // futures::future::pending() — never resolves.
-            std::future::pending::<()>().await;
-        }
-        if self.fail_content_lookup.load(Ordering::SeqCst) {
-            return Err(Status::unavailable("mock: injected content_lookup failure"));
-        }
-        let req = request.into_inner();
-        // Scan stored paths for a nar_hash match. O(n) is fine for a
-        // mock; real store has a PG index. First match wins (same
-        // semantics as the real LIMIT 1 — multiple paths with same
-        // content are all correct answers).
-        //
-        // Respects exclude_store_path (store.content.self-exclude):
-        // skip rows whose store_path equals the exclude. Empty
-        // exclude = no filter (proto3 empty-string sentinel). The
-        // real store's PG query has `AND n.store_path != $2`; this
-        // mirrors it so scheduler CA-compare tests can assert
-        // first-build → miss, second-build → match.
-        let paths = self.paths.read().unwrap();
-        for (store_path, (info, _nar)) in paths.iter() {
-            if info.nar_hash == req.content_hash
-                && (req.exclude_store_path.is_empty() || store_path != &req.exclude_store_path)
-            {
-                return Ok(Response::new(types::ContentLookupResponse {
-                    store_path: store_path.clone(),
-                    info: Some(info.clone()),
-                }));
-            }
-        }
-        Ok(Response::new(types::ContentLookupResponse {
-            store_path: String::new(),
-            info: None,
         }))
     }
 
@@ -866,12 +775,6 @@ pub struct MockSchedulerOutcome {
     /// succeeding (or returning not_found if watch_scripted_events
     /// is None). Decremented on each call. For reconnect-exhausted tests.
     pub watch_fail_count: Arc<AtomicU32>,
-    /// If true, SubmitBuild omits the `x-rio-build-id` initial-metadata
-    /// header. For exercising the gateway's legacy first-event-peek
-    /// fallback. Default false (header set — matches phase4a+ scheduler).
-    /// `#[derive(Default)]` gives `bool::default() = false`, so existing
-    /// tests using `..Default::default()` need no changes.
-    pub suppress_build_id_header: bool,
 }
 
 /// Mock scheduler that records SubmitBuild + CancelBuild calls and has a
@@ -927,9 +830,8 @@ impl SchedulerService for MockScheduler {
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
-        // Clone before any spawn moves build_id. None = suppress
-        // (legacy-scheduler simulation for fallback-path tests).
-        let build_id_for_header = (!outcome.suppress_build_id_header).then(|| build_id.clone());
+        // Clone before any spawn moves build_id.
+        let build_id_for_header = build_id.clone();
 
         // Scripted mode: send events verbatim, auto-fill build_id/sequence, close.
         if let Some(events) = outcome.scripted_events {
@@ -973,12 +875,10 @@ impl SchedulerService for MockScheduler {
                 // tx drops → stream ends
             });
             let mut resp = Response::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-            if let Some(id) = build_id_for_header {
-                resp.metadata_mut().insert(
-                    rio_proto::BUILD_ID_HEADER,
-                    id.parse().expect("test build_id is ASCII"),
-                );
-            }
+            resp.metadata_mut().insert(
+                rio_proto::BUILD_ID_HEADER,
+                build_id_for_header.parse().expect("test build_id is ASCII"),
+            );
             return Ok(resp);
         }
 
@@ -1030,12 +930,10 @@ impl SchedulerService for MockScheduler {
         });
 
         let mut resp = Response::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-        if let Some(id) = build_id_for_header {
-            resp.metadata_mut().insert(
-                rio_proto::BUILD_ID_HEADER,
-                id.parse().expect("test build_id is ASCII"),
-            );
-        }
+        resp.metadata_mut().insert(
+            rio_proto::BUILD_ID_HEADER,
+            build_id_for_header.parse().expect("test build_id is ASCII"),
+        );
         Ok(resp)
     }
 
@@ -1170,11 +1068,9 @@ impl MockAdmin {
 }
 
 // build.rs-generated: defines the `mock_admin_default_methods!` macro
-// (expands to default-stub unary method bodies) and the
-// `MockAdmin::METHODS` const (all proto RPC names, PascalCase).
-// Must appear AFTER the MockAdmin struct (METHODS is an inherent
-// impl) and BEFORE the AdminService impl (macro_rules is textually
-// scoped — definition-before-use within a module).
+// (expands to default-stub unary method bodies). Must appear BEFORE
+// the AdminService impl (macro_rules is textually scoped —
+// definition-before-use within a module).
 include!(concat!(env!("OUT_DIR"), "/mock_admin_generated.rs"));
 
 #[tonic::async_trait]

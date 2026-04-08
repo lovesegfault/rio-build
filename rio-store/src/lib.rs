@@ -9,7 +9,6 @@ pub mod backend;
 pub mod cache_server;
 pub mod cas;
 pub(crate) mod chunker;
-pub(crate) mod content_index;
 pub mod gc;
 pub mod grpc;
 // pub (not pub(crate)) so the fuzz target at rio-store/fuzz/ can call
@@ -71,10 +70,6 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_integrity_failures_total",
         "GetPath content integrity check failures (bitrot/corruption)"
-    );
-    describe_gauge!(
-        "rio_store_chunks_total",
-        "Total chunks in storage (piggybacked on FindMissingChunks)"
     );
     describe_gauge!(
         "rio_store_chunk_dedup_ratio",

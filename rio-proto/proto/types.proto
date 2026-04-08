@@ -2,7 +2,7 @@ syntax = "proto3";
 package rio.types;
 
 // Shared primitive message types — imported by every other .proto in the
-// package. After P0376 domain split:
+// package. Domain split:
 //
 //   - dag.proto          — DerivationNode/Edge/Event*, GraphNode/Edge, GetBuildGraph*
 //   - build_types.proto  — BuildEvent*, SubmitBuild*, BuildResult*, Executor/Scheduler stream, Heartbeat*
@@ -11,7 +11,7 @@ package rio.types;
 //
 // All four share `package rio.types;` → prost merges into one `rio.types.rs`.
 // Rust callers see every type at `rio_proto::types::*` regardless of source
-// file. The split is for FILE-level collision tracking in the plan DAG.
+// file.
 
 // Build result status codes. Lives here (not build_types.proto) to break
 // the dag.proto ↔ build_types.proto circular import — DerivationFailed.status
@@ -223,26 +223,6 @@ message FindMissingPathsResponse {
   repeated string substitutable_paths = 2;
 }
 
-// Content-addressed lookup: find a store path by its content hash.
-message ContentLookupRequest {
-  bytes content_hash = 1;                 // SHA-256 of the output content
-  // Field 2 (output_name) was never read — content_index is keyed
-  // purely on content_hash.
-  reserved 2;
-  reserved "output_name";
-  // Store path to EXCLUDE from the lookup. The CA cutoff-compare
-  // hook sets this to the just-built output's path so the lookup
-  // answers "have we seen this content in a DIFFERENT path before?"
-  // (not "have we seen it at all?" — the just-uploaded path always
-  // matches itself). Empty = no exclusion (legacy callers unchanged).
-  string exclude_store_path = 3;
-}
-
-message ContentLookupResponse {
-  string store_path = 1;                 // Matching store path, empty if not found
-  PathInfo info = 2;                     // Full path info if found
-}
-
 // Resolve a store path from its nixbase32 hash part (32 chars).
 // NOT_FOUND if no path with that hash-part exists.
 message QueryPathFromHashPartRequest {
@@ -293,36 +273,12 @@ message QueryRealisationRequest {
 // Chunk service types
 // ───────────────────────────────────────────────────────────────────────────
 
-message PutChunkRequest {
-  oneof msg {
-    PutChunkMetadata metadata = 1;
-    bytes data = 2;
-  }
-}
-
-message PutChunkMetadata {
-  bytes digest = 1;                       // Expected BLAKE3 digest
-  uint64 size = 2;                        // Expected chunk size
-}
-
-message PutChunkResponse {
-  bytes digest = 1;                       // Confirmed BLAKE3 digest
-}
-
 message GetChunkRequest {
   bytes digest = 1;                       // BLAKE3 digest of the chunk
 }
 
 message GetChunkResponse {
   bytes data = 1;                         // Chunk data
-}
-
-message FindMissingChunksRequest {
-  repeated bytes digests = 1;             // BLAKE3 digests to check
-}
-
-message FindMissingChunksResponse {
-  repeated bytes missing_digests = 1;     // Digests not found in store
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -357,16 +313,6 @@ message GCProgress {
   uint64 bytes_freed = 3;
   bool is_complete = 4;
   string current_path = 5;              // Path currently being processed
-}
-
-message PinPathRequest {
-  string store_path = 1;                 // Full store path to pin/unpin
-  string source = 2;                     // Free-form: who/what pinned this (audit)
-}
-
-message PinPathResponse {
-  bool success = 1;
-  string message = 2;                    // Error detail on failure (path not found etc)
 }
 
 // Per-tenant quota check (gateway → store, pre-SubmitBuild gate).
@@ -410,22 +356,6 @@ message VerifyChunksProgress {
   uint64 missing = 2;                  // Cumulative PG-yes-backend-no
   repeated bytes missing_hashes = 3;   // BLAKE3 (32 bytes each) found missing in THIS batch
   bool done = 4;                       // True on the final message
-}
-
-// ResignPaths backfill job: re-scan NAR references + re-sign for paths
-// uploaded before the builder refscan fix (narinfo.refs_backfilled=FALSE,
-// migration 010). Cursor-paginated; empty response cursor = complete.
-message ResignPathsRequest {
-  string cursor = 1;     // Hex store_path_hash to resume after. Empty = start. Opaque — pass verbatim.
-  uint32 batch_size = 2; // Max paths per call. 0 = server default (100). Capped at 1000.
-  bool dry_run = 3;      // Compute delta but ROLLBACK (staging on prod snapshot).
-}
-
-message ResignPathsResponse {
-  string cursor = 1;       // Next-request cursor. Empty = no more pending.
-  uint32 processed = 2;    // Paths processed this batch (≤ batch_size).
-  uint32 refs_changed = 3; // Subset of processed where refs changed (old scanner missed).
-  uint32 failed = 4;       // NAR/chunk errors; stay refs_backfilled=FALSE for next pass.
 }
 
 // Per-tenant upstream cache config (tenant_upstreams table, migration

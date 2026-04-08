@@ -3,7 +3,7 @@
 //! Submodules:
 //! - `put_path` — write-ahead upload flow (Steps 1-6)
 //! - `get_path` — streaming NAR download (inline/chunked reassembly)
-//! - `chunk` — ChunkService (GetChunk, FindMissingChunks, PutChunk stub)
+//! - `chunk` — ChunkService (GetChunk)
 //!
 //! This file holds shared helpers, StoreServiceImpl, and the small RPCs
 //! (QueryPathInfo, FindMissingPaths, etc.). put_path/get_path delegate
@@ -25,15 +25,13 @@ use rio_proto::StoreService;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::types::{
     AddSignaturesRequest, AddSignaturesResponse, BatchGetManifestRequest, BatchGetManifestResponse,
-    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, ChunkRef, ContentLookupRequest,
-    ContentLookupResponse, FindMissingChunksRequest, FindMissingChunksResponse,
-    FindMissingPathsRequest, FindMissingPathsResponse, GetChunkRequest, GetChunkResponse,
-    GetPathRequest, GetPathResponse, ManifestEntry, ManifestHint, PathInfo, PathInfoEntry,
-    PutChunkRequest, PutChunkResponse, PutPathBatchRequest, PutPathBatchResponse, PutPathRequest,
-    PutPathResponse, PutPathTrailer, QueryPathFromHashPartRequest, QueryPathInfoRequest,
-    QueryRealisationRequest, Realisation, RegisterRealisationRequest, RegisterRealisationResponse,
-    TenantQuotaRequest, TenantQuotaResponse, get_path_response, put_chunk_request,
-    put_path_request,
+    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, ChunkRef, FindMissingPathsRequest,
+    FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
+    ManifestEntry, ManifestHint, PathInfo, PathInfoEntry, PutPathBatchRequest,
+    PutPathBatchResponse, PutPathRequest, PutPathResponse, PutPathTrailer,
+    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
+    RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
+    TenantQuotaResponse, get_path_response, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -467,15 +465,11 @@ impl StoreServiceImpl {
         self
     }
 
-    /// Clone the signer Arc for sharing with StoreAdminServiceImpl.
-    /// ResignPaths needs the SAME cluster key as PutPath so re-signed
-    /// narinfos verify against the same `trusted-public-keys` entry.
-    /// Admin re-signing uses `ts.cluster()` directly — backfilled
-    /// historical paths have no per-tenant attribution. Returning an
-    /// `Option<Arc>` (rather than exposing the field) keeps the
-    /// Arc-wrapping detail internal.
-    pub fn signer(&self) -> Option<Arc<TenantSigner>> {
-        self.signer.clone()
+    /// Borrow the signer Arc (PutPathBatch resolves tenant→key once
+    /// per stream, not per output). Returning `Option<&Arc>` keeps
+    /// the Arc-wrapping detail internal.
+    pub fn signer(&self) -> Option<&Arc<TenantSigner>> {
+        self.signer.as_ref()
     }
 
     /// Override the global NAR buffer budget (total permits across all
@@ -1006,58 +1000,6 @@ impl StoreService for StoreServiceImpl {
             missing_paths: missing,
             substitutable_paths: substitutable,
         }))
-    }
-
-    /// Content-addressed lookup: "have we ever seen these bytes?"
-    ///
-    /// Queries the content_index populated by PutPath. Empty
-    /// `store_path` in the response = not found (proto convention;
-    /// caller checks `.is_empty()` not Option).
-    // WONTFIX(P0432): no production callers — scheduler CA cutoff
-    // switched to realisation-based lookup because ContentLookup's
-    // self-exclusion is broken for CA (same content → same path →
-    // excludes the only matching row; see actor/completion.rs). Kept
-    // because 4 integration tests use it to verify content_index
-    // population after PutPath/PutPathBatch, and store.md still
-    // documents it. P0432 decides whether content_index itself is
-    // dead and can cascade-remove this RPC + tests + docs.
-    #[instrument(skip(self, request), fields(rpc = "ContentLookup"))]
-    async fn content_lookup(
-        &self,
-        request: Request<ContentLookupRequest>,
-    ) -> Result<Response<ContentLookupResponse>, Status> {
-        rio_proto::interceptor::link_parent(&request);
-        let req = request.into_inner();
-
-        // Validate hash length. 32 bytes = SHA-256. Anything else is
-        // a client bug — reject with INVALID_ARGUMENT rather than
-        // silently missing on the PG index.
-        if req.content_hash.len() != 32 {
-            return Err(Status::invalid_argument(format!(
-                "content_hash must be 32 bytes (SHA-256), got {}",
-                req.content_hash.len()
-            )));
-        }
-
-        // Self-exclusion (store.content.self-exclude): empty string →
-        // None (proto3 has no optional-string, empty is the sentinel).
-        let exclude = if req.exclude_store_path.is_empty() {
-            None
-        } else {
-            Some(req.exclude_store_path.as_str())
-        };
-
-        match crate::content_index::lookup(&self.pool, &req.content_hash, exclude).await {
-            Ok(Some(info)) => Ok(Response::new(ContentLookupResponse {
-                store_path: info.store_path.to_string(),
-                info: Some(info.into()),
-            })),
-            Ok(None) => Ok(Response::new(ContentLookupResponse {
-                store_path: String::new(),
-                info: None,
-            })),
-            Err(e) => Err(rio_common::grpc::internal("ContentLookup", e)),
-        }
     }
 
     /// Resolve a store path from its 32-char nixbase32 hash part.

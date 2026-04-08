@@ -1,11 +1,11 @@
 //! CA data model end-to-end: register a realisation via the Nix wire
-//! protocol, query it back, and find the output by content hash.
+//! protocol, query it back via the wire AND via gRPC.
 // r[verify gw.opcode.mandatory-set]
 //!
 //! This is the Phase 2c CA cache-hit path BEFORE Phase 5 early cutoff:
 //! a CA build completes → output uploaded to store → realisation
 //! registered → NEXT build with the same modular drv_hash finds the
-//! realisation AND can verify content via ContentLookup.
+//! realisation.
 //!
 //! Flow under test:
 //!   1. Upload a path (the CA build output). Known nar_hash.
@@ -13,8 +13,8 @@
 //!      path — gateway → store_client.register_realisation.
 //!   3. wopQueryRealisation with the same DrvOutput id — gets outPath
 //!      back. This is the cache-hit lookup.
-//!   4. ContentLookup via gRPC with the nar_hash — finds the path by
-//!      content identity — the store's content_index in action.
+//!   4. QueryRealisation via gRPC directly — proves the store-side
+//!      record matches what the wire layer surfaces.
 //!
 //! All against MockStore (in-memory). The wire protocol path is real
 //! (gateway session with DuplexStream); the store is mocked to keep
@@ -28,8 +28,8 @@ use rio_test_support::wire::{do_handshake, drain_stderr_until_last, send_set_opt
 use rio_test_support::wire_send;
 
 /// The full roundtrip: write via wopRegisterDrvOutput, read via
-/// wopQueryRealisation, verify content via ContentLookup. All three
-/// hops working together is what makes CA cache-hits real.
+/// wopQueryRealisation, cross-check via the gRPC QueryRealisation. All
+/// three hops working together is what makes CA cache-hits real.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
     common::init_test_logging();
@@ -125,54 +125,25 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
         "signatures roundtrip"
     );
 
-    // --- Step 4: ContentLookup via gRPC ---
-    // "Have we ever seen these bytes?" — the content-addressed
-    // question. Given the nar_hash, find the path. A CA build that
-    // produces identical output to a previous one can short-circuit
-    // here even if the drv_hash differs (e.g., different inputDrvs
-    // but same output bytes).
-    //
-    // Via the gRPC client directly — not the Nix wire protocol (Nix
-    // doesn't have a ContentLookup opcode; this is our internal RPC
-    // for Phase 5's early-cutoff cross-reference).
-    let lookup_resp = sess
+    // --- Step 4: QueryRealisation via gRPC ---
+    // Same lookup as step 3, but via the gRPC client directly — proves
+    // the store-side record matches what the wire layer surfaces, and
+    // that the gateway's basename↔full-path translation is the only
+    // layer doing path-shape munging.
+    let realisation = sess
         .store_client
-        .content_lookup(rio_proto::types::ContentLookupRequest {
-            content_hash: nar_hash.to_vec(),
-            exclude_store_path: String::new(),
+        .query_realisation(rio_proto::types::QueryRealisationRequest {
+            drv_hash: drv_hash_bytes.clone(),
+            output_name: "out".into(),
         })
         .await?
         .into_inner();
 
     assert_eq!(
-        lookup_resp.store_path, output_path,
-        "ContentLookup(nar_hash) finds the path — content identity works"
+        realisation.output_path, output_path,
+        "gRPC QueryRealisation returns full /nix/store/ path (store-internal repr)"
     );
-    let info = lookup_resp.info.expect("PathInfo should be populated");
-    assert_eq!(info.nar_hash, nar_hash.to_vec());
+    assert_eq!(realisation.signatures, vec!["test-key:fake-sig-base64"]);
 
-    Ok(())
-}
-
-/// Negative path: ContentLookup for unknown content → empty string,
-/// not error. "Not found" is a normal answer (cache miss), not a fault.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_content_lookup_miss_returns_empty() -> anyhow::Result<()> {
-    let sess = common::GatewaySession::new().await?;
-    let mut store_client = sess.store_client.clone();
-
-    let resp = store_client
-        .content_lookup(rio_proto::types::ContentLookupRequest {
-            content_hash: vec![0xffu8; 32],
-            exclude_store_path: String::new(),
-        })
-        .await?
-        .into_inner();
-
-    assert!(
-        resp.store_path.is_empty(),
-        "unknown content → empty store_path (not an error)"
-    );
-    assert!(resp.info.is_none());
     Ok(())
 }

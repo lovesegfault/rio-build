@@ -47,7 +47,7 @@ mod tenant_keys;
 pub mod upstreams;
 
 // Public API — re-exports so all external callers in grpc/, cas.rs,
-// cache_server.rs, content_index.rs keep their `metadata::foo` paths.
+// cache_server.rs keep their `metadata::foo` paths.
 pub use chunked::*;
 pub use cluster_key_history::*;
 pub use inline::*;
@@ -278,9 +278,9 @@ impl ManifestKind {
 // ---------------------------------------------------------------------------
 // Shared helpers — NarinfoRow column list + validation epilogue + UPDATE SQL
 //
-// These three are used by query_path_info, query_by_hash_part, and
-// content_index::lookup. Extracting them means adding a column to
-// NarinfoRow requires editing ONE macro, not 3 SELECT strings.
+// These are used by query_path_info and query_by_hash_part. Extracting
+// them means adding a column to NarinfoRow requires editing ONE macro,
+// not N SELECT strings.
 // ---------------------------------------------------------------------------
 
 /// Expands to the 10-column SELECT list for `NarinfoRow`, aliased `n.*`.

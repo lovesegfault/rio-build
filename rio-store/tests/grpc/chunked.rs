@@ -429,67 +429,6 @@ async fn gt13_batch_reclaims_stale_uploading() -> TestResult {
     Ok(())
 }
 
-/// Content-index parity: batch-uploaded outputs are findable by
-/// nar_hash via ContentLookup. Without T1's `content_index::insert`
-/// loop, ContentLookup returns empty for a path that only ever went
-/// through PutPathBatch — the scheduler's CA cutoff check at
-/// `sched.ca.cutoff-compare` hits no match, and identical-content
-/// derivations rebuild every time.
-///
-/// Mirrors `content_lookup_found_after_put_path` (realisations.rs) but
-/// uploads via PutPathBatch instead of PutPath.
-// r[verify store.atomic.multi-output]
-// r[verify sched.ca.cutoff-compare]
-#[tokio::test]
-async fn gt13_batch_content_lookup_finds_outputs() -> TestResult {
-    use rio_proto::types::ContentLookupRequest;
-
-    let s = StoreSession::new().await?;
-
-    let out0_path = test_store_path("content-idx-0");
-    let (out0_nar, out0_hash) = make_nar(b"content lookup zero");
-    let out0_info = make_path_info_for_nar(&out0_path, &out0_nar);
-
-    let out1_path = test_store_path("content-idx-1");
-    let (out1_nar, out1_hash) = make_nar(b"content lookup one");
-    let out1_info = make_path_info_for_nar(&out1_path, &out1_nar);
-
-    let (tx, rx) = mpsc::channel(16);
-    send_batch_output(&tx, 0, out0_info.into(), out0_nar).await;
-    send_batch_output(&tx, 1, out1_info.into(), out1_nar).await;
-    drop(tx);
-
-    let mut client = s.client.clone();
-    let resp = client
-        .put_path_batch(ReceiverStream::new(rx))
-        .await?
-        .into_inner();
-    assert_eq!(resp.created, vec![true, true]);
-
-    // THE ASSERTION: ContentLookup by nar_hash finds each batch output.
-    // content_hash IS nar_hash (content-addressed identity). Without
-    // content_index::insert in the batch handler, this returns an empty
-    // store_path — CA cutoff is blind to batch uploads.
-    for (hash, path) in [(out0_hash, &out0_path), (out1_hash, &out1_path)] {
-        let lookup = client
-            .content_lookup(ContentLookupRequest {
-                content_hash: hash.to_vec(),
-                exclude_store_path: String::new(),
-            })
-            .await?
-            .into_inner();
-        assert!(
-            !lookup.store_path.is_empty(),
-            "ContentLookup must find batch-uploaded path {path} by nar_hash — \
-             without content_index::insert, CA cutoff is blind to batch uploads"
-        );
-        assert_eq!(&lookup.store_path, path);
-        assert!(lookup.info.is_some(), "found → info populated");
-    }
-
-    Ok(())
-}
-
 /// The `bail!` macro at `put_path_batch.rs:82-87` is load-bearing: it
 /// calls `abort_batch()` before returning. A bare `?` bypasses it —
 /// `owned_placeholders` leak, and the next `PutPathBatch` for those

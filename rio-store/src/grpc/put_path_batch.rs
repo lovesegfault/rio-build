@@ -390,35 +390,16 @@ impl StoreServiceImpl {
             bail!(rio_common::grpc::internal("PutPathBatch: commit", e));
         }
 
-        // Content-index each created output. Same best-effort semantics as
-        // PutPath (see put_path.rs content_index::insert call):
-        // failure doesn't fail the upload
-        // (paths are addressable by store_path); CA ContentLookup just
-        // won't find them until a future single-path re-upload indexes
-        // them. Done AFTER tx commits so ContentLookup's INNER JOIN on
-        // manifests.status='complete' always sees a complete row.
+        // Bytes counter per created output (put_path.rs bytes_total parity).
         // r[impl store.put.wal-manifest]
-        for (idx, accum) in &outputs {
+        for accum in outputs.values() {
             if accum.already_complete {
-                continue; // indexed by a previous upload
+                continue; // counted by a previous upload
             }
             let info = accum
                 .info
                 .as_ref()
                 .expect("validated in phase 2, not taken");
-            if let Err(e) =
-                crate::content_index::insert(&self.pool, &info.nar_hash, &accum.store_path_hash)
-                    .await
-            {
-                warn!(
-                    output_index = %idx,
-                    store_path = %info.store_path.as_str(),
-                    error = %e,
-                    "PutPathBatch: content_index insert failed \
-                     (path still addressable by store_path)"
-                );
-            }
-            // Bytes counter per created output (put_path.rs bytes_total parity).
             // r[impl obs.metric.transfer-volume]
             metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         }

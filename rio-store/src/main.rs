@@ -376,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
         let mut s = Substituter::new(pool.clone(), chunk_backend)
             .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent);
         if let Some(signer) = store_service.signer() {
-            s = s.with_signer(signer);
+            s = s.with_signer(Arc::clone(signer));
         }
         Arc::new(s)
     };
@@ -385,18 +385,12 @@ async fn main() -> anyhow::Result<()> {
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there
     // ARE no chunks to get).
-    let chunk_service = ChunkServiceImpl::new(pool.clone(), chunk_cache.clone());
+    let chunk_service = ChunkServiceImpl::new(chunk_cache.clone());
 
-    // StoreAdminServiceImpl: TriggerGC + PinPath/UnpinPath +
-    // ResignPaths backfill. Gets the chunk backend directly (for
-    // key_for in sweep's pending_s3_deletes enqueue) AND the
-    // chunk cache (for ResignPaths NAR reassembly) AND the signer
-    // (for ResignPaths re-sign). None for inline-only stores —
-    // sweep does CASCADE delete only, ResignPaths handles inline
-    // blobs without the cache.
-    //
-    // Signer is shared with StoreServiceImpl (same Arc) so
-    // PutPath and ResignPaths produce sigs under the SAME key.
+    // StoreAdminServiceImpl: TriggerGC + VerifyChunks + upstream CRUD
+    // + GetLoad. Gets the chunk backend directly (for key_for in
+    // sweep's pending_s3_deletes enqueue + VerifyChunks HeadObject).
+    // None for inline-only stores — sweep does CASCADE delete only.
     //
     // Also spawn GC background tasks (orphan scanner + orphan-chunk
     // sweep + drain). All periodic (15min / 1h / 30s).
@@ -404,17 +398,8 @@ async fn main() -> anyhow::Result<()> {
     // (degraded GC, not down).
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
         chunk_cache.as_ref().map(|c| c.backend());
-    let admin_service = {
-        let mut s = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone())
-            .with_shutdown(shutdown.clone());
-        if let Some(cache) = &chunk_cache {
-            s = s.with_chunk_cache(Arc::clone(cache));
-        }
-        if let Some(signer) = store_service.signer() {
-            s = s.with_signer(signer);
-        }
-        s
-    };
+    let admin_service = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone())
+        .with_shutdown(shutdown.clone());
     rio_store::gc::orphan::spawn_scanner(
         pool.clone(),
         chunk_backend_for_gc.clone(),

@@ -381,18 +381,9 @@ impl TenantSigner {
         &self.prior_cluster
     }
 
-    /// The cluster fallback key's name (for logging which key signed
-    /// when the tenant had none).
-    pub fn cluster_key_name(&self) -> &str {
-        self.cluster.key_name()
-    }
-
     /// Direct access to the cluster-fallback [`Signer`].
     ///
-    /// ResignPaths (admin.rs) uses this for backfill re-signing:
-    /// historical paths have no per-tenant attribution, so re-signing
-    /// them always uses the cluster key. Sync, no DB hit — the
-    /// cluster key is held by value.
+    /// Sync, no DB hit — the cluster key is held by value.
     pub fn cluster(&self) -> &Signer {
         &self.cluster
     }

@@ -670,28 +670,6 @@ impl StoreServiceImpl {
             debug!(store_path = %full_info.store_path.as_str(), "PutPath: inline upload completed");
         }
 
-        // Content-index the upload. nar_hash IS the content identity for
-        // CA purposes: same bytes → same SHA-256. Two input-addressed
-        // builds producing identical output get the same content_hash
-        // entry, pointing at different store_paths (both rows kept, PK
-        // is the pair). Best-effort — failure here doesn't fail the
-        // upload (path is still addressable by store_path); log only.
-        // Done AFTER the manifest commits so lookup's INNER JOIN on
-        // manifests.status='complete' always sees a complete row.
-        if let Err(e) = crate::content_index::insert(
-            &self.pool,
-            &full_info.nar_hash,
-            &full_info.store_path_hash,
-        )
-        .await
-        {
-            tracing::warn!(
-                store_path = %full_info.store_path.as_str(),
-                error = %e,
-                "content_index insert failed (path still addressable by store_path)"
-            );
-        }
-
         // Defuse: placeholder is now status='complete'; nothing to clean up.
         scopeguard::ScopeGuard::into_inner(placeholder_guard);
 

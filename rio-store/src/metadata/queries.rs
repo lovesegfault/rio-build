@@ -17,7 +17,7 @@ use crate::narinfo_cols;
 /// SHA-256 of the full path string — the `narinfo` PK. The gRPC layer
 /// has already run `validate_store_path` (which calls `StorePath::
 /// parse`), so this re-parse can't fail; the `Err` path is for direct
-/// callers (tests, content_index) that may pass unvalidated strings.
+/// callers (tests) that may pass unvalidated strings.
 fn path_hash(store_path: &str) -> Result<[u8; 32]> {
     Ok(StorePath::parse(store_path)
         .map_err(|e| MetadataError::InvariantViolation(format!("unparseable {store_path}: {e}")))?

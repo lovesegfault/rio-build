@@ -49,9 +49,6 @@ service StoreService {
   // Batch check which paths are missing from the store.
   rpc FindMissingPaths(rio.types.FindMissingPathsRequest) returns (rio.types.FindMissingPathsResponse);
 
-  // Content-addressed lookup: find a store path by its content hash.
-  rpc ContentLookup(rio.types.ContentLookupRequest) returns (rio.types.ContentLookupResponse);
-
   // Resolve a store path from its 32-char nixbase32 hash part.
   //
   // wopQueryPathFromHashPart (29) gives us just "abc123..." (the hash-part
@@ -104,16 +101,11 @@ service StoreService {
 }
 
 // Chunk-level storage service for content-defined chunking.
-// PutChunk is UNIMPLEMENTED (server-side chunking only; see chunk.rs).
+// Server-side chunking only — PutPath chunks via cas::put_chunked; the
+// builder fans out GetChunk to reassemble NARs.
 service ChunkService {
-  // Upload a chunk.
-  rpc PutChunk(stream rio.types.PutChunkRequest) returns (rio.types.PutChunkResponse);
-
   // Download a chunk by its digest.
   rpc GetChunk(rio.types.GetChunkRequest) returns (stream rio.types.GetChunkResponse);
-
-  // Batch check which chunks are missing from the store.
-  rpc FindMissingChunks(rio.types.FindMissingChunksRequest) returns (rio.types.FindMissingChunksResponse);
 }
 
 // Store-side administrative operations. The scheduler's AdminService.
@@ -129,26 +121,10 @@ service StoreAdminService {
   // dry_run=true: compute stats but ROLLBACK the sweep tx.
   rpc TriggerGC(rio.types.GCRequest) returns (stream rio.types.GCProgress);
 
-  // Pin a store path (add to gc_roots). Protects it from GC
-  // regardless of reachability. Explicit unpin via UnpinPath.
-  rpc PinPath(rio.types.PinPathRequest) returns (rio.types.PinPathResponse);
-
-  // Remove a GC root. The path becomes eligible for collection
-  // on the next GC run (if unreachable).
-  rpc UnpinPath(rio.types.PinPathRequest) returns (rio.types.PinPathResponse);
-
-  // Backfill references + re-sign for paths uploaded before the worker
-  // refscan fix (migration 010 marks them refs_backfilled=FALSE).
-  // Cursor-paginated: caller loops until response.cursor is empty.
-  // Idempotent per path — safe to re-run on crash.
-  rpc ResignPaths(rio.types.ResignPathsRequest) returns (rio.types.ResignPathsResponse);
-
   // PG↔backend chunk consistency audit: HeadObject every non-deleted
   // chunk, stream PG-says-exists-but-backend-says-no. I-040 diagnostic —
-  // catches chunks stranded by key-format changes (the I-007 prefix-
-  // normalize) or genuinely lost (S3 lifecycle policies, manual deletes).
-  // Read-only; no repair (a missing chunk could be at a legacy key,
-  // and the get() fallback already covers that on the read path).
+  // catches chunks stranded by key-format changes or genuinely lost
+  // (S3 lifecycle policies, manual deletes). Read-only; no repair.
   rpc VerifyChunks(rio.types.VerifyChunksRequest) returns (stream rio.types.VerifyChunksProgress);
 
   // Per-tenant upstream cache CRUD (tenant_upstreams, migration 026).

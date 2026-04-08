@@ -51,7 +51,6 @@ pub struct StoreSeed {
     nar_hash: [u8; 32],
     nar_size: i64,
     ca: Option<String>,
-    refs_backfilled: Option<bool>,
 }
 
 impl StoreSeed {
@@ -75,7 +74,6 @@ impl StoreSeed {
             nar_hash: [0u8; 32],
             nar_size: 0,
             ca: None,
-            refs_backfilled: None,
         }
     }
 
@@ -110,7 +108,7 @@ impl StoreSeed {
 
     /// Set `narinfo.nar_hash`. Default is `[0u8; 32]` — fine for tests
     /// that don't assert on the hash, but anything touching
-    /// `path_by_nar_hash` or `content_index` needs a distinct value.
+    /// `path_by_nar_hash` needs a distinct value.
     pub fn with_nar_hash(mut self, h: [u8; 32]) -> Self {
         self.nar_hash = h;
         self
@@ -125,15 +123,6 @@ impl StoreSeed {
     /// Set `narinfo.ca`. The GC empty-refs gate excludes CA paths.
     pub fn with_ca(mut self, ca: impl Into<String>) -> Self {
         self.ca = Some(ca.into());
-        self
-    }
-
-    /// Set `narinfo.refs_backfilled`. Migration-010 column; only the
-    /// ResignPaths backfill tests care about this. Schema default is
-    /// NULL (post-fix rows); backfill tests want `Some(false)`
-    /// (pre-fix rows needing scan).
-    pub fn with_refs_backfilled(mut self, v: bool) -> Self {
-        self.refs_backfilled = Some(v);
         self
     }
 
@@ -156,9 +145,9 @@ impl StoreSeed {
             r#"
             INSERT INTO narinfo
                 (store_path_hash, store_path, nar_hash, nar_size,
-                 "references", ca, refs_backfilled, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7,
-                    now() - make_interval(hours => COALESCE($8, 0)::int))
+                 "references", ca, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6,
+                    now() - make_interval(hours => COALESCE($7, 0)::int))
             "#,
         )
         .bind(&hash)
@@ -167,7 +156,6 @@ impl StoreSeed {
         .bind(self.nar_size)
         .bind(&self.refs)
         .bind(self.ca.as_deref())
-        .bind(self.refs_backfilled)
         .bind(self.created_hours_ago)
         .execute(pool)
         .await

@@ -12,10 +12,7 @@
 /// SIGTERM between MergeDag commit and first BuildEvent send).
 ///
 /// Value: UUID v7 stringified (always ASCII, always a valid
-/// `MetadataValue<Ascii>`).
-///
-/// Introduced phase4a (remediation 20). Absent header = legacy
-/// scheduler; callers fall back to first-event peek.
+/// `MetadataValue<Ascii>`). Always set by the scheduler.
 pub const BUILD_ID_HEADER: &str = "x-rio-build-id";
 
 /// gRPC initial-metadata key carrying the scheduler handler span's
@@ -50,14 +47,12 @@ pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.
 ///
-/// P0376 domain split: the underlying `.proto` definitions are spread across
-/// `types.proto` (shared primitives: store, chunk, GC, ResourceUsage,
-/// BuildResultStatus), `dag.proto` (DAG + derivation events + GraphNode/Edge),
+/// The underlying `.proto` definitions are spread across `types.proto`
+/// (shared primitives: store, chunk, GC, ResourceUsage, BuildResultStatus),
+/// `dag.proto` (DAG + derivation events + GraphNode/Edge),
 /// `build_types.proto` (build lifecycle, executor stream, heartbeat), and
 /// `admin_types.proto` (admin RPC data types). All four share
-/// `package rio.types;`, so prost merges them into ONE module here. The
-/// file-level split is for plan-DAG collision tracking; this Rust module is
-/// the single flattened namespace.
+/// `package rio.types;`, so prost merges them into ONE module here.
 pub mod types {
     tonic::include_proto!("rio.types");
 }
@@ -65,8 +60,6 @@ pub mod types {
 /// Re-export of DAG-domain types from [`types`]. Sourced from
 /// `proto/dag.proto`. Callers MAY use either `rio_proto::types::DerivationNode`
 /// or `rio_proto::dag::DerivationNode` — both resolve to the same struct.
-/// The domain-scoped path is encouraged for new code (makes file-level
-/// collision tracking in plan docs meaningful).
 pub mod dag {
     pub use crate::types::{
         DerivationCached, DerivationCompleted, DerivationEdge, DerivationEvent, DerivationFailed,
@@ -77,10 +70,6 @@ pub mod dag {
 
 /// Re-export of build-lifecycle-domain types from [`types`]. Sourced
 /// from `proto/build_types.proto`. Same dual-path semantics as [`dag`].
-///
-/// `dag::` migration is complete (zero `types::Derivation*` refs
-/// remain). `build_types::` migration is opportunistic — existing
-/// `types::` paths are valid, new code SHOULD use `build_types::`.
 pub mod build_types {
     pub use crate::types::{
         BuildCancelled, BuildCompleted, BuildEvent, BuildFailed, BuildInputsResolved,
@@ -105,18 +94,15 @@ pub mod builder {
 
 /// Store service: NAR storage and path metadata RPCs.
 ///
-/// Also includes `ChunkService` (`GetChunk`/`FindMissingChunks`/
-/// `PutChunk`). Chunking is **server-side only** — executors stream
-/// full NARs via `StoreService::PutPath`; rio-store does the FastCDC
-/// cut internally. `GetChunk`/`FindMissingChunks` exist so the store
-/// can dedupe across tenants without clients knowing chunk
-/// boundaries. `PutChunk` is stubbed `UNIMPLEMENTED`.
+/// Also includes `ChunkService` (`GetChunk` only). Chunking is
+/// **server-side**: executors stream full NARs via `StoreService::
+/// PutPath`; rio-store does the FastCDC cut internally and dedupes
+/// chunks via the `chunks` table refcount. The builder fans out
+/// `GetChunk` to reassemble NARs from their manifests.
 ///
-/// `ChunkServiceClient` is **not** re-exported at crate root (P0430):
-/// client-side chunking was descoped in favor of P0434's
-/// manifest-mode (`StoreService::PutPathManifest`), where the executor
-/// sends a manifest and the store resolves chunks server-side. The
-/// store's own tests reach the client stub via the deep codegen path
+/// `ChunkServiceClient` is **not** re-exported at crate root: the
+/// only production caller (the builder's reassembly loop) reaches it
+/// via the deep codegen path
 /// `store::chunk_service_client::ChunkServiceClient`.
 pub mod store {
     tonic::include_proto!("rio.store");
