@@ -14,15 +14,6 @@ use sha2::{Digest, Sha256};
 /// tests can construct matching paths (e.g., `format!("/nix/store/{TEST_HASH}-foo")`).
 pub const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// nixbase32 alphabet (0-9, a-z minus e/o/u/t). `StorePath::parse`
-/// validates against exactly this set — a random ASCII-alphanumeric
-/// string won't pass (the chars 'e','o','u','t' are rejected).
-///
-/// Re-export of `rio_nix::store_path::nixbase32::CHARS` — single source
-/// of truth. `pub` because rio-bench and property tests need it for
-/// generating valid store paths on the fly.
-pub use rio_nix::store_path::nixbase32::CHARS as NIXBASE32;
-
 /// 32 random nixbase32 chars. A fresh valid store-path hash per call.
 ///
 /// Use when tests need DISTINCT paths (criterion iterates;
@@ -32,9 +23,10 @@ pub use rio_nix::store_path::nixbase32::CHARS as NIXBASE32;
 // r[impl ts.fixtures.builders]
 pub fn rand_store_hash() -> String {
     use rand::RngExt;
+    use rio_nix::store_path::nixbase32::CHARS;
     let mut rng = rand::rng();
     (0..32)
-        .map(|_| NIXBASE32[rng.random_range(0..32)] as char)
+        .map(|_| CHARS[rng.random_range(0..32)] as char)
         .collect()
 }
 
