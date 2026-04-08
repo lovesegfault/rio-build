@@ -95,8 +95,7 @@ pub struct ExecutorEnv {
     /// `register_inputs` (JIT allowlist, I-043 redesign) and
     /// `prefetch_manifests` (I-110c PG-skip hints) on it after
     /// `compute_input_closure` and before daemon spawn. `None` in
-    /// tests that don't mount FUSE — both calls are skipped, FUSE
-    /// `lookup` falls back to legacy `JitClass::NotArmed`.
+    /// tests that don't mount FUSE — both calls are skipped.
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
     /// (`worker.toml fuse_fetch_timeout_secs`, default 60s). JIT
@@ -109,8 +108,8 @@ pub struct ExecutorEnv {
     /// so the pre-cgroup phase (overlay → resolve → prefetch → warm) can
     /// poll it and abort with [`ExecutorError::Cancelled`] instead of
     /// burning compute until `activeDeadlineSeconds`. Same `Arc` as the
-    /// one in `runtime::CancelRegistry` and the one `spawn_build_task`
-    /// reads to classify the final `Err`.
+    /// one in `BuildSlot.cancel` and the one `spawn_build_task` reads to
+    /// classify the final `Err`.
     pub cancelled: Arc<AtomicBool>,
 }
 
@@ -486,23 +485,14 @@ pub async fn execute_build(
     }
     if let Some(cache) = &env.fuse_cache {
         // r[impl builder.fuse.jit-register]
-        // `RIO_BUILDER_JIT_FETCH=0` disarms (forces `NotArmed` →
-        // legacy gRPC-anything) for one-revert rollback during stress.
-        // Default on. Remove the gate after one stress cycle green.
-        let jit_enabled = std::env::var("RIO_BUILDER_JIT_FETCH")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        if jit_enabled {
-            cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
-                Some((
-                    p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?
-                        .to_owned(),
-                    *sz,
-                ))
-            }));
-            metrics::gauge!("rio_builder_jit_inputs_registered")
-                .set(cache.known_inputs_len() as f64);
-        }
+        cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
+            Some((
+                p.strip_prefix(rio_nix::store_path::STORE_PREFIX)?
+                    .to_owned(),
+                *sz,
+            ))
+        }));
+        metrics::gauge!("rio_builder_jit_inputs_registered").set(cache.known_inputs_len() as f64);
         // I-110c: prime manifest hints so each JIT fetch's `GetPath`
         // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
         // Unimplemented (old store) or any error, the per-path
@@ -880,11 +870,11 @@ pub async fn execute_build(
     .await?;
 
     // 11. Tear down overlay (explicit, before Drop).
-    // The leak-threshold check happens at ENTRY (above), not here: we don't
-    // override a successful build result just because its own teardown fails.
-    // Teardown failure increments the counter (in OverlayMount::Drop); the
-    // NEXT build is what gets refused. The metric is also incremented in
-    // Drop (centralized so ?-early-returns and panics also count).
+    // We don't override a successful build result just because its own
+    // teardown fails. Teardown failure increments
+    // `rio_builder_overlay_unmount_failures_total` (in OverlayMount::Drop,
+    // centralized so ?-early-returns and panics also count); with one build
+    // per pod a leaked mount is reclaimed when the pod is discarded.
     let merged_path = overlay_mount.merged_dir().to_path_buf();
     if let Err(e) = overlay::teardown_overlay(overlay_mount) {
         tracing::error!(

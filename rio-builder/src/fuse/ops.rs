@@ -276,9 +276,7 @@ impl Filesystem for NixStoreFs {
                             // I-179: `wait_for_fetcher` now returns EIO
                             // directly on guard-drop-with-cache-empty; this
                             // remap is defense-in-depth (catches any future
-                            // ENOENT leak from `ensure_cached`). The legacy
-                            // `NotArmed` arm preserves its ENOENT semantics
-                            // unchanged.
+                            // ENOENT leak from `ensure_cached`).
                             // I-189: log errno symbolically (`EIO`/`ENOENT`/
                             // `EAGAIN`) not the integer. The underlying gRPC
                             // status was already error!-logged in
@@ -303,47 +301,11 @@ impl Filesystem for NixStoreFs {
                     }
                 }
                 JitClass::NotArmed => {
-                    // JIT not armed: tests, `RIO_BUILDER_JIT_FETCH=0`, or
-                    // the pre-register window. LEGACY behavior — gRPC any
-                    // store-path-shaped name. Keep the original len/dot
-                    // heuristic + I-115 suffix denylist here (the JIT-
-                    // armed arms above use neither — pure allowlist).
-                    if name_str.len() < 34
-                        || name_str.starts_with('.')
-                        || name_str.ends_with(".chroot")
-                        || name_str.ends_with(".lock")
-                        || name_str.ends_with(".check")
-                    {
-                        reply.error(Errno::ENOENT);
-                        return;
-                    }
-                    match self.ensure_cached(name_str) {
-                        Ok(local_path) => match local_path.symlink_metadata() {
-                            Ok(meta) => {
-                                let ino = self.get_or_create_inode_for_lookup(child_path);
-                                let attr = stat_to_attr(ino, &meta);
-                                reply.entry(&ATTR_TTL, &attr, Generation(0));
-                                return;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    path = %local_path.display(),
-                                    error = %e,
-                                    "ensure_cached succeeded but stat failed"
-                                );
-                                reply.error(io_error_to_errno(&e));
-                                return;
-                            }
-                        },
-                        Err(errno) if i32::from(errno) == i32::from(Errno::ENOENT) => {
-                            // Not in remote store — fall through to final ENOENT reply.
-                        }
-                        Err(errno) => {
-                            // Transport/server/extract error — surface it, don't mask as ENOENT.
-                            reply.error(errno);
-                            return;
-                        }
-                    }
+                    // JIT not armed: pre-register window only (a build's
+                    // `lookup` always lands AFTER `register_inputs`, so in
+                    // production this arm is unreachable from the daemon).
+                    // Fall through to ENOENT — block-or-fail semantics:
+                    // nothing outside the declared closure is fetched.
                 }
             }
         }
