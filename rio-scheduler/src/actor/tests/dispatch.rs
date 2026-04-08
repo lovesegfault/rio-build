@@ -1095,7 +1095,7 @@ async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
     // capacity frees. Here we just assert no spurious second
     // assignment from the steady-state heartbeat.
     send_heartbeat_with(&handle, "i163-w", "x86_64-linux", |hb| {
-        hb.running_builds = vec![a.drv_path.clone()];
+        hb.running_build = Some(a.drv_path.clone());
     })
     .await?;
     barrier(&handle).await;

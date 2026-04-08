@@ -337,11 +337,10 @@ impl ExecutorService for SchedulerGrpc {
         }
 
         // Bound heartbeat payload sizes. Heartbeats bypass backpressure
-        // (send_unchecked below), so an unbounded running_builds list from
-        // a malicious/buggy worker would allocate megabytes and stall the
-        // actor event loop during reconciliation with no backpressure signal.
+        // (send_unchecked below), so unbounded payloads from a
+        // malicious/buggy worker would stall the actor event loop with
+        // no backpressure signal.
         const MAX_HEARTBEAT_FEATURES: usize = 64;
-        const MAX_HEARTBEAT_RUNNING_BUILDS: usize = 1000;
         // A worker advertising thousands of systems is buggy or
         // hostile. 16 covers native + linux-builder + the four
         // cross-arch targets × two OSes.
@@ -352,11 +351,16 @@ impl ExecutorService for SchedulerGrpc {
             req.supported_features.len(),
             MAX_HEARTBEAT_FEATURES,
         )?;
-        rio_common::grpc::check_bound(
-            "running_builds",
-            req.running_builds.len(),
-            MAX_HEARTBEAT_RUNNING_BUILDS,
-        )?;
+        // P0537: one build per pod, ever. The wire field is still
+        // `repeated` for compat but a real builder populates it from a
+        // single `Option` (rio-builder runtime.rs). >1 entry is a
+        // protocol invariant violation — reject, don't silently drop.
+        if req.running_builds.len() > 1 {
+            return Err(Status::invalid_argument(format!(
+                "running_builds has {} entries (P0537: max 1 build per executor)",
+                req.running_builds.len()
+            )));
+        }
 
         // size_class: empty-string in proto → None. Proto doesn't have
         // Option for strings; empty is the conventional "unset." An
@@ -376,7 +380,7 @@ impl ExecutorService for SchedulerGrpc {
             executor_id: req.executor_id.into(),
             systems: req.systems,
             supported_features: req.supported_features,
-            running_builds: req.running_builds,
+            running_build: req.running_builds.into_iter().next(),
             size_class,
             resources: req.resources,
             store_degraded: req.store_degraded,

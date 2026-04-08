@@ -174,7 +174,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
         .await?;
     send_heartbeat_with(&handle, "i066-a", "x86_64-linux", |hb| {
         hb.draining = true;
-        hb.running_builds = vec![drv_path.clone()];
+        hb.running_build = Some(drv_path.clone());
     })
     .await?;
 
@@ -204,7 +204,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
         .find(|w| w.executor_id == "i066-a")
         .expect("A registered");
     assert!(
-        a.running_builds.contains(&drv_hash.to_string()),
+        a.running_build == Some(drv_hash.to_string()),
         "worker.running_build set so A reads at-capacity"
     );
 
@@ -218,7 +218,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
         .find(|w| w.executor_id == "i066-b")
         .expect("B registered");
     assert!(
-        b.running_builds.is_empty(),
+        b.running_build.is_none(),
         "B must NOT receive the drv — adoption prevented re-dispatch"
     );
     let info = handle
@@ -323,8 +323,8 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
     // immediately (nothing to prefetch). So we can't assert warm=false
     // here without merging a derivation FIRST. The connect_executor
     // helper below covers the warm=true post-ACK case.
-    assert_eq!(w.running_count, 0);
-    assert!(w.running_builds.is_empty());
+    assert!(w.running_build.is_none());
+    assert!(w.running_build.is_none());
     // last_heartbeat_ago_secs: just-heartbeated → 0 or 1. Don't assert
     // exact value (timing); assert sanity.
     assert!(
@@ -399,7 +399,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
         .find(|w| w.executor_id == "toctou-worker")
         .expect("toctou-worker registered");
     assert!(
-        w.running_builds.contains(&drv_hash.to_string()),
+        w.running_build == Some(drv_hash.to_string()),
         "scheduler should have tracked the assignment in worker.running_builds"
     );
 
@@ -417,7 +417,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
         .find(|w| w.executor_id == "toctou-worker")
         .expect("toctou-worker registered");
     assert!(
-        w.running_builds.contains(&drv_hash.to_string()),
+        w.running_build == Some(drv_hash.to_string()),
         "stale heartbeat must not clobber scheduler's fresh assignment"
     );
     Ok(())
@@ -454,7 +454,7 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
         .find(|w| w.executor_id == "phantom-worker")
         .expect("phantom-worker registered");
     assert!(
-        w.running_builds.contains(&drv_hash.to_string()),
+        w.running_build == Some(drv_hash.to_string()),
         "precondition: dispatch tracked the assignment"
     );
 
@@ -466,7 +466,7 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
         .find(|w| w.executor_id == "phantom-worker")
         .expect("phantom-worker registered");
     assert!(
-        w.running_builds.contains(&drv_hash.to_string()),
+        w.running_build == Some(drv_hash.to_string()),
         "first miss is the TOCTOU race — keep"
     );
     let info = handle
@@ -556,8 +556,8 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let w1 = workers.iter().find(|w| w.executor_id == "i042-w1").unwrap();
     let w2 = workers.iter().find(|w| w.executor_id == "i042-w2").unwrap();
-    assert!(w1.running_builds.contains(&drv_hash.to_string()));
-    assert!(w2.running_builds.contains(&drv_hash.to_string()));
+    assert!(w1.running_build == Some(drv_hash.to_string()));
+    assert!(w2.running_build == Some(drv_hash.to_string()));
 
     // w2's completion: PermanentFailure → poison_and_cascade. This
     // is the NORMAL flow — handle_completion runs to line 515 and
@@ -576,12 +576,12 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let w2 = workers.iter().find(|w| w.executor_id == "i042-w2").unwrap();
     assert!(
-        !w2.running_builds.contains(&drv_hash.to_string()),
+        w2.running_build != Some(drv_hash.to_string()),
         "w2's normal completion path frees its slot (line 515)"
     );
     let w1 = workers.iter().find(|w| w.executor_id == "i042-w1").unwrap();
     assert!(
-        w1.running_builds.contains(&drv_hash.to_string()),
+        w1.running_build == Some(drv_hash.to_string()),
         "w1's stale entry is still there (no completion processed yet)"
     );
 
@@ -602,7 +602,7 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
     let workers = handle.debug_query_workers().await?;
     let w1 = workers.iter().find(|w| w.executor_id == "i042-w1").unwrap();
     assert!(
-        !w1.running_builds.contains(&drv_hash.to_string()),
+        w1.running_build != Some(drv_hash.to_string()),
         "I-042: completion for already-terminal derivation must free \
          the executor's running_builds slot — pre-fix this leaked"
     );
@@ -634,7 +634,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestR
         .iter()
         .find(|w| w.executor_id == "i042-hb-w")
         .unwrap();
-    assert!(w.running_builds.contains(&drv_hash.to_string()));
+    assert!(w.running_build == Some(drv_hash.to_string()));
 
     // Poison via PermanentFailure. The completion-side fix frees the
     // slot here (proven by the test above). To probe the heartbeat
@@ -665,7 +665,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestR
         .find(|w| w.executor_id == "i042-hb-w")
         .unwrap();
     assert!(
-        !w.running_builds.contains(&drv_hash.to_string()),
+        w.running_build != Some(drv_hash.to_string()),
         "Poisoned derivation must not survive heartbeat reconcile in \
          running_builds (still_inflight = matches!(Poisoned, Assigned|Running) = false)"
     );
@@ -1265,7 +1265,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     // (heartbeat doesn't touch it).
     send_heartbeat_with(&handle, "b-eph2", "x86_64-linux", |hb| {
         hb.size_class = Some("tiny".into());
-        hb.running_builds = vec![drv_path];
+        hb.running_build = Some(drv_path);
     })
     .await?;
     barrier(&handle).await;
@@ -1278,8 +1278,8 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
         .iter()
         .find(|w| w.executor_id == "b-eph2")
         .expect("b-eph2 still registered");
-    assert_eq!(
-        w.running_count, 1,
+    assert!(
+        w.running_build.is_some(),
         "precondition: heartbeat reconcile re-populated running_build; \
          test would pass trivially otherwise"
     );
@@ -1360,8 +1360,8 @@ async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult 
         w.draining,
         "I-188: ephemeral executor must be draining after completion"
     );
-    assert_eq!(
-        w.running_count, 0,
+    assert!(
+        w.running_build.is_none(),
         "I-188: ephemeral executor must not be re-assigned post-completion"
     );
 
@@ -1456,7 +1456,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     // dispatch_ready() can't ALSO assign (would muddy "worker claims
     // it, scheduler didn't know").
     send_heartbeat_with(&handle, "hb-worker", "x86_64-linux", |hb| {
-        hb.running_builds = vec![test_drv_path("hb-drv")];
+        hb.running_build = Some(test_drv_path("hb-drv"));
     })
     .await?;
     barrier(&handle).await;
@@ -1477,7 +1477,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
         .find(|w| w.executor_id == "hb-worker")
         .expect("worker registered");
     assert!(
-        w.running_builds.contains(&"hb-drv".to_string()),
+        w.running_build == Some("hb-drv".to_string()),
         "worker's claim adopted into running_build"
     );
 
@@ -1514,10 +1514,7 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
     let result = reply_rx.await?;
 
     assert!(result.accepted, "known worker → accepted=true");
-    assert_eq!(
-        result.running_builds, 0,
-        "idle worker → nothing to reassign"
-    );
+    assert!(!result.busy, "idle worker → nothing to reassign");
 
     // No CancelSignal should appear in the stream. barrier-then-
     // try_recv: any message sent during drain would be in the
@@ -1532,7 +1529,7 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
 }
 
 /// DrainExecutor(force=true) on a BUSY worker → CancelSignal per in-flight
-/// build + result.running_builds=N. The preemption hook: controller sees
+/// build + result.busy. The preemption hook: controller sees
 /// DisruptionTarget on a pod, calls this so the worker cgroup.kills its
 /// builds NOW instead of running the full 2h terminationGracePeriod.
 /// (wired: P0285 rio-controller disruption.rs watcher)
@@ -1566,8 +1563,8 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     // force=true → running_builds: 0 (worker.rs:277 "reassigned:
     // caller doesn't wait"). The count is only nonzero for
     // force=false (caller polls until it drains naturally).
-    assert_eq!(
-        result.running_builds, 0,
+    assert!(
+        !result.busy,
         "force-drain reassigns immediately; caller doesn't wait"
     );
 

@@ -34,8 +34,8 @@ pub struct DebugExecutorInfo {
     /// view — PG `last_seen` may differ (heartbeat reaches PG and actor
     /// independently; post-failover PG can be fresher).
     pub last_heartbeat_ago_secs: u64,
-    pub running_count: usize,
-    pub running_builds: Vec<String>,
+    /// P0537: at most one. Populated from `ExecutorState.running_build`.
+    pub running_build: Option<String>,
     /// I-056b: `has_capacity()` checks both. Either true → invisible
     /// to dispatch regardless of `is_registered`/`warm`. Added after
     /// 45min chasing PG/recovery red herrings when a stale drain flag

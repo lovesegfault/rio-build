@@ -524,7 +524,7 @@ impl DagActor {
                 kind: w.kind,
                 systems: w.systems.clone(),
                 supported_features: w.supported_features.clone(),
-                running_builds: u32::from(w.running_build.is_some()),
+                busy: w.running_build.is_some(),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
                 size_class: w.size_class.clone(),
@@ -632,8 +632,7 @@ impl DagActor {
                 kind: w.kind,
                 systems: w.systems.clone(),
                 last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
-                running_count: usize::from(w.running_build.is_some()),
-                running_builds: w.running_build.iter().map(|h| h.to_string()).collect(),
+                running_build: w.running_build.as_ref().map(|h| h.to_string()),
                 draining: w.is_draining(),
                 store_degraded: w.store_degraded,
             })

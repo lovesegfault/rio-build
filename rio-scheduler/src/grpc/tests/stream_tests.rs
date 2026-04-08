@@ -281,21 +281,22 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
 
     Ok(())
 }
-/// Heartbeat with too many running_builds entries should be rejected.
-/// Heartbeats bypass backpressure (send_unchecked), so unbounded payload
-/// would stall the actor event loop with no backpressure signal.
+/// Heartbeat with >1 running_builds entry must be rejected at the gRPC
+/// layer. P0537 collapsed executors to one build per pod; the wire field
+/// stays `repeated` for compat but a real builder can only ever send 0
+/// or 1. A multi-entry heartbeat is a protocol invariant violation —
+/// surfacing it here (not silently truncating in the actor) makes a
+/// buggy/hostile builder visible.
 #[tokio::test]
-async fn test_heartbeat_rejects_too_many_running_builds() {
+async fn test_heartbeat_rejects_multiple_running_builds() {
     let (_db, grpc, _handle, _task) = setup_grpc().await;
-
-    let too_many: Vec<String> = (0..1001).map(|i| format!("/nix/store/{i}.drv")).collect();
 
     let req = Request::new(rio_proto::types::HeartbeatRequest {
         executor_id: "test-worker".into(),
         kind: rio_proto::types::ExecutorKind::Builder as i32,
         systems: vec!["x86_64-linux".into()],
         supported_features: vec![],
-        running_builds: too_many,
+        running_builds: vec!["/nix/store/a.drv".into(), "/nix/store/b.drv".into()],
         resources: None,
         size_class: String::new(),
         store_degraded: false,
@@ -305,7 +306,7 @@ async fn test_heartbeat_rejects_too_many_running_builds() {
     let result = grpc.heartbeat(req).await;
     assert!(
         result.is_err(),
-        "heartbeat with >1000 running_builds should be rejected"
+        "heartbeat with >1 running_builds should be rejected (P0537 invariant)"
     );
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);

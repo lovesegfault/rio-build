@@ -251,7 +251,7 @@ pub(crate) struct HeartbeatFields {
     pub resources: Option<rio_proto::types::ResourceUsage>,
     pub size_class: Option<String>,
     pub supported_features: Vec<String>,
-    pub running_builds: Vec<String>,
+    pub running_build: Option<String>,
 }
 
 impl Default for HeartbeatFields {
@@ -263,7 +263,7 @@ impl Default for HeartbeatFields {
             resources: None,
             size_class: None,
             supported_features: vec![],
-            running_builds: vec![],
+            running_build: None,
         }
     }
 }
@@ -292,7 +292,7 @@ pub(crate) async fn send_heartbeat_with(
             resources: hb.resources,
             size_class: hb.size_class,
             supported_features: hb.supported_features,
-            running_builds: hb.running_builds,
+            running_build: hb.running_build,
         }))
         .await?;
     Ok(())

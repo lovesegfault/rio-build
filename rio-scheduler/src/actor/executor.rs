@@ -510,7 +510,7 @@ impl DagActor {
             debug!(executor_id = %executor_id, "drain request for unknown worker");
             return DrainResult {
                 accepted: false,
-                running_builds: 0,
+                busy: false,
             };
         };
 
@@ -614,13 +614,13 @@ impl DagActor {
 
             return DrainResult {
                 accepted: true,
-                running_builds: 0, // reassigned: caller doesn't wait
+                busy: false, // reassigned: caller doesn't wait
             };
         }
 
         DrainResult {
             accepted: true,
-            running_builds: u32::from(worker.running_build.is_some()),
+            busy: worker.running_build.is_some(),
         }
     }
 
@@ -672,7 +672,7 @@ impl DagActor {
             .is_some_and(|w| w.has_capacity());
 
         let (reconciled, suspect, confirmed_phantoms) =
-            self.reconcile_running_build(executor_id, hb.running_builds);
+            self.reconcile_running_build(executor_id, hb.running_build);
 
         // Existence asserted at top of function (I-048b early-return).
         // get_mut not entry().or_insert: this path never creates.
@@ -809,22 +809,12 @@ impl DagActor {
     fn reconcile_running_build(
         &mut self,
         executor_id: &ExecutorId,
-        running_builds: Vec<String>,
+        running_build: Option<String>,
     ) -> (Option<DrvHash>, Option<DrvHash>, Vec<DrvHash>) {
-        // Worker reports drv_paths (Vec for wire compat); resolve [0] to a
-        // drv_hash via the DAG index. Extra entries warn — P0537 invariant.
-        if running_builds.len() > 1 {
-            warn!(
-                executor_id = %executor_id,
-                count = running_builds.len(),
-                "heartbeat reports {} running builds (P0537: max 1); using [0]",
-                running_builds.len()
-            );
-        }
-        let heartbeat_hash: Option<DrvHash> = running_builds
-            .into_iter()
-            .next()
-            .and_then(|path| self.dag.hash_for_path(&path).cloned());
+        // Worker reports a drv_path; resolve to a drv_hash via the DAG
+        // index. The gRPC layer already rejected >1 entry (P0537).
+        let heartbeat_hash: Option<DrvHash> =
+            running_build.and_then(|path| self.dag.hash_for_path(&path).cloned());
 
         // Compute the reconciled value before borrowing worker mutably,
         // so we can read self.dag for derivation state checks.

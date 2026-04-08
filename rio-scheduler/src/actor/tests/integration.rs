@@ -339,10 +339,10 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
         .iter()
         .find(|w| w.executor_id == "tight-worker")
         .expect("tight-worker registered");
-    assert_eq!(
-        worker.running_count, 0,
-        "failed try_send must clean up running_builds; got {:?}",
-        worker.running_builds
+    assert!(
+        worker.running_build.is_none(),
+        "failed try_send must clean up running_build; got {:?}",
+        worker.running_build
     );
 
     // The derivation should be back in Ready (not stuck Assigned).

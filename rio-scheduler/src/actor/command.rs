@@ -28,8 +28,12 @@ pub struct HeartbeatPayload {
     /// (handle_heartbeat treats empty systems as "not registered").
     pub systems: Vec<String>,
     pub supported_features: Vec<String>,
-    /// drv_paths from worker proto (not hashes).
-    pub running_builds: Vec<String>,
+    /// drv_path the worker reports as in-flight (not a hash). P0537:
+    /// at most one build per pod, so the wire's `repeated string
+    /// running_builds` is collapsed to an `Option` at the gRPC layer
+    /// — a heartbeat with >1 entry is rejected as a protocol
+    /// violation there, not silently truncated here.
+    pub running_build: Option<String>,
     /// Size-class from worker config (e.g. "small", "large"). gRPC
     /// maps empty-string → None. Stored on ExecutorState for the
     /// classify() → best_executor() filter.
@@ -453,11 +457,13 @@ impl ActorCommand {
 #[derive(Debug, Clone, Copy)]
 pub struct DrainResult {
     pub accepted: bool,
-    /// Builds still in-flight on the worker after drain. For
-    /// `force=false`, these will complete normally. For `force=true`,
-    /// this is 0 (reassigned). The worker's preStop hook uses this to
-    /// decide whether to wait.
-    pub running_builds: u32,
+    /// Whether a build is still in-flight on the worker after drain
+    /// (P0537: at most one). For `force=false`, it will complete
+    /// normally. For `force=true`, this is `false` (reassigned). The
+    /// worker's preStop hook uses this to decide whether to wait.
+    /// Converted to the proto's legacy `uint32 running_builds` (0/1)
+    /// at the admin gRPC boundary.
+    pub busy: bool,
 }
 
 /// Point-in-time executor snapshot for `AdminService.ListExecutors`.
@@ -469,7 +475,9 @@ pub struct ExecutorSnapshot {
     pub kind: rio_proto::types::ExecutorKind,
     pub systems: Vec<String>,
     pub supported_features: Vec<String>,
-    pub running_builds: u32,
+    /// P0537: at most one build per executor. Converted to the proto's
+    /// legacy `uint32 running_builds` (0/1) at the admin gRPC boundary.
+    pub busy: bool,
     pub draining: bool,
     pub store_degraded: bool,
     pub size_class: Option<String>,
