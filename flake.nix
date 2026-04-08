@@ -461,8 +461,8 @@
           # touching rio-scheduler only re-clippy's rio-scheduler +
           # its dependents, not the full workspace.
           #
-          # Exposed below as checks.* and packages.clippy-* / test-* /
-          # doc-* for targeted invocation.
+          # Exposed below as checks.* and packages.clippy-* / doc-*
+          # for targeted invocation.
           crateChecks = import ./nix/checks.nix {
             inherit
               pkgs
@@ -1718,14 +1718,11 @@
           // crateBuild.members
           # Per-member check derivations for targeted runs:
           #   nix build .#clippy-rio-scheduler
-          #   nix build .#test-rio-common
           #   nix build .#doc-rio-nix
           // prefixed "clippy-" crateChecks.clippy
           // prefixed "clippy-test-" crateChecks.clippyTest
-          // prefixed "test-" crateChecks.tests
           // prefixed "test-bin-" crateChecks.testBins
           // prefixed "doc-" crateChecks.doc
-          // prefixed "cov-profraw-" crateChecks.covProfraw
           // {
             # Raw symlinkJoin of all built crate outputs. References
             # the intermediate .rlib tree — use workspace-bins for
@@ -1741,7 +1738,6 @@
             # Aggregate check derivations (same as checks.* but
             # exposed as packages for --print-out-paths convenience).
             clippy-all = crateChecks.clippyCheck;
-            test-all = crateChecks.testCheck;
             doc-all = crateChecks.docCheck;
             # nextest reuse-build runner — characteristic
             # `PASS [Xs] crate::test` output, test groups, retries.
@@ -1751,7 +1747,9 @@
             # --binaries-metadata result/binaries-metadata.json`.
             nextest-all = crateChecks.nextest;
             nextest-meta = crateChecks.nextestMetadata;
-            # Coverage output (lcov.info at $out/lcov.info).
+            # Coverage: nextest run against instrumented binaries
+            # (raw profraws at $out/profraw/) + merged lcov.
+            cov-profraw = crateChecks.covProfraw;
             inherit (crateChecks) coverage;
             # Toolchain wrappers for debugging the arg-filtering:
             #   nix build .#clippy-rustc

@@ -422,148 +422,6 @@ let
   };
 
   # ──────────────────────────────────────────────────────────────────
-  # Test runners (per-crate + aggregate)
-  # ──────────────────────────────────────────────────────────────────
-  #
-  # Direct harness execution (what `cargo test` does under the hood).
-  # nextest would require a nextest-archive format with its own
-  # metadata requirements (Cargo.toml paths, target-dir layout) —
-  # follow-up work. Direct execution proves the mechanism and caches
-  # per-crate.
-  #
-  # Each runner gets the full runtimeTestInputs (PG, nix-cli, openssh)
-  # regardless of whether that specific crate needs them — sandbox
-  # inputs are cheap and keeping the matrix uniform avoids "forgot
-  # to add PG for the new crate" regressions. testEnv injects
-  # RIO_GOLDEN_* + PG_BIN.
-  #
-  # Parameterized on the test-binary derivation set so the coverage
-  # variant (covTestBinDrvs) reuses the same runner logic.
-  mkTestRunner =
-    {
-      name,
-      testBin,
-      extraEnv ? { },
-      preRun ? "",
-      postRun ? "",
-    }:
-    pkgs.runCommand "rio-test-run-${name}"
-      (
-        testEnv
-        // extraEnv
-        // {
-          nativeBuildInputs = runtimeTestInputs;
-          RUST_BACKTRACE = "1";
-          # Remote builders can under-provision (one run got 3.2GB —
-          # postgres + 16 tokio test threads OOM'd). Per-crate test
-          # runs are lighter than a workspace-wide nextest, so this
-          # is below the 64/65536 the latter would need.
-          NIXBUILDNET_MIN_CPU = "16";
-          NIXBUILDNET_MIN_MEM = "16384";
-        }
-      )
-      ''
-        set -euo pipefail
-        mkdir -p $out
-        ${preRun}
-        echo "── ${name} ──" | tee -a $out/log
-
-        # ──────────────────────────────────────────────────────────
-        # PG bootstrap (wrapper-level, not in-test)
-        # ──────────────────────────────────────────────────────────
-        #
-        # rio-test-support::pg::PgServer::bootstrap spawns postgres
-        # with PR_SET_PDEATHSIG(SIGTERM). On Linux, PDEATHSIG fires
-        # when the SPAWNING THREAD terminates — not the process.
-        # libtest spawns a fresh std::thread for each test fn (then
-        # joins it before the next). The first test to reach
-        # TestDb::new does the bootstrap on its libtest thread;
-        # when that test completes and its thread exits, postgres
-        # gets SIGTERM. Subsequent tests see the socket gone →
-        # "failed to connect: NotFound".
-        #
-        # nextest avoids this structurally — it runs each test in
-        # its OWN process, so each test
-        # bootstraps its own PG and the spawning process outlives
-        # the test (nextest's worker is the spawner, not the test
-        # thread). Direct libtest harness execution has no such
-        # isolation.
-        #
-        # Fix: bootstrap postgres HERE in the bash wrapper (stable
-        # parent — lives for the entire derivation build) and hand
-        # the socket URL to tests via DATABASE_URL (pg.rs:44-48
-        # takes DATABASE_URL as external-PG override, skipping
-        # bootstrap). Unix socket only (no TCP) — matches the
-        # in-test bootstrap's defaults and works in the sandbox's
-        # --private-network namespace.
-        pgdata=$TMPDIR/pgdata
-        sockdir=$TMPDIR/pgsock
-        mkdir -p "$sockdir"
-        "$PG_BIN/initdb" -D "$pgdata" --encoding=UTF8 --locale=C \
-          -U postgres --auth=trust >/dev/null
-        cat >> "$pgdata/postgresql.conf" <<EOF
-        listen_addresses = '''
-        unix_socket_directories = '$sockdir'
-        fsync = off
-        synchronous_commit = off
-        full_page_writes = off
-        max_connections = 500
-        EOF
-        "$PG_BIN/postgres" -D "$pgdata" 2>$TMPDIR/pg.log &
-        pg_pid=$!
-        trap 'kill $pg_pid 2>/dev/null || true' EXIT
-        # Wait for socket (postgres writes .s.PGSQL.5432 when ready).
-        for i in $(seq 100); do
-          [ -S "$sockdir/.s.PGSQL.5432" ] && break
-          sleep 0.1
-        done
-        if ! [ -S "$sockdir/.s.PGSQL.5432" ]; then
-          echo "postgres failed to start:" >&2
-          cat $TMPDIR/pg.log >&2
-          exit 1
-        fi
-        export DATABASE_URL="postgres:///postgres?host=$sockdir&user=postgres&port=5432"
-        echo "  postgres up at $sockdir" | tee -a $out/log
-
-        failed=0
-        shopt -s nullglob
-        bins=(${testBin}/tests/*)
-        if [ ''${#bins[@]} -eq 0 ]; then
-          echo "  (no test binaries)" | tee -a $out/log
-        fi
-        for t in "''${bins[@]}"; do
-          echo "  running $(basename $t)" | tee -a $out/log
-          # --test-threads=8: TestDb::new names databases by
-          # SystemTime::now().as_nanos(). With libtest's default
-          # NCPU threads (64 on large remote builders), two tests can hit
-          # the same nanosecond → CREATE DATABASE unique-constraint
-          # violation. 8 threads makes collision vanishingly rare
-          # and is still plenty for per-crate test parallelism.
-          if ! "$t" --test-threads=8 2>&1 | tee -a $out/log; then
-            echo "  FAIL: $(basename $t)" | tee -a $out/log
-            failed=1
-          fi
-        done
-        ${postRun}
-        if [[ "$failed" == 1 ]]; then
-          echo "── FAILURES ──" >&2
-          cat $TMPDIR/pg.log >&2
-          exit 1
-        fi
-      '';
-
-  testRunDrvs = lib.mapAttrs (name: testBin: mkTestRunner { inherit name testBin; }) testBinDrvs;
-
-  # Aggregate runner: symlinkJoin forces all per-crate runners to
-  # build (and thus pass). Simpler than a single mega-runCommand and
-  # caches better — a passing crate's runner doesn't re-execute when
-  # a sibling's test changes.
-  testRunAll = pkgs.symlinkJoin {
-    name = "rio-test-all";
-    paths = lib.attrValues testRunDrvs;
-  };
-
-  # ──────────────────────────────────────────────────────────────────
   # nextest reuse-build runner
   # ──────────────────────────────────────────────────────────────────
   #
@@ -624,26 +482,28 @@ let
     offline = true
   '';
 
-  # Map of { "<memberName>" = "<storePath>/tests"; } — stringified at
-  # Nix-eval time so the JSON synthesizer bash script can map package
-  # names to their testBinDrv output directories without running
-  # per-crate Nix evals.
-  testBinDirsJson = builtins.toJSON (lib.mapAttrs (_: drv: "${drv}/tests") testBinDrvs);
-
   # Target list from `cargo metadata --no-deps --offline` at build
   # time. A previous draft tried fromTOML + hand-replicated auto-
   # discovery (src/lib.rs, tests/*.rs, [[test]] override) — abandoned
   # because cargo's autodiscover rules are a moving target and
   # --no-deps --offline costs nothing (zero registry access, zero
   # lockfile read).
-  nextestMeta =
+  #
+  # Parameterized on the test-binary derivation set so the coverage
+  # variant (covTestBinDrvs) reuses the same synthesis.
+  mkNextestMeta =
+    binDrvs:
     pkgs.runCommand "rio-nextest-meta"
       {
         nativeBuildInputs = [
           rustStable
           pkgs.jq
         ];
-        inherit testBinDirsJson;
+        # Map of { "<memberName>" = "<storePath>/tests"; } — stringified
+        # at Nix-eval time so the JSON synthesizer bash script can map
+        # package names to their testBinDrv output directories without
+        # running per-crate Nix evals.
+        testBinDirsJson = builtins.toJSON (lib.mapAttrs (_: drv: "${drv}/tests") binDrvs);
         passAsFile = [ "testBinDirsJson" ];
       }
       ''
@@ -791,6 +651,8 @@ let
         [ "$n" -ge 1 ] || { echo "ERROR: zero binaries synthesized"; exit 1; }
       '';
 
+  nextestMeta = mkNextestMeta testBinDrvs;
+
   # nextest runner: the actual test-execution derivation. Consumes the
   # cached nextestMeta and runs `cargo-nextest run` against the
   # prebuilt binaries. Per-test-process isolation means the
@@ -811,6 +673,9 @@ let
   mkNextestRun =
     {
       name ? "rio-nextest-all",
+      # Metadata derivation (cargo-metadata.json + binaries-metadata.json).
+      # Override to point at instrumented binaries for the coverage run.
+      meta ? nextestMeta,
       # Extra runtime inputs layered on top of runtimeTestInputs.
       # PREPENDED so callers can shadow the module-level nix-cli with
       # a variant daemon — the golden harness shells out to nix-store
@@ -822,6 +687,12 @@ let
       # Appended after the module-level nextestExtraArgs. Use for
       # filter expressions like `-E 'binary(golden_conformance)'`.
       extraArgs ? [ ],
+      # Shell hooks around the nextest invocation. preRun fires after
+      # $out exists; postRun after junit.xml is collected. The
+      # coverage variant uses these to set LLVM_PROFILE_FILE and
+      # gather profraws.
+      preRun ? "",
+      postRun ? "",
     }:
     pkgs.runCommand name
       (
@@ -834,7 +705,8 @@ let
           # sequences by default; disable for log greppability.
           CARGO_TERM_COLOR = "never";
           NEXTEST_HIDE_PROGRESS_BAR = "1";
-          # Same remote-builder resource floor as the libtest runner.
+          # Remote-builder resource floor — postgres + tokio test
+          # parallelism OOMs below ~16GB.
           NIXBUILDNET_MIN_CPU = "16";
           NIXBUILDNET_MIN_MEM = "16384";
         }
@@ -842,6 +714,7 @@ let
       ''
         set -euo pipefail
         mkdir -p $out
+        ${preRun}
         # nextest's [store] dir in .config/nextest.toml is
         # "target/nextest" — resolved RELATIVE TO THE WORKSPACE ROOT,
         # not the target dir. --target-dir-remap doesn't remap this
@@ -866,18 +739,16 @@ let
         # makes those probes SUCCEED but the actual operation (write
         # drv to /nix/store) still fails because the sandbox store is
         # a readonly FUSE mount — the test sees nix-instantiate return
-        # rc=0 with a path that then ENOENTs on read_to_string. This
-        # matches the libtest mkTestRunner behavior (which never sets
-        # HOME).
+        # rc=0 with a path that then ENOENTs on read_to_string.
         #
         # nextest's own user-config discovery (~/.config/nextest/) is
         # bypassed with --user-config-file none so the readonly HOME
         # doesn't trip nextest itself.
 
-        echo "── nextest: ${nextestMeta} ──" | tee $out/log
+        echo "── nextest: ${meta} ──" | tee $out/log
         cargo-nextest nextest run \
-          --cargo-metadata ${nextestMeta}/cargo-metadata.json \
-          --binaries-metadata ${nextestMeta}/binaries-metadata.json \
+          --cargo-metadata ${meta}/cargo-metadata.json \
+          --binaries-metadata ${meta}/binaries-metadata.json \
           --workspace-remap $ws \
           --user-config-file none \
           ${lib.escapeShellArgs (nextestExtraArgs ++ extraArgs)} \
@@ -889,6 +760,7 @@ let
         # disabled by default, and the profile name is caller-configurable
         # via nextestExtraArgs — we don't know it at Nix-eval time.
         find $ws -name junit.xml -exec cp {} $out/ \; 2>/dev/null || true
+        ${postRun}
       '';
 
   nextestRun = mkNextestRun { };
@@ -902,56 +774,45 @@ let
   # llvm-profdata gives "unsupported profile format version" errors.
   sysroot = "${rustStable}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
 
-  # Per-crate coverage runner: run instrumented test binaries with
-  # LLVM_PROFILE_FILE set, collect profraws into $out/profraw/.
-  # Separate from the merge step so profraw collection caches
-  # independently of lcov generation (merge options can change
-  # without re-running tests).
-  covProfrawDrvs = lib.mapAttrs (
-    name: testBin:
-    mkTestRunner {
-      inherit name testBin;
-      preRun = ''
-        # %m = module signature (one per binary), %p = PID.
-        # LLVM_PROFILE_FILE must be an absolute path set BEFORE the
-        # test binary exec's — the runtime reads it at startup.
-        # $TMPDIR is the sandbox-writable scratch; /build is the
-        # remote-builder build root but not always writable at
-        # arbitrary subdirs.
-        mkdir -p $TMPDIR/profraw
-        export LLVM_PROFILE_FILE="$TMPDIR/profraw/%m-%p.profraw"
-      '';
-      postRun = ''
-        mkdir -p $out/profraw
-        shopt -s nullglob
-        cp $TMPDIR/profraw/*.profraw $out/profraw/ 2>/dev/null || true
-        echo "  collected $(ls $out/profraw/ | wc -l) profraw files" | tee -a $out/log
-      '';
-    }
-  ) covTestBinDrvs;
+  # Coverage runner: run instrumented test binaries via nextest with
+  # LLVM_PROFILE_FILE set, then merge profraws → a single .profdata
+  # in $out. nextest's per-test-process model would emit ~2200
+  # profraws at ~12GB under naive %m-%p; pool mode (%Nm) caps scratch
+  # at N files per binary signature (runtime lock-merges concurrent
+  # writers), and merging here keeps the cached $out under 100MB.
+  # Re-running 47s of tests is cheaper than caching 12GB of raw
+  # profile, so the old profraw/merge cache split is not worth it.
+  covProfraw = mkNextestRun {
+    name = "rio-nextest-cov";
+    meta = mkNextestMeta covTestBinDrvs;
+    preRun = ''
+      # %4m = pool of 4 raw profiles per module signature; the LLVM
+      # runtime lock-merges concurrent writes from same-binary test
+      # processes. nextest spawns each test as a child process; the
+      # env var is inherited. $TMPDIR is the sandbox-writable scratch.
+      mkdir -p $TMPDIR/profraw
+      export LLVM_PROFILE_FILE="$TMPDIR/profraw/rio-%4m.profraw"
+    '';
+    postRun = ''
+      shopt -s nullglob
+      profraws=($TMPDIR/profraw/*.profraw)
+      if [ ''${#profraws[@]} -eq 0 ]; then
+        echo "ERROR: no profraws collected from any test binary" >&2
+        exit 1
+      fi
+      echo "  merging ''${#profraws[@]} profraw files" | tee -a $out/log
+      ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $out/merged.profdata
+    '';
+  };
 
-  # Merge + export: all profraws → single profdata → lcov. Object
-  # files (--object) are the test binaries themselves — llvm-cov
-  # reads the __llvm_covfun/__llvm_covmap sections embedded at
-  # compile time. We read the TEST binaries (not the main binaries)
-  # since they contain both the library code (via --test) and
-  # test-only code.
+  # Export: profdata → lcov. Object files (--object) are the test
+  # binaries themselves — llvm-cov reads the __llvm_covfun /
+  # __llvm_covmap sections embedded at compile time. We read the TEST
+  # binaries (not the main binaries) since they contain both the
+  # library code (via --test) and test-only code.
   coverageLcov = pkgs.runCommand "rio-coverage-lcov" { } ''
     set -euo pipefail
-    mkdir -p $TMPDIR/raw $out
-    ${lib.concatMapStringsSep "\n" (d: ''
-      for f in ${d}/profraw/*.profraw; do
-        [ -e "$f" ] && cp "$f" $TMPDIR/raw/ || true
-      done
-    '') (lib.attrValues covProfrawDrvs)}
-    shopt -s nullglob
-    profraws=($TMPDIR/raw/*.profraw)
-    if [ ''${#profraws[@]} -eq 0 ]; then
-      echo "ERROR: no profraws collected from any test binary" >&2
-      exit 1
-    fi
-    echo "merging ''${#profraws[@]} profraw files"
-    ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $TMPDIR/merged.profdata
+    mkdir -p $out
 
     # Object list: every test binary from every cov member.
     # llvm-cov reads coverage-map sections; any binary not present
@@ -971,7 +832,7 @@ let
     # level via --extract instead.
     ${sysroot}/llvm-cov export \
       --format=lcov \
-      --instr-profile=$TMPDIR/merged.profdata \
+      --instr-profile=${covProfraw}/merged.profdata \
       $objs \
       2>/dev/null > $TMPDIR/raw.lcov
 
@@ -1001,13 +862,12 @@ in
   clippy = clippyDrvs;
   clippyTest = clippyTestDrvs;
   testBins = testBinDrvs;
-  tests = testRunDrvs;
   doc = docDrvs;
 
   # Coverage (populated when crateBuildCov is passed). covProfraw
   # runs instrumented tests + collects raw profile data; coverage is
   # the merged lcov.
-  covProfraw = covProfrawDrvs;
+  covProfraw = if crateBuildCov != null then covProfraw else null;
   coverage = if crateBuildCov != null then coverageLcov else null;
 
   # Aggregate checks (CI entry points). All of these go in checks.*:
@@ -1015,7 +875,6 @@ in
   #   checks.nextest — fails if any test binary exits nonzero
   #   checks.doc     — fails if rustdoc errors on any member
   clippyCheck = clippyAll;
-  testCheck = testRunAll;
   docCheck = docAll;
 
   # nextest: metadata synthesis (cached) + reuse-build runner. null
