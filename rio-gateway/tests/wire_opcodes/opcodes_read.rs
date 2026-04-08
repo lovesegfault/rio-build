@@ -46,39 +46,23 @@ async fn test_is_valid_path_missing() -> anyhow::Result<()> {
 // ===========================================================================
 
 // r[verify gw.opcode.mandatory-set]
+/// EnsurePath returns 1 unconditionally for present AND missing paths — the
+/// handler queries the store but only logs the result (no substituter
+/// support).
 #[tokio::test]
-async fn test_ensure_path_exists() -> anyhow::Result<()> {
+async fn test_ensure_path_returns_one_regardless_of_presence() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.store.seed_with_content(TEST_PATH_A, b"ensure");
 
-    wire_send!(&mut h.stream;
-        u64: 10,                            // wopEnsurePath
-        string: TEST_PATH_A,
-    );
-
-    drain_stderr_until_last(&mut h.stream).await?;
-    let result = wire::read_u64(&mut h.stream).await?;
-    assert_eq!(result, 1, "EnsurePath should return 1 (success)");
-
-    h.finish().await;
-    Ok(())
-}
-
-/// EnsurePath stub: always returns success regardless of whether the path
-/// exists — reads the path argument and returns 1 (no substituter support).
-#[tokio::test]
-async fn test_ensure_path_stub_always_succeeds() -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
-
-    wire_send!(&mut h.stream;
-        u64: 10,                            // wopEnsurePath
-        string: TEST_PATH_MISSING,
-    );
-
-    // Stub behavior: always STDERR_LAST + 1, even for missing paths.
-    drain_stderr_until_last(&mut h.stream).await?;
-    let result = wire::read_u64(&mut h.stream).await?;
-    assert_eq!(result, 1, "EnsurePath stub returns 1 unconditionally");
+    for path in [TEST_PATH_A, TEST_PATH_MISSING] {
+        wire_send!(&mut h.stream;
+            u64: 10,                            // wopEnsurePath
+            string: path,
+        );
+        drain_stderr_until_last(&mut h.stream).await?;
+        let result = wire::read_u64(&mut h.stream).await?;
+        assert_eq!(result, 1, "EnsurePath returns 1 for {path}");
+    }
 
     h.finish().await;
     Ok(())
