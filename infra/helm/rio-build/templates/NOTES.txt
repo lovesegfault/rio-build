@@ -20,7 +20,7 @@ Prerequisite:
     fixture: services.k3s.containerdConfigTemplate).
 
 Verify on a builder pod:
-  kubectl -n {{ .Values.namespace.builders }} debug rio-builder-x86-64-0 -it --image=busybox -- ls -l /dev/fuse
+  kubectl -n {{ .Values.namespaces.builders.name }} debug rio-builder-x86-64-0 -it --image=busybox -- ls -l /dev/fuse
 {{- end }}
 
 {{- if not .Values.builderPoolDefaults.privileged }}

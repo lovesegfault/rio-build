@@ -1,6 +1,6 @@
 # Default values = prod topology (TLS on, external PG/S3, PDBs, NetworkPolicy).
 # values/dev.yaml flips everything for local k3s.
-# values/vmtest.yaml renders controller-only for VM test k3s injection.
+# values/vmtest-full.yaml renders the full chart for k3s VM tests.
 
 global:
   image:

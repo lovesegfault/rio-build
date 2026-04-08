@@ -19,7 +19,7 @@ let
   subcharts = import ./helm-charts.nix { inherit nixhelm system; };
 in
 {
-  # Path to a values file (typically values/vmtest.yaml).
+  # Path to a values file (typically values/vmtest-full.yaml).
   valuesFile,
   # Additional values files layered AFTER valuesFile (-f is
   # repeatable; last wins on key conflict). Used by the

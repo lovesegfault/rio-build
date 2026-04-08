@@ -7,7 +7,8 @@
 # To update an image:
 #   1. Find the new digest:
 #        skopeo inspect docker://<image>:<tag> --format '{{.Digest}}'
-#   2. Zero the `hash` field and `nix build .#pulledImages.<name>`
+#   2. Zero the `hash` field and rebuild a consumer (e.g.
+#        `nix build .#checks.x86_64-linux.vm-protocol-warm-k3s`)
 #      → hash mismatch error gives the real hash
 #   3. Update both `imageDigest` and `hash`
 #

@@ -1,9 +1,6 @@
 # Full-chart VM test profile: all rio services + bitnami PG as pods.
-#
-# Unlike vmtest.yaml (controller-only, systemd control plane on a
-# separate VM), this renders gateway/scheduler/store/controller/PG
-# templates for the first time in CI. 2-node k3s via
-# nix/tests/fixtures/k3s-full.nix.
+# Renders gateway/scheduler/store/controller/PG templates in CI.
+# 2-node k3s via nix/tests/fixtures/k3s-full.nix.
 #
 # Airgapped: all images preloaded via services.k3s.images. NodePort
 # gateway (no cloud LB). Inline chunk backend (no S3).
@@ -62,8 +59,7 @@ controller:
   # not six. Each image's Entrypoint is /bin/rio-<name> — no command:
   # override needed.
   image: rio-controller
-  # In-cluster Service DNS. hostNetwork=false — unlike vmtest.yaml,
-  # everything is in-cluster so CoreDNS works.
+  # In-cluster Service DNS. Everything is in-cluster so CoreDNS works.
   hostNetwork: false
   # ADR-019: store moved to rio-store namespace. FQDN required for
   # cross-ns resolution — short names only work same-ns. Controller
