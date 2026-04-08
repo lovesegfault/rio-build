@@ -39,7 +39,7 @@ use super::provider::{Provider, ProviderKind};
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
 use crate::k8s::eks::smoke::CliCtx;
-use crate::k8s::k3s::smoke::{port_forward, scheduler_leader_pod};
+use crate::k8s::k3s::smoke::port_forward;
 use crate::sh::repo_root;
 
 #[derive(Subcommand)]
@@ -518,8 +518,8 @@ async fn cmd_watch(session: Option<String>) -> Result<()> {
     // that was here never noticed. Target the leader pod (which DOES
     // expose 9091) and TCP-poll like tunnel_grpc does for the gRPC
     // forwards. Second Lease lookup (CliCtx::open did one internally)
-    // is one extra `kubectl get` — negligible vs. a 30s poll loop.
-    let leader = scheduler_leader_pod().await?;
+    // is one extra apiserver round-trip — negligible vs. a 30s poll loop.
+    let leader = format!("pod/{}", crate::kube::scheduler_leader(&client, NS).await?);
     let (metrics_port, _metrics_fwd) = port_forward(NS, &leader, 0, 9091).await?;
     crate::ui::poll(
         "scheduler metrics TCP accept",

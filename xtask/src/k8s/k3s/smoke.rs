@@ -129,31 +129,6 @@ pub(crate) async fn port_forward(
     Ok((bound, guard))
 }
 
-/// Look up the scheduler leader pod from the `rio-scheduler-leader`
-/// Lease. Port-forwarding to `svc/rio-scheduler` load-balances across
-/// all replicas; standbys reject writes with "not leader". Targeting
-/// the leader pod directly makes admin ops deterministic.
-///
-/// Also used for the metrics forward (port 9091): the Service spec
-/// only exposes 9001, so `kubectl port-forward svc/rio-scheduler
-/// X:9091` errors with "does not have a service port 9091" — must
-/// target the pod. See I-050.
-pub(crate) async fn scheduler_leader_pod() -> Result<String> {
-    let sh = crate::sh::shell()?;
-    // xshell cmd! interpolates {var} — pass jsonpath as a var to avoid
-    // brace-escaping gymnastics.
-    let jp = "jsonpath={.spec.holderIdentity}";
-    let holder = crate::sh::read(xshell::cmd!(
-        sh,
-        "kubectl -n {NS} get lease rio-scheduler-leader -o {jp}"
-    ))?;
-    anyhow::ensure!(
-        !holder.is_empty(),
-        "rio-scheduler-leader Lease has no holder"
-    );
-    Ok(format!("pod/{holder}"))
-}
-
 /// Port-forward scheduler:9001 + store:9002, wait for TCP accept on both.
 /// Shared by all three providers — kubectl reaches the apiserver proxy
 /// regardless of whether that's via k3s loopback or `aws eks
@@ -168,7 +143,8 @@ pub async fn tunnel_grpc(
     sched_port: u16,
     store_port: u16,
 ) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
-    let leader = scheduler_leader_pod().await?;
+    let client = kube::client().await?;
+    let leader = format!("pod/{}", kube::scheduler_leader(&client, NS).await?);
     let sched = port_forward(NS, &leader, sched_port, 9001).await?;
     let store = port_forward(NS_STORE, "svc/rio-store", store_port, 9002).await?;
     let (sp, tp) = (sched.0, store.0);
