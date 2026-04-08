@@ -3,18 +3,12 @@ package rio.types;
 
 // DAG wire types — derivation nodes/edges and per-derivation events.
 //
-// Split from types.proto (P0376): DAG-shape messages churn orthogonally
-// to build-lifecycle and admin messages. This file's collision-set tracks
-// schema evolution of the derivation graph, not every field-add across
-// the proto package.
-//
 // Same `package rio.types;` as types.proto / build_types.proto /
 // admin_types.proto — prost merges by package into a single
 // `rio.types.rs`, so Rust callers see all types at `rio_proto::types::*`
-// regardless of which .proto file defines them. The split is for
-// FILE-level collision tracking in the plan DAG, not Rust-module
-// separation. lib.rs `pub mod dag { pub use ... }` re-exports the
-// domain-scoped path for callers that want it.
+// regardless of which .proto file defines them. lib.rs
+// `pub mod dag { pub use ... }` re-exports the domain-scoped path for
+// callers that want it.
 
 import "types.proto"; // DerivationFailed.status → BuildResultStatus
 

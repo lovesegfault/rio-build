@@ -5,10 +5,6 @@ package rio.types;
 // requests, BuildEvent stream, BuildExecution bidirectional stream messages,
 // and the heartbeat protocol.
 //
-// Split from types.proto (P0376): build-lifecycle field additions
-// (critical_path, assigned_executors, progress update fields, etc.) are the
-// highest-churn domain and orthogonal to DAG-shape and admin messages.
-//
 // Same `package rio.types;` as types.proto / dag.proto / admin_types.proto
 // — prost merges by package into a single `rio.types.rs`. lib.rs
 // `pub mod build_types { pub use ... }` re-exports the domain-scoped path.

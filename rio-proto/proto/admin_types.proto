@@ -5,9 +5,8 @@ package rio.types;
 // GetBuildLogs, DrainExecutor, ClearPoison, GetSizeClassStatus. Data
 // types for the AdminService RPCs defined in admin.proto.
 //
-// Split from types.proto (P0376). Same `package rio.types;` — prost merges
-// by package into a single `rio.types.rs` so Rust callers see these at
-// `rio_proto::types::*` unchanged.
+// Same `package rio.types;` — prost merges by package into a single
+// `rio.types.rs` so Rust callers see these at `rio_proto::types::*`.
 
 import "google/protobuf/timestamp.proto";
 import "types.proto";       // ExecutorInfo.resources → ResourceUsage

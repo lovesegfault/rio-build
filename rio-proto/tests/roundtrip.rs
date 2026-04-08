@@ -95,11 +95,11 @@ fn derivation_node_is_content_addressed_roundtrip() {
     assert!(!default_decoded.is_content_addressed);
 }
 
-/// P0376 domain split: all four .proto files (types / dag / build_types /
-/// admin_types) share `package rio.types;` → prost merges into one module.
-/// This test is a COMPILE-TIME smoke: if a message moved but wasn't added
-/// to build.rs's compile list, or a re-export in lib.rs points at a type
-/// that no longer exists, this `use` fails to resolve.
+/// All four .proto files (types / dag / build_types / admin_types) share
+/// `package rio.types;` → prost merges into one module. This test is a
+/// COMPILE-TIME smoke: if a message moved but wasn't added to build.rs's
+/// compile list, or a re-export in lib.rs points at a type that no longer
+/// exists, this `use` fails to resolve.
 ///
 /// Also pins the dual-path invariant: `rio_proto::dag::DerivationNode` and
 /// `rio_proto::types::DerivationNode` are the SAME type (identity assertion
@@ -107,7 +107,7 @@ fn derivation_node_is_content_addressed_roundtrip() {
 /// what we actually want — both paths compile and refer to one struct).
 #[test]
 #[allow(clippy::useless_conversion)]
-fn p0376_domain_split_reexports_resolve() {
+fn domain_split_reexports_resolve() {
     // dag.proto → rio_proto::dag re-exports
     let _: rio_proto::dag::DerivationNode = rio_proto::types::DerivationNode::default();
     let _: rio_proto::dag::DerivationEdge = rio_proto::types::DerivationEdge::default();
