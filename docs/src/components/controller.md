@@ -264,53 +264,78 @@ kind: BuilderPoolSet
 metadata:
   name: default
 spec:
-  sizeClasses:
+  poolTemplate:                      # shared across ALL child BuilderPools
+    image: rio-builder:latest        # required
+    systems: [x86_64-linux]          # required
+    features: []
+    seccompProfile: { type: Localhost, localhostProfile: operator/rio-builder.json }
+    hostUsers: false
+    hostNetwork: false
+    privileged: false
+    tlsSecretName: rio-builder-tls
+    nodeSelector:
+      rio.build/worker: "true"
+    tolerations:
+      - { key: rio.build/worker, operator: Equal, value: "true", effect: NoSchedule }
+  classes:
     - name: small
-      durationCutoff: 60s
-      pool:
-        maxConcurrent: 40
-        resources:
-          requests: { cpu: "2", memory: "4Gi" }
-          limits: { cpu: "4", memory: "8Gi" }
-        fuseCacheSize: 50Gi
+      cutoffSecs: 60                 # f64; required (no null/unbounded — last class catches the tail)
+      maxConcurrent: 40
+      targetQueuePerReplica: 5
+      resources:
+        requests: { cpu: "2", memory: "4Gi" }
+        limits: { cpu: "4", memory: "8Gi" }
     - name: medium
-      durationCutoff: 600s
-      pool:
-        maxConcurrent: 15
-        resources:
-          requests: { cpu: "4", memory: "8Gi" }
-          limits: { cpu: "8", memory: "16Gi" }
-        fuseCacheSize: 100Gi
+      cutoffSecs: 600
+      maxConcurrent: 15
+      resources:
+        requests: { cpu: "4", memory: "8Gi" }
+        limits: { cpu: "8", memory: "16Gi" }
     - name: large
-      durationCutoff: null           # unbounded (everything > 600s)
-      pool:
-        maxConcurrent: 10
-        resources:
-          requests: { cpu: "8", memory: "16Gi" }
-          limits: { cpu: "16", memory: "32Gi" }
-        fuseCacheSize: 200Gi
-  cutoffLearning:
-    enabled: true
-    algorithm: sita-e
-    recomputeInterval: 1h
-    minSamples: 100
-    smoothingFactor: 0.1
+      cutoffSecs: 7200
+      maxConcurrent: 10
+      resources:
+        requests: { cpu: "8", memory: "16Gi" }
+        limits: { cpu: "16", memory: "32Gi" }
 status:
   classes:
     - name: small
-      effectiveCutoff: 45s           # learned cutoff (may differ from spec)
+      effectiveCutoffSecs: 45        # learned cutoff (may differ from spec)
+      queued: 18
+      childPool: default-small
       replicas: 12
       readyReplicas: 12
     - name: medium
-      effectiveCutoff: 480s
+      effectiveCutoffSecs: 480
+      queued: 3
+      childPool: default-medium
       replicas: 5
       readyReplicas: 4
     - name: large
-      effectiveCutoff: null
+      effectiveCutoffSecs: 7200
+      queued: 1
+      childPool: default-large
       replicas: 3
       readyReplicas: 3
-  lastCutoffUpdate: 2026-02-13T07:00:00Z
 ```
+
+| `PoolTemplate` field | Type | Notes |
+|---|---|---|
+| `image` | string | Required. Container image for all child pools. |
+| `systems` | list\<string\> | Required. Separate arches → separate `BuilderPoolSet` CRs. |
+| `features` | list\<string\> | `requiredSystemFeatures` advertised by all child pools. |
+| `nodeSelector` / `tolerations` | map / list | Builder node placement. |
+| `seccompProfile` | `{type, localhostProfile?}` | CEL-validated; `Localhost` requires `localhostProfile`. |
+| `privileged` / `hostNetwork` / `hostUsers` | bool | Shared escape hatches; see `r[ctrl.crd.host-users-network-exclusive]`. |
+| `tlsSecretName` | string | mTLS client cert Secret. |
+
+| `SizeClassSpec` field | Type | Notes |
+|---|---|---|
+| `name` | string | Child pool name suffix and `BuilderPoolSpec.sizeClass` value. |
+| `cutoffSecs` | f64 | Required. Upper duration bound for this class; last class catches the tail. |
+| `maxConcurrent` | u32? | Per-class concurrent-Job ceiling. |
+| `targetQueuePerReplica` | u32? | Autoscaler target (default 5). |
+| `resources` | ResourceRequirements | Required — distinct resource profiles are the point of size classes. |
 
 The existing `BuilderPool` CRD remains valid for single-pool deployments without size-class routing.
 
