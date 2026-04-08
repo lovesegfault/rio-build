@@ -275,6 +275,8 @@ impl StoreService for MockStore {
                 .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo"))?,
             _ => return Err(Status::invalid_argument("first message must be metadata")),
         };
+        let _ = rio_nix::store_path::StorePath::parse(&info.store_path)
+            .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
         // r[impl ts.mock.store-put-validate]
         // Mirror real store (put_path.rs:206-211): hash-upfront was removed
         // pre-phase3a. A non-empty metadata.nar_hash means an un-updated
@@ -396,6 +398,9 @@ impl StoreService for MockStore {
                             "batch: metadata.nar_hash must be empty",
                         ));
                     }
+                    let _ = rio_nix::store_path::StorePath::parse(&i.store_path).map_err(|e| {
+                        Status::invalid_argument(format!("mock: invalid store path: {e}"))
+                    })?;
                     *info = Some(i);
                 }
                 types::put_path_request::Msg::NarChunk(chunk) => {
@@ -539,6 +544,8 @@ impl StoreService for MockStore {
             ));
         }
         let store_path = request.into_inner().store_path;
+        let _ = rio_nix::store_path::StorePath::parse(&store_path)
+            .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
         self.calls
             .qpi_calls
             .write()
@@ -636,6 +643,10 @@ impl StoreService for MockStore {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }
         let requested = request.into_inner().store_paths;
+        for p in &requested {
+            let _ = rio_nix::store_path::StorePath::parse(p)
+                .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
+        }
         let paths = self.state.paths.read().unwrap();
         let missing: Vec<String> = requested
             .into_iter()
