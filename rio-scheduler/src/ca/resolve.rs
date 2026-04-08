@@ -596,7 +596,7 @@ pub type RealisationOutput = (String, [u8; 32]);
 /// Returns `(drv_hash, output_name) → (output_path, output_hash)`.
 /// The caller matches these against the current DAG's cascade
 /// candidates by name-suffix (output_path ends with `-{pname}`).
-// r[impl sched.ca.cutoff-propagate]
+// r[impl sched.ca.cutoff-propagate+2]
 #[instrument(skip(pool, seeds))]
 pub async fn walk_dependent_realisations(
     pool: &PgPool,

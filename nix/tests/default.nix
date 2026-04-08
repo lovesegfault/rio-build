@@ -208,7 +208,7 @@ in
     cold = false;
   };
 
-  # r[verify sched.ca.cutoff-propagate]
+  # r[verify sched.ca.cutoff-propagate+2]
   #   Build CA-on-CA chain (A→B→C, all __contentAddressed=true),
   #   then resubmit with a different marker (A's drv hash differs,
   #   but A's output content is marker-independent → same nar_hash).

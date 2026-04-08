@@ -61,17 +61,19 @@ impl InstantWorker {
             })
             .await?;
         actor
-            .send_unchecked(ActorCommand::Heartbeat {
-                executor_id: executor_id.into(),
-                systems: vec!["x86_64-linux".into()],
-                supported_features: vec![],
-                running_builds: vec![],
-                size_class: None,
-                resources: None,
-                store_degraded: false,
-                draining: false,
-                kind: rio_proto::types::ExecutorKind::Builder,
-            })
+            .send_unchecked(ActorCommand::Heartbeat(
+                rio_scheduler::actor::HeartbeatPayload {
+                    executor_id: executor_id.into(),
+                    systems: vec!["x86_64-linux".into()],
+                    supported_features: vec![],
+                    running_builds: vec![],
+                    size_class: None,
+                    resources: None,
+                    store_degraded: false,
+                    draining: false,
+                    kind: rio_proto::types::ExecutorKind::Builder,
+                },
+            ))
             .await?;
         Ok(Self {
             id: executor_id.into(),

@@ -496,7 +496,7 @@ async fn ca_compare_no_prior_counts_as_miss() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// `verify_cutoff_candidates` wiring: the `|h| verified.contains_key(h)`
 /// closure is LOAD-BEARING. A mutant that replaces it with `|_| true`
 /// (skip every candidate unconditionally) would let nodes with no

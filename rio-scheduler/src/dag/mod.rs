@@ -616,7 +616,7 @@ impl DerivationDag {
         ready
     }
 
-    // r[impl sched.ca.cutoff-propagate]
+    // r[impl sched.ca.cutoff-propagate+2]
     /// Walk downstream from a CA-unchanged completion. Return derivations
     /// whose ONLY remaining incomplete dependency was the just-completed
     /// (or just-skipped) node — i.e., status is `Queued` and all deps are
@@ -728,7 +728,7 @@ impl DerivationDag {
         (reachable, cap_hit)
     }
 
-    // r[impl sched.ca.cutoff-propagate]
+    // r[impl sched.ca.cutoff-propagate+2]
     /// Cascade CA-cutoff Skip transitions starting from a trigger node.
     ///
     /// Two-phase: (1) BFS-collect all verified-eligible downstream

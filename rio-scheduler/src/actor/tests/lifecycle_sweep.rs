@@ -239,7 +239,7 @@ async fn test_starvation_intersects_live() -> TestResult {
 // m052: cascade notifies union of interested_builds
 // ═══════════════════════════════════════════════════════════════════════════
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// Cascade notifies builds whose ONLY interested nodes are the
 /// cascaded ones (not the trigger). Scenario: shared leaf fails,
 /// cascades to parent that belongs ONLY to build Y. Build Y must
@@ -323,7 +323,7 @@ async fn test_cascade_notifies_merged_builds() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// The real m052 scenario: A→B→C. Build X={A,B,C}. Build Y={A} only.
 /// C fails, cascades to B,A. A.interested={X,Y}, C.interested={X}.
 /// Old code: notify trigger's set {X} → Y hangs. New: union {X,Y}.

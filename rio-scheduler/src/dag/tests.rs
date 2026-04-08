@@ -1249,7 +1249,7 @@ fn chain_dag(n: usize) -> DerivationDag {
     dag
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// A→B→C chain: A completes with unchanged CA output. Cascade skips
 /// B (only incomplete dep was A), then C (only incomplete dep was B).
 /// Neither ran; both end Skipped.
@@ -1315,7 +1315,7 @@ fn ca_cutoff_skips_running() {
     );
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// A has two deps: B (CA, completes unchanged) and C (still Queued).
 /// A is NOT eligible — it has another incomplete dep. Only when ALL
 /// deps are terminal can we skip.
@@ -1357,7 +1357,7 @@ fn ca_cutoff_not_eligible_with_incomplete_sibling() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// Depth cap: chain of MAX_CASCADE_NODES+2 nodes (1 trigger +
 /// MAX_CASCADE_NODES+1 Queued). The cascade processes MAX_CASCADE_NODES
 /// iterations, skipping MAX_CASCADE_NODES nodes; the (MAX+1)th stays
@@ -1395,7 +1395,7 @@ fn ca_cutoff_depth_cap() {
     );
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// Defensive guard: the verify closure gates which nodes are
 /// Skipped. A node that fails verification (output doesn't exist
 /// in store) is NOT skipped AND the cascade doesn't continue
@@ -1432,7 +1432,7 @@ fn ca_cutoff_verify_gates_cascade() {
     );
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// `find_cutoff_eligible_speculative` with NON-EMPTY `provisional_
 /// skipped` set. The non-empty path (the OR-branch `provisional_
 /// skipped.contains(d)` in the all-deps-terminal check) is only
@@ -1535,7 +1535,7 @@ fn build_summary_skipped_counts_as_completed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.ca.cutoff-propagate]
+// r[verify sched.ca.cutoff-propagate+2]
 /// H1 regression (P0399): verify-rejected parent of Skipped must be
 /// Ready-promotable, not stuck Queued.
 ///

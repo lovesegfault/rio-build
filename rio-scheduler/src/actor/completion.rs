@@ -1045,7 +1045,7 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.ca.cutoff-propagate]
+        // r[impl sched.ca.cutoff-propagate+2]
         // Cascade: if the compare set ca_output_unchanged=true,
         // transitively skip downstream Queued derivations whose only
         // incomplete dep was this one.

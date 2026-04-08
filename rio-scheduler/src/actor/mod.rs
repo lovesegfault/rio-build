@@ -760,6 +760,7 @@ impl DagActor {
     /// (shared dependency) → same expected_output_paths would be
     /// duplicated N× in the roots list. The store's mark CTE handles
     /// dups correctly, but it's wasted network + CTE work.
+    // r[impl sched.gc.live-pins]
     fn handle_gc_roots(&self) -> Vec<String> {
         self.dag
             .iter_nodes()

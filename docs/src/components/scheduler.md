@@ -184,6 +184,30 @@ r[sched.admin.capacity-manifest]
 r[sched.admin.capacity-manifest.bucket]
 Estimates are `EMA × headroom_multiplier`, rounded UP to 4GiB memory buckets and 2000-millicore CPU buckets. Bucketing at the scheduler (not the controller) means all consumers see identical buckets --- two derivations that should share a pod don't diverge from floating-point rounding applied in different places. Cold-start derivations (no `build_history` sample) are omitted; the controller uses its operator-configured floor.
 
+r[sched.admin.estimator-stats]
+`AdminService.GetEstimatorStats` dumps the in-memory `build_history` snapshot — every `(pname, system)` EMA — joined with `classify()` under the current effective cutoffs. Reflects the last Tick refresh (~60s stale at worst), NOT a live PG read: this is "what the scheduler SEES".
+
+r[sched.admin.inspect-dag]
+`AdminService.InspectBuildDag` returns the actor's in-memory snapshot of a build's derivations cross-referenced with the live executor stream pool. `executor_has_stream=false` for an Assigned derivation means its assigned executor's gRPC bidi stream is gone from the actor's map — dispatch can never complete. PG may still show the executor as alive; only the actor knows the stream is dead.
+
+r[sched.admin.debug-list-executors]
+`AdminService.DebugListExecutors` snapshots the in-memory executor map (`has_stream`, `warm`, `kind` per entry) — what `dispatch_ready()` filters on, not what PG `last_seen` claims.
+
+r[sched.gc.live-pins]
+`AdminQuery::GcRoots` returns `expected_output_paths ∪ output_paths` for all non-terminal derivations. Passed as extra roots to the store's GC mark phase to protect in-flight build outputs that may not be in narinfo yet (worker hasn't uploaded).
+
+r[sched.heartbeat.adopt]
+A heartbeat-reported running build the scheduler doesn't have on record for that executor is adopted into BOTH `worker.running_build` (so dispatch sees at-capacity) AND the DAG node (so dispatch_ready won't re-pop it). Expected after scheduler restart: recovery's reconcile may have reset the assignment to Ready while the worker still has it in-flight.
+
+r[sched.heartbeat.phantom-drain]
+If the scheduler-kept running build is missing from the worker's heartbeat report across two consecutive heartbeats (past the ~10s race window), the scheduler drains the phantom assignment: the derivation is reset to Ready and re-queued.
+
+r[sched.breaker.cache-check]
+The merge-time `FindMissingPaths` and CA cutoff-compare lookups go through a circuit breaker that opens after 5 consecutive store-side failures and half-opens after 30s. While open, the scheduler skips cache checks (degrade to "build everything" / "no cutoff") rather than blocking merge.
+
+r[sched.freeze-detector]
+`dispatch_ready` WARNs once per minute when `fod_deferred > 0 && fetcher_streams == 0` (or `class_deferred > 0 && builder_streams == 0`) holds for ≥60s. The scheduler already surfaces the freeze via gauges, but a WARN lands in `kubectl logs` without a port-forward.
+
 ## Multi-Build DAG Merging
 
 r[sched.merge.dedup]
@@ -322,8 +346,8 @@ The scheduler MUST distinguish content-addressed derivations from input-addresse
 r[sched.ca.cutoff-compare]
 When a CA derivation completes successfully, the scheduler MUST compare the output `nar_hash` against the content index. A match means the output is byte-identical to a prior build — downstream builds depending only on this output can be skipped.
 
-r[sched.ca.cutoff-propagate]
-On hash match, the scheduler MUST transition downstream derivations whose only incomplete dependency was the matched CA output from `Queued` to `Skipped` without running them. The transition cascades recursively (depth-capped at 1000). Running derivations are NEVER killed — cutoff applies to `Queued` only (see `r[sched.preempt.never-running]`).
+r[sched.ca.cutoff-propagate+2]
+On hash match, the scheduler MUST transition downstream derivations whose only incomplete dependency was the matched CA output from `Queued` or `Ready` to `Skipped` without running them. `Ready` is allowed for order-independence vs `find_newly_ready` (the cascade may race a prior `Queued→Ready` promotion). The transition cascades recursively (depth-capped at 1000). Running derivations are NEVER killed — cutoff applies pre-dispatch only (see `r[sched.preempt.never-running]`).
 
 r[sched.ca.resolve+2]
 When a CA derivation's inputs are themselves CA (CA-depends-on-CA), the scheduler MUST rewrite `inputDrvs` placeholder paths to realized store paths before dispatch. Each successful `(drv_hash, output_name) → output_path` lookup during resolution is inserted into the `realisation_deps` junction table as a side-effect — this table is rio's derived-build-trace cache (per [ADR-018](../decisions/018-ca-resolution.md)), populated by the scheduler at resolve time. It never crosses the wire; `wopRegisterDrvOutput`'s `dependentRealisations` field is always `{}` from current Nix.
@@ -770,7 +794,7 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainExecutor, GetBuildLogs, TriggerGC)
 - `rio-scheduler/src/rebalancer.rs` — CutoffRebalancer (SITA-E adaptive cutoff adjustment from `build_samples`)
 
-CA early cutoff is end-to-end: compare (`r[sched.ca.cutoff-compare]` — completion-time content-index lookup), propagate (`r[sched.ca.cutoff-propagate]` — `Queued`→`Skipped` cascade with `MAX_CASCADE_NODES=1000`), and resolve (`r[sched.ca.resolve]` — dispatch-time placeholder rewrite for CA-on-CA chains). The `Skipped` terminal state is distinct from `Completed` for metrics (`rio_scheduler_ca_cutoff_saves_total`, `rio_scheduler_ca_cutoff_seconds_saved`) and audit trail. Resolution uses the gateway-computed `ca_modular_hash` (plumbed via `DerivationNode.ca_modular_hash` post-BFS) to query the `realisations` table; each lookup is recorded in `realisation_deps` at completion time after the parent's own realisation lands (FK ordering).
+CA early cutoff is end-to-end: compare (`r[sched.ca.cutoff-compare]` — completion-time content-index lookup), propagate (`r[sched.ca.cutoff-propagate+2]` — `Queued`→`Skipped` cascade with `MAX_CASCADE_NODES=1000`), and resolve (`r[sched.ca.resolve]` — dispatch-time placeholder rewrite for CA-on-CA chains). The `Skipped` terminal state is distinct from `Completed` for metrics (`rio_scheduler_ca_cutoff_saves_total`, `rio_scheduler_ca_cutoff_seconds_saved`) and audit trail. Resolution uses the gateway-computed `ca_modular_hash` (plumbed via `DerivationNode.ca_modular_hash` post-BFS) to query the `realisations` table; each lookup is recorded in `realisation_deps` at completion time after the parent's own realisation lands (FK ordering).
 
 ```mermaid
 flowchart LR

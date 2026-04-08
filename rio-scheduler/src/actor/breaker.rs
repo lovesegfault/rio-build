@@ -38,6 +38,7 @@ use super::*;
 /// only close via timeout. A successful probe is a faster, more responsive
 /// signal that the store is back. The probe costs one RPC per SubmitBuild
 /// — same as the closed state — so there's no extra load.
+// r[impl sched.breaker.cache-check]
 #[derive(Debug, Default)]
 pub(crate) struct CacheCheckBreaker {
     /// Consecutive cache-check failures. Reset to 0 on any success.
