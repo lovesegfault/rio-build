@@ -104,7 +104,7 @@ pub(in crate::executor) async fn run_daemon_build(
 
     // Timeout is a BUILD OUTCOME, not an executor error. Returning
     // Ok(failure) flows through execute_build's status-mapping path
-    // (nix_failure_to_proto → BuildResultStatus::TimedOut), which the
+    // (BuildResultStatus::from → TimedOut), which the
     // scheduler treats as permanent-no-reassign. Returning Err would
     // land in runtime.rs's InfrastructureFailure arm → reassignment
     // storm (same build, same inputs, same timeout, forever).

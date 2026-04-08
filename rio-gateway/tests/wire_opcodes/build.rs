@@ -850,6 +850,7 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
             ev(build_event::Event::Failed(types::BuildFailed {
                 error_message: "build failed".into(),
                 failed_derivation: target.clone(),
+                status: 0,
             })),
         ]),
         ..Default::default()
@@ -920,8 +921,8 @@ async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()>
     let _derived_path = wire::read_string(&mut h.stream).await?;
     let status = wire::read_u64(&mut h.stream).await?;
     let error_msg = wire::read_string(&mut h.stream).await?;
-    // BuildStatus::MiscFailure = 9
-    assert_eq!(status, 9, "MiscFailure");
+    // BuildStatus::TransientFailure = 6 (Cancelled is retryable)
+    assert_eq!(status, 6, "Cancelled → TransientFailure");
     assert!(
         error_msg.contains("build cancelled") && error_msg.contains("user abort"),
         "error_msg: {error_msg}"
@@ -1178,6 +1179,7 @@ async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<(
         scripted_events: Some(vec![ev(build_event::Event::Failed(types::BuildFailed {
             error_message: "instant fail".into(),
             failed_derivation: String::new(),
+            status: 0,
         }))]),
         ..Default::default()
     });
@@ -1201,7 +1203,7 @@ async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<(
 /// This path hits submit_and_process_build's first-event peek for Cancelled
 /// (lines ~246-252 in handler/build.rs) — a reconnect arriving AFTER the build
 /// was already cancelled, where Cancelled is the first event past since_seq.
-/// For opcode 46, the BuildResult has MiscFailure + "build cancelled: <reason>".
+/// For opcode 46, the BuildResult has TransientFailure + "build cancelled: <reason>".
 #[tokio::test]
 async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1227,8 +1229,8 @@ async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Resul
     let _derived_path = wire::read_string(&mut h.stream).await?;
     let status = wire::read_u64(&mut h.stream).await?;
     let error_msg = wire::read_string(&mut h.stream).await?;
-    // BuildStatus::MiscFailure = 9
-    assert_eq!(status, 9, "first-event-Cancelled → MiscFailure");
+    // BuildStatus::TransientFailure = 6 (Cancelled is retryable)
+    assert_eq!(status, 6, "first-event-Cancelled → TransientFailure");
     assert!(
         error_msg.contains("build cancelled") && error_msg.contains("early cancel"),
         "error_msg: {error_msg}"

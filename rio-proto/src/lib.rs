@@ -17,6 +17,7 @@ pub use rio_common::grpc::{
 
 pub mod client;
 pub mod interceptor;
+pub mod status;
 pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.

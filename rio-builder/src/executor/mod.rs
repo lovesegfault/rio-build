@@ -1402,7 +1402,7 @@ async fn collect_outputs(
         // materialization failure (warm timeout / FUSE EIO / I-043
         // negative-dentry), NOT a build defect. Reclassify so the
         // scheduler retries instead of poisoning. Checked BEFORE the
-        // generic nix_failure_to_proto collapse (MiscFailure →
+        // generic BuildResultStatus::from collapse (MiscFailure →
         // PermanentFailure).
         if is_input_materialization_failure(
             build_result.status,
@@ -1437,7 +1437,7 @@ async fn collect_outputs(
         );
         return Ok(BuildOutputs {
             proto_result: ProtoBuildResult {
-                status: nix_failure_to_proto(build_result.status).into(),
+                status: BuildResultStatus::from(build_result.status).into(),
                 error_msg: build_result.error_msg.clone(),
                 ..Default::default()
             },
@@ -1835,56 +1835,6 @@ pub(crate) fn is_input_materialization_failure(
         .any(|p| p.rsplit('/').next().unwrap_or(p) == basename)
 }
 
-/// Map a Nix daemon BuildStatus (failure path only — caller has already
-/// branched on is_success()) to the proto BuildResultStatus reported to
-/// the scheduler.
-///
-/// Exhaustive: no `_` arm. Adding a new BuildStatus variant in rio-nix
-/// is a compile error here until the mapping decision is made.
-///
-// r[impl builder.status.nix-to-proto]
-pub(crate) fn nix_failure_to_proto(
-    nix: rio_nix::protocol::build::BuildStatus,
-) -> BuildResultStatus {
-    use rio_nix::protocol::build::BuildStatus as Nix;
-    match nix {
-        // Success variants: caller branched on is_success(), these are
-        // unreachable. Return Built anyway (not a panic — if the caller
-        // contract is ever violated, a wrong-but-success status is less
-        // damaging than a worker crash mid-build).
-        Nix::Built | Nix::Substituted | Nix::AlreadyValid | Nix::ResolvesToAlreadyValid => {
-            debug_assert!(
-                false,
-                "nix_failure_to_proto called with success status {nix:?}"
-            );
-            BuildResultStatus::Built
-        }
-
-        // 1:1 mappings — proto variant exists with identical semantics.
-        Nix::PermanentFailure => BuildResultStatus::PermanentFailure,
-        Nix::TransientFailure => BuildResultStatus::TransientFailure,
-        Nix::CachedFailure => BuildResultStatus::CachedFailure,
-        Nix::DependencyFailed => BuildResultStatus::DependencyFailed,
-        Nix::LogLimitExceeded => BuildResultStatus::LogLimitExceeded,
-        Nix::OutputRejected => BuildResultStatus::OutputRejected,
-        Nix::InputRejected => BuildResultStatus::InputRejected,
-        Nix::TimedOut => BuildResultStatus::TimedOut,
-        Nix::NotDeterministic => BuildResultStatus::NotDeterministic,
-
-        // Intentional collapse: MiscFailure is nix-daemon's own catch-all
-        // (used when it can't classify). PermanentFailure is the honest
-        // proto equivalent — "it failed, we don't know why, don't retry."
-        Nix::MiscFailure => BuildResultStatus::PermanentFailure,
-
-        // Intentional collapse: NoSubstituters means "I was asked to
-        // substitute and couldn't find a substituter." Our workers run
-        // with `substitute = false` (WORKER_NIX_CONF) — we never ask the
-        // daemon to substitute. If we see this, something is misconfigured;
-        // PermanentFailure + the error_msg is the right signal.
-        Nix::NoSubstituters => BuildResultStatus::PermanentFailure,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2005,51 +1955,6 @@ mod tests {
         assert!(content.contains("cores = 1\n"), "0 clamped to 1");
         assert!(!content.contains("cores = 0"));
         Ok(())
-    }
-
-    /// Every non-success Nix BuildStatus maps to a proto status. No
-    /// variant hits a `_` arm — the mapping fn is exhaustive so adding
-    /// a Nix variant is a compile error.
-    ///
-    /// Stronger than "compiles": asserts the MAPPING DECISIONS stay
-    /// stable. If someone changes TimedOut → TransientFailure (which
-    /// would reintroduce the reassignment storm), this test fails.
-    ///
-    // r[verify builder.status.nix-to-proto]
-    #[test]
-    fn test_nix_failure_to_proto_is_exhaustive_and_stable() {
-        use rio_nix::protocol::build::BuildStatus as Nix;
-        use rio_proto::types::BuildResultStatus as Proto;
-
-        // 1:1 mappings — each Nix failure gets its OWN proto variant.
-        let one_to_one = [
-            (Nix::PermanentFailure, Proto::PermanentFailure),
-            (Nix::TransientFailure, Proto::TransientFailure),
-            (Nix::CachedFailure, Proto::CachedFailure),
-            (Nix::DependencyFailed, Proto::DependencyFailed),
-            (Nix::LogLimitExceeded, Proto::LogLimitExceeded),
-            (Nix::OutputRejected, Proto::OutputRejected),
-            (Nix::InputRejected, Proto::InputRejected),
-            (Nix::TimedOut, Proto::TimedOut),
-            (Nix::NotDeterministic, Proto::NotDeterministic),
-        ];
-        for (nix, want) in one_to_one {
-            assert_eq!(
-                nix_failure_to_proto(nix),
-                want,
-                "1:1 mapping broke for {nix:?}"
-            );
-        }
-
-        // Intentional collapses — documented reasons in the fn body.
-        assert_eq!(
-            nix_failure_to_proto(Nix::MiscFailure),
-            Proto::PermanentFailure
-        );
-        assert_eq!(
-            nix_failure_to_proto(Nix::NoSubstituters),
-            Proto::PermanentFailure
-        );
     }
 
     /// I-178: daemon `MiscFailure` with `getting attributes of path
@@ -2255,7 +2160,7 @@ mod tests {
         use rio_nix::protocol::build::BuildStatus as Nix;
         use rio_proto::types::BuildResultStatus as Proto;
 
-        let mapped = nix_failure_to_proto(Nix::TimedOut);
+        let mapped = Proto::from(Nix::TimedOut);
         // completion.rs:151-152: these two trigger handle_transient_failure
         // (reassign). TimedOut must not be either.
         assert_ne!(mapped, Proto::TransientFailure, "TimedOut → reassign storm");

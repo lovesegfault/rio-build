@@ -309,6 +309,7 @@ impl DagActor {
                     rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
                         error_message: build.error_summary.clone().unwrap_or_default(),
                         failed_derivation: build.failed_derivation.clone().unwrap_or_default(),
+                        status: 0,
                     })
                 }
                 BuildState::Cancelled => rio_proto::types::build_event::Event::Cancelled(
@@ -488,6 +489,7 @@ impl DagActor {
             rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
                 error_message: error_summary,
                 failed_derivation,
+                status: 0,
             }),
         );
         metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);

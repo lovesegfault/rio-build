@@ -179,7 +179,7 @@ impl Default for BuildActivityState {
         Self {
             drv: HashMap::default(),
             builds_root: None,
-            machine_name: std::env::var("RIO_GATEWAY_MACHINE_NAME").unwrap_or_default(),
+            machine_name: rio_common::config::env_or("RIO_GATEWAY_MACHINE_NAME", String::new()),
         }
     }
 }
@@ -435,6 +435,7 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
             }
             Some(types::build_event::Event::Failed(failed)) => {
                 return Ok(BuildEventOutcome::Failed {
+                    status: failed.status(),
                     error_message: failed.error_message,
                 });
             }
@@ -463,8 +464,13 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
 /// Outcome of processing a build event stream.
 enum BuildEventOutcome {
     Completed,
-    Failed { error_message: String },
-    Cancelled { reason: String },
+    Failed {
+        status: types::BuildResultStatus,
+        error_message: String,
+    },
+    Cancelled {
+        reason: String,
+    },
 }
 
 /// Submit a build to the scheduler and process events, returning a BuildResult.
@@ -584,14 +590,19 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // itself completes fine on a worker. With reconnect: client
     // doesn't notice the scheduler blip.
     //
-    // 10 attempts = 1+2+4+8+16 + 5×16 = 111s total (backoff capped
-    // at 16s via `.min(4)` shift below). 5 attempts (=31s) was too
-    // tight: a force-killed leader's REPLACEMENT pod needs ~20-30s
-    // (start + mTLS cert mount + lease acquire on 5s tick). Found
-    // by vm-le-build-k3s under the replacement-wins-race
+    // 10 attempts = 1+2+4+8+16 + 5×16 = 111s total. 5 attempts
+    // (=31s) was too tight: a force-killed leader's REPLACEMENT pod
+    // needs ~20-30s (start + mTLS cert mount + lease acquire on 5s
+    // tick). Found by vm-le-build-k3s under the replacement-wins-race
     // path — standby-wins was fast enough to mask it.
     // r[impl gw.reconnect.backoff]
     const MAX_RECONNECT: u32 = 10;
+    const RECONNECT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+        base: std::time::Duration::from_secs(1),
+        mult: 2.0,
+        cap: std::time::Duration::from_secs(16),
+        jitter: rio_common::backoff::Jitter::None,
+    };
     let mut reconnect_attempts = 0u32;
     // Activity-ID state survives reconnects so a WatchBuild resume can
     // stop_activity derivations whose Started arrived on the prior
@@ -627,8 +638,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             ) => {
                 reconnect_attempts += 1;
                 if reconnect_attempts > MAX_RECONNECT {
-                    // Max retries exhausted. Give up — surface
-                    // MiscFailure to the client.
                     break Err(e);
                 }
 
@@ -637,7 +646,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 // WatchBuild with since=0 replays from the start.
                 let since_seq = active_build_ids.get(&build_id).copied().unwrap_or(0);
 
-                let backoff = std::time::Duration::from_secs(1 << (reconnect_attempts - 1).min(4));
+                let backoff = RECONNECT_BACKOFF.duration(reconnect_attempts - 1);
                 tracing::warn!(
                     %build_id,
                     error = %e,
@@ -749,16 +758,16 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
     match outcome {
         Ok(BuildEventOutcome::Completed) => Ok(BuildResult::success()),
-        Ok(BuildEventOutcome::Failed { error_message }) => Ok(BuildResult::failure(
-            BuildStatus::MiscFailure,
+        Ok(BuildEventOutcome::Failed {
+            status,
             error_message,
-        )),
+        }) => Ok(BuildResult::failure(status.into(), error_message)),
         Ok(BuildEventOutcome::Cancelled { reason }) => Ok(BuildResult::failure(
-            BuildStatus::MiscFailure,
+            BuildStatus::TransientFailure,
             format!("build cancelled: {reason}"),
         )),
         Err(e) => Ok(BuildResult::failure(
-            BuildStatus::MiscFailure,
+            BuildStatus::TransientFailure,
             format!("build stream error (reconnect exhausted): {e}"),
         )),
     }
@@ -881,7 +890,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         // The client receives the rejection via BuildResult.errorMsg
         // after STDERR_LAST. See build.rs:160-164 for the inverse
         // invariant (STDERR_ERROR → STDERR_LAST is equally invalid).
-        let failure = BuildResult::failure(BuildStatus::MiscFailure, reason);
+        let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
         stderr.finish().await?;
         write_build_result(stderr.inner_mut(), &failure).await?;
         return Ok(());
@@ -919,7 +928,10 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "build submission failed");
-            BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
+            BuildResult::failure(
+                BuildStatus::TransientFailure,
+                format!("scheduler error: {e}"),
+            )
         }
     };
 
@@ -1120,7 +1132,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 opaque_results.insert(
                     idx,
                     BuildResult::failure(
-                        BuildStatus::MiscFailure,
+                        BuildStatus::InputRejected,
                         format!("invalid path '{raw}': {e}"),
                     ),
                 );
@@ -1131,21 +1143,21 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                let result = match grpc_is_valid_path(store_client, jwt_token.as_deref(), path)
-                    .await
-                {
-                    Ok(true) => BuildResult {
-                        status: BuildStatus::AlreadyValid,
-                        ..Default::default()
-                    },
-                    Ok(false) => BuildResult::failure(
-                        BuildStatus::MiscFailure,
-                        format!("path '{}' not valid", path),
-                    ),
-                    Err(e) => {
-                        BuildResult::failure(BuildStatus::MiscFailure, format!("store error: {e}"))
-                    }
-                };
+                let result =
+                    match grpc_is_valid_path(store_client, jwt_token.as_deref(), path).await {
+                        Ok(true) => BuildResult {
+                            status: BuildStatus::AlreadyValid,
+                            ..Default::default()
+                        },
+                        Ok(false) => BuildResult::failure(
+                            BuildStatus::NoSubstituters,
+                            format!("path '{}' not valid", path),
+                        ),
+                        Err(e) => BuildResult::failure(
+                            BuildStatus::TransientFailure,
+                            format!("store error: {e}"),
+                        ),
+                    };
                 opaque_results.insert(idx, result);
                 drv_indices.push(None);
             }
@@ -1190,7 +1202,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         // is delivered via STDERR_LAST + result at the write loop below.
         let build_result = if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
             warn!(reason = %reason, "rejecting build: DAG validation failed");
-            BuildResult::failure(BuildStatus::MiscFailure, reason)
+            BuildResult::failure(BuildStatus::InputRejected, reason)
         } else if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
             // Rate limit BEFORE SubmitBuild. STDERR_ERROR already
             // sent by rate_limit_check — same early-return as
@@ -1220,7 +1232,10 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
                 metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                     .increment(1);
-                BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
+                BuildResult::failure(
+                    BuildStatus::TransientFailure,
+                    format!("scheduler error: {e}"),
+                )
             })
         };
 

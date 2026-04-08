@@ -99,6 +99,7 @@ message BuildCompleted {
 message BuildFailed {
   string error_message = 1;
   string failed_derivation = 2;             // Which derivation caused the failure
+  BuildResultStatus status = 3;             // Failure classification (for nix-wire BuildStatus at gateway)
 }
 
 message BuildCancelled {
