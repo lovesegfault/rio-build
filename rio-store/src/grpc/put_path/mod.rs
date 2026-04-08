@@ -137,6 +137,49 @@ impl StoreServiceImpl {
             return Ok(None);
         };
 
+        // Service-token bypass (transport-agnostic). Checked BEFORE
+        // peer_certs so the gateway's bypass works once application-
+        // level TLS is removed (`peer_certs()` becomes None under
+        // Cilium WireGuard). A valid token whose `caller` is in the
+        // allowlist short-circuits — no assignment token required.
+        if let Some(sv) = &self.service_verifier
+            && let Some(tok) = request
+                .metadata()
+                .get(rio_proto::SERVICE_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+        {
+            match sv.verify::<rio_auth::hmac::ServiceClaims>(tok) {
+                Ok(claims)
+                    if self
+                        .service_bypass_callers
+                        .iter()
+                        .any(|a| a == &claims.caller) =>
+                {
+                    metrics::counter!(
+                        "rio_store_service_token_accepted_total",
+                        "caller" => claims.caller,
+                    )
+                    .increment(1);
+                    return Ok(None);
+                }
+                Ok(claims) => {
+                    metrics::counter!("rio_store_hmac_rejected_total",
+                                     "reason" => "service_caller_not_allowlisted")
+                    .increment(1);
+                    return Err(Status::permission_denied(format!(
+                        "service-token caller {:?} not in allowlist",
+                        claims.caller
+                    )));
+                }
+                Err(e) => {
+                    metrics::counter!("rio_store_hmac_rejected_total",
+                                     "reason" => "service_token_invalid")
+                    .increment(1);
+                    return Err(Status::permission_denied(format!("service token: {e}")));
+                }
+            }
+        }
+
         // mTLS bypass: check first peer cert's CN + SAN DNSNames against
         // the allowlist. Previously: ANY peer cert + no token → bypass.
         // That defeated the entire HMAC threat model: a compromised

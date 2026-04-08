@@ -163,6 +163,10 @@ pub fn describe_metrics() {
         "rio_store_hmac_bypass_total",
         "PutPath HMAC checks bypassed via mTLS cert CN=rio-gateway (labeled by cn)"
     );
+    describe_counter!(
+        "rio_store_service_token_accepted_total",
+        "PutPath HMAC checks bypassed via x-rio-service-token (labeled by caller)"
+    );
     describe_gauge!(
         "rio_store_s3_deletes_pending",
         "Rows in pending_s3_deletes awaiting drain"

@@ -39,6 +39,7 @@ pub fn spawn_session_task(
             &mut sched_client,
             tenant,
             None,
+            None,
             rio_gateway::TenantLimiter::disabled(),
             rio_gateway::QuotaCache::new(),
             shutdown,

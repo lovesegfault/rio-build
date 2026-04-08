@@ -302,6 +302,7 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
         scheduler_client,
         None, // tenant
         None, // jwt
+        None, // service_signer
         rio_gateway::TenantLimiter::disabled(),
         rio_gateway::QuotaCache::new(),
     );

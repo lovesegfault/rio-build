@@ -102,6 +102,14 @@ pub(crate) struct Config {
     /// extensions and leave CN empty (modern best practice).
     /// Default: `["rio-gateway"]`.
     pub hmac_bypass_cns: Vec<String>,
+    /// HMAC key file for verifying `x-rio-service-token` on PutPath.
+    /// SEPARATE from `hmac_key_path` (different secret). Unset =
+    /// service-token bypass disabled (gateway falls back to mTLS
+    /// CN-allowlist). Set via `RIO_SERVICE_HMAC_KEY_PATH`.
+    pub service_hmac_key_path: Option<PathBuf>,
+    /// `ServiceClaims.caller` values that bypass HMAC via a valid
+    /// `x-rio-service-token`. Default: `["rio-gateway"]`.
+    pub service_bypass_callers: Vec<String>,
     /// Max concurrent S3 chunk uploads per `put_chunked` call.
     /// Default 32 — with `RIO_SUBSTITUTE_MAX_CONCURRENT=16`
     /// (scheduler side, P0473) this caps total in-flight S3 puts at
@@ -150,6 +158,8 @@ impl Default for Config {
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
             hmac_bypass_cns: vec!["rio-gateway".into()],
+            service_hmac_key_path: None,
+            service_bypass_callers: vec!["rio-gateway".into()],
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
             max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,

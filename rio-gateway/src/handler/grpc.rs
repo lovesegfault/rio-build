@@ -80,6 +80,7 @@ const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Back
 pub(super) async fn grpc_put_path(
     store_client: &mut StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
+    service_signer: Option<&rio_auth::hmac::HmacSigner>,
     info: ValidatedPathInfo,
     nar_data: Vec<u8>,
 ) -> anyhow::Result<bool> {
@@ -88,10 +89,12 @@ pub(super) async fn grpc_put_path(
     loop {
         let stream =
             rio_proto::client::chunk_nar_for_put(info.clone(), std::sync::Arc::clone(&nar));
+        let mut req = with_jwt(stream, jwt_token)?;
+        attach_service_token(&mut req, service_signer);
         let result = rio_common::grpc::with_timeout_status(
             "PutPath",
             GRPC_STREAM_TIMEOUT,
-            store_client.put_path(with_jwt(stream, jwt_token)?),
+            store_client.put_path(req),
         )
         .await;
         match result {
@@ -151,6 +154,7 @@ pub(super) async fn grpc_put_path(
 pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     store_client: &StoreServiceClient<Channel>,
     jwt_token: Option<&str>,
+    service_signer: Option<&rio_auth::hmac::HmacSigner>,
     info: ValidatedPathInfo,
     nar_reader: &mut R,
     nar_size: u64,
@@ -178,7 +182,8 @@ pub(super) async fn grpc_put_path_streaming<R: AsyncRead + Unpin>(
     // extend into the 'static task.
     let mut client = store_client.clone();
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let req = with_jwt(outbound, jwt_token)?;
+    let mut req = with_jwt(outbound, jwt_token)?;
+    attach_service_token(&mut req, service_signer);
     let rpc: tokio::task::JoinHandle<anyhow::Result<tonic::Response<types::PutPathResponse>>> =
         tokio::spawn(async move {
             rio_common::grpc::with_timeout("PutPath", GRPC_STREAM_TIMEOUT, client.put_path(req))

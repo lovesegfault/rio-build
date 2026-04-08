@@ -82,6 +82,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
     let jwt_token = ctx.jwt_token.as_deref();
+    let service_signer = ctx.service_signer.as_deref();
     let drv_cache = &mut ctx.drv_cache;
     let EntryHead {
         path,
@@ -116,7 +117,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
             stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}");
         }
         try_cache_drv(&path, &nar_data, drv_cache);
-        if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
+        if let Err(e) = grpc_put_path(store_client, jwt_token, service_signer, info, nar_data).await {
             stderr_err!(stderr, "store error: {e}");
         }
     } else {
@@ -129,6 +130,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         if let Err(e) = grpc_put_path_streaming(
             store_client,
             jwt_token,
+            service_signer,
             info,
             &mut framed,
             nar_size,
@@ -287,6 +289,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
     let jwt_token = ctx.jwt_token.as_deref();
+    let service_signer = ctx.service_signer.as_deref();
     let drv_cache = &mut ctx.drv_cache;
     let name = wire::read_string(reader).await?;
     let cam_str = wire::read_string(reader).await?;
@@ -370,7 +373,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     };
     let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca.clone());
 
-    if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
+    if let Err(e) = grpc_put_path(store_client, jwt_token, service_signer, info, nar_data).await {
         stderr_err!(stderr, "store error: {e}");
     }
 
@@ -406,6 +409,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 ) -> anyhow::Result<()> {
     let store_client = &mut ctx.store_client;
     let jwt_token = ctx.jwt_token.as_deref();
+    let service_signer = ctx.service_signer.as_deref();
     let drv_cache = &mut ctx.drv_cache;
     let name = wire::read_string(reader).await?;
     let text = wire::read_string(reader).await?;
@@ -454,7 +458,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     };
     let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca);
 
-    if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
+    if let Err(e) = grpc_put_path(store_client, jwt_token, service_signer, info, nar_data).await {
         stderr_err!(stderr, "store error: {e}");
     }
 
@@ -505,6 +509,7 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let service_signer = ctx.service_signer.clone();
     let store_client = &mut ctx.store_client;
     let jwt_token = ctx.jwt_token.as_deref();
     let drv_cache = &mut ctx.drv_cache;
@@ -603,16 +608,18 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
 
             let mut client = store_client.clone();
             let jwt = jwt_owned.clone();
+            let svc = service_signer.clone();
             let path_str = head.path_str;
             let info = head.info;
             tasks.spawn(
                 async move {
-                    let r = grpc_put_path(&mut client, jwt.as_deref(), info, nar_data)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| {
-                            GatewayError::Store(format!("entry '{path_str}': {e}")).into()
-                        });
+                    let r =
+                        grpc_put_path(&mut client, jwt.as_deref(), svc.as_deref(), info, nar_data)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| {
+                                GatewayError::Store(format!("entry '{path_str}': {e}")).into()
+                            });
                     (i, r)
                 }
                 .instrument(span.clone()),
@@ -635,6 +642,7 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
             if let Err(e) = grpc_put_path_streaming(
                 store_client,
                 jwt_token,
+                service_signer.as_deref(),
                 head.info,
                 &mut framed,
                 head.nar_size,

@@ -75,4 +75,5 @@ pkgs.runCommand "rio-test-pki" { buildInputs = [ pkgs.openssl ]; } ''
   # trailing \n (see rio-common/src/hmac.rs:105-111) so `echo`
   # vs `echo -n` doesn't matter here.
   openssl rand -hex 32 > $out/hmac.key
+  openssl rand -hex 32 > $out/service-hmac.key
 ''

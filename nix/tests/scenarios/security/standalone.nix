@@ -255,12 +255,19 @@ pkgs.testers.runNixOSTest {
         # and (b) the CN check ran. Without this assertion, a broken
         # verifier-load (wrong env var, config wiring bug →
         # verifier=None) would let the build below pass silently.
+        # r[verify sec.authz.service-token]
+        # With RIO_SERVICE_HMAC_KEY_PATH set on gateway and store,
+        # the gateway attaches x-rio-service-token on PutPath and
+        # the store accepts it BEFORE the CN check — so the
+        # service-token metric increments and the CN-bypass metric
+        # stays at 0. Same proof as before (verifier loaded + bypass
+        # ran), via the transport-agnostic path.
         assert_metric_ge(
             ${gatewayHost}, 9092,
-            "rio_store_hmac_bypass_total", 1.0,
-            labels='{cn="rio-gateway"}',
+            "rio_store_service_token_accepted_total", 1.0,
+            labels='{caller="rio-gateway"}',
         )
-        print("hmac-verifier PASS: rio_store_hmac_bypass_total{cn=rio-gateway} >= 1")
+        print("service-token PASS: rio_store_service_token_accepted_total{caller=rio-gateway} >= 1")
 
         # Positive path: scheduler has HMAC signer, store has HMAC
         # verifier. A successful build proves the full token flow:

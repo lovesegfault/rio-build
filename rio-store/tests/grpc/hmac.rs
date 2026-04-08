@@ -8,10 +8,11 @@
 //! Some — in dev mode (None) the check is bypassed entirely.
 
 use super::*;
-use rio_auth::hmac::{AssignmentClaims, HmacSigner};
+use rio_auth::hmac::{AssignmentClaims, HmacSigner, ServiceClaims};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_KEY: &[u8] = b"test-hmac-key-at-least-32-bytes!!!";
+const SERVICE_KEY: &[u8] = b"test-service-hmac-key-32-bytes!!!!";
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -35,6 +36,116 @@ fn sign_claims(outputs: Vec<String>, expiry_offset_secs: i64) -> String {
 // ---------------------------------------------------------------------------
 // Enforcement ON + no token → reject
 // ---------------------------------------------------------------------------
+
+fn sign_service(caller: &str, expiry_offset_secs: i64) -> String {
+    let claims = ServiceClaims {
+        caller: caller.into(),
+        expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
+    };
+    HmacSigner::from_key(SERVICE_KEY.to_vec()).sign(&claims)
+}
+
+// ---------------------------------------------------------------------------
+// Service-token bypass (transport-agnostic CN-allowlist replacement)
+// ---------------------------------------------------------------------------
+
+// r[verify sec.authz.service-token]
+#[tokio::test]
+async fn service_token_bypasses_hmac() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    let path = test_store_path("svc-bypass");
+    let (nar, _) = make_nar(b"content");
+    let info = make_path_info_for_nar(&path, &nar);
+
+    // Valid service token, NO assignment token → accepted (bypass).
+    let created = put_path_with_header(
+        &mut s.client,
+        info,
+        nar,
+        rio_proto::SERVICE_TOKEN_HEADER,
+        &sign_service("rio-gateway", 60),
+    )
+    .await?;
+    assert!(created);
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_service_token_rejected() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    let path = test_store_path("svc-expired");
+    let (nar, _) = make_nar(b"content");
+    let info = make_path_info_for_nar(&path, &nar);
+
+    let err = put_path_with_header(
+        &mut s.client,
+        info,
+        nar,
+        rio_proto::SERVICE_TOKEN_HEADER,
+        &sign_service("rio-gateway", -60),
+    )
+    .await
+    .expect_err("expired service token should be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_token_wrong_caller_rejected() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    let path = test_store_path("svc-wrong-caller");
+    let (nar, _) = make_nar(b"content");
+    let info = make_path_info_for_nar(&path, &nar);
+
+    // Valid signature but caller not in allowlist → reject. Proves a
+    // compromised builder that somehow obtained the service key still
+    // cannot bypass without ALSO knowing an allowlisted caller name
+    // (defense-in-depth; the primary defense is key isolation).
+    let err = put_path_with_header(
+        &mut s.client,
+        info,
+        nar,
+        rio_proto::SERVICE_TOKEN_HEADER,
+        &sign_service("rio-builder", 60),
+    )
+    .await
+    .expect_err("non-allowlisted caller should be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("not in allowlist"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_token_wrong_key_rejected() -> TestResult {
+    let mut s =
+        StoreSession::new_with_service_hmac(TEST_KEY.to_vec(), SERVICE_KEY.to_vec()).await?;
+    let path = test_store_path("svc-wrong-key");
+    let (nar, _) = make_nar(b"content");
+    let info = make_path_info_for_nar(&path, &nar);
+
+    // Signed with the ASSIGNMENT key (which a builder might plausibly
+    // obtain via a leaked WorkAssignment) → service_verifier rejects
+    // (different key → InvalidSignature). This is the core threat-
+    // model property: assignment-key compromise does NOT grant bypass.
+    let forged = HmacSigner::from_key(TEST_KEY.to_vec()).sign(&ServiceClaims {
+        caller: "rio-gateway".into(),
+        expiry_unix: now_unix() + 60,
+    });
+    let err = put_path_with_header(
+        &mut s.client,
+        info,
+        nar,
+        rio_proto::SERVICE_TOKEN_HEADER,
+        &forged,
+    )
+    .await
+    .expect_err("wrong-key service token should be rejected");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    Ok(())
+}
 
 // r[verify sec.boundary.grpc-hmac]
 #[tokio::test]

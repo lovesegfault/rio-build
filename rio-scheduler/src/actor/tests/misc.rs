@@ -159,7 +159,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     // Verify with the same key.
     let verifier = HmacVerifier::from_key(test_key);
     let claims = verifier
-        .verify(&assignment.assignment_token)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
         .expect("token should verify with same key");
 
     assert_eq!(claims.executor_id, "hmac-w");
@@ -218,7 +218,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
     let assignment = recv_assignment(&mut worker_rx).await;
 
     let claims = HmacVerifier::from_key(test_key)
-        .verify(&assignment.assignment_token)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
         .expect("token verifies");
 
     let now = std::time::SystemTime::now()

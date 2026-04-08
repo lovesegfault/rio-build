@@ -89,6 +89,21 @@ impl StoreSession {
         Self::build(|pool| StoreServiceImpl::new(pool).with_hmac_verifier(verifier)).await
     }
 
+    /// Store with BOTH assignment-token verifier and service-token
+    /// verifier (separate keys). For testing the `x-rio-service-token`
+    /// bypass branch in `verify_assignment_token`.
+    pub async fn new_with_service_hmac(
+        assignment_key: Vec<u8>,
+        service_key: Vec<u8>,
+    ) -> anyhow::Result<Self> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let service = StoreServiceImpl::new(db.pool.clone())
+            .with_hmac_verifier(rio_auth::hmac::HmacVerifier::from_key(assignment_key))
+            .with_service_hmac_verifier(rio_auth::hmac::HmacVerifier::from_key(service_key));
+        let (client, server) = spawn_store_server(service).await?;
+        Ok(Self { db, client, server })
+    }
+
     /// Store WITH chunk backend. NARs ≥ 256 KiB are FastCDC-chunked.
     /// Returns the `MemoryChunkBackend` so tests can inspect chunk counts.
     pub async fn new_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
@@ -105,6 +120,45 @@ impl Drop for StoreSession {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+/// Like [`put_path`] but sets an arbitrary metadata header. For HMAC
+/// enforcement tests (assignment token) and service-token bypass tests.
+pub async fn put_path_with_header(
+    client: &mut StoreServiceClient<Channel>,
+    info: ValidatedPathInfo,
+    nar: Vec<u8>,
+    header: &'static str,
+    value: &str,
+) -> Result<bool, tonic::Status> {
+    let mut info: PathInfo = info.into();
+    let (tx, rx) = mpsc::channel(8);
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info),
+        })),
+    })
+    .await
+    .unwrap();
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .unwrap();
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    req.metadata_mut()
+        .insert(header, value.parse().expect("test token is valid ascii"));
+    client.put_path(req).await.map(|r| r.into_inner().created)
 }
 
 /// Like [`put_path`] but sets the `x-rio-assignment-token` metadata

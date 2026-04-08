@@ -113,6 +113,10 @@ pub struct ConnectionHandler {
     /// ResolveTenant RPC timeout — gateway-only knob, lives here rather
     /// than on `JwtConfig` (scheduler/store never read it).
     pub(super) resolve_timeout: std::time::Duration,
+    /// Service-identity HMAC signer (`RIO_SERVICE_HMAC_KEY_PATH`).
+    /// Cloned into every `SessionContext` so write opcodes can attach
+    /// `x-rio-service-token` on store `PutPath`. `None` = disabled.
+    pub(super) service_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// Per-tenant rate limiter, cloned from `GatewayServer`. Passed
     /// through to every spawned protocol session. Clones share the
     /// underlying `dashmap` — the bucket for `tenant_name` "foo" is
@@ -611,6 +615,7 @@ impl Handler for ConnectionHandler {
         let jwt_token = self.ensure_fresh_jwt().map(str::to_owned);
         // Shared-state clone: all channels on all connections drain
         // the same per-tenant bucket.
+        let service_signer = self.service_signer.clone();
         let limiter = self.limiter.clone();
         let quota_cache = self.quota_cache.clone();
         // Graceful-shutdown link: Drop fires this, run_protocol selects
@@ -633,6 +638,7 @@ impl Handler for ConnectionHandler {
                     &mut scheduler_client,
                     tenant_name,
                     jwt_token,
+                    service_signer,
                     limiter,
                     quota_cache,
                     shutdown_child,

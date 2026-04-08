@@ -70,6 +70,12 @@ pub const TRACE_ID_HEADER: &str = "x-rio-trace-id";
 /// base64-encoded bytes (always ASCII).
 pub const ASSIGNMENT_TOKEN_HEADER: &str = "x-rio-assignment-token";
 
+/// Service-identity HMAC token. Minted by trusted control-plane callers
+/// (gateway) on `PutPath`; the store verifies it as the HMAC-bypass
+/// condition. Transport-agnostic replacement for the mTLS CN-allowlist.
+/// See [`crate::hmac::ServiceClaims`].
+pub const SERVICE_TOKEN_HEADER: &str = "x-rio-service-token";
+
 /// gRPC metadata key the gateway sets on every outbound call in JWT mode.
 ///
 /// Lowercase: tonic normalizes metadata keys (HTTP/2 header rules).

@@ -224,6 +224,17 @@ pub struct StoreServiceImpl {
     /// and `StoreServiceImpl` isn't cloned per-request (tonic shares
     /// one instance across all handlers via `&self`).
     hmac_bypass_cns: Vec<String>,
+    /// HMAC verifier for `x-rio-service-token` (SEPARATE key from
+    /// `hmac_verifier`). When Some + token verifies + `caller` is in
+    /// `service_bypass_callers` → skip the assignment-token check.
+    /// Transport-agnostic replacement for the mTLS CN-allowlist;
+    /// `hmac_bypass_cns` stays as a fallback while application-level
+    /// TLS is still on.
+    service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
+    /// Allowlist of `ServiceClaims.caller` values that bypass the
+    /// assignment-token check via a valid `x-rio-service-token`.
+    /// Default `["rio-gateway"]`.
+    service_bypass_callers: Vec<String>,
     /// Global budget for in-flight NAR bytes across ALL concurrent PutPath
     /// handlers. Each handler acquires `chunk.len()` permits before extending
     /// its `nar_data: Vec<u8>`; permits release on handler drop. Default
@@ -271,6 +282,8 @@ impl StoreServiceImpl {
             signer: None,
             hmac_verifier: None,
             hmac_bypass_cns: vec!["rio-gateway".to_string()],
+            service_verifier: None,
+            service_bypass_callers: vec!["rio-gateway".to_string()],
             nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
             substituter: None,
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
@@ -317,6 +330,21 @@ impl StoreServiceImpl {
     /// bypass entirely or custom CNs to exercise the allowlist.
     pub fn with_hmac_bypass_cns(mut self, cns: Vec<String>) -> Self {
         self.hmac_bypass_cns = cns;
+        self
+    }
+
+    /// Enable `x-rio-service-token` verification on PutPath. Builder-
+    /// style. Verifier is keyed with `RIO_SERVICE_HMAC_KEY_PATH`
+    /// (NOT the assignment key — separate secret).
+    pub fn with_service_hmac_verifier(mut self, verifier: rio_auth::hmac::HmacVerifier) -> Self {
+        self.service_verifier = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Set the `ServiceClaims.caller` allowlist for service-token
+    /// bypass. Replaces the constructor default (`["rio-gateway"]`).
+    pub fn with_service_bypass_callers(mut self, callers: Vec<String>) -> Self {
+        self.service_bypass_callers = callers;
         self
     }
 

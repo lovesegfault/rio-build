@@ -132,6 +132,9 @@ r[store.put.wal-manifest]
 r[store.hmac.san-bypass]
 The HMAC bypass check accepts a client certificate whose CN **or** any SAN `DNSName` entry matches the configured allowlist (`hmac_bypass_cns`, default `["rio-gateway"]`). SAN matching enables cert-manager-issued certificates that place identity in SAN extensions rather than CN. The check is CN-first, SAN-second; either match grants bypass.
 
+r[sec.authz.service-token]
+Callers may alternatively present an `x-rio-service-token` header: an HMAC-SHA256-signed `ServiceClaims { caller, expiry_unix }` keyed with `RIO_SERVICE_HMAC_KEY_PATH` (a separate secret from the assignment-token key). The store verifies signature and expiry, then checks `caller ∈ service_bypass_callers` (default `["rio-gateway"]`). A valid service token bypasses the assignment-token check without any TLS dependency — the gateway mints one per `PutPath` with a 60-second expiry. This is the transport-agnostic replacement for the CN-allowlist; the cert-based bypass above remains as a fallback while application-level mTLS is still configured.
+
 1. **Idempotency check + `'uploading'` placeholder:** If a `'complete'` manifest already exists for this path, return success immediately (fast-path no-op). Otherwise, insert an `'uploading'` placeholder row in `manifests` as an idempotency lock --- this PG write happens **before** the NAR is buffered or verified.
 2. **Buffer + verify:** Accumulate the streamed NAR chunks into a buffer, then compute SHA-256 over the buffered bytes and verify against the declared `NarHash`. On mismatch, delete the placeholder row and reject.
 3. **Write-ahead manifest (PG):** Chunk the buffered NAR with FastCDC, then in a single PostgreSQL transaction: write `manifest_data` (serialized chunk list) and UPSERT chunk refcounts. This protects chunks from GC sweep immediately — even if the upload crashes after this point, orphan cleanup will find the stale `'uploading'` row and decrement refcounts correctly.

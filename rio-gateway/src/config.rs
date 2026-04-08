@@ -82,6 +82,12 @@ pub struct Config {
     /// `RIO_RATE_LIMIT__BURST` env vars. Both fields must be ≥1.
     /// See `r[gw.rate.per-tenant]`.
     pub rate_limit: Option<crate::RateLimitConfig>,
+    /// HMAC key file for minting `x-rio-service-token` on store
+    /// `PutPath`. SAME file as the store's `service_hmac_key_path`
+    /// (separate secret from the assignment-token key). Unset =
+    /// service-token disabled (store falls back to mTLS CN-allowlist
+    /// or rejects). Set via `RIO_SERVICE_HMAC_KEY_PATH`.
+    pub service_hmac_key_path: Option<std::path::PathBuf>,
     /// Global SSH connection cap (`r[gw.conn.cap]`). At cap, new
     /// connects are rejected at the first `auth_*` callback. Default
     /// [`crate::server::DEFAULT_MAX_CONNECTIONS`] (1000 —
@@ -118,6 +124,7 @@ impl Default for Config {
             resolve_timeout_ms: 500,
             session_drain: std::time::Duration::from_secs(60),
             rate_limit: None,
+            service_hmac_key_path: None,
             max_connections: crate::server::DEFAULT_MAX_CONNECTIONS,
             max_transitive_inputs: crate::drv_cache::DEFAULT_MAX_TRANSITIVE_INPUTS,
         }

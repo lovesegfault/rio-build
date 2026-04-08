@@ -124,6 +124,7 @@ pub async fn run_protocol<R, W>(
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     tenant_name: Option<NormalizedName>,
     jwt_token: Option<String>,
+    service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     // Per-tenant rate limiter, shared across all sessions via
     // `Arc`-inside-`TenantLimiter`. Checked in the build handlers
     // before `SubmitBuild`. Disabled limiter (default) is a no-op.
@@ -148,6 +149,7 @@ where
         scheduler_client.clone(),
         tenant_name,
         jwt_token,
+        service_signer,
         limiter,
         quota_cache,
     );

@@ -77,6 +77,36 @@ pub(crate) fn jwt_metadata(jwt_token: Option<&str>) -> Vec<(&'static str, &str)>
     }
 }
 
+/// Mint and attach an `x-rio-service-token` to a request.
+///
+/// `signer` is keyed with `RIO_SERVICE_HMAC_KEY_PATH` (NOT the
+/// assignment key). Mints fresh per call (`expiry = now + 60s`) —
+/// HMAC-SHA256 over ~50 bytes is sub-µs, no caching needed. No-op when
+/// `signer` is `None` (dev mode; store falls back to mTLS CN-allowlist
+/// or rejects).
+pub(crate) fn attach_service_token<T>(
+    req: &mut tonic::Request<T>,
+    signer: Option<&rio_auth::hmac::HmacSigner>,
+) {
+    let Some(signer) = signer else { return };
+    let claims = rio_auth::hmac::ServiceClaims {
+        caller: "rio-gateway".into(),
+        expiry_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + 60,
+    };
+    // Token is base64url(ascii) — always a valid metadata value.
+    req.metadata_mut().insert(
+        rio_proto::SERVICE_TOKEN_HEADER,
+        signer
+            .sign(&claims)
+            .parse()
+            .expect("base64url HMAC token is always valid ASCII metadata"),
+    );
+}
+
 /// Typed errors for the handler layer.
 ///
 /// Converts to `anyhow::Error` at the boundary via `thiserror`'s
@@ -229,6 +259,13 @@ pub struct SessionContext {
     /// fallback (downstream reads `tenant_name` from the proto
     /// body instead). See `r[gw.jwt.issue]` / `r[gw.jwt.dual-mode]`.
     pub jwt_token: Option<String>,
+    /// Service-identity HMAC signer keyed with
+    /// `RIO_SERVICE_HMAC_KEY_PATH`. Attached as `x-rio-service-token`
+    /// on store `PutPath` calls so the store grants HMAC bypass
+    /// without relying on mTLS peer certs. `None` = disabled (dev
+    /// mode). `Arc` because the spawned tasks in
+    /// `handle_add_multiple_to_store` need an owned clone.
+    pub service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     /// Per-tenant build-submit rate limiter. Checked in the build
     /// opcode handlers before `SubmitBuild`. Disabled by default
     /// (the disabled variant's `check()` is a no-op). Shared state
@@ -248,6 +285,7 @@ impl SessionContext {
         scheduler_client: SchedulerServiceClient<Channel>,
         tenant_name: Option<NormalizedName>,
         jwt_token: Option<String>,
+        service_signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
         limiter: TenantLimiter,
         quota_cache: QuotaCache,
     ) -> Self {
@@ -259,6 +297,7 @@ impl SessionContext {
             active_build_ids: HashMap::new(),
             tenant_name,
             jwt_token,
+            service_signer,
             limiter,
             quota_cache,
         }

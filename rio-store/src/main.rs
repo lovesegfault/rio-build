@@ -86,6 +86,12 @@ async fn main() -> anyhow::Result<()> {
     if hmac_verifier.is_some() {
         info!("HMAC assignment token verification enabled on PutPath");
     }
+    let service_verifier =
+        rio_auth::hmac::HmacVerifier::load(cfg.service_hmac_key_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("service-HMAC key load: {e}"))?;
+    if service_verifier.is_some() {
+        info!("x-rio-service-token bypass enabled on PutPath");
+    }
 
     // Tenant-aware signer (with prior-cluster-key history). Computed
     // before the StoreServiceImpl chain so the side-effecty PG load +
@@ -132,6 +138,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(v) = hmac_verifier {
         store_service = store_service.with_hmac_verifier(v);
+    }
+    store_service = store_service.with_service_bypass_callers(cfg.service_bypass_callers);
+    if let Some(v) = service_verifier {
+        store_service = store_service.with_service_hmac_verifier(v);
     }
     if let Some(budget) = cfg.nar_buffer_budget_bytes {
         info!(

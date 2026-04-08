@@ -136,10 +136,20 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let service_signer = rio_auth::hmac::HmacSigner::load(cfg.service_hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("service-HMAC key load: {e}"))?;
+    if service_signer.is_some() {
+        info!("x-rio-service-token minting enabled on store PutPath");
+    }
+
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys)
         .with_rate_limiter(limiter)
         .with_max_connections(cfg.max_connections)
         .with_resolve_timeout(std::time::Duration::from_millis(cfg.resolve_timeout_ms));
+    let server = match service_signer {
+        Some(s) => server.with_service_hmac_signer(s),
+        None => server,
+    };
     // I-109: hot-reload the key set when the Secret mount refreshes.
     // Tied to serve_shutdown so the watcher exits with the accept loop;
     // the JoinHandle is dropped (detached) — nothing to await on exit.

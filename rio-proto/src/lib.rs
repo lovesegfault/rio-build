@@ -12,7 +12,8 @@
 // r[impl proto.metadata.assignment-token]
 // r[impl proto.metadata.tenant-token]
 pub use rio_common::grpc::{
-    ASSIGNMENT_TOKEN_HEADER, BUILD_ID_HEADER, TENANT_TOKEN_HEADER, TRACE_ID_HEADER,
+    ASSIGNMENT_TOKEN_HEADER, BUILD_ID_HEADER, SERVICE_TOKEN_HEADER, TENANT_TOKEN_HEADER,
+    TRACE_ID_HEADER,
 };
 
 pub mod client;

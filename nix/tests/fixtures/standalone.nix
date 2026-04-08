@@ -75,9 +75,11 @@ let
     RIO_TLS__KEY_PATH = "${pki}/server.key";
     RIO_TLS__CA_PATH = "${pki}/ca.crt";
     RIO_HMAC_KEY_PATH = "${pki}/hmac.key";
+    RIO_SERVICE_HMAC_KEY_PATH = "${pki}/service-hmac.key";
   };
 
   gatewayTlsEnv = lib.optionalAttrs withPki {
+    RIO_SERVICE_HMAC_KEY_PATH = "${pki}/service-hmac.key";
     RIO_TLS__CERT_PATH = "${pki}/gateway.crt";
     RIO_TLS__KEY_PATH = "${pki}/gateway.key";
     RIO_TLS__CA_PATH = "${pki}/ca.crt";

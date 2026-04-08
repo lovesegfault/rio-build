@@ -15,14 +15,18 @@
 //! store paths. The `.` separator is URL-safe (base64url alphabet doesn't
 //! use it).
 //!
-//! # mTLS bypass for the gateway
+//! # Gateway bypass: service-identity tokens
 //!
 //! The gateway also calls `PutPath` (for `nix copy --to`). It doesn't
-//! have an assignment token. Two options: (a) long-lived gateway token
-//! with `expected_outputs: *`, (b) mTLS-based bypass where the store
-//! checks `request.peer_certs()` and skips HMAC for the gateway cert.
-//! We go with (b) — simpler, relies on the mTLS identity. See
-//! `rio-store/src/grpc/put_path.rs` for the bypass logic.
+//! have an assignment token. The store grants bypass when the request
+//! carries an `x-rio-service-token` header signed with a SEPARATE HMAC
+//! key (`RIO_SERVICE_HMAC_KEY_PATH`) and `caller` is in the store's
+//! allowlist. The gateway mints a fresh [`ServiceClaims`] per call
+//! (60s expiry — sub-µs to sign, no caching).
+//!
+//! The mTLS CN-allowlist bypass (`request.peer_certs()` → CN check)
+//! remains as a fallback while transport-level TLS is still on; it is
+//! removed once Cilium WireGuard replaces application-level mTLS.
 
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
@@ -30,6 +34,18 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Claims types signed by [`HmacSigner`] / verified by [`HmacVerifier`].
+///
+/// The trait exists so `sign`/`verify` are generic over the claims
+/// shape — [`AssignmentClaims`] (scheduler→builder) and
+/// [`ServiceClaims`] (gateway→store) share the envelope and expiry
+/// machinery without duplicating sign/verify. The expiry accessor is
+/// the only behaviour [`HmacVerifier::verify`] needs beyond serde.
+// r[impl sec.authz.service-token]
+pub trait HmacClaims: Serialize + serde::de::DeserializeOwned {
+    fn expiry_unix(&self) -> u64;
+}
 
 /// Claims embedded in an assignment token. The scheduler builds these
 /// at dispatch time; the store verifies them on PutPath.
@@ -40,6 +56,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// source of confusion.
 // r[impl common.hmac.claims]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AssignmentClaims {
     /// Worker the assignment was for. Not checked on verify (the store
     /// doesn't know which worker is calling — mTLS identifies the cert
@@ -74,6 +91,40 @@ pub struct AssignmentClaims {
     /// after build completion is well within that window. Prevents
     /// replay from a leaked token months later.
     pub expiry_unix: u64,
+}
+
+impl HmacClaims for AssignmentClaims {
+    fn expiry_unix(&self) -> u64 {
+        self.expiry_unix
+    }
+}
+
+/// Claims for a service-identity token. Minted by trusted control-plane
+/// callers (gateway) on each `PutPath`; verified by the store as the
+/// HMAC-bypass condition. Transport-agnostic replacement for the mTLS
+/// CN-allowlist check.
+///
+/// Signed with a SEPARATE key from [`AssignmentClaims`] so a leaked
+/// assignment key (or a stolen assignment token) cannot satisfy
+/// `verify::<ServiceClaims>` — wrong key → `InvalidSignature`, and the
+/// serde shape diverges (`ServiceClaims` lacks `drv_hash`/
+/// `expected_outputs`) as a second independent reject.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceClaims {
+    /// Caller identity. Checked against the store's
+    /// `service_bypass_callers` allowlist (default `["rio-gateway"]`).
+    pub caller: String,
+    /// Unix seconds. Gateway sets `now + 60`; store rejects past
+    /// expiry. No nonce — replay-within-60s is a no-op given
+    /// idempotent PutPath (`r[store.put.idempotent]`).
+    pub expiry_unix: u64,
+}
+
+impl HmacClaims for ServiceClaims {
+    fn expiry_unix(&self) -> u64 {
+        self.expiry_unix
+    }
 }
 
 /// Shared HMAC key. The scheduler signs, the store verifies — same key
@@ -168,9 +219,9 @@ impl HmacKey {
     /// Format: `base64url(json(claims)).base64url(hmac(key, json(claims)))`.
     /// The claims JSON is what's signed — the base64 is just transport
     /// encoding.
-    pub fn sign(&self, claims: &AssignmentClaims) -> String {
+    pub fn sign<C: HmacClaims>(&self, claims: &C) -> String {
         let claims_json = serde_json::to_vec(claims)
-            .expect("AssignmentClaims serialization can't fail (no maps with non-string keys)");
+            .expect("HmacClaims serialization can't fail (no maps with non-string keys)");
         let mut mac = HmacSha256::new_from_slice(&self.key)
             .expect("HMAC::new_from_slice accepts any key length");
         mac.update(&claims_json);
@@ -191,7 +242,7 @@ impl HmacKey {
     /// concern here — the JSON decode is after sig check anyway —
     /// but good discipline). Constant-time compare via
     /// `Mac::verify_slice` (never `==` on raw tag bytes).
-    pub fn verify(&self, token: &str) -> Result<AssignmentClaims, HmacError> {
+    pub fn verify<C: HmacClaims>(&self, token: &str) -> Result<C, HmacError> {
         // Split on the single '.'. More parts → someone injected a
         // '.' into claims (impossible with our encoding) or
         // tampered.
@@ -218,7 +269,7 @@ impl HmacKey {
         // verified), so malicious-input concerns don't apply.
         // (serde_json is safe on untrusted input anyway, but the
         // principle holds.)
-        let claims: AssignmentClaims = serde_json::from_slice(&claims_json)?;
+        let claims: C = serde_json::from_slice(&claims_json)?;
 
         // Expiry check. SystemTime::now → Unix secs. Clock skew
         // concern: scheduler + store + worker clocks may drift.
@@ -228,9 +279,9 @@ impl HmacKey {
         // — debuggable. Pre-epoch clock → `Clock` error (NOT the
         // old `unwrap_or(0)`, which silently accepted every token).
         let now_unix = crate::now_unix()?;
-        if now_unix > claims.expiry_unix {
+        if now_unix > claims.expiry_unix() {
             return Err(HmacError::Expired {
-                expiry_unix: claims.expiry_unix,
+                expiry_unix: claims.expiry_unix(),
                 now_unix,
             });
         }
@@ -270,7 +321,9 @@ mod tests {
         let claims = test_claims(3600); // 1h future
         let token = signer.sign(&claims);
 
-        let verified = verifier.verify(&token).expect("valid token should verify");
+        let verified = verifier
+            .verify::<AssignmentClaims>(&token)
+            .expect("valid token should verify");
         assert_eq!(verified, claims);
     }
 
@@ -295,7 +348,7 @@ mod tests {
         let tampered = format!("{}.{}", parts[0], b64.encode(&sig));
 
         assert!(matches!(
-            verifier.verify(&tampered),
+            verifier.verify::<AssignmentClaims>(&tampered),
             Err(HmacError::InvalidSignature)
         ));
     }
@@ -320,7 +373,7 @@ mod tests {
         // Signature was over ORIGINAL claims; tampered claims →
         // signature mismatch.
         assert!(matches!(
-            verifier.verify(&tampered),
+            verifier.verify::<AssignmentClaims>(&tampered),
             Err(HmacError::InvalidSignature)
         ));
     }
@@ -333,7 +386,7 @@ mod tests {
         let claims = test_claims(-60); // expired 1 minute ago
         let token = signer.sign(&claims);
 
-        let result = verifier.verify(&token);
+        let result = verifier.verify::<AssignmentClaims>(&token);
         assert!(
             matches!(result, Err(HmacError::Expired { .. })),
             "expected Expired, got {result:?}"
@@ -347,7 +400,7 @@ mod tests {
 
         let token = signer.sign(&test_claims(3600));
         assert!(matches!(
-            verifier.verify(&token),
+            verifier.verify::<AssignmentClaims>(&token),
             Err(HmacError::InvalidSignature)
         ));
     }
@@ -358,18 +411,54 @@ mod tests {
 
         // No '.'
         assert!(matches!(
-            verifier.verify("nodot"),
+            verifier.verify::<AssignmentClaims>("nodot"),
             Err(HmacError::Format(1))
         ));
         // Too many '.'
         assert!(matches!(
-            verifier.verify("a.b.c"),
+            verifier.verify::<AssignmentClaims>("a.b.c"),
             Err(HmacError::Format(3))
         ));
         // Bad base64
         assert!(matches!(
-            verifier.verify("!!!.!!!"),
+            verifier.verify::<AssignmentClaims>("!!!.!!!"),
             Err(HmacError::Base64(_))
+        ));
+    }
+
+    #[test]
+    fn service_claims_roundtrip_and_shape_isolation() {
+        let signer = HmacSigner::from_key(TEST_KEY.to_vec());
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let svc = ServiceClaims {
+            caller: "rio-gateway".into(),
+            expiry_unix: now + 60,
+        };
+        let svc_token = signer.sign(&svc);
+        assert_eq!(
+            verifier
+                .verify::<ServiceClaims>(&svc_token)
+                .expect("service token verifies"),
+            svc
+        );
+        // Shape isolation, both directions: a token signed as one
+        // claims type cannot verify as the other, even with the
+        // correct key — serde rejects the mismatched JSON shape after
+        // the signature passes. This is the second independent
+        // defence (the primary one is separate keys in production).
+        assert!(matches!(
+            verifier.verify::<AssignmentClaims>(&svc_token),
+            Err(HmacError::Json(_))
+        ));
+        let asn_token = signer.sign(&test_claims(3600));
+        assert!(matches!(
+            verifier.verify::<ServiceClaims>(&asn_token),
+            Err(HmacError::Json(_))
         ));
     }
 
@@ -406,7 +495,7 @@ mod tests {
         let claims = test_claims(3600);
         let token = signer.sign(&claims);
         let verified = verifier
-            .verify(&token)
+            .verify::<AssignmentClaims>(&token)
             .expect("trailing newline trimmed → same key → verify succeeds");
         assert_eq!(verified, claims);
     }
@@ -427,7 +516,7 @@ mod tests {
         let claims = test_claims(3600);
         let token = signer.sign(&claims);
         let verified = verifier
-            .verify(&token)
+            .verify::<AssignmentClaims>(&token)
             .expect("CRLF trimmed → same key → verify succeeds");
         assert_eq!(verified, claims);
     }
