@@ -37,9 +37,9 @@ spec:
   # Only `privileged: bool` is exposed (for VM-test/airgap escape
   # hatches); production pods use granular caps, not privileged.
   nodeSelector:
-    rio.build/worker: "true"
+    rio.build/builder: "true"
   tolerations:
-    - key: rio.build/worker
+    - key: rio.build/builder
       operator: Equal
       value: "true"
       effect: NoSchedule
@@ -135,7 +135,7 @@ Jobs MUST set `spec.activeDeadlineSeconds` from
 the spawn decision reads the **cluster-wide**
 `ClusterStatus.queued_derivations`, not pool-matching depth. A queue
 full of `x86_64-linux` work on an `aarch64-darwin` pool triggers a Job
-spawn; the spawned worker heartbeats in, never matches dispatch (wrong
+spawn; the spawned executor heartbeats in, never matches dispatch (wrong
 `system`), and would hang indefinitely without a deadline. K8s kills
 the pod at deadline, `backoffLimit: 0` marks the Job Failed,
 `ttlSecondsAfterFinished` reaps.
@@ -163,7 +163,7 @@ intersect the class's `SizeClassStatus.queued_by_system` with
 Size-class pools are per-arch (one BuilderPoolSet per arch), so the
 class scalar includes other-arch derivations the pool can never build —
 an x86-64-tiny pool spawned at ceiling for an aarch64-only backlog
-floods the scheduler with wrong-arch idle workers (I-143). Falls back
+floods the scheduler with wrong-arch idle executors (I-143). Falls back
 to the scalar when `queued_by_system` is empty (scheduler predates the
 breakdown) — over-spawn rather than never spawn, same posture as
 I-107's cluster-wide filter. This narrows but does not eliminate the
@@ -173,7 +173,7 @@ r[ctrl.pool.per-feature-class-depth]
 For pools with `spec.sizeClass` set, the spawn/scale decision MUST
 pass `spec.features` as the `GetSizeClassStatus` feature filter
 (`r[sched.sizeclass.feature-filter+2]`) so the per-class count reflects
-derivations whose `requiredSystemFeatures` this pool's workers can
+derivations whose `requiredSystemFeatures` this pool's executors can
 satisfy. When `spec.features` is non-empty, the pool sums the filtered
 count across ALL classes rather than only `spec.sizeClass`: dispatch
 overflow walks up the class chain, so a `tiny`-classified kvm derivation
@@ -207,7 +207,7 @@ Manifest-mode scale-down is per-bucket: when `supply > demand` for a `(memory-cl
 r[ctrl.pool.manifest-failed-sweep+2]
 The manifest reconciler MUST delete Failed Jobs alongside `ttlSecondsAfterFinished` reaping. With `backoff_limit=0`, a crash-looping pod produces up to `maxConcurrent` Failed Jobs per reconcile tick (the spawn pass fires `headroom` replacements, all of which may fail); the ceiling (`spec.maxConcurrent`) does not cap accumulation because Failed Jobs are not active supply. The sweep is bounded per-tick to `max(20, spec.maxConcurrent)` — the cap tracks the pool's own spawn ceiling so the sweep converges under full crash-loop (net accumulation ≤ 0 per tick). A `CrashLoopDetected` Warning event is emitted when the Failed count crosses 3.
 
-Manifest-spawned pods are one-shot like static-sizing pods: the worker exits after one build, the Job completes, `ttlSecondsAfterFinished` reaps. The only difference from `sizing: Static` is the per-derivation `ResourceRequirements` taken from the manifest bucket instead of `spec.resources`.
+Manifest-spawned pods are one-shot like static-sizing pods: the executor exits after one build, the Job completes, `ttlSecondsAfterFinished` reaps. The only difference from `sizing: Static` is the per-derivation `ResourceRequirements` taken from the manifest bucket instead of `spec.resources`.
 
 r[ctrl.pool.manifest-fairness]
 When the manifest ceiling (`spec.maxConcurrent - active`) is less than
@@ -274,9 +274,9 @@ spec:
     privileged: false
     tlsSecretName: rio-builder-tls
     nodeSelector:
-      rio.build/worker: "true"
+      rio.build/builder: "true"
     tolerations:
-      - { key: rio.build/worker, operator: Equal, value: "true", effect: NoSchedule }
+      - { key: rio.build/builder, operator: Equal, value: "true", effect: NoSchedule }
   classes:
     - name: small
       cutoffSecs: 60                 # f64; required (no null/unbounded — last class catches the tail)
@@ -366,7 +366,7 @@ Lease permissions (`coordination.k8s.io/leases`: get, create, update) are grante
 
 NetworkPolicy resources are deployed via the Helm chart (`infra/helm/rio-build/templates/networkpolicy.yaml`, gated on `networkPolicy.enabled`), not controller-managed. The controller has no `networking.k8s.io` RBAC permissions. Intended policies:
 
-- **Workers**: egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`169.254.169.254`). DNS egress to kube-system (CoreDNS) required for service resolution.
+- **Executors**: egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`169.254.169.254`). DNS egress to kube-system (CoreDNS) required for service resolution.
 - **Gateway**: ingress from external (Service type LoadBalancer/NodePort for SSH). Egress to rio-scheduler and rio-store. DNS egress to kube-system.
 - **Scheduler**: egress to PostgreSQL. DNS egress to kube-system.
 - **Store**: egress to PostgreSQL and S3. DNS egress to kube-system.
@@ -379,14 +379,14 @@ NetworkPolicy resources are deployed via the Helm chart (`infra/helm/rio-build/t
 | Scheduler | Static manifest | `maxUnavailable: 1` | Leader election handles failover; at most one pod unavailable |
 | Gateway | Static manifest | `minAvailable: 1` | At least one pod must remain for SSH connectivity |
 
-Scheduler and gateway PDBs are static manifests in the Helm chart (`infra/helm/rio-build/templates/pdb.yaml`, gated on `podDisruptionBudget.enabled`). Worker pods are one-shot Jobs — a PDB on Jobs is meaningless (eviction of a Job pod just reschedules the build via `r[ctrl.drain.disruption-target]`).
+Scheduler and gateway PDBs are static manifests in the Helm chart (`infra/helm/rio-build/templates/pdb.yaml`, gated on `podDisruptionBudget.enabled`). Executor pods are one-shot Jobs — a PDB on Jobs is meaningless (eviction of a Job pod just reschedules the build via `r[ctrl.drain.disruption-target]`).
 
 ## Service Definitions
 
 | Service | Type | Purpose |
 |---|---|---|
 | `rio-gateway` | LoadBalancer or NodePort | SSH ingress for `nix copy` / `nix build --store ssh://` |
-| `rio-scheduler` | ClusterIP | Internal gRPC for workers, gateway, and controller |
+| `rio-scheduler` | ClusterIP | Internal gRPC for executors, gateway, and controller |
 | `rio-store` | ClusterIP + optional Ingress | gRPC for internal components; HTTP for binary cache serving |
 
 ## Health Probes
@@ -394,7 +394,7 @@ Scheduler and gateway PDBs are static manifests in the Helm chart (`infra/helm/r
 r[ctrl.probe.named-service]
 Health probes against `grpc.health.v1.Health/Check` MUST target a named service (e.g., `rio.scheduler.SchedulerService`), not the empty-string default. `set_not_serving` only affects named services, not `""` --- a probe on `""` stays green through drain and through standby.
 
-> **Note:** This requirement applies to the **client-side balancer** (`rio-proto/src/client/balance.rs`), which probes the named service to find the leader. It does NOT apply to K8s probes: `infra/helm/rio-build/templates/scheduler.yaml` intentionally uses `tcpSocket` for both readiness and liveness --- standby replicas report `NOT_SERVING` on the gRPC health endpoint (they haven't won the lease), so gRPC-based K8s probes would crash-loop them. TCP-accept succeeding proves the process is live; leader-election is client-side routing's concern, not K8s'. `store.yaml` does use `grpc.service: rio.store.StoreService` for readiness (store is not leader-elected, so `NOT_SERVING` only means drain or PG/S3 unhealthy --- correct to take out of rotation). Worker probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
+> **Note:** This requirement applies to the **client-side balancer** (`rio-proto/src/client/balance.rs`), which probes the named service to find the leader. It does NOT apply to K8s probes: `infra/helm/rio-build/templates/scheduler.yaml` intentionally uses `tcpSocket` for both readiness and liveness --- standby replicas report `NOT_SERVING` on the gRPC health endpoint (they haven't won the lease), so gRPC-based K8s probes would crash-loop them. TCP-accept succeeding proves the process is live; leader-election is client-side routing's concern, not K8s'. `store.yaml` does use `grpc.service: rio.store.StoreService` for readiness (store is not leader-elected, so `NOT_SERVING` only means drain or PG/S3 unhealthy --- correct to take out of rotation). Executor probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
 
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|
@@ -402,20 +402,20 @@ Health probes against `grpc.health.v1.Health/Check` MUST target a named service 
 | Scheduler | TCP socket (gRPC health is leader-election-aware, unsuitable for K8s probes on HA standby) | TCP socket — process is live, port is bound. Leader election happens; client-side balancer routes to leader via named-service health. | TCP socket. Startup budget sized for state recovery (reload non-terminal builds from PG). |
 | Store | TCP socket | gRPC health check on named service --- after PostgreSQL + S3 reachable | — |
 | Controller | HTTP `/healthz` | After CRD watches established | — |
-| Worker | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
+| Executor | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
 
-## Worker Lifecycle
+## Executor Lifecycle
 
 r[ctrl.drain.sigterm]
 **Scale-down:** `terminationGracePeriodSeconds` is set to `7200` (2 hours) to allow in-flight builds to complete.
 
-**SIGTERM drain (no preStop hook needed):** the worker's main loop has a `select!` arm on SIGTERM. On signal:
+**SIGTERM drain (no preStop hook needed):** the executor's main loop has a `select!` arm on SIGTERM. On signal:
 
-1. Set heartbeat `draining=true` (the worker-authoritative drain source — I-063); the scheduler's `has_capacity()` reads it via `is_draining()`.
+1. Set heartbeat `draining=true` (the executor-authoritative drain source — I-063); the scheduler's `has_capacity()` reads it via `is_draining()`.
 2. Keep the `BuildExecution` stream connected (and reconnect across scheduler restart) until `BuildSlot::wait_idle()` returns — the in-flight build's completion is reported.
 3. Send `AdminService.DrainExecutor` (best-effort exit deregister) and exit 0.
 
-A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The Job pod template does NOT define a preStop.
+A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the executor's signal handler implements the drain. The Job pod template does NOT define a preStop.
 
 r[ctrl.drain.disruption-target]
 **Eviction-triggered preemption:** the controller runs a Pod watcher filtered to `rio.build/pool`-labeled pods with `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a pod for eviction (node drain, spot interrupt), the watcher calls `AdminService.DrainExecutor{force:true}` — the scheduler sends `CancelSignal` for the in-flight build → executor `cgroup.kill()`s → the build reassigns to a healthy executor within seconds. Without this, the evicting pod would self-drain with `force=false` and wait up to `terminationGracePeriodSeconds` (2h) for the in-flight build to complete naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above) is the fallback if the watcher misses the window.

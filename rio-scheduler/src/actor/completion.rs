@@ -662,7 +662,7 @@ impl DagActor {
                 // workers all seeing this means it's not actually transient.
                 self.handle_transient_failure(drv_hash, executor_id).await;
             }
-            // r[impl sched.retry.per-worker-budget]
+            // r[impl sched.retry.per-executor-budget]
             rio_proto::types::BuildResultStatus::InfrastructureFailure => {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
@@ -1583,7 +1583,7 @@ impl DagActor {
             .record_failure_and_check_poison(drv_hash, executor_id, false)
             .await;
 
-        // r[impl sched.retry.per-worker-budget]
+        // r[impl sched.retry.per-executor-budget]
         // Starvation guard: clamp effective threshold to the
         // kind-matching fleet. If ALL registered workers of the
         // matching kind are in failed_builders, best_executor returns

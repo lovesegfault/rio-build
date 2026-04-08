@@ -7,11 +7,11 @@ flowchart LR
     Clients["Untrusted<br/>(Nix clients)"] -->|SSH| GW["rio-gateway"]
     GW -->|"gRPC (mTLS)"| Sched["rio-scheduler"]
     Sched -->|"gRPC (mTLS)"| Store["rio-store"]
-    Worker["rio-builder"] -->|"gRPC (mTLS)"| Store
-    Worker -->|"gRPC (mTLS)"| Sched
+    Executor["rio-builder"] -->|"gRPC (mTLS)"| Store
+    Executor -->|"gRPC (mTLS)"| Sched
     Store --> S3["S3 (IRSA)"]
     Store --> PG["PostgreSQL"]
-    Worker --> Sandbox["nix sandbox<br/>(purity, NOT security)"]
+    Executor --> Sandbox["nix sandbox<br/>(purity, NOT security)"]
 ```
 
 ### Boundary 1: Nix Client → Gateway (SSH)
@@ -24,7 +24,7 @@ The gateway authenticates SSH connections via public key authentication. Authori
 
 > **TODO:** per-tenant rate limiting; connection/channel limits; SSH-key→tenant mapping. (Key-algorithm filtering is not planned — operator's `authorized_keys` is operator's trust boundary.)
 
-### Boundary 2: Gateway/Worker → Internal Services (gRPC)
+### Boundary 2: Gateway/Executor → Internal Services (gRPC)
 
 r[sec.boundary.grpc-hmac]
 Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs, authorized via HMAC-signed assignment tokens.
@@ -34,29 +34,29 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 - **Mitigations**: mTLS with per-service certificates, NetworkPolicy restricting pod-to-pod communication
 - **Authorization**: mTLS authenticates component identity. Application-level authorization uses assignment-scoped tokens for sensitive RPCs:
   - The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(Claims)).base64url(hmac_sha256(key, claims_json))`. The `Claims` struct has exactly five fields: `executor_id` (string, audit only), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `is_ca` (bool, skips the membership check for floating-CA derivations whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds, replay prevention).
-  - Workers present the assignment token in the `x-rio-assignment-token` gRPC metadata header when calling `PutPath` on the store. The store verifies the token signature, checks `now < expiry_unix`, and rejects with `PERMISSION_DENIED` if the uploaded `store_path ∉ expected_outputs`.
-  - This prevents a compromised worker from writing to store paths it was never assigned to build.
+  - Executors present the assignment token in the `x-rio-assignment-token` gRPC metadata header when calling `PutPath` on the store. The store verifies the token signature, checks `now < expiry_unix`, and rejects with `PERMISSION_DENIED` if the uploaded `store_path ∉ expected_outputs`.
+  - This prevents a compromised executor from writing to store paths it was never assigned to build.
   - Token lifetime is scoped to the build assignment; tokens expire after a configurable TTL (default: 2× the build timeout).
   - The signing key is a shared HMAC secret between the scheduler and store, stored as a Kubernetes Secret (recommend KMS/Vault for production).
-  - **Read authorization:** Workers call `GetPath` and `QueryPathInfo` on the store for FUSE cache fetches. Read access is authorized by mTLS component identity --- any authenticated worker can read any store path. This is acceptable because: (a) store paths are content-addressed and immutable, (b) workers need access to shared paths (glibc, coreutils) regardless of tenant, (c) output isolation is enforced at the scheduling level (workers only build what they are assigned). For deployments requiring strict tenant read isolation, a future enhancement could add tenant-scoped read tokens.
+  - **Read authorization:** Executors call `GetPath` and `QueryPathInfo` on the store for FUSE cache fetches. Read access is authorized by mTLS component identity --- any authenticated executor can read any store path. This is acceptable because: (a) store paths are content-addressed and immutable, (b) executors need access to shared paths (glibc, coreutils) regardless of tenant, (c) output isolation is enforced at the scheduling level (executors only build what they are assigned). For deployments requiring strict tenant read isolation, a future enhancement could add tenant-scoped read tokens.
 
 > **Implemented (Phase 3b):** mTLS + HMAC assignment tokens are live. When `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` are set, all gRPC channels use TLS with client cert verification (`ServerTlsConfig::client_ca_root`). When `RIO_HMAC_KEY_PATH` is set on scheduler + store, assignment tokens are HMAC-SHA256-signed at dispatch and verified on `PutPath` (rejected if the uploaded path isn't in `claims.expected_outputs`). **mTLS CN bypass:** PutPath skips HMAC verification when the caller's client certificate has `CN=rio-gateway` (the gateway handles `nix copy --to` and has no assignment token). This check only applies when an `HmacVerifier` is configured --- without one, PutPath accepts all callers (dev mode). See `rio-common/src/tls.rs`, `rio-common/src/hmac.rs`, `rio-store/src/grpc/put_path.rs`.
 
-> **TLS SNI:** `load_client_tls` does **not** set a fixed `domain_name` on the `ClientTlsConfig`. tonic derives the SNI server name from the connect URL's host per-connection. A global `domain_name` override would break multi-service clients (gateway/worker connect to both scheduler and store, each with a different cert SAN).
+> **TLS SNI:** `load_client_tls` does **not** set a fixed `domain_name` on the `ClientTlsConfig`. tonic derives the SNI server name from the connect URL's host per-connection. A global `domain_name` override would break multi-service clients (gateway/executor connect to both scheduler and store, each with a different cert SAN).
 
 r[sec.jwt.pubkey-mount]
 When `jwt.enabled=true`, scheduler and store pods MUST have the `rio-jwt-pubkey` ConfigMap mounted at `/etc/rio/jwt/ed25519_pubkey` and `RIO_JWT__KEY_PATH` set to that path. Without the mount, `cfg.jwt.key_path` remains `None` and the interceptor falls through to inert mode (every RPC passes, no `Claims` attached) --- a silent fail-open. The gateway correspondingly mounts the `rio-jwt-signing` Secret at `/etc/rio/jwt/ed25519_seed`. Helm `_helpers.tpl` provides `rio.jwtVerifyEnv`/`VolumeMount`/`Volume` and `rio.jwtSignEnv`/`VolumeMount`/`Volume` triplets, self-guarded on `.Values.jwt.enabled`.
 
-### Boundary 3: Worker → Nix Sandbox
+### Boundary 3: Executor → Nix Sandbox
 
 - **Auth**: None (sandbox is a purity mechanism, NOT a security boundary)
-- **Threat**: Malicious derivation escaping sandbox and accessing worker resources
+- **Threat**: Malicious derivation escaping sandbox and accessing executor resources
 - **Mitigations**: `CAP_SYS_ADMIN` + `seccompProfile: RuntimeDefault` (NOT `privileged: true`), `hostUsers: false` (user-namespace isolation), dedicated node pool, NetworkPolicy, `automountServiceAccountToken: false`, IMDSv2 hop limit=1
 
-## Worker Pod Security
+## Executor Pod Security
 
 r[sec.pod.host-users-false]
-Worker pods MUST set `hostUsers: false` to activate Kubernetes user-namespace
+Executor pods MUST set `hostUsers: false` to activate Kubernetes user-namespace
 isolation (K8s 1.33+). Container UIDs are remapped to unprivileged host UIDs;
 `CAP_SYS_ADMIN` applies only within the user namespace. A container escape
 gaining `CAP_SYS_ADMIN` cannot affect the host or other pods. See
@@ -67,7 +67,7 @@ containers cannot be user-namespaced.
 
 r[sec.pod.fuse-device-plugin]
 <!-- rule-id is historical; mechanism is base_runtime_spec since ADR-021 §7 -->
-Worker pods MUST NOT obtain `/dev/fuse` via a hostPath volume — the kernel
+Executor pods MUST NOT obtain `/dev/fuse` via a hostPath volume — the kernel
 rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding), so
 hostPath is incompatible with `hostUsers: false`. The device node is
 delivered by containerd's `base_runtime_spec` declaring `/dev/{fuse,kvm}`
@@ -109,10 +109,10 @@ scheduler image expands the attack surface (every transitive dependency
 is an execution primitive in a compromised pod) and couples the
 control-plane release cadence to CLI dependency updates.
 
-> **seccomp:** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is available — see `r[builder.seccomp.localhost-profile]` below.
+> **seccomp:** Executor pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A Localhost profile additionally blocking `ptrace`/`bpf`/`setns`/`process_vm_*` under `CAP_SYS_ADMIN` is available — see `r[builder.seccomp.localhost-profile]` below.
 
 r[builder.seccomp.localhost-profile+2]
-Worker pods MAY be configured with a Localhost seccomp profile (`BuilderPoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's ~40-syscall denylist. The profile JSON lives at `nix/nixos-node/seccomp/rio-{builder,fetcher}.json`; the chart's default `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode `operator/rio-fetcher.json`) — that path is relative to `/var/lib/kubelet/seccomp/`, where the file must exist on every node before a pod referencing it schedules. All supported targets are NixOS and bake the profiles via `systemd.tmpfiles` so the file is present before kubelet starts (`nix/nixos-node/hardening.nix` on EKS, [ADR-021](./decisions/021-nixos-node-ami.md); `nix/tests/fixtures/k3s-full.nix` for k3s VM tests); see [ADR-012 § Seccomp Profile Distribution](./decisions/012-privileged-builder-pods.md#seccomp-profile-distribution). The controller emits no wait machinery — a missing profile surfaces as the executor container's `CreateContainerError` with the profile path in the message.
+Executor pods MAY be configured with a Localhost seccomp profile (`BuilderPoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's ~40-syscall denylist. The profile JSON lives at `nix/nixos-node/seccomp/rio-{builder,fetcher}.json`; the chart's default `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode `operator/rio-fetcher.json`) — that path is relative to `/var/lib/kubelet/seccomp/`, where the file must exist on every node before a pod referencing it schedules. All supported targets are NixOS and bake the profiles via `systemd.tmpfiles` so the file is present before kubelet starts (`nix/nixos-node/hardening.nix` on EKS, [ADR-021](./decisions/021-nixos-node-ami.md); `nix/tests/fixtures/k3s-full.nix` for k3s VM tests); see [ADR-012 § Seccomp Profile Distribution](./decisions/012-privileged-builder-pods.md#seccomp-profile-distribution). The controller emits no wait machinery — a missing profile surfaces as the executor container's `CreateContainerError` with the profile path in the message.
 
 ### Boundary 4: Binary Cache HTTP → External Clients
 
@@ -135,23 +135,23 @@ Per-tenant narinfo visibility is implemented via `path_tenants` JOIN: authentica
 | **Chunk integrity** | BLAKE3 verified on every read from S3/cache | Designed |
 | **Signing key protection** | K8s Secret (minimum); recommend KMS/Vault for production | Designed |
 | **S3 credential management** | IRSA (IAM Roles for Service Accounts) on EKS | Recommended |
-| **Worker isolation** | Per-build overlayfs, Nix sandbox, NetworkPolicy | Designed |
+| **Executor isolation** | Per-build overlayfs, Nix sandbox, NetworkPolicy | Designed |
 | **Metadata service blocking** | NetworkPolicy egress deny `169.254.169.254`; IMDSv2 hop limit=1 | Designed |
 | **Inter-component auth** | mTLS between all gRPC endpoints | Implemented (Phase 3b) — configure via `RIO_TLS__*` env |
-| **Multi-tenant data isolation** | Per-tenant narinfo visibility filtering + per-tenant signing keys; shared workers with per-build overlay isolation | Implemented |
+| **Multi-tenant data isolation** | Per-tenant narinfo visibility filtering + per-tenant signing keys; shared executors with per-build overlay isolation | Implemented |
 
 ## Derivation Validation
 
 r[sec.drv.validate]
-On `PutPath`, rio-store recomputes the SHA-256 digest of the uploaded NAR bytes and rejects the upload if the digest does not match the `nar_hash` declared in the accompanying `PathInfo`. This is the core integrity check: a worker cannot store data under a mismatched content hash. See `rio-store/src/validate.rs`.
+On `PutPath`, rio-store recomputes the SHA-256 digest of the uploaded NAR bytes and rejects the upload if the digest does not match the `nar_hash` declared in the accompanying `PathInfo`. This is the core integrity check: an executor cannot store data under a mismatched content hash. See `rio-store/src/validate.rs`.
 
 Additional validation checks (below) are enforced at other points in the pipeline. These are **not** covered by `r[sec.drv.validate]` — each has its own tracey rule or phase deferral.
 
 | Check | Where | Status | Description |
 |-------|-------|--------|-------------|
 | NAR SHA-256 verification | Store | `r[sec.drv.validate]` | On `PutPath`, the store recomputes SHA-256 over the NAR bytes and rejects on mismatch. |
-| `restrict-eval` | Worker | Implemented | The worker's `nix.conf` sets `restrict-eval = true`, preventing derivations from accessing paths outside the Nix store during evaluation. |
-| Sandbox enforcement | Worker | Implemented | `sandbox = true` in `nix.conf` ensures all builds run inside the Nix sandbox (user/mount/PID/network namespaces). |
+| `restrict-eval` | Executor | Implemented | The executor's `nix.conf` sets `restrict-eval = true`, preventing derivations from accessing paths outside the Nix store during evaluation. |
+| Sandbox enforcement | Executor | Implemented | `sandbox = true` in `nix.conf` ensures all builds run inside the Nix sandbox (user/mount/PID/network namespaces). |
 | DAG size limit | Gateway + Scheduler | Implemented | Gateway's `translate::validate_dag` checks `nodes.len() > MAX_DAG_NODES` before SubmitBuild (early reject); scheduler also enforces. |
 | `__noChroot` rejection | Gateway | Implemented | `translate::validate_dag` checks derivation env for `__noChroot=1` via drv_cache lookup. Rejected with "sandbox escape" error. |
 | Per-tenant store quota | Gateway | Implemented | `TenantQuota` RPC gates `SubmitBuild` against `gc_max_store_bytes` (30s-TTL cached, eventually-enforcing). Per-upload NAR size uses the global `MAX_NAR_SIZE` limit. |
@@ -261,11 +261,11 @@ heartbeat) plus one reconciler tick (~10s).
 
 ## Known Limitations
 
-1. **The Nix sandbox is NOT a security boundary.** It prevents builds from accessing undeclared inputs (purity) but does not prevent a determined attacker from escaping. For multi-tenant deployments, the security boundary is the worker pod + node isolation.
+1. **The Nix sandbox is NOT a security boundary.** It prevents builds from accessing undeclared inputs (purity) but does not prevent a determined attacker from escaping. For multi-tenant deployments, the security boundary is the executor pod + node isolation.
 
-2. **Workers require `CAP_SYS_ADMIN`.** This capability enables mount namespace manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[builder.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `BuilderPoolSpec.seccompProfile: {type: Localhost, localhostProfile: operator/rio-builder.json}` (the chart default). Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Worker pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
+2. **Executors require `CAP_SYS_ADMIN`.** This capability enables mount namespace manipulation, which is powerful. `seccompProfile: RuntimeDefault` blocks ~40 syscalls (`kexec_load`, `open_by_handle_at`, etc.), but `CAP_SYS_ADMIN` still grants significant host access. The Localhost seccomp profile (`r[builder.seccomp.localhost-profile]`) additionally blocks `ptrace`/`bpf`/`setns`/`process_vm_*` — production deployments should set `BuilderPoolSpec.seccompProfile: {type: Localhost, localhostProfile: operator/rio-builder.json}` (the chart default). Dedicated node pools with taints are essential. **Mitigation (K8s 1.33+):** Executor pods must set `hostUsers: false` to enable user namespace isolation. With user namespaces, `CAP_SYS_ADMIN` applies only within the user namespace, not on the host --- the attacker gains capabilities within a namespace that maps to unprivileged host UIDs, significantly reducing the blast radius. See [ADR-012](./decisions/012-privileged-builder-pods.md#kubernetes-user-namespace-isolation).
 
-3. **`CAP_SYS_ADMIN` is held throughout build execution.** The worker cannot drop `CAP_SYS_ADMIN` between overlay setup and build completion because the Nix sandbox itself requires mount namespace manipulation. A sandbox escape gives the attacker `CAP_SYS_ADMIN` capabilities within the user namespace (see mitigation in #2). Additional mitigations: RuntimeDefault or Localhost seccomp (`r[builder.seccomp.localhost-profile]`), dedicated node pools, and NetworkPolicy. Future work: explore splitting the worker into a privileged setup process and an unprivileged build supervisor.
+3. **`CAP_SYS_ADMIN` is held throughout build execution.** The executor cannot drop `CAP_SYS_ADMIN` between overlay setup and build completion because the Nix sandbox itself requires mount namespace manipulation. A sandbox escape gives the attacker `CAP_SYS_ADMIN` capabilities within the user namespace (see mitigation in #2). Additional mitigations: RuntimeDefault or Localhost seccomp (`r[builder.seccomp.localhost-profile]`), dedicated node pools, and NetworkPolicy. Future work: explore splitting the executor into a privileged setup process and an unprivileged build supervisor.
 
 4. **Cross-tenant chunk deduplication leaks build activity.** A tenant can probe `FindMissingChunks` to determine whether another tenant has built a specific package. Mitigation: scope `FindMissingChunks` per tenant (at the cost of dedup savings) or accept the risk with documentation.
 

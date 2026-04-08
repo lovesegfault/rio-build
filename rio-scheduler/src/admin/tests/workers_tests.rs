@@ -9,7 +9,7 @@
 use super::*;
 use tokio::sync::oneshot;
 
-// r[verify sched.admin.list-workers]
+// r[verify sched.admin.list-executors]
 #[tokio::test]
 async fn test_list_workers_with_filter() -> anyhow::Result<()> {
     use crate::actor::tests::connect_executor;

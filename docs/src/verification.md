@@ -48,7 +48,7 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 ## Unit Tests
 
 - Wire format: roundtrip serialization for all protocol types (property tests via `proptest`)
-- DAG scheduling: known graphs -> expected critical paths and worker assignments
+- DAG scheduling: known graphs -> expected critical paths and executor assignments
 - Scheduler invariants (proptest): for any DAG and completion sequence, no derivation is dispatched before all dependencies complete
 - DAG merging: merging two DAGs produces correct dedup and shared-node priority inheritance
 - FastCDC chunking: deterministic chunking, dedup verification, chunk/reassembly roundtrip
@@ -75,10 +75,10 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 - `nix build --store ssh-ng://rio nixpkgs#hello` --- minimal end-to-end
 - `nix build --builders 'ssh-ng://rio x86_64-linux'` --- build hook path
 - `nix flake check --store ssh-ng://rio` --- checks output
-- Multi-derivation chain (A -> B -> C) distributed across workers
+- Multi-derivation chain (A -> B -> C) distributed across executors
 - Cache hit path: second build of same derivation returns instantly
 - Chunk dedup: build two similar packages, verify shared chunks
-- Worker failure mid-build -> rescheduled to another worker
+- Executor failure mid-build -> rescheduled to another executor
 - CA early cutoff: change input that produces same output -> downstream skipped
 - Binary cache: configure rio-store as substituter, `nix build` from cache
 - Binary cache `/nix-cache-info` endpoint returns valid response
@@ -101,10 +101,10 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 ## Chaos Testing
 
 - S3 timeout during PutPath -> verify orphan scanner reclaims stale manifests
-- Worker disconnect during build -> verify reassignment to another worker
+- Executor disconnect during build -> verify reassignment to another executor
 - PostgreSQL unavailability -> verify readiness probes gate traffic; verify recovery
 - Scheduler crash during active builds -> verify state recovery algorithm
-- Network partition between worker and scheduler -> verify completion buffering and retry
+- Network partition between executor and scheduler -> verify completion buffering and retry
 
 > **Implemented:** toxiproxy fault-injection chaos harness at [`nix/tests/scenarios/chaos.nix`](../../nix/tests/scenarios/chaos.nix).
 
@@ -138,8 +138,8 @@ NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgrou
 | Test | VMs | Validates |
 |------|-----|-----------|
 | `vm-phase1a` | 2 | Read-only opcodes (store info, path-info, store ls, verify) |
-| `vm-phase1b` | 3 | Single-worker build end-to-end |
-| `vm-phase2a` | 4 | Distributed 2-worker build, FUSE assertions, metrics |
+| `vm-phase1b` | 3 | Single-executor build end-to-end |
+| `vm-phase2a` | 4 | Distributed 2-executor build, FUSE assertions, metrics |
 | `vm-phase2b` | 5 | OTLP trace export (Tempo), build log forwarding, config overlay |
 | `vm-phase2c` | 5 | Size-class routing, chunked CAS, binary cache HTTP |
 | `vm-phase3a` | 3 | k3s in-cluster: BuilderPool CRD → pod → FUSE → build → cgroup memory.peak → build\_history |
@@ -157,12 +157,12 @@ NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgrou
 
 | Metric | Description | Target |
 |--------|-------------|--------|
-| **Scheduling latency** | Time from `nix build` invocation to first derivation starting on a worker | p99 < 5s |
+| **Scheduling latency** | Time from `nix build` invocation to first derivation starting on an executor | p99 < 5s |
 | **Cache hit latency** | End-to-end time for a fully cached 1MB output | < 1s |
-| **Throughput** | Derivations/second at 1, 5, 10, 20 workers | Document actual |
+| **Throughput** | Derivations/second at 1, 5, 10, 20 executors | Document actual |
 | **Cache hit rate** | Fraction of derivations served from store vs. built | Document actual |
 | **Dedup ratio** | Chunk storage savings compared to full NAR storage | Document actual |
-| **Transfer volume** | Bytes moved between store and workers per build | Document actual |
+| **Transfer volume** | Bytes moved between store and executors per build | Document actual |
 | **Critical path accuracy** | Predicted vs. actual build completion time | Within 2x |
 | **Comparison baseline** | `nix build` with standard remote builders on same hardware | Document speedup |
 

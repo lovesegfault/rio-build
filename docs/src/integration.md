@@ -125,11 +125,11 @@ This is useful for bootstrapping a new rio-build deployment with commonly-used p
 rio-build supports multiple architectures via separate builder pools. Each `BuilderPool` CRD declares a `systems` list (e.g., `["x86_64-linux"]`, or `["aarch64-linux", "aarch64-darwin"]` for a macOS host with Linux builder). The scheduler matches derivation `system` to executors whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the executor's `features` list.
 
 ```bash
-# Build for a specific architecture (requires workers with matching system)
+# Build for a specific architecture (requires executors with matching system)
 nix build --store ssh-ng://rio:2222 --system aarch64-linux .#myPackage
 ```
 
-> **Note:** Cross-compilation (building aarch64 packages on x86_64 workers via `binfmt_misc` / QEMU) is not explicitly supported. Workers should run on native hardware matching their declared `system`. For cross-compilation workflows, use Nix's cross-compilation support (`crossSystem`) on matching workers.
+> **Note:** Cross-compilation (building aarch64 packages on x86_64 executors via `binfmt_misc` / QEMU) is not explicitly supported. Executors should run on native hardware matching their declared `system`. For cross-compilation workflows, use Nix's cross-compilation support (`crossSystem`) on matching executors.
 
 ## Binary Cache as Substituter
 
@@ -162,7 +162,7 @@ Recommended dashboards:
 | Dashboard | Key Panels |
 |-----------|-----------|
 | **Build Overview** | Active builds, queue depth, cache hit rate, build duration p50/p95/p99 |
-| **Worker Utilization** | CPU/memory per worker, FUSE cache hit ratio, builds/hour |
+| **Executor Utilization** | CPU/memory per executor, FUSE cache hit ratio, builds/hour |
 | **Store Health** | Chunk dedup ratio, S3 request rate, PutPath latency, GC progress |
 | **Scheduler** | Assignment latency, critical path accuracy, DAG size distribution |
 

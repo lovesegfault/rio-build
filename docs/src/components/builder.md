@@ -246,7 +246,7 @@ r[builder.overlay.upper-not-overlayfs]
 After build completes:
 
 1. Read new paths from upper layer
-2. Chunk and upload to rio-store (CAS). Each `PutPath` request carries the scheduler-issued HMAC assignment token in the `x-rio-assignment-token` gRPC metadata header; the store verifies the token and rejects uploads for paths not in `claims.expected_outputs` (see [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc))
+2. Chunk and upload to rio-store (CAS). Each `PutPath` request carries the scheduler-issued HMAC assignment token in the `x-rio-assignment-token` gRPC metadata header; the store verifies the token and rejects uploads for paths not in `claims.expected_outputs` (see [Security: assignment tokens](../security.md#boundary-2-gatewayexecutor--internal-services-grpc))
 3. Register path metadata (narinfo, references)
 4. Discard upper layer
 

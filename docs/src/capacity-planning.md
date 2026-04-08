@@ -30,9 +30,9 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 
 **Recommendation:** Start with 500 GB. Enable S3 lifecycle rules to transition old chunks to infrequent access storage after 90 days. The store's two-phase GC reclaims unreachable chunks.
 
-## Workers
+## Executors
 
-### Sizing Per Worker
+### Sizing Per Executor
 
 One build per pod (P0537). Size the pod for the build, not for a slot count.
 
@@ -48,20 +48,20 @@ One build per pod (P0537). Size the pod for the build, not for a slot count.
 
 | Metric | Formula | Notes |
 |--------|---------|-------|
-| Concurrent builds | `workers` | One build per pod |
-| Throughput (small builds, ~30s avg) | `workers * 120/hr` | ~120 derivations/hr per worker |
-| Throughput (mixed, ~5min avg) | `workers * 12/hr` | ~12 derivations/hr per worker |
+| Concurrent builds | `executors` | One build per pod |
+| Throughput (small builds, ~30s avg) | `executors * 120/hr` | ~120 derivations/hr per executor |
+| Throughput (mixed, ~5min avg) | `executors * 12/hr` | ~12 derivations/hr per executor |
 
 **Worked example --- nixpkgs full rebuild (60K derivations):**
-- 40 workers = 40 concurrent builds
+- 40 executors = 40 concurrent builds
 - With 30s average build time: ~4,800 derivations/hour = ~12.5 hours total
 - With 5min average (including large packages): ~480 derivations/hour = ~125 hours total
-- Reality is bimodal: most builds are seconds, a few are hours. Expect 15-25 hours for a full nixpkgs rebuild on 40 workers.
+- Reality is bimodal: most builds are seconds, a few are hours. Expect 15-25 hours for a full nixpkgs rebuild on 40 executors.
 
 **With size-class routing:**
-- Small pool (10 workers, 8 concurrent each): handles 90% of builds (short-lived)
-- Large pool (2 workers, 2 concurrent each): handles 10% of builds (GCC, LLVM, Firefox)
-- Better utilization: small workers aren't blocked by multi-hour builds
+- Small pool (10 executors, 8 concurrent each): handles 90% of builds (short-lived)
+- Large pool (2 executors, 2 concurrent each): handles 10% of builds (GCC, LLVM, Firefox)
+- Better utilization: small executors aren't blocked by multi-hour builds
 
 The `BuilderPoolSet` CRD wraps this: one BPS defines all size classes declaratively, spawns one child `BuilderPool` per class (ownerReference → cascade delete), and surfaces per-class `effective_cutoff_secs` + `queued` in `.status.classes[]`. See [controller component spec](components/controller.md) for the reconciler flow.
 
@@ -80,7 +80,7 @@ The `BuilderPoolSet` CRD wraps this: one BPS defines all size classes declarativ
 |--------|---------|----------|
 | PG connection pool utilization | > 70% | > 90% |
 | S3 request rate (429 errors) | > 0 sustained | > 10/min |
-| Worker queue depth | > 2x worker count | > 5x worker count |
+| Executor queue depth | > 2x executor count | > 5x executor count |
 | Scheduler actor queue depth | > 50% capacity (5,000) | > 80% capacity (8,000) |
 | FUSE cache hit rate | < 80% | < 50% |
 | Build failure rate | > 5% | > 15% |
@@ -123,7 +123,7 @@ For a fair comparison against `hydra-queue-runner`:
 
 The two systems place work differently across the pipeline, so identical top-line numbers would be coincidence:
 
-- **DAG reconstruction location.** rio-build parses `.drv` files gateway-side and sends a pre-materialized node/edge list over gRPC. Hydra's `hydra-queue-runner` parses derivations from its own Nix store on the scheduler host. rio's SubmitBuild latency therefore *excludes* parse time; an apples-to-apples measurement starts the clock at "client sends bytes" and stops at "worker receives assignment" — which spans gateway + scheduler for rio, but queue-runner only for Hydra.
+- **DAG reconstruction location.** rio-build parses `.drv` files gateway-side and sends a pre-materialized node/edge list over gRPC. Hydra's `hydra-queue-runner` parses derivations from its own Nix store on the scheduler host. rio's SubmitBuild latency therefore *excludes* parse time; an apples-to-apples measurement starts the clock at "client sends bytes" and stops at "executor receives assignment" — which spans gateway + scheduler for rio, but queue-runner only for Hydra.
 
 - **Batch vs. incremental insert.** rio inserts the full DAG in one `SubmitBuild`. Hydra discovers derivations incrementally as `hydra-eval-jobs` emits them. At large N, rio pays one big insert; Hydra amortizes over the evaluation window. Compare rio's `linear/1000` latency against Hydra's *total* time-to-all-rows-visible, not time-to-first-row.
 
@@ -135,4 +135,4 @@ The two systems place work differently across the pipeline, so identical top-lin
 
 - **gRPC overhead in `submit_build`.** The latency benchmark drives the scheduler over real TCP gRPC. That's correct for production characterization (clients are remote) but adds ~1-2 ms of per-call overhead that isn't present in the dispatch benchmark, which drives the actor directly. Don't subtract numbers across the two benchmark groups.
 
-- **No real builds.** Both benchmarks use synthetic DAGs with instant (or no) execution. They measure the scheduler's control plane, not end-to-end build time. For throughput-of-real-builds, use the worker-fleet formula in [Fleet Sizing](#fleet-sizing) above.
+- **No real builds.** Both benchmarks use synthetic DAGs with instant (or no) execution. They measure the scheduler's control plane, not end-to-end build time. For throughput-of-real-builds, use the executor-fleet formula in [Fleet Sizing](#fleet-sizing) above.

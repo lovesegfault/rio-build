@@ -670,7 +670,7 @@ in
 
   # r[verify sched.admin.create-tenant]
   # r[verify sched.admin.list-tenants]
-  # r[verify sched.admin.list-workers]
+  # r[verify sched.admin.list-executors]
   # r[verify sched.admin.list-builds]
   # r[verify sched.admin.clear-poison]
   # rio-cli had 0% coverage — never invoked by any test. This runs

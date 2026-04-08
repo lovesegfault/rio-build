@@ -7,10 +7,10 @@ This page documents the behavior of rio-build when individual components fail, i
 | Component Down | Immediate Effect | Cascading Effect | Recovery |
 |---|---|---|---|
 | **Gateway pod(s)** | Active SSH connections drop; clients see connection reset | Log streams for in-progress builds are lost; builds continue in the scheduler | Clients reconnect to surviving replicas via NLB. No data loss. |
-| **Scheduler** | No new builds accepted; `SubmitBuild` returns `UNAVAILABLE` | Workers' `BuildExecution` streams disconnect; workers go idle. Gateways return errors to clients. | New leader acquires the Kubernetes Lease → fire-and-forgets `LeaderAcquired` → `recover_from_pg` rebuilds DAG from PG. Workers reconnect; `ReconcileAssignments` (45s delayed) checks for orphan completions or resets stale assignments. Gateways reconnect via `WatchBuild(build_id, since_sequence=last_seen)`. |
-| **Store (all replicas)** | `QueryPathInfo`, `PutPath`, `GetPath` fail | Workers can't fetch inputs (FUSE cache misses fail) or upload outputs; builds stall on I/O. Gateway can't answer `wopQueryPathInfo`. | Retry on store recovery. Builds that timed out waiting for store are retried. Worker overlay outputs are lost if all upload retries fail. |
+| **Scheduler** | No new builds accepted; `SubmitBuild` returns `UNAVAILABLE` | Executors' `BuildExecution` streams disconnect; executors go idle. Gateways return errors to clients. | New leader acquires the Kubernetes Lease → fire-and-forgets `LeaderAcquired` → `recover_from_pg` rebuilds DAG from PG. Executors reconnect; `ReconcileAssignments` (45s delayed) checks for orphan completions or resets stale assignments. Gateways reconnect via `WatchBuild(build_id, since_sequence=last_seen)`. |
+| **Store (all replicas)** | `QueryPathInfo`, `PutPath`, `GetPath` fail | Executors can't fetch inputs (FUSE cache misses fail) or upload outputs; builds stall on I/O. Gateway can't answer `wopQueryPathInfo`. | Retry on store recovery. Builds that timed out waiting for store are retried. Executor overlay outputs are lost if all upload retries fail. |
 | **PostgreSQL** | Scheduler can't persist state; store can't query metadata | Full system halt --- no scheduling, no metadata lookups, no new builds | Restore PG from backup. All components reconnect via connection retry. Scheduler rebuilds DAG via `recover_from_pg` on next LeaderAcquired. If PG is restored but DAG state is lost (full data loss), clients must resubmit. |
-| **S3 (object storage)** | Chunk reads/writes fail | Store returns errors to workers and gateways; worker uploads fail. Builds whose inputs are fully SSD-cached may continue. | Retry with backoff (S3 DELETE is idempotent). Worker overlay outputs are lost if all upload retries fail. |
+| **S3 (object storage)** | Chunk reads/writes fail | Store returns errors to executors and gateways; executor uploads fail. Builds whose inputs are fully SSD-cached may continue. | Retry with backoff (S3 DELETE is idempotent). Executor overlay outputs are lost if all upload retries fail. |
 | **Builder pod** | Running build on that pod is orphaned | Scheduler detects via missed heartbeats (~50-60s wall-clock), calls `reset_to_ready()` on the affected derivation --- it goes straight back to Ready (increments `retry_count`) and re-queues, no intermediate `InfrastructureFailure` classification | Controller spawns a fresh Job for the re-queued derivation. New pod starts with cold FUSE cache. |
 | **Controller** | No autoscaling decisions; CRD reconciliation pauses | BuilderPool sizes remain static; no GC scheduling | Restart controller. State is in CRDs and K8s API; no persistent state lost. |
 
@@ -20,14 +20,14 @@ This page documents the behavior of rio-build when individual components fail, i
 
 If S3 writes fail but reads succeed (e.g., S3 rate limiting on PUTs):
 - **Reads** (cache hits, binary cache serving): continue normally
-- **Writes** (build output uploads): fail and retry. If all retries fail, the build output on the worker's overlay is lost
+- **Writes** (build output uploads): fail and retry. If all retries fail, the build output on the executor's overlay is lost
 - **Impact**: New builds that produce outputs can't persist them, but builds that only consume existing cache entries work fine
 
-### Network Partition: Scheduler <-> Workers
+### Network Partition: Scheduler <-> Executors
 
-- Workers detect partition via heartbeat timeout (~50-60s wall-clock: 30s staleness threshold + 3-tick confirmation)
-- Workers close their `BuildExecution` stream and attempt reconnection with backoff
-- The scheduler calls `reset_to_ready()` on disconnected workers' running builds --- they go directly back to Ready (increment `retry_count`), no intermediate status classification
+- Executors detect partition via heartbeat timeout (~50-60s wall-clock: 30s staleness threshold + 3-tick confirmation)
+- Executors close their `BuildExecution` stream and attempt reconnection with backoff
+- The scheduler calls `reset_to_ready()` on disconnected executors' running builds --- they go directly back to Ready (increment `retry_count`), no intermediate status classification
 - Builds already assigned but not yet started are reassigned immediately
 
 ### Network Partition: Gateway <-> Scheduler
@@ -40,13 +40,13 @@ If S3 writes fail but reads succeed (e.g., S3 rate limiting on PUTs):
 
 Split-brain is bounded by the Kubernetes Lease renew deadline (default 15s):
 - Each Lease acquisition increments an in-memory `Arc<AtomicU64>` generation counter
-- The generation flows into `WorkAssignment.generation`; workers reject stale-generation assignments after their next heartbeat sync
+- The generation flows into `WorkAssignment.generation`; executors reject stale-generation assignments after their next heartbeat sync
 - **No PostgreSQL-level write fencing exists** --- a deposed leader's in-flight PG writes will succeed. PG writes are idempotent (INSERT ON CONFLICT, status-check UPDATEs), which limits the damage
 - Optional future hardening: add a `scheduler_meta` row with a generation-guard WHERE clause for strict fencing (current: idempotent writes tolerate dual-leader window)
 
 ### Cascading FUSE Cache Miss Storm
 
-If rio-store is degraded (slow but not down), all workers' FUSE cache misses queue up:
-- Workers' FUSE read operations block, causing build sandboxes to stall
+If rio-store is degraded (slow but not down), all executors' FUSE cache misses queue up:
+- Executors' FUSE read operations block, causing build sandboxes to stall
 - The scheduler's backpressure mechanism (actor queue depth > 80%) rejects new builds with `RESOURCE_EXHAUSTED`
 - After 5 consecutive `ensure_cached` failures, the FUSE circuit breaker opens and `check()` returns `EIO` immediately (fail-fast). The existing `WAIT_DEADLINE` timeout on each fetch feeds the failure counter. See `r[builder.fuse.circuit-breaker]`.

@@ -46,9 +46,9 @@ For development or evaluation, a minimal deployment needs:
 
 This fits in a 4-node cluster (1 control plane + 1 general workload + 2 worker nodes with taints).
 
-## Worker Node Pool
+## Executor Node Pool
 
-Workers require a dedicated node pool with:
+Executors require a dedicated node pool with:
 
 r[infra.node.nixos-ami]
 
@@ -58,20 +58,20 @@ r[infra.node.prebake-layer-warm]
 
 The AMI also bakes a `rio-executor-seed.oci.tar` (builder+fetcher images, deduplicated layers, ~124 MB) and imports it into containerd's content store via a `containerd-seed-warm` oneshot that runs concurrently with kubelet registration (the import completes inside kubelet's ~5–15 s TLS-bootstrap window; if it loses the race, the first pod pull is cold-from-ECR — degraded, not broken). PodSpec image refs stay `<ECR>/rio-{builder,fetcher}:<git-sha>` — the seed is a layer-cache warm, not the pulled ref. On a fresh node's first pod, containerd resolves the ECR manifest and finds most layer blobs already local by digest; only layers that changed since the AMI was cut are fetched (typically the ~10 MB `rio-workspace` top layer, or zero if AMI and deploy are at the same commit). The seed's `seed.local/…:prebaked` image-store refs are pinned (`io.cri-containerd.pinned=pinned`) so kubelet image-GC can't reclaim the layer blobs before the first pod runs. Dev loop is unchanged (`up --push --deploy`); `up --ami` is an optional optimization to keep the delta near zero.
 
-- **Taint:** `rio.build/worker=true:NoSchedule` (only worker pods scheduled here). Note: system pods (coredns) need at least one untainted node — use a separate system node group.
+- **Taint:** `rio.build/executor=true:NoSchedule` (only executor pods scheduled here). Note: system pods (coredns) need at least one untainted node — use a separate system node group.
 - **Instance type:** Compute-optimized (e.g., `c8a.xlarge` on AWS). Avoid instance types with instance store NVMe (`m6id`, `i3`) unless the EKS AMI supports them — AL2023 EKS AMIs may report `InvalidDiskCapacity` with instance store volumes.
-- **AMI:** the NixOS node AMI (`.#node-ami-<arch>`, [ADR-021](decisions/021-nixos-node-ami.md)) or AL2023 with kernel 6.1+. Amazon Linux 2 (AL2, kernel 5.10) does **NOT** support overlayfs-over-FUSE and is not compatible with rio-build workers.
+- **AMI:** the NixOS node AMI (`.#node-ami-<arch>`, [ADR-021](decisions/021-nixos-node-ami.md)) or AL2023 with kernel 6.1+. Amazon Linux 2 (AL2, kernel 5.10) does **NOT** support overlayfs-over-FUSE and is not compatible with rio-build executors.
 - **Kernel:** Linux 6.1+ (for overlayfs-over-FUSE support). Linux 6.9+ recommended for FUSE passthrough mode. Verify with `uname -r` on worker nodes.
 - **IMDSv2:** Hop limit = 1 (defense-in-depth against metadata access from containers)
 - **Pod spec:** `hostUsers: false` is incompatible with `/dev/fuse` hostPath volumes (kernel rejects idmap mounts on device nodes). containerd `base_runtime_spec` injects `/dev/{fuse,kvm}` directly (OCI `linux.devices` — runc `mknod`s inside the container's `/dev`); see `nix/base-runtime-spec.nix` (NixOS AMI: `nix/nixos-node/containerd-config.nix`; k3s VM fixture: `services.k3s.containerdConfigTemplate` in `nix/tests/fixtures/k3s-full.nix`).
-- **`/dev/fuse` access:** Worker pods need access to `/dev/fuse`. A `hostPath` volume with `privileged: true` works for development but production should use `base_runtime_spec` device injection to avoid granting full privileges. `CAP_SYS_ADMIN` alone is not sufficient for `/dev/fuse` access — the container's device cgroup must also allow the FUSE character device.
+- **`/dev/fuse` access:** Executor pods need access to `/dev/fuse`. A `hostPath` volume with `privileged: true` works for development but production should use `base_runtime_spec` device injection to avoid granting full privileges. `CAP_SYS_ADMIN` alone is not sufficient for `/dev/fuse` access — the container's device cgroup must also allow the FUSE character device.
 - **EKS addons:** `vpc-cni` and `kube-proxy` must be installed before node groups are created (they are daemonsets). `coredns` requires schedulable (untainted) nodes and should be installed after the system node group is ready.
 
 ### Node autoscaling
 
 Builder pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller spawns BuilderPool Jobs based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
 
-The EKS reference deployment (`infra/eks/`) uses Karpenter: the `workers` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on builder NodePools means Karpenter never evicts a node with a builder pod on it --- ephemeral Jobs terminate on completion, then Karpenter consolidates the empty node. Scale-to-zero is the default: cold start from zero is ~50-80s (node boot + pod start).
+The EKS reference deployment (`infra/eks/`) uses Karpenter: the `executors` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on builder NodePools means Karpenter never evicts a node with a builder pod on it --- ephemeral Jobs terminate on completion, then Karpenter consolidates the empty node. Scale-to-zero is the default: cold start from zero is ~50-80s (node boot + pod start).
 
 ## Key Configuration
 
@@ -156,13 +156,13 @@ The pod's `RIO_TLS__*` env gives rio-cli mTLS to `localhost:9001` automatically.
 - **Schema migrations:** Run via `sqlx::migrate!` (uses sqlx's built-in PG advisory lock internally). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables). Note: sqlx's lock covers single-service migrations; multi-replica store deployment needs a migration-lock mechanism (hence `replicas: 1` today).
 - **Rolling updates:** Builder Jobs (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the builder's SIGTERM handler blocks until its single in-flight build completes, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Builder pods are one-shot, so a control-plane upgrade naturally rolls the fleet as Jobs complete and new ones spawn with the new image.
 - **Blue/green deployments:** Supported if separate PostgreSQL schemas and S3 key prefixes are used per deployment. The gateway can be switched atomically via NLB target group changes.
-- **Version skew policy:** Gateway and worker binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.
+- **Version skew policy:** Gateway and executor binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.
 
 ## Disaster Recovery
 
 - **PostgreSQL:** Standard backup/restore via `pg_dump`, WAL archiving, or managed service snapshots (e.g., RDS automated backups). PostgreSQL is the authoritative source for all metadata (narinfo, chunk manifests, scheduling state, build history). **PG metadata cannot be reconstructed from S3 alone.**
 - **S3:** Durable by default (11 nines). Chunk data in S3 is the source of truth for build artifacts. Enable S3 versioning as defense against accidental deletes.
-- **Recovery procedure:** Restore PostgreSQL from backup, verify S3 bucket accessibility, restart all components. Workers reconnect and re-register.
+- **Recovery procedure:** Restore PostgreSQL from backup, verify S3 bucket accessibility, restart all components. Executors reconnect and re-register.
 
     > **State recovery (Phase 3b):** On `LeaderAcquired` (lease acquisition), the scheduler calls `recover_from_pg` which rebuilds the in-memory DAG from PostgreSQL: loads non-terminal builds + derivations + edges + build_derivations, reconstructs `DerivationState` via `from_recovery_row`, recomputes critical-path priorities, repopulates the ready queue. The lease loop fire-and-forgets `LeaderAcquired` (non-blocking — keeps renewing during recovery); `recovery_complete` flag gates dispatch. If recovery fails (PG down), sets `recovery_complete=true` anyway with an empty DAG (degrade to pre-recovery behavior, don't block). Generation counter seeded from `MAX(assignments.generation) + 1` via `fetch_max` for defensive monotonicity. See `rio-scheduler/src/actor/recovery.rs`.
 - **RPO:** Determined by PostgreSQL backup frequency. With WAL archiving, RPO can be near-zero. S3 data has effectively zero RPO.

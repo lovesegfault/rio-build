@@ -85,7 +85,7 @@ impl ActorHandle {
     /// `DagActorPlumbing::default()` (always-leader, no store/flusher).
     /// main.rs populates both from scheduler.toml and the lease task's
     /// shared `LeaderState`.
-    // r[impl sched.retry.per-worker-budget]
+    // r[impl sched.retry.per-executor-budget]
     pub fn spawn(db: SchedulerDb, cfg: DagActorConfig, plumbing: DagActorPlumbing) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let actor = DagActor::new(db, cfg, plumbing);

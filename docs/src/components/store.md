@@ -116,7 +116,7 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 ### Write-Ahead Manifest Pattern (PutPath flow)
 
 r[store.put.wal-manifest]
-**Authorization:** Worker `PutPath` calls include an HMAC-SHA256-signed assignment token in the `x-rio-assignment-token` gRPC metadata header. The store verifies the token signature, checks expiry, and rejects uploads whose `store_path` is not in `claims.expected_outputs`. Callers presenting a client certificate with `CN=rio-gateway` bypass the HMAC check (the gateway handles `nix copy --to` and has no assignment). See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
+**Authorization:** Executor `PutPath` calls include an HMAC-SHA256-signed assignment token in the `x-rio-assignment-token` gRPC metadata header. The store verifies the token signature, checks expiry, and rejects uploads whose `store_path` is not in `claims.expected_outputs`. Callers presenting a client certificate with `CN=rio-gateway` bypass the HMAC check (the gateway handles `nix copy --to` and has no assignment). See [Security: assignment tokens](../security.md#boundary-2-gatewayexecutor--internal-services-grpc).
 
 r[store.hmac.san-bypass]
 The HMAC bypass check accepts a client certificate whose CN **or** any SAN `DNSName` entry matches the configured allowlist (`hmac_bypass_cns`, default `["rio-gateway"]`). SAN matching enables cert-manager-issued certificates that place identity in SAN extensions rather than CN. The check is CN-first, SAN-second; either match grants bypass.

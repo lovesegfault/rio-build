@@ -1209,7 +1209,7 @@ async fn test_fleet_exhaustion_is_kind_aware() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.per-worker-budget]
+// r[verify sched.retry.per-executor-budget]
 /// InfrastructureFailure is a worker-local problem (FUSE EIO, cgroup
 /// setup fail, OOM-kill of the build process) — NOT the build's fault.
 /// 3× InfrastructureFailure on distinct workers → failed_builders stays

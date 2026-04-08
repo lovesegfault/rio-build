@@ -92,7 +92,7 @@ struct Config {
     /// Env: `RIO_LEASE_NAMESPACE`. Ignored when `lease_name` is None.
     lease_namespace: Option<String>,
     /// Poison-detection thresholds. `[poison]` table in scheduler.toml.
-    /// `r[sched.retry.per-worker-budget]` (scheduler.md:110) specifies
+    /// `r[sched.retry.per-executor-budget]` (scheduler.md:110) specifies
     /// both this and `retry` below as TOML-configurable. P0219 shipped
     /// the structs + builders; this wires them. Default: 3 distinct
     /// workers must fail (matches the former `POISON_THRESHOLD` const).
@@ -216,7 +216,7 @@ impl rio_common::config::ValidateConfig for Config {
             !cfg.tick_interval.is_zero(),
             "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
         );
-        // r[impl sched.retry.per-worker-budget]
+        // r[impl sched.retry.per-executor-budget]
         // `RetryPolicy::backoff_duration` (worker.rs) computes
         // `random_range(-jf..=jf)` — rand panics if low > high, so jf < 0
         // crashes on the first retry. And jf > 1 makes `clamped * (1 - jf)`
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(d.retry, rio_scheduler::RetryPolicy::default());
     }
 
-    // r[verify sched.retry.per-worker-budget]
+    // r[verify sched.retry.per-executor-budget]
     /// TOML → Config parse for `[poison]` and `[retry]` tables.
     /// Field names match PoisonConfig (`threshold`,
     /// `require_distinct_workers`) and RetryPolicy (`max_retries`,
@@ -1136,7 +1136,7 @@ mod tests {
         cfg
     }
 
-    // r[verify sched.retry.per-worker-budget]
+    // r[verify sched.retry.per-executor-budget]
     /// Negative `jitter_fraction` → `random_range(-jf..=jf)` with low >
     /// high → rand panic on the FIRST retry (not at config load — hours
     /// later, inside a worker-retry codepath). validate_config catches
@@ -1278,7 +1278,7 @@ mod tests {
             .expect("default config should be valid");
     }
 
-    // r[verify sched.retry.per-worker-budget]
+    // r[verify sched.retry.per-executor-budget]
     /// Negative backoff_base_secs → silently zero backoff via the
     /// `.max(0.0)` at worker.rs:248. Same thrash-mode as jitter>1
     /// but via a different field — both guarded at config-load.

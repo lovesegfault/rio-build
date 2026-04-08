@@ -222,7 +222,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    // r[impl sched.admin.list-workers]
+    // r[impl sched.admin.list-executors]
     #[instrument(skip(self, request), fields(rpc = "ListExecutors"))]
     async fn list_executors(
         &self,

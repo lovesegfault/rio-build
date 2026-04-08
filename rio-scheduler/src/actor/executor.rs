@@ -1,6 +1,6 @@
 //! Worker lifecycle: connect/disconnect, heartbeat, periodic tick.
-// r[impl sched.worker.dual-register]
-// r[impl sched.worker.deregister-reassign]
+// r[impl sched.executor.dual-register]
+// r[impl sched.executor.deregister-reassign]
 
 use super::*;
 

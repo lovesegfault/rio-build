@@ -29,7 +29,7 @@ service ExecutorService {
 }
 ```
 
-> **Executor registration:** Executor registration is implicit and two-step: (1) the executor opens a `BuildExecution` bidirectional stream, (2) the executor calls the separate `Heartbeat` unary RPC with its initial capabilities (executor_id, systems, supported_features, size_class, kind). The scheduler creates the executor entry when it receives a heartbeat from an executor_id that also has an open `BuildExecution` stream. Periodic heartbeats update resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
+> **Executor registration:** Executor registration is implicit and two-step: (1) the executor opens a `BuildExecution` bidirectional stream, (2) the executor calls the separate `Heartbeat` unary RPC with its initial capabilities (executor_id, systems, supported_features, size_class, kind). The scheduler creates the executor entry when it receives a heartbeat from an executor_id that also has an open `BuildExecution` stream. Periodic heartbeats update resource usage. See [rio-scheduler](./scheduler.md#executor-registration-protocol) for deregistration rules.
 
 ```protobuf
 // store.proto --- inspired by tvix castore/store protos (MIT)
@@ -48,7 +48,7 @@ service StoreService {
 }
 ```
 
-> **PutPath stream shape:** `metadata` (1) → `nar_chunk` (0+) → `trailer` (1, mandatory). The `nar_hash` / `nar_size` go in the **trailer**, NOT the metadata — `metadata.info.nar_hash` MUST be empty (store rejects non-empty as a protocol violation). This enables single-pass streaming: the worker's `HashingChannelWriter` tee reads the file once, hashing + uploading simultaneously (~256 KiB peak memory, down from 8 GiB pre-phase2b).
+> **PutPath stream shape:** `metadata` (1) → `nar_chunk` (0+) → `trailer` (1, mandatory). The `nar_hash` / `nar_size` go in the **trailer**, NOT the metadata — `metadata.info.nar_hash` MUST be empty (store rejects non-empty as a protocol violation). This enables single-pass streaming: the executor's `HashingChannelWriter` tee reads the file once, hashing + uploading simultaneously (~256 KiB peak memory, down from 8 GiB pre-phase2b).
 
 ```protobuf
 service ChunkService {
@@ -86,18 +86,18 @@ service AdminService {
 }
 ```
 
-> **TriggerGC layering:** `AdminService.TriggerGC` (scheduler) proxies to `StoreAdminService.TriggerGC` (store). The scheduler populates `GCRequest.extra_roots` with expected output paths from all non-terminal derivations before forwarding — this protects in-flight build outputs that the worker hasn't uploaded yet. Calling `StoreAdminService.TriggerGC` directly bypasses this protection.
+> **TriggerGC layering:** `AdminService.TriggerGC` (scheduler) proxies to `StoreAdminService.TriggerGC` (store). The scheduler populates `GCRequest.extra_roots` with expected output paths from all non-terminal derivations before forwarding — this protects in-flight build outputs that the executor hasn't uploaded yet. Calling `StoreAdminService.TriggerGC` directly bypasses this protection.
 
 ## Key Messages
 
 ### BuildExecution Bidirectional Stream
 
 r[proto.stream.bidi]
-The `BuildExecution` RPC replaces the previous `PullWork` + `ReportCompletion` design with a single bidirectional stream per worker, enabling:
+The `BuildExecution` RPC replaces the previous `PullWork` + `ReportCompletion` design with a single bidirectional stream per executor, enabling:
 
-- Scheduler-to-worker signals (assignment, cancellation, prefetch hints) without out-of-band RPCs
-- Worker-to-scheduler signals (log batches, completion, ack) with reliability guarantees
-- Assignment acknowledgment: the worker confirms receipt of each assignment
+- Scheduler-to-executor signals (assignment, cancellation, prefetch hints) without out-of-band RPCs
+- Executor-to-scheduler signals (log batches, completion, ack) with reliability guarantees
+- Assignment acknowledgment: the executor confirms receipt of each assignment
 
 ```protobuf
 message ExecutorMessage {
@@ -117,7 +117,7 @@ message ExecutorMessage {
 message SchedulerMessage {
   oneof msg {
     WorkAssignment assignment = 1;    // New work to execute
-    CancelSignal cancel = 2;          // Cancel a specific derivation (worker pod termination only)
+    CancelSignal cancel = 2;          // Cancel a specific derivation (executor pod termination only)
     PrefetchHint prefetch = 3;        // Paths to pre-warm in FUSE cache
   }
 }
@@ -125,7 +125,7 @@ message SchedulerMessage {
 
 ### BuildLogBatch
 
-Log lines are **batched** for efficiency rather than sent per-line. The worker buffers up to 64 lines or 100ms (whichever comes first) and sends a batch. Use `bytes` (not `string`) for log content since build output may contain non-UTF-8 data.
+Log lines are **batched** for efficiency rather than sent per-line. The executor buffers up to 64 lines or 100ms (whichever comes first) and sends a batch. Use `bytes` (not `string`) for log content since build output may contain non-UTF-8 data.
 
 ```protobuf
 message BuildLogBatch {
@@ -138,7 +138,7 @@ message BuildLogBatch {
 
 ### CompletionReport
 
-Worker → scheduler message on the `BuildExecution` stream reporting the result of a single derivation build, including cgroup-v2-derived resource metrics:
+Executor → scheduler message on the `BuildExecution` stream reporting the result of a single derivation build, including cgroup-v2-derived resource metrics:
 
 ```protobuf
 message CompletionReport {
@@ -151,18 +151,18 @@ message CompletionReport {
 }
 ```
 
-`peak_memory_bytes` / `peak_cpu_cores` feed the `build_history` EMA columns for size-class memory-bump routing. Zero is the no-signal sentinel (cgroup setup failed or build failed before the cgroup was populated) — the scheduler keeps the prior EMA instead of dragging toward zero. cgroup v2 is a **hard requirement**; the worker fails startup if the delegated subtree is unavailable.
+`peak_memory_bytes` / `peak_cpu_cores` feed the `build_history` EMA columns for size-class memory-bump routing. Zero is the no-signal sentinel (cgroup setup failed or build failed before the cgroup was populated) — the scheduler keeps the prior EMA instead of dragging toward zero. cgroup v2 is a **hard requirement**; the executor fails startup if the delegated subtree is unavailable.
 
 ### HeartbeatRequest
 
-Workers include inventory data in heartbeats so the scheduler can make informed placement decisions:
+Executors include inventory data in heartbeats so the scheduler can make informed placement decisions:
 
 ```protobuf
 message HeartbeatRequest {
   string executor_id = 1;
   repeated string running_builds = 2;
   ResourceUsage resources = 3;
-  reserved 4;                      // was BloomFilter local_paths — locality routing dropped with persistent workers
+  reserved 4;                      // was BloomFilter local_paths — locality routing dropped with persistent executors
   repeated string systems = 5;     // Systems this executor builds for (e.g. ["x86_64-linux", "aarch64-linux"])
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
   reserved 7;                      // was max_builds (always 1 now)
@@ -173,7 +173,7 @@ message HeartbeatRequest {
 }
 ```
 
-> **Locality routing removed:** Field 4 previously carried a bloom filter of cached store paths for transfer-cost-weighted placement. Under the ephemeral one-build-per-pod model a worker has no warm cache to advertise, so locality routing was dropped entirely.
+> **Locality routing removed:** Field 4 previously carried a bloom filter of cached store paths for transfer-cost-weighted placement. Under the ephemeral one-build-per-pod model an executor has no warm cache to advertise, so locality routing was dropped entirely.
 
 ### BuildEvent
 
@@ -222,7 +222,7 @@ message SubmitBuildRequest {
 
   // Client build options. For ssh:// these propagate from wopSetOptions;
   // for ssh-ng they're populated gateway-side (P0310) or fall back to
-  // worker config defaults (P0215 — ssh-ng never sends wopSetOptions).
+  // executor config defaults (P0215 — ssh-ng never sends wopSetOptions).
   uint64 max_silent_time = 5;
   uint64 build_timeout = 6;
   uint64 build_cores = 7;
@@ -244,7 +244,7 @@ message DerivationNode {
                                               // (for scheduler-side cache check: closes
                                               //  TOCTOU between gateway FindMissingPaths
                                               //  and DAG merge)
-  bytes drv_content = 9;           // Inline ATerm-serialized .drv. Empty = worker fetches from store.
+  bytes drv_content = 9;           // Inline ATerm-serialized .drv. Empty = executor fetches from store.
                                    // Populated by gateway's filter_and_inline_drv ONLY for nodes with
                                    // missing outputs (≤64KB per node, 16MB total DAG budget).
   uint64 input_srcs_nar_size = 10; // Sum of nar_size of this node's input_srcs (direct static sources,
@@ -268,7 +268,7 @@ message DerivationEdge {
 
 > **Tenant identification:** `tenant_name` is set by the gateway from the SSH `authorized_keys` comment field, not from client-provided data. The scheduler resolves the name to a tenant UUID via the `tenants` table (see `r[sched.tenant.resolve]`). Field 1 (`tenant_id`) is reserved — it was removed when resolution moved scheduler-side. The tenant's JWT is propagated via gRPC metadata (`x-rio-tenant-token`) for downstream authorization checks. Note: `tenant_id` still appears as a UUID-string field in `BuildInfo` and `TenantInfo` — those are the **resolved** UUID, not the pre-resolution name.
 
-> **BuildResultStatus ↔ Nix BuildStatus mapping:** The gRPC `BuildResultStatus` enum is a **subset** of Nix's wire `BuildStatus` with a different numbering scheme. The proto enum has `UNSPECIFIED=0` (proto3 default), then `BUILT=1`, `SUBSTITUTED=2`, `ALREADY_VALID=3`, `PERMANENT_FAILURE=4`, `TRANSIENT_FAILURE=5`, `CACHED_FAILURE=6`, `DEPENDENCY_FAILED=7`, `LOG_LIMIT_EXCEEDED=8`, `OUTPUT_REJECTED=9`, `INFRASTRUCTURE_FAILURE=10`. This differs from Nix's wire values (where `TransientFailure=6`, `DependencyFailed=10`). The worker (`executor.rs`) and gateway translate explicitly; they do NOT map 1:1. The proto enum is currently missing `InputRejected`, `TimedOut`, `MiscFailure`, `NotDeterministic`, `ResolvesToAlreadyValid`, and `NoSubstituters` — these Nix statuses currently round-trip through `PERMANENT_FAILURE` or `TRANSIENT_FAILURE` in the gRPC layer. `InfrastructureFailure` is gRPC-only (worker-internal errors: daemon crash, overlay failure); the gateway maps it to Nix `TransientFailure` (6).
+> **BuildResultStatus ↔ Nix BuildStatus mapping:** The gRPC `BuildResultStatus` enum is a **subset** of Nix's wire `BuildStatus` with a different numbering scheme. The proto enum has `UNSPECIFIED=0` (proto3 default), then `BUILT=1`, `SUBSTITUTED=2`, `ALREADY_VALID=3`, `PERMANENT_FAILURE=4`, `TRANSIENT_FAILURE=5`, `CACHED_FAILURE=6`, `DEPENDENCY_FAILED=7`, `LOG_LIMIT_EXCEEDED=8`, `OUTPUT_REJECTED=9`, `INFRASTRUCTURE_FAILURE=10`. This differs from Nix's wire values (where `TransientFailure=6`, `DependencyFailed=10`). The executor (`executor.rs`) and gateway translate explicitly; they do NOT map 1:1. The proto enum is currently missing `InputRejected`, `TimedOut`, `MiscFailure`, `NotDeterministic`, `ResolvesToAlreadyValid`, and `NoSubstituters` — these Nix statuses currently round-trip through `PERMANENT_FAILURE` or `TRANSIENT_FAILURE` in the gRPC layer. `InfrastructureFailure` is gRPC-only (executor-internal errors: daemon crash, overlay failure); the gateway maps it to Nix `TransientFailure` (6).
 
 ### WatchBuildRequest
 
@@ -307,5 +307,5 @@ Executor-facing RPCs are in a separate `ExecutorService` (in `builder.proto`) to
 **Per-service configuration:** The `max_message_size` applies to all gRPC services:
 - Gateway -> Scheduler (`SubmitBuild` is the largest message)
 - Gateway -> Store (`GetPath` responses for large NARs use streaming, so unaffected)
-- Worker -> Scheduler (`BuildExecution` stream messages are individually small)
-- Worker -> Store (`PutPath` uses streaming, so unaffected)
+- Executor -> Scheduler (`BuildExecution` stream messages are individually small)
+- Executor -> Store (`PutPath` uses streaming, so unaffected)
