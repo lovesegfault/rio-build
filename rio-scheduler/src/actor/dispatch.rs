@@ -3,6 +3,41 @@
 
 use super::*;
 
+/// Per-dispatch-pass accumulators threaded through
+/// [`DagActor::try_dispatch_one`]. The drain loop in
+/// [`DagActor::dispatch_ready`] previously closed over five outer
+/// `mut` locals; collecting them here lets the loop body extract as a
+/// method without 6-positional-`&mut` signatures.
+#[derive(Default)]
+struct DispatchTickCtx {
+    /// Hashes the batch FOD pre-pass already checked (I-163).
+    /// `try_dispatch_one` skips the per-FOD store RPC for these.
+    batch_checked: HashSet<DrvHash>,
+    /// Derivations that couldn't dispatch this pass (backoff not
+    /// elapsed, no eligible worker, or assignment send failed).
+    /// Re-pushed onto the ready queue at end of each cycle.
+    deferred: Vec<DrvHash>,
+    /// Per-TARGET-class deferral counts (operator gauge).
+    class_deferred: HashMap<String, u64>,
+    /// FOD deferral count. Separate from `class_deferred` — fetchers
+    /// aren't size-classed (ADR-019).
+    fod_deferred: u64,
+    /// Successful assign_to_worker calls (for the >1s debug log).
+    n_assigned: u64,
+}
+
+/// Result of [`DagActor::try_dispatch_one`]. Only the outer drain
+/// loop's `dispatched_any` flag depends on this — all other
+/// accumulators are mutated through [`DispatchTickCtx`].
+enum DispatchOutcome {
+    /// Assigned to a worker, or short-circuited a Ready FOD from
+    /// store. Triggers another drain cycle.
+    Progressed,
+    /// Stale entry / backoff / deferred / poisoned. May have pushed
+    /// into `ctx.deferred`.
+    NoProgress,
+}
+
 /// I-025 freeze detector: state machine that WARNs when derivations are
 /// queued but zero streams of the matching kind exist for >60s.
 ///
@@ -92,7 +127,6 @@ impl DagActor {
         let t_total = Instant::now();
         let mut t_phase = Instant::now();
         let mut n_popped = 0u64;
-        let mut n_assigned = 0u64;
         macro_rules! phase {
             ($name:literal) => {
                 tracing::trace!(elapsed = ?t_phase.elapsed(), phase = $name, "dispatch phase");
@@ -116,209 +150,31 @@ impl DagActor {
         // actor at medium-mixed-32x scale. The doc-comment on
         // `fod_outputs_in_store` already claimed deferred FODs use
         // the batch; this honors it.
-        let batch_checked = self.batch_complete_cached_ready_fods().await;
+        let mut ctx = DispatchTickCtx {
+            batch_checked: self.batch_complete_cached_ready_fods().await,
+            ..Default::default()
+        };
         phase!("0-batch-fod-precheck");
 
         // Drain the queue, dispatching eligible derivations and deferring
         // ineligible ones. Deferring (instead of breaking on the first
         // ineligible derivation) prevents head-of-line blocking — an
         // aarch64 drv at queue head must not block all x86_64 dispatch.
-        let mut deferred: Vec<DrvHash> = Vec::new();
-        let mut dispatched_any = true;
-        // Track how many derivations WANTED each class but got deferred.
-        // Reported as a gauge at the end — operator signal for "class X
-        // is bottlenecked, scale that pool."
-        let mut class_deferred: HashMap<String, u64> = HashMap::new();
-        // FODs deferred waiting for a fetcher. Separate from
-        // class_deferred — fetchers aren't size-classed (ADR-019).
-        let mut fod_deferred: u64 = 0;
-
+        //
         // Keep cycling until a full pass with no dispatches AND no stale removals.
         // In practice this terminates quickly: each derivation is either
         // dispatched, deferred, or removed (stale) exactly once per pass.
+        let mut dispatched_any = true;
         while dispatched_any {
             dispatched_any = false;
 
             while let Some(drv_hash) = self.ready_queue.pop() {
                 n_popped += 1;
-                // Stale-entry guards: drop if not in DAG or not Ready.
-                let Some(state) = self.dag.node(&drv_hash) else {
-                    continue;
-                };
-                if state.status() != DerivationStatus::Ready {
-                    continue;
-                }
-                // Retry backoff: if set and not yet elapsed, defer.
-                // The derivation stays Ready + in queue (re-pushed
-                // at the end of the pass with the other deferred).
-                // Next dispatch pass re-checks — convergent without
-                // timers. Cheap: one Instant::now() only for
-                // derivations that failed transiently (backoff_until
-                // is None for fresh ones).
-                if let Some(deadline) = state.retry.backoff_until
-                    && Instant::now() < deadline
-                {
-                    deferred.push(drv_hash);
-                    continue;
-                }
-
-                // Classify by estimated duration + memory + CPU. None
-                // if size_classes unconfigured (optional feature off —
-                // no filter, all workers candidates).
-                //
-                // Also compute the ADR-020 bucketed memory estimate for
-                // the resource-fit filter. Same estimator lookup path
-                // as compute_capacity_manifest (lookup_entry +
-                // bucketed_estimate + self.headroom_mult) so the
-                // placement filter and the manifest RPC agree.
-                //
-                // `is_fixed_output` is captured into a local so the
-                // `state` borrow ends here — `node_mut` below needs
-                // exclusive access to `self.dag`.
-                //
-                // Read guard is dropped at the end of this block —
-                // BEFORE `assign_to_worker().await`. parking_lot
-                // guards aren't `Send`; the await point would be a
-                // compile error anyway, but keeping the scope tight
-                // is defensive.
-                let (target_class, est_memory_bytes, is_fixed_output) = {
-                    let pname = state.pname.as_deref();
-                    let system = &state.system;
-                    let classes = self.size_classes.read();
-                    let target_class = crate::assignment::classify(
-                        state.sched.est_duration,
-                        self.estimator.peak_memory(pname, system),
-                        self.estimator.peak_cpu(pname, system),
-                        &classes,
-                    );
-                    // None-chain: no pname → no lookup key → None.
-                    // No history entry → None. No memory sample →
-                    // bucketed_estimate returns None. All three mean
-                    // "cold start" to the filter (any worker fits).
-                    //
-                    // Skip for FODs: MEMORY_BUCKET_BYTES (4 GiB, ADR-020
-                    // compile-workload pod sizing) rounds a 22 MB fetch
-                    // up to 4 GiB → resource-fit rejects 2 GiB fetchers.
-                    // I-062: 5 recurrences of fod_queue=2 + fetcher_util=0
-                    // before the per-clause diagnostic exposed this. FOD
-                    // memory is the download buffer, not a compile heap;
-                    // resource-fit is the wrong gate.
-                    let est_memory_bytes = if state.is_fixed_output {
-                        None
-                    } else {
-                        pname
-                            .and_then(|p| self.estimator.lookup_entry(p, system))
-                            .and_then(|e| Estimator::bucketed_estimate(&e, self.headroom_mult))
-                            .map(|b| b.memory_bytes)
-                    };
-                    (target_class, est_memory_bytes, state.is_fixed_output)
-                };
-
-                // Write the estimate onto the state BEFORE placement
-                // so `hard_filter` (via find_executor_with_overflow →
-                // best_executor) reads the fresh value. Refreshed each
-                // dispatch pass — picks up estimator Tick updates.
-                if let Some(state) = self.dag.node_mut(&drv_hash) {
-                    state.sched.est_memory_bytes = est_memory_bytes;
-                }
-
-                // I-067: a Ready FOD whose output already exists in
-                // rio-store should not dispatch — re-fetching is a
-                // wasted round-trip at best, and a hash-mismatch
-                // poison if upstream changed since the cached output
-                // was produced (I-041). The merge-time
-                // check_cached_outputs only checks newly_inserted, so
-                // a FOD that was already in-DAG (e.g. stuck Ready via
-                // I-062, or Completed→Ready via verify_preexisting_
-                // completed) is never re-checked there. Re-check here.
-                // FOD-only: non-FOD outputs are compile-dependent and
-                // the merge-time check covers their fresh-insert case.
-                // Best-effort: store unreachable → dispatch as before.
-                //
-                // I-163: skip the per-FOD RPC if the batch pre-pass
-                // already checked this hash. A FOD in `batch_checked`
-                // that's still Ready here was found NOT-in-store by
-                // the batch (otherwise it would have completed and the
-                // status guard above would have dropped it) — no need
-                // to ask again. Only cascade-promoted FODs (Ready
-                // AFTER the batch ran) hit the per-FOD path.
-                if is_fixed_output
-                    && !batch_checked.contains(&drv_hash)
-                    && self.fod_outputs_in_store(&drv_hash).await
-                {
-                    self.complete_ready_fod_from_store(&drv_hash).await;
+                if matches!(
+                    self.try_dispatch_one(drv_hash, &mut ctx).await,
+                    DispatchOutcome::Progressed
+                ) {
                     dispatched_any = true;
-                    continue;
-                }
-
-                // Try target class first, then overflow to larger
-                // classes if no worker in target has capacity. A
-                // "small" build CAN go to a "large" worker (just
-                // wasteful); a "large" build CANNOT go to "small"
-                // (would under-provision). So overflow walks UP only.
-                let (eligible_worker, chosen_class) =
-                    self.find_executor_with_overflow(&drv_hash, target_class.as_deref());
-
-                match eligible_worker {
-                    Some(executor_id) => {
-                        // Record what class we ACTUALLY routed to (may
-                        // be larger than target if we overflowed).
-                        // Misclassification detector reads this at
-                        // completion time.
-                        if let Some(state) = self.dag.node_mut(&drv_hash) {
-                            state.sched.assigned_size_class = chosen_class.clone();
-                        }
-                        if let Some(class) = &chosen_class {
-                            metrics::counter!(
-                                "rio_scheduler_size_class_assignments_total",
-                                "class" => class.clone()
-                            )
-                            .increment(1);
-                        }
-
-                        if self.assign_to_worker(&drv_hash, &executor_id).await {
-                            dispatched_any = true;
-                            n_assigned += 1;
-                        } else {
-                            // Assignment send failed (worker stream full or
-                            // disconnected). Defer — retrying immediately in
-                            // the same pass would spin: the channel won't
-                            // drain until we yield to the runtime.
-                            deferred.push(drv_hash);
-                        }
-                    }
-                    None => {
-                        // No eligible worker (even with overflow).
-                        //
-                        // I-065: if EVERY currently-registered worker of
-                        // the matching kind is in failed_builders, this
-                        // derivation can never dispatch on this fleet —
-                        // it would defer forever (poison threshold
-                        // counts failures, but with N workers you can't
-                        // exceed N). Poison now so the build fails
-                        // visibly instead of hanging silently.
-                        //
-                        // The "every registered worker" check (not
-                        // `failed_builders.len() >= total`) handles
-                        // worker replacement: failed_builders may hold
-                        // stale IDs that don't count against the
-                        // current fleet.
-                        if self.failed_builders_exhausts_fleet(&drv_hash, is_fixed_output) {
-                            self.poison_and_cascade(&drv_hash).await;
-                            continue;
-                        }
-                        // Defer and track by TARGET class (not chosen —
-                        // chosen is None when there's no eligible).
-                        // FODs tracked separately: they have no class,
-                        // and the operator action is "scale fetchers"
-                        // not "scale class X builders".
-                        if is_fixed_output {
-                            fod_deferred += 1;
-                        } else if let Some(class) = target_class {
-                            *class_deferred.entry(class).or_insert(0) += 1;
-                        }
-                        deferred.push(drv_hash);
-                    }
                 }
             }
 
@@ -326,13 +182,13 @@ impl DagActor {
             // priority (unchanged since we just popped them), so they
             // slot back into the same position. The old "push_front to
             // preserve order" doesn't apply — priority IS the order.
-            for hash in std::mem::take(&mut deferred) {
+            for hash in std::mem::take(&mut ctx.deferred) {
                 self.push_ready(hash);
             }
         }
         phase!("1-drain-loop");
 
-        self.publish_dispatch_gauges(class_deferred, fod_deferred);
+        self.publish_dispatch_gauges(ctx.class_deferred, ctx.fod_deferred);
         phase!("2-gauges");
         let _ = &mut t_phase;
         let total = t_total.elapsed();
@@ -340,10 +196,202 @@ impl DagActor {
             debug!(
                 elapsed = ?total,
                 popped = n_popped,
-                assigned = n_assigned,
+                assigned = ctx.n_assigned,
                 ready_queue = self.ready_queue.len(),
                 "dispatch_ready total"
             );
+        }
+    }
+
+    /// One iteration of the dispatch drain loop: stale guards, backoff
+    /// check, classify, FOD store short-circuit, executor placement,
+    /// assign or defer or poison. Mutates `ctx` for deferral/count
+    /// accumulators; returns whether progress was made (drives the
+    /// outer `dispatched_any` cycle).
+    async fn try_dispatch_one(
+        &mut self,
+        drv_hash: DrvHash,
+        ctx: &mut DispatchTickCtx,
+    ) -> DispatchOutcome {
+        // Stale-entry guards: drop if not in DAG or not Ready.
+        let Some(state) = self.dag.node(&drv_hash) else {
+            return DispatchOutcome::NoProgress;
+        };
+        if state.status() != DerivationStatus::Ready {
+            return DispatchOutcome::NoProgress;
+        }
+        // Retry backoff: if set and not yet elapsed, defer.
+        // The derivation stays Ready + in queue (re-pushed
+        // at the end of the pass with the other deferred).
+        // Next dispatch pass re-checks — convergent without
+        // timers. Cheap: one Instant::now() only for
+        // derivations that failed transiently (backoff_until
+        // is None for fresh ones).
+        if let Some(deadline) = state.retry.backoff_until
+            && Instant::now() < deadline
+        {
+            ctx.deferred.push(drv_hash);
+            return DispatchOutcome::NoProgress;
+        }
+
+        // Classify by estimated duration + memory + CPU. None
+        // if size_classes unconfigured (optional feature off —
+        // no filter, all workers candidates).
+        //
+        // Also compute the ADR-020 bucketed memory estimate for
+        // the resource-fit filter. Same estimator lookup path
+        // as compute_capacity_manifest (lookup_entry +
+        // bucketed_estimate + self.headroom_mult) so the
+        // placement filter and the manifest RPC agree.
+        //
+        // `is_fixed_output` is captured into a local so the
+        // `state` borrow ends here — `node_mut` below needs
+        // exclusive access to `self.dag`.
+        //
+        // Read guard is dropped at the end of this block —
+        // BEFORE `assign_to_worker().await`. parking_lot
+        // guards aren't `Send`; the await point would be a
+        // compile error anyway, but keeping the scope tight
+        // is defensive.
+        let (target_class, est_memory_bytes, is_fixed_output) = {
+            let pname = state.pname.as_deref();
+            let system = &state.system;
+            let classes = self.size_classes.read();
+            let target_class = crate::assignment::classify(
+                state.sched.est_duration,
+                self.estimator.peak_memory(pname, system),
+                self.estimator.peak_cpu(pname, system),
+                &classes,
+            );
+            // None-chain: no pname → no lookup key → None.
+            // No history entry → None. No memory sample →
+            // bucketed_estimate returns None. All three mean
+            // "cold start" to the filter (any worker fits).
+            //
+            // Skip for FODs: MEMORY_BUCKET_BYTES (4 GiB, ADR-020
+            // compile-workload pod sizing) rounds a 22 MB fetch
+            // up to 4 GiB → resource-fit rejects 2 GiB fetchers.
+            // I-062: 5 recurrences of fod_queue=2 + fetcher_util=0
+            // before the per-clause diagnostic exposed this. FOD
+            // memory is the download buffer, not a compile heap;
+            // resource-fit is the wrong gate.
+            let est_memory_bytes = if state.is_fixed_output {
+                None
+            } else {
+                pname
+                    .and_then(|p| self.estimator.lookup_entry(p, system))
+                    .and_then(|e| Estimator::bucketed_estimate(&e, self.headroom_mult))
+                    .map(|b| b.memory_bytes)
+            };
+            (target_class, est_memory_bytes, state.is_fixed_output)
+        };
+
+        // Write the estimate onto the state BEFORE placement
+        // so `hard_filter` (via find_executor_with_overflow →
+        // best_executor) reads the fresh value. Refreshed each
+        // dispatch pass — picks up estimator Tick updates.
+        if let Some(state) = self.dag.node_mut(&drv_hash) {
+            state.sched.est_memory_bytes = est_memory_bytes;
+        }
+
+        // I-067: a Ready FOD whose output already exists in
+        // rio-store should not dispatch — re-fetching is a
+        // wasted round-trip at best, and a hash-mismatch
+        // poison if upstream changed since the cached output
+        // was produced (I-041). The merge-time
+        // check_cached_outputs only checks newly_inserted, so
+        // a FOD that was already in-DAG (e.g. stuck Ready via
+        // I-062, or Completed→Ready via verify_preexisting_
+        // completed) is never re-checked there. Re-check here.
+        // FOD-only: non-FOD outputs are compile-dependent and
+        // the merge-time check covers their fresh-insert case.
+        // Best-effort: store unreachable → dispatch as before.
+        //
+        // I-163: skip the per-FOD RPC if the batch pre-pass
+        // already checked this hash. A FOD in `batch_checked`
+        // that's still Ready here was found NOT-in-store by
+        // the batch (otherwise it would have completed and the
+        // status guard above would have dropped it) — no need
+        // to ask again. Only cascade-promoted FODs (Ready
+        // AFTER the batch ran) hit the per-FOD path.
+        if is_fixed_output
+            && !ctx.batch_checked.contains(&drv_hash)
+            && self.fod_outputs_in_store(&drv_hash).await
+        {
+            self.complete_ready_fod_from_store(&drv_hash).await;
+            return DispatchOutcome::Progressed;
+        }
+
+        // Try target class first, then overflow to larger
+        // classes if no worker in target has capacity. A
+        // "small" build CAN go to a "large" worker (just
+        // wasteful); a "large" build CANNOT go to "small"
+        // (would under-provision). So overflow walks UP only.
+        let (eligible_worker, chosen_class) =
+            self.find_executor_with_overflow(&drv_hash, target_class.as_deref());
+
+        match eligible_worker {
+            Some(executor_id) => {
+                // Record what class we ACTUALLY routed to (may
+                // be larger than target if we overflowed).
+                // Misclassification detector reads this at
+                // completion time.
+                if let Some(state) = self.dag.node_mut(&drv_hash) {
+                    state.sched.assigned_size_class = chosen_class.clone();
+                }
+                if let Some(class) = &chosen_class {
+                    metrics::counter!(
+                        "rio_scheduler_size_class_assignments_total",
+                        "class" => class.clone()
+                    )
+                    .increment(1);
+                }
+
+                if self.assign_to_worker(&drv_hash, &executor_id).await {
+                    ctx.n_assigned += 1;
+                    DispatchOutcome::Progressed
+                } else {
+                    // Assignment send failed (worker stream full or
+                    // disconnected). Defer — retrying immediately in
+                    // the same pass would spin: the channel won't
+                    // drain until we yield to the runtime.
+                    ctx.deferred.push(drv_hash);
+                    DispatchOutcome::NoProgress
+                }
+            }
+            None => {
+                // No eligible worker (even with overflow).
+                //
+                // I-065: if EVERY currently-registered worker of
+                // the matching kind is in failed_builders, this
+                // derivation can never dispatch on this fleet —
+                // it would defer forever (poison threshold
+                // counts failures, but with N workers you can't
+                // exceed N). Poison now so the build fails
+                // visibly instead of hanging silently.
+                //
+                // The "every registered worker" check (not
+                // `failed_builders.len() >= total`) handles
+                // worker replacement: failed_builders may hold
+                // stale IDs that don't count against the
+                // current fleet.
+                if self.failed_builders_exhausts_fleet(&drv_hash, is_fixed_output) {
+                    self.poison_and_cascade(&drv_hash).await;
+                    return DispatchOutcome::NoProgress;
+                }
+                // Defer and track by TARGET class (not chosen —
+                // chosen is None when there's no eligible).
+                // FODs tracked separately: they have no class,
+                // and the operator action is "scale fetchers"
+                // not "scale class X builders".
+                if is_fixed_output {
+                    ctx.fod_deferred += 1;
+                } else if let Some(class) = target_class {
+                    *ctx.class_deferred.entry(class).or_insert(0) += 1;
+                }
+                ctx.deferred.push(drv_hash);
+                DispatchOutcome::NoProgress
+            }
         }
     }
 
@@ -902,116 +950,19 @@ impl DagActor {
         // works, just fetches on-demand via FUSE.
         self.send_prefetch_hint(executor_id, drv_hash);
 
-        // CA input resolution: rewrite placeholder paths in
-        // env/args/builder to realized output paths before
-        // dispatch. Fires when gateway set needs_resolve (ADR-018
-        // Appendix B: floating-CA self OR ia.deferred — IA drv
-        // with a floating-CA input).
-        //
-        // `maybe_resolve_ca` returns the (possibly rewritten)
-        // drv_content PLUS the realisation lookups performed. On
-        // resolve error (missing realisation, PG blip) it logs and
-        // returns the original unresolved bytes + empty lookups —
-        // the worker's build fails on the placeholder path, which
-        // is the correct signal (retry after the realisation lands).
-        //
-        // The resolve runs in its OWN scoped borrow of `self.dag`
-        // (node() + collect_ca_inputs both &-borrow) so the lookups
-        // can be stashed via node_mut() below before the main
-        // WorkAssignment construction takes its own & borrow.
-        let (drv_content_to_send, resolve_lookups) = {
-            let Some(state) = self.dag.node(drv_hash) else {
-                return false;
-            };
-            self.maybe_resolve_ca(drv_hash, state).await
+        // Resolve CA inputs + construct the WorkAssignment proto.
+        // None means the DAG node disappeared between the Ready
+        // check and here (TOCTOU vs. concurrent cancel) — treat as
+        // assignment failure so the caller defers.
+        let Some(assignment) = self
+            .build_assignment_proto(drv_hash, executor_id, generation)
+            .await
+        else {
+            return false;
         };
 
-        // Stash lookups for handle_success_completion's
-        // insert_realisation_deps (the FK needs the parent's own
-        // realisation row to exist, which only happens post-build).
-        // Empty vec → no-op; non-empty only for CA-on-CA chains
-        // that actually resolved.
-        if !resolve_lookups.is_empty()
-            && let Some(state) = self.dag.node_mut(drv_hash)
-        {
-            state.ca.pending_realisation_deps = resolve_lookups;
-        }
-
         // Send WorkAssignment to worker via stream
-        if let Some(state) = self.dag.node(drv_hash) {
-            let build_opts = self.build_options_for_derivation(drv_hash);
-
-            // Assignment token: HMAC-signed if configured, else
-            // legacy format-string. The store verifies signed
-            // tokens on PutPath (prevents arbitrary-path upload
-            // from a compromised worker). Unsigned tokens are
-            // accepted by a store with hmac_verifier=None (dev).
-            //
-            // Expiry: 2× build_timeout (or 2× daemon_timeout
-            // default if timeout=0). A worker legitimately
-            // uploading after completion is well within that
-            // window. Prevents replay from a leaked token later.
-            let assignment_token = if let Some(signer) = &self.hmac_signer {
-                let timeout_secs = if build_opts.build_timeout > 0 {
-                    build_opts.build_timeout
-                } else {
-                    // Match rio-builder's DEFAULT_DAEMON_TIMEOUT.
-                    // Can't reference the const cross-crate, so
-                    // duplicate the value. 7200s = 2h.
-                    7200
-                };
-                // Clamp BEFORE saturating_mul: a client sending
-                // build_timeout=u64::MAX would get saturating_mul
-                // → u64::MAX → expiry_unix = u64::MAX = immortal
-                // token. A leaked immortal token defeats the
-                // replay-prevention purpose of expiry entirely.
-                // 7 days max: well above any real build duration.
-                const MAX_HMAC_TIMEOUT_SECS: u64 = 7 * 86400;
-                let timeout_secs = timeout_secs.min(MAX_HMAC_TIMEOUT_SECS);
-                let expiry_unix = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    .saturating_add(timeout_secs.saturating_mul(2));
-                signer.sign(&rio_common::hmac::AssignmentClaims {
-                    executor_id: executor_id.to_string(),
-                    drv_hash: drv_hash.to_string(),
-                    expected_outputs: state.expected_output_paths.clone(),
-                    // Floating-CA: output path is computed post-build
-                    // from the NAR hash, so expected_output_paths is
-                    // [""] here. Store skips the path-in-claims check
-                    // when is_ca is set (verify-on-put still hashes
-                    // the NAR independently; threat model holds).
-                    // Fixed-output CA (FOD) has a known path → treat
-                    // as IA for the membership check.
-                    is_ca: state.ca.is_ca && !state.is_fixed_output,
-                    expiry_unix,
-                })
-            } else {
-                // Legacy unsigned: format-string. Store with
-                // hmac_verifier=None accepts this.
-                format!("{executor_id}-{drv_hash}-{generation}")
-            };
-
-            let assignment = rio_proto::types::WorkAssignment {
-                drv_path: state.drv_path().to_string(),
-                // Forward what the gateway inlined (or empty → worker
-                // fetches from store). Gateway only inlines for nodes
-                // whose outputs are MISSING (will-dispatch), so cache
-                // hits don't bloat this. Worker already handles both
-                // paths (executor/mod.rs:241 branches on is_empty).
-                // For CA-depends-on-CA derivations, this is the
-                // RESOLVED ATerm (placeholders replaced by realized
-                // paths) — see maybe_resolve_ca above.
-                drv_content: drv_content_to_send,
-                output_names: state.output_names.clone(),
-                build_options: Some(build_opts),
-                assignment_token,
-                generation,
-                is_fixed_output: state.is_fixed_output,
-                traceparent: state.traceparent.clone(),
-            };
-
+        {
             let msg = rio_proto::types::SchedulerMessage {
                 msg: Some(rio_proto::types::scheduler_message::Msg::Assignment(
                     assignment,
@@ -1112,6 +1063,130 @@ impl DagActor {
         debug!(drv_hash = %drv_hash, executor_id = %executor_id, "assigned derivation to worker");
         metrics::counter!("rio_scheduler_assignments_total").increment(1);
         true
+    }
+
+    /// Construct the [`WorkAssignment`] proto for `drv_hash` →
+    /// `executor_id`: CA-input resolve, HMAC token sign, build-options
+    /// lookup. Side-effect: stashes `pending_realisation_deps` on the
+    /// node so `handle_success_completion` can write the realisation FK
+    /// rows post-build.
+    ///
+    /// Returns `None` if the DAG node is gone (TOCTOU vs. concurrent
+    /// cancel) — caller treats that as assignment failure.
+    ///
+    /// [`WorkAssignment`]: rio_proto::types::WorkAssignment
+    async fn build_assignment_proto(
+        &mut self,
+        drv_hash: &DrvHash,
+        executor_id: &ExecutorId,
+        generation: u64,
+    ) -> Option<rio_proto::types::WorkAssignment> {
+        // CA input resolution: rewrite placeholder paths in
+        // env/args/builder to realized output paths before
+        // dispatch. Fires when gateway set needs_resolve (ADR-018
+        // Appendix B: floating-CA self OR ia.deferred — IA drv
+        // with a floating-CA input).
+        //
+        // `maybe_resolve_ca` returns the (possibly rewritten)
+        // drv_content PLUS the realisation lookups performed. On
+        // resolve error (missing realisation, PG blip) it logs and
+        // returns the original unresolved bytes + empty lookups —
+        // the worker's build fails on the placeholder path, which
+        // is the correct signal (retry after the realisation lands).
+        //
+        // The resolve runs in its OWN scoped borrow of `self.dag`
+        // (node() + collect_ca_inputs both &-borrow) so the lookups
+        // can be stashed via node_mut() below before the main
+        // WorkAssignment construction takes its own & borrow.
+        let (drv_content_to_send, resolve_lookups) = {
+            let state = self.dag.node(drv_hash)?;
+            self.maybe_resolve_ca(drv_hash, state).await
+        };
+
+        // Stash lookups for handle_success_completion's
+        // insert_realisation_deps (the FK needs the parent's own
+        // realisation row to exist, which only happens post-build).
+        // Empty vec → no-op; non-empty only for CA-on-CA chains
+        // that actually resolved.
+        if !resolve_lookups.is_empty()
+            && let Some(state) = self.dag.node_mut(drv_hash)
+        {
+            state.ca.pending_realisation_deps = resolve_lookups;
+        }
+
+        let state = self.dag.node(drv_hash)?;
+        let build_opts = self.build_options_for_derivation(drv_hash);
+
+        // Assignment token: HMAC-signed if configured, else
+        // legacy format-string. The store verifies signed
+        // tokens on PutPath (prevents arbitrary-path upload
+        // from a compromised worker). Unsigned tokens are
+        // accepted by a store with hmac_verifier=None (dev).
+        //
+        // Expiry: 2× build_timeout (or 2× daemon_timeout
+        // default if timeout=0). A worker legitimately
+        // uploading after completion is well within that
+        // window. Prevents replay from a leaked token later.
+        let assignment_token = if let Some(signer) = &self.hmac_signer {
+            let timeout_secs = if build_opts.build_timeout > 0 {
+                build_opts.build_timeout
+            } else {
+                // Match rio-builder's DEFAULT_DAEMON_TIMEOUT.
+                // Can't reference the const cross-crate, so
+                // duplicate the value. 7200s = 2h.
+                7200
+            };
+            // Clamp BEFORE saturating_mul: a client sending
+            // build_timeout=u64::MAX would get saturating_mul
+            // → u64::MAX → expiry_unix = u64::MAX = immortal
+            // token. A leaked immortal token defeats the
+            // replay-prevention purpose of expiry entirely.
+            // 7 days max: well above any real build duration.
+            const MAX_HMAC_TIMEOUT_SECS: u64 = 7 * 86400;
+            let timeout_secs = timeout_secs.min(MAX_HMAC_TIMEOUT_SECS);
+            let expiry_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_add(timeout_secs.saturating_mul(2));
+            signer.sign(&rio_common::hmac::AssignmentClaims {
+                executor_id: executor_id.to_string(),
+                drv_hash: drv_hash.to_string(),
+                expected_outputs: state.expected_output_paths.clone(),
+                // Floating-CA: output path is computed post-build
+                // from the NAR hash, so expected_output_paths is
+                // [""] here. Store skips the path-in-claims check
+                // when is_ca is set (verify-on-put still hashes
+                // the NAR independently; threat model holds).
+                // Fixed-output CA (FOD) has a known path → treat
+                // as IA for the membership check.
+                is_ca: state.ca.is_ca && !state.is_fixed_output,
+                expiry_unix,
+            })
+        } else {
+            // Legacy unsigned: format-string. Store with
+            // hmac_verifier=None accepts this.
+            format!("{executor_id}-{drv_hash}-{generation}")
+        };
+
+        Some(rio_proto::types::WorkAssignment {
+            drv_path: state.drv_path().to_string(),
+            // Forward what the gateway inlined (or empty → worker
+            // fetches from store). Gateway only inlines for nodes
+            // whose outputs are MISSING (will-dispatch), so cache
+            // hits don't bloat this. Worker already handles both
+            // paths (executor/mod.rs:241 branches on is_empty).
+            // For CA-depends-on-CA derivations, this is the
+            // RESOLVED ATerm (placeholders replaced by realized
+            // paths) — see maybe_resolve_ca above.
+            drv_content: drv_content_to_send,
+            output_names: state.output_names.clone(),
+            build_options: Some(build_opts),
+            assignment_token,
+            generation,
+            is_fixed_output: state.is_fixed_output,
+            traceparent: state.traceparent.clone(),
+        })
     }
 
     /// Send a PrefetchHint for the chosen worker to warm its FUSE
