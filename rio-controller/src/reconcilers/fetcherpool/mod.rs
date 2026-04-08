@@ -7,9 +7,7 @@
 //! scheduler can route by `size_class_floor`. Simpler than
 //! [`builderpool`](super::builderpool): no manifest mode, no
 //! duration-cutoff rebalancer.
-// TODO: add the ctrl.fetcherpool.reconcile impl marker once
-// ADR-019 is in tracey spec_include (the rule is defined in
-// decisions/019 but tracey only scans components/ today).
+// r[impl ctrl.fetcherpool.reconcile]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

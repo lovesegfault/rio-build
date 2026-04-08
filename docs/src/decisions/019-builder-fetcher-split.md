@@ -39,11 +39,11 @@ Split the single worker type into two distinct executor kinds with separate CRDs
 
 r[ctrl.builderpool.reconcile]
 
-`BuilderPool` (renamed `WorkerPool`) lives in `rio-builders`. Same spec as today minus `fodProxyUrl`. Reconciler labels pods `rio.build/role: builder`.
+`BuilderPool` (renamed `WorkerPool`) lives in `rio-builders`. Same spec as today minus `fodProxyUrl`. The reconciler spawns one-shot rio-builder Jobs up to `spec.maxConcurrent` against scheduler queue depth (see [`r[ctrl.pool.ephemeral]`](../components/controller.md)) and labels pods `rio.build/role: builder`.
 
 r[ctrl.fetcherpool.reconcile]
 
-`FetcherPool` is new, lives in `rio-fetchers`. Minimal spec (`replicas`, `systems`, `nodeSelector`, `tolerations`, `resources`, optionally `classes[]`). Reconciler labels pods `rio.build/role: fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem: true`, stricter seccomp).
+`FetcherPool` is new, lives in `rio-fetchers`. Minimal spec (`maxConcurrent`, `systems`, `nodeSelector`, `tolerations`, `resources`, optionally `classes[]`). The reconciler spawns one-shot fetcher Jobs up to `spec.maxConcurrent` against `queued_fod_derivations`, labels pods `rio.build/role: fetcher`, and sets stricter `securityContext` (`readOnlyRootFilesystem: true`, stricter seccomp).
 
 Originally this CRD had no size-class on the assumption that fetches are network-bound and not CPU-predictable. I-170 falsified that: fetchers run arbitrary code (the FOD's `builder` script), and a large source unpack + NAR-serialize can OOM a 2Gi pod (chromium-source.drv at medium-mixed-32x). There is still no a-priori signal --- FODs are excluded from `build_samples`, and `outputHash` carries no size information --- so routing is reactive: a FOD that fails on class N retries on class N+1 (`r[sched.fod.size-class-reactive]`). The `FetcherPool.spec.classes[]` field declares the available classes; the scheduler's `[[fetcher_size_classes]]` config carries just the ordered names.
 
@@ -65,7 +65,7 @@ FODs route only to fetchers. Non-FODs route only to builders.
 
 The overflow chain (`find_executor_with_overflow()`) for FODs walks fetcher classes only --- never the builder size-class chain. If no fetcher of any class is available, the FOD queues. The scheduler NEVER sends a FOD to a builder, even under pressure. This keeps the builder airgap absolute.
 
-The `CutoffRebalancer` operates on builder pools only. Fetcher replica count is a fixed `FetcherPool.spec.replicas` (or a simple HPA on queue depth; not duration-EMA).
+The `CutoffRebalancer` operates on builder pools only. Fetcher concurrency is bounded by `FetcherPool.spec.maxConcurrent`; the reconciler spawns Jobs reactively against `queued_fod_derivations` (no duration-EMA).
 
 ### Executor enforcement
 
@@ -122,7 +122,7 @@ The `rio-builder` upload module exposes `trait OutputUploader` with two impls: `
 
 **Migration** is big-bang: proto, CRD, crate renames must land together or CI breaks. The only deployment is dev EKS via `xtask`, so destroy-and-redeploy is acceptable. A new SQL migration `ALTER TABLE ... RENAME COLUMN` handles the schema (frozen-migration rule prohibits editing shipped `.sql`, but adding new ones is fine).
 
-**Operational:** four namespaces instead of one means cross-namespace RBAC for the controller (watch/patch STS in `rio-builders` and `rio-fetchers`) and `namespaceSelector`-based NetworkPolicies. The helm chart and `xtask` deploy flow both need to create all four namespaces before installing.
+**Operational:** four namespaces instead of one means cross-namespace RBAC for the controller (create/watch/patch Jobs in `rio-builders` and `rio-fetchers`) and `namespaceSelector`-based NetworkPolicies. The helm chart and `xtask` deploy flow both need to create all four namespaces before installing.
 
 **Observability:** `rio_worker_*` metrics become `rio_builder_*`; Grafana dashboards need regenerating. New metrics `rio_scheduler_fod_queue_depth` and `rio_scheduler_fetcher_utilization` track the split.
 

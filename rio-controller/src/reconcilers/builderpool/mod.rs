@@ -5,6 +5,7 @@
 //! 2. Spawn Jobs up to `spec.maxConcurrent` (see `ephemeral.rs`).
 //! 3. Reap excess Pending and orphan Running Jobs.
 //! 4. Patch BuilderPool.status from active Job count.
+// r[impl ctrl.builderpool.reconcile]
 // r[impl ctrl.crd.builderpool]
 // r[impl ctrl.reconcile.owner-refs]
 // r[impl ctrl.drain.sigterm]
