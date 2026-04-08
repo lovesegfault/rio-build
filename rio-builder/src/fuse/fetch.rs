@@ -275,7 +275,7 @@ const RETRY_BACKOFF: &[Duration] = &[
 /// sum.
 // r[impl builder.fuse.retry-jitter]
 fn jitter(delay: Duration) -> Duration {
-    use rand::Rng as _;
+    use rand::RngExt as _;
     delay.mul_f64(rand::rng().random_range(0.5..1.5))
 }
 

@@ -18,7 +18,6 @@ use rio_common::signal::Token as CancellationToken;
 use rio_common::tenant::{NameError, NormalizedName};
 use rio_proto::SchedulerServiceClient;
 use rio_proto::StoreServiceClient;
-use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Msg, Server as _, Session, run_stream};
 use russh::{ChannelId, MethodKind, MethodSet};
@@ -186,7 +185,7 @@ pub fn load_or_generate_host_key(path: &Path) -> anyhow::Result<PrivateKey> {
             path = %path.display(),
             "SSH host key not found, generating a new one (dev mode)"
         );
-        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
             .context("failed to generate host key")?;
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
@@ -1671,7 +1670,7 @@ mod tests {
 
     /// Generate a fresh ed25519 public key line for authorized_keys fixtures.
     fn make_valid_pubkey_line() -> anyhow::Result<String> {
-        Ok(PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?
+        Ok(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?
             .public_key()
             .to_openssh()?)
     }
@@ -1879,7 +1878,7 @@ mod tests {
         let key_path = tmp.path().join("host_key");
 
         // Write a key manually
-        let orig = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+        let orig = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
         std::fs::write(&key_path, orig.to_openssh(ssh_key::LineEnding::LF)?)?;
         let orig_fp = orig.public_key().fingerprint(Default::default());
 

@@ -32,13 +32,12 @@ cipher = { version = "0.4", default-features = false, features = ["block-padding
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
 crypto-bigint = { version = "0.5", features = ["generic-array", "zeroize"] }
-curve25519-dalek = { version = "4", features = ["digest"] }
+crypto-common = { version = "0.2", default-features = false, features = ["getrandom"] }
+ctutils = { version = "0.4", default-features = false, features = ["subtle"] }
 der = { version = "0.7", default-features = false, features = ["oid", "pem", "std"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
-ecdsa = { version = "0.16", features = ["pem", "signing", "std", "verifying"] }
 either = { version = "1", features = ["serde", "use_std"] }
-elliptic-curve = { version = "0.13", features = ["ecdh", "hazmat", "pem", "std"] }
 event-listener-strategy = { version = "0.5" }
 fastrand = { version = "2" }
 figment = { version = "0.10", default-features = false, features = ["env", "test", "toml"] }
@@ -50,8 +49,10 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
+hybrid-array = { version = "0.4", default-features = false, features = ["alloc", "ctutils", "extra-sizes", "subtle", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "logging", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service", "tracing"] }
@@ -69,15 +70,14 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.10" }
 memchr = { version = "2" }
 nom = { version = "7" }
-num-bigint = { version = "0.4", features = ["rand"] }
+num-bigint = { version = "0.4" }
 num-bigint-dig = { version = "0.8", default-features = false, features = ["i128", "prime", "std", "u64_digit", "zeroize"] }
 num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
-p256 = { version = "0.13", features = ["ecdh"] }
 pem-rfc7468 = { version = "0.7", default-features = false, features = ["std"] }
 percent-encoding = { version = "2" }
-pkcs8 = { version = "0.10", default-features = false, features = ["encryption", "pem", "std"] }
+pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost = { version = "0.14" }
@@ -107,7 +107,7 @@ sqlx-postgres = { version = "0.8", default-features = false, features = ["migrat
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline", "uuid"] }
 ssh-cipher = { version = "0.2", default-features = false, features = ["aes-cbc", "aes-ctr", "aes-gcm", "chacha20poly1305"] }
 ssh-encoding = { version = "0.2", default-features = false, features = ["bytes", "pem", "sha2", "std"] }
-subtle = { version = "2" }
+subtle = { version = "2", features = ["const-generics"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -175,7 +175,7 @@ spin = { version = "0.9" }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "any", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline", "uuid"] }
 sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline", "uuid"] }
-subtle = { version = "2" }
+subtle = { version = "2", features = ["const-generics"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
@@ -199,6 +199,7 @@ tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-resp
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
@@ -210,6 +211,7 @@ tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-resp
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 
 ### END HAKARI SECTION

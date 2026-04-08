@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use rio_gateway::server::{GatewayServer, build_ssh_config};
 use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};
-use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 use russh::server::Server as _;
 use russh::{MethodKind, client};
@@ -31,7 +30,7 @@ use tokio::net::TcpListener;
 /// by its own test suite); we only verify we wired the config correctly.
 #[test]
 fn test_ssh_config_hardened_fields() {
-    let host_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let cfg = build_ssh_config(host_key);
 
     // keepalive: russh drops at interval × (max+1). 30s × (9+1) = 300s
@@ -149,10 +148,10 @@ async fn spawn_ssh_server() -> anyhow::Result<(SocketAddr, PrivateKey, tokio::ta
     let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
     let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
 
-    let client_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
     let client_pub = client_key.public_key().clone();
 
-    let host_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
     let config = Arc::new(build_ssh_config(host_key));
 
     let socket = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -258,7 +257,7 @@ async fn test_auth_publickey_offered_rejects_unknown_key() -> anyhow::Result<()>
     // We'll connect with a DIFFERENT key.
     let (addr, _authorized_key, srv) = spawn_ssh_server().await?;
 
-    let unknown_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let unknown_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
 
     let config = Arc::new(client::Config::default());
     let mut session = client::connect(config, addr, AcceptAllClient).await?;
@@ -299,7 +298,7 @@ async fn spawn_ssh_server_watching(
 
     let initial = rio_gateway::load_authorized_keys(&path)?;
 
-    let host_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
     let config = Arc::new(build_ssh_config(host_key));
 
     let socket = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -363,8 +362,8 @@ fn atomic_write(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
 async fn test_authorized_keys_hot_reload() -> anyhow::Result<()> {
     common::init_test_logging();
 
-    let key_a = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
-    let key_b = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let key_a = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+    let key_b = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("authorized_keys");
@@ -406,7 +405,7 @@ async fn test_authorized_keys_hot_reload() -> anyhow::Result<()> {
 async fn test_authorized_keys_reload_failure_keeps_old_set() -> anyhow::Result<()> {
     common::init_test_logging();
 
-    let key_a = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    let key_a = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("authorized_keys");

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use rand::{Rng, RngCore, distr::Alphanumeric};
+use rand::{Rng, RngExt, distr::Alphanumeric};
 
 use crate::config::XtaskConfig;
 use crate::k8s::NS;

@@ -581,7 +581,7 @@ pub(crate) fn scheduler_unreachable_condition(
 /// (409, other API errors). Generating our own suffix is the
 /// same collision math with better observability.
 pub(crate) fn random_suffix() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     // 36^6 ≈ 2.18 billion combinations. With ttl=60s and even
     // 1000 Jobs/sec, steady-state population is ~60k live names
     // → birthday collision ~0.08%. K8s 409 handles it.

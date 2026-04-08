@@ -342,7 +342,7 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     /// Compute the backoff duration for a given retry attempt.
     pub fn backoff_duration(&self, attempt: u32) -> std::time::Duration {
-        use rand::Rng;
+        use rand::RngExt;
 
         let base = self.backoff_base_secs * self.backoff_multiplier.powi(attempt as i32);
         let clamped = base.min(self.backoff_max_secs);

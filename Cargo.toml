@@ -42,7 +42,7 @@ bytes = "1"
 tokio = { version = "1", features = ["full"] }
 
 # SSH server
-russh = "0.59"
+russh = "0.60"
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 async-trait = "0.1"
 
@@ -237,7 +237,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Randomness (retry jitter)
-rand = "0.9"
+rand = "0.10"
 
 # Stream utilities (tonic re-exports, but we need it directly for ReceiverStream etc.)
 tokio-stream = "0.1"

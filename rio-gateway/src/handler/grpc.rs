@@ -82,7 +82,7 @@ pub(super) async fn grpc_put_path(
     info: ValidatedPathInfo,
     nar_data: Vec<u8>,
 ) -> anyhow::Result<bool> {
-    use rand::Rng;
+    use rand::RngExt;
     let nar: std::sync::Arc<[u8]> = nar_data.into();
     let mut attempt = 0u32;
     loop {

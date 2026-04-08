@@ -131,7 +131,7 @@ pub(crate) async fn run_loop<F, Fut>(
     F: FnMut() -> Fut,
     Fut: Future<Output = TickResult>,
 {
-    use rand::Rng;
+    use rand::RngExt;
     let jitter = Duration::from_secs(rand::rng().random_range(0..=60));
     let start = tokio::time::Instant::now() + STARTUP_DELAY + jitter;
     let mut interval = tokio::time::interval_at(start, tick);

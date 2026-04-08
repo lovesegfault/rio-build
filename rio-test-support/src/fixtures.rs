@@ -30,7 +30,7 @@ pub use rio_nix::store_path::nixbase32::CHARS as NIXBASE32;
 /// merge path). Use [`TEST_HASH`] / [`test_store_path`] when
 /// determinism matters (most unit tests).
 pub fn rand_store_hash() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     (0..32)
         .map(|_| NIXBASE32[rng.random_range(0..32)] as char)
