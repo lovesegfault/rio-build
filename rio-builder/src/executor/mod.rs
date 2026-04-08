@@ -484,9 +484,11 @@ pub async fn execute_build(
     }
     if let Some(cache) = &env.fuse_cache {
         // r[impl builder.fuse.jit-register]
-        cache.register_inputs(input_sized.iter().filter_map(|(p, sz)| {
-            Some((rio_nix::store_path::basename(p)?.to_owned(), *sz))
-        }));
+        cache.register_inputs(
+            input_sized
+                .iter()
+                .filter_map(|(p, sz)| Some((rio_nix::store_path::basename(p)?.to_owned(), *sz))),
+        );
         metrics::gauge!("rio_builder_jit_inputs_registered").set(cache.known_inputs_len() as f64);
         // I-110c: prime manifest hints so each JIT fetch's `GetPath`
         // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on

@@ -191,6 +191,16 @@ pub trait DerivationLike {
 ///
 /// Contains `input_drvs` (dependency DAG edges) which are NOT present in the
 /// wire format's `BasicDerivation`.
+//
+// WONTFIX: 6 of 7 fields duplicate `BasicDerivation`. Upstream Nix models this
+// as C++ inheritance (`struct Derivation : BasicDerivation`, derivations.hh);
+// the Rust analog would be `{ basic: BasicDerivation, input_drvs }` + `Deref`.
+// Kept flat because the ATerm parser (aterm.rs) and the wire codec
+// (protocol/build.rs) each construct fields in the on-disk / on-wire order —
+// flat fields keep both codecs self-contained without threading through
+// `BasicDerivation::new`'s validation mid-parse. ~40 LoC of accessor
+// duplication is the cost; `DerivationLike` already abstracts the shared
+// surface for callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Derivation {
     /// Output definitions.
