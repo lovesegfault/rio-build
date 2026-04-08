@@ -332,32 +332,42 @@ impl DagActor {
         }
         phase!("1-drain-loop");
 
-        // Gauge: per-class deferral count. Snapshot from this dispatch
-        // pass. Fire-and-forget — next dispatch overwrites. An operator
-        // seeing rio_scheduler_class_queue_depth{class="large"}=50 knows
-        // large workers are the bottleneck.
-        //
-        // Zero out ALL configured classes first. Gauges PERSIST in
-        // Prometheus until overwritten — a class that was backed up
-        // (gauge=50) then cleared (no entries in class_deferred this
-        // pass) would STAY at 50 forever without this zeroing.
-        // Operators would see a phantom bottleneck.
+        self.publish_dispatch_gauges(class_deferred, fod_deferred);
+        phase!("2-gauges");
+        let _ = &mut t_phase;
+        let total = t_total.elapsed();
+        if total >= std::time::Duration::from_secs(1) {
+            debug!(
+                elapsed = ?total,
+                popped = n_popped,
+                assigned = n_assigned,
+                ready_queue = self.ready_queue.len(),
+                "dispatch_ready total"
+            );
+        }
+    }
+
+    /// Per-class deferral gauges + FOD queue depth + fetcher
+    /// utilization + I-025 freeze-detector. Snapshot from one dispatch
+    /// pass; next pass overwrites. ALL configured classes are zeroed
+    /// first — gauges PERSIST in Prometheus until overwritten, so a
+    /// class that was backed up (gauge=50) then cleared would stay at
+    /// 50 forever otherwise.
+    // r[impl sched.freeze-detector]
+    fn publish_dispatch_gauges(&mut self, class_deferred: HashMap<String, u64>, fod_deferred: u64) {
         for sc in self.size_classes.read().iter() {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
         }
         // Sum before class_deferred is consumed by the gauge loop below.
         // Feeds the I-025 builder-freeze check at the end of this fn.
         let class_total: u64 = class_deferred.values().sum();
-        // Now overwrite for classes that actually have deferrals.
         for (class, count) in class_deferred {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => class).set(count as f64);
         }
 
         // FOD queue depth + fetcher utilization (ADR-019 observability).
-        // Same snapshot semantics as class_queue_depth: per-dispatch-
-        // pass gauge, next pass overwrites. Zero is a legitimate value
-        // (no FODs queued), emitted explicitly so Prometheus doesn't
-        // persist stale nonzero.
+        // Zero is a legitimate value (no FODs queued), emitted
+        // explicitly so Prometheus doesn't persist stale nonzero.
         metrics::gauge!("rio_scheduler_fod_queue_depth").set(fod_deferred as f64);
         // I-048b: count only is_registered() fetchers. A heartbeat-only
         // zombie (stream_tx: None — race after scheduler restart, fixed
@@ -384,7 +394,6 @@ impl DagActor {
         metrics::gauge!("rio_scheduler_fetcher_utilization").set(util);
 
         // I-025 freeze detector: WARN if queue pressure + zero streams >60s.
-        // `total` is the fetcher-stream count from the fold above.
         check_freeze(
             &mut self.fod_freeze_since,
             fod_deferred > 0 && total == 0,
@@ -404,18 +413,6 @@ impl DagActor {
             class_total,
             builder_stream_count,
         );
-        phase!("2-gauges");
-        let _ = &mut t_phase;
-        let total = t_total.elapsed();
-        if total >= std::time::Duration::from_secs(1) {
-            debug!(
-                elapsed = ?total,
-                popped = n_popped,
-                assigned = n_assigned,
-                ready_queue = self.ready_queue.len(),
-                "dispatch_ready total"
-            );
-        }
     }
 
     /// I-067: best-effort store check for a Ready FOD's outputs.
