@@ -61,7 +61,7 @@ struct Entry {
 /// Per-tenant quota cache. `Clone` is cheap (inner `Arc`). One
 /// instance on `GatewayServer`, cloned into every `ConnectionHandler`
 /// then every `SessionContext` — the same pattern as
-/// [`TenantLimiter`](crate::ratelimit::TenantLimiter). All clones
+/// [`TenantLimiter`](crate::TenantLimiter). All clones
 /// share one map so a tenant's quota fetched by connection A is warm
 /// for connection B.
 ///
@@ -82,7 +82,7 @@ impl QuotaCache {
     }
 
     /// Check the tenant's quota, fetching via `store_client` on TTL
-    /// miss. Returns [`QuotaVerdict::Unlimited`] on any fetch error
+    /// miss. Returns `QuotaVerdict::Unlimited` on any fetch error
     /// (fail-open: a transient store/PG hiccup shouldn't block builds
     /// — quota is a soft limit, not a security gate). The error is
     /// logged so ops sees repeated misses.

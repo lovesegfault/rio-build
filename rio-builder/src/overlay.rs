@@ -113,13 +113,6 @@ impl OverlayMount {
         &self.build_dir
     }
 
-    /// The upper root path under which outputs land.
-    ///
-    /// Note: the overlayfs `upperdir` is `{upper}/nix/store/`, not `{upper}/`.
-    pub fn upper_dir(&self) -> &Path {
-        &self.upper
-    }
-
     /// `{upper}/nix/store` — the overlayfs upperdir itself. Build outputs
     /// materialize here. scan_new_outputs + upload_output read this;
     /// executor's FOD-whiteout (mknod) writes here.

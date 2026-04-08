@@ -152,9 +152,6 @@ fn executor_params(
             Some(c) => format!("{}-{}", fp.name_any(), c.name),
             None => fp.name_any(),
         },
-        namespace: fp
-            .namespace()
-            .ok_or_else(|| Error::InvalidSpec("FetcherPool has no namespace".into()))?,
         node_selector,
         tolerations,
         image: fp.spec.image.clone(),

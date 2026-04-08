@@ -12,7 +12,7 @@
 //! ## Modules
 //!
 //! - [`actor`]: DAG actor (single-owner event loop, dispatch)
-//! - [`dag`]: In-memory derivation graph
+//! - `dag`: In-memory derivation graph
 //! - [`state`]: Derivation and build state machines
 //! - `queue`: FIFO ready queue
 //! - [`db`]: PostgreSQL persistence (sqlx)
@@ -21,9 +21,9 @@
 pub mod actor;
 pub mod admin;
 pub(crate) mod assignment;
-pub mod ca;
+pub(crate) mod ca;
 pub(crate) mod critical_path;
-pub mod dag;
+pub(crate) mod dag;
 pub mod db;
 pub(crate) mod estimator;
 pub mod event_log;

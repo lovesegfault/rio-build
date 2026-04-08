@@ -151,7 +151,7 @@ pub(super) const EMA_ALPHA: f64 = 0.3;
 /// (see TenantRow pattern below). Kept as the raw `Uuid` (not `::text`)
 /// so cursor encoding doesn't round-trip through strings.
 #[derive(Debug, sqlx::FromRow)]
-pub struct BuildListRow {
+pub(crate) struct BuildListRow {
     pub build_id: Uuid,
     pub tenant_id: Option<String>,
     pub priority_class: String,
@@ -168,7 +168,7 @@ pub struct BuildListRow {
 /// is never returned. `created_at` is epoch seconds via
 /// `EXTRACT(EPOCH FROM created_at)::bigint` — avoids a chrono dep.
 #[derive(Debug, sqlx::FromRow)]
-pub struct TenantRow {
+pub(crate) struct TenantRow {
     pub tenant_id: Uuid,
     pub tenant_name: String,
     pub gc_retention_hours: i32,
@@ -184,7 +184,7 @@ pub struct TenantRow {
 /// is NULLable (rows from before migration 004). Caller unwraps
 /// with `.map(|j| j.0).unwrap_or_default()`.
 #[derive(Debug, sqlx::FromRow)]
-pub struct RecoveryBuildRow {
+pub(crate) struct RecoveryBuildRow {
     pub build_id: Uuid,
     pub tenant_id: Option<Uuid>,
     pub status: String,
@@ -205,7 +205,7 @@ pub struct RecoveryBuildRow {
 /// PG-side (`now() - poisoned_at`) so the caller can reconstruct
 /// an `Instant` via `Instant::now() - Duration::from_secs_f64(elapsed)`.
 #[derive(Debug, sqlx::FromRow)]
-pub struct PoisonedDerivationRow {
+pub(crate) struct PoisonedDerivationRow {
     pub derivation_id: Uuid,
     pub drv_hash: String,
     pub drv_path: String,
@@ -224,7 +224,7 @@ pub struct PoisonedDerivationRow {
 /// columns from `batch_upsert_derivations` plus live-state fields
 /// (retry_count, assigned_builder_id, failed_builders).
 #[derive(Debug, sqlx::FromRow)]
-pub struct RecoveryDerivationRow {
+pub(crate) struct RecoveryDerivationRow {
     pub derivation_id: Uuid,
     pub drv_hash: String,
     pub drv_path: String,
@@ -277,7 +277,7 @@ impl RecoveryDerivationRow {
 /// `derivation_id` is NOT in the proto — it's collected here so the edge
 /// query can filter to the returned node set (truncation correctness).
 #[derive(Debug, sqlx::FromRow)]
-pub struct GraphNodeRow {
+pub(crate) struct GraphNodeRow {
     pub derivation_id: Uuid,
     pub drv_path: String,
     pub pname: String,
@@ -290,14 +290,14 @@ pub struct GraphNodeRow {
 /// `is_cutoff` deliberately dropped (retro P0027: always FALSE; Skipped
 /// is a node status, not an edge flag).
 #[derive(Debug, sqlx::FromRow)]
-pub struct GraphEdgeRow {
+pub(crate) struct GraphEdgeRow {
     pub parent_drv_path: String,
     pub child_drv_path: String,
 }
 
 /// Row for [`SchedulerDb::batch_upsert_derivations`].
 #[derive(Debug)]
-pub struct DerivationRow {
+pub(crate) struct DerivationRow {
     pub drv_hash: String,
     pub drv_path: String,
     pub pname: Option<String>,

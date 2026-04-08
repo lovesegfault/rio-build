@@ -31,7 +31,7 @@ pub mod executor;
 pub mod fuse;
 pub mod health;
 pub mod log_stream;
-pub mod overlay;
+pub(crate) mod overlay;
 pub mod runtime;
 pub(crate) mod synth_db;
 pub(crate) mod upload;

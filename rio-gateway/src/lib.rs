@@ -5,8 +5,8 @@
 //! and store services.
 
 pub mod handler;
-pub mod quota;
-pub mod ratelimit;
+pub(crate) mod quota;
+pub(crate) mod ratelimit;
 pub mod server;
 pub mod session;
 pub mod translate;

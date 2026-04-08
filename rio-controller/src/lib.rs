@@ -41,11 +41,11 @@
 //! submission is via SSH (`nix build --store ssh-ng://`) — no
 //! K8s-native submission CRD.
 
-pub mod error;
+pub(crate) mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod reconcilers;
-pub mod scaling;
+pub(crate) mod scaling;
 
 /// Register `# HELP` descriptions for all controller metrics.
 ///

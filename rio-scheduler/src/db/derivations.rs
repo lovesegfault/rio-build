@@ -331,7 +331,7 @@ impl SchedulerDb {
     /// TTL-tracked. The `failed_builders` count matters for display;
     /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
     /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
-    pub async fn load_poisoned_derivations(
+    pub(crate) async fn load_poisoned_derivations(
         &self,
     ) -> Result<Vec<PoisonedDerivationRow>, sqlx::Error> {
         sqlx::query_as(

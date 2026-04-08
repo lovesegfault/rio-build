@@ -4,7 +4,7 @@
 //! Reconcile (10s tick): poll scheduler `GetSizeClassStatus` →
 //! `Σ(queued+running)` builders; poll each `loadEndpoint` pod's
 //! `StoreAdminService.GetLoad` → max `pg_pool_utilization`; feed
-//! both into [`crate::scaling::component::decide`]; patch the target
+//! both into `crate::scaling::component::decide`; patch the target
 //! Deployment's `/scale` subresource; write `.status` (which
 //! persists `learnedRatio` across controller restarts).
 //!

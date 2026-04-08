@@ -4,7 +4,7 @@ use super::{SchedulerDb, TenantRow};
 
 impl SchedulerDb {
     /// List all tenants (for AdminService.ListTenants).
-    pub async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {
+    pub(crate) async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
             SELECT tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
@@ -18,7 +18,7 @@ impl SchedulerDb {
     }
 
     /// Default `gc_retention_hours` for new tenants: 168h = 7 days.
-    /// Used as the COALESCE fallback in [`Self::create_tenant`] when
+    /// Used as the COALESCE fallback in `Self::create_tenant` when
     /// the CreateTenant request omits retention (proto3 default 0 →
     /// `None` here → this value).
     pub const DEFAULT_GC_RETENTION_HOURS: i32 = 168;
@@ -29,7 +29,7 @@ impl SchedulerDb {
     /// `gc_retention_hours=None` → [`DEFAULT_GC_RETENTION_HOURS`] via SQL COALESCE.
     ///
     /// [`DEFAULT_GC_RETENTION_HOURS`]: Self::DEFAULT_GC_RETENTION_HOURS
-    pub async fn create_tenant(
+    pub(crate) async fn create_tenant(
         &self,
         name: &str,
         gc_retention_hours: Option<i32>,

@@ -20,7 +20,7 @@ impl SchedulerDb {
     /// submitted builds shift later pages). Kept for dashboard backward
     /// compat; new callers should prefer
     /// [`list_builds_keyset`](Self::list_builds_keyset).
-    pub async fn list_builds(
+    pub(crate) async fn list_builds(
         &self,
         status_opt: Option<&str>,
         tenant_filter: Option<Uuid>,
@@ -77,7 +77,7 @@ impl SchedulerDb {
     /// total; subsequent pages carry it client-side. If a caller needs a
     /// total on a cursor-only walk, they can call `list_builds(limit=0)`
     /// once or use `count_builds` directly.
-    pub async fn list_builds_keyset(
+    pub(crate) async fn list_builds_keyset(
         &self,
         status_opt: Option<&str>,
         tenant_filter: Option<Uuid>,

@@ -724,7 +724,7 @@ fn ca_on_ca_fixture() -> (
     [u8; 32],
     String,
 ) {
-    use crate::ca::downstream_placeholder;
+    use crate::ca::resolve::downstream_placeholder;
     use rio_nix::store_path::StorePath;
 
     let child_path = test_drv_path("ca-child");

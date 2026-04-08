@@ -47,7 +47,7 @@ impl SchedulerDb {
     /// floor promoted by a prior run's failures. Without this, the FOD
     /// snapshot buckets to `fetcher_size_classes[0]` and the controller
     /// re-spawns the smallest fetcher every run.
-    pub async fn batch_upsert_derivations(
+    pub(crate) async fn batch_upsert_derivations(
         tx: &mut PgConnection,
         rows: &[DerivationRow],
     ) -> Result<HashMap<String, (Uuid, Option<String>)>, sqlx::Error> {

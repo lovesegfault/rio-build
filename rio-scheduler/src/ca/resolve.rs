@@ -522,10 +522,6 @@ pub struct PriorRealisation {
     pub drv_hash: [u8; 32],
     /// Output name (usually `"out"`).
     pub output_name: String,
-    /// Realized store path (same as current — CA content-addressing).
-    pub output_path: String,
-    /// NAR hash of the output (same as current — same content).
-    pub output_hash: [u8; 32],
 }
 
 /// Find a prior realisation for `output_path` with a DIFFERENT
@@ -553,8 +549,8 @@ pub async fn query_prior_realisation(
     output_path: &str,
     exclude_modular_hash: &[u8; 32],
 ) -> Result<Option<PriorRealisation>, sqlx::Error> {
-    let row: Option<(Vec<u8>, String, String, Vec<u8>)> = sqlx::query_as(
-        "SELECT drv_hash, output_name, output_path, output_hash \
+    let row: Option<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT drv_hash, output_name \
          FROM realisations \
          WHERE output_path = $1 AND drv_hash != $2 \
          LIMIT 1",
@@ -563,12 +559,10 @@ pub async fn query_prior_realisation(
     .bind(exclude_modular_hash.as_slice())
     .fetch_optional(pool)
     .await?;
-    Ok(row.and_then(|(h, name, path, oh)| {
+    Ok(row.and_then(|(h, name)| {
         Some(PriorRealisation {
             drv_hash: h.as_slice().try_into().ok()?,
             output_name: name,
-            output_path: path,
-            output_hash: oh.as_slice().try_into().ok()?,
         })
     }))
 }

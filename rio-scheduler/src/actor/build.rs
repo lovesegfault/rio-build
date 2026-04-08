@@ -309,6 +309,9 @@ impl DagActor {
                     rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
                         error_message: build.error_summary.clone().unwrap_or_default(),
                         failed_derivation: build.failed_derivation.clone().unwrap_or_default(),
+                        // TODO: thread BuildResultStatus from the failing
+                        // derivation (completion.rs:517 receives it from the
+                        // worker; build state needs a field to carry it).
                         status: 0,
                     })
                 }

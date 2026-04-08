@@ -22,7 +22,9 @@ impl SchedulerDb {
     /// WatchBuild subscriber has already received the terminal event
     /// (or will time out waiting, which is the same as "scheduler
     /// restarted and forgot").
-    pub async fn load_nonterminal_builds(&self) -> Result<Vec<RecoveryBuildRow>, sqlx::Error> {
+    pub(crate) async fn load_nonterminal_builds(
+        &self,
+    ) -> Result<Vec<RecoveryBuildRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
             SELECT build_id, tenant_id, status, priority_class,
@@ -49,7 +51,7 @@ impl SchedulerDb {
     /// gates on that — DON'T remove that gate without adding a
     /// `WHERE EXISTS (... builds.status IN pending/active)` here. The
     /// gate is the cheaper invariant; this comment is the tripwire.
-    pub async fn load_nonterminal_derivations(
+    pub(crate) async fn load_nonterminal_derivations(
         &self,
     ) -> Result<Vec<RecoveryDerivationRow>, sqlx::Error> {
         sqlx::query_as(&format!(
@@ -80,7 +82,7 @@ impl SchedulerDb {
     /// ANY($1): PG unnest-style array comparison. Scales to ~100k
     /// IDs before the planner starts preferring a temp table; recovery
     /// DAGs are typically <10k nodes.
-    pub async fn load_edges_for_derivations(
+    pub(crate) async fn load_edges_for_derivations(
         &self,
         derivation_ids: &[Uuid],
     ) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
@@ -101,7 +103,7 @@ impl SchedulerDb {
     /// Load (build_id, derivation_id) links for a set of builds.
     /// `recover_from_pg` uses this to rebuild `interested_builds`
     /// on each DerivationState and `derivation_hashes` on BuildInfo.
-    pub async fn load_build_derivations(
+    pub(crate) async fn load_build_derivations(
         &self,
         build_ids: &[Uuid],
     ) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
@@ -193,7 +195,7 @@ impl SchedulerDb {
     // r[impl dash.graph.degrade-threshold] marker at the 5000-node cap
     // IS correctly placed (scheduler implements server-side cap
     // regardless of which db/ file hosts it).
-    pub async fn load_build_graph(
+    pub(crate) async fn load_build_graph(
         &self,
         build_id: Uuid,
         limit: u32,

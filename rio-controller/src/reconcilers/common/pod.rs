@@ -135,8 +135,6 @@ pub struct ExecutorPodParams {
     // ── metadata ─────────────────────────────────────────────────
     /// Pool CR name. Feeds [`job_name`] (`rio-{role}-{pool_name}-…`).
     pub pool_name: String,
-    /// Pool CR namespace. Jobs + pods live here.
-    pub namespace: String,
 
     // ── scheduling ───────────────────────────────────────────────
     pub node_selector: Option<BTreeMap<String, String>>,

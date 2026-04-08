@@ -48,7 +48,6 @@ fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
         read_only_root_fs: false,
         extra_env,
         pool_name: wp.name_any(),
-        namespace: wp.namespace().unwrap_or_default(),
         node_selector: wp.spec.node_selector.clone(),
         tolerations: wp.spec.tolerations.clone(),
         image: wp.spec.image.clone(),

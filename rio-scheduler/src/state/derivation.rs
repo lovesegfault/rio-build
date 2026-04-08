@@ -636,7 +636,7 @@ impl DerivationState {
     /// be defensive against PG corruption / manual edits. On error,
     /// returns `(drv_hash, err)` so the caller can log without
     /// having cloned drv_hash up front.
-    pub fn from_recovery_row(
+    pub(crate) fn from_recovery_row(
         row: crate::db::RecoveryDerivationRow,
         status: DerivationStatus,
     ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
@@ -700,7 +700,7 @@ impl DerivationState {
     /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
     /// Duration::from_secs_f64(elapsed)` — approximate but good enough
     /// for a 24h TTL.
-    pub fn from_poisoned_row(
+    pub(crate) fn from_poisoned_row(
         row: crate::db::PoisonedDerivationRow,
     ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
         let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)

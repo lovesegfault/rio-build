@@ -784,15 +784,6 @@ impl DerivationDag {
         (skipped, cap_hit)
     }
 
-    /// Get all derivation hashes involved in a build.
-    pub fn build_derivations(&self, build_id: Uuid) -> Vec<DrvHash> {
-        self.nodes
-            .iter()
-            .filter(|(_, state)| state.interested_builds.contains(&build_id))
-            .map(|(hash, _)| hash.clone())
-            .collect()
-    }
-
     /// Remove a build's interest from all its derivations.
     /// Returns derivation hashes that are now orphaned (no builds interested).
     pub fn remove_build_interest(&mut self, build_id: Uuid) -> Vec<DrvHash> {

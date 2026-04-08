@@ -16,7 +16,6 @@
 pub mod resolve;
 
 pub use resolve::{
-    CaResolveInput, IaResolveInput, RealisationLookup, downstream_placeholder, insert_realisation,
-    insert_realisation_deps, query_prior_realisation, resolve_ca_inputs,
-    walk_dependent_realisations,
+    CaResolveInput, IaResolveInput, RealisationLookup, insert_realisation, insert_realisation_deps,
+    query_prior_realisation, resolve_ca_inputs, walk_dependent_realisations,
 };
