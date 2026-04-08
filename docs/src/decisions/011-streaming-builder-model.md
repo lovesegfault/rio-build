@@ -10,7 +10,7 @@ and completion as described, but each stream's lifetime spans exactly one
 derivation.
 
 ## Context
-Workers execute builds on behalf of the scheduler. The communication model between scheduler and workers determines latency, failure handling, and operational characteristics. Workers may run multiple concurrent builds, and the scheduler must be able to send control signals (cancel, prefetch hints) to active builds.
+Workers execute builds on behalf of the scheduler. The communication model between scheduler and workers determines latency, failure handling, and operational characteristics. The scheduler must be able to send control signals (cancel, prefetch hints) to the active build.
 
 ## Decision
 Workers connect to the scheduler via a bidirectional `BuildExecution` streaming RPC. A single long-lived stream per worker carries:
