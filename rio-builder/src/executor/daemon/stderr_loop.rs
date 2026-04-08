@@ -34,6 +34,7 @@ use super::DAEMON_SETUP_TIMEOUT;
 // 8 args: daemon handle + drv identity + three timeout/limit knobs +
 // log plumbing. Bundling into a struct would obscure the per-knob
 // provenance (timeout from config, max_silent_time from assignment).
+// r[impl builder.daemon.stdio-client]
 #[allow(clippy::too_many_arguments)]
 #[instrument(
     skip_all,

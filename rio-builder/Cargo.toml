@@ -51,6 +51,9 @@ regex = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# upload.rs tests use the eager `nar::dump_path` as a byte-exact oracle for
+# the streaming upload pipeline.
+rio-nix = { workspace = true, features = ["test-oracle"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-test-support = { workspace = true }

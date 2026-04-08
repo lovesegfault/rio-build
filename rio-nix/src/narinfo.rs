@@ -205,6 +205,10 @@ impl NarInfo {
     }
 
     /// Serialize to narinfo text format.
+    ///
+    /// Used by rio-store's HTTP binary-cache façade (`cache_server`) to
+    /// emit `.narinfo` responses; also serves as the parse↔serialize
+    /// roundtrip oracle in this crate's proptests.
     pub fn serialize(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();

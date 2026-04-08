@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Eager in-memory NAR dump/restore (`dump_path`, `extract_to_path`). Kept as a
+# byte-exact differential-testing oracle for the streaming implementations;
+# enabled via dev-dependencies and the fuzz crate, not production builds.
+test-oracle = []
+
 [dependencies]
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }

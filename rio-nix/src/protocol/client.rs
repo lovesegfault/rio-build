@@ -8,7 +8,7 @@
 //! - Client reads the STDERR loop (log messages, activities, errors)
 //! - Client sends opcodes and reads results
 
-use super::build::{BuildMode, BuildResult, read_build_result, write_basic_derivation};
+use super::build::{BuildMode, write_basic_derivation};
 use super::handshake::{
     HandshakeError, HandshakeResult, PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2,
 };
@@ -320,9 +320,10 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// Write the `wopBuildDerivation` request payload (opcode + path + drv + mode) and flush.
 ///
-/// Read side is left to the caller. [`client_build_derivation`] is the turnkey
-/// driver; rio-builder calls this directly because its stderr loop layers
-/// cancel-safe batching and a silence deadline on top of the protocol read.
+/// Read side is left to the caller: loop on [`read_stderr_message`] until
+/// [`StderrMessage::Last`], then call [`read_build_result`](super::build::read_build_result).
+/// rio-builder's `run_daemon_build` does this with cancel-safe batching and a
+/// silence deadline layered on top of the protocol read.
 pub async fn client_send_build_derivation<W: AsyncWrite + Unpin>(
     writer: &mut W,
     drv_path: &str,
@@ -337,51 +338,13 @@ pub async fn client_send_build_derivation<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-// r[impl builder.daemon.stdio-client]
-/// Turnkey `wopBuildDerivation` client: send the request, drain the STDERR
-/// loop invoking `on_log` for each non-terminal message, then read and
-/// return the [`BuildResult`].
-///
-/// `on_log` receives every [`StderrMessage`] except `Last` and `Error`.
-/// Returns `Err` on `STDERR_ERROR` or wire failure. Aborts after
-/// `MAX_STDERR_MESSAGES` to bound a daemon that never sends `Last`.
-pub async fn client_build_derivation<R, W, F>(
-    reader: &mut R,
-    writer: &mut W,
-    drv_path: &str,
-    drv: &BasicDerivation,
-    build_mode: BuildMode,
-    mut on_log: F,
-) -> Result<BuildResult>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-    F: FnMut(StderrMessage),
-{
-    client_send_build_derivation(writer, drv_path, drv, build_mode).await?;
-
-    for _ in 0..MAX_STDERR_MESSAGES {
-        match read_stderr_message(reader).await? {
-            StderrMessage::Last => return read_build_result(reader).await,
-            StderrMessage::Error(e) => {
-                return Err(WireError::Io(std::io::Error::other(format!(
-                    "daemon error: {}",
-                    e.message
-                ))));
-            }
-            msg => on_log(msg),
-        }
-    }
-    Err(WireError::Io(std::io::Error::other(format!(
-        "exceeded {MAX_STDERR_MESSAGES} STDERR messages without STDERR_LAST"
-    ))))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::derivation::DerivationOutput;
-    use crate::protocol::build::{BuildStatus, read_basic_derivation, write_build_result};
+    use crate::protocol::build::{
+        BuildResult, BuildStatus, read_basic_derivation, read_build_result, write_build_result,
+    };
     use crate::protocol::handshake::{MIN_CLIENT_VERSION, encode_version, server_handshake_split};
     use crate::protocol::stderr::StderrWriter;
 
@@ -397,6 +360,10 @@ mod tests {
         .unwrap()
     }
 
+    /// Roundtrip the decomposed wopBuildDerivation client primitives the
+    /// way rio-builder's `run_daemon_build` drives them:
+    /// `client_send_build_derivation` → `read_stderr_message`* →
+    /// `read_build_result`.
     // r[verify builder.daemon.stdio-client]
     #[tokio::test]
     async fn client_build_derivation_roundtrip() -> anyhow::Result<()> {
@@ -431,14 +398,17 @@ mod tests {
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
+        client_send_build_derivation(&mut cw, drv_path, &drv, BuildMode::Normal).await?;
+
         let mut log_lines = Vec::new();
-        let result =
-            client_build_derivation(&mut cr, &mut cw, drv_path, &drv, BuildMode::Normal, |msg| {
-                if let StderrMessage::Next(s) = msg {
-                    log_lines.push(s);
-                }
-            })
-            .await?;
+        let result = loop {
+            match read_stderr_message(&mut cr).await? {
+                StderrMessage::Last => break read_build_result(&mut cr).await?,
+                StderrMessage::Error(e) => panic!("daemon error: {}", e.message),
+                StderrMessage::Next(s) => log_lines.push(s),
+                _ => {}
+            }
+        };
 
         let (server_path, server_drv) = server.await??;
         assert_eq!(server_path, drv_path);

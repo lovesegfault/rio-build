@@ -421,6 +421,7 @@ fn serialize_node(w: &mut impl Write, node: &NarNode) -> Result<()> {
 
 /// Eager in-memory NAR dump. Test/fuzz oracle only — production uses
 /// [`dump_path_streaming`].
+#[cfg(any(test, feature = "test-oracle"))]
 #[doc(hidden)]
 pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
     let node = node_from_path(path)?;
@@ -432,7 +433,7 @@ pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
 /// Serialize a filesystem path directly to a `Write` sink, reading file
 /// contents in 256 KiB chunks without buffering the full tree in memory.
 ///
-/// **Byte-identical output to [`dump_path`]** — only the memory profile
+/// **Byte-identical output to the eager `dump_path` oracle** — only the memory profile
 /// differs. Directory structure (names, order, symlinks) is still traversed
 /// in-memory (negligible: ~bytes per entry); only file CONTENTS are streamed.
 ///
@@ -737,6 +738,7 @@ fn restore_node(r: &mut impl Read, dest: &std::path::Path, depth: usize) -> Resu
 }
 
 /// Build a [`NarNode`] tree from a filesystem path.
+#[cfg(any(test, feature = "test-oracle"))]
 fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
     let metadata = std::fs::symlink_metadata(path)?;
 
@@ -778,6 +780,7 @@ fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
 
 /// Eager in-memory NAR extract. Test/fuzz oracle only — production uses
 /// [`restore_path_streaming`].
+#[cfg(any(test, feature = "test-oracle"))]
 #[doc(hidden)]
 pub fn extract_to_path(node: &NarNode, path: &std::path::Path) -> Result<()> {
     match node {

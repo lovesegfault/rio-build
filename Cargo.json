@@ -20391,6 +20391,10 @@
           "packageId": "figment"
         },
         {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
         },
@@ -21077,6 +21081,9 @@
           "name": "tracing-test",
           "packageId": "tracing-test"
         }
+      ],
+      "resolvedDefaultFeatures": [
+        "test-oracle"
       ],
       "libCrateTypes": [
         "lib"
