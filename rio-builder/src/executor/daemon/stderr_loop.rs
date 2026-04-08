@@ -147,6 +147,76 @@ pub(in crate::executor) async fn run_daemon_build(
     Ok(build_result)
 }
 
+/// Hard cap on STDERR-protocol messages per build. Distinct from the
+/// log-byte limit (`LogLimits.total_bytes`): a malformed daemon could
+/// emit millions of zero-length `STDERR_NEXT` frames without ever
+/// tripping the byte limit. Generous (10M) — a real build emitting that
+/// many lines is itself pathological.
+const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
+
+/// Send a log batch on the executor stream. Returns `false` if the
+/// channel is closed (scheduler stream gone — caller breaks the loop
+/// with `MiscFailure`).
+async fn send_batch(
+    log_tx: &mpsc::Sender<ExecutorMessage>,
+    batch: rio_proto::types::BuildLogBatch,
+) -> bool {
+    let msg = ExecutorMessage {
+        msg: Some(executor_message::Msg::LogBatch(batch)),
+    };
+    log_tx.send(msg).await.is_ok()
+}
+
+/// Outcome of handling one log line. `Continue` = keep reading.
+/// `Break(r)` = exit the stderr loop with this result.
+enum LineOutcome {
+    Continue,
+    Break(Result<Option<BuildResult>, wire::WireError>),
+}
+
+/// Shared log-line handling for `STDERR_NEXT` and `STDERR_RESULT`
+/// `BuildLogLine` — both need msg_count bound check + `batcher.add_line`
+/// + `AddLineResult` dispatch.
+async fn handle_log_line(
+    line: Vec<u8>,
+    msg_count: &mut u64,
+    batcher: &mut LogBatcher,
+    log_tx: &mpsc::Sender<ExecutorMessage>,
+) -> LineOutcome {
+    *msg_count += 1;
+    if *msg_count >= MAX_BUILD_STDERR_MESSAGES {
+        return LineOutcome::Break(Err(wire::WireError::Io(std::io::Error::other(
+            "exceeded maximum STDERR messages during build",
+        ))));
+    }
+    match batcher.add_line(line) {
+        AddLineResult::Buffered => LineOutcome::Continue,
+        AddLineResult::BatchReady(batch) => {
+            if send_batch(log_tx, batch).await {
+                LineOutcome::Continue
+            } else {
+                LineOutcome::Break(Ok(Some(BuildResult::failure(
+                    BuildStatus::MiscFailure,
+                    "log channel closed during build (scheduler stream gone)".to_string(),
+                ))))
+            }
+        }
+        AddLineResult::LimitExceeded { reason } => {
+            // Flush what's buffered so client sees output up to
+            // the limit. Best-effort: channel-closed is moot,
+            // we're breaking with LogLimitExceeded anyway.
+            if batcher.has_pending() {
+                let _ = send_batch(log_tx, batcher.flush()).await;
+            }
+            tracing::warn!(reason = %reason, "build log limit exceeded, aborting");
+            LineOutcome::Break(Ok(Some(BuildResult::failure(
+                BuildStatus::LogLimitExceeded,
+                reason,
+            ))))
+        }
+    }
+}
+
 /// Read the STDERR loop from the daemon, streaming logs via the batcher.
 ///
 /// The reader is spawned into an owned task that pushes each parsed
@@ -175,8 +245,6 @@ async fn read_build_stderr_loop<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
-
     // r[impl builder.silence.timeout-kill]
     // Silence deadline: fires when last_output + max_silent_time is
     // reached without an intervening output-producing message. Uses
@@ -190,68 +258,7 @@ where
     let mut last_output = Instant::now();
     let silence_duration = Duration::from_secs(max_silent_time);
 
-    /// Helper: send a log batch. Returns false if the channel is closed.
-    async fn send_batch(
-        log_tx: &mpsc::Sender<ExecutorMessage>,
-        batch: rio_proto::types::BuildLogBatch,
-    ) -> bool {
-        let msg = ExecutorMessage {
-            msg: Some(executor_message::Msg::LogBatch(batch)),
-        };
-        log_tx.send(msg).await.is_ok()
-    }
-
     let misc_fail = |m: &str| BuildResult::failure(BuildStatus::MiscFailure, m.to_string());
-
-    /// Outcome of handling one log line. `Continue` = keep reading.
-    /// `Break(r)` = exit the stderr loop with this result.
-    enum LineOutcome {
-        Continue,
-        Break(Result<Option<BuildResult>, wire::WireError>),
-    }
-
-    /// Shared log-line handling for STDERR_NEXT and STDERR_RESULT
-    /// BuildLogLine — both need msg_count bound check + batcher.add_line
-    /// + AddLineResult dispatch.
-    async fn handle_log_line(
-        line: Vec<u8>,
-        msg_count: &mut u64,
-        batcher: &mut LogBatcher,
-        log_tx: &mpsc::Sender<ExecutorMessage>,
-    ) -> LineOutcome {
-        *msg_count += 1;
-        if *msg_count >= MAX_BUILD_STDERR_MESSAGES {
-            return LineOutcome::Break(Err(wire::WireError::Io(std::io::Error::other(
-                "exceeded maximum STDERR messages during build",
-            ))));
-        }
-        match batcher.add_line(line) {
-            AddLineResult::Buffered => LineOutcome::Continue,
-            AddLineResult::BatchReady(batch) => {
-                if send_batch(log_tx, batch).await {
-                    LineOutcome::Continue
-                } else {
-                    LineOutcome::Break(Ok(Some(BuildResult::failure(
-                        BuildStatus::MiscFailure,
-                        "log channel closed during build (scheduler stream gone)".to_string(),
-                    ))))
-                }
-            }
-            AddLineResult::LimitExceeded { reason } => {
-                // Flush what's buffered so client sees output up to
-                // the limit. Best-effort: channel-closed is moot,
-                // we're breaking with LogLimitExceeded anyway.
-                if batcher.has_pending() {
-                    let _ = send_batch(log_tx, batcher.flush()).await;
-                }
-                tracing::warn!(reason = %reason, "build log limit exceeded, aborting");
-                LineOutcome::Break(Ok(Some(BuildResult::failure(
-                    BuildStatus::LogLimitExceeded,
-                    reason,
-                ))))
-            }
-        }
-    }
 
     // Spawn the owned reader task. It reads one StderrMessage at a time and
     // pushes to `msg_tx`. Terminal messages (Last, Error, wire Err) break the
