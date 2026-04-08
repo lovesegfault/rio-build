@@ -454,11 +454,6 @@ rec {
     extraContents = nonrootEtc;
   };
 
-  # fod-proxy image removed per ADR-019 — Squid proxy deleted. FODs
-  # route to FetcherPool with direct egress. The FOD hash check is
-  # the integrity boundary; domain allowlist added friction for
-  # marginal gain.
-
   # Secrets bootstrap. Argo PreSync hook — runs before the main sync,
   # generates rio/hmac + rio/signing-key in AWS Secrets Manager IF THEY
   # DON'T EXIST (describe-secret guard). Regenerating would invalidate

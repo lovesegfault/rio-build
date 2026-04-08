@@ -82,9 +82,6 @@ let
   cli = import ./scenarios/cli.nix;
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
   dashboard = import ./scenarios/dashboard.nix;
-  # fod-proxy scenario removed per ADR-019 — Squid proxy deleted;
-  # fetchers get direct egress. The FOD hash check is the integrity
-  # boundary. See fetcher.netpol.egress-open (follow-on plan).
   netpol = import ./scenarios/netpol.nix;
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
@@ -712,10 +709,6 @@ in
     inherit pkgs common;
     fixture = k3sFull { envoyGatewayEnabled = true; };
   };
-
-  # vm-fod-proxy-k3s removed per ADR-019 — Squid proxy deleted. FODs
-  # route to FetcherPool with direct egress + hash-check integrity
-  # boundary. Scenario file deleted too.
 
   # Builder + store egress NetworkPolicy: IMDS + public internet + k8s
   # API all blocked. networkPolicy.enabled via extraValues (--set-string

@@ -45,16 +45,6 @@ rec {
   # Takes `{ tag, sleepSecs }` at nix-build time via `--arg`.
   coldBootstrap = ./derivations/cold-bootstrap.nix;
 
-  # busybox-wget FOD for the fod-proxy scenario. Parameterized at
-  # nix-build time via `--argstr url ... --argstr sha256 ...`. wget
-  # honors http_proxy (the rio-builder is_fod gate → daemon env →
-  # Nix FOD sandbox pass-through → wget → squid chain under test).
-  fodFetch = ./derivations/fod-fetch.nix;
-
-  # Non-FOD sentinel: `busybox env > $out`. fod-proxy asserts
-  # http_proxy is absent — proves executor's is_fod gate.
-  envDump = ./derivations/env-dump.nix;
-
   # builtin:fetchurl FOD + raw consumer for the fetcher-split scenario.
   # Same shape as coldBootstrap; url defaults to the scenario's
   # TEST-NET-3 origin (203.0.113.1:80 — passes fetcher-egress, fails

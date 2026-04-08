@@ -533,8 +533,8 @@ rec {
   #   capture_stderr — 2>&1 (default True; False for stderr-separate
   #                    tests asserting on the clean stdout path)
   #   expect_fail    — use client.fail instead of client.succeed
-  #   timeout_wrap   — `timeout N` outer shell wrapper (fod-proxy uses
-  #                    60s as a regression hard bound)
+  #   timeout_wrap   — `timeout N` outer shell wrapper for a regression
+  #                    hard bound on the spawned nix-build
   #   store_url      — override --store (default ssh-ng://${gatewayHost});
   #                    tenant/identity-file cases pass a different URL.
   #                    Folds in security.nix build_drv (identity_file →
