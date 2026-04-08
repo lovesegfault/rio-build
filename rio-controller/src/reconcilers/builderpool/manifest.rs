@@ -251,27 +251,24 @@ pub(super) async fn spawn_manifest_jobs(
     Ok(())
 }
 
-// r[impl ctrl.pool.manifest-reconcile]
-/// Reconcile a manifest-mode BuilderPool: poll manifest, diff against
-/// inventory, spawn Jobs for the deficit.
+/// Poll `GetCapacityManifest` + `ClusterStatus` for the manifest
+/// reconciler's demand inputs.
 ///
-/// Same one-shot Job lifecycle as static-sizing pools; the only
-/// difference is per-bucket `ResourceRequirements` instead of
-/// one-size from `spec.resources`.
-pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
-    let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
-
-    // ---- Poll: manifest + ClusterStatus ----
-    // Both RPCs, same fail-open behavior as ephemeral: RPC down →
-    // treat as empty → no spawn → requeue. SchedulerUnreachable
-    // condition on the status so operators see WHY. Cloning the
-    // client twice (tonic is Arc-internal).
+/// Both RPCs, same fail-open behavior as ephemeral: RPC down → treat
+/// as empty → no spawn → requeue. The third tuple element is the
+/// stringified gRPC error (or `None` on success) — the caller wires it
+/// into `SchedulerUnreachable` so operators see WHY nothing spawned.
+///
+/// Either RPC down → fail open. The manifest alone isn't enough
+/// (missing cold-start count); ClusterStatus alone isn't enough
+/// (missing buckets). Both-or-nothing.
+async fn poll_manifest_demand(
+    ctx: &Ctx,
+    name: &str,
+) -> (Vec<DerivationResourceEstimate>, u32, Option<String>) {
+    // Cloning the client twice (tonic is Arc-internal).
     let mut admin = ctx.admin.clone();
-    let (estimates, queued_total, scheduler_err): (
-        Vec<DerivationResourceEstimate>,
-        u32,
-        Option<String>,
-    ) = match (
+    match (
         admin
             .get_capacity_manifest(GetCapacityManifestRequest {})
             .await,
@@ -282,9 +279,6 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
             status.into_inner().queued_derivations,
             None,
         ),
-        // Either RPC down → fail open. The manifest alone isn't
-        // enough (missing cold-start count); ClusterStatus alone
-        // isn't enough (missing buckets). Both-or-nothing.
         (Err(e), _) | (_, Err(e)) => {
             warn!(
                 pool = %name, error = %e,
@@ -292,68 +286,43 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
             );
             (Vec::new(), 0, Some(e.to_string()))
         }
-    };
+    }
+}
 
-    // ---- Group: manifest → demand BTreeMap ----
-    let demand = group_by_bucket(&estimates);
-    // Cold-start count: derivations the manifest OMITS (no
-    // build_history sample, admin_types.proto:249). Both RPCs walk
-    // the same ready_queue so `queued_total >= manifest.len()`
-    // structurally — saturating anyway for the RPC-race edge case
-    // (manifest taken at tick N, ClusterStatus at tick N+1 after
-    // a dequeue).
-    let cold_start = (queued_total as usize).saturating_sub(estimates.len());
+/// Sweep Failed manifest Jobs and emit `CrashLoopDetected` if the
+/// pre-cap count crosses [`CRASH_LOOP_WARN_THRESHOLD`].
+///
+/// MUST run before spawn: under a namespace ResourceQuota on
+/// `count/jobs.batch` (GKE Autopilot default, common in hardened
+/// clusters), a crash-loop fills the quota with Failed Jobs. If
+/// spawn-before-sweep, `jobs_api.create` 403s on quota exhaustion →
+/// return Err → sweep never runs → deadlock (can't clear quota to
+/// make room for the spawn that would succeed next). Sweep-first
+/// clears dead weight; spawn then has room.
+///
+/// Separate from the idle-reapable pass: Failed Jobs need no
+/// idle-check (no running pod) and no `ListExecutors` RPC. This is
+/// self-contained — runs unconditionally, bounded-per-tick
+/// ([`select_failed_jobs`] caps at `cap = sweep_cap(max_concurrent)`).
+///
+/// `CrashLoopDetected`: operator visibility via `kubectl describe
+/// builderpool`. The message interpolates a coarse tier
+/// ([`crash_loop_tier`]), not the exact count — K8s deduplicates
+/// events by (reason, message), so a stable message lets the
+/// apiserver collapse per-tick emits into one event with a rising
+/// `.count`. Exact count would change every tick → no dedup → event
+/// flood compounding the Job flood.
+async fn sweep_failed_manifest_jobs(
+    jobs_api: &kube::api::Api<Job>,
+    ctx: &Ctx,
+    wp: &BuilderPool,
+    name: &str,
+    all_jobs: &[Job],
+    cap: usize,
+) {
+    let failed_total = all_jobs.iter().filter(|j| is_failed_job(j)).count();
+    let failed_jobs = select_failed_jobs(all_jobs, cap);
 
-    // ---- Inventory: live Jobs → supply BTreeMap ----
-    // Label selector includes BOTH pool AND sizing=manifest. Without
-    // the sizing filter, an ephemeral Job for the same pool (operator
-    // flipped sizing mid-run) would count as supply.
-    let selector = format!("{POOL_LABEL}={name},{SIZING_LABEL}={SIZING_MANIFEST}");
-    let jobs = jobs_api
-        .list(&ListParams::default().labels(&selector))
-        .await?;
-    // "Active" = same definition as ephemeral (not Complete, not
-    // Failed). A Failed-but-unreap'd Job is NOT supply — we want a
-    // replacement. This is why we don't count by label presence
-    // alone; status matters.
-    let active_jobs: Vec<&Job> = jobs.items.iter().filter(|j| is_active_job(j)).collect();
-    // Failed Jobs: not supply, not capacity, but still ours to reap.
-    // backoff_limit=0 means one pod crash → Job Failed permanently.
-    // Under crash-loop (bad image, OOM-on-start) these accumulate at
-    // up to `max_concurrent` per tick (headroom-worth all fail); sweep
-    // them alongside idle-surplus deletes. Cap tracks the pool's own
-    // spawn ceiling — see FAILED_SWEEP_MIN. failed_total is the
-    // pre-cap count for the Warning event; the sweep acts on the
-    // capped slice.
-    let failed_total = jobs.items.iter().filter(|j| is_failed_job(j)).count();
-    let cap = sweep_cap(wp.spec.max_concurrent as i32);
-    let failed_jobs = select_failed_jobs(&jobs.items, cap);
-    let supply = inventory_by_bucket(&active_jobs);
-    let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
-    let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
-
-    // ---- Sweep Failed Jobs FIRST ----
-    // This MUST run before spawn: under a namespace ResourceQuota on
-    // count/jobs.batch (GKE Autopilot default, common in hardened
-    // clusters), a crash-loop fills the quota with Failed Jobs. If
-    // spawn-before-sweep, jobs_api.create 403s on quota exhaustion →
-    // return Err → sweep never runs → deadlock (can't clear quota to
-    // make room for the spawn that would succeed next). Sweep-first
-    // clears dead weight; spawn then has room.
-    //
-    // Separate from the idle-reapable pass below: Failed Jobs need no
-    // idle-check (no running pod) and no ListExecutors RPC. This block
-    // is self-contained — runs unconditionally, bounded-per-tick
-    // (select_failed_jobs caps internally at cap =
-    // sweep_cap(max_concurrent)).
-    //
-    // CrashLoopDetected: operator visibility via `kubectl describe
-    // builderpool`. The message interpolates a coarse tier
-    // (crash_loop_tier), not the exact count — K8s deduplicates
-    // events by (reason, message), so a stable message lets the
-    // apiserver collapse per-tick emits into one event with a
-    // rising .count. Exact count would change every tick → no dedup
-    // → event flood compounding the Job flood.
     if failed_total >= CRASH_LOOP_WARN_THRESHOLD {
         use kube::runtime::events::{Event as KubeEvent, EventType};
         ctx.publish_event(
@@ -396,6 +365,136 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
             }
         }
     }
+}
+
+/// Delete surplus manifest Jobs that have been idle past
+/// `scale_down_window` AND have no running build per `ListExecutors`.
+///
+/// Only polls `ListExecutors` if there's actually something to reap —
+/// common case is empty (nothing surplus long enough). Saves an RPC
+/// per tick on the hot path.
+///
+/// Fail-open: RPC down → can't verify idle → delete nothing.
+/// Scale-up (caller) is unaffected. Same fail-open philosophy as
+/// [`poll_manifest_demand`] — a transient scheduler blip shouldn't
+/// orphan builds.
+///
+/// `status_filter`: "" (no filter). We match by pod-name prefix, and
+/// a dead executor's Job is either already Failed (filtered from
+/// `active_jobs`) or about to be. An extra-conservative skip costs one
+/// more tick, not a bug.
+async fn reap_surplus_manifest_jobs(
+    jobs_api: &kube::api::Api<Job>,
+    ctx: &Ctx,
+    name: &str,
+    active_jobs: &[&Job],
+    reapable: &BTreeMap<Bucket, usize>,
+) {
+    if reapable.is_empty() {
+        return;
+    }
+    let executors = match ctx
+        .admin
+        .clone()
+        .list_executors(ListExecutorsRequest {
+            status_filter: String::new(),
+        })
+        .await
+    {
+        Ok(resp) => resp.into_inner().executors,
+        Err(e) => {
+            warn!(
+                pool = %name, error = %e, reapable = ?reapable.keys().collect::<Vec<_>>(),
+                "ListExecutors failed; skipping scale-down this tick (can't verify idle)"
+            );
+            return;
+        }
+    };
+    for job in select_deletable_jobs(active_jobs, reapable, &executors) {
+        // name is Some (select_deletable_jobs skips None).
+        let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
+        // Background propagation: K8s deletes the Job's pod
+        // asynchronously. Pod gets SIGTERM → worker's drain handler
+        // (acquire_many on build semaphore) exits cleanly. We've
+        // already verified running_builds == 0, so the semaphore is
+        // immediately acquirable.
+        match jobs_api.delete(job_name, &DeleteParams::default()).await {
+            Ok(_) => {
+                info!(
+                    pool = %name, job = %job_name,
+                    bucket = ?parse_bucket_from_labels(job),
+                    "deleted surplus manifest Job (idle grace elapsed)"
+                );
+            }
+            Err(e) if e.is_not_found() => {
+                // Already gone (another reconcile tick raced us, or
+                // ownerRef GC). Fine.
+                debug!(pool = %name, job = %job_name, "Job already deleted");
+            }
+            Err(e) => {
+                // Don't abort the whole reconcile on one delete
+                // failure — log and continue. Next tick retries (Job
+                // is still surplus).
+                warn!(
+                    pool = %name, job = %job_name, error = %e,
+                    "failed to delete surplus manifest Job; will retry next tick"
+                );
+            }
+        }
+    }
+}
+
+// r[impl ctrl.pool.manifest-reconcile]
+/// Reconcile a manifest-mode BuilderPool: poll manifest, diff against
+/// inventory, spawn Jobs for the deficit.
+///
+/// Same one-shot Job lifecycle as static-sizing pools; the only
+/// difference is per-bucket `ResourceRequirements` instead of
+/// one-size from `spec.resources`.
+pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Action> {
+    let (ns, name, jobs_api) = job_reconcile_prologue(wp, ctx)?;
+
+    // ---- Poll: manifest + ClusterStatus ----
+    let (estimates, queued_total, scheduler_err) = poll_manifest_demand(ctx, &name).await;
+
+    // ---- Group: manifest → demand BTreeMap ----
+    let demand = group_by_bucket(&estimates);
+    // Cold-start count: derivations the manifest OMITS (no
+    // build_history sample, admin_types.proto:249). Both RPCs walk
+    // the same ready_queue so `queued_total >= manifest.len()`
+    // structurally — saturating anyway for the RPC-race edge case
+    // (manifest taken at tick N, ClusterStatus at tick N+1 after
+    // a dequeue).
+    let cold_start = (queued_total as usize).saturating_sub(estimates.len());
+
+    // ---- Inventory: live Jobs → supply BTreeMap ----
+    // Label selector includes BOTH pool AND sizing=manifest. Without
+    // the sizing filter, an ephemeral Job for the same pool (operator
+    // flipped sizing mid-run) would count as supply.
+    let selector = format!("{POOL_LABEL}={name},{SIZING_LABEL}={SIZING_MANIFEST}");
+    let jobs = jobs_api
+        .list(&ListParams::default().labels(&selector))
+        .await?;
+    // "Active" = same definition as ephemeral (not Complete, not
+    // Failed). A Failed-but-unreap'd Job is NOT supply — we want a
+    // replacement. This is why we don't count by label presence
+    // alone; status matters.
+    let active_jobs: Vec<&Job> = jobs.items.iter().filter(|j| is_active_job(j)).collect();
+    let supply = inventory_by_bucket(&active_jobs);
+    let cold_start_supply = active_jobs.iter().filter(|j| is_floor_job(j)).count();
+    let active_total: i32 = active_jobs.len().try_into().unwrap_or(i32::MAX);
+
+    // ---- Sweep Failed Jobs FIRST ----
+    // Failed Jobs: not supply, not capacity, but still ours to reap.
+    // backoff_limit=0 means one pod crash → Job Failed permanently.
+    // Under crash-loop (bad image, OOM-on-start) these accumulate at
+    // up to `max_concurrent` per tick (headroom-worth all fail); sweep
+    // them alongside idle-surplus deletes. Cap tracks the pool's own
+    // spawn ceiling — see FAILED_SWEEP_MIN. MUST run before spawn —
+    // see sweep_failed_manifest_jobs() doc for the ResourceQuota
+    // deadlock this avoids.
+    let cap = sweep_cap(wp.spec.max_concurrent as i32);
+    sweep_failed_manifest_jobs(&jobs_api, ctx, wp, &name, &jobs.items, cap).await;
 
     // ---- Diff: spawn (scale-up) ----
     let plan = compute_spawn_plan(&demand, &supply, cold_start, cold_start_supply);
@@ -453,76 +552,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
     }
 
     // ---- Scale-down: delete reapable Jobs ----
-    // Only poll ListExecutors if there's actually something to reap
-    // — common case is empty (nothing surplus long enough). Saves
-    // an RPC per tick on the hot path.
-    if !reapable.is_empty() {
-        // Fail-open: RPC down → can't verify idle → delete nothing.
-        // Scale-up (above) is unaffected. Same fail-open philosophy
-        // as the poll phase — a transient scheduler blip shouldn't
-        // orphan builds.
-        //
-        // status_filter: "alive" excludes draining/dead. A draining
-        // executor might have running_builds > 0 (finishing what it
-        // has) — we want those visible. But a DEAD executor (hasn't
-        // heartbeat in timeout) with running_builds > 0 is stale
-        // data. Actually "" (no filter) is safest: we match by pod-
-        // name prefix, and a dead executor's Job is either already
-        // Failed (filtered from active_jobs) or about to be. An
-        // extra-conservative skip costs one more tick, not a bug.
-        match ctx
-            .admin
-            .clone()
-            .list_executors(ListExecutorsRequest {
-                status_filter: String::new(),
-            })
-            .await
-        {
-            Ok(resp) => {
-                let executors = resp.into_inner().executors;
-                let deletable = select_deletable_jobs(&active_jobs, &reapable, &executors);
-                for job in deletable {
-                    // name is Some (select_deletable_jobs skips None).
-                    let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
-                    // Background propagation: K8s deletes the Job's
-                    // pod asynchronously. Pod gets SIGTERM → worker's
-                    // drain handler (acquire_many on build semaphore)
-                    // exits cleanly. We've already verified
-                    // running_builds == 0, so the semaphore is
-                    // immediately acquirable.
-                    match jobs_api.delete(job_name, &DeleteParams::default()).await {
-                        Ok(_) => {
-                            info!(
-                                pool = %name, job = %job_name,
-                                bucket = ?parse_bucket_from_labels(job),
-                                "deleted surplus manifest Job (idle grace elapsed)"
-                            );
-                        }
-                        Err(e) if e.is_not_found() => {
-                            // Already gone (another reconcile tick
-                            // raced us, or ownerRef GC). Fine.
-                            debug!(pool = %name, job = %job_name, "Job already deleted");
-                        }
-                        Err(e) => {
-                            // Don't abort the whole reconcile on one
-                            // delete failure — log and continue. Next
-                            // tick retries (Job is still surplus).
-                            warn!(
-                                pool = %name, job = %job_name, error = %e,
-                                "failed to delete surplus manifest Job; will retry next tick"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    pool = %name, error = %e, reapable = ?reapable.keys().collect::<Vec<_>>(),
-                    "ListExecutors failed; skipping scale-down this tick (can't verify idle)"
-                );
-            }
-        }
-    }
+    reap_surplus_manifest_jobs(&jobs_api, ctx, &name, &active_jobs, &reapable).await;
 
     // ---- Status patch ----
     // `replicas` = active Jobs, `desired` = ceiling. SchedulerUnreachable
