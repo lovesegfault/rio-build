@@ -263,12 +263,19 @@ pub(super) async fn fetch_drv_from_store(
         &[],
     )
     .await
-    .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}): {e}")))?;
+    .map_err(|e| ExecutorError::MetadataFetch {
+        path: drv_path.to_string(),
+        source: match e {
+            rio_proto::client::NarCollectError::Stream(s) => s,
+            other => tonic::Status::internal(other.to_string()),
+        },
+    })?;
 
     let Some((_, nar_data)) = result else {
-        return Err(ExecutorError::BuildFailed(format!(
-            ".drv not found in store: {drv_path}"
-        )));
+        return Err(ExecutorError::MetadataFetch {
+            path: drv_path.to_string(),
+            source: tonic::Status::not_found(".drv not found in store"),
+        });
     };
 
     Derivation::parse_from_nar(&nar_data).map_err(|e| {
@@ -1165,7 +1172,11 @@ mod tests {
             .await
             .expect_err("should fail on missing .drv");
 
-        assert!(matches!(err, ExecutorError::BuildFailed(_)));
+        assert!(matches!(
+            err,
+            ExecutorError::MetadataFetch { ref source, .. }
+                if source.code() == tonic::Code::NotFound
+        ));
         assert!(err.to_string().contains("nonexistent.drv"));
         Ok(())
     }
