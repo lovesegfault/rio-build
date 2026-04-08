@@ -33,7 +33,7 @@ use std::fmt;
 
 /// Normalized tenant name: trimmed, non-empty, no interior whitespace.
 ///
-/// Three constructors for three intents:
+/// Two constructors for two intents:
 /// - [`new`](Self::new) → `Result<Self, NameError>` — the caller
 ///   wants a name and will propagate the error. For `CreateTenant`,
 ///   `ResolveTenant`, `TenantQuota`.
@@ -42,8 +42,6 @@ use std::fmt;
 ///   whitespace → `None`. Interior whitespace also → `None` (treated
 ///   as invalid; the caller logs and falls through to single-tenant).
 ///   For `SubmitBuild`, `ListBuilds`, gateway SSH-key comment.
-/// - `new_unchecked` — test-only (`#[cfg(test)]`). Wraps without
-///   validation.
 ///
 /// Storage invariant: if a `NormalizedName` exists, its inner string
 /// is trimmed, non-empty, and contains no whitespace. No `.trim()`
@@ -106,17 +104,6 @@ impl NormalizedName {
     /// [`new`]: Self::new
     pub fn from_maybe_empty(s: &str) -> Option<Self> {
         Self::new(s).ok()
-    }
-
-    /// Test-only: wrap without validation. Bypasses the trim +
-    /// whitespace checks — use only when a test needs to inject a
-    /// known-valid name without round-tripping through `new`.
-    ///
-    /// Cross-crate tests: use `new("...").unwrap()` instead (test
-    /// inputs are known-valid so the unwrap never fires).
-    #[cfg(test)]
-    pub(crate) fn new_unchecked(s: impl Into<String>) -> Self {
-        Self(s.into())
     }
 
     /// Borrow the inner trimmed string. Same as `Deref`/`AsRef` but
@@ -266,18 +253,6 @@ mod tests {
         // Into<String>
         let owned: String = n.into();
         assert_eq!(owned, "surface");
-    }
-
-    #[test]
-    fn new_unchecked_bypasses_validation() {
-        // Test-only escape hatch: wraps without checking. Lets tests
-        // inject known-valid names without the full round-trip.
-        let n = NormalizedName::new_unchecked("team-a");
-        assert_eq!(n.as_str(), "team-a");
-        // Bypasses validation entirely — even invalid input wraps.
-        // (Don't do this outside tests.)
-        let bad = NormalizedName::new_unchecked("has space");
-        assert_eq!(bad.as_str(), "has space");
     }
 
     #[test]
