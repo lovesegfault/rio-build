@@ -432,24 +432,28 @@ let
             f"-d '{payload}' localhost:19001 {method} 2>&1"
         )
 
-    def store_grpc(payload, method):
-        """PinPath/UnpinPath on the store. deploy/ port-forward picks any
-        replica (there's only one). Returns stdout+stderr."""
-        return k3s_server.succeed(
-            f"k3s kubectl -n ${nsStore} port-forward deploy/rio-store 19002:9002 "
-            f">/dev/null 2>&1 & pf=$!; "
-            f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-            f"${grpcurl} ${grpcurlTls} -max-time 30 "
-            f"-protoset ${protoset}/rio.protoset "
-            f"-d '{payload}' localhost:19002 {method} 2>&1"
+    def pin_gc_root(out_path, source):
+        """Insert a gc_roots row for out_path. Looks up store_path_hash
+        via narinfo (gc_roots PK is the BYTEA hash, not the text path)."""
+        psql_k8s(k3s_server,
+            f"INSERT INTO gc_roots (store_path_hash, source) "
+            f"SELECT store_path_hash, '{source}' FROM narinfo "
+            f"WHERE store_path = '{out_path}'"
+        )
+
+    def unpin_gc_root(out_path):
+        psql_k8s(k3s_server,
+            f"DELETE FROM gc_roots WHERE store_path_hash = "
+            f"(SELECT store_path_hash FROM narinfo "
+            f" WHERE store_path = '{out_path}')"
         )
 
     # Port-allocation counter for submit_build_grpc. Each call gets
     # a unique local port (19100, 19101, …) to sidestep TIME_WAIT
     # contention — port-forward lacks SO_REUSEADDR, ~60s to rebind.
-    # sched_grpc above uses 19001 (safe — single-call lifetime);
-    # store_grpc uses 19002. SubmitBuild calls stack within one
-    # subtest (build-timeout does submit→timeout→retry-submit).
+    # sched_grpc above uses 19001 (safe — single-call lifetime).
+    # SubmitBuild calls stack within one subtest (build-timeout does
+    # submit→timeout→retry-submit).
     _submit_port = iter(range(19100, 19200))
 
     def submit_build_grpc(payload: dict, max_time: int = 5) -> str:
@@ -1301,7 +1305,7 @@ let
 
     gc-sweep = ''
       # ══════════════════════════════════════════════════════════════════
-      # gc-sweep — PinPath + backdate + non-dry-run sweep PROVES commit
+      # gc-sweep — pin + backdate + non-dry-run sweep PROVES commit
       # ══════════════════════════════════════════════════════════════════
       # THE test that proves sweep's for-batch loop body executes. With
       # all-in-grace paths, unreachable=vec![] → loop never runs → neither
@@ -1314,7 +1318,7 @@ let
       # In the monolith, these came from the `initial` and `recovery`
       # subtests (ordering hack to avoid slow-build worker-slot block).
       # Split architecture: each fragment owns its data.
-      with subtest("gc-sweep: PinPath + backdated sweep deletes EXACTLY 1"):
+      with subtest("gc-sweep: pinned root + backdated sweep deletes EXACTLY 1"):
           # Build the two target paths. pinDrv = pinned, survives sweep.
           # gcVictimDrv = unpinned, backdated, deleted by sweep.
           out_pin = build("${pinDrv}", capture_stderr=False).strip()
@@ -1322,26 +1326,20 @@ let
           out_victim = build("${gcVictimDrv}", capture_stderr=False).strip()
           assert out_victim.startswith("/nix/store/"), f"victim build: {out_victim!r}"
 
-          # Baseline BEFORE PinPath. The prior absolute-==1 check would
+          # Baseline BEFORE pin. The prior absolute-==1 check would
           # confusingly fail if anything earlier (fixture, controller
           # startup) inserts a gc_roots row, AND ==1 PASSES a no-op
-          # PinPath if nothing else ever inserts either. Delta is robust.
+          # insert if nothing else ever inserts either. Delta is robust.
           gc_roots_base = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
 
-          # Pin out_pin. PinPath is rio.store.StoreAdminService on the
-          # STORE (port 9002), NOT scheduler's AdminService (9001 — that
-          # only has the TriggerGC proxy, not Pin/Unpin).
-          #
-          # JSON construction: f-string inside Python inside Nix.
-          # {{ }} → Python sees { }. The store_path value is a /nix/store/
-          # path — no embedded quotes, safe to single-quote wrap.
-          store_grpc(
-              f'{{"store_path": "{out_pin}", "source": "vm-lifecycle"}}',
-              "rio.store.StoreAdminService/PinPath",
-          )
+          # Pin out_pin via direct gc_roots insert (the table is the
+          # mark-phase seed; an operator-facing pin RPC is a future
+          # extension point). pin_gc_root looks up store_path_hash via
+          # narinfo so we needn't compute the BYTEA hash here.
+          pin_gc_root(out_pin, "vm-lifecycle")
           pin_after = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
           assert pin_after == gc_roots_base + 1, (
-              f"PinPath should add exactly 1 gc_roots row; "
+              f"pin should add exactly 1 gc_roots row; "
               f"before={gc_roots_base}, after={pin_after}"
           )
 
@@ -1397,17 +1395,14 @@ let
               f"nix path-info --store 'ssh-ng://k3s-server' {out_pin}"
           )
 
-          # UnpinPath round-trip (idempotent).
-          store_grpc(
-              f'{{"store_path": "{out_pin}"}}',
-              "rio.store.StoreAdminService/UnpinPath",
-          )
+          # Unpin round-trip.
+          unpin_gc_root(out_pin)
           unpin_after = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
-          # Back to baseline — PinPath's row is gone. ==gc_roots_base NOT
-          # ==0: if anything else ever pins, ==0 is wrong; if PinPath was
-          # a no-op AND UnpinPath was a no-op, ==0 passes (both broke).
+          # Back to baseline — pin row is gone. ==gc_roots_base NOT ==0:
+          # if anything else ever pins, ==0 is wrong; if pin was a no-op
+          # AND unpin was a no-op, ==0 passes (both broke).
           assert unpin_after == gc_roots_base, (
-              f"UnpinPath should restore gc_roots to baseline; "
+              f"unpin should restore gc_roots to baseline; "
               f"base={gc_roots_base}, now={unpin_after}"
           )
           # ── path_tenants end-to-end: tenant-key build → upsert fires ──
@@ -1715,10 +1710,7 @@ let
               "UPDATE narinfo SET created_at = now() - interval '25 hours' "
               f"WHERE store_path IN ('{out_dep}', '{out_consumer}')"
           )
-          store_grpc(
-              f'{{"store_path": "{out_consumer}", "source": "vm-refs-e2e"}}',
-              "rio.store.StoreAdminService/PinPath",
-          )
+          pin_gc_root(out_consumer, "vm-refs-e2e")
           # force=true: dep is sweep-eligible (past grace, unpinned, and
           # unreachable from any root EXCEPT via consumer's refs) and dep
           # has refs=[] (its output is plain text with zero store paths).
@@ -1763,10 +1755,7 @@ let
           # is unreachable). Sweep should collect EXACTLY these two —
           # every other path in PG (out_pin from gc-sweep, busybox seed,
           # earlier subtest outputs) is still in-grace.
-          store_grpc(
-              f'{{"store_path": "{out_consumer}"}}',
-              "rio.store.StoreAdminService/UnpinPath",
-          )
+          unpin_gc_root(out_consumer)
           result = sched_grpc(
               '{"dry_run": false, "grace_period_hours": 24, "force": true}',
               "rio.admin.AdminService/TriggerGC",
@@ -1826,7 +1815,6 @@ let
           assert_cel_rejects(
               "zero-max-concurrent",
               "  maxConcurrent: 0\n"
-              "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               "  image: rio-builder",
               "maxConcurrent must be > 0",
@@ -1840,7 +1828,6 @@ let
               "hostnet-unprivileged",
               "  hostNetwork: true\n"
               "  maxConcurrent: 4\n"
-              "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               "  image: rio-builder",
               "hostNetwork:true requires privileged:true",
@@ -1861,7 +1848,6 @@ let
               "  namespace: ${nsBuilders}\n"
               "spec:\n"
               "  maxConcurrent: 4\n"
-              "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               # rio-builder:dev — MUST match the ref from nix/docker.nix
               # vmTestSeed (tag = "dev"). Bare "rio-builder" normalizes
@@ -2130,7 +2116,6 @@ let
               "spec:\n"
               "  sizing: Manifest\n"
               "  maxConcurrent: 3\n"
-              "  fuseCacheSize: 5Gi\n"
               "  systems: [x86_64-linux]\n"
               # Same rio-builder:dev tag + tlsSecretName rationale as
               # ephemeral-pool (see that fragment's comments).

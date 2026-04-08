@@ -9,7 +9,7 @@
 # with the unresolved placeholder → worker ENOENT), or (b)
 # cutoff-compare is miscounting (self-match exclusion not yet
 # landed). Check the worker journals for "placeholder" or
-# "ContentLookup".
+# "realisation".
 #
 # The marker-independence trick: `ca-chain.nix` bakes the marker into
 # the ATerm env (so A's drv hash differs between build-1 and build-2,
@@ -75,11 +75,10 @@ pkgs.testers.runNixOSTest {
             f"expected a store-path result, got: {out1[:200]}"
 
     # Regression guard (P0397 self-match exclusion): saves_total must
-    # be 0 after build-1. If nonzero, ContentLookup is matching the
-    # just-uploaded output against itself (PutPath writes the
-    # content_index row BEFORE BuildComplete, so a missing self-
-    # exclusion would make every first-ever CA build look like a
-    # cutoff trigger).
+    # be 0 after build-1. If nonzero, the realisation-based cutoff
+    # check is matching the just-uploaded output against itself —
+    # a missing self-exclusion would make every first-ever CA build
+    # look like a cutoff trigger.
     m_after1 = scrape_metrics(${gatewayHost}, 9091)
     saves_after1 = metric_value(m_after1,
         "rio_scheduler_ca_cutoff_saves_total") or 0.0

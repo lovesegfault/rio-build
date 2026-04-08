@@ -256,16 +256,6 @@ let
           # 0 paths) would pass hints≥1 but fail paths≥1. (phase3a:485)
           assert_metric_ge(${gatewayHost}, 9091,
               "rio_scheduler_prefetch_paths_sent_total", 1.0)
-
-          # content_index populated: every PutPath inserts a row. ≥5
-          # (same bound as put_path_total above). Proves the insert is
-          # wired in the real binary, not just unit tests. (phase2c:304)
-          ci_count = int(psql(${gatewayHost},
-              "SELECT count(*) FROM content_index"))
-          assert ci_count >= 5, (
-              f"content_index should have ≥5 entries after fanout; "
-              f"got {ci_count}"
-          )
     '';
 
     fuse-direct = ''

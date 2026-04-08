@@ -215,7 +215,8 @@ in
   #   Asserts rio_scheduler_ca_cutoff_saves_total ≥ 2 (B+C skipped)
   #   AND second-build elapsed <15s (vs ~24s serial). Also asserts
   #   saves=0 after build-1 (P0397 self-match exclusion regression
-  #   guard — ContentLookup must not match the just-uploaded output).
+  #   guard — realisation lookup must not match the just-uploaded
+  #   output against itself).
   #   Single worker: the chain is serial anyway; multi-worker would
   #   only add boot cost.
   vm-ca-cutoff-standalone = ca-cutoff {
