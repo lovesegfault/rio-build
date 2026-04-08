@@ -14,7 +14,10 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use axum::{Router, http::StatusCode, routing::get};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
@@ -182,6 +185,72 @@ where
     })
 }
 
+/// `/healthz` + `/readyz` axum router for kubelet HTTP probes.
+///
+/// | Route | K8s probe | Semantics |
+/// |---|---|---|
+/// | `/healthz` | liveness | 200 unconditionally — handler reached ⇒ process alive + runtime responsive. |
+/// | `/readyz` | readiness | 200 iff `ready` is `true`; 503 otherwise. |
+///
+/// `ready` is the binary's own gate (e.g. rio-builder flips it on the
+/// first accepted heartbeat; rio-controller passes a constant `true`
+/// — it has no "connected but not ready" state).
+///
+/// Serve via [`spawn_axum`] for graceful shutdown wiring. Distinct
+/// from [`spawn_health_plaintext`] (gRPC `grpc.health.v1.Health` for
+/// tonic-served binaries) — this is the plain-HTTP variant for
+/// binaries with no tonic listener.
+pub fn health_router(ready: Arc<AtomicBool>) -> Router {
+    Router::new()
+        .route("/healthz", get(async || StatusCode::OK))
+        .route(
+            "/readyz",
+            get(async move || {
+                if ready.load(Ordering::Relaxed) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
+}
+
+/// Spawn an axum server on `addr` with `with_graceful_shutdown` wired
+/// to `shutdown.cancelled_owned()`. Consolidates the three prior
+/// hand-rolled variants (rio-controller raw-TCP, rio-builder no-
+/// graceful-shutdown, rio-store correct).
+///
+/// Bind failure logs and returns (the spawned task ends; kubelet
+/// liveness fails → pod restart → self-healing). Serve failure logs.
+///
+/// No explicit read timeout: these are kubelet-only LAN endpoints
+/// behind cluster-network firewalling; hyper's connection handling
+/// is sufficient and adding `tower-http` for one timeout layer is
+/// not warranted.
+pub fn spawn_axum(
+    name: &'static str,
+    addr: SocketAddr,
+    router: Router,
+    shutdown: Token,
+) -> tokio::task::JoinHandle<()> {
+    spawn_monitored(name, async move {
+        tracing::info!(addr = %addr, server = name, "starting HTTP server");
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await
+                {
+                    tracing::error!(error = %e, server = name, "HTTP server failed");
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, addr = %addr, server = name, "HTTP bind failed");
+            }
+        }
+    })
+}
+
 /// Spawn a plaintext tonic server with ONLY `grpc.health.v1.Health`, on a
 /// dedicated port, sharing the SAME `HealthReporter` state as the caller's
 /// main server.
@@ -288,11 +357,62 @@ pub fn spawn_drain_task<F, Fut>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
     use super::*;
+
+    /// `/healthz` is unconditional; `/readyz` tracks the flag.
+    #[tokio::test]
+    async fn health_router_liveness_and_readiness() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let app = health_router(Arc::clone(&ready));
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "liveness is unconditional");
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        ready.store(true, Ordering::Relaxed);
+        let resp = app
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `spawn_axum` shuts down cleanly when the token fires (no
+    /// dangling listener — the JoinHandle completes).
+    #[tokio::test]
+    async fn spawn_axum_graceful_shutdown() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let shutdown = Token::new();
+        let handle = spawn_axum(
+            "test",
+            addr,
+            health_router(Arc::new(AtomicBool::new(true))),
+            shutdown.clone(),
+        );
+        // Let it bind.
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("server should exit on shutdown within 5s")
+            .expect("server task should not panic");
+    }
 
     /// spawn_drain_task sequencing: parent cancel → set_not_serving
     /// called → sleep(grace) → serve_shutdown cancelled. ORDER is

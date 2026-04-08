@@ -38,6 +38,8 @@ thiserror = { workspace = true }
 tonic = { workspace = true }
 # Health service types for the shared spawn_health_plaintext helper.
 tonic-health = { workspace = true }
+# HTTP /healthz + /readyz router (kubelet probes) + spawn_axum.
+axum = { workspace = true }
 # CryptoProvider install in server::bootstrap — every binary's first
 # line. Previously 5×-duplicated at each main.rs top.
 rustls = { workspace = true }
@@ -64,6 +66,8 @@ workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Router::oneshot for health-router unit test.
+tower = { workspace = true, features = ["util"] }
 # libc::raise for signal self-delivery test.
 libc = "0.2"
 # start_paused + tokio::time::advance in spawn_drain_task test.

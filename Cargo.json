@@ -20528,6 +20528,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
           "name": "base64",
           "packageId": "base64"
         },
@@ -20656,6 +20660,10 @@
         {
           "name": "tokio-stream",
           "packageId": "tokio-stream"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower"
         }
       ],
       "libCrateTypes": [
@@ -30257,14 +30265,6 @@
         {
           "name": "aws-smithy-runtime",
           "packageId": "aws-smithy-runtime"
-        },
-        {
-          "name": "axum",
-          "packageId": "axum"
-        },
-        {
-          "name": "axum-core",
-          "packageId": "axum-core"
         },
         {
           "name": "base64",

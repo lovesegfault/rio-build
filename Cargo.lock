@@ -6458,6 +6458,7 @@ name = "rio-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "ed25519-dalek 2.2.0",
  "figment",
@@ -6483,6 +6484,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -9497,8 +9499,6 @@ dependencies = [
  "aws-sdk-sts",
  "aws-smithy-http-client",
  "aws-smithy-runtime",
- "axum",
- "axum-core",
  "base64",
  "base64ct",
  "bitflags",

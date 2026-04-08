@@ -335,69 +335,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Spawn a trivial /healthz server. Always 200 — reaching the
-/// handler proves the process is alive. No readiness distinction
-/// (controller has no "connected but not ready" state).
-///
-/// Raw TCP listener speaking minimal HTTP — axum is not in
-/// rio-controller's deps and adding it for one /healthz endpoint
-/// is heavy. K8s livenessProbe sends `GET /healthz HTTP/1.1` and
-/// checks for `200` — that's all we need to match.
+/// Spawn a `/healthz` + `/readyz` server. Always 200 on both —
+/// the controller has no "connected but not ready" state (kube-
+/// client connect happens before this is called; reconcilers run
+/// or don't independent of readiness).
 fn spawn_health_server(addr: std::net::SocketAddr, shutdown: rio_common::signal::Token) {
-    rio_common::task::spawn_monitored("health-server", async move {
-        info!(addr = %addr, "starting HTTP health server");
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                warn!(error = %e, addr = %addr, "health bind failed");
-                return;
-            }
-        };
-        loop {
-            let (mut stream, _) = tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => return,
-                r = listener.accept() => match r {
-                    Ok(pair) => pair,
-                    Err(_) => continue, // accept fail is transient; retry
-                },
-            };
-            // Fire-and-forget: don't block accept on one slow client.
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                // Read the request line (or at least enough to not
-                // RST). Writing before reading + dropping the
-                // stream → kernel sends RST (data was in the recv
-                // buffer). K8s probe doesn't care (it got the 200
-                // before RST) but it's sloppy and breaks tests.
-                //
-                // 512 bytes is enough for any reasonable probe
-                // request. We don't inspect it — K8s sends GET
-                // /healthz. If someone else sends POST /foo they
-                // still get 200. Not a real HTTP server.
-                let mut buf = [0u8; 512];
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
-                        .await;
-
-                // Connection: close — no keep-alive. Probe is
-                // one-shot per periodSeconds.
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\n\
-                          Content-Length: 2\r\n\
-                          Connection: close\r\n\
-                          \r\n\
-                          ok",
-                    )
-                    .await;
-                // shutdown flushes and sends FIN. Without it,
-                // dropping the stream might RST if the client
-                // is still sending. Belt-and-suspenders.
-                let _ = stream.shutdown().await;
-            });
-        }
-    });
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    rio_common::server::spawn_axum(
+        "health-server",
+        addr,
+        rio_common::server::health_router(ready),
+        shutdown,
+    );
 }
 
 #[cfg(test)]
@@ -485,38 +434,5 @@ mod tests {
         test_valid_config()
             .validate()
             .expect("valid config should pass");
-    }
-
-    /// Health server speaks enough HTTP to satisfy a K8s probe.
-    /// Actual socket test — proves the bytes are right.
-    #[tokio::test]
-    async fn health_server_responds_200() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        // Ephemeral port.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // release so spawn_health_server can bind
-        spawn_health_server(addr, rio_common::signal::Token::new());
-
-        // Give it a tick to bind.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
-            .unwrap();
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-
-        // Test assertion display, not parse-path.
-        #[allow(clippy::disallowed_methods)]
-        let response = String::from_utf8_lossy(&buf);
-        assert!(
-            response.starts_with("HTTP/1.1 200 OK"),
-            "probe expects 200: {response}"
-        );
-        assert!(response.contains("Connection: close"));
     }
 }

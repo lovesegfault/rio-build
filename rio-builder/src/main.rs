@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     // false until the first heartbeat comes back accepted — that's the
     // right gate: a worker that can't heartbeat is not useful capacity.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    rio_builder::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
+    rio_builder::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready), shutdown.clone());
 
     let Some((store_clients, mut scheduler_client, _balance_guard)) =
         connect_upstreams(&cfg, &shutdown).await

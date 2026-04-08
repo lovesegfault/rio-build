@@ -623,23 +623,12 @@ fn spawn_cache_http(
         chunk_cache,
         allow_unauthenticated,
     });
-    let router = cache_server::router(state);
-    rio_common::task::spawn_monitored("cache-http-server", async move {
-        info!(addr = %http_addr, "starting binary-cache HTTP server");
-        match tokio::net::TcpListener::bind(http_addr).await {
-            Ok(listener) => {
-                if let Err(e) = axum::serve(listener, router)
-                    .with_graceful_shutdown(shutdown.cancelled_owned())
-                    .await
-                {
-                    error!(error = %e, "cache HTTP server failed");
-                }
-            }
-            Err(e) => {
-                error!(error = %e, addr = %http_addr, "cache HTTP bind failed");
-            }
-        }
-    });
+    rio_common::server::spawn_axum(
+        "cache-http-server",
+        http_addr,
+        cache_server::router(state),
+        shutdown,
+    );
 }
 
 #[cfg(test)]
