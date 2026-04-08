@@ -20240,10 +20240,6 @@
           "packageId": "rio-test-support"
         },
         {
-          "name": "sqlx",
-          "packageId": "sqlx"
-        },
-        {
           "name": "tokio",
           "packageId": "tokio"
         },

@@ -13,7 +13,6 @@
 //! MergeDag path validates DAG shape and persists nodes — it never opens
 //! the .drv on disk.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -184,13 +183,9 @@ pub struct BenchHarness {
     /// Connected `SchedulerServiceClient`. Clone per-iteration if
     /// criterion's closure captures by move.
     pub client: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
-    /// Bound address of the in-process gRPC server (ephemeral port).
-    pub addr: SocketAddr,
     /// Handle to the DAG actor. Benches that bypass gRPC and talk to
     /// the actor directly (dispatch throughput) use this.
     pub actor: ActorHandle,
-    /// PG pool. Benches that assert post-merge DB state use this.
-    pub pool: sqlx::PgPool,
     // Held for lifetime — drop order is LIFO so _server_task aborts
     // before _db drops the database.
     _server_task: tokio::task::JoinHandle<()>,
@@ -227,7 +222,7 @@ impl BenchHarness {
         let grpc = SchedulerGrpc::with_log_buffers(
             actor.clone(),
             Arc::new(LogBuffers::new()),
-            pool.clone(),
+            pool,
             Arc::new(AtomicBool::new(true)),
         );
         let router = tonic::transport::Server::builder()
@@ -241,9 +236,7 @@ impl BenchHarness {
 
         Ok(Self {
             client,
-            addr,
             actor,
-            pool,
             _server_task: server_task,
             _db: db,
         })

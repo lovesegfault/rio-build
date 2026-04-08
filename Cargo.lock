@@ -6389,7 +6389,6 @@ dependencies = [
  "rio-proto",
  "rio-scheduler",
  "rio-test-support",
- "sqlx",
  "tokio",
  "tonic",
  "uuid",

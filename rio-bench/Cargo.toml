@@ -14,7 +14,6 @@ rio-scheduler = { workspace = true }
 rio-test-support = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-sqlx = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
