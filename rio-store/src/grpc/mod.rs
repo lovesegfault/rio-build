@@ -401,7 +401,7 @@ impl StoreServiceImpl {
         }
     }
 
-    /// Create a StoreService with an externally-owned `ChunkCache`.
+    /// Attach an externally-owned `ChunkCache`. Builder-style.
     ///
     /// The cache carries its backend inside (accessible via
     /// `ChunkCache::backend()`). StoreServiceImpl extracts it for
@@ -412,22 +412,12 @@ impl StoreServiceImpl {
     /// services. main.rs constructs one `Arc<ChunkCache>`, passes
     /// clones here + to `ChunkServiceImpl::new` + to
     /// `CacheServerState` — a chunk warmed by any service is hot
-    /// for all. Constructing a fresh `ChunkCache` per service (each
-    /// service has its own moka LRU + singleflight map), which
-    /// defeats the cross-service-warm benefit.
-    pub fn with_chunk_cache(pool: PgPool, cache: Arc<ChunkCache>) -> Self {
-        Self {
-            pool,
-            chunk_backend: Some(cache.backend()),
-            chunk_cache: Some(cache),
-            signer: None,
-            hmac_verifier: None,
-            hmac_bypass_cns: vec!["rio-gateway".to_string()],
-            nar_bytes_budget: Arc::new(tokio::sync::Semaphore::new(DEFAULT_NAR_BUDGET)),
-            substituter: None,
-            chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
-            max_batch_paths: DEFAULT_MAX_BATCH_PATHS,
-        }
+    /// for all. Without this call, the service is inline-only (all
+    /// NARs go into `manifests.inline_blob` regardless of size).
+    pub fn with_chunk_cache(mut self, cache: Arc<ChunkCache>) -> Self {
+        self.chunk_backend = Some(cache.backend());
+        self.chunk_cache = Some(cache);
+        self
     }
 
     /// Enable upstream binary-cache substitution. Builder-style.

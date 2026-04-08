@@ -44,7 +44,8 @@ impl ChunkSession {
             Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
 
-        let store_service = StoreServiceImpl::with_chunk_cache(db.pool.clone(), Arc::clone(&cache));
+        let store_service =
+            StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache));
         let chunk_service = ChunkServiceImpl::new(Some(cache));
 
         let router = Server::builder()

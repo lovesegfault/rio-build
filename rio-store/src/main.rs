@@ -283,18 +283,14 @@ async fn main() -> anyhow::Result<()> {
         info!("HMAC assignment token verification enabled on PutPath");
     }
 
-    // StoreServiceImpl: inline-only vs chunked based on cache. The
-    // signer + hmac_verifier chain after either constructor.
-    let store_service = match &chunk_cache {
-        None => StoreServiceImpl::new(pool.clone()),
-        Some(cache) => StoreServiceImpl::with_chunk_cache(pool.clone(), Arc::clone(cache)),
-    };
-    let store_service = match signer {
-        // Wrap the cluster Signer in a TenantSigner — per-tenant key
-        // lookup hits `tenant_keys` on the same PG pool. `pool.clone()`
-        // is cheap (Arc bump). Paths without tenant attribution (mTLS
-        // bypass, dev mode) fall through to the cluster key inside
-        // resolve_once (via maybe_sign); no extra DB roundtrip on the None path.
+    // Tenant-aware signer (with prior-cluster-key history). Computed
+    // before the StoreServiceImpl chain so the side-effecty PG load +
+    // log don't break up the builder calls below. Wrap the cluster
+    // Signer in a TenantSigner — per-tenant key lookup hits
+    // `tenant_keys` on the same PG pool. Paths without tenant
+    // attribution (mTLS bypass, dev mode) fall through to the cluster
+    // key inside resolve_once (via maybe_sign).
+    let tenant_signer = match signer {
         Some(s) => {
             // Prior cluster keys for sig_visibility_gate after rotation.
             // Loaded once at startup — rotation is a human-driven op that
@@ -308,40 +304,40 @@ async fn main() -> anyhow::Result<()> {
                     "loaded prior cluster keys for sig-gate"
                 );
             }
-            store_service.with_signer(TenantSigner::new(s, pool.clone()).with_prior_cluster(prior))
+            Some(TenantSigner::new(s, pool.clone()).with_prior_cluster(prior))
         }
-        None => store_service,
+        None => None,
     };
-    let store_service = match hmac_verifier {
-        Some(v) => store_service.with_hmac_verifier(v),
-        None => store_service,
-    };
-    // HMAC bypass CN allowlist. Always set (default is ["rio-gateway"]);
-    // an empty Vec means NO bypass — every PutPath needs a token.
-    // with_hmac_bypass_cns replaces the constructor default unconditionally
-    // so the config is the single source of truth (unlike nar_buffer_budget
-    // above which only overrides when explicitly set).
-    let store_service = store_service.with_hmac_bypass_cns(cfg.hmac_bypass_cns);
-    // Chunk-upload concurrency bound. Always set (config is the single
-    // source of truth, same pattern as hmac_bypass_cns). Default 32 in
-    // Config::default() → DEFAULT_CHUNK_UPLOAD_CONCURRENCY.
-    let store_service = store_service
+
+    // StoreServiceImpl: one constructor + builder chain. Unconditional
+    // builders chain directly; Option<T> from config applies via
+    // `if let` so each builder keeps its concrete-argument signature
+    // for tests. Config-is-single-source-of-truth fields
+    // (hmac_bypass_cns, chunk_upload_max_concurrent, max_batch_paths)
+    // always replace the constructor default; nar_buffer_budget only
+    // overrides when explicitly set.
+    let mut store_service = StoreServiceImpl::new(pool.clone())
+        .with_hmac_bypass_cns(cfg.hmac_bypass_cns)
         .with_chunk_upload_max_concurrent(cfg.chunk_upload_max_concurrent)
         .with_max_batch_paths(cfg.max_batch_paths);
-    // NAR buffer budget override. None → constructor already set
-    // DEFAULT_NAR_BUDGET (32 GiB); Some → replace the semaphore.
-    // `as usize`: lossless on 64-bit; on 32-bit (not a supported
-    // target) it would truncate, but so would DEFAULT_NAR_BUDGET.
-    let store_service = match cfg.nar_buffer_budget_bytes {
-        Some(budget) => {
-            info!(
-                budget_bytes = budget,
-                "NAR buffer budget overridden from config"
-            );
-            store_service.with_nar_budget(budget as usize)
-        }
-        None => store_service,
-    };
+    if let Some(cache) = &chunk_cache {
+        store_service = store_service.with_chunk_cache(Arc::clone(cache));
+    }
+    if let Some(ts) = tenant_signer {
+        store_service = store_service.with_signer(ts);
+    }
+    if let Some(v) = hmac_verifier {
+        store_service = store_service.with_hmac_verifier(v);
+    }
+    if let Some(budget) = cfg.nar_buffer_budget_bytes {
+        info!(
+            budget_bytes = budget,
+            "NAR buffer budget overridden from config"
+        );
+        // `as usize`: lossless on 64-bit; on 32-bit (not a supported
+        // target) it would truncate, but so would DEFAULT_NAR_BUDGET.
+        store_service = store_service.with_nar_budget(budget as usize);
+    }
 
     // Substituter: upstream binary-cache fetch-on-miss. Shares the same
     // chunk backend as PutPath (NAR chunks go to the same S3 bucket)

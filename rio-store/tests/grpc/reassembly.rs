@@ -132,7 +132,7 @@ async fn test_chunked_manifest_no_cache_preflight_fails() -> TestResult {
         let cache = Arc::new(rio_store::cas::ChunkCache::new(
             backend as Arc<dyn ChunkBackend>,
         ));
-        let service = StoreServiceImpl::with_chunk_cache(db.pool.clone(), cache);
+        let service = StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(cache);
         let (mut cli, server) = spawn_store_server(service).await?;
         let (nar, info, _) = make_large_nar(44, 512 * 1024);
         put_path(&mut cli, info, nar).await?;

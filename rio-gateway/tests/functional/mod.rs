@@ -100,10 +100,10 @@ impl RioStackBuilder {
     /// Spawn the stack. Stream is BARE — caller handshakes.
     pub async fn build(self) -> anyhow::Result<RioStack> {
         let db = TestDb::new(&MIGRATOR).await;
-        let service = match self.chunk_cache {
-            Some(cache) => StoreServiceImpl::with_chunk_cache(db.pool.clone(), cache),
-            None => StoreServiceImpl::new(db.pool.clone()),
-        };
+        let mut service = StoreServiceImpl::new(db.pool.clone());
+        if let Some(cache) = self.chunk_cache {
+            service = service.with_chunk_cache(cache);
+        }
         RioStack::build_inner(db, service).await
     }
 
