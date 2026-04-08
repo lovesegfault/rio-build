@@ -367,8 +367,19 @@ let
         8472 # cilium VXLAN tunnel (chart default routingMode=tunnel)
         51871 # cilium WireGuard
       ];
+      # Pod→Service after socketLB redirect (10.43.0.1→192.168.1.3:6443)
+      # arrives on cilium_host with a pod-CIDR source. Without trust, the
+      # NixOS firewall INPUT chain + checkReversePath drop it. Cilium's
+      # own datapath enforces policy; the host firewall on these
+      # interfaces is redundant.
+      trustedInterfaces = [
+        "cilium_host"
+        "cilium_net"
+        "cilium_wg0"
+        "lxc+"
+      ];
+      checkReversePath = false;
     };
-
     # cilium-agent creates cilium_host/cilium_net/lxc_health and per-pod
     # lxc* veths. dhcpcd default-config tries to DHCP on every new iface
     # → log spam + a few hundred ms of needless probe traffic per pod
@@ -377,18 +388,6 @@ let
       "cilium_*"
       "lxc*"
     ];
-    # Pod→Service after socketLB redirect (10.43.0.1→192.168.1.3:6443)
-    # arrives on cilium_host with a pod-CIDR source. Without trust, the
-    # NixOS firewall INPUT chain + checkReversePath drop it. Cilium's
-    # own datapath enforces policy; the host firewall on these
-    # interfaces is redundant.
-    networking.firewall.trustedInterfaces = [
-      "cilium_host"
-      "cilium_net"
-      "cilium_wg0"
-      "lxc+"
-    ];
-    networking.firewall.checkReversePath = false;
 
     systemd.services.k3s.serviceConfig = {
       # Pick the base_runtime_spec variant matching host /dev/kvm
