@@ -746,7 +746,7 @@ async fn main() -> anyhow::Result<()> {
         "starting gRPC server"
     );
 
-    let mut builder = tonic::transport::Server::builder();
+    let mut builder = rio_common::server::tonic_builder();
     if let Some(tls) = server_tls {
         builder = builder.tls_config(tls)?;
     }

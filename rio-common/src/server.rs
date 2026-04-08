@@ -21,10 +21,30 @@ use tokio_util::sync::CancellationToken;
 use tonic_health::pb::health_server::{Health, HealthServer};
 
 use crate::config::ValidateConfig;
+use crate::grpc::{H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW};
 use crate::observability::OtelGuard;
 use crate::signal::Token;
 use crate::task::spawn_monitored;
 use crate::tls::TlsConfig;
+
+/// `tonic::transport::Server::builder()` with h2 flow-control window
+/// tuning applied. Use this for every component's main gRPC server
+/// instead of bare `Server::builder()`.
+///
+/// h2 windows are per-direction; the server's send rate on a `GetPath`
+/// stream is bounded by the CLIENT-advertised stream window (which
+/// `rio-proto::client::with_h2_throughput` controls), but the server's
+/// own connection window caps aggregate egress across concurrent
+/// streams. The h2 default 64 KiB was the 30 MB/s wall on builder NAR
+/// fetch (I-180). Mirrored client-side in `rio-proto::client`; see
+/// [`H2_INITIAL_STREAM_WINDOW`] for the rationale.
+// r[impl proto.h2.adaptive-window]
+pub fn tonic_builder() -> tonic::transport::Server {
+    tonic::transport::Server::builder()
+        .http2_adaptive_window(Some(true))
+        .initial_stream_window_size(Some(H2_INITIAL_STREAM_WINDOW))
+        .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
+}
 
 /// Accessor trait for the two config fields [`bootstrap`] needs. All 5
 /// binary `Config` structs already have `tls: TlsConfig` and

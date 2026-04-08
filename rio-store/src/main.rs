@@ -4,7 +4,6 @@ use std::sync::Arc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use tonic::transport::Server;
 use tracing::{error, info};
 
 use rio_proto::ChunkServiceServer;
@@ -473,18 +472,7 @@ async fn main() -> anyhow::Result<()> {
         "starting gRPC server"
     );
 
-    // r[impl proto.h2.adaptive-window]
-    // h2 flow-control window tuning, mirrored from the client-side
-    // `rio_proto::client::with_h2_keepalive`. h2 windows are
-    // per-direction; the server's send rate on a `GetPath` stream is
-    // bounded by the CLIENT-advertised stream window (which the client
-    // tuning controls), but the server's own connection window caps
-    // aggregate egress across concurrent streams. The h2 default 64 KiB
-    // was the 30 MB/s wall on builder NAR fetch (I-180).
-    let mut builder = Server::builder()
-        .http2_adaptive_window(Some(true))
-        .initial_stream_window_size(Some(1024 * 1024))
-        .initial_connection_window_size(Some(16 * 1024 * 1024));
+    let mut builder = rio_common::server::tonic_builder();
     if let Some(tls) = server_tls {
         builder = builder.tls_config(tls)?;
     }

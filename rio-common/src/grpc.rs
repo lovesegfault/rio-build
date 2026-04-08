@@ -42,6 +42,19 @@ pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// gives headroom without being unbounded.
 pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Initial h2 per-stream flow-control window (1 MiB). h2's default is
+/// 65 535 bytes — at 2-3 ms cross-AZ RTT that's a ~20-30 MB/s ceiling
+/// (each 256 KiB NAR chunk needs ~4 WINDOW_UPDATE round-trips before
+/// the next can flow). 1 MiB lifts the floor; `http2_adaptive_window`
+/// (BDP probing) auto-tunes upward from there. I-180: this was the
+/// 30 MB/s wall on builder NAR fetch, not S3 prefetch or proto decode.
+pub const H2_INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
+
+/// Initial h2 connection-level window (16 MiB). Shared across all
+/// streams on the connection; sized so a handful of concurrent
+/// GB-scale `GetPath` streams don't head-of-line block each other.
+pub const H2_INITIAL_CONN_WINDOW: u32 = 16 * 1024 * 1024;
+
 /// Default max gRPC message size: 256 MiB.
 ///
 /// Sized for `MAX_DAG_NODES`-scale SubmitBuild requests: hello-deep-1024x at

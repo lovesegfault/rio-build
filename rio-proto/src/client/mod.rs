@@ -16,7 +16,9 @@ pub use retry::{RetryError, connect_with_retry};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rio_common::grpc::{client_tls, max_message_size};
+use rio_common::grpc::{
+    H2_INITIAL_CONN_WINDOW, H2_INITIAL_STREAM_WINDOW, client_tls, max_message_size,
+};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
@@ -53,19 +55,6 @@ pub const NAR_CHUNK_SIZE: usize = 256 * 1024;
 /// (even cross-AZ) and bounds the failure mode.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Initial h2 per-stream flow-control window (1 MiB). h2's default is
-/// 65 535 bytes — at 2-3 ms cross-AZ RTT that's a ~20-30 MB/s ceiling
-/// (each 256 KiB NAR chunk needs ~4 WINDOW_UPDATE round-trips before
-/// the next can flow). 1 MiB lifts the floor; `http2_adaptive_window`
-/// (BDP probing) auto-tunes upward from there. I-180: this was the
-/// 30 MB/s wall on builder NAR fetch, not S3 prefetch or proto decode.
-const H2_INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
-
-/// Initial h2 connection-level window (16 MiB). Shared across all
-/// streams on the connection; sized so a handful of concurrent
-/// GB-scale `GetPath` streams don't head-of-line block each other.
-const H2_INITIAL_CONN_WINDOW: u32 = 16 * 1024 * 1024;
-
 /// Apply h2 keepalive + flow-control window tuning.
 ///
 /// **Keepalive** (30s PING interval, 10s PONG timeout, while-idle):
@@ -81,8 +70,8 @@ const H2_INITIAL_CONN_WINDOW: u32 = 16 * 1024 * 1024;
 /// fires `GoAway` proactively, all streams error, callers reconnect.
 ///
 /// **Flow-control windows** (1 MiB stream / 16 MiB conn / adaptive):
-/// see [`H2_INITIAL_STREAM_WINDOW`]. Mirrored server-side in each
-/// component's `Server::builder()` — h2 windows are per-direction.
+/// see [`H2_INITIAL_STREAM_WINDOW`]. Mirrored server-side via
+/// [`rio_common::server::tonic_builder`] — h2 windows are per-direction.
 ///
 /// Factored out after I-048c: the balanced channel diverged from
 /// `connect_store_lazy` and went 7 minutes dark on scheduler SIGKILL.
