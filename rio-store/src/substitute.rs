@@ -40,8 +40,6 @@ use crate::signing::TenantSigner;
 /// 5 minutes: long enough that a real concurrent substitution (even a
 /// multi-GB NAR over a slow link) finishes first; short enough that an
 /// rsb retry loop doesn't wait for the orphan scanner's 15-minute sweep.
-/// Overridable via [`Substituter::with_stale_threshold`] — main.rs
-/// threads `[substitute] stale_threshold_secs` from store.toml here.
 pub const SUBSTITUTE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
 /// Bound on concurrent narinfo HEAD probes in [`Substituter::check_available`].
@@ -155,10 +153,6 @@ pub struct Substituter {
     /// calls the same `cas::put_chunked` as PutPath. Default
     /// [`cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY`].
     chunk_upload_max_concurrent: usize,
-    /// Age past which an existing `'uploading'` placeholder is treated
-    /// as stale (crashed uploader) rather than live (concurrent
-    /// uploader). Default [`SUBSTITUTE_STALE_THRESHOLD`].
-    stale_threshold: Duration,
     /// Per-upstream `/nix-cache-info` cache, keyed by trimmed base
     /// URL. TTL [`SUBSTITUTE_PROBE_CACHE_TTL`]. moka `get_with`
     /// singleflights concurrent fetches.
@@ -207,7 +201,6 @@ impl Substituter {
                 .time_to_live(std::time::Duration::from_secs(30))
                 .build(),
             chunk_upload_max_concurrent: cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
-            stale_threshold: SUBSTITUTE_STALE_THRESHOLD,
             upstream_info: Cache::builder()
                 .time_to_live(SUBSTITUTE_PROBE_CACHE_TTL)
                 .build(),
@@ -238,13 +231,6 @@ impl Substituter {
     /// here (same value as `StoreServiceImpl`).
     pub fn with_chunk_upload_max_concurrent(mut self, n: usize) -> Self {
         self.chunk_upload_max_concurrent = n;
-        self
-    }
-
-    /// Override the stale-placeholder reclaim threshold. Builder-style.
-    /// main.rs threads `store.toml [substitute] stale_threshold_secs` here.
-    pub fn with_stale_threshold(mut self, d: Duration) -> Self {
-        self.stale_threshold = d;
         self
     }
 
@@ -581,7 +567,7 @@ impl Substituter {
             // refcount hygiene — it reads `manifest_data.chunk_list`
             // and decrements.
             // r[impl store.substitute.stale-reclaim]
-            let threshold_secs = self.stale_threshold.as_secs() as i64;
+            let threshold_secs = SUBSTITUTE_STALE_THRESHOLD.as_secs() as i64;
             let reaped = crate::gc::orphan::reap_one(
                 &self.pool,
                 &store_path_hash,
@@ -593,7 +579,7 @@ impl Substituter {
             if reaped {
                 warn!(
                     store_path = %info.store_path,
-                    threshold = ?self.stale_threshold,
+                    threshold = ?SUBSTITUTE_STALE_THRESHOLD,
                     "stale 'uploading' placeholder — reclaimed"
                 );
                 metrics::counter!("rio_store_substitute_stale_reclaimed_total").increment(1);
