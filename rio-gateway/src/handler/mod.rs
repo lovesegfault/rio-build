@@ -114,14 +114,6 @@ pub enum GatewayError {
         source: rio_nix::store_path::StorePathError,
     },
 
-    /// Invalid hex encoding from wire input.
-    #[error("{context}: invalid hex: {source}")]
-    InvalidHex {
-        context: String,
-        #[source]
-        source: hex::FromHexError,
-    },
-
     /// NAR size exceeds configured limit.
     #[error("{context}: nar_size {got} exceeds maximum {max}")]
     NarTooLarge { context: String, got: u64, max: u64 },
