@@ -31,6 +31,7 @@ Reference catalog of `.#ci` failure signatures that have bitten this project at 
 | **kubectl logs poll churn** | `http2: stream closed` errors under TCG — `kubectl logs\|grep` in wait_until_succeeds triggers kubelet churn | Don't poll logs for readiness — use cgroup/kernel/metric state instead. |
 | **Wall-clock gate under load** | `assert!(elapsed < Ns)` flakes under builder CPU contention | **(a)** retry-N-times; **(b)** widen gate with documented slack budget; **(c)** convert to structural assertion — count ops, not wall-clock. Prefer (c). |
 | **Parallel test order-dependence** | Passes solo, fails under `nextest` parallelism | Shared fs state or global mutable. Add a nextest `[test-groups.<name>]` with `max-threads = 1` in `.config/nextest.toml`, then `[[profile.default.overrides]]` filter (see `golden-daemon`, `postgres` groups). Or actually fix the shared state. |
+| **Envoy LB to standby replica** | `dashboard-gateway` body-grep for `grpc-status:0` finds nothing; HTTP 200 | `scheduler.replicas=2` → envoy load-balances; standby returns `Unavailable` as Trailers-Only (status in HTTP *headers*, empty body). Fixed via `BackendTrafficPolicy` retry-on-unavailable (`dashboard-gateway-policy.yaml`). If seen again, check the policy's `Accepted` status. |
 
 **Strategy preference:** structural > retry > widen. Retry is cheap but hides drift; structural fixes the root.
 
