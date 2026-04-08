@@ -181,6 +181,7 @@ impl StoreServiceImpl {
 
         let expected_hash = info.nar_hash;
         let expected_size = info.nar_size;
+        let start = std::time::Instant::now();
         // r[impl obs.metric.transfer-volume]
         metrics::counter!("rio_store_get_path_bytes_total").increment(expected_size);
         // Clone for the spawned task. Arc-clone is cheap; the cache
@@ -290,6 +291,10 @@ impl StoreServiceImpl {
                             "whole-NAR integrity check failed (SHA-256 or size mismatch)",
                         )))
                         .await;
+                } else {
+                    metrics::counter!("rio_store_get_path_total").increment(1);
+                    metrics::histogram!("rio_store_get_path_duration_seconds")
+                        .record(start.elapsed().as_secs_f64());
                 }
             };
 

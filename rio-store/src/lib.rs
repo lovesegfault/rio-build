@@ -67,6 +67,14 @@ pub fn describe_metrics() {
         "Bytes served via GetPath (nar_size on stream start)"
     );
     describe_counter!(
+        "rio_store_get_path_total",
+        "Total GetPath operations (incremented on successful whole-NAR verify)"
+    );
+    describe_histogram!(
+        "rio_store_get_path_duration_seconds",
+        "GetPath latency (stream_path entry to whole-NAR verify)"
+    );
+    describe_counter!(
         "rio_store_integrity_failures_total",
         "GetPath content integrity check failures (bitrot/corruption)"
     );

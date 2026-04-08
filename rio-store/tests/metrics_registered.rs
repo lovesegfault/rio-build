@@ -21,5 +21,6 @@ rio_test_support::metrics_suite! {
         // Inline NARs ~5-50ms (PG round-trip), chunked S3 ~100ms-10s.
         // [0.005..10.0] fits.
         "rio_store_put_path_duration_seconds",
+        "rio_store_get_path_duration_seconds",
     ],
 }
