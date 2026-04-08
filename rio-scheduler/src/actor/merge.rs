@@ -717,8 +717,7 @@ impl DagActor {
         if let Some(t) = jwt_token
             && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
         {
-            req.metadata_mut()
-                .insert(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, v);
+            req.metadata_mut().insert(rio_proto::TENANT_TOKEN_HEADER, v);
         }
 
         let resp = match tokio::time::timeout(
@@ -841,7 +840,7 @@ impl DagActor {
         let jwt_pair;
         let jwt_meta: &[(&'static str, &str)] = match jwt_token {
             Some(t) => {
-                jwt_pair = [(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, t)];
+                jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
                 &jwt_pair
             }
             None => &[],
@@ -1281,7 +1280,7 @@ impl DagActor {
                 Ok(v) => {
                     fmp_req
                         .metadata_mut()
-                        .insert(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, v);
+                        .insert(rio_proto::TENANT_TOKEN_HEADER, v);
                 }
                 Err(e) => {
                     warn!(error = %e, "jwt_token not ASCII-encodable; \
@@ -1490,7 +1489,7 @@ impl DagActor {
         {
             fmp_req
                 .metadata_mut()
-                .insert(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, v);
+                .insert(rio_proto::TENANT_TOKEN_HEADER, v);
         }
         let grpc_timeout = self.grpc_timeout;
         let resp = match tokio::time::timeout(
@@ -1561,7 +1560,7 @@ impl DagActor {
             let jwt_pair;
             let jwt_meta: &[(&'static str, &str)] = match jwt_token {
                 Some(t) => {
-                    jwt_pair = [(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, t)];
+                    jwt_pair = [(rio_proto::TENANT_TOKEN_HEADER, t)];
                     &jwt_pair
                 }
                 None => &[],

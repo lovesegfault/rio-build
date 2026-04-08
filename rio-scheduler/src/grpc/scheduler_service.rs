@@ -72,7 +72,7 @@ impl SchedulerService for SchedulerGrpc {
         // panic the handler.
         let jwt_token = request
             .metadata()
-            .get(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER)
+            .get(rio_proto::TENANT_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 

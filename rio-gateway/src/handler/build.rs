@@ -507,7 +507,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // than silently drop auth on the floor.
     if let Some(token) = jwt_token {
         request.metadata_mut().insert(
-            rio_common::jwt_interceptor::TENANT_TOKEN_HEADER,
+            rio_proto::TENANT_TOKEN_HEADER,
             tonic::metadata::MetadataValue::try_from(token)?,
         );
     }

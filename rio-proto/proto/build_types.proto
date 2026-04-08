@@ -6,8 +6,7 @@ package rio.types;
 // and the heartbeat protocol.
 //
 // Same `package rio.types;` as types.proto / dag.proto / admin_types.proto
-// — prost merges by package into a single `rio.types.rs`. lib.rs
-// `pub mod build_types { pub use ... }` re-exports the domain-scoped path.
+// — prost merges by package into a single `rio.types.rs`.
 
 import "google/protobuf/timestamp.proto";
 import "dag.proto";   // BuildEvent.derivation → DerivationEvent;

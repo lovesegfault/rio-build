@@ -6,9 +6,7 @@ package rio.types;
 // Same `package rio.types;` as types.proto / build_types.proto /
 // admin_types.proto — prost merges by package into a single
 // `rio.types.rs`, so Rust callers see all types at `rio_proto::types::*`
-// regardless of which .proto file defines them. lib.rs
-// `pub mod dag { pub use ... }` re-exports the domain-scoped path for
-// callers that want it.
+// regardless of which .proto file defines them.
 
 import "types.proto"; // DerivationFailed.status → BuildResultStatus
 

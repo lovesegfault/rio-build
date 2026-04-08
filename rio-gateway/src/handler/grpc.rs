@@ -18,7 +18,7 @@ use tokio::io::AsyncReadExt;
 /// header as pass-through per `r[gw.jwt.dual-mode]`).
 fn jwt_metadata(jwt_token: Option<&str>) -> Vec<(&'static str, &str)> {
     match jwt_token {
-        Some(t) => vec![(rio_common::jwt_interceptor::TENANT_TOKEN_HEADER, t)],
+        Some(t) => vec![(rio_proto::TENANT_TOKEN_HEADER, t)],
         None => vec![],
     }
 }

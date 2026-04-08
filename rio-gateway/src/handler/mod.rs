@@ -71,7 +71,7 @@ pub(crate) fn with_jwt<T>(body: T, jwt_token: Option<&str>) -> anyhow::Result<to
     rio_proto::interceptor::inject_current(req.metadata_mut());
     if let Some(token) = jwt_token {
         req.metadata_mut().insert(
-            rio_common::jwt_interceptor::TENANT_TOKEN_HEADER,
+            rio_proto::TENANT_TOKEN_HEADER,
             tonic::metadata::MetadataValue::try_from(token)?,
         );
     }

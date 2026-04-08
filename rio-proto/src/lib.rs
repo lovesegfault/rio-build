@@ -6,9 +6,11 @@
 //! validation and [`interceptor`] for W3C traceparent propagation.
 
 // `x-rio-*` header constants live in `rio-common::grpc` (proto-agnostic).
-// Re-exported here so existing `rio_proto::BUILD_ID_HEADER` paths keep
-// resolving across the workspace.
-pub use rio_common::grpc::{ASSIGNMENT_TOKEN_HEADER, BUILD_ID_HEADER, TRACE_ID_HEADER};
+// Re-exported here so callers across the workspace reference one path
+// (`rio_proto::BUILD_ID_HEADER`) regardless of which crate defines them.
+pub use rio_common::grpc::{
+    ASSIGNMENT_TOKEN_HEADER, BUILD_ID_HEADER, TENANT_TOKEN_HEADER, TRACE_ID_HEADER,
+};
 
 pub mod client;
 pub mod interceptor;

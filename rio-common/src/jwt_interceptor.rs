@@ -60,9 +60,7 @@ use tonic::{Request, Status};
 use crate::jwt::{self, TenantClaims};
 use crate::signal::Token as CancellationToken;
 
-/// Re-export — canonical home is [`crate::grpc::TENANT_TOKEN_HEADER`]
-/// alongside the other `x-rio-*` header constants.
-pub use crate::grpc::TENANT_TOKEN_HEADER;
+use crate::grpc::TENANT_TOKEN_HEADER;
 
 /// Shared pubkey handle the interceptor reads on every intercepted call.
 ///

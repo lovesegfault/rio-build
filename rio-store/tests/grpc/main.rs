@@ -141,7 +141,7 @@ pub async fn put_path_with_token(
 
     let mut req = tonic::Request::new(ReceiverStream::new(rx));
     req.metadata_mut().insert(
-        "x-rio-assignment-token",
+        rio_proto::ASSIGNMENT_TOKEN_HEADER,
         token.parse().expect("token must be valid header value"),
     );
     let response = client.put_path(req).await?;
