@@ -39,9 +39,45 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+
+/// Typed errors for TLS config loading. Every variant carries the
+/// offending path so an operator can grep-and-fix without guessing
+/// which of the three files is bad. Callers in `anyhow` contexts get
+/// these via `?` (auto `From<TlsError> for anyhow::Error`).
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    /// Some-but-not-all paths set. Partial config is operator mistake,
+    /// not a valid "half-TLS" mode — better to fail startup than to
+    /// silently run encrypted-but-unauthenticated.
+    #[error(
+        "incomplete TLS config: cert_path={cert}, key_path={key}, ca_path={ca} \
+         — all three must be set or all unset"
+    )]
+    Incomplete { cert: bool, key: bool, ca: bool },
+
+    /// `read_to_string` failed. The default `io::Error` doesn't say
+    /// WHICH file, which is infuriating with three paths.
+    #[error("TLS file I/O ({path}): {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// File readable but no `-----BEGIN` marker — empty Secret mount,
+    /// DER-format binary, wrong file pointed at.
+    #[error("TLS file {path} doesn't contain a PEM block (no '-----BEGIN' marker)")]
+    NoPemMarker { path: PathBuf },
+
+    /// File has a `-----BEGIN` header but the body fails PEM parse —
+    /// corrupt base64, truncated before `-----END`, mismatched section
+    /// type. tonic's `Identity`/`Certificate` are byte holders; they
+    /// don't validate until the FIRST handshake, which surfaces a
+    /// path-less rustls error. This catches it at startup.
+    #[error("TLS file {path} has a PEM header but the body is malformed: {detail}")]
+    MalformedPem { path: PathBuf, detail: String },
+}
 
 /// TLS file paths. Nested in each binary's `Config` as `tls: TlsConfig`.
 ///
@@ -79,48 +115,80 @@ impl TlsConfig {
 
 /// Read a PEM file, returning the UTF-8 contents.
 ///
-/// PEM is always ASCII (base64 + header lines) so UTF-8 is safe. We
-/// don't parse the PEM structure — tonic/rustls do that. This just
-/// surfaces I/O errors with the path attached (the default io::Error
-/// doesn't say WHICH file, which is infuriating with three paths).
-fn read_pem(path: &PathBuf) -> anyhow::Result<String> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("TLS file I/O ({})", path.display()))?;
-    // Validate at least one PEM block exists. Catches: empty file,
-    // DER-format binary, wrong-file-pointed-at. tonic/rustls WOULD
-    // fail eventually but their errors don't mention the path —
-    // operator grep-and-squints for which of 3 paths is bad. This
-    // fails fast with the path.
-    anyhow::ensure!(
-        contents.contains("-----BEGIN"),
-        "TLS file {} doesn't contain a PEM block (no '-----BEGIN' marker)",
-        path.display()
-    );
+/// PEM is always ASCII (base64 + header lines) so UTF-8 is safe.
+/// Validates structure in two passes: a cheap `-----BEGIN` substring
+/// check (catches empty/DER/wrong-file) then a full section parse via
+/// [`validate_pem_sections`] (catches valid-header-garbage-body). Both
+/// attach the path; rustls's own handshake-time error doesn't.
+fn read_pem(path: &PathBuf) -> Result<String, TlsError> {
+    let contents = std::fs::read_to_string(path).map_err(|source| TlsError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if !contents.contains("-----BEGIN") {
+        return Err(TlsError::NoPemMarker { path: path.clone() });
+    }
+    validate_pem_sections(&contents).map_err(|detail| TlsError::MalformedPem {
+        path: path.clone(),
+        detail,
+    })?;
     Ok(contents)
 }
 
-/// Partial config is never valid. Better to fail startup than to
-/// silently run half-TLS (client presents a cert, server doesn't
-/// verify — false sense of security).
-fn incomplete(cert: bool, key: bool, ca: bool) -> anyhow::Error {
-    anyhow::anyhow!(
-        "incomplete TLS config: cert_path={cert}, key_path={key}, ca_path={ca} \
-         — all three must be set or all unset"
-    )
+/// Structurally validate every PEM section: each `-----BEGIN <label>-----`
+/// has a matching `-----END <label>-----` and the body between them is
+/// valid base64. tonic's `Identity`/`Certificate` are byte holders that
+/// only fail at HANDSHAKE time with a path-less rustls error; this
+/// catches corrupt/truncated mounts at startup. We don't decode the DER
+/// (rustls does that) — just confirm the PEM envelope is well-formed.
+fn validate_pem_sections(contents: &str) -> Result<(), String> {
+    use base64::Engine as _;
+    let mut lines = contents.lines().peekable();
+    let mut sections = 0usize;
+    while let Some(line) = lines.next() {
+        let Some(label) = line
+            .trim()
+            .strip_prefix("-----BEGIN ")
+            .and_then(|s| s.strip_suffix("-----"))
+        else {
+            continue;
+        };
+        let end = format!("-----END {label}-----");
+        let mut body = String::new();
+        loop {
+            match lines.next() {
+                None => {
+                    return Err(format!(
+                        "section '{label}' truncated before '-----END {label}-----'"
+                    ));
+                }
+                Some(l) if l.trim() == end => break,
+                Some(l) => body.push_str(l.trim()),
+            }
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(&body)
+            .map_err(|e| format!("section '{label}' body is not valid base64: {e}"))?;
+        sections += 1;
+    }
+    if sections == 0 {
+        return Err("no complete PEM section found".into());
+    }
+    Ok(())
 }
 
 /// Build a server-side TLS config.
 ///
 /// Returns `Ok(None)` if TLS is entirely unconfigured (all paths
 /// `None`) — plaintext mode, not an error. Returns `Err` if partially
-/// configured OR if a file can't be read. Returns `Ok(Some(...))` on
-/// full valid config.
+/// configured OR if a file can't be read/parsed. Returns `Ok(Some(...))`
+/// on full valid config.
 ///
 /// The `ServerTlsConfig` has `.client_ca_root(ca)` set, which tells
 /// tonic/rustls to REQUIRE a client cert and verify it against the CA.
 /// Without that call, the server would accept any client (TLS for
 /// encryption only, not authentication) — not the mTLS we want.
-pub fn load_server_tls(cfg: &TlsConfig) -> anyhow::Result<Option<ServerTlsConfig>> {
+pub fn load_server_tls(cfg: &TlsConfig) -> Result<Option<ServerTlsConfig>, TlsError> {
     match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
         (None, None, None) => Ok(None),
         (Some(cert), Some(key), Some(ca)) => {
@@ -130,9 +198,12 @@ pub fn load_server_tls(cfg: &TlsConfig) -> anyhow::Result<Option<ServerTlsConfig
                 ServerTlsConfig::new().identity(identity).client_ca_root(ca),
             ))
         }
-        (c, k, a) => Err(incomplete(c.is_some(), k.is_some(), a.is_some())),
+        (c, k, a) => Err(TlsError::Incomplete {
+            cert: c.is_some(),
+            key: k.is_some(),
+            ca: a.is_some(),
+        }),
     }
-    .context("server TLS config")
 }
 
 /// Build a client-side TLS config.
@@ -145,7 +216,7 @@ pub fn load_server_tls(cfg: &TlsConfig) -> anyhow::Result<Option<ServerTlsConfig
 ///
 /// Like [`load_server_tls`], returns `Ok(None)` for unconfigured,
 /// `Err` for partial, `Ok(Some)` for valid.
-pub fn load_client_tls(cfg: &TlsConfig) -> anyhow::Result<Option<ClientTlsConfig>> {
+pub fn load_client_tls(cfg: &TlsConfig) -> Result<Option<ClientTlsConfig>, TlsError> {
     match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
         (None, None, None) => Ok(None),
         (Some(cert), Some(key), Some(ca)) => {
@@ -155,9 +226,12 @@ pub fn load_client_tls(cfg: &TlsConfig) -> anyhow::Result<Option<ClientTlsConfig
                 ClientTlsConfig::new().identity(identity).ca_certificate(ca),
             ))
         }
-        (c, k, a) => Err(incomplete(c.is_some(), k.is_some(), a.is_some())),
+        (c, k, a) => Err(TlsError::Incomplete {
+            cert: c.is_some(),
+            key: k.is_some(),
+            ca: a.is_some(),
+        }),
     }
-    .context("client TLS config")
 }
 
 #[cfg(test)]
@@ -172,18 +246,18 @@ mod tests {
         f
     }
 
-    // A minimal self-signed cert + key, generated once via rcgen and
-    // frozen here. We don't VERIFY the cert (rustls does that at
-    // handshake time, which we can't easily trigger in a unit test) —
-    // we're testing the LOADING logic: does partial-config fail, does
-    // missing-file fail, does full-config succeed, does empty-config
-    // return None.
-    //
-    // The actual handshake verification is in tests/tls_integration.rs
-    // (with a real tonic server + client).
-    const DUMMY_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
-        MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAdummy\n\
-        -----END CERTIFICATE-----\n";
+    /// Generate a real self-signed cert + key PEM pair. The deep PEM
+    /// parse in `read_pem` rejects fake `-----BEGIN…dummy…-----END`
+    /// fixtures, so unit tests need structurally-valid PEM. rcgen is
+    /// already a dev-dep for the integration suite.
+    fn gen_pems() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["test".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
 
     #[test]
     fn unconfigured_returns_none() {
@@ -198,42 +272,63 @@ mod tests {
         // cert + key but no ca → Err, not None. This catches the
         // "I configured TLS but forgot the CA mount" case with a
         // startup error instead of a handshake failure at runtime.
-        let cert = write_tmp(DUMMY_PEM);
-        let key = write_tmp(DUMMY_PEM);
+        let (cert_pem, key_pem) = gen_pems();
+        let cert = write_tmp(&cert_pem);
+        let key = write_tmp(&key_pem);
         let cfg = TlsConfig {
             cert_path: Some(cert.path().to_path_buf()),
             key_path: Some(key.path().to_path_buf()),
             ca_path: None,
         };
         assert!(cfg.is_configured());
-        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        let err = load_server_tls(&cfg).unwrap_err();
         assert!(
-            err.contains("incomplete TLS config")
-                && err.contains("cert_path=true")
-                && err.contains("ca_path=false"),
-            "got: {err}"
+            matches!(
+                err,
+                TlsError::Incomplete {
+                    cert: true,
+                    key: true,
+                    ca: false
+                }
+            ),
+            "got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("incomplete TLS config")
+                && msg.contains("cert_path=true")
+                && msg.contains("ca_path=false"),
+            "got: {msg}"
         );
         // Same for client.
-        let err = format!("{:#}", load_client_tls(&cfg).unwrap_err());
-        assert!(err.contains("incomplete TLS config"), "got: {err}");
+        assert!(matches!(
+            load_client_tls(&cfg).unwrap_err(),
+            TlsError::Incomplete { .. }
+        ));
     }
 
     #[test]
     fn only_ca_is_also_incomplete() {
         // Just the CA without our own identity → can't do mTLS (we'd
         // have nothing to present). Still partial.
-        let ca = write_tmp(DUMMY_PEM);
+        let (cert_pem, _) = gen_pems();
+        let ca = write_tmp(&cert_pem);
         let cfg = TlsConfig {
             cert_path: None,
             key_path: None,
             ca_path: Some(ca.path().to_path_buf()),
         };
-        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        let err = load_server_tls(&cfg).unwrap_err();
         assert!(
-            err.contains("incomplete TLS config")
-                && err.contains("cert_path=false")
-                && err.contains("ca_path=true"),
-            "got: {err}"
+            matches!(
+                err,
+                TlsError::Incomplete {
+                    cert: false,
+                    key: false,
+                    ca: true
+                }
+            ),
+            "got: {err:?}"
         );
     }
 
@@ -241,27 +336,30 @@ mod tests {
     fn missing_file_is_io_error_with_path() {
         // Full config but a path points nowhere → Err(Io), and the
         // message includes the path so the operator knows WHICH file.
-        let exists = write_tmp(DUMMY_PEM);
+        let (cert_pem, _) = gen_pems();
+        let exists = write_tmp(&cert_pem);
         let cfg = TlsConfig {
             cert_path: Some(exists.path().to_path_buf()),
             key_path: Some("/nonexistent/key.pem".into()),
             ca_path: Some(exists.path().to_path_buf()),
         };
-        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        let err = load_server_tls(&cfg).unwrap_err();
+        assert!(matches!(err, TlsError::Io { .. }), "got: {err:?}");
         assert!(
-            err.contains("/nonexistent/key.pem"),
+            err.to_string().contains("/nonexistent/key.pem"),
             "error must name the bad path, got: {err}"
         );
     }
 
     #[test]
     fn full_config_loads_some() {
-        // All three paths exist and are readable → Ok(Some). We don't
-        // validate the PEM content here (that's rustls's job at
-        // handshake) — just the loading/config-assembly logic.
-        let cert = write_tmp(DUMMY_PEM);
-        let key = write_tmp(DUMMY_PEM);
-        let ca = write_tmp(DUMMY_PEM);
+        // All three paths exist and parse → Ok(Some). Handshake
+        // verification is in tests/tls_integration.rs; this is the
+        // loading/config-assembly logic only.
+        let (cert_pem, key_pem) = gen_pems();
+        let cert = write_tmp(&cert_pem);
+        let key = write_tmp(&key_pem);
+        let ca = write_tmp(&cert_pem);
         let cfg = TlsConfig {
             cert_path: Some(cert.path().to_path_buf()),
             key_path: Some(key.path().to_path_buf()),
@@ -290,8 +388,8 @@ mod tests {
         );
     }
 
-    /// Empty/garbage PEM → Malformed error with path.
-    /// Catches empty mounted Secret, DER-format cert, wrong file.
+    /// Empty file → NoPemMarker with path. Catches empty mounted
+    /// Secret, DER-format cert, wrong file.
     #[test]
     fn empty_pem_is_malformed() {
         let empty = write_tmp("");
@@ -300,29 +398,73 @@ mod tests {
             key_path: Some(empty.path().to_path_buf()),
             ca_path: Some(empty.path().to_path_buf()),
         };
-        let err = format!("{:#}", load_server_tls(&cfg).unwrap_err());
+        let err = load_server_tls(&cfg).unwrap_err();
+        assert!(matches!(err, TlsError::NoPemMarker { .. }), "got: {err:?}");
+        let msg = err.to_string();
         assert!(
-            err.contains("doesn't contain a PEM block")
-                && err.contains(&empty.path().display().to_string()),
-            "got: {err}"
+            msg.contains("doesn't contain a PEM block")
+                && msg.contains(&empty.path().display().to_string()),
+            "got: {msg}"
         );
     }
 
     #[test]
     fn garbage_pem_is_malformed() {
-        // Content without -----BEGIN → Malformed, not left for
+        // Content without -----BEGIN → NoPemMarker, not left for
         // rustls to fail at handshake with a cryptic error.
         let garbage = write_tmp("this is definitely not a PEM file");
-        let valid = write_tmp(DUMMY_PEM);
+        let (cert_pem, _) = gen_pems();
+        let valid = write_tmp(&cert_pem);
         let cfg = TlsConfig {
             cert_path: Some(valid.path().to_path_buf()),
             key_path: Some(garbage.path().to_path_buf()),
             ca_path: Some(valid.path().to_path_buf()),
         };
-        let err = format!("{:#}", load_client_tls(&cfg).unwrap_err());
+        let err = load_client_tls(&cfg).unwrap_err();
+        assert!(matches!(err, TlsError::NoPemMarker { .. }), "got: {err:?}");
+    }
+
+    /// Valid `-----BEGIN` header but garbage body → MalformedPem.
+    /// The substring check passes; only the deep rustls_pemfile parse
+    /// catches this. Without it, the error surfaces at the first
+    /// handshake as a path-less rustls message.
+    #[test]
+    fn corrupt_pem_body_is_malformed() {
+        let corrupt = write_tmp(
+            "-----BEGIN CERTIFICATE-----\n\
+             this is not base64 at all !!!\n\
+             -----END CERTIFICATE-----\n",
+        );
+        let (cert_pem, key_pem) = gen_pems();
+        let valid_cert = write_tmp(&cert_pem);
+        let valid_key = write_tmp(&key_pem);
+        let cfg = TlsConfig {
+            cert_path: Some(valid_cert.path().to_path_buf()),
+            key_path: Some(valid_key.path().to_path_buf()),
+            ca_path: Some(corrupt.path().to_path_buf()),
+        };
+        let err = load_server_tls(&cfg).unwrap_err();
         assert!(
-            err.contains("doesn't contain a PEM block"),
-            "garbage PEM should be Malformed, got: {err}"
+            matches!(err, TlsError::MalformedPem { .. }),
+            "expected MalformedPem, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&corrupt.path().display().to_string()),
+            "error must name the corrupt file, got: {err}"
+        );
+    }
+
+    /// Header present but truncated before `-----END` → MalformedPem
+    /// via the sections==0 fallback (rustls_pemfile yields nothing
+    /// rather than erroring on a missing footer).
+    #[test]
+    fn truncated_pem_is_malformed() {
+        let truncated = write_tmp("-----BEGIN CERTIFICATE-----\nMIIBIjAN\n");
+        let err = read_pem(&truncated.path().to_path_buf()).unwrap_err();
+        assert!(
+            matches!(err, TlsError::MalformedPem { .. }),
+            "expected MalformedPem, got: {err:?}"
         );
     }
 }
