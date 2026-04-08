@@ -17,8 +17,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use rio_proto::build_types::SubmitBuildRequest;
-use rio_proto::dag::{DerivationEdge, DerivationNode};
+use rio_proto::types::SubmitBuildRequest;
+use rio_proto::types::{DerivationEdge, DerivationNode};
 use rio_scheduler::actor::ActorHandle;
 use rio_scheduler::db::SchedulerDb;
 use rio_scheduler::grpc::SchedulerGrpc;

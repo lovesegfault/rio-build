@@ -144,9 +144,9 @@ Fuzz targets for the parsers live in `rio-nix/fuzz/` (separate workspace, own `C
 ```
 proto/
 ├── types.proto        # Shared: PathInfo, Heartbeat, common enums
-├── dag.proto          # DerivationNode, DerivationEdge, DerivationEvent (P0376 domain split)
-├── build_types.proto  # BuildEvent, BuildResult, BuildProgress (P0376 domain split)
-├── admin_types.proto  # Admin-specific request/response types (P0376 domain split)
+├── dag.proto          # DerivationNode, DerivationEdge, DerivationEvent (package rio.types)
+├── build_types.proto  # BuildEvent, BuildResult, BuildProgress (package rio.types)
+├── admin_types.proto  # Admin-specific request/response types (package rio.types)
 ├── store.proto        # StoreService + ChunkService
 ├── scheduler.proto    # SchedulerService
 ├── builder.proto       # BuilderService

@@ -38,7 +38,7 @@ async fn test_keepgoing_false_fails_fast() -> TestResult {
         &handle,
         worker_a,
         &test_drv_path("hashA"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
     .await?;
@@ -88,7 +88,7 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
         &handle,
         worker_x,
         &test_drv_path("hashX"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "failed",
     )
     .await?;
@@ -159,7 +159,7 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
         &handle,
         "cascade-worker",
         &test_drv_path("cascadeC"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
     .await?;
@@ -216,7 +216,7 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
         &handle,
         "poison-worker",
         &test_drv_path("preleaf"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "preleaf failed",
     )
     .await?;
@@ -292,7 +292,7 @@ async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
         &handle,
         "resub-poison-w",
         &test_drv_path("resub-poison"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent",
     )
     .await?;

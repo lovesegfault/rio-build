@@ -87,7 +87,7 @@ async fn get_build_graph_basic_shape() -> anyhow::Result<()> {
     edge(pool, a, c).await?;
 
     let resp = svc
-        .get_build_graph(Request::new(rio_proto::dag::GetBuildGraphRequest {
+        .get_build_graph(Request::new(rio_proto::types::GetBuildGraphRequest {
             build_id: build.to_string(),
         }))
         .await?
@@ -164,7 +164,7 @@ async fn get_build_graph_subgraph_scoping() -> anyhow::Result<()> {
 
     // Build1: sees {a, shared}, edge a→shared. NOT edge a→b (b ∉ build1).
     let r1 = svc
-        .get_build_graph(Request::new(rio_proto::dag::GetBuildGraphRequest {
+        .get_build_graph(Request::new(rio_proto::types::GetBuildGraphRequest {
             build_id: build1.to_string(),
         }))
         .await?
@@ -182,7 +182,7 @@ async fn get_build_graph_subgraph_scoping() -> anyhow::Result<()> {
 
     // Build2: sees {b, shared}, edge b→shared. NOT edge a→b (a ∉ build2).
     let r2 = svc
-        .get_build_graph(Request::new(rio_proto::dag::GetBuildGraphRequest {
+        .get_build_graph(Request::new(rio_proto::types::GetBuildGraphRequest {
             build_id: build2.to_string(),
         }))
         .await?
@@ -312,7 +312,7 @@ async fn get_build_graph_truncated_no_dangling_edges() -> anyhow::Result<()> {
 async fn get_build_graph_bad_uuid() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc_default().await;
     let err = svc
-        .get_build_graph(Request::new(rio_proto::dag::GetBuildGraphRequest {
+        .get_build_graph(Request::new(rio_proto::types::GetBuildGraphRequest {
             build_id: "not-a-uuid".into(),
         }))
         .await
@@ -328,7 +328,7 @@ async fn get_build_graph_unknown_build_empty() -> anyhow::Result<()> {
     // "build doesn't exist or has no derivations" — same rendering.
     let (svc, _actor, _task, _db) = setup_svc_default().await;
     let resp = svc
-        .get_build_graph(Request::new(rio_proto::dag::GetBuildGraphRequest {
+        .get_build_graph(Request::new(rio_proto::types::GetBuildGraphRequest {
             build_id: uuid::Uuid::new_v4().to_string(),
         }))
         .await?

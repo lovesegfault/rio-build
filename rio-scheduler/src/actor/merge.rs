@@ -127,7 +127,7 @@ impl DagActor {
         self.builds.insert(build_id, build_info);
 
         // Index proto nodes by hash for efficient lookup during cache-check + transitions.
-        let node_index: HashMap<&str, &rio_proto::dag::DerivationNode> =
+        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         // I-099/I-094: existing nodes (inserted by an earlier build, not
@@ -325,14 +325,16 @@ impl DagActor {
 
             self.emit_build_event(
                 build_id,
-                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
-                    derivation_path: node.drv_path.clone(),
-                    status: Some(rio_proto::dag::derivation_event::Status::Cached(
-                        rio_proto::dag::DerivationCached {
-                            output_paths: output_paths.clone(),
-                        },
-                    )),
-                }),
+                rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent {
+                        derivation_path: node.drv_path.clone(),
+                        status: Some(rio_proto::types::derivation_event::Status::Cached(
+                            rio_proto::types::DerivationCached {
+                                output_paths: output_paths.clone(),
+                            },
+                        )),
+                    },
+                ),
             );
             // r[impl sched.gc.path-tenants-upsert]
             // Cache hit during merge: path already in store, new
@@ -658,7 +660,7 @@ impl DagActor {
     /// availability gate like `check_cached_outputs`.
     async fn verify_preexisting_completed(
         &mut self,
-        nodes: &[rio_proto::dag::DerivationNode],
+        nodes: &[rio_proto::types::DerivationNode],
         newly_inserted: &HashSet<DrvHash>,
         cached_hits: &HashMap<DrvHash, Vec<String>>,
         jwt_token: Option<&str>,
@@ -888,8 +890,8 @@ impl DagActor {
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
-        nodes: &[rio_proto::dag::DerivationNode],
-        edges: &[rio_proto::dag::DerivationEdge],
+        nodes: &[rio_proto::types::DerivationNode],
+        edges: &[rio_proto::types::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
@@ -1103,7 +1105,7 @@ impl DagActor {
     async fn check_cached_outputs(
         &mut self,
         probe_set: &HashSet<DrvHash>,
-        node_index: &HashMap<&str, &rio_proto::dag::DerivationNode>,
+        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
         jwt_token: Option<&str>,
     ) -> Result<HashMap<DrvHash, Vec<String>>, ActorError> {
         let mut hits: HashMap<DrvHash, Vec<String>> = HashMap::new();
@@ -1425,10 +1427,10 @@ impl DagActor {
     /// authoritative gate is at step 4.
     async fn check_roots_topdown(
         &mut self,
-        nodes: &[rio_proto::dag::DerivationNode],
-        edges: &[rio_proto::dag::DerivationEdge],
+        nodes: &[rio_proto::types::DerivationNode],
+        edges: &[rio_proto::types::DerivationEdge],
         jwt_token: Option<&str>,
-    ) -> Option<Vec<rio_proto::dag::DerivationNode>> {
+    ) -> Option<Vec<rio_proto::types::DerivationNode>> {
         let store_client = self.store_client.as_ref()?;
 
         // Skip if there's nothing to prune. Single-node and roots-only
@@ -1444,7 +1446,7 @@ impl DagActor {
         // A root is a node that appears as no edge's child. Edges key
         // by drv_path (proto-level), so collect child paths and filter.
         let children: HashSet<&str> = edges.iter().map(|e| e.child_drv_path.as_str()).collect();
-        let roots: Vec<&rio_proto::dag::DerivationNode> = nodes
+        let roots: Vec<&rio_proto::types::DerivationNode> = nodes
             .iter()
             .filter(|n| !children.contains(n.drv_path.as_str()))
             .collect();

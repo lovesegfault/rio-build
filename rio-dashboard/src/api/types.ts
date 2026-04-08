@@ -3,10 +3,11 @@
 // CLIENT; this exports the TYPES). Consumers import from '../api/types'
 // instead of reaching into '../gen/*_pb' at file-depth-specific paths.
 //
-// RATIONALE: P0376 split types.proto into 4 domain protos; each split
-// is a sed across N `../gen/*_pb` consumers. Centralizing here means
-// the next split touches ONE file. Gen paths are buf.gen.yaml output —
-// brittle to codegen config changes, stable when fronted by a barrel.
+// RATIONALE: data types are spread across 4 `.proto` files; each
+// rearrangement is a sed across N `../gen/*_pb` consumers. Centralizing
+// here means a proto-file move touches ONE file. Gen paths are
+// buf.gen.yaml output — brittle to codegen config changes, stable when
+// fronted by a barrel.
 //
 // Enumeration (not `export *`): documents what's ACTUALLY CONSUMED by
 // the dashboard. Extend when a new consumer appears. `export type` is

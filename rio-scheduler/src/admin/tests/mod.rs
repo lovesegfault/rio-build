@@ -621,7 +621,7 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
         &actor,
         "poison-w",
         &test_drv_path("poison-me"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "test permanent failure",
     )
     .await?;
@@ -710,7 +710,7 @@ async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyho
         &actor,
         "pg-blip-w",
         &test_drv_path("pg-blip"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "test",
     )
     .await?;

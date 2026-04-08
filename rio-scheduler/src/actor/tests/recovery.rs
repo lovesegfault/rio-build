@@ -271,7 +271,7 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
         &handle,
         "w-x4",
         "x4-drv",
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "simulated transient",
     )
     .await?;
@@ -1066,7 +1066,7 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
             &handle,
             "poison-rec-w",
             &test_drv_path("poison-rec"),
-            rio_proto::build_types::BuildResultStatus::PermanentFailure,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
             "permanent",
         )
         .await?;
@@ -1142,7 +1142,7 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
             &handle,
             "exp-poison-w",
             &test_drv_path("exp-poison"),
-            rio_proto::build_types::BuildResultStatus::PermanentFailure,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
             "permanent",
         )
         .await?;
@@ -1223,7 +1223,7 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
             &handle,
             "zombie-w",
             &test_drv_path("zombie-drv"),
-            rio_proto::build_types::BuildResultStatus::PermanentFailure,
+            rio_proto::types::BuildResultStatus::PermanentFailure,
             "permanent",
         )
         .await?;

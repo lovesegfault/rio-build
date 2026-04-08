@@ -36,8 +36,8 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "fault-worker".into(),
             drv_key: test_drv_path("fault-hash"),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 start_time: Some(prost_types::Timestamp {
                     seconds: 100,
                     nanos: 0,
@@ -92,7 +92,7 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
         &handle,
         "tfault-worker",
         &test_drv_path("tfault-hash"),
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "flaky network",
     )
     .await?;

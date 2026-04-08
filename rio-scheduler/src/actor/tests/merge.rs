@@ -403,7 +403,7 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
     let cached_paths = loop {
         let e = ev.recv().await?;
         if let Some(rio_proto::types::build_event::Event::Derivation(d)) = e.event
-            && let Some(rio_proto::dag::derivation_event::Status::Cached(c)) = d.status
+            && let Some(rio_proto::types::derivation_event::Status::Cached(c)) = d.status
         {
             break c.output_paths;
         }
@@ -1414,7 +1414,7 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
         &handle,
         "rp-worker",
         &test_drv_path("reprobe-poison"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent",
     )
     .await?;
@@ -1622,7 +1622,7 @@ async fn test_handle_merge_dag_large_perf_bound() -> TestResult {
     // that one is module-private).
     let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
     let nodes: Vec<_> = (0..N)
-        .map(|i| rio_proto::dag::DerivationNode {
+        .map(|i| rio_proto::types::DerivationNode {
             drv_hash: format!("h{i:08}"),
             drv_path: path(i),
             ..make_test_node("x", "x86_64-linux")
@@ -1631,7 +1631,7 @@ async fn test_handle_merge_dag_large_perf_bound() -> TestResult {
     let mut edges = Vec::with_capacity(N * FANOUT);
     for i in FANOUT..N {
         for j in 1..=FANOUT {
-            edges.push(rio_proto::dag::DerivationEdge {
+            edges.push(rio_proto::types::DerivationEdge {
                 parent_drv_path: path(i),
                 child_drv_path: path(i - j),
             });
@@ -1710,7 +1710,7 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
 
     let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
     let nodes: Vec<_> = (0..N)
-        .map(|i| rio_proto::dag::DerivationNode {
+        .map(|i| rio_proto::types::DerivationNode {
             drv_hash: format!("h{i:08}"),
             drv_path: path(i),
             ..make_test_node("x", "x86_64-linux")
@@ -1719,7 +1719,7 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
     let mut edges = Vec::with_capacity(N * FANOUT);
     for i in FANOUT..N {
         for j in 1..=FANOUT {
-            edges.push(rio_proto::dag::DerivationEdge {
+            edges.push(rio_proto::types::DerivationEdge {
                 parent_drv_path: path(i),
                 child_drv_path: path(i - j),
             });
@@ -1846,14 +1846,14 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
     // leaves are all Ready post-merge, so W workers each get one.
     let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
     let nodes: Vec<_> = (0..N)
-        .map(|i| rio_proto::dag::DerivationNode {
+        .map(|i| rio_proto::types::DerivationNode {
             drv_hash: format!("h{i:08}"),
             drv_path: path(i),
             ..make_test_node("x", "x86_64-linux")
         })
         .collect();
     let edges: Vec<_> = (W..N)
-        .map(|i| rio_proto::dag::DerivationEdge {
+        .map(|i| rio_proto::types::DerivationEdge {
             parent_drv_path: path(i),
             child_drv_path: path(i - W),
         })

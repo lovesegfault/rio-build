@@ -502,8 +502,8 @@ pub(crate) async fn merge_single_node(
 pub(crate) async fn merge_dag(
     handle: &ActorHandle,
     build_id: Uuid,
-    nodes: Vec<rio_proto::dag::DerivationNode>,
-    edges: Vec<rio_proto::dag::DerivationEdge>,
+    nodes: Vec<rio_proto::types::DerivationNode>,
+    edges: Vec<rio_proto::types::DerivationEdge>,
     keep_going: bool,
 ) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -599,8 +599,8 @@ pub(crate) async fn complete_success(
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: executor_id.into(),
             drv_key: drv_key.into(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
                     output_path: output_path.into(),
@@ -642,8 +642,8 @@ pub(crate) async fn complete_ca(
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: executor_id.into(),
             drv_key: drv_key.into(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: outputs
                     .iter()
                     .map(|(name, path, hash)| rio_proto::types::BuiltOutput {
@@ -673,8 +673,8 @@ pub(crate) async fn complete_success_empty(
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: executor_id.into(),
             drv_key: drv_key.into(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
             },
             peak_memory_bytes: 0,
@@ -690,14 +690,14 @@ pub(crate) async fn complete_failure(
     handle: &ActorHandle,
     executor_id: &str,
     drv_key: &str,
-    status: rio_proto::build_types::BuildResultStatus,
+    status: rio_proto::types::BuildResultStatus,
     error_msg: &str,
 ) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: executor_id.into(),
             drv_key: drv_key.into(),
-            result: rio_proto::build_types::BuildResult {
+            result: rio_proto::types::BuildResult {
                 status: status.into(),
                 error_msg: error_msg.into(),
                 ..Default::default()

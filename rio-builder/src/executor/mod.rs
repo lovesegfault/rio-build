@@ -2015,7 +2015,7 @@ mod tests {
     #[test]
     fn test_nix_failure_to_proto_is_exhaustive_and_stable() {
         use rio_nix::protocol::build::BuildStatus as Nix;
-        use rio_proto::build_types::BuildResultStatus as Proto;
+        use rio_proto::types::BuildResultStatus as Proto;
 
         // 1:1 mappings — each Nix failure gets its OWN proto variant.
         let one_to_one = [
@@ -2249,7 +2249,7 @@ mod tests {
     #[test]
     fn test_timed_out_is_not_reassignable() {
         use rio_nix::protocol::build::BuildStatus as Nix;
-        use rio_proto::build_types::BuildResultStatus as Proto;
+        use rio_proto::types::BuildResultStatus as Proto;
 
         let mapped = nix_failure_to_proto(Nix::TimedOut);
         // completion.rs:151-152: these two trigger handle_transient_failure

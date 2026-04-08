@@ -190,7 +190,7 @@ async fn test_starvation_intersects_live() -> TestResult {
         &handle,
         "starv-a",
         &test_drv_path("starv-drv"),
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "transient",
     )
     .await?;
@@ -209,7 +209,7 @@ async fn test_starvation_intersects_live() -> TestResult {
         &handle,
         "starv-b",
         &test_drv_path("starv-drv"),
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "transient",
     )
     .await?;
@@ -302,7 +302,7 @@ async fn test_cascade_notifies_merged_builds() -> TestResult {
         &handle,
         "casc-w",
         &test_drv_path("casc-leaf"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "perm",
     )
     .await?;
@@ -365,7 +365,7 @@ async fn test_cascade_notifies_union_across_chain() -> TestResult {
         &handle,
         "chain-w",
         &test_drv_path("chain-c"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "perm",
     )
     .await?;
@@ -491,7 +491,7 @@ async fn test_keep_going_false_cancels_remaining() -> TestResult {
         &handle,
         w_a,
         &test_drv_path("kg-a"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "perm",
     )
     .await?;
@@ -712,7 +712,7 @@ async fn test_poison_ttl_expiry_keep_going_completes() -> TestResult {
         &handle,
         w_d1,
         &test_drv_path("ttl-d1"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "bad",
     )
     .await?;
@@ -787,7 +787,7 @@ async fn test_admin_clear_poison_keep_going_completes() -> TestResult {
         &handle,
         w_d1,
         &test_drv_path("clr-d1"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "bad",
     )
     .await?;

@@ -27,7 +27,7 @@ impl SchedulerService for SchedulerGrpc {
     #[instrument(skip(self, request), fields(rpc = "SubmitBuild", build_id = tracing::field::Empty, tenant_id = tracing::field::Empty))]
     async fn submit_build(
         &self,
-        request: Request<rio_proto::build_types::SubmitBuildRequest>,
+        request: Request<rio_proto::types::SubmitBuildRequest>,
     ) -> Result<Response<Self::SubmitBuildStream>, Status> {
         // Link to the gateway's trace BEFORE doing anything else. The
         // #[instrument] span is already entered by the time we're here;

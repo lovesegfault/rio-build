@@ -294,7 +294,7 @@ message WatchBuildRequest {
 | `build_types.proto` | Build lifecycle: `BuildEvent*`, `SubmitBuildRequest`, `BuildResult`, `BuildStatus`, `ExecutorMessage`/`SchedulerMessage` bidi-stream types, `BuildPhase`, `Heartbeat*` |
 | `admin_types.proto` | Admin RPC data types: `ClusterStatusResponse`, `ListExecutors*`/`Builds*`/`Tenants*`, `SizeClassStatus`, `DrainExecutor*`, `ClearPoison*` |
 
-> **Domain split (P0376):** `types.proto` was a 1034-line / 34-plan-collision monolith. The split puts each domain's churn in its own file so plan-level collision detection tracks semantic overlap instead of the union. **All four data-type files share `package rio.types;`** — prost merges them into one `rio.types.rs`, so Rust callers see everything at `rio_proto::types::*` regardless of source file. `rio_proto::dag::*` / `rio_proto::build_types::*` are re-export modules in `lib.rs` that offer domain-scoped paths for callers that want them; both paths resolve to the same struct.
+> **File layout vs. Rust module:** the four data-type `.proto` files all declare `package rio.types;`, so prost merges them into a single generated `rio.types.rs`. Rust callers see everything at `rio_proto::types::*` regardless of which source file a message lives in. The file split is for proto-file review locality only; there is no corresponding Rust namespace split.
 
 Executor-facing RPCs are in a separate `ExecutorService` (in `builder.proto`) to allow distinct interceptors (auth, rate-limiting), independent evolution, and potential future separation to a dedicated port. Both `SchedulerService` and `ExecutorService` are served by the same scheduler binary.
 

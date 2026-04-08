@@ -716,8 +716,8 @@ async fn recv_assignment_skip_prefetch(
 /// picks it up). The placeholder is what `resolve_ca_inputs` will
 /// replace with `realized_path` once the child's realisation is in PG.
 fn ca_on_ca_fixture() -> (
-    rio_proto::dag::DerivationNode,
-    rio_proto::dag::DerivationNode,
+    rio_proto::types::DerivationNode,
+    rio_proto::types::DerivationNode,
     String,
     String,
     [u8; 32],
@@ -1311,7 +1311,7 @@ async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
         &handle,
         first_exec,
         "oom-fod",
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "simulated OOM",
     )
     .await?;
@@ -1480,7 +1480,7 @@ async fn builder_size_class_floor_skips_smaller() -> TestResult {
         &handle,
         first_exec,
         "glibc-177",
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "simulated OOM",
     )
     .await?;

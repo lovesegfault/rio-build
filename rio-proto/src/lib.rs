@@ -26,31 +26,6 @@ pub mod types {
     tonic::include_proto!("rio.types");
 }
 
-/// Re-export of DAG-domain types from [`types`]. Sourced from
-/// `proto/dag.proto`. Callers MAY use either `rio_proto::types::DerivationNode`
-/// or `rio_proto::dag::DerivationNode` — both resolve to the same struct.
-pub mod dag {
-    pub use crate::types::{
-        DerivationCached, DerivationCompleted, DerivationEdge, DerivationEvent, DerivationFailed,
-        DerivationNode, DerivationQueued, DerivationStarted, GetBuildGraphRequest,
-        GetBuildGraphResponse, GraphEdge, GraphNode, derivation_event,
-    };
-}
-
-/// Re-export of build-lifecycle-domain types from [`types`]. Sourced
-/// from `proto/build_types.proto`. Same dual-path semantics as [`dag`].
-pub mod build_types {
-    pub use crate::types::{
-        BuildCancelled, BuildCompleted, BuildEvent, BuildFailed, BuildInputsResolved,
-        BuildLogBatch, BuildOptions, BuildProgress, BuildResult, BuildResultStatus, BuildStarted,
-        BuildState, BuildStatus, BuiltOutput, CancelBuildRequest, CancelBuildResponse,
-        CancelSignal, CompletionReport, ExecutorKind, ExecutorMessage, ExecutorRegister,
-        HeartbeatRequest, HeartbeatResponse, PrefetchComplete, PrefetchHint, ProgressUpdate,
-        QueryBuildRequest, SchedulerMessage, SubmitBuildRequest, WatchBuildRequest, WorkAssignment,
-        WorkAssignmentAck, build_event, executor_message, scheduler_message,
-    };
-}
-
 /// Scheduler service: gateway-facing RPCs (SubmitBuild, WatchBuild, etc.).
 pub mod scheduler {
     tonic::include_proto!("rio.scheduler");

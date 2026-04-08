@@ -75,7 +75,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
         .expect("heartbeat should succeed");
 
     // Submit a build via SchedulerService.
-    let submit_req = rio_proto::build_types::SubmitBuildRequest {
+    let submit_req = rio_proto::types::SubmitBuildRequest {
         tenant_name: String::new(),
         priority_class: "scheduled".into(),
         nodes: vec![make_test_node("e2e-hash", "x86_64-linux")],
@@ -109,8 +109,8 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             msg: Some(rio_proto::types::executor_message::Msg::Completion(
                 rio_proto::types::CompletionReport {
                     drv_path: work.drv_path.clone(),
-                    result: Some(rio_proto::build_types::BuildResult {
-                        status: rio_proto::build_types::BuildResultStatus::Built.into(),
+                    result: Some(rio_proto::types::BuildResult {
+                        status: rio_proto::types::BuildResultStatus::Built.into(),
                         error_msg: String::new(),
                         times_built: 1,
                         start_time: None,
@@ -219,7 +219,7 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
 
     // Submit a build → worker gets WorkAssignment.
     let mut event_stream = sched_client
-        .submit_build(rio_proto::build_types::SubmitBuildRequest {
+        .submit_build(rio_proto::types::SubmitBuildRequest {
             priority_class: "scheduled".into(),
             nodes: vec![make_test_node("log-pipeline-drv", "x86_64-linux")],
             ..Default::default()

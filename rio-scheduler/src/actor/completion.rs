@@ -503,7 +503,7 @@ impl DagActor {
         executor_id: &ExecutorId,
         // gRPC layer passes CompletionReport.drv_path; may be a drv_hash in tests.
         drv_key: &str,
-        result: rio_proto::build_types::BuildResult,
+        result: rio_proto::types::BuildResult,
         // CompletionReport resource fields. 0 = worker had no signal
         // (build failed before cgroup populated). Converted to None
         // before the DB write so the EMA isn't dragged toward zero.
@@ -513,13 +513,13 @@ impl DagActor {
         // zero-means-no-signal semantics; unpacked immediately.
         (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
     ) {
-        let status = rio_proto::build_types::BuildResultStatus::try_from(result.status)
-            .unwrap_or_else(|_| {
+        let status =
+            rio_proto::types::BuildResultStatus::try_from(result.status).unwrap_or_else(|_| {
                 tracing::warn!(
                     raw_status = result.status,
                     "unknown BuildResultStatus from worker, treating as Unspecified"
                 );
-                rio_proto::build_types::BuildResultStatus::Unspecified
+                rio_proto::types::BuildResultStatus::Unspecified
             });
 
         // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
@@ -646,9 +646,9 @@ impl DagActor {
         }
 
         match status {
-            rio_proto::build_types::BuildResultStatus::Built
-            | rio_proto::build_types::BuildResultStatus::Substituted
-            | rio_proto::build_types::BuildResultStatus::AlreadyValid => {
+            rio_proto::types::BuildResultStatus::Built
+            | rio_proto::types::BuildResultStatus::Substituted
+            | rio_proto::types::BuildResultStatus::AlreadyValid => {
                 self.handle_success_completion(
                     drv_hash,
                     &result,
@@ -657,30 +657,30 @@ impl DagActor {
                 )
                 .await;
             }
-            rio_proto::build_types::BuildResultStatus::TransientFailure => {
+            rio_proto::types::BuildResultStatus::TransientFailure => {
                 // Build ran, exited non-zero. Counts toward poison — 3
                 // workers all seeing this means it's not actually transient.
                 self.handle_transient_failure(drv_hash, executor_id).await;
             }
             // r[impl sched.retry.per-worker-budget]
-            rio_proto::build_types::BuildResultStatus::InfrastructureFailure => {
+            rio_proto::types::BuildResultStatus::InfrastructureFailure => {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry
                 // WITHOUT inserting into failed_builders.
                 self.handle_infrastructure_failure(drv_hash, executor_id, &result.error_msg)
                     .await;
             }
-            rio_proto::build_types::BuildResultStatus::PermanentFailure
-            | rio_proto::build_types::BuildResultStatus::CachedFailure
-            | rio_proto::build_types::BuildResultStatus::DependencyFailed
-            | rio_proto::build_types::BuildResultStatus::LogLimitExceeded
-            | rio_proto::build_types::BuildResultStatus::OutputRejected
+            rio_proto::types::BuildResultStatus::PermanentFailure
+            | rio_proto::types::BuildResultStatus::CachedFailure
+            | rio_proto::types::BuildResultStatus::DependencyFailed
+            | rio_proto::types::BuildResultStatus::LogLimitExceeded
+            | rio_proto::types::BuildResultStatus::OutputRejected
             // NotDeterministic: nix --check failed. Retrying doesn't
             // help — the nondeterminism is in the build itself.
-            | rio_proto::build_types::BuildResultStatus::NotDeterministic
+            | rio_proto::types::BuildResultStatus::NotDeterministic
             // InputRejected: corrupt/invalid .drv. Same .drv on another
             // worker is still corrupt.
-            | rio_proto::build_types::BuildResultStatus::InputRejected => {
+            | rio_proto::types::BuildResultStatus::InputRejected => {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, executor_id)
                     .await;
             }
@@ -690,14 +690,14 @@ impl DagActor {
             // retriable-on-resubmit) — same inputs on the LARGEST class
             // → same timeout, so further auto-retry is a storm.
             // Poisoned's 24h TTL is way too aggressive for a timeout.
-            rio_proto::build_types::BuildResultStatus::TimedOut => {
+            rio_proto::types::BuildResultStatus::TimedOut => {
                 self.handle_timeout_failure(drv_hash, &result.error_msg, executor_id)
                     .await;
             }
-            rio_proto::build_types::BuildResultStatus::Cancelled => {
+            rio_proto::types::BuildResultStatus::Cancelled => {
                 // Unreachable: handled by the Cancelled early-return above.
             }
-            rio_proto::build_types::BuildResultStatus::Unspecified => {
+            rio_proto::types::BuildResultStatus::Unspecified => {
                 warn!(
                     drv_hash = %drv_hash,
                     status = result.status,
@@ -722,7 +722,7 @@ impl DagActor {
     pub(super) async fn handle_success_completion(
         &mut self,
         drv_hash: &DrvHash,
-        result: &rio_proto::build_types::BuildResult,
+        result: &rio_proto::types::BuildResult,
         executor_id: &ExecutorId,
         // Same tuple pattern as handle_completion — clippy 7-arg limit.
         (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
@@ -793,14 +793,16 @@ impl DagActor {
         for build_id in &interested_builds {
             self.emit_build_event(
                 *build_id,
-                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
-                    derivation_path: self.drv_path_or_hash_fallback(drv_hash),
-                    status: Some(rio_proto::dag::derivation_event::Status::Completed(
-                        rio_proto::dag::DerivationCompleted {
-                            output_paths: output_paths.clone(),
-                        },
-                    )),
-                }),
+                rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent {
+                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                        status: Some(rio_proto::types::derivation_event::Status::Completed(
+                            rio_proto::types::DerivationCompleted {
+                                output_paths: output_paths.clone(),
+                            },
+                        )),
+                    },
+                ),
             );
         }
 
@@ -858,7 +860,7 @@ impl DagActor {
     async fn complete_ca_bookkeeping(
         &mut self,
         drv_hash: &DrvHash,
-        built_outputs: &[rio_proto::build_types::BuiltOutput],
+        built_outputs: &[rio_proto::types::BuiltOutput],
     ) -> HashSet<Uuid> {
         // r[impl sched.ca.resolve+2]
         // Realisation insert: for a CA derivation, write
@@ -1233,7 +1235,7 @@ impl DagActor {
     async fn record_build_history(
         &mut self,
         drv_hash: &DrvHash,
-        result: &rio_proto::build_types::BuildResult,
+        result: &rio_proto::types::BuildResult,
         (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
     ) {
         if let Some(state) = self.dag.node(drv_hash)
@@ -1886,16 +1888,18 @@ impl DagActor {
             // Emit failure event
             self.emit_build_event(
                 *build_id,
-                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
-                    derivation_path: self.drv_path_or_hash_fallback(drv_hash),
-                    status: Some(rio_proto::dag::derivation_event::Status::Failed(
-                        rio_proto::dag::DerivationFailed {
-                            error_message: error_msg.to_string(),
-                            status: rio_proto::build_types::BuildResultStatus::PermanentFailure
-                                .into(),
-                        },
-                    )),
-                }),
+                rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent {
+                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                        status: Some(rio_proto::types::derivation_event::Status::Failed(
+                            rio_proto::types::DerivationFailed {
+                                error_message: error_msg.to_string(),
+                                status: rio_proto::types::BuildResultStatus::PermanentFailure
+                                    .into(),
+                            },
+                        )),
+                    },
+                ),
             );
         }
 
@@ -2013,15 +2017,17 @@ impl DagActor {
         for build_id in &trigger_builds {
             self.emit_build_event(
                 *build_id,
-                rio_proto::types::build_event::Event::Derivation(rio_proto::dag::DerivationEvent {
-                    derivation_path: self.drv_path_or_hash_fallback(drv_hash),
-                    status: Some(rio_proto::dag::derivation_event::Status::Failed(
-                        rio_proto::dag::DerivationFailed {
-                            error_message: error_msg.to_string(),
-                            status: rio_proto::build_types::BuildResultStatus::TimedOut.into(),
-                        },
-                    )),
-                }),
+                rio_proto::types::build_event::Event::Derivation(
+                    rio_proto::types::DerivationEvent {
+                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                        status: Some(rio_proto::types::derivation_event::Status::Failed(
+                            rio_proto::types::DerivationFailed {
+                                error_message: error_msg.to_string(),
+                                status: rio_proto::types::BuildResultStatus::TimedOut.into(),
+                            },
+                        )),
+                    },
+                ),
             );
         }
 

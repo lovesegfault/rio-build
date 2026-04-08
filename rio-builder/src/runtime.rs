@@ -592,23 +592,20 @@ pub async fn spawn_build_task(
                     // completion handler treats Cancelled as a no-op
                     // (already transitioned the derivation when it sent
                     // the CancelSignal).
-                    (rio_proto::build_types::BuildResultStatus::Cancelled, false)
+                    (rio_proto::types::BuildResultStatus::Cancelled, false)
                 } else if e.is_permanent() {
                     // Deterministic per-derivation (WrongKind, .drv
                     // parse failure). Another pod will fail identically;
                     // surface as InputRejected so the scheduler stops
                     // burning ephemeral cold-starts before the poison
                     // threshold trips.
-                    (
-                        rio_proto::build_types::BuildResultStatus::InputRejected,
-                        true,
-                    )
+                    (rio_proto::types::BuildResultStatus::InputRejected, true)
                 } else {
                     // Node- or network-local executor failure (overlay
                     // mount, daemon crash, gRPC, IO). Another pod might
                     // succeed → InfrastructureFailure → reassign.
                     (
-                        rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+                        rio_proto::types::BuildResultStatus::InfrastructureFailure,
                         true,
                     )
                 };
@@ -626,7 +623,7 @@ pub async fn spawn_build_task(
                 }
                 CompletionReport {
                     drv_path,
-                    result: Some(rio_proto::build_types::BuildResult {
+                    result: Some(rio_proto::types::BuildResult {
                         status: status.into(),
                         error_msg: if was_cancelled {
                             "cancelled by scheduler".into()
@@ -650,17 +647,15 @@ pub async fn spawn_build_task(
         // cancelled; the "cancelled" bucket is a distinct label so SLIs
         // don't count user-initiated cancels as failures.
         let outcome = match &completion.result {
-            Some(r) => match rio_proto::build_types::BuildResultStatus::try_from(r.status) {
-                Ok(rio_proto::build_types::BuildResultStatus::Built) => "success",
-                Ok(rio_proto::build_types::BuildResultStatus::Cancelled) => "cancelled",
+            Some(r) => match rio_proto::types::BuildResultStatus::try_from(r.status) {
+                Ok(rio_proto::types::BuildResultStatus::Built) => "success",
+                Ok(rio_proto::types::BuildResultStatus::Cancelled) => "cancelled",
                 // Operationally distinct: means "raise the limit," not
                 // "the build is broken." Separate label so SLI queries
                 // can exclude these from failure-rate denominators.
-                Ok(rio_proto::build_types::BuildResultStatus::TimedOut) => "timed_out",
-                Ok(rio_proto::build_types::BuildResultStatus::LogLimitExceeded) => "log_limit",
-                Ok(rio_proto::build_types::BuildResultStatus::InfrastructureFailure) => {
-                    "infra_failure"
-                }
+                Ok(rio_proto::types::BuildResultStatus::TimedOut) => "timed_out",
+                Ok(rio_proto::types::BuildResultStatus::LogLimitExceeded) => "log_limit",
+                Ok(rio_proto::types::BuildResultStatus::InfrastructureFailure) => "infra_failure",
                 _ => "failure",
             },
             None => "failure",
@@ -689,8 +684,8 @@ pub async fn spawn_build_task(
             );
             let completion = CompletionReport {
                 drv_path: panic_drv_path.clone(),
-                result: Some(rio_proto::build_types::BuildResult {
-                    status: rio_proto::build_types::BuildResultStatus::InfrastructureFailure.into(),
+                result: Some(rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
                     error_msg: "worker build task panicked".into(),
                     ..Default::default()
                 }),

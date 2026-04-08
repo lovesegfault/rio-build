@@ -11,8 +11,8 @@ use std::sync::atomic::AtomicBool;
 use rio_builder::executor::{DEFAULT_DAEMON_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
 use rio_builder::log_stream::LogLimits;
 use rio_proto::StoreServiceClient;
-use rio_proto::build_types::WorkAssignment;
 use rio_proto::types::ExecutorKind;
+use rio_proto::types::WorkAssignment;
 use tonic::transport::Channel;
 
 /// Minimal non-FOD ATerm: empty hashAlgo/hash in the output tuple →

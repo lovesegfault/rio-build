@@ -164,7 +164,7 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
         &handle,
         "test-worker",
         &drv_path,
-        rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "worker sent CompletionReport with no result",
     )
     .await?;
@@ -218,8 +218,8 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "test-worker".into(),
             drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 start_time: Some(prost_types::Timestamp {
                     seconds: i64::MIN,
                     nanos: i32::MIN,

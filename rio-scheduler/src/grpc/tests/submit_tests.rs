@@ -20,7 +20,7 @@ async fn test_submit_build_rejects_empty_drv_hash() {
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_hash = String::new(); // empty!
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![bad_node],
         edges: vec![],
         ..Default::default()
@@ -47,7 +47,7 @@ async fn test_submit_build_rejects_empty_drv_path() {
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_path = String::new(); // empty!
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![bad_node],
         edges: vec![],
         ..Default::default()
@@ -70,7 +70,7 @@ async fn test_submit_build_rejects_empty_system() {
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.system = String::new(); // empty!
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![bad_node],
         edges: vec![],
         ..Default::default()
@@ -100,7 +100,7 @@ async fn test_submit_build_rejects_oversized_drv_content() {
     // 256 KB + 1 byte → over limit.
     bad_node.drv_content = vec![b'a'; 256 * 1024 + 1];
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![bad_node],
         edges: vec![],
         ..Default::default()
@@ -127,7 +127,7 @@ async fn test_submit_build_rejects_invalid_priority_class() {
     let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new_for_tests(handle);
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: vec![],
         priority_class: "urgent".into(), // not in {ci, interactive, scheduled}
@@ -155,7 +155,7 @@ async fn test_submit_build_rejects_unknown_tenant() {
     let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: vec![],
         tenant_name: "nonexistent-team".into(),
@@ -189,7 +189,7 @@ async fn test_submit_build_resolves_known_tenant() {
     // Seed the tenants table.
     let tenant_uuid = seed_tenant(&db.pool, "team-alpha").await;
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("resolve-tenant-drv", "x86_64-linux")],
         edges: vec![],
         tenant_name: "team-alpha".into(),
@@ -248,7 +248,7 @@ async fn test_submit_build_sets_trace_id_header() {
     let injected_tid = "abcdef0123456789abcdef0123456789";
     let traceparent = format!("00-{injected_tid}-0123456789abcdef-01");
 
-    let mut req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("trace-id-drv", "x86_64-linux")],
         edges: vec![],
         ..Default::default()
@@ -299,7 +299,7 @@ async fn test_submit_build_no_otel_no_trace_id_header() {
     let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new_for_tests(handle);
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("no-otel-drv", "x86_64-linux")],
         edges: vec![],
         ..Default::default()
@@ -328,7 +328,7 @@ async fn test_submit_build_empty_tenant_is_none() {
     // Intentionally pool-less to assert no PG hit for empty tenant_name.
     let grpc = SchedulerGrpc::new_for_tests(handle);
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("no-tenant-drv", "x86_64-linux")],
         edges: vec![],
         tenant_name: String::new(), // empty = single-tenant mode
@@ -454,13 +454,13 @@ async fn test_submit_build_rejects_too_many_edges() {
     // Construct MAX_DAG_EDGES+1 edges. Content doesn't matter — rejection
     // happens before any path validation.
     let too_many: Vec<_> = (0..rio_common::limits::MAX_DAG_EDGES + 1)
-        .map(|i| rio_proto::dag::DerivationEdge {
+        .map(|i| rio_proto::types::DerivationEdge {
             parent_drv_path: format!("/nix/store/{i}-parent.drv"),
             child_drv_path: format!("/nix/store/{i}-child.drv"),
         })
         .collect();
 
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: too_many,
         ..Default::default()
@@ -507,8 +507,8 @@ fn claims_with_jti(jti: &str) -> rio_common::jwt::TenantClaims {
 /// that fails in the negative test — if the request is malformed, we
 /// get InvalidArgument instead of Unauthenticated and the test proves
 /// nothing about revocation.
-fn valid_request_with_claims(jti: &str) -> Request<rio_proto::build_types::SubmitBuildRequest> {
-    let mut req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+fn valid_request_with_claims(jti: &str) -> Request<rio_proto::types::SubmitBuildRequest> {
+    let mut req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("revoke-test", "x86_64-linux")],
         edges: vec![],
         ..Default::default()
@@ -653,7 +653,7 @@ async fn no_claims_skips_revocation_check() {
         .expect("insert");
 
     // No Claims in extensions — the normal state for dev/VM tests.
-    let req = Request::new(rio_proto::build_types::SubmitBuildRequest {
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("no-jwt", "x86_64-linux")],
         edges: vec![],
         ..Default::default()

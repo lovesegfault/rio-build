@@ -1,5 +1,5 @@
 use super::*;
-use rio_proto::dag::{DerivationEdge, DerivationNode};
+use rio_proto::types::{DerivationEdge, DerivationNode};
 use rio_test_support::fixtures::{make_derivation_node as make_node, make_edge, test_drv_path};
 
 /// Build a test node with an EXPLICIT `drv_path` (for deep-chain tests

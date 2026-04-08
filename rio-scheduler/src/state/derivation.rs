@@ -565,7 +565,7 @@ impl DerivationState {
     /// is belt-and-suspenders for when the actor is driven by something
     /// other than gRPC (tests, future admin APIs).
     pub fn try_from_node(
-        node: &rio_proto::dag::DerivationNode,
+        node: &rio_proto::types::DerivationNode,
     ) -> Result<Self, rio_nix::store_path::StorePathError> {
         let drv_path = rio_nix::store_path::StorePath::parse(&node.drv_path)?;
         Ok(Self {
@@ -928,7 +928,7 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100
 mod tests {
     use super::*;
 
-    fn dummy_node() -> rio_proto::dag::DerivationNode {
+    fn dummy_node() -> rio_proto::types::DerivationNode {
         rio_test_support::fixtures::make_derivation_node("h", "x86_64-linux")
     }
 

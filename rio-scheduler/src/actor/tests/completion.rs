@@ -817,7 +817,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
         &handle,
         &first_worker,
         &p_retry,
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "network hiccup",
     )
     .await?;
@@ -903,7 +903,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
             &handle,
             "flaky-worker",
             &p_maxretry,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("attempt {attempt} failed"),
         )
         .await?;
@@ -978,7 +978,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             &handle,
             &format!("b-{c}"),
             &p,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             "simulated OOM",
         )
         .await?;
@@ -1007,7 +1007,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             &handle,
             "b-xlarge",
             &p,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("xlarge attempt {attempt}"),
         )
         .await?;
@@ -1057,7 +1057,7 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
             &handle,
             worker,
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("failure {i}"),
         )
         .await?;
@@ -1123,7 +1123,7 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
             &handle,
             worker,
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("starve failure {i}"),
         )
         .await?;
@@ -1189,7 +1189,7 @@ async fn test_fleet_exhaustion_is_kind_aware() -> TestResult {
             &handle,
             worker,
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("exhaust failure {i}"),
         )
         .await?;
@@ -1247,7 +1247,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
             &handle,
             worker,
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
             &format!("infra failure {i}"),
         )
         .await?;
@@ -1290,7 +1290,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
         &handle,
         "infra-w4",
         &drv_path,
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "now this one counts",
     )
     .await?;
@@ -1381,7 +1381,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         &handle,
         "to-tiny",
         &drv_path,
-        rio_proto::build_types::BuildResultStatus::TimedOut,
+        rio_proto::types::BuildResultStatus::TimedOut,
         "build exceeded daemon_timeout_secs",
     )
     .await?;
@@ -1428,7 +1428,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         &handle,
         "to-small",
         &drv_path,
-        rio_proto::build_types::BuildResultStatus::TimedOut,
+        rio_proto::types::BuildResultStatus::TimedOut,
         "build exceeded daemon_timeout_secs",
     )
     .await?;
@@ -1457,7 +1457,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         &handle,
         "to-medium",
         &drv_path,
-        rio_proto::build_types::BuildResultStatus::TimedOut,
+        rio_proto::types::BuildResultStatus::TimedOut,
         "build exceeded daemon_timeout_secs",
     )
     .await?;
@@ -1515,7 +1515,7 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
             &handle,
             "infra-cap-w",
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
             &format!("infra attempt {attempt}"),
         )
         .await?;
@@ -1546,7 +1546,7 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
         &handle,
         "infra-cap-w",
         &drv_path,
-        rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "infra attempt 10 (cap hit)",
     )
     .await?;
@@ -1597,7 +1597,7 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
             &handle,
             "putpath-w",
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+            rio_proto::types::BuildResultStatus::InfrastructureFailure,
             "upload failed: concurrent PutPath in progress for this path; retry",
         )
         .await?;
@@ -1631,7 +1631,7 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
         &handle,
         "putpath-w",
         &drv_path,
-        rio_proto::build_types::BuildResultStatus::InfrastructureFailure,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "FUSE EIO",
     )
     .await?;
@@ -1696,7 +1696,7 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
             &handle,
             "solo-worker",
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("same-worker failure {i}"),
         )
         .await?;
@@ -1775,7 +1775,7 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
             &handle,
             "ctrl-worker",
             &drv_path,
-            rio_proto::build_types::BuildResultStatus::TransientFailure,
+            rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("ctrl failure {i}"),
         )
         .await?;
@@ -1924,8 +1924,8 @@ async fn test_completion_unknown_drv_key_ignored() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "ghost-worker".into(),
             drv_key: "never-existed-drv-hash".into(),
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
             },
             peak_memory_bytes: 0,
@@ -1994,7 +1994,7 @@ async fn test_unknown_build_status_treated_as_transient() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "unk-w".into(),
             drv_key: drv_path.clone(),
-            result: rio_proto::build_types::BuildResult {
+            result: rio_proto::types::BuildResult {
                 status: 9999, // not a valid enum
                 error_msg: "mystery".into(),
                 ..Default::default()
@@ -2044,8 +2044,8 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "cancel-w".into(),
             drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Cancelled.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Cancelled.into(),
                 ..Default::default()
             },
             peak_memory_bytes: 0,
@@ -2140,8 +2140,8 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "w-small".into(),
             drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
                     output_path: "/nix/store/zzz-slowthing-out".into(),
@@ -2245,8 +2245,8 @@ async fn test_completion_writes_build_sample() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "bs-worker".into(),
             drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
                     output_path: test_store_path("sample-pkg-out"),
@@ -2362,8 +2362,8 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
         .send_unchecked(ActorCommand::ProcessCompletion {
             executor_id: "clamp-worker".into(),
             drv_key: drv_path,
-            result: rio_proto::build_types::BuildResult {
-                status: rio_proto::build_types::BuildResultStatus::Built.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
                     output_path: test_store_path("clamp-out"),
@@ -2540,7 +2540,7 @@ async fn permanent_failure_terminals_assignment_and_records_executor() -> TestRe
         &handle,
         "i209-w",
         &test_drv_path("i209"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "deterministic compile error",
     )
     .await?;

@@ -563,7 +563,7 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
         &handle,
         "i042-w2",
         &test_drv_path(drv_hash),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "first failure (poisons)",
     )
     .await?;
@@ -591,7 +591,7 @@ async fn test_completion_after_poison_frees_running_builds() -> TestResult {
         &handle,
         "i042-w1",
         &test_drv_path(drv_hash),
-        rio_proto::build_types::BuildResultStatus::TransientFailure,
+        rio_proto::types::BuildResultStatus::TransientFailure,
         "late completion (drv already poisoned)",
     )
     .await?;
@@ -641,7 +641,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_builds_entry() -> TestR
         &handle,
         "i042-hb-w",
         &test_drv_path(drv_hash),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "poison",
     )
     .await?;
@@ -727,7 +727,7 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
         &handle,
         "poison-ttl-worker",
         &test_drv_path("poison-ttl-hash"),
-        rio_proto::build_types::BuildResultStatus::PermanentFailure,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent",
     )
     .await?;

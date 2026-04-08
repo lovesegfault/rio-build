@@ -5,7 +5,7 @@
 //! them ~30s after terminal), but PG persists the full graph. Dashboard
 //! polls at 5s for live status colors.
 
-use rio_proto::dag::{GetBuildGraphResponse, GraphEdge, GraphNode};
+use rio_proto::types::{GetBuildGraphResponse, GraphEdge, GraphNode};
 use tonic::Status;
 
 use rio_common::grpc::StatusExt;
