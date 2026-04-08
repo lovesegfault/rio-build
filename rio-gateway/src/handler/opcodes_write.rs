@@ -62,7 +62,6 @@ fn parse_reference_paths(refs: &[String], context: &str) -> Result<Vec<StorePath
 
 // r[impl gw.opcode.add-to-store-nar]
 // r[impl gw.opcode.add-to-store-nar.framing]
-// r[impl gw.wire.narhash-hex]
 /// wopAddToStoreNar (39): Receive a store path with NAR content via framed stream.
 #[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin>(
@@ -188,7 +187,7 @@ struct EntryHead {
 async fn read_entry_head<R: AsyncRead + Unpin>(framed: &mut R) -> anyhow::Result<EntryHead> {
     let path_str = wire::read_string(framed).await?;
     let deriver_str = wire::read_string(framed).await?;
-    let nar_hash_str = wire::read_string(framed).await?;
+    let nar_hash_bytes = wire::read_nar_hash(framed).await?;
     let references = wire::read_strings(framed).await?;
     let registration_time = wire::read_u64(framed).await?;
     let nar_size = wire::read_u64(framed).await?;
@@ -200,11 +199,6 @@ async fn read_entry_head<R: AsyncRead + Unpin>(framed: &mut R) -> anyhow::Result
 
     let path = StorePath::parse(&path_str).map_err(|e| GatewayError::InvalidStorePath {
         path: path_str.clone(),
-        source: e,
-    })?;
-
-    let nar_hash_bytes = hex::decode(&nar_hash_str).map_err(|e| GatewayError::InvalidHex {
-        context: format!("entry '{path_str}' narHash"),
         source: e,
     })?;
 

@@ -36,6 +36,9 @@ pub enum WireError {
     #[error("invalid UTF-8 in string")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
 
+    #[error("invalid hex in narHash field: {0}")]
+    InvalidNarHash(#[from] hex::FromHexError),
+
     #[error("framed stream frame size {0} exceeds maximum {MAX_FRAME_SIZE}")]
     FrameTooLarge(u64),
 
@@ -162,6 +165,18 @@ pub async fn write_bytes<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Resul
 }
 
 /// Write a length-prefixed, padded UTF-8 string.
+// r[impl gw.wire.narhash-hex]
+/// Read a `narHash` field: wire string of lowercase hex, decoded to bytes.
+pub async fn read_nar_hash<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
+    let s = read_string(r).await?;
+    Ok(hex::decode(s)?)
+}
+
+/// Write a `narHash` field: bytes encoded as a lowercase hex wire string.
+pub async fn write_nar_hash<W: AsyncWrite + Unpin>(w: &mut W, hash: &[u8]) -> Result<()> {
+    write_string(w, &hex::encode(hash)).await
+}
+
 pub async fn write_string<W: AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<()> {
     write_bytes(w, s.as_bytes()).await
 }

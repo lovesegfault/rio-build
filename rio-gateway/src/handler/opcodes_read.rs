@@ -94,7 +94,6 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 }
 
 // r[impl gw.opcode.query-path-info]
-// r[impl gw.wire.narhash-hex]
 /// wopQueryPathInfo (26): Return full path metadata.
 #[instrument(skip_all, fields(path = tracing::field::Empty))]
 pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -139,8 +138,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
             wire::write_bool(w, true).await?;
             // deriver: Option<StorePath> → empty string if None (wire convention)
             wire::write_string(w, info.deriver.as_deref().unwrap_or("")).await?;
-            // narHash: [u8;32] → hex string
-            wire::write_string(w, &hex::encode(info.nar_hash)).await?;
+            wire::write_nar_hash(w, &info.nar_hash).await?;
             // references: Vec<StorePath> — StorePath: AsRef<str>
             wire::write_strings(w, &info.references).await?;
             wire::write_u64(w, info.registration_time).await?;
