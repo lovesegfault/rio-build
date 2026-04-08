@@ -363,8 +363,8 @@ in
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
   # Same 3-worker fixture (wsmall1/wsmall2/wlarge + size-classes) for
   # both — the fragment architecture changes what RUNS, not what's BOOTED.
-  # fanout→fuse-direct→fuse-slowpath cache-state chain stays in core;
-  # sizeclass+reassign are disruptive (psql seed, SIGKILL) → own test.
+  # fanout→fuse-direct cache-state chain stays in core; sizeclass+reassign
+  # are disruptive (psql seed, SIGKILL) → own test.
   vm-scheduling-core-standalone =
     (scheduling {
       inherit pkgs common;
@@ -385,12 +385,6 @@ in
           # r[verify obs.metric.transfer-volume]
           "chunks"
           "cgroup"
-          # TODO: fuse-slowpath tests SQLite-index-vs-disk divergence
-          # by rm'ing cache files while the index says present. With
-          # one-shot + :memory: index, there's no inter-build window
-          # with a populated index — needs redesign to inject the
-          # fault during an in-flight build (long sleep drv).
-          # "fuse-slowpath"
         ];
       };
 

@@ -19,7 +19,7 @@
 #
 # Fragment architecture: returns { fragments, mkTest }. default.nix
 # composes into 2 parallel VM tests (core, disrupt). fanout → fuse-direct
-# → fuse-slowpath chain via FUSE cache state; all else independent.
+# chain via FUSE cache state; all else independent.
 # worker.overlay.stacked-lower — verify marker at default.nix:subtests[fanout]
 # worker.ns.order — verify marker at default.nix:subtests[fanout]
 #   The writableStore=false pattern in common.nix:mkWorkerNode keeps the
@@ -615,113 +615,6 @@ let
           )
     '';
 
-    fuse-slowpath = ''
-      # ══════════════════════════════════════════════════════════════════
-      # fuse-slowpath — fault-inject cache corruption → open/readlink/
-      # readdir slow-paths (ops.rs:217-235, 251-268, 422-437, ~55 lines)
-      # ══════════════════════════════════════════════════════════════════
-      # lookup() at ops.rs:105 eagerly materializes the WHOLE store-path
-      # tree on first access (ensure_cached → fetch NAR → extract). Every
-      # subsequent getattr/readlink/open/readdir hits the fast path
-      # (file already on disk). The slow paths are: fast-path File::open/
-      # read_link/read_dir returns ENOENT → store_basename_for_inode(ino)
-      # finds the store path → ensure_cached → retry. Structurally
-      # unreachable unless the cache dir is corrupted AFTER lookup
-      # populated the kernel's dentry cache but BEFORE the next access.
-      #
-      # Fault: rm files from /var/rio/cache/<busybox>/ while the kernel
-      # still holds valid dentries (ATTR_TTL=3600s from fuse-direct's
-      # `ls -la` above). Kernel routes the next open/readlink/readdir to
-      # FUSE by cached inode — no fresh lookup — and the real path is gone.
-      #
-      # ensure_cached won't re-fetch: it checks the SQLite index
-      # (cache.rs:342 get_path → get_and_touch), not disk. The index
-      # still says busybox is present, so ensure_cached returns Ok and
-      # the slow path's SECOND File::open/read_link/read_dir fails again
-      # → reply.error(ENOENT). That's the "failed after ensure_cached"
-      # branch — defensive code proving the SQLite-vs-disk divergence
-      # surfaces as a build error, not a silent hang.
-      #
-      # getattr slow-path (153-185) NOT hit: kernel caches attrs for
-      # ATTR_TTL=3600s after fuse-direct's stat-via-ls-la, doesn't
-      # re-ask FUSE within the test's remaining lifetime. open/readlink/
-      # readdir don't use the attr cache.
-      #
-      # DESTRUCTIVE to wsmall1's FUSE cache. After all builds, before
-      # collectCoverage — profraws are already on disk, the cache is
-      # throwaway.
-      with subtest("fuse-slowpath: cache-vs-disk divergence → open/readlink/readdir ENOENT"):
-          # Same cache-entry discovery as fuse-direct above. busybox is
-          # always there (fetched as input for every build).
-          cache_bb = wsmall1.succeed(
-              "find /var/rio/cache/ -mindepth 1 -maxdepth 1 -type d "
-              "-name '*busybox*' | head -1"
-          ).strip()
-          assert cache_bb, "no busybox dir in wsmall1 FUSE cache"
-          fuse_bb = cache_bb.replace("/var/rio/cache/", "/var/rio/fuse-store/")
-
-          # Fresh ls -la: re-cache the child dentries. fuse-direct's
-          # earlier ls -la was the original seed, but reassign above
-          # SIGKILLs a worker (possibly wsmall1). AutoUnmount + systemd
-          # restart → fresh FUSE mount → kernel dentry cache cleared.
-          # cgroup's build re-looked-up bin/sh (so bin IS re-cached —
-          # v3 confirmed: readdir slow-path fired, ino=4 = post-restart
-          # counter) but never touched default.script/linuxrc. This ls
-          # re-lstats every child → fresh dentries for all three targets
-          # with ATTR_TTL=3600s.
-          wsmall1.succeed(f"ls -la {fuse_bb}/ 2>&1")
-
-          # Delete targets from the CACHE dir. The SQLite index is
-          # untouched, so ensure_cached thinks they're still there.
-          wsmall1.succeed(
-              f"rm -f {cache_bb}/default.script {cache_bb}/linuxrc && "
-              f"rm -rf {cache_bb}/bin"
-          )
-
-          # Trigger all three slow paths. Kernel has cached dentries
-          # (ATTR_TTL=3600s from the ls -la above) → path resolution
-          # hits the cached ino without a fresh lookup → FUSE open/readlink/
-          # readdir(ino) → File::open/read_link/read_dir on the deleted
-          # cache path → ENOENT → store_basename_for_inode(ino) →
-          # ensure_cached (SQLite index still says yes, Ok) → SECOND
-          # open/readlink/readdir → still ENOENT → tracing::warn! +
-          # reply.error. .execute() not .fail(): cat/readlink do exit
-          # non-zero, but `ls` exits 0 even though FUSE readdir returned
-          # ENOENT (observed v3 2026-03-16: warn fired, ls succeeded —
-          # kernel/glibc swallowed the getdents64 error somewhere). The
-          # shell exit code is a proxy; the journalctl grep is the proof.
-          wsmall1.execute(f"cat {fuse_bb}/default.script 2>&1")
-          wsmall1.execute(f"readlink -v {fuse_bb}/linuxrc 2>&1")
-          wsmall1.execute(f"ls {fuse_bb}/bin/ 2>&1")
-
-          # THE assertion: the slow-path warn!s fired. Each has a
-          # distinctive message (ops.rs:232, 265, 437). If the kernel's
-          # dentry cache had expired and a fresh LOOKUP failed instead,
-          # we'd see "lookup: not found" (trace, not warn) and these
-          # three would be 0 — the slow paths never entered.
-          slowpath_warns = wsmall1.succeed(
-              "journalctl -u rio-builder --no-pager | "
-              "grep -cE 'failed after ensure_cached' || echo 0"
-          ).strip()
-          assert int(slowpath_warns) >= 3, (
-              f"expected ≥3 'failed after ensure_cached' warns (one each "
-              f"from open/readlink/readdir slow-paths); got {slowpath_warns}. "
-              f"If 0: kernel dentry cache expired → fresh lookup failed at "
-              f"ops.rs:138 before the slow paths could run (ATTR_TTL "
-              f"assumption wrong, or cache was dropped elsewhere)."
-          )
-
-          # Disambiguate: which of the three fired? `| sort | uniq -c`
-          # breaks it out by message. readlink/open/readdir each have
-          # their own warn text.
-          breakdown = wsmall1.succeed(
-              "journalctl -u rio-builder --no-pager | "
-              "grep 'failed after ensure_cached' | "
-              "grep -oE '(open|readlink|readdir) failed' | sort | uniq -c"
-          ).strip()
-          print(f"fuse-slowpath PASS: {slowpath_warns} total slow-path warns\n{breakdown}")
-    '';
-
     # worker.silence.timeout-kill — verify marker at default.nix:subtests[max-silent-time]
     max-silent-time = ''
       import time as _time
@@ -1146,9 +1039,9 @@ let
       #      refactor breaking the cancellation arm would silently
       #      zero worker VM coverage.
       #
-      # Uses wsmall2: wsmall1 holds FUSE cache state for fuse-direct /
-      # fuse-slowpath (core-test cache-chain coupling). wsmall2 is
-      # disposable here — disrupt split only.
+      # Uses wsmall2: wsmall1 holds FUSE cache state for fuse-direct
+      # (core-test cache-chain coupling). wsmall2 is disposable here —
+      # disrupt split only.
       #
       # Standalone fixture only (k3s worker pods are distroless, no
       # shell, no systemctl). This is the only place we can deliver
@@ -1356,23 +1249,12 @@ let
     scenario = "scheduling";
     inherit prelude fragments fixture;
     defaultTimeout = 600;
-    # fanout populates the FUSE cache that fuse-direct and fuse-slowpath
-    # read. fuse-slowpath is DESTRUCTIVE (rm from cache) — must run last.
+    # fanout populates the FUSE cache that fuse-direct reads.
     chains = [
       {
         before = "fanout";
         after = "fuse-direct";
         msg = "fuse-direct requires fanout earlier (FUSE cache state)";
-      }
-      {
-        before = "fanout";
-        after = "fuse-slowpath";
-        msg = "fuse-slowpath requires fanout earlier (busybox in cache)";
-      }
-      {
-        name = "fuse-slowpath";
-        last = true;
-        msg = "fuse-slowpath is destructive (cache rm) — must run LAST";
       }
     ];
   };

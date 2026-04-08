@@ -1,21 +1,19 @@
-# Lifecycle scenario: scheduler recovery, GC, autoscaler, finalizer,
+# Lifecycle scenario: scheduler recovery, GC, ephemeral pools,
 # health-shared NOT_SERVING probe — all exercised against the k3s-full
 # fixture.
 #
-# Ports phase3b sections S (recovery), C (GC), T (health-shared) +
-# phase3a autoscaler/finalizer/SSA-field-ownership onto the 2-node k3s
-# Helm-chart fixture. Unlike phase3b (control/worker/k8s/client as
-# separate systemd VMs), everything here runs as PODS — closes the
+# Ports phase3b sections S (recovery), C (GC), T (health-shared) onto the
+# 2-node k3s Helm-chart fixture. Unlike phase3b (control/worker/k8s/client
+# as separate systemd VMs), everything here runs as PODS — closes the
 # "production uses pod path, VM tests use systemd" gap for the
-# reconciler/lease/autoscaler surface.
+# reconciler/lease surface.
 #
 #
 # Fragment architecture: this file returns { fragments, mkTest } instead
-# of a single runNixOSTest. default.nix composes fragments into 3 parallel
-# VM tests (core, recovery, autoscale) — critical path ~8min vs the prior
-# ~14min monolith. Each fragment is a Python
-# `with subtest(...)` block; mkTest concatenates a prelude + the selected
-# fragments + coverage epilogue into a testScript.
+# of a single runNixOSTest. default.nix composes fragments into parallel
+# VM tests — critical path ~8min vs the prior ~14min monolith. Each
+# fragment is a Python `with subtest(...)` block; mkTest concatenates a
+# prelude + the selected fragments + coverage epilogue into a testScript.
 # Key adaptation: scheduler pods are minimal images (no shell, no curl).
 # Metric scrapes go through apiserver pods/proxy (`kubectl get --raw`);
 # grpcurl (needs TCP for mTLS) through `kubectl port-forward`.
@@ -23,22 +21,6 @@
 # across server+agent), so killing the leader means the STANDBY takes
 # over — a strictly stronger recovery test than phase3b's single-instance
 # restart.
-#
-# Caller (default.nix) constructs the fixture via controller.extraEnv
-# (see end-of-file comment block for exact extraValues):
-#
-#   fixture = k3sFull {
-#     extraValues = {
-#       "controller.extraEnv[0].name"  = "RIO_AUTOSCALER_POLL_SECS";
-#       "controller.extraEnv[0].value" = "3";
-#       "controller.extraEnv[1].name"  = "RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS";
-#       "controller.extraEnv[1].value" = "3";
-#       "controller.extraEnv[2].name"  = "RIO_AUTOSCALER_MIN_INTERVAL_SECS";
-#       "controller.extraEnv[2].value" = "3";
-#       "controller.extraEnv[3].name"  = "RIO_AUTOSCALER_SCALE_DOWN_WINDOW_SECS";
-#       "controller.extraEnv[3].value" = "10";
-#     };
-#   };
 #
 # ctrl.probe.named-service — verify marker at default.nix:subtests[health-shared]
 #   health-shared probes with `-service rio.scheduler.SchedulerService`
@@ -48,12 +30,6 @@
 #   CLIENT-SIDE BALANCER constraint via grpc-health-probe CLI — NOT
 #   the K8s readinessProbe (which is tcpSocket, doesn't probe gRPC
 #   health at all).
-#
-# ctrl.autoscale.skip-deleting — verify marker at default.nix:subtests[finalizer]
-#   finalizer subtest deletes the BuilderPool and waits ~300s for pod
-#   termination. The autoscaler's 30s poll fires DURING that window;
-#   scaling.rs:222 deletion_timestamp.is_some() skip-gate MUST fire
-#   or the autoscaler would race the finalizer's scale-to-0.
 #
 # worker.cancel.cgroup-kill — verify marker at default.nix:subtests[cancel-cgroup-kill]
 #   cancel-cgroup-kill calls CancelBuild via gRPC mid-exec and asserts
@@ -100,31 +76,12 @@
 #   Proves tenant retention EXTENDS global grace (the spec's "floor"
 #   semantics) end-to-end with completion-hook-produced rows.
 #
-# ctrl.drain.disruption-target — disruption-drain submits a 120s-sleep
-#   build, evicts the builder pod via the K8s eviction API (sets
-#   status.conditions[DisruptionTarget]=True), and asserts the
-#   controller's watcher fires DrainWorker{force:true}. (Subtest
-#   currently unwired pending one-shot-pod targeting redesign.)
-#
 # ctrl.pool.ephemeral — verify marker at default.nix:subtests[ephemeral-pool]
-#   ephemeral-pool: applies WorkerPoolSpec.ephemeral=true; asserts NO
-#   StatefulSet (apply() took the ephemeral branch, mod.rs:118-132);
-#   asserts status.desiredReplicas == replicas.max (reconcile_ephemeral
-#   ran and patched status, ephemeral.rs:220-228). The full
-#   Job-spawn-on-queue path requires running after finalizer (no STS
-#   worker to steal the dispatch) — proven in the vm-lifecycle-ephemeral
-#   composition (see default.nix), not inline here. The structural
-#   assertions (no-STS, status-patched, cleanup-immediate) ARE
-#   self-contained.
-#
-# ctrl.pdb.workers — verify marker at default.nix:subtests[pdb-ownerref]
-#   pdb-ownerref: build_pdb (builders.rs:178) produces `{pool}-pdb`
-#   with maxUnavailable=1 + ownerReferences[0]→BuilderPool. Asserts
-#   against the fixture's `x86-64` pool: `x86-64-pdb` exists,
-#   spec.maxUnavailable=1, ownerRef[0].kind=BuilderPool, GC'd on
-#   BuilderPool delete (ownerRef cascade). Unit test tests.rs:550
-#   proves the struct shape; this proves the reconciler SSA-applies it
-#   AND K8s GC honors the ownerRef end-to-end.
+#   ephemeral-pool: applies an ephemeral BuilderPool; asserts
+#   status.desiredReplicas == replicas.max (reconcile_ephemeral ran and
+#   patched status, ephemeral.rs:220-228) and the Job-spawn-on-queue path
+#   end-to-end. Subtest deletes the default x86-64 pool first so its
+#   reconciler doesn't steal dispatch.
 #
 # ctrl.wps.reconcile — verify marker at default.nix:subtests[wps-lifecycle]
 # ctrl.wps.autoscale — verify marker at default.nix:subtests[wps-lifecycle]
@@ -143,7 +100,6 @@ let
     ns
     nsStore
     nsBuilders
-    nsFetchers
     pki
     ;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
@@ -216,50 +172,6 @@ let
     sleepSecs = 90;
   };
 
-  # disruption-drain in-flight build. 120s sleep: must survive the
-  # kubectl-eviction + watcher-fire + log-check window (~30s). Shorter
-  # than 2h grace but long enough that "reassign in seconds" (which
-  # DrainWorker force=true enables) vs "burn 2h grace" is OBSERVABLY
-  # different.
-  disruptionDrv = drvs.mkTrivial {
-    marker = "lifecycle-disruption";
-    sleepSecs = 120;
-  };
-
-  # Autoscaler queue pressure: 5 leaves, all independent, all Ready
-  # immediately. With one build per pod, 1 runs + 4 queue →
-  # compute_desired(4, target=2) = ceil(4/2) = 2 → STS
-  # replicas 1→2. sleep 15 × 5 ≈ 75s sequential (pod-1 may never come
-  # Ready on the 4GB agent VM) — long enough for ~3 poll cycles (3s
-  # each, via controller.extraEnv) to see sustained pressure.
-  #
-  # Same ''${...}/''' escaping dance as phase3a.nix:79-81: the inner
-  # .nix file reads ITS OWN let-bound `busybox` arg, not this Nix
-  # evaluation's scope.
-  autoscaleDrvFile = pkgs.writeText "lifecycle-autoscale.nix" ''
-    { busybox }:
-    let
-      sh = "''${busybox}/bin/sh";
-      bb = "''${busybox}/bin/busybox";
-      mk = n: derivation {
-        name = "rio-lifecycle-queue-''${toString n}";
-        system = builtins.currentSystem;
-        builder = sh;
-        args = [ "-c" '''
-          ''${bb} mkdir -p $out
-          ''${bb} echo "queue pressure ''${toString n}" > $out/stamp
-          ''${bb} sleep 15
-        ''' ];
-      };
-    in {
-      d1 = mk 1;
-      d2 = mk 2;
-      d3 = mk 3;
-      d4 = mk 4;
-      d5 = mk 5;
-    }
-  '';
-
   # gc-sweep's backdate+delete target. In the monolith, gc-sweep reused
   # `out_recovery` from the recovery subtest — convenient but coupled.
   # Fragment architecture: gc-sweep builds its own victim.
@@ -301,8 +213,8 @@ let
   # This asymmetry is load-bearing: the GC-survival half of the test
   # pins ONLY consumer and asserts dep survives via the reference edge.
   #
-  # Same ''${...}/''' escaping as autoscaleDrvFile: the inner .nix
-  # reads its OWN let-bound busybox/dep, not this evaluation's scope.
+  # ''${...}/''' escaping: the inner .nix reads its OWN let-bound
+  # busybox/dep, not this evaluation's scope.
   refsDrvFile = pkgs.writeText "lifecycle-refs.nix" ''
     { busybox }:
     let
@@ -406,11 +318,10 @@ let
         )
 
     # workers_active==0 wait, sized for the heartbeat-timeout FALLBACK
-    # path. The autoscale chain (autoscaler→finalizer→ephemeral-pool→
-    # manifest-pool) has flaked at this exact assertion four times
-    # (8cf70d94/d82a0046/69fc4ae0/e76c95b6, GHA 24046508263). Each
-    # prior fix tightened the producer side; this one bounds the
-    # consumer side from first principles.
+    # path. The ephemeral-pool→manifest-pool chain has flaked at this
+    # exact assertion four times (8cf70d94/d82a0046/69fc4ae0/e76c95b6,
+    # GHA 24046508263). Each prior fix tightened the producer side; this
+    # one bounds the consumer side from first principles.
     #
     # Mechanism (GHA 24046508263: pods-gone 1.24s, workers_active==0
     # 57.38s, then next workers_active==0 blew 90s; local KVM 0.17s):
@@ -426,13 +337,11 @@ let
     #   can be lost (CNI veth-teardown vs FIN race, h2 frame congestion);
     #   the scheduler's `worker-stream-reader` then never breaks, and
     #   the entry sits in `self.executors` until `tick_check_heartbeats`
-    #   reaps it. With autoscaler scaling 2→1 mid-drain (`replicas==1`
-    #   was already true at 0.12s — pod-1 SIGTERM'd ~20s before
-    #   finalizer SIGTERMs pod-0), the two pods' `last_heartbeat`s are
-    #   staggered, so the gauge can dip to 0 on the first reap (event-
-    #   driven `decrement` at executor.rs:320) and be re-`set` to 1 by
-    #   the next `tick_publish_gauges` if the second entry is still
-    #   `is_registered()`. Finalizer's wait catches the dip; the next
+    #   reaps it. When two pods' `last_heartbeat`s are staggered, the
+    #   gauge can dip to 0 on the first reap (event-driven `decrement` at
+    #   executor.rs:320) and be re-`set` to 1 by the next
+    #   `tick_publish_gauges` if the second entry is still
+    #   `is_registered()`. The first wait catches the dip; the next
     #   precondition wait then sits out the second entry's full
     #   fallback window.
     #
@@ -440,9 +349,8 @@ let
     #   HEARTBEAT_TIMEOUT_SECS (30) + MAX_MISSED_HEARTBEATS×tick (30)
     #   = ~60s last_heartbeat→reap (tick_check_heartbeats), plus:
     #   + tick alignment (≤10s)
-    #   + autoscale-chain stagger: pod-1 terminates ~20-30s before
-    #     pod-0 (autoscaler 2→1 fires during the 46s q==0 r==0 drain),
-    #     so the second reap lands ~20-30s after the first
+    #   + pod termination stagger: when two pods terminate ~20-30s apart,
+    #     the second reap lands ~20-30s after the first
     #   + one in-flight heartbeat delayed under load (≤10s)
     #   ≈ 110s worst-case from pods-gone to stable workers_active==0.
     #   180s budget = 110s + ~60% GHA tail headroom. Stays under the
@@ -1309,10 +1217,9 @@ let
           )
 
           # Worker re-registered with the new leader. Fresh scheduler
-          # process = metrics reset → workers_active climbs back to 1
-          # (or 2 if pod-1 from a later autoscaler run somehow exists —
-          # it doesn't yet). ≥1 not ==1: the slow build's worker may
-          # have briefly disconnected/reconnected during failover.
+          # process = metrics reset → workers_active climbs back to ≥1.
+          # ≥1 not ==1: the slow build's worker may have briefly
+          # disconnected/reconnected during failover.
           sched_metric_wait(
               "grep -E '^rio_scheduler_workers_active [1-9]'",
               timeout=180,
@@ -1390,201 +1297,6 @@ let
               f"got: {final.get('currentPath')!r}"
           )
           print("gc-dry-run PASS: TriggerGC stream completed via AdminService proxy")
-    '';
-
-    reconciler-replicas = ''
-      # ══════════════════════════════════════════════════════════════════
-      # reconciler-replicas — manual STS scale NOT stomped by reconciler
-      # ══════════════════════════════════════════════════════════════════
-      # Regression: the reconciler was reverting STS.spec.replicas to
-      # spec.replicas.min on every reconcile (SSA with .force() re-claimed
-      # the field from the autoscaler's field-manager). Simulate the
-      # autoscaler by scaling directly — the .owns(StatefulSet) watch
-      # fires → reconcile runs. If bug present, replicas reverts to 1
-      # within the same reconcile that patches status.
-      #
-      # POSITIVE signal before NEGATIVE: wait for the reconciler's own
-      # status patch (desiredReplicas=2) — proves the reconcile RAN —
-      # THEN assert STS.spec.replicas is STILL 2. Replaces phase3a's
-      # `time.sleep(5)` hope-the-reconcile-ran hack with a deterministic
-      # gate (phase3a.nix:725-730).
-      with subtest("reconciler-replicas: SSA field-ownership handoff preserves manual scale"):
-          kubectl("scale statefulset rio-builder-x86-64 --replicas=2", ns="${nsBuilders}")
-
-          # Reconciler observed the change (via .owns watch), reconciled,
-          # patched BuilderPool.status.desiredReplicas. This IS the
-          # reconcile — if it were going to stomp replicas, it would have
-          # done so in the same apply() call. Accept 1 OR 2: with the 10s
-          # scale-down window (controller.extraEnv[3]), the autoscaler may
-          # have already patched 2→1 before reconcile fires. Either way,
-          # desiredReplicas reflecting a NON-STALE value proves reconcile
-          # ran after our scale.
-          k3s_server.wait_until_succeeds(
-              "dr=$(k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
-              "-o jsonpath='{.status.desiredReplicas}'); "
-              'test "$dr" = 1 -o "$dr" = 2',
-              timeout=20,
-          )
-
-          # THE ACTUAL INVARIANT: reconciler's SSA patch does NOT claim
-          # spec.replicas. managedFields records which manager owns each
-          # field. If the rio-controller manager's fieldsV1 includes
-          # f:replicas under f:spec, the reconciler is re-claiming it —
-          # the regression. This check is autoscaler-agnostic: whether
-          # replicas is 1 (autoscaler won) or 2 (we won), rio-controller
-          # must NOT be the owner.
-          #
-          # grep -A50 bounds the managedFields entry scan (each manager's
-          # entry is <50 lines). `! grep -q` inverts: PASS if f:replicas
-          # NOT found under rio-controller. Previously checked value==2
-          # which raced with the 10s-window autoscaler.
-          k3s_server.succeed(
-              "! k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86-64 -o yaml | "
-              "grep -A50 'manager: rio-controller' | "
-              "grep -B50 -m1 '^  - apiVersion\\|^status:' | "
-              "grep -q 'f:replicas'"
-          )
-
-          # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
-          kubectl("scale statefulset rio-builder-x86-64 --replicas=1", ns="${nsBuilders}")
-          k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
-              "-o jsonpath='{.status.desiredReplicas}')\" = 1",
-              timeout=20,
-          )
-          print("reconciler-replicas PASS: manual STS scale survived reconcile")
-    '';
-
-    autoscaler = ''
-      # ══════════════════════════════════════════════════════════════════
-      # autoscaler — queue pressure → STS replicas 1→2
-      # ══════════════════════════════════════════════════════════════════
-      # FIRST TIME scale_one() runs against a real apiserver. The
-      # reconciler-replicas test proved the reconciler doesn't STOMP, but
-      # the autoscaler ITSELF never patched anything until now. Proves:
-      # (a) SSA patch body includes apiVersion+kind — without them the STS
-      # patch 400s "apiVersion must be set" → warn log → autoscaler
-      # silently never scales (phase3a.nix:819-823), (b) autoscaler patches
-      # BuilderPool.status.lastScaleTime via its SEPARATE field-manager.
-      #
-      # Timing: controller.extraEnv sets poll/up-window/min-interval = 3s
-      # (default 30s would mean ~60s to first scale — too slow). With
-      # sustained queued≥3, first scale in ~6-12s.
-      with subtest("autoscaler: queue pressure patches STS replicas 1→2"):
-          # 5 builds, all leaves, one DAG submit. Backgrounded — script
-          # polls metrics while builds run. No NIX_CONFIG: client VM's
-          # nix.settings.experimental-features already set (mkClientNode).
-          client.execute(
-              "nohup nix-build --no-out-link "
-              "--store 'ssh-ng://k3s-server' "
-              "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "${autoscaleDrvFile} -A d1 -A d2 -A d3 -A d4 -A d5 "
-              "> /tmp/autoscale-build.log 2>&1 < /dev/null &"
-          )
-
-          # Queue depth ≥3. One build per pod → 1 runs + 4 queue.
-          # ≥3 not ==4: first dispatch may happen between poll + gauge
-          # update (Tick-lagged). ≥3 is enough for compute_desired=2. 40s
-          # timeout: Tick latency + submit overhead.
-          sched_metric_wait(
-              "awk '/^rio_scheduler_derivations_queued / {print $2}' | "
-              "grep -qE '^[3-9]|^[1-9][0-9]'",
-              timeout=40,
-          )
-
-          # THE ASSERTION: STS replicas 1→2. EXACTLY 2 (not ≥2) — proves
-          # the patch body was well-formed (apiVersion+kind present). A
-          # malformed patch would leave replicas at 1 forever (400s are
-          # swallowed as warn-logs by kube-rs). 60s: 3s poll + 3s
-          # up-window + jitter + k3s VM latency.
-          k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86-64 "
-              "-o jsonpath='{.spec.replicas}')\" = 2",
-              timeout=60,
-          )
-
-          # BuilderPool.status.lastScaleTime set (RFC3339 string, non-
-          # empty). Owned by the autoscaler's SSA field-manager (distinct
-          # from the reconciler's — otherwise reconcile would clobber it
-          # to None every cycle).
-          k3s_server.wait_until_succeeds(
-              "sc=$(k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
-              "-o jsonpath='{.status.lastScaleTime}'); "
-              "test -n \"$sc\"",
-              timeout=20,
-          )
-
-          # Scaling condition explains WHY replicas changed.
-          kubectl(
-              "get builderpool x86-64 "
-              "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "
-              "grep -q ScaledUp",
-              ns="${nsBuilders}",
-          )
-
-          # scaling_decisions_total{direction="up"} ≥1. Proves scale_one()
-          # ran to COMPLETION (metric increments after the patch succeeds,
-          # scaling.rs:257). Not exact — an earlier reconciler-replicas
-          # reset to 1 MIGHT have triggered a scale-up race depending on
-          # timing, so ≥1 is the honest bound.
-          cm = ctrl_metrics()
-          scale_up = metric_value(cm, "rio_controller_scaling_decisions_total",
-                                  labels='{direction="up"}')
-          assert scale_up is not None and scale_up >= 1.0, (
-              f"expected scaling_decisions_total{{direction=\"up\"}} >= 1, "
-              f"got {scale_up!r}\n"
-              f"  all scaling series: {cm.get('rio_controller_scaling_decisions_total', {})!r}"
-          )
-
-          # Drain the 5 builds. Can't `wait` across shell sessions (each
-          # .succeed is a fresh shell — the &-backgrounded nix-build is a
-          # job in a DIFFERENT shell). Poll q==0 AND r==0. 5×15s ≈ 75s
-          # sequential on pod-0 alone (pod-1 may never Ready on 4GB VM).
-          # Build success irrelevant — we only need queue drained so
-          # finalizer's acquire_many doesn't block.
-          sched_metric_wait(
-              "awk '/^rio_scheduler_derivations_queued / {q=$2} "
-              "/^rio_scheduler_derivations_running / {r=$2} "
-              "END {exit !(q==0 && r==0)}'",
-              timeout=150,
-          )
-
-          # ── Scale-down: queue empty → STS replicas 2→1 ───────────────
-          # With RIO_AUTOSCALER_SCALE_DOWN_WINDOW_SECS=10 (default 600s,
-          # shortened via controller.extraEnv[3]), after queue=0 is stable
-          # for 10s the autoscaler patches STS back to 1. This exercises
-          # check_stabilization's Direction::Down arm + ScaledDown event
-          # recorder path — both uncovered before this test.
-          # 60s: 10s down-window + 3s poll + 3s min-interval + k3s latency.
-          k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get statefulset rio-builder-x86-64 "
-              "-o jsonpath='{.spec.replicas}')\" = 1",
-              timeout=60,
-          )
-
-          # direction="down" metric. ≥1: same honest-bound rationale as
-          # scale_up above (reconciler-replicas reset MIGHT have raced).
-          cm = ctrl_metrics()
-          scale_down = metric_value(cm, "rio_controller_scaling_decisions_total",
-                                    labels='{direction="down"}')
-          assert scale_down is not None and scale_down >= 1.0, (
-              'expected scaling_decisions_total{direction="down"} >= 1, '
-              f"got {scale_down!r}\n"
-              f"  all scaling series: {cm.get('rio_controller_scaling_decisions_total', {})!r}"
-          )
-
-          # ScaledDown K8s Event on the BuilderPool. The autoscaler's
-          # recorder.publish path for Direction::Down (scaling.rs:359).
-          events_down = kubectl(
-              "get events "
-              "--field-selector involvedObject.name=x86-64,involvedObject.kind=BuilderPool,reason=ScaledDown "
-              "-o name",
-              ns="${nsBuilders}",
-          ).strip()
-          assert events_down, (
-              "expected ScaledDown K8s Event on BuilderPool/x86-64, got none"
-          )
-          print(f"autoscaler PASS: STS scaled 1→2→1, up={scale_up} down={scale_down}")
     '';
 
     gc-sweep = ''
@@ -2079,11 +1791,10 @@ let
 
     ephemeral-pool = ''
       # ══════════════════════════════════════════════════════════════════
-      # ephemeral-pool — WorkerPoolSpec.ephemeral=true → no STS, Job/build
+      # ephemeral-pool — ephemeral BuilderPool → Job/build
       # ══════════════════════════════════════════════════════════════════
-      # REQUIRES: no STS workers alive (run AFTER finalizer, which
-      # deletes the default pool). Otherwise the STS worker picks up
-      # dispatches before reconcile_ephemeral's 10s tick spawns a Job.
+      # REQUIRES: no other workers alive. Subtest deletes the default
+      # x86-64 pool first so its reconciler doesn't steal dispatch.
       #
       # Proves end-to-end:
       #   - reconciler polls ClusterStatus + spawns Jobs when queued > 0
@@ -2095,14 +1806,11 @@ let
       # poison tenant B's cache). That'd need two tenants building
       # overlapping closures with one malicious. The "fresh pod = fresh
       # emptyDir" property is structural — K8s guarantees it.
-      with subtest("ephemeral-pool: no STS, Job spawned, pod reaped, second build = new Job"):
+      with subtest("ephemeral-pool: Job spawned, pod reaped, second build = new Job"):
           # Precondition: no other BuilderPool may serve this subtest's
-          # builds. Before the STS-path removal, the finalizer fragment
-          # ran first and deleted the default `x86-64` pool; with it
-          # unwired this subtest is first in the chain, so delete the
-          # default pool here. Otherwise the x86-64 pool's ephemeral
-          # reconciler ALSO sees queued>0 and spawns — build 2 may
-          # dispatch there, leaving no `rio.build/pool=ephemeral` Job.
+          # builds. Delete the default `x86-64` pool here, otherwise its
+          # ephemeral reconciler ALSO sees queued>0 and spawns — build 2
+          # may dispatch there, leaving no `rio.build/pool=ephemeral` Job.
           kubectl(
               "delete builderpool x86-64 --ignore-not-found --wait=true",
               ns="${nsBuilders}",
@@ -2342,11 +2050,9 @@ let
           # (main.rs:388) re-registers → workers_active bounces 0→1
           # for up to 180s. GHA run 24012511360: manifest-pool's
           # precondition sched_metric_wait('workers_active 0', 90s)
-          # blew with an ephemeral pod still Terminating. Same
-          # mechanism d82a0046 closed for finalizer's pool=x86-64
-          # wait — every subtest that deletes a pool MUST wait its
-          # own pods gone before the next subtest's workers_active==0
-          # precondition is sound.
+          # blew with an ephemeral pod still Terminating. Every subtest
+          # that deletes a pool MUST wait its own pods gone before the
+          # next subtest's workers_active==0 precondition is sound.
           #
           # 300s: 180s grace + ownerRef-GC controller tick + margin.
           k3s_server.wait_until_succeeds(
@@ -2363,11 +2069,11 @@ let
       # ══════════════════════════════════════════════════════════════════
       # manifest-pool — BuilderPool.spec.sizing=Manifest → per-bucket Jobs
       # ══════════════════════════════════════════════════════════════════
-      # REQUIRES: no STS workers alive (run AFTER ephemeral-pool, which
-      # deletes its own pool; finalizer already deleted the default pool
-      # earlier in the chain). Same reason as ephemeral-pool: an STS
-      # worker picks up the dispatch before reconcile_manifest's 10s
-      # tick spawns a Job, leaving queued=0 → cold_start=0 → no spawn.
+      # REQUIRES: no other workers alive (run AFTER ephemeral-pool, which
+      # deletes both its own pool and the default x86-64 pool). Same
+      # reason as ephemeral-pool: another pool's reconciler picks up the
+      # dispatch before reconcile_manifest's 10s tick spawns a Job,
+      # leaving queued=0 → cold_start=0 → no spawn.
       #
       # Proves end-to-end what manifest_tests.rs CAN'T (pure-function
       # only — no apiserver):
@@ -2402,8 +2108,8 @@ let
           # Precondition: no workers. ephemeral-pool's cleanup waits
           # ALL pool=ephemeral pods gone (not just CR gone — see that
           # fragment's comment re: SIGTERM-reconnect bounce, GHA run
-          # 24012511360), and finalizer earlier waited pool=x86-64
-          # pods gone. wait_workers_zero (see prelude) bounds the
+          # 24012511360) and deleted the default x86-64 pool.
+          # wait_workers_zero (see prelude) bounds the
           # scheduler's view by the heartbeat-timeout fallback —
           # under GHA load the stream-EOF can be lost, falling back
           # to ~60s heartbeat-reap (GHA 24046508263).
@@ -2599,330 +2305,6 @@ let
                 "labels present, status patched, ownerRef cascade cleanup")
     '';
 
-    disruption-drain = ''
-      # ══════════════════════════════════════════════════════════════════
-      # disruption-drain — pod eviction → DisruptionTarget → force=true
-      # ══════════════════════════════════════════════════════════════════
-      # P0285: makes the 4 lying comments TRUE. Before this watcher,
-      # DrainWorker{force:true} had ZERO prod callers — both construction
-      # sites set force:false. The watcher (rio-controller/src/reconcilers/
-      # builderpool/disruption.rs) observes the K8s-set DisruptionTarget
-      # condition and calls force=true.
-      #
-      # Flow: K8s eviction API → pod.status.conditions[DisruptionTarget]
-      # =True → watcher's applied_objects() stream fires → is_disruption_
-      # target() → admin.drain_worker(force:true) → scheduler actor
-      # handle_drain_worker → if force { to_reassign.drain(); send
-      # CancelSignal each; reassign_derivations }.
-      #
-      # Log signal is the CONTROLLER's "DisruptionTarget: DrainWorker
-      # force=true" info! at disruption.rs — cleanest single-grep proof
-      # the watcher fired. The scheduler's "sent CancelSignal for
-      # force-drain (preemption)" at worker.rs:254 is secondary (only
-      # fires if running_builds was non-empty, which this test
-      # arranges).
-      #
-      # Runs LAST in core: the eviction deletes rio-builder-x86-64-0. The
-      # STS recreates it (~120s FUSE-mount+warm), but core has no
-      # subsequent subtests needing a ready worker.
-
-      # P518: 60s was tight under coverage-mode instrumentation
-      # slowdown (mc=67 merge-183 hit it post-P0512's ~12s manifest-pool
-      # subtest; subsequent merge-185 green — one-off). covTimeoutHeadroom
-      # (common.nix:80) pads globalTimeout but not INTERNAL Python
-      # wait-loops. 120 under coverage gives the watcher's applied_objects
-      # stream + gRPC RTT + JSON log flush the same 2× slack ratio.
-      _drain_deadline_s = ${if common.coverage then "120" else "60"}
-
-      with subtest("disruption-drain: eviction → DisruptionTarget → DrainWorker force=true"):
-          # Start a 120s build so running_builds is non-empty when
-          # eviction hits. ssh-ng:// → gateway → SubmitBuild → Ready
-          # → dispatch to rio-builder-x86-64-0 (the only worker). Back-
-          # grounded — script proceeds while build runs.
-          client.execute(
-              "nohup nix-build --no-out-link "
-              "--store 'ssh-ng://k3s-server' "
-              "--arg busybox '(builtins.storePath ${common.busybox})' "
-              "${disruptionDrv} > /tmp/disruption-build.log 2>&1 < /dev/null &"
-          )
-
-          # Wait for dispatch: scheduler's running gauge ≥1. 60s:
-          # ssh-ng connect + gateway translate + Submit + actor Tick
-          # + dispatch lag (flannel subnet race can add ~10s).
-          sched_metric_wait(
-              "awk '/^rio_scheduler_derivations_running / {print $2}' | "
-              "grep -qE '^[1-9]'",
-              timeout=60,
-          )
-          print("disruption-drain: build dispatched, triggering eviction")
-
-          # Evict rio-builder-x86-64-0 via the K8s eviction subresource.
-          # This is what `kubectl drain` calls under the hood — but
-          # targeted at ONE pod instead of draining a whole node (which
-          # would evict scheduler/store too and destabilize the test).
-          #
-          # The PDB (maxUnavailable=1) allows this: with 1 replica, 1
-          # can be evicted (budget is met trivially). K8s sets
-          # DisruptionTarget=True on the pod BEFORE deletion — that
-          # status update is what the watcher observes.
-          #
-          # `|| true`: eviction returns 201 Created; kubectl-delete-
-          # shaped exit handling sometimes reports non-zero depending
-          # on shell plumbing. We assert the controller log below, not
-          # this command's exit code.
-          k3s_server.succeed(
-              "printf '%s' "
-              "'{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\","
-              "\"metadata\":{\"name\":\"rio-builder-x86-64-0\",\"namespace\":\"${nsBuilders}\"}}' "
-              "| k3s kubectl create --raw "
-              "'/api/v1/namespaces/${nsBuilders}/pods/rio-builder-x86-64-0/eviction' -f - "
-              "|| true"
-          )
-
-          # THE ASSERTION: controller logged the watcher-fire.
-          # disruption.rs:info!("DisruptionTarget: DrainWorker force=true").
-          # 30s: watcher stream is applied_objects() with default_
-          # backoff — Pod status update lands within one watch event
-          # (~sub-second) + gRPC RTT to scheduler + JSON log flush.
-          # The grep is anchored on "DisruptionTarget" (unique to the
-          # watcher — no other component logs that word) AND "force=
-          # true" (proving this is the watcher's call, not the pod's
-          # SIGTERM force=false self-drain).
-          # Read /var/log/pods directly (not kubectl logs): kubectl logs
-          # fails with "http2: stream closed" under poll-loop load. Check
-          # both nodes — controller replicas=1 (HARD, controller.yaml:15);
-          # the single pod schedules to either node ~50/50. Poll both
-          # each iteration; the node WITHOUT the pod has no matching log
-          # dir.
-          #
-          # P0535: nullglob + `cat` MUST have a /dev/null sentinel arg.
-          # Without it, on the node WITHOUT a controller pod the glob
-          # expands to nothing → `cat` with NO args reads stdin → blocks
-          # on the backdoor-shell pipe forever. The deadline check below
-          # never runs (Machine.execute default timeout=900s). Observed
-          # drv 3i5wnky7 (impl-19): 7-min silent hang → globalTimeout
-          # SIGTERM → "[Errno 9] Bad file descriptor". Bimodal ~50% =
-          # P(controller on k3s-agent) — k3s_server is checked first;
-          # when it's the empty-glob node, the test hangs immediately.
-          # /dev/null first arg makes empty-glob `cat /dev/null` → exit 0
-          # → grep exits 1 → loop continues to the other node.
-          import time
-          deadline = time.time() + _drain_deadline_s
-          found = False
-          while time.time() < deadline:
-              for node in [k3s_server, k3s_agent]:
-                  rc, _ = node.execute(
-                      "shopt -s nullglob; "
-                      "cat /dev/null "
-                      "/var/log/pods/${ns}_rio-controller-*/controller/*.log "
-                      "2>/dev/null | grep -q 'DisruptionTarget.*force=true'",
-                      timeout=15,
-                  )
-                  if rc == 0:
-                      found = True
-                      break
-              if found:
-                  break
-              time.sleep(2)
-          assert found, (
-              "controller never logged 'DisruptionTarget: DrainWorker "
-              f"force=true' within {_drain_deadline_s}s on either node"
-          )
-
-          # SECONDARY: scheduler saw force=true and preempted. "sent
-          # CancelSignal for force-drain" at actor/worker.rs:254 fires
-          # iff running_builds was non-empty (we arranged it). The
-          # scheduler log is JSON; grep for the message substring.
-          #
-          # Leader lookup fresh (recovery subtest may have changed it;
-          # core doesn't run recovery, but leader_pod() is idempotent).
-          # Same /var/log/pods approach as primary — kubectl logs has
-          # http2:stream-closed under poll load. Scheduler replicas=2,
-          # either node may have the leader.
-          deadline = time.time() + _drain_deadline_s
-          found = False
-          while time.time() < deadline:
-              for node in [k3s_server, k3s_agent]:
-                  rc, _ = node.execute(
-                      "shopt -s nullglob; "
-                      "cat /dev/null "
-                      "/var/log/pods/${ns}_rio-scheduler-*/scheduler/*.log "
-                      "2>/dev/null | grep -q 'force-drain'",
-                      timeout=15,
-                  )
-                  if rc == 0:
-                      found = True
-                      break
-              if found:
-                  break
-              time.sleep(2)
-          assert found, (
-              f"scheduler never logged 'force-drain' within {_drain_deadline_s}s on either node"
-          )
-
-          print("disruption-drain PASS: watcher fired DrainWorker force=true, "
-                "scheduler preempted in-flight build")
-    '';
-
-    finalizer = ''
-      # ══════════════════════════════════════════════════════════════════
-      # finalizer — delete BuilderPool → pod gone → CR gone → workers=0
-      # ══════════════════════════════════════════════════════════════════
-      #   The autoscaler's 30s poll fires DURING this subtest (~300s wall
-      #   time). scaling.rs:222 `if pool.metadata.deletion_timestamp.is_some()
-      #   { skip }` MUST fire — otherwise the autoscaler would try to scale
-      #   a being-deleted pool, racing the finalizer's scale-to-0. The test
-      #   passing (pod gone + CR gone) proves the skip gate works.
-      #
-      # Runs LAST: deletes the only BuilderPool, so no workers exist after.
-      # Finalizer's cleanup(): DrainWorker + scale STS → 0 + wait for pod
-      # termination + remove finalizer. Queue is already empty (autoscaler
-      # drained) → acquire_many succeeds immediately → no blocking.
-      with subtest("finalizer: delete BuilderPool → drain → pod gone → CR gone"):
-          # --wait=false: don't block kubectl on the finalizer. We assert
-          # each stage with its own timeout so a hang points at the exact
-          # stage (pod-gone vs CR-gone vs workers_active).
-          kubectl("delete builderpool x86-64 --wait=false", ns="${nsBuilders}")
-
-          # ALL pool pods gone — pod-0 AND pod-1. Proves: STS scaled
-          # to 0, SIGTERM drain exited cleanly (no in-flight builds),
-          # finalizer removed (K8s could GC the owned StatefulSet).
-          #
-          # MUST be label-selector, not `get pod rio-builder-x86-64-0`.
-          # Reverse-ordinal termination only holds for STS scale-down;
-          # here pod-1 was ALREADY Terminating from autoscaler's 2→1
-          # (only `.spec.replicas==1` was asserted, not pod-1-gone), so
-          # pod-0 and pod-1 terminate independently and pod-0 can finish
-          # first. While pod-1 lingers in its 180s grace window, the
-          # builder's SIGTERM `continue 'reconnect` loop (main.rs:388)
-          # re-opens a stream and re-registers — workers_active dips to
-          # 0 then bounces back to 1. GHA runs 24007069135/24008919569/
-          # 24010744543: sched_metric_wait below blew 90s with pod-1
-          # alive; 8cf70d94's 30→90s widen couldn't fix a 180s tail.
-          #
-          # 300s: vmtest-full.yaml terminationGracePeriodSeconds=180 +
-          # 60s DRAIN_WAIT_SLOP + margin. Covers a stuck/never-Ready
-          # pod-1 sitting out its full grace period (v24/v25 showed
-          # pod-1 Terminating 4m44s with the old 7200s grace).
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get pods "
-              "-l rio.build/pool=x86-64 "
-              "--no-headers 2>/dev/null | grep -q .",
-              timeout=300,
-          )
-
-          # BuilderPool CR gone (finalizer removed → K8s deleted it).
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get builderpool x86-64 2>/dev/null",
-              timeout=30,
-          )
-
-          # Scheduler saw the disconnect. workers_active EXACTLY 0 — not
-          # just ≤0 (gauge underflow would be a bug).
-          #
-          # With the all-pods-gone wait above, this is h2 stream-close
-          # propagation + one tick_publish_gauges cycle (~10s typical;
-          # 0.17s observed local KVM). The old 30→90s widen (8cf70d94)
-          # chased a symptom — the real tail was pod-1 surviving the
-          # pod-0-only check above, now closed. wait_workers_zero
-          # (see prelude) bounds the heartbeat-timeout FALLBACK path:
-          # GHA 24046508263 hit 57.38s here (pods-gone 1.24s) — the
-          # stream-EOF never reached the scheduler, tick_check_
-          # heartbeats reaped at last_hb+~60s.
-          wait_workers_zero("finalizer assertion")
-          print("finalizer PASS: BuilderPool deleted, pod drained, scheduler saw disconnect")
-    '';
-
-    pdb-ownerref = ''
-      # ══════════════════════════════════════════════════════════════════
-      # pdb-ownerref — `{pool}-pdb` exists, ownerRef→BuilderPool, GC'd
-      # ══════════════════════════════════════════════════════════════════
-      # Proves build_pdb (builders.rs:178) produces a real K8s PDB when
-      # the BuilderPool reconciler SSA-applies it. The fixture's `rio`
-      # BuilderPool (vmtest-full.yaml) comes up → reconciler creates
-      # `x86-64-pdb` with maxUnavailable=1 + ownerRef[0]=BuilderPool.
-      # Delete `rio` → finalizer drains + removes → K8s ownerRef GC
-      # cascade takes the PDB.
-      #
-      # Runs FIRST in the wps split (fresh fixture, `rio` BuilderPool
-      # intact). Disruptive: deletes `rio` — subsequent fragments
-      # must not need it.
-      with subtest("pdb-ownerref: PDB exists, owned by BuilderPool, GC'd on delete"):
-          pdb = "x86-64-pdb"
-
-          # ── PDB exists with maxUnavailable=1 ──────────────────────────
-          # The reconciler's first apply() runs during waitReady (CRD
-          # watch fires on the fixture's BuilderPool create). By the time
-          # the prelude returns, `x86-64-pdb` should exist. 30s margin
-          # for the SSA patch + k3s apiserver admission lag.
-          k3s_server.wait_until_succeeds(
-              "test \"$(k3s kubectl -n ${nsBuilders} get pdb x86-64-pdb "
-              "-o jsonpath='{.spec.maxUnavailable}')\" = 1",
-              timeout=30,
-          )
-
-          # ── ownerReferences[0] → BuilderPool ───────────────────────────
-          # controller=true, kind=BuilderPool, name=default. K8s GC
-          # cascades when the owner is deleted IFF controller=true (or
-          # blockOwnerDeletion — same effect for GC). The reconciler's
-          # controller_owner_ref(&()) sets controller=true.
-          owner_kind = kubectl(
-              f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].kind}'",
-              ns="${nsBuilders}",
-          ).strip()
-          assert owner_kind == "BuilderPool", (
-              f"expected ownerRef[0].kind=BuilderPool, got {owner_kind!r}. "
-              f"Without ownerRef, BuilderPool delete leaks the PDB."
-          )
-          owner_name = kubectl(
-              f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].name}'",
-              ns="${nsBuilders}",
-          ).strip()
-          assert owner_name == "x86-64", (
-              f"expected ownerRef[0].name=x86-64 (the pool name), "
-              f"got {owner_name!r}"
-          )
-          owner_ctrl = kubectl(
-              f"get pdb {pdb} "
-              "-o jsonpath='{.metadata.ownerReferences[0].controller}'",
-              ns="${nsBuilders}",
-          ).strip()
-          assert owner_ctrl == "true", (
-              f"expected ownerRef[0].controller=true (K8s GC requires "
-              f"it for cascade), got {owner_ctrl!r}"
-          )
-
-          # ── Delete BuilderPool → PDB GC'd ──────────────────────────────
-          # --wait=false: don't block kubectl on the finalizer. The
-          # finalizer's cleanup (DrainWorker + scale STS→0 + wait for
-          # pods gone + remove finalizer) completes fast here — no
-          # in-flight builds (fresh fixture, no subtest submitted any).
-          # terminationGracePeriodSeconds=180 still applies to the pod,
-          # but with no builds the worker SIGTERM-exits immediately.
-          kubectl("delete builderpool x86-64 --wait=false", ns="${nsBuilders}")
-
-          # BuilderPool CR gone first (finalizer removed → K8s deletes).
-          # 120s: grace=180s would apply if SIGTERM hung, but idle
-          # worker exits in <5s. 120s absorbs the finalizer's
-          # DRAIN_WAIT_SLOP (60s) + k3s controller-manager GC sweep lag.
-          k3s_server.wait_until_succeeds(
-              "! k3s kubectl -n ${nsBuilders} get builderpool x86-64 2>/dev/null",
-              timeout=180,
-          )
-
-          # THE ASSERTION: PDB GC'd via ownerRef cascade. k3s's
-          # built-in GC controller (same as upstream kube-controller-
-          # manager) runs a continuous sweep; orphan detection is
-          # event-driven (owner delete → GC fires). 30s is generous.
-          k3s_server.wait_until_succeeds(
-              f"! k3s kubectl -n ${nsBuilders} get pdb {pdb} 2>/dev/null",
-              timeout=30,
-          )
-          print(f"pdb-ownerref PASS: {pdb} GC'd after BuilderPool delete")
-    '';
-
     wps-lifecycle = ''
       # ══════════════════════════════════════════════════════════════════
       # wps-lifecycle — apply WPS → 3 children → delete → children gone
@@ -2933,17 +2315,6 @@ let
       # carries sizeClass=class.name + ownerRef[0]=BuilderPoolSet
       # (controller=true). Delete WPS → finalizer cleanup() explicitly
       # deletes each child (mod.rs:375); ownerRef GC is the fallback.
-      #
-      # RUNS AFTER pdb-ownerref: the `rio` BuilderPool is gone (no
-      # STS worker to steal dispatches if the child pools' autoscaler
-      # ever decided to scale up — but replicas.min=0 default means
-      # they don't). Doesn't strictly require it, but keeps the
-      # cluster state simple.
-      #
-      # NOT proven here: the per-class autoscaler actually scales a
-      # child. That'd need queue pressure on a specific size class —
-      # scaling.rs unit tests cover compute_desired; this covers the
-      # reconcile→child-create→cleanup wiring.
       with subtest("wps-lifecycle: apply WPS → 3 children → delete → children gone"):
           # ── Apply 3-class WPS ─────────────────────────────────────────
           # poolTemplate.image=rio-builder + imagePullPolicy not-in-template
@@ -3024,8 +2395,8 @@ let
           # --wait=false: don't block on the WPS finalizer. cleanup()
           # (builderpoolset/mod.rs:371) explicitly deletes each child
           # with 404 tolerance. Each child then runs ITS OWN BuilderPool
-          # finalizer (DrainWorker + scale STS→0 — trivially fast at
-          # replicas=0) before K8s GC deletes STS/Service/PDB.
+          # finalizer (DrainWorker — trivially fast at replicas=0)
+          # before K8s GC deletes the owned resources.
           kubectl("delete builderpoolset test-wps --wait=false", ns="${nsBuilders}")
 
           # WPS CR gone: finalizer removed → K8s deletes. 60s: cleanup
@@ -3047,127 +2418,6 @@ let
               )
 
           print("wps-lifecycle PASS: 3 children created + GC'd on WPS delete")
-    '';
-
-    fetcherpool-sts = ''
-      # ══════════════════════════════════════════════════════════════════
-      # fetcherpool-sts — FetcherPool CR → STS with ADR-019 security posture
-      # ══════════════════════════════════════════════════════════════════
-      # Proves the fetcherpool reconciler (ADR-019) produces a real K8s
-      # StatefulSet with the ADR-specified hardening: rio.build/role:
-      # fetcher label, readOnlyRootFilesystem:true, rio-fetcher.json
-      # seccomp, fetcher nodeSelector+toleration. The reconciler calls
-      # common/sts.rs with ExecutorRole::Fetcher; this proves the
-      # params→podspec chain end-to-end against a real apiserver.
-      #
-      # STS-shape-only test: does NOT wait for readyReplicas. The
-      # fetcher pod needs a fetcher-tainted node + the rio-fetcher.json
-      # seccomp profile installed + the device plugin — none of which
-      # the k3s-full fixture provides yet (P0452 scheduler routing +
-      # the four-namespace helm values are the enabling work). The pod
-      # spec IS the proof: if the reconciler emits the right labels/
-      # securityContext/nodeSelector, the ADR-019 wiring is correct.
-      #
-      # Applied in rio-fetchers (ADR-019 four-namespace layout, P0454).
-      # The reconciler creates the STS in the same namespace as the CR.
-      #
-      # Tracey: r[verify ctrl.fetcherpool.reconcile] +
-      # r[verify fetcher.sandbox.strict-seccomp] +
-      # r[verify fetcher.node.dedicated] — markers at the default.nix
-      # subtests entry (P0341 convention).
-      with subtest("fetcherpool-sts: CR → STS with fetcher labels+securityContext"):
-          # ── Apply a minimal FetcherPool CR ────────────────────────────
-          k3s_server.succeed(
-              "k3s kubectl apply -f - <<'EOF'\n"
-              "apiVersion: rio.build/v1alpha1\n"
-              "kind: FetcherPool\n"
-              "metadata:\n"
-              "  name: test-fp\n"
-              "  namespace: ${nsFetchers}\n"
-              "spec:\n"
-              "  maxConcurrent: 1\n"
-              "  image: rio-fetcher:dev\n"
-              "  systems: [x86_64-linux]\n"
-              "EOF"
-          )
-
-          # ── STS exists, owned by the CR ───────────────────────────────
-          # Reconciler SSA-applies on CRD watch event. 30s margin for
-          # the apply + k3s admission lag (same as pdb-ownerref above).
-          sts = "rio-fetcher-test-fp"
-          k3s_server.wait_until_succeeds(
-              f"k3s kubectl -n ${nsFetchers} get statefulset {sts}",
-              timeout=30,
-          )
-
-          # STS-shape checks: pull once, assert against the JSON. Fetch-
-          # per-field was 6 kubectl roundtrips; one -o json + jsonpath
-          # on the python side is cheaper and keeps the ns kwarg in one
-          # place (ADR-019: STS lives in rio-fetchers).
-          import json as _json
-          sts_json = _json.loads(
-              kubectl(f"get sts {sts} -o json", ns="${nsFetchers}")
-          )
-          tmpl = sts_json["spec"]["template"]
-          ctr = tmpl["spec"]["containers"][0]
-
-          # ── Pod template label: rio.build/role=fetcher ────────────────
-          role = tmpl["metadata"]["labels"].get("rio.build/role")
-          assert role == "fetcher", (
-              f"expected rio.build/role=fetcher, got {role!r}. "
-              f"NetworkPolicies and scheduler routing key on this."
-          )
-
-          # ── securityContext: readOnlyRootFilesystem=true ──────────────
-          ro_fs = ctr.get("securityContext", {}).get("readOnlyRootFilesystem")
-          assert ro_fs is True, (
-              f"expected readOnlyRootFilesystem=true, got {ro_fs!r}. "
-              f"ADR-019 §Sandbox hardening — rootfs tampering blocked."
-          )
-
-          # ── seccomp: Localhost rio-fetcher.json ───────────────────────
-          # Container-level (not pod-level — pod-level stays
-          # RuntimeDefault so a missing profile surfaces as the
-          # executor container's CreateContainerError, not a generic
-          # CreatePodSandBoxError on the pause container).
-          seccomp = (
-              ctr.get("securityContext", {})
-              .get("seccompProfile", {})
-              .get("localhostProfile")
-          )
-          assert seccomp == "operator/rio-fetcher.json", (
-              f"expected operator/rio-fetcher.json, got {seccomp!r}. "
-              f"ADR-019 §Sandbox hardening — extra denies for ptrace/bpf/…"
-          )
-
-          # ── nodeSelector + toleration: fetcher node pool ──────────────
-          node_role = tmpl["spec"].get("nodeSelector", {}).get("rio.build/node-role")
-          assert node_role == "fetcher", (
-              f"expected nodeSelector rio.build/node-role=fetcher, "
-              f"got {node_role!r}. ADR-019 §Node isolation."
-          )
-          tols = tmpl["spec"].get("tolerations", [])
-          assert any(t.get("key") == "rio.build/fetcher" for t in tols), (
-              f"expected toleration key rio.build/fetcher, got {tols!r}"
-          )
-
-          # ── RIO_EXECUTOR_KIND=fetcher env ─────────────────────────────
-          # rio-builder's kind-gate (ADR-019 §Executor enforcement)
-          # refuses FODs when RIO_EXECUTOR_KIND!=fetcher.
-          env = {e["name"]: e.get("value") for e in ctr.get("env", [])}
-          assert env.get("RIO_EXECUTOR_KIND") == "fetcher", (
-              f"expected RIO_EXECUTOR_KIND=fetcher in env, got:\n{env!r}"
-          )
-
-          # ── Cleanup ───────────────────────────────────────────────────
-          # --wait=false + short timeout: fetcherpool cleanup is
-          # immediate (no long terminationGracePeriod to wait through).
-          kubectl("delete fetcherpool test-fp --wait=false", ns="${nsFetchers}")
-          k3s_server.wait_until_succeeds(
-              f"! k3s kubectl -n ${nsFetchers} get statefulset {sts} 2>/dev/null",
-              timeout=60,
-          )
-          print("fetcherpool-sts PASS: STS shape matches ADR-019")
     '';
 
     store-rollout = ''
