@@ -66,12 +66,7 @@ pub struct AssignmentClaims {
     /// assigned CA build — same blast radius as IA (it could upload
     /// garbage to its known IA output path too).
     ///
-    /// `#[serde(default)]` for backward compat: tokens signed before
-    /// this field existed deserialize with `is_ca = false` (IA
-    /// semantics, the only kind that existed).
-    ///
     /// [`drv_hash`]: Self::drv_hash
-    #[serde(default)]
     pub is_ca: bool,
     /// Unix timestamp (seconds). Token invalid after this. Scheduler
     /// sets it to ~2× build_timeout; a worker legitimately uploading
@@ -444,40 +439,6 @@ mod tests {
             .verify(&token)
             .expect("CRLF trimmed → same key → verify succeeds");
         assert_eq!(verified, claims);
-    }
-
-    /// Tokens signed before the `is_ca` field existed must still
-    /// verify (deserialize with `is_ca = false`). Pins the
-    /// `#[serde(default)]` annotation — without it, old tokens fail
-    /// with `missing field is_ca` and every in-flight build's PutPath
-    /// gets PERMISSION_DENIED during a rolling deploy.
-    #[test]
-    fn missing_is_ca_defaults_false() {
-        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
-        // Hand-craft a token WITHOUT is_ca (what an old scheduler
-        // would sign). Can't use Claims — it always serializes the
-        // field now.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let old_json = serde_json::json!({
-            "executor_id": "w",
-            "drv_hash": "d",
-            "expected_outputs": ["/nix/store/p"],
-            "expiry_unix": now + 3600,
-        });
-        let claims_json = serde_json::to_vec(&old_json).unwrap();
-        let mut mac = HmacSha256::new_from_slice(TEST_KEY).unwrap();
-        mac.update(&claims_json);
-        let tag = mac.finalize().into_bytes();
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let token = format!("{}.{}", b64.encode(&claims_json), b64.encode(tag));
-
-        let claims = verifier
-            .verify(&token)
-            .expect("token without is_ca field should verify (serde default)");
-        assert!(!claims.is_ca, "missing is_ca should default to false");
     }
 
     /// Token is human-debuggable: base64-decode the first part →
