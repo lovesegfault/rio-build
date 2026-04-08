@@ -43,7 +43,7 @@ use sqlx::PgPool;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, instrument, warn};
 
-use rio_nix::narinfo::NarInfoBuilder;
+use rio_nix::narinfo::NarInfo;
 #[cfg(test)]
 use rio_nix::store_path::StorePath;
 use rio_nix::store_path::nixbase32;
@@ -181,9 +181,6 @@ async fn narinfo(
         }
     };
 
-    // Build the narinfo text. NarInfoBuilder keeps field validation
-    // centralized — we don't hand-format here.
-    //
     // URL: nar/{nixbase32(nar_hash)}.nar.zst — the nar_hash identifies
     // the CONTENT (multiple paths with the same content share a URL,
     // which is fine; we serve the same bytes). User decision from
@@ -199,37 +196,18 @@ async fn narinfo(
         .map(|r| r.basename().to_string())
         .collect();
 
-    let deriver_basename = info.deriver.as_ref().map(|d| d.basename().to_string());
-
-    let mut builder = NarInfoBuilder::new(
-        info.store_path.as_str(),
-        &url,
-        "zstd",
-        format!("sha256:{nar_hash_b32}"),
-        info.nar_size,
-    )
-    .references(ref_basenames);
-
-    if let Some(d) = deriver_basename {
-        builder = builder.deriver(d);
-    }
-    for sig in &info.signatures {
-        builder = builder.sig(sig);
-    }
-    if let Some(ca) = &info.content_address {
-        builder = builder.ca(ca);
-    }
-
-    // NarInfoBuilder::build can only fail on empty required fields.
-    // We populated all of them from ValidatedPathInfo (which itself
-    // can't have empty store_path — StorePath doesn't construct from
-    // empty). If this fires, it's a ValidatedPathInfo invariant bug.
-    let narinfo = match builder.build() {
-        Ok(n) => n,
-        Err(e) => {
-            warn!(error = %e, "narinfo: builder validation failed (bug?)");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    let narinfo = NarInfo {
+        store_path: info.store_path.as_str().to_string(),
+        url,
+        compression: "zstd".into(),
+        nar_hash: format!("sha256:{nar_hash_b32}"),
+        nar_size: info.nar_size,
+        references: ref_basenames,
+        deriver: info.deriver.as_ref().map(|d| d.basename().to_string()),
+        sigs: info.signatures.clone(),
+        ca: info.content_address.clone(),
+        file_hash: None,
+        file_size: None,
     };
 
     let body = narinfo.serialize();

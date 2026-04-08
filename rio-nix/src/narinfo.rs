@@ -391,111 +391,6 @@ pub fn fingerprint(
     format!("1;{store_path};{hash_colon};{nar_size};{refs_joined}")
 }
 
-/// Builder for constructing [`NarInfo`] values.
-pub struct NarInfoBuilder {
-    store_path: String,
-    url: String,
-    compression: String,
-    nar_hash: String,
-    nar_size: u64,
-    references: Vec<String>,
-    deriver: Option<String>,
-    sigs: Vec<String>,
-    ca: Option<String>,
-    file_hash: Option<String>,
-    file_size: Option<u64>,
-}
-
-impl NarInfoBuilder {
-    /// Create a builder with the required fields.
-    pub fn new(
-        store_path: impl Into<String>,
-        url: impl Into<String>,
-        compression: impl Into<String>,
-        nar_hash: impl Into<String>,
-        nar_size: u64,
-    ) -> Self {
-        NarInfoBuilder {
-            store_path: store_path.into(),
-            url: url.into(),
-            compression: compression.into(),
-            nar_hash: nar_hash.into(),
-            nar_size,
-            references: Vec::new(),
-            deriver: None,
-            sigs: Vec::new(),
-            ca: None,
-            file_hash: None,
-            file_size: None,
-        }
-    }
-
-    /// Set the references (store path basenames).
-    pub fn references(mut self, refs: Vec<String>) -> Self {
-        self.references = refs;
-        self
-    }
-
-    /// Set the deriver basename.
-    pub fn deriver(mut self, deriver: impl Into<String>) -> Self {
-        self.deriver = Some(deriver.into());
-        self
-    }
-
-    /// Add a signature.
-    pub fn sig(mut self, sig: impl Into<String>) -> Self {
-        self.sigs.push(sig.into());
-        self
-    }
-
-    /// Set the content address.
-    pub fn ca(mut self, ca: impl Into<String>) -> Self {
-        self.ca = Some(ca.into());
-        self
-    }
-
-    /// Set the compressed file hash.
-    pub fn file_hash(mut self, file_hash: impl Into<String>) -> Self {
-        self.file_hash = Some(file_hash.into());
-        self
-    }
-
-    /// Set the compressed file size.
-    pub fn file_size(mut self, file_size: u64) -> Self {
-        self.file_size = Some(file_size);
-        self
-    }
-
-    /// Build the [`NarInfo`], validating that required fields are non-empty.
-    pub fn build(self) -> Result<NarInfo, NarInfoError> {
-        if self.store_path.is_empty() {
-            return Err(NarInfoError::MissingField("StorePath"));
-        }
-        if self.url.is_empty() {
-            return Err(NarInfoError::MissingField("URL"));
-        }
-        if self.compression.is_empty() {
-            return Err(NarInfoError::MissingField("Compression"));
-        }
-        if self.nar_hash.is_empty() {
-            return Err(NarInfoError::MissingField("NarHash"));
-        }
-        Ok(NarInfo {
-            store_path: self.store_path,
-            url: self.url,
-            compression: self.compression,
-            nar_hash: self.nar_hash,
-            nar_size: self.nar_size,
-            references: self.references,
-            deriver: self.deriver,
-            sigs: self.sigs,
-            ca: self.ca,
-            file_hash: self.file_hash,
-            file_size: self.file_size,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,43 +668,20 @@ Deriver: second.drv
     }
 
     #[test]
-    fn builder_constructs_valid_narinfo() -> anyhow::Result<()> {
-        let info = NarInfoBuilder::new(
-            "/nix/store/abc-test",
-            "nar/abc.nar.zst",
-            "zstd",
-            "sha256:0000",
-            100,
-        )
-        .references(vec!["abc-dep".to_string()])
-        .deriver("xyz-test.drv")
-        .sig("key:sig")
-        .ca("fixed:sha256:beef")
-        .build()?;
-
-        assert_eq!(info.store_path, "/nix/store/abc-test");
-        assert_eq!(info.references, ["abc-dep"]);
-        assert_eq!(info.deriver.as_deref(), Some("xyz-test.drv"));
-        assert_eq!(info.sigs, ["key:sig"]);
-        assert_eq!(info.ca.as_deref(), Some("fixed:sha256:beef"));
-
-        // Verify it roundtrips
-        let serialized = info.serialize();
-        let reparsed = NarInfo::parse(&serialized)?;
-        assert_eq!(info, reparsed);
-        Ok(())
-    }
-
-    #[test]
     fn serialize_omits_empty_optional_fields() -> anyhow::Result<()> {
-        let info = NarInfoBuilder::new(
-            "/nix/store/abc-test",
-            "nar/abc.nar.zst",
-            "none",
-            "sha256:0000",
-            100,
-        )
-        .build()?;
+        let info = NarInfo {
+            store_path: "/nix/store/abc-test".into(),
+            url: "nar/abc.nar.zst".into(),
+            compression: "none".into(),
+            nar_hash: "sha256:0000".into(),
+            nar_size: 100,
+            references: vec![],
+            deriver: None,
+            sigs: vec![],
+            ca: None,
+            file_hash: None,
+            file_size: None,
+        };
 
         let text = info.serialize();
         assert!(!text.contains("Deriver:"));
@@ -893,24 +765,25 @@ FileSize: 54321
 
     #[test]
     fn test_roundtrip_narinfo() -> anyhow::Result<()> {
-        let original = NarInfoBuilder::new(
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-roundtrip",
-            "nar/roundtrip.nar.zst",
-            "zstd",
-            "sha256:abcdef0123456789",
-            42000,
-        )
-        .references(vec![
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1".to_string(),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep2".to_string(),
-        ])
-        .deriver("cccccccccccccccccccccccccccccccc-roundtrip.drv")
-        .sig("test-key-1:sigdata1==")
-        .sig("test-key-2:sigdata2==")
-        .ca("fixed:sha256:cafef00d")
-        .file_hash("sha256:compressed123")
-        .file_size(8000)
-        .build()?;
+        let original = NarInfo {
+            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-roundtrip".into(),
+            url: "nar/roundtrip.nar.zst".into(),
+            compression: "zstd".into(),
+            nar_hash: "sha256:abcdef0123456789".into(),
+            nar_size: 42000,
+            references: vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep2".to_string(),
+            ],
+            deriver: Some("cccccccccccccccccccccccccccccccc-roundtrip.drv".into()),
+            sigs: vec![
+                "test-key-1:sigdata1==".into(),
+                "test-key-2:sigdata2==".into(),
+            ],
+            ca: Some("fixed:sha256:cafef00d".into()),
+            file_hash: Some("sha256:compressed123".into()),
+            file_size: Some(8000),
+        };
 
         let serialized = original.serialize();
         let reparsed = NarInfo::parse(&serialized)?;
@@ -1022,34 +895,21 @@ FileHash: sha256:second
                     .map(|i| format!("{}-{}", ref_hashes[i], ref_names[i]))
                     .collect();
 
-                let mut builder = NarInfoBuilder::new(
-                    &store_path,
-                    &url,
-                    &compression,
-                    &nar_hash,
+                let original = NarInfo {
+                    store_path,
+                    url,
+                    compression: compression.clone(),
+                    nar_hash,
                     nar_size,
-                )
-                .references(refs);
-
-                if has_deriver {
-                    builder = builder.deriver(format!("{drv_hash}-{drv_name}.drv"));
-                }
-
-                for i in 0..sig_count {
-                    builder = builder.sig(format!("{}:{}", sig_keys[i], sig_datas[i]));
-                }
-
-                if has_ca {
-                    builder = builder.ca(format!("fixed:sha256:{ca_hash}"));
-                }
-
-                if has_file_hash {
-                    builder = builder
-                        .file_hash(format!("sha256:{file_hash_hex}"))
-                        .file_size(file_size_val);
-                }
-
-                let original = builder.build()?;
+                    references: refs,
+                    deriver: has_deriver.then(|| format!("{drv_hash}-{drv_name}.drv")),
+                    sigs: (0..sig_count)
+                        .map(|i| format!("{}:{}", sig_keys[i], sig_datas[i]))
+                        .collect(),
+                    ca: has_ca.then(|| format!("fixed:sha256:{ca_hash}")),
+                    file_hash: has_file_hash.then(|| format!("sha256:{file_hash_hex}")),
+                    file_size: has_file_hash.then_some(file_size_val),
+                };
                 let serialized = original.serialize();
                 let reparsed = NarInfo::parse(&serialized)?;
 
