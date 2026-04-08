@@ -144,6 +144,7 @@ fn default_seed_ratio() -> f64 {
 /// BuilderPoolSpec — KubeSchema processes `#[x_kube]` on nested
 /// structs (Replicas, TargetRef, LoadThresholds) so their CEL
 /// rules render.
+// r[impl ctrl.crd.componentscaler]
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, KubeSchema)]
 #[kube(
     group = "rio.build",
@@ -283,6 +284,7 @@ mod tests {
 
     /// Nested CEL rules render: `Replicas` (`min <= max`),
     /// `TargetRef`, `LoadThresholds`.
+    // r[verify ctrl.crd.componentscaler]
     #[test]
     fn cel_rules_render() {
         let crd = ComponentScaler::crd();

@@ -250,6 +250,7 @@ mod tests {
     /// (P0223 entry criterion). The type has `#[x_kube]` CEL
     /// rules — verify those propagate into the BPS schema too
     /// (nested KubeSchema types carry their rules through).
+    // r[verify ctrl.crd.seccomp-cel]
     #[test]
     fn seccomp_cel_propagates() {
         let crd = BuilderPoolSet::crd();

@@ -34,6 +34,7 @@ pub enum Sizing {
 ///
 /// Printer columns: what `kubectl get builderpools` shows. Ready/
 /// Desired at a glance is the main thing operators want.
+// r[impl ctrl.crd.builderpool]
 ///
 /// `KubeSchema` alongside `CustomResource`: KubeSchema processes
 /// `#[x_kube(validation)]` attrs into x-kubernetes-validations.
@@ -292,6 +293,7 @@ pub struct BuilderPoolSpec {
 ///
 /// `KubeSchema` not `JsonSchema`: nested struct with `#[x_kube]`
 /// attrs.
+// r[impl ctrl.crd.seccomp-cel]
 #[derive(Clone, Debug, Serialize, Deserialize, KubeSchema)]
 #[serde(rename_all = "camelCase")]
 #[x_kube(

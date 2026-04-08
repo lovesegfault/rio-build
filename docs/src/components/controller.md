@@ -13,40 +13,48 @@ kind: BuilderPool
 metadata:
   name: default
 spec:
-  maxConcurrent: 20                            # concurrent-Job ceiling (one Job = one build)
-  resources:
+  # ---- PoolSpecCommon (flattened — shared with FetcherPoolSpec) ----
+  maxConcurrent: 20                            # u32, required — concurrent-Job ceiling (one Job = one build)
+  deadlineSeconds: 3600                        # u32?, optional — Job activeDeadlineSeconds; default 3600 (builders), 300 (fetchers)
+  image: rio-builder:dev                       # string, required — container image ref
+  systems: [x86_64-linux]                      # list<string>, required (non-empty per CEL)
+  resources:                                   # ResourceRequirements?, optional
     requests: { cpu: "4", memory: "8Gi" }
-    limits: { cpu: "8", memory: "16Gi" }      # the build's limits — one build per pod
-  fuseCacheSize: 100Gi                         # local SSD cache for rio-fuse
-  features: [big-parallel, kvm]               # maps to requiredSystemFeatures
-  systems: [x86_64-linux]
-  image: rio-builder:dev                       # required — container image ref
-  imagePullPolicy: IfNotPresent                # optional — K8s default if omitted
-  sizeClass: small                             # maps to RIO_SIZE_CLASS env
-  tlsSecretName: rio-builder-tls               # optional — Secret with tls.crt/tls.key/ca.crt for mTLS
-  hostNetwork: false                           # optional — true only for VM-test/airgap escapes; requires privileged:true (hostUsers:false incompatible with host netns)
-  hostUsers: false                             # optional — false runs in a user namespace (production default; ADR-012)
-  seccompProfile: Localhost                    # optional — RuntimeDefault | Localhost | Unconfined
-  fuseThreads: 4                               # optional — fuser worker threads (RIO_FUSE_THREADS)
-  fusePassthrough: true                        # optional — kernel passthrough mode for backed reads (RIO_FUSE_PASSTHROUGH)
-  daemonTimeoutSecs: 300                       # optional — local nix-daemon RPC timeout (RIO_DAEMON_TIMEOUT_SECS)
-  terminationGracePeriodSeconds: 7200          # optional — K8s grace; defaults to 2h to let in-flight build complete
-  topologySpread: true                         # optional — add topologySpreadConstraints across zones
-  # securityContext: NOT a CRD field. The controller hardcodes
-  # capabilities (SYS_ADMIN + SYS_CHROOT) in build_pod_spec().
-  # Only `privileged: bool` is exposed (for VM-test/airgap escape
-  # hatches); production pods use granular caps, not privileged.
+    limits: { cpu: "8", memory: "16Gi" }
+  tlsSecretName: rio-builder-tls               # string?, optional — Secret with tls.crt/tls.key/ca.crt for mTLS
+  hostUsers: false                             # bool?, optional — None ⇒ hostUsers:false (userns per ADR-012); set true to opt out
   nodeSelector:
     rio.build/builder: "true"
   tolerations:
-    - key: rio.build/builder
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
+    - { key: rio.build/builder, operator: Equal, value: "true", effect: NoSchedule }
+  # ---- BuilderPoolSpec-only fields ----
+  sizing: Static                               # Static|Manifest, default Static (ADR-020)
+  sizeClass: small                             # string, default "" — maps to RIO_SIZE_CLASS env
+  sizeClassCutoffSecs: 60.0                    # f64?, optional — stamped from BuilderPoolSet; drives per-class activeDeadlineSeconds
+  features: [big-parallel, kvm]                # list<string>, default [] — maps to requiredSystemFeatures
+  imagePullPolicy: IfNotPresent                # string?, optional — K8s default if omitted
+  fuseThreads: 4                               # u32?, optional — fuser worker threads (RIO_FUSE_THREADS)
+  fusePassthrough: true                        # bool?, optional — kernel passthrough mode for backed reads (RIO_FUSE_PASSTHROUGH)
+  daemonTimeoutSecs: 7200                      # u64?, optional — local nix-daemon RPC timeout (RIO_DAEMON_TIMEOUT_SECS)
+  terminationGracePeriodSeconds: 7200          # i64?, optional — K8s grace; defaults to 7200 (r[ctrl.pod.tgps-default])
+  privileged: false                            # bool?, optional — true ⇒ full privileged (disables seccomp, all caps)
+  hostNetwork: false                           # bool?, optional — true requires privileged:true (CEL-enforced)
+  seccompProfile:                              # SeccompProfileKind?, optional — typed struct, CEL-validated
+    type: Localhost                            #   RuntimeDefault | Localhost | Unconfined
+    localhostProfile: operator/rio-builder.json#   required iff type=Localhost (r[ctrl.crd.seccomp-cel])
+  # NOT CRD fields: securityContext (caps SYS_ADMIN+SYS_CHROOT hardcoded
+  # in build_executor_pod_spec()); fuseCacheSize (hardcoded BUILDER_FUSE_
+  # CACHE=50Gi — pods are one-shot so cache never outlives one closure);
+  # topologySpread (one-shot Jobs don't anti-affine); fodProxyUrl (removed
+  # ADR-019 — builders are airgapped, FODs route to FetcherPool).
 status:
-  replicas: 5                                  # active Jobs
-  readyReplicas: 4
-  desiredReplicas: 8
+  replicas: 5                                  # i32 — active Jobs
+  readyReplicas: 4                             # i32 — Jobs whose pod passed readinessProbe
+  desiredReplicas: 8                           # i32 — concurrent-Job target the reconciler is converging on
+  conditions:                                  # []Condition — see r[ctrl.condition.sched-unreachable]
+    - type: SchedulerUnreachable
+      status: "False"
+      reason: ClusterStatusOK
 ```
 
 ### Job lifecycle
@@ -239,10 +247,10 @@ r[ctrl.wps.reconcile]
 The BuilderPoolSet reconciler creates one child BuilderPool per `spec.classes[i]`, named `{bps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the BPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
 
 r[ctrl.fetcherpool.classes]
-When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; `max_replicas` overrides the pool-wide `spec.maxConcurrent`. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
+When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; per-class `maxConcurrent` overrides the pool-wide `spec.maxConcurrent`. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
 
 r[ctrl.fetcherpool.ephemeral-per-class]
-When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSizeClassStatusResponse.fod_classes[class.name].queued` (in-flight FOD demand bucketed by `size_class_floor`), and spawn `spawn_count(queued, active, class.maxReplicas)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Missing class in the RPC response (scheduler `[[fetcher_size_classes]]` unconfigured or out of sync) falls back to the flat `queued_fod_derivations` count for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
+When `classes[]` is non-empty, the reconciler spawns Jobs per class: for each `class`, list active Jobs labeled `rio.build/pool={fp.name}-{class.name}`, read `GetSizeClassStatusResponse.fod_classes[class.name].queued` (in-flight FOD demand bucketed by `size_class_floor`), and spawn `spawn_count(queued, active, class.maxConcurrent)` Jobs with `RIO_SIZE_CLASS={class.name}` + per-class `resources`. Missing class in the RPC response (scheduler `[[fetcher_size_classes]]` unconfigured or out of sync) falls back to the flat `queued_fod_derivations` count for `classes[0]` only --- better to over-spawn the smallest class than to never spawn.
 
 r[ctrl.fetcherpool.multiarch]
 Multiple `FetcherPool` CRs MAY coexist (typically one per arch). The reconciler derives the `rio.build/pool` label as `{fp.name}-{class.name}` so pools sharing a class name don't collide in the same namespace. Each pool's `spec.systems` and `spec.nodeSelector["kubernetes.io/arch"]` MUST agree (a pool advertising `x86_64-linux` MUST select `amd64` nodes). Dispatch is pool-agnostic: the scheduler scores across all registered fetchers regardless of which `FetcherPool` spawned them.
@@ -281,7 +289,6 @@ spec:
     - name: small
       cutoffSecs: 60                 # f64; required (no null/unbounded — last class catches the tail)
       maxConcurrent: 40
-      targetQueuePerReplica: 5
       resources:
         requests: { cpu: "2", memory: "4Gi" }
         limits: { cpu: "4", memory: "8Gi" }
@@ -333,11 +340,96 @@ status:
 |---|---|---|
 | `name` | string | Child pool name suffix and `BuilderPoolSpec.sizeClass` value. |
 | `cutoffSecs` | f64 | Required. Upper duration bound for this class; last class catches the tail. |
-| `maxConcurrent` | u32? | Per-class concurrent-Job ceiling. |
-| `targetQueuePerReplica` | u32? | Autoscaler target (default 5). |
+| `maxConcurrent` | u32? | Per-class concurrent-Job ceiling. `None` ⇒ inherit `spec.maxConcurrent`. |
 | `resources` | ResourceRequirements | Required — distinct resource profiles are the point of size classes. |
 
+| `ClassStatus` field | Type | Notes |
+|---|---|---|
+| `name` | string | Matches `spec.classes[].name`. |
+| `effectiveCutoffSecs` | f64 | Cutoff the scheduler is actually using (drifts from spec when learning is on). |
+| `queued` | u64 | Builds queued for this class (`GetSizeClassStatus`). |
+| `childPool` | string | Owned child BuilderPool name (`{bps}-{name}`). |
+| `replicas` / `readyReplicas` | i32 | Mirrored from child `BuilderPool.status`. |
+
 The existing `BuilderPool` CRD remains valid for single-pool deployments without size-class routing.
+
+### FetcherPool
+
+r[ctrl.crd.fetcherpool]
+```yaml
+apiVersion: rio.build/v1alpha1
+kind: FetcherPool
+metadata:
+  name: x86-64
+spec:
+  # ---- PoolSpecCommon (flattened — same fields as BuilderPool) ----
+  maxConcurrent: 16                  # u32, required
+  deadlineSeconds: 300               # u32?, optional — Job activeDeadlineSeconds; default 300
+  image: rio-builder:dev             # string, required — same binary, RIO_EXECUTOR_KIND=fetcher
+  systems: [x86_64-linux]            # list<string>
+  hostUsers: false                   # bool?, optional
+  tlsSecretName: rio-builder-tls
+  nodeSelector:
+    rio.build/node-role: fetcher
+  tolerations:
+    - { key: rio.build/fetcher, operator: Equal, value: "true", effect: NoSchedule }
+  # `resources` is mutually exclusive with `classes[]` — CEL rejects both set.
+  # ---- FetcherPoolSpec-only fields ----
+  classes:                           # []FetcherSizeClass, default []
+    - name: tiny
+      maxConcurrent: 16
+      resources: { requests: { cpu: "1", memory: "2Gi" }, limits: { cpu: "2", memory: "4Gi" } }
+    - name: small
+      maxConcurrent: 4
+      resources: { requests: { cpu: "2", memory: "8Gi" }, limits: { cpu: "4", memory: "16Gi" } }
+status:
+  readyReplicas: 3
+  desiredReplicas: 4
+  conditions:
+    - { type: SchedulerUnreachable, status: "False", reason: ClusterStatusOK }
+```
+
+`FetcherSizeClass` is `SizeClassCommon` with no extra fields (no
+`cutoffSecs` — FODs route by reactive floor only,
+`r[sched.fod.size-class-reactive]`). When `classes` is empty (default),
+Jobs use `spec.resources` directly. NOT a separate `*Set` CRD: per-arch
+is handled by rendering multiple `FetcherPool` CRs (helm
+`fetcherPools[]`); promote to a `*Set` only if per-class-per-arch
+autoscaling targets diverge.
+
+### ComponentScaler
+
+r[ctrl.crd.componentscaler]
+```yaml
+apiVersion: rio.build/v1alpha1
+kind: ComponentScaler
+metadata:
+  name: rio-store
+spec:
+  targetRef:                         # required
+    kind: Deployment                 #   CEL: must be "Deployment"
+    name: rio-store                  #   same-namespace
+  signal: scheduler-builders         # scheduler-builders|self-reported, default scheduler-builders
+  replicas:                          # required
+    min: 2                           #   i32; CEL: min <= max
+    max: 14                          #   i32 — for store: Aurora max_connections / pgMaxConnections
+  seedRatio: 50.0                    # f64, default 50.0 — initial builders_per_replica
+  loadEndpoint: rio-store-headless.rio-store:9002   # string, required — headless Service for GetLoad polling
+  loadThresholds:
+    high: 0.8                        # f64, default 0.8 — CEL: 0.0 < low < high <= 1.0
+    low: 0.3                         # f64, default 0.3
+status:
+  learnedRatio: 67.3                 # f64? — EMA-adjusted; persists across controller restart
+  observedLoadFactor: 0.42           # f64? — max(GetLoad.pg_pool_utilization) at last tick
+  desiredReplicas: 5                 # i32 — last value patched onto deployments/scale
+  lastScaleUpTime: "2026-04-08T..."  # Time? — 5min scale-down stabilization window starts here
+  lowLoadTicks: 12                   # u32 — consecutive ticks with load<low (mirrored; authoritative counter in-process)
+```
+
+Why not k8s HPA: no metrics-server / custom.metrics.k8s.io adapter
+in-cluster, and the controller already has the demand signal
+(`GetSizeClassStatus`). See `r[ctrl.scaler.component]` /
+`r[ctrl.scaler.ratio-learn]` for reconciler behavior.
 
 ## Reconciliation Loops
 
@@ -488,9 +580,19 @@ CRDs follow a `v1alpha1` → `v1beta1` → `v1` progression. The initial impleme
 
 CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constraints:
 
-- `spec.maxConcurrent > 0`
-- `spec.systems` must be non-empty
-- `spec.hostNetwork: true` requires `spec.privileged: true` — Kubernetes rejects `hostUsers: false` combined with `hostNetwork: true` at pod admission; the non-privileged path sets `hostUsers: false` per ADR-012
+| CRD | Rule | Reject reason |
+|---|---|---|
+| BuilderPool, FetcherPool | `self.maxConcurrent > 0` | Zero ceiling means no work ever spawns. |
+| BuilderPool | `size(self.systems) > 0` | A builder pool with no target systems accepts no work. |
+| BuilderPool | `hostNetwork ⇒ privileged` | See `r[ctrl.crd.host-users-network-exclusive]`. |
+| FetcherPool | `size(self.classes) == 0 ∨ ¬has(self.resources)` | `classes[]` and top-level `resources` are mutually exclusive. |
+| SeccompProfileKind | type ∈ allowed; `Localhost ⇔ has(localhostProfile)` | See `r[ctrl.crd.seccomp-cel]`. |
+| ComponentScaler.Replicas | `self.min <= self.max` | Clamp range must be non-empty. |
+| ComponentScaler.TargetRef | `self.kind == 'Deployment'` | Reconciler patches `apps/v1 deployments/scale` only. |
+| ComponentScaler.LoadThresholds | `0.0 < low < high <= 1.0` | Threshold ordering for ratio correction. |
+
+r[ctrl.crd.seccomp-cel]
+`SeccompProfileKind` is a struct (`{type, localhostProfile?}`), not a Rust enum: kube-core's structural-schema rewriter rejects oneOf-variant subschemas with non-identical shared properties, so the type/localhostProfile coupling is enforced by CEL instead of the Rust type system. Two rules: `self.type in ['RuntimeDefault', 'Localhost', 'Unconfined']`, and `self.type == 'Localhost' ? has(self.localhostProfile) : !has(self.localhostProfile)`. The struct mirrors `pod.spec.securityContext.seccompProfile` exactly so operators can copy-paste; nested `KubeSchema` carries the rules through into both `BuilderPool` and `BuilderPoolSet` schemas.
 
 r[ctrl.crd.host-users-network-exclusive]
 The controller MUST reject `BuilderPool` specs with `hostNetwork: true` and `privileged` unset or false. Kubernetes admission rejects pod specs combining `hostUsers: false` with `hostNetwork: true` (user-namespace UID remapping is incompatible with the host network namespace). Since the non-privileged path sets `hostUsers: false` unconditionally (ADR-012, `r[sec.pod.host-users-false]`), `hostNetwork: true` implies the `privileged: true` escape hatch. CRD CEL validation enforces this at `kubectl apply` time; the builder additionally suppresses `hostUsers` when the combination is encountered in pre-existing specs (emitting a Warning event).
@@ -498,7 +600,7 @@ The controller MUST reject `BuilderPool` specs with `hostNetwork: true` and `pri
 r[ctrl.event.spec-degrade]
 The BuilderPool reconciler MUST emit a `Warning`-type Kubernetes Event for every spec field the builder silently degrades. CEL validation rejects NEW specs with invalid combinations; existing specs applied before the CEL rule landed are defensively corrected at pod-template time (e.g., `hostUsers` suppressed for `hostNetwork: true`). Without a Warning event, the operator has no signal that their spec is stale — `kubectl get bp -o yaml` shows the original value; the pod template shows the corrected value. The Warning names the field, the spec value, and the remediation.
 
-`spec.fuseCacheSize` is NOT a CEL rule — it is validated at reconcile time (`parse_quantity_to_gb` in `builders.rs` returns `InvalidSpec` on unparseable input, which fails the reconcile and emits an event).
+There is no `spec.fuseCacheSize` CRD field — the FUSE cache emptyDir `sizeLimit` is the hardcoded `BUILDER_FUSE_CACHE` (50Gi) / `FETCHER_FUSE_CACHE` constant; pods are one-shot so the cache never outlives one build's input closure.
 
 ## BuilderPool Finalizer
 

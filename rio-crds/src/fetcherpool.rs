@@ -27,6 +27,7 @@ use crate::common::{PoolSpecCommon, PoolStatusCommon, SizeClassCommon, impl_comm
 /// `KubeSchema` alongside `CustomResource`: same pattern as
 /// BuilderPoolSpec. No CEL on this struct yet, but KubeSchema
 /// keeps the door open without a re-derive.
+// r[impl ctrl.crd.fetcherpool]
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, KubeSchema)]
 #[kube(
     group = "rio.build",
@@ -192,6 +193,7 @@ mod tests {
     /// The `classes`/`resources` mutual-exclusion CEL rule renders.
     /// Absence means a misformed spec with BOTH set is accepted at
     /// admission; the reconciler would silently ignore one.
+    // r[verify ctrl.crd.fetcherpool]
     #[test]
     fn classes_resources_cel_renders() {
         let crd = FetcherPool::crd();
