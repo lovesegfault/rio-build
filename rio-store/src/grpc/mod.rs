@@ -189,7 +189,7 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
 // `put_path::common` now (the fault-line NOTE that was here said to
 // extract them once mod.rs crossed 1000L — it did). Re-exported via
 // `put_path` so `put_path_batch`'s `use super::*` still resolves.
-use put_path::{PlaceholderClaim, apply_trailer, validate_put_metadata};
+use put_path::{PlaceholderClaim, apply_trailer, validate_put_metadata, verify_nar};
 
 /// The StoreService gRPC server.
 ///

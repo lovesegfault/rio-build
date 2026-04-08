@@ -62,40 +62,22 @@ impl StoreServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let start = std::time::Instant::now();
 
-        // HMAC check once for the whole batch. Claims (if any) apply to
-        // every output — each output's path must be in expected_outputs.
-        let hmac_claims = self.verify_assignment_token(&request)?;
-
-        // JWT tenant-id extraction — same mechanism as PutPath (see
-        // put_path.rs for the full interceptor/dual-mode commentary).
-        // One JWT per batch; all outputs in the batch get signed with
-        // the same tenant's key. This is correct: a batch is one
-        // derivation's outputs, one build, one tenant.
-        let tenant_id: Option<uuid::Uuid> = request
-            .extensions()
-            .get::<rio_common::jwt::TenantClaims>()
-            .map(|c| c.sub);
-
+        let auth = self.authorize(&request)?;
         let mut stream = request.into_inner();
 
-        // BTreeMap for deterministic iteration order (output 0, 1, 2, …).
-        // The response `created` array is indexed by output_index, so we
-        // need to fill it in order regardless of stream arrival order.
-        let mut outputs: BTreeMap<u32, OutputAccum> = BTreeMap::new();
-        // NAR byte budget permits — same backpressure as PutPath. Held
-        // for the whole handler so drop-on-exit releases them.
-        let mut _held_permits: Vec<tokio::sync::SemaphorePermit<'_>> = Vec::new();
+        // --- Phase 1: drain the stream, route by output_index ---
+        let (mut outputs, _held_permits) = self
+            .drain_batch_stream(&mut stream, auth.hmac_claims.as_ref())
+            .await?;
+        if outputs.is_empty() {
+            return Err(Status::invalid_argument("PutPathBatch: empty stream"));
+        }
+
         // store_path_hashes of placeholders WE inserted (and thus own
         // and must clean up on error). Separate from `outputs` so the
-        // bail! macro can borrow it while a phase-2/3 loop holds a
-        // mutable borrow of `outputs` — borrow-checker can't see that
-        // abort_batch only needs this subset.
+        // bail! macro can borrow it while a phase-2/3 loop holds
+        // `&mut outputs`.
         let mut owned_placeholders: Vec<Vec<u8>> = Vec::new();
-
-        // Macro: on any error after placeholders are inserted, clean them
-        // up before returning. Tokio can't do async Drop so this is
-        // explicit. Borrows `&owned_placeholders` only — disjoint from
-        // `&mut outputs` held by phase-2/3 loops.
         macro_rules! bail {
             ($status:expr) => {{
                 self.abort_batch(&owned_placeholders).await;
@@ -103,131 +85,26 @@ impl StoreServiceImpl {
             }};
         }
 
-        // --- Phase 1: drain the stream, route by output_index ---
-        while let Some(msg) = stream.message().await.transpose() {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => bail!(e),
-            };
-            let idx = msg.output_index;
-
-            // Bound output count. Checked on every message because the
-            // highest index can arrive at any point in the stream.
-            if idx as usize >= MAX_BATCH_OUTPUTS {
-                bail!(Status::invalid_argument(format!(
-                    "output_index {idx} exceeds MAX_BATCH_OUTPUTS ({MAX_BATCH_OUTPUTS})"
-                )));
-            }
-
-            let inner = msg
-                .inner
-                .and_then(|i| i.msg)
-                .ok_or_else(|| Status::invalid_argument("PutPathBatchRequest.inner must be set"))?;
-
-            let accum = outputs.entry(idx).or_default();
-
-            match inner {
-                put_path_request::Msg::Metadata(meta) => {
-                    if accum.info.is_some() {
-                        bail!(Status::invalid_argument(format!(
-                            "output {idx}: duplicate metadata"
-                        )));
-                    }
-                    let raw_info = meta.info.ok_or_else(|| {
-                        Status::invalid_argument(format!(
-                            "output {idx}: PutPathMetadata missing PathInfo"
-                        ))
-                    })?;
-                    // Shared 6-step validation (trailer-only, bounds,
-                    // placeholder, TryFrom, HMAC path-in-claims) — same
-                    // helper PutPath uses. Phase 1 hasn't inserted any
-                    // placeholders yet, so `?` is safe (the static
-                    // ?-grep test slices from the phase-2 marker below).
-                    let info = validate_put_metadata(
-                        raw_info,
-                        hmac_claims.as_ref(),
-                        &format!("output {idx}"),
-                    )?;
-
-                    accum.store_path_hash = info.store_path.sha256_digest().to_vec();
-                    accum.info = Some(info);
-                }
-                put_path_request::Msg::NarChunk(chunk) => {
-                    if accum.info.is_none() {
-                        bail!(Status::invalid_argument(format!(
-                            "output {idx}: nar_chunk before metadata"
-                        )));
-                    }
-                    if accum.trailer.is_some() {
-                        bail!(Status::invalid_argument(format!(
-                            "output {idx}: nar_chunk after trailer"
-                        )));
-                    }
-                    let new_len = (accum.nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                    if new_len >= MAX_NAR_SIZE {
-                        bail!(Status::invalid_argument(format!(
-                            "output {idx}: NAR exceeds MAX_NAR_SIZE"
-                        )));
-                    }
-                    // Global NAR byte budget — same semaphore PutPath uses.
-                    let permit = self
-                        .nar_bytes_budget
-                        .acquire_many(chunk.len() as u32)
-                        .await
-                        .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
-                    _held_permits.push(permit);
-                    accum.nar_data.extend_from_slice(&chunk);
-                }
-                put_path_request::Msg::Trailer(t) => {
-                    if accum.trailer.is_some() {
-                        bail!(Status::invalid_argument(format!(
-                            "output {idx}: duplicate trailer"
-                        )));
-                    }
-                    accum.trailer = Some(t);
-                }
-            }
-        }
-
-        if outputs.is_empty() {
-            return Err(Status::invalid_argument("PutPathBatch: empty stream"));
-        }
-
         // --- Phase 2: per-output validation + placeholder insert ---
-        // Each output gets the same metadata → trailer-apply → hash-verify
-        // flow PutPath does. Placeholder inserts happen here (before the
-        // commit tx) because they're idempotent-safe: `nar_size=0` +
-        // `status='uploading'` guards mean the abort-path reap can't
-        // touch a concurrent winner.
         for (idx, accum) in outputs.iter_mut() {
+            let ctx = format!("output {idx}");
             let Some(info) = accum.info.as_mut() else {
                 bail!(Status::invalid_argument(format!(
-                    "output {idx}: stream closed without metadata"
+                    "{ctx}: stream closed without metadata"
                 )));
             };
             let Some(t) = accum.trailer.as_ref() else {
                 bail!(Status::invalid_argument(format!(
-                    "output {idx}: stream closed without trailer"
+                    "{ctx}: stream closed without trailer"
                 )));
             };
-
-            // bail! (not `?`): prior loop iterations may have pushed to
-            // owned_placeholders.
-            if let Err(e) = apply_trailer(info, t, &format!("output {idx}")) {
+            if let Err(e) = apply_trailer(info, t, &ctx) {
+                bail!(e);
+            }
+            if let Err(e) = verify_nar(&accum.nar_data, info, &ctx) {
                 bail!(e);
             }
 
-            // Hash verification — the security check.
-            let digest = crate::validate::NarDigest::from_bytes(&accum.nar_data);
-            if let Err(e) = validate_nar_digest(&digest, &info.nar_hash, info.nar_size) {
-                warn!(output_index = %idx, error = %e, "PutPathBatch: NAR validation failed");
-                bail!(Status::invalid_argument(format!(
-                    "output {idx}: NAR validation failed: {e}"
-                )));
-            }
-
-            // Idempotency + placeholder + stale-reclaim. Shared with
-            // PutPath — see `claim_placeholder` for the full commentary.
             let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
             match self
                 .claim_placeholder(
@@ -245,144 +122,33 @@ impl StoreServiceImpl {
                 Ok(PlaceholderClaim::Owned) => {
                     owned_placeholders.push(accum.store_path_hash.clone());
                 }
-                Ok(PlaceholderClaim::Concurrent) => {
-                    // For a batch we can't partially proceed — bail the
-                    // whole batch. Retriable.
-                    bail!(Status::aborted(format!(
-                        "output {idx}: concurrent upload in progress; retry"
-                    )));
-                }
+                Ok(PlaceholderClaim::Concurrent) => bail!(Status::aborted(format!(
+                    "{ctx}: concurrent upload in progress; retry"
+                ))),
                 Err(e) => bail!(putpath_metadata_status(
                     "PutPathBatch: claim_placeholder",
                     e
                 )),
             }
 
-            // Stage: chunked outputs upload to S3 + bump refcounts now
-            // (outside the atomic tx); inline outputs just carry their
-            // bytes forward. info.store_path_hash must be set for
-            // stage_chunked's manifest write.
             info.store_path_hash = accum.store_path_hash.clone();
             let nar_data = std::mem::take(&mut accum.nar_data);
             match self.stage_nar_for_batch(info, nar_data).await {
                 Ok(p) => accum.staged = Some(p),
-                // stage_chunked rolled back this output's placeholder on
-                // its own; abort_batch's reap_one for it is a harmless
-                // no-op (status='uploading' filter). Other outputs'
-                // placeholders are still owned and DO need cleanup.
                 Err(e) => bail!(e),
             }
         }
 
-        // Resolve the tenant's signer ONCE. All outputs in the batch
-        // share the same tenant (one JWT → one Claims.sub). The old
-        // per-output `maybe_sign` call inside the phase-3 loop did N
-        // identical get_active_signer queries while the tx below holds
-        // manifests row locks. N=10 → ~10ms extra lock-hold; N=100
-        // (possible for a many-output derivation) → ~100ms.
-        //
-        // Fallback on TenantKeyLookup Err matches maybe_sign: warn +
-        // cluster key. One warn instead of N — same end state.
-        //
-        // `None` iff `self.signer()` is None (signing disabled). Phase-3
-        // then skips signing entirely (same as maybe_sign's early return).
-        let resolved_signer: Option<(crate::signing::Signer, bool)> = match self.signer() {
-            None => None,
-            Some(ts) => match ts.resolve_once(tenant_id).await {
-                Ok(pair) => Some(pair),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        ?tenant_id,
-                        "PutPathBatch: tenant-key lookup failed; batch will sign with cluster key"
-                    );
-                    Some((ts.cluster().clone(), false))
-                }
-            },
-        };
+        let resolved_signer = self.resolve_batch_signer(auth.tenant_id).await;
 
         // --- Phase 3: ONE transaction, N completions, one commit ---
-        //
-        // THE atomicity guarantee (store.atomic.multi-output spec).
-        // `pool.begin()` → N × complete_manifest_inline_in_tx → commit.
-        // Any error inside the tx → drop → auto-rollback → `abort_batch`
-        // cleans placeholders → zero 'complete' rows. Tx covers DB rows
-        // ONLY; inline_blob writes are inside the same tx so they're
-        // covered too. Chunked blobs were staged outside the tx (phase-2);
-        // on failure here `abort_batch`'s `reap_one` decrements their
-        // refcounts back to zero → GC-eligible.
-        let mut tx = match self.pool.begin().await {
-            Ok(t) => t,
-            Err(e) => bail!(rio_common::grpc::internal(
-                "PutPathBatch: begin transaction",
-                e
-            )),
+        let created = match self
+            .commit_batch(&mut outputs, resolved_signer.as_ref())
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => bail!(e),
         };
-
-        let mut created =
-            vec![false; (*outputs.keys().last().expect("non-empty: checked at :185") as usize) + 1];
-        for (idx, accum) in outputs.iter_mut() {
-            if accum.already_complete {
-                // created[idx] stays false (idempotency hit).
-                continue;
-            }
-            // Clone (not take) — the post-commit content-index loop needs
-            // info.nar_hash + store_path_hash again. Both are 32 bytes;
-            // cheap to clone. staged stays the move-optimized take.
-            let mut info = accum.info.clone().expect("validated in phase 2");
-            info.store_path_hash = accum.store_path_hash.clone();
-            // Sign with the pre-resolved signer (see resolve_once above).
-            // Sync — no DB hit inside the tx.
-            if let Some((signer, was_tenant)) = &resolved_signer {
-                self.sign_with_resolved(signer, *was_tenant, &mut info);
-            }
-
-            let result = match accum.staged.take().expect("staged in phase 2") {
-                NarPersist::Inline(nar_data) => {
-                    metadata::complete_manifest_inline_in_tx(&mut tx, &info, nar_data).await
-                }
-                NarPersist::ChunkedStaged => {
-                    metadata::complete_manifest_chunked_in_tx(&mut tx, &info).await
-                }
-            };
-            if let Err(e) = result {
-                // tx drops here → auto-rollback. Placeholders (and any
-                // staged chunk refcounts) still need explicit cleanup —
-                // they were committed in phase 2's separate per-output
-                // txs. abort_batch's reap_one is chunk-aware.
-                drop(tx);
-                bail!(putpath_metadata_status(
-                    "PutPathBatch: complete_manifest",
-                    e
-                ));
-            }
-            created[*idx as usize] = true;
-        }
-
-        if let Err(e) = tx.commit().await {
-            bail!(rio_common::grpc::internal("PutPathBatch: commit", e));
-        }
-
-        // Bytes counter per created output (put_path.rs bytes_total parity).
-        // r[impl store.put.wal-manifest]
-        for accum in outputs.values() {
-            if accum.already_complete {
-                continue; // counted by a previous upload
-            }
-            let info = accum
-                .info
-                .as_ref()
-                .expect("validated in phase 2, not taken");
-            // r[impl obs.metric.transfer-volume]
-            metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
-        }
-
-        // Success. Count each created output for metrics parity with PutPath.
-        for c in &created {
-            if *c {
-                metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
-            }
-        }
 
         metrics::histogram!("rio_store_put_path_duration_seconds")
             .record(start.elapsed().as_secs_f64());
@@ -405,5 +171,178 @@ impl StoreServiceImpl {
             }
         }
         metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
+    }
+
+    /// Phase 1: demux the batch stream into per-`output_index`
+    /// [`OutputAccum`]s. No placeholders are inserted yet, so `?` is
+    /// safe (the static `?-grep` test slices from the phase-2 marker in
+    /// [`Self::put_path_batch_impl`]).
+    async fn drain_batch_stream<'a>(
+        &'a self,
+        stream: &mut Streaming<PutPathBatchRequest>,
+        hmac_claims: Option<&rio_common::hmac::AssignmentClaims>,
+    ) -> Result<
+        (
+            BTreeMap<u32, OutputAccum>,
+            Vec<tokio::sync::SemaphorePermit<'a>>,
+        ),
+        Status,
+    > {
+        // BTreeMap for deterministic iteration order (output 0, 1, 2, …).
+        // The response `created` array is indexed by output_index, so we
+        // need to fill it in order regardless of stream arrival order.
+        let mut outputs: BTreeMap<u32, OutputAccum> = BTreeMap::new();
+        let mut held_permits = Vec::new();
+
+        while let Some(msg) = stream.message().await? {
+            let idx = msg.output_index;
+            // Bound output count. Checked on every message because the
+            // highest index can arrive at any point in the stream.
+            if idx as usize >= MAX_BATCH_OUTPUTS {
+                return Err(Status::invalid_argument(format!(
+                    "output_index {idx} exceeds MAX_BATCH_OUTPUTS ({MAX_BATCH_OUTPUTS})"
+                )));
+            }
+            let inner = msg
+                .inner
+                .and_then(|i| i.msg)
+                .ok_or_else(|| Status::invalid_argument("PutPathBatchRequest.inner must be set"))?;
+            let accum = outputs.entry(idx).or_default();
+            let ctx = format!("output {idx}");
+
+            match inner {
+                put_path_request::Msg::Metadata(meta) => {
+                    if accum.info.is_some() {
+                        return Err(Status::invalid_argument(format!(
+                            "{ctx}: duplicate metadata"
+                        )));
+                    }
+                    let raw_info = meta.info.ok_or_else(|| {
+                        Status::invalid_argument(format!("{ctx}: PutPathMetadata missing PathInfo"))
+                    })?;
+                    let info = validate_put_metadata(raw_info, hmac_claims, &ctx)?;
+                    accum.store_path_hash = info.store_path.sha256_digest().to_vec();
+                    accum.info = Some(info);
+                }
+                put_path_request::Msg::NarChunk(chunk) => {
+                    if accum.info.is_none() {
+                        return Err(Status::invalid_argument(format!(
+                            "{ctx}: nar_chunk before metadata"
+                        )));
+                    }
+                    if accum.trailer.is_some() {
+                        return Err(Status::invalid_argument(format!(
+                            "{ctx}: nar_chunk after trailer"
+                        )));
+                    }
+                    let permit = self
+                        .accumulate_chunk(&mut accum.nar_data, &chunk, &ctx)
+                        .await?;
+                    held_permits.push(permit);
+                }
+                put_path_request::Msg::Trailer(t) => {
+                    if accum.trailer.is_some() {
+                        return Err(Status::invalid_argument(format!(
+                            "{ctx}: duplicate trailer"
+                        )));
+                    }
+                    accum.trailer = Some(t);
+                }
+            }
+        }
+        Ok((outputs, held_permits))
+    }
+
+    /// Resolve the tenant's signer ONCE for a batch. All outputs share
+    /// the same tenant (one JWT → one Claims.sub), so resolving inside
+    /// the phase-3 tx-loop would do N identical `get_active_signer`
+    /// queries while holding manifest row locks. On lookup error, fall
+    /// back to the cluster key (matches `maybe_sign`'s behaviour).
+    /// `None` iff signing is disabled entirely.
+    async fn resolve_batch_signer(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+    ) -> Option<(crate::signing::Signer, bool)> {
+        let ts = self.signer()?;
+        match ts.resolve_once(tenant_id).await {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    ?tenant_id,
+                    "PutPathBatch: tenant-key lookup failed; batch will sign with cluster key"
+                );
+                Some((ts.cluster().clone(), false))
+            }
+        }
+    }
+
+    /// Phase 3: open ONE transaction, flip every owned output to
+    /// `status='complete'` (inline or chunked-staged), commit, then
+    /// emit per-output created/bytes metrics. Tx auto-rollback on early
+    /// return; caller `abort_batch`es on `Err` to reap placeholders +
+    /// staged chunk refcounts (committed in phase-2's separate txs).
+    // r[impl store.put.wal-manifest]
+    // r[impl obs.metric.transfer-volume]
+    async fn commit_batch(
+        &self,
+        outputs: &mut BTreeMap<u32, OutputAccum>,
+        resolved_signer: Option<&(crate::signing::Signer, bool)>,
+    ) -> Result<Vec<bool>, Status> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| rio_common::grpc::internal("PutPathBatch: begin transaction", e))?;
+
+        let max_idx = *outputs.keys().last().expect("non-empty: checked by caller") as usize;
+        let mut created = vec![false; max_idx + 1];
+        for (idx, accum) in outputs.iter_mut() {
+            if accum.already_complete {
+                continue;
+            }
+            let mut info = accum.info.clone().expect("validated in phase 2");
+            info.store_path_hash = accum.store_path_hash.clone();
+            if let Some((signer, was_tenant)) = resolved_signer {
+                self.sign_with_resolved(signer, *was_tenant, &mut info);
+            }
+            let result = match accum.staged.take().expect("staged in phase 2") {
+                NarPersist::Inline(nar_data) => {
+                    metadata::complete_manifest_inline_in_tx(&mut tx, &info, nar_data).await
+                }
+                NarPersist::ChunkedStaged => {
+                    metadata::complete_manifest_chunked_in_tx(&mut tx, &info).await
+                }
+            };
+            if let Err(e) = result {
+                drop(tx);
+                return Err(putpath_metadata_status(
+                    "PutPathBatch: complete_manifest",
+                    e,
+                ));
+            }
+            created[*idx as usize] = true;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| rio_common::grpc::internal("PutPathBatch: commit", e))?;
+
+        for accum in outputs.values() {
+            if accum.already_complete {
+                continue;
+            }
+            let info = accum
+                .info
+                .as_ref()
+                .expect("validated in phase 2, not taken");
+            metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
+        }
+        for c in &created {
+            if *c {
+                metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
+            }
+        }
+        Ok(created)
     }
 }

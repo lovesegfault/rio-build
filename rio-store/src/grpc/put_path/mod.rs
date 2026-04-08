@@ -18,7 +18,7 @@
 use super::*;
 
 pub(super) mod common;
-pub(super) use common::{PlaceholderClaim, apply_trailer, validate_put_metadata};
+pub(super) use common::{PlaceholderClaim, apply_trailer, validate_put_metadata, verify_nar};
 
 /// Drain remaining messages from a streaming request.
 ///
@@ -228,112 +228,33 @@ impl StoreServiceImpl {
     ) -> Result<Response<PutPathResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let start = std::time::Instant::now();
-        // Record duration on ANY exit (success, error, early return)
-        // via scopeguard on Drop. Recording only on the success path
-        // would make p99 latency metrics artificially good (failures
-        // not counted).
         let _duration_guard = scopeguard::guard((), move |()| {
             metrics::histogram!("rio_store_put_path_duration_seconds")
                 .record(start.elapsed().as_secs_f64());
         });
 
-        // r[impl sec.boundary.grpc-hmac]
-        // HMAC token check BEFORE into_inner (need metadata access).
-        // If verifier=None (dev mode): no-op, claims stays None.
-        // If verifier=Some: token required + valid → claims Some,
-        // OR mTLS bypass (gateway cert) → claims None (no path
-        // restriction for gateway uploads).
-        let hmac_claims = self.verify_assignment_token(&request)?;
-
-        // JWT tenant-id extraction — independent of HMAC claims above.
-        //
-        // The P0259 interceptor (r[gw.jwt.verify]) runs BEFORE this
-        // handler and attaches `jwt::TenantClaims` to request extensions on
-        // successful verify of the `x-rio-tenant-token` header.
-        //
-        // Distinct Claims types — don't confuse them:
-        //   - `hmac::AssignmentClaims` (above): worker_id + drv_hash + expected_outputs.
-        //     Restricts WHICH paths this worker may upload. Per-assignment.
-        //   - `jwt::TenantClaims` (here): sub (tenant UUID) + iat/exp/jti.
-        //     Says WHOSE tenant key signs the narinfo. Per-session.
-        //
-        // `None` here covers three cases, all cluster-key-correct:
-        //   - No interceptor wired (dev mode) → no Claims ever attached
-        //   - Interceptor wired but no x-rio-tenant-token header → dual-mode
-        //     fallback (gateway in SSH-comment mode, or worker/health caller)
-        //   - mTLS bypass (gateway cert, `nix copy` path) — the gateway
-        //     doesn't propagate per-build tenant attribution on PutPath
-        //
-        // Worker uploads: if P0259's scope includes the worker→store call
-        // path AND the worker forwards its assignment's JWT, this fires.
-        // Otherwise None → cluster key, same as pre-P0338.
-        let tenant_id: Option<uuid::Uuid> = request
-            .extensions()
-            .get::<rio_common::jwt::TenantClaims>()
-            .map(|c| c.sub);
-
+        let auth = self.authorize(&request)?;
         let mut stream = request.into_inner();
 
-        // Step 1: Receive the first message (must be metadata)
-        let first_msg = stream
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("empty PutPath stream"))?;
-
-        let raw_info = match first_msg.msg {
-            Some(put_path_request::Msg::Metadata(meta)) => meta
-                .info
-                .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo"))?,
-            Some(put_path_request::Msg::NarChunk(_)) => {
-                return Err(Status::invalid_argument(
-                    "first PutPath message must be metadata, not nar_chunk",
-                ));
-            }
-            Some(put_path_request::Msg::Trailer(_)) => {
-                return Err(Status::invalid_argument(
-                    "first PutPath message must be metadata, not trailer",
-                ));
-            }
-            None => {
-                return Err(Status::invalid_argument("PutPath message has no content"));
-            }
-        };
-
-        // Shared 6-step validation: nar_hash-empty, bounds, placeholder,
-        // TryFrom, HMAC path-in-claims. See validate_put_metadata for the
-        // full commentary (moved there because PutPathBatch has the same
-        // dance). The server still computes the digest either way
-        // (NarDigest::from_bytes below), so the security property
-        // (client-declared hash matches server-computed) is unchanged.
-        let mut info = validate_put_metadata(raw_info, hmac_claims.as_ref(), "PutPath")?;
-
-        // Compute store_path_hash if not provided
+        let raw_info = common::read_first_metadata(&mut stream).await?;
+        let mut info = validate_put_metadata(raw_info, auth.hmac_claims.as_ref(), "PutPath")?;
         let store_path_hash = if info.store_path_hash.is_empty() {
             info.store_path.sha256_digest().to_vec()
         } else {
             info.store_path_hash.clone()
         };
-        debug!(
-            store_path = %info.store_path.as_str(),
-            "PutPath: received metadata"
-        );
+        debug!(store_path = %info.store_path.as_str(), "PutPath: received metadata");
 
-        // Steps 2+3: idempotency + placeholder insert + stale-reclaim.
-        // See `claim_placeholder` for the full commentary (shared with
-        // PutPathBatch). The Concurrent branch re-checks completeness
-        // here (PutPath-specific): if the racing uploader won between
-        // the check and the insert, return `created=false` instead of
-        // bouncing the client.
         let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-        let claim = self
+        match self
             .claim_placeholder(
                 &store_path_hash,
                 info.store_path.as_str(),
                 &refs_str,
                 "PutPath",
             )
-            .await;
-        match claim {
+            .await
+        {
             Ok(PlaceholderClaim::Owned) => {}
             Ok(PlaceholderClaim::AlreadyComplete) => {
                 debug!(store_path = %info.store_path.as_str(), "PutPath: path already complete");
@@ -361,197 +282,19 @@ impl StoreServiceImpl {
             }
         }
 
-        // r[impl store.put.drop-cleanup]
-        // I-125a: from here we own the 'uploading' placeholder. The
-        // explicit `abort_upload` calls below cover every `return Err`
-        // path; they do NOT cover the handler future being DROPPED —
-        // tonic aborts the task when the client RST_STREAMs (builder
-        // killed mid-upload). Pre-I-125a that leaked the placeholder,
-        // and the next uploader for the same path got `Aborted:
-        // concurrent PutPath` until the orphan scanner reaped it.
-        //
-        // scopeguard can't await, so spawn the cleanup. `reap_one`
-        // (chunk-aware) filters status='uploading' so firing after
-        // an explicit `abort_upload` is a harmless no-op; firing
-        // after `upgrade_manifest_to_chunked` correctly decrements
-        // the chunk refcounts the inline-only delete would leak.
-        // Defused on success only — error paths take one wasted spawn.
-        let placeholder_guard = {
-            let pool = self.pool.clone();
-            let hash = store_path_hash.clone();
-            let chunk_backend = self.chunk_backend.clone();
-            scopeguard::guard((), move |()| {
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::gc::orphan::reap_one(&pool, &hash, None, chunk_backend.as_ref())
-                            .await
-                    {
-                        error!(error = %e, "PutPath: drop-path placeholder cleanup failed");
-                    }
-                });
-            })
-        };
+        let placeholder_guard = self.spawn_placeholder_guard(store_path_hash.clone());
 
-        // Step 4: Accumulate NAR chunks into a buffer. Two bounds:
-        //   (a) per-request MAX_NAR_SIZE — enforced in-loop below
-        //   (b) GLOBAL nar_bytes_budget — acquired per-chunk, released on
-        //       handler drop. 10 concurrent 4 GiB uploads = 40 GiB RSS; the
-        //       budget backpressures the 9th+ upload instead of OOM.
-        // Permits held in a Vec so drop-on-any-exit releases them. No
-        // scopeguard needed — SemaphorePermit's Drop does the right thing.
-        let mut nar_data = Vec::new();
-        let mut trailer: Option<rio_proto::types::PutPathTrailer> = None;
-        let mut _held_permits: Vec<tokio::sync::SemaphorePermit<'_>> = Vec::new();
-        loop {
-            let msg = match stream.message().await {
-                Ok(Some(m)) => m,
-                Ok(None) => break, // stream closed
-                Err(e) => {
-                    warn!(store_path = %info.store_path, error = %e, "PutPath: stream read error");
-                    self.abort_upload(&store_path_hash).await;
-                    return Err(e);
-                }
-            };
-            match msg.msg {
-                Some(put_path_request::Msg::NarChunk(chunk)) => {
-                    // Chunk after trailer is a protocol violation — trailer
-                    // MUST be last. Catches buggy clients that keep streaming
-                    // after finalize() (would corrupt the hash validation).
-                    if trailer.is_some() {
-                        self.abort_upload(&store_path_hash).await;
-                        return Err(Status::invalid_argument(
-                            "PutPath: nar_chunk after trailer (trailer must be last)",
-                        ));
-                    }
-                    let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                    // `>=` so a single chunk of exactly 2^32 bytes is rejected
-                    // here, before it reaches acquire_many(0) below and silently
-                    // bypasses the byte budget.
-                    if new_len >= MAX_NAR_SIZE {
-                        warn!(
-                            store_path = %info.store_path,
-                            received = new_len,
-                            "PutPath: NAR chunks exceed size bound, rejecting"
-                        );
-                        self.abort_upload(&store_path_hash).await;
-                        return Err(Status::invalid_argument(format!(
-                            "NAR chunks exceed size bound {MAX_NAR_SIZE} (received {new_len}+ bytes)",
-                        )));
-                    }
-                    // Global byte budget. acquire_many(u32) — chunk.len() is
-                    // bounded by rio_common::grpc::DEFAULT_MAX_MESSAGE_SIZE
-                    // (env-configurable via RIO_GRPC_MAX_MESSAGE_SIZE), so the
-                    // cast never truncates. `await` here backpressures the
-                    // client: if the budget is exhausted, recv stalls,
-                    // gRPC flow control propagates, client send blocks.
-                    // acquire_many only errs if the semaphore is closed
-                    // (never happens; budget lives for the process), so
-                    // we map to resource_exhausted defensively.
-                    // r[impl store.put.nar-bytes-budget]
-                    let permit = self
-                        .nar_bytes_budget
-                        .acquire_many(chunk.len() as u32)
-                        .await
-                        .map_err(|_| Status::resource_exhausted("NAR buffer budget closed"))?;
-                    _held_permits.push(permit);
-                    nar_data.extend_from_slice(&chunk);
-                }
-                Some(put_path_request::Msg::Trailer(t)) => {
-                    if trailer.is_some() {
-                        self.abort_upload(&store_path_hash).await;
-                        return Err(Status::invalid_argument("PutPath: duplicate trailer"));
-                    }
-                    trailer = Some(t);
-                    // Don't break — keep reading to catch chunk-after-trailer.
-                    // A well-behaved client closes the stream right after
-                    // sending the trailer, so this is one extra recv()
-                    // that immediately returns None.
-                }
-                Some(put_path_request::Msg::Metadata(_)) => {
-                    // Protocol violation: metadata must be first-message-only.
-                    // A buggy client sending duplicate metadata with different
-                    // nar_hash would have its "correction" silently ignored.
-                    warn!(
-                        store_path = %info.store_path,
-                        "PutPath: duplicate metadata mid-stream, rejecting"
-                    );
-                    self.abort_upload(&store_path_hash).await;
-                    return Err(Status::invalid_argument(
-                        "PutPath stream contained duplicate metadata (protocol violation)",
-                    ));
-                }
-                None => {
-                    // Empty message, skip
-                }
+        let (nar_data, _held_permits) = match self.ingest_nar_stream(&mut stream, &mut info).await {
+            Ok(x) => x,
+            Err(e) => {
+                self.abort_upload(&store_path_hash).await;
+                return Err(e);
             }
-        }
-
-        // Trailer resolution: overwrite the placeholder hash/size with the
-        // trailer values. Trailer is MANDATORY — stream close without one
-        // is a protocol violation.
-        let Some(t) = trailer else {
-            self.abort_upload(&store_path_hash).await;
-            return Err(Status::invalid_argument(
-                "PutPath: no trailer received \
-                 (PutPathTrailer is required as the last message)",
-            ));
-        };
-        if let Err(e) = apply_trailer(&mut info, &t, "PutPath") {
-            self.abort_upload(&store_path_hash).await;
-            return Err(e);
-        }
-
-        // Step 5: Verify SHA-256. The NAR is already fully buffered in memory,
-        // so use from_bytes (single pass over the slice) instead of wrapping in
-        // a HashingReader + read_to_end into a second Vec (peak ~8 GiB for a
-        // 4 GiB NAR).
-        let digest = crate::validate::NarDigest::from_bytes(&nar_data);
-
-        if let Err(e) = validate_nar_digest(&digest, &info.nar_hash, info.nar_size) {
-            warn!(
-                store_path = %info.store_path,
-                error = %e,
-                "PutPath: NAR validation failed"
-            );
-            self.abort_upload(&store_path_hash).await;
-            return Err(Status::invalid_argument(format!(
-                "NAR validation failed: {e}"
-            )));
-        }
-
-        // Step 6: Complete upload. Branches on size.
-        let mut full_info = ValidatedPathInfo {
-            store_path_hash,
-            ..info
         };
 
-        // Sign BEFORE writing narinfo. The signature goes into PG
-        // alongside the other narinfo fields; the HTTP cache server
-        // serves it from there without touching the privkey. Signing
-        // now (not at serve time) means key rotation doesn't re-sign
-        // old paths — they keep their old-key sig, which stays valid
-        // as long as the old pubkey is in trusted-public-keys.
-        self.maybe_sign(tenant_id, &mut full_info).await;
-
-        // Size gate + persist: small NARs inline, large NARs chunked
-        // (if backend configured). On chunked error put_chunked already
-        // rolled back our step-3 placeholder; on inline error we still
-        // own it. abort_upload's reap_one filters status='uploading' so
-        // calling it unconditionally is a harmless no-op on the
-        // already-rolled-back chunked path — simpler than threading
-        // which-branch-failed back out.
-        if let Err(e) = self.persist_nar(&full_info, nar_data, "PutPath").await {
-            self.abort_upload(&full_info.store_path_hash).await;
-            return Err(e);
-        }
-
-        // Defuse: placeholder is now status='complete'; nothing to clean up.
+        info.store_path_hash = store_path_hash;
+        self.finalize_single(info, nar_data, auth.tenant_id).await?;
         scopeguard::ScopeGuard::into_inner(placeholder_guard);
-
-        metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
-        // r[impl obs.metric.transfer-volume]
-        metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
-        // Duration recorded by _duration_guard on Drop.
         Ok(Response::new(PutPathResponse { created: true }))
     }
 }
