@@ -51,9 +51,6 @@ pub struct Replicas {
 /// Predictive demand signal. Enum (not free-form string) because the
 /// reconciler hard-branches on it — an unknown signal isn't a
 /// degraded mode, it's "the reconciler has nothing to compute from."
-/// `SelfReported` is reserved for gateway scaling (load ∝ connected
-/// nix clients, not builders); the second CR ships when multi-client
-/// load exists to test against.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Signal {
@@ -63,9 +60,6 @@ pub enum Signal {
     /// builder_count` is the assumption the learned ratio corrects.
     #[default]
     SchedulerBuilders,
-    /// Reserved. Gateway load ∝ connected `nix` clients, not
-    /// builders; signal architecture differs.
-    SelfReported,
 }
 
 /// Reference to the scaled workload. Only `Deployment` for now —
@@ -165,7 +159,7 @@ pub struct ComponentScalerSpec {
     pub target_ref: TargetRef,
 
     /// Predictive demand signal. Default `scheduler-builders` — the
-    /// only implemented signal today. `self-reported` is reserved.
+    /// only implemented signal today.
     #[serde(default)]
     pub signal: Signal,
 
@@ -310,8 +304,6 @@ mod tests {
     fn signal_kebab_case() {
         let s = serde_json::to_string(&Signal::SchedulerBuilders).unwrap();
         assert_eq!(s, "\"scheduler-builders\"");
-        let s = serde_json::to_string(&Signal::SelfReported).unwrap();
-        assert_eq!(s, "\"self-reported\"");
         // Default + omitted-field deserialization.
         let yaml = r#"
             targetRef: {kind: Deployment, name: rio-store}

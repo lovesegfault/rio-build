@@ -117,11 +117,9 @@ spec:
               signal:
                 default: scheduler-builders
                 description: "Predictive demand signal. Default `scheduler-builders`\
-                  \ \u2014 the\nonly implemented signal today. `self-reported` is\
-                  \ reserved."
+                  \ \u2014 the\nonly implemented signal today."
                 enum:
                 - scheduler-builders
-                - self-reported
                 type: string
               targetRef:
                 description: The Deployment to scale. Same-namespace.

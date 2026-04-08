@@ -74,9 +74,6 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
     let status = cs.status.clone().unwrap_or_default();
 
     // ── Predictive: total builders (queued + running) ────────────
-    // `self-reported` is reserved (gateway scaling); reject it now
-    // so a misconfigured CR surfaces in `kubectl describe` instead
-    // of silently doing nothing.
     let builders = match spec.signal {
         Signal::SchedulerBuilders => {
             let resp = ctx.size_class_status().await.map_err(|e| {
@@ -101,13 +98,6 @@ async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Acti
             } else {
                 component::total_builders(&resp)
             }
-        }
-        Signal::SelfReported => {
-            return Err(Error::InvalidSpec(
-                "spec.signal=self-reported is reserved (gateway scaling); \
-                 use scheduler-builders for store"
-                    .into(),
-            ));
         }
     };
 
