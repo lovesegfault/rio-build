@@ -143,11 +143,10 @@ pub struct DagActor {
     /// that don't need the store (cache check is then skipped).
     store_client: Option<StoreServiceClient<Channel>>,
     /// Timeout for metadata gRPC calls to the store (FindMissingPaths,
-    /// ContentLookup). Defaults to [`rio_common::grpc::DEFAULT_GRPC_TIMEOUT`]
-    /// (30s). Tests that arm `MockStore.content_lookup_hang` to prove the
-    /// timeout wrapper exists (e.g.
-    /// `ca_cutoff_compare_slow_store_doesnt_block_completion`) override to
-    /// 3s via [`with_grpc_timeout`](Self::with_grpc_timeout) — same
+    /// QueryPathInfo). Defaults to [`rio_common::grpc::DEFAULT_GRPC_TIMEOUT`]
+    /// (30s). Tests that arm a hung MockStore to prove the timeout wrapper
+    /// exists override to 3s via
+    /// [`with_grpc_timeout`](Self::with_grpc_timeout) — same
     /// wrapper-exists proof at 10× less wall-clock. Plumbed as a field
     /// (not `cfg(test)` on the const) because `cfg(test)` is per-crate:
     /// rio-scheduler's test build links against rio-common built WITHOUT
