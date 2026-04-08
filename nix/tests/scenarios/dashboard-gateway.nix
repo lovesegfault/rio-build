@@ -367,6 +367,19 @@ pkgs.testers.runNixOSTest {
     # method is actually wired. Body grep for grpc-status:0 confirms the
     # scheduler accepted the request, not just that envoy routed it.
     with subtest("method-gate: ListExecutors returns 200 + grpc-status:0"):
+        # Structural gate: the curl below depends on BackendTrafficPolicy
+        # rio-scheduler-admin-retry being reconciled into envoy xDS so
+        # Unavailable from the standby replica is retried. Without this
+        # wait, a missing/unaccepted policy gives ~50% lucky-pass (envoy
+        # round-robin first-hit on leader). PolicyAncestorStatus shape
+        # (GEP-713): .status.ancestors[*].conditions[type=Accepted].
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} get backendtrafficpolicy "
+            "rio-scheduler-admin-retry "
+            "-o jsonpath='{.status.ancestors[0].conditions[?(@.type==\"Accepted\")].status}' "
+            "| grep -qx True",
+            timeout=90,
+        )
         listexec_curl = (
             "printf '\\x00\\x00\\x00\\x00\\x00' | "
             "curl -s -w '\\n%{http_code}' "
