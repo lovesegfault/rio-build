@@ -25,7 +25,8 @@ struct Config {
     store_addr: String,
     database_url: String,
     metrics_addr: std::net::SocketAddr,
-    tick_interval_secs: u64,
+    #[serde(rename = "tick_interval_secs", with = "rio_common::config::secs")]
+    tick_interval: std::time::Duration,
     /// S3 bucket for build-log flush. `None` = flush disabled.
     /// Env: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().
     log_s3_bucket: Option<String>,
@@ -133,7 +134,7 @@ impl Default for Config {
             store_addr: String::new(),
             database_url: String::new(),
             metrics_addr: rio_common::default_addr(9091),
-            tick_interval_secs: 10,
+            tick_interval: std::time::Duration::from_secs(10),
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
             size_classes: Vec::new(),
@@ -225,12 +226,12 @@ impl rio_common::config::ValidateConfig for Config {
         required(&cfg.store_addr, "store_addr", "scheduler")?;
         required(&cfg.database_url, "database_url", "scheduler")?;
         // `tokio::time::interval(ZERO)` panics. The tick loop feeds
-        // `from_secs(cfg.tick_interval_secs)` straight in — `tick_interval_
-        // secs = 0` would crash the scheduler on spawn, AFTER migrations
-        // ran and the gRPC port was already bound (a very late, very
-        // confusing failure). Fail fast at config load.
+        // `cfg.tick_interval` straight in — `tick_interval_secs = 0`
+        // would crash the scheduler on spawn, AFTER migrations ran and
+        // the gRPC port was already bound (a very late, very confusing
+        // failure). Fail fast at config load.
         anyhow::ensure!(
-            cfg.tick_interval_secs > 0,
+            !cfg.tick_interval.is_zero(),
             "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
         );
         // r[impl sched.retry.per-worker-budget]
@@ -672,19 +673,23 @@ async fn main() -> anyhow::Result<()> {
     // by the actor's drop path) stops the loop shortly after. No
     // early-break needed — spawn_periodic's biased; shutdown wins.
     let tick_actor = actor.clone();
-    let tick_interval = std::time::Duration::from_secs(cfg.tick_interval_secs);
-    rio_common::task::spawn_periodic("tick-loop", tick_interval, shutdown.clone(), move || {
-        let tick_actor = tick_actor.clone();
-        async move {
-            if tick_actor
-                .try_send(rio_scheduler::actor::ActorCommand::Tick)
-                .is_err()
-                && !tick_actor.is_alive()
-            {
-                tracing::warn!("actor channel closed; tick dropped");
+    rio_common::task::spawn_periodic(
+        "tick-loop",
+        cfg.tick_interval,
+        shutdown.clone(),
+        move || {
+            let tick_actor = tick_actor.clone();
+            async move {
+                if tick_actor
+                    .try_send(rio_scheduler::actor::ActorCommand::Tick)
+                    .is_err()
+                    && !tick_actor.is_alive()
+                {
+                    tracing::warn!("actor channel closed; tick dropped");
+                }
             }
-        }
-    });
+        },
+    );
 
     // Start gRPC server
     let listen_addr: std::net::SocketAddr = cfg.listen_addr.parse()?;
@@ -1018,7 +1023,7 @@ mod tests {
         let d = Config::default();
         assert_eq!(d.listen_addr, "[::]:9001");
         assert_eq!(d.metrics_addr.to_string(), "[::]:9091");
-        assert_eq!(d.tick_interval_secs, 10);
+        assert_eq!(d.tick_interval, std::time::Duration::from_secs(10));
         // Phase2a required these; no default.
         assert!(d.store_addr.is_empty());
         assert!(d.database_url.is_empty());

@@ -46,12 +46,76 @@
 //! the pattern rationale and the P0219 failure mode that motivated it.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+/// Serde adapter: `Duration` ⇄ integer seconds. Lets a `Config` field
+/// be a native [`std::time::Duration`] while keeping the wire format a
+/// plain `u64` (TOML `foo_secs = 6`, env `RIO_FOO_SECS=6`).
+///
+/// ```ignore
+/// #[serde(rename = "tick_interval_secs", with = "rio_common::config::secs")]
+/// tick_interval: Duration,
+/// ```
+///
+/// The `rename` keeps the on-disk key suffixed `_secs` so the unit is
+/// self-documenting in TOML and the env var name stays stable across
+/// the `u64 → Duration` field migration.
+pub mod secs {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        d.as_secs().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        u64::deserialize(d).map(Duration::from_secs)
+    }
+}
+
+/// Serde adapter: `Duration` ⇄ integer milliseconds. Same shape as
+/// [`secs`]; use for sub-second knobs (`*_ms` fields).
+pub mod millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        u64::try_from(d.as_millis())
+            .map_err(serde::ser::Error::custom)?
+            .serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        u64::deserialize(d).map(Duration::from_millis)
+    }
+}
+
+/// Read an env var with a typed fallback. For the handful of
+/// bootstrap-time reads that run BEFORE [`load`] (tracing init,
+/// observability) or that live in leaf crates with no `Config` struct.
+///
+/// Unset OR parse-failure → `default`. A bad value is logged to
+/// stderr (tracing may not be initialized yet) so the operator sees
+/// the fallback was taken.
+///
+/// Prefer a `Config` field over this for anything that can wait until
+/// after figment load — this exists only for the chicken-and-egg
+/// cases (`RIO_LOG_FORMAT`, `RIO_OTEL_*`) and test hooks.
+pub fn env_or<T: FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("warning: invalid {name}={v:?}; using default");
+            default
+        }),
+        Err(_) => default,
+    }
+}
 
 /// Load configuration for `component` with the full precedence chain.
 ///
@@ -810,6 +874,51 @@ mod tests {
             redact_db_url("postgres://admin:a@b@c@db.example.com:5432/rio"),
             "postgres://admin:***@db.example.com:5432/rio"
         );
+    }
+
+    // --- Duration adapter tests ---
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct DurCfg {
+        #[serde(rename = "tick_secs", with = "secs")]
+        tick: std::time::Duration,
+        #[serde(rename = "timeout_ms", with = "millis")]
+        timeout: std::time::Duration,
+    }
+
+    /// `secs`/`millis` round-trip via figment's `Serialized` provider —
+    /// the same path `load()` uses for the base layer. Proves the
+    /// adapters compose with figment, not just raw serde.
+    #[test]
+    fn duration_adapters_roundtrip_via_figment() {
+        let original = DurCfg {
+            tick: std::time::Duration::from_secs(7),
+            timeout: std::time::Duration::from_millis(250),
+        };
+        let extracted: DurCfg = Figment::from(Serialized::defaults(&original))
+            .extract()
+            .unwrap();
+        assert_eq!(extracted, original);
+        // Wire format: rename keeps the unit-suffixed key, value is a
+        // plain integer (so env `RIO_TICK_SECS=7` and TOML `tick_secs
+        // = 7` both work via figment's existing layers).
+        let json = serde_json::to_value(&original).unwrap();
+        assert_eq!(json["tick_secs"], 7);
+        assert_eq!(json["timeout_ms"], 250);
+    }
+
+    #[test]
+    fn env_or_parses_and_falls_back() {
+        // Unset → default.
+        assert_eq!(env_or::<u32>("RIO_TEST_DEFINITELY_UNSET", 42), 42);
+        // figment::Jail for thread-safe env mutation.
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_TEST_ENV_OR_OK", "7");
+            assert_eq!(env_or::<u32>("RIO_TEST_ENV_OR_OK", 0), 7);
+            jail.set_env("RIO_TEST_ENV_OR_BAD", "notanumber");
+            assert_eq!(env_or::<u32>("RIO_TEST_ENV_OR_BAD", 99), 99);
+            Ok(())
+        });
     }
 
     // --- ensure_required tests ---

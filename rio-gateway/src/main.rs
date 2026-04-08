@@ -81,7 +81,8 @@ struct Config {
     /// closures; long builds outlive this and are dropped (client
     /// retries against the new replica via NLB). 0 = exit immediately
     /// after accept stops (pre-I-064 behavior, useful for tests).
-    session_drain_secs: u64,
+    #[serde(rename = "session_drain_secs", with = "rio_common::config::secs")]
+    session_drain: std::time::Duration,
     /// Per-tenant build-submit rate limiting. `None` (default) →
     /// disabled (unlimited). Set via `gateway.toml [rate_limit]`
     /// section or `RIO_RATE_LIMIT__PER_MINUTE` /
@@ -125,7 +126,7 @@ impl Default for Config {
             tls: rio_common::tls::TlsConfig::default(),
             jwt: rio_common::config::JwtConfig::default(),
             drain_grace_secs: 6,
-            session_drain_secs: 60,
+            session_drain: std::time::Duration::from_secs(60),
             rate_limit: None,
             max_connections: rio_gateway::server::DEFAULT_MAX_CONNECTIONS,
             max_transitive_inputs: rio_gateway::translate::DEFAULT_MAX_TRANSITIVE_INPUTS,
@@ -463,12 +464,7 @@ async fn main() -> anyhow::Result<()> {
         .run(host_key, cfg.listen_addr, serve_shutdown.clone())
         .await?;
 
-    wait_for_session_drain(
-        &active_conns,
-        &sessions_shutdown,
-        std::time::Duration::from_secs(cfg.session_drain_secs),
-    )
-    .await;
+    wait_for_session_drain(&active_conns, &sessions_shutdown, cfg.session_drain).await;
 
     info!("gateway shut down cleanly");
     Ok(())
@@ -562,7 +558,7 @@ mod tests {
         assert!(d.host_key.as_os_str().is_empty());
         assert!(d.authorized_keys.as_os_str().is_empty());
         assert_eq!(d.drain_grace_secs, 6);
-        assert_eq!(d.session_drain_secs, 60);
+        assert_eq!(d.session_drain, std::time::Duration::from_secs(60));
         // JWT: disabled by default. Existing deployments (no Secret
         // mounted) keep working via the SSH-comment fallback path.
         assert!(!d.jwt.required);
@@ -712,7 +708,7 @@ mod tests {
     );
 
     rio_test_support::jail_defaults!("gateway", "drain_grace_secs = 6", |cfg: Config| {
-        assert_eq!(cfg.session_drain_secs, 60);
+        assert_eq!(cfg.session_drain, std::time::Duration::from_secs(60));
         assert!(!cfg.tls.is_configured());
         assert_eq!(cfg.jwt, rio_common::config::JwtConfig::default());
         assert!(cfg.rate_limit.is_none());

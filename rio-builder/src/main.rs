@@ -132,8 +132,8 @@ async fn main() -> anyhow::Result<()> {
     let prefetch_runtime = runtime.clone();
     // FUSE fetch timeout (60s default) — NOT GRPC_STREAM_TIMEOUT (300s).
     // FUSE is the build-critical path; a stalled fetch blocks a fuser
-    // thread. See config.rs fuse_fetch_timeout_secs for the full rationale.
-    let fuse_fetch_timeout = Duration::from_secs(cfg.fuse_fetch_timeout_secs);
+    // thread. See config.rs fuse_fetch_timeout for the full rationale.
+    let fuse_fetch_timeout = cfg.fuse_fetch_timeout;
 
     // ─── Startup rootfs writes (readOnlyRootFilesystem audit) ─────
     //
@@ -313,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
-        daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
+        daemon_timeout: cfg.daemon_timeout,
         max_silent_time: cfg.max_silent_time_secs,
         cgroup_parent,
         executor_kind: cfg.executor_kind,

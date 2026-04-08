@@ -101,7 +101,8 @@ pub(crate) struct Config {
     /// within 60s. Pre-I-211, the wall-clock bound aborted a 2.9 GB
     /// `clang-21.1.8-debug` mid-stream → daemon EIO → build failure on a
     /// healthy store. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
-    pub(crate) fuse_fetch_timeout_secs: u64,
+    #[serde(rename = "fuse_fetch_timeout_secs", with = "rio_common::config::secs")]
+    pub(crate) fuse_fetch_timeout: std::time::Duration,
     pub(crate) overlay_base_dir: PathBuf,
     pub(crate) metrics_addr: std::net::SocketAddr,
     /// HTTP /healthz + /readyz listen address. Builder has no gRPC
@@ -132,7 +133,8 @@ pub(crate) struct Config {
     /// long (2h default) — some builds genuinely take that long; this is
     /// a bound on blast radius of a truly stuck daemon, not an expected
     /// build time.
-    pub(crate) daemon_timeout_secs: u64,
+    #[serde(rename = "daemon_timeout_secs", with = "rio_common::config::secs")]
+    pub(crate) daemon_timeout: std::time::Duration,
     /// Silence timeout (seconds): kill the build if no output for N seconds.
     /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
     /// is 0/unset. Env: `RIO_MAX_SILENT_TIME_SECS`.
@@ -177,7 +179,7 @@ impl Default for Config {
             fuse_cache_dir: "/var/rio/cache".into(),
             fuse_threads: 4,
             fuse_passthrough: true,
-            fuse_fetch_timeout_secs: 60,
+            fuse_fetch_timeout: std::time::Duration::from_secs(60),
             overlay_base_dir: "/var/rio/overlays".into(),
             metrics_addr: rio_common::default_addr(9093),
             // 9193 = metrics (9093) + 100. Same +100 pattern as
@@ -188,7 +190,7 @@ impl Default for Config {
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),
-            daemon_timeout_secs: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
+            daemon_timeout: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time_secs: 0,
             tls: rio_common::tls::TlsConfig::default(),
         }
@@ -323,7 +325,8 @@ mod tests {
         assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
         assert_eq!(d.fuse_threads, 4);
         assert_eq!(
-            d.fuse_fetch_timeout_secs, 60,
+            d.fuse_fetch_timeout,
+            std::time::Duration::from_secs(60),
             "FUSE fetch timeout: 60s NOT 300s (GRPC_STREAM_TIMEOUT). \
              I-165: on a fresh ephemeral builder wall_clock_trip can't \
              fire (no last_success), so only the 5-consecutive-failure \
@@ -383,7 +386,7 @@ mod tests {
                 !cfg.fuse_passthrough,
                 "TOML scalar must override the non-serde-bool default of true"
             );
-            assert_eq!(cfg.fuse_fetch_timeout_secs, 222);
+            assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(222));
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
                 cfg.tls.cert_path.as_deref(),
@@ -413,6 +416,6 @@ mod tests {
             "near-empty TOML must preserve fuse_passthrough=true \
              via Serialized::defaults base layer"
         );
-        assert_eq!(cfg.fuse_fetch_timeout_secs, 60);
+        assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(60));
     });
 }
