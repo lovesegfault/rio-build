@@ -10,9 +10,9 @@
 //! scaling is the controller's concern (`FetcherPool.spec.replicas` or
 //! queue-depth HPA), not the scheduler's.
 //!
-//! [`compute_cutoffs`] is pure; [`apply_pass`] writes through the
+//! `compute_cutoffs` is pure; `apply_pass` writes through the
 //! shared `Arc<RwLock<Vec<SizeClassConfig>>>`. The actor spawns a
-//! background task ([`spawn_task`]) that calls [`apply_pass`] hourly.
+//! background task ([`spawn_task`]) that calls `apply_pass` hourly.
 //!
 //! ## Algorithm
 //!
@@ -48,18 +48,20 @@ use crate::db::SchedulerDb;
 
 /// Tunables for the rebalancer. Compile-time defaults — assume
 /// medium-volume (~70 builds/day minimum at 500 samples / 7d).
-/// Not wired to `scheduler.toml`; `spawn_task` uses `::default()`.
+/// Not operator-tunable; `spawn_task` uses `::default()`. Kept as a
+/// struct (not module consts) so tests can construct non-default
+/// instances for `compute_cutoffs` edge cases.
 #[derive(Debug, Clone)]
-pub struct RebalancerConfig {
+pub(crate) struct RebalancerConfig {
     /// Below this sample count, skip rebalancing (return `None`).
     /// Sparse data produces noisy cutoffs that thrash the EMA.
-    pub min_samples: usize,
+    pub(crate) min_samples: usize,
     /// EMA blend weight for new vs previous cutoffs. 0.3 ≈ 3
     /// iterations to ~66% convergence (`1 - 0.7^3`).
-    pub ema_alpha: f64,
+    pub(crate) ema_alpha: f64,
     /// Sample window, passed to `query_build_samples_last_days`.
     /// Not used by `compute_cutoffs` itself (caller does the query).
-    pub lookback_days: u32,
+    pub(crate) lookback_days: u32,
 }
 
 impl Default for RebalancerConfig {
@@ -74,7 +76,7 @@ impl Default for RebalancerConfig {
 
 /// Output of a rebalancer pass.
 #[derive(Debug, Clone)]
-pub struct RebalanceResult {
+pub(crate) struct RebalanceResult {
     /// `n_classes - 1` duration boundaries (seconds), smoothed.
     /// Class `i` covers `[new_cutoffs[i-1], new_cutoffs[i])`.
     pub new_cutoffs: Vec<f64>,
@@ -101,7 +103,7 @@ pub struct RebalanceResult {
 /// smoothing is skipped — raw cutoffs returned directly.
 ///
 /// Returns `None` if `samples.len() < cfg.min_samples`.
-pub fn compute_cutoffs(
+pub(crate) fn compute_cutoffs(
     samples: &[(f64, i64)],
     n_classes: usize,
     prev_cutoffs: &[f64],
@@ -254,14 +256,14 @@ const REBALANCE_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// Each `SizeClassConfig` has its own `cutoff_secs` — the UPPER bound
 /// of that class. N classes = N upper bounds = N cutoffs. We pass
-/// `n = N + 1` to [`compute_cutoffs`] so it partitions samples into
+/// `n = N + 1` to `compute_cutoffs` so it partitions samples into
 /// N+1 buckets and returns N boundaries. The (N+1)th "virtual" bucket
 /// is the overflow catch-all that `classify()` routes to the last
 /// class anyway. This lets the rebalancer resize ALL cutoffs,
 /// including the largest.
 ///
 /// `zip` naturally writes all N (both iterators have N elements).
-pub async fn apply_pass(
+pub(crate) async fn apply_pass(
     db: &SchedulerDb,
     size_classes: &Arc<RwLock<Vec<SizeClassConfig>>>,
     cfg: &RebalancerConfig,
@@ -327,12 +329,12 @@ pub async fn apply_pass(
 }
 
 /// Spawn the rebalancer background task. Called from the actor's
-/// `run_inner` at startup. The task runs [`apply_pass`] hourly
+/// `run_inner` at startup. The task runs `apply_pass` hourly
 /// (`REBALANCE_INTERVAL`) until the actor's shutdown token cancels.
 ///
 /// Emits `rio_scheduler_class_load_fraction` gauge per class after
 /// each successful pass. The `rio_scheduler_cutoff_seconds` gauge is
-/// re-emitted by [`apply_pass`] itself (just after the RwLock write).
+/// re-emitted by `apply_pass` itself (just after the RwLock write).
 ///
 /// No join handle returned — the task is fire-and-forget. If the
 /// actor loop exits, the shutdown token cancels and this task drops

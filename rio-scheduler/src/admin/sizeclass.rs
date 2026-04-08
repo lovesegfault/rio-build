@@ -15,12 +15,10 @@ use crate::actor::{ActorCommand, ActorHandle, AdminQuery, SizeClassSnapshot};
 use crate::db::SchedulerDb;
 
 /// Rebalancer lookback window for the sample-count query. Mirrors
-/// `RebalancerConfig::default().lookback_days`. If the operator
-/// overrides lookback in scheduler.toml, this RPC still reports a
-/// 7-day window — the two are independent views. Making this
-/// config-driven would need plumbing `RebalancerConfig` through
-/// `AdminServiceImpl`; not worth it for a best-effort diagnostic
-/// count.
+/// `RebalancerConfig::default().lookback_days` (neither is
+/// operator-tunable). Kept as a local const rather than plumbing
+/// `RebalancerConfig` through `AdminServiceImpl` for a best-effort
+/// diagnostic count.
 const SAMPLE_LOOKBACK_DAYS: u32 = 7;
 
 /// Query the actor for the size-class snapshot, join DB sample counts,
