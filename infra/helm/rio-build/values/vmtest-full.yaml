@@ -111,44 +111,39 @@ gateway:
     # client uses StrictHostKeyChecking=no.
     hostKeySecret: ""
 
-# I-108: VM tests use the chart-default single-arch builderPools list
-# (just `x86-64`). All settings here are pool-DEFAULTS so the layered
-# nonpriv overlay can null-clear them via Helm's deep-merge.
-builderPoolDefaults:
+# VM tests use the chart-default single-arch builderPoolSets list
+# (`x86-64`) with one tiny size class. Per-class resources sized for
+# the 4GB k3s agent VM; poolTemplate fields (image/privileged/
+# tolerations/nodeSelector) flow from builderPoolDefaults so the
+# layered nonpriv overlay can null-clear them via Helm's deep-merge.
+builderPoolSetDefaults:
   enabled: true
-  maxConcurrent: 2
-  fuseCacheSize: 5Gi
-  features: []
-  sizeClass: ""
+  classes:
+    - name: tiny
+      cutoffSecs: 7200
+      maxConcurrent: 2
+      # Smaller than prod defaults — k3s agent VM is 4GB. Memory limit
+      # at 2× request caps one builder at half the node (I-005).
+      resources:
+        requests: {cpu: "1", memory: "1Gi", ephemeral-storage: "6Gi"}
+        limits: {memory: "2Gi"}
+
+builderPoolDefaults:
   # Per-component ref from the same vmTestSeed preload as control-plane
   # pods. builders.rs sets `command: ["/bin/rio-builder"]` unconditionally
   # (no-op here — rio-builder's Entrypoint is already rio-builder).
   image: rio-builder
-  # Smaller than prod defaults — k3s agent VM is 4GB. Memory limit at
-  # 2× request caps one builder at half the node (I-005).
-  resources:
-    requests:
-      cpu: "1"
-      memory: "1Gi"
-      ephemeral-storage: "6Gi"
-    limits:
-      memory: "2Gi"
   # k3s escape hatch. Most scenarios don't care about pod security
   # posture; privileged:true skips the seccomp/hostUsers caveats (k3s's
   # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN;
   # see vmtest-full-nonpriv.yaml). Production on EKS/GKE uses
   # privileged:false (the chart default).
   privileged: true
-  # Default is 7200 (2h, for LLVM-cold-ccache builds). Test builds
-  # are ≤90s sleeps. 180s covers the longest + drain overhead and
-  # bounds the finalizer's cleanup() wait (grace + 60s) so a stuck
-  # Job pod doesn't stall BuilderPool delete for 2h.
-  terminationGracePeriodSeconds: 180
   # No Karpenter nodepools → no dedicated worker nodes. Workers
   # schedule on any k3s node.
   #
   # null (not {} or []): Helm DEEP-MERGES values files. The default
-  # values.yaml has nodeSelector: {rio.build/node-role: worker} and
+  # values.yaml has nodeSelector: {rio.build/node-role: builder} and
   # a matching toleration. `{}` merges → default wins → pod Pending
   # (no node has that label). `null` deletes the key from the merge.
   tolerations: null

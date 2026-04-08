@@ -749,26 +749,9 @@ dashboard:
       - "http://rio-dashboard.rio-system.svc.cluster.local"
 
 # ──────────────────────────────────────────────────────────────────────────
-# Default BuilderPool
+# BuilderPoolSets (one per arch) — per-size-class builder pools
 # ──────────────────────────────────────────────────────────────────────────
-# I-108: one BuilderPool per arch. `builderPools` is the list of pools to
-# render (each entry needs at minimum `name` + `systems`); every other
-# field is deep-merged from `builderPoolDefaults`. Per-pool entries can
-# override any default. Overlays that want to change a property for ALL
-# pools (privileged, seccompProfile, resources, …) set it on
-# `builderPoolDefaults` — Helm's `null`-deletes-key deep-merge semantics
-# work there. Overlays that want a different POOL SET replace
-# `builderPools` (lists are replaced wholesale, not merged).
-#
-# Phase-4c BuilderPoolSet supersedes with per-size-class pools. When WPS
-# lands, set builderPoolDefaults.enabled=false and apply a WPS CR instead.
-#
-# I-117: BuilderPoolSet renders alongside builderPools[] below; either
-# can be enabled independently. EKS deploy.rs enables builderPoolSets and
-# disables builderPoolDefaults.enabled so only the per-class pools exist.
-#
-# I-117b: same list/defaults split as I-108's builderPools — one
-# BuilderPoolSet per arch. `builderPoolSets` is the list of sets to
+# One BuilderPoolSet per arch. `builderPoolSets` is the list of sets to
 # render (each entry needs at minimum `name` + `systems`); every other
 # field is deep-merged from `builderPoolSetDefaults`. Per-set entries
 # can override `classes` (e.g., aarch64 wants different maxReplicas) or
@@ -795,8 +778,7 @@ builderPoolSetDefaults:
   # Five-tier default sized for c6a/c7a bin-packing on EKS:
   #   tiny→c6a.large(2), small→c6a.2xlarge(8), medium→c6a.8xlarge(32),
   #   large→c6a.16xlarge(64), xlarge→c6a.32xlarge(128).
-  # Memory limit at 2× request (same blast-radius cap as
-  # builderPoolDefaults.resources).
+  # Memory limit at 2× request (blast-radius cap — I-005).
   # I-196/I-197: 2/8/32/64/128 cores. CPU is HARD LIMIT (limits =
   # requests) — a build that needs more should be PROMOTED (I-177),
   # not burst into a neighbor's headroom. Bursting makes EMA duration
@@ -844,53 +826,18 @@ builderPoolSetDefaults:
         limits: {cpu: "128", memory: "256Gi", ephemeral-storage: "96Gi"}
   # poolTemplate fields layer over builderPoolDefaults (deep-merge), so
   # seccomp/tolerations/nodeSelector/privileged/hostUsers stay single-
-  # sourced. Override here only what differs from the flat-pool defaults.
+  # sourced. Override here only for set-specific divergence.
   poolTemplate: {}
 
-builderPools:
-  # I-104: pool name is the suffix in `rio-builder-<name>`. RFC 1123 —
-  # lowercase alphanumeric + `-` (so `x86-64`, not `x86_64`).
-  - name: x86-64
-    systems: [x86_64-linux]
-  # Multi-arch example — add as a second entry (EKS deploy.rs does this
-  # via --set-json):
-  #   - name: aarch64
-  #     systems: [aarch64-linux]
-  #     replicas: {min: 1, max: 100}
-
+# Base for BuilderPoolSet poolTemplate. The builderpoolset.yaml template
+# deep-merges each set's `poolTemplate` over this, so security posture
+# (privileged/hostUsers/seccompProfile) and scheduling (tolerations/
+# nodeSelector) stay single-sourced across all per-arch sets. Overlays
+# that want to change a poolTemplate property for ALL sets set it here —
+# Helm's `null`-deletes-key deep-merge semantics work.
 builderPoolDefaults:
-  enabled: false
-  # max paired with karpenter.nodePools rio-builder-preferred cpu=2000
-  # (500 builders × 2 cpu/builder = 1000 vCPU baseline, 2000 NodePool
-  # limit gives Karpenter bin-packing headroom).
-  maxConcurrent: 500
-  fuseCacheSize: 20Gi
   features: []
-  sizeClass: ""   # unclassified — scheduler with size_classes configured
-                  # would reject this; phase 4b baseline doesn't configure
-                  # size_classes
   image: rio-builder
-  # Phase 4b placeholder. Fits on c6a.large (2 vCPU / 4Gi) and up.
-  # Karpenter picks cheapest-fit — request, not node-size mandate.
-  # TODO(P0503): ADR-020 supersedes — per-derivation capacity manifest
-  # (P0501-P0505) replaces static sizing. Until the manifest reconciler
-  # lands, this is the cold-start floor. P0435 (per-class Static-mode
-  # tuning) demoted to prio 35 — Manifest mode is the primary path.
-  # Memory limit at 2× request: EKS stress testing (I-005) found that an
-  # unbounded builder can consume all node memory and OOM the node (taking
-  # out neighbours — kubelet, containerd, anything). 8Gi caps the blast
-  # radius to one pod while still allowing reasonable burst over the 4Gi
-  # request. No CPU limit — CPU is compressible, throttling is safe.
-  # Builders now report memory_total_bytes=8Gi (was 0 = unknown-ceiling);
-  # scheduler sees a real number. ADR-020 manifest mode will set
-  # limits=requests per-pod from EMA, superseding this static cap.
-  resources:
-    requests:
-      cpu: "2"
-      memory: "4Gi"
-      ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
-    limits:
-      memory: "8Gi"
   # Device cgroup: /dev/fuse is provided via containerd base_runtime_spec
   # (nix/base-runtime-spec.nix). Granular SYS_ADMIN+SYS_CHROOT caps
   # suffice and hostUsers:false works (hostPath /dev/fuse breaks idmap
