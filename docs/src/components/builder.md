@@ -58,12 +58,10 @@ Each builder runs a FUSE filesystem that presents store paths to the build envir
 
 ### FUSE Cache
 
-r[builder.fuse.cache-lru]
-- **Backend**: Local SSD (`emptyDir` or a dedicated PVC)
-- **Eviction**: LRU by last-access time when cache exceeds configured size limit
+- **Backend**: Local SSD (`emptyDir`)
 - **Granularity**: Whole store paths (not individual chunks). The FUSE daemon reassembles NARs from chunks via rio-store and materializes them as directory trees on disk.
-- **Metadata**: A lightweight SQLite index tracks cached paths, sizes, and access timestamps for eviction decisions
-- **Cache warming**: On startup, the cache is cold. Every build fetches its inputs from rio-store; node-level FSx caching survives pod churn, so common paths (glibc, coreutils, etc.) are warm at the storage layer even though every pod-level FUSE cache is fresh.
+- **Metadata**: A lightweight SQLite index tracks cached paths
+- **Lifetime**: Pod-scoped. The cache holds one build's input closure and is discarded with the `emptyDir` when the pod terminates; no eviction is needed. Node-level FSx caching survives pod churn, so common paths (glibc, coreutils, etc.) stay warm at the storage layer even though every pod-level FUSE cache is fresh.
 
 r[builder.fuse.cache-ephemeral-memory]
 The SQLite cache index is `:memory:` — the pod's filesystem is discarded after the single build, so persistence is pointless, and on tiny-class node storage on-disk writes cost >1s each (I-141).

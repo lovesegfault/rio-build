@@ -195,7 +195,6 @@ r[obs.metric.builder]
 | `rio_builder_jit_inputs_registered` | Gauge | Size of the JIT FUSE allowlist (`known_inputs.len()`) at daemon spawn. |
 | `rio_builder_cgroup_oom_total` | Counter | Builds killed by the cgroup OOM watcher (`memory.events` `oom_kill` incremented during build → `cgroup.kill` + `InfrastructureFailure` for scheduler size-class promotion, I-196). Nonzero = pool's `resources.limits.memory` is undersized for its workload. |
 | `rio_builder_input_materialization_failures_total` | Counter | Daemon `MiscFailure` reclassified as `InfrastructureFailure` because the missing path is in the build's input closure (I-178 safety net). Sustained nonzero = `JIT_MIN_THROUGHPUT_BPS` is set above actual store→builder throughput. |
-| `rio_builder_fuse_cache_size_bytes` | Gauge | FUSE SSD cache usage |
 | `rio_builder_fuse_cache_hits_total` | Counter | FUSE cache hits |
 | `rio_builder_fuse_cache_misses_total` | Counter | FUSE cache misses |
 | `rio_builder_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency (labeled by `transport`: `getpath`/`getchunk`) |

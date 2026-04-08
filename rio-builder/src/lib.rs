@@ -99,13 +99,6 @@ pub fn describe_metrics() {
          nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder \
          throughput; lower the floor."
     );
-    // TODO: no longer emitted (LRU eviction removed; ephemeral pods).
-    // Described-only until observability.md's Worker Metrics table drops
-    // the row — that file is outside this crate's ownership.
-    describe_gauge!(
-        "rio_builder_fuse_cache_size_bytes",
-        "FUSE SSD cache usage in bytes"
-    );
     describe_counter!(
         "rio_builder_fuse_cache_hits_total",
         "FUSE cache hits (local symlink_metadata succeeded)"
