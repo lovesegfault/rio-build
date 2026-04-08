@@ -649,9 +649,9 @@ pub(crate) fn scheduler_unreachable_condition(
 /// same collision math with better observability.
 pub(crate) fn random_suffix() -> String {
     use rand::RngExt;
-    // 36^6 ≈ 2.18 billion combinations. With ttl=60s and even
-    // 1000 Jobs/sec, steady-state population is ~60k live names
-    // → birthday collision ~0.08%. K8s 409 handles it.
+    // 36^6 ≈ 2.18 billion combinations. With JOB_TTL_SECS=600 and a
+    // realistic ~10 Jobs/sec, steady-state is ~6k live names → birthday
+    // collision ~0.0008%. K8s 409-on-create handles the rare hit.
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rand::rng();
     (0..6)
