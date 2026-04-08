@@ -91,10 +91,12 @@ impl ReadyQueue {
     /// If `hash` is already in the queue, this pushes a duplicate
     /// entry. `pop()` returns the higher-priority entry first and
     /// then skips the lower one (no longer in `members`). Net effect:
-    /// re-push with **higher-or-equal** priority takes effect; re-push
-    /// with **lower** priority is silently ignored. Current callers
-    /// only ever raise priority (a new interested build raises a
-    /// shared derivation's priority via the critical-path machinery).
+    /// re-push with **higher** priority takes effect; re-push with
+    /// **lower-or-equal** priority is a no-op (the existing higher
+    /// entry pops first; the duplicate is then skipped). Callers only
+    /// ever raise priority — a new interested build raises a shared
+    /// derivation's priority via the critical-path machinery and the
+    /// re-push in `handle_merge_dag`.
     pub fn push(&mut self, hash: DrvHash, priority: f64) {
         // Already-present case: just push again without touching
         // `removed`. pop() sees two entries for the same hash; the

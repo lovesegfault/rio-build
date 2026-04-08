@@ -1975,3 +1975,64 @@ async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
     assert_eq!(small.queued, 1, "I-208: hydrated floor buckets to small");
     Ok(())
 }
+
+/// A pre-existing Ready derivation that gains interest from a
+/// higher-priority build is re-pushed onto the ready queue with its
+/// raised priority. Regression: handle_merge_dag's compute_initial only
+/// walks newly_inserted; a pre-existing Ready node already sat in the
+/// queue under its OLD priority and would dispatch behind lower-
+/// priority work even though an Interactive build now wants it.
+#[tokio::test]
+async fn merge_reheaps_preexisting_ready_on_priority_raise() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Build 1 (Scheduled): two independent nodes. No worker connected
+    // so both stay Ready in the queue. "low" gets a longer
+    // est_duration via input_srcs_nar_size proxy so its base
+    // critical-path priority is higher than "shared" — under build 1
+    // alone, "low" would dispatch first.
+    let mut shared = make_test_node("shared", "x86_64-linux");
+    shared.input_srcs_nar_size = 1;
+    let mut low = make_test_node("low", "x86_64-linux");
+    low.input_srcs_nar_size = 1_000_000_000; // higher closure-size proxy
+    let _ev1 = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![shared.clone(), low],
+        vec![],
+        false,
+    )
+    .await?;
+
+    // Build 2 (Interactive): references ONLY "shared". This adds
+    // interest to a pre-existing Ready node. Interactive boost
+    // (queue::INTERACTIVE_BOOST) should now raise "shared" above
+    // "low".
+    let _ev2 = merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: Uuid::new_v4(),
+            tenant_id: None,
+            priority_class: PriorityClass::Interactive,
+            nodes: vec![shared],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+
+    // Connect a worker → first dispatch goes to "shared" (Interactive
+    // boost) not "low" (higher base priority).
+    let mut rx = connect_executor(&handle, "reheap-w", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path("shared"),
+        "pre-existing Ready node re-heaped with Interactive boost on merge"
+    );
+    Ok(())
+}
