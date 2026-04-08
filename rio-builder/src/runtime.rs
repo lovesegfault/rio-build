@@ -759,6 +759,7 @@ const PREFETCH_WARM_SIZE_CAP_BYTES: u64 = 256 * 1024 * 1024;
 /// dir (see fetch_extract_insert) which cache init cleans up on next
 /// start. The joiner task also aborts; no ACK is sent — that's fine,
 /// we're shutting down.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(count = prefetch.store_paths.len()))]
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
@@ -767,6 +768,7 @@ pub fn handle_prefetch_hint(
     rt: tokio::runtime::Handle,
     sem: Arc<Semaphore>,
     fetch_timeout: std::time::Duration,
+    test_ack_delay: std::time::Duration,
     stream_tx: mpsc::Sender<ExecutorMessage>,
 ) {
     // Collect JoinHandles for the ACK-joiner task. A typical hint
@@ -932,16 +934,12 @@ pub fn handle_prefetch_hint(
         }
 
         // TODO(P0311): ordering-proof VM scenario uses this hook.
-        // Test hook: RIO_TEST_PREFETCH_DELAY_MS injects an extra delay
-        // AFTER all fetches complete but BEFORE the ACK. The VM warm-
-        // gate scenario uses this to prove the scheduler waits for the
-        // ACK (assert assigned_at - registered_at >= delay). Parse
-        // failure → 0 → no delay. Only read once per hint (not hot).
-        if let Ok(ms) = std::env::var("RIO_TEST_PREFETCH_DELAY_MS")
-            && let Ok(ms) = ms.parse::<u64>()
-            && ms > 0
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        // Test hook: `Config.test_prefetch_delay` injects a delay AFTER
+        // all fetches complete but BEFORE the ACK. The VM warm-gate
+        // scenario uses it to prove the scheduler waits for the ACK
+        // (assert assigned_at - registered_at >= delay).
+        if !test_ack_delay.is_zero() {
+            tokio::time::sleep(test_ack_delay).await;
         }
 
         // send().await not try_send(): the ACK MUST land. If the
@@ -1253,6 +1251,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
+            Duration::ZERO,
             tx,
         );
 
@@ -1318,6 +1317,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
+            Duration::ZERO,
             tx,
         );
 
@@ -1379,6 +1379,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             Arc::new(Semaphore::new(4)),
             Duration::from_secs(5),
+            Duration::ZERO,
             tx,
         );
 

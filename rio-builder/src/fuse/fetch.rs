@@ -74,41 +74,34 @@ impl StoreClients {
 /// RPC is independent so the p2c balancer fans across all SERVING
 /// replicas. See `r[builder.fuse.fetch-chunk-fanout]` and
 /// `.stress-test/PLAN-DATAPLANE2.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FetchTransport {
+    #[default]
     GetPath,
     GetChunk,
 }
 
 impl FetchTransport {
-    /// Read once from `RIO_BUILDER_FETCH_TRANSPORT` (`getpath`|`getchunk`).
-    /// Default `getpath` — the chunk path is opt-in until A/B'd live via
-    /// `rio_builder_fuse_fetch_duration_seconds{transport=…}` (the
-    /// existing histogram, now labeled).
-    pub fn from_env() -> Self {
-        static CELL: std::sync::OnceLock<FetchTransport> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| {
-            match std::env::var("RIO_BUILDER_FETCH_TRANSPORT")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-            {
-                Some("getchunk") => {
-                    tracing::info!("FUSE fetch transport: getchunk (parallel chunk fan-out)");
-                    FetchTransport::GetChunk
-                }
-                Some("getpath") | None => FetchTransport::GetPath,
-                Some(other) => {
-                    tracing::warn!(
-                        value = other,
-                        "RIO_BUILDER_FETCH_TRANSPORT unrecognized; using getpath"
-                    );
-                    FetchTransport::GetPath
-                }
-            }
-        })
+    /// Process-global transport, set once from config at startup via
+    /// [`init`]. FUSE callbacks read this — they have no `Config`
+    /// handle (run on `fuser`'s thread pool with only `Arc<Cache>`).
+    /// Default `getpath` — chunk fan-out is opt-in until A/B'd live.
+    pub fn current() -> Self {
+        *CELL.get_or_init(Self::default)
+    }
+
+    /// Set the process-global transport. Call once from `main()` after
+    /// config load, before mounting FUSE. Subsequent calls are no-ops.
+    pub fn init(t: Self) {
+        let _ = CELL.set(t);
+        if t == Self::GetChunk {
+            tracing::info!("FUSE fetch transport: getchunk (parallel chunk fan-out)");
+        }
     }
 }
+
+static CELL: std::sync::OnceLock<FetchTransport> = std::sync::OnceLock::new();
 
 /// In-flight `GetChunk` RPCs per fetch. K=32 → at 256 KiB avg chunks,
 /// 50 ms cold S3 TTFB ≈ 160 MB/s; warm-moka (~1 ms in-cluster RTT) is
@@ -784,13 +777,13 @@ fn fetch_extract_insert(
         runtime,
         fetch_timeout,
         store_basename,
-        FetchTransport::from_env(),
+        FetchTransport::current(),
     )
 }
 
 /// [`fetch_extract_insert`] with explicit transport. Split out so tests
-/// can drive the chunk path without process-global env mutation
-/// (`from_env()` is `OnceLock`-cached — first test to read it wins).
+/// can drive the chunk path without touching the process-global
+/// `OnceLock` (first test to read it wins).
 #[instrument(level = "debug", skip(cache, clients, runtime), fields(store_basename = %store_basename, ?transport))]
 fn fetch_extract_insert_with(
     cache: &Cache,
@@ -1874,22 +1867,14 @@ mod tests {
         );
     }
 
-    /// `FetchTransport::from_env` parses the env var. `OnceLock`-cached so
-    /// this test asserts the parse helper directly (no process-global env
-    /// mutation — other tests may have already poisoned the cell).
+    /// `FetchTransport` default + Eq. The figment env layer
+    /// (`RIO_FETCH_TRANSPORT=getchunk`) goes through serde's
+    /// `rename_all = "lowercase"` derive — exercised by the
+    /// `jail_roundtrip!` test in config.rs.
     #[test]
-    fn test_fetch_transport_parse() {
-        // The branch logic, not the OnceLock: GetChunk transport with a
-        // chunked hint takes the chunk path; GetPath transport (or no
-        // hint) does not.
-        assert_eq!(FetchTransport::GetPath, FetchTransport::GetPath);
+    fn test_fetch_transport_default() {
+        assert_eq!(FetchTransport::default(), FetchTransport::GetPath);
         assert_ne!(FetchTransport::GetPath, FetchTransport::GetChunk);
-        // Default env (unset) is GetPath. Can't safely set the env here
-        // (OnceLock + parallel tests), so the env wiring is covered by
-        // the explicit-transport integration tests above.
-        if std::env::var("RIO_BUILDER_FETCH_TRANSPORT").is_err() {
-            assert_eq!(FetchTransport::from_env(), FetchTransport::GetPath);
-        }
     }
 
     // ========================================================================

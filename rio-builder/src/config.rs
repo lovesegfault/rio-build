@@ -153,6 +153,23 @@ pub(crate) struct Config {
     /// the daemon to advertise `set-options-map-only`, which rio-gateway does
     /// not — tracked under WONTFIX(P0310).
     pub(crate) max_silent_time_secs: u64,
+    /// I-116 idle timeout: exit if no assignment arrives for this
+    /// long. Controller spawns N Jobs based on queue depth; if the
+    /// queue drains before all Jobs receive work, the unlucky ones
+    /// would otherwise idle until activeDeadlineSeconds. Env:
+    /// `RIO_IDLE_SECS`. Default 120.
+    #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
+    pub(crate) idle_timeout: std::time::Duration,
+    /// FUSE fetch transport (`getpath` | `getchunk`). Env:
+    /// `RIO_FETCH_TRANSPORT`. Default `getpath` — chunk fan-out is
+    /// opt-in until A/B'd live (see `r[builder.fuse.fetch-chunk-
+    /// fanout]`).
+    pub(crate) fetch_transport: rio_builder::fuse::fetch::FetchTransport,
+    /// Test hook (VM warm-gate ordering proof): inject a delay
+    /// between prefetch completion and the `PrefetchComplete` ACK.
+    /// Env: `RIO_TEST_PREFETCH_DELAY_MS`. Default 0 (no delay).
+    #[serde(rename = "test_prefetch_delay_ms", with = "rio_common::config::millis")]
+    pub(crate) test_prefetch_delay: std::time::Duration,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -190,6 +207,9 @@ impl Default for Config {
             size_class: String::new(),
             daemon_timeout: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time_secs: 0,
+            idle_timeout: std::time::Duration::from_secs(120),
+            fetch_transport: rio_builder::fuse::fetch::FetchTransport::GetPath,
+            test_prefetch_delay: std::time::Duration::ZERO,
         }
     }
 }
@@ -373,6 +393,7 @@ mod tests {
         r#"
         fuse_passthrough = false
         fuse_fetch_timeout_secs = 222
+        fetch_transport = "getchunk"
         systems = ["x86_64-linux", "aarch64-linux"]
 
         [tls]
@@ -384,6 +405,10 @@ mod tests {
                 "TOML scalar must override the non-serde-bool default of true"
             );
             assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(222));
+            assert_eq!(
+                cfg.fetch_transport,
+                rio_builder::fuse::fetch::FetchTransport::GetChunk
+            );
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
                 cfg.common.tls.cert_path.as_deref(),

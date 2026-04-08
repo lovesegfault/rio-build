@@ -62,7 +62,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_builder_fuse_fetch_chunks_total",
-        "Per-chunk GetChunk fetch outcomes when RIO_BUILDER_FETCH_TRANSPORT=\
+        "Per-chunk GetChunk fetch outcomes when RIO_FETCH_TRANSPORT=\
          getchunk (labeled by outcome: ok/retry/retry_ok/fallback). \
          `fallback` = store returned NotFound/Unimplemented; the fetch \
          re-spooled via GetPath. Absent under the default getpath transport."

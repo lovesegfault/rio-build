@@ -23,22 +23,6 @@ use config::{CliArgs, Config, detect_system};
 const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
-/// I-116: idle timeout. Controller spawns N Jobs based on queue depth;
-/// if the queue drains before all Jobs receive work, the unlucky ones
-/// would otherwise idle until activeDeadlineSeconds (3600s). Override
-/// via `RIO_IDLE_SECS` (tests use a short value).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Parse `RIO_IDLE_SECS`. Separate from the env read so the default +
-/// fallback are unit-testable without `set_var` (unsafe in edition
-/// 2024, and racy under nextest's shared-process model).
-fn parse_idle_timeout(env_val: Option<&str>) -> Duration {
-    env_val
-        .and_then(|s| s.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(IDLE_TIMEOUT)
-}
-
 impl rio_common::config::ValidateConfig for Config {
     /// Lives in main.rs (not config.rs) for cross-crate consistency
     /// with scheduler/gateway/controller/store — the validation
@@ -130,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
     // FUSE is the build-critical path; a stalled fetch blocks a fuser
     // thread. See config.rs fuse_fetch_timeout for the full rationale.
     let fuse_fetch_timeout = cfg.fuse_fetch_timeout;
+    // Process-global FUSE fetch transport — read by FUSE callbacks
+    // that have no Config handle. Set once, before mount.
+    rio_builder::fuse::fetch::FetchTransport::init(cfg.fetch_transport);
 
     // ─── Startup rootfs writes (readOnlyRootFilesystem audit) ─────
     //
@@ -265,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     // idle_timeout` passes with the slot still idle. Lives outside
     // 'reconnect: a scheduler restart (stream churn with no Assignment)
     // is still "idle" from the Job's perspective.
-    let idle_timeout = parse_idle_timeout(std::env::var("RIO_IDLE_SECS").ok().as_deref());
+    let idle_timeout = cfg.idle_timeout;
     let mut last_activity = tokio::time::Instant::now();
 
     // Latest generation observed in an accepted HeartbeatResponse.
@@ -631,6 +618,7 @@ async fn main() -> anyhow::Result<()> {
                                 prefetch_runtime.clone(),
                                 Arc::clone(&prefetch_sem),
                                 fuse_fetch_timeout,
+                                cfg.test_prefetch_delay,
                                 // Warm-gate ACK goes through the
                                 // permanent sink (same as completions
                                 // and log batches) — survives stream
@@ -1652,26 +1640,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // I-116: idle timeout
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn idle_timeout_parses_env() {
-        assert_eq!(
-            parse_idle_timeout(None),
-            Duration::from_secs(120),
-            "unset → default 120s"
-        );
-        assert_eq!(
-            parse_idle_timeout(Some("5")),
-            Duration::from_secs(5),
-            "override honoured"
-        );
-        assert_eq!(
-            parse_idle_timeout(Some("garbage")),
-            Duration::from_secs(120),
-            "unparseable → default (fail open: a bad env value shouldn't \
-             wedge pods forever)"
-        );
-    }
 
     /// I-116 scenario: scheduler never dispatches → idle-timeout arm
     /// fires. Mirrors the select-arm guard + `sleep_until` shape in
