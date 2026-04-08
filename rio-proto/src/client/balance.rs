@@ -302,8 +302,8 @@ impl BalancedChannel {
     }
 
     /// [`Self::new`] with `health_service`/`tls_domain` taken from a
-    /// [`ProtoClient`] impl and `probe_interval` =
-    /// [`DEFAULT_PROBE_INTERVAL`]. The generic [`super::connect`]
+    /// [`ProtoClient`](super::ProtoClient) impl and `probe_interval` =
+    /// `DEFAULT_PROBE_INTERVAL`. The generic [`super::connect`]
     /// dispatches here when `balance_host` is set.
     pub async fn for_client<C: super::ProtoClient>(
         host: String,

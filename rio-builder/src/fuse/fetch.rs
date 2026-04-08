@@ -84,7 +84,7 @@ pub enum FetchTransport {
 
 impl FetchTransport {
     /// Process-global transport, set once from config at startup via
-    /// [`init`]. FUSE callbacks read this — they have no `Config`
+    /// [`Self::init`]. FUSE callbacks read this — they have no `Config`
     /// handle (run on `fuser`'s thread pool with only `Arc<Cache>`).
     /// Default `getpath` — chunk fan-out is opt-in until A/B'd live.
     pub fn current() -> Self {

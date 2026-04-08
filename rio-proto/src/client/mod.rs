@@ -202,12 +202,13 @@ proto_client!(
 ///
 /// For tests and non-K8s callers (rio-cli, VM-test fixtures). K8s
 /// daemons use [`connect`] which dispatches balance-vs-single from
-/// [`UpstreamAddrs`].
+/// [`UpstreamAddrs`](rio_common::config::UpstreamAddrs).
 pub async fn connect_single<C: ProtoClient>(addr: &str) -> anyhow::Result<C> {
     connect_channel(addr).await.map(C::wrap)
 }
 
-/// Dispatch balance-vs-single from an [`UpstreamAddrs`] triple.
+/// Dispatch balance-vs-single from an
+/// [`UpstreamAddrs`](rio_common::config::UpstreamAddrs) triple.
 ///
 /// `balance_host = None` → eager single-channel via `addr`.
 /// `balance_host = Some(host)` → health-aware [`BalancedChannel`] over
