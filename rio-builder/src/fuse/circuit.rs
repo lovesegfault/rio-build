@@ -20,6 +20,10 @@
 //! Pattern reference: `rio-scheduler/src/actor/breaker.rs` has the same
 //! 3-state shape, but that one is single-threaded-actor (plain `u32`);
 //! this one needs atomics because fuser's thread pool is multi-threaded.
+//!
+//! WONTFIX: scheduler and builder breakers intentionally diverge on
+//! interior mutability (plain u32 actor-local vs AtomicU32). Consolidate
+//! only if a third breaker appears.
 //
 // r[impl builder.fuse.circuit-breaker+2]
 

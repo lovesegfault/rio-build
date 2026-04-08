@@ -3,6 +3,15 @@
 //! Without this, a sustained store outage means every SubmitBuild treats
 //! every derivation as a cache miss — an avalanche of unnecessary rebuilds
 //! once the store comes back (or workers thrash trying to fetch inputs).
+//!
+//! Pattern reference: `rio-builder/src/fuse/circuit.rs` has the same
+//! 3-state shape but uses `AtomicU32` (fuser's thread pool is
+//! multi-threaded). This one is actor-local — single-threaded `&mut self`
+//! access — so plain `u32` suffices.
+//!
+//! WONTFIX: scheduler and builder breakers intentionally diverge on
+//! interior mutability (plain u32 actor-local vs AtomicU32). Consolidate
+//! only if a third breaker appears.
 
 use super::*;
 

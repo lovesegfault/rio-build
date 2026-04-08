@@ -112,7 +112,7 @@ where
 /// first tick before the loop starts).
 ///
 /// [`Interval`]: tokio::time::Interval
-pub(crate) fn spawn_periodic_with<F, Fut>(
+pub fn spawn_periodic_with<F, Fut>(
     name: &'static str,
     mut ticker: tokio::time::Interval,
     shutdown: Token,

@@ -352,34 +352,30 @@ pub fn spawn_task(
         return;
     }
 
-    // Not spawn_periodic: skip-first-tick + post-pass gauge emit (using
-    // captured class_names snapshot) makes the body non-trivial; the
-    // biased; select below already satisfies r[common.task.periodic-biased].
-    rio_common::task::spawn_monitored("rebalancer", async move {
-        let cfg = RebalancerConfig::default();
-        let mut interval = tokio::time::interval(REBALANCE_INTERVAL);
-        // Skip the immediate first tick — on scheduler startup the
-        // sample table is probably still empty. First real pass
-        // happens after one interval.
-        interval.tick().await;
+    let cfg = RebalancerConfig::default();
+    info!(
+        min_samples = cfg.min_samples,
+        ema_alpha = cfg.ema_alpha,
+        lookback_days = cfg.lookback_days,
+        "rebalancer task started"
+    );
 
-        info!(
-            min_samples = cfg.min_samples,
-            ema_alpha = cfg.ema_alpha,
-            lookback_days = cfg.lookback_days,
-            "rebalancer task started"
-        );
+    // Skip the immediate first tick — on scheduler startup the sample
+    // table is probably still empty. interval_at(now + period) puts the
+    // first real pass one full interval out (same effect as the old
+    // pre-consume-first-tick, but constructible without an async ctx).
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + REBALANCE_INTERVAL,
+        REBALANCE_INTERVAL,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {
-                    debug!("rebalancer task shutting down");
-                    return;
-                }
-                _ = interval.tick() => {}
-            }
-
+    rio_common::task::spawn_periodic_with("rebalancer", ticker, shutdown, move || {
+        let db = db.clone();
+        let size_classes = Arc::clone(&size_classes);
+        let cfg = cfg.clone();
+        let class_names = class_names.clone();
+        async move {
             if let Some(result) = apply_pass(&db, &size_classes, &cfg).await {
                 // Gauge: per-class load fraction under the NEW cutoffs.
                 // SITA-E's target is 1/N each; deviation means the
