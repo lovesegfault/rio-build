@@ -125,12 +125,7 @@ pub struct NarEntry {
 // Synchronous string encoding (same as wire format but using std::io)
 // ---------------------------------------------------------------------------
 
-const PADDING: usize = 8;
-
-fn padding_len(len: usize) -> usize {
-    let rem = len % PADDING;
-    if rem == 0 { 0 } else { PADDING - rem }
-}
+use crate::protocol::wire::padding_len;
 
 fn read_u64(r: &mut impl Read) -> io::Result<u64> {
     let mut buf = [0u8; 8];
@@ -424,12 +419,9 @@ fn serialize_node(w: &mut impl Write, node: &NarNode) -> Result<()> {
 // Filesystem operations
 // ---------------------------------------------------------------------------
 
-/// Serialize a filesystem path to NAR bytes (equivalent to `nix-store --dump`).
-///
-/// Loads every file's contents into memory while building the [`NarNode`]
-/// tree. For a 4 GiB output, that's 4 GiB for the tree + 4 GiB for the
-/// serialized Vec = 8 GiB peak. Use [`dump_path_streaming`] when writing
-/// directly to a sink (e.g., the worker's upload pipeline) to avoid this.
+/// Eager in-memory NAR dump. Test/fuzz oracle only — production uses
+/// [`dump_path_streaming`].
+#[doc(hidden)]
 pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
     let node = node_from_path(path)?;
     let mut buf = Vec::new();
@@ -784,7 +776,9 @@ fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
     }
 }
 
-/// Extract a NAR archive to a filesystem path (equivalent to `nix-store --restore`).
+/// Eager in-memory NAR extract. Test/fuzz oracle only — production uses
+/// [`restore_path_streaming`].
+#[doc(hidden)]
 pub fn extract_to_path(node: &NarNode, path: &std::path::Path) -> Result<()> {
     match node {
         NarNode::Regular {

@@ -1,8 +1,8 @@
 //! Local cache for FUSE store paths backed by the pod's emptyDir.
 //!
 //! Cached store paths are materialized as directory trees on disk (not stored
-//! as NAR blobs). On cache miss the worker fetches the NAR via `GetPath`,
-//! parses it, and extracts it to disk via [`rio_nix::nar::extract_to_path`].
+//! as NAR blobs). On cache miss the worker fetches the NAR via `GetPath` and
+//! extracts it to disk via [`rio_nix::nar::restore_path_streaming`].
 //!
 //! A lightweight in-memory SQLite index tracks which paths are cached. There
 //! is no eviction: builders are ephemeral (one build per pod), so the cache
