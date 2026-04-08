@@ -2119,19 +2119,10 @@ async fn test_misclass_detection_on_slow_completion() -> TestResult {
             stream_tx: tx,
         })
         .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: Some("small".into()),
-            executor_id: "w-small".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "w-small", "x86_64-linux", |hb| {
+        hb.size_class = Some("small".into());
+    })
+    .await?;
 
     // Merge with pname — the EMA-update block (completion.rs:247-249)
     // gates on pname.is_some(). Without it, misclass detection never fires.

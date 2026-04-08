@@ -199,11 +199,68 @@ pub(crate) async fn setup_with_worker(
     Ok((db, handle, task, rx))
 }
 
+/// Overridable fields of an `ActorCommand::Heartbeat` for
+/// [`send_heartbeat_with`]. `executor_id` and `systems` are NOT here —
+/// every caller passes those explicitly. `Default` is "idle builder,
+/// no class, nothing running".
+pub(crate) struct HeartbeatFields {
+    pub store_degraded: bool,
+    pub draining: bool,
+    pub kind: rio_proto::types::ExecutorKind,
+    pub resources: Option<rio_proto::types::ResourceUsage>,
+    pub size_class: Option<String>,
+    pub supported_features: Vec<String>,
+    pub running_builds: Vec<String>,
+}
+
+impl Default for HeartbeatFields {
+    fn default() -> Self {
+        Self {
+            store_degraded: false,
+            draining: false,
+            kind: rio_proto::types::ExecutorKind::Builder,
+            resources: None,
+            size_class: None,
+            supported_features: vec![],
+            running_builds: vec![],
+        }
+    }
+}
+
+/// Send an `ActorCommand::Heartbeat` with default fields, after `f`
+/// mutates the 1-2 the test cares about. THE single test-side
+/// construction site for the variant — when `ActorCommand::Heartbeat`
+/// grows a field, this is the only edit (not 20+ scattered across
+/// test modules). No trailing `Tick` — callers that need the
+/// dispatch-dirty drain compose with [`tick`] or use [`send_heartbeat`].
+pub(crate) async fn send_heartbeat_with(
+    handle: &ActorHandle,
+    executor_id: &str,
+    system: &str,
+    f: impl FnOnce(&mut HeartbeatFields),
+) -> anyhow::Result<()> {
+    let mut hb = HeartbeatFields::default();
+    f(&mut hb);
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            executor_id: executor_id.into(),
+            systems: vec![system.into()],
+            store_degraded: hb.store_degraded,
+            draining: hb.draining,
+            kind: hb.kind,
+            resources: hb.resources,
+            size_class: hb.size_class,
+            supported_features: hb.supported_features,
+            running_builds: hb.running_builds,
+        })
+        .await?;
+    Ok(())
+}
+
 /// Connect a worker (stream + heartbeat) WITHOUT the automatic
 /// `PrefetchComplete` ACK. For warm-gate tests that need to observe
 /// the initial `PrefetchHint` arrival and/or prove dispatch blocks
-/// until the ACK. Shared `Heartbeat` field list — when
-/// `ActorCommand::Heartbeat` grows a field, one edit not two.
+/// until the ACK.
 pub(crate) async fn connect_executor_no_ack(
     handle: &ActorHandle,
     executor_id: &str,
@@ -235,134 +292,90 @@ pub(crate) async fn connect_executor_no_ack_kind(
             stream_tx,
         })
         .await?;
+    send_heartbeat_with(handle, executor_id, system, |hb| hb.kind = kind).await?;
+    Ok(stream_rx)
+}
+
+/// Connect a size-classed executor (stream + heartbeat + warm-gate
+/// ACK). For `r[sched.fod.size-class-reactive]` (I-170) and
+/// `r[sched.builder.size-class-reactive]` (I-177) — the floor walk
+/// matches against `ExecutorState.size_class`. Callers can merge then
+/// `recv_assignment` directly.
+pub(crate) async fn connect_executor_classed(
+    handle: &ActorHandle,
+    executor_id: &str,
+    system: &str,
+    size_class: &str,
+    kind: rio_proto::types::ExecutorKind,
+) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
+    let (stream_tx, stream_rx) = mpsc::channel(256);
     handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind,
-            resources: None,
-            size_class: None,
+        .send_unchecked(ActorCommand::ExecutorConnected {
             executor_id: executor_id.into(),
-            systems: vec![system.into()],
-            supported_features: vec![],
-            running_builds: vec![],
+            stream_tx,
+        })
+        .await?;
+    send_heartbeat_with(handle, executor_id, system, |hb| {
+        hb.kind = kind;
+        hb.size_class = Some(size_class.into());
+    })
+    .await?;
+    handle
+        .send_unchecked(ActorCommand::PrefetchComplete {
+            executor_id: executor_id.into(),
+            paths_fetched: 0,
         })
         .await?;
     Ok(stream_rx)
 }
 
-/// I-170: connect a Fetcher-kind executor with a size_class. For
-/// `r[sched.fod.size-class-reactive]` tests — the FOD floor walk
-/// matches against `ExecutorState.size_class`. Includes the warm-
-/// gate ACK (same as `connect_executor`) so callers can merge then
-/// `recv_assignment` directly.
+/// [`connect_executor_classed`] with `kind = Fetcher`.
 pub(crate) async fn connect_fetcher_classed(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
     size_class: &str,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let (stream_tx, stream_rx) = mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: executor_id.into(),
-            stream_tx,
-        })
-        .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Fetcher,
-            resources: None,
-            size_class: Some(size_class.into()),
-            executor_id: executor_id.into(),
-            systems: vec![system.into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: executor_id.into(),
-            paths_fetched: 0,
-        })
-        .await?;
-    Ok(stream_rx)
+    connect_executor_classed(
+        handle,
+        executor_id,
+        system,
+        size_class,
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await
 }
 
-/// I-177: connect a Builder-kind executor with a size_class. For
-/// `r[sched.builder.size-class-reactive]` tests — the non-FOD floor
-/// clamp matches against `ExecutorState.size_class`. Mirror of
-/// [`connect_fetcher_classed`] with `kind = Builder`.
+/// [`connect_executor_classed`] with `kind = Builder`.
 pub(crate) async fn connect_builder_classed(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
     size_class: &str,
 ) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let (stream_tx, stream_rx) = mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: executor_id.into(),
-            stream_tx,
-        })
-        .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: Some(size_class.into()),
-            executor_id: executor_id.into(),
-            systems: vec![system.into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: executor_id.into(),
-            paths_fetched: 0,
-        })
-        .await?;
-    Ok(stream_rx)
+    connect_executor_classed(
+        handle,
+        executor_id,
+        system,
+        size_class,
+        rio_proto::types::ExecutorKind::Builder,
+    )
+    .await
 }
 
-/// I-188: connect a Builder-kind executor with `ephemeral=true`. For
-/// Send a default heartbeat (no size_class, empty
-/// running_builds, store_degraded=false), then a `Tick`. For the
-/// "extra heartbeat to trigger dispatch" pattern where the test
-/// doesn't care about heartbeat field values, only that dispatch runs.
+/// Send a default heartbeat then a `Tick`. For the "extra heartbeat to
+/// trigger dispatch" pattern where the test doesn't care about
+/// heartbeat field values, only that dispatch runs.
 ///
 /// I-163: Heartbeat alone now sets `dispatch_dirty` instead of
 /// dispatching inline; the trailing `Tick` drains it. Callers that
-/// specifically need Heartbeat-without-dispatch construct
-/// `ActorCommand::Heartbeat` directly (the field-churn cost is on
-/// those few sites, not the dozen "trigger dispatch" callers).
-///
-/// Shared field list with [`connect_executor_no_ack`] — when
-/// `ActorCommand::Heartbeat` grows a field, this is the second edit
-/// site (not 20+ scattered across test modules).
+/// need a raw heartbeat-without-Tick use [`send_heartbeat_with`].
 pub(crate) async fn send_heartbeat(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
 ) -> anyhow::Result<()> {
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: executor_id.into(),
-            systems: vec![system.into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(handle, executor_id, system, |_| {}).await?;
     handle.send_unchecked(ActorCommand::Tick).await?;
     Ok(())
 }
@@ -376,27 +389,15 @@ pub(crate) async fn tick(handle: &ActorHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// I-063: heartbeat with `draining=true`. For tests that verify the
-/// worker-authoritative drain semantics — heartbeat is the only
-/// reader/writer of a worker's own drain state.
+/// I-063: heartbeat with `draining=true` then `Tick`. For tests that
+/// verify the worker-authoritative drain semantics — heartbeat is the
+/// only reader/writer of a worker's own drain state.
 pub(crate) async fn send_heartbeat_draining(
     handle: &ActorHandle,
     executor_id: &str,
     system: &str,
 ) -> anyhow::Result<()> {
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: true,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: executor_id.into(),
-            systems: vec![system.into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(handle, executor_id, system, |hb| hb.draining = true).await?;
     handle.send_unchecked(ActorCommand::Tick).await?;
     Ok(())
 }

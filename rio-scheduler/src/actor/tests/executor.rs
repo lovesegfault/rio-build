@@ -36,19 +36,11 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
         })
         .await?;
     assert!(reply_rx.await?.accepted);
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: true,
-            draining: true,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "drain-auth".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "drain-auth", "x86_64-linux", |hb| {
+        hb.store_degraded = true;
+        hb.draining = true;
+    })
+    .await?;
 
     let workers = handle.debug_query_workers().await?;
     let w = workers
@@ -179,19 +171,11 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
             stream_tx: stream_tx_a,
         })
         .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: true,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "i066-a".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![drv_path.clone()],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "i066-a", "x86_64-linux", |hb| {
+        hb.draining = true;
+        hb.running_builds = vec![drv_path.clone()];
+    })
+    .await?;
 
     // Adoption: DAG node Assigned to A, A.running_build set, no
     // failed_builders (adoption is reconciliation, not failure).
@@ -1181,19 +1165,10 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
     // an extra heartbeat with ephemeral=true to set the flag (the
     // existing helper is non-ephemeral).
     let mut rx = connect_builder_classed(&handle, "b-eph", "x86_64-linux", "tiny").await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: Some("tiny".into()),
-            executor_id: "b-eph".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "b-eph", "x86_64-linux", |hb| {
+        hb.size_class = Some("tiny".into());
+    })
+    .await?;
     barrier(&handle).await;
 
     let node = make_test_node("eph-glibc-188", "x86_64-linux");
@@ -1273,19 +1248,10 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     });
 
     let mut rx = connect_builder_classed(&handle, "b-eph2", "x86_64-linux", "tiny").await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: Some("tiny".into()),
-            executor_id: "b-eph2".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "b-eph2", "x86_64-linux", |hb| {
+        hb.size_class = Some("tiny".into());
+    })
+    .await?;
     barrier(&handle).await;
 
     let node = make_test_node("eph-race-188", "x86_64-linux");
@@ -1305,19 +1271,11 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     // (adopt_heartbeat_build's terminal-status arm warns but the
     // caller still sets running_build). last_completed stays X
     // (heartbeat doesn't touch it).
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: Some("tiny".into()),
-            executor_id: "b-eph2".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![drv_path],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "b-eph2", "x86_64-linux", |hb| {
+        hb.size_class = Some("tiny".into());
+        hb.running_builds = vec![drv_path];
+    })
+    .await?;
     barrier(&handle).await;
 
     // Precondition: running_build re-populated. Without this the
@@ -1505,19 +1463,10 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     // running_build → has_capacity()=false → the post-heartbeat
     // dispatch_ready() can't ALSO assign (would muddy "worker claims
     // it, scheduler didn't know").
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "hb-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![test_drv_path("hb-drv")],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "hb-worker", "x86_64-linux", |hb| {
+        hb.running_builds = vec![test_drv_path("hb-drv")];
+    })
+    .await?;
     barrier(&handle).await;
 
     assert!(
@@ -2082,19 +2031,10 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     // triggers dispatch_ready (actor/mod.rs:432) but the ready queue
     // is empty, so that's a no-op. The point is ExecutorState.store_
     // degraded is set by the time the merge below runs.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: true,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "degraded-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "degraded-worker", "x86_64-linux", |hb| {
+        hb.store_degraded = true;
+    })
+    .await?;
     barrier(&handle).await;
 
     // Transition logged at info (false → true).
@@ -2129,19 +2069,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     // Recovery: clear the flag. Heartbeat sets dispatch_dirty; Tick
     // drains it (I-163) → best_executor() now finds the worker →
     // derivation goes Assigned.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "degraded-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "degraded-worker", "x86_64-linux", |_| {}).await?;
     handle.send_unchecked(ActorCommand::Tick).await?;
 
     // Assignment should arrive now. recv_assignment has its own 2s
@@ -2369,19 +2297,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
             stream_tx,
         })
         .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "fail-worker".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "fail-worker", "x86_64-linux", |_| {}).await?;
     barrier(&handle).await;
 
     // The defensive path fired: warn + flip warm.
@@ -2548,19 +2464,10 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
     let mut rx = connect_executor(&handle, "w-idle", "x86_64-linux").await?;
 
     // (2) Degrade → capacity 1→0. Raw Heartbeat (no trailing Tick).
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: true,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "w-idle".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "w-idle", "x86_64-linux", |hb| {
+        hb.store_degraded = true;
+    })
+    .await?;
 
     // (3) Queue work. MergeDag dispatches inline but the only executor
     // is degraded → derivation stays Ready in the queue.
@@ -2580,19 +2487,7 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
     // (4) Un-degrade → capacity 0→1 → became_idle=true → dispatch_ready
     // INLINE. NO Tick sent. barrier proves the heartbeat handler ran
     // to completion; assignment must already be on the channel.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "w-idle".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "w-idle", "x86_64-linux", |_| {}).await?;
     barrier(&handle).await;
 
     let a = recv_assignment(&mut rx).await;

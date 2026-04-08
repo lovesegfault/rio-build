@@ -50,19 +50,10 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             stream_tx: small_tx,
         })
         .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: Some("small".into()),
-            executor_id: "w-small".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "w-small", "x86_64-linux", |hb| {
+        hb.size_class = Some("small".into());
+    })
+    .await?;
 
     let (large_tx, mut large_rx) = mpsc::channel(256);
     handle
@@ -71,19 +62,10 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             stream_tx: large_tx,
         })
         .await?;
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: Some("large".into()),
-            executor_id: "w-large".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "w-large", "x86_64-linux", |hb| {
+        hb.size_class = Some("large".into());
+    })
+    .await?;
 
     // Prime the estimator. Normally it refreshes on Tick every 60s;
     // for the test we trigger it via 6 Ticks (the refresh cadence).
@@ -1118,19 +1100,10 @@ async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
     // (worker has no capacity AND no 0→1 edge), only on Tick after
     // capacity frees. Here we just assert no spurious second
     // assignment from the steady-state heartbeat.
-    handle
-        .send_unchecked(ActorCommand::Heartbeat {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            size_class: None,
-            executor_id: "i163-w".into(),
-            systems: vec!["x86_64-linux".into()],
-            supported_features: vec![],
-            running_builds: vec![a.drv_path.clone()],
-        })
-        .await?;
+    send_heartbeat_with(&handle, "i163-w", "x86_64-linux", |hb| {
+        hb.running_builds = vec![a.drv_path.clone()];
+    })
+    .await?;
     barrier(&handle).await;
     while let Ok(m) = rx.try_recv() {
         use rio_proto::types::scheduler_message::Msg;
