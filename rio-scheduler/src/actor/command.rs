@@ -16,6 +16,50 @@ use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 use super::handle::DebugDerivationInfo;
 use super::handle::DebugExecutorInfo;
 
+/// Payload for [`ActorCommand::Heartbeat`]. Passed by value into
+/// `handle_heartbeat` instead of unpacking 9 positionals at the
+/// run_inner arm.
+pub struct HeartbeatPayload {
+    pub executor_id: ExecutorId,
+    /// Systems this worker can build for. Usually single-element
+    /// but multi-arch workers (e.g., qemu-user-static) declare
+    /// multiple. can_build() any-matches against the derivation's
+    /// target. Empty vec is rejected at the gRPC layer
+    /// (handle_heartbeat treats empty systems as "not registered").
+    pub systems: Vec<String>,
+    pub supported_features: Vec<String>,
+    /// drv_paths from worker proto (not hashes).
+    pub running_builds: Vec<String>,
+    /// Size-class from worker config (e.g. "small", "large"). gRPC
+    /// maps empty-string → None. Stored on ExecutorState for the
+    /// classify() → best_executor() filter.
+    pub size_class: Option<String>,
+    /// ResourceUsage from the heartbeat. Prost generates Option for
+    /// message fields; worker always populates, so None is defensive
+    /// (shouldn't happen). Stored on ExecutorState as `last_resources`
+    /// for `ListExecutors`.
+    pub resources: Option<rio_proto::types::ResourceUsage>,
+    /// FUSE circuit breaker open — worker can't fetch from store.
+    /// Proto bool, field 9: wire-default false (old workers don't
+    /// send it). Stored on ExecutorState; `has_capacity()` gates on
+    /// it the same as `draining`.
+    pub store_degraded: bool,
+    /// SIGTERM received — finishing in-flight, not accepting new
+    /// work. Proto bool, field 11. The worker is the authority
+    /// (it knows whether it got SIGTERM); `handle_heartbeat`
+    /// overwrites `worker.draining` from this every tick. I-063:
+    /// supersedes I-056a's reconnect-clears-draining, which was
+    /// wrong when the SAME draining process reconnects after a
+    /// scheduler restart.
+    pub draining: bool,
+    /// Builder or Fetcher (from `HeartbeatRequest.kind`, proto
+    /// field 10). Stored on ExecutorState; `hard_filter()` routes
+    /// FODs to fetchers and non-FODs to builders (ADR-019).
+    /// Wire-default 0 = Builder (pre-ADR-019 executors don't send
+    /// it; treated as builders, the safe default).
+    pub kind: rio_proto::types::ExecutorKind,
+}
+
 /// Request payload for [`ActorCommand::MergeDag`].
 #[derive(Debug)]
 pub struct MergeDagRequest {
@@ -110,46 +154,7 @@ pub enum ActorCommand {
     },
 
     /// Periodic heartbeat from a worker.
-    Heartbeat {
-        executor_id: ExecutorId,
-        /// Systems this worker can build for. Usually single-element
-        /// but multi-arch workers (e.g., qemu-user-static) declare
-        /// multiple. can_build() any-matches against the derivation's
-        /// target. Empty vec is rejected at the gRPC layer
-        /// (handle_heartbeat treats empty systems as "not registered").
-        systems: Vec<String>,
-        supported_features: Vec<String>,
-        /// drv_paths from worker proto (not hashes).
-        running_builds: Vec<String>,
-        /// Size-class from worker config (e.g. "small", "large"). gRPC
-        /// maps empty-string → None. Stored on ExecutorState for the
-        /// classify() → best_executor() filter.
-        size_class: Option<String>,
-        /// ResourceUsage from the heartbeat. Prost generates Option for
-        /// message fields; worker always populates, so None is defensive
-        /// (shouldn't happen). Stored on ExecutorState as `last_resources`
-        /// for `ListExecutors`.
-        resources: Option<rio_proto::types::ResourceUsage>,
-        /// FUSE circuit breaker open — worker can't fetch from store.
-        /// Proto bool, field 9: wire-default false (old workers don't
-        /// send it). Stored on ExecutorState; `has_capacity()` gates on
-        /// it the same as `draining`.
-        store_degraded: bool,
-        /// SIGTERM received — finishing in-flight, not accepting new
-        /// work. Proto bool, field 11. The worker is the authority
-        /// (it knows whether it got SIGTERM); `handle_heartbeat`
-        /// overwrites `worker.draining` from this every tick. I-063:
-        /// supersedes I-056a's reconnect-clears-draining, which was
-        /// wrong when the SAME draining process reconnects after a
-        /// scheduler restart.
-        draining: bool,
-        /// Builder or Fetcher (from `HeartbeatRequest.kind`, proto
-        /// field 10). Stored on ExecutorState; `hard_filter()` routes
-        /// FODs to fetchers and non-FODs to builders (ADR-019).
-        /// Wire-default 0 = Builder (pre-ADR-019 executors don't send
-        /// it; treated as builders, the safe default).
-        kind: rio_proto::types::ExecutorKind,
-    },
+    Heartbeat(HeartbeatPayload),
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).
     Tick,
@@ -421,7 +426,7 @@ impl ActorCommand {
             Self::ExecutorConnected { .. } => "ExecutorConnected",
             Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",
             Self::PrefetchComplete { .. } => "PrefetchComplete",
-            Self::Heartbeat { .. } => "Heartbeat",
+            Self::Heartbeat(_) => "Heartbeat",
             Self::Tick => "Tick",
             Self::QueryBuildStatus { .. } => "QueryBuildStatus",
             Self::WatchBuild { .. } => "WatchBuild",

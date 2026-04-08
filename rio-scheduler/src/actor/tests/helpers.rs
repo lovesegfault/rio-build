@@ -258,7 +258,7 @@ pub(crate) async fn send_heartbeat_with(
     let mut hb = HeartbeatFields::default();
     f(&mut hb);
     handle
-        .send_unchecked(ActorCommand::Heartbeat {
+        .send_unchecked(ActorCommand::Heartbeat(HeartbeatPayload {
             executor_id: executor_id.into(),
             systems: vec![system.into()],
             store_degraded: hb.store_degraded,
@@ -268,7 +268,7 @@ pub(crate) async fn send_heartbeat_with(
             size_class: hb.size_class,
             supported_features: hb.supported_features,
             running_builds: hb.running_builds,
-        })
+        }))
         .await?;
     Ok(())
 }

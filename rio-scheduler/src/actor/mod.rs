@@ -585,28 +585,8 @@ impl DagActor {
                     // hard filter).
                     self.dispatch_ready().await;
                 }
-                ActorCommand::Heartbeat {
-                    executor_id,
-                    systems,
-                    supported_features,
-                    running_builds,
-                    size_class,
-                    resources,
-                    store_degraded,
-                    draining,
-                    kind,
-                } => {
-                    let (phantoms, became_idle) = self.handle_heartbeat(
-                        &executor_id,
-                        systems,
-                        supported_features,
-                        running_builds,
-                        size_class,
-                        resources,
-                        store_degraded,
-                        draining,
-                        kind,
-                    );
+                ActorCommand::Heartbeat(hb) => {
+                    let (phantoms, became_idle) = self.handle_heartbeat(hb);
                     // I-035: drain phantom assignments BEFORE the next
                     // dispatch so the freed slot + re-queued derivation
                     // are both visible to it.

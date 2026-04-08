@@ -14,7 +14,7 @@ use tracing::{info, instrument, warn};
 
 use rio_proto::ExecutorService;
 
-use crate::actor::ActorCommand;
+use crate::actor::{ActorCommand, HeartbeatPayload};
 
 use super::SchedulerGrpc;
 
@@ -372,7 +372,7 @@ impl ExecutorService for SchedulerGrpc {
         let kind = rio_proto::types::ExecutorKind::try_from(req.kind)
             .unwrap_or(rio_proto::types::ExecutorKind::Builder);
 
-        let cmd = ActorCommand::Heartbeat {
+        let cmd = ActorCommand::Heartbeat(HeartbeatPayload {
             executor_id: req.executor_id.into(),
             systems: req.systems,
             supported_features: req.supported_features,
@@ -382,7 +382,7 @@ impl ExecutorService for SchedulerGrpc {
             store_degraded: req.store_degraded,
             draining: req.draining,
             kind,
-        };
+        });
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load
         // would cause a false worker timeout -> reassignment -> more load.
