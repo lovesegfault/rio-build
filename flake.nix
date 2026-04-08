@@ -1117,6 +1117,7 @@
             # gateway*.yaml templates are applied.
             helm-envoy-gateway = subcharts.gateway-helm;
             helm-envoy-gateway-crds = subcharts.gateway-crds-helm;
+            helm-cilium = subcharts.cilium;
             # nix/pins.nix rendered as *.auto.tfvars.json. snake_case
             # keys in pins.nix → direct toJSON passthrough, no mapping
             # layer. Regenerate the committed copy:

@@ -52,6 +52,7 @@ let
   dashboard-gateway = import ./scenarios/dashboard-gateway.nix;
   dashboard = import ./scenarios/dashboard.nix;
   netpol = import ./scenarios/netpol.nix;
+  cilium-encrypt = import ./scenarios/cilium-encrypt.nix;
   fetcher-split = import ./scenarios/fetcher-split.nix;
   chaos = import ./scenarios/chaos.nix;
   ca-cutoff = import ./scenarios/ca-cutoff.nix;
@@ -669,7 +670,8 @@ in
   # "true" is truthy for `{{ if }}`).
   # vmtest-full.yaml defaults it to false; the override renders
   # networkpolicy.yaml into 02-workloads.yaml.
-  # Stock k3s kube-router enforces (P0220) — no Calico preload.
+  # Cilium enforces (eBPF) — k3s's bundled kube-router netpol controller
+  # is disabled (--disable-network-policy in k3s-full.nix).
   #
   # r[verify store.netpol.egress]
   #   store-egress IMDS-deny + postgres-allow probe via nsenter into
@@ -684,6 +686,17 @@ in
         "networkPolicy.enabled" = "true";
       };
     };
+  };
+
+  # Cilium WireGuard transparent encryption: cilium_wg0 peers + encrypt
+  # status on both nodes. Data-plane property the security model leans
+  # on once app-level mTLS is removed.
+  # TODO: add `r[verify sec.transport.cilium-wireguard]` once Phase 7
+  # lands the spec marker in docs/src/security.md (tracey-validate fails
+  # on a verify with no spec).
+  vm-cilium-encrypt-k3s = cilium-encrypt {
+    inherit pkgs common;
+    fixture = k3sFull { };
   };
 
   # ADR-019 builder/fetcher split end-to-end. FIRST test running both

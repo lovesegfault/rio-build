@@ -4,9 +4,8 @@
 # networkPolicy.enabled=true (via extraValues in default.nix) renders
 # infra/helm/rio-build/templates/networkpolicy.yaml → rio-builder-egress
 # policy (allows DNS + scheduler:9001 + store:9002 + fod-proxy:3128 ONLY).
-# Stock k3s kube-router enforces (P0220 pre-verify: deny-all-egress
-# blocks in-cluster 10.43.0.1:443 and external 1.1.1.1; deleting the
-# policy restores connectivity → no Calico preload needed).
+# Cilium enforces (eBPF; --disable-network-policy in the fixture turns
+# off k3s's bundled kube-router so Cilium is the sole policy engine).
 #
 # Probe mechanics: worker image has NO curl/wget (docker.nix: only cacert
 # + tzdata + rio-workspace + nix + fuse3 + util-linux). `kubectl exec --
@@ -21,7 +20,8 @@
 # airgapped VM (unreachable regardless of NetPol). Positive control
 # first: nc -z to rio-scheduler's ClusterIP:9001 MUST succeed (NetPol
 # explicitly allows it). If THAT is blocked, the policy is over-broad
-# or kube-router hasn't synced → the rc≠0 asserts below are worthless.
+# or Cilium hasn't synced the endpoint policy → rc≠0 asserts below are
+# worthless.
 # Then probe the k8s API ClusterIP (10.43.0.1:443 — P0220's proven
 # in-cluster differentiator): reachable without NetPol, blocked with.
 #
@@ -52,7 +52,7 @@ pkgs.testers.runNixOSTest {
   name = "rio-netpol";
   skipTypeCheck = true;
 
-  # k3s bring-up ~4min + kube-router sync + a handful of 5s connect
+  # k3s bring-up ~4min + cilium endpoint sync + a handful of 5s connect
   # probes. No builds, no rollouts.
   # +180s for sshKeySetup gateway-bounce + warmup Job spawn.
   globalTimeout = 780 + common.covTimeoutHeadroom;
@@ -92,13 +92,17 @@ pkgs.testers.runNixOSTest {
     # ADR-019: builder-egress policy lives in rio-builders namespace.
     kubectl("get networkpolicy builder-egress -o name", ns="${nsBuilders}")
 
-    # kube-router watches NetworkPolicy CRs → iptables rules. Watch
-    # latency is usually sub-second but the policy was applied at
-    # cluster boot WITH the pods, so kube-router may still be building
-    # the chain when waitReady returns. P0220's positive result was
-    # with a manually-applied policy mid-test (hot path). 10s is
-    # generous; the positive-control probe below is the real gate.
-    time.sleep(10)
+    # Cilium attaches policy at endpoint-create time. Gate on this
+    # specific pod's CiliumEndpoint reporting egress enforcing — proves
+    # the agent has compiled and loaded the eBPF policy program for THIS
+    # netns. Replaces the previous kube-router 10s sleep with a
+    # structural check.
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n ${nsBuilders} get ciliumendpoint "
+        f"{wp} -o jsonpath="
+        "'{.status.policy.egress.enforcing}' | grep -qx true",
+        timeout=60,
+    )
 
     # ── Resolve worker pod → VM node → container PID ──────────────────
     # The Job pod may schedule to either k3s-server or k3s-agent. Then
@@ -137,8 +141,8 @@ pkgs.testers.runNixOSTest {
     # netpol-positive — ALLOWED egress works (non-vacuous gate)
     # ══════════════════════════════════════════════════════════════════
     # rio-builder-egress explicitly allows TCP→rio-scheduler:9001. If
-    # this nc -z fails, either (a) kube-router hasn't synced the allow
-    # rule yet (10s wasn't enough), or (b) the policy is broken (blocks
+    # this nc -z fails, either (a) Cilium hasn't compiled the allow
+    # rule into the endpoint program yet, or (b) the policy is broken (blocks
     # everything), or (c) nsenter/PID resolution is wrong. In ANY of
     # those cases, the rc≠0 asserts below prove NOTHING — they'd pass
     # on a dead network.
@@ -154,7 +158,7 @@ pkgs.testers.runNixOSTest {
         rc, out = netns_exec(f"${nc} -z -w5 {sched_ip} 9001")
         assert rc == 0, (
             f"nc -z to rio-scheduler:{sched_ip}:9001 FAILED (rc={rc}). "
-            "NetPol ALLOWS this — if blocked, either kube-router not "
+            "NetPol ALLOWS this — if blocked, either Cilium not "
             "synced or policy over-broad. Subsequent rc!=0 asserts "
             f"would be VACUOUS.\n{out}"
         )
@@ -169,7 +173,7 @@ pkgs.testers.runNixOSTest {
     # REACHABLE from pods without NetPol, BLOCKED with deny-all-egress.
     # rio-builder-egress doesn't list the apiserver in its allow-rules
     # (deliberate — a sandbox escapee shouldn't get a k8s API token
-    # AND be able to use it). kube-router DROP → nc hangs until -w5.
+    # AND be able to use it). Cilium drops → nc hangs until -w5.
     #
     # Stronger than the IMDS/1.1.1.1 probes below: those fail in an
     # airgapped VM regardless. THIS one would succeed if NetPol were
@@ -184,9 +188,9 @@ pkgs.testers.runNixOSTest {
         assert rc != 0, (
             f"nc -z to kubernetes API {api_ip}:443 SUCCEEDED (rc=0) — "
             "NetPol NOT enforcing. rio-builder-egress does not allow "
-            "apiserver; kube-router should DROP. P0220 proved this IP "
+            "apiserver; Cilium should DROP. P0220 proved this IP "
             "IS reachable without policy, so rc=0 means policy absent "
-            "or kube-router not loading it."
+            "or Cilium not loading it."
         )
         print(f"netpol-kubeapi PASS: k8s API {api_ip}:443 blocked (rc={rc})")
 
@@ -195,7 +199,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # IMDS is the prime threat — a sandbox escapee shouldn't get AWS
     # creds. 169.254.169.254 is link-local; not in any rio-builder-egress
-    # allow-rule → default-deny. kube-router DROP → curl times out.
+    # allow-rule → default-deny. Cilium drops → curl times out.
     #
     # WEAK in VM context: no IMDS listener exists in a NixOS QEMU VM
     # anyway (not an EC2 instance). rc≠0 would happen regardless. The
@@ -208,7 +212,7 @@ pkgs.testers.runNixOSTest {
         assert rc != 0, (
             "IMDS curl succeeded (rc=0) — NetPol NOT enforcing. "
             "169.254.169.254 is link-local, not in any allow-rule; "
-            f"kube-router should DROP.\n{out}"
+            f"Cilium should DROP.\n{out}"
         )
         print(f"netpol-imds PASS: IMDS blocked (curl rc={rc})")
 
@@ -232,7 +236,7 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # builder-egress now allows BOTH UDP+TCP/53 to CoreDNS. DNS falls
     # back to TCP for responses >512 bytes (DNSSEC, large SRV records).
-    # dig +tcp forces TCP; without the T3 fix kube-router DROPs the SYN
+    # dig +tcp forces TCP; without the T3 fix Cilium dropss the SYN
     # and dig returns "connection refused" (rc≠0). Reuses the builder
     # netns_exec from above — same pod, same nsenter PID.
     with subtest("netpol-dns-tcp: DNS over TCP/53 allowed"):
@@ -251,7 +255,7 @@ pkgs.testers.runNixOSTest {
         assert rc == 0 and out.strip(), (
             f"dig +tcp to CoreDNS {coredns_ip} FAILED (rc={rc}). "
             "builder-egress should allow TCP/53 to kube-system; if "
-            "blocked, the T3 fix didn't render or kube-router hasn't "
+            "blocked, the T3 fix didn't render or Cilium hasn't "
             f"synced.\n{out}"
         )
         print(f"netpol-dns-tcp PASS: dig +tcp resolved via {coredns_ip} "
@@ -306,7 +310,7 @@ pkgs.testers.runNixOSTest {
         # with a 10.43.x.x ClusterIP (k3s Service CIDR, RFC1918). The
         # policy matches by ipBlock CIDR, not namespace, so cross-ns
         # is fine. If this nc -z fails, the policy is over-broad or
-        # kube-router hasn't synced → the IMDS rc≠0 assert below is
+        # Cilium hasn't synced → the IMDS rc≠0 assert below is
         # VACUOUS.
         pg_ip = kubectl(
             "get svc rio-postgresql -o jsonpath='{.spec.clusterIP}'"
@@ -316,7 +320,7 @@ pkgs.testers.runNixOSTest {
         assert rc == 0, (
             f"nc -z to postgres {pg_ip}:5432 FAILED (rc={rc}). "
             "store-egress ALLOWS RFC1918:5432 — if blocked, policy "
-            f"over-broad or kube-router not synced.\n{out}"
+            f"over-broad or Cilium not synced.\n{out}"
         )
         print(f"netpol-store positive PASS: postgres {pg_ip}:5432 "
               "reachable from store netns")
@@ -332,7 +336,7 @@ pkgs.testers.runNixOSTest {
         assert rc != 0, (
             "IMDS curl from store netns succeeded (rc=0) — store-egress "
             "NOT enforcing. 169.254.0.0/16 is not in any allow-rule; "
-            f"kube-router should DROP.\n{out}"
+            f"Cilium should DROP.\n{out}"
         )
         print(f"netpol-store IMDS PASS: blocked (curl rc={rc})")
 

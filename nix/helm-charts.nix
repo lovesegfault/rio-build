@@ -49,4 +49,9 @@ in
   # via nix/envoy-gateway-render.nix because helm's crds/ is
   # install-once-never-upgrade semantics.
   inherit (charts.envoyproxy) gateway-helm gateway-crds-helm;
+
+  # Cilium CNI (eBPF datapath, WireGuard transparent encryption,
+  # CiliumNetworkPolicy, Gateway API). Replaces flannel in the k3s
+  # VM fixture and aws-vpc-cni on EKS.
+  inherit (charts.cilium) cilium;
 }

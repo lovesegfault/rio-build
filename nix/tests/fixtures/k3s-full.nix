@@ -52,7 +52,12 @@ let
   };
   helmRender = import ../../helm-render.nix { inherit pkgs nixhelm system; };
   envoyGatewayRender = import ../../envoy-gateway-render.nix { inherit pkgs nixhelm system; };
+  ciliumRender = import ../../cilium-render.nix { inherit pkgs nixhelm system; };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
+  ciliumImages = [
+    pulled.cilium-agent
+    pulled.cilium-operator-generic
+  ];
   mkPkiK8s = import ../lib/pki-k8s.nix { inherit pkgs; };
   jwtKeys = import ../lib/jwt-keys.nix;
 in
@@ -238,6 +243,10 @@ let
   # counting it explicitly avoids a future uncounted-growth surprise.
   extraImagesBumpGiB =
     builtins.length extraImages
+    # Cilium agent (713M tar) + operator (113M) — always present, the
+    # CNI is unconditional. Spike-A measured 88% of 2G with cilium-only;
+    # with rio-* on top, +2 keeps headroom under the eviction threshold.
+    + 2
     + (if envoyGatewayEnabled then (if dockerImages ? dashboard then 2 else 1) else 0);
   containerdTmpfsSize =
     if coverage then
@@ -340,17 +349,46 @@ let
       containerdConfigTemplate = k3sContainerdConfigTmpl;
     };
     swapDevices = [ ];
-    boot.kernelModules = [ "fuse" ];
+    boot.kernelModules = [
+      "fuse"
+      "wireguard"
+    ];
     boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
 
     networking.firewall = {
       allowedTCPPorts = [
         6443 # apiserver (server only, but opening on agent is a no-op)
         10250 # kubelet (kubectl exec/logs)
-        32222 # gateway NodePort — kube-proxy listens on every node
+        32222 # gateway NodePort — cilium kube-proxy-replacement listens on every node
+        4240 # cilium-health
+        4244 # hubble (Phase 4)
       ];
-      allowedUDPPorts = [ 8472 ]; # flannel VXLAN
+      allowedUDPPorts = [
+        8472 # cilium VXLAN tunnel (chart default routingMode=tunnel)
+        51871 # cilium WireGuard
+      ];
     };
+
+    # cilium-agent creates cilium_host/cilium_net/lxc_health and per-pod
+    # lxc* veths. dhcpcd default-config tries to DHCP on every new iface
+    # → log spam + a few hundred ms of needless probe traffic per pod
+    # churn. Cilium assigns IPs itself.
+    networking.dhcpcd.denyInterfaces = [
+      "cilium_*"
+      "lxc*"
+    ];
+    # Pod→Service after socketLB redirect (10.43.0.1→192.168.1.3:6443)
+    # arrives on cilium_host with a pod-CIDR source. Without trust, the
+    # NixOS firewall INPUT chain + checkReversePath drop it. Cilium's
+    # own datapath enforces policy; the host firewall on these
+    # interfaces is redundant.
+    networking.firewall.trustedInterfaces = [
+      "cilium_host"
+      "cilium_net"
+      "cilium_wg0"
+      "lxc+"
+    ];
+    networking.firewall.checkReversePath = false;
 
     systemd.services.k3s.serviceConfig = {
       # Pick the base_runtime_spec variant matching host /dev/kvm
@@ -403,6 +441,7 @@ let
       pkgs.curl
       pkgs.kubectl
       pkgs.grpc-health-probe # health-shared probe (lifecycle.nix)
+      pkgs.wireguard-tools # `wg show cilium_wg0` (cilium-encrypt.nix)
     ];
 
     # r[impl builder.seccomp.localhost-profile+2]
@@ -434,8 +473,14 @@ let
         role = "server";
         clusterInit = true;
         inherit tokenFile;
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages;
+        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
         manifests = {
+          # Cilium CNI — applied first (filename-alphabetical: `000-` sorts
+          # before everything). Nothing else can schedule until cilium-agent
+          # is Ready on the node. No CRDs file: cilium-operator installs
+          # CRDs at runtime (cilium-render.nix comment).
+          "000-cilium-rbac".source = "${ciliumRender}/01-cilium-rbac.yaml";
+          "001-cilium".source = "${ciliumRender}/02-cilium.yaml";
           "00-rio-crds".source = "${helmRendered}/00-crds.yaml";
           "01-rio-rbac".source = "${helmRendered}/01-rbac.yaml";
           "02-rio-workloads".source = "${helmRendered}/02-workloads.yaml";
@@ -481,8 +526,14 @@ let
           "01-rio-tls-secrets".source = pkiK8s.secretsManifest;
         };
         extraFlags = [
-          "--flannel-iface"
-          "eth1"
+          # Cilium IS the CNI — disable k3s's bundled flannel + kube-router
+          # netpol controller + kube-proxy + servicelb (Cilium's eBPF
+          # replaces all four; cilium-render.nix sets
+          # kubeProxyReplacement=true with devices=eth1 pinned).
+          "--flannel-backend=none"
+          "--disable-network-policy"
+          "--disable-kube-proxy"
+          "--disable=servicelb"
           "--disable"
           "traefik"
           "--disable"
@@ -498,13 +549,12 @@ let
           # NixOS test driver auto-assigns 2001:db8:${vlan}::N/64 to
           # eth1 and exposes it as primaryIPv6Address; node-ip lists v4
           # first to keep it the primary family (kubelet/hostNetwork
-          # binds, kube-proxy NodePort) so existing v4-only assertions
-          # in scenarios stay valid.
+          # binds, cilium NodePort) so existing v4-only assertions in
+          # scenarios stay valid.
           "--cluster-cidr"
           "10.42.0.0/16,2001:db8:42::/56"
           "--service-cidr"
           "10.43.0.0/16,2001:db8:43::/112"
-          "--flannel-ipv6-masq"
           "--node-ip"
           "${config.networking.primaryIPAddress},${config.networking.primaryIPv6Address}"
           # Quiet the "Failed to record snapshots: nodes not found"
@@ -541,10 +591,8 @@ let
         # Agent loads images into its OWN containerd. Pods scheduled
         # here need local images — this is where the second scheduler
         # replica (antiAffinity) + maybe workers land.
-        images = [ config.services.k3s.package.airgap-images ] ++ rioImages;
+        images = [ config.services.k3s.package.airgap-images ] ++ rioImages ++ ciliumImages;
         extraFlags = [
-          "--flannel-iface"
-          "eth1"
           "--node-ip"
           "${config.networking.primaryIPAddress},${config.networking.primaryIPv6Address}"
         ];
@@ -724,8 +772,8 @@ rec {
     # ~107s of rio-* import time in its 120s budget (successful run:
     # 106.70/120s = 89% burned; 1.8× slower builder blew it by ~72s).
     # This gate directly tests the actual precondition. EXISTS (not
-    # Ready) is sufficient: Ready needs CNI which needs flannel which
-    # needs the node to exist first.
+    # Ready) is sufficient: Ready needs CNI which needs cilium-agent
+    # which needs the node to exist first.
     # TODO(P0304): timeout=600 predates containerd-tmpfs (same story as
     # the rio-* seed gate above). ~180s typical under TCG; reduce to 300
     # once tmpfs is verified to have collapsed the builder-disk tail.
@@ -734,21 +782,23 @@ rec {
         timeout=600,
     )
 
-    # ── Flannel CNI ready on BOTH nodes ─────────────────────────────
+    # ── Cilium CNI ready (DaemonSet rolled out + agent registered) ──
     # k3s auto-applies manifests as soon as the apiserver is up —
-    # INDEPENDENTLY of CNI readiness. Pods scheduled on a node before
-    # flannel writes /run/flannel/subnet.env fail CreatePodSandbox
-    # with "loadFlannelSubnetEnv failed: no such file or directory".
-    # Kubelet backoff (exponential, up to 5m) then delays recovery
-    # past the 150s worker-Ready timeout. Observed: pos800 run3
-    # dashboard-gateway — ALL pods failed sandbox at t=32-40s, worker
-    # never recovered in 150s. Gate on flannel-subnet-written directly
-    # on both nodes BEFORE proceeding to pod-level waits.
-    for _cni_node in [k3s_server, k3s_agent]:
-        _cni_node.wait_until_succeeds(
-            "test -f /run/flannel/subnet.env",
-            timeout=120,
-        )
+    # INDEPENDENTLY of CNI readiness. Pods scheduled before the
+    # cilium-agent on that node is Running fail CreatePodSandbox with
+    # `failed to find plugin "cilium-cni"`. Kubelet backoff
+    # (exponential, up to 5m) then delays recovery past the worker-
+    # Ready timeout. Gate on the DaemonSet rollout (both nodes' agents
+    # Ready) + the agent's CiliumNode CR (cilium-agent has registered
+    # with the operator).
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl -n kube-system rollout status ds/cilium --timeout=240s",
+        timeout=260,
+    )
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl get ciliumnode k3s-agent",
+        timeout=120,
+    )
 
     # ── Agent joined ────────────────────────────────────────────────
     # With server registered, agent-Ready now measures ONLY the

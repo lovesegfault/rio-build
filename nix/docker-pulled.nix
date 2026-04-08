@@ -80,4 +80,28 @@
     os = "linux";
     arch = "amd64";
   };
+
+  # Cilium agent (DaemonSet). Chart 1.19.2. image.useDigest=false in
+  # cilium-render.nix → chart renders bare tag, must match finalImageTag.
+  cilium-agent = pkgs.dockerTools.pullImage {
+    imageName = "quay.io/cilium/cilium";
+    imageDigest = "sha256:7bc7e0be845cae0a70241e622cd03c3b169001c9383dd84329c59ca86a8b1341";
+    finalImageName = "quay.io/cilium/cilium";
+    finalImageTag = "v1.19.2";
+    hash = "sha256-lXN5D2G9nuk3isd01SFoYY02ckjKAPcJ/zZqf3ibf9A=";
+    os = "linux";
+    arch = "amd64";
+  };
+
+  # Cilium operator (generic — non-cloud IPAM). operator.image.suffix
+  # defaults to "-generic" when no cloud provider is set.
+  cilium-operator-generic = pkgs.dockerTools.pullImage {
+    imageName = "quay.io/cilium/operator-generic";
+    imageDigest = "sha256:e363f4f634c2a66a36e01618734ea17e7b541b949b9a5632f9c180ab16de23f0";
+    finalImageName = "quay.io/cilium/operator-generic";
+    finalImageTag = "v1.19.2";
+    hash = "sha256-7w75MJ0AFGfRAzmg3beRea7b/lAE/dIr2wpgtmgyiE0=";
+    os = "linux";
+    arch = "amd64";
+  };
 }
