@@ -188,7 +188,12 @@ macro_rules! stderr_err {
 
 /// Client build options received via wopSetOptions.
 ///
-/// Propagated to the scheduler via gRPC `SubmitBuildRequest`.
+/// ssh-ng clients never send `wopSetOptions` (`SSHStore::setOptions()` is an
+/// empty override, ssh-store.cc 088ef8175), so on the production path this
+/// stays `None`. Stored anyway because `handle_set_options` must drain the
+/// wire payload for daemon-socket golden-conformance tests; nothing reads
+/// these fields downstream — `SubmitBuildRequest` build options are reachable
+/// only via the gRPC path (rio-cli), not `nix-build --option`.
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     pub keep_failed: bool,
@@ -201,76 +206,6 @@ pub struct ClientOptions {
     pub build_cores: u64,
     pub use_substitutes: bool,
     pub overrides: Vec<(String, String)>,
-}
-
-/// UNREACHABLE VIA ssh-ng:// — these helpers run only for daemon-socket clients.
-///
-/// Nix `SSHStore` overrides `RemoteStore::setOptions()` with an **empty body**
-/// (ssh-store.cc, unchanged since 088ef8175 "ssh-ng: Don't forward options to
-/// the daemon", 2018-03-05). `RemoteStore::initConnection` calls `setOptions(conn)`
-/// via virtual dispatch → the empty override wins → `wopSetOptions` never hits
-/// the wire for `ssh-ng://` stores. Verified in our pinned flake input
-/// (ssh-store.cc:81-88) and by the `setoptions-unreachable` VM subtest in
-/// scheduling.nix.
-///
-/// The empty override is **intentional** upstream (see NixOS/nix#1713, #1935 —
-/// forwarding options broke shared builders). Upstream fix 32827b9fb (NixOS/nix
-/// #5600) adds selective forwarding, but (a) not in our pinned rev, and (b)
-/// gated on the daemon advertising a `set-options-map-only` protocol feature
-/// that rio-gateway does not implement.
-///
-/// For `unix://` daemon-socket clients (NOT our production path), the base
-/// `RemoteStore::setOptions()` at remote-store.cc:115 DOES fire. But note:
-///
-/// - `max-silent-time` is sent **positionally** (wire slot 6), then **erased**
-///   from the overrides map at remote-store.cc:131. So [`Self::max_silent_time`]'s
-///   override-wins logic would NOT find it in overrides — only the positional
-///   fallback works. The earlier "Empirically: ... overrides=[("max-silent-time",
-///   "5")]" comment here was wrong on both axes (ssh-ng doesn't send; daemon
-///   sends positionally not in overrides).
-///
-/// - `timeout` (canonical) is NOT positionally encoded, so it stays in overrides.
-///   But `Config::getSettings` (configuration.cc:91 `!isAlias` filter) emits the
-///   **canonical** name `"timeout"`, not the alias `"build-timeout"` — so
-///   [`Self::build_timeout`] keying on `"build-timeout"` below would miss it.
-///
-/// The `sched.timeout.per-build` spec requirement is therefore reachable
-/// **only via gRPC `SubmitBuildRequest.build_timeout`** (rio-cli, direct
-/// API consumers), not via `nix-build --option`.
-///
-/// WONTFIX(P0310): If rio-gateway ever advertises `set-options-map-only` AND the
-/// flake's nix input is bumped past 32827b9fb, this block goes live. Fix the
-/// `build_timeout` key (`"timeout"` not `"build-timeout"`) and delete the
-/// override-wins logic in `max_silent_time()` before relying on either.
-impl ClientOptions {
-    /// Extract the build timeout from overrides, defaulting to 0 (no timeout).
-    ///
-    /// **Dead code for ssh-ng** (see impl-level doc). Also keys on wrong name
-    /// for daemon-socket clients: wire sends canonical `"timeout"`, not alias
-    /// `"build-timeout"`. Kept for gRPC-path symmetry (SubmitBuildRequest
-    /// doesn't go through this; it sets the proto field directly).
-    pub fn build_timeout(&self) -> u64 {
-        self.overrides
-            .iter()
-            .find(|(k, _)| k == "build-timeout")
-            .and_then(|(_, v)| v.parse::<u64>().ok())
-            .unwrap_or(0)
-    }
-
-    /// Effective maxSilentTime: positional wire slot 6.
-    ///
-    /// **Dead code for ssh-ng** (see impl-level doc). For daemon-socket
-    /// clients: `max-silent-time` is sent positionally AND erased from
-    /// overrides (remote-store.cc:131), so the override-wins branch never
-    /// matches — only the `self.max_silent_time` fallback is live. Kept
-    /// as-is: correct code, unreachable branch.
-    pub fn max_silent_time(&self) -> u64 {
-        self.overrides
-            .iter()
-            .find(|(k, _)| k == "max-silent-time")
-            .and_then(|(_, v)| v.parse::<u64>().ok())
-            .unwrap_or(self.max_silent_time)
-    }
 }
 
 /// Per-session mutable state, threaded through all opcode handlers.
@@ -700,74 +635,3 @@ pub(crate) use grpc::grpc_query_path_info;
 use grpc::*;
 use opcodes_read::*;
 use opcodes_write::*;
-
-#[cfg(test)]
-mod tests {
-    use super::ClientOptions;
-
-    fn opts(positional_max_silent: u64, overrides: Vec<(String, String)>) -> ClientOptions {
-        ClientOptions {
-            keep_failed: false,
-            keep_going: false,
-            try_fallback: false,
-            verbosity: 0,
-            max_build_jobs: 0,
-            max_silent_time: positional_max_silent,
-            verbose_build: false,
-            build_cores: 0,
-            use_substitutes: false,
-            overrides,
-        }
-    }
-
-    // These tests exercise the ClientOptions accessors DESPITE the code
-    // path being UNREACHABLE via ssh-ng:// (see impl-block doc above).
-    // ssh-ng clients NEVER send wopSetOptions (ssh-store.cc empty
-    // override since 088ef8175, P0310 source-verified) and NEVER put
-    // max-silent-time in argv. These accessors go live only if rio-gateway
-    // advertises `set-options-map-only` AND the flake nix input bumps
-    // past 32827b9fb (WONTFIX(P0310)). Tests kept to pin the accessor
-    // semantics for that future path.
-
-    /// Override-wins logic reads `max-silent-time` from overrides.
-    /// **Unreachable via ssh-ng** — and also NOT the daemon-socket path:
-    /// remote-store.cc:131 erases max-silent-time from overrides before
-    /// sending (positional-only). This branch is speculative for a future
-    /// protocol rev.
-    #[test]
-    fn max_silent_time_reads_from_overrides() {
-        let o = opts(0, vec![("max-silent-time".into(), "5".into())]);
-        assert_eq!(o.max_silent_time(), 5);
-    }
-
-    /// Override wins even when positional is nonzero. Same unreachability
-    /// caveat as above.
-    #[test]
-    fn max_silent_time_override_wins_over_positional() {
-        let o = opts(60, vec![("max-silent-time".into(), "5".into())]);
-        assert_eq!(o.max_silent_time(), 5);
-    }
-
-    /// No override → fall back to positional. This is the ONLY live
-    /// branch for `unix://` daemon-socket clients (remote-store.cc:119
-    /// sends maxSilentTime positionally, :131 erases from overrides).
-    #[test]
-    fn max_silent_time_falls_back_to_positional() {
-        let o = opts(30, vec![("other-key".into(), "x".into())]);
-        assert_eq!(o.max_silent_time(), 30);
-    }
-
-    /// Both zero → 0 (disabled).
-    #[test]
-    fn max_silent_time_zero_when_neither_set() {
-        let o = opts(0, vec![]);
-        assert_eq!(o.max_silent_time(), 0);
-    }
-
-    /// Unparseable override falls back to positional (not panic).
-    #[test]
-    fn max_silent_time_bad_override_falls_back() {
-        let o = opts(30, vec![("max-silent-time".into(), "not-a-number".into())]);
-        assert_eq!(o.max_silent_time(), 30);
-    }
-}

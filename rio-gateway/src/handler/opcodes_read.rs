@@ -243,8 +243,8 @@ pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + U
 ///
 /// UNREACHABLE VIA ssh-ng:// — Nix SSHStore overrides setOptions() with an
 /// empty body (ssh-store.cc since 088ef8175, 2018). This handler fires only
-/// for unix:// daemon-socket clients. See the [`ClientOptions`] impl doc and
-/// the setoptions-unreachable VM subtest in scheduling.nix.
+/// for unix:// daemon-socket clients. See the [`ClientOptions`] struct doc
+/// and the setoptions-unreachable VM subtest in scheduling.nix.
 #[instrument(skip_all)]
 pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,

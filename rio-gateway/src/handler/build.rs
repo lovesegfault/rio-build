@@ -479,38 +479,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     active_build_ids: &mut HashMap<String, u64>,
     jwt_token: Option<&str>,
 ) -> anyhow::Result<BuildResult> {
-    // Trace propagation: gateway is the trace ROOT (no incoming
-    // traceparent from the SSH client — Nix doesn't speak W3C trace
-    // context). The span enclosing this call (the per-opcode #[instrument]
-    // in handle_opcode) is the top of the trace. Inject its context into
-    // the outgoing gRPC metadata so the scheduler's SubmitBuild span
-    // becomes a child, and everything downstream (actor, store, worker)
-    // chains off that. This is THE hop that makes distributed tracing
-    // work — without it, scheduler spans are orphaned root traces.
-    let mut request = tonic::Request::new(request);
-    rio_proto::interceptor::inject_current(request.metadata_mut());
-
-    // JWT propagation: x-rio-tenant-token carries the signed claims.
-    // The scheduler's interceptor (P0259) verifies signature+expiry,
-    // attaches Claims to request extensions, and the SubmitBuild
-    // handler reads jti from there — NO proto body field for jti
-    // (zero wire redundancy: jti lives once in the JWT, parsed once
-    // by the interceptor, read once by the handler; see
-    // r[gw.jwt.issue]). When token is None, header is absent →
-    // scheduler falls back to SubmitBuildRequest.tenant_name per
-    // r[gw.jwt.dual-mode+2].
-    //
-    // try_from on a JWT can't actually fail — jsonwebtoken emits
-    // base64url.base64url.base64url (pure ASCII, no control chars,
-    // well under the 8KB MetadataValue limit). The ? is defensive:
-    // if rio_common::jwt ever changes encoding, we'd rather error
-    // than silently drop auth on the floor.
-    if let Some(token) = jwt_token {
-        request.metadata_mut().insert(
-            rio_proto::TENANT_TOKEN_HEADER,
-            tonic::metadata::MetadataValue::try_from(token)?,
-        );
-    }
+    // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
+    // with_jwt injects the enclosing span's context + tenant JWT — this
+    // is THE hop that makes distributed tracing work; without it,
+    // scheduler spans are orphaned root traces.
+    let request = super::with_jwt(request, jwt_token)?;
 
     let resp = match rio_common::grpc::with_timeout(
         "SubmitBuild",
@@ -807,7 +780,6 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let SessionContext {
         store_client,
         scheduler_client,
-        options,
         drv_cache,
         has_seen_build_paths_with_results,
         active_build_ids,
@@ -932,13 +904,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         return Ok(());
     }
 
-    let request = translate::build_submit_request(
-        nodes,
-        edges,
-        options.as_ref(),
-        priority_class,
-        tenant_name.as_ref(),
-    );
+    let request =
+        translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
 
     let build_result = match submit_and_process_build(
         stderr,
@@ -967,6 +934,19 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     Ok(())
 }
 
+/// Dedup DAG nodes by `drv_path` and edges by `(parent, child)`.
+///
+/// Multi-root builds with shared deps walk the shared subgraph once per
+/// root, producing duplicate nodes/edges. The scheduler tolerates dups
+/// (MergeDag is idempotent; `derivation_edges` PK is `(parent,child)` so
+/// dups are `ON CONFLICT DO NOTHING`) but they waste bytes + PG RTTs.
+fn dedup_dag(nodes: &mut Vec<types::DerivationNode>, edges: &mut Vec<types::DerivationEdge>) {
+    let mut seen = HashSet::new();
+    nodes.retain(|n| seen.insert(n.drv_path.clone()));
+    let mut seen_edges = HashSet::new();
+    edges.retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
+}
+
 // r[impl gw.opcode.build-paths]
 /// wopBuildPaths (9): Build a set of derivations.
 #[instrument(skip_all, fields(count = tracing::field::Empty))]
@@ -978,7 +958,6 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     let SessionContext {
         store_client,
         scheduler_client,
-        options,
         drv_cache,
         active_build_ids,
         tenant_name,
@@ -1043,18 +1022,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         return Ok(());
     }
 
-    let mut seen: HashSet<String> = HashSet::new();
-    all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
-
-    // Also dedup EDGES (nodes were deduped above). Multi-root builds
-    // with shared deps (e.g., both root1 and root2 depend on glibc)
-    // produce duplicate edges when each root's BFS walks the shared
-    // subgraph. Scheduler's MergeDag likely tolerates dups (DAG merge
-    // is idempotent) but sending 2× the edges wastes bytes and PG
-    // writes (derivation_edges has PRIMARY KEY (parent,child) so
-    // dups are ON CONFLICT DO NOTHING — but that's still an RTT).
-    let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-    all_edges.retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
+    dedup_dag(&mut all_nodes, &mut all_edges);
 
     // Validate BEFORE inlining: __noChroot check + early MAX_DAG_NODES.
     if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
@@ -1076,13 +1044,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         return Ok(());
     }
 
-    let request = translate::build_submit_request(
-        all_nodes,
-        all_edges,
-        options.as_ref(),
-        "ci",
-        tenant_name.as_ref(),
-    );
+    let request = translate::build_submit_request(all_nodes, all_edges, "ci", tenant_name.as_ref());
 
     let build_result = match submit_and_process_build(
         stderr,
@@ -1118,7 +1080,6 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     let SessionContext {
         store_client,
         scheduler_client,
-        options,
         drv_cache,
         active_build_ids,
         tenant_name,
@@ -1221,13 +1182,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     if !all_nodes.is_empty() {
-        let mut seen: HashSet<String> = HashSet::new();
-        all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
-
-        // Also dedup edges (same rationale as handle_build_paths above).
-        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
-        all_edges
-            .retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
+        dedup_dag(&mut all_nodes, &mut all_edges);
 
         // Validate BEFORE inlining: __noChroot check + early
         // MAX_DAG_NODES. On reject: per-path BuildResult::failure,
@@ -1250,13 +1205,8 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             // Inline .drv content for will-dispatch nodes.
             translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
-            let request = translate::build_submit_request(
-                all_nodes,
-                all_edges,
-                options.as_ref(),
-                "ci",
-                tenant_name.as_ref(),
-            );
+            let request =
+                translate::build_submit_request(all_nodes, all_edges, "ci", tenant_name.as_ref());
 
             submit_and_process_build(
                 stderr,

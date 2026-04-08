@@ -29,7 +29,7 @@ const MAX_INLINE_DRV_BYTES: usize = 64 * 1024;
 /// still a huge win over inlining zero.
 const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
-use crate::handler::{ClientOptions, resolve_derivations_batch};
+use crate::handler::resolve_derivations_batch;
 
 /// Default cap on transitive input derivations resolved per build (DoS guard).
 /// Matches `rio_nix::protocol::wire::MAX_COLLECTION_COUNT` — the wire layer
@@ -687,7 +687,7 @@ pub async fn filter_and_inline_drv(
     );
 }
 
-/// Build a `SubmitBuildRequest` from nodes, edges, and client options.
+/// Build a `SubmitBuildRequest` from nodes and edges.
 ///
 /// `tenant_name` is `Option<&NormalizedName>` — the proto boundary
 /// convention is empty-string-as-absent, so `None` (single-tenant
@@ -695,41 +695,27 @@ pub async fn filter_and_inline_drv(
 /// inner. The type guarantees no leading/trailing/interior whitespace
 /// ever reaches the scheduler.
 ///
-/// **`options: Some(_)` is dead code for ssh-ng** (P0310 T0 source-verified):
-/// `SSHStore::setOptions()` is an empty override (ssh-store.cc:81-88,
-/// 088ef8175) so `wopSetOptions` never reaches `handle_set_options`, and
-/// `ctx.options` stays `None` for the entire session. The `Some(opts) =>`
-/// arm below is kept as future-proofing: if rio-gateway ever advertises the
-/// `set-options-map-only` protocol feature AND the flake's nix input bumps
-/// past 32827b9fb, ssh-ng clients start sending a filtered `wopSetOptions`
-/// and this path goes live — WONTFIX(P0310) tracks that.
+/// Build-option fields (`max_silent_time`/`build_timeout`/`build_cores`/
+/// `keep_going`) are hardcoded to defaults: ssh-ng clients never send
+/// `wopSetOptions` (see [`crate::handler::ClientOptions`]), so the only
+/// way to set these is via the gRPC path (rio-cli), which constructs
+/// `SubmitBuildRequest` directly without going through this helper.
 pub fn build_submit_request(
     nodes: Vec<types::DerivationNode>,
     edges: Vec<types::DerivationEdge>,
-    options: Option<&ClientOptions>,
     priority_class: &str,
     tenant_name: Option<&NormalizedName>,
 ) -> types::SubmitBuildRequest {
-    let (max_silent_time, build_timeout, build_cores, keep_going) = match options {
-        Some(opts) => (
-            opts.max_silent_time(),
-            opts.build_timeout(),
-            opts.build_cores,
-            opts.keep_going,
-        ),
-        None => (0, 0, 0, false),
-    };
-
     types::SubmitBuildRequest {
         // Proto convention: empty string = absent/single-tenant.
         tenant_name: tenant_name.map(|n| n.to_string()).unwrap_or_default(),
         priority_class: priority_class.to_string(),
         nodes,
         edges,
-        max_silent_time,
-        build_timeout,
-        build_cores,
-        keep_going,
+        max_silent_time: 0,
+        build_timeout: 0,
+        build_cores: 0,
+        keep_going: false,
     }
 }
 
@@ -877,13 +863,13 @@ mod tests {
     #[test]
     fn test_build_submit_request_carries_tenant_name() {
         let name = NormalizedName::new("team-foo").unwrap();
-        let req = build_submit_request(vec![], vec![], None, "ci", Some(&name));
+        let req = build_submit_request(vec![], vec![], "ci", Some(&name));
         assert_eq!(req.tenant_name, "team-foo");
         assert_eq!(req.priority_class, "ci");
 
         // None → empty string on the wire (proto's empty-as-absent
         // convention for single-tenant mode).
-        let req_empty = build_submit_request(vec![], vec![], None, "ci", None);
+        let req_empty = build_submit_request(vec![], vec![], "ci", None);
         assert_eq!(
             req_empty.tenant_name, "",
             "None tenant_name → empty string (single-tenant mode)"
