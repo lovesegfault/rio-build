@@ -1,5 +1,5 @@
 {{- if .Values.dashboard.enabled }}
-{{- $ns := .Values.namespace.name -}}
+{{- $ns := .Values.namespaces.system.name -}}
 {{- $d := .Values.dashboard -}}
 ---
 # EnvoyProxy: data-plane tuning for the rio-dashboard GatewayClass.

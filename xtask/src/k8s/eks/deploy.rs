@@ -157,7 +157,7 @@ pub async fn run(
     kube::wait_crd_established(&client, "nodepools.karpenter.sh", Duration::from_secs(120)).await?;
 
     // Namespaces first. Created here (not by the chart —
-    // namespace.create=false below) because: (a) the SSH Secret must
+    // namespaces.create=false below) because: (a) the SSH Secret must
     // exist before helm runs; (b) Helm refuses to adopt a namespace it
     // didn't create. ADR-019 four-namespace split: control plane +
     // store at baseline, builders + fetchers at privileged (SYS_ADMIN
@@ -195,7 +195,7 @@ pub async fn run(
     ui::step("helm upgrade rio", || async {
         helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
             .namespace(NS)
-            .set("namespace.create", "false")
+            .set("namespaces.create", "false")
             .set("global.image.registry", &ecr)
             .set("global.image.tag", tag)
             .set("global.region", &region)

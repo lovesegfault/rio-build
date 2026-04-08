@@ -22,7 +22,7 @@
 //!      tofu delete `helm_release.karpenter` first, the controller is
 //!      gone before it can terminate its instances → EC2 orphans.
 //!   5. **Delete xtask-managed K8s objects.** rio-* namespaces (xtask
-//!      created them with `namespace.create=false`), the SSH Secret,
+//!      created them with `namespaces.create=false`), the SSH Secret,
 //!      and Envoy Gateway if it was installed.
 //!   6. **tofu destroy.** Everything else: cluster, VPC, RDS, S3, ECR,
 //!      tofu-managed helm releases (cert-manager, aws-lbc, karpenter,
@@ -270,7 +270,7 @@ pub async fn run() -> Result<()> {
     .await?;
 
     // ── 5b. Delete rio namespaces ──────────────────────────────────
-    // xtask created them (deploy uses namespace.create=false), so helm
+    // xtask created them (deploy uses namespaces.create=false), so helm
     // uninstall did NOT remove them. The SSH/JWT secrets, headless
     // services, etc. all go with the namespace — no need to enumerate.
     ui::step("delete rio namespaces", || async {

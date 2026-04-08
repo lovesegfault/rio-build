@@ -41,7 +41,7 @@ in
   # truthy — non-empty string). --set respects YAML types.
   extraSetTyped ? { },
   # Passed as -n to helm template. The rio-build chart uses
-  # .Values.namespace.name (not .Release.Namespace), so -n doesn't
+  # .Values.namespaces.system.name (not .Release.Namespace), so -n doesn't
   # affect rio-* resources. But the bitnami PG subchart uses
   # .Release.Namespace — without this, PG lands in `default` while
   # rio-* land in rio-system, and waitReady's `-n ${ns}` can't see it.

@@ -16,7 +16,7 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: rio-scheduler
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
@@ -34,7 +34,7 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: rio-gateway
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
 spec:

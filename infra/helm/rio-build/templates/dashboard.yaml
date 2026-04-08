@@ -1,6 +1,6 @@
 {{- if .Values.dashboard.enabled }}
 {{- $d := .Values.dashboard -}}
-{{- $ns := .Values.namespace.name -}}
+{{- $ns := .Values.namespaces.system.name -}}
 # nginx-only pod: serves the Svelte SPA and proxies /rio.* gRPC-Web to
 # the Envoy Gateway Service. NO sidecar — envoy is operator-managed
 # (Gateway API CRDs in dashboard-gateway*.yaml). nginx proxies to the

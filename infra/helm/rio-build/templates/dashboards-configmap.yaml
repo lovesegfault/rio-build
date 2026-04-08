@@ -19,7 +19,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rio-dashboard-{{ $name }}
-  namespace: {{ $.Values.namespace.name }}
+  namespace: {{ $.Values.namespaces.system.name }}
   labels:
     grafana_dashboard: "1"
     {{- include "rio.labels" (dict "root" $ "name" "rio-dashboards" "component" "monitoring") | nindent 4 }}

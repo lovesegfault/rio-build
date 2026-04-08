@@ -20,7 +20,7 @@ exposeHeaders:
   - grpc-status-details-bin
 {{- end -}}
 {{- if .Values.dashboard.enabled }}
-{{- $ns := .Values.namespace.name -}}
+{{- $ns := .Values.namespaces.system.name -}}
 ---
 # CORS: grpc-web clients (browser fetch) need the grpc-* response
 # headers exposed or connect-web can't read the trailer status. The

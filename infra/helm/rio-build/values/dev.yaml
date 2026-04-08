@@ -8,7 +8,7 @@ global:
     # means if it's preloaded, k3s won't try to pull.
     tag: dev
 
-namespace:
+namespaces:
   # `cargo xtask k8s -p k3s up` pre-creates rio-system (for rio-s3-creds
   # + SSH secret) before helm runs. Helm won't adopt a namespace it
   # didn't create ("invalid ownership metadata").

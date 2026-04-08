@@ -1,5 +1,5 @@
-{{- if .Values.namespace.create }}
-{{- range $role, $ns := .Values.namespaces }}
+{{- if .Values.namespaces.create }}
+{{- range $role, $ns := omit .Values.namespaces "create" }}
 ---
 apiVersion: v1
 kind: Namespace

@@ -26,15 +26,6 @@ global:
   # reads its own env and passes it through), so one knob covers all.
   logLevel: "info"
 
-namespace:
-  create: true
-  # Control-plane namespace (scheduler, gateway, controller). Most
-  # templates reference this via `.Values.namespace.name` — it's the
-  # "default" ns, the one `helm --namespace` anchors to. Cross-ns
-  # resources (store, builderpool, fetcherpool) set explicit
-  # `metadata.namespace:` from the `namespaces` map below.
-  name: rio-system
-
 # ADR-019 four-namespace split: privileged PSA narrows to the two
 # namespaces whose pods actually need CAP_SYS_ADMIN (FUSE mount).
 # Control plane + store drop to restricted — runAsNonRoot, drop-ALL,
@@ -43,7 +34,13 @@ namespace:
 # PSA enforces). All four carry `app.kubernetes.io/part-of: rio-build`
 # so NetworkPolicy namespaceSelector rules match without enumerating
 # names.
+#
+# `system` is the control-plane namespace (scheduler, gateway,
+# controller) and the one `helm --namespace` anchors to. Cross-ns
+# resources (store, builderpool, fetcherpool) set explicit
+# `metadata.namespace:` from the other entries.
 namespaces:
+  create: true
   system:   {name: rio-system,   psa: restricted}
   store:    {name: rio-store,    psa: restricted}
   builders: {name: rio-builders, psa: privileged}

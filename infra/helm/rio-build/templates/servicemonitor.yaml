@@ -14,9 +14,9 @@
   9090/9091/9092/9094 respectively). Workers use the PodMonitor below.
 */ -}}
 {{- range $c := list
-      (dict "name" "gateway"    "ns" $.Values.namespace.name "port" 9090)
-      (dict "name" "scheduler"  "ns" $.Values.namespace.name "port" 9091)
-      (dict "name" "controller" "ns" $.Values.namespace.name "port" 9094)
+      (dict "name" "gateway"    "ns" $.Values.namespaces.system.name "port" 9090)
+      (dict "name" "scheduler"  "ns" $.Values.namespaces.system.name "port" 9091)
+      (dict "name" "controller" "ns" $.Values.namespaces.system.name "port" 9094)
       (dict "name" "store"      "ns" $ns.store.name          "port" 9092)
 }}
 ---

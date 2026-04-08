@@ -4,7 +4,7 @@ NOTES.txt: printed after `helm install`/`helm upgrade`.
 Post-install prerequisites that the chart cannot apply itself
 (node-level state outside K8s API reach).
 */ -}}
-rio-build installed to namespace {{ .Values.namespace.name }}.
+rio-build installed to namespace {{ .Values.namespaces.system.name }}.
 
 {{- if not .Values.builderPoolDefaults.privileged }}
 

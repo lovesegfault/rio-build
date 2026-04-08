@@ -1,4 +1,4 @@
-{{- $ns := .Values.namespace.name -}}
+{{- $ns := .Values.namespaces.system.name -}}
 # ServiceAccounts first. gateway/store/worker get
 # automountServiceAccountToken: false — no K8s API access. Dedicated SA
 # anyway for IRSA annotations + NetworkPolicy scoping.

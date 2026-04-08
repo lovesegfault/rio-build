@@ -4,7 +4,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: rio-alerts
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-alerts" "component" "monitoring") | nindent 4 }}
 spec:

@@ -18,9 +18,8 @@ global:
     pullPolicy: IfNotPresent
   logLevel: debug
 
-namespace:
+namespaces:
   create: true
-  name: rio-system
 
 # cert-manager not preloaded (phase4c, needs its own airgap images).
 # TLS Secrets provided out-of-band via lib/pki-k8s.nix → k3s manifest.

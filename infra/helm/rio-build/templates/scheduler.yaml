@@ -9,7 +9,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rio-scheduler
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
@@ -182,7 +182,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: rio-scheduler
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
@@ -207,7 +207,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: rio-scheduler-headless
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 spec:
@@ -230,7 +230,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rio-scheduler-config
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
 data:

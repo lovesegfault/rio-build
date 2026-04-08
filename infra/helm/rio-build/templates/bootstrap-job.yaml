@@ -1,5 +1,5 @@
 {{- if .Values.bootstrap.enabled }}
-{{- $ns := .Values.namespace.name -}}
+{{- $ns := .Values.namespaces.system.name -}}
 {{- $b := .Values.bootstrap -}}
 ---
 apiVersion: v1

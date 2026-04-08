@@ -16,7 +16,7 @@
 # Sequence: update ConfigMap → SIGHUP verify pods → rotate Secret →
 # restart gateways. Verify side accepts both old+new during overlap
 # (TODO(P0260): multi-key verify; for now, sequence is tight).
-{{- range $ns := list .Values.namespace.name .Values.namespaces.store.name }}
+{{- range $ns := list .Values.namespaces.system.name .Values.namespaces.store.name }}
 ---
 # ADR-019: scheduler stays in rio-system, store moved to rio-store.
 # ConfigMap duplicated — ConfigMaps are ns-scoped, the store can't

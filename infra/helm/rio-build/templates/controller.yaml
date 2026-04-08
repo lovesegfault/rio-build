@@ -4,7 +4,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rio-controller
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ .Values.namespaces.system.name }}
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
 spec:
