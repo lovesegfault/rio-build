@@ -5,7 +5,6 @@
 //! - Upper layer: `{upper}/nix/store/` on local SSD (separate FS from FUSE)
 // r[impl builder.overlay.per-build]
 // r[impl builder.overlay.stacked-lower+2]
-// r[impl builder.overlay.upper-not-overlayfs]
 //! - Work directory: required by overlayfs (same filesystem as upper)
 //! - Merged: mounted at `{build_dir}/nix/store`. nix-daemon runs with
 //!   `--store local?root={build_dir}` so it reads this as its
@@ -60,6 +59,15 @@ pub enum OverlayError {
         lower: PathBuf,
         st_dev: u64,
     },
+
+    #[error(
+        "overlay upperdir {path} is itself on an overlayfs mount \
+         (statfs f_type=OVERLAYFS_SUPER_MAGIC); the kernel refuses to use \
+         an overlayfs as upperdir/workdir. Set --overlay-base-dir to a \
+         directory on a real filesystem (e.g., a local SSD emptyDir \
+         volume), not the merged view of another overlay."
+    )]
+    UpperOnOverlayfs { path: PathBuf },
 
     #[error("mount overlay failed: {source} (mount_data: {mount_data})")]
     Mount {
@@ -248,6 +256,21 @@ pub fn setup_overlay(
             lower: lower.to_path_buf(),
             st_dev: lower_dev,
         });
+    }
+
+    // r[impl builder.overlay.upper-not-overlayfs]
+    // The kernel refuses to use an overlayfs as upperdir/workdir (it
+    // can't host the trusted.overlay.* xattrs nor the workdir whiteouts
+    // it itself relies on). Check f_type proactively so misconfiguration
+    // surfaces as a clear error instead of EINVAL from mount(2).
+    let upper_fstype = nix::sys::statfs::statfs(&store_upper)
+        .map_err(|source| OverlayError::Stat {
+            path: store_upper.clone(),
+            source,
+        })?
+        .filesystem_type();
+    if upper_fstype == nix::sys::statfs::OVERLAYFS_SUPER_MAGIC {
+        return Err(OverlayError::UpperOnOverlayfs { path: store_upper });
     }
 
     // r[impl builder.overlay.userns-exdev]
@@ -442,6 +465,24 @@ mod tests {
             "build_dir {build_dir:?} must be removed on early-error return"
         );
         assert!(base.exists(), "base_dir itself must survive cleanup");
+        Ok(())
+    }
+
+    /// A normal tempdir (tmpfs/ext4/xfs/…) is NOT overlayfs — the
+    /// preflight statfs check must pass. The positive case (upper
+    /// actually on overlayfs → UpperOnOverlayfs) needs CAP_SYS_ADMIN to
+    /// construct and is exercised by the VM test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_statfs_tmpdir_not_overlayfs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fstype = nix::sys::statfs::statfs(dir.path())?.filesystem_type();
+        assert_ne!(
+            fstype,
+            nix::sys::statfs::OVERLAYFS_SUPER_MAGIC,
+            "tempdir unexpectedly on overlayfs (f_type={fstype:?}); \
+             the preflight check would reject it"
+        );
         Ok(())
     }
 }
