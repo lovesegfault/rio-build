@@ -1240,18 +1240,9 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
 /// `fetcher_size_classes` only).
 #[tokio::test]
 async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
-    use crate::assignment::FetcherSizeClassConfig;
-
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec![
-            FetcherSizeClassConfig {
-                name: "tiny".into(),
-            },
-            FetcherSizeClassConfig {
-                name: "small".into(),
-            },
-        ];
+        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
         // Zero backoff so the retry redispatches on the next Tick
         // (default is 5s exponential — test would need to sleep).
         c.retry_policy = crate::RetryPolicy {
@@ -1332,16 +1323,9 @@ async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
 /// `next_fetcher_class(largest)` returns None.
 #[tokio::test]
 async fn fod_size_class_floor_clamps_at_largest() -> TestResult {
-    use crate::assignment::{FetcherSizeClassConfig, next_fetcher_class};
+    use crate::assignment::next_fetcher_class;
 
-    let classes = vec![
-        FetcherSizeClassConfig {
-            name: "tiny".into(),
-        },
-        FetcherSizeClassConfig {
-            name: "small".into(),
-        },
-    ];
+    let classes = vec!["tiny".into(), "small".into()];
     assert_eq!(
         next_fetcher_class("tiny", &classes).as_deref(),
         Some("small")

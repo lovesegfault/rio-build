@@ -939,7 +939,7 @@ fetcherPoolDefaults:
   # limit (rio-fetcher above) sized for the floor-promotion tail, not
   # for sustained xlarge fanout.
   #
-  # MUST agree with scheduler.toml `[[fetcher_size_classes]]`
+  # MUST agree with scheduler.toml `fetcher_size_classes`
   # (rendered from this list in templates/scheduler.yaml — single
   # source of truth, arch-agnostic floor-walk ordering). Set to `[]`
   # for a single-size pool at the legacy `resources:` field.

@@ -1854,14 +1854,7 @@ async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
 async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec![
-            crate::assignment::FetcherSizeClassConfig {
-                name: "tiny".into(),
-            },
-            crate::assignment::FetcherSizeClassConfig {
-                name: "small".into(),
-            },
-        ];
+        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
     });
 
     // Pre-seed: prior run promoted this FOD to floor='small', then went

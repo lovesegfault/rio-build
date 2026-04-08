@@ -47,7 +47,7 @@ struct Config {
     /// you tweak per-invocation. Change it in scheduler.toml.
     size_classes: Vec<rio_scheduler::SizeClassConfig>,
     /// Fetcher size-class config (I-170). Empty = single-pool mode
-    /// (no class filter on FOD dispatch). Just `{name}` per entry,
+    /// (no class filter on FOD dispatch). A flat list of names,
     /// ordered smallest→largest — the scheduler needs the ORDER to
     /// compute "next larger" for reactive promotion; per-class
     /// resources live on the controller side (`FetcherPool.spec.
@@ -55,11 +55,8 @@ struct Config {
     /// in the helm chart (single source of truth: scheduler.yaml
     /// renders both from `.Values.fetcherPoolDefaults.classes`;
     /// class names are arch-agnostic). TOML:
-    ///   [[fetcher_size_classes]]
-    ///   name = "tiny"
-    ///   [[fetcher_size_classes]]
-    ///   name = "small"
-    fetcher_size_classes: Vec<rio_scheduler::FetcherSizeClassConfig>,
+    ///   fetcher_size_classes = ["tiny", "small"]
+    fetcher_size_classes: Vec<String>,
     /// I-204: `requiredSystemFeatures` values that are capability HINTS,
     /// not hardware gates. Stripped from each derivation at DAG-insert so
     /// they don't drive pool spawn or block dispatch. nixpkgs convention:
@@ -405,7 +402,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if !cfg.fetcher_size_classes.is_empty() {
         info!(
-            classes = ?cfg.fetcher_size_classes.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            classes = ?cfg.fetcher_size_classes,
             "fetcher size-class routing enabled (reactive)"
         );
     }

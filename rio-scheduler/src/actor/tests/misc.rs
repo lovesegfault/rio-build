@@ -1232,14 +1232,7 @@ async fn fod_size_class_snapshot_buckets_by_floor() {
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            fetcher_size_classes: vec![
-                crate::assignment::FetcherSizeClassConfig {
-                    name: "tiny".into(),
-                },
-                crate::assignment::FetcherSizeClassConfig {
-                    name: "small".into(),
-                },
-            ],
+            fetcher_size_classes: vec!["tiny".into(), "small".into()],
             ..Default::default()
         },
     );

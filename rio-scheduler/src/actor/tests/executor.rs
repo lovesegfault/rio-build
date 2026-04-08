@@ -980,18 +980,9 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
 /// `test_ephemeral_disconnect_does_not_promote_floor`.
 #[tokio::test]
 async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
-    use crate::assignment::FetcherSizeClassConfig;
-
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec![
-            FetcherSizeClassConfig {
-                name: "tiny".into(),
-            },
-            FetcherSizeClassConfig {
-                name: "small".into(),
-            },
-        ];
+        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
     });
 
     let mut rx = connect_fetcher_classed(&handle, "f-tiny", "x86_64-linux", "tiny").await?;

@@ -10,10 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-// `oneshot` used by submodules via `use super::*;` — not here.
-// Same for BuildOptions/PriorityClass in the state import.
-// mod.rs is the import hub for the actor/* submodule tree.
-#[allow(unused_imports)]
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tonic::transport::Channel;
 use tracing::{debug, error, info, instrument, warn};
@@ -26,11 +22,9 @@ use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
 use crate::estimator::Estimator;
 use crate::queue::ReadyQueue;
-#[allow(unused_imports)]
 use crate::state::{
-    BuildInfo, BuildOptions, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId,
-    ExecutorState, HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig,
-    PriorityClass, RetryPolicy,
+    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
+    HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS, POISON_TTL, PoisonConfig, RetryPolicy,
 };
 
 mod command;
@@ -219,7 +213,7 @@ pub struct DagActor {
     /// walks from `DerivationState.sched.size_class_floor` upward. Plain
     /// `Vec` (not `Arc<RwLock>`): no rebalancer mutates this — it's
     /// just an ordered name list, config-static after construction.
-    fetcher_size_classes: Vec<crate::assignment::FetcherSizeClassConfig>,
+    fetcher_size_classes: Vec<String>,
     /// I-204: capability-hint features stripped at DAG insertion.
     /// Mirrored onto `self.dag` by `with_soft_features` and re-applied
     /// in `clear_persisted_state` (recovery replaces the DAG).

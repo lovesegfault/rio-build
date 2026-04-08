@@ -42,9 +42,9 @@ pub struct DagActorConfig {
     /// initial values are also captured into `configured_cutoffs` for
     /// drift reporting.
     pub size_classes: Vec<crate::assignment::SizeClassConfig>,
-    /// Fetcher size-class config (I-170). Empty = feature off (single
-    /// fetcher pool, no class filter). Ordered smallest→largest.
-    pub fetcher_size_classes: Vec<crate::assignment::FetcherSizeClassConfig>,
+    /// Fetcher size-class names (I-170), ordered smallest→largest.
+    /// Empty = feature off (single fetcher pool, no class filter).
+    pub fetcher_size_classes: Vec<String>,
     /// `requiredSystemFeatures` values stripped at DAG insertion
     /// (I-204). Empty preserves pre-I-204 behavior — every feature is
     /// a gate.

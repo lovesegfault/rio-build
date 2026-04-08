@@ -403,10 +403,10 @@ impl DagActor {
             .fetcher_size_classes
             .iter()
             .enumerate()
-            .map(|(i, c)| {
-                index.insert(c.name.clone(), i);
+            .map(|(i, name)| {
+                index.insert(name.clone(), i);
                 SizeClassSnapshot {
-                    name: c.name.clone(),
+                    name: name.clone(),
                     // No duration cutoffs for fetcher classes — routing
                     // is reactive-only. Zeroed; proto consumers ignore
                     // these for fod_classes.

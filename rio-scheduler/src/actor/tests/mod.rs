@@ -7,6 +7,7 @@
 
 // Bring actor types into this module's scope so submodules see them via `use super::*;`.
 pub(crate) use super::*;
+pub(crate) use crate::state::{BuildOptions, PriorityClass};
 
 pub(crate) mod helpers;
 pub(crate) use helpers::*; // Re-export for grpc.rs tests

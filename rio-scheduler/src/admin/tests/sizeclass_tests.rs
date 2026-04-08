@@ -37,18 +37,10 @@ async fn test_get_size_class_status_empty_when_unconfigured() -> anyhow::Result<
 #[tokio::test]
 async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> {
     use crate::actor::tests::setup_actor_configured;
-    use crate::assignment::FetcherSizeClassConfig;
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
     let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec![
-            FetcherSizeClassConfig {
-                name: "tiny".into(),
-            },
-            FetcherSizeClassConfig {
-                name: "small".into(),
-            },
-        ];
+        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
     });
     let svc = AdminServiceImpl::new(
         Arc::new(LogBuffers::new()),

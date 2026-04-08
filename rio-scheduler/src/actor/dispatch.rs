@@ -758,13 +758,13 @@ impl DagActor {
                 .sched
                 .size_class_floor
                 .as_deref()
-                .and_then(|f| self.fetcher_size_classes.iter().position(|c| c.name == f))
+                .and_then(|f| self.fetcher_size_classes.iter().position(|c| c == f))
                 .unwrap_or(0);
             for class in &self.fetcher_size_classes[floor_idx..] {
                 if let Some(w) =
-                    crate::assignment::best_executor(&self.executors, drv_state, Some(&class.name))
+                    crate::assignment::best_executor(&self.executors, drv_state, Some(class))
                 {
-                    return (Some(w), Some(class.name.clone()));
+                    return (Some(w), Some(class.clone()));
                 }
             }
             return (None, None);
