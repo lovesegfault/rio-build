@@ -533,13 +533,15 @@ async fn run_up(
 
     let pp = PhaseParams {
         yes: o.yes,
-        log_level: o
-            .deploy_log_level
-            .clone()
-            .unwrap_or_else(|| cfg.log_level.clone()),
-        tenant: o.deploy_tenant.clone(),
-        skip_preflight: o.deploy_skip_preflight,
-        no_hooks: o.deploy_no_hooks,
+        deploy: provider::DeployOpts {
+            log_level: o
+                .deploy_log_level
+                .clone()
+                .unwrap_or_else(|| cfg.log_level.clone()),
+            tenant: o.deploy_tenant.clone(),
+            skip_preflight: o.deploy_skip_preflight,
+            no_hooks: o.deploy_no_hooks,
+        },
     };
     let cfg = Arc::new(cfg.clone());
 
@@ -580,10 +582,7 @@ async fn run_up(
 #[derive(Clone)]
 struct PhaseParams {
     yes: bool,
-    log_level: String,
-    tenant: Option<String>,
-    skip_preflight: bool,
-    no_hooks: bool,
+    deploy: provider::DeployOpts,
 }
 
 /// Concurrent core of `up`: a ready-set DAG executor over
@@ -707,19 +706,7 @@ where
                 Phase::Deploy => {
                     let (p, cfg, pp) = (p.clone(), cfg.clone(), pp.clone());
                     running.spawn(async move {
-                        (
-                            ph,
-                            ui::step("deploy", || {
-                                p.deploy(
-                                    &cfg,
-                                    &pp.log_level,
-                                    pp.tenant.as_deref(),
-                                    pp.skip_preflight,
-                                    pp.no_hooks,
-                                )
-                            })
-                            .await,
-                        )
+                        (ph, ui::step("deploy", || p.deploy(&cfg, &pp.deploy)).await)
                     });
                 }
                 Phase::Envoy => {
@@ -967,14 +954,7 @@ mod tests {
             self.record("push");
             Ok(())
         }
-        async fn deploy(
-            &self,
-            _: &XtaskConfig,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
-            _: bool,
-        ) -> Result<()> {
+        async fn deploy(&self, _: &XtaskConfig, _: &provider::DeployOpts) -> Result<()> {
             self.record("deploy");
             Ok(())
         }
@@ -999,10 +979,10 @@ mod tests {
     fn pp() -> PhaseParams {
         PhaseParams {
             yes: true,
-            log_level: "info".into(),
-            tenant: None,
-            skip_preflight: true,
-            no_hooks: false,
+            deploy: provider::DeployOpts {
+                log_level: "info".into(),
+                ..Default::default()
+            },
         }
     }
 
@@ -1251,15 +1231,8 @@ mod tests {
         async fn push(&self, i: &provider::BuiltImages, c: &XtaskConfig) -> Result<()> {
             self.inner.push(i, c).await
         }
-        async fn deploy(
-            &self,
-            c: &XtaskConfig,
-            l: &str,
-            t: Option<&str>,
-            s: bool,
-            h: bool,
-        ) -> Result<()> {
-            self.inner.deploy(c, l, t, s, h).await
+        async fn deploy(&self, c: &XtaskConfig, o: &provider::DeployOpts) -> Result<()> {
+            self.inner.deploy(c, o).await
         }
         async fn smoke(&self, _: &XtaskConfig) -> Result<()> {
             unimplemented!()

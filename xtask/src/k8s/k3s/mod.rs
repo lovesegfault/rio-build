@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::{BuiltImages, Provider};
+use crate::k8s::provider::{BuiltImages, DeployOpts, Provider};
 use crate::k8s::{NS, ensure_namespaces, shared};
 use crate::sh::{self, cmd, shell};
 use crate::{helm, kube, ui};
@@ -62,14 +62,7 @@ impl Provider for K3s {
         push::push(images, cfg).await
     }
 
-    async fn deploy(
-        &self,
-        cfg: &XtaskConfig,
-        log_level: &str,
-        tenant: Option<&str>,
-        _skip_preflight: bool,
-        _no_hooks: bool,
-    ) -> Result<()> {
+    async fn deploy(&self, cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         let client = kube::client().await?;
 
         ui::step("chart deps", shared::chart_deps).await?;
@@ -77,7 +70,7 @@ impl Provider for K3s {
 
         ui::step("namespaces + ssh secret", || async {
             ensure_namespaces(&client).await?;
-            shared::ensure_gateway_ssh_secret(&client, cfg, tenant).await
+            shared::ensure_gateway_ssh_secret(&client, cfg, opts.tenant.as_deref()).await
         })
         .await?;
 
@@ -96,7 +89,7 @@ impl Provider for K3s {
                 .namespace(NS)
                 .values("infra/helm/rio-build/values/dev.yaml")
                 .set("global.image.tag", "dev")
-                .set("global.logLevel", log_level)
+                .set("global.logLevel", &opts.log_level)
                 .set("postgresql.auth.existingSecret", "rio-postgres-auth")
                 .set("jwt.enabled", "true")
                 .set("jwt.signingSeed", &jwt.seed)
@@ -129,7 +122,7 @@ impl Provider for K3s {
         sched_port: u16,
         store_port: u16,
     ) -> Result<((u16, shared::ProcessGuard), (u16, shared::ProcessGuard))> {
-        smoke::tunnel_grpc(sched_port, store_port).await
+        shared::tunnel_grpc(sched_port, store_port).await
     }
 
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {

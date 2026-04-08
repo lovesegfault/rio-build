@@ -12,7 +12,7 @@ use tracing::info;
 
 use super::TF_DIR;
 use crate::config::XtaskConfig;
-use crate::k8s::provider::ProviderKind;
+use crate::k8s::provider::{DeployOpts, ProviderKind};
 use crate::k8s::{NS, ensure_namespaces, shared, status};
 use crate::sh::repo_root;
 use crate::{git, helm, kube, tofu, ui};
@@ -74,13 +74,11 @@ const FETCHER_POOLS_JSON: &str = r#"[
    "nodeSelector":{"rio.build/node-role":"fetcher","kubernetes.io/arch":"arm64"}}
 ]"#;
 
-pub async fn run(
-    cfg: &XtaskConfig,
-    log_level: &str,
-    tenant: Option<&str>,
-    skip_preflight: bool,
-    no_hooks: bool,
-) -> Result<()> {
+pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
+    let log_level = opts.log_level.as_str();
+    let tenant = opts.tenant.as_deref();
+    let skip_preflight = opts.skip_preflight;
+    let no_hooks = opts.no_hooks;
     // Image tag: the `.rio-image-tag` handoff file if `--push` ran in
     // THIS worktree, else recompute (same `git::image_tag` push uses —
     // short-SHA + `-dirty-${hash}`, deterministic from tree state). A

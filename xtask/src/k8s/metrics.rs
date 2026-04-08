@@ -334,13 +334,9 @@ pub async fn grafana(port: u16) -> Result<()> {
         .context("admin-password key missing in Grafana secret")?;
 
     crate::k8s::shared::kill_port_listeners(port);
-    let (bound, _guard) = crate::k8s::k3s::smoke::port_forward(
-        NS_MONITORING,
-        &format!("svc/{GRAFANA_SVC}"),
-        port,
-        80,
-    )
-    .await?;
+    let (bound, _guard) =
+        crate::k8s::shared::port_forward(NS_MONITORING, &format!("svc/{GRAFANA_SVC}"), port, 80)
+            .await?;
 
     eprintln!();
     eprintln!(

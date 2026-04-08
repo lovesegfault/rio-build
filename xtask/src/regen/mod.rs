@@ -3,7 +3,6 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::config::XtaskConfig;
 use crate::ui;
 
 mod cargo_json;
@@ -33,7 +32,7 @@ pub enum RegenCmd {
     },
 }
 
-pub async fn run(which: Option<RegenCmd>, _cfg: &XtaskConfig) -> Result<()> {
+pub async fn run(which: Option<RegenCmd>) -> Result<()> {
     match which {
         Some(RegenCmd::Sqlx) => sqlx::run().await,
         Some(RegenCmd::Crds) => crds::run().await,

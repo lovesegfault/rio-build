@@ -22,6 +22,27 @@ pub struct ReleaseStatus {
     pub image_tag: Option<String>,
 }
 
+/// Best-effort `global.image.tag` from `helm get values`. `rev = None`
+/// reads the live release; `Some(n)` reads a history revision. Returns
+/// `None` on any failure (revision pruned, network blip, parse error)
+/// so callers degrade rather than bail.
+fn get_image_tag(release: &str, ns: &str, rev: Option<u32>) -> Option<String> {
+    let sh = shell().ok()?;
+    let rev_arg: Vec<String> = rev
+        .map(|r| vec!["--revision".into(), r.to_string()])
+        .unwrap_or_default();
+    let values = sh::read(cmd!(
+        sh,
+        "helm get values {release} -n {ns} {rev_arg...} -o json"
+    ))
+    .ok()?;
+    serde_json::from_str::<serde_json::Value>(&values)
+        .ok()?
+        .pointer("/global/image/tag")
+        .and_then(|t| t.as_str())
+        .map(String::from)
+}
+
 /// `helm ls -n NS -f ^RELEASE$ -o json`, enriched with the deployed
 /// image tag. `None` if the release isn't installed.
 pub fn release_status(release: &str, ns: &str) -> Result<Option<ReleaseStatus>> {
@@ -32,16 +53,7 @@ pub fn release_status(release: &str, ns: &str) -> Result<Option<ReleaseStatus>> 
     let Some(mut rel) = list.pop() else {
         return Ok(None);
     };
-    // Same best-effort tag enrichment as history_json.
-    if let Ok(values) = sh::read(cmd!(sh, "helm get values {release} -n {ns} -o json")) {
-        rel.image_tag = serde_json::from_str::<serde_json::Value>(&values)
-            .ok()
-            .and_then(|v| {
-                v.pointer("/global/image/tag")
-                    .and_then(|t| t.as_str())
-                    .map(String::from)
-            });
-    }
+    rel.image_tag = get_image_tag(release, ns, None);
     Ok(Some(rel))
 }
 
@@ -92,23 +104,8 @@ pub fn history_json(release: &str, ns: &str) -> Result<Vec<Revision>> {
     let json = sh::read(cmd!(sh, "helm history {release} -n {ns} -o json"))?;
     let mut revs: Vec<Revision> = serde_json::from_str(&json)?;
 
-    // Enrich with image tag (global.image.tag from values). Best-effort
-    // — if helm get values fails (revision pruned, network blip), leave
-    // the tag blank rather than bailing the whole picker.
     for r in &mut revs {
-        let rev = r.revision.to_string();
-        if let Ok(values) = sh::read(cmd!(
-            sh,
-            "helm get values {release} -n {ns} --revision {rev} -o json"
-        )) {
-            r.image_tag = serde_json::from_str::<serde_json::Value>(&values)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/global/image/tag")
-                        .and_then(|t| t.as_str())
-                        .map(String::from)
-                });
-        }
+        r.image_tag = get_image_tag(release, ns, Some(r.revision));
     }
 
     revs.reverse(); // newest first — most likely rollback target at top

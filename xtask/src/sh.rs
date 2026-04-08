@@ -175,22 +175,39 @@ pub fn run_sync(cmd: xshell::Cmd<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Captured-output backend for [`try_read`] and [`read`]'s non-verbose
+/// path. xshell `Cmd` doesn't support stderr redirect — convert to
+/// `std::process::Command`, capture both pipes. On failure, optionally
+/// dumps each line to the terminal (`dump_on_err`) then bails with the
+/// 512-char HEAD of combined stdout+stderr (head not tail: rio-cli
+/// puts the message first then a multi-KB backtrace). The head goes in
+/// the error string either way so callers can match on it (idempotent
+/// "already exists" checks).
+fn read_captured(cmd: xshell::Cmd<'_>, dump_on_err: bool) -> Result<String> {
+    let mut std_cmd: std::process::Command = cmd.quiet().into();
+    let out = std_cmd.stderr(Stdio::piped()).output()?;
+    if !out.status.success() {
+        let stdout = std::str::from_utf8(&out.stdout).unwrap_or("");
+        let stderr = std::str::from_utf8(&out.stderr).unwrap_or("");
+        if dump_on_err {
+            for line in stdout.lines().chain(stderr.lines()) {
+                ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
+            }
+        }
+        let combined = format!("{stdout}{stderr}");
+        let head: String = combined.chars().take(512).collect();
+        bail!("command failed: {}: {}", out.status, head.trim());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim_end().to_string())
+}
+
 /// Capture stdout as a String. On failure, returns Err with the
 /// combined stdout+stderr head in the message (for caller matching)
 /// but does NOT dump to the terminal — use [`read`] for that.
 /// Intended for callers that inspect the error for idempotent ops.
 pub fn try_read(cmd: xshell::Cmd<'_>) -> Result<String> {
     debug!("exec (try_read): {}", cmd);
-    let mut std_cmd: std::process::Command = cmd.quiet().into();
-    let out = std_cmd.stderr(Stdio::piped()).output()?;
-    if !out.status.success() {
-        let stdout = std::str::from_utf8(&out.stdout).unwrap_or("");
-        let stderr = std::str::from_utf8(&out.stderr).unwrap_or("");
-        let combined = format!("{stdout}{stderr}");
-        let head: String = combined.chars().take(512).collect();
-        bail!("command failed: {}: {}", out.status, head.trim());
-    }
-    Ok(String::from_utf8(out.stdout)?.trim_end().to_string())
+    read_captured(cmd, false)
 }
 
 /// Capture stdout as a String. At default verbosity, stderr is
@@ -201,25 +218,7 @@ pub fn read(cmd: xshell::Cmd<'_>) -> Result<String> {
     if ui::is_verbose() {
         cmd.quiet().read().map_err(anyhow::Error::from)
     } else {
-        // xshell's Cmd doesn't support stderr redirect directly;
-        // go via std::process::Command.
-        let mut std_cmd: std::process::Command = cmd.quiet().into();
-        let out = std_cmd.stderr(Stdio::piped()).output()?;
-        if !out.status.success() {
-            let stdout = std::str::from_utf8(&out.stdout).unwrap_or("");
-            let stderr = std::str::from_utf8(&out.stderr).unwrap_or("");
-            for line in stdout.lines().chain(stderr.lines()) {
-                ui::eprint(format_args!("  {} {line}\n", style("│").dim()));
-            }
-            // Include both streams in the error so callers can match
-            // on it (e.g., idempotent "already exists" checks).
-            // Take the HEAD not tail — rio-cli puts the message first
-            // and follows with a multi-KB backtrace.
-            let combined = format!("{stdout}{stderr}");
-            let head: String = combined.chars().take(512).collect();
-            bail!("command failed: {}: {}", out.status, head.trim());
-        }
-        Ok(String::from_utf8(out.stdout)?.trim_end().to_string())
+        read_captured(cmd, true)
     }
 }
 

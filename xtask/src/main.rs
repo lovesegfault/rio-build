@@ -94,7 +94,7 @@ fn main() -> std::process::ExitCode {
 
 async fn run(cmd: Cmd, cfg: XtaskConfig) -> Result<()> {
     match cmd {
-        Cmd::Regen { which } => regen::run(which, &cfg).await,
+        Cmd::Regen { which } => regen::run(which).await,
         Cmd::Mutants => mutants::run(),
         Cmd::Fuzz(args) => fuzz::run(args),
         Cmd::NewMigration(args) => migration::run(args),

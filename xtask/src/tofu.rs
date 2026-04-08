@@ -145,6 +145,22 @@ impl Outputs {
     }
 }
 
+/// tfstate bucket: `cfg.tfstate_bucket` override, else
+/// `rio-tfstate-{account_id}` via `lookup_account`. Factored so the
+/// sync ([`ensure_backend_init`] → `aws sts` CLI) and async
+/// ([`state_bucket`] → SDK) paths share one naming convention — only
+/// the account-id lookup differs. The closure isn't called when the
+/// override is set, so both paths skip the network round-trip.
+fn resolve_bucket<F: FnOnce() -> Result<String>>(
+    cfg: &XtaskConfig,
+    lookup_account: F,
+) -> Result<String> {
+    if let Some(b) = &cfg.tfstate_bucket {
+        return Ok(b.clone());
+    }
+    Ok(format!("rio-tfstate-{}", lookup_account()?))
+}
+
 /// Lazy backend init for read-only callers ([`outputs`]). A fresh git
 /// worktree has no `infra/eks/.terraform/`, so `tofu output` fails with
 /// "Backend initialization required" even though the cluster exists in
@@ -154,25 +170,21 @@ impl Outputs {
 /// backend and downloads providers; no state mutation.
 ///
 /// Sync sibling of [`state_bucket`]: shells `aws sts` instead of the
-/// SDK so [`outputs`] can stay sync. Keep the bucket-naming logic in
-/// lockstep with [`state_bucket`].
+/// SDK so [`outputs`] can stay sync. Bucket-naming convention lives in
+/// [`resolve_bucket`].
 fn ensure_backend_init(dir: &str) -> Result<()> {
     if sh::repo_root().join(dir).join(".terraform").is_dir() {
         return Ok(());
     }
     let cfg = XtaskConfig::load()?;
-    let bucket = match &cfg.tfstate_bucket {
-        Some(b) => b.clone(),
-        None => {
-            let sh = shell()?;
-            let account = sh::read(cmd!(
-                sh,
-                "aws sts get-caller-identity --query Account --output text"
-            ))
-            .context("resolve AWS account ID for tfstate bucket")?;
-            format!("rio-tfstate-{account}")
-        }
-    };
+    let bucket = resolve_bucket(&cfg, || {
+        let sh = shell()?;
+        sh::read(cmd!(
+            sh,
+            "aws sts get-caller-identity --query Account --output text"
+        ))
+        .context("resolve AWS account ID for tfstate bucket")
+    })?;
     let backend = Backend {
         bucket,
         region: cfg.tfstate_region,
@@ -222,11 +234,13 @@ pub fn output(dir: &str, name: &str) -> Result<String> {
 
 /// Resolve the tfstate bucket: RIO_TFSTATE_BUCKET or rio-tfstate-${account_id}.
 pub async fn state_bucket(cfg: &XtaskConfig, aws: &aws_config::SdkConfig) -> Result<String> {
-    if let Some(b) = &cfg.tfstate_bucket {
-        return Ok(b.clone());
+    // Short-circuit on override before the SDK call; resolve_bucket
+    // would handle it too but only after constructing the client.
+    if cfg.tfstate_bucket.is_some() {
+        return resolve_bucket(cfg, || unreachable!("override set"));
     }
     let sts = aws_sdk_sts::Client::new(aws);
     let ident = sts.get_caller_identity().send().await?;
-    let account = ident.account().context("no AWS account ID")?;
-    Ok(format!("rio-tfstate-{account}"))
+    let account = ident.account().context("no AWS account ID")?.to_owned();
+    resolve_bucket(cfg, || Ok(account))
 }

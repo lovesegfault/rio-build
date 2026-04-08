@@ -39,7 +39,7 @@ use super::provider::{Provider, ProviderKind};
 use crate::config::XtaskConfig;
 use crate::k8s::NS;
 use crate::k8s::eks::smoke::CliCtx;
-use crate::k8s::k3s::smoke::port_forward;
+use crate::k8s::shared::port_forward;
 use crate::sh::repo_root;
 
 #[derive(Subcommand)]

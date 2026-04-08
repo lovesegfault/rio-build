@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::config::XtaskConfig;
-use crate::k8s::provider::{BuiltImages, Provider};
+use crate::k8s::provider::{BuiltImages, DeployOpts, Provider};
 use crate::{sh, tofu, ui};
 
 pub mod ami;
@@ -58,15 +58,8 @@ impl Provider for Eks {
         push::push(images, cfg).await
     }
 
-    async fn deploy(
-        &self,
-        cfg: &XtaskConfig,
-        log_level: &str,
-        tenant: Option<&str>,
-        skip_preflight: bool,
-        no_hooks: bool,
-    ) -> Result<()> {
-        deploy::run(cfg, log_level, tenant, skip_preflight, no_hooks).await
+    async fn deploy(&self, cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
+        deploy::run(cfg, opts).await
     }
 
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()> {
@@ -88,7 +81,7 @@ impl Provider for Eks {
         // NOT SSM — scheduler/store aren't behind the NLB. kubectl
         // reaches them via the apiserver proxy, which `aws eks
         // update-kubeconfig` (provision step) already set up.
-        crate::k8s::k3s::smoke::tunnel_grpc(sched_port, store_port).await
+        crate::k8s::shared::tunnel_grpc(sched_port, store_port).await
     }
 
     async fn destroy(&self, _cfg: &XtaskConfig) -> Result<()> {

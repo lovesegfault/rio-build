@@ -63,7 +63,7 @@ impl CliCtx {
     /// Open scheduler+store tunnels and fetch the mTLS cert. Cheap:
     /// two `kubectl port-forward` children + one Secret GET.
     pub async fn open(client: &kube::Client, sched: u16, store: u16) -> Result<Self> {
-        let guards = crate::k8s::k3s::smoke::tunnel_grpc(sched, store).await?;
+        let guards = crate::k8s::shared::tunnel_grpc(sched, store).await?;
         // I-101: tunnel_grpc may bind ephemeral ports when 0 was
         // passed — use what kubectl actually bound, not the request.
         let (sched, store) = (guards.0.0, guards.1.0);

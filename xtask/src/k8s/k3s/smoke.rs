@@ -2,14 +2,15 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use anyhow::Result;
 
 use crate::config::XtaskConfig;
+use crate::k8s::NS;
 use crate::k8s::eks::smoke as chaos;
 use crate::k8s::shared::ProcessGuard;
-use crate::k8s::{NS, NS_STORE};
 use crate::{kube, ui};
+
+use crate::k8s::shared::port_forward;
 
 const LOCAL_PORT: u16 = 2222;
 const SCHED_PORT: u16 = 19001;
@@ -76,89 +77,4 @@ pub async fn tunnel(local_port: u16) -> Result<ProcessGuard> {
     })
     .await?;
     Ok(guard)
-}
-
-/// Spawn `kubectl port-forward <target> <local>:<remote>` in `ns` and
-/// return `(bound_local_port, drop-guard)`. `target` is the full
-/// kubectl resource ref (`svc/rio-gateway`, `pod/rio-scheduler-abc`).
-///
-/// Pass `local = 0` for an ephemeral port: kubectl binds `:0`, the OS
-/// picks a free port, and we parse it from the `Forwarding from
-/// 127.0.0.1:NNNNN -> REMOTE` stdout line. I-101: fixed local ports
-/// made concurrent `xtask k8s cli` invocations race on bind — second
-/// one's kubectl failed `address already in use`, surfacing later as a
-/// bare `transport error` from rio-cli.
-///
-/// With `local != 0`, returns `(local, guard)` without waiting for the
-/// bind line — callers layer their own readiness poll (SSH banner,
-/// TCP-accept) as before.
-pub(crate) async fn port_forward(
-    ns: &str,
-    target: &str,
-    local: u16,
-    remote: u16,
-) -> Result<(u16, ProcessGuard)> {
-    let mut cmd = tokio::process::Command::new("kubectl");
-    cmd.args(["-n", ns, "port-forward", target])
-        .arg(format!("{local}:{remote}"))
-        .stderr(std::process::Stdio::null());
-    if local != 0 {
-        cmd.stdout(std::process::Stdio::null());
-        return Ok((local, ProcessGuard::spawn(cmd)?));
-    }
-    cmd.stdout(std::process::Stdio::piped());
-    let mut guard = ProcessGuard::spawn(cmd)?;
-    let stdout = guard.child.stdout.take().expect("piped above");
-    let mut lines = BufReader::new(stdout).lines();
-    let bound = loop {
-        let Some(line) = lines.next_line().await? else {
-            anyhow::bail!("kubectl port-forward {target} exited before binding");
-        };
-        // First line: `Forwarding from 127.0.0.1:NNNNN -> REMOTE`.
-        // (Second is `[::1]:NNNNN`; per-conn `Handling connection` follows.)
-        if let Some(rest) = line.strip_prefix("Forwarding from 127.0.0.1:") {
-            break rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse().ok())
-                .with_context(|| format!("unparseable port-forward line: {line}"))?;
-        }
-    };
-    // Drain the rest so kubectl never blocks on a full pipe.
-    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} });
-    Ok((bound, guard))
-}
-
-/// Port-forward scheduler:9001 + store:9002, wait for TCP accept on both.
-/// Shared by all three providers — kubectl reaches the apiserver proxy
-/// regardless of whether that's via k3s loopback or `aws eks
-/// update-kubeconfig`. ADR-019: scheduler is in rio-system, store in
-/// rio-store — per-service `-n`. Scheduler forward targets the leader
-/// pod (from the Lease) because standbys reject admin writes.
-///
-/// Returns `((sched_port, guard), (store_port, guard))` — the bound
-/// local ports may differ from the inputs when `0` (ephemeral) was
-/// passed. Callers must use the RETURNED ports for the connection.
-pub async fn tunnel_grpc(
-    sched_port: u16,
-    store_port: u16,
-) -> Result<((u16, ProcessGuard), (u16, ProcessGuard))> {
-    let client = kube::client().await?;
-    let leader = format!("pod/{}", kube::scheduler_leader(&client, NS).await?);
-    let sched = port_forward(NS, &leader, sched_port, 9001).await?;
-    let store = port_forward(NS_STORE, "svc/rio-store", store_port, 9002).await?;
-    let (sp, tp) = (sched.0, store.0);
-    ui::poll(
-        "scheduler+store TCP accept",
-        Duration::from_secs(2),
-        10,
-        || async {
-            // gRPC has no greeting — bare connect is the only signal.
-            let s = tokio::net::TcpStream::connect(("127.0.0.1", sp)).await;
-            let t = tokio::net::TcpStream::connect(("127.0.0.1", tp)).await;
-            Ok((s.is_ok() && t.is_ok()).then_some(()))
-        },
-    )
-    .await?;
-    Ok((sched, store))
 }

@@ -8,6 +8,26 @@ use tempfile::TempDir;
 
 use crate::config::XtaskConfig;
 
+/// Knobs for [`Provider::deploy`]. Bundled so adding the next deploy
+/// option touches one struct + the impl that reads it, not the trait
+/// + every impl + every mock + the call site.
+#[derive(Clone, Default)]
+pub struct DeployOpts {
+    /// Sets `RUST_LOG` in all rio pods via `global.logLevel`.
+    pub log_level: String,
+    /// Overrides the `authorized_keys` comment (→ gateway's
+    /// `tenant_name`); `None` falls through to `RIO_SSH_TENANT` then
+    /// `ssh::DEFAULT_TENANT`.
+    pub tenant: Option<String>,
+    /// Bypass the pre-deploy cluster health check (EKS-only; k3s
+    /// ignores it).
+    pub skip_preflight: bool,
+    /// Pass `--no-hooks` to helm — skips post-install/upgrade hooks
+    /// (smoke tests etc.) for AMI bring-up where the hook itself needs
+    /// the thing being brought up.
+    pub no_hooks: bool,
+}
+
 /// Output of the nix-build portion of push. Held separately so `up`
 /// can run the build concurrently with provision (neither depends on
 /// the other), then serialize on the upload portion.
@@ -64,23 +84,9 @@ pub trait Provider: Send + Sync {
     /// ECR skopeo (eks) | ctr import (k3s).
     async fn push(&self, images: &BuiltImages, cfg: &XtaskConfig) -> Result<()>;
 
-    /// helm upgrade with provider-specific values/--set args.
-    /// `log_level` sets RUST_LOG in all rio pods via `global.logLevel`.
-    /// `tenant` overrides the authorized_keys comment (→ gateway's
-    /// `tenant_name`); `None` falls through to RIO_SSH_TENANT then
-    /// `ssh::DEFAULT_TENANT`. `skip_preflight` bypasses the pre-deploy
-    /// cluster health check (EKS-only; k3s ignores it). `no_hooks`
-    /// passes `--no-hooks` to helm — skips post-install/upgrade hooks
-    /// (smoke tests etc.) for AMI bring-up where the hook itself needs
-    /// the thing being brought up.
-    async fn deploy(
-        &self,
-        cfg: &XtaskConfig,
-        log_level: &str,
-        tenant: Option<&str>,
-        skip_preflight: bool,
-        no_hooks: bool,
-    ) -> Result<()>;
+    /// helm upgrade with provider-specific values/--set args. See
+    /// [`DeployOpts`] for the per-field semantics.
+    async fn deploy(&self, cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()>;
 
     /// e2e build + worker-kill chaos. SSM tunnel (eks) | port-forward (k3s).
     async fn smoke(&self, cfg: &XtaskConfig) -> Result<()>;
