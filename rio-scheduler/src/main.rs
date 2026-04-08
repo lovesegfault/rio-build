@@ -17,7 +17,7 @@ use rio_scheduler::db::SchedulerDb;
 use rio_scheduler::grpc::SchedulerGrpc;
 
 mod config;
-use config::{CliArgs, Config};
+use config::{CliArgs, Config, DashboardConfig};
 
 #[cfg(test)]
 mod tests;
@@ -389,11 +389,30 @@ async fn main() -> anyhow::Result<()> {
         "starting gRPC server"
     );
 
-    let mut builder = rio_common::server::tonic_builder();
+    // r[impl dash.envoy.grpc-web-translate+2]
+    // accept_http1: gRPC-Web arrives as HTTP/1.1 POST from browser
+    // fetch(); GrpcWebLayer needs the h1 codec enabled. Native gRPC
+    // clients keep negotiating h2 — both protocols on one port.
+    // r[impl dash.stream.idle-timeout]
+    // http2_keep_alive_interval: 30s server-initiated PING keeps
+    // long-lived server streams (GetBuildLogs, WatchBuild) alive
+    // through any proxy's idle-timeout. Replaces the Envoy Gateway
+    // ClientTrafficPolicy `streamIdleTimeout: 1h` — the stream is
+    // never idle from the proxy's view.
+    let mut builder = rio_common::server::tonic_builder()
+        .accept_http1(true)
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)));
     if let Some(tls) = server_tls {
         builder = builder.tls_config(tls)?;
     }
     builder
+        // Layer order: first .layer() = outermost. CORS must see the
+        // OPTIONS preflight before GrpcWebLayer (which would reject
+        // a non-grpc-web content-type). GrpcWebLayer translates
+        // application/grpc-web+proto → application/grpc before the
+        // JWT interceptor and the tonic services see the request.
+        .layer(build_cors_layer(&cfg.dashboard))
+        .layer(tonic_web::GrpcWebLayer::new())
         // JWT tenant-token verify layer. jwt_pubkey computed above —
         // None (dev/unset) → inert pass-through; Some → verify every
         // x-rio-tenant-token header the gateway sets.
@@ -440,6 +459,44 @@ async fn main() -> anyhow::Result<()> {
 
     info!("scheduler shut down cleanly");
     Ok(())
+}
+
+/// CORS layer for browser gRPC-Web. Replaces the Envoy Gateway
+/// `SecurityPolicy` CRD (D3 cascade). Origins come from
+/// `RIO_DASHBOARD__CORS_ALLOW_ORIGINS` (comma-separated); the three
+/// `expose_headers` are what connect-web reads to surface
+/// `Status.code`/`.message` to the SPA — without them the browser
+/// blocks the trailer headers and every RPC error renders as
+/// `Code.Unknown`.
+fn build_cors_layer(cfg: &DashboardConfig) -> tower_http::cors::CorsLayer {
+    use http::{HeaderName, HeaderValue, Method};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let origins = cfg
+        .cors_allow_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|o| {
+            HeaderValue::from_str(o)
+                .inspect_err(|e| tracing::warn!(origin = o, error = %e, "invalid CORS origin"))
+                .ok()
+        })
+        .collect::<Vec<_>>();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("x-grpc-web"),
+            HeaderName::from_static("x-user-agent"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("grpc-status"),
+            HeaderName::from_static("grpc-message"),
+            HeaderName::from_static("grpc-status-details-bin"),
+        ])
 }
 
 // ── bootstrap helpers (extracted from main) ──────────────────────────

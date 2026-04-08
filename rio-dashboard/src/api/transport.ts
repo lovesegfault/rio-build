@@ -25,11 +25,32 @@
 //   * dev: vite.config.ts server.proxy forwards the same prefix to
 //     localhost:8080 (port-forwarded Envoy).
 // No VITE_* env var plumbing, no per-env rebuild.
+import { Code, ConnectError, type Interceptor } from '@connectrpc/connect';
 import { createGrpcWebTransport } from '@connectrpc/connect-web';
+
+// Retry Unavailable once with a short backoff. Belt-and-suspenders for
+// the standby-replica race: with scheduler.replicas=2 a request can
+// land on the non-leader, which returns Unavailable. The structural fix
+// (health on the main port → standby out of Endpoints) lands when TLS
+// is removed; until then this client-side retry replaces the Envoy
+// BackendTrafficPolicy retry-on-unavailable. Unary only — server
+// streams establish on the leader and stay there.
+const retryUnavailableOnce: Interceptor = (next) => async (req) => {
+  try {
+    return await next(req);
+  } catch (e) {
+    if (req.stream || ConnectError.from(e).code !== Code.Unavailable) {
+      throw e;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+    return await next(req);
+  }
+};
 
 export const transport = createGrpcWebTransport({
   baseUrl: '/',
   // Binary framing (application/grpc-web+proto) matches what the Envoy
   // grpc_web filter expects without a JSON transcoder in the chain.
   useBinaryFormat: true,
+  interceptors: [retryUnavailableOnce],
 });

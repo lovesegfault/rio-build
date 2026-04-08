@@ -197,6 +197,13 @@ serde_yml = "0.0.12"
 # --- phase3a: health + streaming ---
 # grpc.health.v1.Health service. K8s readiness probes hit this.
 tonic-health = "0.14"
+# gRPC-Web on the scheduler's main port (D3: in-process translation
+# instead of an Envoy/Cilium grpc_web filter). Browser fetch sends
+# application/grpc-web+proto over HTTP/1.1; GrpcWebLayer translates.
+tonic-web = "0.14"
+# CORS for the gRPC-Web listener — configurable allow-origins so the
+# dashboard SPA (different origin) can call the scheduler directly.
+tower-http = { version = "0.6", features = ["cors"] }
 # Streaming xz/zstd decode for upstream-substituter NAR fetch
 # (rio-store::substitute). O(chunk) pipeline, never buffers whole NAR.
 async-compression = { version = "0.4", features = ["tokio", "zstd", "xz"] }

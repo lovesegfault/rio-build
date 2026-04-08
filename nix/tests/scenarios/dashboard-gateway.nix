@@ -26,7 +26,7 @@
   fixture,
 }:
 let
-  inherit (fixture) ns;
+  inherit (fixture) ns pki;
 
   # envoy data-plane (Deployment + Service) lives in the OPERATOR's
   # namespace by default (ControllerNamespaceMode, the upstream
@@ -284,6 +284,35 @@ pkgs.testers.runNixOSTest {
             "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 80'",
             timeout=90,
         )
+
+    # ── D3: gRPC-Web direct to scheduler (no Envoy) ─────────────────────
+    # Same ClusterStatus 0x00-prefix assertion, but port-forwarded
+    # straight to rio-scheduler:9001. Proves the scheduler serves
+    # gRPC-Web NATIVELY (tonic-web layer), independent of any proxy.
+    # mTLS is still on in this fixture, so curl presents the controller
+    # client cert over HTTPS/1.1; tonic accept_http1 + tls_config
+    # handles that. After Phase 5 (TLS rip) this becomes plain http.
+    with subtest("gRPC-Web direct: scheduler tonic-web ClusterStatus"):
+        k3s_server.succeed(
+            "k3s kubectl -n ${ns} port-forward svc/rio-scheduler 19001:9001 "
+            ">/tmp/pf-sched.log 2>&1 & echo $! > /tmp/pf-sched.pid"
+        )
+        k3s_server.wait_until_succeeds(
+            "${pkgs.netcat}/bin/nc -z localhost 19001", timeout=10
+        )
+        k3s_server.wait_until_succeeds(
+            "printf '\\x00\\x00\\x00\\x00\\x00' | "
+            "curl -sf -X POST https://localhost:19001/rio.admin.AdminService/ClusterStatus "
+            "--cacert ${pki}/ca.crt "
+            "--cert ${pki}/rio-controller/tls.crt "
+            "--key ${pki}/rio-controller/tls.key "
+            "-H 'content-type: application/grpc-web+proto' "
+            "-H 'x-grpc-web: 1' "
+            "--data-binary @- "
+            "| ${pkgs.xxd}/bin/xxd | head -1 | grep -q '^00000000: 00'",
+            timeout=90,
+        )
+        k3s_server.execute("kill $(cat /tmp/pf-sched.pid) 2>/dev/null || true")
 
     # ── r[dash.auth.method-gate] end-to-end: ClearPoison unrouted ───────
     # With enableMutatingMethods=false (the default; this fixture doesn't

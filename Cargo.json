@@ -20932,6 +20932,10 @@
           "packageId": "hex"
         },
         {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
           "name": "k8s-openapi",
           "packageId": "k8s-openapi"
         },
@@ -21014,6 +21018,14 @@
         {
           "name": "tonic-health",
           "packageId": "tonic-health"
+        },
+        {
+          "name": "tonic-web",
+          "packageId": "tonic-web"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
         },
         {
           "name": "tracing",
@@ -26604,6 +26616,63 @@
         "Lucio Franco <luciofranco14@gmail.com>"
       ]
     },
+    "tonic-web": {
+      "crateName": "tonic-web",
+      "version": "0.14.5",
+      "edition": "2021",
+      "sha256": "16cj03m9valql34l1949c2d1hp69yvwyc8nvffsz3x05vs23si99",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "base64",
+          "packageId": "base64"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
+          "name": "http-body",
+          "packageId": "http-body 1.0.1"
+        },
+        {
+          "name": "pin-project",
+          "packageId": "pin-project"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tonic",
+          "packageId": "tonic"
+        },
+        {
+          "name": "tower-layer",
+          "packageId": "tower-layer"
+        },
+        {
+          "name": "tower-service",
+          "packageId": "tower-service"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Juan Alvarez <alce@me.com>"
+      ]
+    },
     "tower": {
       "crateName": "tower",
       "version": "0.5.3",
@@ -26754,6 +26823,7 @@
       "resolvedDefaultFeatures": [
         "auth",
         "base64",
+        "cors",
         "default",
         "follow-redirect",
         "futures-util",
@@ -30422,6 +30492,10 @@
           "name": "tower",
           "packageId": "tower",
           "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
         },
         {
           "name": "tower-http",

@@ -102,6 +102,34 @@ pub(super) struct Config {
     /// Validated finite + positive at startup.
     #[serde(default = "default_headroom_multiplier")]
     pub(super) headroom_multiplier: f64,
+    /// gRPC-Web / CORS config for the dashboard SPA. `[dashboard]`
+    /// table in scheduler.toml. Env: `RIO_DASHBOARD__*`.
+    pub(super) dashboard: DashboardConfig,
+}
+
+/// Dashboard browser-facing settings. The scheduler serves gRPC-Web
+/// natively on its main port (D3) so the ingress is a plain HTTP
+/// router — CORS therefore lives here, not in a proxy CRD.
+// r[impl dash.envoy.grpc-web-translate+2]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct DashboardConfig {
+    /// Comma-separated CORS allowed origins for gRPC-Web requests.
+    /// Env: `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`. The dashboard nginx
+    /// Service is the only legitimate browser origin in-cluster;
+    /// external access (Ingress/LoadBalancer) appends its public
+    /// hostname via helm `dashboard.cors.allowOrigins`. Comma-joined
+    /// string (not `Vec<String>`) so figment's env provider works
+    /// without a custom split — helm renders `| join ","`.
+    pub(super) cors_allow_origins: String,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            cors_allow_origins: "http://rio-dashboard.rio-system.svc.cluster.local".into(),
+        }
+    }
 }
 
 fn default_substitute_concurrency() -> usize {
@@ -136,6 +164,7 @@ impl Default for Config {
             retry: rio_scheduler::RetryPolicy::default(),
             substitute_max_concurrent: default_substitute_concurrency(),
             headroom_multiplier: default_headroom_multiplier(),
+            dashboard: DashboardConfig::default(),
         }
     }
 }

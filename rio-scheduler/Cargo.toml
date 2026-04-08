@@ -26,6 +26,11 @@ rio-store = { workspace = true, features = ["schema"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+# D3: scheduler natively serves gRPC-Web on its main port so the
+# dashboard ingress is a plain HTTP router (no grpc_web filter).
+tonic-web = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
 # P0473: concurrent QueryPathInfo fan-out for eager substitute fetch
 # (r[sched.merge.substitute-fetch]). FuturesUnordered keeps the
 # actor-blocking window bounded when a DAG has hundreds of paths.
