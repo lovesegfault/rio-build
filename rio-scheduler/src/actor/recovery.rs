@@ -808,7 +808,7 @@ impl DagActor {
                         warn!(drv_hash = %drv_hash, error = %e, "reset_to_ready failed");
                         continue;
                     }
-                    state.retry_count += 1;
+                    state.retry.count += 1;
                     self.push_ready(drv_hash.clone());
                 }
                 if let Err(e) = self.db.increment_retry_count(&drv_hash).await {

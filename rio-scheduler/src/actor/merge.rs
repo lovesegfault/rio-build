@@ -291,7 +291,7 @@ impl DagActor {
                         | DerivationStatus::DependencyFailed
                         | DerivationStatus::Failed
                 ) {
-                    state.clear_failure_history();
+                    state.retry.clear();
                 }
                 from
             };
@@ -1005,8 +1005,8 @@ impl DagActor {
                     // the DAG insert may have set floor=xlarge from a
                     // `big-parallel` hint; a stale DB row at `medium`
                     // must not demote it.
-                    state.size_class_floor = crate::assignment::max_class_by_order(
-                        state.size_class_floor.as_deref(),
+                    state.sched.size_class_floor = crate::assignment::max_class_by_order(
+                        state.sched.size_class_floor.as_deref(),
                         floor.as_deref(),
                         &order,
                     )

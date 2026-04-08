@@ -1496,7 +1496,7 @@ async fn test_resubmit_resets_poisoned_under_retry_limit() -> TestResult {
         .await?
         .expect("node in DAG");
     assert_eq!(info.status, DerivationStatus::Poisoned, "precondition");
-    assert_eq!(info.retry_count, 2, "precondition");
+    assert_eq!(info.retry.count, 2, "precondition");
 
     // Build #2: resubmit. Reset path runs in dag.merge BEFORE the
     // pre-existing-nodes fail-fast loop. No worker connected → node sits
@@ -1516,7 +1516,7 @@ async fn test_resubmit_resets_poisoned_under_retry_limit() -> TestResult {
          (was: stayed Poisoned, build #2 fail-fasted)"
     );
     assert_eq!(
-        info.retry_count, 2,
+        info.retry.count, 2,
         "retry_count carried over so the bound accumulates"
     );
     let status2 = query_status(&handle, build2).await?;

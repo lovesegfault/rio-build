@@ -144,7 +144,7 @@ async fn test_migrations_014_015_016_schema() -> anyhow::Result<()> {
         "tenant_keys_active_idx missing partial predicate: {idx_def}"
     );
 
-    // --- 014 batched: derivations.is_ca ---
+    // --- 014 batched: derivations.ca.is_ca ---
     let (is_ca_default,): (String,) = sqlx::query_as(
         "SELECT column_default FROM information_schema.columns
          WHERE table_name = 'derivations' AND column_name = 'is_ca'",
@@ -153,7 +153,7 @@ async fn test_migrations_014_015_016_schema() -> anyhow::Result<()> {
     .await?;
     assert!(
         is_ca_default.to_lowercase().contains("false"),
-        "derivations.is_ca default: {is_ca_default}"
+        "derivations.ca.is_ca default: {is_ca_default}"
     );
 
     // --- 015: realisation_deps ---

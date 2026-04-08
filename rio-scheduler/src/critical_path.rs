@@ -71,9 +71,9 @@ pub fn compute_initial(
             let est = estimator.estimate(
                 state.pname.as_deref(),
                 &state.system,
-                state.input_srcs_nar_size,
+                state.sched.input_srcs_nar_size,
             );
-            state.est_duration = est;
+            state.sched.est_duration = est;
         }
     }
 
@@ -127,11 +127,11 @@ pub fn compute_initial(
         // priority = est_duration + 0.0 = est_duration.
         let max_child: f64 = children
             .iter()
-            .filter_map(|c| dag.node(c).map(|n| n.priority))
+            .filter_map(|c| dag.node(c).map(|n| n.sched.priority))
             .fold(0.0, f64::max);
 
         if let Some(state) = dag.node_mut(hash) {
-            state.priority = state.est_duration + max_child;
+            state.sched.priority = state.sched.est_duration + max_child;
         }
     }
 
@@ -197,7 +197,7 @@ pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
                     if n.status().is_terminal() {
                         None
                     } else {
-                        Some(n.priority)
+                        Some(n.sched.priority)
                     }
                 })
             })
@@ -207,7 +207,7 @@ pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
             continue;
         };
 
-        let new_priority = state.est_duration + max_child;
+        let new_priority = state.sched.est_duration + max_child;
         // Dirty-flag: if priority didn't change, our ancestors'
         // priorities won't change either (we're the only path through
         // us). Stop this branch.
@@ -216,11 +216,11 @@ pub fn update_ancestors(dag: &mut DerivationDag, from: &str) {
         // SET to the same arithmetic we're about to do. Either the
         // inputs changed (different result) or they didn't (same
         // result, no float drift).
-        if new_priority == state.priority {
+        if new_priority == state.sched.priority {
             continue;
         }
 
-        state.priority = new_priority;
+        state.sched.priority = new_priority;
         // Changed → walk further up.
         for parent in dag.get_parents(&hash) {
             queue.push_back(parent);
@@ -290,7 +290,7 @@ mod tests {
 
         compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
 
-        assert_eq!(dag.node("a").unwrap().priority, 10.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 10.0);
     }
 
     #[test]
@@ -311,9 +311,9 @@ mod tests {
 
         compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
 
-        assert_eq!(dag.node("c").unwrap().priority, 30.0);
-        assert_eq!(dag.node("b").unwrap().priority, 50.0);
-        assert_eq!(dag.node("a").unwrap().priority, 60.0);
+        assert_eq!(dag.node("c").unwrap().sched.priority, 30.0);
+        assert_eq!(dag.node("b").unwrap().sched.priority, 50.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 60.0);
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         let est = Estimator::default(); // everything = 30s
         compute_initial(&mut dag, &est, &merge.newly_inserted);
 
-        assert_eq!(dag.node("a").unwrap().priority, 90.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 90.0);
     }
 
     #[test]
@@ -365,7 +365,7 @@ mod tests {
             )
             .unwrap();
         compute_initial(&mut dag, &test_estimator(), &merge1.newly_inserted);
-        assert_eq!(dag.node("a").unwrap().priority, 30.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 30.0);
 
         // Second merge: b depends on c (new). c=30. Now b has a child
         // with priority 30. b was 20; now 20+30=50. a should propagate:
@@ -376,16 +376,16 @@ mod tests {
         compute_initial(&mut dag, &test_estimator(), &merge2.newly_inserted);
 
         // c is new: priority = 30 (leaf).
-        assert_eq!(dag.node("c").unwrap().priority, 30.0);
+        assert_eq!(dag.node("c").unwrap().sched.priority, 30.0);
         // b should have been RAISED: was 20, now 20+30=50.
         assert_eq!(
-            dag.node("b").unwrap().priority,
+            dag.node("b").unwrap().sched.priority,
             50.0,
             "existing b should get raised priority from new child c"
         );
         // a should propagate: was 30, now 10+50=60.
         assert_eq!(
-            dag.node("a").unwrap().priority,
+            dag.node("a").unwrap().sched.priority,
             60.0,
             "a should propagate from b's raise"
         );
@@ -406,8 +406,8 @@ mod tests {
             )
             .unwrap();
         compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
-        assert_eq!(dag.node("b").unwrap().priority, 50.0);
-        assert_eq!(dag.node("a").unwrap().priority, 60.0);
+        assert_eq!(dag.node("b").unwrap().sched.priority, 50.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 60.0);
 
         // Complete c. (Normally completion.rs does this, then calls
         // update_ancestors.)
@@ -418,9 +418,9 @@ mod tests {
         update_ancestors(&mut dag, "c");
 
         // c is terminal → excluded from b's max-child. b: 20+0=20.
-        assert_eq!(dag.node("b").unwrap().priority, 20.0);
+        assert_eq!(dag.node("b").unwrap().sched.priority, 20.0);
         // a: 10+20=30.
-        assert_eq!(dag.node("a").unwrap().priority, 30.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 30.0);
     }
 
     #[test]
@@ -444,8 +444,8 @@ mod tests {
         compute_initial(&mut dag, &est, &merge.newly_inserted);
 
         // Verify initial: b=30, c=30, a=30+30=60, d=30+60=90.
-        assert_eq!(dag.node("a").unwrap().priority, 60.0);
-        assert_eq!(dag.node("d").unwrap().priority, 90.0);
+        assert_eq!(dag.node("a").unwrap().sched.priority, 60.0);
+        assert_eq!(dag.node("d").unwrap().sched.priority, 90.0);
 
         // Complete b. a's max-child: still c=30. a unchanged (60).
         // d should NOT be recomputed (dirty-flag stops at a).
@@ -460,8 +460,8 @@ mod tests {
             .unwrap();
         update_ancestors(&mut dag, "b");
 
-        assert_eq!(dag.node("a").unwrap().priority, 60.0, "a unchanged");
-        assert_eq!(dag.node("d").unwrap().priority, 90.0, "d unchanged");
+        assert_eq!(dag.node("a").unwrap().sched.priority, 60.0, "a unchanged");
+        assert_eq!(dag.node("d").unwrap().sched.priority, 90.0, "d unchanged");
     }
 
     #[test]
@@ -478,13 +478,13 @@ mod tests {
         let est = test_estimator();
         compute_initial(&mut dag, &est, &merge.newly_inserted);
 
-        let before_a = dag.node("a").unwrap().priority;
-        let before_b = dag.node("b").unwrap().priority;
+        let before_a = dag.node("a").unwrap().sched.priority;
+        let before_b = dag.node("b").unwrap().sched.priority;
 
         // Full sweep should produce the SAME priorities (same input).
         full_sweep(&mut dag, &est);
 
-        assert_eq!(dag.node("a").unwrap().priority, before_a);
-        assert_eq!(dag.node("b").unwrap().priority, before_b);
+        assert_eq!(dag.node("a").unwrap().sched.priority, before_a);
+        assert_eq!(dag.node("b").unwrap().sched.priority, before_b);
     }
 }

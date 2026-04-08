@@ -48,7 +48,7 @@ pub(crate) struct CaFixture {
     /// Build id for the merged single-node DAG.
     pub build_id: Uuid,
     /// The CA node's modular hash (set on the proto node so the
-    /// compare gate `state.ca_modular_hash.is_some()` passes).
+    /// compare gate `state.ca.modular_hash.is_some()` passes).
     /// Deterministic per-key: `Sha256("ca-fixture:" + key)`.
     pub modular_hash: [u8; 32],
     /// PG pool — seed realisations directly (the compare hits PG,
@@ -117,7 +117,7 @@ pub(crate) async fn setup_ca_fixture_configured(
     let rx = connect_executor(&actor, &executor_id, "x86_64-linux").await?;
 
     // Deterministic modular_hash per key — the CA-compare gate
-    // requires `state.ca_modular_hash.is_some()`. Real flow: the
+    // requires `state.ca.modular_hash.is_some()`. Real flow: the
     // gateway's populate_ca_modular_hashes fills this from
     // hash_derivation_modulo; test fixture fakes it with a
     // key-derived hash so tests can seed matching PG rows.

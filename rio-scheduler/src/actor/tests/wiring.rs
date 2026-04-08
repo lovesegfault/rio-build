@@ -104,7 +104,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
         .await?
         .expect("derivation should exist");
     assert_eq!(info.status, DerivationStatus::Assigned);
-    assert_eq!(info.retry_count, 0);
+    assert_eq!(info.retry.count, 0);
 
     // Disconnect the worker
     handle
@@ -127,7 +127,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
         "derivation should return to Ready after worker disconnect"
     );
     assert_eq!(
-        info.retry_count, 0,
+        info.retry.count, 0,
         "disconnect during Assigned-only must NOT count as a retry attempt"
     );
     assert!(info.assigned_executor.is_none());
@@ -178,13 +178,13 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
         .await?
         .expect("derivation should exist");
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "InfrastructureFailure must route to handle_infrastructure_failure \
          (NOT handle_transient_failure which inserts into failed_builders), got {:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
     assert_eq!(
-        info.retry_count, 0,
+        info.retry.count, 0,
         "InfrastructureFailure carries no retry_count penalty (separate infra_retry_count)"
     );
     assert!(

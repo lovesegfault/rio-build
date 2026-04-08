@@ -791,7 +791,7 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
     let s = actor.dag.node("ff").unwrap();
     assert!(s.required_features.is_empty(), "stripped");
     assert_eq!(
-        s.size_class_floor.as_deref(),
+        s.sched.size_class_floor.as_deref(),
         Some("xlarge"),
         "floor_hint applied on strip"
     );
@@ -799,7 +799,13 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
     // benchmark only → stripped, no hint → floor stays None.
     actor.test_inject_ready_with_features("bench", None, "x86_64-linux", &["benchmark"]);
     assert_eq!(
-        actor.dag.node("bench").unwrap().size_class_floor.as_deref(),
+        actor
+            .dag
+            .node("bench")
+            .unwrap()
+            .sched
+            .size_class_floor
+            .as_deref(),
         None,
         "no-hint soft feature is strip-only"
     );
@@ -839,6 +845,7 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
             .dag
             .node("persisted")
             .unwrap()
+            .sched
             .size_class_floor
             .as_deref(),
         Some("xlarge"),
@@ -849,7 +856,13 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
     actor.clear_persisted_state();
     actor.test_inject_ready_with_features("ff2", None, "x86_64-linux", &["big-parallel"]);
     assert_eq!(
-        actor.dag.node("ff2").unwrap().size_class_floor.as_deref(),
+        actor
+            .dag
+            .node("ff2")
+            .unwrap()
+            .sched
+            .size_class_floor
+            .as_deref(),
         Some("xlarge"),
         "floor_hint survives clear_persisted_state"
     );

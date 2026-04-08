@@ -265,25 +265,90 @@ impl std::str::FromStr for DerivationStatus {
     }
 }
 
-/// In-memory state for a single derivation node in the global DAG.
-#[derive(Debug, Clone)]
-pub struct DerivationState {
-    /// Unique hash identifying this derivation (store path for input-addressed, modular hash for CA).
-    pub drv_hash: DrvHash,
-    /// Store path of the .drv file. Private because the DAG maintains a
-    /// `path_to_hash` reverse index keyed on this field — mutating it
-    /// directly would silently corrupt that index. Read via `drv_path()`.
-    drv_path: rio_nix::store_path::StorePath,
-    /// Package name (for duration estimation).
-    pub pname: Option<String>,
-    /// Target system (e.g. "x86_64-linux").
-    pub system: String,
-    /// Required system features the building worker must support.
-    pub required_features: Vec<String>,
-    /// Output names (e.g. ["out", "dev"]).
-    pub output_names: Vec<String>,
-    /// Whether this is a fixed-output derivation (fetchurl, etc.).
-    pub is_fixed_output: bool,
+/// Retry / failure-tracking sub-state of a [`DerivationState`].
+///
+/// All fields are **in-memory only** unless otherwise noted: recovery
+/// resets them to conservative defaults (won't spuriously poison after
+/// restart). `failed_builders` is persisted; `failure_count` is
+/// re-derived from it on recovery (same-worker repeats forgiven).
+#[derive(Debug, Clone, Default)]
+pub struct RetryState {
+    /// Number of retry attempts so far.
+    pub count: u32,
+    /// Number of InfrastructureFailure re-dispatches so far. Separate
+    /// from `count` because infra failures don't count toward the
+    /// transient-failure budget (they're worker-local, not build-local)
+    /// — but still bounded to prevent a misclassified deterministic
+    /// failure from hot-looping forever.
+    pub infra_count: u32,
+    /// Number of `TimedOut` re-dispatches so far (I-200). Separate
+    /// from `count` (timeouts don't eat the transient budget) and from
+    /// `infra_count` (no time-window reset — a build that times out,
+    /// gets promoted, and times out again an hour later on the larger
+    /// class is still the same hung build). Bounded by
+    /// `RetryPolicy::max_timeout_retries`; at the cap,
+    /// `handle_timeout_failure` falls through to terminal Cancelled.
+    pub timeout_count: u32,
+    /// Timestamp of the most recent InfrastructureFailure that
+    /// incremented `infra_count`. Drives the time-window reset
+    /// (I-127): if the last infra failure was longer ago than
+    /// `RetryPolicy::infra_retry_window_secs`, `infra_count` resets to
+    /// 0 before the cap check — sparse failures over a long build
+    /// don't accumulate toward poison.
+    pub last_infra_failure_at: Option<Instant>,
+    /// Workers that have failed building this derivation. Drives
+    /// `best_executor()` exclusion + poison threshold in distinct mode.
+    /// Persisted.
+    pub failed_builders: HashSet<ExecutorId>,
+    /// Total TransientFailure/disconnect count (same-worker repeats
+    /// counted). Drives poison threshold when
+    /// `PoisonConfig::require_distinct_workers = false` (single-worker
+    /// dev deployments). Recovery initializes to `failed_builders.len()`.
+    /// InfrastructureFailure does NOT increment this (T1's split).
+    pub failure_count: u32,
+    /// When the derivation entered the poisoned state (for TTL expiry).
+    pub poisoned_at: Option<Instant>,
+    /// Earliest time this derivation may be dispatched. Set by
+    /// handle_transient_failure to implement the retry backoff —
+    /// the derivation is Ready and in the queue, but dispatch_ready
+    /// defers it if `Instant::now() < backoff_until`.
+    ///
+    /// Why not a timer-based requeue: timers need a scheduled task
+    /// per deferred derivation + cleanup if the derivation
+    /// transitions meanwhile (cancelled, DAG reload). Putting the
+    /// deadline ON the state and checking in dispatch_ready is
+    /// stateless — the existing defer-and-requeue pattern handles
+    /// it. Cost: one Instant::now() comparison per Ready-pop for
+    /// derivations that have backoff set (only transient-failures).
+    ///
+    /// Cleared on successful dispatch (assign_to_worker).
+    pub backoff_until: Option<Instant>,
+}
+
+impl RetryState {
+    /// Reset all failure-tracking fields. Call after a cache-hit
+    /// transition from Poisoned/DependencyFailed/Failed to Completed
+    /// (I-099/I-094) — the prior failures are moot once the output
+    /// exists. Does NOT change `status`; caller transitions separately.
+    pub fn clear(&mut self) {
+        self.count = 0;
+        self.infra_count = 0;
+        self.timeout_count = 0;
+        self.last_infra_failure_at = None;
+        self.failed_builders.clear();
+        self.failure_count = 0;
+        self.poisoned_at = None;
+    }
+}
+
+/// Content-addressed-derivation sub-state of a [`DerivationState`].
+///
+/// All fields except `is_ca` are **in-memory only**: recovered CA-on-CA
+/// chains dispatch unresolved (collect_ca_inputs skips None) → worker
+/// fails on placeholder → retry. The gateway recomputes on the NEXT
+/// SubmitBuild that references the derivation.
+#[derive(Debug, Clone, Default)]
+pub struct CaState {
     /// Whether this derivation is content-addressed (fixed-output OR
     /// floating-CA). Drives CA early-cutoff: on completion the
     /// scheduler compares the output's nar_hash against the content
@@ -294,6 +359,7 @@ pub struct DerivationState {
     /// Distinct from `is_fixed_output`: a floating-CA derivation
     /// (`__contentAddressed = true` in Nix) is CA but not FOD (no
     /// predeclared hash — the output hash is computed post-build).
+    /// Persisted.
     pub is_ca: bool,
     /// Whether this derivation needs dispatch-time placeholder
     /// resolution (ADR-018 Appendix B `shouldResolve`). Set at
@@ -321,7 +387,7 @@ pub struct DerivationState {
     /// - `handle_success_completion` — this node's own
     ///   `(modular_hash, output_name)` for the `realisation_deps`
     ///   insert (the PARENT side of the junction).
-    pub ca_modular_hash: Option<[u8; 32]>,
+    pub modular_hash: Option<[u8; 32]>,
     /// Realisation lookups from dispatch-time resolve. Consumed by
     /// `handle_success_completion` → `insert_realisation_deps` AFTER
     /// the parent's own realisation lands (the FK needs the parent's
@@ -331,9 +397,6 @@ pub struct DerivationState {
     /// Empty for IA derivations and for CA derivations whose resolve
     /// was a no-op (no CA inputs). Populated by `maybe_resolve_ca` in
     /// the dispatch path; consumed + drained at completion time.
-    /// In-memory only: recovered derivations lose this (same lossy
-    /// class as `ca_modular_hash`); the `realisation_deps` rows are
-    /// best-effort cache, not correctness.
     pub pending_realisation_deps: Vec<crate::ca::RealisationLookup>,
     /// CA cutoff-compare result: true iff EVERY output's nar_hash
     /// matched the content index on completion. Set by
@@ -352,22 +415,20 @@ pub struct DerivationState {
     /// `false` on recovery — downstream builds proceed normally
     /// (no cutoff). This is correctness-safe (rebuild > stale-skip)
     /// at the cost of one wasted build per affected derivation.
-    /// The window is tight: P0252's cascade runs in the SAME
-    /// `handle_success_completion` call as the set (at
-    /// `completion.rs:470`), so in practice the compare→propagate
-    /// gap is a single actor-tick iteration, not a multi-second
-    /// span. A restart in that window would have to land between
-    /// line :448 and :476 — possible but rare. Persisting the flag
-    /// (migration + persist_status touch) is not warranted for an
-    /// optimization-only field with a zero-tick consumption window.
-    pub ca_output_unchanged: bool,
-    /// Current state machine status. Private: mutate only via `transition()`
-    /// or `reset_to_ready()` to preserve invariants.
-    status: DerivationStatus,
-    /// Set of build IDs interested in this derivation.
-    pub interested_builds: HashSet<Uuid>,
-    /// Worker currently assigned/running this derivation.
-    pub assigned_executor: Option<ExecutorId>,
+    /// The window is tight: the cascade runs in the SAME
+    /// `handle_success_completion` call as the set, so the
+    /// compare→propagate gap is a single actor-tick iteration.
+    pub output_unchanged: bool,
+}
+
+/// Scheduling-hint sub-state of a [`DerivationState`].
+///
+/// Estimator outputs and critical-path priority. All fields are
+/// **in-memory only** except `size_class_floor` (persisted as
+/// `derivations.size_class_floor`, M_032); the rest are recomputed at
+/// next dispatch / `full_sweep`.
+#[derive(Debug, Clone, Default)]
+pub struct SchedHint {
     /// Size-class this derivation was dispatched to. Recorded at
     /// assign time so completion can check misclassification (actual
     /// duration > 2× the class cutoff). `None` = size-classes not
@@ -393,8 +454,6 @@ pub struct DerivationState {
     ///
     /// Persisted as `derivations.size_class_floor` (P0556, `M_032`)
     /// so the OOM loop doesn't resume across scheduler failover.
-    /// Written at promotion time (`update_size_class_floor`); loaded
-    /// by `from_recovery_row`.
     pub size_class_floor: Option<String>,
     /// Bucketed memory estimate for the resource-fit placement filter
     /// (ADR-020 §5). `hard_filter` checks `worker.memory_total_bytes
@@ -409,65 +468,7 @@ pub struct DerivationState {
     /// Same `Estimator::bucketed_estimate()` + headroom as the
     /// capacity manifest RPC → the controller's pod sizing and the
     /// scheduler's placement filter agree on what "fits".
-    ///
-    /// NOT persisted (lossy on recovery; recomputed next dispatch).
     pub est_memory_bytes: Option<u64>,
-    /// ATerm-serialized .drv content, inlined by the gateway for
-    /// nodes that will actually dispatch (outputs missing from store).
-    /// Empty = worker fetches from store via GetPath (fallback
-    /// path, still works). Forwarded verbatim into WorkAssignment.
-    /// ≤256 KB bound enforced at gRPC ingress.
-    pub drv_content: Vec<u8>,
-    /// Number of retry attempts so far.
-    pub retry_count: u32,
-    /// Number of InfrastructureFailure re-dispatches so far. Separate
-    /// from `retry_count` because infra failures don't count toward
-    /// the transient-failure budget (they're worker-local, not
-    /// build-local) — but still bounded to prevent a misclassified
-    /// deterministic failure from hot-looping forever. In-memory only:
-    /// recovery resets to 0 (conservative — won't spuriously poison
-    /// after restart).
-    pub infra_retry_count: u32,
-    /// Number of `TimedOut` re-dispatches so far (I-200). Separate
-    /// from `retry_count` (timeouts don't eat the transient budget)
-    /// and from `infra_retry_count` (no time-window reset — a build
-    /// that times out, gets promoted, and times out again an hour
-    /// later on the larger class is still the same hung build).
-    /// Bounded by `RetryPolicy::max_timeout_retries`; at the cap,
-    /// `handle_timeout_failure` falls through to terminal Cancelled.
-    /// In-memory only: recovery resets to 0 (conservative — won't
-    /// spuriously terminal-cancel after restart; a recovered build
-    /// gets a fresh promotion ladder, bounded again by the cap).
-    pub timeout_retry_count: u32,
-    /// Timestamp of the most recent InfrastructureFailure that
-    /// incremented `infra_retry_count`. Drives the time-window reset
-    /// (I-127): if the last infra failure was longer ago than
-    /// `RetryPolicy::infra_retry_window_secs`, `infra_retry_count`
-    /// resets to 0 before the cap check — sparse failures over a
-    /// long build don't accumulate toward poison. In-memory only;
-    /// recovery resets to None (same conservative direction as
-    /// `infra_retry_count: 0` above).
-    pub last_infra_failure_at: Option<Instant>,
-    /// Workers that have failed building this derivation. Drives
-    /// `best_executor()` exclusion + poison threshold in distinct mode.
-    pub failed_builders: HashSet<ExecutorId>,
-    /// Total TransientFailure/disconnect count (same-worker repeats
-    /// counted). Drives poison threshold when
-    /// `PoisonConfig::require_distinct_workers = false` (single-worker
-    /// dev deployments). In-memory only: recovery initializes to
-    /// `failed_builders.len()` — same-worker repeats are "forgiven"
-    /// across restart, which is conservative (won't spuriously poison).
-    /// InfrastructureFailure does NOT increment this (T1's split).
-    pub failure_count: u32,
-    /// When the derivation entered the poisoned state (for TTL expiry).
-    pub poisoned_at: Option<Instant>,
-    /// Realized output store paths (filled on completion).
-    pub output_paths: Vec<String>,
-    /// Expected output paths (from the proto node at merge time).
-    /// Used for: cache-check (merge.rs), and prefetch-hint closure
-    /// approximation (children's expected_output_paths = parent's
-    /// inputs; see `approx_input_closure`).
-    pub expected_output_paths: Vec<String>,
     /// Estimated build duration (from Estimator). Set at merge time;
     /// never updated after. The critical-path priority uses this;
     /// stale is fine (a build taking longer than estimated doesn't
@@ -490,25 +491,57 @@ pub struct DerivationState {
     /// first). Recomputed incrementally on completion via
     /// ancestor-walk. The ready queue uses this for BinaryHeap ordering.
     pub priority: f64,
+}
+
+/// In-memory state for a single derivation node in the global DAG.
+#[derive(Debug, Clone)]
+pub struct DerivationState {
+    /// Unique hash identifying this derivation (store path for input-addressed, modular hash for CA).
+    pub drv_hash: DrvHash,
+    /// Store path of the .drv file. Private because the DAG maintains a
+    /// `path_to_hash` reverse index keyed on this field — mutating it
+    /// directly would silently corrupt that index. Read via `drv_path()`.
+    drv_path: rio_nix::store_path::StorePath,
+    /// Package name (for duration estimation).
+    pub pname: Option<String>,
+    /// Target system (e.g. "x86_64-linux").
+    pub system: String,
+    /// Required system features the building worker must support.
+    pub required_features: Vec<String>,
+    /// Output names (e.g. ["out", "dev"]).
+    pub output_names: Vec<String>,
+    /// Whether this is a fixed-output derivation (fetchurl, etc.).
+    pub is_fixed_output: bool,
+    /// Content-addressed-derivation state (cutoff/resolve bookkeeping).
+    pub ca: CaState,
+    /// Current state machine status. Private: mutate only via `transition()`
+    /// or `reset_to_ready()` to preserve invariants.
+    status: DerivationStatus,
+    /// Set of build IDs interested in this derivation.
+    pub interested_builds: HashSet<Uuid>,
+    /// Worker currently assigned/running this derivation.
+    pub assigned_executor: Option<ExecutorId>,
+    /// Scheduling hints (estimator outputs, size-class, critical-path priority).
+    pub sched: SchedHint,
+    /// ATerm-serialized .drv content, inlined by the gateway for
+    /// nodes that will actually dispatch (outputs missing from store).
+    /// Empty = worker fetches from store via GetPath (fallback
+    /// path, still works). Forwarded verbatim into WorkAssignment.
+    /// ≤256 KB bound enforced at gRPC ingress.
+    pub drv_content: Vec<u8>,
+    /// Retry / failure-tracking state.
+    pub retry: RetryState,
+    /// Realized output store paths (filled on completion).
+    pub output_paths: Vec<String>,
+    /// Expected output paths (from the proto node at merge time).
+    /// Used for: cache-check (merge.rs), and prefetch-hint closure
+    /// approximation (children's expected_output_paths = parent's
+    /// inputs; see `approx_input_closure`).
+    pub expected_output_paths: Vec<String>,
     /// Database UUID (set after insertion).
     pub db_id: Option<Uuid>,
     /// When the derivation entered Ready state (for assignment latency metric).
     pub(crate) ready_at: Option<Instant>,
-    /// Earliest time this derivation may be dispatched. Set by
-    /// handle_transient_failure to implement the retry backoff —
-    /// the derivation is Ready and in the queue, but dispatch_ready
-    /// defers it if `Instant::now() < backoff_until`.
-    ///
-    /// Why not a timer-based requeue: timers need a scheduled task
-    /// per deferred derivation + cleanup if the derivation
-    /// transitions meanwhile (cancelled, DAG reload). Putting the
-    /// deadline ON the state and checking in dispatch_ready is
-    /// stateless — the existing defer-and-requeue pattern handles
-    /// it. Cost: one Instant::now() comparison per Ready-pop for
-    /// derivations that have backoff set (only transient-failures).
-    ///
-    /// Cleared on successful dispatch (assign_to_worker).
-    pub backoff_until: Option<Instant>,
     /// When the derivation entered Running state. For the backstop
     /// timeout: handle_tick checks this + est_duration × 3 (clamped
     /// to daemon_timeout + slack). A build that's been Running far
@@ -543,43 +576,37 @@ impl DerivationState {
             required_features: node.required_features.clone(),
             output_names: node.output_names.clone(),
             is_fixed_output: node.is_fixed_output,
-            // r[impl sched.ca.detect]
-            is_ca: node.is_content_addressed,
-            needs_resolve: node.needs_resolve,
-            // Gateway sends 32 bytes for CA nodes it could compute
-            // the modular hash for, empty otherwise (IA, or
-            // BasicDerivation fallback with no transitive closure).
-            // try_into rejects non-32-byte (including empty) →
-            // None. Belt-and-suspenders vs the gateway's own IA
-            // gate (populate_ca_modular_hashes skips non-CA).
-            ca_modular_hash: node.ca_modular_hash.as_slice().try_into().ok(),
-            pending_realisation_deps: Vec::new(),
-            ca_output_unchanged: false,
+            ca: CaState {
+                // r[impl sched.ca.detect]
+                is_ca: node.is_content_addressed,
+                needs_resolve: node.needs_resolve,
+                // Gateway sends 32 bytes for CA nodes it could compute
+                // the modular hash for, empty otherwise (IA, or
+                // BasicDerivation fallback with no transitive closure).
+                // try_into rejects non-32-byte (including empty) →
+                // None. Belt-and-suspenders vs the gateway's own IA
+                // gate (populate_ca_modular_hashes skips non-CA).
+                modular_hash: node.ca_modular_hash.as_slice().try_into().ok(),
+                pending_realisation_deps: Vec::new(),
+                output_unchanged: false,
+            },
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
             assigned_executor: None,
-            assigned_size_class: None,
-            size_class_floor: None,
-            est_memory_bytes: None, // set at dispatch time
+            sched: SchedHint {
+                input_srcs_nar_size: node.input_srcs_nar_size,
+                // est_duration: placeholder — merge.rs sets this from
+                // the Estimator right after try_from_node (try_from_node
+                // doesn't have estimator access). 0.0 is a visible
+                // "not yet set" marker.
+                ..Default::default()
+            },
             drv_content: node.drv_content.clone(),
-            retry_count: 0,
-            infra_retry_count: 0,
-            timeout_retry_count: 0,
-            last_infra_failure_at: None,
-            failed_builders: HashSet::new(),
-            failure_count: 0,
-            poisoned_at: None,
+            retry: RetryState::default(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
-            // Placeholder — merge.rs sets this from the Estimator right
-            // after try_from_node (try_from_node doesn't have estimator
-            // access). 0.0 is a visible "not yet set" marker.
-            est_duration: 0.0,
-            input_srcs_nar_size: node.input_srcs_nar_size,
-            priority: 0.0,
             db_id: None,
             ready_at: None,
-            backoff_until: None,
             running_since: None,
             traceparent: String::new(),
         })
@@ -624,42 +651,33 @@ impl DerivationState {
             required_features: row.required_features,
             output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
-            is_ca: row.is_ca,
-            // Lossy on recovery: not persisted. Conservative false →
-            // dispatch unresolved → worker fails on placeholder →
-            // retry. Same degradation class as ca_modular_hash below.
-            needs_resolve: false,
-            // Lossy on recovery: not persisted. Recovered CA-on-CA
-            // chains dispatch unresolved (collect_ca_inputs skips
-            // None) → worker fails on placeholder → retry. Same
-            // degradation as drv_content=empty below. The gateway
-            // recomputes on the NEXT SubmitBuild that references
-            // this derivation (DAG merge sees the fresh proto).
-            ca_modular_hash: None,
-            pending_realisation_deps: Vec::new(),
-            ca_output_unchanged: false,
+            ca: CaState {
+                is_ca: row.is_ca,
+                // Remaining CA fields lossy on recovery — see CaState doc.
+                ..Default::default()
+            },
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
             assigned_executor: row.assigned_builder_id.map(Into::into),
-            assigned_size_class: None, // lossy; misclassification detector skips None
-            size_class_floor: row.size_class_floor, // P0556: persisted (M_032)
-            est_memory_bytes: None,    // lossy; recomputed at next dispatch
-            drv_content: Vec::new(),   // worker fetches from store
-            retry_count: row.retry_count.max(0) as u32,
-            // In-memory only — recovery resets to 0 (conservative).
-            infra_retry_count: 0,
-            timeout_retry_count: 0,
-            last_infra_failure_at: None,
-            // failure_count: initialize from failed_builders.len() —
-            // same-worker repeats are lost (in-mem only), conservative.
-            failure_count: row.failed_builders.len() as u32,
-            failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
-            poisoned_at: None, // poisoned rows not loaded; if one slips through, stays poisoned
+            sched: SchedHint {
+                size_class_floor: row.size_class_floor, // P0556: persisted (M_032)
+                // Remaining sched fields lossy; recomputed at next
+                // dispatch / full_sweep — see SchedHint doc.
+                ..Default::default()
+            },
+            drv_content: Vec::new(), // worker fetches from store
+            retry: RetryState {
+                count: row.retry_count.max(0) as u32,
+                // failure_count: initialize from failed_builders.len() —
+                // same-worker repeats are lost (in-mem only), conservative.
+                failure_count: row.failed_builders.len() as u32,
+                failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
+                // Remaining retry fields in-memory only — recovery
+                // resets to conservative defaults (see RetryState doc).
+                ..Default::default()
+            },
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
-            est_duration: 0.0,      // recomputed by full_sweep
-            input_srcs_nar_size: 0, // lossy; only used as estimator input (proxy)
-            priority: 0.0,          // recomputed by full_sweep
             db_id: Some(row.derivation_id),
             // Instant fields: conservative defaults.
             // ready_at: Some(now) if Ready → assignment_latency
@@ -672,7 +690,6 @@ impl DerivationState {
             // (won't spuriously cancel) at the cost of a possibly
             // stale build running longer.
             running_since: (status == DerivationStatus::Running).then_some(now),
-            backoff_until: None,        // any in-flight backoff is forgiven
             traceparent: String::new(), // recovered: no user trace
         })
     }
@@ -714,34 +731,23 @@ impl DerivationState {
             required_features: Vec::new(),
             output_names: Vec::new(),
             is_fixed_output: row.is_fixed_output,
-            is_ca: false,
-            needs_resolve: false,
-            ca_modular_hash: None,
-            pending_realisation_deps: Vec::new(),
-            ca_output_unchanged: false,
+            ca: CaState::default(),
             status: DerivationStatus::Poisoned,
             interested_builds: HashSet::new(),
             assigned_executor: None,
-            assigned_size_class: None,
-            size_class_floor: None,
-            est_memory_bytes: None,
+            sched: SchedHint::default(),
             drv_content: Vec::new(),
-            retry_count: 0,
-            infra_retry_count: 0,
-            timeout_retry_count: 0,
-            last_infra_failure_at: None,
-            failure_count: row.failed_builders.len() as u32,
-            failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
-            poisoned_at: Some(poisoned_at),
+            retry: RetryState {
+                failure_count: row.failed_builders.len() as u32,
+                failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
+                poisoned_at: Some(poisoned_at),
+                ..Default::default()
+            },
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
-            est_duration: 0.0,
-            input_srcs_nar_size: 0,
-            priority: 0.0,
             db_id: Some(row.derivation_id),
             ready_at: None,
             running_since: None,
-            backoff_until: None,
             traceparent: String::new(),
         })
     }
@@ -842,21 +848,7 @@ impl DerivationState {
     pub fn is_retriable_on_resubmit(&self) -> bool {
         self.status.is_retriable_on_resubmit()
             || (self.status == DerivationStatus::Poisoned
-                && self.retry_count < POISON_RESUBMIT_RETRY_LIMIT)
-    }
-
-    /// Reset all failure-tracking fields. Call after a cache-hit
-    /// transition from Poisoned/DependencyFailed/Failed to Completed
-    /// (I-099/I-094) — the prior failures are moot once the output
-    /// exists. Does NOT change `status`; caller transitions separately.
-    pub fn clear_failure_history(&mut self) {
-        self.retry_count = 0;
-        self.infra_retry_count = 0;
-        self.timeout_retry_count = 0;
-        self.last_infra_failure_at = None;
-        self.failed_builders.clear();
-        self.failure_count = 0;
-        self.poisoned_at = None;
+                && self.retry.count < POISON_RESUBMIT_RETRY_LIMIT)
     }
 
     /// Test-only: directly set status bypassing state machine validation.
@@ -908,9 +900,9 @@ impl PoisonConfig {
     /// (completion/worker/recovery) stay in lockstep.
     pub fn is_poisoned(&self, state: &DerivationState) -> bool {
         let count = if self.require_distinct_workers {
-            state.failed_builders.len() as u32
+            state.retry.failed_builders.len() as u32
         } else {
-            state.failure_count
+            state.retry.failure_count
         };
         count >= self.threshold
     }
@@ -950,7 +942,7 @@ mod tests {
         let ia_node = dummy_node();
         assert!(!ia_node.is_content_addressed, "fixture precondition");
         let ia_state = DerivationState::try_from_node(&ia_node)?;
-        assert!(!ia_state.is_ca, "input-addressed drv → is_ca=false");
+        assert!(!ia_state.ca.is_ca, "input-addressed drv → is_ca=false");
 
         // Content-addressed: is_ca = true. Proto field set by the
         // gateway from `is_fixed_output() || has_ca_floating_outputs()`;
@@ -958,7 +950,10 @@ mod tests {
         let mut ca_node = dummy_node();
         ca_node.is_content_addressed = true;
         let ca_state = DerivationState::try_from_node(&ca_node)?;
-        assert!(ca_state.is_ca, "CA drv → is_ca=true propagated from proto");
+        assert!(
+            ca_state.ca.is_ca,
+            "CA drv → is_ca=true propagated from proto"
+        );
 
         // needs_resolve propagates independently of is_ca: the
         // ia.deferred case (IA drv with floating-CA input) has
@@ -967,11 +962,11 @@ mod tests {
         deferred.needs_resolve = true;
         let deferred_state = DerivationState::try_from_node(&deferred)?;
         assert!(
-            deferred_state.needs_resolve,
+            deferred_state.ca.needs_resolve,
             "needs_resolve=true propagated from proto"
         );
         assert!(
-            !deferred_state.is_ca,
+            !deferred_state.ca.is_ca,
             "ia.deferred: needs_resolve independent of is_ca"
         );
 
@@ -1214,9 +1209,9 @@ mod tests {
             size_class_floor: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
-        assert!(state.is_ca, "precondition: recovered as CA");
+        assert!(state.ca.is_ca, "precondition: recovered as CA");
         assert!(
-            !state.ca_output_unchanged,
+            !state.ca.output_unchanged,
             "recovery MUST reset ca_output_unchanged to false (NOT persisted — \
              compare result from a prior scheduler instance is stale)"
         );
@@ -1320,7 +1315,7 @@ mod tests {
         // poisoned_at = now. This is a panic guard, not correctness
         // — recovery.rs filters expired rows before calling here so
         // a +inf elapsed would never reach this in practice.
-        assert!(state.poisoned_at.is_some());
+        assert!(state.retry.poisoned_at.is_some());
     }
 }
 

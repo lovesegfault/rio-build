@@ -467,7 +467,7 @@ impl DagActor {
                 // promotion-exempt]` — sizing signal, bounded by
                 // ladder length, not the retry budget).
                 if was_running && !promoted {
-                    state.retry_count += 1;
+                    state.retry.count += 1;
                     if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                         error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
                     }
@@ -1126,7 +1126,7 @@ impl DagActor {
 
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
-                && let Some(poisoned_at) = state.poisoned_at
+                && let Some(poisoned_at) = state.retry.poisoned_at
                 && now.duration_since(poisoned_at) > POISON_TTL
             {
                 expired_poisons.push(drv_hash.into());
@@ -1156,11 +1156,12 @@ impl DagActor {
                 // (NaN.max(x)=NaN, inf.max(x)=inf) → `elapsed > NaN`
                 // is always false → backstop never fires. Treat
                 // non-finite est as "no estimate" (0.0 → floor wins).
-                let est_3x_secs = if state.est_duration.is_finite() && state.est_duration > 0.0 {
-                    state.est_duration * 3.0
-                } else {
-                    0.0
-                };
+                let est_3x_secs =
+                    if state.sched.est_duration.is_finite() && state.sched.est_duration > 0.0 {
+                        state.sched.est_duration * 3.0
+                    } else {
+                        0.0
+                    };
                 let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
                 let backstop_secs = est_3x_secs.max(floor_secs);
 

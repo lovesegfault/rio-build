@@ -308,7 +308,7 @@ pub fn rejection_reason(
     {
         return Some("feature-missing");
     }
-    if drv.failed_builders.contains(&w.executor_id) {
+    if drv.retry.failed_builders.contains(&w.executor_id) {
         return Some("failed-on");
     }
     match (target_class, w.size_class.as_deref()) {
@@ -317,7 +317,7 @@ pub fn rejection_reason(
         (Some(t), Some(wc)) if t != wc => return Some("size-class-mismatch"),
         (Some(_), Some(_)) => {}
     }
-    if let Some(est) = drv.est_memory_bytes
+    if let Some(est) = drv.sched.est_memory_bytes
         && let Some(r) = &w.last_resources
         && r.memory_total_bytes != 0
         && r.memory_total_bytes < est
@@ -717,7 +717,7 @@ mod tests {
 
         // failed-on
         let mut failed_drv = make_drv();
-        failed_drv.failed_builders.insert("w".into());
+        failed_drv.retry.failed_builders.insert("w".into());
         assert_eq!(rejection_reason(&w, &failed_drv, None), Some("failed-on"));
 
         // resource-fit
@@ -727,7 +727,7 @@ mod tests {
             ..Default::default()
         });
         let mut big_drv = make_drv();
-        big_drv.est_memory_bytes = Some(8 << 30);
+        big_drv.sched.est_memory_bytes = Some(8 << 30);
         assert_eq!(
             rejection_reason(&tight, &big_drv, None),
             Some("resource-fit")
@@ -755,7 +755,7 @@ mod tests {
         // attempt goes to worker-b, succeeds.
         let workers = workers_map(vec![make_worker("worker-a", 0), make_worker("worker-b", 0)]);
         let mut drv = make_drv();
-        drv.failed_builders.insert("worker-a".into());
+        drv.retry.failed_builders.insert("worker-a".into());
 
         let chosen = best_executor(&workers, &drv, None);
         assert_eq!(
@@ -767,7 +767,7 @@ mod tests {
         // ALL workers failed → None (caller defers). This is where
         // poison detection kicks in (failed_builders.len() >= 3 →
         // handle_transient_failure poisons).
-        drv.failed_builders.insert("worker-b".into());
+        drv.retry.failed_builders.insert("worker-b".into());
         assert_eq!(
             best_executor(&workers, &drv, None),
             None,
@@ -799,8 +799,8 @@ mod tests {
         // Both workers failed. failed_builders.len() == 2 < 3 →
         // PoisonConfig::is_poisoned alone would NOT poison, but
         // handle_transient_failure's worker_count clamp now does.
-        drv.failed_builders.insert("worker-a".into());
-        drv.failed_builders.insert("worker-b".into());
+        drv.retry.failed_builders.insert("worker-a".into());
+        drv.retry.failed_builders.insert("worker-b".into());
 
         // best_executor still returns None (both excluded via
         // failed_builders) — correct. The caller
@@ -877,7 +877,7 @@ mod tests {
     }
 
     // r[verify sched.assign.resource-fit]
-    // ADR-020 §5: worker.memory_total_bytes >= drv.est_memory_bytes
+    // ADR-020 §5: worker.memory_total_bytes >= drv.sched.est_memory_bytes
     // as a hard filter. Uses `hard_filter` directly (not
     // `best_executor`) to isolate the resource-fit arm from the
     // warm-gate — the filter's pass/fail is what's under test.
@@ -897,7 +897,7 @@ mod tests {
         };
         let mk_drv = |est: Option<u64>| {
             let mut d = make_drv();
-            d.est_memory_bytes = est;
+            d.sched.est_memory_bytes = est;
             d
         };
 
@@ -949,7 +949,7 @@ mod tests {
         let w = make_worker("fresh", 0); // last_resources defaults to None
         assert!(w.last_resources.is_none(), "precondition: no resources");
         let mut d = make_drv();
-        d.est_memory_bytes = Some(128 << 30); // 128Gi
+        d.sched.est_memory_bytes = Some(128 << 30); // 128Gi
 
         assert!(
             hard_filter(&w, &d, None),
@@ -975,7 +975,7 @@ mod tests {
         });
 
         let mut drv_12gi = make_drv();
-        drv_12gi.est_memory_bytes = Some(12 * GIB);
+        drv_12gi.sched.est_memory_bytes = Some(12 * GIB);
 
         // target=small matches size_class, but 8Gi < 12Gi → reject.
         // Proves resource-fit runs AFTER size-class passes.
@@ -988,7 +988,7 @@ mod tests {
         // though 8Gi > 6Gi would pass resource-fit → reject.
         // Proves size-class still works (exit criterion).
         let mut drv_6gi = make_drv();
-        drv_6gi.est_memory_bytes = Some(6 * GIB);
+        drv_6gi.sched.est_memory_bytes = Some(6 * GIB);
         assert!(
             !hard_filter(&small_8gi, &drv_6gi, Some("large")),
             "resource-fit match must not bypass size-class"

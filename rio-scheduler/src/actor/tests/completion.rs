@@ -77,7 +77,7 @@ async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
          fixture raced past CA-compare"
     );
     assert!(
-        info.ca_output_unchanged,
+        info.ca.output_unchanged,
         "prior realisation found → matched=true → ca_output_unchanged=true"
     );
 
@@ -126,8 +126,8 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
         .debug_query_derivation("ca-match")
         .await?
         .expect("exists");
-    assert!(pre.is_ca, "precondition: merged with is_ca=true");
-    assert!(!pre.ca_output_unchanged, "default false before completion");
+    assert!(pre.ca.is_ca, "precondition: merged with is_ca=true");
+    assert!(!pre.ca.output_unchanged, "default false before completion");
 
     let match_before = recorder.get(match_key);
     complete_ca(
@@ -145,7 +145,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        info.ca_output_unchanged,
+        info.ca.output_unchanged,
         "CA + prior realisation found → ca_output_unchanged=true"
     );
     assert_eq!(
@@ -194,7 +194,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "AND-fold: [match, miss] → ca_output_unchanged=false (not last-iter-wins)"
     );
     assert_eq!(
@@ -235,9 +235,9 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
         .debug_query_derivation("ia-skip")
         .await?
         .expect("exists");
-    assert!(!info.is_ca);
+    assert!(!info.ca.is_ca);
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "non-CA → hook skipped, flag stays false"
     );
     assert_eq!(
@@ -307,7 +307,7 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "FIRST build: query_prior_realisation(path, exclude=own_modular) → None → \
          ca_output_unchanged=false. (Mutation: drop `drv_hash != $2` → true.)"
     );
@@ -371,7 +371,7 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     );
     // No prior realisation seeded → lookup returns None → miss.
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "no prior → miss → ca_output_unchanged=false"
     );
     Ok(())
@@ -408,7 +408,7 @@ async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "zero outputs → all_matched starts false (!is_empty() guard); \
          NEVER flip true on no data"
     );
@@ -445,7 +445,7 @@ async fn ca_compare_empty_path_counts_as_miss() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "empty path → all_matched=false (the is_empty() guard), no PG query fired"
     );
     Ok(())
@@ -486,7 +486,7 @@ async fn ca_compare_no_prior_counts_as_miss() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "no prior realisation → matched=false → ca_output_unchanged stays false"
     );
     assert!(
@@ -620,7 +620,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
         .await?
         .expect("verify-a exists");
     assert!(
-        info_a.ca_output_unchanged,
+        info_a.ca.output_unchanged,
         "precondition: A matched prior realisation → ca_output_unchanged=true"
     );
 
@@ -699,7 +699,7 @@ async fn ca_compare_second_build_matches_prior() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        info.ca_output_unchanged,
+        info.ca.output_unchanged,
         "SECOND build: query_prior_realisation(P, exclude=M_current) → \
          finds M_prior → ca_output_unchanged=true (downstream CAN skip)"
     );
@@ -765,7 +765,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
-        !info.ca_output_unchanged,
+        !info.ca.output_unchanged,
         "first-output miss → AND-fold false"
     );
 
@@ -810,7 +810,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
         .assigned_executor
         .clone()
         .expect("assigned to a worker");
-    assert_eq!(info1.retry_count, 0);
+    assert_eq!(info1.retry.count, 0);
 
     // Send TransientFailure from the first worker
     complete_failure(
@@ -831,7 +831,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        info2.retry_count, 1,
+        info2.retry.count, 1,
         "transient failure should increment retry_count"
     );
     // Status: Ready with backoff_until set. NOT Assigned — backoff
@@ -989,13 +989,13 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             .await?
             .expect("exists");
         assert_eq!(
-            s.size_class_floor.as_deref(),
+            s.sched.size_class_floor.as_deref(),
             Some(classes[i + 1]),
             "failure on {c} → floor promoted to {}",
             classes[i + 1]
         );
         assert_eq!(
-            s.retry_count, 0,
+            s.retry.count, 0,
             "I-213: promotion-causing failure does NOT increment retry_count (after {c})"
         );
         assert_ne!(s.status, DerivationStatus::Poisoned);
@@ -1143,7 +1143,7 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
          clamp (effective threshold = min(3, 2) = 2), not starve in Ready"
     );
     assert_eq!(
-        info.failed_builders.len(),
+        info.retry.failed_builders.len(),
         2,
         "both workers recorded in failed_builders"
     );
@@ -1263,16 +1263,16 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
         .expect("derivation should exist");
     // Exit criterion: 3× InfrastructureFailure → failed_builders.is_empty()
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "InfrastructureFailure must NOT insert into failed_builders, got {:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
     assert_eq!(
-        info.failure_count, 0,
+        info.retry.failure_count, 0,
         "InfrastructureFailure must NOT increment failure_count"
     );
     assert_eq!(
-        info.retry_count, 0,
+        info.retry.count, 0,
         "InfrastructureFailure must NOT increment retry_count (separate infra_retry_count tracks it)"
     );
     // Exit criterion: NOT poisoned. Ready-or-Assigned (no backoff →
@@ -1304,11 +1304,11 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
         .await?
         .expect("exists");
     assert_eq!(
-        info.failed_builders.len(),
+        info.retry.failed_builders.len(),
         1,
         "1× TransientFailure after 3× InfrastructureFailure → exactly 1 failed worker"
     );
-    assert_eq!(info.failure_count, 1);
+    assert_eq!(info.retry.failure_count, 1);
     assert_ne!(
         info.status,
         DerivationStatus::Poisoned,
@@ -1395,7 +1395,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        info.size_class_floor.as_deref(),
+        info.sched.size_class_floor.as_deref(),
         Some("small"),
         "I-200: TimedOut on tiny → floor promoted to small"
     );
@@ -1408,20 +1408,20 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         info.status
     );
     assert_eq!(
-        info.timeout_retry_count, 1,
+        info.retry.timeout_count, 1,
         "timeout_retry_count incremented"
     );
     // Timeout MUST NOT eat other budgets.
     assert_eq!(
-        info.retry_count, 0,
+        info.retry.count, 0,
         "TimedOut must not consume transient budget"
     );
     assert_eq!(
-        info.infra_retry_count, 0,
+        info.retry.infra_count, 0,
         "TimedOut must not consume infra budget"
     );
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "TimedOut is not per-worker — failed_builders stays empty"
     );
 
@@ -1440,7 +1440,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         .debug_query_derivation(drv_hash)
         .await?
         .expect("exists");
-    assert_eq!(info.size_class_floor.as_deref(), Some("medium"));
+    assert_eq!(info.sched.size_class_floor.as_deref(), Some("medium"));
     assert!(
         matches!(
             info.status,
@@ -1449,7 +1449,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "2nd TimedOut still under cap=2 → Ready, got {:?}",
         info.status
     );
-    assert_eq!(info.timeout_retry_count, 2);
+    assert_eq!(info.retry.timeout_count, 2);
 
     // ── Cap exhausted: 3rd TimedOut on medium → terminal Cancelled ──
     // Floor still promoted (promote happens before cap check) so an
@@ -1476,7 +1476,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         info.status
     );
     assert_eq!(
-        info.size_class_floor.as_deref(),
+        info.sched.size_class_floor.as_deref(),
         Some("medium"),
         "promote ran but clamped at largest class (no demote)"
     );
@@ -1541,7 +1541,7 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
          (boundary: cap check is pre-increment), got {:?}",
         before.status
     );
-    assert_eq!(before.infra_retry_count, 10);
+    assert_eq!(before.retry.infra_count, 10);
 
     // 11th failure: infra_retry_count=10 >= max_infra_retries=10 → poison.
     let ok = handle.debug_force_assign(drv_hash, "infra-cap-w").await?;
@@ -1566,9 +1566,9 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
     );
     // Confirm the infra path never touched the transient-failure
     // accounting (these stay at 0 the whole way through).
-    assert!(after.failed_builders.is_empty());
-    assert_eq!(after.retry_count, 0);
-    assert_eq!(after.failure_count, 0);
+    assert!(after.retry.failed_builders.is_empty());
+    assert_eq!(after.retry.count, 0);
+    assert_eq!(after.retry.failure_count, 0);
 
     Ok(())
 }
@@ -1620,12 +1620,12 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
         after.status
     );
     assert_eq!(
-        after.infra_retry_count, 0,
+        after.retry.infra_count, 0,
         "concurrent-PutPath must NOT increment infra_retry_count"
     );
-    assert!(after.failed_builders.is_empty());
-    assert_eq!(after.retry_count, 0);
-    assert_eq!(after.failure_count, 0);
+    assert!(after.retry.failed_builders.is_empty());
+    assert_eq!(after.retry.count, 0);
+    assert_eq!(after.retry.failure_count, 0);
 
     // A NON-exempt infra failure after that DOES count — proves the
     // exemption is keyed on error_msg, not a blanket disable.
@@ -1644,7 +1644,7 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        after2.infra_retry_count, 1,
+        after2.retry.infra_count, 1,
         "non-exempt infra failure after exempt ones → counter increments normally"
     );
 
@@ -1711,13 +1711,13 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
             .expect("exists");
         // failed_builders (HashSet) stays at 1 — same worker every time.
         assert_eq!(
-            info.failed_builders.len(),
+            info.retry.failed_builders.len(),
             1,
             "HashSet: same worker inserted once, stays len()=1"
         );
         // failure_count increments regardless.
         assert_eq!(
-            info.failure_count,
+            info.retry.failure_count,
             i + 1,
             "non-distinct: failure_count increments unconditionally"
         );
@@ -1733,7 +1733,7 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
         info.status,
         DerivationStatus::Poisoned,
         "non-distinct mode: 3× same-worker failures → poisoned (failure_count={} >= threshold=3)",
-        info.failure_count
+        info.retry.failure_count
     );
     Ok(())
 }
@@ -1790,8 +1790,12 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
         .debug_query_derivation(drv_hash)
         .await?
         .expect("exists");
-    assert_eq!(info.failed_builders.len(), 1, "HashSet: same worker = 1");
-    assert_eq!(info.failure_count, 3, "flat count still increments");
+    assert_eq!(
+        info.retry.failed_builders.len(),
+        1,
+        "HashSet: same worker = 1"
+    );
+    assert_eq!(info.retry.failure_count, 3, "flat count still increments");
     // NOT poisoned: distinct mode uses failed_builders.len()=1 < 3.
     assert_ne!(
         info.status,
@@ -2523,7 +2527,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
 // r[verify sched.db.assignment-terminal-on-status]
 /// I-209: PermanentFailure MUST close the active `assignments` row
 /// (`pending` → `failed`, `completed_at` set) and record the executor
-/// in `derivations.failed_builders`. Pre-fix, only the success path
+/// in `derivations.retry.failed_builders`. Pre-fix, only the success path
 /// did the assignment write — every poisoned/cancelled derivation
 /// kept a `pending` row, the pruner's `NOT EXISTS assignments` never
 /// matched, and `derivations` leaked.

@@ -1034,7 +1034,7 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
         "store unreachable → assume incomplete → reset to Ready"
     );
     assert!(
-        post.retry_count >= 1,
+        post.retry.count >= 1,
         "retry_count should be bumped (this is a retry)"
     );
 

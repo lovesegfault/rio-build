@@ -110,7 +110,7 @@ impl DerivationDag {
     // r[impl sched.dispatch.soft-features]
     // r[impl sched.sizing.soft-feature-floor]
     /// Strip configured soft features from `state.required_features`
-    /// and raise `state.size_class_floor` to the highest `floor_hint`
+    /// and raise `state.sched.size_class_floor` to the highest `floor_hint`
     /// among the stripped features. Only RAISES --- a recovered node
     /// with a persisted floor higher than the hint keeps it.
     fn apply_soft_features(&self, state: &mut DerivationState) {
@@ -132,11 +132,11 @@ impl DerivationDag {
         });
         if let Some(h) = hint {
             let raised = crate::assignment::max_class_by_order(
-                state.size_class_floor.as_deref(),
+                state.sched.size_class_floor.as_deref(),
                 Some(h),
                 &self.class_order,
             );
-            state.size_class_floor = raised.map(String::from);
+            state.sched.size_class_floor = raised.map(String::from);
         }
     }
 
@@ -288,7 +288,7 @@ impl DerivationDag {
             {
                 self.nodes
                     .remove(&drv_hash)
-                    .map(|old| (old.interested_builds, old.retry_count))
+                    .map(|old| (old.interested_builds, old.retry.count))
             } else {
                 None
             };
@@ -334,7 +334,7 @@ impl DerivationDag {
                 // POISON_RESUBMIT_RETRY_LIMIT.
                 if let Some((prior_interest, prior_retry)) = prior {
                     state.interested_builds.extend(prior_interest);
-                    state.retry_count = prior_retry;
+                    state.retry.count = prior_retry;
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();
@@ -934,7 +934,7 @@ impl DerivationDag {
     ///   build's root(s) hold the critical-path ETA. Taking the max
     ///   over ALL non-terminal nodes (not just `find_roots`) is
     ///   correct AND more robust: if X has a build-interested
-    ///   parent P, then P.priority ≥ X.priority (P includes X in
+    ///   parent P, then P.sched.priority ≥ X.sched.priority (P includes X in
     ///   its max-child), so the max is achieved at a node with no
     ///   build-interested parent anyway. This sidesteps the
     ///   `find_roots` global-vs-build-scoped-parent question.
@@ -983,7 +983,7 @@ impl DerivationDag {
             // recomputed on completion), so including them would
             // over-report.
             if !state.status().is_terminal() {
-                summary.critpath_remaining = summary.critpath_remaining.max(state.priority);
+                summary.critpath_remaining = summary.critpath_remaining.max(state.sched.priority);
             }
         }
 

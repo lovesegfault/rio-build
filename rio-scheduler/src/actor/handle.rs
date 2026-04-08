@@ -44,37 +44,19 @@ pub struct DebugExecutorInfo {
     pub store_degraded: bool,
 }
 
-/// Test-only: snapshot of derivation state for assertions.
+/// Test-only: snapshot of derivation state for assertions. Mirrors the
+/// nested sub-struct shape of [`crate::state::DerivationState`] so test
+/// accesses (`info.retry.count`, `info.ca.output_unchanged`) read the
+/// same as production code.
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct DebugDerivationInfo {
     pub status: DerivationStatus,
-    pub retry_count: u32,
     pub assigned_executor: Option<String>,
-    pub assigned_size_class: Option<String>,
-    /// FOD reactive size-class floor (I-170). For asserting
-    /// `r[sched.fod.size-class-reactive]` promotion-on-failure.
-    pub size_class_floor: Option<String>,
     pub output_paths: Vec<String>,
-    /// Distinct worker IDs that have failed this derivation. For
-    /// asserting InfrastructureFailure does NOT populate this.
-    pub failed_builders: Vec<String>,
-    /// Flat failure counter (non-distinct mode). For asserting
-    /// same-worker failures count under `require_distinct_workers=false`.
-    pub failure_count: u32,
-    /// InfrastructureFailure re-dispatch count. For asserting the
-    /// I-127 cap behavior + concurrent-PutPath exemption.
-    pub infra_retry_count: u32,
-    /// `TimedOut` re-dispatch count (I-200). For asserting
-    /// `r[sched.timeout.promote-on-exceed]` cap behavior.
-    pub timeout_retry_count: u32,
-    /// Whether this derivation is content-addressed. For precondition
-    /// asserts in CA cutoff-compare tests.
-    pub is_ca: bool,
-    /// CA cutoff-compare result. True iff every output's nar_hash
-    /// matched the content index on completion. For asserting
-    /// `r[sched.ca.cutoff-compare]` sets the flag correctly.
-    pub ca_output_unchanged: bool,
+    pub retry: crate::state::RetryState,
+    pub ca: crate::state::CaState,
+    pub sched: crate::state::SchedHint,
 }
 
 /// Handle for sending commands to the actor.

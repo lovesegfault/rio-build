@@ -395,7 +395,7 @@ impl DagActor {
             // metric when floor is already at `to` (e.g. floor=small,
             // overflow-placed on tiny, `next(tiny)=small` — equal, no
             // log spam).
-            if state.size_class_floor.as_deref() != Some(to.as_str()) {
+            if state.sched.size_class_floor.as_deref() != Some(to.as_str()) {
                 info!(
                     drv_hash = %drv_hash, kind, from = %from, to = %to,
                     "transient failure: promoting size_class_floor"
@@ -405,7 +405,7 @@ impl DagActor {
                     "kind" => kind, "from" => from.to_owned(), "to" => to.clone()
                 )
                 .increment(1);
-                state.size_class_floor = Some(to.clone());
+                state.sched.size_class_floor = Some(to.clone());
                 promoted_to = Some(to);
             }
         }
@@ -471,11 +471,11 @@ impl DagActor {
         // unclassed worker — same semantics as the retry_count gate).
         if !promoted {
             if let Some(state) = self.dag.node_mut(drv_hash) {
-                state.failed_builders.insert(executor_id.clone());
+                state.retry.failed_builders.insert(executor_id.clone());
                 // Unconditional (doesn't check HashSet::insert's bool) —
                 // same worker counts twice. Only used when
                 // require_distinct_workers=false.
-                state.failure_count += 1;
+                state.retry.failure_count += 1;
             }
             if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
                 error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
@@ -786,8 +786,8 @@ impl DagActor {
         // in-mem transition to Completed already happened; a missing
         // realisation degrades CA-on-CA resolve, not the build itself.
         if let Some(state) = self.dag.node(drv_hash)
-            && state.is_ca
-            && let Some(modular_hash) = state.ca_modular_hash
+            && state.ca.is_ca
+            && let Some(modular_hash) = state.ca.modular_hash
         {
             // Log the hash in the same hex-encoding the gateway's
             // wopQueryRealisation handler uses — if nix-build's later
@@ -864,8 +864,8 @@ impl DagActor {
         // refinement.
         let mut prior_seeds: Vec<(Vec<u8>, String)> = Vec::new();
         if let Some(state) = self.dag.node(drv_hash)
-            && state.is_ca
-            && let Some(modular_hash) = state.ca_modular_hash
+            && state.ca.is_ca
+            && let Some(modular_hash) = state.ca.modular_hash
         {
             let mut all_matched = !result.built_outputs.is_empty();
             for (i, output) in result.built_outputs.iter().enumerate() {
@@ -945,7 +945,7 @@ impl DagActor {
                 }
             }
             if let Some(state) = self.dag.node_mut(drv_hash) {
-                state.ca_output_unchanged = all_matched;
+                state.ca.output_unchanged = all_matched;
             }
         }
 
@@ -974,7 +974,7 @@ impl DagActor {
         if self
             .dag
             .node(drv_hash)
-            .is_some_and(|s| s.ca_output_unchanged)
+            .is_some_and(|s| s.ca.output_unchanged)
         {
             let verified = self.verify_cutoff_candidates(drv_hash, &prior_seeds).await;
             let (skipped, cap_hit) = self
@@ -990,7 +990,7 @@ impl DagActor {
             // all cascades, like saves_total.
             let seconds_saved: f64 = skipped
                 .iter()
-                .filter_map(|h| self.dag.node(h).map(|s| s.est_duration))
+                .filter_map(|h| self.dag.node(h).map(|s| s.sched.est_duration))
                 .sum();
             metrics::counter!("rio_scheduler_ca_cutoff_seconds_saved")
                 .increment(seconds_saved.max(0.0) as u64);
@@ -1009,7 +1009,7 @@ impl DagActor {
                             prior_outs.iter().map(|o| o.output_path.clone()).collect();
                     }
                     if let Some(state) = self.dag.node(hash)
-                        && let Some(modular) = state.ca_modular_hash
+                        && let Some(modular) = state.ca.modular_hash
                     {
                         for o in prior_outs {
                             if let Err(e) = crate::ca::insert_realisation(
@@ -1103,10 +1103,10 @@ impl DagActor {
         // `realisation_deps` is rio's derived-build-trace cache
         // (ADR-018:45), not correctness-critical for the build.
         if let Some(state) = self.dag.node_mut(drv_hash)
-            && let Some(modular_hash) = state.ca_modular_hash
-            && !state.pending_realisation_deps.is_empty()
+            && let Some(modular_hash) = state.ca.modular_hash
+            && !state.ca.pending_realisation_deps.is_empty()
         {
-            let lookups = std::mem::take(&mut state.pending_realisation_deps);
+            let lookups = std::mem::take(&mut state.ca.pending_realisation_deps);
             let output_names: Vec<String> = result
                 .built_outputs
                 .iter()
@@ -1233,7 +1233,7 @@ impl DagActor {
                 // Harsh but self-correcting — a fluke gets blended back
                 // down by the next normal completion.
                 // r[impl sched.classify.penalty-overwrite]
-                if let Some(assigned_class) = &state.assigned_size_class {
+                if let Some(assigned_class) = &state.sched.assigned_size_class {
                     // Cutoff-drift: would we classify differently post-hoc?
                     // Distinct from the misclassification/penalty check
                     // below — a build can drift (assigned "small"
@@ -1345,13 +1345,13 @@ impl DagActor {
         // Histogram of actual/estimated. 1.0 = perfect, >1.0 = took
         // longer than expected. Helps tune the estimator.
         if let Some(state) = self.dag.node(drv_hash)
-            && state.est_duration > 0.0
+            && state.sched.est_duration > 0.0
             && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
         {
             let actual_secs = stop.seconds.saturating_sub(start.seconds) as f64;
             if actual_secs > 0.0 {
                 metrics::histogram!("rio_scheduler_critical_path_accuracy")
-                    .record(actual_secs / state.est_duration);
+                    .record(actual_secs / state.sched.est_duration);
             }
         }
         crate::critical_path::update_ancestors(&mut self.dag, drv_hash);
@@ -1440,7 +1440,7 @@ impl DagActor {
                   "poison_and_cascade: ->Poisoned transition rejected, skipping PG write + cascade");
             return;
         }
-        state.poisoned_at = Some(Instant::now());
+        state.retry.poisoned_at = Some(Instant::now());
 
         self.persist_poisoned(drv_hash).await;
         self.unpin_best_effort(drv_hash).await;
@@ -1572,7 +1572,7 @@ impl DagActor {
             // tried.
             if reached_poison {
                 false // poison_and_cascade below does the transition
-            } else if promoted || state.retry_count < self.retry_policy.max_retries {
+            } else if promoted || state.retry.count < self.retry_policy.max_retries {
                 state.ensure_running();
                 if let Err(e) = state.transition(DerivationStatus::Failed) {
                     warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
@@ -1581,9 +1581,9 @@ impl DagActor {
             } else {
                 warn!(
                     drv_hash = %drv_hash,
-                    retry_count = state.retry_count,
+                    retry_count = state.retry.count,
                     max = self.retry_policy.max_retries,
-                    size_class_floor = ?state.size_class_floor,
+                    size_class_floor = ?state.sched.size_class_floor,
                     "transient failure: max_retries exhausted, poisoning"
                 );
                 false // poison_and_cascade below does the transition
@@ -1593,7 +1593,7 @@ impl DagActor {
         };
 
         if should_retry {
-            let retry_count = self.dag.node(drv_hash).map_or(0, |s| s.retry_count);
+            let retry_count = self.dag.node(drv_hash).map_or(0, |s| s.retry.count);
 
             // Schedule retry with backoff
             let backoff = self.retry_policy.backoff_duration(retry_count);
@@ -1601,7 +1601,7 @@ impl DagActor {
 
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 if !promoted {
-                    state.retry_count += 1;
+                    state.retry.count += 1;
                 }
                 state.assigned_executor = None;
             }
@@ -1626,7 +1626,7 @@ impl DagActor {
             // on the state, ignored for non-Ready). Cleared on
             // successful dispatch in assign_to_worker.
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
-                state.backoff_until = Some(Instant::now() + backoff);
+                state.retry.backoff_until = Some(Instant::now() + backoff);
                 if let Err(e) = state.transition(DerivationStatus::Ready) {
                     warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
                 } else {
@@ -1718,16 +1718,16 @@ impl DagActor {
         // Sparse failures over a long build (4 fails over an hour)
         // are independent; only a tight burst (4 fails in 2min)
         // suggests a misclassified permanent error.
-        if let Some(last) = state.last_infra_failure_at
+        if let Some(last) = state.retry.last_infra_failure_at
             && last.elapsed().as_secs_f64() > self.retry_policy.infra_retry_window_secs
         {
             debug!(
                 drv_hash = %drv_hash,
-                prev_count = state.infra_retry_count,
+                prev_count = state.retry.infra_count,
                 window_secs = self.retry_policy.infra_retry_window_secs,
                 "infra-retry window elapsed — resetting counter"
             );
-            state.infra_retry_count = 0;
+            state.retry.infra_count = 0;
         }
 
         // Bound check BEFORE reset_to_ready: if we've already exhausted
@@ -1737,14 +1737,14 @@ impl DagActor {
         // poison signal to investigate. ensure_running() first:
         // poison_and_cascade expects Running (not Assigned).
         // Exempt errors skip the cap entirely (see above).
-        if !exempt_from_cap && state.infra_retry_count >= self.retry_policy.max_infra_retries {
+        if !exempt_from_cap && state.retry.infra_count >= self.retry_policy.max_infra_retries {
             state.ensure_running();
             warn!(
                 drv_hash = %drv_hash,
                 executor_id = %executor_id,
-                infra_retry_count = state.infra_retry_count,
+                infra_retry_count = state.retry.infra_count,
                 max = self.retry_policy.max_infra_retries,
-                size_class_floor = ?state.size_class_floor,
+                size_class_floor = ?state.sched.size_class_floor,
                 "infrastructure failure: max_infra_retries exhausted, poisoning"
             );
             self.poison_and_cascade(drv_hash).await;
@@ -1765,13 +1765,13 @@ impl DagActor {
         // can't indicate a misclassified permanent failure, so the
         // hot-loop guard isn't needed for them.
         if !exempt_from_cap {
-            state.infra_retry_count += 1;
-            state.last_infra_failure_at = Some(Instant::now());
+            state.retry.infra_count += 1;
+            state.retry.last_infra_failure_at = Some(Instant::now());
         }
         info!(
             drv_hash = %drv_hash,
             executor_id = %executor_id,
-            infra_retry_count = state.infra_retry_count,
+            infra_retry_count = state.retry.infra_count,
             exempt_from_cap,
             "infrastructure failure — retry without poison count"
         );
@@ -1805,14 +1805,14 @@ impl DagActor {
                   "handle_permanent_failure: ->Poisoned transition rejected, skipping");
             return;
         }
-        state.poisoned_at = Some(Instant::now());
+        state.retry.poisoned_at = Some(Instant::now());
         // I-209: record which builder produced the permanent failure.
         // Diagnostics-only — `failed_builders` doesn't gate anything
         // on the permanent path (no retry), but rio-cli/kubectl shows
         // an empty array as "never ran" without this. Mirrors the
         // record_failure_and_check_poison shape (in-mem first, PG
         // best-effort).
-        state.failed_builders.insert(executor_id.clone());
+        state.retry.failed_builders.insert(executor_id.clone());
 
         self.persist_poisoned(drv_hash).await;
         if let Err(e) = self.db.append_failed_worker(drv_hash, executor_id).await {
@@ -1910,7 +1910,7 @@ impl DagActor {
         // to terminal Cancelled — a build that timed out on every
         // class (or on a class where promote_size_class_floor
         // returned None: already at largest) is genuinely stuck.
-        if state.timeout_retry_count < self.retry_policy.max_timeout_retries {
+        if state.retry.timeout_count < self.retry_policy.max_timeout_retries {
             state.ensure_running();
             if let Err(e) = state.reset_to_ready() {
                 warn!(drv_hash = %drv_hash, error = %e,
@@ -1922,11 +1922,11 @@ impl DagActor {
             // would succeed). NO retry_count++ (separate counter).
             // NO backoff (next class has a longer deadline; that IS
             // the backoff).
-            state.timeout_retry_count += 1;
+            state.retry.timeout_count += 1;
             info!(
                 drv_hash = %drv_hash,
                 executor_id = %executor_id,
-                timeout_retry_count = state.timeout_retry_count,
+                timeout_retry_count = state.retry.timeout_count,
                 max = self.retry_policy.max_timeout_retries,
                 failed_class = ?failed_class,
                 "timeout — promoted size_class_floor, retrying on larger class"
@@ -1944,7 +1944,7 @@ impl DagActor {
         warn!(
             drv_hash = %drv_hash,
             executor_id = %executor_id,
-            timeout_retry_count = state.timeout_retry_count,
+            timeout_retry_count = state.retry.timeout_count,
             max = self.retry_policy.max_timeout_retries,
             "timeout: max_timeout_retries exhausted, transitioning to Cancelled"
         );

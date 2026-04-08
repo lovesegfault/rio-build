@@ -219,7 +219,7 @@ pub struct DagActor {
     /// Fetcher size-class config (I-170). Empty = feature off (single
     /// fetcher pool, no class filter — original behavior). Ordered
     /// smallest→largest; `find_executor_with_overflow`'s FOD branch
-    /// walks from `DerivationState.size_class_floor` upward. Plain
+    /// walks from `DerivationState.sched.size_class_floor` upward. Plain
     /// `Vec` (not `Arc<RwLock>`): no rebalancer mutates this — it's
     /// just an ordered name list, config-static after construction.
     fetcher_size_classes: Vec<crate::assignment::FetcherSizeClassConfig>,
@@ -1050,6 +1050,7 @@ impl DagActor {
                     .as_ref()
                     .is_some_and(|e| self.executors.contains_key(e));
                 let backoff_remaining_secs = s
+                    .retry
                     .backoff_until
                     .and_then(|deadline| deadline.checked_duration_since(now))
                     .map(|d| d.as_secs())
@@ -1079,13 +1080,18 @@ impl DagActor {
                     is_fod: s.is_fixed_output,
                     assigned_executor,
                     executor_has_stream,
-                    retry_count: s.retry_count,
-                    infra_retry_count: s.infra_retry_count,
+                    retry_count: s.retry.count,
+                    infra_retry_count: s.retry.infra_count,
                     backoff_remaining_secs,
                     interested_build_count: s.interested_builds.len() as u32,
                     system: s.system.clone(),
                     required_features: s.required_features.clone(),
-                    failed_builders: s.failed_builders.iter().map(|e| e.to_string()).collect(),
+                    failed_builders: s
+                        .retry
+                        .failed_builders
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect(),
                     rejections,
                 }
             })
@@ -1126,17 +1132,11 @@ impl DagActor {
     fn handle_debug_query_derivation(&self, drv_hash: &str) -> Option<DebugDerivationInfo> {
         self.dag.node(drv_hash).map(|s| DebugDerivationInfo {
             status: s.status(),
-            retry_count: s.retry_count,
             assigned_executor: s.assigned_executor.as_ref().map(|w| w.to_string()),
-            assigned_size_class: s.assigned_size_class.clone(),
-            size_class_floor: s.size_class_floor.clone(),
             output_paths: s.output_paths.clone(),
-            failed_builders: s.failed_builders.iter().map(|w| w.to_string()).collect(),
-            failure_count: s.failure_count,
-            infra_retry_count: s.infra_retry_count,
-            timeout_retry_count: s.timeout_retry_count,
-            is_ca: s.is_ca,
-            ca_output_unchanged: s.ca_output_unchanged,
+            retry: s.retry.clone(),
+            ca: s.ca.clone(),
+            sched: s.sched.clone(),
         })
     }
 
@@ -1162,7 +1162,7 @@ impl DagActor {
         if !prepped {
             return false;
         }
-        state.backoff_until = None;
+        state.retry.backoff_until = None;
         state.assigned_executor = Some(executor_id.clone());
         let assigned = state.transition(DerivationStatus::Assigned).is_ok();
         // Set worker's running build so subsequent complete_failure
@@ -1219,8 +1219,8 @@ impl DagActor {
             return false;
         };
         state.set_status_for_test(DerivationStatus::Poisoned);
-        state.retry_count = retry_count;
-        state.poisoned_at = Some(std::time::Instant::now());
+        state.retry.count = retry_count;
+        state.retry.poisoned_at = Some(std::time::Instant::now());
         true
     }
 
@@ -1597,7 +1597,7 @@ impl DagActor {
                     // target_class=None) rather than vanishing from
                     // every pool's queued count.
                     let classify_idx = crate::assignment::classify(
-                        state.est_duration,
+                        state.sched.est_duration,
                         self.estimator
                             .peak_memory(state.pname.as_deref(), &state.system),
                         self.estimator
@@ -1620,6 +1620,7 @@ impl DagActor {
                     // no-clamp via `index.get()=None` — same fallback
                     // as dispatch's `cutoff_for()=None`.
                     let i = state
+                        .sched
                         .size_class_floor
                         .as_deref()
                         .and_then(|f| index.get(f).copied())
@@ -1640,7 +1641,7 @@ impl DagActor {
                     // capacity, this says "large". That's the
                     // operator-relevant answer for "where are my
                     // workers busy?"
-                    if let Some(class) = &state.assigned_size_class
+                    if let Some(class) = &state.sched.assigned_size_class
                         && let Some(&i) = index.get(class)
                     {
                         snapshots[i].running += 1;
@@ -1730,6 +1731,7 @@ impl DagActor {
             // floor=None → smallest (index 0, config-order convention).
             // Unknown floor (config drift) → also smallest.
             let i = state
+                .sched
                 .size_class_floor
                 .as_ref()
                 .and_then(|f| index.get(f).copied())
@@ -2076,7 +2078,11 @@ impl DagActor {
     /// priority = harmless (stale entries get skipped on pop anyway
     /// if status != Ready).
     fn queue_priority(&self, drv_hash: &DrvHash) -> f64 {
-        let base = self.dag.node(drv_hash).map(|n| n.priority).unwrap_or(0.0);
+        let base = self
+            .dag
+            .node(drv_hash)
+            .map(|n| n.sched.priority)
+            .unwrap_or(0.0);
         if self.should_prioritize(drv_hash) {
             base + crate::queue::INTERACTIVE_BOOST
         } else {

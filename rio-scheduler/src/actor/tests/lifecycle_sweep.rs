@@ -104,7 +104,7 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(pre.status, DerivationStatus::Assigned);
-    assert_eq!(pre.retry_count, 0);
+    assert_eq!(pre.retry.count, 0);
 
     // Disconnect → reassign_derivations. Before the fix:
     // retry_count++. After: no bump (was never Running).
@@ -120,7 +120,7 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        post.retry_count, 0,
+        post.retry.count, 0,
         "Assigned-only disconnect must not bump retry_count"
     );
     Ok(())
@@ -226,10 +226,10 @@ async fn test_starvation_intersects_live() -> TestResult {
         info.status
     );
     assert_eq!(
-        info.failed_builders.len(),
+        info.retry.failed_builders.len(),
         2,
         "failed_builders={{A,B}}; got {:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
 
     Ok(())

@@ -83,7 +83,7 @@ pub enum ResolveError {
 /// `hash_derivation_modulo` — the same value Nix sends as the
 /// `sha256:<hex>` prefix of `wopRegisterDrvOutput`'s `id` field.
 /// The scheduler does NOT compute this itself; it receives it from
-/// the gateway via `DerivationNode.ca_modular_hash` (computed
+/// the gateway via `DerivationNode.ca.modular_hash` (computed
 /// post-BFS from the full drv_cache — see
 /// `rio-gateway/src/translate.rs:populate_ca_modular_hashes`).
 #[derive(Debug, Clone)]

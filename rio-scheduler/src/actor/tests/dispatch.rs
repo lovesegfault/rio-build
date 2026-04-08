@@ -99,7 +99,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        state.assigned_size_class.as_deref(),
+        state.sched.assigned_size_class.as_deref(),
         Some("large"),
         "assigned_size_class recorded for misclassification detection"
     );
@@ -947,7 +947,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 // -----------------------------------------------------------------------------
 
 // r[verify sched.ca.resolve+2]
-/// IA passthrough: `state.needs_resolve = false` → gate at
+/// IA passthrough: `state.ca.needs_resolve = false` → gate at
 /// dispatch.rs:681 fails → `drv_content` returned unchanged. No
 /// resolve fires, no ContentLookup, no PG query. The cheapest path —
 /// every IA-with-IA-inputs dispatch takes it.
@@ -1322,7 +1322,7 @@ async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        state.size_class_floor.as_deref(),
+        state.sched.size_class_floor.as_deref(),
         Some("small"),
         "transient failure on tiny → floor promoted to small"
     );
@@ -1411,7 +1411,7 @@ async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        state.size_class_floor, None,
+        state.sched.size_class_floor, None,
         "feature off: floor stays None"
     );
     Ok(())
@@ -1491,7 +1491,7 @@ async fn builder_size_class_floor_skips_smaller() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        state.size_class_floor.as_deref(),
+        state.sched.size_class_floor.as_deref(),
         Some("small"),
         "I-177: transient failure on tiny builder → floor promoted to small"
     );

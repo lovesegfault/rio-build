@@ -552,13 +552,13 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
         .await?
         .expect("drv exists");
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "synthesized InfrastructureFailure must route to handle_infrastructure_failure \
          (NOT handle_transient_failure), got failed_builders={:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
     assert_eq!(
-        info.retry_count, 0,
+        info.retry.count, 0,
         "InfrastructureFailure carries no retry_count penalty (separate infra_retry_count)"
     );
 

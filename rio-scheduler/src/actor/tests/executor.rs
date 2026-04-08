@@ -194,7 +194,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
         "assigned_executor set to the reconnecting worker"
     );
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "adoption must not penalize the worker"
     );
     let workers = handle.debug_query_workers().await?;
@@ -497,10 +497,10 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
     // empty. The drain path explicitly does NOT penalize the worker
     // (a phantom is not a worker failure).
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "phantom drain must NOT add to failed_builders — \
          not the worker's fault, got {:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
     Ok(())
 }
@@ -864,19 +864,19 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
             .await?
             .expect("exists");
         assert_eq!(
-            s.size_class_floor.as_deref(),
+            s.sched.size_class_floor.as_deref(),
             Some(classes[i + 1]),
             "disconnect on {c} → floor promoted"
         );
         assert_eq!(
-            s.failure_count, 0,
+            s.retry.failure_count, 0,
             "I-213: promoted disconnect not recorded in failure_count (after {c})"
         );
         assert!(
-            s.failed_builders.is_empty(),
+            s.retry.failed_builders.is_empty(),
             "I-213: promoted disconnect not recorded in failed_builders (after {c})"
         );
-        assert_eq!(s.retry_count, 0);
+        assert_eq!(s.retry.count, 0);
         assert_ne!(s.status, DerivationStatus::Poisoned);
     }
 
@@ -947,9 +947,9 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
         info.status
     );
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "Assigned-only disconnects must not populate failed_builders; got {:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
 
     // Sensitivity: a 4th worker DOES get it (proves Ready is real,
@@ -1026,15 +1026,15 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        info.size_class_floor.as_deref(),
+        info.sched.size_class_floor.as_deref(),
         Some("small"),
         "I-173: non-ephemeral Assigned-disconnect must promote FOD floor tiny→small"
     );
     // I-097 still holds: no failure recorded.
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "I-097: Assigned-disconnect must not record failure; got {:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
     assert_eq!(info.status, DerivationStatus::Ready);
 
@@ -1107,15 +1107,15 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        info.size_class_floor.as_deref(),
+        info.sched.size_class_floor.as_deref(),
         Some("small"),
         "I-177: non-ephemeral Assigned-disconnect must promote builder floor tiny→small"
     );
     // I-097 still holds: no failure recorded for Assigned-only disconnect.
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "I-097: Assigned-disconnect must not record failure; got {:?}",
-        info.failed_builders
+        info.retry.failed_builders
     );
     assert_eq!(info.status, DerivationStatus::Ready);
 
@@ -1194,14 +1194,14 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
         .await?
         .expect("exists");
     assert_eq!(
-        info.size_class_floor.as_deref(),
+        info.sched.size_class_floor.as_deref(),
         Some("small"),
         "I-197: ephemeral OOMKilled disconnect (no CompletionReport) \
          must promote floor tiny→small; got {:?}",
-        info.size_class_floor
+        info.sched.size_class_floor
     );
     assert!(
-        info.failed_builders.is_empty(),
+        info.retry.failed_builders.is_empty(),
         "I-097: Assigned-only disconnect must not record failure"
     );
     assert_eq!(info.status, DerivationStatus::Ready);
@@ -1307,11 +1307,11 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
         .await?
         .expect("exists");
     assert_eq!(
-        info.size_class_floor, None,
+        info.sched.size_class_floor, None,
         "I-188: ephemeral disconnect AFTER CompletionReport for the \
          running drv (last_completed == running_build) must NOT \
          promote floor; got {:?}",
-        info.size_class_floor
+        info.sched.size_class_floor
     );
 
     Ok(())
@@ -1498,7 +1498,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
         .expect("exists");
     assert_eq!(info.status, DerivationStatus::Assigned);
     assert_eq!(info.assigned_executor.as_deref(), Some("hb-worker"));
-    assert!(info.failed_builders.is_empty());
+    assert!(info.retry.failed_builders.is_empty());
 
     Ok(())
 }
@@ -1767,7 +1767,7 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
         post.status
     );
     assert!(
-        post.retry_count >= 1,
+        post.retry.count >= 1,
         "retry_count should be bumped after backstop reassign"
     );
 

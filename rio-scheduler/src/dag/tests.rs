@@ -284,7 +284,7 @@ fn test_merge_resets_poisoned_under_retry_limit() -> anyhow::Result<()> {
     {
         let child = dag.nodes.get_mut("childI").expect("childI");
         child.set_status_for_test(DerivationStatus::Poisoned);
-        child.retry_count = 2;
+        child.retry.count = 2;
     }
     dag.nodes
         .get_mut("parentI")
@@ -308,7 +308,7 @@ fn test_merge_resets_poisoned_under_retry_limit() -> anyhow::Result<()> {
     let child = &dag.nodes["childI"];
     assert_eq!(child.status(), DerivationStatus::Created);
     assert_eq!(
-        child.retry_count, 2,
+        child.retry.count, 2,
         "retry_count carried over across reset so the bound accumulates"
     );
 
@@ -340,7 +340,7 @@ fn test_merge_keeps_poisoned_at_retry_limit() -> anyhow::Result<()> {
     {
         let n = dag.nodes.get_mut("hashL").expect("hashL");
         n.set_status_for_test(DerivationStatus::Poisoned);
-        n.retry_count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+        n.retry.count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
     }
 
     let build2 = Uuid::new_v4();
@@ -378,7 +378,7 @@ fn test_merge_resets_depfailed_but_rederives_if_dep_still_poisoned() -> anyhow::
         child.set_status_for_test(DerivationStatus::Poisoned);
         // At/above the resubmit-retry limit so the child stays Poisoned
         // (this test exercises the dep-STILL-poisoned re-derive path).
-        child.retry_count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+        child.retry.count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
     }
     dag.nodes
         .get_mut("parentD")
@@ -418,7 +418,7 @@ fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
     {
         let leaf = dag.nodes.get_mut("leafP").expect("leafP");
         leaf.set_status_for_test(DerivationStatus::Poisoned);
-        leaf.retry_count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+        leaf.retry.count = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
     }
 
     assert!(!dag.any_dep_terminally_failed("leafP")); // no deps
@@ -956,7 +956,7 @@ fn test_large_dag_hot_ops_perf_bound() -> anyhow::Result<()> {
     // doesn't fire and the walk goes the full DAG depth. Set node 0's
     // priority above its siblings, propagate up, then complete it and
     // propagate the drop back up.
-    dag.node_mut("h00000000").unwrap().priority = 1e9;
+    dag.node_mut("h00000000").unwrap().sched.priority = 1e9;
     time!(
         "update_ancestors(propagate-up)",
         15000,
@@ -1124,8 +1124,8 @@ fn build_summary_critpath_excludes_terminal() -> anyhow::Result<()> {
     // Directly set priorities (priority is pub; normally populated
     // via compute_initial but we're testing build_summary's max-
     // over-non-terminal filter, not the priority computation itself).
-    dag.node_mut("big").unwrap().priority = 100.0;
-    dag.node_mut("small").unwrap().priority = 5.0;
+    dag.node_mut("big").unwrap().sched.priority = 100.0;
+    dag.node_mut("small").unwrap().sched.priority = 5.0;
 
     // Both non-terminal: max is 100.
     let s = dag.build_summary(build);
@@ -1168,8 +1168,8 @@ fn build_summary_critpath_build_scoped() -> anyhow::Result<()> {
     dag.merge(build_a, &[make_node("a-drv", "x86_64-linux")], &[], "")?;
     dag.merge(build_b, &[make_node("b-drv", "x86_64-linux")], &[], "")?;
 
-    dag.node_mut("a-drv").unwrap().priority = 10.0;
-    dag.node_mut("b-drv").unwrap().priority = 999.0;
+    dag.node_mut("a-drv").unwrap().sched.priority = 10.0;
+    dag.node_mut("b-drv").unwrap().sched.priority = 999.0;
 
     let s = dag.build_summary(build_a);
     assert_eq!(

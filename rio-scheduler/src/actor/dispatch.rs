@@ -155,7 +155,7 @@ impl DagActor {
                 // timers. Cheap: one Instant::now() only for
                 // derivations that failed transiently (backoff_until
                 // is None for fresh ones).
-                if let Some(deadline) = state.backoff_until
+                if let Some(deadline) = state.retry.backoff_until
                     && Instant::now() < deadline
                 {
                     deferred.push(drv_hash);
@@ -186,7 +186,7 @@ impl DagActor {
                     let system = &state.system;
                     let classes = self.size_classes.read();
                     let target_class = crate::assignment::classify(
-                        state.est_duration,
+                        state.sched.est_duration,
                         self.estimator.peak_memory(pname, system),
                         self.estimator.peak_cpu(pname, system),
                         &classes,
@@ -219,7 +219,7 @@ impl DagActor {
                 // best_executor) reads the fresh value. Refreshed each
                 // dispatch pass — picks up estimator Tick updates.
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
-                    state.est_memory_bytes = est_memory_bytes;
+                    state.sched.est_memory_bytes = est_memory_bytes;
                 }
 
                 // I-067: a Ready FOD whose output already exists in
@@ -266,7 +266,7 @@ impl DagActor {
                         // Misclassification detector reads this at
                         // completion time.
                         if let Some(state) = self.dag.node_mut(&drv_hash) {
-                            state.assigned_size_class = chosen_class.clone();
+                            state.sched.assigned_size_class = chosen_class.clone();
                         }
                         if let Some(class) = &chosen_class {
                             metrics::counter!(
@@ -640,7 +640,7 @@ impl DagActor {
         let Some(state) = self.dag.node(drv_hash) else {
             return false;
         };
-        if state.failed_builders.is_empty() {
+        if state.retry.failed_builders.is_empty() {
             return false;
         }
         let want_kind = if is_fixed_output {
@@ -658,12 +658,12 @@ impl DagActor {
         };
         let exhausted = std::iter::once(first)
             .chain(fleet)
-            .all(|w| state.failed_builders.contains(&w.executor_id));
+            .all(|w| state.retry.failed_builders.contains(&w.executor_id));
         if exhausted {
             warn!(
                 drv_hash = %drv_hash,
                 kind = ?want_kind,
-                failed_on = state.failed_builders.len(),
+                failed_on = state.retry.failed_builders.len(),
                 "failed_builders excludes every registered worker; poisoning \
                  (would otherwise defer forever — see I-065)"
             );
@@ -710,6 +710,7 @@ impl DagActor {
             // config (stale after a config change) degrades to "start
             // from smallest" via `position().unwrap_or(0)`.
             let floor_idx = drv_state
+                .sched
                 .size_class_floor
                 .as_deref()
                 .and_then(|f| self.fetcher_size_classes.iter().position(|c| c.name == f))
@@ -753,6 +754,7 @@ impl DagActor {
         // degrades to no-clamp via `cutoff_for() = None` — same
         // graceful fallback as the FOD branch's `unwrap_or(0)`.
         let floor_cutoff = drv_state
+            .sched
             .size_class_floor
             .as_deref()
             .and_then(|f| crate::assignment::cutoff_for(f, &classes));
@@ -828,7 +830,7 @@ impl DagActor {
             // have let us here otherwise). Next failure gets a
             // fresh computed backoff from the (incremented)
             // retry_count.
-            state.backoff_until = None;
+            state.retry.backoff_until = None;
             state.assigned_executor = Some(executor_id.clone());
         }
 
@@ -935,7 +937,7 @@ impl DagActor {
         if !resolve_lookups.is_empty()
             && let Some(state) = self.dag.node_mut(drv_hash)
         {
-            state.pending_realisation_deps = resolve_lookups;
+            state.ca.pending_realisation_deps = resolve_lookups;
         }
 
         // Send WorkAssignment to worker via stream
@@ -985,7 +987,7 @@ impl DagActor {
                     // the NAR independently; threat model holds).
                     // Fixed-output CA (FOD) has a known path → treat
                     // as IA for the membership check.
-                    is_ca: state.is_ca && !state.is_fixed_output,
+                    is_ca: state.ca.is_ca && !state.is_fixed_output,
                     expiry_unix,
                 })
             } else {
@@ -1190,7 +1192,7 @@ impl DagActor {
     /// (possibly rewritten) ATerm plus every
     /// `(dep_modular_hash, dep_output_name) → realized_path` lookup
     /// the resolve performed. Caller stashes lookups on
-    /// `DerivationState.pending_realisation_deps` for the
+    /// `DerivationState.ca.pending_realisation_deps` for the
     /// completion-time `insert_realisation_deps` call (the FK needs
     /// the parent's OWN realisation row to exist first).
     ///
@@ -1228,14 +1230,14 @@ impl DagActor {
         // self AND ia.deferred (IA with CA inputs — the CA input's
         // placeholder is embedded in this drv's env/args and needs
         // rewriting to the realized path).
-        if !state.needs_resolve {
+        if !state.ca.needs_resolve {
             return (state.drv_content.clone(), Vec::new());
         }
 
         // Build the input lists: walk DAG children, split into CA
         // and IA. For CA children we need the MODULAR hash (the
         // `realisations` table key, plumbed by the gateway via
-        // `DerivationNode.ca_modular_hash`). For IA children we need
+        // `DerivationNode.ca.modular_hash`). For IA children we need
         // the `expected_output_paths` (deterministic, computed at
         // gateway submit time from the parsed `.drv`).
         //
@@ -1439,10 +1441,10 @@ impl DagActor {
             let Some(child) = self.dag.node(&child_hash) else {
                 continue;
             };
-            if !child.is_ca {
+            if !child.ca.is_ca {
                 continue;
             }
-            let Some(modular_hash) = child.ca_modular_hash else {
+            let Some(modular_hash) = child.ca.modular_hash else {
                 // Gateway didn't populate (BasicDerivation fallback
                 // OR recovered state). Skip — resolve is incomplete
                 // for this input, worker fails on placeholder,
@@ -1493,7 +1495,7 @@ impl DagActor {
             let Some(child) = self.dag.node(&child_hash) else {
                 continue;
             };
-            if child.is_ca {
+            if child.ca.is_ca {
                 // CA child with a modular hash — handled by
                 // collect_ca_inputs via realisation lookup. But a CA
                 // child WITHOUT a modular hash (recovered state,
@@ -1501,7 +1503,7 @@ impl DagActor {
                 // still contribute its realized output_paths here:
                 // the resolve doesn't need the realisation table when
                 // we already have the concrete path in-memory.
-                if child.ca_modular_hash.is_some() || child.output_paths.is_empty() {
+                if child.ca.modular_hash.is_some() || child.output_paths.is_empty() {
                     continue;
                 }
                 // Fall through: CA child, no modular hash, but
