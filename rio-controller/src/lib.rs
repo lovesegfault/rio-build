@@ -41,17 +41,11 @@
 //! submission is via SSH (`nix build --store ssh-ng://`) — no
 //! K8s-native submission CRD.
 
-// CRD types live in rio-crds (extracted so rio-cli can use them
-// without pulling the full reconciler stack). Re-exported as `crds`
-// so existing `crate::crds::builderpool::...` paths still work.
-pub use rio_crds as crds;
 pub mod error;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod reconcilers;
 pub mod scaling;
-
-pub use crds::builderpool::{BuilderPool, BuilderPoolSpec, BuilderPoolStatus};
 
 /// Register `# HELP` descriptions for all controller metrics.
 ///

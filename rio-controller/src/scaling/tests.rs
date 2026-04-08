@@ -2,8 +2,8 @@
 //! and the `is_wps_owned_by` ownership predicate.
 
 use super::*;
-use crate::crds::builderpool::BuilderPool;
-use crate::crds::builderpoolset::BuilderPoolSet;
+use rio_crds::builderpool::BuilderPool;
+use rio_crds::builderpoolset::BuilderPoolSet;
 
 #[test]
 fn queued_for_systems_filters_by_pool_systems() {
@@ -263,8 +263,8 @@ fn class_queued_for_pool_feature_aware() {
 // ---- is_wps_owned_by ----
 
 fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> BuilderPoolSet {
-    use crate::crds::builderpoolset::{BuilderPoolSetSpec, PoolTemplate, SizeClassSpec};
     use k8s_openapi::api::core::v1::ResourceRequirements;
+    use rio_crds::builderpoolset::{BuilderPoolSetSpec, PoolTemplate, SizeClassSpec};
     let classes = class_names
         .iter()
         .map(|n| SizeClassSpec {

@@ -12,9 +12,6 @@ description = "CustomResourceDefinition types for rio-build (BuilderPool, Builde
 # depend on them without pulling the full reconciler stack (~500
 # transitive deps via kube-runtime). This crate is type-definitions
 # only — no reconcile logic, no kube::Client, no tokio runtime.
-#
-# rio-controller re-exports this crate as `pub use rio_crds as crds;`
-# so existing `use rio_controller::crds::...` paths still work.
 
 [dependencies]
 # `derive` feature only — CustomResource + KubeSchema proc-macros.

@@ -25,12 +25,12 @@ use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, ResourceExt};
 use tracing::{debug, instrument, warn};
 
-use crate::crds::componentscaler::{
-    ComponentScaler, ComponentScalerSpec, ComponentScalerStatus, Signal,
-};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::{Ctx, error_key};
 use crate::scaling::component::{self, Decision};
+use rio_crds::componentscaler::{
+    ComponentScaler, ComponentScalerSpec, ComponentScalerStatus, Signal,
+};
 
 /// Reconcile interval. 10s: fast enough that scale-up beats the
 /// I-105 cliff (a 200-builder burst takes ~30s from queued to all-

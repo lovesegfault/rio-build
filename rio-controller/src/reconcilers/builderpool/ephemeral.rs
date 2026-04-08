@@ -60,10 +60,10 @@ use kube::api::{ListParams, ObjectMeta};
 use kube::runtime::controller::Action;
 use tracing::{debug, info, warn};
 
-use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 use crate::reconcilers::common::pod::{self, ExecutorRole};
+use rio_crds::builderpool::BuilderPool;
 
 use super::builders::{self, SchedulerAddrs, StoreAddrs};
 use super::job_common::{
@@ -127,7 +127,7 @@ pub(crate) const DEADLINE_MULTIPLIER: i64 = 5;
 /// kills the pod immediately; clamp to 1s so the misconfiguration is
 /// at least observable (pod starts, then dies) rather than a silent
 /// no-op spawn loop.
-fn ephemeral_deadline(spec: &crate::crds::builderpool::BuilderPoolSpec) -> i64 {
+fn ephemeral_deadline(spec: &rio_crds::builderpool::BuilderPoolSpec) -> i64 {
     if let Some(explicit) = spec.deadline_seconds {
         return i64::from(explicit);
     }

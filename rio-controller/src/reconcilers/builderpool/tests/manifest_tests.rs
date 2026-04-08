@@ -19,7 +19,6 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 use rio_proto::types::{DerivationResourceEstimate, ExecutorInfo};
 
-use crate::crds::builderpool::Sizing;
 use crate::fixtures::{test_sched_addrs, test_store_addrs};
 use crate::reconcilers::builderpool::manifest::{
     Bucket, CPU_CLASS_LABEL, CRASH_LOOP_WARN_THRESHOLD, FAILED_SWEEP_MIN, FLOOR_CLASS,
@@ -28,6 +27,7 @@ use crate::reconcilers::builderpool::manifest::{
     group_by_bucket, inventory_by_bucket, parse_bucket_from_labels, select_deletable_jobs,
     select_failed_jobs, spawn_manifest_jobs, sweep_cap, truncate_plan, update_idle_and_reapable,
 };
+use rio_crds::builderpool::Sizing;
 
 use super::*;
 

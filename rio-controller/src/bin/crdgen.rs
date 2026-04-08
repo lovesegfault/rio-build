@@ -6,10 +6,10 @@
 //! Write-only here — serializes our own structs.
 
 use kube::CustomResourceExt;
-use rio_controller::crds::builderpool::BuilderPool;
-use rio_controller::crds::builderpoolset::BuilderPoolSet;
-use rio_controller::crds::componentscaler::ComponentScaler;
-use rio_controller::crds::fetcherpool::FetcherPool;
+use rio_crds::builderpool::BuilderPool;
+use rio_crds::builderpoolset::BuilderPoolSet;
+use rio_crds::componentscaler::ComponentScaler;
+use rio_crds::fetcherpool::FetcherPool;
 
 fn main() {
     // serde_yml does NOT emit the `---` document separator

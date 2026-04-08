@@ -23,11 +23,11 @@ use kube::{Api, Client};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use rio_controller::crds::builderpool::BuilderPool;
-use rio_controller::crds::builderpoolset::BuilderPoolSet;
-use rio_controller::crds::componentscaler::ComponentScaler;
-use rio_controller::crds::fetcherpool::FetcherPool;
 use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset, componentscaler, fetcherpool};
+use rio_crds::builderpool::BuilderPool;
+use rio_crds::builderpoolset::BuilderPoolSet;
+use rio_crds::componentscaler::ComponentScaler;
+use rio_crds::fetcherpool::FetcherPool;
 
 // ----- config (figment two-struct) --------------------------------------------
 

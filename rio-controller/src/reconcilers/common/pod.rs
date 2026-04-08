@@ -17,7 +17,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use crate::crds::builderpool::SeccompProfileKind;
+use rio_crds::builderpool::SeccompProfileKind;
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the

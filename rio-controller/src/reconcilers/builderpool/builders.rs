@@ -11,8 +11,8 @@ use k8s_openapi::api::core::v1::{PodSpec, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
 
-use crate::crds::builderpool::BuilderPool;
 use crate::reconcilers::common::pod::{self, ExecutorPodParams, ExecutorRole};
+use rio_crds::builderpool::BuilderPool;
 
 // Re-exports for ephemeral.rs + tests.
 pub use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs};

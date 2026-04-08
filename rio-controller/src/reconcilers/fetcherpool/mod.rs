@@ -23,11 +23,11 @@ use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
 use tracing::{info, warn};
 
-use crate::crds::builderpool::SeccompProfileKind;
-use crate::crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::common::pod::{self, ExecutorPodParams, ExecutorRole};
 use crate::reconcilers::{Ctx, error_key};
+use rio_crds::builderpool::SeccompProfileKind;
+use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
 mod ephemeral;
 
@@ -233,7 +233,7 @@ mod tests {
     fn mk(max: u32) -> FetcherPool {
         let mut fp = FetcherPool::new(
             "test",
-            crate::crds::fetcherpool::FetcherPoolSpec {
+            rio_crds::fetcherpool::FetcherPoolSpec {
                 deadline_seconds: None,
                 max_concurrent: max,
                 image: "rio-builder:test".into(),

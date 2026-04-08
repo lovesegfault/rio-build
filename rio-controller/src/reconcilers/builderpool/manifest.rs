@@ -64,9 +64,9 @@ use rio_proto::types::{
 };
 use tracing::{debug, info, warn};
 
-use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
+use rio_crds::builderpool::BuilderPool;
 
 use super::POOL_LABEL;
 use super::builders::{self, SchedulerAddrs, StoreAddrs};

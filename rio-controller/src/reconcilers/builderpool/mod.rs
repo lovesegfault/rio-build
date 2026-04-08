@@ -33,9 +33,9 @@ use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
 use tracing::{info, warn};
 
-use crate::crds::builderpool::{BuilderPool, Sizing};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::{Ctx, error_key};
+use rio_crds::builderpool::{BuilderPool, Sizing};
 
 mod builders;
 pub mod disruption;

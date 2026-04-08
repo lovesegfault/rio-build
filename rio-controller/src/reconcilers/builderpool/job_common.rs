@@ -15,9 +15,9 @@ use kube::api::{Api, DeleteParams, PostParams};
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crds::builderpool::BuilderPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
+use rio_crds::builderpool::BuilderPool;
 
 use super::MANAGER;
 use super::builders::{SchedulerAddrs, StoreAddrs};

@@ -29,7 +29,6 @@ use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 use crate::reconcilers::builderpool::ephemeral::{EPHEMERAL_REQUEUE, JOB_TTL_SECS, spawn_count};
@@ -38,6 +37,7 @@ use crate::reconcilers::builderpool::job_common::{
     scheduler_unreachable_condition, try_spawn_job,
 };
 use crate::reconcilers::common::pod::{self, ExecutorRole, POOL_LABEL, SchedulerAddrs};
+use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
 use super::{MANAGER, executor_params};
 
@@ -405,8 +405,8 @@ mod tests {
     use kube::Resource;
 
     fn test_fp() -> FetcherPool {
-        let spec: crate::crds::fetcherpool::FetcherPoolSpec = serde_json::from_value(
-            serde_json::to_value(crate::crds::fetcherpool::FetcherPoolSpec {
+        let spec: rio_crds::fetcherpool::FetcherPoolSpec = serde_json::from_value(
+            serde_json::to_value(rio_crds::fetcherpool::FetcherPoolSpec {
                 deadline_seconds: None,
                 max_concurrent: 8,
                 image: "rio-fetcher:test".into(),

@@ -48,11 +48,11 @@ use tracing::{debug, info, warn};
 
 use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
-use crate::crds::builderpool::BuilderPool;
-use crate::crds::builderpoolset::{BuilderPoolSet, ClassStatus};
 use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::{Ctx, error_key};
 use crate::scaling::is_wps_owned_by;
+use rio_crds::builderpool::BuilderPool;
+use rio_crds::builderpoolset::{BuilderPoolSet, ClassStatus};
 
 pub(crate) mod builders;
 use builders::{build_child_builderpool, child_name};

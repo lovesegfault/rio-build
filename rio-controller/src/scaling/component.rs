@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use rio_proto::types::GetSizeClassStatusResponse;
 
-use crate::crds::componentscaler::{ComponentScalerSpec, ComponentScalerStatus, LoadThresholds};
+use rio_crds::componentscaler::{ComponentScalerSpec, ComponentScalerStatus, LoadThresholds};
 
 /// Consecutive low-load ticks before the learned ratio grows.
 /// 30 ticks × 10s = 5 minutes of sustained `< low` before we believe
@@ -209,7 +209,7 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::componentscaler::{Replicas, Signal, TargetRef};
+    use rio_crds::componentscaler::{Replicas, Signal, TargetRef};
     use rio_proto::types::SizeClassStatus;
 
     fn spec(min: i32, max: i32) -> ComponentScalerSpec {

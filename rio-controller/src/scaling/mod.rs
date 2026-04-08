@@ -6,9 +6,9 @@
 
 pub mod component;
 
-use crate::crds::builderpool::BuilderPool;
-use crate::crds::builderpoolset::BuilderPoolSet;
-use crate::crds::fetcherpool::FetcherPool;
+use rio_crds::builderpool::BuilderPool;
+use rio_crds::builderpoolset::BuilderPoolSet;
+use rio_crds::fetcherpool::FetcherPool;
 
 /// Compute `lastTransitionTime` per K8s convention: preserve the
 /// existing timestamp if `status` is unchanged, stamp now() on

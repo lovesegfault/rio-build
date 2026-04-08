@@ -6,9 +6,9 @@
 
 use kube::{Resource, ResourceExt};
 
-use crate::crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
-use crate::crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 use crate::error::{Error, Result};
+use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
+use rio_crds::builderpoolset::{BuilderPoolSet, SizeClassSpec};
 
 const DEFAULT_MAX_CONCURRENT: u32 = 10;
 
@@ -139,9 +139,9 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::crds::builderpoolset::{BuilderPoolSetSpec, PoolTemplate};
     use k8s_openapi::api::core::v1::ResourceRequirements;
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+    use rio_crds::builderpoolset::{BuilderPoolSetSpec, PoolTemplate};
 
     /// Construct a test WPS with the given class names. Each class
     /// gets a dummy (empty) ResourceRequirements — the builder
