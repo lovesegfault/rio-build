@@ -48,9 +48,8 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
     let (store_addr, _store_handle) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let (_sched, sched_addr, _sched_handle) = spawn_mock_scheduler().await?;
 
-    let mut store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
-    let mut scheduler_client =
-        rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+    let mut store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let mut scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let (response_reader, response_writer) = tokio::io::duplex(256 * 1024);
 
@@ -153,9 +152,8 @@ async fn test_golden_live_handshake() -> anyhow::Result<()> {
         .await
         .expect("daemon exchange failed");
 
-    let mut store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
-    let mut scheduler_client =
-        rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+    let mut store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let mut scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let (response_reader, response_writer) = tokio::io::duplex(256 * 1024);
     let client_data = client_bytes.clone();

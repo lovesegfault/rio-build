@@ -1,7 +1,8 @@
 //! gRPC client connection and streaming helpers.
 //!
-//! - Connection: `connect_*` build `"http(s)://{addr}"` from a `host:port`
-//!   string, apply the process-global TLS config (see
+//! - Connection: [`connect_single`] / [`connect`] build
+//!   `"http(s)://{addr}"` from a `host:port` string, apply the
+//!   process-global TLS config (see
 //!   [`rio_common::grpc::init_client_tls`]), connect, and apply
 //!   [`max_message_size`].
 //! - NAR streaming: [`collect_nar_stream`] drains `GetPath` responses;
@@ -51,7 +52,7 @@ pub const NAR_CHUNK_SIZE: usize = 256 * 1024;
 /// (e.g., scheduler pod killed → replacement has new IP, but DNS TTL /
 /// caller's cached addr hasn't updated) hangs forever on TCP SYN.
 /// Observed in lifecycle test: controller's cleanup() never logged
-/// "starting drain" — stuck in connect_admin after the scheduler
+/// "starting drain" — stuck in the admin connect after the scheduler
 /// leader was killed mid-run. 10s is enough for a real connect
 /// (even cross-AZ) and bounds the failure mode.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -100,7 +101,16 @@ pub(crate) fn with_h2_throughput(ep: tonic::transport::Endpoint) -> tonic::trans
         .initial_connection_window_size(Some(H2_INITIAL_CONN_WINDOW))
 }
 
-pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
+/// Build an `Endpoint` for `host:port`: scheme-select from
+/// [`client_tls`], `from_shared`, [`CONNECT_TIMEOUT`], conditional
+/// `tls_config`. Callers layer their own `with_h2_*` tuning and
+/// connect mode (eager vs lazy) on top.
+///
+/// Shared by [`connect_channel`] (eager + throughput-only) and
+/// [`connect_store_lazy`] (lazy + keepalive) — the endpoint
+/// construction is identical, only the h2 wrapper and connect call
+/// differ.
+fn build_endpoint(addr: &str) -> anyhow::Result<tonic::transport::Endpoint> {
     // `client_tls()` collapses both "OnceLock not initialized" and
     // "initialized with None" to plaintext. Tests that never call
     // init_client_tls stay plaintext.
@@ -108,13 +118,19 @@ pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
         Some(tls) => ("https", Some(tls)),
         None => ("http", None),
     };
-    let mut ep = with_h2_throughput(
-        Channel::from_shared(format!("{scheme}://{addr}"))?.connect_timeout(CONNECT_TIMEOUT),
-    );
+    let mut ep =
+        Channel::from_shared(format!("{scheme}://{addr}"))?.connect_timeout(CONNECT_TIMEOUT);
     if let Some(tls) = tls {
         ep = ep.tls_config(tls)?;
     }
-    ep.connect().await.map_err(Into::into)
+    Ok(ep)
+}
+
+pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
+    with_h2_throughput(build_endpoint(addr)?)
+        .connect()
+        .await
+        .map_err(Into::into)
 }
 
 // ===========================================================================
@@ -127,9 +143,10 @@ pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
 /// [`BalancedChannel`] probes) and the TLS-domain override (cert SAN —
 /// what the balanced channel verifies pod-IP connections against).
 ///
-/// Collapses the previous 9 near-identical `connect_X` /
+/// Collapses what was previously 9 near-identical `connect_X` /
 /// `connect_X_balanced` wrappers (each varying only in client type +
-/// these two strings) to one generic + 6 small impls. The
+/// these two strings) to two generics ([`connect_single`] /
+/// [`connect`]) + small per-client impls. The
 /// `max_{en,de}coding_message_size` pair is applied ONCE in
 /// [`ProtoClient::wrap`], so per-binary connect blocks can't drift on
 /// where it's set.
@@ -254,20 +271,9 @@ pub async fn connect_raw<C: ProtoClient>(
     }
 }
 
-// --- Named wrappers (single-channel) ---------------------------------------
-//
-// One-liners over `connect_single::<X>`. Kept so the ~20 test call
-// sites (`connect_store(&addr.to_string())`, etc.) and ad-hoc callers
-// (rio-cli, gc_schedule, run_drain) don't need turbofish noise.
-
-/// Connect to the store service.
-pub async fn connect_store(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
-    connect_single(addr).await
-}
-
 /// Lazy-connect store client with HTTP/2 keepalive.
 ///
-/// Unlike [`connect_store`], this does NOT establish a TCP connection at
+/// Unlike [`connect_single`], this does NOT establish a TCP connection at
 /// call time — the channel connects on first RPC and RE-RESOLVES DNS on
 /// each reconnect. This is the difference between "connection pinned to
 /// the pod IP that DNS resolved to at startup" (eager) and "connection
@@ -287,53 +293,8 @@ pub async fn connect_store(addr: &str) -> anyhow::Result<StoreServiceClient<Chan
 /// config — never on connection failure (that's deferred to first RPC).
 /// So callers can drop their retry loop: the channel ALWAYS constructs.
 pub fn connect_store_lazy(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
-    let (scheme, tls) = match client_tls() {
-        Some(tls) => ("https", Some(tls)),
-        None => ("http", None),
-    };
-    let mut ep = with_h2_keepalive(
-        tonic::transport::Endpoint::from_shared(format!("{scheme}://{addr}"))?
-            .connect_timeout(CONNECT_TIMEOUT),
-    );
-    if let Some(tls) = tls {
-        ep = ep.tls_config(tls)?;
-    }
-    let ch = ep.connect_lazy();
+    let ch = with_h2_keepalive(build_endpoint(addr)?).connect_lazy();
     Ok(StoreServiceClient::wrap(ch))
-}
-
-/// Connect to the scheduler service (gateway-facing).
-pub async fn connect_scheduler(
-    addr: &str,
-) -> anyhow::Result<crate::SchedulerServiceClient<Channel>> {
-    connect_single(addr).await
-}
-
-/// Connect to the executor service (builder/fetcher-facing scheduler RPCs).
-pub async fn connect_executor(addr: &str) -> anyhow::Result<crate::ExecutorServiceClient<Channel>> {
-    connect_single(addr).await
-}
-
-/// Connect to the admin service (controller + executor preStop).
-///
-/// Same address as `connect_executor` — AdminService is hosted on the
-/// scheduler's gRPC port alongside SchedulerService/ExecutorService.
-/// The executor's SIGTERM handler uses this for `DrainExecutor` (step 1
-/// of preStop); the controller uses it for `ClusterStatus` autoscaling.
-pub async fn connect_admin(addr: &str) -> anyhow::Result<crate::AdminServiceClient<Channel>> {
-    connect_single(addr).await
-}
-
-/// Connect to the store admin service (scheduler's TriggerGC proxy).
-///
-/// Same address as `connect_store` — StoreAdminService is hosted on
-/// the store's gRPC port alongside StoreService/ChunkService. The
-/// scheduler's `AdminService.TriggerGC` populates extra_roots from
-/// GcRoots and proxies here.
-pub async fn connect_store_admin(
-    addr: &str,
-) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
-    connect_single(addr).await
 }
 
 // ===========================================================================

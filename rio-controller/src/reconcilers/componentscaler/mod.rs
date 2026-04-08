@@ -197,7 +197,7 @@ async fn poll_max_load(endpoint: &str) -> Option<f64> {
 
     let mut max: Option<f64> = None;
     for addr in addrs {
-        // `connect_store_admin_at` (not `connect_store_admin`): the
+        // `connect_store_admin_at` (not `connect_single`): the
         // per-pod connect must override the TLS-verify domain to
         // `rio-store` (the cert's SAN), since we dial a pod IP. The
         // plain helper would SAN-check against the IP and fail under

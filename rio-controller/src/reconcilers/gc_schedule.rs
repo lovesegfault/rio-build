@@ -9,7 +9,7 @@
 //!
 //! tonic has NO default connect timeout. A held channel whose
 //! backing pod died (stale endpoint IP) hangs on the NEXT RPC's
-//! lazy-reconnect SYN forever. `connect_store_admin` sets a 10s
+//! lazy-reconnect SYN forever. `connect_single` sets a 10s
 //! `connect_timeout` on the Channel builder — but that only guards
 //! the INITIAL eager connect, not reconnects.
 //!
@@ -41,7 +41,7 @@ use tracing::{info, warn};
 
 use rio_proto::types::{GcProgress, GcRequest};
 
-/// Connect timeout wrapping [`rio_proto::client::connect_store_admin`].
+/// Connect timeout wrapping [`rio_proto::client::connect_single`].
 /// See module doc for why this is separate from the channel builder's
 /// own `connect_timeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -161,12 +161,13 @@ pub(crate) async fn run_loop<F, Fut>(
 /// manifests + grace window + scheduler_live_pins + tenant
 /// retention) are sufficient.
 async fn tick_once(store_addr: &str) -> TickResult {
-    // Connect with timeout. The inner connect_store_admin has a
-    // 10s connect_timeout on the Channel builder, but wrap again:
+    // Connect with timeout. The inner connect_single has a 10s
+    // connect_timeout on the Channel builder, but wrap again:
     // belt-and-suspenders against any code path that bypasses
     // the builder timeout (e.g. DNS resolution stalls before the
     // socket connect even starts).
-    let connect = rio_proto::client::connect_store_admin(store_addr);
+    let connect =
+        rio_proto::client::connect_single::<rio_proto::StoreAdminServiceClient<_>>(store_addr);
     let mut client = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {

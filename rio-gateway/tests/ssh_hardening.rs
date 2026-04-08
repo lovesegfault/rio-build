@@ -98,8 +98,8 @@ async fn test_handle_session_error_increments_metric() -> anyhow::Result<()> {
     // them), but GatewayServer::new wants them.
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
-    let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
-    let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let mut server = GatewayServer::new(store_client, scheduler_client, vec![]);
 
@@ -145,8 +145,8 @@ async fn spawn_ssh_server() -> anyhow::Result<(SocketAddr, PrivateKey, tokio::ta
 {
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
-    let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
-    let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
     let client_pub = client_key.public_key().clone();
@@ -293,8 +293,8 @@ async fn spawn_ssh_server_watching(
 )> {
     let (_store, store_addr, _sh) = spawn_mock_store().await?;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
-    let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
-    let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     let initial = rio_gateway::load_authorized_keys(&path)?;
 

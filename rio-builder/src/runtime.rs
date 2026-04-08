@@ -1534,7 +1534,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     // follows (process exit drops the bidi) triggers
     // ExecutorDisconnected anyway.
     //
-    // I-142: 5s hard timeout. run_drain's connect_admin + RPC have no
+    // I-142: 5s hard timeout. run_drain's connect + RPC have no
     // built-in timeout; an overloaded scheduler stalls this and the
     // process never reaches drop(fuse_session) below. Best-effort
     // means best-effort — log and move on.
@@ -1791,7 +1791,9 @@ async fn run_drain(scheduler_addr: &str, executor_id: &str) {
     // Still best-effort: two standby picks in a row falls through to
     // the warn path; heartbeat already reported draining either way.
     for attempt in 0..2 {
-        match rio_proto::client::connect_admin(scheduler_addr).await {
+        match rio_proto::client::connect_single::<rio_proto::AdminServiceClient<_>>(scheduler_addr)
+            .await
+        {
             Ok(mut admin) => {
                 match admin
                     .drain_executor(rio_proto::types::DrainExecutorRequest {

@@ -95,7 +95,7 @@ impl RioStack {
         let (store_client, store_handle) = spawn_store_service(service).await?;
         let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
-        let sched_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+        let sched_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
         // Functional tests don't exercise the shutdown-signal or tenant
         // paths — those are wire_opcodes concerns. Never-cancelled token,

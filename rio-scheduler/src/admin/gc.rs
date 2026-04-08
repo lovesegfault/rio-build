@@ -93,10 +93,11 @@ pub(super) async fn trigger_gc(
     );
 
     // Step 2: connect to store admin service. Same TLS config
-    // as connect_store (OnceLock rio_common::grpc::CLIENT_TLS).
-    let mut store_admin = rio_proto::client::connect_store_admin(store_addr)
-        .await
-        .status_unavailable("store admin connect failed")?;
+    // as connect_single (OnceLock rio_common::grpc::CLIENT_TLS).
+    let mut store_admin: rio_proto::StoreAdminServiceClient<_> =
+        rio_proto::client::connect_single(store_addr)
+            .await
+            .status_unavailable("store admin connect failed")?;
 
     // Step 3: proxy the call. The store's stream becomes OUR
     // stream — we wrap it in a forwarding task. inject_current

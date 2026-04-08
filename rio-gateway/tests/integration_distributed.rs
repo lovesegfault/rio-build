@@ -291,8 +291,8 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
     // Real gRPC mocks on ephemeral TCP. Setup completes before pause().
     let (_store, store_addr, store_handle) = spawn_mock_store().await?;
     let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
-    let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
-    let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+    let store_client = rio_proto::client::connect_single(&store_addr.to_string()).await?;
+    let scheduler_client = rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
     // Build SessionContext directly and seed the map. This is the
     // entire point of the run_protocol_loop seam — run_protocol

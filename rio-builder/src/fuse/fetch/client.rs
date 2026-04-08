@@ -27,7 +27,7 @@ pub struct StoreClients {
 impl StoreClients {
     /// Wrap both clients over a single `Channel`. Sets the same
     /// max-message-size on both (chunks are ≤1 MiB but the headroom
-    /// matches `connect_store`'s convention).
+    /// matches `connect_single`'s convention).
     pub fn from_channel(ch: Channel) -> Self {
         let max = rio_common::grpc::max_message_size();
         Self {

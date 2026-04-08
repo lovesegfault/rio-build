@@ -5,7 +5,7 @@
 //! [`check_bound`], the `CLIENT_TLS` OnceLock, [`max_message_size`], h2
 //! tuning, the shared retry predicate, backoff/jitter, `x-rio-*` metadata
 //! key constants. Anything that names a generated client or message type
-//! (`connect_store`, `BalancedChannel`, NAR stream chunk/collect) belongs
+//! (`connect_single`, `BalancedChannel`, NAR stream chunk/collect) belongs
 //! in `rio-proto::client`. `rio-proto` depends on this crate, not the
 //! other way round, so `rio-controller` can take a backoff helper without
 //! pulling in the whole proto crate.

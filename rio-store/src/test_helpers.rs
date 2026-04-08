@@ -42,7 +42,7 @@ use crate::grpc::StoreServiceImpl;
 /// `rio-store/tests/grpc/`, `rio-gateway/tests/functional/`, and
 /// `rio-scheduler/src/actor/tests/integration.rs`.
 ///
-/// Uses [`rio_proto::client::connect_store`] (which sets
+/// Uses [`rio_proto::client::connect_single`] (which sets
 /// `max_decoding_message_size`) so large-NAR tests don't hit tonic's
 /// 4 MiB default. Tests that don't init `client_tls()` get plaintext.
 pub async fn spawn_store_service(
@@ -50,7 +50,7 @@ pub async fn spawn_store_service(
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
     let router = Server::builder().add_service(StoreServiceServer::new(service));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
-    let client = rio_proto::client::connect_store(&addr.to_string()).await?;
+    let client = rio_proto::client::connect_single(&addr.to_string()).await?;
     Ok((client, server))
 }
 

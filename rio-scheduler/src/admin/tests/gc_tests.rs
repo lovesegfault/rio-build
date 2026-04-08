@@ -7,7 +7,7 @@ use super::*;
 
 /// TriggerGC with store unreachable → Status::Unavailable.
 /// The store_addr in setup_svc is `127.0.0.1:1` which never listens
-/// → connect_store_admin fails → UNAVAILABLE. Not UNIMPLEMENTED —
+/// → store-admin connect fails → UNAVAILABLE. Not UNIMPLEMENTED —
 /// the RPC IS implemented, just the downstream dependency is down.
 /// Client should retry.
 #[tokio::test]

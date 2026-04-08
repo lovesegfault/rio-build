@@ -129,7 +129,7 @@ pub async fn spawn_mock_store_with_client() -> anyhow::Result<(
     tokio::task::JoinHandle<()>,
 )> {
     let (store, addr, handle) = spawn_mock_store().await?;
-    let client = rio_proto::client::connect_store(&addr.to_string()).await?;
+    let client = rio_proto::client::connect_single(&addr.to_string()).await?;
     Ok((store, client, handle))
 }
 

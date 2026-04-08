@@ -88,14 +88,15 @@ async fn resolve_tenant(tenant: String, scheduler_addr: &str) -> anyhow::Result<
     if uuid::Uuid::parse_str(&tenant).is_ok() {
         return Ok(tenant);
     }
-    let mut ac = rio_proto::client::connect_admin(scheduler_addr)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "tenant '{tenant}' is not a UUID; name lookup needs scheduler at \
-                 {scheduler_addr}: {e}"
-            )
-        })?;
+    let mut ac: rio_proto::AdminServiceClient<_> =
+        rio_proto::client::connect_single(scheduler_addr)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "tenant '{tenant}' is not a UUID; name lookup needs scheduler at \
+                     {scheduler_addr}: {e}"
+                )
+            })?;
     let resp = rpc("ListTenants", async || ac.list_tenants(()).await).await?;
     resp.tenants
         .into_iter()

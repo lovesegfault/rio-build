@@ -50,9 +50,10 @@ pub(crate) async fn run_cancel(
     build_id: String,
     reason: String,
 ) -> anyhow::Result<()> {
-    let mut sched = rio_proto::client::connect_scheduler(scheduler_addr)
-        .await
-        .map_err(|e| anyhow!("connect to scheduler at {scheduler_addr}: {e}"))?;
+    let mut sched: rio_proto::SchedulerServiceClient<_> =
+        rio_proto::client::connect_single(scheduler_addr)
+            .await
+            .map_err(|e| anyhow!("connect to scheduler at {scheduler_addr}: {e}"))?;
     let req = CancelBuildRequest {
         build_id: build_id.clone(),
         reason,

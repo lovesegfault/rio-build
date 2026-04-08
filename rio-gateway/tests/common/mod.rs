@@ -150,9 +150,10 @@ impl GatewaySession {
         let (store, store_addr, store_handle) = spawn_mock_store().await?;
         let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
-        let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
-        let scheduler_client =
-            rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
+        let store_client: StoreServiceClient<Channel> =
+            rio_proto::client::connect_single(&store_addr.to_string()).await?;
+        let scheduler_client: SchedulerServiceClient<Channel> =
+            rio_proto::client::connect_single(&sched_addr.to_string()).await?;
 
         // Normalize at the test boundary — same path as production
         // (auth_publickey does the same from_maybe_empty on the

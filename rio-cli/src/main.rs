@@ -51,7 +51,7 @@ mod workers;
 /// `InspectBuildDag` and other actor-routed admin RPCs still queue,
 /// and the operator needs the dump precisely when the actor is busy.
 ///
-/// `connect_admin` already has a 10s CONNECT timeout (rio-proto
+/// `connect_single` already has a 10s CONNECT timeout (rio-proto
 /// client/mod.rs CONNECT_TIMEOUT) — that bounds TCP SYN / handshake.
 /// This bounds the RPC itself (scheduler accepted the connection but
 /// the handler is blocked on something).
@@ -147,7 +147,7 @@ impl Config {
     /// `?`s on an unreachable scheduler — `rio-cli bps describe` must
     /// work when the scheduler is down (e.g., to diagnose why).
     async fn connect_admin(&self) -> anyhow::Result<AdminServiceClient<Channel>> {
-        rio_proto::client::connect_admin(&self.scheduler_addr)
+        rio_proto::client::connect_single(&self.scheduler_addr)
             .await
             .map_err(|e| anyhow!("connect to scheduler at {}: {e}", self.scheduler_addr))
     }
@@ -156,7 +156,7 @@ impl Config {
     /// `verify-chunks` need this; called per-arm so scheduler-only
     /// subcommands don't fail on an unreachable store.
     async fn connect_store_admin(&self) -> anyhow::Result<StoreAdminServiceClient<Channel>> {
-        rio_proto::client::connect_store_admin(&self.store_addr)
+        rio_proto::client::connect_single(&self.store_addr)
             .await
             .map_err(|e| anyhow!("connect to store at {}: {e}", self.store_addr))
     }
