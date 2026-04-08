@@ -164,10 +164,6 @@ impl Ctx {
         transient_backoff(*n)
     }
 
-    /// Reset the consecutive-error count for an object. Called on
-    /// successful reconcile so the next failure starts the backoff
-    /// curve from zero (not from where the last failure streak
-    /// left off).
     // r[impl ctrl.cache.size-class-status]
     /// `GetSizeClassStatus` with a 5s TTL cache. See the
     /// `size_class_cache` field doc for rationale.
@@ -206,6 +202,10 @@ impl Ctx {
         Ok(resp)
     }
 
+    /// Reset the consecutive-error count for an object. Called on
+    /// successful reconcile so the next failure starts the backoff
+    /// curve from zero (not from where the last failure streak
+    /// left off).
     pub fn reset_error_count(&self, key: &str) {
         self.error_counts.lock().remove(key);
     }
