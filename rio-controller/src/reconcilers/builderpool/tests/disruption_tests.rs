@@ -3,9 +3,8 @@
 //! Two distinct clusters that share the mock-apiserver fixtures:
 //!
 //! - figment::Jail env-propagation tests — prove
-//!   `build_executor_pod_spec` injects `LLVM_PROFILE_FILE`/
-//!   `RUST_LOG` from the controller's own env (coverage-mode
-//!   passthrough)
+//!   `build_statefulset` injects `LLVM_PROFILE_FILE`/`RUST_LOG`
+//!   from the controller's own env (coverage-mode passthrough)
 //! - P0365's `warn_on_spec_degrades` event-reason tests — prove the
 //!   helper fires BEFORE the ephemeral early-return in `apply()`
 //!
@@ -255,29 +254,6 @@ async fn warn_fires_for_ephemeral_with_host_network() {
     apply(Arc::new(wp), &ctx)
         .await
         .expect("apply completes (reconcile_ephemeral path)");
-
-    guard.verified().await;
-}
-
-/// Non-regression: the hostNetwork warning fires after the helper
-/// extraction. T1 deleted the inline event block that used to live
-/// at the old callsite; prove the helper restores coverage.
-// r[verify ctrl.crd.host-users-network-exclusive]
-#[tokio::test]
-async fn warn_fires_for_sts_mode_with_host_network() {
-    let (client, verifier) = ApiServerVerifier::new();
-    let ctx = test_ctx(client);
-
-    let mut wp = test_wp();
-    wp.spec.host_network = Some(true);
-    wp.spec.privileged = None;
-
-    // Event POST first, then the full apply() call chain.
-    let mut scenarios = vec![event_post_scenario(REASON_HOST_USERS_SUPPRESSED)];
-    scenarios.extend(ephemeral_reconcile_scenarios());
-    let guard = verifier.run(scenarios);
-
-    apply(Arc::new(wp), &ctx).await.expect("apply completes");
 
     guard.verified().await;
 }
