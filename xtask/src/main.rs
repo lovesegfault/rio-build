@@ -46,7 +46,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Regenerate derived files (sqlx cache, CRDs, grafana, Cargo.json).
+    /// Regenerate derived files (sqlx cache, CRDs, Cargo.json).
     /// With no subcommand, runs all regenerators in sequence.
     Regen {
         #[command(subcommand)]
