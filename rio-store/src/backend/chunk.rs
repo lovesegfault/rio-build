@@ -285,6 +285,7 @@ impl ChunkBackend for MemoryChunkBackend {
 /// Layout: `{base_dir}/chunks/{aa}/{blake3-hex}`. The two-level dir
 /// structure matches the S3 key scheme (so switching backends doesn't
 /// surprise operators) and keeps per-directory file counts reasonable.
+// r[impl store.backend.filesystem]
 pub struct FilesystemChunkBackend {
     base_dir: PathBuf,
 }
@@ -730,6 +731,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    // r[verify store.backend.filesystem]
     fn fs_precreates_subdirs() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let _backend = FilesystemChunkBackend::new(dir.path())?;

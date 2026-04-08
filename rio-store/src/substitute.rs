@@ -196,6 +196,7 @@ impl Substituter {
             chunk_backend,
             http,
             signer: None,
+            // r[impl store.substitute.singleflight]
             // Short TTL + small cap: this is a singleflight coalescer,
             // not a PathInfo cache. The narinfo table IS the cache.
             // 30s is long enough to coalesce a burst of GetPaths for

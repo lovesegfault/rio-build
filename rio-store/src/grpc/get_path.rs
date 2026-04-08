@@ -100,6 +100,7 @@ impl StoreServiceImpl {
 
         validate_store_path(&req.store_path)?;
 
+        // r[impl store.get.manifest-hint]
         // I-110c: client-supplied (PathInfo, manifest) — skip both PG
         // lookups. The whole-NAR SHA-256 verify (step 4) checks the
         // reassembled bytes against `hint.info.nar_hash`, so a

@@ -192,6 +192,7 @@ pub async fn run_gc(
         warn!(error = %e, "GC: pool acquire for advisory lock failed");
         Status::internal(format!("pool acquire: {e}"))
     })?;
+    // r[impl store.gc.serialize-lock]
     let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(GC_LOCK_ID)
         .fetch_one(&mut *lock_conn)
@@ -299,6 +300,7 @@ pub async fn run_gc(
     .await
     {
         Ok(s) => s,
+        // r[impl store.gc.shutdown-abort]
         Err(sweep::SweepAbort::Shutdown) => {
             info!("GC: sweep aborted by shutdown signal");
             gc_unlock(lock_conn).await;

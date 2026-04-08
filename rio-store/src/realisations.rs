@@ -49,6 +49,7 @@ pub struct Realisation {
 /// Returns `true` if a row was inserted, `false` if it already existed.
 /// The caller doesn't usually care — both are success — but tests can
 /// use the distinction.
+// r[impl store.realisation.register]
 #[instrument(skip(pool, r), fields(drv_hash = hex::encode(r.drv_hash), output = %r.output_name))]
 pub async fn insert(pool: &PgPool, r: &Realisation) -> Result<bool, MetadataError> {
     let result = sqlx::query(
@@ -77,6 +78,7 @@ pub async fn insert(pool: &PgPool, r: &Realisation) -> Result<bool, MetadataErro
 /// registered) before — a cache miss, not an error. The gRPC layer
 /// maps this to NOT_FOUND; the gateway maps NOT_FOUND to an empty-set
 /// wire response.
+// r[impl store.realisation.query]
 #[instrument(skip(pool), fields(drv_hash = hex::encode(drv_hash), output = %output_name))]
 pub async fn query(
     pool: &PgPool,

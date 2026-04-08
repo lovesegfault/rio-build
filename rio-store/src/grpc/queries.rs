@@ -69,6 +69,7 @@ impl StoreServiceImpl {
     /// round-trips, defeating the batch). Callers needing those use
     /// `query_path_info`. The builder (the only current caller) sends
     /// no tenant token, so neither would apply anyway.
+    // r[impl store.api.batch-query]
     pub(super) async fn batch_query_path_info_impl(
         &self,
         request: Request<BatchQueryPathInfoRequest>,
@@ -106,6 +107,7 @@ impl StoreServiceImpl {
     /// I-110c: builder FUSE-warm prefetch. Local-only — same caveats as
     /// `batch_query_path_info` (no upstream substitution, no
     /// sig-visibility gate).
+    // r[impl store.api.batch-manifest]
     pub(super) async fn batch_get_manifest_impl(
         &self,
         request: Request<BatchGetManifestRequest>,
@@ -209,6 +211,7 @@ impl StoreServiceImpl {
     }
 
     /// Resolve a store path from its 32-char nixbase32 hash part.
+    // r[impl store.api.hash-part]
     pub(super) async fn query_path_from_hash_part_impl(
         &self,
         request: Request<QueryPathFromHashPartRequest>,
@@ -253,6 +256,7 @@ impl StoreServiceImpl {
     }
 
     /// Append signatures to an existing store path.
+    // r[impl store.api.add-signatures]
     pub(super) async fn add_signatures_impl(
         &self,
         request: Request<AddSignaturesRequest>,
@@ -292,6 +296,7 @@ impl StoreServiceImpl {
     }
 
     /// Register a CA derivation realisation.
+    // r[impl store.realisation.register]
     pub(super) async fn register_realisation_impl(
         &self,
         request: Request<RegisterRealisationRequest>,
@@ -350,6 +355,7 @@ impl StoreServiceImpl {
     }
 
     /// Look up a CA derivation realisation.
+    // r[impl store.realisation.query]
     pub(super) async fn query_realisation_impl(
         &self,
         request: Request<QueryRealisationRequest>,

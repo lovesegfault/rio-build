@@ -112,6 +112,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// CTE handles this gracefully (unnest of non-existent path
     /// = 0 rows, the root itself stays in reachable).
     ///
+    /// r[impl store.gc.dry-run]
     /// `dry_run`: compute stats, ROLLBACK sweep tx. Operator sees
     /// "would delete N paths, free M bytes" without committing.
     #[instrument(skip(self, request), fields(rpc = "TriggerGC"))]
@@ -210,6 +211,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// Read-only. No `--repair`: deleting the PG row would be the
     /// wrong move if the object is recoverable (backup, manual
     /// re-upload). The operator decides.
+    // r[impl store.admin.verify-chunks]
     #[instrument(skip(self, request), fields(rpc = "VerifyChunks"))]
     async fn verify_chunks(
         &self,
@@ -370,6 +372,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     // ────────────────────────────────────────────────────────────────
     // Upstream CRUD — per-tenant binary-cache substitution config.
     // r[impl store.substitute.upstream]
+    // r[impl store.admin.upstream-crud]
     // ────────────────────────────────────────────────────────────────
 
     #[instrument(skip(self, request), fields(rpc = "ListUpstreams"))]

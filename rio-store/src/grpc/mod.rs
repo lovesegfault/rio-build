@@ -250,6 +250,7 @@ pub struct StoreServiceImpl {
     /// NOT shared with GetPath's chunk cache — that's moka-bounded separately
     /// (chunk_cache above). This bounds ONLY the per-request accumulation
     /// Vec, which is the OOM vector: 10 × 4 GiB = 40 GiB RSS.
+    // r[impl store.put.nar-bytes-budget]
     nar_bytes_budget: Arc<tokio::sync::Semaphore>,
     /// Upstream binary-cache substituter. `None` disables substitution
     /// (QueryPathInfo/GetPath miss → NotFound immediately, pre-P0462

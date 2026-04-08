@@ -361,6 +361,7 @@ impl StoreServiceImpl {
             }
         }
 
+        // r[impl store.put.drop-cleanup]
         // I-125a: from here we own the 'uploading' placeholder. The
         // explicit `abort_upload` calls below cover every `return Err`
         // path; they do NOT cover the handler future being DROPPED —
@@ -446,6 +447,7 @@ impl StoreServiceImpl {
                     // acquire_many only errs if the semaphore is closed
                     // (never happens; budget lives for the process), so
                     // we map to resource_exhausted defensively.
+                    // r[impl store.put.nar-bytes-budget]
                     let permit = self
                         .nar_bytes_budget
                         .acquire_many(chunk.len() as u32)
@@ -763,6 +765,7 @@ mod tests {
     /// `acquire_many(chunk.len())` before `extend_from_slice`, with
     /// permits held in a Vec that drops on handler exit.
     #[tokio::test]
+    // r[verify store.put.nar-bytes-budget]
     async fn nar_budget_backpressures_then_releases() {
         use rio_test_support::TestDb;
         use std::time::Duration;

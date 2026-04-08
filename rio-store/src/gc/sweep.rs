@@ -378,6 +378,7 @@ pub async fn sweep(
                 continue;
             }
 
+            // r[impl store.realisation.gc-sweep]
             // Step 2a: DELETE realisations for this path. NOT via
             // CASCADE — realisations has NO FK to narinfo (002_
             // store.sql:134). Without this explicit DELETE, dangling
@@ -700,6 +701,7 @@ mod tests {
     /// realisations has NO FK to narinfo (002_store.sql:134); without
     /// the explicit DELETE, dangling rows → wopQueryRealisation returns
     /// a path that 404s on fetch.
+    // r[verify store.realisation.gc-sweep]
     #[tokio::test]
     async fn sweep_deletes_realisations() {
         let db = TestDb::new(&crate::MIGRATOR).await;

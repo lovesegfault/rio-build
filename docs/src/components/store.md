@@ -69,8 +69,11 @@ Each manifest is stored as a single PostgreSQL row with a `bytea` column contain
 - **S3 key schema:** `chunks/{first-2-hex-chars}/{full-blake3-hex}` (prefix-partitioned to avoid S3 hotspots)
 - Chunks are stored uncompressed in S3 to maximize dedup across packages
 - NAR streams are compressed on-the-fly (zstd) when serving via the binary cache HTTP endpoint
-- Dedup during `PutPath` uses a `refcount == 1` heuristic: after the refcount UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload and need to go to S3; chunks with refcount > 1 already existed. This has a small TOCTOU window (two concurrent uploaders of the same chunk may both skip upload), but the race is harmless — `GetPath` BLAKE3-verifies every chunk and surfaces `NotFound` as a clear error, not silent corruption. A separate `FindMissingChunks` gRPC batch-query exists for external callers (e.g., worker-side pre-upload checks).
+- Dedup during `PutPath` uses a `refcount == 1` heuristic: after the refcount UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload and need to go to S3; chunks with refcount > 1 already existed. This has a small TOCTOU window (two concurrent uploaders of the same chunk may both skip upload), but the race is harmless — `GetPath` BLAKE3-verifies every chunk and surfaces `NotFound` as a clear error, not silent corruption. A separate `FindMissingChunks` gRPC batch-query exists for external callers (e.g., executor-side pre-upload checks).
 - **S3 backend requirements:** Strong read-after-write consistency is required. AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph RADOS GW) must be validated for consistency.
+
+r[store.backend.filesystem]
+For dev/single-node deployments, `FilesystemChunkBackend` stores chunks on local disk under `{base_dir}/chunks/{aa}/{full-blake3-hex}` --- the same two-hex-prefix fanout as the S3 key schema (so switching backends doesn't surprise operators, and per-directory file counts stay bounded). All 256 `{aa}/` subdirs are pre-created at construction (~256 mkdir calls, ~1ms) so `put()` never check-then-mkdirs on the hot path. Writes are crash-safe via temp + `fsync` + `rename` + parent-dir-`fsync`: a crash between `put()` returning and `complete_manifest()` committing must not leave the manifest claiming a chunk that's zero-length or absent. The temp file goes in the same `{aa}/` subdir (rename atomicity needs same filesystem) with a random suffix so concurrent puts of the same content-addressed chunk don't race on the same temp name.
 
 ## Chunk Lifecycle
 
@@ -94,10 +97,10 @@ r[store.chunk.put-standalone]
 The `PutChunk` RPC MUST accept chunks independent of any NAR manifest. A chunk with no manifest reference is held for the grace-TTL before GC eligibility. (Sibling to `r[store.chunk.refcount-txn]`.)
 
 r[store.chunk.grace-ttl]
-Chunks with zero manifest references AND `created_at < now() - grace_seconds` are GC-eligible. The grace period prevents a race where a worker's `PutChunk` arrives before its `PutPath` manifest. (Sibling to `r[store.chunk.refcount-txn]`.)
+Chunks with zero manifest references AND `created_at < now() - grace_seconds` are GC-eligible. The grace period prevents a race where an executor's `PutChunk` arrives before its `PutPath` manifest. (Sibling to `r[store.chunk.refcount-txn]`.)
 
 r[store.chunk.tenant-scoped]
-`FindMissingChunks` is tenant-scoped via the `chunk_tenants` junction: a chunk is reported present to tenant X IFF a `(blake3_hash, tenant_id=X)` row exists. GC MUST delete junction rows in the same transaction as chunk soft-delete (the `chunks.blake3_hash` FK has `ON DELETE CASCADE`, but chunks are soft-deleted — `UPDATE SET deleted=TRUE`, never `DELETE` — so CASCADE never fires). A stale junction row for a tombstoned chunk would report false-present, causing the worker to skip `PutChunk` for a chunk whose S3 object is already deleted.
+`FindMissingChunks` is tenant-scoped via the `chunk_tenants` junction: a chunk is reported present to tenant X IFF a `(blake3_hash, tenant_id=X)` row exists. GC MUST delete junction rows in the same transaction as chunk soft-delete (the `chunks.blake3_hash` FK has `ON DELETE CASCADE`, but chunks are soft-deleted — `UPDATE SET deleted=TRUE`, never `DELETE` — so CASCADE never fires). A stale junction row for a tombstoned chunk would report false-present, causing the executor to skip `PutChunk` for a chunk whose S3 object is already deleted.
 
 **Refcount decrement:** In the same PostgreSQL transaction that deletes a manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of unreachable `'complete'` manifests). Uses `UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)` — atomic batch decrement.
 
@@ -110,8 +113,27 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 | `PutPath(narinfo, nar_stream)` | Chunk the NAR, verify NAR hash, deduplicate chunks, store metadata |
 | `GetPath(store_path)` | Return narinfo + reconstruct NAR from verified chunks |
 | `QueryPathInfo(store_path)` | Return narinfo only |
+| `BatchQueryPathInfo(paths)` | Batch narinfo lookup, one PG round-trip (`r[store.api.batch-query]`) |
+| `BatchGetManifest(paths)` | Batch (narinfo, manifest) lookup, ≤2 PG round-trips (`r[store.api.batch-manifest]`) |
 | `FindMissingPaths(paths)` | Batch validity check (like REAPI's FindMissingBlobs) |
+| `QueryPathFromHashPart(hash_part)` | Resolve full store path from 32-char nixbase32 hash prefix (`r[store.api.hash-part]`) |
+| `AddSignatures(store_path, sigs)` | Append ed25519 signatures to existing narinfo (`r[store.api.add-signatures]`) |
+| `RegisterRealisation` / `QueryRealisation` | CA derivation output mapping (`r[store.realisation.register]`, `r[store.realisation.query]`) |
 | `ContentLookup(content_hash)` | Find existing store path with matching content (CA cutoff) |
+
+### Batch Query RPCs
+
+r[store.api.batch-query]
+`BatchQueryPathInfo` returns `(store_path, Option<PathInfo>)` for many paths in ONE PostgreSQL round-trip. Local-only --- it does NOT trigger upstream substitution and does NOT apply the cross-tenant signature-visibility gate (both add per-path round-trips, defeating the batch). The request is bounded by `max_batch_paths` (default `DEFAULT_MAX_BATCH_PATHS`, configurable via `RIO_MAX_BATCH_PATHS`); over-cap returns `INVALID_ARGUMENT` naming the env var. Every path is `validate_store_path`-checked before PG. I-110: builder closure-BFS (`compute_input_closure`) is the only current caller; the per-path → batch swap was the 130× scale unlock.
+
+r[store.api.batch-manifest]
+`BatchGetManifest` returns `(store_path, Option<ManifestHint>)` for many paths in ≤2 PostgreSQL round-trips (one for narinfo, one for `manifest_data`). A `ManifestHint` carries the full `PathInfo` plus either `inline_blob` or the `(blake3_hash, size)` chunk list. Same local-only / DoS-bound / validation rules as `r[store.api.batch-query]`. I-110c: the builder issues this once per build (`r[builder.warmgate.manifest-prime]`) so each subsequent `GetPath` can supply `manifest_hint` and skip both PG lookups.
+
+r[store.api.hash-part]
+`QueryPathFromHashPart` resolves a full store path from its 32-char nixbase32 hash prefix (the 20-byte `compressHash` output). The hash part MUST be exactly 32 chars and MUST decode as nixbase32 --- both checked BEFORE the PG query. The decoded bytes are discarded; the decode is purely a validator that blocks LIKE-injection (the lookup builds `'/nix/store/{hash}-%'`, and nixbase32's alphabet contains neither `%` nor `_`). Returns `NOT_FOUND` if no matching `'complete'` narinfo exists. Backs the gateway's `wopQueryPathFromHashPart`.
+
+r[store.api.add-signatures]
+`AddSignatures` appends ed25519 signature strings to an existing `'complete'` narinfo (`array_cat`, deduped). The signatures list is bounded by `MAX_SIGNATURES`. An empty list is a no-op (NOT an error --- `nix store sign` with no configured key legitimately produces it). Returns `NOT_FOUND` if the path has no `'complete'` narinfo. The store does NOT verify the signatures --- that's the consumer's job at `narinfo` read time. Backs the gateway's `wopAddSignatures`.
 
 ### Write-Ahead Manifest Pattern (PutPath flow)
 
@@ -144,6 +166,12 @@ The `'uploading'` placeholder narinfo MUST carry `references` from the instant i
 r[store.atomic.multi-output]
 Multi-output derivation registration MUST be atomic at the DB level: all output rows commit in one transaction, or none do. Blob-store writes are NOT rolled back (orphaned blobs are refcount-zero and GC-eligible on the next sweep). The bound is ≤1 NAR-size per failure.
 
+r[store.put.nar-bytes-budget]
+A process-global `tokio::sync::Semaphore` (default `8 × MAX_NAR_SIZE` = 32 GiB; configurable via `nar_buffer_budget_bytes`) bounds in-flight NAR bytes across ALL concurrent `PutPath` handlers. Each handler `acquire_many(chunk.len())` BEFORE extending its `nar_data: Vec<u8>`; permits are held in a `Vec<SemaphorePermit>` and released on handler drop (any exit path). When the budget is exhausted, the `await` backpressures the client via gRPC flow control instead of OOMing the process (10 × 4 GiB concurrent uploads = 40 GiB RSS otherwise). The per-request `MAX_NAR_SIZE` check uses `>=` so a single chunk of exactly 2³² bytes is rejected before it reaches `acquire_many(0)` and silently bypasses the budget. NOT shared with GetPath's chunk cache (moka-bounded separately).
+
+r[store.put.drop-cleanup]
+Once `PutPath` owns the `'uploading'` placeholder, it installs a `scopeguard` that, on Drop, spawns `gc::orphan::reap_one(store_path_hash)`. This covers the handler future being DROPPED --- tonic aborts the task when the client `RST_STREAM`s (builder killed mid-upload) --- which the explicit `abort_upload` calls on `return Err` paths do NOT cover. `reap_one` filters `status='uploading'` so firing after an explicit `abort_upload` is a harmless no-op; firing after `upgrade_manifest_to_chunked` correctly decrements the chunk refcounts the inline-only delete would leak. The guard is defused only on success. I-125a: pre-fix, a phantom-drained builder leaked the placeholder and the next uploader for the same path got `Aborted: concurrent PutPath` until the orphan scanner reaped it (15 min); the builder side polls for that case per `r[builder.upload.aborted-poll]`.
+
 ## NAR Reassembly
 
 r[store.nar.reassembly]
@@ -152,6 +180,9 @@ r[store.nar.reassembly]
 - In-process LRU chunk cache (configurable, default 2GB) to avoid repeated S3 round-trips for hot chunks
 - BLAKE3-verify every chunk on read (see Content Integrity Verification above)
 - Stream the reassembled NAR to the client without materializing the full NAR in memory
+
+r[store.get.manifest-hint]
+When `GetPathRequest.manifest_hint` is set with a non-null `info`, `GetPath` bypasses BOTH PG lookups (`query_path_info` and `get_manifest`) and streams directly from the supplied `(PathInfo, chunk-list-or-inline-blob)`. The hint MUST be for the requested path (`hint.info.store_path == req.store_path`, else `INVALID_ARGUMENT`) and structurally well-formed (32-byte chunk hashes, valid `PathInfo`); a hint with `info=None` falls through to PG. Safety: the post-stream whole-NAR SHA-256 verify checks the reassembled bytes against `hint.info.nar_hash`, so a stale or forged hint surfaces as `DATA_LOSS` exactly like a corrupt `manifest_data` row would; chunks are content-addressed and BLAKE3-verified in `get_verified`, so a hint cannot read chunks the client doesn't already know the hash of. I-110c: with `r[store.api.batch-manifest]` priming the builder, this collapses ~2 PG hits/input to zero on the JIT-fetch hot path.
 
 r[store.get.size-sanity-check]
 Before streaming, `GetPath` MUST verify the manifest's summed size (inline blob length, or sum of chunk sizes) equals `narinfo.nar_size`. A mismatch indicates manifest/narinfo drift — PutPath wrote inconsistent state, or the DB was manually modified. The store MUST return `DATA_LOSS` without streaming any NAR bytes. This is a fail-fast over the post-stream integrity check, which would only catch the drift after the client received (and wasted bandwidth on) a corrupt NAR.
@@ -202,7 +233,7 @@ r[store.signing.fingerprint]
 - Multi-tenant: each tenant can have their own signing key for their paths
 
 r[store.signing.empty-refs-warn]
-When signing a non-CA path with zero references, the store MUST emit a warning. Non-leaf derivations with empty references indicate the worker's reference scanner missed deps.
+When signing a non-CA path with zero references, the store MUST emit a warning. Non-leaf derivations with empty references indicate the executor's reference scanner missed deps.
 
 r[store.tenant.sign-key]
 narinfo signing MUST use the tenant's active signing key from `tenant_keys` when present, falling back to the cluster key otherwise. A tenant with its own key produces narinfo that `nix store verify --trusted-public-keys tenant:<pk>` accepts for that tenant's paths only.
@@ -224,7 +255,16 @@ The cluster signing key MAY be rotated. Prior cluster public keys MUST remain in
 r[store.key.admin-cli]
 Cluster key rotation history and per-tenant signing keys MUST be manageable via `rio-cli keys`. The CLI validates pubkey entry format (`name:base64(32-byte-ed25519-pubkey)`) before INSERT — malformed entries are rejected with a specific reason (missing separator, bad base64, wrong length, invalid curve point). Retirement sets `retired_at`, preserving the audit trail; deletion is not exposed. Manual `psql` remains possible but bypasses validation — load-time checks (`r[store.key.rotation-cluster-history]`) catch malformed rows regardless.
 
-### Realisation Signing
+### Realisations
+
+r[store.realisation.register]
+`RegisterRealisation` inserts a CA derivation realisation row `(drv_hash, output_name) → (output_path, output_hash, signatures)` into the `realisations` table. `drv_hash` is the modular derivation hash (`hashDerivationModulo`) --- it depends only on the derivation's fixed attributes, NOT on output paths, so two CA derivations with identical inputs hash the same. The insert is `ON CONFLICT (drv_hash, output_name) DO NOTHING` (idempotent --- CA derivations are deterministic, so a duplicate insert means "already knew that"). `drv_hash`/`output_hash` MUST be 32 bytes; the gRPC layer validates and converts to `[u8; 32]` at the trust boundary. Backs the gateway's `wopRegisterDrvOutput`.
+
+r[store.realisation.query]
+`QueryRealisation` returns the realisation row for `(drv_hash, output_name)`, or `NOT_FOUND` if no row exists. `NOT_FOUND` means cache miss, not error --- the gateway maps it to an empty-set wire response for `wopQueryRealisation`. DB-egress validation re-checks hash lengths so a row written directly via psql can't poison the response.
+
+r[store.realisation.gc-sweep]
+GC sweep MUST `DELETE FROM realisations WHERE output_path = $swept_path` in the same transaction as the `narinfo` DELETE. The `realisations` table has NO foreign key to `narinfo` (migration 002) so CASCADE does not cover it; without explicit cleanup, stale rows would point to swept paths and `QueryRealisation` would claim a CA cache hit for an output no longer in the store. The `realisations_output_idx` index makes the per-path DELETE fast.
 
 CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv_hash, output_name, output_path, nar_hash)`. This provides integrity for content-addressed output mappings independently of narinfo signatures.
 
@@ -241,6 +281,9 @@ A substituted path is cross-tenant visible only by signature: tenant B's `QueryP
 
 r[store.substitute.probe-bounded]
 `check_available` (the HEAD-only probe feeding `FindMissingPathsResponse.substitutable_paths`) MUST bound its upstream load. Per-path probe results (positive and negative) are cached for 1h (cap 100k entries) so overlapping `FindMissingPaths` for the same closure don't re-probe. For uncached paths, concurrency is gated on each upstream's `/nix-cache-info` (also cached, 1h TTL): 128 concurrent HEADs if every upstream advertises `WantMassQuery: 1`, else 8. At most 4096 uncached paths are probed per call; requests above the cap return only cached hits without probing — the field is a scheduler optimization hint, and per-derivation substitutability is rediscovered at dispatch time, so skipping is conservative rather than a correctness issue.
+
+r[store.substitute.singleflight]
+`try_substitute` is wrapped in a moka `Cache<(tenant_id, store_path), Option<Arc<ValidatedPathInfo>>>` with 30s TTL and 10 000-entry cap. moka's `get_with` coalesces N concurrent callers for the same key into one `do_substitute` call. This is a singleflight coalescer, not a PathInfo cache (the narinfo table IS the cache) --- 30s is long enough to coalesce a burst of `GetPath`s for the same path from N workers, short enough that a substitution-miss doesn't stay stale. `get_with` (NOT `try_get_with`) so a transient fetch error doesn't poison the slot for 30s --- it resolves to `None` and the next caller after eviction retries cleanly. The `reqwest::Client` has a 60s timeout so a hung upstream can't wedge the singleflight slot forever.
 
 r[store.substitute.stale-reclaim]
 When `try_substitute` finds an existing `'uploading'` placeholder for the requested path, it MUST check the placeholder's age. If older than `stale_threshold_secs` (default 5 minutes), the substituter reclaims the placeholder (DELETE + re-INSERT) and proceeds with the fetch. A young placeholder indicates a live concurrent uploader and returns a miss. This prevents a crashed substitution from blocking the path for the full orphan-scanner interval (15 minutes). The `rio_store_substitute_stale_reclaimed_total` counter tracks reclaim events.
@@ -299,10 +342,17 @@ SubmitBuild over quota).
 r[store.gc.tenant-quota-enforce]
 The gateway MUST reject `SubmitBuild` with `STDERR_ERROR` when `tenant_store_bytes(tenant_id)` exceeds `tenants.gc_max_store_bytes`. Enforcement is eventually-consistent — `tenant_store_bytes` may be cached with ≤30s TTL. The connection stays open; the user can retry after GC. (Sibling to `r[store.gc.tenant-quota]` — distinguishes enforcement from accounting.)
 
-Supports dry-run mode via `GCRequest.dry_run`.
+r[store.gc.serialize-lock]
+`run_gc` serializes against itself via `pg_try_advisory_lock(GC_LOCK_ID)` on a dedicated session-scoped pool connection. If the lock is held, `run_gc` returns `Ok(None)` immediately ("already running") --- two concurrent sweeps would not corrupt anything but waste work and produce misleading stats. The lock is explicitly released via `pg_advisory_unlock` on every exit path (a scopeguard backs the explicit calls). The constant `GC_LOCK_ID = 0x724F47430001` is arbitrary; it just must not collide with other advisory locks in the schema (`r[store.db.migrate-try-lock]` uses a different ID).
+
+r[store.gc.dry-run]
+`GcRequest.dry_run=true` runs mark + sweep with full stats computation but the sweep transaction is `ROLLBACK`ed instead of committed. The operator sees "would delete N paths, free M bytes" without touching narinfo, chunk refcounts, or `pending_s3_deletes`. The final progress message's `current_path` reads `"dry-run: no paths actually deleted"`. `rio_store_gc_path_swept_total` is NOT incremented on dry-run.
+
+r[store.gc.shutdown-abort]
+`sweep` checks the shutdown token between batches (NOT mid-transaction --- a partial batch ROLLBACKs cleanly via tx drop). On cancellation it returns `SweepAbort::Shutdown`; `run_gc` releases `GC_LOCK_ID` and returns `Status::aborted("GC aborted: process shutting down")`. `VerifyChunks` likewise checks the token between PG batches and sends `Aborted` on the progress stream.
 
 r[store.gc.empty-refs-gate]
-Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the worker's reference scanner is broken.
+Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the executor's reference scanner is broken.
 
 r[store.cas.upsert-inserted+2]
 The chunk-upsert batch INSERT returns per-row `(uploaded_at IS NULL) AS
@@ -332,7 +382,15 @@ S3 deletes are not transactional with PostgreSQL. To prevent data leaks (chunks 
 3. On crash/restart, unprocessed rows are retried automatically --- S3 DELETE is idempotent.
 4. Rows exceeding max retry count (default: 10) remain in the table for alerting (`rio_store_s3_deletes_stuck` gauge).
 
-**GC-vs-GC serialization:** `TriggerGC` takes a non-blocking advisory lock (`GC_LOCK_ID = 0x724F47430001`) via `pg_try_advisory_lock`. A second concurrent `TriggerGC` gets "already running" and returns early.
+**GC-vs-GC serialization:** see `r[store.gc.serialize-lock]`.
+
+## Admin RPCs
+
+r[store.admin.verify-chunks]
+`StoreAdminService.VerifyChunks` server-streams `VerifyChunksProgress{scanned, missing, missing_hashes, is_complete}` while keyset-paginating `chunks WHERE deleted=FALSE AND blake3_hash > $cursor ORDER BY blake3_hash LIMIT batch_size` and calling `ChunkBackend.exists_batch` per page. Keyset (NOT OFFSET) so a 100k-chunk store is O(N) overall. `batch_size=0` → default; clamped at `VERIFY_BATCH_MAX`. `deleted=TRUE` rows are skipped (awaiting S3-delete drain --- presence is undefined); `refcount=0` IS verified (could be a mid-upload row in grace TTL --- the object SHOULD exist once `uploaded_at` is set). Returns `FAILED_PRECONDITION` for inline-only stores (no chunk backend). Read-only --- no `--repair` (deleting the PG row would be wrong if the object is recoverable; the operator decides). Aborts on shutdown token per `r[store.gc.shutdown-abort]`.
+
+r[store.admin.upstream-crud]
+`StoreAdminService.{ListUpstreams, AddUpstream, RemoveUpstream}` manage `tenant_upstreams` rows over gRPC. `AddUpstream` validates `trusted_keys[]` entry format (`name:base64(32-byte-ed25519-pubkey)`) and `sig_mode ∈ {keep, add, replace}` before INSERT. `RemoveUpstream` deletes by `(tenant_id, base_url)`; `NOT_FOUND` if no row matched. `ListUpstreams` returns rows for one tenant ordered by `priority ASC`. These back `rio-cli upstream {add, rm, ls}`; `r[store.substitute.upstream]` consumes the resulting rows.
 
 ## PostgreSQL Schema
 
@@ -433,7 +491,7 @@ CREATE TABLE gc_roots (
 
 -- Scheduler auto-pins input closures of dispatched derivations.
 -- Unpinned on completion. NOT FK'd to narinfo (input paths may not
--- be in the local store yet — they'll arrive via worker upload).
+-- be in the local store yet — they'll arrive via executor upload).
 CREATE TABLE scheduler_live_pins (
     store_path_hash  BYTEA NOT NULL,
     drv_hash         TEXT NOT NULL,
