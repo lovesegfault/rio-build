@@ -352,7 +352,7 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 ///     retrying the same pod on the same node risks retry-in-a-
 ///     -tight-loop on a node-local problem.
 ///   - `backoffLimit: 0` — same reasoning. One attempt.
-///   - `ttlSecondsAfterFinished: 60` — K8s TTL controller reaps.
+///   - `ttlSecondsAfterFinished: 600` — K8s TTL controller reaps.
 ///   - `activeDeadlineSeconds` — backstop for wrong-pool spawns.
 ///     `reconcile_ephemeral` spawns from the CLUSTER-WIDE
 ///     `queued_derivations` count, not pool-matching depth. A

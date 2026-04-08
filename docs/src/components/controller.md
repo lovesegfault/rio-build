@@ -568,7 +568,7 @@ Health probes against `grpc.health.v1.Health/Check` MUST target a named service 
 | Gateway | TCP check on SSH port | After scheduler gRPC connection established | — |
 | Scheduler | TCP socket (gRPC health is leader-election-aware, unsuitable for K8s probes on HA standby) | TCP socket — process is live, port is bound. Leader election happens; client-side balancer routes to leader via named-service health. | TCP socket. Startup budget sized for state recovery (reload non-terminal builds from PG). |
 | Store | TCP socket | gRPC health check on named service --- after PostgreSQL + S3 reachable | — |
-| Controller | HTTP `/healthz` | After CRD watches established | — |
+| Controller | HTTP `/healthz` | After kube-client + scheduler gRPC connect (intentionally before CRD watches; single-replica, no leader election) | — |
 | Executor | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
 
 ## Executor Lifecycle
