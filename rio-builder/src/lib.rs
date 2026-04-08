@@ -26,6 +26,7 @@
 //! ```
 
 pub mod cgroup;
+pub mod config;
 pub mod executor;
 pub mod fuse;
 pub mod health;
@@ -34,10 +35,6 @@ pub mod overlay;
 pub mod runtime;
 pub mod synth_db;
 pub mod upload;
-
-// Re-exports for main.rs — keeps `use rio_builder::{...}` imports stable
-// after the lib.rs → runtime.rs extraction.
-pub use runtime::{BuildSpawnContext, build_heartbeat_request, spawn_build_task, try_cancel_build};
 
 /// Register `# HELP` descriptions for all worker metrics.
 ///

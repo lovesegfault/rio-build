@@ -39,9 +39,9 @@ fn executor_kind_ser<S: serde::Serializer>(k: &ExecutorKind, s: S) -> Result<S::
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
-pub(crate) struct Config {
+pub struct Config {
     /// If empty after merge → auto-detect via hostname.
-    pub(crate) executor_id: String,
+    pub executor_id: String,
     /// Builder (airgapped, arbitrary derivation code) or fetcher
     /// (open egress, FOD-only). Env: `RIO_EXECUTOR_KIND=builder|fetcher`.
     /// Default builder (wire-compat pre-ADR-019). Sent in heartbeat
@@ -51,37 +51,37 @@ pub(crate) struct Config {
         deserialize_with = "executor_kind",
         serialize_with = "executor_kind_ser"
     )]
-    pub(crate) executor_kind: ExecutorKind,
+    pub executor_kind: ExecutorKind,
     /// rio-scheduler upstream. Env: `RIO_SCHEDULER__ADDR` /
     /// `__BALANCE_HOST` / `__BALANCE_PORT`. `balance_host = Some` →
     /// health-aware p2c (route to leader). `None` = single-channel.
-    pub(crate) scheduler: rio_common::config::UpstreamAddrs,
+    pub scheduler: rio_common::config::UpstreamAddrs,
     /// rio-store upstream. Env: `RIO_STORE__ADDR` / `__BALANCE_HOST` /
     /// `__BALANCE_PORT`. Balance is for load distribution across
     /// replicas, not leader routing (all store pods serve). I-077: a
     /// sticky single-channel meant scaling rio-store 1→4 didn't help.
-    pub(crate) store: rio_common::config::UpstreamAddrs,
+    pub store: rio_common::config::UpstreamAddrs,
     /// Systems this builder can build for. Empty after merge →
     /// auto-detect single element via std::env::consts. Multi-
     /// element for qemu-user-static or cross-arch builders.
     /// Env: `RIO_SYSTEMS=x86_64-linux,aarch64-linux` (comma-sep)
     /// or TOML `systems = ["x86_64-linux"]`.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
-    pub(crate) systems: Vec<String>,
+    pub systems: Vec<String>,
     /// requiredSystemFeatures this builder supports (e.g., "kvm",
     /// "big-parallel"). Scheduler's can_build() all-matches the
     /// derivation's required_features against this. Must be populated
     /// or the scheduler's can_build() check fails for any derivation
     /// with requiredSystemFeatures.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
-    pub(crate) features: Vec<String>,
-    pub(crate) fuse_mount_point: PathBuf,
-    pub(crate) fuse_cache_dir: PathBuf,
-    pub(crate) fuse_threads: u32,
+    pub features: Vec<String>,
+    pub fuse_mount_point: PathBuf,
+    pub fuse_cache_dir: PathBuf,
+    pub fuse_threads: u32,
     /// Defaults to `true`. NOT the serde bool default — see `default_true`.
     /// A drift here (`false`) would silently disable kernel passthrough,
     /// adding a userspace copy per FUSE read and ~2× per-build latency.
-    pub(crate) fuse_passthrough: bool,
+    pub fuse_passthrough: bool,
     /// Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 60.
     /// NOT the global `GRPC_STREAM_TIMEOUT` (300s) — that's for large-NAR
     /// uploads and passthrough. FUSE fetches are the build-critical path;
@@ -99,15 +99,15 @@ pub(crate) struct Config {
     /// `clang-21.1.8-debug` mid-stream → daemon EIO → build failure on a
     /// healthy store. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.
     #[serde(rename = "fuse_fetch_timeout_secs", with = "rio_common::config::secs")]
-    pub(crate) fuse_fetch_timeout: std::time::Duration,
-    pub(crate) overlay_base_dir: PathBuf,
+    pub fuse_fetch_timeout: std::time::Duration,
+    pub overlay_base_dir: PathBuf,
     #[serde(flatten)]
-    pub(crate) common: rio_common::config::CommonConfig,
+    pub common: rio_common::config::CommonConfig,
     /// HTTP /healthz + /readyz listen address. Builder has no gRPC
     /// server so tonic-health doesn't fit — plain HTTP via axum.
     /// K8s readinessProbe hits /readyz (200 after first accepted
     /// heartbeat), livenessProbe hits /healthz (always 200).
-    pub(crate) health_addr: std::net::SocketAddr,
+    pub health_addr: std::net::SocketAddr,
     /// Log limits (configuration.md:68-69). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
     ///
@@ -116,8 +116,8 @@ pub(crate) struct Config {
     /// means the build is broken, not the limit. Operators
     /// shouldn't be tuning around a runaway log producer. See
     /// plan 21 Batch E `cfg-builder-knobs-unreachable-in-k8s`.
-    pub(crate) log_rate_limit: u64,
-    pub(crate) log_size_limit: u64,
+    pub log_rate_limit: u64,
+    pub log_size_limit: u64,
     /// Size-class this builder is deployed as. Empty = unclassified.
     /// If the scheduler has size_classes configured, unclassified
     /// builders are REJECTED (misconfiguration — set this). Operator
@@ -125,14 +125,14 @@ pub(crate) struct Config {
     /// "small" builders on cheap spot instances, "large" on
     /// memory-optimized. The scheduler routes by estimated duration;
     /// this just declares which bucket this builder serves.
-    pub(crate) size_class: String,
+    pub size_class: String,
     /// Timeout (seconds) for the local nix-daemon subprocess build when
     /// the client didn't specify BuildOptions.build_timeout. Intentionally
     /// long (2h default) — some builds genuinely take that long; this is
     /// a bound on blast radius of a truly stuck daemon, not an expected
     /// build time.
     #[serde(rename = "daemon_timeout_secs", with = "rio_common::config::secs")]
-    pub(crate) daemon_timeout: std::time::Duration,
+    pub daemon_timeout: std::time::Duration,
     /// Silence timeout (seconds): kill the build if no output for N seconds.
     /// 0 = disabled. Used when the assignment's BuildOptions.max_silent_time
     /// is 0/unset. Env: `RIO_MAX_SILENT_TIME_SECS`.
@@ -149,24 +149,24 @@ pub(crate) struct Config {
     /// Upstream fix 32827b9fb adds selective ssh-ng forwarding but requires
     /// the daemon to advertise `set-options-map-only`, which rio-gateway does
     /// not — tracked under WONTFIX(P0310).
-    pub(crate) max_silent_time_secs: u64,
+    pub max_silent_time_secs: u64,
     /// I-116 idle timeout: exit if no assignment arrives for this
     /// long. Controller spawns N Jobs based on queue depth; if the
     /// queue drains before all Jobs receive work, the unlucky ones
     /// would otherwise idle until activeDeadlineSeconds. Env:
     /// `RIO_IDLE_SECS`. Default 120.
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
-    pub(crate) idle_timeout: std::time::Duration,
+    pub idle_timeout: std::time::Duration,
     /// FUSE fetch transport (`getpath` | `getchunk`). Env:
     /// `RIO_FETCH_TRANSPORT`. Default `getpath` — chunk fan-out is
     /// opt-in until A/B'd live (see `r[builder.fuse.fetch-chunk-
     /// fanout]`).
-    pub(crate) fetch_transport: rio_builder::fuse::fetch::FetchTransport,
+    pub fetch_transport: crate::fuse::fetch::FetchTransport,
     /// Test hook (VM warm-gate ordering proof): inject a delay
     /// between prefetch completion and the `PrefetchComplete` ACK.
     /// Env: `RIO_TEST_PREFETCH_DELAY_MS`. Default 0 (no delay).
     #[serde(rename = "test_prefetch_delay_ms", with = "rio_common::config::millis")]
-    pub(crate) test_prefetch_delay: std::time::Duration,
+    pub test_prefetch_delay: std::time::Duration,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -198,12 +198,37 @@ impl Default for Config {
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),
-            daemon_timeout: rio_builder::executor::DEFAULT_DAEMON_TIMEOUT,
+            daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time_secs: 0,
             idle_timeout: std::time::Duration::from_secs(120),
-            fetch_transport: rio_builder::fuse::fetch::FetchTransport::GetPath,
+            fetch_transport: crate::fuse::fetch::FetchTransport::GetPath,
             test_prefetch_delay: std::time::Duration::ZERO,
         }
+    }
+}
+
+impl rio_common::config::ValidateConfig for Config {
+    fn validate(&self) -> anyhow::Result<()> {
+        self.scheduler
+            .ensure_required("scheduler.addr", "builder")?;
+        self.store.ensure_required("store.addr", "builder")?;
+        Ok(())
+    }
+}
+
+impl rio_common::server::HasCommonConfig for Config {
+    fn common(&self) -> &rio_common::config::CommonConfig {
+        &self.common
+    }
+    fn metric_labels(&self) -> Vec<(&'static str, String)> {
+        // Fetcher pods share this binary. Without a role label, both
+        // export identical rio_builder_* metrics — Prometheus can't
+        // tell them apart.
+        let role = match self.executor_kind {
+            ExecutorKind::Builder => "builder",
+            ExecutorKind::Fetcher => "fetcher",
+        };
+        vec![("role", role.into())]
     }
 }
 
@@ -212,7 +237,7 @@ impl Default for Config {
     name = "rio-builder",
     about = "Build executor with FUSE store for rio-build"
 )]
-pub(crate) struct CliArgs {
+pub struct CliArgs {
     /// Executor ID (defaults to hostname)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,7 +313,7 @@ pub(crate) struct CliArgs {
 }
 
 /// Detect the system architecture (e.g. "x86_64-linux").
-pub(crate) fn detect_system() -> String {
+pub fn detect_system() -> String {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
     // Map Rust arch names to Nix system names
@@ -390,7 +415,7 @@ mod tests {
             assert_eq!(cfg.fuse_fetch_timeout, std::time::Duration::from_secs(222));
             assert_eq!(
                 cfg.fetch_transport,
-                rio_builder::fuse::fetch::FetchTransport::GetChunk
+                crate::fuse::fetch::FetchTransport::GetChunk
             );
             assert_eq!(cfg.systems, vec!["x86_64-linux", "aarch64-linux"]);
             assert_eq!(
