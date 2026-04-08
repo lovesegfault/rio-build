@@ -288,6 +288,11 @@ pub trait StatusExt<T> {
     fn status_internal(self, ctx: &str) -> Result<T, Status>;
     /// Map the error to `Status::invalid_argument("{ctx}: {e}")`.
     fn status_invalid(self, ctx: &str) -> Result<T, Status>;
+    /// Map the error to `Status::unavailable("{ctx}: {e}")`. Unlike
+    /// [`Self::status_internal`] the error text is included: `Unavailable`
+    /// is transient/retryable and the underlying detail (connect refused,
+    /// S3 5xx) is the client's retry signal, not a server-fault leak.
+    fn status_unavailable(self, ctx: &str) -> Result<T, Status>;
 }
 
 impl<T, E: Display> StatusExt<T> for Result<T, E> {
@@ -296,6 +301,9 @@ impl<T, E: Display> StatusExt<T> for Result<T, E> {
     }
     fn status_invalid(self, ctx: &str) -> Result<T, Status> {
         self.map_err(|e| Status::invalid_argument(format!("{ctx}: {e}")))
+    }
+    fn status_unavailable(self, ctx: &str) -> Result<T, Status> {
+        self.map_err(|e| Status::unavailable(format!("{ctx}: {e}")))
     }
 }
 

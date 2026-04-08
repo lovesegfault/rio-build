@@ -189,12 +189,12 @@ async fn try_s3(
         .key(&s3_key)
         .send()
         .await
-        .map_err(|e| Status::unavailable(format!("S3 GetObject failed: {e}")))?;
+        .status_unavailable("S3 GetObject failed")?;
     let gzipped = resp
         .body
         .collect()
         .await
-        .map_err(|e| Status::unavailable(format!("S3 body read failed: {e}")))?
+        .status_unavailable("S3 body read failed")?
         .into_bytes();
 
     // Gunzip in spawn_blocking — same rationale as the flusher's gzip.
