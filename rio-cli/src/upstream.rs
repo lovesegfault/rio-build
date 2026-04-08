@@ -16,9 +16,7 @@ use serde::Serialize;
 use tonic::transport::Channel;
 
 use rio_proto::StoreAdminServiceClient;
-use rio_proto::types::{
-    AddUpstreamRequest, ListUpstreamsRequest, RemoveUpstreamRequest, UpstreamInfo,
-};
+use rio_proto::types::{AddUpstreamRequest, ListUpstreamsRequest, RemoveUpstreamRequest};
 
 use crate::{json, rpc};
 
@@ -124,13 +122,7 @@ pub(crate) async fn run(
             )
             .await?;
             if as_json {
-                json(
-                    &resp
-                        .upstreams
-                        .iter()
-                        .map(UpstreamJson::from)
-                        .collect::<Vec<_>>(),
-                )?;
+                json(&resp.upstreams)?;
             } else if resp.upstreams.is_empty() {
                 println!("(no upstreams configured)");
             } else {
@@ -169,7 +161,7 @@ pub(crate) async fn run(
             )
             .await?;
             if as_json {
-                json(&UpstreamJson::from(&info))?;
+                json(&info)?;
             } else {
                 println!(
                     "added upstream {} (id={}, priority={}, sig_mode={}, {} key{})",
@@ -212,29 +204,4 @@ pub(crate) async fn run(
         }
     }
     Ok(())
-}
-
-/// JSON projection of `UpstreamInfo`. Same thin-wrapper pattern as
-/// `TenantJson`/`ExecutorJson` in `main.rs` — stable CLI JSON surface
-/// decoupled from proto evolution.
-#[derive(Serialize)]
-struct UpstreamJson<'a> {
-    id: i32,
-    tenant_id: &'a str,
-    url: &'a str,
-    priority: i32,
-    trusted_keys: &'a [String],
-    sig_mode: &'a str,
-}
-impl<'a> From<&'a UpstreamInfo> for UpstreamJson<'a> {
-    fn from(u: &'a UpstreamInfo) -> Self {
-        Self {
-            id: u.id,
-            tenant_id: &u.tenant_id,
-            url: &u.url,
-            priority: u.priority,
-            trusted_keys: &u.trusted_keys,
-            sig_mode: &u.sig_mode,
-        }
-    }
 }

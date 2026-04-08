@@ -21127,6 +21127,10 @@
           "packageId": "rio-nix"
         },
         {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
           "name": "thiserror",
           "packageId": "thiserror 2.0.18"
         },

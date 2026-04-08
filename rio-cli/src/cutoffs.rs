@@ -9,8 +9,7 @@
 //! `main.rs` deltas to the enum variant + match arm + mod decl only.
 
 use rio_proto::AdminServiceClient;
-use rio_proto::types::{GetSizeClassStatusRequest, SizeClassStatus};
-use serde::Serialize;
+use rio_proto::types::GetSizeClassStatusRequest;
 use tonic::transport::Channel;
 
 /// Run the `cutoffs` subcommand.
@@ -28,12 +27,7 @@ pub(crate) async fn run(
     .await?;
 
     if as_json {
-        // Named key (not a bare array) — same future-proofing as
-        // `workers --json` / `builds --json`: room for snapshot
-        // metadata without a breaking change.
-        return crate::json(&CutoffsJson {
-            classes: resp.classes.iter().map(ClassJson::from).collect(),
-        });
+        return crate::json(&resp);
     }
 
     if resp.classes.is_empty() {
@@ -63,39 +57,4 @@ pub(crate) async fn run(
         );
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// JSON projection
-//
-// Prost types don't derive `Serialize` (see the module comment in
-// `main.rs`'s JSON block). Thin wrapper like every other subcommand's.
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-struct CutoffsJson<'a> {
-    classes: Vec<ClassJson<'a>>,
-}
-
-#[derive(Serialize)]
-struct ClassJson<'a> {
-    name: &'a str,
-    configured_cutoff_secs: f64,
-    effective_cutoff_secs: f64,
-    queued: u64,
-    running: u64,
-    sample_count: u64,
-}
-
-impl<'a> From<&'a SizeClassStatus> for ClassJson<'a> {
-    fn from(c: &'a SizeClassStatus) -> Self {
-        Self {
-            name: &c.name,
-            configured_cutoff_secs: c.configured_cutoff_secs,
-            effective_cutoff_secs: c.effective_cutoff_secs,
-            queued: c.queued,
-            running: c.running,
-            sample_count: c.sample_count,
-        }
-    }
 }

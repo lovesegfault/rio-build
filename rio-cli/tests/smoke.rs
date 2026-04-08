@@ -147,7 +147,7 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     let (status, stdout, stderr) = run_cli(&addr, &["status", "--json"]);
     assert!(status.success(), "status --json: {stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
-    assert!(v.get("total_executors").is_some()); // flattened StatusJson field
+    assert!(v.get("total_executors").is_some()); // flattened ClusterStatusResponse field
     assert!(v.get("executors").is_some_and(|w| w.is_array()));
 
     // cutoffs --json: named key (not bare array), same as workers/builds.

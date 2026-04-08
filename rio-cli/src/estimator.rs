@@ -10,8 +10,7 @@
 //! `--filter` is a substring match on pname.
 
 use rio_proto::AdminServiceClient;
-use rio_proto::types::{EstimatorEntry, GetEstimatorStatsRequest};
-use serde::Serialize;
+use rio_proto::types::GetEstimatorStatsRequest;
 use tonic::transport::Channel;
 
 // r[impl cli.cmd.estimator]
@@ -30,9 +29,7 @@ pub(crate) async fn run(
     .await?;
 
     if as_json {
-        return crate::json(&EstimatorJson {
-            entries: resp.entries.iter().map(EntryJson::from).collect(),
-        });
+        return crate::json(&resp);
     }
 
     if resp.entries.is_empty() {
@@ -65,37 +62,4 @@ pub(crate) async fn run(
         );
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// JSON projection — prost types don't derive Serialize. Same shape as
-// `cutoffs.rs` / `workers.rs`.
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-struct EstimatorJson<'a> {
-    entries: Vec<EntryJson<'a>>,
-}
-
-#[derive(Serialize)]
-struct EntryJson<'a> {
-    drv_name: &'a str,
-    system: &'a str,
-    sample_count: u64,
-    ema_duration_secs: f64,
-    ema_peak_memory_bytes: f64,
-    size_class: &'a str,
-}
-
-impl<'a> From<&'a EstimatorEntry> for EntryJson<'a> {
-    fn from(e: &'a EstimatorEntry) -> Self {
-        Self {
-            drv_name: &e.drv_name,
-            system: &e.system,
-            sample_count: e.sample_count,
-            ema_duration_secs: e.ema_duration_secs,
-            ema_peak_memory_bytes: e.ema_peak_memory_bytes,
-            size_class: &e.size_class,
-        }
-    }
 }

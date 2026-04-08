@@ -24,9 +24,8 @@ use rio_proto::{AdminServiceClient, StoreAdminServiceClient};
 use tonic::transport::Channel;
 
 use rio_proto::types::{
-    BuildInfo, ClearPoisonRequest, ClusterStatusResponse, CreateTenantRequest,
-    DrainExecutorRequest, ExecutorInfo, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, TenantInfo,
+    BuildInfo, ClearPoisonRequest, CreateTenantRequest, DrainExecutorRequest, ExecutorInfo,
+    ListBuildsRequest, ListExecutorsRequest, TenantInfo,
 };
 
 mod cutoffs;
@@ -421,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
                 .tenant
                 .ok_or_else(|| anyhow!("CreateTenant returned no TenantInfo"))?;
             if as_json {
-                json(&TenantJson::from(&t))?;
+                json(&t)?;
             } else {
                 print_tenant(&t);
             }
@@ -430,13 +429,7 @@ async fn main() -> anyhow::Result<()> {
             let mut client = cfg.connect_admin().await?;
             let resp = rpc("ListTenants", client.list_tenants(())).await?;
             if as_json {
-                json(
-                    &resp
-                        .tenants
-                        .iter()
-                        .map(TenantJson::from)
-                        .collect::<Vec<_>>(),
-                )?;
+                json(&resp.tenants)?;
             } else if resp.tenants.is_empty() {
                 println!("(no tenants)");
             } else {
@@ -468,7 +461,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
                 if as_json {
-                    json(&WorkersJson::from(&resp))?;
+                    json(&resp)?;
                 } else if resp.executors.is_empty() {
                     println!("(no executors)");
                 } else {
@@ -490,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             if as_json {
-                json(&BuildsJson::from(&resp))?;
+                json(&resp)?;
             } else if resp.builds.is_empty() {
                 println!("(no builds — {} total matching filter)", resp.total_count);
             } else {
@@ -669,17 +662,12 @@ async fn main() -> anyhow::Result<()> {
 // JSON output
 // ===========================================================================
 //
-// Prost-generated types don't derive `serde::Serialize` (enabling it
-// workspace-wide would be a blast-radius change: every rio crate's
-// serialization surface shifts, `google.protobuf.Timestamp` needs
-// `prost-wkt-types`, enum repr changes). Thin per-subcommand wrappers
-// project just the fields a CLI consumer cares about — stable JSON
-// surface under our control, not coupled to proto evolution.
-//
-// Timestamps (`prost_types::Timestamp`) and nested `ResourceUsage`
-// are flattened / stringified rather than projected structurally —
-// `rio-cli --json | jq` consumers want readable scalars, not
-// `{seconds: N, nanos: M}` objects.
+// The admin-facing proto response types derive `serde::Serialize`
+// (targeted `type_attribute` in `rio-proto/build.rs`), so `--json`
+// emits the proto value directly. `prost_types::Timestamp` and nested
+// `ResourceUsage` fields are `#[serde(skip)]`ed there rather than
+// pulling in `prost-wkt-types`; enum fields serialize as their wire
+// `i32` (pre-prod — no JSON-shape stability contract yet).
 
 /// Print a serde value as pretty JSON. Single emission point so all
 /// `--json` output is consistent (pretty, trailing newline, errors
@@ -687,132 +675,6 @@ async fn main() -> anyhow::Result<()> {
 pub(crate) fn json<T: Serialize>(v: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
-}
-
-#[derive(Serialize)]
-struct TenantJson<'a> {
-    tenant_id: &'a str,
-    tenant_name: &'a str,
-    gc_retention_hours: u32,
-    gc_max_store_bytes: Option<u64>,
-    has_cache_token: bool,
-}
-impl<'a> From<&'a TenantInfo> for TenantJson<'a> {
-    fn from(t: &'a TenantInfo) -> Self {
-        Self {
-            tenant_id: &t.tenant_id,
-            tenant_name: &t.tenant_name,
-            gc_retention_hours: t.gc_retention_hours,
-            gc_max_store_bytes: t.gc_max_store_bytes,
-            has_cache_token: t.has_cache_token,
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub(crate) struct StatusJson {
-    total_executors: u32,
-    active_executors: u32,
-    draining_executors: u32,
-    pending_builds: u32,
-    active_builds: u32,
-    queued_derivations: u32,
-    running_derivations: u32,
-    store_size_bytes: u64,
-}
-impl From<&ClusterStatusResponse> for StatusJson {
-    fn from(s: &ClusterStatusResponse) -> Self {
-        Self {
-            total_executors: s.total_executors,
-            active_executors: s.active_executors,
-            draining_executors: s.draining_executors,
-            pending_builds: s.pending_builds,
-            active_builds: s.active_builds,
-            queued_derivations: s.queued_derivations,
-            running_derivations: s.running_derivations,
-            store_size_bytes: s.store_size_bytes,
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub(crate) struct ExecutorJson<'a> {
-    executor_id: &'a str,
-    status: &'a str,
-    systems: &'a [String],
-    supported_features: &'a [String],
-    running_builds: u32,
-    size_class: &'a str,
-}
-impl<'a> From<&'a ExecutorInfo> for ExecutorJson<'a> {
-    fn from(w: &'a ExecutorInfo) -> Self {
-        Self {
-            executor_id: &w.executor_id,
-            status: &w.status,
-            systems: &w.systems,
-            supported_features: &w.supported_features,
-            running_builds: w.running_builds,
-            size_class: &w.size_class,
-        }
-    }
-}
-
-#[derive(Serialize)]
-pub(crate) struct BuildJson<'a> {
-    build_id: &'a str,
-    tenant_id: &'a str,
-    /// `BuildState` enum stringified via prost's `as_str_name` — gives
-    /// `"BUILD_STATE_ACTIVE"` etc. Proto-native naming so consumers
-    /// can round-trip it through the proto enum if they need to.
-    state: &'a str,
-    priority_class: &'a str,
-    total_derivations: u32,
-    completed_derivations: u32,
-    cached_derivations: u32,
-    error_summary: &'a str,
-}
-impl<'a> From<&'a BuildInfo> for BuildJson<'a> {
-    fn from(b: &'a BuildInfo) -> Self {
-        Self {
-            build_id: &b.build_id,
-            tenant_id: &b.tenant_id,
-            state: b.state().as_str_name(),
-            priority_class: &b.priority_class,
-            total_derivations: b.total_derivations,
-            completed_derivations: b.completed_derivations,
-            cached_derivations: b.cached_derivations,
-            error_summary: &b.error_summary,
-        }
-    }
-}
-
-/// Top-level wrapper so `rio-cli workers --json | jq '.executors | length'`
-/// works. A bare array would work too, but the named key future-proofs
-/// for adding metadata (e.g. snapshot time) without a breaking change.
-#[derive(Serialize)]
-struct WorkersJson<'a> {
-    executors: Vec<ExecutorJson<'a>>,
-}
-impl<'a> From<&'a ListExecutorsResponse> for WorkersJson<'a> {
-    fn from(r: &'a ListExecutorsResponse) -> Self {
-        Self {
-            executors: r.executors.iter().map(ExecutorJson::from).collect(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct BuildsJson<'a> {
-    builds: Vec<BuildJson<'a>>,
-    total_count: u32,
-}
-impl<'a> From<&'a ListBuildsResponse> for BuildsJson<'a> {
-    fn from(r: &'a ListBuildsResponse) -> Self {
-        Self {
-            builds: r.builds.iter().map(BuildJson::from).collect(),
-            total_count: r.total_count,
-        }
-    }
 }
 
 // ===========================================================================

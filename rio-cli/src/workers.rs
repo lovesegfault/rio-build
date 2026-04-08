@@ -32,7 +32,7 @@ pub(crate) async fn run_actor(
 ) -> anyhow::Result<()> {
     let resp = rpc("DebugListExecutors", client.debug_list_executors(())).await?;
     if as_json {
-        return json(&ActorWorkersJson::from(&resp.executors[..]));
+        return json(&resp);
     }
     if resp.executors.is_empty() {
         println!("(actor map empty — no streams connected to this scheduler instance)");
@@ -279,52 +279,4 @@ fn kind_str(w: &DebugExecutorState) -> &'static str {
 
 fn yn(b: bool) -> &'static str {
     if b { "Y" } else { "N" }
-}
-
-/// Top-level JSON wrapper. Same `executors` key as `WorkersJson` so
-/// `jq '.executors | length'` works for both `workers --json` and
-/// `workers --actor --json`. The shape inside differs (proto fields
-/// vs PG fields), but the envelope matches.
-#[derive(Serialize)]
-struct ActorWorkersJson<'a> {
-    executors: Vec<ActorExecutorJson<'a>>,
-}
-impl<'a> From<&'a [DebugExecutorState]> for ActorWorkersJson<'a> {
-    fn from(ws: &'a [DebugExecutorState]) -> Self {
-        Self {
-            executors: ws.iter().map(ActorExecutorJson::from).collect(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ActorExecutorJson<'a> {
-    executor_id: &'a str,
-    has_stream: bool,
-    is_registered: bool,
-    warm: bool,
-    kind: &'static str,
-    systems: &'a [String],
-    last_heartbeat_ago_secs: u64,
-    running_count: u32,
-    running_builds: &'a [String],
-    draining: bool,
-    store_degraded: bool,
-}
-impl<'a> From<&'a DebugExecutorState> for ActorExecutorJson<'a> {
-    fn from(w: &'a DebugExecutorState) -> Self {
-        Self {
-            executor_id: &w.executor_id,
-            has_stream: w.has_stream,
-            is_registered: w.is_registered,
-            warm: w.warm,
-            kind: kind_str(w),
-            systems: &w.systems,
-            last_heartbeat_ago_secs: w.last_heartbeat_ago_secs,
-            running_count: w.running_count,
-            running_builds: &w.running_builds,
-            draining: w.draining,
-            store_degraded: w.store_degraded,
-        }
-    }
 }

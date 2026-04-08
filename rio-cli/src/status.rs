@@ -10,11 +10,13 @@
 //! match arm + mod decl only.
 
 use rio_proto::AdminServiceClient;
-use rio_proto::types::{ClusterStatusResponse, ListBuildsRequest, ListExecutorsRequest};
+use rio_proto::types::{
+    BuildInfo, ClusterStatusResponse, ExecutorInfo, ListBuildsRequest, ListExecutorsRequest,
+};
 use serde::Serialize;
 use tonic::transport::Channel;
 
-use crate::{BuildJson, ExecutorJson, StatusJson, json, rpc};
+use crate::{json, rpc};
 
 /// Run the `status` subcommand.
 pub(crate) async fn run(
@@ -51,14 +53,14 @@ pub(crate) async fn run(
         #[derive(Serialize)]
         struct StatusFull<'a> {
             #[serde(flatten)]
-            summary: StatusJson,
-            executors: Vec<ExecutorJson<'a>>,
-            builds: Vec<BuildJson<'a>>,
+            summary: &'a ClusterStatusResponse,
+            executors: &'a [ExecutorInfo],
+            builds: &'a [BuildInfo],
         }
         return json(&StatusFull {
-            summary: StatusJson::from(&cs),
-            executors: workers.executors.iter().map(ExecutorJson::from).collect(),
-            builds: builds.builds.iter().map(BuildJson::from).collect(),
+            summary: &cs,
+            executors: &workers.executors,
+            builds: &builds.builds,
         });
     }
 
