@@ -1488,46 +1488,53 @@
               # probes, protobuf+cmake for rio-proto's codegen).
               mkRioShell =
                 rust:
-                pkgs.mkShell (
-                  sysCrateEnv.allEnv
-                  // {
-                    packages = [ rust ] ++ shellPackages;
-                    nativeBuildInputs = with pkgs; [
-                      pkg-config
-                      protobuf
-                      cmake
-                    ];
-                    buildInputs =
-                      with pkgs;
-                      [
-                        openssl
-                        llvmPackages.libclang.lib
-                      ]
-                      ++ sysCrateEnv.allLibs;
-                    RUST_BACKTRACE = "1";
-                    PROTOC = "${pkgs.protobuf}/bin/protoc";
-                    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-                    PG_BIN = "${pkgs.postgresql_18}/bin";
-                    # sqlx query! macros read .sqlx/ instead of connecting
-                    # to PG. `cargo build` works without a live DB.
-                    # `cargo xtask regen sqlx` unsets this locally to regenerate.
-                    SQLX_OFFLINE = "true";
-                    RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
-                    # Repo-local kubeconfig: xtask k8s writes here, so
-                    # direct kubectl/helm in the shell hits the same
-                    # cluster. Matches xtask/src/sh.rs:kubeconfig_path().
-                    shellHook = ''
-                      export KUBECONFIG="$PWD/.kube/config"
-                      # Shared intermediate build cache across all worktrees
-                      # (~/src/rio-build/*). Per-worktree target/ keeps only
-                      # final artifacts. Fine-grain locking (nightly; ignored
-                      # on stable) lets concurrent `cargo check` run lock-free.
-                      export CARGO_BUILD_BUILD_DIR="''${CARGO_BUILD_BUILD_DIR:-$HOME/.cache/rio-build/build}"
-                      export CARGO_UNSTABLE_FINE_GRAIN_LOCKING=true
-                      ${config.pre-commit.installationScript}
-                    '';
-                  }
-                );
+                (pkgs.mkShell.override {
+                  # mold via cc-wrapper: rustc's linker is `cc`, so this
+                  # speeds dev-loop relinks without touching RUSTFLAGS
+                  # (shared build-dir fingerprints stay valid). crate2nix
+                  # uses its own stdenv — `nix build` stays on GNU ld.
+                  stdenv = if pkgs.stdenv.isLinux then pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv else pkgs.stdenv;
+                })
+                  (
+                    sysCrateEnv.allEnv
+                    // {
+                      packages = [ rust ] ++ shellPackages;
+                      nativeBuildInputs = with pkgs; [
+                        pkg-config
+                        protobuf
+                        cmake
+                      ];
+                      buildInputs =
+                        with pkgs;
+                        [
+                          openssl
+                          llvmPackages.libclang.lib
+                        ]
+                        ++ sysCrateEnv.allLibs;
+                      RUST_BACKTRACE = "1";
+                      PROTOC = "${pkgs.protobuf}/bin/protoc";
+                      LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+                      PG_BIN = "${pkgs.postgresql_18}/bin";
+                      # sqlx query! macros read .sqlx/ instead of connecting
+                      # to PG. `cargo build` works without a live DB.
+                      # `cargo xtask regen sqlx` unsets this locally to regenerate.
+                      SQLX_OFFLINE = "true";
+                      RUST_SRC_PATH = "${rust}/lib/rustlib/src/rust/library";
+                      # Repo-local kubeconfig: xtask k8s writes here, so
+                      # direct kubectl/helm in the shell hits the same
+                      # cluster. Matches xtask/src/sh.rs:kubeconfig_path().
+                      shellHook = ''
+                        export KUBECONFIG="$PWD/.kube/config"
+                        # Shared intermediate build cache across all worktrees
+                        # (~/src/rio-build/*). Per-worktree target/ keeps only
+                        # final artifacts. Fine-grain locking (nightly; ignored
+                        # on stable) lets concurrent `cargo check` run lock-free.
+                        export CARGO_BUILD_BUILD_DIR="''${CARGO_BUILD_BUILD_DIR:-$HOME/.cache/rio-build/build}"
+                        export CARGO_UNSTABLE_FINE_GRAIN_LOCKING=true
+                        ${config.pre-commit.installationScript}
+                      '';
+                    }
+                  );
             in
             {
               default = mkRioShell rustNightly;
