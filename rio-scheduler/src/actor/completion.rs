@@ -405,15 +405,6 @@ impl DagActor {
                     "kind" => kind, "from" => from.to_owned(), "to" => to.clone()
                 )
                 .increment(1);
-                if state.is_fixed_output {
-                    // Back-compat alias for existing dashboards;
-                    // prefer the kind-labeled metric above.
-                    metrics::counter!(
-                        "rio_scheduler_fod_size_class_promotions_total",
-                        "from" => from.to_owned(), "to" => to.clone()
-                    )
-                    .increment(1);
-                }
                 state.size_class_floor = Some(to.clone());
                 promoted_to = Some(to);
             }
