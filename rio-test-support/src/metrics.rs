@@ -182,9 +182,6 @@ impl CountingRecorder {
         self.gauges.lock().unwrap().contains(name)
     }
 
-    /// All gauge names seen so far (sorted). For assertion-failure
-    /// diagnostics: when an absence-check fails, this shows what DID
-    /// get touched.
     /// True if any `histogram!()` invocation has been observed for `name`
     /// (unlabeled name only). For "this code path recorded into this
     /// histogram" assertions where the value is non-deterministic.
@@ -192,6 +189,9 @@ impl CountingRecorder {
         self.histograms.lock().unwrap().contains(name)
     }
 
+    /// All gauge names seen so far (sorted). For assertion-failure
+    /// diagnostics: when an absence-check fails, this shows what DID
+    /// get touched.
     pub fn gauge_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.gauges.lock().unwrap().iter().cloned().collect();
         names.sort();
