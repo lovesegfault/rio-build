@@ -243,11 +243,7 @@ pub async fn run(
             //
             // builderPoolDefaults stays the poolTemplate base (seccomp,
             // tolerations, nodeSelector, hostUsers — deep-merged in the
-            // chart). enabled=false stops the flat builderpool.yaml
-            // template from ALSO rendering. builderPools=[] drops the
-            // chart-default x86-64 flat pool (BPS handles both arches).
-            .set("builderPoolDefaults.enabled", "false")
-            .set_json("builderPools", "[]")
+            // chart).
             .set("builderPoolSetDefaults.enabled", "true")
             // I-186: hostUsers:false breaks FUSE passthrough
             // (FUSE_DEV_IOC_BACKING_OPEN needs init-userns
