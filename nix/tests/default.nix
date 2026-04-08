@@ -159,40 +159,19 @@ let
     ];
   };
 
-  # Shared lifecycle module for core/ctrlrestart/recovery/reconnect.
-  # Plain k3sFull — no autoscaler env tuning. The autoscaler's default
-  # poll/windows (~30s/600s) make it effectively inert in these splits.
+  # Shared lifecycle module for all lifecycle splits.
   #
   # jwtEnabled: mounts the rio-jwt-pubkey ConfigMap into scheduler+store
   # and the rio-jwt-signing Secret into gateway (lib/jwt-keys.nix fixed
   # test keypair). The interceptor is DUAL-MODE (header-absent → pass-
   # through), so enabling it doesn't break existing lifecycle subtests
   # that call gRPC without the x-rio-tenant-token header. Turned on here
-  # for jwt-mount-present; recovery+autoscale don't need it but the
-  # shared module means they get it too (harmless — just an extra
-  # ConfigMap mount).
+  # for jwt-mount-present; the other splits don't need it but the shared
+  # module means they get it too (harmless — just an extra ConfigMap
+  # mount).
   lifecycleMod = lifecycle {
     inherit pkgs common;
     fixture = k3sFull { jwtEnabled = true; };
-  };
-
-  # Autoscale split gets the fast-poll env so the scale-up/down cycle
-  # completes within the test window. Same chart/images; only the
-  # controller pod's env ConfigMap differs.
-  lifecycleAutoscaleMod = lifecycle {
-    inherit pkgs common;
-    fixture = k3sFull {
-      extraValues = {
-        "controller.extraEnv[0].name" = "RIO_AUTOSCALER_POLL_SECS";
-        "controller.extraEnv[0].value" = "3";
-        "controller.extraEnv[1].name" = "RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS";
-        "controller.extraEnv[1].value" = "3";
-        "controller.extraEnv[2].name" = "RIO_AUTOSCALER_MIN_INTERVAL_SECS";
-        "controller.extraEnv[2].value" = "3";
-        "controller.extraEnv[3].name" = "RIO_AUTOSCALER_SCALE_DOWN_WINDOW_SECS";
-        "controller.extraEnv[3].value" = "10";
-      };
-    };
   };
 
   leMod = leader-election {
@@ -201,9 +180,8 @@ let
   };
 
   # Prod-parity lifecycle module. No jwtEnabled — bootstrap-job-ran +
-  # bootstrap-tenant don't touch JWT. No autoscaler extraEnv — these
-  # subtests don't scale. Bare k3sProdParity {} just flips bootstrap
-  # on and preloads the rio-bootstrap image.
+  # bootstrap-tenant don't touch JWT. Bare k3sProdParity {} just flips
+  # bootstrap on and preloads the rio-bootstrap image.
   lifecycleProdParityMod = lifecycle {
     inherit pkgs common;
     fixture = k3sProdParity { };
@@ -589,7 +567,7 @@ in
     ];
   };
 
-  vm-lifecycle-autoscale-k3s = lifecycleAutoscaleMod.mkTest {
+  vm-lifecycle-autoscale-k3s = lifecycleMod.mkTest {
     name = "autoscale";
     subtests = [
       # r[verify ctrl.pool.ephemeral]
