@@ -17,6 +17,7 @@
 }:
 let
   subcharts = import ./helm-charts.nix { inherit nixhelm system; };
+  split = import ./lib/helm-split.nix { inherit (pkgs) lib; };
 in
 {
   # Path to a values file (typically values/vmtest-full.yaml).
@@ -78,34 +79,13 @@ pkgs.runCommand "rio-helm-rendered"
 
     mkdir -p $out
     # CRDs come from infra/helm/crds/ (not the chart — Helm's crds/ dir
-    # is install-only, wrong for a dev-phase project). Concatenate with
-    # explicit --- separators: the generated CRD yamls don't end with
-    # document separators, so a bare `cat` produces one malformed
-    # document — k3s silently applies only part (or none) of it.
-    for f in ${crds}/*.yaml; do
-      cat "$f"
-      echo "---"
-    done > $out/00-crds.yaml
+    # is install-only, wrong for a dev-phase project).
+    ${split.concatYamlDocs "${crds}/*.yaml" "$out/00-crds.yaml"}
     # yq-go: filter by kind. k3s applies in filename order — CRDs must
     # establish before the controller pod tries to watch them; Namespace
     # must exist before ServiceAccounts can be created in it; RBAC must
     # bind before the pod's SA token is validated against it.
-    yq 'select(.kind == "Namespace" or
-               .kind == "ServiceAccount" or
-               .kind == "ClusterRole" or
-               .kind == "ClusterRoleBinding" or
-               .kind == "Role" or
-               .kind == "RoleBinding")' all.yaml > $out/01-rbac.yaml
-    yq 'select(.kind != "Namespace" and
-               .kind != "ServiceAccount" and
-               .kind != "ClusterRole" and
-               .kind != "ClusterRoleBinding" and
-               .kind != "Role" and
-               .kind != "RoleBinding")' all.yaml > $out/02-workloads.yaml
-
-    # Sanity: all three files have content (empty file = k3s silently
-    # skips it, test passes wrongly).
-    for f in $out/*.yaml; do
-      test -s "$f" || { echo "rendered file $f is empty" >&2; exit 1; }
-    done
+    yq 'select(${split.kindIs split.rbacKinds})' all.yaml > $out/01-rbac.yaml
+    yq 'select(${split.kindIsNot split.rbacKinds})' all.yaml > $out/02-workloads.yaml
+    ${split.assertNonEmpty "$out"}
   ''

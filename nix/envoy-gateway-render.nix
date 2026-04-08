@@ -1,7 +1,7 @@
 # Render the Envoy Gateway operator chart for airgapped k3s VM tests.
 #
-# Same pattern as helm-render.nix (template → split → k3s manifests)
-# but for the upstream gateway-helm chart. Output is a directory with
+# Same template → split → k3s-manifests pattern as helm-render.nix
+# (shared logic in lib/helm-split.nix). Output is a directory with
 # numbered YAML files that k3s applies in filename order:
 #
 #   00-envoy-gateway-crds.yaml  Gateway API + gateway.envoyproxy.io CRDs
@@ -30,6 +30,9 @@
 let
   subcharts = import ./helm-charts.nix { inherit nixhelm system; };
   chart = subcharts.gateway-helm;
+  split = import ./lib/helm-split.nix { inherit (pkgs) lib; };
+  # envoy needs Namespace in its OWN ordered file (sorts before rbac).
+  rbacNoNs = pkgs.lib.filter (k: k != "Namespace") split.rbacKinds;
 in
 pkgs.runCommand "envoy-gateway-rendered"
   {
@@ -44,13 +47,8 @@ pkgs.runCommand "envoy-gateway-rendered"
     # ── CRDs ───────────────────────────────────────────────────────────
     # gateway-helm's crds/ has both Gateway API (gatewayapi-crds.yaml,
     # ~20K lines) and Envoy Gateway extension CRDs
-    # (crds/generated/gateway.envoyproxy.io_*.yaml). Concat with explicit
-    # separators — some generated files don't end with ---.
-    for f in ${chart}/crds/gatewayapi-crds.yaml ${chart}/crds/generated/*.yaml; do
-      cat "$f"
-      echo "---"
-    done > $out/00-envoy-gateway-crds.yaml
-
+    # (crds/generated/gateway.envoyproxy.io_*.yaml).
+    ${split.concatYamlDocs "${chart}/crds/gatewayapi-crds.yaml ${chart}/crds/generated/*.yaml" "$out/00-envoy-gateway-crds.yaml"}
     # ── Operator ───────────────────────────────────────────────────────
     # --namespace envoy-gateway-system (chart's default, also its
     # hardcoded lease/configmap namespace references). createNamespace=
@@ -64,22 +62,7 @@ pkgs.runCommand "envoy-gateway-rendered"
 
     # Namespace MUST come first (separate file, sorts before rbac).
     yq 'select(.kind == "Namespace")' all.yaml > $out/01-envoy-gateway-ns.yaml
-
-    yq 'select(.kind == "ServiceAccount" or
-               .kind == "ClusterRole" or
-               .kind == "ClusterRoleBinding" or
-               .kind == "Role" or
-               .kind == "RoleBinding")' all.yaml > $out/02-envoy-gateway-rbac.yaml
-
-    yq 'select(.kind != "Namespace" and
-               .kind != "ServiceAccount" and
-               .kind != "ClusterRole" and
-               .kind != "ClusterRoleBinding" and
-               .kind != "Role" and
-               .kind != "RoleBinding")' all.yaml > $out/03-envoy-gateway.yaml
-
-    # Sanity: non-empty
-    for f in $out/*.yaml; do
-      test -s "$f" || { echo "rendered file $f is empty" >&2; exit 1; }
-    done
+    yq 'select(${split.kindIs rbacNoNs})' all.yaml > $out/02-envoy-gateway-rbac.yaml
+    yq 'select(${split.kindIsNot split.rbacKinds})' all.yaml > $out/03-envoy-gateway.yaml
+    ${split.assertNonEmpty "$out"}
   ''
