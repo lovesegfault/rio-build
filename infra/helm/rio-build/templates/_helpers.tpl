@@ -290,3 +290,51 @@ ipFamilies:
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+NetworkPolicy egress rule fragments. Each renders ONE `egress:` list
+item — include with `| nindent 4` inside a policy's `egress:` block.
+Single edit point for port/selector changes; before extraction these
+three stanzas were copy-pasted verbatim across builder-egress,
+fetcher-egress, rio-controller-egress, store-egress(-upstream) and
+rio-dashboard-egress (a port move on scheduler/store meant editing 6+
+sites in a security-critical file with no compile-time check they
+stayed in sync).
+
+rio.egressDns takes no context (kube-system is a literal). Scheduler
+and Store take the root context to read .Values.namespaces.{system,
+store}.name. TCP/53: DNS falls back to TCP for responses >512 bytes
+(DNSSEC, large SRV records, long CNAME chains) — missing TCP =
+intermittent resolution failures on large responses.
+*/}}
+{{- define "rio.egressDns" -}}
+- to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  ports:
+    - {protocol: UDP, port: 53}
+    - {protocol: TCP, port: 53}
+{{- end -}}
+
+{{- define "rio.egressScheduler" -}}
+- to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.namespaces.system.name }}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: rio-scheduler
+  ports: [{protocol: TCP, port: 9001}]
+{{- end -}}
+
+{{- define "rio.egressStore" -}}
+- to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.namespaces.store.name }}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: rio-store
+  ports: [{protocol: TCP, port: 9002}]
+{{- end -}}

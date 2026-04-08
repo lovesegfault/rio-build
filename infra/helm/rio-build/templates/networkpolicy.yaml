@@ -35,35 +35,12 @@ spec:
   policyTypes: [Egress]
   egress:
     # Can't resolve rio-scheduler.rio-system.svc without CoreDNS.
-    # TCP/53: DNS falls back to TCP for responses >512 bytes (DNSSEC,
-    # large SRV records, long CNAME chains). Missing TCP → intermittent
-    # resolution failures on large responses.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
+    {{- include "rio.egressDns" . | nindent 4 }}
     # Scheduler: Heartbeat/BuildExecution. 9001 only, no metrics (9091).
     # Cross-ns: namespaceSelector + podSelector AND-composed.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.system.name }}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: rio-scheduler
-      ports: [{protocol: TCP, port: 9001}]
+    {{- include "rio.egressScheduler" . | nindent 4 }}
     # Store: GetPath inputs, PutPath outputs. Cross-ns to rio-store.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.store.name }}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: rio-store
-      ports: [{protocol: TCP, port: 9002}]
+    {{- include "rio.egressStore" . | nindent 4 }}
     {{- with .Values.networkPolicy.builderS3Cidr }}
     # S3 VPC endpoint CIDR — builder reads chunks directly from S3 when
     # the store hands back a presigned URL. Only rendered when the
@@ -96,29 +73,9 @@ spec:
       rio.build/role: fetcher
   policyTypes: [Egress]
   egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.system.name }}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: rio-scheduler
-      ports: [{protocol: TCP, port: 9001}]
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.store.name }}
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: rio-store
-      ports: [{protocol: TCP, port: 9002}]
+    {{- include "rio.egressDns" . | nindent 4 }}
+    {{- include "rio.egressScheduler" . | nindent 4 }}
+    {{- include "rio.egressStore" . | nindent 4 }}
     # Public internet on 80/443 only. `except` carves out all private
     # address space — a compromised fetcher can fetchurl github.com but
     # cannot probe the cluster's pod/service CIDRs, the node's metadata
@@ -168,13 +125,7 @@ spec:
       app.kubernetes.io/name: rio-controller
   policyTypes: [Egress]
   egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
+    {{- include "rio.egressDns" . | nindent 4 }}
     - to:
         - ipBlock: {cidr: 10.0.0.0/8}
         - ipBlock: {cidr: 172.16.0.0/12}
@@ -287,13 +238,7 @@ spec:
       app.kubernetes.io/name: rio-store
   policyTypes: [Egress]
   egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
+    {{- include "rio.egressDns" . | nindent 4 }}
     # Postgres: RFC1918 (+ v6 ULA) on 5432. External PG (RDS, CloudSQL)
     # lives in the VPC's private CIDR. Link-local + public implicitly
     # DENIED. RDS has no AAAA today; the ULA peer is forward-compat.
@@ -343,13 +288,7 @@ spec:
     # (NetworkPolicy is additive on egress), so this duplicates the
     # DNS rule for clarity: if an operator reads only THIS policy to
     # audit upstream access, they see the DNS dependency.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
+    {{- include "rio.egressDns" . | nindent 4 }}
     {{- range .Values.store.upstreamCaches }}
     # {{ .name | default .cidr }}
     - to:
@@ -387,13 +326,7 @@ spec:
   egress:
     # Can't resolve rio-dashboard-envoy.{{ .Values.dashboard.envoyGatewayNamespace }}.svc
     # without CoreDNS.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
+    {{- include "rio.egressDns" . | nindent 4 }}
     # Port 8080 = the Gateway listener (dashboard-gateway.yaml).
     # namespaceSelector required: cross-namespace egress needs an
     # explicit ns match or the podSelector scopes to {{ $ns.system.name }}
