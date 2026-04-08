@@ -1518,6 +1518,12 @@
                     # cluster. Matches xtask/src/sh.rs:kubeconfig_path().
                     shellHook = ''
                       export KUBECONFIG="$PWD/.kube/config"
+                      # Shared intermediate build cache across all worktrees
+                      # (~/src/rio-build/*). Per-worktree target/ keeps only
+                      # final artifacts. Fine-grain locking (nightly; ignored
+                      # on stable) lets concurrent `cargo check` run lock-free.
+                      export CARGO_BUILD_BUILD_DIR="''${CARGO_BUILD_BUILD_DIR:-$HOME/.cache/rio-build/build}"
+                      export CARGO_UNSTABLE_FINE_GRAIN_LOCKING=true
                       ${config.pre-commit.installationScript}
                     '';
                   }

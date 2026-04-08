@@ -29023,10 +29023,6 @@
           "packageId": "axum-core"
         },
         {
-          "name": "base16ct",
-          "packageId": "base16ct 0.2.0"
-        },
-        {
           "name": "base64",
           "packageId": "base64"
         },
@@ -29335,10 +29331,6 @@
           "packageId": "scopeguard"
         },
         {
-          "name": "sec1",
-          "packageId": "sec1 0.7.3"
-        },
-        {
           "name": "serde",
           "packageId": "serde"
         },
@@ -29465,10 +29457,6 @@
         {
           "name": "tracing-core",
           "packageId": "tracing-core"
-        },
-        {
-          "name": "tracing-log",
-          "packageId": "tracing-log"
         },
         {
           "name": "tracing-subscriber",

@@ -28,11 +28,12 @@ pub async fn run() -> Result<()> {
     // `cargo sqlx prepare` sets RUSTFLAGS before its internal `cargo
     // check`, which poisons the main target/ fingerprint — the next
     // `cargo run` sees different flags and rebuilds everything. Isolate
-    // into a sub-target so the main cache stays warm.
-    let _env3 = sh.push_env(
-        "CARGO_TARGET_DIR",
-        sh.current_dir().join("target/sqlx-prepare"),
-    );
+    // into a sub-target so the main cache stays warm. Override build-dir
+    // too: the devshell points it at a shared ~/.cache location which
+    // would otherwise leak the poisoned fingerprints across worktrees.
+    let isolated = sh.current_dir().join("target/sqlx-prepare");
+    let _env3 = sh.push_env("CARGO_TARGET_DIR", &isolated);
+    let _env4 = sh.push_env("CARGO_BUILD_BUILD_DIR", &isolated);
 
     // `cargo sqlx prepare` bumps src/{lib,main}.rs mtimes on every
     // workspace crate to force proc-macro re-expansion (stable can't

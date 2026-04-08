@@ -310,7 +310,11 @@ console = "0.16"
 filetime = "0.2"
 
 [profile.release]
+incremental = false
 lto = "thin"
+
+[profile.dev]
+incremental = false
 
 # Compile dependencies with optimization even in dev/test profile.
 # Speeds up crypto-heavy tests (zstd/blake3/sha2/ed25519/fastcdc) — those
