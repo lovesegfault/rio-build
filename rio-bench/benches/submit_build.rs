@@ -39,6 +39,7 @@ async fn submit_once(harness: &BenchHarness, build: impl FnOnce() -> Dag) {
         .expect("SubmitBuild should accept a valid synthetic DAG");
 }
 
+// r[impl bench.shapes]
 fn bench_submit_build(c: &mut Criterion) {
     // Multi-threaded runtime: the harness runs the actor task, the
     // gRPC server task, and the client connection all concurrently.

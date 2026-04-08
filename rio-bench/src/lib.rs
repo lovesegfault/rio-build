@@ -155,6 +155,7 @@ fn synth_node(name: &str) -> DerivationNode {
     use rio_test_support::fixtures::{make_derivation_node, rand_store_hash};
     let hash = rand_store_hash();
     DerivationNode {
+        // r[impl bench.unique-drv-hash]
         // drv_hash must be globally unique within a bench run (across
         // criterion iterations) or MergeDag's dedup path fires and we
         // measure a cache hit, not a cold insert. make_derivation_node
@@ -200,6 +201,7 @@ impl BenchHarness {
     /// Spawn the full stack. Mirrors what `SchedulerGrpc::new_for_tests`
     /// and `setup_actor` do inside rio-scheduler's `#[cfg(test)]` modules,
     /// but built from the public API so an external crate can drive it.
+    // r[impl bench.harness-scope]
     pub async fn spawn() -> anyhow::Result<Self> {
         let db = TestDb::new(&rio_scheduler::MIGRATOR).await;
         let pool = db.pool.clone();

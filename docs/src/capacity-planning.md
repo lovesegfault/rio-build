@@ -119,6 +119,15 @@ For a fair comparison against `hydra-queue-runner`:
 | `dispatch/binary_tree_drain/depth` throughput (elements/s) | `hydra-queue-runner` log delta: first `building` → last `finished`, with a no-op builder | Ready-scan + assignment-send + completion-handle loop. |
 | Time-to-first-dispatch (not yet benchmarked) | `hydra-queue-runner` wakeup latency after `builds` insert | Cold-start responsiveness. Hydra polls `builds` on an interval; rio-scheduler's actor reacts immediately on MergeDag. |
 
+r[bench.shapes]
+`submit_build` runs three shape series, not just `linear`: `submit_build/linear/{1,10,100,1000}` (chain — ready queue never holds >1), `submit_build/binary_tree/{1,4,7,10}` (depth → 2^d−1 nodes; all leaves enter ready at merge), `submit_build/shared_diamond/n100/frac{0.1,0.5,0.9}` (many edges converging on one root). Comparing `linear/1000` against `binary_tree/10` (both ~1000 nodes, same edge count, different structure) isolates whether MergeDag's BFS cost is shape-sensitive.
+
+r[bench.unique-drv-hash]
+Generated `drv_hash` values MUST be globally unique across criterion iterations: `synth_node` calls `rand_store_hash()` per node so MergeDag's dedup path doesn't fire (a deterministic tag would measure a cache hit after iteration 1). The `synth_hashes_are_unique` test guards this precondition.
+
+r[bench.harness-scope]
+`BenchHarness::spawn` builds the scheduler stack from the public API with intentional omissions: no store client (TOCTOU `FindMissingPaths` re-check is gated on `Option::Some` → skipped), no log flusher, no size classes, `is_leader` hardwired true (no lease loop). The bench measures DAG merge + DB insert + gRPC round-trip, not store RPC latency or S3 flush.
+
 ### Expected differences
 
 The two systems place work differently across the pipeline, so identical top-line numbers would be coincidence:
