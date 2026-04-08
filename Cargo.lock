@@ -6643,6 +6643,7 @@ dependencies = [
  "rand 0.10.0",
  "regex",
  "rio-common",
+ "rio-crds",
  "rio-nix",
  "rio-proto",
  "rio-store",

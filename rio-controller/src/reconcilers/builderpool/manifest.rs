@@ -65,7 +65,7 @@ use rio_proto::types::{
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::reconcilers::Ctx;
+use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::builderpool::BuilderPool;
 
 use super::POOL_LABEL;
@@ -386,7 +386,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                     "swept Failed manifest Job (backoff_limit=0 crash)"
                 );
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            Err(e) if e.is_not_found() => {
                 debug!(pool = %name, job = %job_name, "Failed Job already deleted");
             }
             Err(e) => {
@@ -499,7 +499,7 @@ pub(super) async fn reconcile_manifest(wp: &BuilderPool, ctx: &Ctx) -> Result<Ac
                                 "deleted surplus manifest Job (idle grace elapsed)"
                             );
                         }
-                        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                        Err(e) if e.is_not_found() => {
                             // Already gone (another reconcile tick
                             // raced us, or ownerRef GC). Fine.
                             debug!(pool = %name, job = %job_name, "Job already deleted");

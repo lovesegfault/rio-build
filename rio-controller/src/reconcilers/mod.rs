@@ -18,10 +18,18 @@ pub mod fetcherpool;
 pub mod gc_schedule;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kube::Client;
+use kube::runtime::controller::Action;
 use parking_lot::Mutex;
+
+use crate::error::{Error, Result, error_kind};
+
+/// Re-export so reconciler modules can `use crate::reconcilers::
+/// KubeErrorExt` without naming rio-crds directly.
+pub use rio_crds::{KubeErrorExt, KubeResultExt};
 
 /// Per-pool manifest idle-tracking state: `builderpool::job_common::
 /// Bucket` → when it first went surplus. See `builderpool::manifest::
@@ -262,6 +270,107 @@ where
         obj.namespace().unwrap_or_default(),
         obj.name_any()
     )
+}
+
+/// Standard reconcile timing+metrics wrapper. Every reconciler's
+/// public `reconcile()` is `timed("name", obj, ctx, reconcile_inner)`:
+/// records `rio_controller_reconcile_duration_seconds{reconciler=name}`
+/// (success AND error paths — slow apiserver timeouts show as long
+/// duration + error) and resets the per-object error-backoff counter
+/// on success so the next failure starts the curve from 5s.
+///
+/// The `#[tracing::instrument]` span stays on the caller — span
+/// fields are reconciler-specific (`pool=`, `wps=`, `cs=`).
+pub async fn timed<K, F, Fut>(
+    name: &'static str,
+    obj: Arc<K>,
+    ctx: Arc<Ctx>,
+    f: F,
+) -> Result<Action>
+where
+    K: kube::Resource<DynamicType = ()> + kube::ResourceExt,
+    F: FnOnce(Arc<K>, Arc<Ctx>) -> Fut,
+    Fut: Future<Output = Result<Action>>,
+{
+    let start = Instant::now();
+    let key = error_key(obj.as_ref());
+    let result = f(obj, ctx.clone()).await;
+    if result.is_ok() {
+        ctx.reset_error_count(&key);
+    }
+    metrics::histogram!("rio_controller_reconcile_duration_seconds",
+        "reconciler" => name)
+    .record(start.elapsed().as_secs_f64());
+    result
+}
+
+/// Standard `error_policy`: emit `reconcile_errors_total`, then
+/// `InvalidSpec` → fixed `invalid_requeue` (operator must fix the
+/// CRD; retrying fast is noise), transient → exponential backoff via
+/// [`Ctx::error_backoff`] (5s → 300s cap, reset on next success).
+///
+/// `invalid_requeue` is per-reconciler: most use 300s; ComponentScaler
+/// uses 30s because transient scheduler/store unreachability funnels
+/// through `InvalidSpec` there and 5min of no scaling under a builder
+/// burst is the I-105 cliff.
+pub fn standard_error_policy<K>(
+    name: &'static str,
+    obj: Arc<K>,
+    err: &Error,
+    ctx: Arc<Ctx>,
+    invalid_requeue: Duration,
+) -> Action
+where
+    K: kube::Resource<DynamicType = ()> + kube::ResourceExt,
+{
+    metrics::counter!("rio_controller_reconcile_errors_total",
+        "reconciler" => name, "error_kind" => error_kind(err))
+    .increment(1);
+    match err {
+        Error::InvalidSpec(msg) => {
+            tracing::warn!(reconciler = name, error = %msg,
+                "invalid spec / upstream unreachable; fix the CRD");
+            Action::requeue(invalid_requeue)
+        }
+        _ => {
+            let delay = ctx.error_backoff(&error_key(obj.as_ref()));
+            tracing::warn!(reconciler = name, error = %err, backoff = ?delay,
+                "reconcile failed; retrying");
+            Action::requeue(delay)
+        }
+    }
+}
+
+/// Build a `Controller::new().owns().run().for_each()` future for a
+/// reconciler module. Expands to the ~25L block that was repeated 4×
+/// in `main.rs`. The result is a future — caller `tokio::join!`s them.
+///
+/// Two forms: with `owns: Type` (BuilderPool/BuilderPoolSet/
+/// FetcherPool watch a child resource) and without (ComponentScaler
+/// owns nothing — it patches `/scale` on a helm-owned Deployment).
+///
+/// The `for_each` body is debug-only: `error_policy` already logged
+/// the real error; the controller-runtime wrapper errors here
+/// (ObjectNotFound on a delete race etc.) are normal.
+#[macro_export]
+macro_rules! spawn_controller {
+    ($client:expr, $shutdown:expr, $ctx:expr, $crd:ty, $module:ident $(, owns: $owned:ty)?) => {{
+        use ::futures_util::StreamExt as _;
+        let api: ::kube::Api<$crd> = ::kube::Api::all($client.clone());
+        ::kube::runtime::Controller::new(api, ::kube::runtime::watcher::Config::default())
+            $(.owns(
+                ::kube::Api::<$owned>::all($client.clone()),
+                ::kube::runtime::watcher::Config::default(),
+            ))?
+            .graceful_shutdown_on($shutdown.clone().cancelled_owned())
+            .run($module::reconcile, $module::error_policy, $ctx.clone())
+            .for_each(|res| async move {
+                match res {
+                    Ok((obj, _)) => ::tracing::debug!(obj = %obj.name, "reconciled"),
+                    Err(e) => ::tracing::debug!(error = %e, "reconcile loop error"),
+                }
+            })
+    }};
 }
 
 #[cfg(test)]

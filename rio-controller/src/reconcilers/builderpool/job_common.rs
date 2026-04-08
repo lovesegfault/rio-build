@@ -16,7 +16,7 @@ use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::reconcilers::Ctx;
+use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::builderpool::BuilderPool;
 
 use super::MANAGER;
@@ -219,7 +219,7 @@ pub(crate) async fn reap_excess_pending(
                 );
                 reaped += 1;
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            Err(e) if e.is_not_found() => {
                 debug!(pool, class, job = %job_name, "Pending Job already gone");
             }
             Err(e) => {
@@ -374,7 +374,7 @@ pub(crate) async fn reap_orphan_running(
                 );
                 reaped += 1;
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            Err(e) if e.is_not_found() => {
                 debug!(pool, class, job = %job_name, "orphan Job already gone");
             }
             Err(e) => {
@@ -469,7 +469,7 @@ pub(crate) enum SpawnOutcome {
 pub(crate) async fn try_spawn_job(jobs_api: &Api<Job>, job: &Job) -> SpawnOutcome {
     match jobs_api.create(&PostParams::default(), job).await {
         Ok(_) => SpawnOutcome::Spawned,
-        Err(kube::Error::Api(ae)) if ae.code == 409 => SpawnOutcome::NameCollision,
+        Err(e) if e.is_conflict() => SpawnOutcome::NameCollision,
         Err(e) => SpawnOutcome::Failed(e),
     }
 }

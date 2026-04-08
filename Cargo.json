@@ -21264,6 +21264,10 @@
           "packageId": "rio-common"
         },
         {
+          "name": "rio-crds",
+          "packageId": "rio-crds"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },

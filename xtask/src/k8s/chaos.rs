@@ -40,6 +40,7 @@ use clap::ValueEnum;
 use console::style;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use rio_crds::KubeErrorExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
@@ -649,7 +650,7 @@ pub async fn remediate(session_dir: &Path) -> Result<(usize, bool)> {
         // Delete the original chaos pod first (if it's still there).
         // Best-effort — 404 means it already exited or was deleted.
         if let Err(e) = pods.delete(&entry.pod_name, &DeleteParams::default()).await
-            && !is_not_found(&e)
+            && !e.is_not_found()
         {
             warn!("delete chaos pod {}: {e:#}", entry.pod_name);
         }
@@ -705,10 +706,6 @@ pub async fn remediate(session_dir: &Path) -> Result<(usize, bool)> {
     // Clear chaos.json — we've done what we can.
     write_chaos(session_dir, &ChaosState::default())?;
     Ok((remediated, true))
-}
-
-fn is_not_found(e: &kube::Error) -> bool {
-    matches!(e, kube::Error::Api(r) if r.code == 404)
 }
 
 // ─── tests ──────────────────────────────────────────────────────────

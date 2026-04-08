@@ -21,11 +21,11 @@ use kube::ResourceExt;
 use kube::api::Api;
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::error::{Error, Result, error_kind};
+use crate::error::{Error, Result};
 use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
-use crate::reconcilers::{Ctx, error_key};
+use crate::reconcilers::{Ctx, standard_error_policy, timed};
 use rio_crds::builderpool::SeccompProfileKind;
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
@@ -49,16 +49,7 @@ const FETCHER_FUSE_CACHE: &str = "10Gi";
     fields(reconciler = "fetcherpool", pool = %fp.name_any(), ns = fp.namespace().as_deref().unwrap_or(""))
 )]
 pub async fn reconcile(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> {
-    let start = std::time::Instant::now();
-    let key = error_key(fp.as_ref());
-    let result = reconcile_inner(fp, ctx.clone()).await;
-    if result.is_ok() {
-        ctx.reset_error_count(&key);
-    }
-    metrics::histogram!("rio_controller_reconcile_duration_seconds",
-        "reconciler" => "fetcherpool")
-    .record(start.elapsed().as_secs_f64());
-    result
+    timed("fetcherpool", fp, ctx, reconcile_inner).await
 }
 
 async fn reconcile_inner(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> {
@@ -208,21 +199,7 @@ fn executor_params(
 /// Requeue policy. Same curve as builderpool — exponential backoff
 /// for transients, slow requeue for InvalidSpec.
 pub fn error_policy(fp: Arc<FetcherPool>, err: &Error, ctx: Arc<Ctx>) -> Action {
-    metrics::counter!("rio_controller_reconcile_errors_total",
-        "reconciler" => "fetcherpool", "error_kind" => error_kind(err))
-    .increment(1);
-
-    match err {
-        Error::InvalidSpec(msg) => {
-            warn!(error = %msg, "invalid FetcherPool spec; fix the CRD");
-            Action::requeue(Duration::from_secs(300))
-        }
-        _ => {
-            let delay = ctx.error_backoff(&error_key(fp.as_ref()));
-            warn!(error = %err, backoff = ?delay, "reconcile failed; retrying");
-            Action::requeue(delay)
-        }
-    }
+    standard_error_policy("fetcherpool", fp, err, ctx, Duration::from_secs(300))
 }
 
 #[cfg(test)]

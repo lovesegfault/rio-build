@@ -20,6 +20,52 @@ pub mod common;
 pub mod componentscaler;
 pub mod fetcherpool;
 
+// ----- kube::Error classification helpers ---------------------------
+//
+// `kube::Error::Api(ae) if ae.code == 404` was open-coded across
+// rio-controller / rio-scheduler / xtask. Hosted here (not rio-common,
+// which stays kube-free; not rio-controller, which scheduler can't
+// depend on without pulling the reconciler stack).
+
+/// Classify a `kube::Error` by API status code. Covers the two codes
+/// callers actually branch on: 404 (delete-race / get-missing) and
+/// 409 (resourceVersion conflict / AlreadyExists).
+pub trait KubeErrorExt {
+    /// `Error::Api` with status 404. Typical: delete raced GC, or
+    /// get on a not-yet-created child.
+    fn is_not_found(&self) -> bool;
+    /// `Error::Api` with status 409. Typical: optimistic-concurrency
+    /// `replace()` lost the race, or `create()` name collision.
+    fn is_conflict(&self) -> bool;
+}
+
+impl KubeErrorExt for kube::Error {
+    fn is_not_found(&self) -> bool {
+        matches!(self, kube::Error::Api(ae) if ae.code == 404)
+    }
+    fn is_conflict(&self) -> bool {
+        matches!(self, kube::Error::Api(ae) if ae.code == 409)
+    }
+}
+
+/// Map `Err(404)` → `Ok(None)`. For `delete()` / `get()` calls where
+/// "already gone" is the same as success.
+pub trait KubeResultExt<T> {
+    /// `Ok(v)` → `Ok(Some(v))`; `Err(404)` → `Ok(None)`; other
+    /// errors pass through.
+    fn ok_if_not_found(self) -> Result<Option<T>, kube::Error>;
+}
+
+impl<T> KubeResultExt<T> for Result<T, kube::Error> {
+    fn ok_if_not_found(self) -> Result<Option<T>, kube::Error> {
+        match self {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 // ----- schemars helpers for k8s-openapi passthrough types -----------
 //
 // k8s-openapi types (ResourceRequirements, Toleration, Condition)

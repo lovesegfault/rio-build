@@ -48,8 +48,8 @@ use tracing::{debug, info, warn};
 
 use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
-use crate::error::{Error, Result, error_kind};
-use crate::reconcilers::{Ctx, error_key};
+use crate::error::{Error, Result};
+use crate::reconcilers::{Ctx, KubeErrorExt, standard_error_policy, timed};
 use crate::scaling::is_wps_owned_by;
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::builderpoolset::{BuilderPoolSet, ClassStatus};
@@ -89,16 +89,7 @@ const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
     fields(reconciler = "builderpoolset", wps = %wps.name_any(), ns = wps.namespace().as_deref().unwrap_or(""))
 )]
 pub async fn reconcile(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
-    let start = std::time::Instant::now();
-    let key = error_key(wps.as_ref());
-    let result = reconcile_inner(wps, ctx.clone()).await;
-    if result.is_ok() {
-        ctx.reset_error_count(&key);
-    }
-    metrics::histogram!("rio_controller_reconcile_duration_seconds",
-        "reconciler" => "builderpoolset")
-    .record(start.elapsed().as_secs_f64());
-    result
+    timed("builderpoolset", wps, ctx, reconcile_inner).await
 }
 
 async fn reconcile_inner(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
@@ -267,10 +258,9 @@ async fn prune_stale_children(wps: &BuilderPoolSet, wp_api: &Api<BuilderPool>) {
         );
         match wp_api.delete(&name, &DeleteParams::default()).await {
             Ok(_) => {}
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                // Already gone. Race with ownerRef GC or manual
-                // delete — same tolerance as cleanup().
-            }
+            // Already gone. Race with ownerRef GC or manual delete —
+            // same tolerance as cleanup().
+            Err(e) if e.is_not_found() => {}
             Err(e) => {
                 warn!(
                     child = %name,
@@ -403,7 +393,7 @@ async fn cleanup(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
         let name = child.name_any();
         match wp_api.delete(&name, &DeleteParams::default()).await {
             Ok(_) => debug!(child = %name, "child BuilderPool deleted"),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            Err(e) if e.is_not_found() => {
                 debug!(child = %name, "child already gone (404)");
             }
             Err(e) => {
@@ -425,23 +415,7 @@ async fn cleanup(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
 /// gets a long backoff; transient Kube/Finalizer errors retry
 /// sooner.
 pub fn error_policy(wps: Arc<BuilderPoolSet>, err: &Error, ctx: Arc<Ctx>) -> Action {
-    metrics::counter!("rio_controller_reconcile_errors_total",
-        "reconciler" => "builderpoolset", "error_kind" => error_kind(err))
-    .increment(1);
-
-    match err {
-        Error::InvalidSpec(msg) => {
-            warn!(error = %msg, "invalid BuilderPoolSet spec; fix the CRD");
-            Action::requeue(Duration::from_secs(300))
-        }
-        _ => {
-            // Exponential backoff: 5s → 300s cap. Same pattern
-            // as builderpool::error_policy.
-            let delay = ctx.error_backoff(&error_key(wps.as_ref()));
-            warn!(error = %err, backoff = ?delay, "reconcile failed; retrying");
-            Action::requeue(delay)
-        }
-    }
+    standard_error_policy("builderpoolset", wps, err, ctx, Duration::from_secs(300))
 }
 
 // r[verify ctrl.wps.cutoff-status]

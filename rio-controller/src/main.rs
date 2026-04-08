@@ -16,14 +16,13 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
-use kube::runtime::{Controller, watcher};
-use kube::{Api, Client};
+use kube::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use rio_controller::reconcilers::{Ctx, builderpool, builderpoolset, componentscaler, fetcherpool};
+use rio_controller::spawn_controller;
 use rio_crds::builderpool::BuilderPool;
 use rio_crds::builderpoolset::BuilderPoolSet;
 use rio_crds::componentscaler::ComponentScaler;
@@ -267,117 +266,25 @@ async fn main() -> anyhow::Result<()> {
         scale_down_window: std::time::Duration::from_secs(600),
     });
 
-    // ---- BuilderPool controller ----
-    // .owns(Job): pools spawn one Job per build. Without this,
-    // re-spawn latency is the 10s poll interval; with it,
-    // kube-runtime watch fires on Job status change → <1s re-enqueue.
+    // ---- Reconcilers ----
+    // `spawn_controller!` expands to `Controller::new().owns()
+    // .graceful_shutdown_on().run().for_each()`. Each yields a
+    // future; `tokio::join!` below polls all four concurrently.
+    //
+    // `owns:` — kube-runtime watches that child kind and re-enqueues
+    // the parent on child status change (e.g. Job complete → re-spawn
+    // in <1s instead of waiting for the 10s poll). ComponentScaler
+    // owns nothing: it patches `/scale` on a helm-owned Deployment.
     //
     // graceful_shutdown_on: SIGTERM cancels the token (registered
     // eagerly at top of main()), which drains in-flight reconciles.
-    // K8s sends SIGTERM on pod delete.
-    let pools: Api<BuilderPool> = Api::all(client.clone());
-    let jobs: Api<Job> = Api::all(client.clone());
-    let wp_controller = Controller::new(pools, watcher::Config::default())
-        .owns(jobs, watcher::Config::default())
-        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(
-            builderpool::reconcile,
-            builderpool::error_policy,
-            ctx.clone(),
-        )
-        .for_each(|res| async move {
-            match res {
-                Ok((obj, _action)) => {
-                    tracing::debug!(pool = %obj.name, "reconciled");
-                }
-                Err(e) => {
-                    // Already logged by error_policy; this is
-                    // the controller-runtime's own wrapper error
-                    // (ObjectNotFound etc). debug not warn —
-                    // these are normal (delete race).
-                    tracing::debug!(error = %e, "reconcile loop error");
-                }
-            }
-        });
-
-    // ---- BuilderPoolSet controller ----
-    // .owns(BuilderPool): the WPS reconciler SSA-applies one child
-    // BuilderPool per size class (ownerReferences → WPS). When a
-    // child's status changes (e.g. replicas go ready), re-enqueue
-    // the parent WPS so its per-class status refresh picks it up.
-    //
-    // Separate Api<BuilderPool> client: can't reuse `pools` above —
-    // `Controller::new(pools, ...)` moved it. kube Client is an
-    // Arc internally so cloning is cheap.
-    let wps_api: Api<BuilderPoolSet> = Api::all(client.clone());
-    let wp_children: Api<BuilderPool> = Api::all(client.clone());
-    let wps_controller = Controller::new(wps_api, watcher::Config::default())
-        .owns(wp_children, watcher::Config::default())
-        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(
-            builderpoolset::reconcile,
-            builderpoolset::error_policy,
-            ctx.clone(),
-        )
-        .for_each(|res| async move {
-            match res {
-                Ok((obj, _action)) => {
-                    tracing::debug!(wps = %obj.name, "reconciled");
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "wps reconcile loop error");
-                }
-            }
-        });
-
-    // ---- FetcherPool controller ----
-    // ADR-019: FOD-only executor pods with open egress + stricter
-    // seccomp. .owns(Job): same reactive trigger as BuilderPool.
-    let fp_api: Api<FetcherPool> = Api::all(client.clone());
-    let fp_jobs: Api<Job> = Api::all(client.clone());
-    let fp_controller = Controller::new(fp_api, watcher::Config::default())
-        .owns(fp_jobs, watcher::Config::default())
-        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(
-            fetcherpool::reconcile,
-            fetcherpool::error_policy,
-            ctx.clone(),
-        )
-        .for_each(|res| async move {
-            match res {
-                Ok((obj, _action)) => {
-                    tracing::debug!(pool = %obj.name, "reconciled fetcherpool");
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "fetcherpool reconcile loop error");
-                }
-            }
-        });
-
-    // ---- ComponentScaler controller ----
-    // Predictive store autoscaling. No `.owns()` — the target
-    // Deployment is helm's, not ours; we patch /scale only. The 10s
-    // requeue (Action::requeue in the reconciler) is the tick; the
-    // CR watch additionally fires on `kubectl edit` of bounds/
-    // thresholds for immediate re-evaluation.
-    let cs_api: Api<ComponentScaler> = Api::all(client.clone());
-    let cs_controller = Controller::new(cs_api, watcher::Config::default())
-        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
-        .run(
-            componentscaler::reconcile,
-            componentscaler::error_policy,
-            ctx,
-        )
-        .for_each(|res| async move {
-            match res {
-                Ok((obj, _action)) => {
-                    tracing::debug!(cs = %obj.name, "reconciled componentscaler");
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "componentscaler reconcile loop error");
-                }
-            }
-        });
+    let wp_controller =
+        spawn_controller!(client, shutdown, ctx, BuilderPool, builderpool, owns: Job);
+    let wps_controller =
+        spawn_controller!(client, shutdown, ctx, BuilderPoolSet, builderpoolset, owns: BuilderPool);
+    let fp_controller =
+        spawn_controller!(client, shutdown, ctx, FetcherPool, fetcherpool, owns: Job);
+    let cs_controller = spawn_controller!(client, shutdown, ctx, ComponentScaler, componentscaler);
 
     // ---- DisruptionTarget watcher ----
     // Pod watcher: K8s sets DisruptionTarget=True on a pod BEFORE

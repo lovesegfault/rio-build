@@ -25,8 +25,8 @@ use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, ResourceExt};
 use tracing::{debug, instrument, warn};
 
-use crate::error::{Error, Result, error_kind};
-use crate::reconcilers::{Ctx, error_key};
+use crate::error::{Error, Result};
+use crate::reconcilers::{Ctx, error_key, standard_error_policy, timed};
 use crate::scaling::component::{self, Decision};
 use rio_crds::componentscaler::{
     ComponentScaler, ComponentScalerSpec, ComponentScalerStatus, Signal,
@@ -63,16 +63,7 @@ const MANAGER: &str = "rio-controller-componentscaler";
     fields(reconciler = "componentscaler", cs = %cs.name_any(), ns = cs.namespace().as_deref().unwrap_or(""))
 )]
 pub async fn reconcile(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Action> {
-    let start = std::time::Instant::now();
-    let key = error_key(cs.as_ref());
-    let result = reconcile_inner(cs, ctx.clone()).await;
-    if result.is_ok() {
-        ctx.reset_error_count(&key);
-    }
-    metrics::histogram!("rio_controller_reconcile_duration_seconds",
-        "reconciler" => "componentscaler")
-    .record(start.elapsed().as_secs_f64());
-    result
+    timed("componentscaler", cs, ctx, reconcile_inner).await
 }
 
 async fn reconcile_inner(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Action> {
@@ -340,25 +331,11 @@ fn since(t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Option<Dur
     Some(Duration::from_secs(secs as u64))
 }
 
-/// Requeue policy. Same shape as the other reconcilers.
+/// Requeue policy. 30s on `InvalidSpec` (not 300s like the other
+/// reconcilers): transient scheduler/store unreachability funnels
+/// through `InvalidSpec` here, and 5min of no scaling under a builder
+/// burst is the I-105 cliff. The error message names the fix for
+/// genuine spec errors.
 pub fn error_policy(cs: Arc<ComponentScaler>, err: &Error, ctx: Arc<Ctx>) -> Action {
-    metrics::counter!("rio_controller_reconcile_errors_total",
-        "reconciler" => "componentscaler", "error_kind" => error_kind(err))
-    .increment(1);
-    match err {
-        Error::InvalidSpec(msg) => {
-            warn!(error = %msg, "ComponentScaler invalid spec / upstream unreachable");
-            // 30s (not 300s like the other InvalidSpec branches): a
-            // transient scheduler/store unreachability funnels
-            // through InvalidSpec here, and 5min of no scaling under
-            // a builder burst is the I-105 cliff. The error message
-            // names the fix for genuine spec errors.
-            Action::requeue(Duration::from_secs(30))
-        }
-        _ => {
-            let delay = ctx.error_backoff(&error_key(cs.as_ref()));
-            warn!(error = %err, backoff = ?delay, "componentscaler reconcile failed; retrying");
-            Action::requeue(delay)
-        }
-    }
+    standard_error_policy("componentscaler", cs, err, ctx, Duration::from_secs(30))
 }

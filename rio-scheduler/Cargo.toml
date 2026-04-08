@@ -34,6 +34,9 @@ tonic-health = { workspace = true }
 # at 1, VM tests unaffected).
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+# KubeErrorExt::is_conflict for the lease election 409 branches.
+# rio-crds is type-defs + a tiny kube::Error helper — no runtime deps.
+rio-crds = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 # P0271: ListBuilds keyset cursor encoding (URL_SAFE_NO_PAD). Already

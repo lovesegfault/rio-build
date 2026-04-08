@@ -34,6 +34,7 @@ use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use k8s_openapi::jiff;
 use kube::api::{Api, ObjectMeta, PostParams};
+use rio_crds::KubeErrorExt;
 use tracing::debug;
 
 /// Result of one `try_acquire_or_renew()` call.
@@ -249,7 +250,7 @@ impl LeaderElection {
             .await
         {
             Ok(_) => Ok(()),
-            Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(()),
+            Err(e) if e.is_conflict() => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -280,7 +281,7 @@ impl LeaderElection {
                 debug!(lease = %self.lease_name, "created lease");
                 Ok(ElectionResult::Leading)
             }
-            Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(ElectionResult::Conflict),
+            Err(e) if e.is_conflict() => Ok(ElectionResult::Conflict),
             Err(e) => Err(e),
         }
     }
@@ -322,7 +323,7 @@ impl LeaderElection {
                 }
                 Ok(ElectionResult::Leading)
             }
-            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+            Err(e) if e.is_conflict() => {
                 debug!(lease = %self.lease_name, steal, "replace 409 (raced)");
                 Ok(ElectionResult::Conflict)
             }
@@ -464,9 +465,9 @@ mod tests {
         .to_string()
     }
 
-    /// Renew hits 409 → `Conflict`, not `Err`. Proves the
-    /// `kube::Error::Api(ae) if ae.code == 409` pattern matches
-    /// what kube-rs actually returns for a failed PUT.
+    /// Renew hits 409 → `Conflict`, not `Err`. Proves
+    /// [`KubeErrorExt::is_conflict`] matches what kube-rs actually
+    /// returns for a failed PUT.
     ///
     /// This is the load-bearing case: our GET said we're holder,
     /// but the PUT bounced — someone stole since the GET. The
