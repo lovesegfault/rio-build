@@ -959,14 +959,41 @@ fn dedup_dag(nodes: &mut Vec<types::DerivationNode>, edges: &mut Vec<types::Deri
     edges.retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
 }
 
-// r[impl gw.opcode.build-paths]
-/// wopBuildPaths (9): Build a set of derivations.
-#[instrument(skip_all, fields(count = tracing::field::Empty))]
-pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    reader: &mut R,
+/// Outcome of [`submit_dag`] — the shared DAG-submit pipeline for
+/// `wopBuildPaths` and `wopBuildPathsWithResults`.
+enum DagSubmitOutcome {
+    /// Rate-limited or quota-exceeded. `STDERR_ERROR` already sent by
+    /// the respective check; caller should `return Ok(())`.
+    Gated,
+    /// `validate_dag` rejected the DAG before submission. No
+    /// `STDERR_ERROR` sent — caller decides whether to surface as
+    /// `stderr_err!` (wopBuildPaths) or as a per-path
+    /// `BuildResult::failure(InputRejected, …)` (wopBuildPathsWithResults).
+    Rejected(String),
+    /// Build was submitted and the scheduler returned a result
+    /// (success OR failure — caller inspects `.status`).
+    Built(BuildResult),
+}
+
+/// Shared DAG-submit pipeline:
+/// `dedup → validate → rate-limit → quota → inline-drv → SubmitBuild`.
+///
+/// Runs every gate between DAG reconstruction and the scheduler RPC.
+/// Gate ORDER is fixed here so the two build-paths opcodes cannot drift:
+/// validate first (cheap, no I/O), then rate/quota (may send
+/// `STDERR_ERROR`), then inline (store I/O), then submit. Prior to this
+/// extraction the two handlers ran inline at different points relative
+/// to rate/quota — harmless but inconsistent.
+///
+/// Returns `Err` only when `submit_and_process_build` itself errors
+/// (scheduler transport/timeout); caller decides whether that is
+/// session-terminal (`stderr_err!`) or a per-path `TransientFailure`.
+async fn submit_dag<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
-) -> anyhow::Result<()> {
+    mut nodes: Vec<types::DerivationNode>,
+    mut edges: Vec<types::DerivationEdge>,
+) -> anyhow::Result<DagSubmitOutcome> {
     let SessionContext {
         store_client,
         scheduler_client,
@@ -978,6 +1005,43 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         quota_cache,
         ..
     } = ctx;
+
+    dedup_dag(&mut nodes, &mut edges);
+
+    if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
+        warn!(reason = %reason, "rejecting build: DAG validation failed");
+        return Ok(DagSubmitOutcome::Rejected(reason));
+    }
+
+    if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
+        return Ok(DagSubmitOutcome::Gated);
+    }
+    if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
+        return Ok(DagSubmitOutcome::Gated);
+    }
+
+    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
+
+    let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
+    let result = submit_and_process_build(
+        stderr,
+        scheduler_client,
+        request,
+        active_build_ids,
+        jwt_token.as_deref(),
+    )
+    .await?;
+    Ok(DagSubmitOutcome::Built(result))
+}
+
+// r[impl gw.opcode.build-paths]
+/// wopBuildPaths (9): Build a set of derivations.
+#[instrument(skip_all, fields(count = tracing::field::Empty))]
+pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    ctx: &mut SessionContext,
+) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
     let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
@@ -1002,21 +1066,36 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                match grpc_is_valid_path(store_client, jwt_token.as_deref(), path).await {
+                match grpc_is_valid_path(&mut ctx.store_client, ctx.jwt_token.as_deref(), path)
+                    .await
+                {
                     Ok(true) => { /* exists, fine */ }
                     Ok(false) => {
                         stderr_err!(stderr, "path '{path}' is not valid and cannot be built");
                     }
-                    Err(e) => return send_store_error(stderr, e).await,
+                    Err(e) => stderr_err!(stderr, "store error: {e}"),
                 }
             }
             DerivedPath::Built { drv, .. } => {
-                let drv_obj = match resolve_derivation(drv, store_client, drv_cache).await {
+                let drv_obj = match resolve_derivation(
+                    drv,
+                    &mut ctx.store_client,
+                    &mut ctx.drv_cache,
+                )
+                .await
+                {
                     Ok(d) => d,
-                    Err(e) => return send_store_error(stderr, e).await,
+                    Err(e) => stderr_err!(stderr, "store error: {e}"),
                 };
 
-                match translate::reconstruct_dag(drv, &drv_obj, store_client, drv_cache).await {
+                match translate::reconstruct_dag(
+                    drv,
+                    &drv_obj,
+                    &mut ctx.store_client,
+                    &mut ctx.drv_cache,
+                )
+                .await
+                {
                     Ok((nodes, edges)) => {
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
@@ -1027,52 +1106,18 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         }
     }
 
-    if all_nodes.is_empty() {
-        // All paths were opaque and valid -- nothing to build
-        stderr.finish().await?;
-        wire::write_u64(stderr.inner_mut(), 1).await?;
-        return Ok(());
-    }
-
-    dedup_dag(&mut all_nodes, &mut all_edges);
-
-    // Validate BEFORE inlining: __noChroot check + early MAX_DAG_NODES.
-    if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
-        warn!(reason = %reason, "rejecting build: DAG validation failed");
-        stderr_err!(stderr, "build rejected: {reason}");
-    }
-
-    // Inline .drv content for will-dispatch nodes (after dedup so we
-    // don't serialize the same derivation twice).
-    translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
-
-    // Rate limit + quota BEFORE SubmitBuild. Same placement as
-    // wopBuildDerivation — after wire reads + validation, before the
-    // scheduler RPC.
-    if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
-        return Ok(());
-    }
-    if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
-        return Ok(());
-    }
-
-    let request = translate::build_submit_request(all_nodes, all_edges, "ci", tenant_name.as_ref());
-
-    let build_result = match submit_and_process_build(
-        stderr,
-        scheduler_client,
-        request,
-        active_build_ids,
-        jwt_token.as_deref(),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => stderr_err!(stderr, "build failed: {e}"),
-    };
-
-    if !build_result.status.is_success() {
-        stderr_err!(stderr, "build failed: {}", build_result.error_msg);
+    if !all_nodes.is_empty() {
+        match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+            Ok(DagSubmitOutcome::Gated) => return Ok(()),
+            Ok(DagSubmitOutcome::Rejected(reason)) => {
+                stderr_err!(stderr, "build rejected: {reason}")
+            }
+            Ok(DagSubmitOutcome::Built(r)) if !r.status.is_success() => {
+                stderr_err!(stderr, "build failed: {}", r.error_msg)
+            }
+            Ok(DagSubmitOutcome::Built(_)) => {}
+            Err(e) => stderr_err!(stderr, "build failed: {e}"),
+        }
     }
 
     stderr.finish().await?;
@@ -1089,17 +1134,6 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
-    let SessionContext {
-        store_client,
-        scheduler_client,
-        drv_cache,
-        active_build_ids,
-        tenant_name,
-        jwt_token,
-        limiter,
-        quota_cache,
-        ..
-    } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
     let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
@@ -1117,7 +1151,6 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     // Collect all derivation paths to build together
     let mut all_nodes = Vec::new();
     let mut all_edges = Vec::new();
-    let mut drv_indices: Vec<Option<usize>> = Vec::new(); // maps raw_paths index to build result
     let mut opaque_results: HashMap<usize, BuildResult> = HashMap::new();
     // Track idx → (drvPath, Derivation) for successful Built paths so we can
     // populate builtOutputs per-derivation after the build completes.
@@ -1136,7 +1169,6 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                         format!("invalid path '{raw}': {e}"),
                     ),
                 );
-                drv_indices.push(None);
                 continue;
             }
         };
@@ -1144,7 +1176,9 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         match &dp {
             DerivedPath::Opaque(path) => {
                 let result =
-                    match grpc_is_valid_path(store_client, jwt_token.as_deref(), path).await {
+                    match grpc_is_valid_path(&mut ctx.store_client, ctx.jwt_token.as_deref(), path)
+                        .await
+                    {
                         Ok(true) => BuildResult {
                             status: BuildStatus::AlreadyValid,
                             ..Default::default()
@@ -1159,26 +1193,36 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                         ),
                     };
                 opaque_results.insert(idx, result);
-                drv_indices.push(None);
             }
             DerivedPath::Built { drv, .. } => {
-                let drv_obj = match resolve_derivation(drv, store_client, drv_cache).await {
+                let drv_obj = match resolve_derivation(
+                    drv,
+                    &mut ctx.store_client,
+                    &mut ctx.drv_cache,
+                )
+                .await
+                {
                     Ok(d) => d,
                     Err(e) => {
                         opaque_results.insert(
                             idx,
                             BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
                         );
-                        drv_indices.push(None);
                         continue;
                     }
                 };
 
-                match translate::reconstruct_dag(drv, &drv_obj, store_client, drv_cache).await {
+                match translate::reconstruct_dag(
+                    drv,
+                    &drv_obj,
+                    &mut ctx.store_client,
+                    &mut ctx.drv_cache,
+                )
+                .await
+                {
                     Ok((nodes, edges)) => {
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
-                        drv_indices.push(Some(idx));
                         drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
                     }
                     Err(e) => {
@@ -1186,7 +1230,6 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                             idx,
                             BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
                         );
-                        drv_indices.push(None);
                     }
                 }
             }
@@ -1194,41 +1237,13 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     if !all_nodes.is_empty() {
-        dedup_dag(&mut all_nodes, &mut all_edges);
-
-        // Validate BEFORE inlining: __noChroot check + early
-        // MAX_DAG_NODES. On reject: per-path BuildResult::failure,
-        // no SubmitBuild. No STDERR_ERROR — the failure BuildResult
-        // is delivered via STDERR_LAST + result at the write loop below.
-        let build_result = if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
-            warn!(reason = %reason, "rejecting build: DAG validation failed");
-            BuildResult::failure(BuildStatus::InputRejected, reason)
-        } else if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
-            // Rate limit BEFORE SubmitBuild. STDERR_ERROR already
-            // sent by rate_limit_check — same early-return as
-            // wopBuildDerivation / wopBuildPaths. No per-path result
-            // written: the STDERR_ERROR terminates the opcode.
-            return Ok(());
-        } else if quota_check(stderr, quota_cache, store_client, tenant_name.as_ref()).await? {
-            // Quota BEFORE SubmitBuild. Same STDERR_ERROR + early-
-            // return shape as rate_limit_check above.
-            return Ok(());
-        } else {
-            // Inline .drv content for will-dispatch nodes.
-            translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
-
-            let request =
-                translate::build_submit_request(all_nodes, all_edges, "ci", tenant_name.as_ref());
-
-            submit_and_process_build(
-                stderr,
-                scheduler_client,
-                request,
-                active_build_ids,
-                jwt_token.as_deref(),
-            )
-            .await
-            .unwrap_or_else(|e| {
+        let build_result = match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+            Ok(DagSubmitOutcome::Gated) => return Ok(()),
+            Ok(DagSubmitOutcome::Rejected(reason)) => {
+                BuildResult::failure(BuildStatus::InputRejected, reason)
+            }
+            Ok(DagSubmitOutcome::Built(r)) => r,
+            Err(e) => {
                 warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
                 metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                     .increment(1);
@@ -1236,7 +1251,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     BuildStatus::TransientFailure,
                     format!("scheduler error: {e}"),
                 )
-            })
+            }
         };
 
         // Apply the build result to all derivation paths, enriching each with
@@ -1251,7 +1266,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 && let Some(hash) = translate::compute_modular_hash_cached(
                     drv_obj,
                     drv_path,
-                    drv_cache,
+                    &ctx.drv_cache,
                     &mut hash_cache,
                 )
             {
@@ -1274,7 +1289,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     match rio_common::grpc::with_timeout(
                         "QueryRealisation",
                         DEFAULT_GRPC_TIMEOUT,
-                        store_client.query_realisation(req),
+                        ctx.store_client.query_realisation(req),
                     )
                     .await
                     {

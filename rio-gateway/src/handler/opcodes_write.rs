@@ -105,7 +105,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         }
         try_cache_drv(&path, &nar_data, drv_cache);
         if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
-            return send_store_error(stderr, e).await;
+            stderr_err!(stderr, "store error: {e}");
         }
     } else {
         if path.is_derivation() {
@@ -124,7 +124,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         )
         .await
         {
-            return send_store_error(stderr, e).await;
+            stderr_err!(stderr, "store error: {e}");
         }
     }
 
@@ -360,7 +360,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca.clone());
 
     if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
-        return send_store_error(stderr, e).await;
+        stderr_err!(stderr, "store error: {e}");
     }
 
     stderr.finish().await?;
@@ -437,7 +437,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca);
 
     if let Err(e) = grpc_put_path(store_client, jwt_token, info, nar_data).await {
-        return send_store_error(stderr, e).await;
+        stderr_err!(stderr, "store error: {e}");
     }
 
     stderr.finish().await?;

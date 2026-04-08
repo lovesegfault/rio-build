@@ -69,13 +69,24 @@ const PROGRAM_NAME: &str = "rio-gateway";
 pub(crate) fn with_jwt<T>(body: T, jwt_token: Option<&str>) -> anyhow::Result<tonic::Request<T>> {
     let mut req = tonic::Request::new(body);
     rio_proto::interceptor::inject_current(req.metadata_mut());
-    if let Some(token) = jwt_token {
-        req.metadata_mut().insert(
-            rio_proto::TENANT_TOKEN_HEADER,
-            tonic::metadata::MetadataValue::try_from(token)?,
-        );
+    for (k, v) in jwt_metadata(jwt_token) {
+        req.metadata_mut()
+            .insert(k, tonic::metadata::MetadataValue::try_from(v)?);
     }
     Ok(req)
+}
+
+/// Build the `x-rio-tenant-token` metadata pair list. Single source of
+/// truth for JWT-header injection: [`with_jwt`] iterates this into a
+/// `tonic::Request`, and `rio_proto::client::*` helpers take it as
+/// `extra_metadata: &[(&str, &str)]` directly. Empty when `jwt_token`
+/// is `None` (dual-mode fallback — store's interceptor treats absent
+/// header as pass-through per `r[gw.jwt.dual-mode]`).
+pub(crate) fn jwt_metadata(jwt_token: Option<&str>) -> Vec<(&'static str, &str)> {
+    match jwt_token {
+        Some(t) => vec![(rio_proto::TENANT_TOKEN_HEADER, t)],
+        None => vec![],
+    }
 }
 
 /// Typed errors for the handler layer.
@@ -165,6 +176,12 @@ pub enum GatewayError {
 /// `return Err(GatewayError::ClientReported(msg).into())`.
 /// The same message is used for both the client-visible error and the
 /// internal error. Use inside `match ... { Err(e) => stderr_err!(stderr, "... {e}") }`.
+///
+/// Send-failure semantics: if writing the STDERR_ERROR frame itself fails
+/// (client disconnected, SSH channel closed), that I/O error is propagated
+/// via `?` — both paths terminate the session, so there is nothing useful
+/// to be gained by swallowing it. This is the SOLE error-reporting
+/// mechanism for the handler layer; do not add a function variant.
 macro_rules! stderr_err {
     ($stderr:expr, $($arg:tt)*) => {{
         let __msg = format!($($arg)*);
@@ -178,28 +195,6 @@ macro_rules! stderr_err {
     }};
 }
 
-/// Client build options received via wopSetOptions.
-///
-/// ssh-ng clients never send `wopSetOptions` (`SSHStore::setOptions()` is an
-/// empty override, ssh-store.cc 088ef8175), so on the production path this
-/// stays `None`. Stored anyway because `handle_set_options` must drain the
-/// wire payload for daemon-socket golden-conformance tests; nothing reads
-/// these fields downstream — `SubmitBuildRequest` build options are reachable
-/// only via the gRPC path (rio-cli), not `nix-build --option`.
-#[derive(Debug, Clone)]
-pub struct ClientOptions {
-    pub keep_failed: bool,
-    pub keep_going: bool,
-    pub try_fallback: bool,
-    pub verbosity: u64,
-    pub max_build_jobs: u64,
-    pub max_silent_time: u64,
-    pub verbose_build: bool,
-    pub build_cores: u64,
-    pub use_substitutes: bool,
-    pub overrides: Vec<(String, String)>,
-}
-
 /// Per-session mutable state, threaded through all opcode handlers.
 ///
 /// Holds the gRPC clients and protocol-session-scoped state (options,
@@ -208,7 +203,6 @@ pub struct ClientOptions {
 pub struct SessionContext {
     pub store_client: StoreServiceClient<Channel>,
     pub scheduler_client: SchedulerServiceClient<Channel>,
-    pub options: Option<ClientOptions>,
     pub drv_cache: HashMap<StorePath, Derivation>,
     /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
     /// is likely an IFD or build-hook request.
@@ -252,7 +246,6 @@ impl SessionContext {
         Self {
             store_client,
             scheduler_client,
-            options: None,
             drv_cache: HashMap::new(),
             has_seen_build_paths_with_results: false,
             active_build_ids: HashMap::new(),
@@ -324,9 +317,7 @@ where
             handle_query_valid_paths(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
         Some(WorkerOp::AddTempRoot) => handle_add_temp_root(reader, &mut stderr).await,
-        Some(WorkerOp::SetOptions) => {
-            handle_set_options(reader, &mut stderr, &mut ctx.options).await
-        }
+        Some(WorkerOp::SetOptions) => handle_set_options(reader, &mut stderr).await,
         Some(WorkerOp::NarFromPath) => {
             handle_nar_from_path(reader, &mut stderr, &mut ctx.store_client, jwt).await
         }
@@ -409,23 +400,6 @@ where
     }
 
     result
-}
-
-/// Send a store error as STDERR_ERROR to the client, then return the error.
-async fn send_store_error<W: AsyncWrite + Unpin>(
-    stderr: &mut StderrWriter<&mut W>,
-    err: anyhow::Error,
-) -> anyhow::Result<()> {
-    if let Err(send_err) = stderr
-        .error(&StderrError::simple(
-            PROGRAM_NAME,
-            format!("store error: {err}"),
-        ))
-        .await
-    {
-        warn!(error = %send_err, "failed to send store error to client");
-    }
-    Err(err)
 }
 
 /// If `path` is a `.drv`, parse the ATerm from NAR data and cache it.

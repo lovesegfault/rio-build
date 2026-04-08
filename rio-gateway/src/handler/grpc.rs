@@ -1,27 +1,16 @@
 //! Store-query helpers using gRPC.
 //!
 //! All helpers take `jwt_token: Option<&str>` and attach it as
-//! `x-rio-tenant-token` via [`with_jwt`]. Without the JWT, store-side
-//! tenant-scoped operations (substitution, narinfo visibility gate)
-//! short-circuit — see `r[gw.jwt.issue]`.
+//! `x-rio-tenant-token` via [`with_jwt`] / [`jwt_metadata`] (the former
+//! wraps a `tonic::Request`, the latter feeds `rio_proto::client::*`
+//! helpers; both share one header-construction path). Without the JWT,
+//! store-side tenant-scoped operations (substitution, narinfo
+//! visibility gate) short-circuit — see `r[gw.jwt.issue]`.
 
 use super::*;
 use rio_proto::client::NAR_CHUNK_SIZE;
 use rio_proto::validated::ValidatedPathInfo;
 use tokio::io::AsyncReadExt;
-
-/// Build the `x-rio-tenant-token` metadata pair for rio-proto helpers.
-///
-/// Returns a borrowed-slice-compatible array so callers can pass
-/// `&jwt_metadata(token)` directly. Empty slice when `jwt_token` is
-/// `None` (dual-mode fallback — store's interceptor treats absent
-/// header as pass-through per `r[gw.jwt.dual-mode]`).
-fn jwt_metadata(jwt_token: Option<&str>) -> Vec<(&'static str, &str)> {
-    match jwt_token {
-        Some(t) => vec![(rio_proto::TENANT_TOKEN_HEADER, t)],
-        None => vec![],
-    }
-}
 
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
 pub(crate) async fn grpc_query_path_info(
