@@ -13,8 +13,10 @@
   // builders or just the open-egress fetchers when diagnosing.
   import { admin } from '../api/admin';
   import DrainButton from '../components/DrainButton.svelte';
+  import Pill from '../components/Pill.svelte';
   import type { ExecutorInfo } from '../api/types';
   import { fmtTsRel, tsToMs } from '../lib/buildInfo';
+  import { startPoll } from '../lib/poll';
 
   // 30s matches the scheduler's dead-executor threshold (heartbeat period
   // is 10s, dead after 3 misses — see scheduler spec). A heartbeat
@@ -29,6 +31,16 @@
     0: 'builder',
     1: 'fetcher',
   };
+
+  // Executor-status colour table. Same pattern as BuildStatePill's
+  // STATE_META — single source of truth for the palette, rendered via
+  // the shared <Pill>. Unknown statuses fall through to neutral grey.
+  const STATUS_META: Record<string, { bg: string; fg: string }> = {
+    alive: { bg: '#cfe8cf', fg: '#1a5a1a' },
+    draining: { bg: '#fde8c9', fg: '#7a4a00' },
+    dead: { bg: '#f3cccc', fg: '#7a1a1a' },
+  };
+  const STATUS_FALLBACK = { bg: '#eee', fg: '#374151' };
 
   let executors = $state<ExecutorInfo[]>([]);
   let error = $state<string | null>(null);
@@ -56,11 +68,7 @@
     }
   }
 
-  $effect(() => {
-    void refresh();
-    const id = setInterval(refresh, 5000);
-    return () => clearInterval(id);
-  });
+  $effect(() => startPoll(refresh));
 
   function isBusy(e: ExecutorInfo): boolean {
     return e.runningBuilds > 0;
@@ -101,15 +109,12 @@
              treated as stale; display reads "—" via fmtTsRel. -->
         {@const hb = tsToMs(e.lastHeartbeat)}
         {@const stale = hb === undefined || now - hb > STALE_MS}
+        {@const sm = STATUS_META[e.status] ?? STATUS_FALLBACK}
         <tr>
           <td>{e.executorId}</td>
           <td data-testid="kind-cell">{KIND_META[e.kind] ?? '—'}</td>
-          <td
-            ><span
-              class="pill pill-{e.status}"
-              data-testid="status-pill"
-              aria-label="status: {e.status}">{e.status}</span
-            ></td
+          <td data-testid="status-pill"
+            ><Pill label={e.status} bg={sm.bg} fg={sm.fg} /></td
           >
           <td>
             <span
@@ -138,25 +143,6 @@
     text-align: left;
     padding: 0.4rem 0.75rem;
     border-bottom: 1px solid #ddd;
-  }
-  .pill {
-    display: inline-block;
-    padding: 0.1rem 0.5rem;
-    border-radius: 999px;
-    font-size: 0.85em;
-    background: #eee;
-  }
-  .pill-alive {
-    background: #cfe8cf;
-    color: #1a5a1a;
-  }
-  .pill-draining {
-    background: #fde8c9;
-    color: #7a4a00;
-  }
-  .pill-dead {
-    background: #f3cccc;
-    color: #7a1a1a;
   }
   .load-pill {
     display: inline-block;

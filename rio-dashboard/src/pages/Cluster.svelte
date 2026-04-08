@@ -7,6 +7,7 @@
   import { navigate } from 'svelte-routing';
   import { admin } from '../api/admin';
   import type { ClusterStatusResponse } from '../api/types';
+  import { startPoll } from '../lib/poll';
 
   let status = $state<ClusterStatusResponse | null>(null);
   let error = $state<string | null>(null);
@@ -24,22 +25,9 @@
   }
 
   // $effect mirrors the component lifetime: one interval per mount,
-  // return value is the teardown. No onMount/onDestroy pair to keep
-  // in sync, no stale-closure trap — the rune re-runs if deps change
-  // (none here), and the cleanup fires on unmount.
-  $effect(() => {
-    // Fire once immediately; setInterval waits the full period first.
-    void refresh();
-    // Skip ticks when the tab is backgrounded — stops hammering the
-    // scheduler from a tab the user isn't looking at. Page Visibility
-    // API is well-supported; document.hidden is true on tab-switch or
-    // window-minimize.
-    const id = setInterval(() => {
-      if (document.hidden) return;
-      void refresh();
-    }, 5000);
-    return () => clearInterval(id);
-  });
+  // teardown on unmount. startPoll bakes in the fire-immediately +
+  // document.hidden gate; see lib/poll.ts.
+  $effect(() => startPoll(refresh));
 </script>
 
 {#if error}

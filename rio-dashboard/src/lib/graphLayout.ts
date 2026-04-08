@@ -105,11 +105,19 @@ export const DERIVATION_STATUSES = [
   'skipped',
 ] as const;
 
-// /nix/store/<32-char-hash>-<name>.drv → <8-char-prefix>. Falls back to
-// the last path segment when the shape doesn't match (tests, mocks).
+// /nix/store/<32-char-hash>-<name> → 32-char hash. undefined when the
+// shape doesn't match (tests, mocks, raw pname). DrvNode keys the
+// ClearPoison RPC on the full hash; hashPrefix below truncates for
+// display.
+export function parseStoreHash(storePath: string): string | undefined {
+  return /\/nix\/store\/([a-z0-9]{32})-/.exec(storePath)?.[1];
+}
+
+// 8-char display prefix. Falls back to the last path segment when the
+// input isn't store-path-shaped.
 export function hashPrefix(drvPath: string): string {
-  const m = /\/nix\/store\/([a-z0-9]{32})-/.exec(drvPath);
-  if (m) return m[1].slice(0, 8);
+  const h = parseStoreHash(drvPath);
+  if (h) return h.slice(0, 8);
   const base = drvPath.split('/').pop() ?? drvPath;
   return base.slice(0, 8);
 }

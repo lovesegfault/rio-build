@@ -31,6 +31,8 @@
 </script>
 
 <script lang="ts">
+  import Pill from './Pill.svelte';
+
   let { state }: { state: number } = $props();
   // Future-proof the lookup: if the proto grows a BUILD_STATE_POISONED
   // before this table is updated, fall back to the "unknown" styling
@@ -38,21 +40,4 @@
   let meta = $derived(STATE_META[state] ?? STATE_META[0]);
 </script>
 
-<span
-  class="pill"
-  data-state={meta.label}
-  style="background-color: {meta.bg}; color: {meta.fg}"
->
-  {meta.label}
-</span>
-
-<style>
-  .pill {
-    display: inline-block;
-    padding: 0.125rem 0.5rem;
-    border-radius: 9999px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    white-space: nowrap;
-  }
-</style>
+<Pill label={meta.label} bg={meta.bg} fg={meta.fg} />

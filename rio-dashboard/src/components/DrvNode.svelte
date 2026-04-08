@@ -14,7 +14,12 @@
   // select, connectable) are unused but still present in the type;
   // Svelte 5's `$props()` just drops them.
   import { Handle, Position, type NodeProps } from '@xyflow/svelte';
-  import { hashPrefix, statusClass, type DrvNode } from '../lib/graphLayout';
+  import {
+    hashPrefix,
+    parseStoreHash,
+    statusClass,
+    type DrvNode,
+  } from '../lib/graphLayout';
   import ClearPoisonButton from './ClearPoisonButton.svelte';
 
   let { id, data }: NodeProps<DrvNode> = $props();
@@ -23,11 +28,9 @@
   let cls = $derived(statusClass(data.status));
 
   // ClearPoison RPC keys on the 32-char store-path hash, not the full
-  // drvPath. Same regex as hashPrefix but captures the whole thing.
-  // Falls back to the full id for non-standard paths (tests, mocks).
-  let drvHash = $derived(
-    /\/nix\/store\/([a-z0-9]{32})-/.exec(id)?.[1] ?? id,
-  );
+  // drvPath. Falls back to the full id for non-standard paths (tests,
+  // mocks).
+  let drvHash = $derived(parseStoreHash(id) ?? id);
 
   // Context-menu state. Right-click opens; any click (inside or out)
   // closes via the window listener below. stopPropagation on the menu

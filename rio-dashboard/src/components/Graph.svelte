@@ -30,6 +30,7 @@
     type RawEdge,
     type RawNode,
   } from '../lib/graphLayout';
+  import { startPoll } from '../lib/poll';
   import type {
     WorkerRequest,
     WorkerResponse,
@@ -227,16 +228,16 @@
     // re-mounts us with a different build (it shouldn't — the {#key}
     // wrapper tears this whole component down — but belt-and-braces).
     void buildId;
-    fetchAndLayout();
     // allTerminal is reactive: when fetchAndLayout flips it true the
     // effect re-runs, the old interval is cleared by the teardown
     // closure, and this branch declines to start a new one. One last
-    // fetchAndLayout fires (above) — harmless, the inflight gate or
-    // the sig-match short-circuits it.
-    const t = allTerminal ? null : setInterval(fetchAndLayout, 5000);
-    return () => {
-      if (t !== null) clearInterval(t);
-    };
+    // fetchAndLayout fires — harmless, the inflight gate or the
+    // sig-match short-circuits it.
+    if (allTerminal) {
+      fetchAndLayout();
+      return;
+    }
+    return startPoll(fetchAndLayout);
   });
 
   // Worker lifecycle split into its own effect so the allTerminal flip
