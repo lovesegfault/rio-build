@@ -307,10 +307,10 @@ impl StoreServiceImpl {
         // `pool.begin()` → N × complete_manifest_inline_in_tx → commit.
         // Any error inside the tx → drop → auto-rollback → `abort_batch`
         // cleans placeholders → zero 'complete' rows. Tx covers DB rows
-        // ONLY; blob-store writes (inline_blob here) are inside the same
-        // tx so they're covered too, but chunked blobs (not v1) would be
-        // orphaned — refcount-zero, GC-eligible. Bound: ≤1 NAR-size per
-        // failure.
+        // ONLY; inline_blob writes are inside the same tx so they're
+        // covered too. Chunked blobs were staged outside the tx (phase-2);
+        // on failure here `abort_batch`'s `reap_one` decrements their
+        // refcounts back to zero → GC-eligible.
         let mut tx = match self.pool.begin().await {
             Ok(t) => t,
             Err(e) => bail!(rio_common::grpc::internal(
