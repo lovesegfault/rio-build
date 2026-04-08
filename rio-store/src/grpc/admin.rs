@@ -12,6 +12,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, instrument, warn};
 
+use rio_common::grpc::StatusExt;
+
 use rio_proto::types::{
     AddUpstreamRequest, GcProgress, GcRequest, GetLoadRequest, GetLoadResponse,
     ListUpstreamsRequest, ListUpstreamsResponse, RemoveUpstreamRequest, UpstreamInfo,

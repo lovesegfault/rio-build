@@ -20573,7 +20573,7 @@
         },
         {
           "name": "rand",
-          "packageId": "rand 0.9.2"
+          "packageId": "rand 0.10.0"
         },
         {
           "name": "rustls",

@@ -4177,6 +4177,7 @@ name = "rio-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "ed25519-dalek",
  "figment",
@@ -4187,6 +4188,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rand 0.10.0",
  "rustls 0.23.37",
  "serde",
  "serde_json",
@@ -6416,8 +6418,6 @@ dependencies = [
  "aws-sdk-sts",
  "aws-smithy-http-client",
  "aws-smithy-runtime",
- "axum",
- "axum-core",
  "base64",
  "base64ct",
  "bitflags",

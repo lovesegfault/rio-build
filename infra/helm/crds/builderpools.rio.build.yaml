@@ -61,20 +61,9 @@ spec:
                 nullable: true
                 type: integer
               deadlineSeconds:
-                description: "Job `activeDeadlineSeconds` \u2014 K8s kills the pod\
-                  \ if it doesn't\ncomplete within this many seconds. Backstop for\
-                  \ wrong-pool\nspawns: `reconcile` spawns from the CLUSTER-WIDE\n\
-                  `queued_derivations` count, not pool-matching depth. A queue\nfull\
-                  \ of `x86_64-linux` work on an `aarch64-darwin` pool\ntriggers a\
-                  \ Job spawn; the worker heartbeats, never matches\ndispatch, and\
-                  \ would hang indefinitely without a deadline.\nDefault 3600 (1h):\
-                  \ long enough that a matched dispatch + build\ncompletes; short\
-                  \ enough that a wrong-pool spawn doesn't leak\nfor the life of the\
-                  \ cluster. Raise for pools running known-long\nbuilds. This bounds\
-                  \ BUILD time too \u2014 `backoffLimit: 0` means\nK8s doesn't distinguish\
-                  \ \"builder idle\" from \"builder busy on\n90min build\").\n\nPer-pool\
-                  \ queue depth (the proper fix) is deferred to phase5's\nClusterStatus\
-                  \ proto extension. See `r[ctrl.pool.ephemeral-\ndeadline]` in controller.md."
+                description: 'Backstop `activeDeadlineSeconds` on Jobs. `None` = per-role
+
+                  default (3600 for builders, 300 for fetchers).'
                 format: uint32
                 minimum: 0.0
                 nullable: true
@@ -129,23 +118,16 @@ spec:
                 nullable: true
                 type: boolean
               hostUsers:
-                description: "Explicit `hostUsers` override. `None` (default) = derived:\n\
-                  `hostUsers: false` when `!privileged && !hostNetwork` (user-\nnamespace\
-                  \ isolation per ADR-012). `Some(true)` = opt OUT of\nuserns even\
-                  \ when non-privileged. `Some(false)` = force userns\n(same as derived\
-                  \ for the non-privileged path; no-op).\n\nWhen to set `true`: containerd\
-                  \ with the systemd cgroup driver\nmay not chown the pod's cgroup\
-                  \ to the userns-mapped root UID\n(runc `Cgroup.OwnerUID` path).\
-                  \ The worker's `mkdir /sys/fs/\ncgroup/leaf` then fails EACCES \u2192\
-                  \ CrashLoopBackOff. Observed\non k3s 1.35.2 (vm-security-nonpriv-k3s\
-                  \ scenario). Production\nEKS/GKE with containerd 2.0+ and proper\
-                  \ delegation should\nleave this unset. See the diagnostic comment\
-                  \ in\n`nix/tests/fixtures/k3s-full.nix` worker-Ready wait."
+                description: "Explicit `hostUsers` override. `None` defaults to `hostUsers:\n\
+                  false` (userns isolation per ADR-012). Set `true` for k3s/\ncontainerd\
+                  \ deployments that don't chown the pod cgroup to the\nuserns-mapped\
+                  \ root UID \u2014 see `BuilderPoolSpec.host_users` doc\nfor the\
+                  \ full diagnostic."
                 nullable: true
                 type: boolean
               image:
-                description: "Container image ref. Required \u2014 there's no sensible\n\
-                  default (depends on how operators build/tag)."
+                description: "Container image ref. Required \u2014 there's no sensible\
+                  \ default\n(depends on how operators build/tag)."
                 type: string
               imagePullPolicy:
                 description: "Container imagePullPolicy. None = K8s default (IfNotPresent\n\
@@ -157,19 +139,19 @@ spec:
                 nullable: true
                 type: string
               maxConcurrent:
-                description: "Concurrent-Job ceiling. The reconciler spawns one Job\
-                  \ per\ndispatch-need up to this many active at once. There is no\n\
-                  standing set \u2014 Jobs spawn when there's work, exit after one\n\
-                  build. CEL enforces `> 0`."
+                description: 'Concurrent-Job ceiling. The reconciler spawns one Job
+                  per
+
+                  dispatch-need up to this many active at once. Both CRDs add
+
+                  a struct-level CEL `self.maxConcurrent > 0`.'
                 format: uint32
                 minimum: 0.0
                 type: integer
               nodeSelector:
                 additionalProperties:
                   type: string
-                description: 'Node selector for the Job pod spec. Common:
-
-                  `rio.build/builder: "true"` to confine to tainted nodes.'
+                description: Node selector for the Job pod spec.
                 nullable: true
                 type: object
               privileged:
@@ -192,15 +174,8 @@ spec:
                 nullable: true
                 type: boolean
               resources:
-                description: "K8s resource requests/limits for the worker container.\n\
-                  `None` = unbounded (cluster default). Operators should set\nthis\
-                  \ \u2014 unbounded workers on a shared node is a noisy-\nneighbor\
-                  \ risk.\n\nschemars(schema_with): k8s-openapi types don't impl\n\
-                  JsonSchema. `any_object` emits `type: object` +\n`x-kubernetes-preserve-unknown-fields:\
-                  \ true` \u2014 the\napiserver validates against its OWN schema (it\
-                  \ knows\nResourceRequirements), we just tell it \"object, don't\n\
-                  strip unknowns.\" `serde_json::Value` emitted `{}` which\nthe apiserver\
-                  \ REJECTS (`type: Required value`)."
+                description: "K8s resource requests/limits for the executor container.\n\
+                  `any_object` passthrough \u2014 see `crate::any_object` for why."
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
@@ -300,15 +275,15 @@ spec:
                 - Manifest
                 type: string
               systems:
-                description: "Target systems (e.g., \"x86_64-linux\"). CEL: non-empty\
-                  \ \u2014\na worker that builds nothing is a config error."
+                description: 'Target systems (e.g., `["x86_64-linux"]`). Builders
+                  AND
+
+                  fetchers execute derivation `builder` scripts, so the host
+
+                  system must match.'
                 items:
                   type: string
                 type: array
-                x-kubernetes-validations:
-                - message: "systems must be non-empty \u2014 a builder pool with no\
-                    \ target systems accepts no work"
-                  rule: size(self) > 0
               terminationGracePeriodSeconds:
                 description: "Pod terminationGracePeriodSeconds. SIGTERM \u2192 executor\
                   \ drain\n(DrainExecutor + wait for in-flight builds to complete).\
@@ -322,21 +297,18 @@ spec:
                 nullable: true
                 type: integer
               tlsSecretName:
-                description: "mTLS client cert Secret name. When set, the controller\n\
-                  mounts this Secret at `/etc/rio/tls/` and sets the\n`RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH`\
-                  \ env vars.\n\nThe Secret must have keys `tls.crt`, `tls.key`, `ca.crt`\n\
-                  (cert-manager's standard output for a Certificate with a\nCA issuer).\
-                  \ In the prod overlay, this is `rio-builder-tls`\n(see cert-manager.yaml).\n\
-                  \nUnset = plaintext gRPC (dev mode). The builder's TlsConfig\ndefaults\
-                  \ to empty \u2192 load_client_tls returns None."
+                description: "mTLS client cert Secret name (`tls.crt`/`tls.key`/`ca.crt`).\n\
+                  Same cert across builders and fetchers \u2014 same binary, same\n\
+                  scheduler/store endpoints. Unset = plaintext gRPC (dev mode)."
                 nullable: true
                 type: string
               tolerations:
-                description: 'Tolerations for the Job pod spec. Pairs with
+                description: 'Tolerations for the Job pod spec. Typed `Toleration`
+                  (not
 
-                  node_selector: tolerate the `rio.build/builder:NoSchedule`
+                  `serde_json::Value`); `any_object_array` passthrough because
 
-                  taint so workers (and only workers) land on those nodes.'
+                  k8s-openapi types don''t impl JsonSchema.'
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -351,6 +323,9 @@ spec:
             - message: "maxConcurrent must be > 0 \u2014 it is the concurrent-Job\
                 \ ceiling"
               rule: self.maxConcurrent > 0
+            - message: "systems must be non-empty \u2014 a builder pool with no target\
+                \ systems accepts no work"
+              rule: size(self.systems) > 0
             - message: "hostNetwork:true requires privileged:true \u2014 Kubernetes\
                 \ rejects hostUsers:false with hostNetwork:true at admission; the\
                 \ non-privileged path sets hostUsers:false (see ADR-012)"
@@ -365,11 +340,10 @@ spec:
             properties:
               conditions:
                 default: []
-                description: "Standard K8s Conditions. One type:\n  - `SchedulerUnreachable`:\
-                  \ status=True when the\n    reconciler's ClusterStatus RPC fails.\
-                  \ Disambiguates\n    \"scheduler idle (queued=0)\" from \"scheduler\
-                  \ down\n    (queued unknown, fail-open to 0).\" Written by the\n\
-                  \    ephemeral reconciler."
+                description: "Standard K8s Conditions. Both pools currently expose\
+                  \ one type:\n`SchedulerUnreachable` (status=True when the reconciler's\n\
+                  `ClusterStatus` RPC fails \u2014 disambiguates \"scheduler idle,\n\
+                  queued=0\" from \"scheduler down, queued unknown\")."
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -377,13 +351,15 @@ spec:
                 type: array
               desiredReplicas:
                 default: 0
-                description: Concurrent-Job ceiling (`spec.maxConcurrent`).
+                description: Concurrent-Job target the reconciler is converging on.
                 format: int32
                 type: integer
               readyReplicas:
                 default: 0
-                description: Jobs whose pod has passed readinessProbe = heartbeat
-                  accepted.
+                description: 'Jobs whose pod has passed readinessProbe (heartbeating
+                  to
+
+                  scheduler).'
                 format: int32
                 type: integer
               replicas:

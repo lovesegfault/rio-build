@@ -76,20 +76,16 @@ spec:
                       nullable: true
                       type: integer
                     name:
-                      description: 'Class name. Becomes the Job name component
+                      description: 'Class name. Becomes the child pool / Job name
+                        suffix AND the
 
-                        (`rio-fetcher-{pool}-{name}-*`) AND the `RIO_SIZE_CLASS` env
-                        the
-
-                        executor reports in its heartbeat. Convention: "tiny" /
-
-                        "small"; nothing enforces that.'
+                        `RIO_SIZE_CLASS` env the executor reports in its heartbeat.'
                       type: string
                     resources:
                       description: "K8s resource requests/limits for this class's\
-                        \ fetcher pods.\nNON-Option: distinct resource profiles are\
-                        \ the entire point\nof size classes. `any_object` passthrough\
-                        \ \u2014 see\nbuilderpool.rs for why."
+                        \ pods.\nNON-Option: distinct resource profiles are the entire\
+                        \ point\nof size classes. `any_object` passthrough \u2014\
+                        \ see\n`crate::any_object` for why."
                       nullable: true
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
@@ -99,85 +95,68 @@ spec:
                   type: object
                 type: array
               deadlineSeconds:
-                description: "Backstop `activeDeadlineSeconds` on Jobs. Same field\
-                  \ as\nBuilderPool. Default 300 (`reconcilers/fetcherpool/\nephemeral.rs::FOD_DEADLINE_SECS`)\
-                  \ \u2014 fetches are network-bound\nand short; a stuck download\
-                  \ is the failure mode, not a 90min\ncompile."
+                description: 'Backstop `activeDeadlineSeconds` on Jobs. `None` = per-role
+
+                  default (3600 for builders, 300 for fetchers).'
                 format: uint32
                 minimum: 0.0
                 nullable: true
                 type: integer
               hostUsers:
-                description: "Explicit `hostUsers` override \u2014 same semantics\
-                  \ as BuilderPool.\n`None` defaults to `hostUsers: false` (userns\
-                  \ isolation). Set\n`true` for k3s/containerd deployments that don't\
-                  \ chown the pod\ncgroup to the userns-mapped root UID (rio-builder's\
-                  \ `mkdir\n/sys/fs/cgroup/leaf` fails EACCES \u2192 CrashLoopBackOff).\
-                  \ See\nbuilderpool.rs's `host_users` doc for the full diagnostic."
+                description: "Explicit `hostUsers` override. `None` defaults to `hostUsers:\n\
+                  false` (userns isolation per ADR-012). Set `true` for k3s/\ncontainerd\
+                  \ deployments that don't chown the pod cgroup to the\nuserns-mapped\
+                  \ root UID \u2014 see `BuilderPoolSpec.host_users` doc\nfor the\
+                  \ full diagnostic."
                 nullable: true
                 type: boolean
               image:
-                description: 'Container image. Same binary as builders (`rio-builder`),
-
-                  different `RIO_EXECUTOR_KIND` env baked into the pod spec.'
+                description: "Container image ref. Required \u2014 there's no sensible\
+                  \ default\n(depends on how operators build/tag)."
                 type: string
               maxConcurrent:
                 description: 'Concurrent-Job ceiling. The reconciler spawns one Job
                   per
 
-                  outstanding FOD up to this many active at once. FODs spike at
+                  dispatch-need up to this many active at once. Both CRDs add
 
-                  build start (40+ ready simultaneously when chains hit FOD-phase
-
-                  together) but are short (~seconds each).'
+                  a struct-level CEL `self.maxConcurrent > 0`.'
                 format: uint32
                 minimum: 0.0
                 type: integer
               nodeSelector:
                 additionalProperties:
                   type: string
-                description: 'Node selector. Pairs with `rio.build/node-role: fetcher`
-
-                  label on the Karpenter NodePool (spec: fetcher.node.dedicated).'
+                description: Node selector for the Job pod spec.
                 nullable: true
                 type: object
               resources:
-                description: "K8s resource requests/limits for a single-size pool.\
-                  \ Fetchers\nare typically lighter than builders (network-bound)\
-                  \ \u2014 500m/1Gi\ndefault. Mutually exclusive with `classes[]`\
-                  \ (CEL-enforced):\nwhen `classes` is non-empty, per-class resources\
-                  \ apply and this\nfield MUST be unset. `any_object` passthrough\
-                  \ \u2014 see\nbuilderpool.rs for why."
+                description: "K8s resource requests/limits for the executor container.\n\
+                  `any_object` passthrough \u2014 see `crate::any_object` for why."
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               systems:
-                description: 'Target systems (e.g., `["x86_64-linux"]`). Fetchers
-                  still
+                description: 'Target systems (e.g., `["x86_64-linux"]`). Builders
+                  AND
 
-                  execute the FOD''s `builder` script (curl, git, etc.), so the
+                  fetchers execute derivation `builder` scripts, so the host
 
                   system must match.'
                 items:
                   type: string
                 type: array
               tlsSecretName:
-                description: 'mTLS Secret name (tls.crt/tls.key/ca.crt) for outgoing
-                  gRPC
-
-                  to scheduler + store. Same cert as builders (same binary,
-
-                  same client role). If unset, the fetcher runs without TLS
-
-                  and the scheduler rejects the heartbeat in mTLS deployments.'
+                description: "mTLS client cert Secret name (`tls.crt`/`tls.key`/`ca.crt`).\n\
+                  Same cert across builders and fetchers \u2014 same binary, same\n\
+                  scheduler/store endpoints. Unset = plaintext gRPC (dev mode)."
                 nullable: true
                 type: string
               tolerations:
-                description: 'Tolerations. Pairs with `rio.build/fetcher=true:NoSchedule`
+                description: 'Tolerations for the Job pod spec. Typed `Toleration`
+                  (not
 
-                  taint on fetcher nodes. Typed `Toleration` (not
-
-                  serde_json::Value); `any_object_array` passthrough because
+                  `serde_json::Value`); `any_object_array` passthrough because
 
                   k8s-openapi types don''t impl JsonSchema.'
                 items:
@@ -204,7 +183,10 @@ spec:
             properties:
               conditions:
                 default: []
-                description: Standard K8s Conditions.
+                description: "Standard K8s Conditions. Both pools currently expose\
+                  \ one type:\n`SchedulerUnreachable` (status=True when the reconciler's\n\
+                  `ClusterStatus` RPC fails \u2014 disambiguates \"scheduler idle,\n\
+                  queued=0\" from \"scheduler down, queued unknown\")."
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -212,17 +194,15 @@ spec:
                 type: array
               desiredReplicas:
                 default: 0
-                description: 'In-flight Job count the reconciler is targeting (queued
-                  FOD
-
-                  demand, capped at `maxConcurrent`).'
+                description: Concurrent-Job target the reconciler is converging on.
                 format: int32
                 type: integer
               readyReplicas:
                 default: 0
-                description: 'Count of active Jobs whose pod passed readinessProbe
+                description: 'Jobs whose pod has passed readinessProbe (heartbeating
+                  to
 
-                  (heartbeating to scheduler as `ExecutorKind::Fetcher`).'
+                  scheduler).'
                 format: int32
                 type: integer
             type: object

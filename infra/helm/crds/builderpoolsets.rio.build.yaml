@@ -58,37 +58,25 @@ spec:
                       format: double
                       type: number
                     maxConcurrent:
-                      description: "Concurrent-Job ceiling for this class. `None`\
-                        \ = inherit.\nPer-class because \"large\" workers have big\
-                        \ resource requests\n\u2014 capping them prevents one class\
-                        \ from starving the cluster."
+                      description: 'Concurrent-Job ceiling for this class. `None`
+                        = inherit
+
+                        `spec.max_concurrent`.'
                       format: uint32
                       minimum: 0.0
                       nullable: true
                       type: integer
                     name:
-                      description: 'Class name. Becomes the child BuilderPool''s name
-                        suffix
+                      description: 'Class name. Becomes the child pool / Job name
+                        suffix AND the
 
-                        (`{bps}-{name}`) AND the `BuilderPoolSpec.size_class` value
-
-                        the scheduler matches against. Convention: "small" / "medium"
-
-                        / "large"; nothing enforces that.'
+                        `RIO_SIZE_CLASS` env the executor reports in its heartbeat.'
                       type: string
                     resources:
                       description: "K8s resource requests/limits for this class's\
-                        \ builder\npods. NON-Option: the entire POINT of size classes\
-                        \ is\ndistinct resource profiles (\"small\" = 1cpu/2Gi; \"\
-                        large\"\n= 16cpu/64Gi). An inherited default defeats the purpose.\n\
-                        P0233's child-builder does `Some(class.resources.clone())`\n\
-                        straight into `Option<ResourceRequirements>`.\n\n`any_object`\
-                        \ passthrough \u2014 see builderpool.rs for why.\nThe helper\
-                        \ emits `nullable: true` (it was written for\nOption fields);\
-                        \ here the field is non-Option so serde\nrejects `null` at\
-                        \ deserialize regardless. Apiserver\naccepts `null` \u2192\
-                        \ controller fails deserialize with a\nclear error \u2014\
-                        \ acceptable (operators see it)."
+                        \ pods.\nNON-Option: distinct resource profiles are the entire\
+                        \ point\nof size classes. `any_object` passthrough \u2014\
+                        \ see\n`crate::any_object` for why."
                       nullable: true
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
