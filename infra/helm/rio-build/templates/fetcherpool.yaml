@@ -1,6 +1,3 @@
-{{- if hasKey .Values "fetcherPool" -}}
-{{- fail "values key `fetcherPool` (singular) was renamed to `fetcherPools` (list) + `fetcherPoolDefaults` — update your --set/values overrides" -}}
-{{- end -}}
 {{- $root := . -}}
 {{- range .Values.fetcherPools }}
 {{- /* One FetcherPool per entry, deep-merged over

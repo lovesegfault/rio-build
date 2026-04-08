@@ -9,7 +9,7 @@ locals {
   # exist" at push time.
   rio_images = [
     "gateway", "scheduler", "store", "controller", "builder",
-    "fetcher", "bootstrap", "seccomp-bootstrap", "dashboard", "all",
+    "fetcher", "bootstrap", "dashboard",
   ]
 }
 
@@ -43,7 +43,7 @@ resource "aws_ecr_repository" "rio" {
 # version (`-amd64`, `-arm64`, and the manifest index), so 30
 # images ≈ 10 versions — enough for "roll back to last week"
 # while keeping ECR storage bounded (each rio image is ~50-150MB;
-# 9 repos × 30 images × 150MB ≈ 40GB worst case).
+# 8 repos × 30 images × 150MB ≈ 36GB worst case).
 #
 # Rule matches all tags (tagStatus: any). ECR lifecycle rules
 # can't filter by tag prefix within a single rule — if you want

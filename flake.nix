@@ -1656,10 +1656,10 @@
             # file; `cargo xtask regen crds` splits it into
             # one-file-per-CRD under infra/helm/crds/.
             #
-            # NOT a derivation that the kustomize base depends on
-            # directly (kustomize needs real files, not /nix/store
-            # paths). It's a convenience for regeneration:
-            #   nix build .#crds && cp result infra/k8s/base/crds.yaml
+            # NOT a derivation that the chart depends on directly
+            # (helm needs real files, not /nix/store paths). It's a
+            # convenience for regeneration — `cargo xtask regen crds`
+            # wraps this and splits one-file-per-CRD.
             #
             # Why not auto-regenerate in CI: the committed YAML is
             # what operators `kubectl apply`. Regenerating on every

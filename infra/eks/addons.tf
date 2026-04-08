@@ -87,14 +87,6 @@ resource "kubernetes_service_account_v1" "aws_lbc" {
   depends_on = [module.eks]
 }
 
-# kubernetes provider ~> 3.0 deprecated the unsuffixed resource. Same
-# schema, pure state-rename — no destroy/create. Drop this block once
-# all live clusters have been applied past it.
-moved {
-  from = kubernetes_service_account.aws_lbc
-  to   = kubernetes_service_account_v1.aws_lbc
-}
-
 module "aws_lbc_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
   version = "~> 6.0"
