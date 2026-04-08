@@ -573,7 +573,7 @@ in
       # r[verify ctrl.crd.host-users-network-exclusive]
       # ~180s: two builds × (reconcile tick + pod schedule + FUSE +
       # heartbeat + build + exit). Subtest deletes the default x86-64
-      # pool first so its reconciler doesn't steal dispatch.
+      # BuilderPoolSet first so its child pool doesn't steal dispatch.
       "ephemeral-pool"
       # r[verify ctrl.pool.manifest-reconcile]
       # r[verify ctrl.pool.manifest-labels]
@@ -743,8 +743,8 @@ in
   # nonpriv overlay as vm-security-nonpriv-k3s. Seccomp profile
   # delivered via systemd-tmpfiles (k3sBase, same as the NixOS
   # AMI). fetcherPools[] enabled via extraValues with name=
-  # "x86-64" + classes=[tiny] (I-170 + multiarch naming → pod
-  # rio-fetcher-x86-64-tiny-0) and image=rio-fetcher (per-component ref
+  # "x86-64" + classes=[tiny] (I-170 + multiarch naming → pool
+  # label `x86-64-tiny`) and image=rio-fetcher (per-component ref
   # from the vmTestSeed preload). Systems
   # includes "builtin" so builtin:fetchurl's system=builtin passes
   # the hard_filter can_build check. nodeSelector/tolerations left

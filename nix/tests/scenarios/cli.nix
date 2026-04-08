@@ -84,8 +84,8 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # The three AdminService RPCs fire in sequence (main.rs:131-170).
     # print_status formats as "executors: N total, ...". At least one
-    # builder pod (rio-builder-x86-64-0) should be registered by now —
-    # waitReady blocks until it's Ready.
+    # builder pod should be registered by now — waitReady blocks until
+    # the x86-64-tiny pool has reconciled status.
     with subtest("cli status: ClusterStatus RPC succeeds"):
         # Ephemeral workers: zero executors until a build is queued.
         # The test cares that the AdminService RPCs succeed and the

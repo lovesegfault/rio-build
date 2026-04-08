@@ -60,9 +60,9 @@ let
 
   # Ephemeral workers: pod names are Job-generated, not STS ordinals.
   # Resolved at runtime via wait_worker_pod() after the build is
-  # queued. fetcherPools[] entry "x86-64" + class "tiny" → pool
-  # label `x86-64-tiny`.
-  builderPool = "x86-64";
+  # queued. BuilderPoolSet "x86-64" + class "tiny" → child pool
+  # label `x86-64-tiny`; same scheme for fetcherPools[].
+  builderPool = "x86-64-tiny";
   fetcherPool = "x86-64-tiny";
 in
 pkgs.testers.runNixOSTest {

@@ -627,7 +627,7 @@ rec {
             "-o jsonpath='{.spec.holderIdentity}'"
         ).strip()
 
-    def worker_pod(pool="x86-64", ns="${nsBuilders}", node=k3s_server):
+    def worker_pod(pool="x86-64-tiny", ns="${nsBuilders}", node=k3s_server):
         """First Running worker pod for a pool. Ephemeral Jobs have no
         stable ordinal — resolve by label. Raises if none found."""
         name = node.succeed(
@@ -638,7 +638,7 @@ rec {
         assert name, f"no Running pod for rio.build/pool={pool} in ns={ns}"
         return name
 
-    def wait_worker_pod(pool="x86-64", ns="${nsBuilders}", timeout=180):
+    def wait_worker_pod(pool="x86-64-tiny", ns="${nsBuilders}", timeout=180):
         """Poll until a worker pod is Running for the pool; return its
         name. With ephemeral Jobs, a build must be queued first."""
         try:
@@ -784,7 +784,7 @@ rec {
     # Job spawn (~10s reconcile tick + ~10s pod schedule).
     try:
         k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${nsBuilders} get builderpool x86-64 "
+            "k3s kubectl -n ${nsBuilders} get builderpool x86-64-tiny "
             "-o jsonpath='{.status}' | grep -q .",
             timeout=60,
         )
@@ -796,140 +796,6 @@ rec {
             "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 2>&1"
         )[1])
         raise
-  '';
-
-  # ═══ DEAD: STS-mode worker-wait (phase 6 deletes) ═══════════════════
-  _deadStsWorkerWait = ''
-    # `kubectl wait pod/X` fails IMMEDIATELY (rc=1, "NotFound") if the
-    # pod doesn't exist — it does NOT block for --timeout. Controller
-    # became Available above, but its first BuilderPool reconcile
-    # (watch establish + SSA the STS + STS controller creates pod-0)
-    # is still ~1-2s away. impl-39 hit this race: store CrashLoopBackOff
-    # × 2 + extra migrations 028/029 pushed controller-Available to
-    # 14.69s (vs 0.19s typical), and the immediate NotFound at line ~640
-    # below was misread as "controller hung 270s". Gate on the STS
-    # existing first — short poll, the actual reconcile is fast once
-    # the controller's connect+watch loop is past startup jitter.
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${nsBuilders} get sts rio-builder-x86-64",
-        timeout=60,
-    )
-
-    # ── Worker pod Ready ────────────────────────────────────────────
-    # workerPool.replicas.min=1 in vmtest-full.yaml → controller
-    # scales STS to 1 immediately. vmtest-full.yaml uses the
-    # privileged:true escape hatch (hostPath /dev/fuse) — the node's
-    # /dev/fuse must exist (boot.kernelModules = ["fuse"] above).
-    # vmtest-full-nonpriv.yaml exercises the production ADR-012 path
-    # (containerd base_runtime_spec /dev/fuse injection — see
-    # security.nix:privileged-hardening-e2e).
-    #
-    # On timeout: dump logs + describe + containerd config before
-    # re-raising. The nonpriv path (vm-security-nonpriv-k3s) has
-    # several novel failure modes this exposes: containerd config
-    # template not picked up (k3s template-var drift → /dev/fuse
-    # absent in container → fuser::mount2 ENOENT), cgroup remount
-    # EPERM under hostUsers:false. Without this dump, the test just
-    # times out at 270s with no signal.
-    # Single kubectl wait (not wait_until_succeeds retry loop): the
-    # inner --timeout=270s already retries internally. A second
-    # wait_until_succeeds retry would block another 270s, pushing
-    # the diagnostic dump past most CI outer-timeouts.
-    rc, _ = k3s_server.execute(
-        "k3s kubectl -n ${nsBuilders} wait --for=condition=Ready "
-        "pod/rio-builder-x86-64-0 --timeout=270s"
-    )
-    if rc != 0:
-        print("=== worker-Ready TIMEOUT: diagnostic dump ===")
-        # Pod describe: shows Pending reason (Unschedulable →
-        # insufficient resource) OR CrashLoopBackOff + last-state
-        # exit code + events.
-        print(k3s_server.execute(
-            "k3s kubectl -n ${nsBuilders} describe pod rio-builder-x86-64-0 2>&1"
-        )[1])
-        # Previous container logs: the crash stderr. --previous
-        # because current container may be in backoff (no logs yet).
-        # Fall through to current if --previous fails (first crash,
-        # no previous container).
-        print("--- kubectl logs --previous ---")
-        print(k3s_server.execute(
-            "k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 --previous 2>&1 "
-            "|| k3s kubectl -n ${nsBuilders} logs rio-builder-x86-64-0 2>&1"
-        )[1])
-        # containerd config state. If the worker container has no
-        # /dev/fuse, the containerdConfigTemplate didn't render
-        # base_runtime_spec — dump the generated config.toml to see
-        # why.
-        print("--- containerd base_runtime_spec ---")
-        print(k3s_server.execute(
-            "set +e; "
-            "echo '--- /run/base-runtime-spec.json -> '; "
-            "readlink -f /run/base-runtime-spec.json 2>&1; "
-            "echo '--- /var/lib/rancher/k3s/agent/etc/containerd/config.toml ---'; "
-            "cat /var/lib/rancher/k3s/agent/etc/containerd/config.toml 2>&1; "
-            "true"
-        )[1])
-        # STS + controller state: if the pod was NEVER created (NotFound
-        # above), the STS describe shows the admission reject reason
-        # (procMount:Unmasked → feature gate, PodSecurity, hostUsers
-        # interaction) or controller apply error. If the STS itself
-        # is NotFound, the BuilderPool CR may have been rejected at
-        # apply time (CRD CEL validation) — dump k3s addon events.
-        #
-        # set +e: nixos-test-driver wraps execute() in `set -euo
-        # pipefail` — without this, the first NotFound aborts the
-        # chain and the rest never prints (observed: only the STS
-        # error made it out when the BuilderPool CR was CEL-rejected).
-        print("--- STS describe + controller logs ---")
-        print(k3s_server.execute(
-            "set +e; "
-            "k3s kubectl -n ${nsBuilders} describe sts rio-builder-x86-64 2>&1; "
-            "echo '--- BuilderPool status ---'; "
-            "k3s kubectl -n ${nsBuilders} get builderpool x86-64 -o yaml 2>&1; "
-            "echo '--- k3s addon events (manifest apply) ---'; "
-            "k3s kubectl -n kube-system get events "
-            "--field-selector involvedObject.kind=Addon "
-            "-o custom-columns=REASON:.reason,MSG:.message 2>&1; "
-            # rio_controller=debug means tail=30 is 30 lines of h2/tower
-            # noise from a ~10ms window. tail=2000 + grep keeps the
-            # actual reconcile flow visible without flooding the test
-            # log. store/scheduler logs: a store CrashLoop blocks
-            # scheduler from SERVING which blocks controller's connect
-            # loop (impl-39: builder-ready timed out, dump showed only
-            # h2 noise — store crash invisible).
-            "echo '--- controller logs (rio_controller-only) ---'; "
-            "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=2000 2>&1 "
-            "  | grep -E '\"target\":\"rio_' || true; "
-            "echo '--- scheduler logs (ERRORs+state) ---'; "
-            "k3s kubectl -n ${ns} logs deploy/rio-scheduler --tail=200 2>&1 "
-            "  | grep -E 'ERROR|WARN|migrat|leader|SERVING' || true; "
-            "echo '--- store logs (ERRORs+state) ---'; "
-            "k3s kubectl -n ${nsStore} logs deploy/rio-store --tail=100 --previous 2>&1; "
-            "k3s kubectl -n ${nsStore} logs deploy/rio-store --tail=100 2>&1 "
-            "  | grep -E 'ERROR|WARN|migrat|SERVING' || true; "
-            "echo '--- pod overview ---'; "
-            "k3s kubectl get pods -A 2>&1; "
-            "true"
-        )[1])
-        raise Exception("rio-builder-x86-64-0 not Ready after 270s (see dump above)")
-
-    # ── Worker registered at scheduler ───────────────────────────────
-    # Scheduler pods have no shell (minimal image). Scrape via the
-    # apiserver's pods/proxy subresource — no local port-forward,
-    # no TIME_WAIT churn, no `sleep 2` bind wait.
-    #
-    # NUMERIC port (9091), not named (`:metrics`): k3s apiserver
-    # PANICS (nil-deref in normalizeLocation, upgradeaware.go:173)
-    # when named-port resolution fails. Observed v20.
-    k3s_server.wait_until_succeeds(
-        "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-        "  -o jsonpath='{.spec.holderIdentity}') && "
-        'test -n "$leader" && '
-        "k3s kubectl get --raw "
-        '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
-        "| grep -qx 'rio_scheduler_workers_active 1'",
-        timeout=60,
-    )
   '';
 
   # Scale gateway to 0 → wait for full pod deletion → scale to 1.

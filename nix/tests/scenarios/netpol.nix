@@ -14,7 +14,7 @@
 # host (which HAS curl — k3sBase systemPackages), keeping the host's
 # mountns so ${pkgs.curl}/${pkgs.netcat} store paths resolve. All
 # containers in a k8s pod share one netns, so any running container in
-# rio-builder-x86-64-0 gives the right PID.
+# the builder pod gives the right PID.
 #
 # "Proves nothing" guard (review pattern — test asserts its own
 # precondition): rc≠0 to 169.254.169.254 / 1.1.1.1 is vacuous in an

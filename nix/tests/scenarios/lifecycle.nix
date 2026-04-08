@@ -80,8 +80,8 @@
 #   ephemeral-pool: applies an ephemeral BuilderPool; asserts
 #   status.desiredReplicas == replicas.max (reconcile_ephemeral ran and
 #   patched status, ephemeral.rs:220-228) and the Job-spawn-on-queue path
-#   end-to-end. Subtest deletes the default x86-64 pool first so its
-#   reconciler doesn't steal dispatch.
+#   end-to-end. Subtest deletes the default x86-64 BuilderPoolSet first
+#   so its child pool's reconciler doesn't steal dispatch.
 #
 # ctrl.wps.reconcile — verify marker at default.nix:subtests[wps-lifecycle]
 # ctrl.wps.autoscale — verify marker at default.nix:subtests[wps-lifecycle]
@@ -1783,7 +1783,8 @@ let
       # ephemeral-pool — ephemeral BuilderPool → Job/build
       # ══════════════════════════════════════════════════════════════════
       # REQUIRES: no other workers alive. Subtest deletes the default
-      # x86-64 pool first so its reconciler doesn't steal dispatch.
+      # x86-64 BuilderPoolSet first so its child pool's reconciler
+      # doesn't steal dispatch.
       #
       # Proves end-to-end:
       #   - reconciler polls ClusterStatus + spawns Jobs when queued > 0
@@ -1797,11 +1798,12 @@ let
       # emptyDir" property is structural — K8s guarantees it.
       with subtest("ephemeral-pool: Job spawned, pod reaped, second build = new Job"):
           # Precondition: no other BuilderPool may serve this subtest's
-          # builds. Delete the default `x86-64` pool here, otherwise its
+          # builds. Delete the default `x86-64` BuilderPoolSet here (which
+          # cascades to its `x86-64-tiny` child), otherwise that pool's
           # ephemeral reconciler ALSO sees queued>0 and spawns — build 2
           # may dispatch there, leaving no `rio.build/pool=ephemeral` Job.
           kubectl(
-              "delete builderpool x86-64 --ignore-not-found --wait=true",
+              "delete builderpoolset x86-64 --ignore-not-found --wait=true",
               ns="${nsBuilders}",
           )
           # wait_workers_zero (see prelude) bounds the scheduler's view
@@ -2056,7 +2058,7 @@ let
       # manifest-pool — BuilderPool.spec.sizing=Manifest → per-bucket Jobs
       # ══════════════════════════════════════════════════════════════════
       # REQUIRES: no other workers alive (run AFTER ephemeral-pool, which
-      # deletes both its own pool and the default x86-64 pool). Same
+      # deletes both its own pool and the default x86-64 BuilderPoolSet). Same
       # reason as ephemeral-pool: another pool's reconciler picks up the
       # dispatch before reconcile_manifest's 10s tick spawns a Job,
       # leaving queued=0 → cold_start=0 → no spawn.
@@ -2094,7 +2096,7 @@ let
           # Precondition: no workers. ephemeral-pool's cleanup waits
           # ALL pool=ephemeral pods gone (not just CR gone — see that
           # fragment's comment re: SIGTERM-reconnect bounce, GHA run
-          # 24012511360) and deleted the default x86-64 pool.
+          # 24012511360) and deleted the default x86-64 BuilderPoolSet.
           # wait_workers_zero (see prelude) bounds the
           # scheduler's view by the heartbeat-timeout fallback —
           # under GHA load the stream-EOF can be lost, falling back

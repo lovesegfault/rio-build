@@ -1208,7 +1208,7 @@ in
         }
 
         # ── Worker pod security posture: non-privileged admitted ────────
-        # waitReady already proved rio-builder-x86-64-0 condition=Ready.
+        # waitReady already proved the x86-64-tiny builder pool reconciled.
         # Fetch the live pod spec and assert hostUsers:false + privileged
         # absent/false. If privileged:true leaked through (helm layering
         # miss, null vs false semantics), the DS check above might still
