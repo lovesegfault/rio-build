@@ -2,10 +2,10 @@
 //!
 //! DAG shape generators ([`linear`], [`binary_tree`], [`shared_diamond`])
 //! produce synthetic-but-valid `SubmitBuildRequest` payloads. The
-//! [`BenchHarness`] bundles an ephemeral PostgreSQL, a fully-wired
-//! scheduler actor + gRPC server, and a connected client — same setup
-//! path the integration tests take, exposed through the public API so
-//! criterion benches can drive it.
+//! [`ActorHarness`] bundles an ephemeral PostgreSQL with a fully-wired
+//! scheduler actor; [`BenchHarness`] layers a gRPC server + connected
+//! client on top — same setup path the integration tests take, exposed
+//! through the public API so criterion benches can drive it.
 //!
 //! Generated drv_paths are structurally valid (`/nix/store/{32-char-
 //! nixbase32}-{name}.drv`) so they pass `SubmitBuild`'s StorePath::parse
@@ -173,33 +173,31 @@ fn synth_node(name: &str) -> DerivationNode {
 // Bench harness
 // ---------------------------------------------------------------------------
 
-/// Fully-wired scheduler stack for benchmarks: ephemeral PG + actor +
-/// gRPC server + connected client. Drop when done; the ephemeral DB
-/// tears down via `TestDb::Drop`.
+/// Actor-only harness: ephemeral PG + scheduler actor, no gRPC.
 ///
-/// Built via [`BenchHarness::spawn`]. Not `Clone` — the whole point
-/// is single ownership of the stack lifetime.
-pub struct BenchHarness {
-    /// Connected `SchedulerServiceClient`. Clone per-iteration if
-    /// criterion's closure captures by move.
-    pub client: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
-    /// Handle to the DAG actor. Benches that bypass gRPC and talk to
-    /// the actor directly (dispatch throughput) use this.
+/// Benches that drive the actor directly via `ActorCommand` (dispatch
+/// throughput) never touch the gRPC layer; spinning up a tonic server +
+/// connected client for them is dead setup overhead plus a background
+/// task running for the whole criterion session. Use [`BenchHarness`]
+/// when the bench needs a real `SchedulerServiceClient`.
+///
+/// Drop when done; the ephemeral DB tears down via `TestDb::Drop`.
+/// Not `Clone` — the whole point is single ownership of the stack
+/// lifetime.
+pub struct ActorHarness {
+    /// Handle to the DAG actor.
     pub actor: ActorHandle,
-    // Held for lifetime — drop order is LIFO so _server_task aborts
-    // before _db drops the database.
-    _server_task: tokio::task::JoinHandle<()>,
+    // Held for lifetime — drop tears down the ephemeral DB.
     _db: TestDb,
 }
 
-impl BenchHarness {
-    /// Spawn the full stack. Mirrors what `SchedulerGrpc::new_for_tests`
-    /// and `setup_actor` do inside rio-scheduler's `#[cfg(test)]` modules,
-    /// but built from the public API so an external crate can drive it.
+impl ActorHarness {
+    /// Spawn ephemeral PG + actor. Mirrors what `setup_actor` does
+    /// inside rio-scheduler's `#[cfg(test)]` modules, but built from
+    /// the public API so an external crate can drive it.
     // r[impl bench.harness-scope]
     pub async fn spawn() -> anyhow::Result<Self> {
         let db = TestDb::new(&rio_scheduler::MIGRATOR).await;
-        let pool = db.pool.clone();
 
         // No store client: SubmitBuild's TOCTOU re-check against the
         // store is skipped when store_client is None (merge.rs gates
@@ -212,8 +210,40 @@ impl BenchHarness {
         // and no S3 flush on completion (completion path is faster
         // without it, which is fine for the ready-scan isolation the
         // dispatch bench wants).
-        let sched_db = SchedulerDb::new(pool.clone());
+        let sched_db = SchedulerDb::new(db.pool.clone());
         let actor = ActorHandle::spawn(sched_db, Default::default(), Default::default());
+
+        Ok(Self { actor, _db: db })
+    }
+}
+
+/// Fully-wired scheduler stack for benchmarks: ephemeral PG + actor +
+/// gRPC server + connected client. Layers gRPC on top of
+/// [`ActorHarness`].
+///
+/// Built via [`BenchHarness::spawn`]. Not `Clone` — the whole point
+/// is single ownership of the stack lifetime.
+pub struct BenchHarness {
+    /// Connected `SchedulerServiceClient`. Clone per-iteration if
+    /// criterion's closure captures by move.
+    pub client: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
+    /// Handle to the DAG actor. Cloned from the inner [`ActorHarness`]
+    /// for ergonomic access.
+    pub actor: ActorHandle,
+    // Held for lifetime — drop order is LIFO so _server_task aborts
+    // before _inner drops the database.
+    _server_task: tokio::task::JoinHandle<()>,
+    _inner: ActorHarness,
+}
+
+impl BenchHarness {
+    /// Spawn the full stack: [`ActorHarness::spawn`] + gRPC server +
+    /// connected client. Mirrors what `SchedulerGrpc::new_for_tests`
+    /// does inside rio-scheduler's `#[cfg(test)]` modules.
+    pub async fn spawn() -> anyhow::Result<Self> {
+        let inner = ActorHarness::spawn().await?;
+        let actor = inner.actor.clone();
+        let pool = inner._db.pool.clone();
 
         // Production constructor: shared LogBuffers + pool + leader
         // flag. is_leader hardwired true — there's no lease loop in
@@ -238,7 +268,7 @@ impl BenchHarness {
             client,
             actor,
             _server_task: server_task,
-            _db: db,
+            _inner: inner,
         })
     }
 }

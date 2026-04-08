@@ -126,7 +126,7 @@ r[bench.unique-drv-hash]
 Generated `drv_hash` values MUST be globally unique across criterion iterations: `synth_node` calls `rand_store_hash()` per node so MergeDag's dedup path doesn't fire (a deterministic tag would measure a cache hit after iteration 1). The `synth_hashes_are_unique` test guards this precondition.
 
 r[bench.harness-scope]
-`BenchHarness::spawn` builds the scheduler stack from the public API with intentional omissions: no store client (TOCTOU `FindMissingPaths` re-check is gated on `Option::Some` → skipped), no log flusher, no size classes, `is_leader` hardwired true (no lease loop). The bench measures DAG merge + DB insert + gRPC round-trip, not store RPC latency or S3 flush.
+`ActorHarness::spawn` builds the scheduler actor from the public API with intentional omissions: no store client (TOCTOU `FindMissingPaths` re-check is gated on `Option::Some` → skipped), no log flusher, no size classes. `BenchHarness::spawn` layers a gRPC server + connected client on top with `is_leader` hardwired true (no lease loop). Actor-only benches measure DAG merge + DB insert; full-harness benches add the gRPC round-trip. Neither measures store RPC latency or S3 flush.
 
 ### Expected differences
 

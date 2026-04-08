@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::sync::{mpsc, oneshot};
 
-use rio_bench::{BenchHarness, Dag, binary_tree};
+use rio_bench::{ActorHarness, Dag, binary_tree};
 use rio_proto::types::{
     BuildEvent, BuildResult, BuildResultStatus, BuiltOutput, SchedulerMessage, build_event,
     scheduler_message,
@@ -45,15 +45,11 @@ impl InstantWorker {
     /// build per pod), so "unlimited slots" is no longer expressible.
     /// The bench compensates with the instant-ack `recv_loop` below —
     /// completion frees the slot before the next dispatch tick, so
-    /// the scheduler's ceiling is still what's measured.
+    /// the scheduler's ceiling is still what's measured. The
+    /// scheduler→worker stream therefore carries at most one
+    /// assignment in flight; a small bounded channel is plenty.
     async fn connect(actor: &ActorHandle, executor_id: &str) -> anyhow::Result<Self> {
-        // Deep channel: binary_tree(10) has 512 leaves ready at once.
-        // The actor sends all 512 assignments in one dispatch burst
-        // before the mock worker's recv loop gets a chance to run
-        // (both are on the same runtime; the actor task holds the
-        // scheduler until it awaits). 2048 covers any realistic
-        // bench depth.
-        let (stream_tx, stream_rx) = mpsc::channel(2048);
+        let (stream_tx, stream_rx) = mpsc::channel(4);
         actor
             .send_unchecked(ActorCommand::ExecutorConnected {
                 executor_id: executor_id.into(),
@@ -248,7 +244,11 @@ fn bench_dispatch(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    let harness = rt.block_on(BenchHarness::spawn()).expect("spawn harness");
+    // Actor-only harness: this bench drives the actor directly via
+    // ActorCommand (see module doc) and never touches gRPC, so the
+    // server + client that BenchHarness::spawn adds would be dead
+    // setup overhead.
+    let harness = rt.block_on(ActorHarness::spawn()).expect("spawn harness");
     let actor = harness.actor.clone();
 
     let mut group = c.benchmark_group("dispatch/binary_tree_drain");
