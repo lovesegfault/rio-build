@@ -127,7 +127,14 @@ impl Backoff {
         // per IEEE 754); .min(MAX) handles inf.
         #[allow(clippy::manual_clamp)]
         let safe = capped.max(0.0).min(MAX_BACKOFF.as_secs_f64());
-        self.jitter.apply(Duration::from_secs_f64(safe))
+        // Jitter::Proportional can multiply by up to (1+f), pushing
+        // the result above `cap`. Re-clamp so the policy cap is a
+        // hard ceiling regardless of jitter — matches the original
+        // RetryPolicy::backoff_duration semantics.
+        self.jitter
+            .apply(Duration::from_secs_f64(safe))
+            .min(self.cap)
+            .min(MAX_BACKOFF)
     }
 }
 
