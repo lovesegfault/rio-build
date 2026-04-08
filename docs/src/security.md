@@ -7,7 +7,7 @@ flowchart LR
     Clients["Untrusted<br/>(Nix clients)"] -->|SSH| GW["rio-gateway"]
     GW -->|"gRPC (mTLS)"| Sched["rio-scheduler"]
     Sched -->|"gRPC (mTLS)"| Store["rio-store"]
-    Worker["rio-worker"] -->|"gRPC (mTLS)"| Store
+    Worker["rio-builder"] -->|"gRPC (mTLS)"| Store
     Worker -->|"gRPC (mTLS)"| Sched
     Store --> S3["S3 (IRSA)"]
     Store --> PG["PostgreSQL"]
@@ -229,21 +229,19 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 
 ## Ephemeral Builders
 
-For untrusted multi-tenant deployments where **isolation > throughput**,
-`BuilderPoolSpec.ephemeral: true` (see `r[ctrl.pool.ephemeral]` in
-[components/controller.md](components/controller.md#job-lifecycle))
-provides the strongest cross-build isolation rio offers: one pod per
-build, zero shared state. Each build gets a fresh emptyDir for the FUSE
-cache and overlayfs upper — an untrusted tenant cannot leave behind
-poisoned cache entries, doctored overlays, or stale mount points for the
-next build, because there is no "next build" on that pod. The pod
-terminates after one `CompletionReport`; K8s reaps the Job via
+Builder pods are **always** one-shot Jobs (see `r[ctrl.pool.ephemeral]`
+in [components/controller.md](components/controller.md#job-lifecycle)):
+one pod per build, zero shared state. Each build gets a fresh emptyDir
+for the FUSE cache and overlayfs upper — an untrusted tenant cannot
+leave behind poisoned cache entries, doctored overlays, or stale mount
+points for the next build, because there is no "next build" on that pod.
+The pod terminates after one `CompletionReport`; K8s reaps the Job via
 `ttlSecondsAfterFinished`.
 
-**What ephemeral mode does NOT provide** (limitations #1–3 below still
-apply): the Nix sandbox is still a purity boundary, not a security
-boundary. A malicious derivation can still attempt sandbox escape and
-gain `CAP_SYS_ADMIN` within the pod. Ephemeral mode limits the BLAST
+**What this does NOT provide** (limitations #1–3 below still apply): the
+Nix sandbox is still a purity boundary, not a security boundary. A
+malicious derivation can still attempt sandbox escape and gain
+`CAP_SYS_ADMIN` within the pod. The one-shot model limits the BLAST
 RADIUS of such an escape — the attacker is confined to one pod with no
 persistent state to poison and no cached inputs from other tenants to
 exfiltrate.
@@ -252,16 +250,14 @@ exfiltrate.
 
 | Layer | Mechanism | What it provides |
 |---|---|---|
-| Pod lifetime | `BuilderPoolSpec.ephemeral: true` (the CRD default) | Zero cross-build state; no cache/overlay poisoning |
+| Pod lifetime | One-shot Job (always on) | Zero cross-build state; no cache/overlay poisoning |
 | User namespace | `hostUsers: false` (K8s 1.33+) | `CAP_SYS_ADMIN` scoped to unprivileged host UIDs (see limitation #2) |
 | Seccomp | `BuilderPoolSpec.seccompProfile: Localhost` | `ptrace`/`bpf`/`setns`/`process_vm_*` denied (see `r[builder.seccomp.localhost-profile]`) |
-| Node isolation | Dedicated tainted node pool | Sandbox escape confined to worker nodes |
-| Network | NetworkPolicy egress deny + FOD proxy allowlist | No exfil to arbitrary endpoints |
+| Node isolation | Dedicated tainted node pool | Sandbox escape confined to builder nodes |
+| Network | NetworkPolicy egress deny | No exfil to arbitrary endpoints (FODs route to FetcherPool) |
 
 The cost is per-build cold start (~10–30s pod scheduling + FUSE mount +
-heartbeat) plus one reconciler tick (~10s). For trusted-tenant CI
-workloads, prefer the default StatefulSet mode (warm cache, ~ms
-dispatch latency).
+heartbeat) plus one reconciler tick (~10s).
 
 ## Known Limitations
 

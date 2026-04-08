@@ -112,7 +112,7 @@ first post-idle fetch trips → EIO on upload → InfrastructureFailure →
 reassign loop. After `auto_close_after` (default 30s) the circuit goes
 half-open: the next `check()` probes — success closes the circuit,
 failure re-opens it. The fetch timeout is `fuse_fetch_timeout_secs`
-(default 180) from `worker.toml` — NOT the global `GRPC_STREAM_TIMEOUT`.
+(default 180) from `builder.toml` — NOT the global `GRPC_STREAM_TIMEOUT`.
 **CRITICAL: std::sync ONLY** — FUSE callbacks run on fuser's thread
 pool, NOT in a tokio context. `AtomicU32` + `parking_lot::Mutex`; zero
 `tokio::sync`, zero `.await`.
@@ -204,7 +204,7 @@ r[builder.daemon.no-unwrap-stdio]
 When spawning `nix-daemon --stdio`, never `.unwrap()` on `daemon.stdin.take()` / `daemon.stdout.take()` --- use `.ok_or_else()`.
 
 r[builder.daemon.timeout-wrap]
-Wrap all daemon communication in `tokio::time::timeout` (default: 2h, configurable via `RIO_DAEMON_TIMEOUT_SECS` / `--daemon-timeout-secs` / `worker.toml`).
+Wrap all daemon communication in `tokio::time::timeout` (default: 2h, configurable via `RIO_DAEMON_TIMEOUT_SECS` / `--daemon-timeout-secs` / `builder.toml`).
 
 r[builder.daemon.kill-both-paths]
 Always `daemon.kill().await` in both success and error paths, and set `kill_on_drop` on the Command to guard against early-exit leaks.

@@ -13,7 +13,7 @@ Start with 3 crates:
 - **`rio-build`**: Scheduler, gateway, worker orchestration (single binary initially).
 - **`rio-proto`**: Protobuf/gRPC definitions and generated code.
 
-Split into the full 9-crate structure as module boundaries are validated through implementation. The planned eventual structure adds `rio-store`, `rio-gateway`, `rio-scheduler`, `rio-worker`, and `rio-controller` as independent crates. (FUSE was originally planned as a separate `rio-fuse` crate but shipped as a module inside `rio-worker`.)
+Split into the full multi-crate structure as module boundaries are validated through implementation. The planned eventual structure adds `rio-store`, `rio-gateway`, `rio-scheduler`, `rio-builder`, and `rio-controller` as independent crates. (FUSE was originally planned as a separate `rio-fuse` crate but shipped as a module inside `rio-builder`.)
 
 Splitting criteria: extract a crate when its API surface stabilizes, when it needs independent testing, or when build times justify parallel compilation.
 

@@ -7,7 +7,7 @@ Accepted
 Nix builds require a populated `/nix/store` with all build inputs present, plus a valid SQLite store database. In a distributed system, workers must access potentially hundreds of gigabytes of store paths without pre-materializing everything. The store model must support concurrent builds with isolation, be Kubernetes-native, and avoid shared mutable state.
 
 ## Decision
-Each worker runs a custom FUSE filesystem (the `fuse` module in `rio-worker`) mounted at a configurable path (default `/var/rio/fuse-store` — see `rio-worker/src/config.rs`). The FUSE daemon:
+Each worker runs a custom FUSE filesystem (the `fuse` module in `rio-builder`) mounted at a configurable path (default `/var/rio/fuse-store` — see `rio-builder/src/config.rs`). The FUSE daemon:
 
 - Lazily fetches store path content from rio-store via gRPC on demand.
 - Caches fetched content on local SSD with LRU eviction.

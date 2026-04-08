@@ -32,7 +32,7 @@ The worker maps `rio_nix::BuildStatus` (the real Nix wire enum) to the proto `Bu
 | `OutputRejected` (5) | PermanentFailure | Fallthrough. Output hash mismatch (FOD) or path collision. |
 | `NoSubstituters` (14) | PermanentFailure | Fallthrough. rio-build does not use external substituters. |
 
-See `rio-worker/src/executor/mod.rs` for the mapping implementation.
+See `rio-builder/src/executor/mod.rs` for the mapping implementation.
 
 ### Infrastructure Error Types (rio-common)
 
@@ -92,7 +92,7 @@ Poisoned derivations:
 
 | Level | Enforced By | Mechanism | Status |
 |-------|------------|-----------|--------|
-| Per-derivation wall-clock timeout | Worker | `tokio::time::timeout` wrapping the nix-daemon build. Duration is `WorkAssignment.build_options.build_timeout` if nonzero, else `DEFAULT_DAEMON_TIMEOUT` (7200s / 2h). Configurable via `RIO_DAEMON_TIMEOUT_SECS`, `--daemon-timeout-secs`, or `worker.toml`. | **Implemented** |
+| Per-derivation wall-clock timeout | Builder | `tokio::time::timeout` wrapping the nix-daemon build. Duration is `WorkAssignment.build_options.build_timeout` if nonzero, else `DEFAULT_DAEMON_TIMEOUT` (7200s / 2h). Configurable via `RIO_DAEMON_TIMEOUT_SECS`, `--daemon-timeout-secs`, or `builder.toml`. | **Implemented** |
 | Per-derivation silence timeout | Worker | `maxSilentTime` (kill if no output for N seconds) enforced by a `select!` arm in the stderr read loop. Resets on each output-producing message (`STDERR_NEXT`, `STDERR_RESULT BuildLogLine`). The nix-daemon subprocess MAY also enforce it (forwarded via `client_set_options`); rio-side is the authoritative backstop. See [`worker.silence.timeout-kill`](./components/builder.md). | **Implemented** |
 | Per-build overall timeout | Scheduler `handle_tick` | Wall-clock limit on the entire build from submission. When `submitted_at.elapsed() > BuildOptions.build_timeout`, scheduler cancels non-terminal derivations and transitions the build to `Failed` with error_summary "build_timeout Ns exceeded". Zero = no overall timeout. See [`sched.timeout.per-build`](./components/scheduler.md). | **Implemented** |
 | Scheduler backstop timeout | `handle_tick` | When a Running derivation's `running_since.elapsed()` exceeds `max(est_duration × 3, daemon_timeout + 10min)`, scheduler sends CancelSignal + resets to Ready + increments retry_count + adds worker to failed_workers. Catches "worker heartbeating but daemon wedged." | Implemented (Phase 3b) |

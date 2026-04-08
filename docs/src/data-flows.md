@@ -64,7 +64,7 @@ sequenceDiagram
     participant Client as Nix Client
     participant GW as rio-gateway
     participant Sched as rio-scheduler
-    participant Worker as rio-worker
+    participant Worker as rio-builder
     participant Store as rio-store
 
     Client->>GW: SSH connect + handshake
@@ -126,7 +126,7 @@ sequenceDiagram
     participant Hook as Build Hook
     participant GW as rio-gateway
     participant Sched as rio-scheduler
-    participant Worker as rio-worker
+    participant Worker as rio-builder
 
     Daemon->>Hook: delegate derivation
     Hook->>GW: SSH connect
@@ -167,7 +167,7 @@ sequenceDiagram
     participant Client as Nix Client
     participant GW as rio-gateway
     participant Sched as rio-scheduler
-    participant Worker as rio-worker
+    participant Worker as rio-builder
 
     Client-xGW: SSH connection drops
     GW->>Sched: CancelBuild (client_disconnect)

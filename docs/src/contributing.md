@@ -60,7 +60,7 @@ Commits use [Conventional Commits](https://www.conventionalcommits.org/) enforce
 
 ```
 feat(rio-nix): add ATerm derivation parser
-fix(rio-worker): propagate BuildResult start_time/stop_time
+fix(rio-builder): propagate BuildResult start_time/stop_time
 docs(challenges): update FUSE timeout description
 ```
 
@@ -76,7 +76,7 @@ The scope regex only allows alphanumerics and `-`/`_`/`/` --- **no commas** in t
 
 ## Project Structure
 
-The workspace is split into 12 crates (`rio-common`, `rio-nix`, `rio-proto`, `rio-crds`, `rio-gateway`, `rio-scheduler`, `rio-store`, `rio-worker`, `rio-controller`, `rio-cli`, `rio-bench`, `rio-test-support`). See [Crate Structure](./crate-structure.md) for the responsibilities and module layout of each.
+The workspace is split into 14 crates (`rio-common`, `rio-nix`, `rio-proto`, `rio-crds`, `rio-gateway`, `rio-scheduler`, `rio-store`, `rio-builder`, `rio-controller`, `rio-cli`, `rio-bench`, `rio-test-support`, `xtask`, `workspace-hack`). See [Crate Structure](./crate-structure.md) for the responsibilities and module layout of each.
 
 ## Where to Start
 

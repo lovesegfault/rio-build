@@ -83,7 +83,7 @@ See [Configuration Reference](./configuration.md) for all parameters. The minimu
 | Scheduler | `database_url` |
 | Store | `database_url`, `chunk_backend` (tagged enum: `inline` / `filesystem` / `s3`), `signing_key_path` |
 | Controller | `scheduler_addr` |
-| Workers | `scheduler_addr`, `store_addr` |
+| Builder | `scheduler_addr`, `store_addr` |
 
 > **Store chunk backend config** uses a serde internally-tagged enum (`kind`). TOML example for S3: `[chunk_backend]` / `kind = "s3"` / `bucket = "..."` / `prefix = "..."`. Default is `inline` (NARs stored in PostgreSQL --- fine for dev, does not scale). There is no flat `s3_bucket` field.
 
@@ -154,7 +154,7 @@ The pod's `RIO_TLS__*` env gives rio-cli mTLS to `localhost:9001` automatically.
 ## Upgrades
 
 - **Schema migrations:** Run via `sqlx::migrate!` (uses sqlx's built-in PG advisory lock internally). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables). Note: sqlx's lock covers single-service migrations; multi-replica store deployment needs a migration-lock mechanism (hence `replicas: 1` today).
-- **Rolling updates:** Worker StatefulSets (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the worker's SIGTERM handler blocks on its build semaphore until in-flight builds complete, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Use `maxUnavailable: 1` in the StatefulSet update strategy.
+- **Rolling updates:** Builder Jobs (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the builder's SIGTERM handler blocks until its single in-flight build completes, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Builder pods are one-shot, so a control-plane upgrade naturally rolls the fleet as Jobs complete and new ones spawn with the new image.
 - **Blue/green deployments:** Supported if separate PostgreSQL schemas and S3 key prefixes are used per deployment. The gateway can be switched atomically via NLB target group changes.
 - **Version skew policy:** Gateway and worker binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.
 

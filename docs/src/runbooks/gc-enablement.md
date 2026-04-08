@@ -4,7 +4,7 @@ GC mark-and-sweep deletes paths with no reachable references. Before enabling GC
 
 ## Prerequisites (must be true before enabling GC)
 
-1. **Worker version**: All workers running a version with the NAR reference scanner (commit `9165dc23` or later). Check: `kubectl get pods -l app=rio-worker -o jsonpath='{.items[*].spec.containers[*].image}'`
+1. **Builder version**: All builders running a version with the NAR reference scanner (commit `9165dc23` or later). Check: `kubectl get pods -l app=rio-builder -o jsonpath='{.items[*].spec.containers[*].image}'`
 
 2. **Backfill complete**: All paths uploaded before the scanner fix have been re-scanned. Check: `SELECT COUNT(*) FROM narinfo WHERE refs_backfilled = false` should be 0.
 

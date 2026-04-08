@@ -66,35 +66,38 @@ echo "Gateway: $GATEWAY_HOST"
 - Check Events: `kubectl -n rio-system describe svc rio-gateway`
 - Common: missing IAM permissions for the controller's SA
 
-## Step 4: Create BuilderPool
+## Step 4: Create BuilderPoolSet
 
 ```bash
 cat <<EOF | kubectl apply -f -
 apiVersion: rio.build/v1alpha1
-kind: BuilderPool
+kind: BuilderPoolSet
 metadata:
   name: smoke-test
   namespace: rio-system
 spec:
-  ephemeral: false
-  replicas: { min: 2, max: 4 }
-  autoscaling: { metric: queueDepth, targetValue: 5 }
-  fuseCacheSize: 20Gi
-  systems: [x86_64-linux]
-  features: []
-  sizeClass: ""
-  image: rio-worker:latest
-  tolerations:
-    - key: rio.build/worker
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
-  nodeSelector:
-    rio.build/node-role: worker
+  poolTemplate:
+    image: rio-builder:latest
+    systems: [x86_64-linux]
+    features: []
+    nodeSelector:
+      rio.build/node-role: worker
+    tolerations:
+      - key: rio.build/worker
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+  classes:
+    - name: default
+      cutoffSecs: 600
+      maxConcurrent: 4
+      resources:
+        requests: { cpu: "2", memory: "4Gi" }
+        limits: { cpu: "4", memory: "8Gi" }
 EOF
 
-kubectl -n rio-system wait --for=condition=Ready pod \
-  -l rio.build/pool=smoke-test --timeout=300s
+# Builder Jobs spawn on demand once a build is queued — no standing pods to wait for.
+kubectl -n rio-system get builderpool -l rio.build/owner-bps=smoke-test
 ```
 
 **Troubleshooting if workers stuck ContainerCreating:**
@@ -159,7 +162,7 @@ grpcurl -d '{"dry_run": true, "grace_period_hours": 2}' \
 ## Cleanup
 
 ```bash
-kubectl -n rio-system delete builderpool smoke-test
+kubectl -n rio-system delete builderpoolset smoke-test
 helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for full teardown
 ```
 

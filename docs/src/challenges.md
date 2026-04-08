@@ -124,7 +124,7 @@ The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. Under heav
 - Benchmark FUSE read latency (p50, p99) during the Phase 1a spike under concurrent load
 - Compare against direct filesystem reads to quantify overhead
 - The `fuser` crate supports multi-threaded FUSE dispatch; ensure this is enabled
-- **FUSE passthrough mode (Linux 6.9+):** For cached paths on local SSD, FUSE passthrough (`FUSE_PASSTHROUGH`) eliminates the `read()` context switch by handing off file descriptors to the backing files. See [rio-worker: FUSE Passthrough Mode](./components/builder.md#fuse-passthrough-mode-linux-69).
+- **FUSE passthrough mode (Linux 6.9+):** For cached paths on local SSD, FUSE passthrough (`FUSE_PASSTHROUGH`) eliminates the `read()` context switch by handing off file descriptors to the backing files. See [rio-builder: FUSE Passthrough Mode](./components/builder.md#fuse-passthrough-mode-linux-69).
 - **File handle caching:** Keep backing file handles open across reads. Passthrough only helps for `read()` on already-open files; `lookup()` and `open()` still traverse userspace. Builds that open many small files once (header-heavy C++) won't benefit from passthrough alone --- they need reduced `open()` overhead via kernel entry/attribute caching (high TTL on immutable store paths).
 - If FUSE overhead exceeds 2x vs direct reads even with all mitigations, consider the bind-mount fallback
 
