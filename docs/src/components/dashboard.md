@@ -54,7 +54,7 @@ endpoint). CORS `allowOrigins` defaults to the in-cluster nginx Service hostname
 | Log viewer | `AdminService.GetBuildLogs` (server stream) | Live-tail build output, UTF-8-lossy decode, embedded in the build drawer |
 
 Executor utilization time-series and cache hit-rate analytics are **NOT** dashboard
-scope — they live in the Grafana dashboards (`infra/helm/grafana/`). The
+scope — they live in the Grafana dashboards (`infra/helm/rio-build/dashboards/`). The
 rio-dashboard focuses on interactive per-build detail (DAG, logs, management
 actions) that a Prometheus/Grafana stack can't give you.
 

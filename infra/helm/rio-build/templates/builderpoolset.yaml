@@ -1,8 +1,7 @@
 {{- $root := . -}}
 {{- range .Values.builderPoolSets }}
-{{- /* I-117b: per-set entry deep-merged over builderPoolSetDefaults (same
-       pattern as I-108 builderpool.yaml). mergeOverwrite mutates its first
-       arg, so deepCopy the defaults each iteration. */ -}}
+{{- /* per-set entry deep-merged over builderPoolSetDefaults. mergeOverwrite
+       mutates its first arg, so deepCopy the defaults each iteration. */ -}}
 {{- $bps := mergeOverwrite (deepCopy $root.Values.builderPoolSetDefaults) . -}}
 {{- $tpl := mergeOverwrite (deepCopy $root.Values.builderPoolDefaults) $bps.poolTemplate -}}
 {{- if $bps.enabled }}
@@ -10,14 +9,11 @@
 # BuilderPoolSet: one child BuilderPool per size class. The scheduler's
 # classify() routes each derivation to the smallest covering class by
 # (est_duration, peak_memory, peak_cpu); the controller spawns workers
-# sized by classes[].resources. Supersedes the flat builderPools[] list
-# (set builderPoolDefaults.enabled=false when this is on, or pools
-# double-render).
+# sized by classes[].resources.
 #
-# poolTemplate inherits from builderPoolDefaults (deep-merge, same as
-# builderpool.yaml) so seccomp/tolerations/nodeSelector/hostUsers stay
-# single-sourced. Per-BPS overrides go on the builderPoolSets[] entry's
-# .poolTemplate.
+# poolTemplate inherits from builderPoolDefaults (deep-merge) so
+# seccomp/tolerations/nodeSelector/hostUsers stay single-sourced.
+# Per-BPS overrides go on the builderPoolSets[] entry's .poolTemplate.
 apiVersion: rio.build/v1alpha1
 kind: BuilderPoolSet
 metadata:
