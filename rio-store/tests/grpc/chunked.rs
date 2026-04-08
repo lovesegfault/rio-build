@@ -607,6 +607,262 @@ async fn gt13_batch_placeholder_cleanup_on_midloop_abort() -> TestResult {
     Ok(())
 }
 
+/// `PutPathBatch` with a chunk backend, both outputs over
+/// `INLINE_THRESHOLD`: phase-2 stages each via `cas::stage_chunked`
+/// (chunks uploaded + refcounted, manifest still `'uploading'`),
+/// phase-3's atomic tx flips both to `'complete'` via
+/// `complete_manifest_chunked_in_tx`. Asserts both are queryable and
+/// both landed as chunked (`manifest_data.chunk_list IS NOT NULL`,
+/// `manifests.inline_blob IS NULL`).
+#[tokio::test]
+async fn gt13_batch_chunked_happy_path() -> TestResult {
+    let (s, backend) = StoreSession::new_chunked().await?;
+    let mut client = s.client.clone();
+
+    // 512 KiB each — well over INLINE_THRESHOLD (256 KiB). Distinct
+    // seeds → distinct store_paths AND distinct chunk content.
+    let (nar0, info0, path0) = make_large_nar(20, 512 * 1024);
+    let (nar1, info1, path1) = make_large_nar(21, 512 * 1024);
+
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, info0.into(), nar0).await;
+    send_batch_output(&tx, 1, info1.into(), nar1).await;
+    drop(tx);
+
+    let resp = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await
+        .context("chunked batch happy path should succeed")?
+        .into_inner();
+    assert_eq!(resp.created, vec![true, true], "both outputs newly created");
+
+    // Both queryable end-to-end.
+    for p in [&path0, &path1] {
+        let info = client
+            .query_path_info(QueryPathInfoRequest {
+                store_path: p.clone(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(&info.store_path, p);
+    }
+
+    // Both persisted as CHUNKED: manifest_data.chunk_list populated,
+    // manifests.inline_blob NULL, status='complete'.
+    let chunked_complete: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifests m \
+         JOIN manifest_data md ON m.store_path_hash = md.store_path_hash \
+         WHERE m.status = 'complete' AND m.inline_blob IS NULL \
+         AND md.chunk_list IS NOT NULL",
+    )
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert_eq!(
+        chunked_complete, 2,
+        "both outputs flipped to status='complete' via complete_manifest_chunked_in_tx"
+    );
+
+    // Backend received chunks (2× 512 KiB at ~64 KiB avg ≈ 16 chunks).
+    assert!(
+        backend.len() > 4,
+        "chunk backend should hold >4 chunks, got {}",
+        backend.len()
+    );
+
+    Ok(())
+}
+
+/// `PutPathBatch` chunked abort: output-0 large+valid (gets fully
+/// staged in phase-2: placeholder owned, chunks uploaded, refcounts
+/// at 1), output-1 hash-mismatches → phase-2 `bail!` → `abort_batch`
+/// → `reap_one(output-0)` MUST decrement output-0's chunk refcounts
+/// back to zero (the "GC-eligible orphan" guarantee from the
+/// `put_path_batch.rs` doc-comment). DB ends with no committed
+/// manifests and no positive-refcount chunks; only the S3-side blobs
+/// orphan (spec: "blob-store writes are NOT rolled back").
+#[tokio::test]
+async fn gt13_batch_chunked_abort_decrements_refcounts() -> TestResult {
+    let (s, backend) = StoreSession::new_chunked().await?;
+    let mut client = s.client.clone();
+
+    // Output-0: valid large NAR.
+    let (nar0, info0, _) = make_large_nar(22, 512 * 1024);
+    // Output-1: declare info for seed=23's content but SEND seed=24's
+    // bytes → trailer hash mismatch → validate_nar_digest fails.
+    let (_, info1, _) = make_large_nar(23, 512 * 1024);
+    let (bad_nar1, _, _) = make_large_nar(24, 512 * 1024);
+
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, info0.into(), nar0).await;
+    send_batch_output(&tx, 1, info1.into(), bad_nar1).await;
+    drop(tx);
+
+    let r = client.put_path_batch(ReceiverStream::new(rx)).await;
+    let status = r.expect_err("batch with corrupt output-1 must fail");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("output 1"),
+        "error should name the failing output: {}",
+        status.message()
+    );
+
+    // No 'complete' rows (atomic tx never opened — phase-2 bailed).
+    let complete: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'complete'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(complete, 0, "no output committed");
+
+    // No 'uploading' rows (abort_batch's reap_one deleted output-0's
+    // placeholder; output-1 never claimed one — hash check is BEFORE
+    // claim_placeholder).
+    let uploading: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'uploading'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(
+        uploading, 0,
+        "abort_batch reaped output-0's staged placeholder"
+    );
+
+    // THE REFCOUNT ASSERTION: output-0's chunks were staged at
+    // refcount=1; reap_one decremented them back to 0 (GC-eligible).
+    // Without this, every failed batch leaks refcounted chunks forever.
+    let live_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE refcount > 0")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(
+        live_chunks, 0,
+        "abort_batch's reap_one must decrement staged chunk refcounts to zero"
+    );
+
+    // Blob-store writes are NOT rolled back — output-0's chunks orphan
+    // in the backend until S3 GC sweeps them. This is the documented
+    // bound (≤1 NAR-size of orphaned blob per failed output).
+    assert!(
+        !backend.is_empty(),
+        "staged chunks remain in blob backend (spec: not rolled back)"
+    );
+
+    Ok(())
+}
+
+/// `PutPathBatch` mixed inline+chunked: output-0 small (< threshold,
+/// → `NarPersist::Inline`), output-1 large (≥ threshold, →
+/// `NarPersist::ChunkedStaged`). Phase-3's atomic tx must flip BOTH
+/// to `'complete'` together — proves the two `complete_manifest_*_in_tx`
+/// variants compose inside one transaction.
+#[tokio::test]
+async fn gt13_batch_mixed_inline_chunked() -> TestResult {
+    let (s, _backend) = StoreSession::new_chunked().await?;
+    let mut client = s.client.clone();
+
+    // Output-0: tiny → inline.
+    let path0 = test_store_path("batch-mixed-inline");
+    let (nar0, _) = make_nar(b"tiny mixed-batch output");
+    let info0 = make_path_info_for_nar(&path0, &nar0);
+    // Output-1: 512 KiB → chunked.
+    let (nar1, info1, path1) = make_large_nar(25, 512 * 1024);
+
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, info0.into(), nar0).await;
+    send_batch_output(&tx, 1, info1.into(), nar1).await;
+    drop(tx);
+
+    let resp = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await
+        .context("mixed inline+chunked batch should succeed")?
+        .into_inner();
+    assert_eq!(resp.created, vec![true, true]);
+
+    // Both 'complete'.
+    let complete: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'complete'")
+            .fetch_one(&s.db.pool)
+            .await?;
+    assert_eq!(complete, 2, "both outputs committed in one tx");
+
+    // Output-0 is inline: inline_blob NOT NULL, no manifest_data row.
+    let inline0: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
+         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    )
+    .bind(&path0)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert!(inline0.is_some(), "small output stored inline");
+
+    // Output-1 is chunked: inline_blob NULL, manifest_data.chunk_list NOT NULL.
+    let inline1: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
+         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    )
+    .bind(&path1)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert!(inline1.is_none(), "large output NOT stored inline");
+
+    let chunk_list1: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT md.chunk_list FROM manifest_data md JOIN narinfo n \
+         ON md.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    )
+    .bind(&path1)
+    .fetch_one(&s.db.pool)
+    .await?;
+    assert!(chunk_list1.is_some(), "large output has chunk_list");
+
+    Ok(())
+}
+
+/// `PutPathBatch` chunked idempotency: resend the same large-output
+/// batch → `created=[false,false]`. Phase-2's `claim_placeholder` hits
+/// `AlreadyComplete` for both, sets `accum.already_complete=true`,
+/// SKIPS `stage_nar_for_batch` — backend chunk count must not grow.
+#[tokio::test]
+async fn gt13_batch_chunked_idempotent() -> TestResult {
+    let (s, backend) = StoreSession::new_chunked().await?;
+    let mut client = s.client.clone();
+
+    let (nar0, info0, _) = make_large_nar(26, 512 * 1024);
+    let (nar1, info1, _) = make_large_nar(27, 512 * 1024);
+
+    // First send: both created.
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, info0.clone().into(), nar0.clone()).await;
+    send_batch_output(&tx, 1, info1.clone().into(), nar1.clone()).await;
+    drop(tx);
+    let first = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    assert_eq!(first.created, vec![true, true]);
+    let chunks_after_first = backend.len();
+    assert!(chunks_after_first > 0);
+
+    // Resend: idempotency short-circuits at check_manifest_complete.
+    let (tx, rx) = mpsc::channel(16);
+    send_batch_output(&tx, 0, info0.into(), nar0).await;
+    send_batch_output(&tx, 1, info1.into(), nar1).await;
+    drop(tx);
+    let second = client
+        .put_path_batch(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    assert_eq!(
+        second.created,
+        vec![false, false],
+        "resend returns created=[false,false]"
+    );
+    assert_eq!(
+        backend.len(),
+        chunks_after_first,
+        "idempotent resend must not stage new chunks"
+    );
+
+    Ok(())
+}
+
 /// Send one output's full message sequence (metadata → chunk → trailer)
 /// tagged with `output_index`. Mirrors `put_path_raw` but wraps each
 /// inner message in `PutPathBatchRequest`.
