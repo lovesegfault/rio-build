@@ -264,7 +264,7 @@ message DerivationEdge {
 }
 ```
 
-> **Size limits:** A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes. At ~200 bytes per `DerivationNode`, the message is ~12MB. The gateway should enforce a per-tenant `max_dag_size` limit (default: 100,000 nodes) before constructing the request. gRPC max message size should be set to at least 32MB.
+> **Size limits:** A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes. At ~200 bytes per `DerivationNode`, the message is ~12MB. The gateway enforces `MAX_DAG_NODES` (1,048,576) before constructing the request. gRPC max message size should be set to at least 32MB.
 
 > **Tenant identification:** `tenant_name` is set by the gateway from the SSH `authorized_keys` comment field, not from client-provided data. The scheduler resolves the name to a tenant UUID via the `tenants` table (see `r[sched.tenant.resolve]`). Field 1 (`tenant_id`) is reserved — it was removed when resolution moved scheduler-side. The tenant's JWT is propagated via gRPC metadata (`x-rio-tenant-token`) for downstream authorization checks. Note: `tenant_id` still appears as a UUID-string field in `BuildInfo` and `TenantInfo` — those are the **resolved** UUID, not the pre-resolution name.
 

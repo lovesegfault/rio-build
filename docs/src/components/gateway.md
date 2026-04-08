@@ -468,7 +468,7 @@ When the gateway receives `wopBuildDerivation` or `wopBuildPathsWithResults`, it
 
 1. **During store uploads:** The gateway intercepts each uploaded path. If the path ends in `.drv`, the gateway extracts the `.drv` file from the NAR, parses the ATerm-format derivation, and caches the parsed result in per-session memory (keyed by store path). This applies to all upload opcodes: `wopAddToStore` (7), `wopAddTextToStore` (8), `wopAddToStoreNar` (39), and `wopAddMultipleToStore` (44). For `wopAddToStoreNar` and `wopAddMultipleToStore`, the handler branches on the path name: `.drv` paths (small --- typically <10KB, capped at `DRV_NAR_BUFFER_LIMIT` = 16MiB) are buffered and parsed via `try_cache_drv`; non-`.drv` paths stream directly to the store via `grpc_put_path_streaming` without buffering. `wopAddToStore` and `wopAddTextToStore` still buffer (they compute the store path from the content hash, so need the full bytes before `PutPath` metadata). A `.drv` NAR exceeding `DRV_NAR_BUFFER_LIMIT` is streamed without caching --- `resolve_derivation` fetches it from the store later during DAG reconstruction.
 2. **On `wopBuildDerivation`/`wopBuildPathsWithResults`:** The gateway identifies all requested derivation paths. For each, it looks up the parsed derivation from the session cache (step 1). If a `.drv` was not uploaded in the current session (e.g., it was uploaded in a previous session and already exists in the store), the gateway fetches it from rio-store via `GetPath`, unpacks the NAR, and parses the ATerm.
-3. **DAG construction:** Starting from the requested derivation(s), the gateway walks `inputDrvs` references recursively (BFS) to build the full DAG. **DAG reconstruction is capped at 10,000 transitive input derivations** (`MAX_TRANSITIVE_INPUTS`) to prevent DoS via pathological derivation graphs. The gateway sends the **full DAG** to the scheduler; cache-hit determination (which nodes have outputs already in the store) happens in the scheduler, not here.
+3. **DAG construction:** Starting from the requested derivation(s), the gateway walks `inputDrvs` references recursively (BFS) to build the full DAG. **DAG reconstruction is capped at 1,048,576 transitive input derivations** (`DEFAULT_MAX_TRANSITIVE_INPUTS`, overridable via `RIO_MAX_TRANSITIVE_INPUTS`) to prevent DoS via pathological derivation graphs. The gateway sends the **full DAG** to the scheduler; cache-hit determination (which nodes have outputs already in the store) happens in the scheduler, not here.
 4. **Validation (`validate_dag`):** Malformed `.drv` files and missing `.drv` files (referenced by `inputDrvs` but not in the store) are rejected via `BuildResult::failure` delivered through `STDERR_LAST` — the session stays open, subsequent opcodes are accepted. (Previously `STDERR_ERROR` terminal; changed in remediation-07 to avoid the ERROR→LAST desync when called from `wopBuildPaths`/`wopBuildPathsWithResults`, which wrap the error.) `validate_dag` also enforces two early rejections before the gRPC round-trip: (a) `nodes.len() > MAX_DAG_NODES` (scheduler enforces this too, but gateway-side early reject saves the submission), and (b) any derivation with `__noChroot=1` in its env (sandbox escape --- this check is ONLY at the gateway; the scheduler does not re-check). `validate_dag` is invoked from all three build handlers (`wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`).
 5. **The reconstructed DAG is sent to the scheduler via `SubmitBuild`.** The gateway holds the SSH connection open and converts the `BuildEvent` response stream into STDERR messages for the Nix client.
 
@@ -504,7 +504,7 @@ r[gw.jwt.verify]
 The tonic interceptor on scheduler and store MUST extract `x-rio-tenant-token`, verify signature+expiry, attach `Claims` to request extensions, and reject invalid tokens with `Status::unauthenticated`. (Controller has no gRPC ingress — kube reconcile loop + raw-TCP /healthz only.) The scheduler ADDITIONALLY checks `jti NOT IN jwt_revoked` (PG lookup — gateway stays PG-free).
 
 r[gw.jwt.dual-mode]
-Gateway auth is two-branched PERMANENTLY: `x-rio-tenant-token` header present → JWT verify; absent → SSH-comment fallback. Operator chooses per-deployment via `gateway.toml auth_mode`. Both paths stay maintained. (Does NOT bump `r[gw.auth.tenant-from-key-comment]`.)
+Gateway auth is two-branched PERMANENTLY: `x-rio-tenant-token` header present → JWT verify; absent → SSH-comment fallback. Operator selects the deployment posture via `jwt.key_path` and `jwt.required` in `gateway.toml`: `key_path` absent → comment-fallback only (no JWT minting); `key_path` set with `required=false` → mint-with-degrade (JWT minted on auth, downstream falls back to comment if verify fails); `key_path` set with `required=true` → mint-or-reject. Both paths stay maintained. (Does NOT bump `r[gw.auth.tenant-from-key-comment]`.)
 
 ## Connection Lifecycle
 
@@ -552,8 +552,8 @@ requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`. The limit matches Nix's
 default `max-jobs`.
 
 r[gw.conn.keepalive]
-The gateway sends SSH keepalive requests every 30 seconds. After 3
-consecutive unanswered keepalives (~90 s), the connection is closed.
+The gateway sends SSH keepalive requests every 30 seconds. After 9
+consecutive unanswered keepalives (~270 s), the connection is closed.
 This detects half-open TCP that kernel-level keepalive would not.
 
 r[gw.conn.nodelay]
@@ -747,8 +747,8 @@ russh's `handle_session_error` logs the reject.
 
 r[gw.reconnect.backoff]
 **WatchBuild reconnect:** When the `SubmitBuild` / `WatchBuild` response stream breaks (scheduler failover, transient network), the gateway's `process_stream` distinguishes error classes via `StreamProcessError`:
-- `Transport` (scheduler connection dropped) → retried up to **5 times** with exponential backoff (**1s/2s/4s/8s/16s**). The scheduler replays `BuildEvent`s from `build_event_log` starting at `since_sequence`.
-- `EofWithoutTerminal` / `Wire` → **not** retried; the gateway returns `MiscFailure` to the Nix client immediately. These indicate the build itself terminated incompletely or a protocol bug, not a transient connectivity issue.
+- `Transport` (scheduler connection dropped) and `EofWithoutTerminal` (stream closed without a terminal `BuildCompleted`/`Failed`/`Cancelled` event — typical leader-failover signature) → retried up to **10 times** with exponential backoff (**1s/2s/4s/…/512s**). The scheduler replays `BuildEvent`s from `build_event_log` starting at `since_sequence`.
+- `Wire` → **not** retried; the gateway returns `MiscFailure` to the Nix client immediately. This indicates a protocol bug, not a transient connectivity issue.
 The reconnect counter resets on the first successful `BuildEvent` received after a reconnect.
 
 r[gw.reconnect.since-seq]

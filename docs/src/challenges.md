@@ -107,7 +107,7 @@ The scheduler maintains the entire global DAG in memory via a single-owner actor
 **Mitigations:**
 - Profile memory and throughput during Phase 2c benchmarks (target: 60K-node DAG in < 500MB, actor processes > 1000 ops/sec)
 - Consider offloading compute-heavy operations (critical-path recomputation) to a background task with dirty-flag coalescing
-- Bound individual submissions: `MAX_DAG_NODES = 100,000` / `MAX_DAG_EDGES = 500,000` --- global compile-time constants (`rio-common/src/limits.rs`), not per-tenant. SubmitBuild rejects DAGs exceeding either limit before merge.
+- Bound individual submissions: `MAX_DAG_NODES = 1,048,576` / `MAX_DAG_EDGES = 5,242,880` --- global compile-time constants (`rio-common/src/limits.rs`), not per-tenant. SubmitBuild rejects DAGs exceeding either limit before merge.
 
 ## 13. FUSE Local I/O Performance
 
