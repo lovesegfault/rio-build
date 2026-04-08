@@ -7,7 +7,7 @@
 use rio_proto::types::{DerivationResourceEstimate, GetCapacityManifestResponse};
 use tonic::Status;
 
-use crate::actor::{ActorCommand, ActorHandle};
+use crate::actor::{ActorCommand, ActorHandle, AdminQuery};
 use crate::estimator::BucketedEstimate;
 
 /// Walk the ready queue inside the actor, bucket via the Estimator,
@@ -20,7 +20,7 @@ pub(super) async fn get_capacity_manifest(
     // polls this to size the builder fleet — dropping the query under
     // backpressure would blind it exactly when the queue is deepest.
     let estimates = actor
-        .query_unchecked(|reply| ActorCommand::CapacityManifest { reply })
+        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::CapacityManifest { reply }))
         .await
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 

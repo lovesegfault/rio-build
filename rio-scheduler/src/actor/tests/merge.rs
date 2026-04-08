@@ -1781,14 +1781,14 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
     );
 
     // --- Admin RPC under load -----------------------------------------
-    // ClusterSnapshot iterates the full DAG. With 50k nodes this should
-    // be tens-of-ms, not the 30s+ timeout seen in prod.
+    // compute_cluster_snapshot iterates the full DAG. With 50k nodes
+    // this should be tens-of-ms, not the 30s+ timeout seen in prod.
+    // Tick recomputes + publishes the snapshot; the cached read is
+    // O(1), so the elapsed measures the Tick's actor-side scan.
     let t = std::time::Instant::now();
-    let (tx, rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::ClusterSnapshot { reply: tx })
-        .await?;
-    let _snap = rx.await?;
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    let _snap = handle.cluster_snapshot_cached();
     let snap_elapsed = t.elapsed();
     eprintln!("I-140 ClusterSnapshot bench: {N} nodes — {snap_elapsed:?}");
 
@@ -1959,9 +1959,11 @@ async fn merge_hydrates_size_class_floor_from_db() -> TestResult {
     merge_dag(&handle, build_id, vec![fod], vec![], false).await?;
 
     let (_builder, fod_snap) = handle
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
-            pool_features: None,
-            reply,
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
+                pool_features: None,
+                reply,
+            })
         })
         .await?;
     let tiny = fod_snap.iter().find(|s| s.name == "tiny").unwrap();

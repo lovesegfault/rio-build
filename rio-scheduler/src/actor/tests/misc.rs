@@ -267,7 +267,7 @@ async fn test_gc_roots_collects_expected_outputs() -> TestResult {
 
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
-        .send_unchecked(ActorCommand::GcRoots { reply: reply_tx })
+        .send_unchecked(ActorCommand::Admin(AdminQuery::GcRoots { reply: reply_tx }))
         .await?;
     let roots = reply_rx.await?;
 
@@ -293,7 +293,7 @@ async fn test_gc_roots_dedupes() -> TestResult {
 
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
-        .send_unchecked(ActorCommand::GcRoots { reply: reply_tx })
+        .send_unchecked(ActorCommand::Admin(AdminQuery::GcRoots { reply: reply_tx }))
         .await?;
     let roots = reply_rx.await?;
 
@@ -1362,9 +1362,11 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
     // Snapshot before dispatch: 3 queued in small (est_dur=0 →
     // smallest covering class), 0 running.
     let (snap, _fod) = handle
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
-            pool_features: None,
-            reply,
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
+                pool_features: None,
+                reply,
+            })
         })
         .await?;
     assert_eq!(snap.len(), 2);
@@ -1405,9 +1407,11 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
         .expect("assignment not dropped");
 
     let (snap, _fod) = handle
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
-            pool_features: None,
-            reply,
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
+                pool_features: None,
+                reply,
+            })
         })
         .await?;
     let small = snap.iter().find(|s| s.name == "small").unwrap();
@@ -1471,9 +1475,11 @@ async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> Te
     .await?;
 
     let (snap, _fod) = handle
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
-            pool_features: None,
-            reply,
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
+                pool_features: None,
+                reply,
+            })
         })
         .await?;
     assert_eq!(snap.len(), 2);

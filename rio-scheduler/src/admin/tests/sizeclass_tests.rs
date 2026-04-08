@@ -84,7 +84,7 @@ async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> 
 // r[verify sched.admin.sizeclass-status]
 /// Feature-on: actor configured with 2 classes → response has 2 entries
 /// with effective/configured cutoffs matching the config. Proves the
-/// gRPC handler threads `ActorCommand::GetSizeClassSnapshot` through to
+/// gRPC handler threads `ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot` through to
 /// the proto response.
 #[tokio::test]
 async fn test_get_size_class_status_reports_configured_classes() -> anyhow::Result<()> {

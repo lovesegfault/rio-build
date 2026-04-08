@@ -654,30 +654,12 @@ impl DagActor {
                 ActorCommand::CleanupTerminalBuild { build_id } => {
                     self.handle_cleanup_terminal_build(build_id);
                 }
-                ActorCommand::ClusterSnapshot { reply } => {
-                    let _ = reply.send(self.compute_cluster_snapshot());
-                }
-                ActorCommand::GetSizeClassSnapshot {
-                    pool_features,
-                    reply,
-                } => {
-                    let _ = reply.send((
-                        self.compute_size_class_snapshot(pool_features.as_deref()),
-                        self.compute_fod_size_class_snapshot(),
-                    ));
-                }
-                ActorCommand::CapacityManifest { reply } => {
-                    let _ = reply.send(self.compute_capacity_manifest());
-                }
-                ActorCommand::EstimatorStats { reply } => {
-                    let _ = reply.send(self.compute_estimator_stats());
+                ActorCommand::Admin(q) => {
+                    self.handle_admin(q);
                 }
                 ActorCommand::ClearPoison { drv_hash, reply } => {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
                     let _ = reply.send(cleared);
-                }
-                ActorCommand::ListExecutors { reply } => {
-                    let _ = reply.send(self.handle_list_executors());
                 }
                 ActorCommand::DrainExecutor {
                     executor_id,
@@ -692,9 +674,6 @@ impl DagActor {
                 }
                 ActorCommand::ForwardPhase { phase } => {
                     self.handle_forward_phase(phase);
-                }
-                ActorCommand::GcRoots { reply } => {
-                    let _ = reply.send(self.handle_gc_roots());
                 }
                 ActorCommand::LeaderAcquired => {
                     self.handle_leader_acquired().await;
@@ -711,55 +690,9 @@ impl DagActor {
                 ActorCommand::ReconcileAssignments => {
                     self.handle_reconcile_assignments().await;
                 }
-                ActorCommand::InspectBuildDag { build_id, reply } => {
-                    let _ = reply.send(self.handle_inspect_build_dag(build_id));
-                }
-                ActorCommand::DebugQueryWorkers { reply } => {
-                    let _ = reply.send(self.handle_debug_query_workers());
-                }
                 #[cfg(test)]
-                ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
-                    let _ = reply.send(self.handle_debug_query_derivation(&drv_hash));
-                }
-                #[cfg(test)]
-                ActorCommand::DebugForceAssign {
-                    drv_hash,
-                    executor_id,
-                    reply,
-                } => {
-                    let _ = reply.send(self.handle_debug_force_assign(&drv_hash, &executor_id));
-                }
-                #[cfg(test)]
-                ActorCommand::DebugBackdateRunning {
-                    drv_hash,
-                    secs_ago,
-                    reply,
-                } => {
-                    let _ = reply.send(self.handle_debug_backdate_running(&drv_hash, secs_ago));
-                }
-                #[cfg(test)]
-                ActorCommand::DebugBackdateSubmitted {
-                    build_id,
-                    secs_ago,
-                    reply,
-                } => {
-                    let _ = reply.send(self.handle_debug_backdate_submitted(build_id, secs_ago));
-                }
-                #[cfg(test)]
-                ActorCommand::DebugForcePoisoned {
-                    drv_hash,
-                    retry_count,
-                    reply,
-                } => {
-                    let _ = reply.send(self.handle_debug_force_poisoned(&drv_hash, retry_count));
-                }
-                #[cfg(test)]
-                ActorCommand::DebugClearDrvContent { drv_hash, reply } => {
-                    let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
-                }
-                #[cfg(test)]
-                ActorCommand::DebugTripBreaker { n, reply } => {
-                    let _ = reply.send(self.handle_debug_trip_breaker(n));
+                ActorCommand::Debug(d) => {
+                    self.handle_debug(d);
                 }
             }
 

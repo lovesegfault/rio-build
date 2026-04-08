@@ -232,91 +232,8 @@ pub enum ActorCommand {
         reply: oneshot::Sender<DrainResult>,
     },
 
-    /// Snapshot cluster state for `AdminService.ClusterStatus`.
-    ///
-    /// Counts are computed by iterating actor-owned collections
-    /// (`workers`, `builds`, `ready_queue`, `dag`). That's O(n) in
-    /// workers+derivations per call — fine for the controller's 30s
-    /// autoscaling poll. If this ever gets hot (dashboard refresh at
-    /// 1Hz × many clients), the actor could maintain running counters
-    /// incremented on state transitions instead. Not a concern today.
-    ///
-    /// `send_unchecked` — bypasses backpressure like Heartbeat. The
-    /// controller's autoscaling loop needs a reading even (especially!)
-    /// when the scheduler is saturated; dropping the snapshot under
-    /// backpressure would blind the autoscaler exactly when it needs
-    /// to scale up.
-    ClusterSnapshot {
-        reply: oneshot::Sender<ClusterSnapshot>,
-    },
-
-    /// Snapshot SITA-E size-class state for
-    /// `AdminService.GetSizeClassStatus`.
-    ///
-    /// Per-class: effective (post-rebalancer) + configured (TOML)
-    /// cutoffs, queued count (ready derivations that classify() into
-    /// this class), running count (Assigned/Running derivations whose
-    /// `assigned_size_class` matches).
-    ///
-    /// O(dag_nodes) for the classify() pass over Ready derivations.
-    /// Same reasoning as `ClusterSnapshot` — admin RPC, not hot path.
-    ///
-    /// `send_unchecked`: the WPS autoscaler (P0234) reads this to
-    /// decide per-class replica targets. Blinding it under load is the
-    /// same failure mode as blinding ClusterStatus.
-    GetSizeClassSnapshot {
-        /// I-176: when `Some`, only count Ready derivations whose
-        /// `required_features ⊆ pool_features` — mirrors
-        /// `hard_filter`'s feature check so per-pool ephemeral
-        /// reconcilers see the queue depth their workers could
-        /// actually accept. `None` = unfiltered (CLI, BPS status).
-        /// `Some(vec![])` = "I support no features" → only counts
-        /// derivations with empty `required_features`.
-        pool_features: Option<Vec<String>>,
-        /// `(builder_classes, fod_classes)`. FOD classes (P0556) reuse
-        /// the same struct with cutoffs zeroed — fetcher routing is
-        /// reactive (`size_class_floor`), not duration-estimated.
-        reply: oneshot::Sender<(Vec<SizeClassSnapshot>, Vec<SizeClassSnapshot>)>,
-    },
-
-    /// Bucketed resource estimates for ready-queue derivations
-    /// (ADR-020 capacity manifest). Headroom applied from
-    /// `self.headroom_mult` (config-static, same value the dispatch
-    /// filter uses at `dispatch.rs` — one source of truth post-P0510).
-    /// Cold-start derivations (no `build_history` sample) are omitted —
-    /// controller uses its operator floor.
-    ///
-    /// `send_unchecked`: the controller polls this to size the builder
-    /// fleet. Same blinding-under-load rationale as above.
-    CapacityManifest {
-        reply: oneshot::Sender<Vec<BucketedEstimate>>,
-    },
-
-    /// Dump the in-memory estimator snapshot — every `(pname, system)`
-    /// `HistoryEntry` plus what `classify()` returns for it under the
-    /// current effective cutoffs. I-124 / `rio-cli estimator`.
-    ///
-    /// O(build_history rows × size_classes); admin-only, not hot path.
-    /// Reflects the last Tick refresh (~60s stale at worst), NOT a
-    /// live PG read — that's deliberate, this is "what the scheduler
-    /// SEES", not "what PG says".
-    EstimatorStats {
-        reply: oneshot::Sender<Vec<EstimatorStatsEntry>>,
-    },
-
-    /// Return expected output paths for all non-terminal
-    /// derivations. Used by TriggerGC to pass as extra_roots to
-    /// the store's mark phase — protects in-flight build outputs
-    /// that may not be in narinfo yet (worker hasn't uploaded).
-    GcRoots { reply: oneshot::Sender<Vec<String>> },
-
-    /// Snapshot all workers for `AdminService.ListExecutors`.
-    /// O(workers) scan; acceptable for dashboard polling.
-    /// `send_unchecked`: same rationale as `ClusterSnapshot` —
-    /// dashboard needs a reading even (especially) under saturation.
-    ListExecutors {
-        reply: oneshot::Sender<Vec<ExecutorSnapshot>>,
-    },
+    /// Read-only admin/snapshot query. See [`AdminQuery`].
+    Admin(AdminQuery),
 
     /// Clear poison state for a derivation: in-mem reset + PG clear.
     /// Returns `true` if the derivation was poisoned and is now cleared.
@@ -327,16 +244,6 @@ pub enum ActorCommand {
     ClearPoison {
         drv_hash: DrvHash,
         reply: oneshot::Sender<bool>,
-    },
-
-    /// Actor in-memory snapshot of a build's derivations + live
-    /// executor stream IDs. I-025 diagnostic: surfaces the PG-vs-
-    /// stream-pool mismatch that silently freezes dispatch. Unlike
-    /// GetBuildGraph (PG-backed, works for completed builds), this
-    /// is the exact view dispatch_ready() sees.
-    InspectBuildDag {
-        build_id: Uuid,
-        reply: oneshot::Sender<(Vec<rio_proto::types::DerivationDiagnostic>, Vec<String>)>,
     },
 
     /// Lease acquired: trigger state recovery from PG. Fire-and-
@@ -357,6 +264,69 @@ pub enum ActorCommand {
     /// query store → Completed (orphan) or reset to Ready.
     ReconcileAssignments,
 
+    /// `cfg(test)` debug command. See [`DebugCmd`].
+    #[cfg(test)]
+    Debug(DebugCmd),
+}
+
+/// Read-only admin/snapshot queries on actor in-memory state. All
+/// `&self`; `send_unchecked` — the controller's autoscaling loop and
+/// dashboards need a reading even (especially!) when the scheduler is
+/// saturated; dropping the snapshot under backpressure blinds the
+/// autoscaler exactly when it needs to scale up.
+pub enum AdminQuery {
+    /// Snapshot SITA-E size-class state for
+    /// `AdminService.GetSizeClassStatus`. O(dag_nodes) for the
+    /// classify() pass over Ready derivations.
+    GetSizeClassSnapshot {
+        /// I-176: when `Some`, only count Ready derivations whose
+        /// `required_features ⊆ pool_features` — mirrors
+        /// `hard_filter`'s feature check so per-pool ephemeral
+        /// reconcilers see the queue depth their workers could
+        /// actually accept. `None` = unfiltered (CLI, BPS status).
+        /// `Some(vec![])` = "I support no features" → only counts
+        /// derivations with empty `required_features`.
+        pool_features: Option<Vec<String>>,
+        /// `(builder_classes, fod_classes)`. FOD classes (P0556) reuse
+        /// the same struct with cutoffs zeroed — fetcher routing is
+        /// reactive (`size_class_floor`), not duration-estimated.
+        reply: oneshot::Sender<(Vec<SizeClassSnapshot>, Vec<SizeClassSnapshot>)>,
+    },
+    /// Bucketed resource estimates for ready-queue derivations
+    /// (ADR-020 capacity manifest). Headroom applied from
+    /// `self.headroom_mult` (config-static, same value the dispatch
+    /// filter uses). Cold-start derivations (no `build_history`
+    /// sample) are omitted — controller uses its operator floor.
+    CapacityManifest {
+        reply: oneshot::Sender<Vec<BucketedEstimate>>,
+    },
+    /// Dump the in-memory estimator snapshot — every `(pname, system)`
+    /// `HistoryEntry` plus what `classify()` returns for it under the
+    /// current effective cutoffs. I-124 / `rio-cli estimator`.
+    /// Reflects the last Tick refresh (~60s stale at worst), NOT a
+    /// live PG read — this is "what the scheduler SEES".
+    EstimatorStats {
+        reply: oneshot::Sender<Vec<EstimatorStatsEntry>>,
+    },
+    /// Return expected output paths for all non-terminal
+    /// derivations. Used by TriggerGC to pass as extra_roots to
+    /// the store's mark phase — protects in-flight build outputs
+    /// that may not be in narinfo yet (worker hasn't uploaded).
+    GcRoots { reply: oneshot::Sender<Vec<String>> },
+    /// Snapshot all workers for `AdminService.ListExecutors`.
+    /// O(workers) scan; acceptable for dashboard polling.
+    ListExecutors {
+        reply: oneshot::Sender<Vec<ExecutorSnapshot>>,
+    },
+    /// Actor in-memory snapshot of a build's derivations + live
+    /// executor stream IDs. I-025 diagnostic: surfaces the PG-vs-
+    /// stream-pool mismatch that silently freezes dispatch. Unlike
+    /// GetBuildGraph (PG-backed, works for completed builds), this
+    /// is the exact view dispatch_ready() sees.
+    InspectBuildDag {
+        build_id: Uuid,
+        reply: oneshot::Sender<(Vec<rio_proto::types::DerivationDiagnostic>, Vec<String>)>,
+    },
     /// Actor in-memory executor map snapshot. I-048b/c diagnostic:
     /// surfaces `has_stream`/`warm`/`kind` per entry — what
     /// `dispatch_ready()` filters on, not what PG `last_seen` claims.
@@ -365,94 +335,77 @@ pub enum ActorCommand {
     DebugQueryWorkers {
         reply: oneshot::Sender<Vec<DebugExecutorInfo>>,
     },
+}
 
-    /// Test-only: query a derivation's state.
-    #[cfg(test)]
-    DebugQueryDerivation {
+/// `cfg(test)` debug commands that bypass the state machine / dispatch
+/// path so tests can set up preconditions directly.
+#[cfg(test)]
+pub enum DebugCmd {
+    /// Query a derivation's state.
+    QueryDerivation {
         drv_hash: String,
         reply: oneshot::Sender<Option<DebugDerivationInfo>>,
     },
-
-    /// Test-only: force a derivation to Assigned state with the
-    /// given worker, bypassing dispatch + backoff. Used by retry/
-    /// poison tests that need to drive multiple completion cycles
-    /// without waiting for real backoff durations.
-    ///
-    /// With backoff + failed_builders exclusion, dispatch won't
-    /// re-assign immediately after a failure. This helper lets tests
-    /// control the state machine directly instead of waiting for
-    /// real backoff durations.
-    #[cfg(test)]
-    DebugForceAssign {
+    /// Force a derivation to Assigned with the given worker, bypassing
+    /// dispatch + backoff. For retry/poison tests that need to drive
+    /// multiple completion cycles without waiting for real backoff.
+    ForceAssign {
         drv_hash: String,
         executor_id: ExecutorId,
         reply: oneshot::Sender<bool>,
     },
-
-    /// Test-only: backdate a derivation's `running_since` and force it
-    /// into Running status. For backstop-timeout tests: with the
-    /// cfg(test) floor of 0s, any positive elapsed triggers the
-    /// backstop on the next Tick. `secs_ago` controls how stale the
-    /// timestamp looks. Returns `false` if the derivation isn't in
-    /// the DAG or the transition to Running failed.
-    #[cfg(test)]
-    DebugBackdateRunning {
+    /// Backdate a derivation's `running_since` and force it into
+    /// Running status. For backstop-timeout tests: with the cfg(test)
+    /// floor of 0s, any positive elapsed triggers the backstop on the
+    /// next Tick.
+    BackdateRunning {
         drv_hash: String,
         secs_ago: u64,
         reply: oneshot::Sender<bool>,
     },
-
-    /// Test-only: backdate a build's `submitted_at` timestamp. For
-    /// per-build-timeout tests (`sched.timeout.per-build` spec): handle_tick
-    /// checks `submitted_at.elapsed() > build_timeout`. `submitted_at`
-    /// is `std::time::Instant` — tokio paused time cannot mock it, and
-    /// paused time breaks PG pool timeouts anyway (see tests/worker.rs
-    /// comment). Returns `false` if the build isn't in `self.builds`.
-    #[cfg(test)]
-    DebugBackdateSubmitted {
+    /// Backdate a build's `submitted_at` timestamp. For per-build-
+    /// timeout tests (`sched.timeout.per-build` spec): `submitted_at`
+    /// is `std::time::Instant` — tokio paused time cannot mock it.
+    BackdateSubmitted {
         build_id: Uuid,
         secs_ago: u64,
         reply: oneshot::Sender<bool>,
     },
-
-    /// Test-only: force a derivation into `Poisoned` with the given
-    /// `retry_count`. For the I-169 resubmit-bound tests
-    /// (`sched.merge.poisoned-resubmit-bounded`): driving N transient
-    /// failures + a permanent failure to reach a specific `retry_count`
-    /// is slow and tangles with poison-threshold/backoff config. Sets
-    /// `poisoned_at = now()` so TTL tracking is consistent. Returns
-    /// `false` if the derivation isn't in the DAG.
-    #[cfg(test)]
-    DebugForcePoisoned {
+    /// Force a derivation into `Poisoned` with the given `retry_count`.
+    /// For the I-169 resubmit-bound tests
+    /// (`sched.merge.poisoned-resubmit-bounded`).
+    ForcePoisoned {
         drv_hash: String,
         retry_count: u32,
         reply: oneshot::Sender<bool>,
     },
-
-    /// Test-only: clear a derivation's `drv_content`. Simulates the
-    /// post-recovery state where the DAG was reloaded from PG but
-    /// `drv_content` wasn't persisted (too large to store for every
-    /// derivation). For the `sched.ca.resolve` recovery-fetch test:
-    /// `maybe_resolve_ca` should fetch the ATerm from the store when
-    /// `drv_content` is empty on a CA-on-CA dispatch. Returns `false`
-    /// if the derivation isn't in the DAG.
-    #[cfg(test)]
-    DebugClearDrvContent {
+    /// Clear a derivation's `drv_content`. Simulates the post-recovery
+    /// state for the `sched.ca.resolve` recovery-fetch test.
+    ClearDrvContent {
         drv_hash: String,
         reply: oneshot::Sender<bool>,
     },
-
-    /// Test-only: call `cache_breaker.record_failure()` `n` times.
-    /// For CA cutoff-compare breaker-integration tests: trip the
-    /// breaker open without driving N failing SubmitBuild merges
-    /// (slow + lots of boilerplate) or N failing CA completions
-    /// (also slow). `OPEN_THRESHOLD` is 5; callers pass `n=5` to
-    /// trip immediately. Reply is `is_open()` after the calls.
-    #[cfg(test)]
-    DebugTripBreaker {
+    /// Call `cache_breaker.record_failure()` `n` times. For CA
+    /// cutoff-compare breaker-integration tests. `OPEN_THRESHOLD` is 5;
+    /// callers pass `n=5` to trip immediately.
+    TripBreaker {
         n: u32,
         reply: oneshot::Sender<bool>,
     },
+}
+
+impl AdminQuery {
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            Self::GetSizeClassSnapshot { .. } => "GetSizeClassSnapshot",
+            Self::CapacityManifest { .. } => "CapacityManifest",
+            Self::EstimatorStats { .. } => "EstimatorStats",
+            Self::GcRoots { .. } => "GcRoots",
+            Self::ListExecutors { .. } => "ListExecutors",
+            Self::InspectBuildDag { .. } => "InspectBuildDag",
+            Self::DebugQueryWorkers { .. } => "DebugQueryWorkers",
+        }
+    }
 }
 
 impl ActorCommand {
@@ -476,31 +429,12 @@ impl ActorCommand {
             Self::ForwardLogBatch { .. } => "ForwardLogBatch",
             Self::ForwardPhase { .. } => "ForwardPhase",
             Self::DrainExecutor { .. } => "DrainExecutor",
-            Self::ClusterSnapshot { .. } => "ClusterSnapshot",
-            Self::GetSizeClassSnapshot { .. } => "GetSizeClassSnapshot",
-            Self::CapacityManifest { .. } => "CapacityManifest",
-            Self::EstimatorStats { .. } => "EstimatorStats",
-            Self::GcRoots { .. } => "GcRoots",
-            Self::ListExecutors { .. } => "ListExecutors",
+            Self::Admin(q) => q.name(),
             Self::ClearPoison { .. } => "ClearPoison",
-            Self::InspectBuildDag { .. } => "InspectBuildDag",
             Self::LeaderAcquired => "LeaderAcquired",
             Self::ReconcileAssignments => "ReconcileAssignments",
-            Self::DebugQueryWorkers { .. } => "DebugQueryWorkers",
             #[cfg(test)]
-            Self::DebugQueryDerivation { .. } => "DebugQueryDerivation",
-            #[cfg(test)]
-            Self::DebugForceAssign { .. } => "DebugForceAssign",
-            #[cfg(test)]
-            Self::DebugBackdateRunning { .. } => "DebugBackdateRunning",
-            #[cfg(test)]
-            Self::DebugBackdateSubmitted { .. } => "DebugBackdateSubmitted",
-            #[cfg(test)]
-            Self::DebugForcePoisoned { .. } => "DebugForcePoisoned",
-            #[cfg(test)]
-            Self::DebugClearDrvContent { .. } => "DebugClearDrvContent",
-            #[cfg(test)]
-            Self::DebugTripBreaker { .. } => "DebugTripBreaker",
+            Self::Debug(_) => "Debug",
         }
     }
 }

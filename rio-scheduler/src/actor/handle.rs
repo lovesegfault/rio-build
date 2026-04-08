@@ -189,8 +189,10 @@ impl ActorHandle {
     /// succeed under saturation, that's exactly when you need them.
     pub async fn debug_query_workers(&self) -> Result<Vec<DebugExecutorInfo>, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugQueryWorkers { reply: tx })
-            .await?;
+        self.send_unchecked(ActorCommand::Admin(AdminQuery::DebugQueryWorkers {
+            reply: tx,
+        }))
+        .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
 
@@ -201,10 +203,10 @@ impl ActorHandle {
         drv_hash: &str,
     ) -> Result<Option<DebugDerivationInfo>, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugQueryDerivation {
+        self.send_unchecked(ActorCommand::Debug(DebugCmd::QueryDerivation {
             drv_hash: drv_hash.to_string(),
             reply: tx,
-        })
+        }))
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
@@ -221,11 +223,11 @@ impl ActorHandle {
         executor_id: &str,
     ) -> Result<bool, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugForceAssign {
+        self.send_unchecked(ActorCommand::Debug(DebugCmd::ForceAssign {
             drv_hash: drv_hash.to_string(),
             executor_id: executor_id.into(),
             reply: tx,
-        })
+        }))
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
@@ -240,11 +242,11 @@ impl ActorHandle {
         secs_ago: u64,
     ) -> Result<bool, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugBackdateRunning {
+        self.send_unchecked(ActorCommand::Debug(DebugCmd::BackdateRunning {
             drv_hash: drv_hash.to_string(),
             secs_ago,
             reply: tx,
-        })
+        }))
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
@@ -258,11 +260,11 @@ impl ActorHandle {
         secs_ago: u64,
     ) -> Result<bool, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugBackdateSubmitted {
+        self.send_unchecked(ActorCommand::Debug(DebugCmd::BackdateSubmitted {
             build_id,
             secs_ago,
             reply: tx,
-        })
+        }))
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
@@ -276,11 +278,11 @@ impl ActorHandle {
         retry_count: u32,
     ) -> Result<bool, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugForcePoisoned {
+        self.send_unchecked(ActorCommand::Debug(DebugCmd::ForcePoisoned {
             drv_hash: drv_hash.to_string(),
             retry_count,
             reply: tx,
-        })
+        }))
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
@@ -290,10 +292,10 @@ impl ActorHandle {
     #[cfg(test)]
     pub async fn debug_clear_drv_content(&self, drv_hash: &str) -> Result<bool, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugClearDrvContent {
+        self.send_unchecked(ActorCommand::Debug(DebugCmd::ClearDrvContent {
             drv_hash: drv_hash.to_string(),
             reply: tx,
-        })
+        }))
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
@@ -305,7 +307,7 @@ impl ActorHandle {
     #[cfg(test)]
     pub async fn debug_trip_breaker(&self, n: u32) -> Result<bool, ActorError> {
         let (tx, rx) = oneshot::channel();
-        self.send_unchecked(ActorCommand::DebugTripBreaker { n, reply: tx })
+        self.send_unchecked(ActorCommand::Debug(DebugCmd::TripBreaker { n, reply: tx }))
             .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }

@@ -13,7 +13,7 @@
 use rio_proto::types::{EstimatorEntry, GetEstimatorStatsResponse};
 use tonic::Status;
 
-use crate::actor::{ActorCommand, ActorHandle, EstimatorStatsEntry};
+use crate::actor::{ActorCommand, ActorHandle, AdminQuery, EstimatorStatsEntry};
 
 /// Query the actor for the full estimator snapshot, filter by
 /// substring, sort by sample_count desc, convert to proto.
@@ -26,7 +26,7 @@ pub(super) async fn get_estimator_stats(
     // "don't drop the diagnostic exactly when it's needed" reasoning
     // as ClusterStatus / GetSizeClassStatus.
     let mut entries = actor
-        .query_unchecked(|reply| ActorCommand::EstimatorStats { reply })
+        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::EstimatorStats { reply }))
         .await
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 

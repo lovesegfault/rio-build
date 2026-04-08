@@ -11,10 +11,44 @@ use crate::estimator::{BucketedEstimate, Estimator};
 use crate::state::{BuildState, DerivationStatus};
 
 use super::{
-    ClusterSnapshot, DagActor, DebugExecutorInfo, EstimatorStatsEntry, SizeClassSnapshot, command,
+    AdminQuery, ClusterSnapshot, DagActor, DebugExecutorInfo, EstimatorStatsEntry,
+    SizeClassSnapshot, command,
 };
 
 impl DagActor {
+    /// Dispatch a read-only [`AdminQuery`].
+    pub(super) fn handle_admin(&self, q: AdminQuery) {
+        match q {
+            AdminQuery::GetSizeClassSnapshot {
+                pool_features,
+                reply,
+            } => {
+                let _ = reply.send((
+                    self.compute_size_class_snapshot(pool_features.as_deref()),
+                    self.compute_fod_size_class_snapshot(),
+                ));
+            }
+            AdminQuery::CapacityManifest { reply } => {
+                let _ = reply.send(self.compute_capacity_manifest());
+            }
+            AdminQuery::EstimatorStats { reply } => {
+                let _ = reply.send(self.compute_estimator_stats());
+            }
+            AdminQuery::GcRoots { reply } => {
+                let _ = reply.send(self.handle_gc_roots());
+            }
+            AdminQuery::ListExecutors { reply } => {
+                let _ = reply.send(self.handle_list_executors());
+            }
+            AdminQuery::InspectBuildDag { build_id, reply } => {
+                let _ = reply.send(self.handle_inspect_build_dag(build_id));
+            }
+            AdminQuery::DebugQueryWorkers { reply } => {
+                let _ = reply.send(self.handle_debug_query_workers());
+            }
+        }
+    }
+
     /// Compute counts for `AdminService.ClusterStatus`.
     ///
     /// O(workers + builds + dag_nodes) per call. The autoscaler polls

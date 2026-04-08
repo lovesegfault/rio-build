@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::state::{DerivationStatus, ExecutorId};
 
-use super::{DagActor, DebugDerivationInfo};
+use super::{DagActor, DebugCmd, DebugDerivationInfo};
 
 /// Backdate an Instant by `secs_ago` seconds. `checked_sub` is used
 /// defensively: if `secs_ago` is absurd (e.g. `u64::MAX`) and
@@ -24,6 +24,49 @@ pub(super) fn backdate(secs_ago: u64) -> Instant {
 }
 
 impl DagActor {
+    /// Dispatch a `cfg(test)` [`DebugCmd`].
+    pub(super) fn handle_debug(&mut self, d: DebugCmd) {
+        match d {
+            DebugCmd::QueryDerivation { drv_hash, reply } => {
+                let _ = reply.send(self.handle_debug_query_derivation(&drv_hash));
+            }
+            DebugCmd::ForceAssign {
+                drv_hash,
+                executor_id,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_debug_force_assign(&drv_hash, &executor_id));
+            }
+            DebugCmd::BackdateRunning {
+                drv_hash,
+                secs_ago,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_debug_backdate_running(&drv_hash, secs_ago));
+            }
+            DebugCmd::BackdateSubmitted {
+                build_id,
+                secs_ago,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_debug_backdate_submitted(build_id, secs_ago));
+            }
+            DebugCmd::ForcePoisoned {
+                drv_hash,
+                retry_count,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_debug_force_poisoned(&drv_hash, retry_count));
+            }
+            DebugCmd::ClearDrvContent { drv_hash, reply } => {
+                let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
+            }
+            DebugCmd::TripBreaker { n, reply } => {
+                let _ = reply.send(self.handle_debug_trip_breaker(n));
+            }
+        }
+    }
+
     pub(super) fn handle_debug_query_derivation(
         &self,
         drv_hash: &str,

@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime};
 use rio_proto::types::{ExecutorInfo, ListExecutorsResponse};
 use tonic::Status;
 
-use crate::actor::{ActorCommand, ActorHandle, ExecutorSnapshot};
+use crate::actor::{ActorCommand, ActorHandle, AdminQuery, ExecutorSnapshot};
 
 /// 3-bool → 4-state. `systems.is_empty()` = no heartbeat yet = not
 /// fully registered (stream-only or heartbeat-only) → "connecting".
@@ -30,7 +30,7 @@ pub(super) async fn list_executors(
     status_filter: &str,
 ) -> Result<ListExecutorsResponse, Status> {
     let snapshots = actor
-        .query_unchecked(|reply| ActorCommand::ListExecutors { reply })
+        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::ListExecutors { reply }))
         .await
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 

@@ -11,7 +11,7 @@
 use rio_proto::types::{GetSizeClassStatusResponse, SizeClassStatus};
 use tonic::Status;
 
-use crate::actor::{ActorCommand, ActorHandle, SizeClassSnapshot};
+use crate::actor::{ActorCommand, ActorHandle, AdminQuery, SizeClassSnapshot};
 use crate::db::SchedulerDb;
 
 /// Rebalancer lookback window for the sample-count query. Mirrors
@@ -40,9 +40,11 @@ pub(super) async fn get_size_class_status(
     // the autoscaler exactly when it should scale up — same
     // reasoning as ClusterStatus.
     let (snapshots, fod_snapshots) = actor
-        .query_unchecked(|reply| ActorCommand::GetSizeClassSnapshot {
-            pool_features,
-            reply,
+        .query_unchecked(|reply| {
+            ActorCommand::Admin(AdminQuery::GetSizeClassSnapshot {
+                pool_features,
+                reply,
+            })
         })
         .await
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;

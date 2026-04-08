@@ -13,7 +13,7 @@ use tracing::debug;
 
 use rio_proto::types::{GcProgress, GcRequest};
 
-use crate::actor::{ActorCommand, ActorHandle};
+use crate::actor::{ActorCommand, ActorHandle, AdminQuery};
 
 /// Spawn a background task that refreshes `store_size_bytes` every 60s
 /// via a PG query on the shared store DB. Scheduler already has the pool
@@ -56,7 +56,7 @@ pub fn spawn_store_size_refresh(
 /// after populating `extra_roots` from the scheduler's live builds.
 ///
 /// Flow:
-/// 1. `ActorCommand::GcRoots` → collect expected_output_paths from all
+/// 1. `ActorCommand::Admin(AdminQuery::GcRoots` → collect expected_output_paths from all
 ///    non-terminal derivations. These may not be in narinfo yet (worker
 ///    hasn't uploaded); the store's mark phase includes them as root
 ///    seeds so in-flight outputs aren't collected.
@@ -76,7 +76,7 @@ pub(super) async fn trigger_gc(
     // bypasses backpressure — GC is operator-initiated, rare,
     // and should work even when the scheduler is saturated.
     let mut extra_roots = actor
-        .query_unchecked(|reply| ActorCommand::GcRoots { reply })
+        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::GcRoots { reply }))
         .await
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 

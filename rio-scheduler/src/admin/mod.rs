@@ -37,7 +37,7 @@ use rio_proto::types::{
 };
 use uuid::Uuid;
 
-use crate::actor::{ActorCommand, ActorHandle};
+use crate::actor::{ActorCommand, ActorHandle, AdminQuery};
 use crate::logs::LogBuffers;
 
 mod builds;
@@ -76,7 +76,7 @@ pub struct AdminServiceImpl {
     started_at: Instant,
     /// Store gRPC address for TriggerGC proxy. The scheduler's
     /// `AdminService.TriggerGC` collects extra_roots via
-    /// `ActorCommand::GcRoots`, then proxies to the store's
+    /// `ActorCommand::Admin(AdminQuery::GcRoots`, then proxies to the store's
     /// `StoreAdminService.TriggerGC`. GC runs IN the store (it
     /// owns the chunk backend); scheduler contributes roots.
     store_addr: String,
@@ -504,7 +504,9 @@ impl AdminService for AdminServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid build_id UUID"))?;
         let (derivations, live_executor_ids) = self
             .actor
-            .query_unchecked(|reply| ActorCommand::InspectBuildDag { build_id, reply })
+            .query_unchecked(|reply| {
+                ActorCommand::Admin(AdminQuery::InspectBuildDag { build_id, reply })
+            })
             .await
             .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
         Ok(Response::new(InspectBuildDagResponse {
