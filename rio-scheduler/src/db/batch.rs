@@ -9,7 +9,9 @@ use uuid::Uuid;
 use super::{DerivationRow, SchedulerDb, encode_pg_text_array};
 
 impl SchedulerDb {
-    /// Link a build to a derivation.
+    /// Link a build to a derivation. Test-only singular form; production
+    /// path is [`Self::batch_insert_build_derivations`].
+    #[cfg(test)]
     pub async fn insert_build_derivation(
         &self,
         build_id: Uuid,
