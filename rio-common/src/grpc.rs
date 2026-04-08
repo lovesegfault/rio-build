@@ -125,19 +125,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 /// Single underscore (not `__`): this is a direct env read, not figment.
 /// The double underscore is figment's nesting separator — misleading here.
 pub fn max_message_size() -> usize {
-    match std::env::var("RIO_GRPC_MAX_MESSAGE_SIZE") {
-        Ok(val) => match val.parse::<usize>() {
-            Ok(size) => size,
-            Err(_) => {
-                // Direct env read, pre-tracing-init — eprintln not warn!.
-                eprintln!(
-                    "warning: invalid RIO_GRPC_MAX_MESSAGE_SIZE={val:?}, expected bytes as a positive integer; defaulting to {DEFAULT_MAX_MESSAGE_SIZE}"
-                );
-                DEFAULT_MAX_MESSAGE_SIZE
-            }
-        },
-        Err(_) => DEFAULT_MAX_MESSAGE_SIZE,
-    }
+    crate::config::env_or("RIO_GRPC_MAX_MESSAGE_SIZE", DEFAULT_MAX_MESSAGE_SIZE)
 }
 
 /// Process-global client TLS config. Set once via [`init_client_tls`] in

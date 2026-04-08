@@ -146,38 +146,22 @@ fn build_otel_layer<S>(
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
 {
-    let Ok(endpoint) = std::env::var("RIO_OTEL_ENDPOINT") else {
-        return Ok((None, OtelGuard(None)));
-    };
-
-    // Empty-string is distinct from unset: `RIO_OTEL_ENDPOINT=""` in a
-    // k8s env block or a shell export reaches here as Ok(""). Building
-    // an exporter against an empty URL succeeds but every export fails
-    // at DEBUG level — effectively silent. Treat empty as unset.
+    // Unset and empty (`RIO_OTEL_ENDPOINT=""` in a k8s env block) both
+    // mean disabled. Building an exporter against "" succeeds but every
+    // export fails at DEBUG — effectively silent — so treat as unset.
+    let endpoint: String = crate::config::env_or("RIO_OTEL_ENDPOINT", String::new());
     if endpoint.is_empty() {
-        eprintln!("RIO_OTEL_ENDPOINT is empty — OTel disabled");
         return Ok((None, OtelGuard(None)));
     }
 
-    // f64::clamp(NaN, 0.0, 1.0) returns NaN (both min() and max()
-    // propagate NaN), so a finite-check must happen BEFORE clamp.
-    // Parse errors and non-finite values both fall back loudly to
-    // the default; unset is the normal case and stays silent.
-    let sample_rate = match std::env::var("RIO_OTEL_SAMPLE_RATE") {
-        Ok(val) => match val.parse::<f64>() {
-            Ok(rate) if rate.is_finite() => rate.clamp(0.0, 1.0),
-            Ok(rate) => {
-                eprintln!("warning: RIO_OTEL_SAMPLE_RATE={rate} is not finite; defaulting to 1.0");
-                1.0
-            }
-            Err(_) => {
-                eprintln!(
-                    "warning: invalid RIO_OTEL_SAMPLE_RATE={val:?}, expected a float 0.0-1.0; defaulting to 1.0"
-                );
-                1.0
-            }
-        },
-        Err(_) => 1.0,
+    // `f64::from_str` accepts "nan"/"inf"; `f64::clamp(NaN, 0, 1)`
+    // returns NaN — so finite-check after parse, before clamp.
+    let raw: f64 = crate::config::env_or("RIO_OTEL_SAMPLE_RATE", 1.0);
+    let sample_rate = if raw.is_finite() {
+        raw.clamp(0.0, 1.0)
+    } else {
+        eprintln!("warning: RIO_OTEL_SAMPLE_RATE={raw} is not finite; defaulting to 1.0");
+        1.0
     };
 
     // OTLP gRPC span exporter.
@@ -422,18 +406,7 @@ pub fn init_metrics(
 
 /// Parse `RIO_LOG_FORMAT` environment variable, defaulting to JSON.
 fn log_format_from_env() -> LogFormat {
-    match std::env::var("RIO_LOG_FORMAT") {
-        Ok(val) => match val.parse() {
-            Ok(fmt) => fmt,
-            Err(_) => {
-                eprintln!(
-                    "warning: invalid RIO_LOG_FORMAT={val:?}, valid options are 'json' or 'pretty'; defaulting to json"
-                );
-                LogFormat::default()
-            }
-        },
-        Err(_) => LogFormat::default(),
-    }
+    crate::config::env_or("RIO_LOG_FORMAT", LogFormat::default())
 }
 
 #[cfg(test)]
