@@ -382,14 +382,19 @@ pkgs.testers.runNixOSTest {
             f"ListExecutors unrouted (http_code={code}). "
             "GRPCRoute method literal drifted from admin.proto."
         )
-        # k3s-full deploys scheduler.replicas=2; envoy load-balances across
-        # both. The standby returns Unavailable as Trailers-Only (status in
-        # HTTP headers, empty body), so a body-grep finds nothing. Retry
-        # until envoy picks the leader.
-        k3s_server.wait_until_succeeds(
-            listexec_curl
-            + " && grep -a 'grpc-status:[[:space:]]*0' /tmp/listexec.out",
-            timeout=30,
+        # k3s-full deploys scheduler.replicas=2; the standby returns
+        # Unavailable from leader-gated RPCs as Trailers-Only (status in
+        # HTTP headers, empty body). The BackendTrafficPolicy retry-on-
+        # unavailable in dashboard-gateway-policy.yaml makes envoy pick
+        # the other endpoint, so a single request reaches the leader.
+        # This grep failing means the retry policy is missing or broken.
+        k3s_server.succeed(
+            "grep -a 'grpc-status:' /tmp/listexec.out || "
+            "{ echo '--- listexec.out (no grpc-status in body) ---'; "
+            "  xxd /tmp/listexec.out; false; }"
+        )
+        k3s_server.succeed(
+            "grep -a 'grpc-status:[[:space:]]*0' /tmp/listexec.out"
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-envoy.pid) 2>/dev/null || true")

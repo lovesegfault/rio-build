@@ -96,4 +96,32 @@ spec:
   timeout:
     http:
       streamIdleTimeout: {{ .Values.dashboard.streamIdleTimeout | default "1h" }}
+---
+# ── Retry Unavailable across scheduler replicas ───────────────────────
+# scheduler.replicas>1 means the Service load-balances to standby
+# replicas, which return Unavailable from leader-gated admin RPCs
+# (ListExecutors, DrainExecutor, …). Envoy retry-on-unavailable picks
+# the other endpoint so the dashboard doesn't surface the standby race.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: rio-scheduler-admin-retry
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      name: rio-scheduler-readonly
+    {{- if .Values.dashboard.enableMutatingMethods }}
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      name: rio-scheduler-mutating
+    {{- end }}
+  retry:
+    numRetries: 3
+    retryOn:
+      triggers:
+        - unavailable
 {{- end }}
