@@ -376,7 +376,7 @@ pub struct BuilderPoolSpec {
 /// EXACTLY — operators can copy-paste between the two.
 ///
 /// `KubeSchema` not `JsonSchema`: nested struct with `#[x_kube]`
-/// attrs (same as `Replicas` below).
+/// attrs.
 #[derive(Clone, Debug, Serialize, Deserialize, KubeSchema)]
 #[serde(rename_all = "camelCase")]
 #[x_kube(
@@ -404,35 +404,6 @@ pub struct SeccompProfileKind {
     /// value is `operator/rio-builder.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localhost_profile: Option<String>,
-}
-
-/// Replica bounds with cross-field CEL.
-///
-/// `KubeSchema` (NOT `JsonSchema`) — the kube-rs derive that
-/// processes `#[x_kube(validation)]` attributes and emits
-/// x-kubernetes-validations into the generated schema. It also
-/// implements JsonSchema internally (the two conflict if both
-/// derived). CustomResource auto-processes kube attrs on the
-/// top-level Spec; nested structs need KubeSchema explicitly.
-///
-/// Why min/max instead of a single replicas field: autoscaler
-/// needs BOUNDS, not a fixed number. Operator says "2-20"; the
-/// autoscaler picks within that based on queue depth.
-#[derive(Deserialize, Serialize, Clone, Debug, KubeSchema)]
-#[serde(rename_all = "camelCase")]
-#[x_kube(
-    validation = Rule::new("self.min <= self.max").message(
-        "replicas.min must be <= replicas.max"
-    )
-)]
-pub struct Replicas {
-    /// Floor. Autoscaler never scales below this, even with empty
-    /// queue. Keeps a warm pool for fast dispatch when builds
-    /// arrive (cold start = minutes of pod scheduling + FUSE warm).
-    pub min: i32,
-    /// Ceiling. Cost control — don't burn through the cluster
-    /// under a pathological burst.
-    pub max: i32,
 }
 
 /// BuilderPool status — reconciler writes, operators read.

@@ -213,8 +213,7 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::builderpool::Replicas;
-    use crate::crds::componentscaler::{Signal, TargetRef};
+    use crate::crds::componentscaler::{Replicas, Signal, TargetRef};
     use rio_proto::types::SizeClassStatus;
 
     fn spec(min: i32, max: i32) -> ComponentScalerSpec {

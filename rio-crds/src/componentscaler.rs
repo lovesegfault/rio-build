@@ -18,7 +18,35 @@ use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::builderpool::Replicas;
+/// Replica bounds with cross-field CEL.
+///
+/// `KubeSchema` (NOT `JsonSchema`) — the kube-rs derive that
+/// processes `#[x_kube(validation)]` attributes and emits
+/// x-kubernetes-validations into the generated schema. It also
+/// implements JsonSchema internally (the two conflict if both
+/// derived). CustomResource auto-processes kube attrs on the
+/// top-level Spec; nested structs need KubeSchema explicitly.
+///
+/// min/max bounds (not a single replicas field): the reconciler
+/// computes desired from `ceil(builders / learnedRatio)` and
+/// clamps to this range. Operator says "2-14"; the loop picks.
+#[derive(Deserialize, Serialize, Clone, Debug, KubeSchema)]
+#[serde(rename_all = "camelCase")]
+#[x_kube(
+    validation = Rule::new("self.min <= self.max").message(
+        "replicas.min must be <= replicas.max"
+    )
+)]
+pub struct Replicas {
+    /// Floor. The reconciler never scales below this even at zero
+    /// builders. For rio-store: at least 2 (PDB `maxUnavailable: 1`
+    /// needs ≥2 to survive a node drain).
+    pub min: i32,
+    /// Ceiling. For rio-store: `Aurora max_connections /
+    /// pgMaxConnections` — over-provisioning past this is wasted
+    /// pods that can't open a PG connection.
+    pub max: i32,
+}
 
 /// Predictive demand signal. Enum (not free-form string) because the
 /// reconciler hard-branches on it — an unknown signal isn't a
@@ -143,7 +171,7 @@ pub struct ComponentScalerSpec {
     /// Replica bounds. The reconciler clamps to `[min, max]`.
     /// `max` for rio-store should be `Aurora max_connections /
     /// pgMaxConnections` — at 16ACU≈2800 / 200, that's 14. The
-    /// `min <= max` CEL rule is inherited from `Replicas`.
+    /// `min <= max` CEL rule is on [`Replicas`].
     pub replicas: Replicas,
 
     /// Initial `builders_per_replica` for a fresh CR (no
@@ -253,15 +281,15 @@ mod tests {
         assert!(!json.contains("\"learned_ratio\""));
     }
 
-    /// Nested CEL rules render. `Replicas` (`min <= max`) is
-    /// inherited; `TargetRef` and `LoadThresholds` are local.
+    /// Nested CEL rules render: `Replicas` (`min <= max`),
+    /// `TargetRef`, `LoadThresholds`.
     #[test]
     fn cel_rules_render() {
         let crd = ComponentScaler::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
         assert!(
             json.contains("self.min <= self.max"),
-            "Replicas CEL inherited"
+            "Replicas CEL renders"
         );
         assert!(
             json.contains("self.kind == 'Deployment'"),
