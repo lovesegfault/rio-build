@@ -4,7 +4,6 @@
 //! `stderr_loop` (wire-protocol STDERR parsing + LogBatcher).
 // r[impl builder.daemon.timeout-wrap]
 // r[impl builder.daemon.kill-both-paths]
-// r[impl builder.daemon.stdio-client]
 
 use std::time::Duration;
 

@@ -164,7 +164,6 @@ pub async fn write_bytes<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Resul
     Ok(())
 }
 
-/// Write a length-prefixed, padded UTF-8 string.
 // r[impl gw.wire.narhash-hex]
 /// Read a `narHash` field: wire string of lowercase hex, decoded to bytes.
 pub async fn read_nar_hash<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
@@ -177,6 +176,7 @@ pub async fn write_nar_hash<W: AsyncWrite + Unpin>(w: &mut W, hash: &[u8]) -> Re
     write_string(w, &hex::encode(hash)).await
 }
 
+/// Write a length-prefixed, padded UTF-8 string.
 pub async fn write_string<W: AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<()> {
     write_bytes(w, s.as_bytes()).await
 }

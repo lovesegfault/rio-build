@@ -8,7 +8,8 @@ use tokio::time::Instant;
 
 use rio_nix::protocol::build::{BuildMode, BuildResult, BuildStatus};
 use rio_nix::protocol::client::{
-    StderrMessage, client_handshake, client_set_options, read_stderr_message,
+    StderrMessage, client_handshake, client_send_build_derivation, client_set_options,
+    read_stderr_message,
 };
 use rio_nix::protocol::stderr::ResultField;
 use rio_nix::protocol::wire;
@@ -80,17 +81,7 @@ pub(in crate::executor) async fn run_daemon_build(
 
         client_set_options(stdout_ref, &mut stdin, max_silent_time, build_cores).await?;
 
-        wire::write_u64(
-            &mut stdin,
-            rio_nix::protocol::opcodes::WorkerOp::BuildDerivation as u64,
-        )
-        .await?;
-        wire::write_string(&mut stdin, drv_path).await?;
-        rio_nix::protocol::build::write_basic_derivation(&mut stdin, basic_drv).await?;
-        wire::write_u64(&mut stdin, BuildMode::Normal as u64).await?;
-        tokio::io::AsyncWriteExt::flush(&mut stdin)
-            .await
-            .map_err(wire::WireError::from)?;
+        client_send_build_derivation(&mut stdin, drv_path, basic_drv, BuildMode::Normal).await?;
 
         Ok::<_, ExecutorError>(())
     })

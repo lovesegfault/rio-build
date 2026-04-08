@@ -8,6 +8,7 @@
 //! - Client reads the STDERR loop (log messages, activities, errors)
 //! - Client sends opcodes and reads results
 
+use super::build::{BuildMode, BuildResult, read_build_result, write_basic_derivation};
 use super::handshake::{
     HandshakeError, HandshakeResult, PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2,
 };
@@ -17,6 +18,7 @@ use super::stderr::{
     STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY, STDERR_WRITE, StderrError,
 };
 use super::wire::{self, Result, WireError};
+use crate::derivation::BasicDerivation;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// A message received from the daemon during the STDERR loop.
@@ -316,11 +318,135 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Write the `wopBuildDerivation` request payload (opcode + path + drv + mode) and flush.
+///
+/// Read side is left to the caller. [`client_build_derivation`] is the turnkey
+/// driver; rio-builder calls this directly because its stderr loop layers
+/// cancel-safe batching and a silence deadline on top of the protocol read.
+pub async fn client_send_build_derivation<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    drv_path: &str,
+    drv: &BasicDerivation,
+    build_mode: BuildMode,
+) -> Result<()> {
+    wire::write_u64(writer, WorkerOp::BuildDerivation as u64).await?;
+    wire::write_string(writer, drv_path).await?;
+    write_basic_derivation(writer, drv).await?;
+    wire::write_u64(writer, build_mode as u64).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+// r[impl builder.daemon.stdio-client]
+/// Turnkey `wopBuildDerivation` client: send the request, drain the STDERR
+/// loop invoking `on_log` for each non-terminal message, then read and
+/// return the [`BuildResult`].
+///
+/// `on_log` receives every [`StderrMessage`] except `Last` and `Error`.
+/// Returns `Err` on `STDERR_ERROR` or wire failure. Aborts after
+/// `MAX_STDERR_MESSAGES` to bound a daemon that never sends `Last`.
+pub async fn client_build_derivation<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    drv_path: &str,
+    drv: &BasicDerivation,
+    build_mode: BuildMode,
+    mut on_log: F,
+) -> Result<BuildResult>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut(StderrMessage),
+{
+    client_send_build_derivation(writer, drv_path, drv, build_mode).await?;
+
+    for _ in 0..MAX_STDERR_MESSAGES {
+        match read_stderr_message(reader).await? {
+            StderrMessage::Last => return read_build_result(reader).await,
+            StderrMessage::Error(e) => {
+                return Err(WireError::Io(std::io::Error::other(format!(
+                    "daemon error: {}",
+                    e.message
+                ))));
+            }
+            msg => on_log(msg),
+        }
+    }
+    Err(WireError::Io(std::io::Error::other(format!(
+        "exceeded {MAX_STDERR_MESSAGES} STDERR messages without STDERR_LAST"
+    ))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derivation::DerivationOutput;
+    use crate::protocol::build::{BuildStatus, read_basic_derivation, write_build_result};
     use crate::protocol::handshake::{MIN_CLIENT_VERSION, encode_version, server_handshake_split};
     use crate::protocol::stderr::StderrWriter;
+
+    fn test_drv() -> BasicDerivation {
+        BasicDerivation::new(
+            vec![DerivationOutput::new("out", "/nix/store/abc-hello", "", "").unwrap()],
+            std::collections::BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "true".into()],
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    // r[verify builder.daemon.stdio-client]
+    #[tokio::test]
+    async fn client_build_derivation_roundtrip() -> anyhow::Result<()> {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let drv = test_drv();
+        let drv_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello.drv";
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            let op = wire::read_u64(&mut sr).await?;
+            assert_eq!(op, WorkerOp::BuildDerivation as u64);
+            let path = wire::read_string(&mut sr).await?;
+            let received = read_basic_derivation(&mut sr).await?;
+            let mode = wire::read_u64(&mut sr).await?;
+            assert_eq!(mode, BuildMode::Normal as u64);
+
+            wire::write_u64(&mut sw, STDERR_NEXT).await?;
+            wire::write_string(&mut sw, "building...").await?;
+            wire::write_u64(&mut sw, STDERR_NEXT).await?;
+            wire::write_string(&mut sw, "done").await?;
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            write_build_result(
+                &mut sw,
+                &BuildResult {
+                    status: BuildStatus::Built,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            sw.flush().await?;
+            anyhow::Ok((path, received))
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let mut log_lines = Vec::new();
+        let result =
+            client_build_derivation(&mut cr, &mut cw, drv_path, &drv, BuildMode::Normal, |msg| {
+                if let StderrMessage::Next(s) = msg {
+                    log_lines.push(s);
+                }
+            })
+            .await?;
+
+        let (server_path, server_drv) = server.await??;
+        assert_eq!(server_path, drv_path);
+        assert_eq!(server_drv.platform(), drv.platform());
+        assert_eq!(result.status, BuildStatus::Built);
+        assert_eq!(log_lines, vec!["building...", "done"]);
+        Ok(())
+    }
 
     /// Test client handshake against our own server handshake.
     #[tokio::test]
