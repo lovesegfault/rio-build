@@ -208,24 +208,8 @@ mod tests {
     use k8s_openapi::api::core::v1::ResourceRequirements;
 
     fn mk(max: u32) -> FetcherPool {
-        let mut fp = FetcherPool::new(
-            "test",
-            rio_crds::fetcherpool::FetcherPoolSpec {
-                common: rio_crds::common::PoolSpecCommon {
-                    deadline_seconds: None,
-                    max_concurrent: max,
-                    image: "rio-builder:test".into(),
-                    systems: vec!["x86_64-linux".into()],
-                    node_selector: None,
-                    tolerations: None,
-                    resources: None,
-                    tls_secret_name: None,
-                    host_users: None,
-                },
-                classes: vec![],
-            },
-        );
-        fp.metadata.namespace = Some("rio-fetchers".into());
+        let mut fp = crate::fixtures::test_fetcherpool("test");
+        fp.spec.max_concurrent = max;
         fp
     }
 

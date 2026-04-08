@@ -28,6 +28,7 @@ pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
 use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs};
 use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
+use rio_crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
 
 /// Minimal BuilderPoolSpec with all CEL-required fields explicit
 /// and optional fields `None`. Used by [`test_builderpool`] and
@@ -65,6 +66,36 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
         seccomp_profile: None,
         host_network: None,
     }
+}
+
+/// Minimal FetcherPoolSpec mirroring [`test_builderpool_spec`].
+///
+/// NEXT FIELD ADD: touch THIS fn — 1 site (the only production
+/// `FetcherPoolSpec` literal is helm-side YAML).
+pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
+    FetcherPoolSpec {
+        common: rio_crds::common::PoolSpecCommon {
+            max_concurrent: 8,
+            deadline_seconds: None,
+            resources: None,
+            systems: vec!["x86_64-linux".into()],
+            image: "rio-fetcher:test".into(),
+            node_selector: None,
+            tolerations: None,
+            host_users: None,
+            tls_secret_name: None,
+        },
+        classes: vec![],
+    }
+}
+
+/// Wrap a [`test_fetcherpool_spec`] in a `FetcherPool` with name +
+/// UID + namespace set.
+pub fn test_fetcherpool(name: &str) -> FetcherPool {
+    let mut fp = FetcherPool::new(name, test_fetcherpool_spec());
+    fp.metadata.uid = Some(format!("{name}-uid"));
+    fp.metadata.namespace = Some("rio-fetchers".into());
+    fp
 }
 
 /// Wrap a [`test_builderpool_spec`] in a `BuilderPool` with name +

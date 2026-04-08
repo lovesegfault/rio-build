@@ -397,32 +397,11 @@ pub(super) fn build_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::test_sched_addrs;
+    use crate::fixtures::{test_fetcherpool, test_sched_addrs, test_store_addrs};
     use kube::Resource;
 
     fn test_fp() -> FetcherPool {
-        let spec: rio_crds::fetcherpool::FetcherPoolSpec = serde_json::from_value(
-            serde_json::to_value(rio_crds::fetcherpool::FetcherPoolSpec {
-                common: rio_crds::common::PoolSpecCommon {
-                    deadline_seconds: None,
-                    max_concurrent: 8,
-                    image: "rio-fetcher:test".into(),
-                    systems: vec!["x86_64-linux".into()],
-                    node_selector: None,
-                    tolerations: None,
-                    resources: None,
-                    tls_secret_name: None,
-                    host_users: None,
-                },
-                classes: vec![],
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let mut fp = FetcherPool::new("eph-fp", spec);
-        fp.metadata.namespace = Some("rio-fetchers".into());
-        fp.metadata.uid = Some("11111111-1111-1111-1111-111111111111".into());
-        fp
+        test_fetcherpool("eph-fp")
     }
 
     /// Job carries the fetcher-hardened pod spec (not the builder
@@ -432,14 +411,7 @@ mod tests {
     fn build_job_uses_fetcher_params() {
         let fp = test_fp();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(
-            &fp,
-            None,
-            oref,
-            &test_sched_addrs(),
-            &crate::fixtures::test_store_addrs(),
-        )
-        .unwrap();
+        let job = build_job(&fp, None, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         let spec = job.spec.unwrap();
         let pod = spec.template.spec.unwrap();
         let c = &pod.containers[0];
@@ -497,14 +469,7 @@ mod tests {
         let mut fp = test_fp();
         fp.spec.deadline_seconds = Some(900);
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(
-            &fp,
-            None,
-            oref,
-            &test_sched_addrs(),
-            &crate::fixtures::test_store_addrs(),
-        )
-        .unwrap();
+        let job = build_job(&fp, None, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(job.spec.unwrap().active_deadline_seconds, Some(900));
     }
 
@@ -514,14 +479,7 @@ mod tests {
     fn build_job_labels_include_pool() {
         let fp = test_fp();
         let oref = fp.controller_owner_ref(&()).unwrap();
-        let job = build_job(
-            &fp,
-            None,
-            oref,
-            &test_sched_addrs(),
-            &crate::fixtures::test_store_addrs(),
-        )
-        .unwrap();
+        let job = build_job(&fp, None, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         let labels = job.metadata.labels.unwrap();
         assert_eq!(labels.get(POOL_LABEL).map(String::as_str), Some("eph-fp"));
         assert_eq!(
@@ -558,7 +516,7 @@ mod tests {
             Some(&class),
             oref,
             &test_sched_addrs(),
-            &crate::fixtures::test_store_addrs(),
+            &test_store_addrs(),
         )
         .unwrap();
 
@@ -621,7 +579,7 @@ mod tests {
             Some(&class),
             oref,
             &test_sched_addrs(),
-            &crate::fixtures::test_store_addrs(),
+            &test_store_addrs(),
         )
         .unwrap();
         assert_eq!(
