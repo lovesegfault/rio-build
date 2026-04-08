@@ -44,15 +44,15 @@ axum = { workspace = true }
 # line. Previously 5×-duplicated at each main.rs top.
 rustls = { workspace = true }
 
-# HMAC-SHA256 assignment tokens (phase3b B track). Constant-time
-# verify via Mac::verify_slice.
+# HMAC-SHA256 assignment tokens (hmac.rs). Constant-time verify
+# via Mac::verify_slice.
 hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 # Claims serialize to JSON (self-delimiting, human-debuggable).
 serde_json = { workspace = true }
 
-# JWT tenant tokens (phase5 JWT spine). ed25519 sign/verify via
+# JWT tenant tokens (jwt.rs). ed25519 sign/verify via
 # jsonwebtoken's EdDSA; pkcs8 feature on ed25519-dalek gives us
 # to_pkcs8_der()/to_public_key_der() → the DER encoding from_ed_der
 # expects. uuid serde feature for `sub: Uuid` in Claims.
