@@ -367,7 +367,7 @@ pkgs.testers.runNixOSTest {
     # method is actually wired. Body grep for grpc-status:0 confirms the
     # scheduler accepted the request, not just that envoy routed it.
     with subtest("method-gate: ListExecutors returns 200 + grpc-status:0"):
-        out = k3s_server.succeed(
+        listexec_curl = (
             "printf '\\x00\\x00\\x00\\x00\\x00' | "
             "curl -s -w '\\n%{http_code}' "
             "-X POST http://localhost:18080/rio.admin.AdminService/ListExecutors "
@@ -375,14 +375,21 @@ pkgs.testers.runNixOSTest {
             "-H 'x-grpc-web: 1' "
             "--data-binary @- | tee /tmp/listexec.out"
         )
+        out = k3s_server.succeed(listexec_curl)
         code = out.rstrip().rsplit("\n", 1)[-1]
         print(f"ListExecutors http_code={code}")
         assert code == "200", (
             f"ListExecutors unrouted (http_code={code}). "
             "GRPCRoute method literal drifted from admin.proto."
         )
-        k3s_server.succeed(
-            "grep -a 'grpc-status:[[:space:]]*0' /tmp/listexec.out"
+        # k3s-full deploys scheduler.replicas=2; envoy load-balances across
+        # both. The standby returns Unavailable as Trailers-Only (status in
+        # HTTP headers, empty body), so a body-grep finds nothing. Retry
+        # until envoy picks the leader.
+        k3s_server.wait_until_succeeds(
+            listexec_curl
+            + " && grep -a 'grpc-status:[[:space:]]*0' /tmp/listexec.out",
+            timeout=30,
         )
 
     k3s_server.execute("kill $(cat /tmp/pf-envoy.pid) 2>/dev/null || true")
