@@ -9,7 +9,7 @@ Nix's build model --- pure, deterministic derivations forming a DAG with content
 - **Binary caches** (cachix, attic, S3) solve distribution of *results* but not distribution of *work*.
 - **Tvix** pioneers the right storage model (chunked CAS, Merkle DAGs) but doesn't provide a Kubernetes-native distributed scheduler.
 
-rio-build fills this gap by implementing Nix's own remote protocols (`ssh-ng://` remote store and `--builders` remote builder) as a Kubernetes-native distributed build backend. From Nix's perspective, rio-build *is* a Nix store and builder. From Kubernetes' perspective, it's an operator that schedules build DAGs across worker pods with intelligent caching.
+rio-build fills this gap by implementing Nix's own remote protocols (`ssh-ng://` remote store and `--builders` remote builder) as a Kubernetes-native distributed build backend. From Nix's perspective, rio-build *is* a Nix store and builder. From Kubernetes' perspective, it's an operator that schedules build DAGs across builder pods with intelligent caching.
 
 ## Key Innovations
 
@@ -17,7 +17,7 @@ rio-build fills this gap by implementing Nix's own remote protocols (`ssh-ng://`
 2. **DAG-aware scheduling** with critical-path analysis and transfer-cost-weighted closure-locality affinity
 3. **Chunked content-addressable store** with cross-build deduplication (FastCDC + BLAKE3), with inline fast-path for small NARs
 4. **CA-ready design** --- store schema and scheduler support content-addressed derivations from day one; early cutoff optimization with per-edge tracking
-5. **FUSE-backed worker stores** with lazy on-demand fetching from CAS, local SSD caching, and per-build overlay isolation with synthetic SQLite DB
+5. **FUSE-backed builder stores** with lazy on-demand fetching from CAS, local SSD caching, and per-build overlay isolation with synthetic SQLite DB
 6. **Observability** from Phase 1 (structured logging, metrics) with distributed tracing from Phase 2
 
 ## Non-Goals
@@ -28,8 +28,8 @@ rio-build is a **build execution backend**, not a complete CI/CD system. The fol
 - **VCS integration**: No GitHub/GitLab webhook receiver, no PR status reporting, no commit status updates. Use an external CI system (GitHub Actions, Buildkite, etc.) to trigger builds via `nix build --store ssh-ng://rio`.
 - **Notification hooks**: No email, Slack, or webhook notifications on build completion. These belong in the CI layer above rio-build.
 - **Eval scheduling / jobsets**: No equivalent of Hydra's jobset model. For periodic rebuilds, use cron + `nix-eval-jobs` + rio-build. See [Integration](./integration.md) for patterns.
-- **macOS (Darwin) workers**: The worker architecture (FUSE, overlayfs, Linux namespaces) is Linux-only. Darwin builds require a separate worker architecture (future work).
-- **Recursive Nix**: Derivations that invoke Nix internally (`__recursive` / `recursive-nix`) are not supported. Workers disable substitution and remote builders to prevent build hook recursion. See [worker configuration](./components/builder.md#builder-nix-configuration).
+- **macOS (Darwin) builders**: The builder architecture (FUSE, overlayfs, Linux namespaces) is Linux-only. Darwin builds require a separate builder architecture (future work).
+- **Recursive Nix**: Derivations that invoke Nix internally (`__recursive` / `recursive-nix`) are not supported. Builders disable substitution and remote builders to prevent build hook recursion. See [builder configuration](./components/builder.md#builder-nix-configuration).
 
 ## When to Use rio-build
 
@@ -49,7 +49,7 @@ It is NOT the right choice when:
 
 See [Multi-Tenancy](./multi-tenancy.md) for tenant isolation details: resource
 quotas, per-tenant signing keys, and narinfo visibility filtering are enforced.
-Worker pods run with `privileged: false` by default (device plugin +
+Builder pods run with `privileged: false` by default (device plugin +
 `hostUsers: false` per ADR-012).
 
 ## Landscape

@@ -28,20 +28,20 @@
     a. Queries rio-store for cache hits (already-built outputs)
     b. Computes remaining build graph
     c. Computes critical-path priorities
-    d. Dispatches ready derivations to workers
+    d. Dispatches ready derivations to executors
 11. For each dispatched derivation:
     a. Scheduler sends PrefetchHint (anticipated input paths) on the
-       BuildExecution stream so the worker can pre-warm its FUSE cache
-    b. Worker's FUSE daemon checks local SSD cache for input paths (fast path)
+       BuildExecution stream so the executor can pre-warm its FUSE cache
+    b. Executor's FUSE daemon checks local SSD cache for input paths (fast path)
     c. Cache miss: FUSE daemon fetches from rio-store via gRPC, caches on SSD
-    d. Worker executes build in nix sandbox (overlay-merged /nix/store)
-    e. Worker streams build logs to scheduler via bidirectional
+    d. Executor runs build in nix sandbox (overlay-merged /nix/store)
+    e. Executor streams build logs to scheduler via bidirectional
        BuildExecution stream (log lines batched for efficiency)
        Scheduler relays logs to gateway via BuildEvent stream (from SubmitBuild)
        Gateway converts to STDERR_NEXT messages for the Nix client
-    f. Worker streams output NAR via PutPath; rio-store chunks via
-       FastCDC on the server side (workers never chunk locally)
-    g. Worker reports completion to scheduler
+    f. Executor streams output NAR via PutPath; rio-store chunks via
+       FastCDC on the server side (executors never chunk locally)
+    g. Executor reports completion to scheduler
     h. Scheduler stores completion, releases downstream nodes
 12. When top-level derivation completes:
     a. Scheduler notifies gateway
@@ -64,7 +64,7 @@ sequenceDiagram
     participant Client as Nix Client
     participant GW as rio-gateway
     participant Sched as rio-scheduler
-    participant Worker as rio-builder
+    participant Builder as rio-builder
     participant Store as rio-store
 
     Client->>GW: SSH connect + handshake
@@ -83,14 +83,14 @@ sequenceDiagram
     GW->>Sched: SubmitBuild (DAG)
     Sched->>Store: FindMissingPaths (cache check)
     Store-->>Sched: missing paths
-    Sched->>Worker: WorkAssignment (via BuildExecution)
-    Worker->>Store: GetPath (FUSE fetch)
-    Worker->>Worker: nix sandbox build
-    Worker->>Sched: BuildLogBatch
+    Sched->>Builder: WorkAssignment (via BuildExecution)
+    Builder->>Store: GetPath (FUSE fetch)
+    Builder->>Builder: nix sandbox build
+    Builder->>Sched: BuildLogBatch
     Sched->>GW: BuildEvent (logs)
     GW->>Client: STDERR_NEXT
-    Worker->>Store: PutPath (output)
-    Worker->>Sched: CompletionReport
+    Builder->>Store: PutPath (output)
+    Builder->>Sched: CompletionReport
     Sched->>GW: BuildEvent (completed)
     GW->>Client: STDERR_LAST + BuildResult
     Client->>GW: wopNarFromPath
@@ -109,8 +109,8 @@ sequenceDiagram
 5. Build hook sends the .drv path, system, and features
 6. rio-gateway receives single-derivation build request
    -> creates a mini build plan in rio-scheduler
-7. rio-scheduler assigns to a worker (same algorithm but single-derivation)
-8. Worker builds, uploads output to rio-store
+7. rio-scheduler assigns to an executor (same algorithm but single-derivation)
+8. Executor builds, uploads output to rio-store
 9. rio-gateway returns output to build hook
 10. Build hook copies output back to local store
 11. Local daemon continues with next derivation
@@ -126,15 +126,15 @@ sequenceDiagram
     participant Hook as Build Hook
     participant GW as rio-gateway
     participant Sched as rio-scheduler
-    participant Worker as rio-builder
+    participant Builder as rio-builder
 
     Daemon->>Hook: delegate derivation
     Hook->>GW: SSH connect
     Hook->>GW: wopBuildDerivation (single)
     GW->>Sched: SubmitBuild (single node)
-    Sched->>Worker: WorkAssignment
-    Worker->>Worker: build
-    Worker->>Sched: CompletionReport
+    Sched->>Builder: WorkAssignment
+    Builder->>Builder: build
+    Builder->>Sched: CompletionReport
     Sched->>GW: BuildEvent (completed)
     GW->>Hook: BuildResult
     Hook->>Daemon: output path
@@ -152,8 +152,8 @@ sequenceDiagram
       (the DAG merge logic keeps shared derivation nodes live as long as
       at least one interested build remains)
    b. For derivations unique to this build: removed from the queue
-      immediately. If already Running, the worker is allowed to complete
-      (wasted work is bounded by one derivation per worker)
+      immediately. If already Running, the executor is allowed to complete
+      (wasted work is bounded by one derivation per executor)
 5. Completed outputs remain in rio-store regardless of client state
 6. If the client reconnects and re-submits, the scheduler's DAG merge
    re-inserts the derivations. Any outputs already stored in step 5 are
@@ -167,7 +167,7 @@ sequenceDiagram
     participant Client as Nix Client
     participant GW as rio-gateway
     participant Sched as rio-scheduler
-    participant Worker as rio-builder
+    participant Builder as rio-builder
 
     Client-xGW: SSH connection drops
     GW->>Sched: CancelBuild (client_disconnect)
@@ -176,7 +176,7 @@ sequenceDiagram
     else Unique derivation
         Sched->>Sched: remove from queue immediately
     end
-    Worker->>Sched: CompletionReport (if already Running)
+    Builder->>Sched: CompletionReport (if already Running)
     Note over Sched: Outputs kept in store regardless
     Client->>GW: Reconnect + re-submit
     Sched->>Sched: DAG merge + cache hits on stored outputs
@@ -190,7 +190,7 @@ sequenceDiagram
 3. New leader reconstructs in-memory state from PostgreSQL
    (see scheduler.md State Recovery). Dispatch is gated on
    recovery_complete.
-4. Workers detect stream break, reconnect BuildExecution streams to new leader
+4. Executors detect stream break, reconnect BuildExecution streams to new leader
 5. For gateway connections with active SubmitBuild streams:
    a. The SubmitBuild response stream (BuildEvent) breaks with a gRPC
       Transport error
@@ -222,7 +222,7 @@ IFD occurs when Nix evaluation depends on a build result. The flow is:
       priority_class = "interactive" (IFD builds are evaluation-blocking)
 4. rio-scheduler detects IFD priority: the scheduler assigns maximum
    priority to this derivation (above all queued non-IFD work)
-5. Worker builds the derivation, uploads output
+5. Executor builds the derivation, uploads output
 6. rio-gateway returns BuildResult to the client on the IFD channel
 7. Client retrieves the output via wopNarFromPath on the IFD channel
 8. Client resumes evaluation using the IFD output
