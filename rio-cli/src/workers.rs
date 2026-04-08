@@ -24,6 +24,7 @@ use tonic::transport::Channel;
 
 use crate::{json, rpc};
 
+// r[impl cli.workers.actor-diff]
 /// `--actor` path: in-memory snapshot only.
 pub(crate) async fn run_actor(
     as_json: bool,

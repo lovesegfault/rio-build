@@ -54,6 +54,7 @@ pub struct UpstreamArgs {
 }
 
 // r[impl store.substitute.upstream]
+// r[impl cli.cmd.upstream]
 #[derive(Subcommand, Clone)]
 pub enum UpstreamCmd {
     /// List configured upstream caches for a tenant (priority order).

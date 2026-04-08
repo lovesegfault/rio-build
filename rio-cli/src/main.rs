@@ -58,6 +58,7 @@ mod wps;
 /// client/mod.rs CONNECT_TIMEOUT) — that bounds TCP SYN / handshake.
 /// This bounds the RPC itself (scheduler accepted the connection but
 /// the handler is blocked on something).
+// r[impl cli.rpc-timeout]
 pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Wrap an AdminService RPC call with timeout + error context.
@@ -303,6 +304,7 @@ enum Cmd {
     /// the disconnect cleanup leaves the build Active forever. This is
     /// the manual escape hatch; the scheduler's orphan-watcher sweep is
     /// the automatic one.
+    // r[impl cli.cmd.cancel-build]
     CancelBuild {
         /// Build UUID (as shown by `rio-cli builds` or `status`).
         build_id: String,

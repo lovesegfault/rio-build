@@ -16,6 +16,7 @@ use tonic::transport::Channel;
 
 use crate::RPC_TIMEOUT;
 
+// r[impl cli.cmd.verify-chunks]
 pub(crate) async fn run(
     client: &mut StoreAdminServiceClient<Channel>,
     batch_size: u32,

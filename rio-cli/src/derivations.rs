@@ -17,6 +17,7 @@ use tonic::transport::Channel;
 
 use crate::{json, rpc};
 
+// r[impl cli.cmd.derivations]
 /// Run the `derivations` subcommand.
 pub(crate) async fn run(
     as_json: bool,

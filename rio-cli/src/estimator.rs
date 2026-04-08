@@ -14,6 +14,7 @@ use rio_proto::types::{EstimatorEntry, GetEstimatorStatsRequest};
 use serde::Serialize;
 use tonic::transport::Channel;
 
+// r[impl cli.cmd.estimator]
 /// Run the `estimator` subcommand.
 pub(crate) async fn run(
     as_json: bool,

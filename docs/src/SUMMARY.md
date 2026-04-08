@@ -36,6 +36,7 @@
   - [rio-controller](./components/controller.md)
   - [rio-proto](./components/proto.md)
   - [rio-dashboard](./components/dashboard.md)
+  - [rio-cli](./components/cli.md)
 - [Data Flows](./data-flows.md)
 - [Crate Structure](./crate-structure.md)
 
