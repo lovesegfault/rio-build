@@ -32,7 +32,7 @@ derivation is invalidated on `.proto` changes but not on Rust-only commits.
 
 ```mermaid
 graph TD
-    rio-common["rio-common<br/>(config, observability, limits, newtypes)"]
+    rio-common["rio-common<br/>(config, observability, limits)"]
     rio-nix["rio-nix<br/>(protocol, derivations, NAR)"]
     rio-proto["rio-proto<br/>(gRPC definitions)"]
     rio-test-support["rio-test-support<br/>(PG, mock gRPC, wire)"]
@@ -88,7 +88,6 @@ Notable edges:
 - **`rio-proto → rio-common` (dev-only)**: contract tests check `rio-common::limits` against proto-side `check_bound` enforcement.
 - **`rio-scheduler → rio-nix` (prod)**: `Derivation` parsing for closure resolution and `StorePath` validation in the merge path.
 - **`rio-scheduler → rio-store` (dev-only)**: integration tests spin up a real `StoreServiceServer` from `rio-store::grpc`.
-- **`DrvHash` / `ExecutorId` live in `rio-common::newtype`**: Arc<str>-backed string newtypes shared by scheduler, builder, and proto translation. Placing them in rio-common avoids a `proto → common → proto` cycle.
 
 ## Module Structure
 
@@ -103,7 +102,6 @@ src/
 ├── jwt.rs             # JWT encode/decode primitives (ed25519)
 ├── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
 ├── limits.rs          # MAX_NAR_SIZE, MAX_COLLECTION_COUNT, etc.
-├── newtype.rs         # string_newtype! macro; DrvHash, ExecutorId
 ├── observability.rs   # Tracing init, describe!() metric registration
 ├── server.rs          # tonic server builder helpers (drain, graceful-shutdown)
 ├── signal.rs          # SIGTERM/SIGINT → CancellationToken
@@ -217,7 +215,7 @@ src/
 │       └── integration.rs # Multi-handler scenarios
 ├── state/
 │   ├── mod.rs         # PriorityClass, re-exports
-│   ├── newtypes.rs    # Scheduler-local newtypes
+│   ├── newtypes.rs    # DrvHash, ExecutorId (Arc<str>-backed)
 │   ├── derivation.rs  # DerivationState, DerivationStatus transitions
 │   ├── build.rs       # BuildInfo, BuildState transitions
 │   └── executor.rs    # ExecutorInfo, heartbeat timeout tracking

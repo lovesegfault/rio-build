@@ -1,8 +1,8 @@
 //! Shared configuration, observability, and utility types.
 //!
-//! Leaf crate — no `rio-*` dependencies. Provides the `string_newtype!` macro
-//! and [`DrvHash`](newtype::DrvHash) / [`ExecutorId`](newtype::ExecutorId) shared
-//! across the workspace, plus [`limits`] constants and [`observability`] init.
+//! Leaf crate — no `rio-*` dependencies. Provides [`limits`] constants,
+//! [`observability`] init, and gRPC/TLS/JWT plumbing shared across the
+//! workspace.
 
 pub mod config;
 pub mod grpc;
@@ -10,7 +10,6 @@ pub mod hmac;
 pub mod jwt;
 pub mod jwt_interceptor;
 pub mod limits;
-pub mod newtype;
 pub mod observability;
 pub mod server;
 pub mod signal;

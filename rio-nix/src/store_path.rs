@@ -288,7 +288,7 @@ impl fmt::Display for StorePath {
     }
 }
 
-// --- Ergonomic string-like impls (match string_newtype! pattern) ---
+// --- Ergonomic string-like impls (Deref/Borrow/AsRef/PartialEq<str>) ---
 
 impl std::ops::Deref for StorePath {
     type Target = str;
