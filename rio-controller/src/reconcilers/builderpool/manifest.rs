@@ -1028,20 +1028,10 @@ pub(super) fn build_manifest_job(
 ) -> Result<Job> {
     let pool = wp.name_any();
 
-    let cache_quantity = Quantity(wp.spec.fuse_cache_size.clone());
-    let cache_gb = builders::parse_quantity_to_gb(&wp.spec.fuse_cache_size)?;
-
     // resources_override: Some → bucket; None → spec.resources floor.
     // T1's signature change is what makes this possible.
     let resources_override = bucket.map(bucket_to_resources);
-    let mut pod_spec = builders::build_pod_spec(
-        wp,
-        scheduler,
-        store,
-        cache_gb,
-        cache_quantity,
-        resources_override,
-    );
+    let mut pod_spec = builders::build_pod_spec(wp, scheduler, store, resources_override);
 
     // restartPolicy: Never. Required by K8s for Jobs with
     // backoffLimit=0. Same reasoning as ephemeral: if the pod

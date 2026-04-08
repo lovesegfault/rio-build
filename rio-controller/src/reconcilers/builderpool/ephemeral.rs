@@ -55,7 +55,6 @@ use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::PodTemplateSpec;
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use kube::api::{ListParams, ObjectMeta};
@@ -446,15 +445,7 @@ pub(super) fn build_job(
     let pool = wp.name_any();
     let labels = builders::labels(wp);
 
-    // Same cache-size parse as build_statefulset. Ephemeral workers
-    // still get a FUSE cache (emptyDir) — it's just wiped when the
-    // pod terminates. The RIO_FUSE_CACHE_SIZE_GB env is still needed
-    // for the worker's internal LRU bookkeeping.
-    let cache_quantity = Quantity(wp.spec.fuse_cache_size.clone());
-    let cache_gb = builders::parse_quantity_to_gb(&wp.spec.fuse_cache_size)?;
-
-    let mut pod_spec =
-        builders::build_pod_spec(wp, scheduler, store, cache_gb, cache_quantity, None);
+    let mut pod_spec = builders::build_pod_spec(wp, scheduler, store, None);
 
     // restartPolicy: Never is REQUIRED by K8s for Jobs with
     // backoffLimit=0. "Always" (the PodSpec default) is rejected.
@@ -541,7 +532,6 @@ mod tests {
         // a field — the fixture is the single touch point.
         let mut spec = crate::fixtures::test_builderpool_spec();
         spec.max_concurrent = 4;
-        spec.fuse_cache_size = "10Gi".into();
         spec.features = vec![];
         spec.size_class = String::new();
         let mut wp = BuilderPool::new("eph-pool", spec);

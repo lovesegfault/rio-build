@@ -97,10 +97,7 @@ pub struct SizeClassSpec {
 /// building child `BuilderPoolSpec`s.
 ///
 /// NOT the full BuilderPoolSpec — only the fields that make
-/// sense to share across size classes. `fuse_cache_size` etc.
-/// deliberately omitted: those scale WITH class size (a "large"
-/// builder should have a bigger FUSE cache). A future plan can
-/// add them if the use case emerges.
+/// sense to share across size classes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolTemplate {

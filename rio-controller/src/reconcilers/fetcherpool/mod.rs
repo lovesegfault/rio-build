@@ -103,8 +103,6 @@ fn executor_params(
     fp: &FetcherPool,
     class: Option<&FetcherSizeClass>,
 ) -> Result<ExecutorPodParams> {
-    let cache_gb = pod::parse_quantity_to_gb(FETCHER_FUSE_CACHE)?;
-
     // ADR-019 §Node isolation: fetchers land on dedicated nodes via
     // the `rio.build/fetcher=true:NoSchedule` taint + matching
     // selector. If the operator supplies their own, honor those
@@ -180,7 +178,6 @@ fn executor_params(
         resources: class
             .map(|c| c.resources.clone())
             .or_else(|| fp.spec.resources.clone()),
-        fuse_cache_gb: cache_gb,
         fuse_cache_quantity: Quantity(FETCHER_FUSE_CACHE.into()),
         fuse_threads: None,
         // Never privileged — fetchers face the open internet; the

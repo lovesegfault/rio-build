@@ -46,7 +46,6 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
         deadline_seconds: None,
         size_class_cutoff_secs: None,
         resources: None,
-        fuse_cache_size: "50Gi".into(),
         fuse_threads: None,
         fuse_passthrough: None,
         daemon_timeout_secs: None,

@@ -26,11 +26,6 @@ const DEFAULT_MAX_CONCURRENT: u32 = 10;
 #[allow(dead_code)]
 const DEFAULT_MAX_REPLICAS: i32 = 10;
 
-/// Default FUSE cache size for child pools. Mirrors
-/// `BuilderPoolSpec::default_fuse_cache_size` (same rationale:
-/// PoolTemplate deliberately omits this).
-const DEFAULT_FUSE_CACHE_SIZE: &str = "50Gi";
-
 /// Child BuilderPool name: `{wps}-{class.name}`. The scheduler
 /// routes by `size_class` (which equals `class.name`), not pool
 /// name — so the pool name is for operator readability, not
@@ -97,9 +92,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         host_network: template.host_network,
         host_users: template.host_users,
         tls_secret_name: template.tls_secret_name.clone(),
-
-        // --- Hardcoded (neither in template nor class; see consts) ---
-        fuse_cache_size: DEFAULT_FUSE_CACHE_SIZE.into(),
 
         // --- Unset optional (use BuilderPool defaults) ---
         // WPS is inherently size-class-based (ADR-015) — that IS

@@ -15,18 +15,23 @@ use crate::crds::builderpool::BuilderPool;
 use crate::reconcilers::common::pod::{self, ExecutorPodParams, ExecutorRole};
 
 // Re-exports for ephemeral.rs + tests.
-pub use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs, parse_quantity_to_gb};
+pub use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs};
+
+/// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on
+/// overshoot. No CRD knob: pods are one-shot so the cache never
+/// outlives one build's input closure.
+pub(crate) const BUILDER_FUSE_CACHE: &str = "50Gi";
 
 /// Labels applied to Jobs and pods for this pool.
 pub(super) fn labels(wp: &BuilderPool) -> BTreeMap<String, String> {
-    pod::executor_labels(&executor_params_for_labels(wp))
+    pod::executor_labels(&executor_params(wp))
 }
 
 /// Convert `BuilderPool` → `ExecutorPodParams`. The builder-specific
 /// tuning knobs (size_class, daemon_timeout, fuse_passthrough)
 /// become `extra_env` entries — keeps them out of the shared params
 /// struct where the fetcher reconciler would have to supply dummies.
-fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) -> ExecutorPodParams {
+fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
     let mut extra_env = vec![pod::env("RIO_SIZE_CLASS", &wp.spec.size_class)];
     if let Some(p) = wp.spec.fuse_passthrough {
         extra_env.push(pod::env(
@@ -51,8 +56,7 @@ fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) ->
         systems: wp.spec.systems.clone(),
         features: wp.spec.features.clone(),
         resources: wp.spec.resources.clone(),
-        fuse_cache_gb: cache_gb,
-        fuse_cache_quantity: cache_quantity,
+        fuse_cache_quantity: Quantity(BUILDER_FUSE_CACHE.into()),
         fuse_threads: wp.spec.fuse_threads,
         privileged: wp.spec.privileged == Some(true),
         seccomp_profile: wp.spec.seccomp_profile.clone(),
@@ -61,13 +65,6 @@ fn executor_params(wp: &BuilderPool, cache_gb: u64, cache_quantity: Quantity) ->
         tls_secret_name: wp.spec.tls_secret_name.clone(),
         termination_grace_period_seconds: wp.spec.termination_grace_period_seconds,
     }
-}
-
-/// Minimal params for label computation only. `labels()` is called
-/// before cache parsing so it can't depend on the full params. The
-/// cache fields don't affect labels anyway.
-fn executor_params_for_labels(wp: &BuilderPool) -> ExecutorPodParams {
-    executor_params(wp, 0, Quantity("0".into()))
 }
 
 /// The pod spec. Re-exported for `ephemeral::build_job` and
@@ -82,11 +79,9 @@ pub(super) fn build_pod_spec(
     wp: &BuilderPool,
     scheduler: &SchedulerAddrs,
     store: &StoreAddrs,
-    cache_gb: u64,
-    cache_quantity: Quantity,
     resources_override: Option<ResourceRequirements>,
 ) -> PodSpec {
-    let mut params = executor_params(wp, cache_gb, cache_quantity);
+    let mut params = executor_params(wp);
     if let Some(r) = resources_override {
         params.resources = Some(r);
     }

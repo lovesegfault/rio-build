@@ -67,7 +67,6 @@ fn ephemeral_reconcile_scenarios() -> Vec<Scenario> {
                 "metadata": {"name": "test-pool", "namespace": "rio"},
                 "spec": {
                     "maxConcurrent": 10,
-                    "fuseCacheSize": "1Gi",
                     "features": [],
                     "systems": ["x"],
                     "sizeClass": "x",

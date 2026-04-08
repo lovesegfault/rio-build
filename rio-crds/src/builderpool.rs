@@ -152,17 +152,6 @@ pub struct BuilderPoolSpec {
     #[schemars(schema_with = "crate::any_object")]
     pub resources: Option<ResourceRequirements>,
 
-    /// FUSE cache size as a K8s Quantity string (e.g., "100Gi").
-    /// Maps to an emptyDir sizeLimit + parsed to bytes for
-    /// `RIO_FUSE_CACHE_SIZE_GB` env. String because Quantity is
-    /// standard K8s (operators know "50Gi" syntax); the reconciler
-    /// parses it.
-    ///
-    /// Why not u64 bytes directly: operators write "100Gi" in
-    /// kustomize; making them write 107374182400 is hostile.
-    #[serde(default = "default_fuse_cache_size")]
-    pub fuse_cache_size: String,
-
     /// FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
     /// `None` = worker default (4). Tune up for NAR-heavy build
     /// profiles where FUSE readahead is the bottleneck (visible
@@ -421,13 +410,6 @@ pub struct BuilderPoolStatus {
     pub conditions: Vec<Condition>,
 }
 
-// ----- serde defaults --------------------------------------------------------
-// Functions because serde default needs fn() -> T, not const.
-
-fn default_fuse_cache_size() -> String {
-    "50Gi".into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,16 +482,15 @@ mod tests {
     /// camelCase field renames applied. The K8s convention is
     /// camelCase in JSON/YAML; Rust is snake_case. serde rename_all
     /// bridges. If someone removes #[serde(rename_all)] from a
-    /// nested struct, the schema has `fuse_cache_size` instead of
-    /// `fuseCacheSize` — `kubectl apply` with camelCase YAML would
+    /// nested struct, the schema has `fuse_threads` instead of
+    /// `fuseThreads` — `kubectl apply` with camelCase YAML would
     /// silently ignore the field (K8s doesn't error on unknown
     /// fields by default).
     #[test]
     fn camel_case_renames() {
         let crd = BuilderPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
-        assert!(!json.contains("fuse_cache_size"));
-        assert!(json.contains("fuseCacheSize"));
+        assert!(!json.contains("fuse_threads"));
         assert!(json.contains("maxConcurrent"));
         // P0223 seccomp: field + nested variant field both camelCase.
         assert!(json.contains("seccompProfile"));

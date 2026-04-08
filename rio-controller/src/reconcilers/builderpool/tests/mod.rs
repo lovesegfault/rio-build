@@ -16,7 +16,6 @@ use super::*;
 use crate::crds::builderpool::SeccompProfileKind;
 use crate::fixtures::{ApiServerVerifier, Scenario, test_sched_addrs, test_store_addrs};
 use k8s_openapi::api::core::v1::PodSpec;
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 mod builders_tests;
 mod disruption_tests;
@@ -37,15 +36,7 @@ pub(crate) fn test_wp() -> BuilderPool {
 /// scheduler/store addrs. Tests that need a full Job object
 /// use `build_job` directly.
 pub(crate) fn test_pod_spec(wp: &BuilderPool) -> PodSpec {
-    let cache_gb = parse_quantity_to_gb(&wp.spec.fuse_cache_size).unwrap();
-    build_pod_spec(
-        wp,
-        &test_sched_addrs(),
-        &test_store_addrs(),
-        cache_gb,
-        Quantity(wp.spec.fuse_cache_size.clone()),
-        None,
-    )
+    build_pod_spec(wp, &test_sched_addrs(), &test_store_addrs(), None)
 }
 
 /// Build a `Ctx` wired to the mock apiserver client. Scheduler/

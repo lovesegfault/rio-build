@@ -18,7 +18,6 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use crate::crds::builderpool::SeccompProfileKind;
-use crate::error::{Error, Result};
 
 /// Nix `system-features` string that signals "this builder runs
 /// qemu-kvm". When present in `spec.features`, the pod gets the
@@ -158,8 +157,6 @@ pub struct ExecutorPodParams {
     pub resources: Option<ResourceRequirements>,
 
     // ── FUSE ─────────────────────────────────────────────────────
-    /// Parsed GB for `RIO_FUSE_CACHE_SIZE_GB`.
-    pub fuse_cache_gb: u64,
     /// Raw Quantity for the emptyDir sizeLimit.
     pub fuse_cache_quantity: Quantity,
     pub fuse_threads: Option<u32>,
@@ -478,7 +475,6 @@ fn build_executor_container(
             let mut e = vec![
                 env("RIO_SCHEDULER_ADDR", &scheduler.addr),
                 env("RIO_STORE_ADDR", &store.addr),
-                env("RIO_FUSE_CACHE_SIZE_GB", &p.fuse_cache_gb.to_string()),
                 env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
                 env("RIO_FUSE_CACHE_DIR", "/var/rio/cache"),
                 env("RIO_OVERLAY_BASE_DIR", "/var/rio/overlays"),
@@ -704,57 +700,6 @@ pub fn env_from_field(name: &str, field_path: &str) -> EnvVar {
         }),
         ..Default::default()
     }
-}
-
-/// Parse a K8s Quantity string to gigabytes (integer, rounded DOWN).
-///
-/// Handles common cases: "100Gi" (binary), "100G" (decimal),
-/// "107374182400" (raw bytes), "1.5Gi" (decimal mantissa). Rounding
-/// DOWN: better to under-report cache ceiling than over (kubelet
-/// evicts on overshoot).
-pub fn parse_quantity_to_gb(q: &str) -> Result<u64> {
-    let q = q.trim();
-    // Suffixes in DECREASING length order so "Gi" matches before "G".
-    const SUFFIXES: &[(&str, u64)] = &[
-        ("Gi", 1024 * 1024 * 1024),
-        ("Mi", 1024 * 1024),
-        ("Ki", 1024),
-        ("Ti", 1024 * 1024 * 1024 * 1024),
-        ("G", 1_000_000_000),
-        ("M", 1_000_000),
-        ("K", 1_000),
-        ("T", 1_000_000_000_000),
-    ];
-
-    for (suffix, mult) in SUFFIXES {
-        if let Some(num) = q.strip_suffix(suffix) {
-            let n: f64 = num.trim().parse().map_err(|_| {
-                Error::InvalidSpec(format!(
-                    "fuseCacheSize {q:?}: {num:?} before suffix is not a number"
-                ))
-            })?;
-            if n < 0.0 || !n.is_finite() {
-                return Err(Error::InvalidSpec(format!(
-                    "fuseCacheSize {q:?}: must be a non-negative finite number"
-                )));
-            }
-            let bytes_f = n * *mult as f64;
-            if bytes_f > u64::MAX as f64 {
-                return Err(Error::InvalidSpec(format!(
-                    "fuseCacheSize {q:?}: overflows u64"
-                )));
-            }
-            return Ok(bytes_f.floor() as u64 / (1024 * 1024 * 1024));
-        }
-    }
-
-    let bytes: u64 = q.parse().map_err(|_| {
-        Error::InvalidSpec(format!(
-            "fuseCacheSize {q:?}: not a recognized quantity \
-             (expected e.g. '100Gi', '50G', or raw bytes)"
-        ))
-    })?;
-    Ok(bytes / (1024 * 1024 * 1024))
 }
 
 #[cfg(test)]

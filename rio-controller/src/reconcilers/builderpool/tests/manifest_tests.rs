@@ -39,7 +39,6 @@ fn test_manifest_wp() -> BuilderPool {
     let mut spec = crate::fixtures::test_builderpool_spec();
     spec.max_concurrent = 10;
     spec.sizing = Sizing::Manifest;
-    spec.fuse_cache_size = "10Gi".into();
     let mut wp = BuilderPool::new("mf-pool", spec);
     wp.metadata.uid = Some("uid-mf".into());
     wp.metadata.namespace = Some("rio".into());

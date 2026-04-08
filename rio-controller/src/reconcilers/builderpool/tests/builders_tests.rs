@@ -768,11 +768,6 @@ fn job_pod_env_vars() {
         "balance host injected when ctx.store_balance_host is Some"
     );
     assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small".into()));
-    assert_eq!(
-        envs.get("RIO_FUSE_CACHE_SIZE_GB"),
-        Some(&"50".into()),
-        "50Gi parsed to 50 GB (binary → binary, integer)"
-    );
     // systems + features: comma-sep strings. fixture wp has
     // systems=["x86_64-linux"], features=["kvm"]. CRD defines
     // them → reconciler passes them as env → worker's comma_vec
@@ -867,94 +862,4 @@ fn job_pod_image_pull_policy_passthrough() {
     let pod = test_pod_spec(&wp);
     let container = &pod.containers[0];
     assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
-}
-
-// ----- quantity parsing -----
-
-#[test]
-fn quantity_binary_suffix() {
-    assert_eq!(parse_quantity_to_gb("50Gi").unwrap(), 50);
-    assert_eq!(parse_quantity_to_gb("100Gi").unwrap(), 100);
-    assert_eq!(
-        parse_quantity_to_gb("1Ti").unwrap(),
-        1024,
-        "1 TiB = 1024 GiB"
-    );
-    // Mi rounds DOWN to GB. 2048 MiB = 2 GiB exactly.
-    assert_eq!(parse_quantity_to_gb("2048Mi").unwrap(), 2);
-    // 1500 MiB = 1.46 GiB → rounds down to 1.
-    assert_eq!(
-        parse_quantity_to_gb("1500Mi").unwrap(),
-        1,
-        "rounds DOWN (cache limit: better under than over → kubelet eviction)"
-    );
-}
-
-#[test]
-fn quantity_decimal_suffix() {
-    // 100G = 100 * 10^9 bytes = 93.13 GiB → 93.
-    assert_eq!(parse_quantity_to_gb("100G").unwrap(), 93);
-    // 50G = 46.56 GiB → 46.
-    assert_eq!(parse_quantity_to_gb("50G").unwrap(), 46);
-}
-
-#[test]
-fn quantity_raw_bytes() {
-    // 107374182400 = 100 * 1024^3 = 100 GiB exactly.
-    assert_eq!(parse_quantity_to_gb("107374182400").unwrap(), 100);
-}
-
-#[test]
-fn quantity_suffix_order_gi_before_g() {
-    // If we matched "G" before "Gi", "100Gi" would strip "G"
-    // leaving "100i" which doesn't parse. The SUFFIXES const
-    // is ordered to prevent this. If someone reorders it,
-    // this test catches it.
-    assert_eq!(
-        parse_quantity_to_gb("100Gi").unwrap(),
-        100,
-        "Gi matched, not G"
-    );
-}
-
-#[test]
-fn quantity_invalid_rejected() {
-    assert!(matches!(
-        parse_quantity_to_gb("not-a-number"),
-        Err(Error::InvalidSpec(_))
-    ));
-    assert!(matches!(
-        parse_quantity_to_gb("100Pi"),
-        Err(Error::InvalidSpec(_))
-    ));
-    // Empty
-    assert!(matches!(
-        parse_quantity_to_gb(""),
-        Err(Error::InvalidSpec(_))
-    ));
-    // Negative and non-finite rejected.
-    assert!(matches!(
-        parse_quantity_to_gb("-5Gi"),
-        Err(Error::InvalidSpec(_))
-    ));
-    assert!(matches!(
-        parse_quantity_to_gb("infGi"),
-        Err(Error::InvalidSpec(_))
-    ));
-}
-
-/// Decimal quantities (K8s Quantity allows them). u64 parse would
-/// reject "1.5Gi" even though it's a valid K8s Quantity; f64 parse
-/// + floor-to-u64 accepts it.
-#[test]
-fn quantity_decimal_fraction() {
-    // 1.5 GiB = 1.5 * 1024^3 = 1610612736 bytes → 1 GB (floor).
-    assert_eq!(parse_quantity_to_gb("1.5Gi").unwrap(), 1);
-    // 2.5 GiB → 2 GB (floor).
-    assert_eq!(parse_quantity_to_gb("2.5Gi").unwrap(), 2);
-    // 0.5 GiB = 512 MiB → 0 GB (floor). Operator probably wants
-    // at least 1 GB but the spec says 0.5Gi so we honor it.
-    assert_eq!(parse_quantity_to_gb("0.5Gi").unwrap(), 0);
-    // 1.5Ti = 1536 GiB.
-    assert_eq!(parse_quantity_to_gb("1.5Ti").unwrap(), 1536);
 }
