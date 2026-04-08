@@ -156,7 +156,7 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
         // and 500 into the same silent `-/-` as a genuine 404 — an
         // operator diagnosing a misbehaving autoscaler couldn't tell
         // "child not reconciled yet" from "my ServiceAccount can't
-        // `get workerpools`."
+        // `get builderpools`."
         let child_status = match wp_api.get_opt(&child_name).await {
             Ok(Some(wp)) => wp.status,
             Ok(None) => {
@@ -172,9 +172,9 @@ async fn describe(as_json: bool, client: Client, ns: &str, name: &str) -> anyhow
                 // if the child status is unavailable. 403 on a
                 // per-resource get is common post-deploy when the
                 // helm chart's RBAC covers `get builderpoolsets` but
-                // forgot `get workerpools`.
+                // forgot `get builderpools`.
                 eprintln!(
-                    "warning: RBAC denied `get workerpools/{child_name}` ({}). \
+                    "warning: RBAC denied `get builderpools/{child_name}` ({}). \
                      Child status unavailable — check service account permissions.",
                     ae.message
                 );
