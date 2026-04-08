@@ -338,8 +338,8 @@ impl StoreServiceImpl {
         // Step 3: Insert manifest placeholder with status='uploading'.
         // Returns false (ON CONFLICT DO NOTHING no-op) if another uploader
         // already holds a placeholder. In that case we must NOT proceed: if
-        // we do and later fail validation, delete_manifest_uploading would
-        // delete the OTHER uploader's placeholder, losing their valid upload.
+        // we do and later fail validation, the drop-path reap would delete
+        // the OTHER uploader's placeholder, losing their valid upload.
         //
         // STRUCTURAL: insert_manifest_uploading now takes references and
         // writes them into the placeholder narinfo. Mark's CTE walks them

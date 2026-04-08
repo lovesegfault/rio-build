@@ -191,8 +191,8 @@ impl StoreServiceImpl {
         // Each output gets the same metadata → trailer-apply → hash-verify
         // flow PutPath does. Placeholder inserts happen here (before the
         // commit tx) because they're idempotent-safe: `nar_size=0` +
-        // `status='uploading'` guards mean `delete_manifest_uploading`
-        // can't touch a concurrent winner.
+        // `status='uploading'` guards mean the abort-path reap can't
+        // touch a concurrent winner.
         for (idx, accum) in outputs.iter_mut() {
             let Some(info) = accum.info.as_mut() else {
                 bail!(Status::invalid_argument(format!(
@@ -442,7 +442,10 @@ impl StoreServiceImpl {
     /// loop holds `&mut outputs`.
     async fn abort_batch(&self, owned_placeholders: &[Vec<u8>]) {
         for hash in owned_placeholders {
-            if let Err(e) = metadata::delete_manifest_uploading(&self.pool, hash).await {
+            if let Err(e) =
+                crate::gc::orphan::reap_one(&self.pool, hash, None, self.chunk_backend.as_ref())
+                    .await
+            {
                 error!(store_path_hash = %hex::encode(hash), error = %e,
                        "PutPathBatch abort: failed to clean up placeholder");
             }
