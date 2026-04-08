@@ -552,7 +552,7 @@ mod tests {
         // that differ for ephemeral-mode tests. Keeps this site
         // out of the E0063 blast radius when BuilderPoolSpec gains
         // a field — the fixture is the single touch point.
-        let mut spec = crate::fixtures::test_workerpool_spec();
+        let mut spec = crate::fixtures::test_builderpool_spec();
         spec.max_concurrent = 4;
         spec.fuse_cache_size = "10Gi".into();
         spec.features = vec![];

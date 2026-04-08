@@ -36,7 +36,7 @@ const GI: u64 = 1024 * 1024 * 1024;
 /// BuilderPool with `sizing=Manifest`. Starts from the shared
 /// fixture (E0063-proof) and overrides the manifest-relevant fields.
 fn test_manifest_wp() -> BuilderPool {
-    let mut spec = crate::fixtures::test_workerpool_spec();
+    let mut spec = crate::fixtures::test_builderpool_spec();
     spec.max_concurrent = 10;
     spec.sizing = Sizing::Manifest;
     spec.fuse_cache_size = "10Gi".into();

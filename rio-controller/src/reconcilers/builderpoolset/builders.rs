@@ -76,7 +76,7 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
     // E0063 here forces a decision — does PoolTemplate mirror it
     // (expose to WPS users) or hardcode a default (controller
     // concern)? This is the ONE production literal; test literals
-    // delegate to crate::fixtures::test_workerpool_spec().
+    // delegate to crate::fixtures::test_builderpool_spec().
     let spec = BuilderPoolSpec {
         // --- Per-class (SizeClassSpec) ---
         max_concurrent,

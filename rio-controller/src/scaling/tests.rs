@@ -291,7 +291,7 @@ fn test_wps(name: &str, ns: &str, class_names: &[&str]) -> BuilderPoolSet {
 }
 
 fn test_wp_in_ns(name: &str, ns: &str) -> BuilderPool {
-    let mut wp = BuilderPool::new(name, crate::fixtures::test_workerpool_spec());
+    let mut wp = BuilderPool::new(name, crate::fixtures::test_builderpool_spec());
     wp.metadata.namespace = Some(ns.into());
     wp
 }

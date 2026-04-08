@@ -39,7 +39,7 @@ use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs};
 /// — 2 sites (down from the previous 4-5 test literals each
 /// hitting E0063 on every field add). CEL-exhaustiveness is the
 /// point; don't `#[derive(Default)]` on `BuilderPoolSpec`.
-pub fn test_workerpool_spec() -> BuilderPoolSpec {
+pub fn test_builderpool_spec() -> BuilderPoolSpec {
     BuilderPoolSpec {
         max_concurrent: 10,
         sizing: Sizing::Static,
@@ -67,11 +67,11 @@ pub fn test_workerpool_spec() -> BuilderPoolSpec {
     }
 }
 
-/// Wrap a [`test_workerpool_spec`] in a `BuilderPool` with name +
+/// Wrap a [`test_builderpool_spec`] in a `BuilderPool` with name +
 /// UID + namespace set. `controller_owner_ref` needs UID; the
 /// apiserver sets it in prod, tests fake it.
 pub fn test_builderpool(name: &str) -> BuilderPool {
-    let mut wp = BuilderPool::new(name, test_workerpool_spec());
+    let mut wp = BuilderPool::new(name, test_builderpool_spec());
     wp.metadata.uid = Some(format!("{name}-uid"));
     wp.metadata.namespace = Some("rio".into());
     wp
