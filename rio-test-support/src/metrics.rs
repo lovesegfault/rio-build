@@ -80,36 +80,29 @@ impl Recorder for DescribedNames {
 }
 
 // ===========================================================================
-// DescribedByType — captures describe_*! names, split by metric type
+// DescribedHistograms — captures describe_histogram! names only
 // ===========================================================================
 
-/// `(counters, gauges, histograms)` — one vec per `describe_*!` kind.
-type NamesByType = (Vec<String>, Vec<String>, Vec<String>);
-
-/// Like `DescribedNames` but keeps the three metric types in separate
-/// vecs. For "every describe_histogram! has a bucket config" checks where
-/// you need to distinguish histograms from counters/gauges.
-///
-/// Inner tuple: `(counters, gauges, histograms)`.
+/// Recorder that captures `describe_histogram!` names and ignores
+/// counters/gauges. For "every describe_histogram! has a bucket config"
+/// checks ([`assert_histograms_have_buckets`]) where the histogram set
+/// must be distinguished from the rest. `DescribedNames` already covers
+/// the "all names regardless of type" case.
 #[derive(Default)]
-pub(crate) struct DescribedByType(Arc<Mutex<NamesByType>>);
+pub(crate) struct DescribedHistograms(Arc<Mutex<Vec<String>>>);
 
-impl DescribedByType {
+impl DescribedHistograms {
     /// Snapshot of all `describe_histogram!` names captured so far.
     pub fn histograms(&self) -> Vec<String> {
-        self.0.lock().unwrap().2.clone()
+        self.0.lock().unwrap().clone()
     }
 }
 
-impl Recorder for DescribedByType {
-    fn describe_counter(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
-        self.0.lock().unwrap().0.push(key.as_str().to_string());
-    }
-    fn describe_gauge(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
-        self.0.lock().unwrap().1.push(key.as_str().to_string());
-    }
+impl Recorder for DescribedHistograms {
+    fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+    fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
     fn describe_histogram(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
-        self.0.lock().unwrap().2.push(key.as_str().to_string());
+        self.0.lock().unwrap().push(key.as_str().to_string());
     }
     fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
         Counter::noop()
@@ -469,7 +462,7 @@ pub fn assert_histograms_have_buckets(
     exempt: &[&str],
     crate_name: &str,
 ) {
-    let recorder = DescribedByType::default();
+    let recorder = DescribedHistograms::default();
     metrics::with_local_recorder(&recorder, describe_fn);
     let histograms = recorder.histograms();
 

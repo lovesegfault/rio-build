@@ -27,18 +27,12 @@ use super::store::MockStore;
 pub async fn spawn_grpc_server(
     router: tonic::transport::server::Router,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local_addr");
-    let handle = tokio::spawn(async move {
-        router
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .expect("in-process gRPC server");
-    });
-    tokio::task::yield_now().await;
-    (addr, handle)
+    // `Router` is `Router<tower::layer::util::Identity>`, which trivially
+    // satisfies `_layered`'s where-bounds (it's what tonic itself calls
+    // for the unlayered path). Kept as a separate non-generic fn so
+    // existing callers don't hit inference ambiguity — see the doc on
+    // `spawn_grpc_server_layered` for why a default type param won't work.
+    spawn_grpc_server_layered(router).await
 }
 
 /// Generic variant of [`spawn_grpc_server`] for routers with layers.
@@ -64,9 +58,9 @@ pub async fn spawn_grpc_server(
 // r[impl ts.spawn.layered]
 ///
 /// The non-generic [`spawn_grpc_server`] (≈ `L = Identity`) is kept as a
-/// separate fn: Rust's default type parameters on functions are unstable,
-/// and a `L = Identity` blanket would force existing callers to turbofish
-/// or hit inference ambiguity.
+/// separate fn that delegates here: Rust's default type parameters on
+/// functions are unstable, and a `L = Identity` blanket would force
+/// existing callers to turbofish or hit inference ambiguity.
 ///
 /// `ResBody` is the layer's HTTP response body type — each layer can
 /// transform the body (e.g., compression, tracing wrappers), so tonic's

@@ -28,10 +28,7 @@ const NOCHROOT_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","",""
 #[tokio::test]
 async fn test_build_paths_success() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        send_completed: true,
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     // Seed a .drv in store so translate::reconstruct_dag can resolve it.
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
@@ -61,10 +58,8 @@ async fn test_build_paths_success() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        submit_error: Some(tonic::Code::Unavailable),
-        ..Default::default()
-    });
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
     h.store
@@ -102,13 +97,13 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Resu
 #[tokio::test]
 async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        // SubmitBuild: close stream after Started → EofWithoutTerminal.
-        close_stream_early: true,
-        // WatchBuild: deliver Completed on the retry. Explicit sequence=2:
-        // SubmitBuild's Started was seq=1, so gateway reconnects with
-        // since_seq=1. Mock's since-filter drops seq≤1; seq=2 survives.
-        watch_scripted_events: Some(vec![types::BuildEvent {
+    // SubmitBuild: close stream after Started → EofWithoutTerminal.
+    h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
+    // WatchBuild: deliver Completed on the retry. Explicit sequence=2:
+    // SubmitBuild's Started was seq=1, so gateway reconnects with
+    // since_seq=1. Mock's since-filter drops seq≤1; seq=2 survives.
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![types::BuildEvent {
             build_id: String::new(),
             sequence: 2,
             timestamp: None,
@@ -162,10 +157,7 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
 #[tokio::test]
 async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        send_completed: true,
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
     h.store
@@ -226,10 +218,7 @@ async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        send_completed: true,
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
 
@@ -263,7 +252,7 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
     // BuildResult: status + errorMsg + timesBuilt + isNonDet + start + stop +
     // cpuUser(tag+val?) + cpuSystem(tag+val?) + builtOutputs
     let status = wire::read_u64(&mut h.stream).await?;
-    // Mock sent send_completed: true, so status should be Built (0), not
+    // Mock sent SubmitOutcome::completed(), so status should be Built (0), not
     // just "any valid status" — a weak assertion here would let failure
     // states pass silently.
     assert_eq!(
@@ -650,24 +639,21 @@ async fn collect_stderr_frames_terminal(
 #[tokio::test]
 async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![
-            ev(build_event::Event::Started(types::BuildStarted {
-                total_derivations: 1,
-                cached_derivations: 0,
-            })),
-            ev(build_event::Event::Log(types::BuildLogBatch {
-                derivation_path: String::new(),
-                executor_id: String::new(),
-                lines: vec![b"building foo".to_vec(), b"linking".to_vec()],
-                first_line_number: 0,
-            })),
-            ev(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec![],
-            })),
-        ]),
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Log(types::BuildLogBatch {
+            derivation_path: String::new(),
+            executor_id: String::new(),
+            lines: vec![b"building foo".to_vec(), b"linking".to_vec()],
+            first_line_number: 0,
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -699,34 +685,31 @@ async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> 
 async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     let target = "/nix/store/aaa-activity-test.drv".to_string();
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![
-            ev(build_event::Event::Started(types::BuildStarted {
-                total_derivations: 1,
-                cached_derivations: 0,
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: target.clone(),
-                status: Some(types::derivation_event::Status::Started(
-                    types::DerivationStarted {
-                        executor_id: "w1".into(),
-                    },
-                )),
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: target.clone(),
-                status: Some(types::derivation_event::Status::Completed(
-                    types::DerivationCompleted {
-                        output_paths: vec![],
-                    },
-                )),
-            })),
-            ev(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec![],
-            })),
-        ]),
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: target.clone(),
+            status: Some(types::derivation_event::Status::Started(
+                types::DerivationStarted {
+                    executor_id: "w1".into(),
+                },
+            )),
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: target.clone(),
+            status: Some(types::derivation_event::Status::Completed(
+                types::DerivationCompleted {
+                    output_paths: vec![],
+                },
+            )),
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -824,37 +807,34 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
 async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     let target = "/nix/store/bbb-failed.drv".to_string();
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![
-            ev(build_event::Event::Started(types::BuildStarted {
-                total_derivations: 1,
-                cached_derivations: 0,
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: target.clone(),
-                status: Some(types::derivation_event::Status::Started(
-                    types::DerivationStarted {
-                        executor_id: "w1".into(),
-                    },
-                )),
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: target.clone(),
-                status: Some(types::derivation_event::Status::Failed(
-                    types::DerivationFailed {
-                        error_message: "boom".into(),
-                        status: types::BuildResultStatus::PermanentFailure.into(),
-                    },
-                )),
-            })),
-            ev(build_event::Event::Failed(types::BuildFailed {
-                error_message: "build failed".into(),
-                failed_derivation: target.clone(),
-                status: 0,
-            })),
-        ]),
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: target.clone(),
+            status: Some(types::derivation_event::Status::Started(
+                types::DerivationStarted {
+                    executor_id: "w1".into(),
+                },
+            )),
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: target.clone(),
+            status: Some(types::derivation_event::Status::Failed(
+                types::DerivationFailed {
+                    error_message: "boom".into(),
+                    status: types::BuildResultStatus::PermanentFailure.into(),
+                },
+            )),
+        })),
+        ev(build_event::Event::Failed(types::BuildFailed {
+            error_message: "build failed".into(),
+            failed_derivation: target.clone(),
+            status: 0,
+        })),
+    ]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -894,18 +874,15 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
 #[tokio::test]
 async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![
-            ev(build_event::Event::Started(types::BuildStarted {
-                total_derivations: 1,
-                cached_derivations: 0,
-            })),
-            ev(build_event::Event::Cancelled(types::BuildCancelled {
-                reason: "user abort".into(),
-            })),
-        ]),
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Cancelled(types::BuildCancelled {
+            reason: "user abort".into(),
+        })),
+    ]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -937,41 +914,38 @@ async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()>
 #[tokio::test]
 async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![
-            ev(build_event::Event::Started(types::BuildStarted {
-                total_derivations: 3,
-                cached_derivations: 1,
-            })),
-            ev(build_event::Event::Progress(types::BuildProgress {
-                completed: 1,
-                running: 1,
-                queued: 1,
-                total: 3,
-                // critical_path_remaining_secs + assigned_workers: don't
-                // care — this test asserts Progress is silent (no stderr).
-                ..Default::default()
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: "/nix/store/cached.drv".into(),
-                status: Some(types::derivation_event::Status::Cached(
-                    types::DerivationCached {
-                        output_paths: vec![],
-                    },
-                )),
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: "/nix/store/queued.drv".into(),
-                status: Some(types::derivation_event::Status::Queued(
-                    types::DerivationQueued {},
-                )),
-            })),
-            ev(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec![],
-            })),
-        ]),
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 3,
+            cached_derivations: 1,
+        })),
+        ev(build_event::Event::Progress(types::BuildProgress {
+            completed: 1,
+            running: 1,
+            queued: 1,
+            total: 3,
+            // critical_path_remaining_secs + assigned_workers: don't
+            // care — this test asserts Progress is silent (no stderr).
+            ..Default::default()
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: "/nix/store/cached.drv".into(),
+            status: Some(types::derivation_event::Status::Cached(
+                types::DerivationCached {
+                    output_paths: vec![],
+                },
+            )),
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: "/nix/store/queued.drv".into(),
+            status: Some(types::derivation_event::Status::Queued(
+                types::DerivationQueued {},
+            )),
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1044,44 +1018,41 @@ async fn test_build_paths_progress_events_emit_result() -> anyhow::Result<()> {
 async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     let target = "/nix/store/ccc-loglines.drv".to_string();
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![
-            ev(build_event::Event::Started(types::BuildStarted {
-                total_derivations: 1,
-                cached_derivations: 0,
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: target.clone(),
-                status: Some(types::derivation_event::Status::Started(
-                    types::DerivationStarted {
-                        executor_id: "rio-builder-x86-64-abc".into(),
-                    },
-                )),
-            })),
-            ev(build_event::Event::Phase(types::BuildPhase {
-                derivation_path: target.clone(),
-                phase: "unpackPhase".into(),
-            })),
-            ev(build_event::Event::Log(types::BuildLogBatch {
-                derivation_path: target.clone(),
-                executor_id: String::new(),
-                lines: vec![b"unpacking source".to_vec()],
-                first_line_number: 0,
-            })),
-            ev(build_event::Event::Derivation(types::DerivationEvent {
-                derivation_path: target.clone(),
-                status: Some(types::derivation_event::Status::Completed(
-                    types::DerivationCompleted {
-                        output_paths: vec![],
-                    },
-                )),
-            })),
-            ev(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec![],
-            })),
-        ]),
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::scripted(vec![
+        ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: target.clone(),
+            status: Some(types::derivation_event::Status::Started(
+                types::DerivationStarted {
+                    executor_id: "rio-builder-x86-64-abc".into(),
+                },
+            )),
+        })),
+        ev(build_event::Event::Phase(types::BuildPhase {
+            derivation_path: target.clone(),
+            phase: "unpackPhase".into(),
+        })),
+        ev(build_event::Event::Log(types::BuildLogBatch {
+            derivation_path: target.clone(),
+            executor_id: String::new(),
+            lines: vec![b"unpacking source".to_vec()],
+            first_line_number: 0,
+        })),
+        ev(build_event::Event::Derivation(types::DerivationEvent {
+            derivation_path: target.clone(),
+            status: Some(types::derivation_event::Status::Completed(
+                types::DerivationCompleted {
+                    output_paths: vec![],
+                },
+            )),
+        })),
+        ev(build_event::Event::Completed(types::BuildCompleted {
+            output_paths: vec![],
+        })),
+    ]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1148,14 +1119,12 @@ async fn test_build_paths_log_and_phase_attached_to_activity() -> anyhow::Result
 #[tokio::test]
 async fn test_build_paths_first_event_completed_short_circuit() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![ev(build_event::Event::Completed(
-            types::BuildCompleted {
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::scripted(vec![ev(
+            build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec!["/nix/store/cached".into()],
-            },
-        ))]),
-        ..Default::default()
-    });
+            }),
+        )]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1175,14 +1144,14 @@ async fn test_build_paths_first_event_completed_short_circuit() -> anyhow::Resul
 #[tokio::test]
 async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![ev(build_event::Event::Failed(types::BuildFailed {
-            error_message: "instant fail".into(),
-            failed_derivation: String::new(),
-            status: 0,
-        }))]),
-        ..Default::default()
-    });
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::scripted(vec![ev(
+            build_event::Event::Failed(types::BuildFailed {
+                error_message: "instant fail".into(),
+                failed_derivation: String::new(),
+                status: 0,
+            }),
+        )]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1207,14 +1176,12 @@ async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<(
 #[tokio::test]
 async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![ev(build_event::Event::Cancelled(
-            types::BuildCancelled {
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::scripted(vec![ev(
+            build_event::Event::Cancelled(types::BuildCancelled {
                 reason: "early cancel".into(),
-            },
-        ))]),
-        ..Default::default()
-    });
+            }),
+        )]));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1257,16 +1224,17 @@ async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Resul
 #[tokio::test]
 async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        // Zero events: tx drops immediately, stream is empty. Header
-        // IS set (default). Gateway reads build_id from header, enters
-        // the reconnect loop, process_build_events gets EofWithoutTerminal
-        // on its first read, reconnect arm fires.
-        scripted_events: Some(vec![]),
-        // WatchBuild delivers the terminal event. Auto-seq=1 > since=0
-        // (gateway's initial insert for header path), so it passes the
-        // mock's since-filter.
-        watch_scripted_events: Some(vec![ev(build_event::Event::Completed(
+    // Zero events: tx drops immediately, stream is empty. Header
+    // IS set (default). Gateway reads build_id from header, enters
+    // the reconnect loop, process_build_events gets EofWithoutTerminal
+    // on its first read, reconnect arm fires.
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::scripted(vec![]));
+    // WatchBuild delivers the terminal event. Auto-seq=1 > since=0
+    // (gateway's initial insert for header path), so it passes the
+    // mock's since-filter.
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![ev(build_event::Event::Completed(
             types::BuildCompleted {
                 output_paths: vec!["/nix/store/zzz-out".into()],
             },
@@ -1323,10 +1291,8 @@ async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result
 #[tokio::test]
 async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        submit_error: Some(tonic::Code::Unavailable),
-        ..Default::default()
-    });
+    h.scheduler
+        .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1377,12 +1343,12 @@ async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        // SubmitBuild: send Started, then inject a transport error.
-        // The gateway's first-event peek consumes Started, then
-        // process_build_events tries to read the next event and gets
-        // the Err → StreamProcessError::Transport → reconnect loop.
-        scripted_events: Some(vec![
+    // SubmitBuild: send Started, then inject a transport error.
+    // The gateway's first-event peek consumes Started, then
+    // process_build_events tries to read the next event and gets
+    // the Err → StreamProcessError::Transport → reconnect loop.
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: vec![
             ev(build_event::Event::Started(types::BuildStarted {
                 total_derivations: 1,
                 cached_derivations: 0,
@@ -1391,14 +1357,17 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
             ev(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec![],
             })),
-        ]),
+        ],
         error_after_n: Some((1, tonic::Code::Unavailable)),
-        // WatchBuild: deliver Completed. Gateway's process_build_events
-        // reads from this fresh stream after the reconnect.
-        // Explicit sequence=2: SubmitBuild's Started was seq=1, so
-        // gateway reconnects with since_seq=1. Mock's since-filter
-        // drops seq≤1; seq=2 survives.
-        watch_scripted_events: Some(vec![types::BuildEvent {
+        interval: None,
+    });
+    // WatchBuild: deliver Completed. Gateway's process_build_events
+    // reads from this fresh stream after the reconnect.
+    // Explicit sequence=2: SubmitBuild's Started was seq=1, so
+    // gateway reconnects with since_seq=1. Mock's since-filter
+    // drops seq≤1; seq=2 survives.
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![types::BuildEvent {
             build_id: String::new(),
             sequence: 2,
             timestamp: None,
@@ -1446,10 +1415,10 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        // SubmitBuild: Started (auto-fill → seq=1), then transport error
-        // at index 1 (before the second event, which is just a placeholder).
-        scripted_events: Some(vec![
+    // SubmitBuild: Started (auto-fill → seq=1), then transport error
+    // at index 1 (before the second event, which is just a placeholder).
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: vec![
             ev(build_event::Event::Started(types::BuildStarted {
                 total_derivations: 1,
                 cached_derivations: 0,
@@ -1457,11 +1426,14 @@ async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<
             ev(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec![],
             })),
-        ]),
+        ],
         error_after_n: Some((1, tonic::Code::Unavailable)),
-        // WatchBuild: Completed at explicit seq=2 (> since_seq=1 → delivered).
-        // Hand-construct instead of ev() so we control sequence directly.
-        watch_scripted_events: Some(vec![types::BuildEvent {
+        interval: None,
+    });
+    // WatchBuild: Completed at explicit seq=2 (> since_seq=1 → delivered).
+    // Hand-construct instead of ev() so we control sequence directly.
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![types::BuildEvent {
             build_id: String::new(),
             sequence: 2,
             timestamp: None,
@@ -1499,7 +1471,7 @@ async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<
 }
 
 /// SubmitBuild stream errors → gateway tries WatchBuild → WatchBuild fails
-/// every time (watch_fail_count > MAX_RECONNECT) → gateway gives up →
+/// every time (fail_count > MAX_RECONNECT) → gateway gives up →
 /// MiscFailure with "reconnect exhausted".
 ///
 /// Uses opcode 46 so we can read the BuildResult back (opcode 9 would
@@ -1507,8 +1479,8 @@ async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<
 #[tokio::test(start_paused = true)]
 async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let outcome = MockSchedulerOutcome {
-        scripted_events: Some(vec![
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: vec![
             ev(build_event::Event::Started(types::BuildStarted {
                 total_derivations: 1,
                 cached_derivations: 0,
@@ -1516,21 +1488,19 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
             ev(build_event::Event::Completed(types::BuildCompleted {
                 output_paths: vec![],
             })),
-        ]),
+        ],
         error_after_n: Some((1, tonic::Code::Unavailable)),
-        // watch_fail_count > MAX_RECONNECT (5) → every WatchBuild attempt
-        // fails. The gateway's reconnect loop: process_build_events on
-        // dead stream → Transport err → attempt++ → backoff+watch_build →
-        // watch_build errs → next loop iter → dead stream errs again → ...
-        // After 5 attempts it gives up.
-        watch_scripted_events: None, // irrelevant — watch_fail_count blocks
-        ..Default::default()
-    };
-    // Set watch_fail_count AFTER Default because Default gives Arc::new(0).
-    outcome
-        .watch_fail_count
-        .store(10, std::sync::atomic::Ordering::SeqCst);
-    h.scheduler.set_outcome(outcome);
+        interval: None,
+    });
+    // fail_count > MAX_RECONNECT (5) → every WatchBuild attempt fails.
+    // The gateway's reconnect loop: process_build_events on dead stream →
+    // Transport err → attempt++ → backoff+watch_build → watch_build errs →
+    // next loop iter → dead stream errs again → ... After 5 attempts it
+    // gives up.
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        fail_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(10)),
+        scripted_events: None, // irrelevant — fail_count blocks
+    });
     let drv_path = seed_minimal_drv(&h);
 
     wire_send!(&mut h.stream;
@@ -1589,10 +1559,10 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
         .collect();
 
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(log_events),
-        scripted_event_interval: Some(std::time::Duration::from_millis(20)),
-        ..Default::default()
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: log_events,
+        interval: Some(std::time::Duration::from_millis(20)),
+        error_after_n: None,
     });
     let drv_path = seed_minimal_drv(&h);
 
@@ -1735,10 +1705,10 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
         .collect();
 
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(log_events),
-        scripted_event_interval: Some(std::time::Duration::from_millis(20)),
-        ..Default::default()
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: log_events,
+        interval: Some(std::time::Duration::from_millis(20)),
+        error_after_n: None,
     });
     let drv_path = seed_minimal_drv(&h);
 
@@ -1841,10 +1811,10 @@ async fn test_shutdown_signal_mid_build_no_pipe_break_cancels() -> anyhow::Resul
         .collect();
 
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(log_events),
-        scripted_event_interval: Some(std::time::Duration::from_millis(20)),
-        ..Default::default()
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: log_events,
+        interval: Some(std::time::Duration::from_millis(20)),
+        error_after_n: None,
     });
     let drv_path = seed_minimal_drv(&h);
 
@@ -1979,10 +1949,7 @@ async fn over_quota_sends_stderr_error() -> anyhow::Result<()> {
 async fn under_quota_passes_through() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_tenant_handshake("team-under").await?;
 
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        send_completed: true,
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     // 50 used, 100 limit → Under.
     h.store
@@ -2025,10 +1992,7 @@ async fn under_quota_passes_through() -> anyhow::Result<()> {
 async fn unknown_tenant_fails_open() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_tenant_handshake("team-unseeded").await?;
 
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        send_completed: true,
-        ..Default::default()
-    });
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     // NO tenant_quotas entry → MockStore returns NOT_FOUND →
     // QuotaCache caches the negative → classify → Unlimited.

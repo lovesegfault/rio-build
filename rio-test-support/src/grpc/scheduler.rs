@@ -12,49 +12,99 @@ use rio_proto::{SchedulerService, SchedulerServiceServer};
 
 use super::spawn::spawn_grpc_server;
 
-/// Configurable scheduler behavior for a single SubmitBuild stream.
-// r[impl ts.mock.scheduler-outcome]
-#[derive(Clone, Default)]
-pub struct MockSchedulerOutcome {
-    /// If set, SubmitBuild immediately fails with this status code.
-    pub submit_error: Option<tonic::Code>,
-    /// If set, SubmitBuild sends BuildCompleted after BuildStarted.
-    pub send_completed: bool,
-    /// If set, the stream is closed immediately after BuildStarted (no
-    /// terminal event). Simulates scheduler disconnect mid-build.
-    pub close_stream_early: bool,
-    /// If Some, send these events verbatim (ignoring the bool flags above)
-    /// then close the stream. Empty build_id / zero sequence are
-    /// auto-populated so tests only need to set the `event` oneof.
-    pub scripted_events: Option<Vec<types::BuildEvent>>,
-    /// Inject `Err(Status)` into the SubmitBuild stream after sending N
-    /// scripted events. Only applies in scripted mode. For gateway
-    /// reconnect-on-transport-error tests.
-    pub error_after_n: Option<(usize, tonic::Code)>,
-    /// Sleep this long between each scripted event. Only applies in
-    /// scripted mode. For mid-opcode-disconnect tests: gives the test
-    /// time to drop the client stream while the scheduler is still
-    /// sending Log events, so the gateway's next stderr.log write
-    /// gets BrokenPipe → `StreamProcessError::Wire`. Without this,
-    /// scripted events flood the mpsc channel synchronously and the
-    /// race between client-drop and stream-EOF is nondeterministic.
-    pub scripted_event_interval: Option<std::time::Duration>,
-    /// If Some, WatchBuild returns a stream of these events (same
-    /// build_id/sequence auto-fill as SubmitBuild scripted mode).
-    /// For gateway reconnect tests: SubmitBuild stream errors →
-    /// gateway calls WatchBuild → this stream delivers the remainder.
-    pub watch_scripted_events: Option<Vec<types::BuildEvent>>,
-    /// How many times watch_build fails with Unavailable before
-    /// succeeding (or returning not_found if watch_scripted_events
-    /// is None). Decremented on each call. For reconnect-exhausted tests.
-    pub watch_fail_count: Arc<AtomicU32>,
+/// What `SubmitBuild` does on the next call.
+///
+/// The three variants are mutually exclusive — previously encoded as a flat
+/// struct of mostly-dead `Option`s where invalid combinations were silently
+/// resolved by field-probe order. The enum makes the mode explicit.
+// r[impl ts.mock.scheduler-outcome+2]
+#[derive(Clone)]
+pub enum SubmitOutcome {
+    /// Immediately return `Err(Status::new(code, ...))`.
+    Error(tonic::Code),
+    /// Send these events verbatim, auto-filling empty `build_id` / zero
+    /// `sequence`, then close the stream.
+    Scripted {
+        events: Vec<types::BuildEvent>,
+        /// Inject `Err(Status)` after sending N events. For gateway
+        /// reconnect-on-transport-error tests.
+        error_after_n: Option<(usize, tonic::Code)>,
+        /// Sleep between each event. For mid-opcode-disconnect tests:
+        /// gives the test time to drop the client stream while the
+        /// scheduler is still sending Log events, so the gateway's next
+        /// stderr.log write gets BrokenPipe → `StreamProcessError::Wire`.
+        /// Without this, scripted events flood the mpsc channel
+        /// synchronously and the race between client-drop and stream-EOF
+        /// is nondeterministic.
+        interval: Option<std::time::Duration>,
+    },
+    /// Send `BuildStarted`, then either `BuildCompleted`, close the stream
+    /// without a terminal event, or hang for 3600s (default).
+    Simple {
+        send_completed: bool,
+        close_early: bool,
+    },
 }
 
-/// Mock scheduler that records SubmitBuild + CancelBuild calls and has a
-/// configurable outcome for SubmitBuild streams.
+impl Default for SubmitOutcome {
+    /// `BuildStarted` then hang — the gateway blocks on build events
+    /// until the client disconnects.
+    fn default() -> Self {
+        Self::Simple {
+            send_completed: false,
+            close_early: false,
+        }
+    }
+}
+
+impl SubmitOutcome {
+    /// `BuildStarted` → `BuildCompleted`.
+    pub fn completed() -> Self {
+        Self::Simple {
+            send_completed: true,
+            close_early: false,
+        }
+    }
+
+    /// `BuildStarted` → close stream (no terminal event). Simulates
+    /// scheduler disconnect mid-build.
+    pub fn close_early() -> Self {
+        Self::Simple {
+            send_completed: false,
+            close_early: true,
+        }
+    }
+
+    /// Send `events` verbatim (no error injection, no inter-event delay).
+    pub fn scripted(events: Vec<types::BuildEvent>) -> Self {
+        Self::Scripted {
+            events,
+            error_after_n: None,
+            interval: None,
+        }
+    }
+}
+
+/// What `WatchBuild` does on the next call. Orthogonal to [`SubmitOutcome`].
+#[derive(Clone, Default)]
+pub struct WatchOutcome {
+    /// If Some, return a stream of these events (same `build_id`/`sequence`
+    /// auto-fill as scripted submit), honoring `since_sequence`. For gateway
+    /// reconnect tests: SubmitBuild stream errors → gateway calls WatchBuild
+    /// → this stream delivers the remainder.
+    pub scripted_events: Option<Vec<types::BuildEvent>>,
+    /// How many times `watch_build` fails with `Unavailable` before
+    /// succeeding (or returning `not_found` if `scripted_events` is `None`).
+    /// Decremented on each call. For reconnect-exhausted tests.
+    pub fail_count: Arc<AtomicU32>,
+}
+
+/// Mock scheduler that records SubmitBuild + CancelBuild calls and has
+/// independently-configurable SubmitBuild / WatchBuild behavior.
 #[derive(Clone, Default)]
 pub struct MockScheduler {
-    pub outcome: Arc<RwLock<MockSchedulerOutcome>>,
+    pub submit: Arc<RwLock<SubmitOutcome>>,
+    pub watch: Arc<RwLock<WatchOutcome>>,
     /// Full SubmitBuild requests received (for inspecting DAG contents).
     pub submit_calls: Arc<RwLock<Vec<types::SubmitBuildRequest>>>,
     /// CancelBuild calls received: (build_id, reason).
@@ -70,10 +120,16 @@ impl MockScheduler {
         Self::default()
     }
 
-    pub fn set_outcome(&self, outcome: MockSchedulerOutcome) {
-        *self.outcome.write().unwrap() = outcome;
+    pub fn set_submit_outcome(&self, outcome: SubmitOutcome) {
+        *self.submit.write().unwrap() = outcome;
+    }
+
+    pub fn set_watch_outcome(&self, outcome: WatchOutcome) {
+        *self.watch.write().unwrap() = outcome;
     }
 }
+
+const TEST_BUILD_ID: &str = "test-build-00000000-1111-2222-3333-444444444444";
 
 #[tonic::async_trait]
 impl SchedulerService for MockScheduler {
@@ -87,104 +143,102 @@ impl SchedulerService for MockScheduler {
         let req = request.into_inner();
         self.submit_calls.write().unwrap().push(req);
 
-        let outcome = self.outcome.read().unwrap().clone();
-        if let Some(code) = outcome.submit_error {
-            return Err(Status::new(code, "mock scheduler error"));
-        }
-
+        let outcome = self.submit.read().unwrap().clone();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
-        // Clone before any spawn moves build_id.
-        let build_id_for_header = build_id.clone();
+        let build_id = TEST_BUILD_ID.to_string();
 
-        // Scripted mode: send events verbatim, auto-fill build_id/sequence, close.
-        if let Some(events) = outcome.scripted_events {
-            let error_after_n = outcome.error_after_n;
-            let interval = outcome.scripted_event_interval;
-            let n_events = events.len();
-            tokio::spawn(async move {
-                for (seq, mut ev) in events.into_iter().enumerate() {
-                    if let Some(d) = interval {
-                        tokio::time::sleep(d).await;
+        match outcome {
+            SubmitOutcome::Error(code) => {
+                return Err(Status::new(code, "mock scheduler error"));
+            }
+            SubmitOutcome::Scripted {
+                events,
+                error_after_n,
+                interval,
+            } => {
+                let n_events = events.len();
+                tokio::spawn(async move {
+                    for (seq, mut ev) in events.into_iter().enumerate() {
+                        if let Some(d) = interval {
+                            tokio::time::sleep(d).await;
+                        }
+                        // Error injection: after sending N events, send an Err(Status)
+                        // into the stream. Gateway's process_build_events maps this
+                        // to StreamProcessError::Transport → triggers the reconnect loop.
+                        if let Some((n, code)) = error_after_n
+                            && seq == n
+                        {
+                            let _ = tx
+                                .send(Err(Status::new(code, "mock: injected stream error")))
+                                .await;
+                            return;
+                        }
+                        if ev.build_id.is_empty() {
+                            ev.build_id = build_id.clone();
+                        }
+                        if ev.sequence == 0 {
+                            ev.sequence = (seq as u64) + 1;
+                        }
+                        if tx.send(Ok(ev)).await.is_err() {
+                            return;
+                        }
                     }
-                    // Error injection: after sending N events, send an Err(Status)
-                    // into the stream. Gateway's process_build_events maps this
-                    // to StreamProcessError::Transport → triggers the reconnect loop.
+                    // If error_after_n >= events.len(), fire after the last event.
                     if let Some((n, code)) = error_after_n
-                        && seq == n
+                        && n >= n_events
                     {
                         let _ = tx
                             .send(Err(Status::new(code, "mock: injected stream error")))
                             .await;
-                        return;
                     }
-                    if ev.build_id.is_empty() {
-                        ev.build_id = build_id.clone();
-                    }
-                    if ev.sequence == 0 {
-                        ev.sequence = (seq as u64) + 1;
-                    }
-                    if tx.send(Ok(ev)).await.is_err() {
-                        return;
-                    }
-                }
-                // If error_after_n >= events.len(), fire after the last event.
-                if let Some((n, code)) = error_after_n
-                    && n >= n_events
-                {
-                    let _ = tx
-                        .send(Err(Status::new(code, "mock: injected stream error")))
-                        .await;
-                }
-                // tx drops → stream ends
-            });
-            let mut resp = Response::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-            resp.metadata_mut().insert(
-                rio_proto::BUILD_ID_HEADER,
-                build_id_for_header.parse().expect("test build_id is ASCII"),
-            );
-            return Ok(resp);
-        }
-
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(types::BuildEvent {
-                    build_id: build_id.clone(),
-                    sequence: 1,
-                    timestamp: None,
-                    event: Some(types::build_event::Event::Started(types::BuildStarted {
-                        total_derivations: 1,
-                        cached_derivations: 0,
-                    })),
-                }))
-                .await;
-
-            if outcome.send_completed {
-                let _ = tx
-                    .send(Ok(types::BuildEvent {
-                        build_id: build_id.clone(),
-                        sequence: 2,
-                        timestamp: None,
-                        event: Some(types::build_event::Event::Completed(
-                            types::BuildCompleted {
-                                output_paths: vec!["/nix/store/zzz-output".into()],
-                            },
-                        )),
-                    }))
-                    .await;
-            } else if outcome.close_stream_early {
-                // Drop tx immediately: stream ends without a terminal event.
-                drop(tx);
-            } else {
-                // Keep open so gateway blocks on build events until client disconnects.
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    // tx drops → stream ends
+                });
             }
-        });
+            SubmitOutcome::Simple {
+                send_completed,
+                close_early,
+            } => {
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(Ok(types::BuildEvent {
+                            build_id: build_id.clone(),
+                            sequence: 1,
+                            timestamp: None,
+                            event: Some(types::build_event::Event::Started(types::BuildStarted {
+                                total_derivations: 1,
+                                cached_derivations: 0,
+                            })),
+                        }))
+                        .await;
+
+                    if send_completed {
+                        let _ = tx
+                            .send(Ok(types::BuildEvent {
+                                build_id: build_id.clone(),
+                                sequence: 2,
+                                timestamp: None,
+                                event: Some(types::build_event::Event::Completed(
+                                    types::BuildCompleted {
+                                        output_paths: vec!["/nix/store/zzz-output".into()],
+                                    },
+                                )),
+                            }))
+                            .await;
+                    } else if close_early {
+                        // Drop tx immediately: stream ends without a terminal event.
+                        drop(tx);
+                    } else {
+                        // Keep open so gateway blocks on build events until client disconnects.
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                });
+            }
+        }
 
         let mut resp = Response::new(tokio_stream::wrappers::ReceiverStream::new(rx));
         resp.metadata_mut().insert(
             rio_proto::BUILD_ID_HEADER,
-            build_id_for_header.parse().expect("test build_id is ASCII"),
+            TEST_BUILD_ID.parse().expect("test build_id is ASCII"),
         );
         Ok(resp)
     }
@@ -203,13 +257,13 @@ impl SchedulerService for MockScheduler {
             .unwrap()
             .push((req.build_id, since));
 
-        let outcome = self.outcome.read().unwrap().clone();
+        let watch = self.watch.read().unwrap().clone();
 
         // Injected-failure countdown: decrement and return Unavailable while > 0.
         // For reconnect-exhausted tests (gateway retries watch_build up to
         // MAX_RECONNECT times before giving up).
-        if outcome
-            .watch_fail_count
+        if watch
+            .fail_count
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n > 0).then(|| n - 1)
             })
@@ -224,9 +278,9 @@ impl SchedulerService for MockScheduler {
         // FIRST (so `sequence: 0` in a scripted event becomes `(idx+1)`
         // before the filter checks it), then the filter compares the
         // FINAL sequence value against `since`.
-        if let Some(events) = outcome.watch_scripted_events {
+        if let Some(events) = watch.scripted_events {
             let (tx, rx) = tokio::sync::mpsc::channel(32);
-            let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
+            let build_id = TEST_BUILD_ID.to_string();
             tokio::spawn(async move {
                 for (seq, mut ev) in events.into_iter().enumerate() {
                     if ev.build_id.is_empty() {
