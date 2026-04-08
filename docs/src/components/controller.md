@@ -193,6 +193,19 @@ no-feature derivations (`∅ ⊆ pool_features`); `spawn_count`'s
 active-subtraction and the `r[ctrl.pool.ephemeral-deadline]` backstop
 bound the waste.
 
+r[ctrl.manifest.cold-floor]
+Under `spec.sizing=Manifest`, derivations the manifest omits (no
+`build_history` sample yet) MUST be spawned at `spec.resources` — the
+operator-configured cold-start floor. The floor count is
+`ClusterStatus.queued_derivations - manifest.estimates.len()`; floor
+Jobs are labeled `rio.build/memory-class=floor` so the inventory pass
+counts them separately from manifest buckets (a floor Job already in
+flight claims one cold-start slot, same subtraction as
+`spawn_count`). Cold-start starvation is a livelock — derivations
+that never build never graduate out of cold-start — so the
+`r[ctrl.pool.manifest-fairness]` per-bucket-floor truncation includes
+the cold-start bucket.
+
 r[ctrl.pool.manifest-reconcile]
 Under `spec.sizing=Manifest`, the reconciler polls `GetCapacityManifest`,
 groups estimates by `(est_memory_bytes, est_cpu_millicores)` buckets,
@@ -227,6 +240,27 @@ would never reach large buckets or cold-start. Cold-start starvation is
 a livelock: derivations that never build never get a `build_history`
 sample, so they never graduate out of cold-start.
 
+r[ctrl.pod.arch-selector]
+When the pool's `spec.systems` resolves to a single CPU architecture,
+the controller MUST inject `kubernetes.io/arch={amd64|arm64|386|arm}`
+into the Job pod's `nodeSelector` (operator-set value wins via
+`or_insert`). Builder-only: fetchers run `builtin` (arch-agnostic) and
+benefit from cheaper nodes. Without this, an `x86_64-linux` pool can
+land on an arm64 node (unconstrained fallback NodePool — I-098),
+register as `x86_64` from `RIO_SYSTEMS`, accept dispatch, and have the
+local nix-daemon refuse the build. Multi-arch and `builtin`-only pools
+get no selector and rely on the executor's startup arch check as the
+safety net.
+
+r[ctrl.pod.tgps-default]
+The Job pod spec MUST default `terminationGracePeriodSeconds` to
+`7200` (2h) when `BuilderPoolSpec.terminationGracePeriodSeconds` is
+unset. SIGTERM → executor drain (`r[ctrl.drain.sigterm]`) waits for
+the in-flight build to complete before exit; nix builds can
+legitimately take 2h (LLVM, full NixOS closure from cold cache).
+Clusters with known-shorter builds set this lower so pool deletion
+doesn't stall on a stuck pod for 2h.
+
 r[ctrl.builderpool.kvm-device]
 When `BuilderPoolSpec.features` contains `"kvm"`, the controller MUST
 append `rio.build/kvm: "true"` to the pod's `nodeSelector` AND append a
@@ -244,7 +278,10 @@ NodePools. The nodeSelector + toleration are unconditional wrt
 > **Implemented:** CRD types, child-builder reconciler, status aggregation (`r[ctrl.wps.cutoff-status]`), CutoffRebalancer (`r[sched.rebalancer.sita-e]`).
 
 r[ctrl.wps.reconcile]
-The BuilderPoolSet reconciler creates one child BuilderPool per `spec.classes[i]`, named `{bps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the BPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children for deterministic timing; k8s ownerRef GC is the fallback.
+The BuilderPoolSet reconciler creates one child BuilderPool per `spec.classes[i]`, named `{bps}-{class.name}`, with `ownerReferences[0].controller=true` pointing at the BPS. SSA-apply with force (field manager `rio-controller-wps`). On deletion, the finalizer-wrapped cleanup explicitly deletes children (`r[ctrl.wps.cleanup-sweep]`); k8s ownerRef GC is the fallback.
+
+r[ctrl.wps.cleanup-sweep]
+The BuilderPoolSet finalizer's `cleanup()` MUST list child BuilderPools by ownerRef UID (NOT by iterating `spec.classes`) and explicitly delete each. Spec-iteration leaks orphans when an operator removes a class from `spec.classes` then deletes the BPS before the next reconcile runs `r[ctrl.wps.prune-stale]` — the now-shortened spec never names the orphan. 404 on delete is tolerated (GC ran first / operator manually deleted / previous cleanup partially succeeded); a non-404 delete error propagates so the finalizer stays and cleanup retries — leaking a child after BPS delete is worse than retrying. ownerRef GC would eventually do this; explicit delete is deterministic for tests and produces clear `kubectl get events` output.
 
 r[ctrl.fetcherpool.classes]
 When `FetcherPool.spec.classes[]` is non-empty, the FetcherPool reconciler spawns Jobs per class, labeled `rio.build/pool={fp.name}-{class.name}` (see `r[ctrl.fetcherpool.multiarch]`), each with `RIO_SIZE_CLASS={class.name}` injected via env so the executor reports it in `HeartbeatRequest.size_class`. Per-class `resources` apply; per-class `maxConcurrent` overrides the pool-wide `spec.maxConcurrent`. Security posture (`readOnlyRootFilesystem`, fetcher seccomp, node placement) is identical across classes. When `classes` is empty (default), Jobs use `spec.resources` directly.
@@ -438,16 +475,54 @@ r[ctrl.reconcile.owner-refs]
 - **BuilderPoolSet reconciler**: manages multiple `BuilderPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `BuilderPoolSet` status.
 - **GC reconciler**: trigger store garbage collection on schedule.
 
+r[ctrl.backoff.per-object]
+`error_policy` requeues transient reconcile errors with per-object
+exponential backoff: `5s × 2^(n-1)` capped at `300s`, keyed by
+`{kind}/{ns}/{name}`. A persistent apiserver 5xx backs off to the cap
+in ~6 rounds (5→10→20→40→80→160→300s) instead of retrying every 30s
+indefinitely. The counter resets on the next successful reconcile so a
+fresh failure restarts the curve from 5s. `Error::InvalidSpec` is NOT
+on the curve — it requeues at a fixed per-reconciler interval (300s
+for pools, 30s for ComponentScaler where 5min of no scaling under a
+builder burst is the I-105 cliff).
+
+r[ctrl.cache.size-class-status]
+`Ctx::size_class_status()` caches the `AdminService.GetSizeClassStatus`
+response with a 5s TTL, shared across the BuilderPool ephemeral
+reconciler and the ComponentScaler reconciler (both poll on ~10s
+ticks). The lock is held across the gRPC call so two concurrent callers
+share one fetch; the call has a 5s timeout, and on timeout the caller
+falls back to the stale cached value (reconcilers already tolerate
+half-a-tick staleness). Without the cache the two reconcilers
+double-poll the scheduler.
+
+r[ctrl.condition.sched-unreachable]
+BuilderPool and FetcherPool `.status.conditions[]` MUST carry a
+`SchedulerUnreachable` condition reflecting the reconciler's poll-phase
+RPC result: `status="True", reason="ClusterStatusFailed"` with the gRPC
+error in `message` when the poll failed; `status="False",
+reason="ClusterStatusOK"` otherwise. Written every reconcile (SSA with
+the `rio-controller-ephemeral` field manager owns the condition —
+omitting it would leave a stale `True` after recovery).
+`lastTransitionTime` is preserved across same-status writes so
+operators see when the scheduler actually went down, not "~10s ago".
+Without this, `replicas=0` is indistinguishable between "scheduler
+idle, queued=0" and "scheduler down, queued unknown".
+
 ## RBAC
 
 The controller requires a dedicated ServiceAccount with a ClusterRole granting (see `infra/helm/rio-build/templates/rbac.yaml`):
 
 | API Group | Resources | Verbs |
 |---|---|---|
-| `rio.build` | builderpools | get, list, watch, create, update, patch, delete |
-| `rio.build` | builderpools/status | get, patch |
+| `rio.build` | builderpools, fetcherpools | get, list, watch, create, update, patch, delete |
+| `rio.build` | builderpoolsets, componentscalers | get, list, watch, patch, update |
+| `rio.build` | {builderpools,builderpoolsets,fetcherpools,componentscalers}/status | get, patch[, update] |
+| `rio.build` | {builderpools,builderpoolsets,fetcherpools}/finalizers | update — `OwnerReferencesPermissionEnforcement` checks this when creating children with `blockOwnerDeletion: true` |
+| `apps` | deployments | get, list, watch — ComponentScaler reads current `.spec.replicas` |
+| `apps` | deployments/scale | get, patch, update — ComponentScaler `/scale` subresource patch |
 | `""` (core) | pods | get, list, watch |
-| `""` (core) | events | create, patch |
+| `events.k8s.io` | events | create, patch |
 | `batch` | jobs | get, list, watch, create, delete |
 
 Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).

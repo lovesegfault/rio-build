@@ -611,6 +611,7 @@ pub(crate) async fn patch_job_pool_status(
 /// this reconciler writes every 10s tick; without preservation the
 /// timestamp always reads "~10s ago" regardless of when the
 /// scheduler actually went down/recovered.
+// r[impl ctrl.condition.sched-unreachable]
 // TODO(P0304): T505 adds an `rpc_name` param so the message names
 // which RPC failed (ClusterStatus vs GetCapacityManifest vs
 // ListExecutors). Apply here post-extraction.
@@ -666,6 +667,7 @@ mod tests {
     /// on whether the ClusterStatus RPC failed. Operators need this
     /// to distinguish "scheduler idle (queued=0)" from "scheduler
     /// down (queued unknown, treated as 0)."
+    // r[verify ctrl.condition.sched-unreachable]
     #[test]
     fn scheduler_unreachable_condition_shape() {
         // RPC failed → status=True, error in message.

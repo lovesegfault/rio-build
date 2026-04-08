@@ -675,6 +675,7 @@ pub(super) fn bucket_labels(bucket: Option<Bucket>) -> (String, String) {
 /// derivation.
 ///
 /// Returns only non-zero directives (no `count: 0` noise).
+// r[impl ctrl.manifest.cold-floor]
 pub(super) fn compute_spawn_plan(
     demand: &BTreeMap<Bucket, usize>,
     supply: &BTreeMap<Bucket, usize>,

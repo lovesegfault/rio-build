@@ -372,6 +372,7 @@ pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
 /// or the operator manually deleted it, or a previous cleanup
 /// succeeded on this child before crashing on the next).
 /// Fine — skip and continue to the next child.
+// r[impl ctrl.wps.cleanup-sweep]
 async fn cleanup(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
     let ns = wps
         .namespace()

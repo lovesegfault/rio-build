@@ -148,6 +148,7 @@ impl Ctx {
         }
     }
 
+    // r[impl ctrl.backoff.per-object]
     /// Increment the consecutive-error count for an object and
     /// return the requeue delay. Exponential: 5s × 2^n capped at
     /// 5min. A persistent apiserver 5xx backs off to 5min after
@@ -167,6 +168,7 @@ impl Ctx {
     /// successful reconcile so the next failure starts the backoff
     /// curve from zero (not from where the last failure streak
     /// left off).
+    // r[impl ctrl.cache.size-class-status]
     /// `GetSizeClassStatus` with a 5s TTL cache. See the
     /// `size_class_cache` field doc for rationale.
     ///
@@ -357,6 +359,7 @@ mod tests {
 
     /// Backoff curve: 5s base, double per attempt, cap at 300s.
     /// Proves the ~5min cap and the reset-to-base after success.
+    // r[verify ctrl.backoff.per-object]
     #[test]
     fn transient_backoff_curve() {
         assert_eq!(transient_backoff(1), Duration::from_secs(5));

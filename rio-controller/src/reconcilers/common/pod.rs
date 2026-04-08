@@ -202,6 +202,7 @@ pub fn executor_labels(p: &ExecutorPodParams) -> BTreeMap<String, String> {
 /// nodeSelector value. `None` when the list is empty, multi-arch, or
 /// `builtin`-only — those pools deliberately float across arches and
 /// rely on rio-builder's startup arch check (I-098 part B) instead.
+// r[impl ctrl.pod.arch-selector]
 pub(super) fn nix_systems_to_k8s_arch(systems: &[String]) -> Option<&'static str> {
     let mut arch: Option<&'static str> = None;
     for s in systems {
@@ -405,9 +406,11 @@ pub fn build_executor_pod_spec(
         }),
 
         automount_service_account_token: Some(false),
+        // r[impl ctrl.pod.tgps-default]
         termination_grace_period_seconds: Some(p.termination_grace_period_seconds.unwrap_or(7200)),
         node_selector: {
             let mut ns = p.node_selector.clone().unwrap_or_default();
+            // r[impl ctrl.pod.arch-selector]
             // I-098: a pool with systems=[x86_64-linux] landed pods on an
             // arm64 node (fallback NodePool unconstrained) — builder
             // registers as x86_64 from RIO_SYSTEMS, scheduler dispatches
