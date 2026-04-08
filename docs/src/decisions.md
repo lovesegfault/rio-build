@@ -17,6 +17,10 @@ Key design decisions are recorded as Architecture Decision Records (ADRs). Each 
 | [ADR-011](./decisions/011-streaming-builder-model.md) | Streaming builder model (bidirectional BuildExecution RPC) | Accepted |
 | [ADR-012](./decisions/012-privileged-builder-pods.md) | Privileged builder pods (CAP_SYS_ADMIN, custom seccomp) | Accepted |
 | [ADR-013](./decisions/013-incremental-crate-structure.md) | Incremental crate structure (3 crates to 9) | Accepted |
-| [ADR-014](./decisions/014-web-dashboard.md) | Web dashboard (React SPA, gRPC-Web, Phase 5) | Accepted |
-| [ADR-015](./decisions/015-size-class-routing.md) | Size-class routing with adaptive SITA-E cutoffs | Accepted |
+| [ADR-014](./decisions/014-web-dashboard.md) | Web dashboard (Svelte 5 SPA, gRPC-Web) | Accepted |
+| [ADR-015](./decisions/015-size-class-routing.md) | Size-class routing with adaptive SITA-E cutoffs | Superseded by ADR-020 (sizing) |
 | [ADR-018](./decisions/018-ca-resolution.md) | CA derivation resolution (scheduler-side Realisation tracking) | Accepted |
+| [ADR-019](./decisions/019-builder-fetcher-split.md) | Builder/fetcher split (airgapped builders, FetcherPool for FODs) | Accepted |
+| [ADR-020](./decisions/020-per-derivation-capacity-manifest.md) | Per-derivation capacity manifest (manifest sizing mode) | Accepted |
+| [ADR-021](./decisions/021-nixos-node-ami.md) | NixOS worker-node AMI (prebaked kernel + containerd config) | Accepted |
+| [ADR-022](./decisions/022-lazy-store-fs-erofs-vs-riofs.md) | Lazy store filesystem (EROFS vs riofs) | Accepted |

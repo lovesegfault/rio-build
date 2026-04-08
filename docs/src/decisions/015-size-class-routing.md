@@ -1,7 +1,13 @@
 # ADR-015: Size-Class Routing with Adaptive Cutoffs
 
 ## Status
-Accepted
+Superseded in part by [ADR-020](020-per-derivation-capacity-manifest.md) (sizing).
+
+## Status update
+Builder pods are now one-shot (one build per pod), so the "8 builds/pod"
+concurrency consequence below no longer applies; size classes determine
+per-pod resource requests, not multi-build slot counts. Adaptive SITA-E
+cutoff learning and the `BuilderPoolSet` CRD remain as described.
 
 ## Context
 

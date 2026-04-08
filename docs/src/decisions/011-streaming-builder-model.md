@@ -3,6 +3,12 @@
 ## Status
 Accepted
 
+## Status update
+Builder pods are now one-build-per-pod (one-shot Jobs). The bidirectional
+`BuildExecution` stream still carries assignment, prefetch, cancel, logs,
+and completion as described, but each stream's lifetime spans exactly one
+derivation.
+
 ## Context
 Workers execute builds on behalf of the scheduler. The communication model between scheduler and workers determines latency, failure handling, and operational characteristics. Workers may run multiple concurrent builds, and the scheduler must be able to send control signals (cancel, prefetch hints) to active builds.
 

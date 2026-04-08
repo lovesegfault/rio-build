@@ -25,6 +25,8 @@
   - [ADR-018: CA Resolution and dependentRealisations Schema](./decisions/018-ca-resolution.md)
   - [ADR-019: Builder/Fetcher Split](./decisions/019-builder-fetcher-split.md)
   - [ADR-020: Per-Derivation Capacity Manifest](./decisions/020-per-derivation-capacity-manifest.md)
+  - [ADR-021: NixOS Worker-Node AMI](./decisions/021-nixos-node-ami.md)
+  - [ADR-022: Lazy Store Filesystem](./decisions/022-lazy-store-fs-erofs-vs-riofs.md)
 - [Components](./components.md)
   - [rio-gateway](./components/gateway.md)
   - [rio-scheduler](./components/scheduler.md)

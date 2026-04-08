@@ -3,6 +3,11 @@
 ## Status
 Accepted
 
+## Status update
+The implemented dashboard uses **Svelte 5** (runes mode), not React. The
+gRPC-Web transport, separate-Deployment model, and Phase-5 scope below
+are unchanged. See [components/dashboard.md](../components/dashboard.md).
+
 ## Context
 Operators and developers need visibility into the build system: what is building, what failed, how long builds take, cache hit rates, and worker health. CLI tools provide point-in-time queries but lack the interactive exploration and visualization needed for operational dashboards.
 
