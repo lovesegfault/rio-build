@@ -200,8 +200,7 @@ controller:
   # distribution. Empty → single-channel fallback.
   storeBalanceHost: rio-store-headless.rio-store
   storeBalancePort: 9002
-  # Extra env injected after base vars. VM tests use this for autoscaler
-  # tuning (RIO_AUTOSCALER_POLL_SECS=3 etc); coverage mode injects
+  # Extra env injected after base vars. Coverage mode injects
   # LLVM_PROFILE_FILE here.
   extraEnv: []
   # hostNetwork: CoreDNS in k3s VM tests doesn't know NixOS-test VM

@@ -128,7 +128,9 @@ jobs:
           flags: ${{ matrix.name }}
           use_oidc: true
           # Fail the job if Codecov's ingest endpoint rejects the upload.
-          # Without this, all 15 jobs go green even when 14 are dropped.
+          # One flag per `githubActions.matrix.coverage` entry; count
+          # enforced by `codecov-matrix-sync`. Without this, every job
+          # goes green even when N-1 uploads are dropped.
           fail_ci_if_error: true
           # `files:` is exhaustive; don't fall back to repo-wide discovery.
           disable_search: true

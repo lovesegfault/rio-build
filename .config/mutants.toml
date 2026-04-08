@@ -2,9 +2,10 @@
 # surviving mutants are real test gaps. Expand over time as the
 # missed-count baseline is understood.
 #
-# Run via `just mutants` (local, against $PWD) or `nix build .#mutants`
-# (hermetic weekly tier). Exits 2 when any mutant survives — that's
-# expected; we diff missed-count week-over-week.
+# Run via `nix develop -c cargo mutants` (local, against $PWD) or
+# `nix build .#mutants` (hermetic weekly tier). Exits 2 when any
+# mutant survives — that's expected; we diff missed-count week-
+# over-week.
 
 # Files to mutate. Globs relative to workspace root. Each target here
 # has tight unit-test coverage where a surviving mutant is a genuine
@@ -60,31 +61,17 @@ exclude_re = [
   "metrics::",
   "^describe_",
 
-  # wire/mod.rs — `if total > MAX_FRAMED_TOTAL` boundary mutations
-  # NOTE: line:col anchors are drift-brittle — re-verify after any
-  # wire/mod.rs edit above the hardcoded lines. A cargo mutants --list
-  # grep-check tripwire is deferred until drift hits in practice.
-  #
-  # (The former pad-guard exclusions at :87/:158 were removed — the
-  # guards themselves were deleted as perf no-ops, eliminating both
-  # the exclusion AND the drift problem.)
-  #
-  # wire/mod.rs:230 — `if total > MAX_FRAMED_TOTAL` boundary mutations
-  # in the eager `read_framed_stream` (no configurable max, hardcoded
-  # 1 GiB).
-  # reason: testing the 1 GiB boundary requires allocating ≥1 GiB; the
-  # configurable-max `FramedStreamReader` path is boundary-tested
-  # instead (framed_reader_total_exact_at_max). The eager-reader's
-  # total check is defense-in-depth behind the per-frame cap.
-  "wire/mod\\.rs:230:18: replace > with >= in read_framed_stream",
-  "wire/mod\\.rs:230:18: replace > with == in read_framed_stream",
-
-  # wire/mod.rs:229 — `result.len() + frame_len` → `*` in eager reader.
-  # reason: same 1 GiB barrier as :230. The accumulation is only used
-  # for the >MAX_FRAMED_TOTAL check; a wrong arithmetic here only
-  # matters at the 1 GiB scale. FramedStreamReader's identical pattern
-  # at framed.rs:140 is boundary-tested.
-  "wire/mod\\.rs:229:41: replace \\+ with \\* in read_framed_stream",
+  # `if total > MAX_FRAMED_TOTAL` and `result.len() + frame_len`
+  # boundary/arith mutations in the eager `read_framed_stream` (no
+  # configurable max, hardcoded 1 GiB). reason: testing the 1 GiB
+  # boundary requires allocating ≥1 GiB; the configurable-max
+  # `FramedStreamReader` path is boundary-tested instead
+  # (framed_reader_total_exact_at_max). The eager-reader's total check
+  # is defense-in-depth behind the per-frame cap. Matched by function
+  # name (not line:col) so wire/mod.rs edits don't silently un-exclude.
+  "replace > with >= in read_framed_stream",
+  "replace > with == in read_framed_stream",
+  "replace \\+ with \\* in read_framed_stream",
 ]
 
 # Per-mutant timeout: 2× the baseline test time. A mutation that

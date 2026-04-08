@@ -1,13 +1,13 @@
 # Codecov configuration for rio-build.
 #
-# Twenty coverage flags upload per PR (1 unit + 19 vm-*), one per matrix
-# entry in the `coverage` job (.github/workflows/ci.yml). Paths in the
+# One flag per `githubActions.matrix.coverage` entry uploads per PR;
+# count enforced by the `codecov-matrix-sync` flake check. Paths in the
 # lcov files are already repo-relative — nix/coverage.nix strips the
 # sandbox prefix before upload, so no `fixes:` block is needed here.
 
 codecov:
   notify:
-    # Block status/comment until all 20 uploads are ingested. The previous
+    # Block status/comment until all uploads are ingested. The previous
     # approach (wait_for_ci alone, no count) was chosen to avoid a value
     # that goes stale as vm-* fragments grow — but at this many parallel
     # uploads the server-side ingest race is guaranteed: wait_for_ci gates
