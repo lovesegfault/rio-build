@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tonic::transport::Channel;
 use tracing::instrument;
 
+use rio_common::backoff::{Backoff, Jitter};
 use rio_nix::nar;
 use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_nix::store_path::StorePath;
@@ -26,11 +27,31 @@ use rio_proto::types::{
 };
 use rio_proto::validated::ValidatedPathInfo;
 
-/// Maximum number of upload retry attempts.
-const MAX_UPLOAD_RETRIES: u32 = 3;
+/// Maximum number of upload retry attempts. Aligned with the
+/// gateway's PutPath retry (`rio-gateway/src/handler/grpc.rs`): both
+/// hit the same store-side placeholder contention (I-068/I-125b), so
+/// they share curve+budget. 8 attempts × full-jitter ≤~6 s — was 3
+/// attempts × no-jitter, which thundering-herded under deep-256x.
+const MAX_UPLOAD_RETRIES: u32 = 8;
 
-/// Base delay for exponential backoff between retries.
-const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+/// PutPath retry curve. See [`MAX_UPLOAD_RETRIES`] for the
+/// gateway-alignment rationale.
+const UPLOAD_BACKOFF: Backoff = Backoff {
+    base: Duration::from_millis(50),
+    mult: 2.0,
+    cap: Duration::from_secs(2),
+    jitter: Jitter::Full,
+};
+
+/// I-125b poll curve: 1s, 2s, 4s, 8s, 16s ≈ 31s total. No jitter —
+/// only one builder polls per path (the contention is on PutPath, not
+/// the poll).
+const CONCURRENT_PUT_POLL_BACKOFF: Backoff = Backoff {
+    base: Duration::from_secs(1),
+    mult: 2.0,
+    cap: Duration::from_secs(16),
+    jitter: Jitter::None,
+};
 
 /// I-125b: on `Aborted: concurrent PutPath`, poll QueryPathInfo this
 /// many times (1s, 2s, 4s, 8s, 16s ≈ 31s total) before falling back to
@@ -231,7 +252,7 @@ async fn upload_output(
     let mut last_error = None;
     for attempt in 0..MAX_UPLOAD_RETRIES {
         if attempt > 0 {
-            let delay = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+            let delay = UPLOAD_BACKOFF.duration(attempt - 1);
             tracing::warn!(
                 store_path = %store_path,
                 attempt,
@@ -345,8 +366,7 @@ async fn wait_for_concurrent_put(
     store_path: &str,
 ) -> Option<ValidatedPathInfo> {
     for poll in 0..CONCURRENT_PUT_POLL_ATTEMPTS {
-        let delay = RETRY_BASE_DELAY * 2u32.pow(poll);
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(CONCURRENT_PUT_POLL_BACKOFF.duration(poll)).await;
         match rio_proto::client::query_path_info_opt(
             store_client,
             store_path,
@@ -372,7 +392,7 @@ async fn wait_for_concurrent_put(
 /// stays the single source of truth.
 fn approx_poll_total_secs() -> u64 {
     (0..CONCURRENT_PUT_POLL_ATTEMPTS)
-        .map(|p| RETRY_BASE_DELAY.as_secs() * 2u64.pow(p))
+        .map(|p| CONCURRENT_PUT_POLL_BACKOFF.duration(p).as_secs())
         .sum()
 }
 

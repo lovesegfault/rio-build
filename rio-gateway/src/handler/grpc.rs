@@ -56,13 +56,18 @@ pub(super) async fn grpc_is_valid_path(
 /// clear in one round-trip (.drv NARs are KB). GC no longer blocks
 /// PutPath at all (I-192).
 ///
-/// Exponential backoff (base [`PUT_PATH_ABORTED_BASE_MS`], ×2, full
-/// jitter, ceiling [`PUT_PATH_ABORTED_CEIL_MS`]). 8 attempts → ≤~6 s
-/// budget — generous for the remaining (fast-clearing) cases; kept as
-/// a safety margin rather than tightened.
+/// 50 ms base, ×2, full jitter, 2 s cap. 8 attempts → ≤~6 s budget —
+/// generous for the remaining (fast-clearing) cases; kept as a safety
+/// margin rather than tightened. Shared with rio-builder's PutPath
+/// retry (`upload.rs`): both hit the same store-side placeholder
+/// contention, so they use the same curve+budget.
 const PUT_PATH_ABORTED_MAX_ATTEMPTS: u32 = 8;
-const PUT_PATH_ABORTED_BASE_MS: u64 = 50;
-const PUT_PATH_ABORTED_CEIL_MS: u64 = 2000;
+const PUT_PATH_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_millis(50),
+    mult: 2.0,
+    cap: std::time::Duration::from_secs(2),
+    jitter: rio_common::backoff::Jitter::Full,
+};
 
 /// Upload a path to the store via gRPC PutPath (metadata + NAR chunks).
 ///
@@ -82,7 +87,6 @@ pub(super) async fn grpc_put_path(
     info: ValidatedPathInfo,
     nar_data: Vec<u8>,
 ) -> anyhow::Result<bool> {
-    use rand::RngExt;
     let nar: std::sync::Arc<[u8]> = nar_data.into();
     let mut attempt = 0u32;
     loop {
@@ -112,22 +116,21 @@ pub(super) async fn grpc_put_path(
                     );
                     return Err(status.into());
                 }
-                // Exponential backoff with FULL jitter (`0..=cap`): N
-                // clients retrying the SAME path don't re-collide in
-                // lockstep, and the I-068 placeholder case stays fast
-                // (first retry ≤50 ms) while the I-168 mark-busy case
-                // gets a multi-second window. `attempt-1` so attempt=1
-                // uses 2^0 = base.
-                let cap = (PUT_PATH_ABORTED_BASE_MS << (attempt - 1)).min(PUT_PATH_ABORTED_CEIL_MS);
-                let jitter_ms = rand::rng().random_range(0..=cap);
+                // FULL jitter (`U(0, capᵃ]`): N clients retrying the
+                // SAME path don't re-collide in lockstep, and the
+                // I-068 placeholder case stays fast (first retry
+                // ≤50 ms) while the I-168 mark-busy case gets a
+                // multi-second window. `attempt-1` so attempt=1 uses
+                // mult⁰ = base.
+                let delay = PUT_PATH_BACKOFF.duration(attempt - 1);
                 tracing::debug!(
                     store_path = %info.store_path,
                     attempt,
-                    jitter_ms,
+                    backoff = ?delay,
                     msg = %status.message(),
                     "PutPath: store Aborted; retrying with exponential backoff"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                tokio::time::sleep(delay).await;
             }
             Err(status) => return Err(status.into()),
         }

@@ -341,31 +341,26 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     /// Compute the backoff duration for a given retry attempt.
+    ///
+    /// Thin adapter over [`rio_common::backoff::Backoff`]: the serde
+    /// field names (`backoff_base_secs` etc.) are the config-file
+    /// contract, so this struct stays; the curve+NaN/overflow safety
+    /// lives in the shared mechanism.
     pub fn backoff_duration(&self, attempt: u32) -> std::time::Duration {
-        use rand::RngExt;
-
-        let base = self.backoff_base_secs * self.backoff_multiplier.powi(attempt as i32);
-        let clamped = base.min(self.backoff_max_secs);
-
-        // Apply jitter: duration * (1 +/- jitter_fraction * random)
-        let mut rng = rand::rng();
-        let jitter = rng.random_range(-self.jitter_fraction..=self.jitter_fraction);
-        let with_jitter = clamped * (1.0 + jitter);
-        // Clamp to [0, 1yr]. max(0.0) handles NaN (NaN.max(x) = x);
-        // min(1yr) handles infinity (from_secs_f64(inf) PANICS).
-        // A 1-year backoff is far above any sane value — the clamp
-        // exists to prevent a crash from misconfigured backoff_max_
-        // secs=inf (e.g., parsed from TOML that had "inf" literally).
-        //
-        // NOT using .clamp() (clippy suggestion): clamp returns NaN
-        // if input is NaN, which would then panic from_secs_f64.
-        // The .max(0.0) form handles NaN correctly (NaN.max(x) = x
-        // per IEEE 754).
-        const MAX_BACKOFF_SECS: f64 = 365.0 * 86400.0;
-        #[allow(clippy::manual_clamp)]
-        let final_secs = with_jitter.max(0.0).min(MAX_BACKOFF_SECS);
-
-        std::time::Duration::from_secs_f64(final_secs)
+        use rio_common::backoff::{Backoff, Jitter};
+        Backoff {
+            base: std::time::Duration::from_secs_f64(self.backoff_base_secs.max(0.0)),
+            mult: self.backoff_multiplier,
+            cap: std::time::Duration::from_secs_f64(
+                // from_secs_f64 panics on inf/NaN; clamp here so a
+                // TOML `backoff_max_secs = "inf"` degrades to the
+                // shared 1yr ceiling instead of crashing config load.
+                #[allow(clippy::manual_clamp)]
+                self.backoff_max_secs.max(0.0).min(365.0 * 86400.0),
+            ),
+            jitter: Jitter::Proportional(self.jitter_fraction),
+        }
+        .duration(attempt)
     }
 }
 

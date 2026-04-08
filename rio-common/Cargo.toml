@@ -29,6 +29,8 @@ tokio = { workspace = true }
 futures-util = { workspace = true }
 # CancellationToken (graceful shutdown, signal.rs).
 tokio-util = { workspace = true }
+# Backoff jitter (backoff.rs). Not crypto — thread-local SmallRng.
+rand = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

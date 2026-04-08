@@ -4,6 +4,7 @@
 //! [`observability`] init, and gRPC/TLS/JWT plumbing shared across the
 //! workspace.
 
+pub mod backoff;
 pub mod config;
 pub mod grpc;
 pub mod hmac;

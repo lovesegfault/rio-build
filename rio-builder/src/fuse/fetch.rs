@@ -263,20 +263,18 @@ const RETRY_BACKOFF: &[Duration] = &[
     Duration::from_millis(500),
 ];
 
-/// Full-jitter a backoff delay: `delay × U(0.5, 1.5)`.
+/// Jitter a backoff delay: `delay × U(0.5, 1.5)`.
 ///
 /// I-189: under thundering-herd, every builder that hit the same
 /// transient error retries at the same instant — the retry IS the herd.
-/// Multiplying by a per-call random in `[0.5, 1.5)` breaks lockstep
-/// while keeping the expected delay equal to the schedule entry.
-/// Applied at the `tokio::time::sleep` call sites that consume
-/// [`RETRY_BACKOFF`], not baked into the const, so the schedule stays
-/// inspectable and the test-cfg short schedule stays deterministic in
-/// sum.
+/// ±50% spread breaks lockstep while keeping the expected delay equal
+/// to the schedule entry. Applied at the `tokio::time::sleep` call
+/// sites that consume [`RETRY_BACKOFF`], not baked into the const, so
+/// the schedule stays inspectable and the test-cfg short schedule
+/// stays deterministic in sum.
 // r[impl builder.fuse.retry-jitter]
 fn jitter(delay: Duration) -> Duration {
-    use rand::RngExt as _;
-    delay.mul_f64(rand::rng().random_range(0.5..1.5))
+    rio_common::backoff::Jitter::Proportional(0.5).apply(delay)
 }
 
 impl NixStoreFs {

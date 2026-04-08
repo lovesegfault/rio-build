@@ -557,7 +557,7 @@ pub async fn spawn_build_task(
                         && attempt < executor::DAEMON_RETRY_MAX
                         && !build_cancelled.load(std::sync::atomic::Ordering::Acquire) =>
                 {
-                    let delay = executor::DAEMON_RETRY_BASE_DELAY * 2u32.pow(attempt);
+                    let delay = executor::DAEMON_RETRY_BACKOFF.duration(attempt);
                     attempt += 1;
                     tracing::warn!(
                         drv_path = %drv_path,

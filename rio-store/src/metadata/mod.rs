@@ -185,28 +185,20 @@ impl From<sqlx::Error> for MetadataError {
 
 pub type Result<T> = std::result::Result<T, MetadataError>;
 
-/// Cheap pseudo-jitter for PG-retry backoff: uniform `lo..=hi` ms
-/// derived from the low bits of the system clock. Not cryptographic —
-/// just enough to desynchronize two retrying txns so they don't
-/// re-collide in lockstep.
-///
-/// NOT the same as rio-scheduler's configurable-fraction backoff jitter
-/// (`state/executor.rs`) — that's scheduling backoff with different
-/// semantics. This is fixed-range PG-retry jitter; unifying across
-/// crates would add a dep for 4 lines.
-pub(crate) fn jitter_range(lo_ms: u64, hi_ms: u64) -> Duration {
-    debug_assert!(lo_ms <= hi_ms);
-    let span = (hi_ms - lo_ms).max(1);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    Duration::from_millis(lo_ms + (nanos as u64 % span))
-}
+/// PG 40P01-retry backoff: ~50–150 ms (`100ms ± 50%`). One-shot — no
+/// exponential growth (mult=1, single attempt). Just enough to
+/// desynchronize two retrying txns so they don't re-collide in
+/// lockstep.
+const PG_DEADLOCK_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: Duration::from_millis(100),
+    mult: 1.0,
+    cap: Duration::from_millis(100),
+    jitter: rio_common::backoff::Jitter::Proportional(0.5),
+};
 
-/// 50–150ms jitter; see [`jitter_range`].
+/// 50–150ms jitter; see [`PG_DEADLOCK_BACKOFF`].
 pub(crate) fn jitter() -> Duration {
-    jitter_range(50, 150)
+    PG_DEADLOCK_BACKOFF.duration(0)
 }
 
 /// Execute a batch `UPDATE ... WHERE <key> = ANY($1)` with deadlock-safe

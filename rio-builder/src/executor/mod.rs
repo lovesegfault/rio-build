@@ -272,11 +272,16 @@ impl ExecutorError {
 /// indefinitely.
 pub const DAEMON_RETRY_MAX: u32 = 3;
 
-/// Base delay for exponential backoff between daemon retry attempts.
-/// Sequence: 500ms, 1s, 2s. Total worst-case retry overhead ~3.5s
-/// — small vs the scheduler round-trip (re-dispatch + re-fetch
-/// closure + re-generate synth DB).
-pub const DAEMON_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+/// Backoff between daemon retry attempts. Sequence: 500ms, 1s, 2s.
+/// Total worst-case retry overhead ~3.5s — small vs the scheduler
+/// round-trip (re-dispatch + re-fetch closure + re-generate synth
+/// DB). No jitter: only one daemon per pod, no herd to break.
+pub const DAEMON_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: Duration::from_millis(500),
+    mult: 2.0,
+    cap: Duration::from_secs(2),
+    jitter: rio_common::backoff::Jitter::None,
+};
 
 /// Result of executing a single build.
 #[derive(Debug)]

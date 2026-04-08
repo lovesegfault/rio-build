@@ -841,8 +841,8 @@ async fn init_db_pool(
         Err(RetryError::Cancelled) => {
             anyhow::bail!("shutdown during PostgreSQL connect")
         }
-        Err(RetryError::Exhausted { last, tries }) => {
-            anyhow::bail!("PostgreSQL connect failed after {tries} tries: {last}")
+        Err(RetryError::Exhausted { last, attempts }) => {
+            anyhow::bail!("PostgreSQL connect failed after {attempts} tries: {last}")
         }
     };
     info!("connected to PostgreSQL");
