@@ -79,12 +79,13 @@ async fn cleanup(fp: Arc<FetcherPool>, _ctx: &Ctx) -> Result<Action> {
 /// Convert `FetcherPool` → `ExecutorPodParams` with fetcher-specific
 /// hardening defaults.
 ///
-/// `class`: when `Some`, overrides `pool_name` suffix, `resources`,
-/// and injects `RIO_SIZE_CLASS` so the executor reports it in
-/// heartbeat (`r[ctrl.fetcherpool.classes]`). When `None`, single-
-/// pool behavior at `spec.resources` (back-compat). Security
-/// posture (read-only rootfs, seccomp, node placement) is identical
-/// across classes — only resources + size_class env vary.
+/// `class`: overrides `pool_name` suffix, `resources`, and injects
+/// `RIO_SIZE_CLASS` so the executor reports it in heartbeat
+/// (`r[ctrl.fetcherpool.classes]`). `Option` is vestigial — the CRD
+/// CEL-enforces `size(self.classes) > 0` so callers always pass
+/// `Some`; the `None` arms below are unreachable at runtime.
+/// Security posture (read-only rootfs, seccomp, node placement) is
+/// identical across classes — only resources + size_class env vary.
 fn executor_params(
     fp: &FetcherPool,
     class: Option<&FetcherSizeClass>,
@@ -153,12 +154,9 @@ fn executor_params(
         // Fetchers don't advertise features — FODs route by
         // is_fixed_output alone, not by feature set.
         features: vec![],
-        // Per-class resources override; CEL guarantees spec.resources
-        // is None when classes is non-empty, so the `or` is for the
-        // unclassed back-compat path.
-        resources: class
-            .map(|c| c.resources.clone())
-            .or_else(|| fp.spec.resources.clone()),
+        // Per-class resources. CEL enforces classes non-empty, so the
+        // legacy single-size `spec.resources` fallback is gone.
+        resources: class.map(|c| c.resources.clone()),
         fuse_cache_quantity: Quantity(FETCHER_FUSE_CACHE.into()),
         fuse_threads: None,
         // Never privileged — fetchers face the open internet; the
@@ -304,7 +302,7 @@ mod tests {
             pod::job_name(&params.pool_name, ExecutorKind::Fetcher, "abc123"),
             "rio-fetcher-test-small-abc123"
         );
-        // Per-class resources, NOT spec.resources (which is None).
+        // Per-class resources applied.
         assert_eq!(
             params
                 .resources

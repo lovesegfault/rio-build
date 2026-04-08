@@ -63,7 +63,6 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
         common: PoolSpecCommon {
             // --- Per-class (SizeClassSpec) ---
             max_concurrent,
-            resources: Some(class.resources.clone()),
             // --- Shared (PoolTemplate) ---
             image: template.image.clone(),
             systems: template.systems.clone(),
@@ -77,6 +76,8 @@ pub fn build_child_builderpool(wps: &BuilderPoolSet, class: &SizeClassSpec) -> R
             // WPS author controls cutoff_secs which controls the deadline.
             deadline_seconds: None,
         },
+        // --- Per-class (SizeClassSpec) ---
+        resources: Some(class.resources.clone()),
         // `size_class` is what the scheduler matches. Setting it to
         // the class name is the contract — `r[sched.classify.*]`
         // routes by this string.

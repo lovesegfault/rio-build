@@ -106,6 +106,15 @@ pub struct BuilderPoolSpec {
     #[serde(flatten)]
     pub common: PoolSpecCommon,
 
+    /// K8s resource requests/limits for the executor container.
+    /// `Static` sizing applies these directly; `Manifest` sizing uses
+    /// them as the cold-start floor when `GetCapacityManifest` has no
+    /// sample for a derivation. `any_object` passthrough — see
+    /// `crate::any_object` for why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::any_object")]
+    pub resources: Option<k8s_openapi::api::core::v1::ResourceRequirements>,
+
     /// Pod sizing mode (ADR-020). `Static` = operator-set
     /// `spec.resources`. `Manifest` = controller polls
     /// `GetCapacityManifest`, spawns Jobs with per-derivation resources.

@@ -175,7 +175,10 @@ spec:
                 type: boolean
               resources:
                 description: "K8s resource requests/limits for the executor container.\n\
-                  `any_object` passthrough \u2014 see `crate::any_object` for why."
+                  `Static` sizing applies these directly; `Manifest` sizing uses\n\
+                  them as the cold-start floor when `GetCapacityManifest` has no\n\
+                  sample for a derivation. `any_object` passthrough \u2014 see\n`crate::any_object`\
+                  \ for why."
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true

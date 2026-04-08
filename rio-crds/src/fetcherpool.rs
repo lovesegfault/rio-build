@@ -16,17 +16,16 @@ use crate::common::{PoolSpecCommon, PoolStatusCommon, SizeClassCommon, impl_comm
 /// fetcher` and sets stricter `securityContext` (`readOnlyRootFilesystem:
 /// true`, stricter seccomp).
 ///
-/// Optionally size-classed via `classes[]` (I-170): fetchers run
-/// arbitrary code (the FOD's `builder` script) and a large source
-/// unpack+NAR-serialize can OOM a 2Gi pod. Unlike BuilderPoolSet
-/// there is no a-priori signal (no `build_samples` history, no
-/// duration cutoff) — the scheduler routes FODs to the smallest
-/// class by default and reactively promotes on transient failure
+/// Size-classed via `classes[]` (I-170/I-208): fetchers run arbitrary
+/// code (the FOD's `builder` script) and a large source unpack+NAR-
+/// serialize can OOM a 2Gi pod. Unlike BuilderPoolSet there is no
+/// a-priori signal (no `build_samples` history, no duration cutoff) —
+/// the scheduler routes FODs to the smallest class by default and
+/// reactively promotes on transient failure
 /// (`r[sched.fod.size-class-reactive]`).
 ///
 /// `KubeSchema` alongside `CustomResource`: same pattern as
-/// BuilderPoolSpec. No CEL on this struct yet, but KubeSchema
-/// keeps the door open without a re-derive.
+/// BuilderPoolSpec.
 // r[impl ctrl.crd.fetcherpool]
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, KubeSchema)]
 #[kube(
@@ -45,32 +44,23 @@ use crate::common::{PoolSpecCommon, PoolStatusCommon, SizeClassCommon, impl_comm
         "maxConcurrent must be > 0 — it is the concurrent-Job ceiling"
     )
 )]
-// CEL: classes[] and resources are mutually exclusive. When classes is
-// non-empty, per-class resources apply; the top-level field would be
-// ambiguous (which class does it size?). When classes is empty, the
-// single-size pool uses top-level resources.
 #[x_kube(
-    validation = Rule::new(
-        "size(self.classes) == 0 || !has(self.resources)"
-    ).message(
-        "classes[] and resources are mutually exclusive — set per-class resources in classes[].resources, or omit classes[] for a single-size pool"
+    validation = Rule::new("size(self.classes) > 0").message(
+        "classes must be non-empty — fetcher pools are size-classed (I-170/I-208); the legacy single-size spec.resources path has been removed"
     )
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FetcherPoolSpec {
     /// Fields shared with `BuilderPoolSpec` (image, systems,
-    /// max_concurrent, node placement, resources, mTLS, …).
-    /// Flattened — the rendered CRD has these as top-level spec
-    /// properties. `Deref`/`DerefMut` below let call sites keep
-    /// writing `fp.spec.image`.
+    /// max_concurrent, node placement, mTLS, …). Flattened — the
+    /// rendered CRD has these as top-level spec properties.
+    /// `Deref`/`DerefMut` below let call sites keep writing
+    /// `fp.spec.image`.
     ///
     /// Fetcher-side notes on common fields:
     ///   * `deadline_seconds`: default 300 (`FOD_DEADLINE_SECS`) —
     ///     fetches are network-bound and short; a stuck download is
     ///     the failure mode, not a 90min compile.
-    ///   * `resources`: mutually exclusive with `classes[]` (CEL-
-    ///     enforced) — when `classes` is non-empty, per-class
-    ///     resources apply and this field MUST be unset.
     ///   * `node_selector` / `tolerations`: pair with the
     ///     `rio.build/node-role: fetcher` label and
     ///     `rio.build/fetcher=true:NoSchedule` taint on the
@@ -78,11 +68,11 @@ pub struct FetcherPoolSpec {
     #[serde(flatten)]
     pub common: PoolSpecCommon,
 
-    /// Optional size classes (I-170). When empty (default), single
-    /// Job loop at `spec.resources`. When non-empty, the reconciler
-    /// runs one Job loop per class; each registers with
-    /// `size_class = name` so the scheduler can route by
-    /// `DerivationState.size_class_floor`.
+    /// Size classes (I-170/I-208). The reconciler runs one Job loop
+    /// per class; each registers with `size_class = name` so the
+    /// scheduler can route by `DerivationState.size_class_floor`.
+    /// CEL-enforced non-empty — the legacy single-size
+    /// `spec.resources` path has been removed.
     ///
     /// Unlike `BuilderPoolSet.classes[]` there is NO `cutoff_secs` —
     /// fetchers have no a-priori duration estimate (FODs are excluded
@@ -177,28 +167,23 @@ mod tests {
         assert!(!json.contains("\"max_concurrent\":"));
     }
 
-    /// `classes` defaults to empty (back-compat: existing FetcherPool
-    /// YAMLs without the field deserialize as single-size pools).
-    #[test]
-    fn classes_default_empty() {
-        let yaml = r#"
-            maxConcurrent: 8
-            image: rio-fetcher:test
-            systems: [x86_64-linux]
-        "#;
-        let spec: FetcherPoolSpec = serde_yml::from_str(yaml).expect("deserializes");
-        assert!(spec.classes.is_empty(), "absent → empty (back-compat)");
-    }
-
-    /// The `classes`/`resources` mutual-exclusion CEL rule renders.
-    /// Absence means a misformed spec with BOTH set is accepted at
-    /// admission; the reconciler would silently ignore one.
+    /// The `classes` non-empty CEL rule renders. Absence means a
+    /// FetcherPool with `classes: []` is accepted at admission and
+    /// the reconciler runs zero Job loops — silent no-op.
     // r[verify ctrl.crd.fetcherpool]
     #[test]
-    fn classes_resources_cel_renders() {
+    fn classes_nonempty_cel_renders() {
         let crd = FetcherPool::crd();
         let json = serde_json::to_string(&crd).expect("serializes");
-        assert!(json.contains("size(self.classes) == 0 || !has(self.resources)"));
+        assert!(json.contains("size(self.classes) > 0"));
+        // Legacy single-size `spec.resources` path removed — the
+        // field MUST NOT exist at the top of the schema (it was
+        // flattened from PoolSpecCommon before I-208; per-class
+        // `classes[].resources` is the only resources knob now).
+        assert!(
+            !json.contains(r#""resources":{"description":"K8s resource requests/limits for the executor container"#),
+            "top-level spec.resources leaked into FetcherPool schema"
+        );
     }
 
     /// The `maxConcurrent > 0` CEL rule renders.

@@ -52,8 +52,8 @@ pub struct PoolStatusCommon {
 ///
 /// Fetchers run the SAME `rio-builder` binary with a different
 /// `RIO_EXECUTOR_KIND`, so the deployment knobs (image, systems,
-/// node placement, mTLS, resource shape) are identical. Per-role
-/// fields (FUSE tuning, seccomp, `classes[]`) stay on the outer
+/// node placement, mTLS) are identical. Per-role fields (FUSE
+/// tuning, seccomp, `resources`, `classes[]`) stay on the outer
 /// structs.
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -87,12 +87,6 @@ pub struct PoolSpecCommon {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
-
-    /// K8s resource requests/limits for the executor container.
-    /// `any_object` passthrough — see `crate::any_object` for why.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::any_object")]
-    pub resources: Option<ResourceRequirements>,
 
     /// mTLS client cert Secret name (`tls.crt`/`tls.key`/`ca.crt`).
     /// Same cert across builders and fetchers — same binary, same

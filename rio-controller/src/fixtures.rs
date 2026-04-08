@@ -45,7 +45,6 @@ pub fn test_builderpool_spec() -> BuilderPoolSpec {
         common: rio_crds::common::PoolSpecCommon {
             max_concurrent: 10,
             deadline_seconds: None,
-            resources: None,
             systems: vec!["x86_64-linux".into()],
             image: "rio-builder:test".into(),
             node_selector: None,
@@ -77,7 +76,6 @@ pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
         common: rio_crds::common::PoolSpecCommon {
             max_concurrent: 8,
             deadline_seconds: None,
-            resources: None,
             systems: vec!["x86_64-linux".into()],
             image: "rio-fetcher:test".into(),
             node_selector: None,
