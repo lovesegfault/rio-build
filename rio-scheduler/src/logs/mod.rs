@@ -66,19 +66,15 @@ impl LogBuffers {
     }
 
     /// Push a batch. Evicts oldest lines if the buffer exceeds `RING_CAPACITY`.
-    ///
-    /// Returns `true` if this is the first batch for this `drv_path` (i.e., a
-    /// new buffer was created). Callers can use this to know when a derivation
-    /// first started producing output — potentially useful for the periodic
-    /// flush to skip just-started derivations.
-    pub fn push(&self, batch: &BuildLogBatch) -> bool {
+    pub fn push(&self, batch: &BuildLogBatch) {
         // `entry()` locks the shard's write lock for the duration of the
         // closure. For the same-key case (one worker per drv_path), this is
         // uncontended. For cross-key, DashMap's sharding means we rarely
         // block other drv_paths.
-        let entry = self.buffers.entry(batch.derivation_path.clone());
-        let is_new = matches!(&entry, dashmap::Entry::Vacant(_));
-        let mut buf = entry.or_default();
+        let mut buf = self
+            .buffers
+            .entry(batch.derivation_path.clone())
+            .or_default();
 
         let base = batch.first_line_number;
         for (i, line) in batch.lines.iter().enumerate() {
@@ -92,8 +88,6 @@ impl LogBuffers {
         while buf.len() > RING_CAPACITY {
             buf.pop_front();
         }
-
-        is_new
     }
 
     /// Drain all lines for a derivation, removing the buffer entry.
@@ -211,8 +205,7 @@ mod tests {
     #[test]
     fn push_then_read_since_returns_all() {
         let bufs = LogBuffers::new();
-        let is_new = bufs.push(&mk_batch("drv-a", 0, &[b"line0", b"line1", b"line2"]));
-        assert!(is_new, "first push should report new buffer");
+        bufs.push(&mk_batch("drv-a", 0, &[b"line0", b"line1", b"line2"]));
 
         let lines = bufs.read_since("drv-a", 0);
         assert_eq!(lines.len(), 3);
@@ -222,10 +215,10 @@ mod tests {
     }
 
     #[test]
-    fn push_twice_second_is_not_new() {
+    fn push_twice_appends() {
         let bufs = LogBuffers::new();
-        assert!(bufs.push(&mk_batch("drv-a", 0, &[b"l0"])));
-        assert!(!bufs.push(&mk_batch("drv-a", 1, &[b"l1"])), "second push");
+        bufs.push(&mk_batch("drv-a", 0, &[b"l0"]));
+        bufs.push(&mk_batch("drv-a", 1, &[b"l1"]));
         assert_eq!(bufs.read_since("drv-a", 0).len(), 2);
     }
 
