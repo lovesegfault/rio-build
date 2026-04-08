@@ -445,7 +445,10 @@ async fn test_prefetch_idle_timeout_slow_but_progressing_ok() {
     let store_path = format!("/nix/store/{basename}");
     let (nar, hash) = make_nar(&payload);
     store.seed(make_path_info(&store_path, &nar, hash), nar);
-    store.faults.get_path_chunk_delay_ms.store(200, Ordering::SeqCst);
+    store
+        .faults
+        .get_path_chunk_delay_ms
+        .store(200, Ordering::SeqCst);
 
     let idle = Duration::from_millis(500);
     let started = std::time::Instant::now();
@@ -484,7 +487,10 @@ async fn test_prefetch_idle_timeout_stalled_chunk_eio() {
     let (nar, hash) = make_nar(&vec![0xcd; 128 * 1024]);
     store.seed(make_path_info(&store_path, &nar, hash), nar);
     // 800ms gap > 300ms idle bound → first NarChunk after Info trips.
-    store.faults.get_path_chunk_delay_ms.store(800, Ordering::SeqCst);
+    store
+        .faults
+        .get_path_chunk_delay_ms
+        .store(800, Ordering::SeqCst);
 
     let idle = Duration::from_millis(300);
     let started = std::time::Instant::now();
@@ -641,7 +647,10 @@ async fn test_fetch_via_chunks_reassembles_correctly() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fetch_via_chunks_unimplemented_falls_back_to_getpath() {
     let (cache, clients, store, dir, rt, _srv) = setup_fetch_harness().await;
-    store.faults.get_chunk_unimplemented.store(true, Ordering::SeqCst);
+    store
+        .faults
+        .get_chunk_unimplemented
+        .store(true, Ordering::SeqCst);
 
     let basename = test_store_basename("chunk-fallback");
     let store_path = format!("/nix/store/{basename}");
@@ -753,7 +762,10 @@ async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
     let store_path = format!("/nix/store/{basename}");
     let (nar, hash) = make_nar(b"slow-payload");
     store.seed(make_path_info(&store_path, &nar, hash), nar);
-    store.faults.get_path_gate_armed.store(true, Ordering::SeqCst);
+    store
+        .faults
+        .get_path_gate_armed
+        .store(true, Ordering::SeqCst);
 
     // N=5 concurrent ensure_cached. One wins Fetch, four get WaitFor.
     // fuse_threads=N → permits = N-1 = 4 ≥ 1 fetcher, so the semaphore
