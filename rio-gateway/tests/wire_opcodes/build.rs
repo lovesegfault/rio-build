@@ -1314,65 +1314,6 @@ async fn test_build_paths_empty_stream_reconnects_via_header() -> anyhow::Result
     Ok(())
 }
 
-/// Legacy scheduler (no x-rio-build-id header): gateway falls back to
-/// first-event peek. Stream empty → no build_id → Err with diagnostic
-/// STDERR_NEXT, then caller's stderr_err!. This is the PRE-fix behaviour,
-/// preserved under `suppress_build_id_header` for deploy-order safety.
-#[tokio::test]
-async fn test_build_paths_empty_stream_legacy_no_header() -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_outcome(MockSchedulerOutcome {
-        scripted_events: Some(vec![]),
-        suppress_build_id_header: true, // ← legacy scheduler
-        ..Default::default()
-    });
-    let drv_path = seed_minimal_drv(&h);
-
-    wire_send!(&mut h.stream;
-        u64: 9,
-        strings: &[format!("{drv_path}!out")],
-        u64: 0,
-    );
-
-    // Drain: expect STDERR_NEXT diagnostic ("legacy path, no build_id
-    // to reconnect"), THEN STDERR_ERROR (opcode 9 wraps the returned
-    // Err with stderr_err!).
-    let frames = collect_stderr_frames_terminal(&mut h.stream).await;
-
-    // Diagnostic STDERR_NEXT — this is the bare-? fix. Before, the
-    // user saw only the STDERR_ERROR with no context.
-    let saw_diag = frames.iter().any(
-        |m| matches!(m, StderrMessage::Next(s) if s.contains("legacy") || s.contains("before first event")),
-    );
-    assert!(
-        saw_diag,
-        "expected diagnostic STDERR_NEXT on legacy empty-stream. frames: {frames:?}"
-    );
-
-    // STDERR_ERROR follows (caller's stderr_err!).
-    let err = frames
-        .iter()
-        .find_map(|m| match m {
-            StderrMessage::Error(e) => Some(e),
-            _ => None,
-        })
-        .expect("expected STDERR_ERROR on legacy empty-stream path");
-    assert!(
-        err.message.contains("empty") || err.message.contains("legacy"),
-        "error message: {}",
-        err.message
-    );
-
-    // NO reconnect attempt — legacy path has no build_id.
-    let saw_reconnect = frames
-        .iter()
-        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("reconnecting")));
-    assert!(!saw_reconnect, "legacy path cannot reconnect (no build_id)");
-
-    h.finish().await;
-    Ok(())
-}
-
 /// SubmitBuild RPC itself fails (Unavailable — scheduler down before
 /// accept). Gateway emits "SubmitBuild RPC failed" STDERR_NEXT before
 /// the caller's stderr_err!. No header, no build_id, nothing committed

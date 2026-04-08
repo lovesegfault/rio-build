@@ -155,43 +155,6 @@ async fn quota_check<W: AsyncWrite + Unpin>(
     }
 }
 
-/// Legacy-path helper: the first event was consumed by the build_id
-/// peek. Process it. Returns `Some(BuildResult)` if the first event
-/// was terminal (Completed/Failed/Cancelled — caller returns early),
-/// `None` otherwise (caller continues into process_build_events).
-///
-/// Delete when the legacy peek path is removed (after fleet-wide
-/// scheduler upgrade; see phase4a remediation 20).
-// TODO(P0199): delete legacy peek path after fleet-wide scheduler
-// upgrade. P0199 (Rem-20) landed build_id-in-gRPC-initial-metadata;
-// this fallback stays until all schedulers serve the new path.
-fn handle_peeked_first_event(first: &types::BuildEvent) -> Option<BuildResult> {
-    match &first.event {
-        Some(types::build_event::Event::Started(started)) => {
-            debug!(
-                build_id = %first.build_id,
-                total = started.total_derivations,
-                cached = started.cached_derivations,
-                "build started"
-            );
-            None
-        }
-        Some(types::build_event::Event::Completed(_)) => Some(BuildResult::success()),
-        Some(types::build_event::Event::Failed(failed)) => Some(BuildResult::failure(
-            BuildStatus::MiscFailure,
-            failed.error_message.clone(),
-        )),
-        // Cancelled can be the first event on WatchBuild reconnect
-        // after the build was already cancelled — scheduler replays
-        // from build_event_log past since_sequence.
-        Some(types::build_event::Event::Cancelled(cancelled)) => Some(BuildResult::failure(
-            BuildStatus::MiscFailure,
-            format!("build cancelled: {}", cancelled.reason),
-        )),
-        _ => None,
-    }
-}
-
 /// STDERR-activity state that survives `process_build_events`
 /// reconnects. Hoisted to `submit_and_process_build` so a WatchBuild
 /// resume after scheduler failover keeps the activity-ID map intact —
@@ -578,10 +541,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // AFTER MergeDag commits (grpc/mod.rs:~480) — if we have it, the
     // build IS durable and WatchBuild can resume it. Reconnect
     // protection is total: even zero stream events is recoverable.
-    //
-    // Fallback to first-event peek if the header is absent — legacy
-    // scheduler (pre-phase4a). After one deploy cycle this branch is
-    // dead; keep until the fleet is known-upgraded.
     let header_build_id = resp
         .metadata()
         .get(rio_proto::BUILD_ID_HEADER)
@@ -604,53 +563,21 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
     let build_id = match header_build_id {
         Some(id) => {
-            // Header path: no event consumed yet. seq=0 is correct —
+            // No event consumed yet. seq=0 is correct —
             // process_build_events updates on every event received
             // (see get_mut + *seq = event.sequence inside the loop).
+            // r[impl gw.reconnect.since-seq]
             active_build_ids.insert(id.clone(), 0);
             id
         }
         None => {
-            // Legacy path. NOT reconnect-protected — that's the bug
-            // this remediation closes for the header path.
-            tracing::debug!(
-                "scheduler did not set x-rio-build-id header (legacy); peeking first event"
-            );
-            let first = match event_stream.message().await {
-                Ok(Some(ev)) => ev,
-                Ok(None) => {
-                    let _ = stderr
-                        .log("scheduler closed stream before first event (legacy path, no build_id to reconnect)\n")
-                        .await;
-                    return Err(GatewayError::Scheduler(
-                        "empty build event stream (legacy scheduler, no header)".into(),
-                    )
-                    .into());
-                }
-                Err(e) => {
-                    let _ = stderr
-                        .log(&format!("build event stream error on first read: {e}\n"))
-                        .await;
-                    return Err(
-                        GatewayError::Scheduler(format!("build event stream error: {e}")).into(),
-                    );
-                }
-            };
-            let id = first.build_id.clone();
-            // r[impl gw.reconnect.since-seq]
-            // Track the FIRST event's sequence, not hardcoded 0. The
-            // real scheduler starts sequences at 1 (0 is the
-            // WatchBuildRequest-side "from start" sentinel).
-            // Hardcoding 0 meant the very first reconnect after
-            // Started(seq=1) would replay that Started. Header path
-            // inserts 0 above — correct there because the event is
-            // NOT consumed; process_build_events updates on read.
-            active_build_ids.insert(id.clone(), first.sequence);
-            if let Some(result) = handle_peeked_first_event(&first) {
-                active_build_ids.remove(&id);
-                return Ok(result);
-            }
-            id
+            // The scheduler ALWAYS sets this header AFTER MergeDag
+            // commits. Absence is a scheduler bug, not a recoverable
+            // condition — there is no build_id to WatchBuild against.
+            return Err(GatewayError::Scheduler(
+                "scheduler did not set x-rio-build-id header".into(),
+            )
+            .into());
         }
     };
     tracing::Span::current().record("build_id", &build_id);
