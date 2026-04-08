@@ -7,8 +7,8 @@
 #      via describe-secret guard
 #   3. ESO → syncs all of the above into k8s Secrets in rio-system
 #
-# `just eks deploy` reads the IRSA ARNs + Aurora ARN/endpoint from tofu
-# outputs and passes them as helm --set args.
+# xtask reads the IRSA ARNs + Aurora ARN/endpoint from tofu outputs
+# and passes them as helm --set args.
 
 # ────────────────────────────────────────────────────────────────────────
 # External Secrets Operator

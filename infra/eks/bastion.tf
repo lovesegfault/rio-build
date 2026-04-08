@@ -2,7 +2,7 @@
 #
 # The gateway Service has `aws-load-balancer-scheme: internal` —
 # the NLB gets a private DNS name resolvable only inside the VPC.
-# smoke-test.sh (and humans) reach it via:
+# `cargo xtask k8s -p eks smoke` (and humans) reach it via:
 #
 #   aws ssm start-session --target <instance-id> \
 #     --document-name AWS-StartPortForwardingSessionToRemoteHost \

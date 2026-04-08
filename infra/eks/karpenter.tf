@@ -3,7 +3,7 @@
 # controller IAM role + Pod Identity association, SQS interruption
 # queue + EventBridge rules, node IAM role, and EKS access entry.
 # NodePool/EC2NodeClass CRs live in the rio-build chart (gated by
-# karpenter.enabled — `just eks deploy` sets it from tofu outputs).
+# karpenter.enabled — xtask sets it from tofu outputs).
 
 # Creates:
 #   - Controller IAM role + Pod Identity association (v21 of the
@@ -85,8 +85,8 @@ resource "helm_release" "karpenter" {
   skip_crds = true
 
   # Karpenter's post-install webhook validation hook can flake on
-  # first install. NodePool CRs (applied later by `just eks deploy`)
-  # retry on transient webhook unavailability, so we don't block here.
+  # first install. NodePool CRs (applied later by xtask deploy) retry
+  # on transient webhook unavailability, so we don't block here.
   wait = false
 
   values = [

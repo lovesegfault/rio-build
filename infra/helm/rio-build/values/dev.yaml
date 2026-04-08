@@ -9,9 +9,9 @@ global:
     tag: dev
 
 namespace:
-  # `just dev apply` pre-creates rio-system (for rio-s3-creds + SSH
-  # secret) before helm runs. Helm won't adopt a namespace it didn't
-  # create ("invalid ownership metadata").
+  # `cargo xtask k8s -p k3s up` pre-creates rio-system (for rio-s3-creds
+  # + SSH secret) before helm runs. Helm won't adopt a namespace it
+  # didn't create ("invalid ownership metadata").
   create: false
 
 tls:
@@ -43,8 +43,8 @@ store:
     # RGW Service from rook-ceph-cluster. Service name is
     # `rook-ceph-rgw-<objectstore-name>` in the rook-ceph namespace.
     endpoint: http://rook-ceph-rgw-rio.rook-ceph.svc:80
-  # AWS creds from `rio-s3-creds` — `just dev apply` copies them from
-  # Rook's CephObjectStoreUser secret (which lands in rook-ceph ns;
+  # AWS creds from `rio-s3-creds` — xtask copies them from Rook's
+  # CephObjectStoreUser secret (which lands in rook-ceph ns;
   # cross-namespace secretKeyRef doesn't work). Rook generates
   # AccessKey/SecretKey dynamically when the user CR reconciles.
   extraEnv:
@@ -56,7 +56,7 @@ store:
         secretKeyRef: {name: rio-s3-creds, key: SecretKey}
 
 # ──────────────────────────────────────────────────────────────────────────
-# Subchart: PG only. Rook is a separate `just dev apply` step (operator-
+# Subchart: PG only. Rook is a separate xtask step (operator-
 # first-then-cluster lifecycle doesn't fit conditional subchart pattern).
 # ──────────────────────────────────────────────────────────────────────────
 postgresql:

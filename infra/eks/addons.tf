@@ -3,7 +3,7 @@
 # issues the mTLS certs (the chart's cert-manager.yaml template has
 # Certificate CRs when tls.enabled=true), and aws-lbc provisions the
 # gateway NLB (service.beta.kubernetes.io/aws-load-balancer-type:
-# external annotation, set via `just eks deploy` --set-json).
+# external annotation, set via xtask deploy --set-json).
 #
 # helm_release here (not a separate `helm install` step) keeps
 # everything in one `tofu apply`. The tradeoff: terraform now owns

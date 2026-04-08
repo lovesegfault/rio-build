@@ -1,21 +1,22 @@
 # Bootstrap: the S3 bucket that holds terraform state for infra/eks
 # AND for this module itself (self-referential).
 #
-# Chicken-and-egg solved by `just eks bootstrap`: it checks whether
-# the state object already exists in S3. If not (first time), it
-# inits with -backend=false (local state), applies to create the
-# bucket, then migrates local → S3. If yes, normal init + apply.
-# Idempotent from any machine, nothing state-like is committed.
+# Chicken-and-egg solved by `cargo xtask k8s -p eks up --bootstrap`:
+# it checks whether the state object already exists in S3. If not
+# (first time), it inits with -backend=false (local state), applies
+# to create the bucket, then migrates local → S3. If yes, normal
+# init + apply. Idempotent from any machine, nothing state-like is
+# committed.
 #
 # OpenTofu ≥1.6 (and Terraform ≥1.10) support native S3 state
 # locking via the bucket's own object lock — no DynamoDB table
 # needed. We enable versioning + object lock here; both backend
 # blocks (here and in infra/eks/backend.tf) set `use_lockfile = true`.
 #
-# bucket_name and region are REQUIRED vars, always passed by the
-# justfile (computed from sts, or RIO_TFSTATE_* in .env.local).
-# No defaults here — single source of truth in the justfile, so
-# backend config and the created bucket can't drift apart.
+# bucket_name and region are REQUIRED vars, always passed by xtask
+# (computed from sts, or RIO_TFSTATE_* in .env.local). No defaults
+# here — single source of truth in xtask, so backend config and the
+# created bucket can't drift apart.
 
 terraform {
   required_version = ">= 1.6"
@@ -27,17 +28,17 @@ terraform {
   }
 
   # Self-referential: this bucket IS aws_s3_bucket.state below.
-  # bucket + region are passed via -backend-config (justfile
-  # computes rio-tfstate-${account_id} from sts, or reads
-  # RIO_TFSTATE_BUCKET / RIO_TFSTATE_REGION from .env.local).
-  # See header comment for first-time-setup bootstrap dance.
+  # bucket + region are passed via -backend-config (xtask computes
+  # rio-tfstate-${account_id} from sts, or reads RIO_TFSTATE_BUCKET /
+  # RIO_TFSTATE_REGION from .env.local). See header comment for
+  # first-time-setup bootstrap dance.
   backend "s3" {
     key          = "bootstrap/terraform.tfstate"
     use_lockfile = true
   }
 }
 
-# No defaults: justfile always passes these (sts-computed, or
+# No defaults: xtask always passes these (sts-computed, or
 # RIO_TFSTATE_* from .env.local). See header comment.
 variable "region" {
   type = string
@@ -87,6 +88,6 @@ resource "aws_s3_bucket_public_access_block" "state" {
 }
 
 output "bucket" {
-  description = "State bucket name (`just eks init` computes this from account ID, but the output is handy for verification)"
+  description = "State bucket name (xtask computes this from account ID, but the output is handy for verification)"
   value       = aws_s3_bucket.state.bucket
 }

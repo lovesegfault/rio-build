@@ -1,8 +1,8 @@
 # EKS deployment for rio-build
 
-One-shot bring-up: OpenTofu for infra, `push-images.sh` for images,
-`just eks deploy` for the chart, `smoke-test.sh` for verification. Driven
-by the justfile at the repo root — `just --list` for the menu.
+One-shot bring-up via `cargo xtask k8s -p eks up`: OpenTofu for infra,
+nix-built images pushed to ECR, helm chart applied, smoke-test verified.
+`cargo xtask k8s --help` for the full menu.
 
 ## What gets created
 
@@ -36,30 +36,28 @@ direnv allow
 # ONE-TIME per AWS account: S3 state bucket. Idempotent — detects
 # whether state already exists in S3; if not, does the first-time
 # dance (local apply → create bucket → migrate state to S3).
-just eks bootstrap                # ~5s if already set up
+cargo xtask k8s -p eks up --bootstrap   # ~5s if already set up
 
-# Full bring-up: apply (prompts) → kubeconfig → push → deploy
-just eks up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
+# Full bring-up: apply → kubeconfig → push → deploy
+cargo xtask k8s -p eks up               # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
 
 # Or piecewise:
-# just eks apply                  # tofu apply (prompts)
-# just eks kubeconfig             # aws eks update-kubeconfig
-# just eks push                   # nix build + skopeo copy to ECR, zstd layers
-# just eks deploy                 # render + kubectl apply
+# cargo xtask k8s -p eks up --apply     # tofu apply
+# cargo xtask k8s -p eks up --kubeconfig
+# cargo xtask k8s -p eks up --push      # nix build + skopeo copy to ECR, zstd layers
+# cargo xtask k8s -p eks up --deploy    # render + kubectl apply
 
 # Verify
-kubectl get nodes                 # should show 3 system nodes Ready (workers scale from 0 on demand)
-just eks smoke                    # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
+kubectl get nodes                       # should show 3 system nodes Ready (workers scale from 0 on demand)
+cargo xtask k8s -p eks smoke            # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
 ```
-
-`just eks up-auto` skips the tofu apply prompt (`-auto-approve`).
 
 ### State backend configuration
 
 Both `infra/eks/bootstrap` and `infra/eks` store state in the same S3
 bucket (bootstrap is self-referential — it manages the bucket it
 stores its own state in). Bucket name and region are passed via
-`-backend-config` by the justfile, so nothing account-specific is
+`-backend-config` by xtask, so nothing account-specific is
 committed. Defaults:
 
 | Var | Default | Override in `.env.local` |
@@ -67,26 +65,24 @@ committed. Defaults:
 | bucket | `rio-tfstate-${account_id}` (from `aws sts`) | `RIO_TFSTATE_BUCKET` |
 | region | `us-east-2` | `RIO_TFSTATE_REGION` |
 
-Running in a fresh AWS account just works: `just eks bootstrap`
-computes the bucket name, creates it, migrates state into it.
-Everything downstream reads the same computed name.
+Running in a fresh AWS account just works: `cargo xtask k8s -p eks up
+--bootstrap` computes the bucket name, creates it, migrates state into
+it. Everything downstream reads the same computed name.
 
 ## Iterating
 
-The cluster stays up. `just eks deploy` runs `helm upgrade` from the
-working tree — chart changes deploy without commit/push. Code changes
-need a push (image tag is derived from git SHA + dirty-tree hash):
+The cluster stays up. `cargo xtask k8s -p eks up --deploy` runs `helm
+upgrade` from the working tree — chart changes deploy without
+commit/push. Code changes need a push (image tag is derived from git
+SHA + dirty-tree hash):
 
 ```bash
 # Chart-only change (template/values): no push needed
-just eks deploy
+cargo xtask k8s -p eks up --deploy
 
 # Code change: push new image + deploy
-just eks push eks deploy
+cargo xtask k8s -p eks up --push --deploy
 ```
-
-Deploy history: `just eks history`. Rollback: `just eks rollback [REV]`
-(omit REV for previous).
 
 ## Autoscaling
 
@@ -116,7 +112,7 @@ Worker cost scales with build load. rio-controller's 10-min scale-down + Karpent
 ## Teardown
 
 ```bash
-just eks destroy                  # ~15min
+cargo xtask k8s -p eks destroy    # ~15min
 ```
 
 This deletes BuilderPools/FetcherPools first (their finalizers hold pods → NLB
@@ -138,8 +134,9 @@ The helm/kubernetes providers try to contact the cluster during plan.
 Run `tofu apply -target=module.eks` first, then full `tofu apply`.
 
 **Pods stuck ImagePullBackOff:**
-`just eks push` wasn't run (no image at that tag in ECR). Check the
-current release values: `helm get values rio -n rio-system | grep tag`.
+images weren't pushed (no image at that tag in ECR). Re-run `cargo
+xtask k8s -p eks up --push`. Check the current release values:
+`helm get values rio -n rio-system | grep tag`.
 
 **Scheduler/store CrashLoopBackOff with PG connection errors:**
 Check the rio-postgres Secret: `kubectl -n rio-system get secret
@@ -147,7 +144,7 @@ rio-postgres -o jsonpath='{.data.url}' | base64 -d`. If it's
 missing `?sslmode=require`, Aurora (rds.force_ssl=1) rejects the
 connection. Check the rio-postgres ExternalSecret status.
 
-**smoke-test.sh SSM tunnel times out:**
+**smoke-test SSM tunnel times out:**
 Check `aws ssm describe-instance-information --region us-east-2`
 — the bastion should show `PingStatus: Online`. If not, the SSM
 agent isn't connecting (usually NAT gateway routing or instance

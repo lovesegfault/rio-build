@@ -12,8 +12,8 @@ appVersion: "0.1.0"
 # Rook (dev S3) is NOT a subchart: its operator-first-then-cluster
 # lifecycle doesn't fit (operator CRDs must establish before CephCluster
 # CRs apply, and store needs the dynamically-generated ObjectStoreUser
-# access key). `just dev apply` installs rook-ceph + rook-ceph-cluster
-# as separate helm releases before this chart.
+# access key). `cargo xtask k8s -p k3s up` installs rook-ceph +
+# rook-ceph-cluster as separate helm releases before this chart.
 dependencies:
   - name: postgresql
     version: "18.5.6"

@@ -6,10 +6,10 @@ global:
   image:
     # Registry prefix (e.g., "123456.dkr.ecr.us-east-2.amazonaws.com").
     # Empty → bare repo names (dev: airgap-loaded images).
-    # EKS: `just eks deploy` passes --set global.image.registry=<ecr> from tofu output.
+    # EKS: xtask passes --set global.image.registry=<ecr> from tofu output.
     registry: ""
-    # Set via `--set global.image.tag=<sha>` (read from .rio-image-tag by
-    # `just eks deploy`). NEVER committed — private ECR, dev tags include
+    # Set via `--set global.image.tag=<sha>` (xtask reads from
+    # .rio-image-tag). NEVER committed — private ECR, dev tags include
     # -dirty-<hash>. See infra/eks/README.md.
     tag: ""
     pullPolicy: IfNotPresent
@@ -457,7 +457,7 @@ gateway:
 # (Karpenter CRDs don't exist until helm_release.karpenter applies).
 #
 # Requires helm_release.karpenter in terraform to have run (installs CRDs).
-# `just eks deploy` sets enabled=true + clusterName + nodeRoleName from
+# xtask deploy sets enabled=true + clusterName + nodeRoleName from
 # tofu outputs.
 karpenter:
   enabled: false
@@ -534,7 +534,7 @@ karpenter:
           effect: NoSchedule
       requirements:
         # No arch constraint: rio images are multi-arch (x86_64 + aarch64
-        # via OCI manifest list, see infra/eks/push-images.sh). m6g/m7g/
+        # via OCI manifest list, see xtask push). m6g/m7g/
         # r6g/r7g Graviton nodes are now eligible — containerd pulls the
         # arm64 image, pod runs natively. Re-add `kubernetes.io/arch In
         # [amd64]` only if an arch-specific regression surfaces.
@@ -981,7 +981,8 @@ fetcherPoolDefaults:
 # ──────────────────────────────────────────────────────────────────────────
 # Conditional subchart: PG (dev only). From nixhelm (FOD), not vendored.
 # Dev S3 (Rook) is NOT a subchart — operator-first-then-cluster lifecycle
-# doesn't fit; `just dev apply` installs it as separate helm releases.
+# doesn't fit; `cargo xtask k8s -p k3s up` installs it as separate helm
+# releases.
 # ──────────────────────────────────────────────────────────────────────────
 postgresql:
   enabled: false

@@ -1,4 +1,5 @@
-# rook-ceph-cluster values for single-node dev. Used by `just dev apply`.
+# rook-ceph-cluster values for single-node dev. Used by
+# `cargo xtask k8s -p k3s up`.
 #
 # This is Ceph on a single node with a loop-device OSD — heavyweight for
 # dev S3 (~3GB memory floor, multi-minute bootstrap) compared to MinIO,

@@ -1,12 +1,12 @@
-# ECR repositories for the rio images. push-images.sh builds each via
-# nix/docker.nix and skopeo-copies here with a git-SHA tag. `bootstrap`
-# is the helm pre-install hook Job image (awscli + openssl + nix for
-# seeding rio/* secrets in Secrets Manager).
+# ECR repositories for the rio images. `cargo xtask k8s -p eks up
+# --push` builds each via nix/docker.nix and skopeo-copies here with a
+# git-SHA tag. `bootstrap` is the helm pre-install hook Job image
+# (awscli + openssl + nix for seeding rio/* secrets in Secrets Manager).
 
 locals {
-  # Must stay in sync with nix/docker.nix — push-images.sh globs the
-  # linkFarm and pushes everything, so a drift shows up as "repository
-  # does not exist" at push time.
+  # Must stay in sync with nix/docker.nix — xtask globs the linkFarm
+  # and pushes everything, so a drift shows up as "repository does not
+  # exist" at push time.
   rio_images = [
     "gateway", "scheduler", "store", "controller", "builder",
     "fetcher", "bootstrap", "seccomp-bootstrap", "dashboard", "all",

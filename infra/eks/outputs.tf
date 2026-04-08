@@ -14,12 +14,12 @@ output "kubeconfig_command" {
 }
 
 output "store_iam_role_arn" {
-  description = "IAM role ARN for rio-store IRSA (`just eks deploy` passes as helm --set store.serviceAccount.annotations)"
+  description = "IAM role ARN for rio-store IRSA (xtask passes as helm --set store.serviceAccount.annotations)"
   value       = module.rio_store_irsa.arn
 }
 
 output "scheduler_iam_role_arn" {
-  description = "IAM role ARN for rio-scheduler IRSA (`just eks deploy` passes as --set scheduler.serviceAccount.annotations)"
+  description = "IAM role ARN for rio-scheduler IRSA (xtask passes as --set scheduler.serviceAccount.annotations)"
   value       = module.rio_scheduler_irsa.arn
 }
 
@@ -34,12 +34,12 @@ output "oidc_provider_arn" {
 }
 
 output "ecr_registry" {
-  description = "ECR registry hostname (<account>.dkr.ecr.<region>.amazonaws.com). push-images.sh and `just eks deploy` both read this."
+  description = "ECR registry hostname (<account>.dkr.ecr.<region>.amazonaws.com). xtask push and deploy both read this."
   value       = local.ecr_registry
 }
 
 output "chunk_bucket_name" {
-  description = "S3 bucket for NAR chunks (`just eks deploy` passes as --set store.chunkBackend.bucket)"
+  description = "S3 bucket for NAR chunks (xtask passes as --set store.chunkBackend.bucket)"
   value       = aws_s3_bucket.chunks.bucket
 }
 
@@ -54,12 +54,12 @@ output "db_endpoint" {
 }
 
 output "db_secret_arn" {
-  description = "Secrets Manager ARN for the Aurora master password (`just eks deploy` passes to the chart; ESO builds the connection string)"
+  description = "Secrets Manager ARN for the Aurora master password (xtask passes to the chart; ESO builds the connection string)"
   value       = aws_rds_cluster.rio.master_user_secret[0].secret_arn
 }
 
 output "bastion_instance_id" {
-  description = "SSM bastion instance ID (smoke-test.sh uses this for the port-forward session)"
+  description = "SSM bastion instance ID (xtask smoke uses this for the port-forward session)"
   value       = aws_instance.bastion.id
 }
 
@@ -69,6 +69,6 @@ output "vpc_id" {
 }
 
 output "karpenter_node_role_name" {
-  description = "Node IAM role name for Karpenter-provisioned instances (goes into EC2NodeClass.spec.role — `just eks deploy` passes as --set karpenter.nodeRoleName)"
+  description = "Node IAM role name for Karpenter-provisioned instances (goes into EC2NodeClass.spec.role — xtask passes as --set karpenter.nodeRoleName)"
   value       = module.karpenter.node_iam_role_name
 }

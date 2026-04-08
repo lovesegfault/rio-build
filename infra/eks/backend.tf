@@ -1,5 +1,5 @@
 # S3 remote state backend. The bucket must exist BEFORE
-# `tofu init` — create it via `just eks bootstrap` first.
+# `tofu init` — create it via `cargo xtask k8s -p eks up --bootstrap`.
 #
 # use_lockfile = true: native S3 state locking (OpenTofu ≥1.6,
 # Terraform ≥1.10). Uses S3's conditional-write support — no
@@ -13,7 +13,7 @@
 # terraform.tfstate file.
 
 terraform {
-  # bucket + region via -backend-config — `just eks init` computes
+  # bucket + region via -backend-config — xtask computes
   # rio-tfstate-${account_id} from sts (or RIO_TFSTATE_BUCKET /
   # RIO_TFSTATE_REGION from .env.local). Keeps this file free of
   # account-specific literals.
