@@ -259,9 +259,9 @@ fn print_actor_worker(w: &DebugExecutorState) {
             w.systems.join(", ")
         }
     );
-    println!("  running:  {} build(s)", w.running_count);
-    for h in &w.running_builds {
-        println!("    {h}");
+    match w.running_builds.first() {
+        Some(h) => println!("  running:  {h}"),
+        None => println!("  running:  (idle)"),
     }
 }
 

@@ -170,7 +170,7 @@ enum Cmd {
     Status,
     /// Detailed worker list. `Status` shows a one-line summary per
     /// worker; this shows everything `ListExecutors` returns — features,
-    /// size class, running/max slots — for operational drill-down.
+    /// size class, current build — for operational drill-down.
     ///
     /// `--actor` reads the scheduler's IN-MEMORY map instead of PG —
     /// what `dispatch_ready()` sees, not what `last_seen` claims.
@@ -866,12 +866,12 @@ async fn main() -> anyhow::Result<()> {
                     running_builds: resp.running_builds,
                 })?;
             } else if resp.accepted {
-                println!(
-                    "draining {executor_id} ({} build{} {})",
-                    resp.running_builds,
-                    if resp.running_builds == 1 { "" } else { "s" },
-                    if force { "reassigned" } else { "in flight" }
-                );
+                let action = if force { "reassigned" } else { "in flight" };
+                if resp.running_builds > 0 {
+                    println!("draining {executor_id} (build {action})");
+                } else {
+                    println!("draining {executor_id} (idle)");
+                }
             } else {
                 println!("{executor_id}: not found (nothing to drain)");
             }
