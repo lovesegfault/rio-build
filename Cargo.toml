@@ -298,8 +298,6 @@ inquire = { version = "0.9", default-features = false, features = [
 # Timestamp parsing + friendly duration display (rollback picker).
 # Already transitive via kube 3.0; direct for jiff::fmt::friendly.
 jiff = "0.2"
-# Don't hand-roll "1.5 GB" — use this for size display.
-bytesize = "2.3"
 # Parse workspace Cargo.toml (fuzz-lock auto-discovery). Already
 # transitive; direct for toml::from_str.
 toml = "1.1"
