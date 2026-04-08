@@ -591,6 +591,20 @@ pub const M_033: () = ();
 /// rough timing for audit queries.
 pub const M_034: () = ();
 
+/// `migrations/035_drop_dead_rpc_tables.sql`
+///
+/// Drops `chunk_tenants`, `content_index`, and `narinfo.refs_backfilled`
+/// — all three backed RPCs that were never wired into a production
+/// caller (PutChunk/FindMissingChunks, ContentLookup, ResignPaths).
+/// Chunking is server-side only; CA cutoff uses realisations; the
+/// pre-refscan-fix data was greenfield-reset long ago.
+///
+/// `DROP TABLE` cascades the indexes; the standalone `DROP INDEX` for
+/// `narinfo_refs_backfill_pending_idx` is belt-and-suspenders (PG drops
+/// a partial index when its predicate column is dropped, but the
+/// explicit drop documents intent and survives a reorder).
+pub const M_035: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

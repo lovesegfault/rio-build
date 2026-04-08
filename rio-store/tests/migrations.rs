@@ -54,10 +54,10 @@ async fn concurrent_migrations_no_deadlock() {
     .expect("a replica failed to migrate");
     let _ = r;
 
-    // CONCURRENTLY indexes from 011/022 exist AND are valid (CIC
-    // leaves an INVALID shell on failure; IF NOT EXISTS would then
-    // no-op the retry — assert validity, not just presence).
-    for idx in ["narinfo_refs_backfill_pending_idx", "builds_keyset_idx"] {
+    // CONCURRENTLY indexes from 022 exist AND are valid (CIC leaves
+    // an INVALID shell on failure; IF NOT EXISTS would then no-op
+    // the retry — assert validity, not just presence).
+    for idx in ["builds_keyset_idx"] {
         let valid: Option<bool> = sqlx::query_scalar(
             "SELECT i.indisvalid \
              FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
@@ -139,6 +139,7 @@ fn migration_checksums_frozen() {
         (32, "fac4e2a1a72c75c832b66bc0c26dd9a521ee8ed51dadd2f1f6f79f50da755128cb063d18048769f764e56e5283434fa5"),
         (33, "4e370e504aa3c15a25272156f659d2a0f2740934e33eae2cef33c2c7848978b091acc83e3c215480c04a6732681fbcfc"),
         (34, "83e2abe90e43267f4b676dfe7d2fe2d3edb8daa2951eb9016c88128c7f221a5cd71861ba92466ce14c5d3513eee908f7"),
+        (35, "7277e889fdeabd8db54f6f93bb48bd166a95764aece25ae3cfc3e0de9cbd5c1de6d09634ec3cca9216c3a2f60a1e3ecb"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
