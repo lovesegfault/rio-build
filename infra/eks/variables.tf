@@ -56,3 +56,43 @@ variable "system_instance_type" {
 # chunk_bucket var removed — now terraform-managed (s3.tf). Bucket name
 # is derived from cluster_name + random suffix (S3 bucket names are
 # global). Output: chunk_bucket_name.
+
+# ──────────────────────────────────────────────────────────────────────
+# NixOS-node AMI build pins. NOT terraform inputs — consumed by
+# nix/nixos-node/ directly from nix/pins.nix. Declared here only to
+# silence tofu's "Value for undeclared variable" warning ×6 on every
+# plan/apply: generated.auto.tfvars.json is the JSON-serialized pins
+# file and carries every key, terraform-relevant or not, so a key
+# added to pins.nix lands in tfvars automatically (no mapping layer
+# to forget). Unused in *.tf — `tofu validate` is fine with that.
+# ──────────────────────────────────────────────────────────────────────
+
+variable "node_kernel_minor" {
+  description = "NixOS-node kernel minor (consumed by nix/nixos-node/, not terraform)."
+  type        = string
+}
+
+variable "nodeadm_rev" {
+  description = "amazon-eks-ami nodeadm release tag (consumed by nix/nixos-node/, not terraform)."
+  type        = string
+}
+
+variable "nodeadm_src_hash" {
+  description = "nodeadm source hash (consumed by nix/nixos-node/, not terraform)."
+  type        = string
+}
+
+variable "ecr_credential_provider_rev" {
+  description = "cloud-provider-aws ecr-credential-provider tag (consumed by nix/nixos-node/, not terraform)."
+  type        = string
+}
+
+variable "ecr_credential_provider_src_hash" {
+  description = "ecr-credential-provider source hash (consumed by nix/nixos-node/, not terraform)."
+  type        = string
+}
+
+variable "ecr_credential_provider_vendor_hash" {
+  description = "ecr-credential-provider Go vendor hash (consumed by nix/nixos-node/, not terraform)."
+  type        = string
+}
