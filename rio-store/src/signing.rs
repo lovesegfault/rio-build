@@ -541,31 +541,21 @@ mod tests {
         assert_eq!(signer.key_name(), "seed-only");
     }
 
-    #[test]
-    fn parse_rejects_no_colon() {
-        let result = Signer::parse("nocolon");
-        assert!(matches!(result, Err(SignerError::Format(1))));
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
-    #[test]
-    fn parse_rejects_empty_name() {
-        let b64 = base64::engine::general_purpose::STANDARD.encode([0; 32]);
-        let result = Signer::parse(&format!(":{b64}"));
-        assert!(matches!(result, Err(SignerError::EmptyName)));
-    }
-
-    #[test]
-    fn parse_rejects_wrong_key_length() {
-        // 16 bytes — neither 32 nor 64.
-        let b64 = base64::engine::general_purpose::STANDARD.encode([0; 16]);
-        let result = Signer::parse(&format!("name:{b64}"));
-        assert!(matches!(result, Err(SignerError::KeyLength(16))));
-    }
-
-    #[test]
-    fn parse_rejects_bad_base64() {
-        let result = Signer::parse("name:not!valid!base64!");
-        assert!(matches!(result, Err(SignerError::Base64(_))));
+    #[rstest::rstest]
+    #[case::no_colon("nocolon".into(), |e: &SignerError| matches!(e, SignerError::Format(1)))]
+    #[case::empty_name(format!(":{}", b64(&[0; 32])), |e: &SignerError| matches!(e, SignerError::EmptyName))]
+    // 16 bytes — neither 32 nor 64.
+    #[case::wrong_key_length(format!("name:{}", b64(&[0; 16])), |e: &SignerError| matches!(e, SignerError::KeyLength(16)))]
+    #[case::bad_base64("name:not!valid!base64!".into(), |e: &SignerError| matches!(e, SignerError::Base64(_)))]
+    fn parse_rejects(#[case] input: String, #[case] check: fn(&SignerError) -> bool) {
+        let Err(err) = Signer::parse(&input) else {
+            panic!("input {input:?}: expected parse error, got Ok");
+        };
+        assert!(check(&err), "input {input:?}: got {err:?}");
     }
 
     // ------------------------------------------------------------------------
