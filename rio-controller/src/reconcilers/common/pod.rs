@@ -95,17 +95,9 @@ impl ExecutorKindExt for ExecutorKind {
 /// ClusterIP `addr` for single-channel mode plus an optional
 /// headless-Service `balance_host` for health-aware p2c. Same shape
 /// for scheduler and store; the env-var prefix differs at the
-/// injection site below.
-///
-/// Type aliases (rather than two distinct structs) keep the
-/// `SchedulerAddrs` / `StoreAddrs` names at every call site without
-/// duplicating the field set. The struct itself is shared with each
-/// binary's `Config` (figment-deserialized) — see
-/// [`rio_common::config::UpstreamAddrs`].
+/// injection site below. Shared with each binary's `Config`
+/// (figment-deserialized) — see [`rio_common::config::UpstreamAddrs`].
 pub use rio_common::config::UpstreamAddrs;
-
-pub type SchedulerAddrs = UpstreamAddrs;
-pub type StoreAddrs = UpstreamAddrs;
 
 /// Every spec field the pod-spec builder reads. Both reconcilers
 /// construct this from their respective CRD spec and call
@@ -235,8 +227,8 @@ pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
 /// `manifest::build_manifest_job`, and `fetcherpool::build_job`.
 pub fn build_executor_pod_spec(
     p: &ExecutorPodParams,
-    scheduler: &SchedulerAddrs,
-    store: &StoreAddrs,
+    scheduler: &UpstreamAddrs,
+    store: &UpstreamAddrs,
 ) -> PodSpec {
     // cgroup handling: we do NOT hostPath-mount /sys/fs/cgroup.
     // See builderpool/builders.rs pre-extraction commentary for the
@@ -459,8 +451,8 @@ pub fn build_executor_pod_spec(
 /// The executor container.
 fn build_executor_container(
     p: &ExecutorPodParams,
-    scheduler: &SchedulerAddrs,
-    store: &StoreAddrs,
+    scheduler: &UpstreamAddrs,
+    store: &UpstreamAddrs,
 ) -> Container {
     let privileged = p.privileged;
 

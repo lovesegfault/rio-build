@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::common::PoolStatusCommon;
 
-use super::pod::{SchedulerAddrs, StoreAddrs};
+use super::pod::UpstreamAddrs;
 
 /// Field manager for server-side apply on Job-mode pool resources
 /// (BuilderPool/FetcherPool status, owned Jobs). K8s tracks which
@@ -475,8 +475,8 @@ pub(crate) struct JobReconcilePrologue {
     /// that construct one in memory forget this; production reconcile
     /// always has it.
     pub oref: OwnerReference,
-    pub scheduler: SchedulerAddrs,
-    pub store: StoreAddrs,
+    pub scheduler: UpstreamAddrs,
+    pub store: UpstreamAddrs,
 }
 
 /// Extract namespaced identity, Job API handle, ownerRef and

@@ -68,7 +68,7 @@ use crate::reconcilers::{Ctx, KubeErrorExt};
 use rio_crds::builderpool::BuilderPool;
 
 use super::POOL_LABEL;
-use super::builders::{self, SchedulerAddrs, StoreAddrs};
+use super::builders::{self, UpstreamAddrs};
 /// Re-export: `Bucket` lives in `common::job` so `reconcilers::mod`
 /// can see the same alias `pub(crate)`. Re-exported here so
 /// `manifest_tests.rs`'s `use ...::manifest::Bucket` stays intact.
@@ -1057,8 +1057,8 @@ fn bucket_to_resources(bucket: Bucket) -> ResourceRequirements {
 pub(super) fn build_manifest_job(
     wp: &BuilderPool,
     oref: OwnerReference,
-    scheduler: &SchedulerAddrs,
-    store: &StoreAddrs,
+    scheduler: &UpstreamAddrs,
+    store: &UpstreamAddrs,
     bucket: Option<Bucket>,
 ) -> Result<Job> {
     let pool = wp.name_any();

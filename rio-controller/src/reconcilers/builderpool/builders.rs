@@ -14,8 +14,8 @@ use kube::ResourceExt;
 use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
 use rio_crds::builderpool::BuilderPool;
 
-// Re-exports for ephemeral.rs + tests.
-pub use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs};
+// Re-export for static_sizing.rs / manifest.rs + tests.
+pub use crate::reconcilers::common::pod::UpstreamAddrs;
 
 /// FUSE cache emptyDir sizeLimit for builder pods. Kubelet evicts on
 /// overshoot. No CRD knob: pods are one-shot so the cache never
@@ -76,8 +76,8 @@ fn executor_params(wp: &BuilderPool) -> ExecutorPodParams {
 /// ADR-020).
 pub(super) fn build_pod_spec(
     wp: &BuilderPool,
-    scheduler: &SchedulerAddrs,
-    store: &StoreAddrs,
+    scheduler: &UpstreamAddrs,
+    store: &UpstreamAddrs,
     resources_override: Option<ResourceRequirements>,
 ) -> PodSpec {
     let mut params = executor_params(wp);

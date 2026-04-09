@@ -35,7 +35,7 @@ use crate::reconcilers::common::job::{
     job_reconcile_prologue, patch_job_pool_status, random_suffix, reap_excess_pending,
     reap_orphan_running, spawn_count, try_spawn_job,
 };
-use crate::reconcilers::common::pod::{self, ExecutorKind, POOL_LABEL, SchedulerAddrs};
+use crate::reconcilers::common::pod::{self, ExecutorKind, POOL_LABEL, UpstreamAddrs};
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
 use super::executor_params;
@@ -276,8 +276,8 @@ pub(super) fn build_job(
     fp: &FetcherPool,
     class: &FetcherSizeClass,
     oref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
-    scheduler: &SchedulerAddrs,
-    store: &pod::StoreAddrs,
+    scheduler: &UpstreamAddrs,
+    store: &UpstreamAddrs,
 ) -> Result<Job> {
     let params = executor_params(fp, class)?;
     // P0556: pool_name (= `rio.build/pool` label) is `{fp.name}-{class.

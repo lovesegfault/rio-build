@@ -67,10 +67,10 @@ pub struct Ctx {
     /// rio-scheduler addresses. For builder pod env injection ONLY
     /// (reconcilers use `admin` above). `balance_host = None` → env
     /// var NOT injected → builders fall back to single-channel.
-    pub scheduler: common::pod::SchedulerAddrs,
+    pub scheduler: common::pod::UpstreamAddrs,
     /// rio-store addresses. Injected into builder pod containers
     /// (builders connect to the store directly for PutPath/GetPath).
-    pub store: common::pod::StoreAddrs,
+    pub store: common::pod::UpstreamAddrs,
     /// Recorder for K8s Events. Reconcilers call `ctx.publish_
     /// event(obj, ev)` to emit; events show in `kubectl describe`
     /// and `kubectl get events`. Operator visibility for "what

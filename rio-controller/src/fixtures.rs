@@ -26,7 +26,7 @@
 
 pub use rio_test_support::kube_mock::{ApiServerVerifier, Scenario};
 
-use crate::reconcilers::common::pod::{SchedulerAddrs, StoreAddrs};
+use crate::reconcilers::common::pod::UpstreamAddrs;
 use rio_crds::builderpool::{BuilderPool, BuilderPoolSpec, Sizing};
 use rio_crds::fetcherpool::{FetcherPool, FetcherPoolSpec};
 
@@ -117,11 +117,11 @@ pub fn test_builderpool(name: &str) -> BuilderPool {
     wp
 }
 
-/// SchedulerAddrs for builder tests. Dedup of the previous
+/// UpstreamAddrs for builder tests. Dedup of the previous
 /// `test_sched_addrs` / `test_sched` local helpers in
 /// `reconcilers/builderpool/{tests,ephemeral}.rs`.
-pub fn test_sched_addrs() -> SchedulerAddrs {
-    SchedulerAddrs {
+pub fn test_sched_addrs() -> UpstreamAddrs {
+    UpstreamAddrs {
         addr: "sched:9001".into(),
         balance_host: Some("sched-headless".into()),
         balance_port: 9001,
@@ -129,8 +129,8 @@ pub fn test_sched_addrs() -> SchedulerAddrs {
 }
 
 /// Store address fixture mirroring `test_sched_addrs`.
-pub fn test_store_addrs() -> StoreAddrs {
-    StoreAddrs {
+pub fn test_store_addrs() -> UpstreamAddrs {
+    UpstreamAddrs {
         addr: "store:9002".into(),
         balance_host: Some("store-headless".into()),
         balance_port: 9002,

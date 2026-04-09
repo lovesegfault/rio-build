@@ -68,7 +68,7 @@ use crate::reconcilers::common::job::{
 use crate::reconcilers::common::pod::{self, ExecutorKind};
 use rio_crds::builderpool::BuilderPool;
 
-use super::builders::{self, SchedulerAddrs, StoreAddrs};
+use super::builders::{self, UpstreamAddrs};
 
 /// Fallback `activeDeadlineSeconds` when neither `ephemeral_deadline_
 /// seconds` nor `size_class_cutoff_secs` is set (standalone unclassed
@@ -377,8 +377,8 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 pub(super) fn build_job(
     wp: &BuilderPool,
     oref: OwnerReference,
-    scheduler: &SchedulerAddrs,
-    store: &StoreAddrs,
+    scheduler: &UpstreamAddrs,
+    store: &UpstreamAddrs,
 ) -> Result<Job> {
     let pool = wp.name_any();
     let labels = builders::labels(wp);
