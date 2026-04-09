@@ -247,6 +247,22 @@ impl Estimator {
     pub fn bucketed_estimate(entry: &HistoryEntry, headroom_mult: f64) -> Option<BucketedEstimate> {
         let mem_ema = entry.ema_peak_memory_bytes?;
 
+        // Finiteness guard: PG `build_history` columns are DOUBLE
+        // PRECISION; a bad sample (division-by-zero in a future EMA
+        // path, or a manual psql UPDATE) could land NaN/±inf. `as u64`
+        // on NaN→0 / +inf→u64::MAX is well-defined but produces a
+        // garbage bucket (controller spawns a 16EiB pod request). Treat
+        // non-finite mem as "no sample" — caller uses the operator
+        // floor. CPU/duration are clamped below since they have a
+        // useful default.
+        debug_assert!(
+            mem_ema.is_finite() && headroom_mult.is_finite(),
+            "non-finite EMA input: mem={mem_ema} headroom={headroom_mult}"
+        );
+        if !mem_ema.is_finite() {
+            return None;
+        }
+
         // Memory: EMA × headroom, ceil to bucket. f64→u64 via ceil
         // then integer-ceil: (x + b - 1) / b * b. The f64 ceil
         // handles the headroom math (6.2e9 × 1.25 = 7.75e9); the
@@ -259,15 +275,27 @@ impl Estimator {
         // CPU: cores→millicores, same ceiling math. Absent CPU
         // defaults to 1.0 core BEFORE headroom — after ×1.25 that's
         // 1250mcores → buckets to 2000. A single-threaded build is
-        // the conservative guess.
-        let cpu_cores = entry.ema_peak_cpu_cores.unwrap_or(1.0);
+        // the conservative guess. Non-finite → same default.
+        let cpu_cores = entry
+            .ema_peak_cpu_cores
+            .filter(|c| c.is_finite())
+            .unwrap_or(1.0);
         let cpu_raw = (cpu_cores * headroom_mult * 1000.0).ceil() as u32;
         let cpu_millicores = cpu_raw.div_ceil(CPU_BUCKET_MILLICORES).max(1) * CPU_BUCKET_MILLICORES;
+
+        // Duration: informational only — clamp non-finite to 0 (caller
+        // treats 0 as "no hint"). `as u32` on NaN→0 anyway, but +inf
+        // → u32::MAX would mislead controller grace-period heuristics.
+        let duration_secs = if entry.ema_duration_secs.is_finite() {
+            entry.ema_duration_secs as u32
+        } else {
+            0
+        };
 
         Some(BucketedEstimate {
             memory_bytes,
             cpu_millicores,
-            duration_secs: entry.ema_duration_secs as u32,
+            duration_secs,
         })
     }
 
