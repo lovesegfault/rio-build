@@ -32,7 +32,7 @@ use rio_store::MIGRATOR;
 /// to simulate different clients hitting the same server — cheaper
 /// than spawning N servers, one per tenant.
 ///
-/// The real interceptor (`rio_common::jwt_interceptor`) verifies a
+/// The real interceptor (`rio_auth::jwt_interceptor`) verifies a
 /// signed JWT. Handlers only read `extensions().get::<TenantClaims>()`
 /// and don't care how Claims got there — so injecting directly is
 /// equivalent for testing the handler's behavior.
@@ -55,7 +55,7 @@ impl SwitchableTenant {
         let state = Arc::clone(&self.0);
         move |mut req: tonic::Request<()>| {
             if let Some(tid) = *state.read().unwrap() {
-                req.extensions_mut().insert(rio_common::jwt::TenantClaims {
+                req.extensions_mut().insert(rio_auth::jwt::TenantClaims {
                     sub: tid,
                     iat: 1_700_000_000,
                     exp: 9_999_999_999,

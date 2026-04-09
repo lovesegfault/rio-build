@@ -8,7 +8,7 @@
 //! Some — in dev mode (None) the check is bypassed entirely.
 
 use super::*;
-use rio_common::hmac::{AssignmentClaims, HmacSigner};
+use rio_auth::hmac::{AssignmentClaims, HmacSigner};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_KEY: &[u8] = b"test-hmac-key-at-least-32-bytes!!!";

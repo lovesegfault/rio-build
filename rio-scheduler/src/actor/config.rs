@@ -178,7 +178,7 @@ pub struct DagActorPlumbing {
     pub event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
     /// HMAC signer for assignment tokens. `None` = legacy unsigned
     /// format-string (dev mode).
-    pub hmac_signer: Option<Arc<rio_common::hmac::HmacSigner>>,
+    pub hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// Leader-election shared state. The lease task writes
     /// `is_leader`/`generation`; the actor reads both and writes
     /// `recovery_complete`. Non-K8s/test default is

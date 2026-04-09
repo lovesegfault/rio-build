@@ -58,9 +58,8 @@ use ed25519_dalek::VerifyingKey;
 use tonic::{Request, Status};
 
 use crate::jwt::{self, TenantClaims};
-use crate::signal::Token as CancellationToken;
-
-use crate::grpc::TENANT_TOKEN_HEADER;
+use rio_common::grpc::TENANT_TOKEN_HEADER;
+use rio_common::signal::Token as CancellationToken;
 
 /// Shared pubkey handle the interceptor reads on every intercepted call.
 ///
@@ -128,7 +127,7 @@ pub(crate) fn spawn_pubkey_reload(
     key: Arc<RwLock<VerifyingKey>>,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    crate::signal::sighup_reload(shutdown, move || {
+    rio_common::signal::sighup_reload(shutdown, move || {
         let path = path.clone();
         let key = Arc::clone(&key);
         async move {
@@ -170,11 +169,11 @@ pub(crate) fn spawn_pubkey_reload(
 /// **`shutdown` is the PARENT token, not serve_shutdown.** The reload
 /// loop is a background task like lease-loop/tick-loop — stops the
 /// instant SIGTERM fires, not after the drain window. See
-/// [`crate::server::spawn_drain_task`] for the two-token pattern.
+/// `rio_common::server::spawn_drain_task` for the two-token pattern.
 ///
 /// ```ignore
 /// // in scheduler/main.rs AND store/main.rs:
-/// let jwt_pubkey = rio_common::jwt_interceptor::load_and_wire_jwt(
+/// let jwt_pubkey = rio_auth::jwt_interceptor::load_and_wire_jwt(
 ///     cfg.jwt.key_path.as_deref(),
 ///     shutdown.clone(),
 /// )?;
@@ -628,7 +627,7 @@ mod tests {
         // Shared RwLock seeded with key-A (what main.rs does via
         // load_jwt_pubkey at boot).
         let shared = Arc::new(RwLock::new(vk_a));
-        let shutdown = crate::signal::Token::new();
+        let shutdown = rio_common::signal::Token::new();
 
         let handle = spawn_pubkey_reload(
             tmp.path().to_path_buf(),

@@ -198,7 +198,7 @@ pub struct DagActor {
     /// Store with hmac_verifier=None accepts both (dev mode).
     /// Arc because assign_to_worker is hot path and cloning the
     /// underlying key Vec on every dispatch would allocate.
-    hmac_signer: Option<Arc<rio_common::hmac::HmacSigner>>,
+    hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// Shutdown token. When cancelled (SIGTERM via `shutdown_signal`),
     /// the run loop drains `self.executors` and breaks. Dropping the
     /// worker `stream_tx` senders cascades: `build-exec-bridge` tasks

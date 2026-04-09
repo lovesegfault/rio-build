@@ -1147,7 +1147,7 @@ impl DagActor {
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
                 .saturating_add(timeout_secs.saturating_mul(2));
-            signer.sign(&rio_common::hmac::AssignmentClaims {
+            signer.sign(&rio_auth::hmac::AssignmentClaims {
                 executor_id: executor_id.to_string(),
                 drv_hash: drv_hash.to_string(),
                 expected_outputs: state.expected_output_paths.clone(),

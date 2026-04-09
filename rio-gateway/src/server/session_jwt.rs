@@ -9,7 +9,7 @@
 use std::time::SystemTime;
 
 use ed25519_dalek::SigningKey;
-use rio_common::jwt;
+use rio_auth::jwt;
 use tracing::{debug, warn};
 
 /// JWT `exp` = mint time + this. Upper-bounds a single SSH session's
@@ -56,7 +56,7 @@ const JWT_REFRESH_SLACK_SECS: i64 = 300;
 /// key** (INSERTed into `builds.jwt_jti`). It is NOT the rate-limit
 /// partition key — that's `sub` (bounded: one key per tenant). A
 /// `jti`-keyed rate limiter would leak memory proportional to
-/// connection churn. See the `Claims.jti` doc in `rio_common::jwt`.
+/// connection churn. See the `Claims.jti` doc in `rio_auth::jwt`.
 ///
 /// Returns `(token, claims)` so callers that want to log `jti`
 /// without re-parsing the token can read it directly. The token is

@@ -55,7 +55,7 @@ pub(in crate::grpc) enum NarPersist {
 /// (path allowlist) + JWT tenant id (signing-key selection). Both
 /// extracted from request metadata BEFORE `into_inner()` consumes it.
 pub(in crate::grpc) struct PutAuth {
-    pub hmac_claims: Option<rio_common::hmac::AssignmentClaims>,
+    pub hmac_claims: Option<rio_auth::hmac::AssignmentClaims>,
     pub tenant_id: Option<uuid::Uuid>,
 }
 
@@ -75,7 +75,7 @@ pub(in crate::grpc) struct PutAuth {
 // r[impl sec.boundary.grpc-hmac]
 pub(in crate::grpc) fn validate_put_metadata(
     mut raw_info: rio_proto::types::PathInfo,
-    hmac_claims: Option<&rio_common::hmac::AssignmentClaims>,
+    hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
     ctx_label: &str,
 ) -> Result<ValidatedPathInfo, Status> {
     // Step 1: trailer-only enforcement. metadata.nar_hash must be empty;
@@ -233,7 +233,7 @@ impl StoreServiceImpl {
         let hmac_claims = self.verify_assignment_token(request)?;
         let tenant_id = request
             .extensions()
-            .get::<rio_common::jwt::TenantClaims>()
+            .get::<rio_auth::jwt::TenantClaims>()
             .map(|c| c.sub);
         Ok(PutAuth {
             hmac_claims,

@@ -106,6 +106,8 @@ pub enum HmacError {
     InvalidSignature,
     #[error("token expired (expiry={expiry_unix}, now={now_unix})")]
     Expired { expiry_unix: u64, now_unix: u64 },
+    #[error(transparent)]
+    Clock(#[from] crate::ClockBeforeEpoch),
 }
 
 /// Load a key from a file. Returns `Ok(None)` if `path` is `None` —
@@ -233,11 +235,9 @@ impl HmacVerifier {
         // The expiry is ~2× build_timeout (hours); NTP keeps skew
         // under seconds. Non-issue in practice. If clocks are
         // wildly wrong, tokens fail with a clear "Expired" error
-        // — debuggable.
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // — debuggable. Pre-epoch clock → `Clock` error (NOT the
+        // old `unwrap_or(0)`, which silently accepted every token).
+        let now_unix = crate::now_unix()?;
         if now_unix > claims.expiry_unix {
             return Err(HmacError::Expired {
                 expiry_unix: claims.expiry_unix,

@@ -284,7 +284,7 @@ async fn main() -> anyhow::Result<()> {
 
     // HMAC verifier for assignment tokens. Same key file as the
     // scheduler's signer. None → accept all PutPath (dev mode).
-    let hmac_verifier = rio_common::hmac::HmacVerifier::load(cfg.hmac_key_path.as_deref())
+    let hmac_verifier = rio_auth::hmac::HmacVerifier::load(cfg.hmac_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("HMAC key load: {e}"))?;
     if hmac_verifier.is_some() {
         info!("HMAC assignment token verification enabled on PutPath");
@@ -440,7 +440,7 @@ async fn main() -> anyhow::Result<()> {
     // scheduler. See load_and_wire_jwt docstring for None→inert /
     // Some→fail-fast. Parent shutdown token: reload loop stops on
     // SIGTERM instantly, same disposition as orphan-scanner/GC-drain.
-    let jwt_pubkey = rio_common::jwt_interceptor::load_and_wire_jwt(
+    let jwt_pubkey = rio_auth::jwt_interceptor::load_and_wire_jwt(
         cfg.jwt.key_path.as_deref(),
         shutdown.clone(),
     )?;
@@ -469,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
         // wrapping ChunkService/StoreAdminService is harmless — those
         // callers never set x-rio-tenant-token either.
         .layer(tonic::service::InterceptorLayer::new(
-            rio_common::jwt_interceptor::jwt_interceptor(jwt_pubkey),
+            rio_auth::jwt_interceptor::jwt_interceptor(jwt_pubkey),
         ))
         .add_service(health_service)
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))

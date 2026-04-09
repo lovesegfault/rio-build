@@ -180,7 +180,7 @@ async fn test_putpath_sig_covers_references() -> TestResult {
 /// Spawn a store server with a fake interceptor that ALWAYS attaches
 /// `jwt::Claims { sub: tenant_id }` to every request's extensions.
 ///
-/// The real P0259 interceptor (`rio_common::jwt_interceptor`) verifies a
+/// The real P0259 interceptor (`rio_auth::jwt_interceptor`) verifies a
 /// signed JWT from the `x-rio-tenant-token` metadata header. Here we skip
 /// all that and inject Claims directly — the handler reads `request
 /// .extensions().get::<jwt::Claims>()`, it doesn't care HOW Claims got
@@ -195,7 +195,7 @@ async fn spawn_store_with_fake_jwt(
         // Attach Claims exactly as the real interceptor would on
         // successful verify. Only `sub` is read by put_path — iat/exp/jti
         // are for audit/expiry/revocation, all scheduler-side concerns.
-        req.extensions_mut().insert(rio_common::jwt::TenantClaims {
+        req.extensions_mut().insert(rio_auth::jwt::TenantClaims {
             sub: tenant_id,
             iat: 1_700_000_000,
             exp: 9_999_999_999,

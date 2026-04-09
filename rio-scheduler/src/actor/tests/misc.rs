@@ -138,7 +138,7 @@ async fn test_recovery_not_complete_does_not_dispatch() -> TestResult {
 /// "worker can only upload assigned outputs".
 #[tokio::test]
 async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
-    use rio_common::hmac::{HmacSigner, HmacVerifier};
+    use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
     let db = TestDb::new(&MIGRATOR).await;
     let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
@@ -192,7 +192,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
 /// the token's expiry stays bounded (≤ ~14 days from now: 7d × 2).
 #[tokio::test]
 async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
-    use rio_common::hmac::{HmacSigner, HmacVerifier};
+    use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
     let db = TestDb::new(&MIGRATOR).await;
     let test_key = b"test-clamp-key-at-least-32-bytes!!".to_vec();

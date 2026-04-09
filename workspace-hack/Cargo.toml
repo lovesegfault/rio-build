@@ -22,6 +22,7 @@ aws-sdk-s3 = { version = "1", features = ["test-util"] }
 aws-sdk-sts = { version = "1" }
 aws-smithy-http-client = { version = "1", default-features = false, features = ["legacy-rustls-ring", "legacy-test-util", "rustls-aws-lc"] }
 aws-smithy-runtime = { version = "1", default-features = false, features = ["client", "default-https-client", "rt-tokio", "test-util", "tls-rustls"] }
+base16ct = { version = "0.2", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22" }
 base64ct = { version = "1", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
@@ -90,6 +91,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rustls = { version = "0.23", default-features = false, features = ["logging", "prefer-post-quantum", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 scopeguard = { version = "1" }
+sec1 = { version = "0.7", features = ["pem", "std", "subtle"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "preserve_order", "raw_value"] }

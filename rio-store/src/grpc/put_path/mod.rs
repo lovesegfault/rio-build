@@ -134,7 +134,7 @@ impl StoreServiceImpl {
     pub(super) fn verify_assignment_token<T>(
         &self,
         request: &Request<T>,
-    ) -> Result<Option<rio_common::hmac::AssignmentClaims>, Status> {
+    ) -> Result<Option<rio_auth::hmac::AssignmentClaims>, Status> {
         let Some(verifier) = &self.hmac_verifier else {
             // Verifier not configured = dev mode, accept all.
             return Ok(None);

@@ -119,7 +119,7 @@ pub fn shutdown_signal() -> CancellationToken {
 /// [`shutdown_signal`], same rationale (Unix-only binaries, signal
 /// handling is a hard requirement).
 // r[impl common.signal.sighup-reload]
-pub(crate) fn sighup_reload<F, Fut>(
+pub fn sighup_reload<F, Fut>(
     shutdown: CancellationToken,
     mut reload: F,
 ) -> tokio::task::JoinHandle<()>

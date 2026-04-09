@@ -23,6 +23,7 @@ test-utils = ["dep:rio-test-support"]
 
 [dependencies]
 rio-common = { workspace = true, features = ["postgres", "aws"] }
+rio-auth = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 # Optional: only when test-utils feature is on. Also a dev-dep below so

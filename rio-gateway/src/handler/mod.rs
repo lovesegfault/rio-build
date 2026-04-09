@@ -59,7 +59,7 @@ const PROGRAM_NAME: &str = "rio-gateway";
 /// `try_from` on a JWT can't actually fail — jsonwebtoken emits
 /// `base64url.base64url.base64url` (pure ASCII, no control chars, well
 /// under the 8KB MetadataValue limit). The `?` is defensive: if
-/// `rio_common::jwt` ever changes encoding, we'd rather error than
+/// `rio_auth::jwt` ever changes encoding, we'd rather error than
 /// silently drop auth on the floor.
 ///
 /// Explicit per-call, not a tonic `Interceptor` layer — matches the

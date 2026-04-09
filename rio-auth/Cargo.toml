@@ -1,0 +1,52 @@
+[package]
+name = "rio-auth"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Tenant JWT + assignment HMAC token sign/verify and the gRPC interceptor that wires them"
+
+# Extracted from rio-common (Arch#9): the auth stack (~1600 LoC) is the
+# largest cohesive sub-tree in what was a 17-module god crate. Touching
+# rio-common rebuilt every binary; touching auth now rebuilds only the
+# three that verify tokens (gateway, scheduler, store). Depends on
+# rio-common for `signal::Token` / `sighup_reload` and the
+# `TENANT_TOKEN_HEADER` constant — the dep arrow is auth→common, never
+# the reverse.
+
+[dependencies]
+rio-common = { workspace = true }
+
+# JWT tenant tokens (jwt.rs). ed25519 sign/verify via jsonwebtoken's
+# EdDSA; pkcs8 feature on ed25519-dalek gives us to_pkcs8_der() → the
+# DER encoding from_ed_der expects. uuid serde feature for `sub: Uuid`
+# in TenantClaims.
+jsonwebtoken = { workspace = true }
+ed25519-dalek = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+
+# HMAC-SHA256 assignment tokens (hmac.rs). Constant-time verify via
+# Mac::verify_slice.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+# Claims serialize to JSON (self-delimiting, human-debuggable).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+# Interceptor returns tonic::Status; pubkey reload spawns on tokio.
+tonic = { workspace = true }
+tokio = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+# libc::raise for SIGHUP self-delivery in pubkey-reload test.
+libc = "0.2"

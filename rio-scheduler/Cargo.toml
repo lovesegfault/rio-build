@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rio-common = { workspace = true, features = ["postgres", "aws"] }
+rio-auth = { workspace = true }
 rio-proto = { workspace = true }
 
 tokio = { workspace = true }

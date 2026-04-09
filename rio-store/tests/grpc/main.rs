@@ -79,7 +79,7 @@ impl StoreSession {
     /// as rio-gateway. For testing the assignment-token enforcement.
     pub async fn new_with_hmac(key: Vec<u8>) -> anyhow::Result<Self> {
         let db = TestDb::new(&MIGRATOR).await;
-        let verifier = rio_common::hmac::HmacVerifier::from_key(key);
+        let verifier = rio_auth::hmac::HmacVerifier::from_key(key);
         let service = StoreServiceImpl::new(db.pool.clone()).with_hmac_verifier(verifier);
         let (client, server) = spawn_store_server(service).await?;
         Ok(Self { db, client, server })

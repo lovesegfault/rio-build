@@ -468,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
     // (unsigned tokens, dev mode). Bad path / empty file = startup
     // error (operator configured it, failing silently = workers can
     // upload arbitrary paths = security surprise).
-    let hmac_signer = rio_common::hmac::HmacSigner::load(cfg.hmac_key_path.as_deref())
+    let hmac_signer = rio_auth::hmac::HmacSigner::load(cfg.hmac_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("HMAC key load: {e}"))?;
     if hmac_signer.is_some() {
         info!("HMAC assignment token signing enabled");
@@ -699,7 +699,7 @@ async fn main() -> anyhow::Result<()> {
     // Parent shutdown token: reload loop stops on SIGTERM instantly,
     // not after the drain window. See load_and_wire_jwt docstring for
     // the None→inert / Some→fail-fast semantics.
-    let jwt_pubkey = rio_common::jwt_interceptor::load_and_wire_jwt(
+    let jwt_pubkey = rio_auth::jwt_interceptor::load_and_wire_jwt(
         cfg.jwt.key_path.as_deref(),
         shutdown.clone(),
     )?;
@@ -732,7 +732,7 @@ async fn main() -> anyhow::Result<()> {
         // it; only gateway-originated calls get verified. See the
         // module docs in rio-common for the coexistence table.
         .layer(tonic::service::InterceptorLayer::new(
-            rio_common::jwt_interceptor::jwt_interceptor(jwt_pubkey),
+            rio_auth::jwt_interceptor::jwt_interceptor(jwt_pubkey),
         ))
         .add_service(health_service)
         .add_service(

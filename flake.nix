@@ -246,6 +246,7 @@
           workspaceFileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
+            ./rio-auth
             ./rio-bench
             ./rio-cli
             ./rio-common

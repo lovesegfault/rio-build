@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ed25519_dalek::SigningKey;
+use rio_auth::jwt;
 use rio_common::config::JwtConfig;
-use rio_common::jwt;
 use rio_common::signal::Token as CancellationToken;
 use rio_common::tenant::{NameError, NormalizedName};
 use rio_proto::SchedulerServiceClient;

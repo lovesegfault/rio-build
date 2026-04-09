@@ -228,7 +228,7 @@ pub struct StoreServiceImpl {
     /// explicitly allowlisted.
     ///
     /// None = accept all callers (dev mode, same as pre-Phase-3b).
-    hmac_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
+    hmac_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     /// Client-cert identities (CN or SAN DNSName) that bypass the
     /// HMAC check above. Default `["rio-gateway"]`. The bypass check
     /// reads peer_certs()[0], parses CN + SAN DNSNames, returns true
@@ -322,7 +322,7 @@ impl StoreServiceImpl {
 
     /// Enable HMAC verification on PutPath assignment tokens.
     /// Builder-style — chains after `new()` or `with_chunk_cache()`.
-    pub fn with_hmac_verifier(mut self, verifier: rio_common::hmac::HmacVerifier) -> Self {
+    pub fn with_hmac_verifier(mut self, verifier: rio_auth::hmac::HmacVerifier) -> Self {
         self.hmac_verifier = Some(Arc::new(verifier));
         self
     }
@@ -393,7 +393,7 @@ impl StoreServiceImpl {
     fn request_tenant_id<T>(request: &Request<T>) -> Option<uuid::Uuid> {
         request
             .extensions()
-            .get::<rio_common::jwt::TenantClaims>()
+            .get::<rio_auth::jwt::TenantClaims>()
             .map(|c| c.sub)
     }
 

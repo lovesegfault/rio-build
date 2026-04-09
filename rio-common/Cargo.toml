@@ -59,21 +59,12 @@ axum = { workspace = true }
 # line. Previously 5×-duplicated at each main.rs top.
 rustls = { workspace = true }
 
-# HMAC-SHA256 assignment tokens (hmac.rs). Constant-time verify
-# via Mac::verify_slice.
-hmac = { workspace = true }
-sha2 = { workspace = true }
+# PEM body validation (tls.rs validate_pem_sections).
 base64 = { workspace = true }
-# Claims serialize to JSON (self-delimiting, human-debuggable).
+# config.rs / task.rs JSON tests.
 serde_json = { workspace = true }
-
-# JWT tenant tokens (jwt.rs). ed25519 sign/verify via
-# jsonwebtoken's EdDSA; pkcs8 feature on ed25519-dalek gives us
-# to_pkcs8_der()/to_public_key_der() → the DER encoding from_ed_der
-# expects. uuid serde feature for `sub: Uuid` in Claims.
-jsonwebtoken = { workspace = true }
-ed25519-dalek = { workspace = true }
-uuid = { workspace = true, features = ["serde"] }
+# schema.rs `Uuid` columns. Auth-stack `serde` feature moved to rio-auth.
+uuid = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies.proptest]

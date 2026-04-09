@@ -180,7 +180,7 @@ impl StoreServiceImpl {
     async fn drain_batch_stream<'a>(
         &'a self,
         stream: &mut Streaming<PutPathBatchRequest>,
-        hmac_claims: Option<&rio_common::hmac::AssignmentClaims>,
+        hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
     ) -> Result<
         (
             BTreeMap<u32, OutputAccum>,
