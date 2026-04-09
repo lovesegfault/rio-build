@@ -225,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
     // invasive for a value that IS process-wide.
     rio_gateway::translate::init_max_transitive_inputs(cfg.max_transitive_inputs);
 
-    // Retry-until-connected via connect_with_retry (shutdown-aware,
+    // Retry-until-connected via connect_forever (shutdown-aware,
     // exponential backoff). Cold-start race: all rio-* pods start in
     // parallel; this process can reach here before rio-store /
     // rio-scheduler Services have endpoints. Pod stays not-Ready
@@ -243,26 +243,17 @@ async fn main() -> anyhow::Result<()> {
     //   loop. Held in _balance_guard.
     // - Single (non-K8s): plain connect. VM tests and local dev.
     //
-    // `?` on the RetryError: Cancelled → main returns Ok (clean
-    // shutdown, nothing to do). Exhausted unreachable (max_tries=None).
-    let (store_client, scheduler_client, _balance_guard) =
-        match rio_proto::client::connect_with_retry(
-            &shutdown,
-            || async {
-                let (store, _) = rio_proto::client::connect(&cfg.store).await?;
-                let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
-                anyhow::Ok((store, sched, guard))
-            },
-            None,
-        )
+    // `connect_forever` → `None` only on shutdown (clean exit).
+    let Some((store_client, scheduler_client, _balance_guard)) =
+        rio_proto::client::connect_forever(&shutdown, || async {
+            let (store, _) = rio_proto::client::connect(&cfg.store).await?;
+            let (sched, guard) = rio_proto::client::connect(&cfg.scheduler).await?;
+            anyhow::Ok((store, sched, guard))
+        })
         .await
-        {
-            Ok(triple) => triple,
-            Err(rio_proto::client::RetryError::Cancelled) => return Ok(()),
-            Err(e @ rio_proto::client::RetryError::Exhausted { .. }) => {
-                unreachable!("infinite retries cannot exhaust: {e}")
-            }
-        };
+    else {
+        return Ok(());
+    };
 
     // gRPC health server. Dedicated tonic instance — the gateway's main
     // protocol is SSH (russh), no existing tonic server to attach to.

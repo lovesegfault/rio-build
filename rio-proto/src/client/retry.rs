@@ -113,6 +113,31 @@ where
     .await
 }
 
+/// [`connect_with_retry`] with `max_tries = None` (retry forever),
+/// flattened to `Option<T>`: `Some` ⇔ connected, `None` ⇔ shutdown
+/// fired.
+///
+/// With infinite retries, [`RetryError::Exhausted`] is unreachable;
+/// before this helper every infinite-retry caller (gateway, controller,
+/// builder `main()`) open-coded the same `match { Ok, Cancelled,
+/// Exhausted => unreachable!() }` — three copies of an arm that exists
+/// only to satisfy exhaustiveness. Callers now write
+/// `let Some(x) = connect_forever(...) else { return Ok(()) };`.
+pub async fn connect_forever<F, Fut, T, E>(shutdown: &CancellationToken, op: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match connect_with_retry(shutdown, op, None).await {
+        Ok(v) => Some(v),
+        Err(RetryError::Cancelled) => None,
+        Err(RetryError::Exhausted { .. }) => {
+            unreachable!("max_tries=None cannot exhaust")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -427,7 +427,7 @@ fn init_cgroup(
 }
 
 /// Retry-until-connected store + scheduler clients via
-/// [`connect_with_retry`](rio_proto::client::connect_with_retry)
+/// [`connect_forever`](rio_proto::client::connect_forever)
 /// (shutdown-aware, exponential backoff).
 ///
 /// Cold-start race: store/scheduler Services may have no endpoints
@@ -448,21 +448,15 @@ async fn connect_upstreams(
     cfg: &crate::config::Config,
     shutdown: &rio_common::signal::Token,
 ) -> Option<(StoreClients, WorkerClient, BalanceGuards)> {
-    rio_proto::client::connect_with_retry(
-        shutdown,
-        || async {
-            // `connect_raw` returns the bare Channel; StoreClients wraps it
-            // in the typed StoreService client with the standard message-size
-            // headroom.
-            let (ch, store_guard) =
-                rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store)
-                    .await?;
-            let store = StoreClients::from_channel(ch);
-            let (sched, sched_guard) = rio_proto::client::connect(&cfg.scheduler).await?;
-            anyhow::Ok((store, sched, (store_guard, sched_guard)))
-        },
-        None,
-    )
+    rio_proto::client::connect_forever(shutdown, || async {
+        // `connect_raw` returns the bare Channel; StoreClients wraps it
+        // in the typed StoreService client with the standard message-size
+        // headroom.
+        let (ch, store_guard) =
+            rio_proto::client::connect_raw::<rio_proto::StoreServiceClient<_>>(&cfg.store).await?;
+        let store = StoreClients::from_channel(ch);
+        let (sched, sched_guard) = rio_proto::client::connect(&cfg.scheduler).await?;
+        anyhow::Ok((store, sched, (store_guard, sched_guard)))
+    })
     .await
-    .ok()
 }

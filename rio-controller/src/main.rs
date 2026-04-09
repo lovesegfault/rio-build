@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
     info!("kubernetes client connected");
 
     // ---- Scheduler clients (autoscaler + reconcilers) ----
-    // Retry until connected via connect_with_retry (shutdown-aware,
+    // Retry until connected via connect_forever (shutdown-aware,
     // exponential backoff). All rio-* pods start in parallel via
     // helm; this process can reach here before the scheduler Service
     // has endpoints. Pod stays not-Ready (health server below hasn't
@@ -158,18 +158,12 @@ async fn main() -> anyhow::Result<()> {
     // ticks; balanced channel health-probes pod IPs and routes only
     // to the leader. Guard held in _balance_guard (dropping it stops
     // the probe loop). Single-channel mode: dev/test only.
-    let (admin, _balance_guard) = match rio_proto::client::connect_with_retry(
-        &shutdown,
-        || rio_proto::client::connect::<rio_proto::AdminServiceClient<_>>(&cfg.scheduler),
-        None,
-    )
+    let Some((admin, _balance_guard)) = rio_proto::client::connect_forever(&shutdown, || {
+        rio_proto::client::connect::<rio_proto::AdminServiceClient<_>>(&cfg.scheduler)
+    })
     .await
-    {
-        Ok(pair) => pair,
-        Err(rio_proto::client::RetryError::Cancelled) => return Ok(()),
-        Err(e @ rio_proto::client::RetryError::Exhausted { .. }) => {
-            unreachable!("infinite retries cannot exhaust: {e}")
-        }
+    else {
+        return Ok(());
     };
 
     // ---- Health server ----
