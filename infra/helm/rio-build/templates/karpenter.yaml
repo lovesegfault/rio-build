@@ -66,6 +66,19 @@ spec:
     httpEndpoint: enabled
     httpTokens: required
     httpPutResponseHopLimit: 2
+  # NLB target-type=instance + ip-address-type=dualstack creates an
+  # IPv6 target group that requires instances to have a PRIMARY IPv6
+  # (not just secondary). EC2NodeClass has no primary_ipv6 field; EKS
+  # managed-nodegroup LTs ignore NetworkInterfaces. So set it on boot
+  # via IMDS → modify-network-interface-attribute. Node IAM has
+  # ec2:ModifyNetworkInterfaceAttribute (karpenter.tf).
+  userData: |
+    #!/bin/bash
+    TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+    MAC=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac)
+    ENI=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id)
+    REGION=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+    aws ec2 modify-network-interface-attribute --region $REGION --network-interface-id $ENI --enable-primary-ipv6 || true
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs:

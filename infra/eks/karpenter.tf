@@ -34,12 +34,29 @@ module "karpenter" {
   # not node IAM, but ENI mode is IPv4-only so moot here.)
   node_iam_role_additional_policies = {
     AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    PrimaryIpv6                  = aws_iam_policy.karpenter_node_primary_ipv6.arn
   }
 
   # Pod Identity — requires the eks-pod-identity-agent addon (main.tf
   # addons block). Karpenter is the first Pod Identity user in this
   # cluster; everything else stays IRSA.
   create_pod_identity_association = true
+}
+
+# Allow nodes to set primary-IPv6 on their own ENI at boot
+# (EC2NodeClass userData in karpenter.yaml). NLB target-type=instance
+# + dualstack requires it; neither EC2NodeClass nor managed-nodegroup
+# LTs can set it declaratively.
+resource "aws_iam_policy" "karpenter_node_primary_ipv6" {
+  name = "${var.cluster_name}-karpenter-node-primary-ipv6"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ec2:ModifyNetworkInterfaceAttribute"]
+      Resource = "*"
+    }]
+  })
 }
 
 # Separate CRD chart: Helm NEVER upgrades CRDs in a chart's crds/

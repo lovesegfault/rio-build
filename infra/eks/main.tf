@@ -277,14 +277,11 @@ module "eks" {
       # when ip_family=ipv6, but that policy is only created when
       # vpc-cni is in cluster_addons (which it no longer is).
       iam_role_attach_cni_policy = false
-
-      # NLB target-type=instance + dualstack requires instances to
-      # have a PRIMARY IPv6 address (not just secondary). Without
-      # this, target registration fails InvalidTarget. AL2023 default
-      # is secondary-only.
-      network_interfaces = [{
-        primary_ipv6 = true
-      }]
+      # network_interfaces.primary_ipv6 in the LT is a no-op: EKS
+      # managed nodegroups wrap with their own LT and ignore the
+      # user-LT NetworkInterfaces block. Primary-IPv6 is set on
+      # Karpenter nodes via EC2NodeClass userData (karpenter.yaml)
+      # since rio-gateway runs there, not on system nodes.
 
       # No taint: system components (plus kube-system addons like
       # CoreDNS, Karpenter controller) schedule here freely.
