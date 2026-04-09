@@ -1,11 +1,12 @@
 # Crate Structure
 
-## Workspace Layout (14 crates)
+## Workspace Layout (15 crates)
 
 ```
 rio-build/
 ├── Cargo.toml           # Workspace root
 ├── rio-common/          # Shared utilities (no rio-* deps — leaf)
+├── rio-auth/            # JWT/HMAC tokens + tonic auth interceptor (depends on rio-common only)
 ├── rio-nix/             # Nix protocol types and wire format (no rio-* deps — leaf)
 ├── rio-proto/           # Protobuf/gRPC definitions
 ├── rio-crds/            # Kubernetes CRD types (BuilderPool, BuilderPoolSet, FetcherPool, ComponentScaler)
@@ -113,10 +114,8 @@ src/
 ├── lib.rs             # default_addr ([::] dual-stack bind)
 ├── backoff.rs         # Exponential backoff with jitter + shutdown-aware retry loop
 ├── config.rs          # figment-based config layering; CommonConfig, ValidateConfig, JwtConfig
-├── grpc.rs            # gRPC timeouts, message-size constants, x-rio-* metadata keys, h2 window tuning
-├── hmac.rs            # HMAC-SHA256 assignment tokens (AssignmentClaims sign/verify)
-├── jwt.rs             # JWT encode/decode primitives (ed25519)
-├── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
+├── grpc.rs            # gRPC timeouts, message-size constants, x-rio-* metadata keys, h2 window tuning,
+│                      #   retry_status (transient-status retry helper)
 ├── limits.rs          # MAX_NAR_SIZE, MAX_DAG_NODES/EDGES, heartbeat constants
 ├── migrate.rs         # Shared sqlx migration runner (try-then-wait advisory lock)
 ├── observability.rs   # Tracing/OTel init (OtelGuard), init_metrics (global_labels, DEFAULT_BUCKETS,
@@ -139,6 +138,18 @@ r[common.signal.sighup-reload]
 
 r[common.helpers]
 `default_addr` produces `[::]` dual-stack bind addresses (Linux `bindv6only=0`: one socket answers both v4-mapped and native v6). `grpc.rs` is the proto-agnostic tonic helper layer (timeout wrappers, `StatusExt`, `check_bound`, h2 window constants, `x-rio-*` metadata keys); anything naming a generated proto type lives in `rio-proto::client` instead. `ValidateConfig::validate` is the post-load bounds check; `JwtConfig` carries the dual-mode `required`/`key_path` switch. `init_metrics` applies `global_labels` and a global `DEFAULT_BUCKETS` (so unmapped histograms still emit `_bucket` series), then per-metric overrides from the per-crate `HISTOGRAM_BUCKETS` table threaded through `bootstrap`.
+
+### rio-auth — Tenant JWT + assignment HMAC
+
+```
+src/
+├── lib.rs             # ClockBeforeEpoch, now_unix() shared pre-epoch guard
+├── hmac.rs            # HMAC-SHA256 assignment tokens (AssignmentClaims sign/verify)
+├── jwt.rs             # JWT encode/decode primitives (ed25519)
+└── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
+```
+
+Extracted from `rio-common` so a JWT-comment edit no longer rebuilds every binary. Depends on `rio-common` for `signal::Token` / `sighup_reload` and the `TENANT_TOKEN_HEADER` constant; nothing in `rio-common` depends back. Gateway holds the JWT signing key; scheduler/store/controller verify via `JwtLayer`.
 
 ### rio-nix — Nix protocol and data types
 
