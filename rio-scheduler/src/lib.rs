@@ -73,7 +73,7 @@ const CRITICAL_PATH_ACCURACY_BUCKETS: &[f64] = &[0.5, 0.75, 0.9, 1.0, 1.1, 1.25,
 /// `[0.001..5.0]` set put every sample in `+Inf` (I-124). These span
 /// 100ms..10min: low buckets catch the warm-fleet path, the 30s..600s range
 /// gives resolution across cold-node provision.
-const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[
+const DISPATCH_WAIT_BUCKETS: &[f64] = &[
     0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0,
 ];
 
@@ -108,16 +108,7 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_scheduler_critical_path_accuracy",
         CRITICAL_PATH_ACCURACY_BUCKETS,
     ),
-    (
-        "rio_scheduler_assignment_latency_seconds",
-        ASSIGNMENT_LATENCY_BUCKETS,
-    ),
-    (
-        // Same buckets as assignment_latency_seconds — same measurement
-        // (Ready→Assigned), dashboard-facing alias (P0539c).
-        "rio_scheduler_dispatch_wait_seconds",
-        ASSIGNMENT_LATENCY_BUCKETS,
-    ),
+    ("rio_scheduler_dispatch_wait_seconds", DISPATCH_WAIT_BUCKETS),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
     (
         "rio_scheduler_warm_prefetch_paths",
@@ -152,10 +143,6 @@ pub fn describe_metrics() {
         "Per-ActorCommand handling latency (labeled by cmd variant); \
          the actor is single-threaded so a slow command head-of-line \
          blocks every queued RPC"
-    );
-    describe_histogram!(
-        "rio_scheduler_assignment_latency_seconds",
-        "Time from ready to assigned"
     );
     describe_histogram!(
         "rio_scheduler_build_duration_seconds",
@@ -453,9 +440,9 @@ pub fn describe_metrics() {
     );
     describe_histogram!(
         "rio_scheduler_dispatch_wait_seconds",
-        "Time from a derivation entering Ready to being Assigned. Same \
-         measurement as assignment_latency_seconds (both fed from \
-         DerivationState.ready_at); this is the dashboard-facing name."
+        "Time from a derivation entering Ready to being Assigned (fed \
+         from DerivationState.ready_at). With ephemeral builders, \
+         dominated by node-provision (~60–180s on EKS)."
     );
     describe_counter!(
         "rio_scheduler_broadcast_lagged_total",

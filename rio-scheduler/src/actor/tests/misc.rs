@@ -1608,10 +1608,5 @@ async fn test_dispatch_wait_recorded_on_assignment() -> TestResult {
         recorder.histogram_touched("rio_scheduler_dispatch_wait_seconds"),
         "dispatch_wait_seconds not recorded on Ready→Assigned"
     );
-    // Legacy alias still emitted (same ready_at source).
-    assert!(
-        recorder.histogram_touched("rio_scheduler_assignment_latency_seconds"),
-        "assignment_latency_seconds (legacy alias) not recorded"
-    );
     Ok(())
 }

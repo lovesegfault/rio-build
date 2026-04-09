@@ -70,7 +70,8 @@ fn check_freeze(
                 "derivations queued but zero {kind} streams — dispatch stuck. \
                  Worker gRPC bidi-streams may have disconnected. \
                  Run `rio-cli derivations --all-active --stuck` to diagnose. \
-                 Restart workers: `kubectl rollout restart sts -n rio-builders rio-builders`"
+                 Workers are ephemeral Jobs — check controller reconcile: \
+                 `kubectl get builderpool,fetcherpool -A` and `rio-cli executors`"
             );
             // Rate-limit: reset so we WARN once/minute, not once/pass.
             *since = Some(Instant::now());
@@ -855,17 +856,11 @@ impl DagActor {
                     .increment(1);
                 return false;
             }
-            // Record assignment latency (Ready -> Assigned time) after transitioning
+            // Record dispatch wait (Ready -> Assigned time) after transitioning.
+            // Fed from `ready_at` (set on transition→Ready in DerivationState).
             if let Some(ready_at) = state.ready_at.take() {
-                let latency = ready_at.elapsed().as_secs_f64();
-                metrics::histogram!("rio_scheduler_assignment_latency_seconds").record(latency);
-                // P0539c: same measurement, dashboard-facing name. Kept
-                // distinct from `assignment_latency_seconds` (legacy
-                // alias) so part-B Grafana JSON can reference a stable
-                // name without coupling to the older one's eventual
-                // deprecation. Both fed from the same `ready_at`
-                // (set on transition→Ready in DerivationState).
-                metrics::histogram!("rio_scheduler_dispatch_wait_seconds").record(latency);
+                metrics::histogram!("rio_scheduler_dispatch_wait_seconds")
+                    .record(ready_at.elapsed().as_secs_f64());
             }
             // Clear retry-backoff deadline: we're dispatching, the
             // backoff has been honored (dispatch_ready wouldn't

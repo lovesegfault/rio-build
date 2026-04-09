@@ -680,7 +680,7 @@ impl DerivationState {
             expected_output_paths: row.expected_output_paths,
             db_id: Some(row.derivation_id),
             // Instant fields: conservative defaults.
-            // ready_at: Some(now) if Ready → assignment_latency
+            // ready_at: Some(now) if Ready → dispatch_wait_seconds
             // metric skews (looks like instant dispatch) but
             // doesn't break anything.
             ready_at: (status == DerivationStatus::Ready).then_some(now),
