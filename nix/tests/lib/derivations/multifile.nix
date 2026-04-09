@@ -18,37 +18,20 @@
 #            only the entries they'd already touched by name.
 { busybox }:
 let
-  sh = "${busybox}/bin/sh";
-  bb = "${busybox}/bin/busybox";
+  inherit (import ./_busybox.nix { inherit busybox; }) bb mkDrv;
 
-  dep = derivation {
-    name = "rio-multifile-dep";
-    system = builtins.currentSystem;
-    builder = sh;
-    args = [
-      "-c"
-      ''
-        ${bb} mkdir -p $out
-        ${bb} echo a > $out/file-a
-        ${bb} echo b > $out/file-b
-        ${bb} echo c > $out/file-c
-        ${bb} echo d > $out/file-d
-        ${bb} echo e > $out/file-e
-      ''
-    ];
-  };
+  dep = mkDrv "rio-multifile-dep" ''
+    ${bb} mkdir -p $out
+    ${bb} echo a > $out/file-a
+    ${bb} echo b > $out/file-b
+    ${bb} echo c > $out/file-c
+    ${bb} echo d > $out/file-d
+    ${bb} echo e > $out/file-e
+  '' { };
 in
-derivation {
-  name = "rio-multifile-consumer";
-  system = builtins.currentSystem;
-  builder = sh;
-  args = [
-    "-c"
-    ''
-      # ls BEFORE any cat — forces overlayfs to enumerate the FUSE
-      # lower with a cold dcache for ${dep}'s children.
-      count=$(${bb} ls ${dep}/ | ${bb} wc -l)
-      ${bb} echo "$count" > $out
-    ''
-  ];
-}
+mkDrv "rio-multifile-consumer" ''
+  # ls BEFORE any cat — forces overlayfs to enumerate the FUSE
+  # lower with a cold dcache for ${dep}'s children.
+  count=$(${bb} ls ${dep}/ | ${bb} wc -l)
+  ${bb} echo "$count" > $out
+'' { }

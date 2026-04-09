@@ -12,40 +12,31 @@
 # ForwardLogBatch → BuildEvent::Log → gateway STDERR_NEXT → SSH → client.
 { busybox }:
 let
-  sh = "${busybox}/bin/sh";
-  bb = "${busybox}/bin/busybox";
+  inherit (import ./_busybox.nix { inherit busybox; }) bb mkDrv;
 
   mkStep =
     name: dep:
-    derivation {
-      inherit name;
-      system = builtins.currentSystem;
-      builder = sh;
-      args = [
-        "-c"
-        ''
-          set -e
-          # stderr (>&2) is what nix-daemon captures as STDERR_NEXT and
-          # the worker forwards as LogBatch. stdout would be swallowed.
-          ${bb} echo "PHASE2B-LOG-MARKER: building ${name}" >&2
-          ${bb} mkdir -p $out
-          ${
-            if dep == null then
-              ''${bb} echo "root" > $out/chain''
-            else
-              ''
-                ${bb} cat ${dep}/chain > $out/chain
-                ${bb} echo "${name}" >> $out/chain
-                # Exercise FUSE readdir: builds otherwise access deps by
-                # known path only (cat ${dep}/chain). Listing the dep dir
-                # goes overlayfs-lower → FUSE readdir() — without this,
-                # ops.rs:readdir stays uncov (~70 lines).
-                ${bb} ls -la ${dep}/ >&2
-              ''
-          }
-        ''
-      ];
-    };
+    mkDrv name ''
+      set -e
+      # stderr (>&2) is what nix-daemon captures as STDERR_NEXT and
+      # the worker forwards as LogBatch. stdout would be swallowed.
+      ${bb} echo "PHASE2B-LOG-MARKER: building ${name}" >&2
+      ${bb} mkdir -p $out
+      ${
+        if dep == null then
+          ''${bb} echo "root" > $out/chain''
+        else
+          ''
+            ${bb} cat ${dep}/chain > $out/chain
+            ${bb} echo "${name}" >> $out/chain
+            # Exercise FUSE readdir: builds otherwise access deps by
+            # known path only (cat ${dep}/chain). Listing the dep dir
+            # goes overlayfs-lower → FUSE readdir() — without this,
+            # ops.rs:readdir stays uncov (~70 lines).
+            ${bb} ls -la ${dep}/ >&2
+          ''
+      }
+    '' { };
 
   a = mkStep "rio-chain-a" null;
   b = mkStep "rio-chain-b" a;

@@ -12,50 +12,56 @@
 #    scenario needs a different marker/sleep. These produce a store path
 #    that `nix-build` in the VM can read.
 { pkgs }:
+let
+  # Directory copy (not per-file) so `import ./_busybox.nix` inside
+  # each target resolves to the sibling in the same store path. A bare
+  # `./derivations/fanout.nix` path literal would copy ONLY that file.
+  dir = "${./derivations}";
+in
 rec {
   # ── Path literals (in-VM nix-build targets) ─────────────────────────
 
   # 4 parallel leaves + 1 collector. Exercises fanout distribution and
   # FUSE fetch across workers. Phase2a pattern: `nix-build fanout.nix` →
   # rio-root output contains 4 "rio-leaf-N" lines in its stamp file.
-  fanout = ./derivations/fanout.nix;
+  fanout = "${dir}/fanout.nix";
 
   # A → B → C sequential chain. Each step echoes PHASE2B-LOG-MARKER to
   # stderr → validates the worker LogBatcher → gateway STDERR_NEXT chain.
   # Also does `ls -la ${dep}/` to exercise FUSE readdir.
-  chain = ./derivations/chain.nix;
+  chain = "${dir}/chain.nix";
 
   # A → B → C floating-CA chain (`__contentAddressed = true`). Every
   # step writes marker-independent content to `$out/chain`, so a
   # rebuild of A with a different `marker` arg produces an identical
   # nar_hash → cutoff-compare matches → B+C Skipped on the second
   # submit. Drives vm-ca-cutoff-standalone.
-  caChain = ./derivations/ca-chain.nix;
+  caChain = "${dir}/ca-chain.nix";
 
   # Multi-attr set: `all` (chain+solo for critical-path), `bigthing`
   # (pname in env for estimator lookup), `bigblob` (300KiB → chunked).
-  sizeclass = ./derivations/sizeclass.nix;
+  sizeclass = "${dir}/sizeclass.nix";
 
   # Overlay-readdir correctness probe: 5-file dep + consumer that ls's
   # it FIRST (no prior lookup of child names). Asserts count=5.
   # If <5: overlayfs serves readdir from stale dcache (correctness bug).
-  multifile = ./derivations/multifile.nix;
+  multifile = "${dir}/multifile.nix";
 
   # builtin:fetchurl busybox FOD + raw consumer. Cold-store only.
   # Takes `{ tag, sleepSecs }` at nix-build time via `--arg`.
-  coldBootstrap = ./derivations/cold-bootstrap.nix;
+  coldBootstrap = "${dir}/cold-bootstrap.nix";
 
   # builtin:fetchurl FOD + raw consumer for the fetcher-split scenario.
   # Same shape as coldBootstrap; url defaults to the scenario's
   # TEST-NET-3 origin (203.0.113.1:80 — passes fetcher-egress, fails
   # builder-egress). One nix-build exercises both dispatch roles.
-  fodConsumer = ./derivations/fod-consumer.nix;
+  fodConsumer = "${dir}/fod-consumer.nix";
 
   # 50 parallel leaves + 1 collector. Load-test fanout for
   # scheduling.nix:load-50drv. Fanout not linear chain: 50 serial
   # builds at tick=2s ≈ 150-200s; fanout is ~40-60s and exercises
   # bulk-ready dispatch (the actual load concern).
-  fiftyFanout = ./derivations/fifty-fanout.nix;
+  fiftyFanout = "${dir}/fifty-fanout.nix";
 
   # Host-side pre-fetch of the busybox for airgapped VM workers. Served
   # via Python http.server on the client VM (see coldBootstrapServer

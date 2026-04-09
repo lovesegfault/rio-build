@@ -32,61 +32,55 @@
   iaFinal ? false,
 }:
 let
-  sh = "${busybox}/bin/sh";
-  bb = "${busybox}/bin/busybox";
+  inherit (import ./_busybox.nix { inherit busybox; }) bb mkDrv;
 
   mkStep =
     name: dep: ca:
-    derivation (
-      {
-        inherit name;
-        system = builtins.currentSystem;
-        builder = sh;
+    mkDrv name
+      ''
+        set -e
+        ${bb} echo "CA-CHAIN building ${name} marker=${marker}" >&2
+        ${bb} sleep ${toString sleepSecs}
+        ${bb} mkdir -p $out
+        ${
+          if dep == null then
+            # Root: content is "root" regardless of marker. Second
+            # build of A with a different marker produces the SAME
+            # output bytes → same nar_hash → cutoff-compare matches.
+            ''${bb} echo "root" > $out/chain''
+          else
+            # Downstream: `${dep}` is a placeholder
+            # (`/1rlll<hash>-...`) in the ATerm that the scheduler
+            # rewrites to the realized store path before dispatch.
+            # After rewrite, cat reads the prior step's actual
+            # output. Content is the concatenated chain; also
+            # marker-independent.
+            ''
+              ${bb} cat ${dep}/chain > $out/chain
+              ${bb} echo "${name}" >> $out/chain
+            ''
+        }
+      ''
+      (
         # The marker env var goes into the ATerm (drvs differ), but
         # NOT into $out/chain (contents identical across markers →
         # nar_hash identical → cutoff fires on rebuild).
-        CA_CHAIN_MARKER = marker;
-        args = [
-          "-c"
-          ''
-            set -e
-            ${bb} echo "CA-CHAIN building ${name} marker=${marker}" >&2
-            ${bb} sleep ${toString sleepSecs}
-            ${bb} mkdir -p $out
-            ${
-              if dep == null then
-                # Root: content is "root" regardless of marker. Second
-                # build of A with a different marker produces the SAME
-                # output bytes → same nar_hash → cutoff-compare matches.
-                ''${bb} echo "root" > $out/chain''
-              else
-                # Downstream: `${dep}` is a placeholder
-                # (`/1rlll<hash>-...`) in the ATerm that the scheduler
-                # rewrites to the realized store path before dispatch.
-                # After rewrite, cat reads the prior step's actual
-                # output. Content is the concatenated chain; also
-                # marker-independent.
-                ''
-                  ${bb} cat ${dep}/chain > $out/chain
-                  ${bb} echo "${name}" >> $out/chain
-                ''
+        {
+          CA_CHAIN_MARKER = marker;
+        }
+        // (
+          if ca then
+            {
+              # Floating-CA: output path computed post-build from the NAR
+              # hash. Three attrs required; any one missing → IA fallback.
+              __contentAddressed = true;
+              outputHashMode = "recursive";
+              outputHashAlgo = "sha256";
             }
-          ''
-        ];
-      }
-      // (
-        if ca then
-          {
-            # Floating-CA: output path computed post-build from the NAR
-            # hash. Three attrs required; any one missing → IA fallback.
-            __contentAddressed = true;
-            outputHashMode = "recursive";
-            outputHashAlgo = "sha256";
-          }
-        else
-          { }
-      )
-    );
+          else
+            { }
+        )
+      );
 
   a = mkStep "rio-ca-a" null true;
   b = mkStep "rio-ca-b" a true;

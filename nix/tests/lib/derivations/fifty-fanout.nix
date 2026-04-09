@@ -15,25 +15,16 @@
 # bulk-ready handling (the actual load concern) in ~40-60s.
 { busybox }:
 let
-  sh = "${busybox}/bin/sh";
-  bb = "${busybox}/bin/busybox";
+  inherit (import ./_busybox.nix { inherit busybox; }) bb mkDrv;
 
   mkStep =
     name: deps:
-    derivation {
-      inherit name;
-      system = builtins.currentSystem;
-      builder = sh;
-      args = [
-        "-c"
-        ''
-          set -e
-          ${bb} mkdir -p $out
-          ${bb} echo "${name}" > $out/stamp
-          ${builtins.concatStringsSep "\n" (map (d: "${bb} cat ${d}/stamp >> $out/stamp") deps)}
-        ''
-      ];
-    };
+    mkDrv name ''
+      set -e
+      ${bb} mkdir -p $out
+      ${bb} echo "${name}" > $out/stamp
+      ${builtins.concatStringsSep "\n" (map (d: "${bb} cat ${d}/stamp >> $out/stamp") deps)}
+    '' { };
 
   # 50 parallel leaves — genList gives rio-load-0..rio-load-49. Each
   # unique by name → unique drv hash → no DAG dedup. No deps → all

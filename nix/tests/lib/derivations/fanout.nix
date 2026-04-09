@@ -10,26 +10,17 @@
 # build inputs.
 { busybox }:
 let
-  sh = "${busybox}/bin/sh";
-  bb = "${busybox}/bin/busybox";
+  inherit (import ./_busybox.nix { inherit busybox; }) bb mkDrv;
 
   mkStep =
     name: deps:
-    derivation {
-      inherit name;
-      system = builtins.currentSystem;
-      builder = sh;
-      args = [
-        "-c"
-        ''
-          set -ex
-          ${bb} mkdir -p $out
-          ${bb} echo "${name}" > $out/stamp
-          ${builtins.concatStringsSep "\n" (map (d: "${bb} cat ${d}/stamp >> $out/stamp") deps)}
-          ${bb} echo "built on $(${bb} hostname || ${bb} echo unknown)" >> $out/stamp
-        ''
-      ];
-    };
+    mkDrv name ''
+      set -ex
+      ${bb} mkdir -p $out
+      ${bb} echo "${name}" > $out/stamp
+      ${builtins.concatStringsSep "\n" (map (d: "${bb} cat ${d}/stamp >> $out/stamp") deps)}
+      ${bb} echo "built on $(${bb} hostname || ${bb} echo unknown)" >> $out/stamp
+    '' { };
 
   # 4 parallel leaves — no deps, all ready simultaneously.
   leaf1 = mkStep "rio-leaf-1" [ ];
