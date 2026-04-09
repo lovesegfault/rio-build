@@ -528,7 +528,7 @@ impl DagActor {
         // functions after this point use the newtype.
         let drv_hash: DrvHash = if self.dag.contains(drv_key) {
             drv_key.into()
-        } else if let Some(h) = self.drv_path_to_hash(drv_key) {
+        } else if let Some(h) = self.dag.hash_for_path(drv_key).cloned() {
             h
         } else {
             // Drv not in DAG (reaped after build-terminal, or truly
@@ -791,7 +791,7 @@ impl DagActor {
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
                         status: Some(rio_proto::types::derivation_event::Status::Completed(
                             rio_proto::types::DerivationCompleted {
                                 output_paths: output_paths.clone(),
@@ -1878,7 +1878,7 @@ impl DagActor {
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
                         status: Some(rio_proto::types::derivation_event::Status::Failed(
                             rio_proto::types::DerivationFailed {
                                 error_message: error_msg.to_string(),
@@ -2007,7 +2007,7 @@ impl DagActor {
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
                         status: Some(rio_proto::types::derivation_event::Status::Failed(
                             rio_proto::types::DerivationFailed {
                                 error_message: error_msg.to_string(),

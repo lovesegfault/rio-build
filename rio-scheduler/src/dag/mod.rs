@@ -191,6 +191,34 @@ impl DerivationDag {
         self.path_to_hash.get(drv_path)
     }
 
+    /// Look up a drv_path by drv_hash (O(1) via the node map).
+    pub fn path_for_hash(&self, drv_hash: &str) -> Option<&str> {
+        self.nodes.get(drv_hash).map(|s| s.drv_path().as_ref())
+    }
+
+    /// Resolve drv_hash → drv_path, falling back to the hash string if
+    /// the node isn't in the DAG. Used for `derivation_path` fields in
+    /// `BuildEvent`s — better to emit SOMETHING (the hash is still a
+    /// useful identifier) than empty.
+    pub fn path_or_hash_fallback(&self, drv_hash: &str) -> String {
+        self.path_for_hash(drv_hash)
+            .map(String::from)
+            .unwrap_or_else(|| {
+                tracing::warn!(%drv_hash, "no DAG node for hash; using hash as path fallback");
+                drv_hash.to_string()
+            })
+    }
+
+    /// Resolve drv_path → `DerivationState.db_id` via the reverse
+    /// index. `None` if the path isn't in the DAG or `db_id` is unset
+    /// (PG insert hasn't happened yet).
+    pub fn db_id_for_path(&self, drv_path: &str) -> Option<Uuid> {
+        self.path_to_hash
+            .get(drv_path)
+            .and_then(|h| self.nodes.get(h.as_str()))
+            .and_then(|s| s.db_id)
+    }
+
     /// Returns a clone of the canonical `DrvHash` stored as a key in `nodes`.
     ///
     /// "Canonical" means: the Arc allocated when the node was FIRST inserted

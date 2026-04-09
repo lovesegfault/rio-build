@@ -197,7 +197,9 @@ pub enum ActorCommand {
     /// Fire-and-forget; no reply.
     ///
     /// `drv_path` not `drv_hash` because that's what BuildLogBatch carries.
-    /// The actor resolves it via `drv_path_to_hash` (DAG reverse index).
+    /// The actor resolves it via [`DerivationDag::hash_for_path`].
+    ///
+    /// [`DerivationDag::hash_for_path`]: crate::dag::DerivationDag::hash_for_path
     ForwardLogBatch {
         drv_path: String,
         batch: rio_proto::types::BuildLogBatch,
@@ -589,7 +591,7 @@ pub enum ActorError {
 
     /// Invariant violation: an edge references a derivation that was never
     /// persisted to PG. Merge assigns db_ids to every node before processing
-    /// edges; if `find_db_id_by_path` returns None for an edge endpoint, the
+    /// edges; if `DerivationDag::db_id_for_path` returns None for an endpoint, the
     /// node was never in the submission (malformed request) or the id_map
     /// build loop has a bug.
     #[error("edge references unpersisted derivation (db_id missing): {drv_path}")]

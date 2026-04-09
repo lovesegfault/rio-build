@@ -263,7 +263,7 @@ impl DagActor {
         drv_path: &str,
         batch: rio_proto::types::BuildLogBatch,
     ) {
-        let Some(hash) = self.drv_path_to_hash(drv_path) else {
+        let Some(hash) = self.dag.hash_for_path(drv_path).cloned() else {
             return;
         };
         let lines = batch.lines.len() as u64;
@@ -293,7 +293,7 @@ impl DagActor {
     /// is a state edge, not log content. Unknown drv_path → drop
     /// silently (same rationale: late-arrival race or buggy worker).
     pub(super) fn handle_forward_phase(&mut self, phase: rio_proto::types::BuildPhase) {
-        let Some(hash) = self.drv_path_to_hash(&phase.derivation_path) else {
+        let Some(hash) = self.dag.hash_for_path(&phase.derivation_path).cloned() else {
             return;
         };
         for build_id in self.get_interested_builds(&hash) {
@@ -314,7 +314,7 @@ impl DagActor {
     /// logs replace the partial ones. The ring buffer gets `discard()`ed
     /// by the BuildExecution recv task on worker disconnect.
     pub(super) fn trigger_log_flush(&self, drv_hash: &DrvHash, interested_builds: Vec<Uuid>) {
-        let Some(drv_path) = self.drv_hash_to_path(drv_hash) else {
+        let Some(drv_path) = self.dag.path_for_hash(drv_hash).map(String::from) else {
             // Should be impossible at this call site (completion handlers
             // already validated the hash exists in the DAG), but defensive.
             warn!(drv_hash = %drv_hash, "trigger_log_flush: hash not in DAG, skipping");

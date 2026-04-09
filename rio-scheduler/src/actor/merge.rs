@@ -1058,7 +1058,7 @@ impl DagActor {
             path_to_hash
                 .get(drv_path)
                 .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
-                .or_else(|| self.find_db_id_by_path(drv_path))
+                .or_else(|| self.dag.db_id_for_path(drv_path))
         };
         let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
             .iter()

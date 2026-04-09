@@ -1037,7 +1037,7 @@ impl DagActor {
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
+                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
                         status: Some(rio_proto::types::derivation_event::Status::Started(
                             rio_proto::types::DerivationStarted {
                                 executor_id: executor_id.to_string(),
@@ -1604,41 +1604,13 @@ impl DagActor {
     }
 
     // -----------------------------------------------------------------------
-    // DAG/queue lookup helpers (used by dispatch + completion + event)
+    // Queue priority helpers
     // -----------------------------------------------------------------------
-
-    pub(super) fn drv_hash_to_path(&self, drv_hash: &DrvHash) -> Option<String> {
-        self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
-    }
-
-    /// Resolve drv_hash → drv_path, falling back to the hash string
-    /// if the node isn't in the DAG. Used for `derivation_path`
-    /// fields in BuildEvents — better to emit SOMETHING (the hash
-    /// is still a useful identifier) than empty. Extracted from
-    /// three duplicate call sites (dispatch.rs + completion.rs ×2).
-    pub(super) fn drv_path_or_hash_fallback(&self, drv_hash: &DrvHash) -> String {
-        self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
-            warn!(
-                drv_hash = %drv_hash,
-                "drv_hash_to_path returned None; using hash as fallback"
-            );
-            drv_hash.to_string()
-        })
-    }
-
-    /// Resolve a drv_path to its drv_hash via the DAG's reverse index.
-    /// Used by handle_completion since the gRPC layer receives CompletionReport
-    /// with drv_path, but the DAG is keyed by drv_hash.
-    pub(super) fn drv_path_to_hash(&self, drv_path: &str) -> Option<DrvHash> {
-        self.dag.hash_for_path(drv_path).cloned()
-    }
-
-    pub(super) fn find_db_id_by_path(&self, drv_path: &str) -> Option<Uuid> {
-        self.dag
-            .hash_for_path(drv_path)
-            .and_then(|h| self.dag.node(h))
-            .and_then(|s| s.db_id)
-    }
+    //
+    // Pure DAG lookup helpers (`path_for_hash`, `hash_for_path`,
+    // `path_or_hash_fallback`, `db_id_for_path`) live on
+    // [`crate::dag::DerivationDag`]; the helpers below stay on
+    // `DagActor` because they cross-reference `self.builds`.
 
     /// Whether any interested build for this derivation is interactive (IFD).
     /// Interactive derivations get a priority boost in the queue.
