@@ -15,6 +15,7 @@
 mod drain;
 mod heartbeat;
 mod prefetch;
+mod result;
 mod setup;
 mod slot;
 
@@ -25,6 +26,7 @@ pub use slot::{BuildSlot, BuildSlotGuard, try_cancel_build};
 
 use drain::{reconnect_drain_gate, run_drain};
 use prefetch::PrefetchDeps;
+use result::{err_completion, ok_completion, outcome_label, panic_completion};
 use setup::{BalanceGuards, WorkerClient};
 
 // Test-only re-exports: the `mod tests` block below predates the
@@ -45,8 +47,8 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{Instrument, info, instrument};
 
 use rio_proto::types::{
-    CompletionReport, ExecutorMessage, ExecutorRegister, ProgressUpdate, ResourceUsage,
-    WorkAssignment, WorkAssignmentAck, executor_message, scheduler_message,
+    ExecutorMessage, ExecutorRegister, ProgressUpdate, ResourceUsage, WorkAssignment,
+    WorkAssignmentAck, executor_message, scheduler_message,
 };
 
 use crate::{executor, log_stream};
@@ -361,100 +363,22 @@ pub async fn spawn_build_task(
         };
 
         // Send CompletionReport. Resource fields flow from the executor
-        // (cgroup memory.peak + polled cpu.stat).
+        // (cgroup memory.peak + polled cpu.stat). On Err, the cancel flag
+        // is read BEFORE deciding the status — Acquire pairs with
+        // try_cancel_build's Release (not strictly needed, no other state
+        // to synchronize, but cheap and documents the pairing).
         let completion = match result {
-            Ok(exec_result) => CompletionReport {
-                drv_path: exec_result.drv_path,
-                result: Some(exec_result.result),
-                assignment_token: exec_result.assignment_token,
-                peak_memory_bytes: exec_result.peak_memory_bytes,
-                output_size_bytes: exec_result.output_size_bytes,
-                peak_cpu_cores: exec_result.peak_cpu_cores,
-            },
-            Err(e) => {
-                // Check the cancel flag BEFORE deciding the status.
-                // try_cancel_build sets this BEFORE writing cgroup.kill;
-                // the kill → SIGKILL → stdout-EOF → Err path has some
-                // latency, so by the time we're here the flag is set.
-                // Acquire pairs with try_cancel_build's Release — not
-                // strictly needed (no other state to synchronize) but
-                // cheap and documents the pairing.
-                let was_cancelled = cancelled.load(std::sync::atomic::Ordering::Acquire);
-                let (status, log_level) = if was_cancelled {
-                    // Expected outcome of CancelBuild / DrainExecutor(force).
-                    // Not an error — info, not error. Scheduler's
-                    // completion handler treats Cancelled as a no-op
-                    // (already transitioned the derivation when it sent
-                    // the CancelSignal).
-                    (rio_proto::types::BuildResultStatus::Cancelled, false)
-                } else if e.is_permanent() {
-                    // Deterministic per-derivation (WrongKind, .drv
-                    // parse failure). Another pod will fail identically;
-                    // surface as InputRejected so the scheduler stops
-                    // burning ephemeral cold-starts before the poison
-                    // threshold trips.
-                    (rio_proto::types::BuildResultStatus::InputRejected, true)
-                } else {
-                    // Node- or network-local executor failure (overlay
-                    // mount, daemon crash, gRPC, IO). Another pod might
-                    // succeed → InfrastructureFailure → reassign.
-                    (
-                        rio_proto::types::BuildResultStatus::InfrastructureFailure,
-                        true,
-                    )
-                };
-                if log_level {
-                    tracing::error!(
-                        drv_path = %drv_path,
-                        error = %e,
-                        "build execution failed"
-                    );
-                } else {
-                    tracing::info!(
-                        drv_path = %drv_path,
-                        "build cancelled (cgroup.kill)"
-                    );
-                }
-                CompletionReport {
-                    drv_path,
-                    result: Some(rio_proto::types::BuildResult {
-                        status: status.into(),
-                        error_msg: if was_cancelled {
-                            "cancelled by scheduler".into()
-                        } else {
-                            e.to_string()
-                        },
-                        ..Default::default()
-                    }),
-                    assignment_token,
-                    // Executor error → cgroup never populated.
-                    // All resource fields = 0 = no-signal.
-                    peak_memory_bytes: 0,
-                    output_size_bytes: 0,
-                    peak_cpu_cores: 0.0,
-                }
-            }
+            Ok(exec_result) => ok_completion(exec_result),
+            Err(e) => err_completion(
+                &e,
+                drv_path,
+                assignment_token,
+                cancelled.load(std::sync::atomic::Ordering::Acquire),
+            ),
         };
 
-        // Record outcome for SLI dashboards. Ok(exec) doesn't mean success —
-        // check the proto status. Err(ExecutorError) is infra failure OR
-        // cancelled; the "cancelled" bucket is a distinct label so SLIs
-        // don't count user-initiated cancels as failures.
-        let outcome = match &completion.result {
-            Some(r) => match rio_proto::types::BuildResultStatus::try_from(r.status) {
-                Ok(rio_proto::types::BuildResultStatus::Built) => "success",
-                Ok(rio_proto::types::BuildResultStatus::Cancelled) => "cancelled",
-                // Operationally distinct: means "raise the limit," not
-                // "the build is broken." Separate label so SLI queries
-                // can exclude these from failure-rate denominators.
-                Ok(rio_proto::types::BuildResultStatus::TimedOut) => "timed_out",
-                Ok(rio_proto::types::BuildResultStatus::LogLimitExceeded) => "log_limit",
-                Ok(rio_proto::types::BuildResultStatus::InfrastructureFailure) => "infra_failure",
-                _ => "failure",
-            },
-            None => "failure",
-        };
-        metrics::counter!("rio_builder_builds_total", "outcome" => outcome).increment(1);
+        metrics::counter!("rio_builder_builds_total", "outcome" => outcome_label(&completion))
+            .increment(1);
 
         let msg = ExecutorMessage {
             msg: Some(executor_message::Msg::Completion(completion)),
@@ -476,22 +400,11 @@ pub async fn spawn_build_task(
                 drv_path = %panic_drv_path,
                 "build task panicked; sending InfrastructureFailure to scheduler"
             );
-            let completion = CompletionReport {
-                drv_path: panic_drv_path.clone(),
-                result: Some(rio_proto::types::BuildResult {
-                    status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
-                    error_msg: "worker build task panicked".into(),
-                    ..Default::default()
-                }),
-                assignment_token: panic_token,
-                // Panic = cgroup file descriptor likely dropped mid-
-                // read, or we never got past spawn. 0 = no-signal.
-                peak_memory_bytes: 0,
-                output_size_bytes: 0,
-                peak_cpu_cores: 0.0,
-            };
             let msg = ExecutorMessage {
-                msg: Some(executor_message::Msg::Completion(completion)),
+                msg: Some(executor_message::Msg::Completion(panic_completion(
+                    panic_drv_path.clone(),
+                    panic_token,
+                ))),
             };
             if let Err(e) = panic_tx.send(msg).await {
                 tracing::error!(
@@ -613,15 +526,9 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                 // channel's probe loop rediscovers within ~3s.
                 tracing::warn!(error = %e, "BuildExecution open failed; retrying in 1s");
                 rt.relay_target_tx.send_replace(None);
-                tokio::select! {
-                    biased;
-                    // First SIGTERM: skip the sleep, transition at the
-                    // top of 'reconnect, then resume reconnecting.
-                    _ = rt.shutdown.cancelled(),
-                        if !rt.draining.load(Ordering::Relaxed)
-                        => continue 'reconnect,
-                    _ = rt.drain_done.notified() => break 'reconnect,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue 'reconnect,
+                match reconnect_backoff(&rt).await {
+                    std::ops::ControlFlow::Continue(()) => continue 'reconnect,
+                    std::ops::ControlFlow::Break(()) => break 'reconnect,
                 }
             }
         };
@@ -769,18 +676,41 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
                     "BuildExecution stream ended; reconnecting (running build continues)"
                 );
                 rt.relay_target_tx.send_replace(None);
-                tokio::select! {
-                    biased;
-                    _ = rt.shutdown.cancelled(),
-                        if !rt.draining.load(Ordering::Relaxed)
-                        => continue 'reconnect,
-                    _ = rt.drain_done.notified() => break 'reconnect,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue 'reconnect,
+                match reconnect_backoff(&rt).await {
+                    std::ops::ControlFlow::Continue(()) => continue 'reconnect,
+                    std::ops::ControlFlow::Break(()) => break 'reconnect,
                 }
             }
         }
     }
 
+    run_teardown(rt).await;
+    Ok(())
+}
+
+/// 1s reconnect backoff with shutdown/drain interruption. Used by both
+/// the stream-open-failed and stream-ended paths in [`run`].
+///
+/// `Continue` → retry the connect at the top of `'reconnect` (also
+/// taken on first SIGTERM, so the drain transition runs there before
+/// resuming reconnection). `Break` → drain finished, exit `'reconnect`.
+async fn reconnect_backoff(rt: &BuilderRuntime) -> std::ops::ControlFlow<()> {
+    tokio::select! {
+        biased;
+        // First SIGTERM: skip the sleep, transition at the top of
+        // 'reconnect, then resume reconnecting.
+        _ = rt.shutdown.cancelled(),
+            if !rt.draining.load(Ordering::Relaxed)
+            => std::ops::ControlFlow::Continue(()),
+        _ = rt.drain_done.notified() => std::ops::ControlFlow::Break(()),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => std::ops::ControlFlow::Continue(()),
+    }
+}
+
+/// Exit teardown after `'reconnect` breaks: heartbeat abort,
+/// `DrainExecutor`, FUSE abort. By now `in_flight=0` (drain_done fired,
+/// or the single build returned its permit).
+async fn run_teardown(rt: BuilderRuntime) {
     // r[impl builder.ephemeral.exit-aborts-heartbeat]
     // I-142: stop the heartbeat task FIRST, before run_drain. While
     // it's alive the scheduler sees `heartbeat-alive but stream_tx
@@ -854,8 +784,6 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     // flush we're optimizing for, and a sleep is sufficient.
     drop(rt.fuse_session);
     std::thread::sleep(std::time::Duration::from_millis(200));
-
-    Ok(())
 }
 
 /// Handle a `WorkAssignment` arriving on the stream: gate (generation
