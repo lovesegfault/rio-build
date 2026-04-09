@@ -4173,17 +4173,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "hmac 0.13.0",
+ "jsonwebtoken",
+ "rio-common",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tracing",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "rio-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-config",
+ "aws-sdk-s3",
  "axum",
  "base64",
- "ed25519-dalek",
  "figment",
  "futures-util",
- "hmac 0.13.0",
- "jsonwebtoken",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4192,7 +4212,7 @@ dependencies = [
  "rustls 0.23.37",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -4233,6 +4253,7 @@ dependencies = [
  "rand 0.10.0",
  "rio-common",
  "rio-nix",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -4253,7 +4274,6 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-trait",
- "aws-config",
  "aws-sdk-s3",
  "axum",
  "base64",
@@ -4269,6 +4289,7 @@ dependencies = [
  "moka",
  "regex",
  "reqwest 0.13.1",
+ "rio-auth",
  "rio-common",
  "rio-nix",
  "rio-proto",
@@ -6418,6 +6439,7 @@ dependencies = [
  "aws-sdk-sts",
  "aws-smithy-http-client",
  "aws-smithy-runtime",
+ "base16ct 0.2.0",
  "base64",
  "base64ct",
  "bitflags",
@@ -6491,6 +6513,7 @@ dependencies = [
  "rustls 0.23.37",
  "rustls-webpki 0.103.10",
  "scopeguard",
+ "sec1 0.7.3",
  "serde",
  "serde_core",
  "serde_json",
@@ -6522,6 +6545,7 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "typenum",
+ "unicode-normalization",
  "uuid",
  "winnow 0.7.15",
  "winnow 1.0.0",
