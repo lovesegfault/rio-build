@@ -119,9 +119,12 @@ impl SchedulerDb {
              WHERE build_id = $1",
         )
         .bind(build_id)
-        .bind(total as i32)
-        .bind(completed as i32)
-        .bind(cached as i32)
+        // u32→i32: column is INTEGER (migration 030). A build with
+        // >2^31 derivations is impossible (in-memory DAG, 10k mailbox)
+        // but make the wrap explicit instead of `as`-silent.
+        .bind(i32::try_from(total).unwrap_or(i32::MAX))
+        .bind(i32::try_from(completed).unwrap_or(i32::MAX))
+        .bind(i32::try_from(cached).unwrap_or(i32::MAX))
         .execute(&self.pool)
         .await?;
         Ok(())
