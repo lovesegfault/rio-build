@@ -9530,6 +9530,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "crypto-bigint 0.5.5",
+ "crypto-common 0.1.7",
  "crypto-common 0.2.1",
  "ctutils",
  "der 0.7.10",

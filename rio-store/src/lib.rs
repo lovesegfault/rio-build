@@ -4,30 +4,66 @@
 //! chunk deduplication, moka chunk cache, ed25519 narinfo [`signing`],
 //! and an axum binary-cache HTTP server. Serves `StoreService` +
 //! `ChunkService` gRPC (see [`grpc`]).
+//!
+//! # Feature flags
+//!
+//! - `server` (default): the full store — gRPC services, S3 backend,
+//!   chunked CAS, GC, binary-cache HTTP, signing, substitution. Pulls
+//!   the heavy dep tree (aws-sdk-s3, axum, moka, reqwest, tonic, …).
+//! - `schema`: lean subset for crates that only need to read/write the
+//!   shared PG tables directly (rio-scheduler's CA resolver). Exposes
+//!   [`error`] + [`realisations`]; compiles with `sqlx` + `thiserror` +
+//!   `tracing` + `hex` only. Exists so the scheduler doesn't carry a
+//!   raw-SQL copy of `realisations::query` just to avoid the server dep
+//!   cascade.
+//! - `test-utils`: test fixtures (`test_helpers`, `MIGRATOR`). Implies
+//!   `server`.
 
-pub mod backend;
-pub mod cache_server;
-pub mod cas;
-pub(crate) mod chunker;
-pub mod gc;
-pub mod grpc;
-pub(crate) mod ingest;
-// pub (not pub(crate)) so the fuzz target at rio-store/fuzz/ can call
-// Manifest::deserialize. The fuzz crate is a separate workspace root.
-pub mod manifest;
-pub(crate) mod metadata;
-pub mod migrations;
+// ---------------------------------------------------------------------------
+// Always-on (`schema` feature surface)
+// ---------------------------------------------------------------------------
+
+pub mod error;
 // Per ADR-018 §3 resolution logic belongs in the scheduler, but the
 // scheduler accesses the same `realisations` table on the shared pool.
 // Exported pub so rio-scheduler can call `rio_store::realisations::query`
-// instead of duplicating the raw SQL (rio-scheduler/src/ca/resolve.rs
-// `query_realisation` is a near-verbatim copy). Single owner for the
-// table's SQL means schema changes touch one crate.
+// instead of duplicating the raw SQL. Single owner for the table's SQL
+// means schema changes touch one crate.
 pub mod realisations;
+
+// ---------------------------------------------------------------------------
+// Server-only (`server` feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "server")]
+pub mod backend;
+#[cfg(feature = "server")]
+pub mod cache_server;
+#[cfg(feature = "server")]
+pub mod cas;
+#[cfg(feature = "server")]
+pub(crate) mod chunker;
+#[cfg(feature = "server")]
+pub mod gc;
+#[cfg(feature = "server")]
+pub mod grpc;
+#[cfg(feature = "server")]
+pub(crate) mod ingest;
+// pub (not pub(crate)) so the fuzz target at rio-store/fuzz/ can call
+// Manifest::deserialize. The fuzz crate is a separate workspace root.
+#[cfg(feature = "server")]
+pub mod manifest;
+#[cfg(feature = "server")]
+pub(crate) mod metadata;
+#[cfg(feature = "server")]
+pub mod migrations;
+#[cfg(feature = "server")]
 pub mod signing;
+#[cfg(feature = "server")]
 pub mod substitute;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
+#[cfg(feature = "server")]
 pub(crate) mod validate;
 
 /// Shared sqlx migrator for the `migrations/` directory. Embeds
@@ -49,6 +85,7 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 /// (chromium, llvm) are ~1-2GB → 60s+. The default 10s top would lose all
 /// of those in `+Inf`. 10ms low end for narinfo-only short-circuits; 120s
 /// top for the largest paths.
+#[cfg(feature = "server")]
 const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
     &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
 
@@ -57,6 +94,7 @@ const SUBSTITUTE_DURATION_BUCKETS: &[f64] =
 /// `describe_histogram!` in this crate must have an entry here OR be in
 /// the `DEFAULT_BUCKETS_OK` exemption list (`tests/metrics_registered.rs`);
 /// histograms not listed fall through to the global `[0.005..10.0]` default.
+#[cfg(feature = "server")]
 pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[(
     "rio_store_substitute_duration_seconds",
     SUBSTITUTE_DURATION_BUCKETS,
@@ -68,6 +106,7 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[(
 /// sourced from docs/src/observability.md (the Store Metrics table).
 /// See rio_gateway::describe_metrics for rationale.
 // r[impl obs.metric.store]
+#[cfg(feature = "server")]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 

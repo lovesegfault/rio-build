@@ -21,7 +21,7 @@
 //! ~200 bytes per CA output and one INSERT; the payoff is every
 //! subsequent build of the same CA derivation becomes a lookup.
 
-use crate::metadata::MetadataError;
+use crate::error::MetadataError;
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 

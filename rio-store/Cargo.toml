@@ -11,111 +11,157 @@ description = "NAR content-addressable store for rio-build"
 [[bin]]
 name = "rio-store"
 path = "src/main.rs"
+required-features = ["server"]
 
 [features]
+default = ["server"]
+# Lean PG-schema accessors only (`error` + `realisations` modules). Lets
+# rio-scheduler depend on `rio_store::realisations::query` without
+# pulling aws-sdk-s3/axum/moka/reqwest/tonic into its build. Compiles
+# with sqlx + thiserror + tracing + hex.
+schema = []
+# Full store: gRPC services, S3 backend, chunked CAS, GC, binary-cache
+# HTTP, signing, substitution. The whole heavy dep tree.
+server = [
+  "dep:rio-common",
+  "dep:rio-auth",
+  "dep:rio-nix",
+  "dep:rio-proto",
+  "dep:tokio",
+  "dep:async-trait",
+  "dep:tonic",
+  "dep:tokio-stream",
+  "dep:tonic-health",
+  "dep:async-compression",
+  "dep:tokio-util",
+  "dep:uuid",
+  "dep:aws-sdk-s3",
+  "dep:bytes",
+  "dep:sha2",
+  "dep:ed25519-dalek",
+  "dep:base64",
+  "dep:axum",
+  "dep:fastcdc",
+  "dep:blake3",
+  "dep:futures-util",
+  "dep:moka",
+  "dep:dashmap",
+  "dep:reqwest",
+  "dep:clap",
+  "dep:metrics",
+  "dep:x509-parser",
+  "dep:anyhow",
+  "dep:scopeguard",
+  "dep:serde",
+]
 # Exposes `test_helpers` (StoreSeed/ChunkSeed builders, spawn_store_service,
 # put_path) and `MIGRATOR` to downstream crates' tests. Without this, every
 # crate that needs a real StoreServiceImpl in its test fixture re-implements
 # spawn + Channel::connect + the PutPath mpsc-stream dance (4× duplication
 # before this feature existed). Not in `default` — pulls in rio-test-support
-# (initdb spawn machinery) which production builds don't want.
-test-utils = ["dep:rio-test-support"]
+# (initdb spawn machinery) which production builds don't want. Implies
+# `server` (test_helpers builds StoreServiceImpl).
+test-utils = ["server", "dep:rio-test-support"]
 
 [dependencies]
-rio-common = { workspace = true, features = ["postgres", "aws"] }
-rio-auth = { workspace = true }
-rio-nix = { workspace = true }
-rio-proto = { workspace = true }
+# --- always-on (`schema` feature surface) -----------------------------
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# realisations.rs hex-encodes drv_hash for instrument span fields.
+hex = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+# --- server-only (gated via the `server` feature) ---------------------
+rio-common = { workspace = true, features = [
+  "postgres",
+  "aws",
+], optional = true }
+rio-auth = { workspace = true, optional = true }
+rio-nix = { workspace = true, optional = true }
+rio-proto = { workspace = true, optional = true }
 # Optional: only when test-utils feature is on. Also a dev-dep below so
 # rio-store's own `cargo test` (which doesn't enable test-utils) still
 # sees it for the cfg(test) arm of test_helpers.rs.
 rio-test-support = { workspace = true, optional = true }
 
 # Async runtime
-tokio = { workspace = true }
-async-trait = { workspace = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 
 # gRPC
-tonic = { workspace = true }
-tokio-stream = { workspace = true }
+tonic = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
 # grpc.health.v1.Health for K8s readiness probes. SERVING after PG
 # migrations complete — before that, every store RPC would fail.
-tonic-health = { workspace = true }
+tonic-health = { workspace = true, optional = true }
 # Streaming zstd for the cache_server /nar/ route. Replaces buffered
 # encode_all (4GB peak for 4GB NAR) with O(chunk*K) pipeline.
-async-compression = { workspace = true }
+async-compression = { workspace = true, optional = true }
 # StreamReader (Stream<Bytes> → AsyncRead) + ReaderStream (AsyncRead
 # → Stream<Bytes>). The round-trip lets zstd sit in the middle.
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, optional = true }
 
-# Database
-sqlx = { workspace = true }
 # Per-tenant accounting (gc/tenant.rs) + cache_server auth extension.
-uuid = { workspace = true }
+uuid = { workspace = true, optional = true }
 
 # S3. Client builder shared with rio-scheduler via rio-common's `aws`
 # feature; aws-sdk-s3 stays a direct dep for backend.rs op types.
-aws-sdk-s3 = { workspace = true }
+aws-sdk-s3 = { workspace = true, optional = true }
 
 # Byte buffers
-bytes = { workspace = true }
+bytes = { workspace = true, optional = true }
 
 # Crypto
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 # narinfo signing. Signatures are computed at PutPath time and stored
 # in narinfo.signatures so the HTTP cache server never touches the privkey.
-ed25519-dalek = { workspace = true }
-base64 = { workspace = true }
+ed25519-dalek = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 # Binary cache HTTP server. axum for routing. We store uncompressed
 # chunks for dedup and zstd-compress at serve time via async-compression.
-axum = { workspace = true }
+axum = { workspace = true, optional = true }
 
 # Phase 2c chunked CAS
-fastcdc = { workspace = true }
-blake3 = { workspace = true }
+fastcdc = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
 # join_all for bounded-parallel S3 HeadObject batches (exists_batch).
 # Worker already uses this; not a new transitive dep.
-futures-util = { workspace = true }
+futures-util = { workspace = true, optional = true }
 # In-process chunk cache. Lock-free, weight-based eviction — tracks
 # byte-size per entry so the 2GB cap is a real memory bound, not just
 # an entry count.
-moka = { workspace = true }
+moka = { workspace = true, optional = true }
 # Singleflight: DashMap<hash, Shared<JoinHandle>> tracks in-flight
 # backend fetches so N concurrent GetPaths for the same chunk issue
 # one S3 GET, not N.
-dashmap = { workspace = true }
+dashmap = { workspace = true, optional = true }
 
 # Upstream binary-cache substitution: HTTP narinfo + NAR fetch. `stream`
 # for bytes_stream() on the NAR body (pipes into xz/zstd decoder without
 # buffering the compressed file). rustls matches the rest of the stack.
-reqwest = { workspace = true, features = ["stream"] }
-
-# Encoding
-hex = { workspace = true }
+reqwest = { workspace = true, features = ["stream"], optional = true }
 
 # CLI
-clap = { workspace = true }
+clap = { workspace = true, optional = true }
 
-# Logging & metrics
-tracing = { workspace = true }
-metrics = { workspace = true }
+# Metrics
+metrics = { workspace = true, optional = true }
 
 # TLS cert parsing for CN-based HMAC bypass on PutPath. tonic's
 # peer_certs() gives DER bytes; we parse to read subject CN.
 # Only CN=rio-gateway bypasses HMAC (not any mTLS client).
-x509-parser = { workspace = true }
+x509-parser = { workspace = true, optional = true }
 
 # Error handling
-anyhow = { workspace = true }
-thiserror = { workspace = true }
+anyhow = { workspace = true, optional = true }
 # Advisory lock RAII: detach PoolConnection on ANY exit (including
 # cancel) so PG session-scoped lock auto-releases. Round 4 Z2/Z7.
-scopeguard = { workspace = true }
+scopeguard = { workspace = true, optional = true }
 
 # Config
-serde = { workspace = true }
-workspace-hack = { version = "0.1", path = "../workspace-hack" }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Self-reference to enable `test-utils` for integration tests under

@@ -33,7 +33,10 @@ rio-common = { path = "rio-common" }
 rio-nix = { path = "rio-nix" }
 rio-proto = { path = "rio-proto" }
 rio-scheduler = { path = "rio-scheduler" }
-rio-store = { path = "rio-store" }
+# default-features off so members can opt into the lean `schema` feature
+# (rio-scheduler) without the server dep cascade. Members that need the
+# full store enable `server` (or `test-utils`, which implies it).
+rio-store = { path = "rio-store", default-features = false }
 rio-test-support = { path = "rio-test-support" }
 rio-crds = { path = "rio-crds" }
 

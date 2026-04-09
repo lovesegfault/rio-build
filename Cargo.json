@@ -21703,6 +21703,9 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "default",
+        "schema",
+        "server",
         "test-utils"
       ],
       "crateBin": [
@@ -30401,7 +30404,13 @@
         },
         {
           "name": "crypto-common",
-          "packageId": "crypto-common 0.2.1"
+          "packageId": "crypto-common 0.1.7",
+          "rename": "crypto_common_c65f7effa3be6d31"
+        },
+        {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.2.1",
+          "rename": "crypto_common_6f8ce4dd05d13bba"
         },
         {
           "name": "ctutils",
@@ -30879,6 +30888,11 @@
         {
           "name": "crossbeam-utils",
           "packageId": "crossbeam-utils"
+        },
+        {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.1.7",
+          "rename": "crypto_common_c65f7effa3be6d31"
         },
         {
           "name": "digest",
