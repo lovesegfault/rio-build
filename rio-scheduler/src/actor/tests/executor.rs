@@ -2483,3 +2483,104 @@ async fn test_heartbeat_became_idle_dispatches_inline() -> TestResult {
     assert_eq!(a.drv_path, test_drv_path("idle-immediate"));
     Ok(())
 }
+
+/// r[verify sched.dispatch.became-idle-immediate]
+///
+/// Mass 0→1 capacity edges (failover, fleet-wide degrade clear): every
+/// executor's heartbeat fires `became_idle=true`. Without
+/// `BECAME_IDLE_INLINE_CAP`, N heartbeats → N inline `dispatch_ready`
+/// passes (the I-163 storm via the back door — each pass runs the
+/// ~150ms batch-FOD precheck). The cap bounds inline dispatches at 4
+/// per Tick; the remainder coalesce to `dispatch_dirty`.
+///
+/// Setup uses degrade→undegrade on ALREADY-warm workers to isolate the
+/// `became_idle` heartbeat path from `PrefetchComplete` (which has its
+/// own inline dispatch, naturally spread by fetch latency in prod).
+///
+/// Asserts BOTH halves of the cap:
+///   - exactly CAP assignments land from heartbeats alone (no Tick) —
+///     steady-state immediacy preserved up to the cap.
+///   - the (CAP+1)th waits for a Tick — burst is gated.
+#[tokio::test]
+async fn test_became_idle_burst_capped_per_tick() -> TestResult {
+    use crate::actor::BECAME_IDLE_INLINE_CAP;
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    let n = BECAME_IDLE_INLINE_CAP as usize + 1;
+
+    // (1) Connect+warm N workers (queue empty → on_worker_registered
+    // flips warm immediately; PrefetchComplete is a no-op re-set).
+    // Drain a Tick so the cap counter starts at 0 for the burst.
+    let mut rxs = Vec::new();
+    for i in 0..n {
+        let rx = connect_executor(&handle, &format!("burst-w{i}"), "x86_64-linux").await?;
+        rxs.push(rx);
+    }
+    handle.send(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    // (2) Degrade all → capacity 1→0 (no became_idle).
+    for i in 0..n {
+        send_heartbeat_with(&handle, &format!("burst-w{i}"), "x86_64-linux", |hb| {
+            hb.store_degraded = true;
+        })
+        .await?;
+    }
+    barrier(&handle).await;
+
+    // (3) Queue N derivations. MergeDag's inline dispatch sees all
+    // workers degraded → everything stays Ready.
+    for i in 0..n {
+        let _ = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            &format!("burst-{i}"),
+            PriorityClass::Scheduled,
+        )
+        .await?;
+    }
+    barrier(&handle).await;
+    for rx in &mut rxs {
+        assert!(
+            rx.try_recv().is_err(),
+            "precondition: degraded executors must not receive assignments"
+        );
+    }
+
+    // (4) Undegrade all in a tight loop, NO Tick between → N
+    // became_idle edges. The cap should let exactly CAP through
+    // inline; the rest set dispatch_dirty.
+    for i in 0..n {
+        send_heartbeat_with(&handle, &format!("burst-w{i}"), "x86_64-linux", |_| {}).await?;
+    }
+    barrier(&handle).await;
+
+    let mut assigned_inline = 0;
+    for rx in &mut rxs {
+        if rx.try_recv().is_ok() {
+            assigned_inline += 1;
+        }
+    }
+    assert_eq!(
+        assigned_inline, BECAME_IDLE_INLINE_CAP as usize,
+        "expected exactly CAP={} inline assignments; \
+         got {assigned_inline} (cap not enforced or steady-state broken)",
+        BECAME_IDLE_INLINE_CAP
+    );
+
+    // (5) One Tick drains dispatch_dirty → remaining worker(s) assigned.
+    handle.send(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+    let mut assigned_total = assigned_inline;
+    for rx in &mut rxs {
+        if rx.try_recv().is_ok() {
+            assigned_total += 1;
+        }
+    }
+    assert_eq!(
+        assigned_total, n,
+        "all {n} derivations should be assigned after one Tick drains dispatch_dirty"
+    );
+    Ok(())
+}

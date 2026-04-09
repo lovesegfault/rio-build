@@ -197,9 +197,7 @@ pub enum ActorCommand {
     /// Fire-and-forget; no reply.
     ///
     /// `drv_path` not `drv_hash` because that's what BuildLogBatch carries.
-    /// The actor resolves it via [`DerivationDag::hash_for_path`].
-    ///
-    /// [`DerivationDag::hash_for_path`]: crate::dag::DerivationDag::hash_for_path
+    /// The actor resolves it via `DerivationDag::hash_for_path` (DAG reverse index).
     ForwardLogBatch {
         drv_path: String,
         batch: rio_proto::types::BuildLogBatch,

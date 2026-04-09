@@ -106,6 +106,17 @@ pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 16;
 /// is dropped.
 const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Max inline `dispatch_ready` calls from the `became_idle` heartbeat
+/// carve-out per Tick. Past this, `became_idle` only sets
+/// `dispatch_dirty` (deferred ≤1 Tick). Prevents leader-failover from
+/// reintroducing the I-163 storm: with 290 executors all reconnecting,
+/// 290 first-heartbeats are all 0→1 transitions → 290 sequential
+/// `dispatch_ready` passes (each does the ~150ms batch-FOD precheck).
+/// 4 inline + remainder coalesced bounds the burst at ~600ms regardless
+/// of fleet size while keeping the steady-state "fresh ephemeral
+/// dispatches immediately" win.
+pub(crate) const BECAME_IDLE_INLINE_CAP: u32 = 4;
+
 /// The DAG actor state.
 pub struct DagActor {
     /// The global derivation DAG.
@@ -236,6 +247,17 @@ pub struct DagActor {
     /// inline because those genuinely unlock new work.
     // r[impl sched.actor.dispatch-decoupled]
     dispatch_dirty: bool,
+    /// Inline `dispatch_ready` calls fired from the `became_idle`
+    /// carve-out since the last Tick. Capped at
+    /// [`BECAME_IDLE_INLINE_CAP`]; once hit, further `became_idle`
+    /// heartbeats only set `dispatch_dirty`. Reset to 0 in
+    /// `handle_tick`. Guards the failover/mass-reconnect case where
+    /// every executor's first heartbeat is a 0→1 transition — the
+    /// `r[sched.dispatch.became-idle-immediate]` carve-out assumed "≤1
+    /// per executor per spawn cycle", which is true steady-state but
+    /// becomes N-at-once after leader failover (the I-163 storm via
+    /// the back door).
+    became_idle_inline_this_tick: u32,
     /// Last [`ClusterSnapshot`] published by `handle_tick`. The
     /// AdminService `cluster_status` handler reads `snapshot_tx.
     /// subscribe().borrow()` via [`ActorHandle::cluster_snapshot_cached`]
@@ -295,6 +317,7 @@ impl DagActor {
             fod_freeze_since: None,
             builder_freeze_since: None,
             dispatch_dirty: false,
+            became_idle_inline_this_tick: 0,
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
@@ -477,10 +500,13 @@ impl DagActor {
                     // r[impl sched.dispatch.became-idle-immediate]
                     // Carve-out: capacity 0→1 (fresh ephemeral, degrade
                     // clear, drain clear) dispatches inline. ≤1 per
-                    // executor per spawn cycle — not the 29/s storm.
-                    // Steady-state (already-idle or already-busy) still
-                    // only sets dirty.
-                    if became_idle {
+                    // executor per spawn cycle steady-state — but
+                    // leader-failover makes EVERY executor's first
+                    // heartbeat a 0→1 edge. Cap inline dispatches per
+                    // Tick so mass-reconnect coalesces to dirty
+                    // instead of N sequential dispatch_ready passes.
+                    if became_idle && self.became_idle_inline_this_tick < BECAME_IDLE_INLINE_CAP {
+                        self.became_idle_inline_this_tick += 1;
                         self.dispatch_ready().await;
                     } else {
                         self.dispatch_dirty = true;

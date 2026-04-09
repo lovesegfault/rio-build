@@ -99,6 +99,12 @@ impl DagActor {
     }
 
     pub(super) async fn handle_tick(&mut self) {
+        // Reset the became_idle inline-dispatch budget. See
+        // `BECAME_IDLE_INLINE_CAP` — past the cap, 0→1 heartbeats
+        // since the previous Tick set dispatch_dirty instead; the
+        // dispatch below drains it.
+        self.became_idle_inline_this_tick = 0;
+
         self.maybe_refresh_estimator().await;
 
         let now = Instant::now();
