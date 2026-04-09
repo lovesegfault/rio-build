@@ -137,14 +137,12 @@ pkgs.testers.runNixOSTest {
 
     # ── gRPC-Web through Cilium Gateway (from-pod) ──────────────────────
     # Cilium's per-Gateway Service is selectorless — the eBPF L7
-    # redirect to cilium-envoy fires for pod-netns traffic only, not
-    # host-netns. So wget from inside the rio-dashboard nginx pod
-    # (alpine, has busybox wget+od). Same-ns → short-name DNS works.
-    # busybox wget needs --post-file (no --data-binary); write the
-    # 5-byte grpc-web header to a tmpfile first.
+    # redirect fires for pod-netns traffic only, not host-netns. So
+    # curl from inside the rio-dashboard pod (image has busybox+curl
+    # in contents, see docker.nix). Same-ns → short-name DNS works.
     gw_url = "http://cilium-gateway-rio-dashboard:8080"
 
-    def pod_wget(script):
+    def pod_sh(script):
         # Heredoc-via-stdin avoids the nested-quote escaping of
         # `sh -c '...'` inside Python inside Nix.
         return (
@@ -159,26 +157,28 @@ pkgs.testers.runNixOSTest {
         # scheduler replicas; a non-leader hit yields Unavailable.
         try:
             k3s_server.wait_until_succeeds(
-                pod_wget(
-                    "printf '\\000\\000\\000\\000\\000' >/tmp/b && "
-                    "wget -qO- --header='content-type: application/grpc-web+proto' "
-                    "--header='x-grpc-web: 1' --post-file=/tmp/b "
+                pod_sh(
+                    "printf '\\000\\000\\000\\000\\000' | "
+                    "curl -sf -X POST "
                     f"{gw_url}/rio.admin.AdminService/ClusterStatus "
+                    "-H 'content-type: application/grpc-web+proto' "
+                    "-H 'x-grpc-web: 1' --data-binary @- "
                     "| od -An -tx1 -N1 | grep -qw 00"
                 ),
                 timeout=90,
             )
         except Exception:
-            print("── DIAGNOSTIC: from-pod wget via Gateway ──")
-            print(k3s_server.succeed(pod_wget(
-                "wget -SO- --header='content-type: application/grpc-web+proto' "
-                "--header='x-grpc-web: 1' --post-data=x "
-                f"{gw_url}/rio.admin.AdminService/ClusterStatus 2>&1 | head -30 || true"
-            )))
-            print(k3s_server.succeed(
-                "k3s kubectl -n ${ns} get svc cilium-gateway-rio-dashboard -o wide 2>&1; "
-                "k3s kubectl -n ${ns} get httproute rio-scheduler-readonly -o yaml 2>&1 | tail -30"
+            print("── DIAGNOSTIC: from-pod curl via Gateway ──")
+            k3s_server.execute(pod_sh(
+                "curl -sv -X POST "
+                f"{gw_url}/rio.admin.AdminService/ClusterStatus "
+                "-H 'content-type: application/grpc-web+proto' "
+                "-H 'x-grpc-web: 1' -d x 2>&1 | head -30 || true"
             ))
+            k3s_server.execute(
+                "k3s kubectl -n ${ns} get svc cilium-gateway-rio-dashboard -o wide; "
+                "k3s kubectl -n ${ns} get httproute rio-scheduler-readonly -o yaml | tail -30"
+            )
             raise
 
     with subtest("gRPC-Web streaming via Gateway: GetBuildLogs trailer 0x80"):
@@ -186,12 +186,13 @@ pkgs.testers.runNixOSTest {
         # len 8) → handler returns Ok(stream-yielding-Err) so tonic-web
         # emits the trailer as a 0x80-flagged length-prefixed-message.
         k3s_server.wait_until_succeeds(
-            pod_wget(
-                "printf '\\000\\000\\000\\000\\012\\022\\010nonexist' >/tmp/b && "
-                "wget -qO- --header='content-type: application/grpc-web+proto' "
-                "--header='x-grpc-web: 1' --post-file=/tmp/b "
+            pod_sh(
+                "printf '\\000\\000\\000\\000\\012\\022\\010nonexist' | "
+                "curl -sf -X POST "
                 f"{gw_url}/rio.admin.AdminService/GetBuildLogs "
-                "| od -An -tx1 -N1 | grep -qw 80"
+                "-H 'content-type: application/grpc-web+proto' "
+                "-H 'x-grpc-web: 1' --data-binary @- "
+                "| od -An -tx1 | grep -qw 80"
             ),
             timeout=90,
         )
@@ -201,12 +202,11 @@ pkgs.testers.runNixOSTest {
     # Gateway has no route for /ClearPoison → 404. Live proof the
     # method-gate holds at the data plane (helm-lint proves it
     # statically; this proves the operator's xDS respects it).
-    # busybox wget exits nonzero on 4xx → wrap in `! wget` for the 404.
     with subtest("method-gate via Gateway: ClearPoison 404"):
-        k3s_server.succeed(pod_wget(
-            "! wget -qO- --post-data=x "
-            f"{gw_url}/rio.admin.AdminService/ClearPoison 2>&1 "
-            "| grep -q ."
+        k3s_server.succeed(pod_sh(
+            "curl -s -o /dev/null -w '%{http_code}' -X POST "
+            f"{gw_url}/rio.admin.AdminService/ClearPoison "
+            "-d x | grep -qx 404"
         ))
   '';
 }
