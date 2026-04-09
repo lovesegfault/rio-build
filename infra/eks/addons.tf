@@ -77,23 +77,33 @@ resource "helm_release" "cilium" {
         operator = {
           clusterPoolIPv6PodCIDRList = ["fd42::/104"]
           clusterPoolIPv6MaskSize    = 120
+          # IPv4 pool: pods don't use these (Services are IPv6-only),
+          # but ipv4.enabled=true requires a pool to be configured.
+          clusterPoolIPv4PodCIDRList = ["10.244.0.0/16"]
         }
       }
-      ipv6                 = { enabled = true }
-      ipv4                 = { enabled = false }
+      ipv6 = { enabled = true }
+      # ipv4.enabled=true is REQUIRED for the Geneve underlay: cilium-
+      # agent --underlay-protocol defaults to ipv4. With ipv4 disabled,
+      # the node has no IPv4 datapath address → tunnelendpoint=0.0.0.0
+      # → all cross-node overlay traffic dropped. Nodes have VPC IPv4
+      # (10.42.x.x); Geneve uses that as the tunnel outer. Pod traffic
+      # stays IPv6. The pure-IPv6 alternative (underlayProtocol: ipv6,
+      # PR #40324) is untested here.
+      ipv4                 = { enabled = true }
       enableIPv6Masquerade = true
 
       routingMode    = "tunnel"
       tunnelProtocol = "geneve"
+      bpf            = { masquerade = true }
 
       kubeProxyReplacement = true
       k8sServiceHost       = replace(module.eks.cluster_endpoint, "https://", "")
       k8sServicePort       = 443
 
       encryption = {
-        enabled        = true
-        type           = "wireguard"
-        nodeEncryption = true
+        enabled = true
+        type    = "wireguard"
       }
 
       # C3: dsrDispatch=geneve is the ONLY DSR mode compatible with
