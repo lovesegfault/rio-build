@@ -30474,18 +30474,6 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
-        },
-        {
-          "name": "zstd-safe",
-          "packageId": "zstd-safe"
-        },
-        {
-          "name": "zstd-sys",
-          "packageId": "zstd-sys"
         }
       ],
       "buildDependencies": [
@@ -31479,12 +31467,6 @@
           "packageId": "zstd-safe"
         }
       ],
-      "resolvedDefaultFeatures": [
-        "arrays",
-        "default",
-        "legacy",
-        "zdict_builder"
-      ],
       "libCrateTypes": [
         "lib"
       ],
@@ -31507,10 +31489,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "arrays",
-        "legacy",
-        "std",
-        "zdict_builder"
+        "std"
       ],
       "libCrateTypes": [
         "lib"
@@ -31538,9 +31517,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "legacy",
-        "std",
-        "zdict_builder"
+        "std"
       ],
       "libCrateTypes": [
         "lib"
