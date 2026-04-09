@@ -74,6 +74,85 @@ const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[cfg(test)]
 const ORPHAN_CHUNK_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Populate the session-scoped `sweep_unreachable` temp table used by
+/// the reference re-check anti-join.
+///
+/// Before P0449 the re-check bound the WHOLE `unreachable` Vec<bytea>
+/// as $2 inside the per-path loop: N paths × N-element bytea[] = O(N²)
+/// wire bytes. A 10k-path sweep sent ~3GB of $2 traffic, and
+/// `<> ALL(array_param)` is an unindexed linear scan PG-side.
+/// Populating once here is O(N) wire; NOT EXISTS against the PRIMARY
+/// KEY is an index probe per-row.
+///
+/// `DROP IF EXISTS` first: defends against a prior sweep that crashed
+/// mid-run on the same pooled connection (temp tables are
+/// session-scoped, not transaction-scoped).
+async fn setup_sweep_unreachable(
+    conn: &mut sqlx::PgConnection,
+    unreachable: &[Vec<u8>],
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DROP TABLE IF EXISTS sweep_unreachable")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("CREATE TEMP TABLE sweep_unreachable (path_hash bytea PRIMARY KEY)")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("INSERT INTO sweep_unreachable (path_hash) SELECT unnest($1::bytea[])")
+        .bind(unreachable)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Delete one swept path's metadata: realisations + path_tenants +
+/// narinfo (CASCADE → manifests/manifest_data). Runs inside the
+/// caller's batch transaction.
+///
+/// Returns `false` if narinfo was already gone (defensive; shouldn't
+/// happen under FOR UPDATE). Chunk refcount handling
+/// ([`decrement_and_enqueue`]) is the caller's responsibility — this
+/// only touches the path-keyed tables.
+// r[impl store.realisation.gc-sweep]
+// r[impl store.gc.sweep-path-tenants]
+async fn delete_swept_path(
+    tx: &mut Transaction<'_, Postgres>,
+    store_path_hash: &[u8],
+) -> Result<bool, sqlx::Error> {
+    // Step 2a: DELETE realisations. NOT via CASCADE — realisations has
+    // NO FK to narinfo (002_store.sql:134). Without this, dangling
+    // realisations rows point to swept paths → wopQueryRealisation
+    // returns a path that 404s on fetch. realisations_output_idx makes
+    // the subselect fast.
+    sqlx::query(
+        r#"
+        DELETE FROM realisations
+         WHERE output_path = (
+           SELECT store_path FROM narinfo WHERE store_path_hash = $1
+         )
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut **tx)
+    .await?;
+
+    // Step 2a': DELETE path_tenants. NOT via CASCADE — path_tenants has
+    // NO FK to narinfo (012_path_tenants.sql). Without this, orphaned
+    // rows survive the sweep and grant wrong-tenant visibility when a
+    // different tenant later re-uploads the same store path (the stale
+    // row still JOINs in the r[store.gc.tenant-retention] CTE arm).
+    sqlx::query("DELETE FROM path_tenants WHERE store_path_hash = $1")
+        .bind(store_path_hash)
+        .execute(&mut **tx)
+        .await?;
+
+    // Step 2b: DELETE narinfo. CASCADE takes manifests, manifest_data.
+    let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
+        .bind(store_path_hash)
+        .execute(&mut **tx)
+        .await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
 /// Re-check whether `store_path_hash` has a referrer outside the
 /// `sweep_unreachable` temp table, or a direct `scheduler_live_pins`
 /// entry. See the call-site comment in [`sweep`] for the GIN/anti-join
@@ -183,23 +262,7 @@ pub async fn sweep(
     // pooled connection with stale state.
     let mut conn = pool.acquire().await?;
 
-    // Temp-table anti-join for the reference re-check. Before P0449
-    // the re-check bound the WHOLE `unreachable` Vec<bytea> as $2
-    // inside the per-path loop: N paths × N-element bytea[] = O(N²)
-    // wire bytes. A 10k-path sweep sent ~3GB of $2 traffic, and
-    // `<> ALL(array_param)` is an unindexed linear scan PG-side.
-    // Populating once here is O(N) wire; NOT EXISTS against the
-    // PRIMARY KEY is an index probe per-row.
-    sqlx::query("DROP TABLE IF EXISTS sweep_unreachable")
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("CREATE TEMP TABLE sweep_unreachable (path_hash bytea PRIMARY KEY)")
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query("INSERT INTO sweep_unreachable (path_hash) SELECT unnest($1::bytea[])")
-        .bind(&unreachable)
-        .execute(&mut *conn)
-        .await?;
+    setup_sweep_unreachable(&mut conn, &unreachable).await?;
 
     // Pass 1 (whole-sweep): drain resurrections from sweep_unreachable.
     // For each candidate, re-check for a live referrer; if found,
@@ -377,47 +440,9 @@ pub async fn sweep(
                 continue;
             }
 
-            // r[impl store.realisation.gc-sweep]
-            // Step 2a: DELETE realisations for this path. NOT via
-            // CASCADE — realisations has NO FK to narinfo (002_
-            // store.sql:134). Without this explicit DELETE, dangling
-            // realisations rows point to swept paths →
-            // wopQueryRealisation returns a path that 404s on fetch.
-            // The realisations_output_idx index makes this fast.
-            sqlx::query(
-                r#"
-                DELETE FROM realisations
-                 WHERE output_path = (
-                   SELECT store_path FROM narinfo WHERE store_path_hash = $1
-                 )
-                "#,
-            )
-            .bind(store_path_hash)
-            .execute(&mut *tx)
-            .await?;
-
-            // Step 2a': DELETE path_tenants for this path. NOT via
-            // CASCADE — path_tenants has NO FK to narinfo
-            // (012_path_tenants.sql). Without this explicit DELETE,
-            // orphaned rows survive the sweep and grant wrong-tenant
-            // visibility when a different tenant later re-uploads the
-            // same store path (the stale row still JOINs in the
-            // r[store.gc.tenant-retention] CTE arm).
-            // r[impl store.gc.sweep-path-tenants]
-            sqlx::query("DELETE FROM path_tenants WHERE store_path_hash = $1")
-                .bind(store_path_hash)
-                .execute(&mut *tx)
-                .await?;
-
-            // Step 2b: DELETE narinfo. CASCADE takes manifests,
-            // manifest_data (but NOT realisations — see step 2a above).
-            let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
-                .bind(store_path_hash)
-                .execute(&mut *tx)
-                .await?;
-            if deleted.rows_affected() == 0 {
-                // Already gone (concurrent sweep? shouldn't happen
-                // with FOR UPDATE but be defensive). Skip.
+            if !delete_swept_path(&mut tx, store_path_hash).await? {
+                // narinfo already gone (concurrent sweep? shouldn't
+                // happen under FOR UPDATE). Skip chunk handling.
                 continue;
             }
             stats.paths_deleted += 1;
