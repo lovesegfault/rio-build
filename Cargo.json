@@ -11246,6 +11246,21 @@
         "Sebastian Thiel <sebastian.thiel@icloud.com>"
       ]
     },
+    "glob": {
+      "crateName": "glob",
+      "version": "0.3.3",
+      "edition": "2015",
+      "sha256": "106jpd3syfzjfj2k70mwm0v436qbx96wig98m4q8x071yrq35hhc",
+      "source": {
+        "type": "crates-io"
+      },
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "The Rust Project Developers"
+      ]
+    },
     "gloo-timers": {
       "crateName": "gloo-timers",
       "version": "0.3.0",
@@ -19764,6 +19779,24 @@
         "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
+    "relative-path": {
+      "crateName": "relative-path",
+      "version": "1.9.3",
+      "edition": "2021",
+      "sha256": "1limlh8fzwi21g0473fqzd6fln9iqkwvzp3816bxi31pkilz6fds",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "default"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "John-John Tedro <udoprog@tedro.se>"
+      ]
+    },
     "reqwest 0.12.28": {
       "crateName": "reqwest",
       "version": "0.12.28",
@@ -20481,6 +20514,10 @@
           "packageId": "rio-test-support"
         },
         {
+          "name": "rstest",
+          "packageId": "rstest"
+        },
+        {
           "name": "tempfile",
           "packageId": "tempfile"
         },
@@ -20584,6 +20621,10 @@
         {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
+        },
+        {
+          "name": "rstest",
+          "packageId": "rstest"
         }
       ],
       "crateBin": [
@@ -21051,6 +21092,10 @@
           "packageId": "rio-test-support"
         },
         {
+          "name": "rstest",
+          "packageId": "rstest"
+        },
+        {
           "name": "sqlx",
           "packageId": "sqlx"
         },
@@ -21134,6 +21179,10 @@
         {
           "name": "proptest",
           "packageId": "proptest"
+        },
+        {
+          "name": "rstest",
+          "packageId": "rstest"
         },
         {
           "name": "tempfile",
@@ -21652,6 +21701,10 @@
           "packageId": "rio-test-support"
         },
         {
+          "name": "rstest",
+          "packageId": "rstest"
+        },
+        {
           "name": "tempfile",
           "packageId": "tempfile"
         },
@@ -22010,6 +22063,80 @@
       "authors": [
         "RustCrypto Developers",
         "dignifiedquire <dignifiedquire@gmail.com>"
+      ]
+    },
+    "rstest": {
+      "crateName": "rstest",
+      "version": "0.26.1",
+      "edition": "2021",
+      "sha256": "0jcxhg9mxlr2p9an14algbcq6ax7r0sk1w1kbals5aiv0qy1k8zm",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "rstest_macros",
+          "packageId": "rstest_macros"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Michele d'Amico <michele.damico@gmail.com>"
+      ]
+    },
+    "rstest_macros": {
+      "crateName": "rstest_macros",
+      "version": "0.26.1",
+      "edition": "2021",
+      "sha256": "185v185wn2x3llp3nn1i7h44vi5ffnnsj8b1a32m2ygzy08m714w",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "cfg-if",
+          "packageId": "cfg-if"
+        },
+        {
+          "name": "glob",
+          "packageId": "glob"
+        },
+        {
+          "name": "proc-macro2",
+          "packageId": "proc-macro2"
+        },
+        {
+          "name": "quote",
+          "packageId": "quote"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "relative-path",
+          "packageId": "relative-path"
+        },
+        {
+          "name": "syn",
+          "packageId": "syn"
+        },
+        {
+          "name": "unicode-ident",
+          "packageId": "unicode-ident"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "rustc_version",
+          "packageId": "rustc_version"
+        }
+      ],
+      "procMacro": true,
+      "authors": [
+        "Michele d'Amico <michele.damico@gmail.com>"
       ]
     },
     "russh": {

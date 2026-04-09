@@ -64,6 +64,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 rio-test-support = { workspace = true }
+rstest = { workspace = true }
 # tests/functional/: RioStack fixture runs REAL StoreServiceImpl (not
 # MockStore) backed by ephemeral PG. No dep cycle: both rio-gateway and
 # rio-store depend on rio-proto; neither depends on the other.

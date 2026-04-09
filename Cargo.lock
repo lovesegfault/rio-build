@@ -3550,6 +3550,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "gloo-timers"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6260,6 +6266,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "relative-path"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6437,6 +6449,7 @@ dependencies = [
  "rio-nix",
  "rio-proto",
  "rio-test-support",
+ "rstest",
  "scopeguard",
  "serde",
  "sha1 0.11.0",
@@ -6466,6 +6479,7 @@ dependencies = [
  "rio-crds",
  "rio-proto",
  "rio-test-support",
+ "rstest",
  "rustls 0.23.37",
  "serde",
  "serde_json",
@@ -6575,6 +6589,7 @@ dependencies = [
  "rio-proto",
  "rio-store",
  "rio-test-support",
+ "rstest",
  "russh",
  "serde",
  "serde_json",
@@ -6600,6 +6615,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "proptest",
+ "rstest",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
@@ -6716,6 +6732,7 @@ dependencies = [
  "rio-proto",
  "rio-store",
  "rio-test-support",
+ "rstest",
  "scopeguard",
  "serde",
  "sha2 0.11.0",
@@ -6819,6 +6836,32 @@ dependencies = [
  "signature 3.0.0-rc.10",
  "spki 0.8.0",
  "zeroize",
+]
+
+[[package]]
+name = "rstest"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5a3193c063baaa2a95a33f03035c8a72b83d97a54916055ba22d35ed3839d49"
+dependencies = [
+ "rstest_macros",
+]
+
+[[package]]
+name = "rstest_macros"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c845311f0ff7951c5506121a9ad75aec44d083c31583b2ea5a30bcb0b0abba0"
+dependencies = [
+ "cfg-if",
+ "glob",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "relative-path",
+ "rustc_version",
+ "syn",
+ "unicode-ident",
 ]
 
 [[package]]

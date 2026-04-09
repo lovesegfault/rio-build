@@ -164,6 +164,7 @@ scopeguard = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
+rstest = { workspace = true }
 # Self-reference to enable `test-utils` for integration tests under
 # tests/ — those compile the lib as a dep WITHOUT cfg(test), so the
 # feature is the only way they see `test_helpers` / `MIGRATOR`.

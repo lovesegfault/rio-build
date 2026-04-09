@@ -44,6 +44,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 rio-test-support = { workspace = true }
+rstest = { workspace = true }
 # wps::tests builds Scenario literals with http::Method::GET for the
 # kube_mock ApiServerVerifier. rio-test-support has http as a dep but
 # doesn't re-export it; add directly so the Method constants resolve.
