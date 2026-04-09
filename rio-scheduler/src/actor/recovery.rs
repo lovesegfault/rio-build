@@ -930,4 +930,37 @@ impl DagActor {
         self.persist_status(drv_hash, DerivationStatus::Ready, None)
             .await;
     }
+
+    /// Schedule reconciliation ~45s out via WeakSender. Same pattern as
+    /// `schedule_terminal_cleanup`. Workers have ~45s (3× heartbeat +
+    /// slack) to reconnect after scheduler restart. Any
+    /// Assigned/Running derivation whose worker DIDN'T reconnect by
+    /// then gets reconciled (Completed if outputs in store, else reset).
+    pub(super) fn schedule_reconcile_timer(&self) {
+        let Some(weak_tx) = self.self_tx.clone() else {
+            return;
+        };
+        rio_common::task::spawn_monitored("reconcile-timer", async move {
+            tokio::time::sleep(RECONCILE_DELAY).await;
+            if let Some(tx) = weak_tx.upgrade()
+                && tx.try_send(ActorCommand::ReconcileAssignments).is_err()
+            {
+                tracing::warn!("reconcile command dropped (channel full)");
+                metrics::counter!("rio_scheduler_reconcile_dropped_total").increment(1);
+            }
+        });
+    }
 }
+
+/// Delay before post-recovery worker reconciliation. Workers have
+/// this long to reconnect after scheduler restart; after that, any
+/// Assigned/Running derivation with an unknown worker is reconciled
+/// (Completed if outputs in store, else reset to Ready).
+///
+/// 45s = 3× HEARTBEAT_INTERVAL (10s) + 15s slack. A worker that's
+/// alive should reconnect within one heartbeat; 3× covers network
+/// blips. Same cfg(test) shadow pattern as POISON_TTL.
+#[cfg(not(test))]
+const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(test)]
+const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);

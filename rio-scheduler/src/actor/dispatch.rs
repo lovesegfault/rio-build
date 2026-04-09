@@ -1610,6 +1610,83 @@ impl DagActor {
         }
         inputs
     }
+
+    // -----------------------------------------------------------------------
+    // DAG/queue lookup helpers (used by dispatch + completion + event)
+    // -----------------------------------------------------------------------
+
+    pub(super) fn drv_hash_to_path(&self, drv_hash: &DrvHash) -> Option<String> {
+        self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
+    }
+
+    /// Resolve drv_hash → drv_path, falling back to the hash string
+    /// if the node isn't in the DAG. Used for `derivation_path`
+    /// fields in BuildEvents — better to emit SOMETHING (the hash
+    /// is still a useful identifier) than empty. Extracted from
+    /// three duplicate call sites (dispatch.rs + completion.rs ×2).
+    pub(super) fn drv_path_or_hash_fallback(&self, drv_hash: &DrvHash) -> String {
+        self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
+            warn!(
+                drv_hash = %drv_hash,
+                "drv_hash_to_path returned None; using hash as fallback"
+            );
+            drv_hash.to_string()
+        })
+    }
+
+    /// Resolve a drv_path to its drv_hash via the DAG's reverse index.
+    /// Used by handle_completion since the gRPC layer receives CompletionReport
+    /// with drv_path, but the DAG is keyed by drv_hash.
+    pub(super) fn drv_path_to_hash(&self, drv_path: &str) -> Option<DrvHash> {
+        self.dag.hash_for_path(drv_path).cloned()
+    }
+
+    pub(super) fn find_db_id_by_path(&self, drv_path: &str) -> Option<Uuid> {
+        self.dag
+            .hash_for_path(drv_path)
+            .and_then(|h| self.dag.node(h))
+            .and_then(|s| s.db_id)
+    }
+
+    /// Whether any interested build for this derivation is interactive (IFD).
+    /// Interactive derivations get a priority boost in the queue.
+    fn should_prioritize(&self, drv_hash: &DrvHash) -> bool {
+        self.get_interested_builds(drv_hash).iter().any(|build_id| {
+            self.builds
+                .get(build_id)
+                .is_some_and(|b| b.priority_class.is_interactive())
+        })
+    }
+
+    /// Compute the effective queue priority for a derivation: its
+    /// critical-path priority + interactive boost if applicable.
+    ///
+    /// All queue pushes go through this. Replaces the old `push_front`/
+    /// `push_back` split — interactive is now a number, not a position.
+    ///
+    /// Returns 0.0 if the node isn't in the DAG (stale hash). The
+    /// caller probably shouldn't be pushing it, but 0.0 = lowest
+    /// priority = harmless (stale entries get skipped on pop anyway
+    /// if status != Ready).
+    pub(super) fn queue_priority(&self, drv_hash: &DrvHash) -> f64 {
+        let base = self
+            .dag
+            .node(drv_hash)
+            .map(|n| n.sched.priority)
+            .unwrap_or(0.0);
+        if self.should_prioritize(drv_hash) {
+            base + crate::queue::INTERACTIVE_BOOST
+        } else {
+            base
+        }
+    }
+
+    /// Push a derivation onto the ready queue with its computed priority.
+    /// Centralizes the priority lookup so call sites are simple.
+    pub(super) fn push_ready(&mut self, drv_hash: DrvHash) {
+        let prio = self.queue_priority(&drv_hash);
+        self.ready_queue.push(drv_hash, prio);
+    }
 }
 
 #[cfg(test)]
