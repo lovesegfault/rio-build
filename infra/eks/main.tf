@@ -272,6 +272,12 @@ module "eks" {
       max_size       = 5
       desired_size   = 3
 
+      # Cilium handles networking; nodes don't need the vpc-cni IAM
+      # policy. The module auto-attaches AmazonEKS_CNI_IPv6_Policy
+      # when ip_family=ipv6, but that policy is only created when
+      # vpc-cni is in cluster_addons (which it no longer is).
+      iam_role_attach_cni_policy = false
+
       # No taint: system components (plus kube-system addons like
       # CoreDNS, Karpenter controller) schedule here freely.
       #
