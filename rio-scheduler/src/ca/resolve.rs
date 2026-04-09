@@ -490,14 +490,19 @@ pub async fn insert_realisation_deps(
 /// "resolution logic belongs in the scheduler."
 ///
 /// TODO: replace this raw-SQL copy with
-/// `rio_store::realisations::query` (now `pub`). The store-side fn
-/// returns the full `Realisation` struct with row validation; this
-/// shim only needs `output_path`. Swapping requires adding rio-store
-/// as a prod scheduler dep — currently dev-only — and rio-store has no
-/// lean feature gate (its only feature is `test-utils`), so this would
-/// pull aws-sdk-s3 + the gRPC server stack into the scheduler build.
-/// Deferred until rio-store grows a `schema`-only feature or the
-/// query moves to `rio_common::schema`.
+/// `rio_store::realisations::query` (now `pub`). Blocked: a
+/// `schema`-only feature on rio-store cascades — `realisations::query`
+/// returns `metadata::MetadataError`, and `metadata/mod.rs` interleaves
+/// the error enum with `ManifestKind`/`NarinfoRow`/queries across ~500
+/// lines + 6 submodules, pulling `bytes` + `rio_proto::validated` even
+/// for the bare enum. Making `default-features = false` actually drop
+/// aws-sdk-s3/axum/moka/reqwest requires (a) extracting
+/// `MetadataError` + `From<sqlx::Error>` into an always-on module,
+/// (b) marking ~15 deps `optional`, (c) `required-features` on the
+/// bin, (d) gating `describe_metrics()` + `build.rs`. That's a
+/// rio-store structural refactor, not a flag add. Alternative: move
+/// the `realisations` table accessors to `rio_common::schema` (already
+/// a shared dep, already has `postgres` feature).
 pub(crate) async fn query_realisation(
     pool: &PgPool,
     modular_hash: &[u8; 32],
