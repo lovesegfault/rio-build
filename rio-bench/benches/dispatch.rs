@@ -62,7 +62,7 @@ impl InstantWorker {
                     executor_id: executor_id.into(),
                     systems: vec!["x86_64-linux".into()],
                     supported_features: vec![],
-                    running_builds: vec![],
+                    running_build: None,
                     size_class: None,
                     resources: None,
                     store_degraded: false,
