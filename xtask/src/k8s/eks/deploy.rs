@@ -178,9 +178,14 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     ui::step("chart deps", crate::k8s::shared::chart_deps).await?;
 
     // NLB annotations (previously a --set-json one-liner in bash).
+    // target-type:instance — Cilium cluster-pool overlay IPs (fd42::)
+    // are NOT VPC-routable, so target-type:ip can't reach pods. NLB
+    // targets node IPs at the NodePort; Cilium's eBPF kube-proxy
+    // replacement handles node→pod (externalTrafficPolicy:Local in
+    // gateway.yaml preserves source IP).
     let nlb_ann = json!({
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
-        "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "ip",
+        "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
         "service.beta.kubernetes.io/aws-load-balancer-scheme": "internal",
         // P0542: dualstack NLB so the gateway has both A and AAAA.
         // v6-only pods inside the cluster reach it via the Service

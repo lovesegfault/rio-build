@@ -63,6 +63,11 @@ spec:
           env:
             - name: AWS_REGION
               value: {{ .Values.global.region | quote }}
+            # Cilium cluster-pool gives pods IPv6-only overlay addresses
+            # (fd42::/104). The default STS/S3/SecretsManager endpoints
+            # are v4-only; dualstack endpoints have AAAA records.
+            - name: AWS_USE_DUALSTACK_ENDPOINT
+              value: "true"
             - name: CHUNK_BUCKET
               value: {{ .Values.store.chunkBackend.bucket | quote }}
             # awscli2 writes config/cache to $HOME/.aws/. With UID 65532 and
