@@ -181,8 +181,9 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     // target-type:instance — Cilium cluster-pool overlay IPs (fd42::)
     // are NOT VPC-routable, so target-type:ip can't reach pods. NLB
     // targets node IPs at the NodePort; Cilium's eBPF kube-proxy
-    // replacement handles node→pod (externalTrafficPolicy:Local in
-    // gateway.yaml preserves source IP).
+    // replacement handles node→pod. externalTrafficPolicy:Local in
+    // gateway.yaml means only nodes hosting a gateway pod pass NLB
+    // health checks (others are correctly unhealthy, not a bug).
     let nlb_ann = json!({
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
@@ -190,11 +191,20 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         // dualstack: cluster is IPv6-only (no IPv4 Service CIDR), so
         // ip-address-type=ipv4 fails with "unsupported IPv6 config".
         // dualstack with target-type=instance needs the instances to
-        // have a PRIMARY IPv6 — set via primary_ipv6=true on the
-        // nodegroup launch template (main.tf) and Karpenter
-        // EC2NodeClass.
+        // have a PRIMARY IPv6 — set by the primary-ipv6-init systemd
+        // oneshot baked into the NixOS AMI (eks-node.nix); system
+        // nodes are excluded from external LBs (main.tf).
         "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
+        // preserve_client_ip OFF: the TG is ipAddressType=ipv6 (Service
+        // is single-stack v6). With preserve on (the instance-target
+        // default): IPv4 clients on the dualstack listener can't be
+        // forwarded to v6 targets without enablePrefixForIpv6SourceNat,
+        // and intra-VPC clients that are themselves registered targets
+        // hit NLB hairpin RST. NLB SNAT to its own v6 fixes both.
+        // Source IP is already lost at Cilium (loadBalancer.mode=snat,
+        // addons.tf) and rio-gateway doesn't consume it.
+        "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes": "preserve_client_ip.enabled=false",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
 
