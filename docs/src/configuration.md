@@ -8,7 +8,7 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `listen_addr` | string | `0.0.0.0:2222` | SSH listen address and port |
+| `listen_addr` | string | `[::]:2222` | SSH listen address and port |
 | `host_key` | string | (required) | SSH host key file path. If unset or missing, gateway generates an ephemeral key (breaks `known_hosts` on restart --- set in production). |
 | `authorized_keys` | string | (required) | Authorized SSH keys file path |
 | `scheduler_addr` | string | (required) | Scheduler gRPC endpoint |
@@ -20,7 +20,7 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `listen_addr` | string | `0.0.0.0:9001` | gRPC listen address |
+| `listen_addr` | string | `[::]:9001` | gRPC listen address |
 | `database_url` | string | (required) | PostgreSQL connection string |
 | `ema_alpha` | f64 | 0.3 | EMA smoothing factor for duration estimates |
 | `poison_threshold` | u32 | 3 | Failures across different executors before poisoning |
@@ -35,10 +35,10 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `listen_addr` | string | `0.0.0.0:9002` | gRPC listen address |
+| `listen_addr` | string | `[::]:9002` | gRPC listen address |
 | `cache_http_addr` | socket addr | (unset) | Binary cache HTTP listen address. None = don't spawn the HTTP server. |
 | `database_url` | string | (required) | PostgreSQL connection string |
-| `metrics_addr` | socket addr | `0.0.0.0:9092` | Prometheus metrics listen address |
+| `metrics_addr` | socket addr | `[::]:9092` | Prometheus metrics listen address |
 | `chunk_backend` | tagged enum | `{ kind = "inline" }` | Where chunks live. See `ChunkBackendKind` below. |
 | `chunk_cache_capacity_bytes` | u64 | 2147483648 (2 GiB) | moka LRU capacity for chunk reads (shared across all services). |
 | `signing_key_path` | path | (unset) | ed25519 narinfo signing key (Nix secret-key format). None = signing disabled. |
@@ -75,8 +75,8 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `fuse_threads` | u32 | 4 | Number of FUSE daemon threads |
 | `fuse_passthrough` | bool | true | Enable kernel passthrough (Linux 6.9+). Disable only for debugging. |
 | `overlay_base_dir` | path | `/var/rio/overlays` | Base directory for per-build overlay upper/work layers |
-| `metrics_addr` | socket addr | `0.0.0.0:9093` | Prometheus metrics listen address |
-| `health_addr` | socket addr | `0.0.0.0:9193` | HTTP `/healthz` + `/readyz` listen address (builder has no gRPC server) |
+| `metrics_addr` | socket addr | `[::]:9093` | Prometheus metrics listen address |
+| `health_addr` | socket addr | `[::]:9193` | HTTP `/healthz` + `/readyz` listen address (builder has no gRPC server) |
 | `log_rate_limit` | u64 | 10000 | Maximum log lines per second per build (0 = unlimited) |
 | `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build (0 = unlimited) |
 | `size_class` | string | `""` | Size-class label (e.g., `small`, `large`). If the scheduler has `size_classes` configured, builders with an empty `size_class` are **rejected**. |
@@ -89,8 +89,8 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `health_addr` | socket addr | `0.0.0.0:9194` | HTTP `/healthz` listen address |
-| `metrics_addr` | socket addr | `0.0.0.0:9094` | Prometheus metrics listen address |
+| `health_addr` | socket addr | `[::]:9194` | HTTP `/healthz` listen address |
+| `metrics_addr` | socket addr | `[::]:9094` | Prometheus metrics listen address |
 | `scheduler_addr` | string | (required) | Scheduler gRPC endpoint (for queue depth queries + DrainExecutor on finalizer) |
 
 > **The controller is NOT leader-elected** (single replica by design). Only the scheduler uses a Kubernetes Lease (see scheduler `RIO_LEASE_NAME` / `RIO_LEASE_NAMESPACE` env vars documented in [scheduler: Leader Election](./components/scheduler.md#leader-election)).

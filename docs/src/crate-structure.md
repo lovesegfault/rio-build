@@ -118,8 +118,11 @@ src/
 ├── jwt.rs             # JWT encode/decode primitives (ed25519)
 ├── jwt_interceptor.rs # tonic interceptor for JWT verify + Claims extraction
 ├── limits.rs          # MAX_NAR_SIZE, MAX_DAG_NODES/EDGES, heartbeat constants
+├── migrate.rs         # Shared sqlx migration runner (try-then-wait advisory lock)
 ├── observability.rs   # Tracing/OTel init (OtelGuard), init_metrics (global_labels, DEFAULT_BUCKETS,
 │                      #   per-crate histogram_buckets)
+├── s3.rs              # Shared aws_sdk_s3::Client builder (store chunk backend + scheduler log flush)
+├── schema.rs          # Cross-service PG row types (compile-time schema contract)
 ├── server.rs          # bootstrap(): 6-step cold-start prologue (crypto, tracing, config, TLS, signal,
 │                      #   metrics); Bootstrap<C>/HasCommonConfig; tonic_builder; drain helpers
 ├── signal.rs          # SIGTERM/SIGINT → CancellationToken; sighup_reload (hot-reload loop)
@@ -209,6 +212,7 @@ src/
 │   ├── balance.rs     # Client-side health-probe balancer (scheduler leader discovery)
 │   └── retry.rs       # Shutdown-aware connect retry with exponential backoff (cold-start loop)
 ├── interceptor.rs     # W3C traceparent inject/extract for tonic
+├── status.rs          # nix-daemon BuildStatus ↔ proto BuildResultStatus bidirectional mapping
 └── validated.rs       # ValidatedPathInfo (proto → domain type validation)
 ```
 
@@ -329,9 +333,7 @@ src/
 src/
 ├── lib.rs
 ├── main.rs
-├── backend/
-│   ├── mod.rs         # ChunkBackend trait + InMemory test impl
-│   └── chunk.rs       # S3-compatible chunk backend
+├── backend.rs         # ChunkBackend trait + S3/filesystem/memory impls + delete_by_key (GC drain)
 ├── grpc/
 │   ├── mod.rs         # StoreService + ChunkService skeleton
 │   ├── admin.rs       # Store AdminService (TriggerGC, VerifyChunks, upstream CRUD, GetLoad)
@@ -522,3 +524,17 @@ src/
 ├── workers.rs         # `rio workers` — ListExecutors table + per-executor drain; --actor/--diff for in-mem state
 └── bps.rs             # `rio bps get|describe` — BuilderPoolSet inspection (kube-rs, not gRPC)
 ```
+
+### rio-bench — Performance regression gates
+
+Criterion benches compiled against `rio-scheduler` + `rio-proto` with
+`rio-test-support` fixtures (ephemeral PG, in-process gRPC). Not a binary
+crate; `cargo bench -p rio-bench` runs the suite. CI compares against
+checked-in baselines.
+
+### xtask — Dev/ops tooling
+
+`cargo xtask` subcommands for codegen (`regen cargo-json`, `regen sqlx`,
+`regen fuzz-lock`), local cluster lifecycle (`up`/`down`/`status`), AMI
+build, and helm/k8s helpers. Depends on `rio-crds` (CRD apply) and
+`rio-test-support` (ephemeral PG bootstrap for `regen sqlx`).

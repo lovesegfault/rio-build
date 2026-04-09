@@ -8,44 +8,44 @@ Per [ADR-019](../decisions/019-builder-fetcher-split.md), this component is scop
 
 ## Responsibilities
 
-- Receive build assignments from scheduler via gRPC
-- Run the FUSE store daemon (`rio-fuse`) that mounts at `/var/rio/fuse-store` (configurable) with lazy on-demand fetching from rio-store
-- Manage per-build overlay filesystem: FUSE mount as lower layer, local SSD as upper layer; the overlay's merged dir is bind-mounted at `/nix/store` inside the build's mount namespace
+- Receive a single build assignment from the scheduler via gRPC (one derivation per pod, then exit)
+- Run the FUSE store daemon (the `fuse` module) that mounts at `/var/rio/fuse-store` (configurable) with lazy on-demand fetching from rio-store
+- Set up the build's overlay filesystem: FUSE mount as lower layer, local SSD as upper layer; the overlay's merged dir is bind-mounted at `/nix/store` inside the build's mount namespace
 - Execute build: invoke `nix-daemon --stdio` locally for sandboxed build execution
 - Stream build logs back to scheduler via gRPC bidirectional streaming
 - After build: upload output NAR to rio-store (chunked), report completion
 - Heartbeat / health checking to scheduler
 - Resource usage reporting (CPU, memory, disk, build duration)
 
-## FUSE Store (`rio-fuse`)
+## FUSE Store (`rio-builder::fuse`)
 
-Each builder runs a FUSE filesystem that presents store paths to the build environment. The FUSE daemon mounts at `/var/rio/fuse-store` (configurable --- **never** directly at `/nix/store`, which would shadow the host store and break every process on the machine including the builder itself). The per-build overlay's merged directory is what gets bind-mounted at `/nix/store`, and only inside the build's mount namespace. The FUSE daemon communicates with rio-store via gRPC to lazily fetch store path content on demand.
+Each builder runs a FUSE filesystem that presents store paths to the build. The FUSE daemon mounts at `/var/rio/fuse-store` (configurable --- **never** directly at `/nix/store`, which would shadow the host store and break every process on the machine including the builder itself). The overlay's merged directory is what gets bind-mounted at `/nix/store`, and only inside the build's mount namespace. The FUSE daemon communicates with rio-store via gRPC to lazily fetch store path content on demand.
 
 ```
-                         Builder Pod
-┌──────────────────────────────────────────────────────────┐
-│                                                          │
-│  rio-fuse (FUSE daemon)                                  │
-│  ├── Mounts /var/rio/fuse-store                          │
-│  ├── On file access: fetches from rio-store via gRPC     │
-│  ├── Local SSD cache (LRU eviction)                      │
-│  ├── Immutable content → no cache invalidation needed    │
-│  └── Accepts prefetch hints from scheduler               │
-│                                                          │
-│  ┌──────────────────┐  ┌──────────────────┐             │
-│  │    Build A        │  │    Build B        │             │
-│  │  overlayfs        │  │  overlayfs        │             │
-│  │  ┌──────────────┐ │  │  ┌──────────────┐ │             │
-│  │  │ Upper (SSD)  │ │  │  │ Upper (SSD)  │ │             │
-│  │  │ - outputs    │ │  │  │ - outputs    │ │             │
-│  │  │ - db.sqlite  │ │  │  │ - db.sqlite  │ │             │
-│  │  ├──────────────┤ │  │  ├──────────────┤ │             │
-│  │  │ Lower        │ │  │  │ Lower        │ │             │
-│  │  │ (FUSE mount) │ │  │  │ (FUSE mount) │ │             │
-│  │  └──────────────┘ │  │  └──────────────┘ │             │
-│  │  nix sandbox      │  │  nix sandbox      │             │
-│  └──────────────────┘  └──────────────────┘             │
-└──────────────────────────────────────────────────────────┘
+                       Builder Pod
+┌────────────────────────────────────────────────────┐
+│                                                    │
+│  FUSE daemon (rio-builder::fuse)                   │
+│  ├── Mounts /var/rio/fuse-store                    │
+│  ├── On file access: fetches from rio-store (gRPC) │
+│  ├── Local SSD cache (LRU eviction)                │
+│  ├── Immutable content → no cache invalidation     │
+│  └── Accepts prefetch hints from scheduler         │
+│                                                    │
+│  ┌──────────────────┐                              │
+│  │  Build (single)  │                              │
+│  │  overlayfs       │                              │
+│  │  ┌─────────────┐ │                              │
+│  │  │ Upper (SSD) │ │                              │
+│  │  │ - outputs   │ │                              │
+│  │  │ - db.sqlite │ │                              │
+│  │  ├─────────────┤ │                              │
+│  │  │ Lower       │ │                              │
+│  │  │ (FUSE mnt)  │ │                              │
+│  │  └─────────────┘ │                              │
+│  │  nix sandbox     │                              │
+│  └──────────────────┘                              │
+└────────────────────────────────────────────────────┘
 ```
 
 ### Why FUSE Instead of a Shared PV
@@ -148,15 +148,11 @@ The `fuser` 0.17 crate includes breaking API changes from 0.14/0.15 that affect 
 ```mermaid
 graph TB
     subgraph "Builder Pod"
-        FUSE["rio-fuse daemon<br/>(FUSE mount at /var/rio/fuse-store)"]
+        FUSE["FUSE daemon<br/>(mount at /var/rio/fuse-store)"]
         Cache["SSD Cache<br/>(LRU, Arc&lt;Cache&gt;)"]
-        subgraph "Build A (child mount ns)"
-            OA["overlayfs merged<br/>upper: /var/rio/overlays/build-a<br/>lower: host /nix/store : FUSE<br/>bind-mounted at /nix/store"]
+        subgraph "Build (child mount ns)"
+            OA["overlayfs merged<br/>upper: /var/rio/overlays/{build}<br/>lower: host /nix/store : FUSE<br/>bind-mounted at /nix/store"]
             SA["nix sandbox<br/>(user/mount/PID/net ns)"]
-        end
-        subgraph "Build B (child mount ns)"
-            OB["overlayfs merged<br/>upper: /var/rio/overlays/build-b<br/>lower: host /nix/store : FUSE<br/>bind-mounted at /nix/store"]
-            SB["nix sandbox"]
         end
     end
     Store["rio-store (gRPC)"]
@@ -164,9 +160,7 @@ graph TB
     FUSE --> Cache
     Cache -->|miss| Store
     OA -->|lower| FUSE
-    OB -->|lower| FUSE
     SA --> OA
-    SB --> OB
 ```
 
 ## Builder Nix Configuration
@@ -433,7 +427,7 @@ Without `/dev/fuse`, the FUSE daemon cannot create the store mount and the build
 r[builder.fuse.passthrough]
 Linux 6.9 introduced FUSE passthrough mode (`FUSE_PASSTHROUGH`), which allows the FUSE daemon to hand off file descriptors to backing files. For cached store paths on local SSD, passthrough mode bypasses the kernel-userspace context switch entirely, providing near-native I/O performance.
 
-This is relevant to rio-fuse because the warm-cache path (store paths already fetched to local SSD) is the most performance-critical. With passthrough:
+This is relevant to the FUSE daemon because the warm-cache path (store paths already fetched to local SSD) is the most performance-critical. With passthrough:
 - Reads from cached paths go directly to the SSD-backed file via the kernel, no userspace FUSE daemon involvement
 - Only cache-miss reads require the full FUSE round-trip to rio-store via gRPC
 - The performance concern from [Challenge #13](../challenges.md) ("FUSE overhead must be < 2x direct reads") may be reduced to near-native for warm builds
@@ -446,13 +440,13 @@ The Phase 1a spike validated passthrough on EKS AL2023 (kernel 6.12). Key findin
 
 1. **Passthrough works on ext4/xfs-backed files.** `open_backing()` succeeds and the kernel handles `read()` directly without entering userspace.
 
-2. **Passthrough does NOT work on overlay-backed files.** The kernel's `fuse_passthrough_open` checks the backing file's filesystem stack depth and returns `EPERM` if it's on a stacked filesystem (overlayfs, another FUSE mount). This means the backing files must be on a real filesystem (local SSD, emptyDir), not on a container's overlay rootfs. This is consistent with the production design where `rio-fuse` serves from local SSD cache.
+2. **Passthrough does NOT work on overlay-backed files.** The kernel's `fuse_passthrough_open` checks the backing file's filesystem stack depth and returns `EPERM` if it's on a stacked filesystem (overlayfs, another FUSE mount). This means the backing files must be on a real filesystem (local SSD, emptyDir), not on a container's overlay rootfs. This is consistent with the production design where the FUSE daemon serves from local SSD cache.
 
 3. **Passthrough does not help for open-heavy workloads.** The spike benchmark (open+read+close per file, 74k files) showed identical latency with and without passthrough. The bottleneck is `lookup()` and `open()` calls which still traverse userspace even with passthrough enabled. Passthrough only bypasses `read()`.
 
-4. **Passthrough benefits sustained reads on open file handles.** For production `rio-fuse`, this means the cache should keep file handles open across multiple reads from the same store path. A build that reads a large `.so` or header file repeatedly will benefit; a build that opens thousands of small files once will not.
+4. **Passthrough benefits sustained reads on open file handles.** For production, this means the cache should keep file handles open across multiple reads from the same store path. A build that reads a large `.so` or header file repeatedly will benefit; a build that opens thousands of small files once will not.
 
-**Implications for `rio-fuse` design:**
+**Implications for the FUSE daemon design:**
 - The FUSE cache (`fuse/cache.rs`) should maintain open file handles for cached paths, not just the path data. When a file is opened via `open()`, register a passthrough backing fd and keep it alive until eviction.
 - `max_stack_depth` must be set to 1 in `init()`. Setting it to 2 allows the FUSE mount itself to be used as the lower layer of an overlayfs (which is the production layout: FUSE lower + SSD upper).
 - The `fuser` crate (0.17+) supports passthrough without patches or forks.

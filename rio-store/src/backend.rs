@@ -1,10 +1,10 @@
 //! Chunk storage backends.
 //!
 //! Stores BLAKE3-addressed chunks. Three impls: S3 (prod), filesystem
-//! (dev), memory (tests). The trait is minimal — put/get/exists_batch —
-//! because chunks are immutable and content-addressed: no update, no
-//! rename, delete only via GC (not this trait's concern; that's the
-//! `pending_s3_deletes` outbox pattern in a later phase).
+//! (dev), memory (tests). The trait is put/get/exists_batch/delete_by_key
+//! — chunks are immutable and content-addressed, so there's no update or
+//! rename. Delete goes through the `pending_s3_deletes` outbox: GC sweep
+//! enqueues keys in-transaction, the drain task calls `delete_by_key`.
 //!
 //! # Design
 //!
