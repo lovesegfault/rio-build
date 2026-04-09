@@ -1,13 +1,14 @@
 //! ed25519 narinfo signing.
 //!
 //! Signatures are computed at PutPath time and stored in
-//! `narinfo.signatures`. The binary-cache HTTP server (cache_server.rs) serves them
-//! as `Sig:` lines — it never touches the private key. This means:
+//! `narinfo.signatures`. Read-path consumers (gRPC `QueryPathInfo`,
+//! gateway narinfo responses) serve them as `Sig:` lines — they
+//! never touch the private key. This means:
 // r[impl store.signing.fingerprint]
 //! - Key rotation doesn't require re-serving anything (paths signed
 //!   under the old key stay valid; new paths get the new key)
-//! - The HTTP server can be a separate, less-privileged process
-//! - A compromised HTTP server can't forge signatures for paths we
+//! - Read-path consumers can be separate, less-privileged processes
+//! - A compromised read path can't forge signatures for paths we
 //!   didn't actually store
 //!
 //! # Key file format (Nix-compatible)

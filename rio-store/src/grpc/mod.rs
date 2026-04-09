@@ -287,9 +287,8 @@ impl StoreServiceImpl {
     ///
     /// Use this when you want ONE cache shared across multiple
     /// services. main.rs constructs one `Arc<ChunkCache>`, passes
-    /// clones here + to `ChunkServiceImpl::new` + to
-    /// `CacheServerState` — a chunk warmed by any service is hot
-    /// for all. Without this call, the service is inline-only (all
+    /// clones here + to `ChunkServiceImpl::new` — a chunk warmed by
+    /// either is hot for both. Without this call, the service is inline-only (all
     /// NARs go into `manifests.inline_blob` regardless of size).
     pub fn with_chunk_cache(mut self, cache: Arc<ChunkCache>) -> Self {
         self.chunk_backend = Some(cache.backend());

@@ -37,7 +37,7 @@ use crate::grpc::StoreServiceImpl;
 /// `Arc::new(MemoryChunkBackend::new())`. Consolidates the ~19 test sites
 /// that hand-roll this. Returns the concrete `Arc<MemoryChunkBackend>` so
 /// callers that need to inspect backend state (e.g. `cas.rs`'s
-/// `make_cache`, `cache_server` blob assertions) keep direct access;
+/// `make_cache`) keep direct access;
 /// callers that only need the trait object rely on unsized coercion at
 /// the binding site:
 ///

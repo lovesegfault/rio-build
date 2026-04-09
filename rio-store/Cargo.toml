@@ -17,11 +17,11 @@ required-features = ["server"]
 default = ["server"]
 # Lean PG-schema accessors only (`error` + `realisations` modules). Lets
 # rio-scheduler depend on `rio_store::realisations::query` without
-# pulling aws-sdk-s3/axum/moka/reqwest/tonic into its build. Compiles
-# with sqlx + thiserror + tracing + hex.
+# pulling aws-sdk-s3/moka/reqwest/tonic into its build. Compiles with
+# sqlx + thiserror + tracing + hex.
 schema = []
-# Full store: gRPC services, S3 backend, chunked CAS, GC, binary-cache
-# HTTP, signing, substitution. The whole heavy dep tree.
+# Full store: gRPC services, S3 backend, chunked CAS, GC, signing,
+# substitution. The whole heavy dep tree.
 server = [
   "dep:rio-common",
   "dep:rio-auth",
@@ -40,7 +40,6 @@ server = [
   "dep:sha2",
   "dep:ed25519-dalek",
   "dep:base64",
-  "dep:axum",
   "dep:fastcdc",
   "dep:blake3",
   "dep:futures-util",
@@ -95,14 +94,13 @@ tokio-stream = { workspace = true, optional = true }
 # grpc.health.v1.Health for K8s readiness probes. SERVING after PG
 # migrations complete — before that, every store RPC would fail.
 tonic-health = { workspace = true, optional = true }
-# Streaming zstd for the cache_server /nar/ route. Replaces buffered
-# encode_all (4GB peak for 4GB NAR) with O(chunk*K) pipeline.
+# Streaming xz/zstd decode for upstream substitution (substitute.rs
+# pipes the upstream NAR body through XzDecoder/ZstdDecoder).
 async-compression = { workspace = true, optional = true }
-# StreamReader (Stream<Bytes> → AsyncRead) + ReaderStream (AsyncRead
-# → Stream<Bytes>). The round-trip lets zstd sit in the middle.
+# StreamReader (Stream<Bytes> → AsyncRead) for substitute.rs.
 tokio-util = { workspace = true, optional = true }
 
-# Per-tenant accounting (gc/tenant.rs) + cache_server auth extension.
+# Per-tenant accounting (gc/tenant.rs).
 uuid = { workspace = true, optional = true }
 
 # S3. Client builder shared with rio-scheduler via rio-common's `aws`
@@ -115,13 +113,9 @@ bytes = { workspace = true, optional = true }
 # Crypto
 sha2 = { workspace = true, optional = true }
 # narinfo signing. Signatures are computed at PutPath time and stored
-# in narinfo.signatures so the HTTP cache server never touches the privkey.
+# in narinfo.signatures so read-path consumers never touch the privkey.
 ed25519-dalek = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-
-# Binary cache HTTP server. axum for routing. We store uncompressed
-# chunks for dedup and zstd-compress at serve time via async-compression.
-axum = { workspace = true, optional = true }
 
 # Phase 2c chunked CAS
 fastcdc = { workspace = true, optional = true }
@@ -170,9 +164,6 @@ rstest = { workspace = true }
 # feature is the only way they see `test_helpers` / `MIGRATOR`.
 rio-store = { path = ".", features = ["test-utils"] }
 rio-test-support = { workspace = true }
-# Sync decode_all for cache_server round-trip tests — verify the
-# async-compression stream produces valid zstd.
-zstd = { workspace = true }
 tempfile = { workspace = true }
 # In-memory cert generation for cert_cn() unit tests (CN parsing).
 rcgen = { workspace = true }
@@ -181,8 +172,9 @@ tokio-stream = { workspace = true, features = ["net"] }
 aws-smithy-mocks = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
-# For cache_server tests: Router::oneshot (ServiceExt trait).
-tower = { workspace = true, features = ["util"] }
+# substitute.rs tests spin an in-process axum server as a fake upstream
+# binary cache (`wiremock` isn't in the deptree).
+axum = { workspace = true }
 # For main.rs ChunkBackendKind TOML + env-var parsing tests. The
 # production code uses figment via rio_common::config::load. dev-dep
 # here for Toml::string + Jail (env manipulation under global mutex).

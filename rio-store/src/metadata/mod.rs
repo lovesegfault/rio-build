@@ -47,8 +47,8 @@ mod tenant_keys;
 pub mod upstreams;
 
 // Public API — explicit re-exports so all external callers in grpc/,
-// cas.rs, cache_server.rs keep their `metadata::foo` paths. Kept
-// explicit (not `pub use chunked::*` etc.) so dead items in submodules
+// cas.rs keep their `metadata::foo` paths. Kept explicit (not
+// `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
 pub use chunked::{
     complete_manifest_chunked, complete_manifest_chunked_in_tx, delete_manifest_chunked_uploading,
@@ -63,7 +63,7 @@ pub use inline::{
 pub use inline::{delete_manifest_uploading, manifest_uploading_age};
 pub use queries::{
     append_signatures, find_missing_paths, get_manifest, get_manifest_batch, path_by_nar_hash,
-    query_by_hash_part, query_by_hash_part_for_tenant, query_path_info, query_path_info_batch,
+    query_by_hash_part, query_path_info, query_path_info_batch,
 };
 pub use tenant_keys::get_active_signer;
 pub use upstreams::{SigMode, Upstream};

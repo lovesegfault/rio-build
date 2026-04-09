@@ -1,15 +1,15 @@
 //! NAR content-addressable store.
 //!
 //! PostgreSQL-backed metadata (`narinfo`, `manifests`) with FastCDC
-//! chunk deduplication, moka chunk cache, ed25519 narinfo [`signing`],
-//! and an axum binary-cache HTTP server. Serves `StoreService` +
-//! `ChunkService` gRPC (see [`grpc`]).
+//! chunk deduplication, moka chunk cache, and ed25519 narinfo
+//! [`signing`]. Serves `StoreService` + `ChunkService` gRPC (see
+//! [`grpc`]).
 //!
 //! # Feature flags
 //!
 //! - `server` (default): the full store — gRPC services, S3 backend,
-//!   chunked CAS, GC, binary-cache HTTP, signing, substitution. Pulls
-//!   the heavy dep tree (aws-sdk-s3, axum, moka, reqwest, tonic, …).
+//!   chunked CAS, GC, signing, substitution. Pulls the heavy dep tree
+//!   (aws-sdk-s3, moka, reqwest, tonic, …).
 //! - `schema`: lean subset for crates that only need to read/write the
 //!   shared PG tables directly (rio-scheduler's CA resolver). Exposes
 //!   [`error`] + [`realisations`]; compiles with `sqlx` + `thiserror` +
@@ -37,8 +37,6 @@ pub mod realisations;
 
 #[cfg(feature = "server")]
 pub mod backend;
-#[cfg(feature = "server")]
-pub mod cache_server;
 #[cfg(feature = "server")]
 pub mod cas;
 #[cfg(feature = "server")]

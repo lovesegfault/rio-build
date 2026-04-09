@@ -65,7 +65,6 @@ Each manifest is stored as a single PostgreSQL row with a `bytea` column contain
 
 - **S3 key schema:** `chunks/{first-2-hex-chars}/{full-blake3-hex}` (prefix-partitioned to avoid S3 hotspots)
 - Chunks are stored uncompressed in S3 to maximize dedup across packages
-- NAR streams are compressed on-the-fly (zstd) when serving via the binary cache HTTP endpoint
 - Dedup during `PutPath` uses a `refcount == 1` heuristic: after the refcount UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload and need to go to S3; chunks with refcount > 1 already existed. This has a small TOCTOU window (two concurrent uploaders of the same chunk may both skip upload), but the race is harmless — `GetPath` BLAKE3-verifies every chunk and surfaces `NotFound` as a clear error, not silent corruption. A separate `FindMissingChunks` gRPC batch-query exists for external callers (e.g., executor-side pre-upload checks).
 - **S3 backend requirements:** Strong read-after-write consistency is required. AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph RADOS GW) must be validated for consistency.
 
@@ -190,34 +189,11 @@ When multiple concurrent requests need the same chunk from S3 (common during col
 
 This is critical for cold start thundering herd: when many builds start simultaneously and request overlapping closures, without coalescing S3 would see O(N*M) GET requests instead of O(M) where N is concurrent builds and M is unique chunks.
 
-## Binary Cache HTTP Server
-
-r[store.http.narinfo]
-rio-store serves the standard Nix binary cache protocol so Nix clients can use it as a substituter directly (e.g., `substituters = https://rio-cache.example.com`).
-
-| Endpoint | Description |
-|----------|-------------|
-| `/nix-cache-info` | Required by Nix clients. Returns `StoreDir`, `WantMassQuery`, `Priority`. |
-| `/<hash>.narinfo` | Path metadata (narinfo format with signatures) |
-| `/nar/<hash>.nar.zst` | NAR content (zstd-compressed, reassembled from chunks) |
-
-- Served by an embedded axum server in the same rio-store process (consider separate scaling for high-traffic caches)
-- Narinfo signatures are pre-computed at `PutPath` time and stored in metadata
-- `Cache-Control: public, max-age=31536000, immutable` for NAR and narinfo (content-addressed = immutable)
-- `ETag` headers derived from NAR hash for conditional requests
-- Compression: serves `.nar.zst` only (target Nix 2.20+ fully supports zstd; `.nar.xz` is not supported to avoid CPU-expensive on-the-fly XZ compression)
-- **FileHash/FileSize omission:** narinfo responses omit the optional `FileHash` and `FileSize` fields because NARs are compressed on-the-fly from chunks (no pre-compressed file exists on disk or in S3). Nix falls back to `NarHash`/`NarSize` verification after decompression, which rio-store already guarantees via its content integrity checks.
-- `HEAD` requests for narinfo are handled efficiently (metadata lookup, no NAR reassembly)
-- **Authentication:** Bearer token authentication for private caches. Nix supports `netrc-file` and `access-tokens` settings for HTTP cache auth.
-
-r[store.cache.auth-bearer]
-Binary cache authentication uses per-tenant Bearer tokens mapped via the `tenants.cache_token` column. The auth middleware queries `SELECT tenant_name FROM tenants WHERE cache_token = $1` on each request; a valid token authenticates as that tenant. Unknown/missing token → `401 Unauthorized` with `WWW-Authenticate: Bearer`. Unauthenticated access requires explicit opt-in via `cache_allow_unauthenticated = true` in the store config (default `false` — fail loud). When auth is required but no tenants have tokens configured (misconfigured deployment), requests return `503 Service Unavailable` with a descriptive message so operators notice immediately.
-
 ## Signing Key Management
 
 r[store.signing.fingerprint]
 - Per-instance signing key stored in a Kubernetes Secret (recommend KMS/Vault for production)
-- Signatures are computed at `PutPath` time --- the binary cache server does not need private key access at serve time
+- Signatures are computed at `PutPath` time --- read-path consumers (gRPC `QueryPathInfo`, gateway narinfo responses) do not need private key access at serve time
 - Narinfo `Sig:` field format: `<key-name>:<base64-ed25519-signature>` (compatible with `nix.settings.trusted-public-keys`)
 - Signed message: canonical fingerprint `1;<store-path>;sha256:<nar-hash-nixbase32>;<nar-size>;<sorted-refs-comma-sep>` — semicolon separator, `1;` version prefix, `sha256:` algorithm tag, references are full paths (not basenames) joined by comma. Matches Nix's `ValidPathInfo::fingerprint()` in `path-info.cc`. See `fingerprint()` in `rio-nix/src/narinfo.rs`.
 - Multi-tenant: each tenant can have their own signing key for their paths
@@ -510,7 +486,6 @@ CREATE INDEX idx_pending_s3_deletes_drain
 - `rio-store/src/chunker.rs` --- FastCDC wrapper (16K/64K/256K min/avg/max)
 - `rio-store/src/manifest.rs` --- Chunk manifest (de)serialization, versioned binary format
 - `rio-store/src/realisations.rs` --- CA (drv_hash, output_name) → output_path mapping
-- `rio-store/src/cache_server/` --- axum binary cache HTTP (narinfo + nar.zst routes)
 - `rio-store/src/signing.rs` --- ed25519 narinfo signing at PutPath time
 
 ## GC Files

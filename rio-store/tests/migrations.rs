@@ -191,8 +191,7 @@ fn migration_checksums_frozen() {
 /// from tables that rio-SCHEDULER owns/writes.
 ///
 /// rio-store's GC reads `scheduler_live_pins` directly (`gc/mark.rs`,
-/// `gc/sweep.rs`), and cache-server auth + GC quotas read `tenants`
-/// (`cache_server/auth.rs`, `gc/tenant.rs`).
+/// `gc/sweep.rs`), and GC quotas read `tenants` (`gc/tenant.rs`).
 ///
 /// **Primary** enforcement is now compile-time: both crates
 /// `query_as!` into `rio_common::schema::{LivePin, TenantRow}`, so a
@@ -216,11 +215,9 @@ async fn cross_service_schema_contract() {
     const STORE_READS: &[(&str, &str, &str)] = &[
         // gc/mark.rs ROOTS_SQL (UNION arm), gc/sweep.rs RECHECK_SQL
         ("scheduler_live_pins", "store_path_hash", "bytea"),
-        // cache_server/auth.rs token lookup
+        // gc/tenant.rs quota lookup
         ("tenants", "tenant_id",          "uuid"),
         ("tenants", "tenant_name",        "text"),
-        ("tenants", "cache_token",        "text"),
-        // gc/tenant.rs quota lookup
         ("tenants", "gc_max_store_bytes", "int8"),
     ];
 
@@ -238,8 +235,8 @@ async fn cross_service_schema_contract() {
             got.as_deref(),
             Some(want_udt),
             "cross-service contract broken: rio-store reads {table}.{col} as {want_udt}, \
-             but schema has {got:?} — see gc/mark.rs, gc/sweep.rs, cache_server/auth.rs, \
-             gc/tenant.rs for the dependent queries",
+             but schema has {got:?} — see gc/mark.rs, gc/sweep.rs, gc/tenant.rs for the \
+             dependent queries",
         );
     }
 }

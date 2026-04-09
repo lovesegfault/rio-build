@@ -6600,13 +6600,11 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
- "tower",
  "tracing",
  "tracing-test",
  "uuid",
  "workspace-hack",
  "x509-parser",
- "zstd",
 ]
 
 [[package]]

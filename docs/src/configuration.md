@@ -36,7 +36,6 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `listen_addr` | string | `[::]:9002` | gRPC listen address |
-| `cache_http_addr` | socket addr | (unset) | Binary cache HTTP listen address. None = don't spawn the HTTP server. |
 | `database_url` | string | (required) | PostgreSQL connection string |
 | `metrics_addr` | socket addr | `[::]:9092` | Prometheus metrics listen address |
 | `chunk_backend` | tagged enum | `{ kind = "inline" }` | Where chunks live. See `ChunkBackendKind` below. |

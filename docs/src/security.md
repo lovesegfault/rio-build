@@ -116,19 +116,6 @@ control-plane release cadence to CLI dependency updates.
 r[builder.seccomp.localhost-profile+2]
 Executor pods MAY be configured with a Localhost seccomp profile (`BuilderPoolSpec.seccompProfile: Localhost`) that denies `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` on top of RuntimeDefault's ~40-syscall denylist. The profile JSON lives at `nix/nixos-node/seccomp/rio-{builder,fetcher}.json`; the chart's default `localhostProfile` is `operator/rio-builder.json` (fetchers hardcode `operator/rio-fetcher.json`) — that path is relative to `/var/lib/kubelet/seccomp/`, where the file must exist on every node before a pod referencing it schedules. All supported targets are NixOS and bake the profiles via `systemd.tmpfiles` so the file is present before kubelet starts (`nix/nixos-node/hardening.nix` on EKS, [ADR-021](./decisions/021-nixos-node-ami.md); `nix/tests/fixtures/k3s-full.nix` for k3s VM tests); see [ADR-012 § Seccomp Profile Distribution](./decisions/012-privileged-builder-pods.md#seccomp-profile-distribution). The controller emits no wait machinery — a missing profile surfaces as the executor container's `CreateContainerError` with the profile path in the message.
 
-### Boundary 4: Binary Cache HTTP → External Clients
-
-- **Auth**: Bearer token or `netrc`-compatible authentication. Nix clients use `netrc-file` or `access-tokens` settings.
-- **Threat**: Unauthenticated enumeration of store paths; data exfiltration via narinfo/NAR download; resource exhaustion via large NAR downloads
-- **Mitigations**:
-  - Mandatory authentication (bearer token per tenant). Unauthenticated access must be an explicit opt-in for public caches.
-  - Per-tenant path visibility: narinfo queries return 404 for paths outside the requesting tenant's scope.
-  - Rate limiting on `/nar/` downloads (configurable per tenant).
-  - NetworkPolicy: restrict access to the HTTP port from trusted CIDR ranges or ingress controller only.
-- **Note**: The binary cache HTTP server runs in the same process as the gRPC StoreService. Consider separate NetworkPolicy rules for the HTTP port vs the gRPC port.
-
-Per-tenant narinfo visibility is implemented via `path_tenants` JOIN: authenticated requests only see paths attributed to their `tenant_id` (404 for anything else — no existence oracle). Anonymous access (when `cache_allow_unauthenticated=true`) is unfiltered for single-tenant/public-cache backward compat. The `/nar/` endpoint relies on narinfo 404 for protection — a tenant who can't see a narinfo never learns the 256-bit nar_hash needed to construct the NAR URL. See [Multi-Tenancy](multi-tenancy.md).
-
 ## Key Security Properties
 
 | Property | Mechanism | Status |

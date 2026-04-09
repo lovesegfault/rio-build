@@ -16,11 +16,6 @@
 # mTLS-reject/-accept + HMAC-verifier prove both halves of the trust
 # boundary: TLS terminates at the gRPC port, HMAC gates PutPath.
 #
-# store.tenant.narinfo-filter — verify marker at default.nix:vm-security-standalone
-# cache-auth-tenant-filter subtest: tenant A → 404 on tenant B's path,
-# tenant B → 200 on own. The 200 control guards against JOIN-matches-
-# nothing (the 404 alone proves nothing if the filter always misses).
-#
 # gw.reject.nochroot — verify marker at default.nix:vm-security-standalone
 # gateway-validate subtest: nix-build a .drv with __noChroot=true via
 # ssh-ng://. Gateway rejects with "sandbox escape" pre-SubmitBuild;

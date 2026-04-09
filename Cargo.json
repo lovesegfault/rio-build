@@ -21117,10 +21117,6 @@
           "packageId": "aws-sdk-s3"
         },
         {
-          "name": "axum",
-          "packageId": "axum"
-        },
-        {
           "name": "base64",
           "packageId": "base64"
         },
@@ -21255,6 +21251,10 @@
           "packageId": "aws-smithy-mocks"
         },
         {
+          "name": "axum",
+          "packageId": "axum"
+        },
+        {
           "name": "figment",
           "packageId": "figment"
         },
@@ -21291,16 +21291,8 @@
           "packageId": "tokio-stream"
         },
         {
-          "name": "tower",
-          "packageId": "tower"
-        },
-        {
           "name": "tracing-test",
           "packageId": "tracing-test"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
         }
       ],
       "resolvedDefaultFeatures": [

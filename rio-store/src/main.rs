@@ -8,8 +8,6 @@ use rio_proto::ChunkServiceServer;
 use rio_proto::StoreAdminServiceServer;
 use rio_proto::StoreServiceServer;
 use rio_store::backend::ChunkBackend;
-use rio_store::cache_server::{self, CacheServerState};
-use rio_store::cas::ChunkCache;
 use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};
 use rio_store::signing::{Signer, TenantSigner};
 use rio_store::substitute::Substituter;
@@ -193,16 +191,6 @@ async fn main() -> anyhow::Result<()> {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }
 
-    if let Some(http_addr) = cfg.cache_http_addr {
-        spawn_cache_http(
-            http_addr,
-            pool.clone(),
-            chunk_cache.clone(),
-            cfg.cache_allow_unauthenticated,
-            shutdown.clone(),
-        );
-    }
-
     let max_msg_size = rio_common::grpc::max_message_size();
 
     let addr = cfg.listen_addr;
@@ -321,30 +309,4 @@ async fn init_db_pool(database_url: &str, max_connections: u32) -> anyhow::Resul
     info!("database migrations applied");
 
     Ok(pool)
-}
-
-/// Binary-cache HTTP server (narinfo + nar.zst routes).
-///
-/// Spawned concurrently with the gRPC server (which blocks on serve()
-/// in main()). This is optional; the gRPC store works without it.
-/// `chunk_cache` is the same Arc as GetPath — `/nar/` reassembly
-/// hits the same moka LRU.
-fn spawn_cache_http(
-    http_addr: std::net::SocketAddr,
-    pool: sqlx::PgPool,
-    chunk_cache: Option<Arc<ChunkCache>>,
-    allow_unauthenticated: bool,
-    shutdown: rio_common::signal::Token,
-) {
-    let state = Arc::new(CacheServerState {
-        pool,
-        chunk_cache,
-        allow_unauthenticated,
-    });
-    rio_common::server::spawn_axum(
-        "cache-http-server",
-        http_addr,
-        cache_server::router(state),
-        shutdown,
-    );
 }

@@ -365,17 +365,14 @@ src/
 │   ├── chunked.rs     # Large-NAR chunked storage (manifest-backed)
 │   ├── queries.rs     # Shared SELECT/UPDATE helpers + narinfo_cols! macro
 │   ├── tenant_keys.rs # Per-tenant signing-key rows (load + rotate)
-│   ├── cluster_key_history.rs # Prior cluster signing keys (unretired pubkeys for cache_server signature filter)
+│   ├── cluster_key_history.rs # Prior cluster signing keys (unretired pubkeys for sig_visibility_gate)
 │   └── upstreams.rs   # Per-tenant upstream binary-cache config (tenant_upstreams table)
 ├── migrations.rs      # Per-migration M_NNN doc-consts (rationale/history — SQL files are frozen)
 ├── realisations.rs    # CA realisation storage (Register/Query)
 ├── substitute.rs      # Upstream binary-cache substitution: block-and-fetch narinfo+NAR, ingest via CAS path
 ├── signing.rs         # ed25519 narinfo signing
 ├── test_helpers.rs    # Shared test-only seeding helpers (seed_* builders, #[cfg(test)])
-├── validate.rs        # ValidatedPathInfo checks (hash, refs, size)
-└── cache_server/
-    ├── mod.rs         # axum binary-cache HTTP (narinfo + nar.zst)
-    └── auth.rs        # Per-tenant Bearer-token auth + narinfo filter
+└── validate.rs        # ValidatedPathInfo checks (hash, refs, size)
 ```
 
 ### rio-builder — Build executor

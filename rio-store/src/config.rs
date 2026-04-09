@@ -30,7 +30,7 @@ use rio_store::cas::ChunkCache;
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub(crate) enum ChunkBackendKind {
     /// No chunk backend. All NARs inline in PG. ChunkService returns
-    /// FAILED_PRECONDITION. cache_server can only serve inline paths.
+    /// FAILED_PRECONDITION.
     #[default]
     Inline,
     /// Local filesystem. 256-subdir fanout by hash prefix (same layout
@@ -59,8 +59,8 @@ pub(crate) struct Config {
     /// [`ChunkBackendKind`] for TOML syntax.
     pub chunk_backend: ChunkBackendKind,
     /// moka LRU capacity for chunk reads, in bytes. Default 2 GiB.
-    /// One cache shared by StoreService + ChunkService + cache_server
-    /// — a chunk warmed by any is hot for all. Only relevant when
+    /// One cache shared by StoreService + ChunkService — a chunk
+    /// warmed by either is hot for both. Only relevant when
     /// chunk_backend != inline.
     pub chunk_cache_capacity_bytes: u64,
     /// Global NAR reassembly buffer budget in bytes — total permits
@@ -75,10 +75,6 @@ pub(crate) struct Config {
     /// without our signature; still serveable, just unverified). The
     /// key file should be mode 0600 and NOT in git.
     pub signing_key_path: Option<PathBuf>,
-    /// Binary-cache HTTP listen address (narinfo + nar.zst routes).
-    /// None = don't spawn. Separate from listen_addr (that's gRPC);
-    /// Nix clients hit this with plain HTTP GETs.
-    pub cache_http_addr: Option<std::net::SocketAddr>,
     /// Plaintext gRPC health listen address. K8s gRPC probes can't
     /// do mTLS, so when server TLS is enabled, the main port's
     /// health check is unreachable to K8s. This spawns a second
@@ -106,11 +102,6 @@ pub(crate) struct Config {
     /// extensions and leave CN empty (modern best practice).
     /// Default: `["rio-gateway"]`.
     pub hmac_bypass_cns: Vec<String>,
-    /// Allow binary cache HTTP requests without `Authorization:
-    /// Bearer` header. Default `false` — Bearer token required
-    /// (mapped to tenant via `tenants.cache_token` column). Set
-    /// `true` explicitly for single-tenant/dev deployments.
-    pub cache_allow_unauthenticated: bool,
     /// Max concurrent S3 chunk uploads per `put_chunked` call.
     /// Default 32 — with `RIO_SUBSTITUTE_MAX_CONCURRENT=16`
     /// (scheduler side, P0473) this caps total in-flight S3 puts at
@@ -153,14 +144,12 @@ impl Default for Config {
             chunk_cache_capacity_bytes: 2 * 1024 * 1024 * 1024,
             nar_buffer_budget_bytes: None,
             signing_key_path: None,
-            cache_http_addr: None,
             // 9102 = gRPC (9002) + 100. Same +100 pattern as
             // gateway (9090→9190). Only used when TLS is on.
             health_addr: rio_common::default_addr(9102),
             hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
             hmac_bypass_cns: vec!["rio-gateway".into()],
-            cache_allow_unauthenticated: false,
             chunk_upload_max_concurrent: rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             s3_max_attempts: DEFAULT_S3_MAX_ATTEMPTS,
             max_batch_paths: rio_store::grpc::DEFAULT_MAX_BATCH_PATHS,
@@ -216,10 +205,9 @@ impl rio_common::server::HasCommonConfig for Config {
 
 /// Construct the chunk backend + ONE shared `ChunkCache`.
 ///
-/// The cache Arc is cloned into all three consumers
-/// (`StoreServiceImpl`, `ChunkServiceImpl`, `CacheServerState`) — a
-/// chunk warmed by GetPath is hot for GetChunk and for the
-/// binary-cache `/nar/` endpoint.
+/// The cache Arc is cloned into both consumers (`StoreServiceImpl`,
+/// `ChunkServiceImpl`) — a chunk warmed by GetPath is hot for
+/// GetChunk.
 ///
 /// `?` on backend construction: filesystem mkdir fail or S3
 /// bad-region means we can't store chunks — startup error, not
@@ -294,15 +282,12 @@ mod tests {
         // NAR budget override: None → DEFAULT_NAR_BUDGET (grpc/mod.rs).
         assert!(d.nar_buffer_budget_bytes.is_none());
         assert!(d.signing_key_path.is_none());
-        assert!(d.cache_http_addr.is_none());
         // Plaintext health listener for K8s probes when mTLS is on the main port.
         assert_eq!(d.health_addr.to_string(), "[::]:9102");
         assert!(!d.common.tls.is_configured());
         // HMAC bypass allowlist defaults to rio-gateway (backward-compat
         // with the pre-allowlist hardcoded CN check).
         assert_eq!(d.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
-        // Binary cache auth required by default — fail loud on misconfigured deployments.
-        assert!(!d.cache_allow_unauthenticated);
         assert_eq!(d.common.drain_grace, std::time::Duration::from_secs(6));
         // JWT verification off by default (interceptor inert until
         // ConfigMap mount configured via RIO_JWT__KEY_PATH).
@@ -550,8 +535,6 @@ mod tests {
         assert_eq!(cfg.hmac_bypass_cns, vec!["rio-gateway".to_string()]);
         assert!(cfg.signing_key_path.is_none());
         assert!(cfg.hmac_key_path.is_none());
-        assert!(cfg.cache_http_addr.is_none());
-        assert!(!cfg.cache_allow_unauthenticated);
         assert_eq!(
             cfg.chunk_upload_max_concurrent,
             rio_store::cas::DEFAULT_CHUNK_UPLOAD_CONCURRENCY
