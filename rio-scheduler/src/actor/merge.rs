@@ -329,64 +329,20 @@ impl DagActor {
         };
         phase!("4-check-cached-outputs");
 
-        // === Step 5: DB persistence with rollback on error ============
-        // If any of these fail, roll back the merge AND the map inserts
-        // AND delete the DB build row, so in-memory and DB state stay
-        // consistent. After this block the build is committed (Active).
+        // === Step 5: PG persist + → Active ============================
+        // All remaining error-returning PG writes. On any error, roll
+        // back the merge AND the map inserts AND delete the DB build row
+        // so in-memory and DB state stay consistent. After this returns
+        // Ok the build is committed (Active); later DB writes are
+        // log-and-continue.
         if let Err(e) = self
-            .persist_merge_to_db(build_id, &nodes, &edges, newly_inserted)
+            .persist_and_activate(build_id, &nodes, &edges, &merge_result)
             .await
         {
-            error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back");
             self.cleanup_failed_merge(build_id, &merge_result).await;
             return Err(e);
         }
-        phase!("5-persist-merge-db");
-
-        // I-169: PG-side poison clear for nodes that were reset by the
-        // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
-        // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
-        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count,
-        // so without this PG keeps stale poison fields. The status itself
-        // is overwritten by `update_derivation_status_batch` below
-        // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
-        // resurrect it; this is about keeping failed_builders/poisoned_at
-        // consistent for the NEXT poison cycle. retry_count is carried
-        // over IN-MEMORY only (`dag.merge`); PG zeroes it here, so the
-        // resubmit bound resets across leader failover — conservative,
-        // matches `infra_retry_count`'s precedent. Best-effort like the
-        // re-probe clear below.
-        // r[impl sched.db.clear-poison-batch]
-        if let Err(e) = self
-            .db
-            .clear_poison_batch(&merge_result.reset_on_resubmit)
-            .await
-        {
-            warn!(
-                count = merge_result.reset_on_resubmit.len(),
-                error = %e,
-                "failed to clear poison in PG for resubmit-reset nodes"
-            );
-        }
-
-        // Transition build to active. If DB write fails, roll back everything.
-        // Pending→Active is always a valid transition for a fresh build; we
-        // debug_assert the outcome but don't branch on it (Rejected here
-        // would be a bug in BuildInfo::transition, not a recoverable error).
-        match self.transition_build(build_id, BuildState::Active).await {
-            Ok(outcome) => {
-                debug_assert_eq!(
-                    outcome,
-                    super::build::TransitionOutcome::Applied,
-                    "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
-                );
-            }
-            Err(e) => {
-                error!(build_id = %build_id, error = %e, "transition to Active failed; rolling back");
-                self.cleanup_failed_merge(build_id, &merge_result).await;
-                return Err(e);
-            }
-        }
+        phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         Ok(MergeIngest {
@@ -401,6 +357,68 @@ impl DagActor {
         })
     }
 
+    /// Step-5 PG-persist tail: derivation/edge upsert, resubmit-poison
+    /// clear, and Pending→Active. All `?`-returnable PG writes after
+    /// the in-memory merge live here so `validate_and_ingest` has a
+    /// single rollback point instead of three repeated
+    /// `cleanup_failed_merge` arms. The caller does the rollback on
+    /// `Err`; this fn does NOT touch in-memory state on failure.
+    async fn persist_and_activate(
+        &mut self,
+        build_id: Uuid,
+        nodes: &[rio_proto::types::DerivationNode],
+        edges: &[rio_proto::types::DerivationEdge],
+        merge_result: &crate::dag::MergeResult,
+    ) -> Result<(), ActorError> {
+        self.persist_merge_to_db(build_id, nodes, edges, &merge_result.newly_inserted)
+            .await
+            .inspect_err(
+                |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
+            )?;
+
+        // I-169: PG-side poison clear for nodes that were reset by the
+        // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
+        // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
+        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count,
+        // so without this PG keeps stale poison fields. The status itself
+        // is overwritten by `update_derivation_status_batch` below
+        // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
+        // resurrect it; this is about keeping failed_builders/poisoned_at
+        // consistent for the NEXT poison cycle. retry_count is carried
+        // over IN-MEMORY only (`dag.merge`); PG zeroes it here, so the
+        // resubmit bound resets across leader failover — conservative,
+        // matches `infra_retry_count`'s precedent. Best-effort.
+        // r[impl sched.db.clear-poison-batch]
+        if let Err(e) = self
+            .db
+            .clear_poison_batch(&merge_result.reset_on_resubmit)
+            .await
+        {
+            warn!(
+                count = merge_result.reset_on_resubmit.len(),
+                error = %e,
+                "failed to clear poison in PG for resubmit-reset nodes"
+            );
+        }
+
+        // Transition build to active. If DB write fails, caller rolls back.
+        // Pending→Active is always a valid transition for a fresh build; we
+        // debug_assert the outcome but don't branch on it (Rejected here
+        // would be a bug in BuildInfo::transition, not a recoverable error).
+        let outcome = self
+            .transition_build(build_id, BuildState::Active)
+            .await
+            .inspect_err(
+                |e| error!(build_id = %build_id, error = %e, "transition to Active failed; rolling back"),
+            )?;
+        debug_assert_eq!(
+            outcome,
+            super::build::TransitionOutcome::Applied,
+            "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
+        );
+        Ok(())
+    }
+
     /// Step 6 of merge: post-Active reconciliation. Transitions
     /// cache-hits to Completed, recomputes critical-path priorities,
     /// resets stale pre-existing Completed nodes, seeds initial
@@ -412,15 +430,12 @@ impl DagActor {
     /// reconciliation).
     async fn reconcile_merged_state(&mut self, ingest: &MergeIngest) -> MergeReconcile {
         let MergeIngest {
-            build_id,
             nodes,
             merge_result,
-            existing_reprobe,
             cached_hits,
             jwt_token,
             ..
         } = ingest;
-        let build_id = *build_id;
         let newly_inserted = &merge_result.newly_inserted;
         // Rebuild node_index here: it borrows from `nodes`, so it can't
         // live in MergeIngest (self-referential). Cheap: one iter pass.
@@ -435,8 +450,105 @@ impl DagActor {
             };
         }
 
-        let mut cached_count = 0u32;
+        let mut cached_count = self.apply_cached_hits(ingest, &node_index).await;
+        phase!("6a-cached-hits-loop");
 
+        // Compute critical-path priorities for newly-inserted nodes.
+        // Done AFTER cache-hit transitions so completed derivations
+        // are correctly excluded from their parents' max-child (a
+        // cached dep doesn't block anything — it's done).
+        //
+        // This sets est_duration (from estimator) + priority (bottom-up)
+        // for new nodes, and propagates to existing nodes if the new
+        // subgraph raises their priority. The ready queue reads these
+        // for BinaryHeap ordering.
+        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
+        phase!("6b-critical-path");
+
+        // I-047: pre-existing Completed nodes may have stale output_paths
+        // (GC deleted the output between the node's original completion and
+        // this merge). Verify outputs exist BEFORE compute_initial_states —
+        // otherwise newly-inserted dependents would be unlocked against a
+        // dep whose output is gone, and the worker fails on isValidPath.
+        // Reset stale nodes to Ready; they re-dispatch and re-complete.
+        // r[impl sched.merge.stale-completed-verify]
+        let stale_reset = self
+            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
+            .await;
+        phase!("6c-verify-preexisting");
+
+        // Compute initial states for the remaining (non-cached) newly-inserted
+        // derivations. Cached derivations above are now Completed, so their
+        // dependents will correctly be computed as Ready here.
+        let remaining_new: HashSet<DrvHash> = newly_inserted
+            .iter()
+            .filter(|h| !cached_hits.contains_key(h.as_str()))
+            .cloned()
+            .collect();
+        let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
+        phase!("6d-seed-initial-states");
+
+        // Pre-existing Ready nodes whose interest set grew: their
+        // critical-path priority may have risen (compute_initial above
+        // re-walked over newly_inserted, but a pre-existing Ready node
+        // already in the queue under its OLD priority isn't touched by
+        // that walk). Re-push so a higher-priority build's shared dep
+        // doesn't sit behind lower-priority work. ReadyQueue::push on
+        // an already-present hash with a lower priority is a no-op
+        // (higher entry pops first; dup is skipped), so this is safe
+        // for the non-raised case.
+        for hash in &merge_result.interest_added {
+            if self
+                .dag
+                .node(hash)
+                .is_some_and(|s| s.status() == DerivationStatus::Ready)
+            {
+                self.push_ready(hash.clone());
+            }
+        }
+
+        // Pre-existing nodes that weren't newly-inserted, stale-reset,
+        // or re-probe-cached: count Completed/Skipped as cached, and
+        // surface Poisoned/DependencyFailed for fail-fast.
+        let (preexisting_cached, preexisting_failed) =
+            self.reconcile_preexisting(ingest, &stale_reset).await;
+        cached_count += preexisting_cached;
+        if first_dep_failed.is_none() {
+            first_dep_failed = preexisting_failed;
+        }
+        phase!("6f-preexisting-nodes-loop");
+        let _ = &mut t_phase; // last phase! write is intentionally unread
+
+        MergeReconcile {
+            cached_count,
+            first_dep_failed,
+        }
+    }
+
+    /// Step-6a body: apply `ingest.cached_hits` — transition each hit
+    /// to `Completed`, set `output_paths`, clear retry state for
+    /// previously-failed re-probes, batch-persist `Completed`, advance
+    /// pre-existing Queued dependents of re-probe hits, and emit
+    /// `DerivationCached` events. Returns the cached-hit count.
+    ///
+    /// All I/O here is best-effort log-and-continue (build is Active).
+    /// Kept as a `&mut self` method (not a free decision fn) because
+    /// the per-hit transition mutates DAG node status, which
+    /// `seed_initial_states` reads downstream — the two are
+    /// intrinsically sequenced.
+    async fn apply_cached_hits(
+        &mut self,
+        ingest: &MergeIngest,
+        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
+    ) -> u32 {
+        let MergeIngest {
+            build_id,
+            existing_reprobe,
+            cached_hits,
+            ..
+        } = ingest;
+        let build_id = *build_id;
+        let mut cached_count = 0u32;
         let mut reprobe_unlocked: Vec<DrvHash> = Vec::new();
         // I-139: collect for one batched Completed update after the
         // loop instead of N sequential round-trips. clear_poison and
@@ -553,69 +665,34 @@ impl DagActor {
                 self.push_ready(ready_hash);
             }
         }
-        phase!("6a-cached-hits-loop");
+        cached_count
+    }
 
-        // Compute critical-path priorities for newly-inserted nodes.
-        // Done AFTER cache-hit transitions so completed derivations
-        // are correctly excluded from their parents' max-child (a
-        // cached dep doesn't block anything — it's done).
-        //
-        // This sets est_duration (from estimator) + priority (bottom-up)
-        // for new nodes, and propagates to existing nodes if the new
-        // subgraph raises their priority. The ready queue reads these
-        // for BinaryHeap ordering.
-        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
-        phase!("6b-critical-path");
-
-        // I-047: pre-existing Completed nodes may have stale output_paths
-        // (GC deleted the output between the node's original completion and
-        // this merge). Verify outputs exist BEFORE compute_initial_states —
-        // otherwise newly-inserted dependents would be unlocked against a
-        // dep whose output is gone, and the worker fails on isValidPath.
-        // Reset stale nodes to Ready; they re-dispatch and re-complete.
-        // r[impl sched.merge.stale-completed-verify]
-        let stale_reset = self
-            .verify_preexisting_completed(nodes, newly_inserted, cached_hits, jwt_token.as_deref())
-            .await;
-        phase!("6c-verify-preexisting");
-
-        // Compute initial states for the remaining (non-cached) newly-inserted
-        // derivations. Cached derivations above are now Completed, so their
-        // dependents will correctly be computed as Ready here.
-        let remaining_new: HashSet<DrvHash> = newly_inserted
-            .iter()
-            .filter(|h| !cached_hits.contains_key(h.as_str()))
-            .cloned()
-            .collect();
-        let mut first_dep_failed = self.seed_initial_states(&remaining_new).await;
-        phase!("6d-seed-initial-states");
-
-        // Pre-existing Ready nodes whose interest set grew: their
-        // critical-path priority may have risen (compute_initial above
-        // re-walked over newly_inserted, but a pre-existing Ready node
-        // already in the queue under its OLD priority isn't touched by
-        // that walk). Re-push so a higher-priority build's shared dep
-        // doesn't sit behind lower-priority work. ReadyQueue::push on
-        // an already-present hash with a lower priority is a no-op
-        // (higher entry pops first; dup is skipped), so this is safe
-        // for the non-raised case.
-        for hash in &merge_result.interest_added {
-            if self
-                .dag
-                .node(hash)
-                .is_some_and(|s| s.status() == DerivationStatus::Ready)
-            {
-                self.push_ready(hash.clone());
-            }
-        }
-
-        // Also handle nodes that already existed. A pre-existing Completed
-        // node counts as cached; a pre-existing Poisoned/DependencyFailed
-        // node must set first_dep_failed so handle_derivation_failure
-        // fires below. Without the failure arm, a single-node resubmit of
-        // a still-poisoned derivation (within TTL, no ClearPoison yet)
-        // leaves the build Active with completed=0, failed=0, total=1 —
-        // check_build_completion never fires.
+    /// Step-6f body: walk pre-existing nodes (not newly-inserted, not
+    /// stale-reset, not already counted as a cache-hit) and classify.
+    /// `Completed`/`Skipped` → bump cached count + path-tenants upsert;
+    /// `Poisoned`/`DependencyFailed` → surface first failed hash so the
+    /// caller can `handle_derivation_failure` (fail-fast). Other
+    /// statuses are in-flight from another build and need no action.
+    ///
+    /// Without the failure arm, a single-node resubmit of a
+    /// still-poisoned derivation (within TTL, no ClearPoison yet)
+    /// leaves the build Active with completed=0, failed=0, total=1 —
+    /// `check_build_completion` never fires.
+    async fn reconcile_preexisting(
+        &mut self,
+        ingest: &MergeIngest,
+        stale_reset: &HashSet<String>,
+    ) -> (u32, Option<DrvHash>) {
+        let MergeIngest {
+            nodes,
+            merge_result,
+            cached_hits,
+            ..
+        } = ingest;
+        let newly_inserted = &merge_result.newly_inserted;
+        let mut cached = 0u32;
+        let mut first_failed: Option<DrvHash> = None;
         for node in nodes {
             if newly_inserted.contains(node.drv_hash.as_str()) {
                 continue;
@@ -627,7 +704,7 @@ impl DagActor {
                 continue;
             }
             // I-099: re-probe hits were already counted + emitted in
-            // the cached_hits loop above. Don't double-count.
+            // apply_cached_hits. Don't double-count.
             if cached_hits.contains_key(node.drv_hash.as_str()) {
                 continue;
             }
@@ -639,7 +716,7 @@ impl DagActor {
                 // from a prior CA-cutoff. Same semantics as a cache
                 // hit from the build's perspective.
                 DerivationStatus::Completed | DerivationStatus::Skipped => {
-                    cached_count += 1;
+                    cached += 1;
                     metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
                         .increment(1);
                     // r[impl sched.gc.path-tenants-upsert]
@@ -653,7 +730,7 @@ impl DagActor {
                         .await;
                 }
                 DerivationStatus::Poisoned | DerivationStatus::DependencyFailed => {
-                    first_dep_failed.get_or_insert_with(|| node.drv_hash.as_str().into());
+                    first_failed.get_or_insert_with(|| node.drv_hash.as_str().into());
                     debug!(
                         drv_hash = %node.drv_hash,
                         status = ?state.status(),
@@ -663,13 +740,7 @@ impl DagActor {
                 _ => {}
             }
         }
-        phase!("6f-preexisting-nodes-loop");
-        let _ = &mut t_phase; // last phase! write is intentionally unread
-
-        MergeReconcile {
-            cached_count,
-            first_dep_failed,
-        }
+        (cached, first_failed)
     }
 
     /// Compute initial Ready/Queued/DependencyFailed for `remaining_new`
