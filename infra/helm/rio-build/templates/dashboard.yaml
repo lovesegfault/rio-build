@@ -2,11 +2,11 @@
 {{- $d := .Values.dashboard -}}
 {{- $ns := .Values.namespaces.system.name -}}
 # nginx-only pod: serves the Svelte SPA and proxies /rio.* gRPC-Web to
-# the Envoy Gateway Service. NO sidecar — envoy is operator-managed
-# (Gateway API CRDs in dashboard-gateway*.yaml). nginx proxies to the
-# cluster-DNS upstream, not localhost. The Envoy Gateway handles
-# grpc_web→gRPC translation + mTLS client cert to rio-scheduler; nginx
-# is a thin HTTP/1.1 proxy.
+# the Cilium Gateway Service. NO sidecar — Cilium reconciles the
+# Gateway (dashboard-gateway.yaml) into a per-Gateway envoy in this
+# namespace. nginx proxies to cilium-gateway-rio-dashboard:8080;
+# rio-scheduler handles gRPC-Web translation in-process (tonic-web,
+# D3). nginx is a thin HTTP/1.1 proxy.
 #
 # No Ingress. Access via `kubectl port-forward svc/rio-dashboard
 # 8080:80` (matches Grafana's model — operator-facing tool, not
@@ -45,7 +45,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        # SPA serve + gRPC-Web proxy to Envoy Gateway Service. Config
+        # SPA serve + gRPC-Web proxy to Cilium Gateway Service. Config
         # is baked into the image (nix/docker.nix dashboardNginxConf)
         # — no ConfigMap, no runtime templating. A changed upstream
         # name is a docker-dashboard rebuild, not a helm value.
@@ -70,7 +70,7 @@ spec:
               mountPath: /tmp
           # / (index.html) is served from the baked-in SPA bundle. If
           # nginx is up, the SPA is servable — no backend dep to
-          # readiness-gate on (envoy-gateway being down means gRPC
+          # readiness-gate on (Cilium Gateway being down means gRPC
           # calls fail in-browser, but the static app still loads and
           # shows its own error state).
           readinessProbe:

@@ -1,14 +1,19 @@
 # Render the Cilium chart for airgapped k3s VM tests.
 #
-# Same template → split → k3s-manifests pattern as envoy-gateway-render.nix
-# (shared logic in lib/helm-split.nix). Output is a directory with
-# numbered YAML files that k3s applies in filename order:
+# Same template → split → k3s-manifests pattern as the (now-deleted)
+# envoy-gateway-render.nix; shared logic in lib/helm-split.nix. Output
+# is a directory with numbered YAML files that k3s applies in filename
+# order:
 #
-#   01-cilium-rbac.yaml   ServiceAccount / ClusterRole / Bindings
-#   02-cilium.yaml        DaemonSet / operator Deployment / ConfigMap
+#   00-gateway-api-crds.yaml   gateway.networking.k8s.io CRDs (only if
+#                              gatewayEnabled — must exist BEFORE the
+#                              cilium chart applies or gatewayAPI.
+#                              enabled is silently ignored, research-A
+#                              caveat C1)
+#   01-cilium-rbac.yaml        ServiceAccount / ClusterRole / Bindings
+#   02-cilium.yaml             DaemonSet / operator Deployment / ConfigMap
 #
-# No 00-crds file: the Cilium chart does NOT template CRDs — cilium-operator
-# installs them at runtime on first start.
+# No Cilium-CRD file: cilium-operator installs Cilium CRDs at runtime.
 #
 # Installed BEFORE any other manifest — Cilium IS the CNI, nothing
 # else can schedule until cilium-agent is Ready on the node. k3s
@@ -18,12 +23,6 @@
 # Airgap: image.useDigest=false makes the chart render bare tags
 # (quay.io/cilium/cilium:v1.19.2) so containerd's exact-string image
 # lookup matches the pullImage finalImageName/Tag in docker-pulled.nix.
-# With useDigest=true (chart default) it renders tag@sha256 which would
-# not match a tag-only preloaded image.
-#
-# envoy.enabled=false: Phase 3 is L4-only (WireGuard + CiliumNetworkPolicy);
-# the standalone cilium-envoy DaemonSet is for L7 policy / Gateway API and
-# would add a third image to preload. Phase 4 flips this on.
 #
 # devices=eth1: NixOS test VMs are dual-NIC — eth0 is QEMU user-net
 # (10.0.2.x slirp, mgmt-only, no inter-VM routing), eth1 is the vde
@@ -47,15 +46,47 @@
 # dropped by the host firewall/rp_filter on cilium_host (local-path-
 # provisioner: `dial tcp 10.43.0.1:443: i/o timeout` → CrashLoopBackOff
 # → PVC never binds → PG never Ready).
+#
+# gatewayEnabled flips on Cilium's Gateway API + the standalone
+# cilium-envoy DaemonSet (L7 proxy for the per-Gateway envoy). Adds
+# ~400M of preload (cilium-envoy image) so only enabled for dashboard
+# scenarios; L4-only tests (the default) keep envoy.enabled=false.
 {
   pkgs,
   nixhelm,
   system,
+  gatewayEnabled ? false,
 }:
 let
   subcharts = import ./helm-charts.nix { inherit nixhelm system; };
   chart = subcharts.cilium;
   split = import ./lib/helm-split.nix { inherit (pkgs) lib; };
+
+  # Upstream Gateway API standard-channel CRDs. Cilium does NOT vendor
+  # these (it expects them pre-installed). v1.4.0 matches what Cilium
+  # 1.19's CI tests against. Standard channel = Gateway, GatewayClass,
+  # HTTPRoute, GRPCRoute, ReferenceGrant — exactly what dashboard-
+  # gateway.yaml uses; no experimental/TLSRoute needed.
+  gatewayApiCrds = pkgs.fetchurl {
+    url = "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml";
+    sha256 = "1wc1njnw1andqlabcykpd2dj250cqk6hx836v2nn8va4c7k2jh3a";
+  };
+
+  # Cilium creates per-Gateway Services as type:LoadBalancer. With k3s
+  # --disable=servicelb and no LB-IPAM pool, the Service stays Pending
+  # for an external IP → Gateway never Programmed:True. This pool lets
+  # Cilium's lbipam assign an address from a test-only range. The
+  # fixture port-forwards to the Service anyway, so the LB IP is never
+  # actually routed — it just satisfies the Programmed gate.
+  lbIpamPool = pkgs.writeText "lbipam-pool.yaml" ''
+    apiVersion: cilium.io/v2
+    kind: CiliumLoadBalancerIPPool
+    metadata:
+      name: vm-test-pool
+    spec:
+      blocks:
+        - cidr: "192.168.100.0/24"
+  '';
 in
 pkgs.runCommand "cilium-rendered"
   {
@@ -66,6 +97,11 @@ pkgs.runCommand "cilium-rendered"
   }
   ''
     mkdir -p $out
+
+    ${pkgs.lib.optionalString gatewayEnabled ''
+      cp ${gatewayApiCrds} $out/00-gateway-api-crds.yaml
+      cp ${lbIpamPool} $out/03-cilium-lbipam-pool.yaml
+    ''}
 
     helm template cilium ${chart} \
       --namespace kube-system \
@@ -83,8 +119,17 @@ pkgs.runCommand "cilium-rendered"
       --set operator.replicas=1 \
       --set encryption.enabled=true \
       --set encryption.type=wireguard \
-      --set envoy.enabled=false \
-      --set gatewayAPI.enabled=false \
+      --set envoy.enabled=${if gatewayEnabled then "true" else "false"} \
+      --set envoy.image.useDigest=false \
+      --set gatewayAPI.enabled=${if gatewayEnabled then "true" else "false"} \
+      ${pkgs.lib.optionalString gatewayEnabled ''
+        --api-versions gateway.networking.k8s.io/v1 \
+        --api-versions gateway.networking.k8s.io/v1/GatewayClass \
+        --api-versions gateway.networking.k8s.io/v1/Gateway \
+        --api-versions gateway.networking.k8s.io/v1/HTTPRoute \
+        --api-versions gateway.networking.k8s.io/v1/GRPCRoute \
+        --api-versions gateway.networking.k8s.io/v1beta1/ReferenceGrant \
+      ''} \
       --set image.useDigest=false \
       --set operator.image.useDigest=false \
       --set ipv6.enabled=true \

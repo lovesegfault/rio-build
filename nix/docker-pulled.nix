@@ -43,40 +43,17 @@
     arch = "amd64";
   };
 
-  # Envoy Gateway operator (gateway-helm v1.7.1 via nixhelm). Both the
-  # Deployment and the certgen Job use this image. The operator
-  # reconciles Gateway/GRPCRoute/EnvoyProxy CRDs into an envoy data-
-  # plane Deployment — that envoy image is NOT referenced by the chart
-  # (it's compiled into the operator as a default) so it's a separate
-  # pullImage below.
-  #
-  # NO helm-lint assert for this image (unlike envoy-distroless below):
-  # gateway-helm uses bare tags, no chart-side digest-pin to compare
-  # against. The imageDigest here is ONLY used by dockerTools.pullImage
-  # to verify the layer fetch — a stale digest after a finalImageTag
-  # bump surfaces as an FOD hash mismatch at eval time (already caught).
-  envoy-gateway = pkgs.dockerTools.pullImage {
-    imageName = "registry-1.docker.io/envoyproxy/gateway";
-    imageDigest = "sha256:8bb273728bacf981cb2862ed11a6ba8b70970e3b31e3a00429f34f8478c94b8b";
-    finalImageName = "docker.io/envoyproxy/gateway";
-    finalImageTag = "v1.7.1";
-    hash = "sha256-obS8rfPfmJN15Zb4NpKHgAeMSAYvVu8oIf5k7OmyVJU=";
-    os = "linux";
-    arch = "amd64";
-  };
-
-  # Envoy data-plane (distroless). v1.37.1 is the compiled-in default
-  # for gateway-helm v1.7.1 (api/v1alpha1/shared_types.go
-  # DefaultEnvoyProxyImage). LOCKSTEP with infra/helm/rio-build/
-  # values.yaml envoyImage (same digest). Bump BOTH — helm-lint assert
-  # at flake.nix checks tag match (P0304-T136). This file feeds the
-  # airgap VM fixture.
-  envoy-distroless = pkgs.dockerTools.pullImage {
-    imageName = "registry-1.docker.io/envoyproxy/envoy";
-    imageDigest = "sha256:4d9226b9fd4d1449887de7cde785beb24b12e47d6e79021dec3c79e362609432";
-    finalImageName = "docker.io/envoyproxy/envoy";
-    finalImageTag = "distroless-v1.37.1";
-    hash = "sha256-s0SFWzm0n5lR4+WopRgglqEC7TdtTGhxy+bz+hb6Kic=";
+  # Cilium L7 proxy (standalone DaemonSet). Only loaded when
+  # cilium-render.nix gatewayEnabled=true — provides the envoy that
+  # Cilium spawns per-Gateway. Tag is the chart 1.19.2 default
+  # (envoy.image.tag in the chart's values.yaml). envoy.image.
+  # useDigest=false in cilium-render.nix → bare-tag match.
+  cilium-envoy = pkgs.dockerTools.pullImage {
+    imageName = "quay.io/cilium/cilium-envoy";
+    imageDigest = "sha256:60031f39669542b21aedf05a3317d14e8d3ea48255790af039b315a1c9637361";
+    finalImageName = "quay.io/cilium/cilium-envoy";
+    finalImageTag = "v1.35.9-1773656288-7b052e66eb2cfc5ac130ce0a5be66202a10d83be";
+    hash = "sha256-u0jUNs9GWsPAaEjlPrPhCCEWWTo9AIPjt82moeAyADM=";
     os = "linux";
     arch = "amd64";
   };

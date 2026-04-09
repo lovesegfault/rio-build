@@ -262,26 +262,17 @@ let
   '';
 
   # ── Dashboard nginx config ───────────────────────────────────────────
-  # Proxy target is the Envoy Gateway operator-managed Service — NOT a
-  # localhost sidecar (P0273 landed Gateway API CRDs; the operator
-  # spins up envoy data-plane pods from the rio-dashboard Gateway, we
-  # don't hand-configure envoy here).
+  # Proxy target is the Cilium per-Gateway Service. Cilium reconciles
+  # the rio-dashboard Gateway into a Deployment + Service named
+  # `cilium-gateway-<gateway-name>` in the Gateway's OWN namespace
+  # (rio-system) — not a separate operator namespace. gRPC-Web
+  # translation happens at rio-scheduler (tonic-web layer, D3); the
+  # gateway is plain HTTP routing.
   #
-  # The Service lives in envoy-gateway-system (also templated as
-  # .Values.dashboard.envoyGatewayNamespace for networkpolicy.yaml —
-  # change BOTH together). ControllerNamespaceMode,
-  # the operator's default — see nix/tests/scenarios/dashboard-
-  # gateway.nix:31-37 comment). The Gateway/GRPCRoute/EnvoyProxy CRs
-  # live in rio-system but the Deployment+Service they produce land in
-  # the operator's namespace. Stable name `rio-dashboard-envoy` is
-  # pinned by EnvoyProxy.spec.provider.kubernetes.envoyService.name
-  # (values.yaml dashboard.envoyServiceName — otherwise the operator
-  # generates envoy-{ns}-{gw}-{hash} which is awkward to hardcode).
-  #
-  # If a deploy changes envoyServiceName or runs the operator in
-  # non-default-namespace mode, this config needs a matching rebuild.
   # Baked-in beats runtime envsubst — a broken upstream is a build-
-  # time failure not a runtime surprise.
+  # time failure not a runtime surprise. If a deploy renames the
+  # Gateway or moves it to a different namespace, this config needs
+  # a matching rebuild.
   dashboardNginxConf = pkgs.writeText "nginx.conf" ''
     # Non-root container (runAsUser, readOnlyRootFilesystem). Master
     # process runs foreground; no `user` directive (we're already
@@ -306,10 +297,11 @@ let
       uwsgi_temp_path       /tmp/uwsgi;
       scgi_temp_path        /tmp/scgi;
 
-      # Single upstream: Envoy Gateway's stable Service DNS. Port
-      # 8080 matches the Gateway listener (dashboard-gateway.yaml).
+      # Single upstream: Cilium per-Gateway Service DNS. Port 8080
+      # matches the Gateway listener (dashboard-gateway.yaml). Cilium
+      # names it `cilium-gateway-<gateway-name>` in the Gateway's ns.
       upstream envoy_gateway {
-        server rio-dashboard-envoy.envoy-gateway-system.svc.cluster.local:8080;
+        server cilium-gateway-rio-dashboard.rio-system.svc.cluster.local:8080;
       }
       server {
         # 8080 not 80: runAsNonRoot means no CAP_NET_BIND_SERVICE →
@@ -351,11 +343,10 @@ let
           # arrive; nginx must pass them through unbuffered. Same
           # constraint the sidecar design had.
           proxy_buffering off;
-          # nginx default proxy_read_timeout is 60s. The
-          # ClientTrafficPolicy (dashboard-gateway-policy.yaml) sets
-          # envoy's streamIdleTimeout to 1h for the LLVM-cold-ccache
-          # case — a build that prints nothing for a while. Match
-          # here or nginx cuts the stream first.
+          # nginx default proxy_read_timeout is 60s. The scheduler's
+          # http2_keepalive_interval(30s) (D3: Server::builder) keeps
+          # quiet GetBuildLogs streams alive for the LLVM-cold-ccache
+          # case. Match here or nginx cuts the stream first.
           proxy_read_timeout 3600s;
 
           # Pass through the headers envoy's CORS SecurityPolicy

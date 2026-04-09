@@ -17,9 +17,9 @@
 # closed — no incremental 0x80 frame at the tail. dashboard-gateway.nix
 # can't prove this; it port-forwards directly to envoy, bypassing nginx.
 #
-# Same k3s fixture as vm-dashboard-gateway-k3s (envoyGatewayEnabled=true
-# preloads the rio-dashboard image AND the envoy-gateway operator). ~6min
-# — ~4min bring-up + ~60s operator reconcile + ~30s nginx schedule + curls.
+# Same k3s fixture as vm-dashboard-gateway-k3s (gatewayEnabled=true
+# preloads the rio-dashboard image AND cilium-envoy). ~6min — ~4min
+# bring-up + ~30s Cilium Gateway reconcile + ~30s nginx schedule + curls.
 #
 # r[verify dash.journey.build-to-logs] lives at the wiring point
 # (default.nix:vm-dashboard-k3s) per the P0341 markers-at-subtests-entry
@@ -31,7 +31,7 @@
 }:
 let
   inherit (fixture) ns;
-  egNs = "envoy-gateway-system";
+  gwSvc = "cilium-gateway-rio-dashboard";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-dashboard-curl";
@@ -46,20 +46,20 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     ${common.mkBootstrap { inherit fixture; }}
 
-    # ── Envoy Gateway operator Available ──────────────────────────────
-    # Same gate as dashboard-gateway.nix — nginx proxies to the envoy
-    # Service, so we need the operator reconciled before the curls hit
-    # the /rio.* location. SPA curls (1+2) don't need this; placed
-    # here so the grpc_web gate has time to settle while we test SPA.
+    # ── cilium-envoy DaemonSet rollout ────────────────────────────────
+    # Same gate as dashboard-gateway.nix — nginx proxies to the Cilium
+    # per-Gateway Service, so cilium-envoy must be Ready before the
+    # curls hit /rio.*. SPA curls (1+2) don't need this; placed here so
+    # the gateway reconcile has time to settle while we test SPA.
     k3s_server.wait_until_succeeds(
-        "k3s kubectl -n envoy-gateway-system wait --for=condition=Available "
-        "deploy/envoy-gateway --timeout=120s",
+        "k3s kubectl -n kube-system rollout status ds/cilium-envoy "
+        "--timeout=120s",
         timeout=150,
     )
 
     # ── nginx Deployment Available ────────────────────────────────────
     # dashboard.yaml renders when dashboard.enabled=true (set by the
-    # fixture's envoyGatewayEnabled flag). The rio-dashboard:dev image
+    # fixture's gatewayEnabled flag). The rio-dashboard:dev image
     # is preloaded (k3s-full.nix rioImages — guarded by dockerImages ?
     # dashboard so coverage-mode skips the scenario entirely rather
     # than deadlock on ImagePullBackOff here).
@@ -97,21 +97,21 @@ pkgs.testers.runNixOSTest {
             "| grep -qF 'id=\"app\"'"
         )
 
-    # ── Envoy Gateway Programmed (before gRPC-Web curls) ──────────────
-    # nginx's upstream is `rio-dashboard-envoy.envoy-gateway-system.
-    # svc.cluster.local:8080` (baked into the image, docker.nix
-    # dashboardNginxConf). That Service exists only after the operator
-    # reconciles the Gateway CR → envoy Deployment + Service.
+    # ── Cilium Gateway Programmed (before gRPC-Web curls) ─────────────
+    # nginx's upstream is `cilium-gateway-rio-dashboard.rio-system.svc.
+    # cluster.local:8080` (baked into the image, docker.nix
+    # dashboardNginxConf). That Service exists only after Cilium
+    # reconciles the Gateway CR → per-Gateway envoy Deployment + Service.
     #
     # nginx's `upstream { server <fqdn>; }` resolves DNS at startup —
     # if the Service doesn't exist, nginx exits with `[emerg] host not
     # found in upstream` → pod CrashLoopBackOff → kubelet retries with
     # backoff → eventually the Service exists → nginx starts. The
     # deploy/rio-dashboard Available check above already proves this
-    # self-heal completed (nginx won't pass readiness until it started,
-    # won't start until DNS resolved). No manual rollout-restart
-    # needed; we just wait for envoy endpoints so kube-proxy has a
-    # backend to route to.
+    # self-heal completed. We wait for the LB IP (from cilium-render's
+    # lbipam pool) — the per-Gateway Service is selectorless, so no
+    # Endpoints object exists; the LB IP being assigned is the
+    # "backend ready" signal.
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} get gateway rio-dashboard "
         "-o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].status}' "
@@ -119,8 +119,8 @@ pkgs.testers.runNixOSTest {
         timeout=120,
     )
     k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${egNs} get endpoints rio-dashboard-envoy "
-        "-o jsonpath='{.subsets[0].addresses[0].ip}' | grep -q .",
+        "k3s kubectl -n ${ns} get svc ${gwSvc} "
+        "-o jsonpath='{.status.loadBalancer.ingress[0].ip}' | grep -q .",
         timeout=60,
     )
 

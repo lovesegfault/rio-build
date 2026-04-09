@@ -662,18 +662,16 @@ karpenter:
       consolidateAfter: 5m
 
 # ──────────────────────────────────────────────────────────────────────────
-# rio-dashboard (Envoy Gateway)
+# rio-dashboard (Cilium Gateway API)
 # ──────────────────────────────────────────────────────────────────────────
-# Svelte SPA + Envoy Gateway gRPC-Web → gRPC+mTLS translation. The
-# GatewayClass/Gateway/GRPCRoute CRDs in dashboard-gateway*.yaml render
-# when enabled; they need the Envoy Gateway operator (gateway-helm via
-# nix/helm-charts.nix) installed first or the CRDs don't exist.
+# Svelte SPA + Cilium Gateway routing to rio-scheduler, which serves
+# gRPC-Web natively via tonic-web (D3). The GatewayClass/Gateway/
+# GRPCRoute in dashboard-gateway.yaml render when enabled; they need
+# Cilium installed with gatewayAPI.enabled=true and the upstream
+# Gateway API CRDs present (cilium-render.nix vendors them).
 #
-# Disabled by default — phase 5 feature. Enabling renders BOTH the
-# Gateway API CRDs (dashboard-gateway*.yaml — operator-managed envoy)
-# AND the SPA Deployment (dashboard.yaml — nginx + static bundle).
-# The Envoy Gateway operator (gateway-helm via nix/helm-charts.nix)
-# must be installed first or the Gateway/GRPCRoute CRDs don't exist.
+# Disabled by default. Enabling renders BOTH the Gateway API CRs and
+# the SPA Deployment (dashboard.yaml — nginx + static bundle).
 dashboard:
   enabled: false
   # nginx pod carrying the Svelte dist/ bundle (nix build .#docker-
@@ -684,34 +682,12 @@ dashboard:
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 128Mi}
-  # ── Envoy Gateway data-plane tuning ───────────────────────────────────
-  # EnvoyProxy.spec.provider.kubernetes.envoyService.name — stable
-  # Service name for the operator-managed envoy data-plane. Without
-  # this, the operator generates envoy-{gateway-ns}-{gateway-name}-
-  # {hash} which is awkward to target. The nginx image bakes this
-  # DNS name into its upstream config (nix/docker.nix) — changing it
-  # here requires a docker-dashboard rebuild, not just a helm upgrade.
-  envoyServiceName: rio-dashboard-envoy
-  # Namespace where the Envoy Gateway operator runs (ControllerNamespaceMode
-  # default). Envoy data-plane pods/Services land here even though the
-  # Gateway/GRPCRoute CRs live in rio-system. Also hardcoded in
-  # nix/docker.nix (nginx upstream hostname — baked at image build time,
-  # not templated). Change BOTH together.
-  envoyGatewayNamespace: envoy-gateway-system
-  # EnvoyProxy.spec.provider.kubernetes.envoyService.type — ClusterIP
-  # by default (nginx sits in-cluster and proxies to this Service).
-  # Set to NodePort for VM tests or LoadBalancer for direct external
-  # gRPC-Web access (bypassing the SPA).
-  envoyServiceType: ClusterIP
-  # Envoy data-plane image. The operator defaults to a compiled-in
-  # version (v1.7.1 → envoy:distroless-v1.37.1); digest-pinned here so
-  # airgapped VM tests and private-registry prod can override. Bump via
-  # `crane digest docker.io/envoyproxy/envoy:distroless-v<new>` on
-  # upstream releases. Tag portion is cosmetic (kubelet pulls by digest).
-  # LOCKSTEP with nix/docker-pulled.nix envoy-distroless entry (same
-  # digest, airgap set). Bump BOTH — helm-lint assert (P0304-T136)
-  # checks tag match.
-  envoyImage: docker.io/envoyproxy/envoy:distroless-v1.37.1@sha256:4d9226b9fd4d1449887de7cde785beb24b12e47d6e79021dec3c79e362609432
+  # Service type for cilium-gateway-rio-dashboard (the Service Cilium
+  # creates per-Gateway in the Gateway's namespace). ClusterIP by
+  # default (nginx sits in-cluster and proxies to it). Set to
+  # LoadBalancer for direct external gRPC-Web access. Applied via
+  # Gateway.spec.infrastructure.annotations[io.cilium/lb-service-type].
+  gatewayServiceType: ClusterIP
   # ── Method-level authz (r[dash.auth.method-gate]) ─────────────────────
   # Expose ClearPoison/DrainExecutor/CreateTenant/TriggerGC via the
   # dashboard gateway. Default false — the GRPCRoute for mutating

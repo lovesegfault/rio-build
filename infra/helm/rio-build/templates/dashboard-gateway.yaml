@@ -5,26 +5,14 @@
 #   (markers are documentary — tracey does not scan yaml; the r[verify]
 #    for both lives at nix/tests/default.nix which IS scanned)
 #
-# Envoy Gateway CRDs. Attaching a GRPCRoute to a listener triggers
-# grpc_web filter injection into that listener's HTTP filter chain —
-# an Envoy Gateway implementation detail (NOT in the Gateway API
-# spec itself). Verified at v1.7.1: when the IR listener has
-# IsHTTP2=true (set by GRPCRoute attachment,
-# internal/gatewayapi/route.go:1293-1295), the translator appends
-# xdsfilters.GRPCWeb + xdsfilters.GRPCStats to the HTTP filter chain
-# (internal/xds/translator/listener.go:424-425).
-#
-# SINGLE LISTENER on purpose — dodges upstream bug
-# envoyproxy/gateway#7559 where the grpc_web filter is silently
-# omitted when a GRPCRoute attaches to a non-first listener on a
-# multi-listener Gateway. The dashboard only needs one HTTP listener
-# anyway.
+# Cilium Gateway API. gRPC-Web translation is in-process at
+# rio-scheduler (tonic-web layer, D3) — the Gateway's job is plain
+# HTTP routing. Cilium reconciles the Gateway into a per-Gateway envoy
+# Deployment + Service named `cilium-gateway-<gateway-name>` in the
+# Gateway's namespace. CORS, idle-timeout, and retry-on-unavailable
+# are handled scheduler-side / dashboard-side per the D3 cascade
+# table; no vendor CRDs.
 ---
-# Cluster-scoped: one GatewayClass shared by however many dashboard
-# Gateways exist. parametersRef → EnvoyProxy in our namespace (the
-# operator resolves namespaced parametersRef since v1.1.0). The
-# EnvoyProxy object itself lives in dashboard-gateway-tls.yaml so
-# backendTLS and provider settings stay together.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
@@ -32,12 +20,7 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
 spec:
-  controllerName: gateway.envoyproxy.io/gatewayclass-controller
-  parametersRef:
-    group: gateway.envoyproxy.io
-    kind: EnvoyProxy
-    name: rio-dashboard-proxy
-    namespace: {{ $ns }}
+  controllerName: io.cilium/gateway-controller
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -48,11 +31,6 @@ metadata:
     {{- include "rio.labels" (dict "root" . "name" "rio-dashboard-gateway" "component" "dashboard") | nindent 4 }}
 spec:
   gatewayClassName: rio-dashboard
-  # Single listener — see #7559 comment at top. Port 8080 is non-
-  # privileged so the envoy container doesn't need CAP_NET_BIND_SERVICE
-  # (EnvoyProxy.spec.provider.kubernetes.useListenerPortAsContainerPort
-  # defaults to false → port-shift for privileged ports, but 8080 is
-  # already ephemeral-range so the shift is a no-op).
   listeners:
     - name: http
       protocol: HTTP
@@ -105,9 +83,9 @@ spec:
 # TriggerGC     — deletes store paths; data loss potential
 #
 # These are NOT rendered by default (enableMutatingMethods: false).
-# With the route absent, envoy has no match → returns 404 on e.g.
-# POST /rio.admin.AdminService/ClearPoison. Use rio-cli with an mTLS
-# client cert for these until dashboard-native authz lands.
+# With the route absent, the gateway has no match → returns 404 on
+# e.g. POST /rio.admin.AdminService/ClearPoison. Use rio-cli for these
+# until dashboard-native authz lands.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GRPCRoute
 metadata:

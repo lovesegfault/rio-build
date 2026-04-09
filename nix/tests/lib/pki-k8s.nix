@@ -19,11 +19,8 @@
   nsBuilders ? "rio-builders",
   nsFetchers ? "rio-fetchers",
   # Additional component names to generate leaf certs for. The
-  # default set matches cert-manager.yaml's `range`; callers that
-  # need more (e.g. k3s-full.nix with envoyGatewayEnabled → adds
-  # "dashboard-envoy" so EnvoyProxy.spec.backendTLS.
-  # clientCertificateRef resolves) extend here. Each component `c`
-  # gets a `rio-<c>-tls` Secret with tls.crt/tls.key/ca.crt.
+  # default set matches cert-manager.yaml's `range`. Each component
+  # `c` gets a `rio-<c>-tls` Secret with tls.crt/tls.key/ca.crt.
   extraComponents ? [ ],
 }:
 let

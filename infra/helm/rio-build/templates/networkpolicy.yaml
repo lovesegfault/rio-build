@@ -5,22 +5,32 @@
 # rio-store — not exfil, not cloud metadata, not K8s apiserver.
 #
 # ADR-019 four-namespace split: builders are airgapped (DNS + scheduler
-# + store only). Fetchers get 0.0.0.0/0:80,443 minus RFC1918+link-local
-# — the FOD hash check at verify_fod_hashes() is the integrity boundary;
-# a domain allowlist is operational friction for marginal gain. Cross-
-# namespace rules use namespaceSelector + podSelector pairs.
+# + store only). Fetchers get world:80,443 minus cluster/link-local —
+# the FOD hash check at verify_fod_hashes() is the integrity boundary.
 #
-# ONE policy per selector — K8s merges additively; multiple policies
-# per selector are confusing.
+# CiliumNetworkPolicy (cilium.io/v2), not networking.k8s.io/v1. The k8s
+# NetworkPolicy semantics broke under Cilium: `ipBlock` rules match
+# CIDR-as-world only — they do NOT match in-cluster endpoints (pods,
+# nodes, apiserver) which Cilium identifies by identity, not IP. The
+# old controller-egress `ipBlock: 10.0.0.0/8` (meant to allow
+# apiserver) and store-egress `ipBlock: 10.0.0.0/8 port 5432` (meant
+# to allow in-cluster postgres) matched nothing under Cilium →
+# CrashLoopBackOff. CNP's `toEntities` and `toEndpoints` are the
+# identity-aware equivalents.
+#
+# ONE policy per selector — Cilium merges additively like k8s NP.
 ---
 # r[impl builder.netpol.airgap]
+# r[impl builder.netpol.deny-kube-api]
 #
 # Builder egress: DNS, scheduler, store. AIRGAPPED per ADR-019 — no
-# internet egress. FODs route to FetcherPool (separate policy below).
-# NO rule for 169.254.169.254 or 0.0.0.0/0 → DENIED (default-deny for
-# listed policyTypes). Metadata block is implicit.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# internet egress, no kube-apiserver. FODs route to FetcherPool
+# (separate policy below). NO `toEntities: [kube-apiserver]` and no
+# world rule → both DENIED (default-deny on policed endpoints). The
+# kube-apiserver deny is the load-bearing isolation: a sandbox-escaped
+# builder cannot read Secrets, list pods, or escalate via RBAC.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: builder-egress
   namespace: {{ $ns.builders.name }}
@@ -29,307 +39,326 @@ metadata:
 spec:
   # Matches pods created by BuilderPool reconciler — the Job pod-spec
   # builder sets rio.build/role (common/pod.rs ROLE_LABEL).
-  podSelector:
+  endpointSelector:
     matchLabels:
       rio.build/role: builder
-  policyTypes: [Egress]
   egress:
-    # Can't resolve rio-scheduler.rio-system.svc without CoreDNS.
-    {{- include "rio.egressDns" . | nindent 4 }}
-    # Scheduler: Heartbeat/BuildExecution. 9001 only, no metrics (9091).
-    # Cross-ns: namespaceSelector + podSelector AND-composed.
-    {{- include "rio.egressScheduler" . | nindent 4 }}
-    # Store: GetPath inputs, PutPath outputs. Cross-ns to rio-store.
-    {{- include "rio.egressStore" . | nindent 4 }}
+    # CoreDNS. L4-only (port 53 allow); the L7 DNS-proxy rule
+    # (`rules: dns:`) is omitted — it would give Hubble DNS visibility
+    # and enable toFQDNs, but requires the Cilium DNS proxy to be
+    # functional which adds a moving part. toFQDNs (store-egress-
+    # upstream) is gated on .Values.store.upstreamCaches and re-adds
+    # the L7 rule when actually needed.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    # Scheduler: Heartbeat/BuildExecution. Cross-ns endpoint match via
+    # the auto-injected k8s:io.kubernetes.pod.namespace label.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+            k8s:app.kubernetes.io/name: rio-scheduler
+      toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
+    # Store: GetPath inputs, PutPath outputs.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
+            k8s:app.kubernetes.io/name: rio-store
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+    {{- with .Values.networkPolicy.builderS3Cidr }}
+    # S3 VPC endpoint CIDR — builder reads chunks via presigned URL.
+    # toCIDR (not toEndpoints) — S3 endpoint is outside the cluster.
+    - toCIDR: [{{ . | quote }}]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+    {{- end }}
 ---
 # r[impl fetcher.netpol.egress-open]
 #
-# Fetcher egress: same three as builder-egress PLUS 0.0.0.0/0:80,443
-# minus RFC1918/link-local/loopback. Fetchers run FODs only (scheduler
-# hard_filter routes by ExecutorKind); the FOD's outputHash check is
-# the integrity boundary. The 169.254.0.0/16 except-entry blocks IMDS
-# (169.254.169.254) — per ADR-019 "metadata-service block is inherited
-# from the link-local deny".
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# Fetcher egress: same three as builder PLUS world:80,443. Fetchers run
+# FODs only (scheduler hard_filter routes by ExecutorKind); the FOD
+# outputHash check is the integrity boundary. `toEntities: [world]`
+# matches any IP NOT known to Cilium as a cluster identity — so it
+# inherently EXCLUDES pod/service/node IPs and the link-local range
+# (no manual `except:` carve-out needed; Cilium's identity model does
+# it). IMDS (169.254.169.254 / fd00:ec2::254) is host-local → covered
+# by the `host` entity, NOT `world` → DENIED.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: fetcher-egress
   namespace: {{ $ns.fetchers.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       rio.build/role: fetcher
-  policyTypes: [Egress]
   egress:
-    {{- include "rio.egressDns" . | nindent 4 }}
-    {{- include "rio.egressScheduler" . | nindent 4 }}
-    {{- include "rio.egressStore" . | nindent 4 }}
-    # Public internet on 80/443 only. `except` carves out all private
-    # address space — a compromised fetcher can fetchurl github.com but
-    # cannot probe the cluster's pod/service CIDRs, the node's metadata
-    # service, or localhost. v4 + v6 peers in one rule (NetworkPolicy
-    # `to:` is OR-of-peers; `except:` must be a subrange of its peer's
-    # `cidr`, so each family carries its own carve-out).
-    - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
-              - 169.254.0.0/16
-              - 127.0.0.0/8
-        - ipBlock:
-            cidr: ::/0
-            except:
-              # ULA — covers cluster pod/service CIDRs (typically
-              # fd00::/8) AND AWS IMDS v6 (fd00:ec2::254).
-              - fc00::/7
-              # Link-local — v6 NDP / SLAAC addresses on the node.
-              - fe80::/10
-              - ::1/128
-      ports:
-        - {protocol: TCP, port: 80}
-        - {protocol: TCP, port: 443}
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+            k8s:app.kubernetes.io/name: rio-scheduler
+      toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
+            k8s:app.kubernetes.io/name: rio-store
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+    # Public internet on 80/443. `world` entity = any non-cluster IP.
+    - toEntities: [world]
+      toPorts:
+        - ports:
+            - {port: "80", protocol: TCP}
+            - {port: "443", protocol: TCP}
 ---
-# Controller egress: DNS + RFC1918. apiserver isn't a pod (control
-# plane, outside cluster network on managed K8s). kubernetes Service
-# ClusterIP is .1 on most distros but not guaranteed. Allow private-IP,
-# deny public + link-local — maintainable vs enumerating every internal
-# IP. Metadata (169.254.169.254, link-local) NOT in any RFC1918 block
-# → DENIED implicitly. No `except` needed. Controller watches/patches
-# STS in rio-builders and rio-fetchers — same apiserver endpoint
-# regardless of which namespace you're CRUDing, so RFC1918 covers it.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# Controller egress: DNS + kube-apiserver. The controller's ONLY
+# upstream is the k8s API (watch/patch CRs across namespaces). The old
+# k8s-NP `ipBlock: 10.0.0.0/8` was a workaround for apiserver-isn't-a-
+# pod; CNP's `kube-apiserver` entity is the direct expression. No
+# RFC1918 CIDR needed.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: rio-controller-egress
   namespace: {{ $ns.system.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       app.kubernetes.io/name: rio-controller
-  policyTypes: [Egress]
   egress:
-    {{- include "rio.egressDns" . | nindent 4 }}
-    - to:
-        - ipBlock: {cidr: 10.0.0.0/8}
-        - ipBlock: {cidr: 172.16.0.0/12}
-        - ipBlock: {cidr: 192.168.0.0/16}
-        # v6 ULA — managed-K8s apiservers on dual-stack clusters
-        # publish a ULA address (e.g. EKS fdxx::/108 service CIDR).
-        - ipBlock: {cidr: fc00::/7}
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    # kube-apiserver entity covers managed-k8s where the apiserver is
+    # outside the cluster. In k3s/embedded-apiserver, the apiserver
+    # runs on a cluster node and is classified as `host`/`remote-node`
+    # instead. Both are listed so the rule works in either topology.
+    - toEntities: [kube-apiserver, host, remote-node]
+    # Scheduler (ClusterStatus/DrainExecutor admin RPCs) + store (GC
+    # tick connects to StoreAdminService). The old k8s-NP RFC1918
+    # ipBlock incidentally matched these (ClusterIPs in 10/8); CNP
+    # toCIDR does not match in-cluster endpoints.
+    - toEndpoints:
+        - matchLabels: {app.kubernetes.io/name: rio-scheduler}
+      toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
+            k8s:app.kubernetes.io/name: rio-store
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
 ---
-# Scheduler ingress: gRPC from rio components + plaintext health from
-# any pod. kubelet isn't a pod → would need ipBlock for node CIDR,
-# which varies. Plaintext port serves ONLY health (SERVING/NOT_SERVING,
-# no data) → harmless.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# Scheduler ingress: gRPC from rio components + health/metrics from
+# host (kubelet probes, Prometheus). `host`/`remote-node` entities
+# cover kubelet (host-network) without an ipBlock for the node CIDR.
+# The Cilium per-Gateway envoy (dashboard route) lives in the Gateway's
+# namespace ({{ $ns.system.name }}) under label `gateway.networking.
+# k8s.io/gateway-name: rio-dashboard` — same-ns so no namespace label
+# needed in its matchLabels.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: scheduler-ingress
   namespace: {{ $ns.system.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       app.kubernetes.io/name: rio-scheduler
-  policyTypes: [Ingress]
   ingress:
-    # Same-ns: gateway (SubmitBuild), controller (ClusterStatus/
-    # DrainExecutor). Bare podSelector scopes to the policy's own ns.
-    - from:
-        - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-gateway}
-        - podSelector:
-            matchLabels: {app.kubernetes.io/name: rio-controller}
-      ports: [{protocol: TCP, port: 9001}]
-    # Cross-ns: builders + fetchers Heartbeat/BuildExecution. Both
-    # carry app.kubernetes.io/part-of: rio-build (set by namespace.yaml)
-    # — match by that instead of enumerating names.
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.builders.name }}
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.fetchers.name }}
-      ports: [{protocol: TCP, port: 9001}]
-    - from:
-        - podSelector: {}
-      ports: [{protocol: TCP, port: 9101}]
-    # Metrics: Prometheus scrape + apiserver pods/proxy. No `from` →
-    # allows any source (pods, host-network kubelet, cross-ns). Metrics
-    # are read-only observability (no tenant data); same harmless-class
-    # as 9101 above. Without this, kubectl get --raw .../pods/$pod:9091/
-    # proxy/metrics is REJECTed by kube-router (kubelet is host-network,
-    # doesn't match podSelector).
-    - ports: [{protocol: TCP, port: 9091}]
+    - fromEndpoints:
+        - matchLabels: {app.kubernetes.io/name: rio-gateway}
+        - matchLabels: {app.kubernetes.io/name: rio-controller}
+        - matchLabels: {gateway.networking.k8s.io/gateway-name: rio-dashboard}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.builders.name }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.fetchers.name }}
+      toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
+    # Health (9101) + metrics (9091): kubelet probes + Prometheus
+    # scrape. kubelet is host-network → `host`/`remote-node` entity.
+    # `cluster` covers apiserver pods/proxy (kubectl get --raw).
+    - fromEntities: [host, remote-node, cluster]
+      toPorts:
+        - ports:
+            - {port: "9101", protocol: TCP}
+            - {port: "9091", protocol: TCP}
 ---
 # Store ingress: GetPath/PutPath/FindMissingPaths from rio components
-# across three namespaces. Store lives in its own rio-store ns so it
-# can run at PSA baseline (no FUSE, no SYS_ADMIN).
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# across three namespaces.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: store-ingress
   namespace: {{ $ns.store.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       app.kubernetes.io/name: rio-store
-  policyTypes: [Ingress]
   ingress:
-    # gateway (PutPath from nix copy), scheduler (FindMissingPaths
-    # cache-check), builders + fetchers (GetPath inputs, PutPath
-    # outputs). All four carry the part-of label.
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.system.name }}
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.builders.name }}
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $ns.fetchers.name }}
-      ports: [{protocol: TCP, port: 9002}]
-    - from:
-        - podSelector: {}
-      ports: [{protocol: TCP, port: 9102}]
-    # Metrics: same any-source allowance as scheduler 9091 above —
-    # Prometheus scrape + apiserver pods/proxy. Read-only observability.
-    - ports: [{protocol: TCP, port: 9092}]
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.builders.name }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.fetchers.name }}
+      toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+    - fromEntities: [host, remote-node, cluster]
+      toPorts:
+        - ports:
+            - {port: "9102", protocol: TCP}
+            - {port: "9092", protocol: TCP}
 ---
 # r[impl store.netpol.egress]
 #
-# Store egress: DNS + postgres + S3 VPC endpoint. The store pod holds
-# S3 creds (presigned-URL minting) + postgres creds — a compromised
-# store should NOT reach IMDS for role escalation or arbitrary public
-# IPs for exfil. No rule for 169.254.0.0/16 or 0.0.0.0/0 → DENIED
-# (default-deny for listed policyTypes).
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# Store egress: DNS + postgres + S3 VPC endpoint. The store holds S3
+# creds + postgres creds — a compromised store should NOT reach IMDS
+# or arbitrary public IPs. No `world` rule, no `kube-apiserver` entity
+# → both DENIED.
+#
+# Postgres reachability needs BOTH selector forms: in-cluster PG (VM
+# tests, dev) is a pod with a Cilium identity → `toEndpoints` matches
+# it; external PG (RDS, CloudSQL) is a VPC IP outside the cluster →
+# `toCIDRSet` matches it. The old k8s-NP used only ipBlock which
+# matched RDS but NOT the in-cluster pod under Cilium (CIDR-as-world).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: store-egress
   namespace: {{ $ns.store.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       app.kubernetes.io/name: rio-store
-  policyTypes: [Egress]
   egress:
-    {{- include "rio.egressDns" . | nindent 4 }}
-    # Postgres: RFC1918 (+ v6 ULA) on 5432. External PG (RDS, CloudSQL)
-    # lives in the VPC's private CIDR. Link-local + public implicitly
-    # DENIED. RDS has no AAAA today; the ULA peer is forward-compat.
-    - to:
-        - ipBlock: {cidr: 10.0.0.0/8}
-        - ipBlock: {cidr: 172.16.0.0/12}
-        - ipBlock: {cidr: 192.168.0.0/16}
-        - ipBlock: {cidr: fc00::/7}
-      ports: [{protocol: TCP, port: 5432}]
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    # In-cluster postgres (bitnami chart, VM tests / dev). Subchart
+    # deploys into the helm release namespace (system), not store.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+            k8s:app.kubernetes.io/name: postgresql
+      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
+    # External postgres (RDS / CloudSQL) — RFC1918 + ULA. These are
+    # outside the cluster so toCIDRSet matches as `world` subspace.
+    - toCIDRSet:
+        - {cidr: 10.0.0.0/8}
+        - {cidr: 172.16.0.0/12}
+        - {cidr: 192.168.0.0/16}
+        - {cidr: fc00::/7}
+      toPorts: [{ports: [{port: "5432", protocol: TCP}]}]
     {{- with .Values.networkPolicy.storeS3Cidr }}
-    # S3 VPC endpoint CIDR — store writes chunks directly. Only
-    # rendered when the operator sets the endpoint CIDR (AWS-specific;
-    # varies by VPC). VPC endpoints are IPv4-only (no AAAA); the value
-    # here is a v4 CIDR even on dual-stack clusters.
-    - to:
-        - ipBlock: {cidr: {{ . }}}
-      ports: [{protocol: TCP, port: 443}]
+    # S3 VPC endpoint CIDR — store writes chunks directly.
+    - toCIDR: [{{ . | quote }}]
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
     {{- end }}
 {{- if .Values.store.upstreamCaches }}
 ---
 # r[impl store.substitute.upstream]
 #
-# Store egress allowlist for upstream binary caches. Separate policy
-# from `store-egress` above so the base egress (DNS + postgres + S3)
-# stays minimal and the upstream allowlist is visibly conditional —
-# absent `store.upstreamCaches` config, this policy does NOT render
-# and the store cannot reach any public IP on 443.
-#
-# CIDR-based because NetworkPolicy has no native FQDN support. The
-# operator resolves cache.nixos.org etc. to their current CIDRs at
-# deploy time. If CIDR churn is operational pain, the upgrade path is
-# a CNI with FQDN-aware policies (Cilium CiliumNetworkPolicy toFQDNs,
-# Calico GlobalNetworkPolicy domain matchers) — out of scope here.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# Store egress allowlist for upstream binary caches. CNP `toFQDNs`
+# replaces the operator-maintained CIDR list — Cilium DNS-proxies the
+# lookups (the DNS rule above) and tracks IP→FQDN, so the policy
+# matches by hostname. The old k8s-NP comment "upgrade path is a CNI
+# with FQDN-aware policies" — this is that upgrade.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: store-egress-upstream
   namespace: {{ $ns.store.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       app.kubernetes.io/name: rio-store
-  policyTypes: [Egress]
   egress:
-    # DNS for upstream hostname resolution. Same kube-system selector
-    # as the base store-egress policy — the two policies OR together
-    # (NetworkPolicy is additive on egress), so this duplicates the
-    # DNS rule for clarity: if an operator reads only THIS policy to
-    # audit upstream access, they see the DNS dependency.
-    {{- include "rio.egressDns" . | nindent 4 }}
-    {{- range .Values.store.upstreamCaches }}
-    # {{ .name | default .cidr }}
-    - to:
-        - ipBlock: {cidr: {{ .cidr | quote }}}
-      ports: [{protocol: TCP, port: 443}]
-    {{- end }}
+    # toFQDNs requires the L7 DNS proxy so Cilium can map IP→FQDN.
+    # This is the ONLY policy that needs it — re-add the rules:dns
+    # block here (the base store-egress DNS rule above is L4-only).
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+          rules:
+            dns:
+              {{- range .Values.store.upstreamCaches }}
+              - matchName: {{ .host | quote }}
+              {{- end }}
+    - toFQDNs:
+        {{- range .Values.store.upstreamCaches }}
+        - matchName: {{ .host | quote }}
+        {{- end }}
+      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
 {{- end }}
 {{- if .Values.dashboard.enabled }}
 ---
-# Dashboard egress: DNS + Envoy Gateway Service only. nginx proxies
-# /rio.* to the operator-managed envoy; envoy handles the mTLS hop
-# to rio-scheduler (EnvoyProxy.backendTLS.clientCertificateRef +
-# BackendTLSPolicy). The dashboard pod never talks to scheduler
-# directly — one less mTLS cert to manage, and a compromised SPA
-# container can't speak gRPC to anything.
-#
-# envoy data-plane pods live in the OPERATOR's namespace
-# (ControllerNamespaceMode, the upstream default — envoy-gateway-
-# system), NOT {{ $ns.system.name }}. The Gateway CR is here; the
-# Deployment+Service it produces land where the operator runs. Label
-# selector gateway.envoyproxy.io/owning-gateway-name is set by the
-# operator on every pod it creates for a given Gateway.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# Dashboard egress: DNS + the Cilium per-Gateway envoy. nginx proxies
+# /rio.* to the Gateway's listener; Cilium's envoy forwards to
+# rio-scheduler (same-ns, plaintext-over-WireGuard). The dashboard pod
+# never talks to scheduler directly — a compromised SPA container
+# can't speak gRPC to anything. Cilium creates the envoy Deployment in
+# the Gateway's OWN namespace with label `gateway.networking.k8s.io/
+# gateway-name: <name>` — same-ns, so no cross-ns selector needed.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
   name: rio-dashboard-egress
   namespace: {{ $ns.system.name }}
   labels:
     app.kubernetes.io/part-of: rio-build
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       app.kubernetes.io/name: rio-dashboard
-  policyTypes: [Egress]
   egress:
-    # Can't resolve rio-dashboard-envoy.{{ .Values.dashboard.envoyGatewayNamespace }}.svc
-    # without CoreDNS.
-    {{- include "rio.egressDns" . | nindent 4 }}
-    # Port 8080 = the Gateway listener (dashboard-gateway.yaml).
-    # namespaceSelector required: cross-namespace egress needs an
-    # explicit ns match or the podSelector scopes to {{ $ns.system.name }}
-    # only (where no envoy pods live under ControllerNamespaceMode).
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.dashboard.envoyGatewayNamespace }}
-          podSelector:
-            matchLabels:
-              gateway.envoyproxy.io/owning-gateway-name: rio-dashboard
-      ports: [{protocol: TCP, port: 8080}]
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    - toEndpoints:
+        - matchLabels:
+            gateway.networking.k8s.io/gateway-name: rio-dashboard
+      toPorts: [{ports: [{port: "8080", protocol: TCP}]}]
 {{- end }}
 {{- end }}

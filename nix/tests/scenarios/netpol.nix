@@ -90,17 +90,21 @@ pkgs.testers.runNixOSTest {
     # 02-workloads.yaml → k3s auto-applies it at boot along with
     # everything else. If this get fails, the helm override didn't take.
     # ADR-019: builder-egress policy lives in rio-builders namespace.
-    kubectl("get networkpolicy builder-egress -o name", ns="${nsBuilders}")
+    kubectl("get cnp builder-egress -o name", ns="${nsBuilders}")
 
     # Cilium attaches policy at endpoint-create time. Gate on this
-    # specific pod's CiliumEndpoint reporting egress enforcing — proves
-    # the agent has compiled and loaded the eBPF policy program for THIS
-    # netns. Replaces the previous kube-router 10s sleep with a
-    # structural check.
+    # specific pod's CiliumEndpoint having an identity — proves the
+    # agent has classified and registered THIS netns. With the CNP
+    # present (checked above) and the endpoint identified, policy is
+    # enforced. (The 1.19 slim CEP status does not expose
+    # `.status.policy.egress.enforcing`; identity.id is the reliable
+    # cross-version "Cilium has processed this endpoint" signal.)
+    # Replaces the previous kube-router 10s sleep with a structural
+    # check; the nsenter probes below are the actual enforcement proof.
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${nsBuilders} get ciliumendpoint "
         f"{wp} -o jsonpath="
-        "'{.status.policy.egress.enforcing}' | grep -qx true",
+        "'{.status.identity.id}' | grep -q .",
         timeout=60,
     )
 
@@ -272,7 +276,7 @@ pkgs.testers.runNixOSTest {
     # Same nsenter mechanics as the builder probe above, but for a
     # rio-store pod (lives in rio-store namespace per ADR-019).
     with subtest("netpol-store-egress: store IMDS blocked, postgres allowed"):
-        kubectl("get networkpolicy store-egress -o name", ns="${nsStore}")
+        kubectl("get cnp store-egress -o name", ns="${nsStore}")
 
         store_pod = kubectl(
             "get pod -l app.kubernetes.io/name=rio-store "

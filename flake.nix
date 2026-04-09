@@ -765,10 +765,10 @@
                 # k3s nonpriv e2e (base_runtime_spec /dev/fuse +
                 # cgroup rw-remount).
                 vm-security-nonpriv-k3s = 8;
-                # k3s + envoy-gateway operator (+2 images). No builds.
+                # k3s + Cilium Gateway API (+cilium-envoy image). No builds.
                 vm-dashboard-gateway-k3s = 8;
                 # Same fixture + rio-dashboard nginx image. curl via
-                # nginx → envoy → scheduler (SPA + proxy_buffering gate).
+                # nginx → Cilium Gateway → scheduler (tonic-web).
                 vm-dashboard-k3s = 8;
                 # k3s base fixture. rio-cli AdminService smoke.
                 vm-cli-k3s = 8;
@@ -1111,12 +1111,6 @@
             helm-postgresql = subcharts.postgresql;
             helm-rook-ceph = subcharts.rook-ceph;
             helm-rook-ceph-cluster = subcharts.rook-ceph-cluster;
-            # Envoy Gateway operator (dashboard gRPC-Web translation).
-            # `cargo xtask k8s envoy -p k3s` installs this before the rio chart
-            # so Gateway API / EnvoyProxy CRDs exist when dashboard-
-            # gateway*.yaml templates are applied.
-            helm-envoy-gateway = subcharts.gateway-helm;
-            helm-envoy-gateway-crds = subcharts.gateway-crds-helm;
             helm-cilium = subcharts.cilium;
             # nix/pins.nix rendered as *.auto.tfvars.json. snake_case
             # keys in pins.nix → direct toJSON passthrough, no mapping

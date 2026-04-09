@@ -662,7 +662,7 @@ in
   #   Envoy encodes them as 0x80 body frames browser fetch can read.
   vm-dashboard-gateway-k3s = dashboard-gateway {
     inherit pkgs common;
-    fixture = k3sFull { envoyGatewayEnabled = true; };
+    fixture = k3sFull { gatewayEnabled = true; };
   };
 
   # Builder + store egress NetworkPolicy: IMDS + public internet + k8s
@@ -837,6 +837,6 @@ in
 // pkgs.lib.optionalAttrs (dockerImages ? dashboard) {
   vm-dashboard-k3s = dashboard {
     inherit pkgs common;
-    fixture = k3sFull { envoyGatewayEnabled = true; };
+    fixture = k3sFull { gatewayEnabled = true; };
   };
 }

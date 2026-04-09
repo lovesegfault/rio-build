@@ -51,8 +51,16 @@ let
       ;
   };
   helmRender = import ../../helm-render.nix { inherit pkgs nixhelm system; };
-  envoyGatewayRender = import ../../envoy-gateway-render.nix { inherit pkgs nixhelm system; };
-  ciliumRender = import ../../cilium-render.nix { inherit pkgs nixhelm system; };
+  mkCiliumRender =
+    gatewayEnabled:
+    import ../../cilium-render.nix {
+      inherit
+        pkgs
+        nixhelm
+        system
+        gatewayEnabled
+        ;
+    };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
   ciliumImages = [
     pulled.cilium-agent
@@ -90,17 +98,18 @@ in
   # replicas: "2" in the rendered Deployment, which k8s API validation
   # rejects. prod-parity fixture passes bootstrap.enabled here.
   extraValuesTyped ? { },
-  # Envoy Gateway (dashboard gRPC-Web). Preloads envoyproxy/gateway +
-  # envoyproxy/envoy:distroless images, renders the gateway-helm chart
-  # as k3s manifests (CRDs+operator+certgen), sets dashboard.enabled=
-  # true in the rio chart so the Gateway/GRPCRoute/EnvoyProxy CRDs
-  # render. Adds a rio-dashboard-envoy-tls Secret to the PKI so the
-  # operator's client-cert ref resolves. Heavyweight — ~200MB of extra
-  # images and ~60s of operator reconcile time; only enable for
-  # dashboard-specific scenarios.
-  envoyGatewayEnabled ? false,
+  # Cilium Gateway API (dashboard routing). Flips gatewayAPI.enabled in
+  # cilium-render.nix (vendors Gateway API CRDs + enables cilium-envoy
+  # DaemonSet), preloads quay.io/cilium/cilium-envoy, sets dashboard.
+  # enabled=true in the rio chart so the Gateway/GRPCRoute CRs render.
+  # gRPC-Web translation is in-process at rio-scheduler (tonic-web, D3)
+  # — the Gateway is plain HTTP routing. ~400MB extra image; only
+  # enable for dashboard-specific scenarios.
+  gatewayEnabled ? false,
 }:
 let
+  ciliumRender = mkCiliumRender gatewayEnabled;
+
   # ── Shared cluster secrets ──────────────────────────────────────────
   # Cleartext fine for an airgapped VM test; real clusters use a random
   # token. Both server and agent read this file.
@@ -129,14 +138,6 @@ let
       "jwt.publicKey" = jwtKeys.pubkeyB64;
       "jwt.signingSeed" = jwtKeys.seedB64;
     })
-    // (pkgs.lib.optionalAttrs envoyGatewayEnabled {
-      # containerd airgap cache is tag-indexed, not digest-indexed.
-      # values.yaml default has @sha256: suffix (P0379 digest-pin) →
-      # exact-string miss → ImagePullBackOff. Override to bare-tag
-      # DERIVED from the preload FOD's finalImageName:finalImageTag
-      # (destNameTag attr) — bumping docker-pulled.nix auto-bumps here.
-      "dashboard.envoyImage" = pulled.envoy-distroless.destNameTag;
-    })
     // (pkgs.lib.optionalAttrs coverage {
       # PSA restricted (ADR-019 default for control-plane) blocks the
       # hostPath "cov" volume (_helpers.tpl rio.mounts cov family) that
@@ -155,11 +156,9 @@ let
     // pkgs.lib.optionalAttrs jwtEnabled {
       "jwt.enabled" = true;
     }
-    // pkgs.lib.optionalAttrs envoyGatewayEnabled {
-      # Renders dashboard-gateway*.yaml (Gateway/GRPCRoute/EnvoyProxy/
-      # SecurityPolicy/ClientTrafficPolicy/BackendTLSPolicy). These CRs
-      # sit in 02-workloads.yaml but don't match any 01-rbac kind, so
-      # they land in the workloads split correctly.
+    // pkgs.lib.optionalAttrs gatewayEnabled {
+      # Renders dashboard-gateway.yaml (GatewayClass/Gateway/GRPCRoute).
+      # These CRs sit in 02-workloads.yaml.
       "dashboard.enabled" = true;
     }
     // extraValuesTyped;
@@ -173,13 +172,8 @@ let
   # phase4c). Makes the fixture representative of production: mTLS
   # on all gRPC links, plaintext health ports (9101/9102/9194).
   #
-  # With envoyGatewayEnabled, also generates rio-dashboard-envoy (the
-  # envoy data-plane's client-cert for upstream mTLS to the scheduler).
-  # dashboard-gateway-tls.yaml's EnvoyProxy.spec.backendTLS.
-  # clientCertificateRef references this Secret.
   pkiK8s = mkPkiK8s {
     inherit ns;
-    extraComponents = pkgs.lib.optional envoyGatewayEnabled "dashboard-envoy";
   };
 
   # ── Airgap image set ────────────────────────────────────────────────
@@ -198,17 +192,13 @@ let
     dockerImages.vmTestSeed
     pulled.bitnami-postgresql
   ]
-  ++ pkgs.lib.optionals envoyGatewayEnabled [
-    # Operator + certgen Job (same image). ~120MB compressed.
-    pulled.envoy-gateway
-    # Data-plane envoy. Pinned via EnvoyProxy.spec.provider.kubernetes.
-    # envoyDeployment.container.image in dashboard-gateway-tls.yaml —
-    # matches extraSet bare-tag override above (destNameTag — values.
-    # yaml default is digest-pinned but airgap containerd needs tag-only).
-    pulled.envoy-distroless
+  ++ pkgs.lib.optionals gatewayEnabled [
+    # Cilium L7 proxy DaemonSet (envoy.enabled=true in cilium-render.nix
+    # when gatewayEnabled). ~400MB compressed.
+    pulled.cilium-envoy
   ]
   # nginx + SPA bundle (rio-dashboard:dev). dashboard.enabled=true
-  # (set when envoyGatewayEnabled) renders the nginx Deployment;
+  # (set when gatewayEnabled) renders the nginx Deployment;
   # without this preload the pod goes ImagePullBackOff. The `?`
   # guard: coverage-mode dockerImages elides the dashboard attr
   # (nginx+static has no LLVM instrumentation — mkDockerImages
@@ -217,7 +207,7 @@ let
   # dashboard-curl scenario waits for it — and that scenario is
   # itself gated on the same `?` check (default.nix), so coverage-
   # mode vmTestsCov skips it entirely.
-  ++ pkgs.lib.optional (envoyGatewayEnabled && dockerImages ? dashboard) dockerImages.dashboard
+  ++ pkgs.lib.optional (gatewayEnabled && dockerImages ? dashboard) dockerImages.dashboard
   ++ extraImages;
 
   # ── Containerd tmpfs sizing ──────────────────────────────────────────
@@ -237,17 +227,15 @@ let
   # to debug — tmpfs is cheap insurance. The VM memory bump must cover
   # what's ACTUALLY written (tmpfs is lazy; unused cap costs nothing).
   #
-  # envoyGatewayEnabled adds 2 images (envoy ~200MB + dashboard ~100MB
-  # if dockerImages?dashboard — 2 bump units when both present, 1 if
-  # dashboard absent). Dashboard fits in envoy's headroom today but
-  # counting it explicitly avoids a future uncounted-growth surprise.
+  # gatewayEnabled adds cilium-envoy (~400MB) + dashboard (~100MB if
+  # dockerImages?dashboard).
   extraImagesBumpGiB =
     builtins.length extraImages
     # Cilium agent (713M tar) + operator (113M) — always present, the
     # CNI is unconditional. Spike-A measured 88% of 2G with cilium-only;
     # with rio-* on top, +2 keeps headroom under the eviction threshold.
     + 2
-    + (if envoyGatewayEnabled then (if dockerImages ? dashboard then 2 else 1) else 0);
+    + (if gatewayEnabled then (if dockerImages ? dashboard then 2 else 1) else 0);
   containerdTmpfsSize =
     if coverage then
       "${toString (4 + extraImagesBumpGiB)}G"
@@ -484,17 +472,17 @@ let
           "01-rio-rbac".source = "${helmRendered}/01-rbac.yaml";
           "02-rio-workloads".source = "${helmRendered}/02-workloads.yaml";
         }
-        // pkgs.lib.optionalAttrs envoyGatewayEnabled {
-          # Envoy Gateway operator + Gateway API CRDs. Alphabetical
-          # sort order (00-envoy-gateway-* < 00-rio-crds, `e` < `r`)
-          # means these apply first — the rio chart's dashboard-
-          # gateway*.yaml CRs in 02-rio-workloads need
-          # gateway.networking.k8s.io + gateway.envoyproxy.io CRDs
-          # to exist.
-          "00-envoy-gateway-crds".source = "${envoyGatewayRender}/00-envoy-gateway-crds.yaml";
-          "01-envoy-gateway-ns".source = "${envoyGatewayRender}/01-envoy-gateway-ns.yaml";
-          "01-envoy-gateway-rbac".source = "${envoyGatewayRender}/02-envoy-gateway-rbac.yaml";
-          "02-envoy-gateway".source = "${envoyGatewayRender}/03-envoy-gateway.yaml";
+        // pkgs.lib.optionalAttrs gatewayEnabled {
+          # Gateway API CRDs (gateway.networking.k8s.io). Cilium expects
+          # these pre-installed; gatewayAPI.enabled is a silent no-op
+          # without them (research-A C1). 000-* prefix sorts before the
+          # cilium manifests so cilium-operator sees CRDs at start.
+          "000-cilium-gateway-api-crds".source = "${ciliumRender}/00-gateway-api-crds.yaml";
+          # LB-IPAM pool so the per-Gateway type:LoadBalancer Service
+          # gets an external IP → Gateway Programmed:True. Applied
+          # after 001-cilium; k3s deploy controller retries until the
+          # CRD exists (cilium-operator installs it at runtime).
+          "002-cilium-lbipam-pool".source = "${ciliumRender}/03-cilium-lbipam-pool.yaml";
         }
         // {
           # Placeholder authorized_keys Secret so the gateway pod's
