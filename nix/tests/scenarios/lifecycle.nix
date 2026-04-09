@@ -1082,13 +1082,24 @@ let
           # Cgroup reappeared — concrete proof no EEXIST in
           # BuildCgroup::create. Same dirname (same drv_path → same
           # sanitize_build_id). `| grep .` so wait_until_succeeds retries.
-          cgroup_retry = worker_vm.wait_until_succeeds(
+          # Re-resolve the node: the first build's worker_vm is gone
+          # (ephemeral one-shot), and the re-dispatch spawns a FRESH Job
+          # pod that kube-scheduler may place on the OTHER node. Polling
+          # the stale worker_vm would hang 180s if placement flipped.
+          wp2 = wait_worker_pod()
+          worker_node2 = k3s_server.succeed(
+              f"k3s kubectl -n ${nsBuilders} get pod {wp2} "
+              "-o jsonpath='{.spec.nodeName}'"
+          ).strip()
+          worker_vm2 = k3s_agent if worker_node2 == "k3s-agent" else k3s_server
+          cgroup_retry = worker_vm2.wait_until_succeeds(
               "find /sys/fs/cgroup -type d -name '*lifecycle-timeout_drv' "
               "-print -quit 2>/dev/null | grep .",
               timeout=180,
           ).strip()
-          print(f"build-timeout PASS: same-drv re-dispatched, "
-                f"cgroup recreated at {cgroup_retry} (no EEXIST leak)")
+          print(f"build-timeout PASS: same-drv re-dispatched to "
+                f"{worker_node2}, cgroup recreated at {cgroup_retry} "
+                f"(no EEXIST leak)")
     '';
 
     recovery = ''
