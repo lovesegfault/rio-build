@@ -94,21 +94,14 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 > **The controller is NOT leader-elected** (single replica by design). Only the scheduler uses a Kubernetes Lease (see scheduler `RIO_LEASE_NAME` / `RIO_LEASE_NAMESPACE` env vars documented in [scheduler: Leader Election](./components/scheduler.md#leader-election)).
 
-## TLS / mTLS
+## Transport
 
-Application-level mTLS is configured via a nested `TlsConfig` on each component:
+There is no application-level TLS. Components run plaintext gRPC servers; encryption is provided by Cilium WireGuard at the overlay layer (`r[sec.transport.cilium-wireguard]`). K8s gRPC health probes hit the main port directly — no separate plaintext-health listener.
 
 | Env var | Description |
 |---------|-------------|
-| `RIO_TLS__CERT_PATH` | Our certificate (PEM). Server presents on accept; client presents for mTLS. |
-| `RIO_TLS__KEY_PATH` | Our private key (PEM, PKCS8). cert-manager's `encoding: PKCS8` emits this for EC keys. |
-| `RIO_TLS__CA_PATH` | CA bundle (PEM). Server verifies client certs against this; client verifies server cert. |
-
-All three must be set together (partial config is a startup error). When set:
-- Scheduler + store: main gRPC port requires client certs. A second plaintext listener on `health_addr` (`RIO_HEALTH_ADDR`, default `:9101`/`:9102`) serves ONLY `grpc.health.v1.Health` for K8s probes, sharing the SAME `HealthReporter` so leadership status propagates.
-- Gateway, builder, controller: client-side TLS for outgoing connections (`connect_*` in `rio-proto/client.rs`).
-
-For K8s deployments, the prod overlay's `cert-manager.yaml` issues per-component certificates from a self-signed CA. See [Security & Threat Model](./security.md) for the threat model.
+| `RIO_SERVICE_HMAC_KEY_PATH` | Service-token HMAC key (raw bytes). Gateway signs `x-rio-service-token`; store verifies. Separate from the assignment-token key. See `r[sec.authz.service-token]`. |
+| `RIO_DASHBOARD__CORS_ALLOW_ORIGINS` | (scheduler) Comma-separated CORS allowed origins for gRPC-Web. Defaults to the in-cluster dashboard nginx Service hostname. |
 
 ## Observability
 

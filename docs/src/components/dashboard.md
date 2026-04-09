@@ -1,7 +1,8 @@
 # rio-dashboard
 
 > Web dashboard for operational visibility. Svelte 5 SPA,
-> Envoy Gateway gRPC-Web translation, DAG visualization via @xyflow/svelte.
+> in-process tonic-web on the scheduler, Cilium Gateway API ingress,
+> DAG visualization via @xyflow/svelte.
 
 ## Architecture
 
@@ -17,21 +18,24 @@ browser (connect-web, gRPC-Web framing)
     │  HTTP/1.1 POST /rio.admin.AdminService/ListBuilds
     ▼
   nginx (baked into the dashboard image, nix/docker.nix)
-    │  proxy_buffering off; proxies /rio.* to the Envoy Gateway Service
+    │  proxy_buffering off; proxies /rio.* to the Cilium Gateway Service
     ▼
-  Envoy Gateway (operator-managed data plane, Gateway API + GRPCRoute)
-    │  grpc_web filter auto-injected on GRPCRoute attachment:
-    │  HTTP/1.1 gRPC-Web → HTTP/2 gRPC, BackendTLSPolicy presents mTLS client cert
+  Cilium Gateway (Gateway API + GRPCRoute, embedded envoy)
+    │  plain HTTP routing — no protocol translation here
     ▼
-  rio-scheduler:9001 (sees a normal mTLS gRPC client — no gRPC-Web awareness)
+  rio-scheduler:9001 (tonic-web layer accepts gRPC-Web natively;
+                      same port serves native gRPC over h2)
 ```
 
-The Envoy data plane is **NOT a sidecar** — it is an operator-managed Deployment
+gRPC-Web translation happens **in-process at the scheduler** via `tonic-web`
+(`GrpcWebLayer` + `accept_http1`). The Cilium Gateway is a plain HTTP router
 reconciled from `GatewayClass`/`Gateway`/`GRPCRoute` CRDs
-(`infra/helm/rio-build/templates/dashboard-gateway*.yaml`). The Envoy Gateway
-operator itself is deployed via the nixhelm `gateway-helm` chart. nginx is a thin
-HTTP/1.1 proxy that serves the SPA static assets and forwards `/rio.*` to the
-operator-generated Envoy Service (`rio-dashboard-envoy.envoy-gateway-system`).
+(`infra/helm/rio-build/templates/dashboard-gateway.yaml`); Cilium's embedded
+envoy handles it (no separate Envoy Gateway operator). nginx is a thin HTTP/1.1
+proxy that serves the SPA static assets and forwards `/rio.*` to the
+Cilium-provisioned Gateway Service. CORS lives in the scheduler
+(`tower-http` `CorsLayer`, `RIO_DASHBOARD__CORS_ALLOW_ORIGINS`), not in a proxy
+CRD.
 
 **No Ingress.** Access is via `kubectl port-forward svc/rio-dashboard 8080:80` —
 the dashboard is an operator-facing tool (matches the Grafana model, not a public
@@ -63,14 +67,14 @@ actions) that a Prometheus/Grafana stack can't give you.
 
 ## Normative requirements
 
-r[dash.envoy.grpc-web-translate+2]
-Envoy Gateway (deployed via nixhelm `gateway-helm` chart) translates gRPC-Web (HTTP/1.1 POST from browser fetch) to gRPC over HTTP/2 with mTLS client cert presented to the scheduler. The scheduler is never aware of gRPC-Web — it sees a normal mTLS client. A `GRPCRoute` CRD routes `rio.admin.AdminService` and `rio.scheduler.SchedulerService` methods to `rio-scheduler:9001`; attaching a `GRPCRoute` to a listener automatically injects the `envoy.filters.http.grpc_web` filter into that listener's filter chain (no `EnvoyPatchPolicy` escape hatch). `SecurityPolicy` configures CORS with `grpc-status`/`grpc-message`/`grpc-status-details-bin` in `exposeHeaders`. `BackendTLSPolicy` + `EnvoyProxy.spec.backendTLS.clientCertificateRef` provide upstream mTLS.
+r[dash.envoy.grpc-web-translate+3]
+The scheduler accepts gRPC-Web natively on its main port via `tonic-web` (`GrpcWebLayer` + `accept_http1(true)`): browser HTTP/1.1 POST and native gRPC over h2 share `:9001`. A Cilium-managed `GRPCRoute` CRD routes `rio.admin.AdminService` and `rio.scheduler.SchedulerService` methods to `rio-scheduler:9001` over plain HTTP — no protocol translation, no upstream TLS. CORS is in-process (`tower-http` `CorsLayer`) with `grpc-status`/`grpc-message`/`grpc-status-details-bin` in `expose_headers`; `RIO_DASHBOARD__CORS_ALLOW_ORIGINS` configures allowed origins. No separate Envoy Gateway operator, no `BackendTLSPolicy`/`SecurityPolicy`/`EnvoyProxy` CRDs.
 
 r[dash.auth.method-gate+2]
-The `GRPCRoute` splits `AdminService` methods by impact: read-only methods (`ClusterStatus`, `ListExecutors`, `ListPoisoned`, `ListBuilds`, `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSizeClassStatus`) route unconditionally; mutating methods (`ClearPoison`, `DrainExecutor`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods` is true (default false). Until dashboard-native authz lands, mutating operations go through `rio-cli` with an mTLS client certificate. CORS `allowOrigins` defaults to the in-cluster nginx Service hostname, not wildcard.
+The `GRPCRoute` splits `AdminService` methods by impact: read-only methods (`ClusterStatus`, `ListExecutors`, `ListPoisoned`, `ListBuilds`, `GetBuildLogs`, `ListTenants`, `GetBuildGraph`, `GetSizeClassStatus`) route unconditionally; mutating methods (`ClearPoison`, `DrainExecutor`, `CreateTenant`, `TriggerGC`) route only when `dashboard.enableMutatingMethods` is true (default false). Until dashboard-native authz lands, mutating operations go through `rio-cli` over a `kubectl port-forward`. CORS `allowOrigins` defaults to the in-cluster nginx Service hostname, not wildcard.
 
 r[dash.journey.build-to-logs]
-The killer journey: click build (Builds page) → drawer opens, DAG renders (Graph tab) → click running node (DrvNode) → log stream renders (Logs tab). The nginx→Envoy Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
+The killer journey: click build (Builds page) → drawer opens, DAG renders (Graph tab) → click running node (DrvNode) → log stream renders (Logs tab). The nginx→Cilium Gateway→scheduler chain MUST support server-streaming end-to-end (verified by the 0x80 trailer-frame byte in curl).
 
 r[dash.graph.degrade-threshold]
 Graph rendering MUST degrade to a sortable table when the node count exceeds 2000. dagre layout on >2000 nodes freezes the main thread. Above 500 nodes, dagre runs in a Web Worker. The server separately caps responses at 5000 nodes (`GetBuildGraphResponse.truncated`).
@@ -79,7 +83,7 @@ r[dash.stream.log-tail]
 `GetBuildLogs` server-stream consumption MUST use `TextDecoder('utf-8', {fatal: false})` — build output can contain non-UTF-8 bytes (compiler locale garbage). Lossy decode to `U+FFFD`, never throw. nginx `proxy_buffering off` is required or the stream buffers entirely before reaching the browser.
 
 r[dash.stream.idle-timeout]
-The streaming chain MUST tolerate ≥1h of silence on an open `GetBuildLogs`/`WatchBuild` stream (a build that prints nothing for 5 minutes is normal under LLVM-cold-ccache). Envoy `ClientTrafficPolicy.timeout.http.streamIdleTimeout` and nginx `proxy_read_timeout` are BOTH set to 1h — Envoy's default `stream_idle_timeout` is 5m and nginx's default `proxy_read_timeout` is 60s; either left at default cuts the stream first. The 1h ceiling is intentional (a stream truly quiet for an hour means the build is stuck).
+The streaming chain MUST tolerate ≥1h of silence on an open `GetBuildLogs`/`WatchBuild` stream (a build that prints nothing for 5 minutes is normal under LLVM-cold-ccache). nginx `proxy_read_timeout` is set to 1h (default 60s cuts first); the scheduler sends a 30s server-initiated h2 keep-alive PING (`http2_keep_alive_interval`) so the Cilium Gateway envoy's `stream_idle_timeout` (default 5m) never fires. The 1h ceiling is intentional (a stream truly quiet for an hour means the build is stuck).
 
 r[dash.log.cap]
 The log stream's reactive line buffer MUST be capped client-side. At `MAX_LINES = 50_000` the store splices the oldest `lines.length - (MAX_LINES - DROP_LINES)` lines (where `DROP_LINES = 10_000`), flips `truncated = true`, and accumulates `droppedLines` for the banner. The hysteresis gap means the splice fires once per ~10k lines instead of every chunk near the cap. 50k lines × ~100 bytes ≈ 5MB of strings — generous for a tab, small enough V8 GC keeps up. Per-chunk append is loop-push (NOT spread-push: a 100k-line backfill chunk would hit V8's ~65k-argument `RangeError`).

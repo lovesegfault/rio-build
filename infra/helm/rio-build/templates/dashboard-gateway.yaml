@@ -1,6 +1,6 @@
 {{- if .Values.dashboard.enabled }}
 {{- $ns := .Values.namespaces.system.name -}}
-# r[impl dash.envoy.grpc-web-translate+2]
+# r[impl dash.envoy.grpc-web-translate+3]
 # r[impl dash.auth.method-gate+2]
 #   (markers are documentary — tracey does not scan yaml; the r[verify]
 #    for both lives at nix/tests/default.nix which IS scanned)

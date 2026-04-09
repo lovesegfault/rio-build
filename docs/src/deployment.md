@@ -21,7 +21,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 
 ## Deployment Order
 
-1. **External dependencies** (PostgreSQL, S3 bucket, TLS certificates)
+1. **External dependencies** (PostgreSQL, S3 bucket; Cilium CNI must be installed first — nodes are NotReady until it lands)
 2. **rio-controller** (creates CRDs, starts watching for resources)
 3. **rio-store** (needs PostgreSQL and S3)
 4. **rio-scheduler** (needs PostgreSQL and rio-store)
@@ -105,9 +105,9 @@ After deployment:
 
 ```bash
 # 1. Tenant bootstrap + cluster status. `xtask k8s cli` port-forwards
-#    scheduler:9001 + store:9002, fetches the mTLS client cert from
-#    the rio-scheduler-tls Secret, and runs rio-cli LOCALLY. No need
-#    for rio-cli (or jq, column, …) inside the scheduler image.
+#    scheduler:9001 + store:9002 and runs rio-cli LOCALLY against the
+#    plaintext gRPC ports. No need for rio-cli (or jq, column, …)
+#    inside the scheduler image.
 cargo xtask k8s cli -p k3s -- create-tenant my-team
 cargo xtask k8s cli -p k3s -- status
 
@@ -137,7 +137,7 @@ kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli create-tenant my-team
 kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli status
 ```
 
-The pod's `RIO_TLS__*` env gives rio-cli mTLS to `localhost:9001` automatically.
+In-pod, rio-cli connects to `localhost:9001` over plaintext gRPC (the loopback interface is not on the Cilium overlay; encryption is moot).
 
 </details>
 
@@ -145,7 +145,8 @@ The pod's `RIO_TLS__*` env gives rio-cli mTLS to `localhost:9001` automatically.
 
 - **PostgreSQL HA:** Use RDS Multi-AZ, Cloud SQL HA, or Patroni. See [Configuration: PostgreSQL Operations](./configuration.md#postgresql-operations).
 - **Monitoring:** Configure Prometheus scraping and Grafana dashboards. See [Integration: Monitoring](./integration.md#monitoring-integration).
-- **TLS:** Application-level mTLS via `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars (see [Configuration: TLS/mTLS](./configuration.md#tls--mtls)). The prod overlay's `cert-manager.yaml` issues per-component certs from a self-signed CA. A service mesh (Istio/Linkerd) also works and may be preferred for large deployments.
+- **Transport encryption:** Cilium WireGuard transparent encryption is on by default (`encryption.type: wireguard`). rio components speak plaintext gRPC; the overlay encrypts node-to-node. There are no per-component TLS certificates and no cert-manager dependency. See [Security: `r[sec.transport.cilium-wireguard]`](./security.md).
+- **NLB target health:** With `externalTrafficPolicy: Local` on the gateway Service, the NLB shows `N/M` targets healthy where `N` = number of nodes hosting a rio-gateway pod (the rest fail the `healthCheckNodePort` probe by design — they have no local backend). This is correct, not a bug.
 - **Backups:** PostgreSQL backups are critical. S3 data is durable by default. No additional backup needed for chunk storage.
 
 ## Upgrades

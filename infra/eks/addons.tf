@@ -101,6 +101,7 @@ resource "helm_release" "cilium" {
       k8sServiceHost       = replace(module.eks.cluster_endpoint, "https://", "")
       k8sServicePort       = 443
 
+      # r[impl sec.transport.cilium-wireguard]
       encryption = {
         enabled = true
         type    = "wireguard"

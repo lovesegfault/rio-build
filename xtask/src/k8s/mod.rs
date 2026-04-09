@@ -266,11 +266,10 @@ pub enum K8sCmd {
         #[command(flatten)]
         remote: RemoteStoreArgs,
     },
-    /// Run rio-cli LOCALLY against a port-forwarded scheduler+store.
-    /// Fetches the mTLS client cert from the cluster (rio-scheduler-tls
-    /// Secret — its `localhost` SAN makes a port-forwarded connection
-    /// pass tonic's :authority check). Prefer this over `kubectl exec
-    /// deploy/rio-scheduler -- rio-cli …`: in-pod exec forces the
+    /// Run rio-cli LOCALLY against a port-forwarded scheduler+store
+    /// (plaintext gRPC; encryption is at the Cilium overlay so the
+    /// port-forward needs no client cert). Prefer this over `kubectl
+    /// exec deploy/rio-scheduler -- rio-cli …`: in-pod exec forces the
     /// scheduler image to bundle rio-cli + jq + whatever pipes through.
     #[command(visible_alias = "cli")]
     CliTunnel {
@@ -530,18 +529,17 @@ where
 }
 
 // r[impl sec.image.control-plane-minimal]
-/// Port-forward scheduler:9001 + store:9002, fetch the mTLS client
-/// cert into a tempdir, set `RIO_SCHEDULER_ADDR`/`RIO_STORE_ADDR`/
-/// Set up port-forwards on a prepared shell, run `f`. Tunnels + tempdir tear
-/// down on return.
+/// Port-forward scheduler:9001 + store:9002, set `RIO_SCHEDULER_ADDR`
+/// / `RIO_STORE_ADDR` on a prepared shell, run `f`. Tunnels tear down
+/// on return.
 ///
-/// The `rio-scheduler-tls` Secret already carries a `localhost` SAN
-/// preserves that `:authority`, so the fetched cert validates cleanly
-/// with no new Certificate resource. Enables running rio-cli LOCALLY
-/// instead of via `kubectl exec deploy/rio-scheduler`, which in turn
-/// lets the scheduler image drop rio-cli + its transitive deps (jq,
-/// column, …) — every extra binary in a control-plane image is an
-/// execution primitive in a compromised pod.
+/// gRPC is plaintext (encryption is at the Cilium overlay), so no
+/// client cert is fetched and no `:authority` validation is in play.
+/// Enables running rio-cli LOCALLY instead of via `kubectl exec
+/// deploy/rio-scheduler`, which in turn lets the scheduler image drop
+/// rio-cli + its transitive deps (jq, column, …) — every extra binary
+/// in a control-plane image is an execution primitive in a compromised
+/// pod.
 pub async fn with_cli_tunnel<F>(p: &dyn Provider, sched: u16, store: u16, f: F) -> Result<()>
 where
     F: FnOnce(&xshell::Shell) -> Result<()>,

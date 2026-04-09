@@ -135,6 +135,7 @@ pkgs.runCommand "cilium-rendered"
       --set bpf.hostLegacyRouting=true \
       --set ipam.mode=kubernetes \
       --set operator.replicas=1 \
+      `# r[impl sec.transport.cilium-wireguard]` \
       --set encryption.enabled=true \
       --set encryption.type=wireguard \
       --set l2announcements.enabled=${if gatewayEnabled then "true" else "false"} \

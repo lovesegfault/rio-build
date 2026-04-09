@@ -1,4 +1,4 @@
-// r[impl dash.envoy.grpc-web-translate+2]
+// r[impl dash.envoy.grpc-web-translate+3]
 // r[impl dash.auth.method-gate+2]
 // r[impl dash.stream.idle-timeout]
 // Shared gRPC-Web transport for the AdminService client.

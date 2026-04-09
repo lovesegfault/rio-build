@@ -362,7 +362,7 @@ async fn main() -> anyhow::Result<()> {
         "starting gRPC server"
     );
 
-    // r[impl dash.envoy.grpc-web-translate+2]
+    // r[impl dash.envoy.grpc-web-translate+3]
     // accept_http1: gRPC-Web arrives as HTTP/1.1 POST from browser
     // fetch(); GrpcWebLayer needs the h1 codec enabled. Native gRPC
     // clients keep negotiating h2 — both protocols on one port.

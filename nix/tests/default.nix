@@ -635,18 +635,16 @@ in
     fixture = k3sFull { };
   };
 
-  # r[verify dash.envoy.grpc-web-translate+2]
-  #   Envoy Gateway gRPC-Web → gRPC+mTLS end-to-end. curl with
-  #   application/grpc-web+proto against the operator-managed envoy
-  #   data-plane Service; asserts DATA frame 0x00 prefix (unary
-  #   ClusterStatus) + trailer frame prefix 80 00 00 00 (streaming
-  #   GetBuildLogs). The frame-prefix grep proves the grpc_web filter
-  #   doesn't buffer server-streams — load-bearing for WatchBuild /
-  #   live log tail. Also greps the envoy /config_dump for
-  #   envoy.filters.http.grpc_web to prove the GRPCRoute auto-inject
-  #   (listener.go:424-425) actually fired. ~6min (k3s bring-up +
-  #   operator reconcile). Heavy: +2 images (envoyproxy/gateway +
-  #   envoy:distroless) — dedicated test so vm-cli-k3s stays fast.
+  # r[verify dash.envoy.grpc-web-translate+3]
+  #   gRPC-Web end-to-end via Cilium Gateway → scheduler tonic-web.
+  #   curl with application/grpc-web+proto against the Cilium-
+  #   provisioned Gateway Service; asserts DATA frame 0x00 prefix
+  #   (unary ClusterStatus) + trailer frame prefix 80 00 00 00
+  #   (streaming GetBuildLogs). The frame-prefix grep proves
+  #   tonic-web doesn't buffer server-streams — load-bearing for
+  #   WatchBuild / live log tail. ~6min (k3s bring-up + Cilium
+  #   Gateway reconcile). No separate Envoy Gateway operator —
+  #   Cilium's embedded envoy handles the GRPCRoute.
   # r[verify dash.auth.method-gate+2]
   #   Same curl shape against ClearPoison → expects 404. The fixture
   #   doesn't set dashboard.enableMutatingMethods so the mutating
@@ -657,9 +655,9 @@ in
   #   class of bug (helm method literal drifting from admin.proto).
   # r[verify dash.journey.build-to-logs]
   #   The GetBuildLogs 0x80 trailer assertion proves server-streaming
-  #   works through the nginx→Envoy Gateway→scheduler chain. Handler
+  #   works through the nginx→Cilium Gateway→scheduler chain. Handler
   #   returns errors as in-stream items (not tonic Trailers-Only) so
-  #   Envoy encodes them as 0x80 body frames browser fetch can read.
+  #   tonic-web encodes them as 0x80 body frames browser fetch can read.
   vm-dashboard-gateway-k3s = dashboard-gateway {
     inherit pkgs common;
     fixture = k3sFull { gatewayEnabled = true; };

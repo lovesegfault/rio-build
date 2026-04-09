@@ -56,6 +56,6 @@
 
 - **`petgraph`**: DAG representation. Rejected --- the scheduler's graph is a simple adjacency-list `HashMap` with a custom `DerivationStatus` state machine; petgraph's algorithms (toposort, scc) don't match the incremental ready-queue pattern.
 - **`memmap2`**: Zero-copy chunk access for filesystem backend. Rejected --- the filesystem backend uses buffered I/O; SIGBUS handling complexity not justified for a dev/test-only backend. Production uses S3 (streamed over HTTP, no mmap).
-- **`ginepro`**: gRPC client-side load balancing via DNS. Rejected --- K8s headless Service DNS + tonic's default round-robin is sufficient for current scale. Revisit if service mesh deployment becomes a requirement.
+- **`ginepro`**: gRPC client-side load balancing via DNS. Rejected --- Cilium provides L4 load-balancing via eBPF kube-proxy replacement; tonic clients connect to a ClusterIP and Cilium distributes per-connection.
 - **`arbtest`**: Property testing via structure-aware fuzzing. Rejected --- `proptest` covers roundtrip serialization; `cargo-fuzz` covers parser fuzzing. No gap between them.
 - **`testcontainers`**: Ephemeral Docker containers for integration tests. Rejected --- `rio-test-support::TestDb` bootstraps ephemeral PostgreSQL via `initdb` (Nix-provided, no Docker dependency). MinIO is exercised only in VM tests via `services.minio`.

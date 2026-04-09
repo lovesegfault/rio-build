@@ -5,13 +5,19 @@
 ```mermaid
 flowchart LR
     Clients["Untrusted<br/>(Nix clients)"] -->|SSH| GW["rio-gateway"]
-    GW -->|"gRPC (mTLS)"| Sched["rio-scheduler"]
-    Sched -->|"gRPC (mTLS)"| Store["rio-store"]
-    Executor["rio-builder"] -->|"gRPC (mTLS)"| Store
-    Executor -->|"gRPC (mTLS)"| Sched
+    GW -->|"gRPC"| Sched["rio-scheduler"]
+    Sched -->|"gRPC"| Store["rio-store"]
+    Executor["rio-builder"] -->|"gRPC"| Store
+    Executor -->|"gRPC"| Sched
     Store --> S3["S3 (IRSA)"]
     Store --> PG["PostgreSQL"]
     Executor --> Sandbox["nix sandbox<br/>(purity, NOT security)"]
+    subgraph overlay ["Cilium overlay (WireGuard node-to-node)"]
+        GW
+        Sched
+        Store
+        Executor
+    end
 ```
 
 ### Boundary 1: Nix Client → Gateway (SSH)
@@ -27,12 +33,15 @@ The gateway authenticates SSH connections via public key authentication. Authori
 ### Boundary 2: Gateway/Executor → Internal Services (gRPC)
 
 r[sec.boundary.grpc-hmac]
-Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs, authorized via HMAC-signed assignment tokens.
+Inter-component gRPC traffic is encrypted by Cilium WireGuard (`r[sec.transport.cilium-wireguard]`), reachability-restricted by CiliumNetworkPolicy, and — for write-path RPCs — authorized via HMAC-signed tokens.
 
-- **Auth**: mTLS (service mesh or cert-manager). Each component has a distinct identity.
+- **Encryption**: Cilium WireGuard transparent encryption (node-to-node, kernel datapath). Components speak plaintext gRPC; the overlay encrypts.
 - **Threat**: Compromised pod impersonating another component
-- **Mitigations**: mTLS with per-service certificates, NetworkPolicy restricting pod-to-pod communication
-- **Authorization**: mTLS authenticates component identity. Application-level authorization uses assignment-scoped tokens for sensitive RPCs:
+- **Mitigations**: CiliumNetworkPolicy restricts pod-to-pod reachability by label-based identity (e.g., only pods labeled `app.kubernetes.io/name=rio-gateway` may reach `rio-store:9002`). Application-level HMAC tokens authorize sensitive write RPCs.
+- **Authorization**: CNP gates *which pods can connect*; HMAC tokens gate *what a connected pod may write*:
+
+r[sec.transport.cilium-wireguard]
+All pod-to-pod traffic is encrypted by Cilium's WireGuard transparent encryption (`encryption.type: wireguard` in the Cilium helm values). Encryption is at the overlay layer (Geneve-encapsulated, ChaCha20-Poly1305) — rio components run plaintext gRPC servers and clients with no TLS configuration. There is no per-service certificate identity; component identity for reachability is the pod's Cilium security identity (derived from k8s labels), enforced by CiliumNetworkPolicy. There is no application-level certificate to rotate or expire.
 
 r[common.hmac.claims]
 The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. Token format is `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`. `AssignmentClaims` has exactly five fields: `executor_id` (string, audit only — the store doesn't know which executor is calling), `drv_hash` (string, ties token to a specific build), `expected_outputs` (list of store paths, the authorization check), `is_ca` (bool, skips the membership check for floating-CA derivations whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds, replay prevention).
@@ -40,11 +49,9 @@ The scheduler signs **assignment tokens** (HMAC-SHA256) when dispatching work. T
   - This prevents a compromised executor from writing to store paths it was never assigned to build.
   - Token lifetime is scoped to the build assignment; tokens expire after a configurable TTL (default: 2× the build timeout).
   - The signing key is a shared HMAC secret between the scheduler and store, stored as a Kubernetes Secret (recommend KMS/Vault for production).
-  - **Read authorization:** Executors call `GetPath` and `QueryPathInfo` on the store for FUSE cache fetches. Read access is authorized by mTLS component identity --- any authenticated executor can read any store path. This is acceptable because: (a) store paths are content-addressed and immutable, (b) executors need access to shared paths (glibc, coreutils) regardless of tenant, (c) output isolation is enforced at the scheduling level (executors only build what they are assigned). For deployments requiring strict tenant read isolation, a future enhancement could add tenant-scoped read tokens.
+  - **Read authorization:** Executors call `GetPath` and `QueryPathInfo` on the store for FUSE cache fetches. Read access is gated by CiliumNetworkPolicy (only labeled executor pods can reach `rio-store:9002`); any reachable executor can read any store path. This is acceptable because: (a) store paths are content-addressed and immutable, (b) executors need access to shared paths (glibc, coreutils) regardless of tenant, (c) output isolation is enforced at the scheduling level (executors only build what they are assigned). For deployments requiring strict tenant read isolation, a future enhancement could add tenant-scoped read tokens.
 
-> **Implemented (Phase 3b):** mTLS + HMAC assignment tokens are live. When `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` are set, all gRPC channels use TLS with client cert verification (`ServerTlsConfig::client_ca_root`). When `RIO_HMAC_KEY_PATH` is set on scheduler + store, assignment tokens are HMAC-SHA256-signed at dispatch and verified on `PutPath` (rejected if the uploaded path isn't in `claims.expected_outputs`). **mTLS CN bypass:** PutPath skips HMAC verification when the caller's client certificate has `CN=rio-gateway` (the gateway handles `nix copy --to` and has no assignment token). This check only applies when an `HmacVerifier` is configured --- without one, PutPath accepts all callers (dev mode). See `rio-common/src/tls.rs`, `rio-common/src/hmac.rs`, `rio-store/src/grpc/put_path.rs`.
-
-> **TLS SNI:** `load_client_tls` does **not** set a fixed `domain_name` on the `ClientTlsConfig`. tonic derives the SNI server name from the connect URL's host per-connection. A global `domain_name` override would break multi-service clients (gateway/executor connect to both scheduler and store, each with a different cert SAN).
+> **Service-token bypass (`r[sec.authz.service-token]`):** PutPath skips assignment-token verification when the caller presents a valid `x-rio-service-token` — an HMAC-signed `ServiceClaims { caller, expiry_unix }` keyed with `RIO_SERVICE_HMAC_KEY_PATH` (a separate secret from the assignment key). The gateway mints one per upload with a 60s expiry. This replaces the former certificate-CN check and is transport-agnostic. See `rio-common/src/hmac.rs`, `rio-store/src/grpc/put_path/`.
 
 r[sec.jwt.pubkey-mount]
 When `jwt.enabled=true`, scheduler and store pods MUST have the `rio-jwt-pubkey` ConfigMap mounted at `/etc/rio/jwt/ed25519_pubkey` and `RIO_JWT__KEY_PATH` set to that path. Without the mount, `cfg.jwt.key_path` remains `None` and the interceptor falls through to inert mode (every RPC passes, no `Claims` attached) --- a silent fail-open. The gateway correspondingly mounts the `rio-jwt-signing` Secret at `/etc/rio/jwt/ed25519_seed`. Helm `_helpers.tpl` provides `rio.jwtVerifyEnv`/`VolumeMount`/`Volume` and `rio.jwtSignEnv`/`VolumeMount`/`Volume` triplets, self-guarded on `.Values.jwt.enabled`.
@@ -126,7 +133,8 @@ Executor pods MAY be configured with a Localhost seccomp profile (`BuilderPoolSp
 | **S3 credential management** | IRSA (IAM Roles for Service Accounts) on EKS | Recommended |
 | **Executor isolation** | Per-build overlayfs, Nix sandbox, NetworkPolicy | Designed |
 | **Metadata service blocking** | NetworkPolicy egress deny `169.254.169.254`; IMDSv2 hop limit=1 | Designed |
-| **Inter-component auth** | mTLS between all gRPC endpoints | Implemented (Phase 3b) — configure via `RIO_TLS__*` env |
+| **Inter-component encryption** | Cilium WireGuard transparent encryption (overlay-level) | Implemented — `encryption.type: wireguard` in Cilium helm values |
+| **Inter-component reachability** | CiliumNetworkPolicy (label-based identity) | Implemented — `infra/helm/rio-build/templates/networkpolicy.yaml` |
 | **Multi-tenant data isolation** | Per-tenant narinfo visibility filtering + per-tenant signing keys; shared executors with per-build overlay isolation | Implemented |
 
 ## Derivation Validation
@@ -144,11 +152,11 @@ Additional validation checks (below) are enforced at other points in the pipelin
 | DAG size limit | Gateway + Scheduler | Implemented | Gateway's `translate::validate_dag` checks `nodes.len() > MAX_DAG_NODES` before SubmitBuild (early reject); scheduler also enforces. |
 | `__noChroot` rejection | Gateway | Implemented | `translate::validate_dag` checks derivation env for `__noChroot=1` via drv_cache lookup. Rejected with "sandbox escape" error. |
 | Per-tenant store quota | Gateway | Implemented | `TenantQuota` RPC gates `SubmitBuild` against `gc_max_store_bytes` (30s-TTL cached, eventually-enforcing). Per-upload NAR size uses the global `MAX_NAR_SIZE` limit. |
-| Output path match | Store | Implemented | HMAC assignment tokens: store verifies `x-rio-assignment-token` metadata on PutPath, checks `store_path ∈ claims.expected_outputs`. mTLS bypass for gateway. |
+| Output path match | Store | Implemented | HMAC assignment tokens: store verifies `x-rio-assignment-token` metadata on PutPath, checks `store_path ∈ claims.expected_outputs`. Gateway bypasses via `x-rio-service-token` (`r[sec.authz.service-token]`). |
 
 ## Secrets Management
 
-rio-build requires several secrets: SSH host keys, signing keys, database credentials, HMAC signing keys for assignment tokens, and TLS certificates (if not using a service mesh).
+rio-build requires several secrets: SSH host keys, signing keys, database credentials, and HMAC signing keys (assignment tokens + service tokens). There are no application-level TLS certificates — transport encryption is at the Cilium overlay layer.
 
 ### Recommended Patterns (by maturity)
 
@@ -157,7 +165,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 
 **Production baseline:**
 - [External Secrets Operator](https://external-secrets.io/) syncing from AWS Secrets Manager, GCP Secret Manager, or HashiCorp Vault into Kubernetes Secrets. Secrets are managed externally and auto-rotated.
-- Mount secrets as files (not environment variables) to avoid `/proc` and `ps` leakage. All rio-build secret config parameters use file paths (`signing_key_path`, `host_key_path`, `tls_key_path`).
+- Mount secrets as files (not environment variables) to avoid `/proc` and `ps` leakage. All rio-build secret config parameters use file paths (`signing_key_path`, `host_key_path`, `hmac_key_path`).
 
 **Production hardened:**
 - HashiCorp Vault with the Vault Agent Injector sidecar. The sidecar injects secrets into a shared `emptyDir` volume, and rio-build reads them from file paths. Vault handles rotation; the sidecar re-renders secrets on change.
@@ -171,9 +179,9 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 | Authorized SSH keys[^authkeys] | Gateway | Per-tenant lifecycle | Implemented (flat file; no tenant annotation) |
 | NAR signing key (`signing-key`) | Store | Annually or on compromise | Implemented |
 | HMAC signing key (assignment tokens) | Scheduler + Store | Annually or on compromise | Implemented — `RIO_HMAC_KEY_PATH`, same key file both sides |
+| HMAC signing key (service tokens) | Gateway + Store | Annually or on compromise | Implemented — `RIO_SERVICE_HMAC_KEY_PATH`; gateway signs, store verifies |
 | JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | Implemented — `RIO_JWT_SIGNING_KEY_PATH`, gateway mints per-session JWT on SSH accept |
 | Database credentials (`database_url`) | Scheduler, Store, Controller | Via Vault database engine or External Secrets | Implemented |
-| TLS certificates | All gRPC components | Via cert-manager auto-renewal (90d certs, renew at 30d) | Implemented — see `infra/helm/rio-build/templates/cert-manager.yaml` |
 
 [^authkeys]: The `authorized_keys` comment field carries the tenant name (e.g., `ssh-ed25519 AAAA... acme`). The gateway resolves this to a tenant UUID via `SchedulerService.ResolveTenant` on SSH accept and mints a per-session JWT with `Claims.sub = tenant_id`.
 [^jwt]: The gateway mints a per-session JWT on SSH accept (`mint_session_jwt`, `r[gw.jwt.issue]`). Downstream services verify via `rio_auth::jwt_interceptor::JwtLayer` with SIGHUP-reloadable public key. Dual-mode fallback (`r[gw.jwt.dual-mode]`): when JWT is disabled, services fall back to `SubmitBuildRequest.tenant_name`.

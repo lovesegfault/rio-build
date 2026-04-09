@@ -9,7 +9,6 @@ automated run fails or for first-time setup validation.
 - `kubectl` configured: `$(cd infra/eks && terraform output -raw kubeconfig_command)`
 - `STORE_IAM_ROLE_ARN` exported: `export STORE_IAM_ROLE_ARN=$(cd infra/eks && terraform output -raw store_iam_role_arn)`
 - SSH keypair for gateway: `ssh-keygen -t ed25519 -f ~/.ssh/rio_test_ed25519 -N ''`
-- cert-manager installed: `kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml`
 
 ## Step 1: Deploy
 
@@ -65,6 +64,8 @@ echo "Gateway: $GATEWAY_HOST"
 - AWS Load Balancer Controller not installed: `kubectl get pods -n kube-system | grep aws-load-balancer`
 - Check Events: `kubectl -n rio-system describe svc rio-gateway`
 - Common: missing IAM permissions for the controller's SA
+
+**NLB target health is N/M, not M/M — this is correct.** `externalTrafficPolicy: Local` means only the N nodes hosting a rio-gateway pod pass the `healthCheckNodePort` probe; the rest are intentionally unhealthy. The dualstack NLB forwards to an IPv6-only target group; xtask sets `preserve_client_ip.enabled=false` and `enable-prefix-for-ipv6-source-nat=on` so IPv4 clients on the dualstack listener can reach IPv6 targets. Nodes set their own primary IPv6 at boot (`primary-ipv6-init.service` in the NixOS AMI).
 
 ## Step 4: Create BuilderPoolSet
 
@@ -151,12 +152,8 @@ echo "After disconnects: $DISCONNECTS_AFTER"
 ## Step 7: GC Test (optional)
 
 ```bash
-# Trigger GC via grpcurl (dry run first)
-grpcurl -d '{"dry_run": true, "grace_period_hours": 2}' \
-  -cacert /etc/rio/tls/ca.crt \
-  -cert /etc/rio/tls/tls.crt \
-  -key /etc/rio/tls/tls.key \
-  rio-scheduler:9001 rio.admin.AdminService/TriggerGC
+# Trigger GC via rio-cli over a port-forward (dry run first)
+cargo xtask k8s cli -p eks -- trigger-gc --dry-run --grace-period-hours 2
 ```
 
 ## Cleanup
@@ -174,4 +171,4 @@ helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for ful
 | Worker `unable to mount overlay` | `kubectl describe pod` Events | privileged: true or SYS_ADMIN cap |
 | Build hangs at "waiting for build" | Scheduler metrics `rio_scheduler_workers_active` | 0 → no worker registered. Check worker logs. |
 | `nix copy` permission denied | `authorized_keys` secret | Secret mounted? Gateway restarted after creating secret? |
-| Store PutPath PERMISSION_DENIED | `rio_store_hmac_rejected_total{reason}` | HMAC key mismatch scheduler↔store, or mTLS cert chain issue |
+| Store PutPath PERMISSION_DENIED | `rio_store_hmac_rejected_total{reason}` | HMAC key mismatch (assignment: scheduler↔store; service: gateway↔store) |
