@@ -671,45 +671,53 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
     Ok(())
 }
 
-/// 3 sequential worker disconnects WHILE RUNNING the same derivation
-/// must poison it (drv may have caused the crashes). I-097 narrowed
-/// this from "any disconnect" to "disconnect-while-Running" — see
-/// `test_assigned_only_disconnects_do_not_poison` for the converse.
+/// 3 sequential worker disconnects: poison iff the drv was Running at
+/// disconnect. I-097 narrowed "any disconnect counts" to
+/// "disconnect-while-Running counts" — Assigned-only means the drv was
+/// never attempted (ephemeral-fetcher race), so a 4th worker should
+/// still receive it.
+///
+/// - **running**: `debug_backdate_running` before each disconnect →
+///   `was_running=true` → `record_failure_and_check_poison` → poison
+///   after 3.
+/// - **assigned_only** (I-097 regression): no Running transition →
+///   `was_running=false` → stays Ready, `failed_builders` empty.
+#[rstest::rstest]
+#[case::running(true, DerivationStatus::Poisoned)]
+#[case::assigned_only(false, DerivationStatus::Ready)]
 #[tokio::test]
-async fn test_three_running_disconnects_poisons() -> TestResult {
+async fn test_three_disconnects_poison_iff_running(
+    #[case] mark_running: bool,
+    #[case] expect_status: DerivationStatus,
+) -> TestResult {
     let (_db, handle, _task) = setup().await;
-
-    let build_id = Uuid::new_v4();
-    let _evt_rx = merge_single_node(&handle, build_id, "x6-drv", PriorityClass::Scheduled).await?;
+    let tag = if mark_running { "x6-drv" } else { "x7-drv" };
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), tag, PriorityClass::Scheduled).await?;
 
     for i in 0..3 {
-        let executor_id = format!("w-x6-{i}");
-        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux").await?;
-        let assignment = recv_assignment(&mut rx).await;
-        assert!(
-            assignment.drv_path.contains("x6-drv"),
-            "worker {i} should get x6-drv"
-        );
-
-        // Transition Assigned → Running so the disconnect counts as a
-        // failed attempt (the drv was actually being built).
-        let ok = handle.debug_backdate_running("x6-drv", 0).await?;
-        assert!(ok, "Assigned→Running for iteration {i}");
-
-        // Disconnect mid-build. reassign_derivations: was_running=
-        // true → record_failure_and_check_poison. For i<2: reset to
-        // Ready + next worker gets it. For i==2: poison.
-        disconnect(&handle, &executor_id).await?;
+        let id = format!("w-{tag}-{i}");
+        let mut rx = connect_executor(&handle, &id, "x86_64-linux").await?;
+        assert!(recv_assignment(&mut rx).await.drv_path.contains(tag));
+        if mark_running {
+            // Assigned → Running so the disconnect counts as a failed attempt.
+            assert!(handle.debug_backdate_running(tag, 0).await?);
+        }
+        disconnect(&handle, &id).await?;
         drop(rx);
     }
 
-    let info = expect_drv(&handle, "x6-drv").await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "3 Running disconnects should poison; got {:?}",
-        info.status
-    );
+    let info = expect_drv(&handle, tag).await;
+    assert_eq!(info.status, expect_status, "after 3 disconnects");
+    if !mark_running {
+        assert!(
+            info.retry.failed_builders.is_empty(),
+            "Assigned-only disconnects must not populate failed_builders; got {:?}",
+            info.retry.failed_builders
+        );
+        // Sensitivity: a 4th worker DOES get it (Ready is real).
+        let mut rx4 = connect_executor(&handle, "w-x7-3", "x86_64-linux").await?;
+        assert!(recv_assignment(&mut rx4).await.drv_path.contains(tag));
+    }
     Ok(())
 }
 
@@ -725,21 +733,15 @@ async fn test_three_running_disconnects_poisons() -> TestResult {
 // r[verify sched.retry.promotion-exempt]
 #[tokio::test]
 async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-    let db = TestDb::new(&MIGRATOR).await;
     let classes = ["tiny", "small", "medium", "large", "xlarge"];
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = classes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| SizeClassConfig {
-                name: (*n).into(),
-                cutoff_secs: 30.0 * (i + 1) as f64,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            })
-            .collect();
-    });
+    let (_db, handle, _task) = setup_with_classes(&[
+        ("tiny", 30.0),
+        ("small", 60.0),
+        ("medium", 90.0),
+        ("large", 120.0),
+        ("xlarge", 150.0),
+    ])
+    .await;
 
     let _ev = merge_single_node(
         &handle,
@@ -811,248 +813,75 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
     Ok(())
 }
 
-/// I-097 regression: 3 disconnects while ASSIGNED (never Running) must
-/// NOT poison. The drv was never attempted — the worker exited between
-/// receiving the assignment and starting it (ephemeral-fetcher race).
-/// Before the fix this poisoned after 3; now it stays Ready with empty
-/// failed_builders, dispatchable to a 4th worker.
-#[tokio::test]
-async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    let build_id = Uuid::new_v4();
-    let _evt_rx = merge_single_node(&handle, build_id, "x7-drv", PriorityClass::Scheduled).await?;
-
-    for i in 0..3 {
-        let executor_id = format!("w-x7-{i}");
-        let mut rx = connect_executor(&handle, &executor_id, "x86_64-linux").await?;
-        let assignment = recv_assignment(&mut rx).await;
-        assert!(assignment.drv_path.contains("x7-drv"));
-
-        // Disconnect WITHOUT transitioning to Running.
-        disconnect(&handle, &executor_id).await?;
-        drop(rx);
-    }
-
-    let info = expect_drv(&handle, "x7-drv").await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Ready,
-        "Assigned-only disconnects must NOT poison; got {:?}",
-        info.status
-    );
-    assert!(
-        info.retry.failed_builders.is_empty(),
-        "Assigned-only disconnects must not populate failed_builders; got {:?}",
-        info.retry.failed_builders
-    );
-
-    // Sensitivity: a 4th worker DOES get it (proves Ready is real,
-    // not stuck-Ready-with-excluded-workers).
-    let mut rx4 = connect_executor(&handle, "w-x7-3", "x86_64-linux").await?;
-    let assignment = recv_assignment(&mut rx4).await;
-    assert!(
-        assignment.drv_path.contains("x7-drv"),
-        "4th worker should receive the never-attempted drv"
-    );
-    Ok(())
-}
-
 // r[verify sched.fod.size-class-reactive]
-/// I-173: a FOD assigned to a tiny fetcher that disconnects while
-/// status==Assigned with NO CompletionReport sent MUST get its
-/// `size_class_floor` promoted. DerivationStatus stays Assigned for
-/// the build's whole lifetime (Running is set only at completion via
-/// ensure_running()), so the production disconnect path is always
-/// Assigned-status. Disconnect-without-completion = unexpected death
-/// (plausibly OOM) → promote. Live: 14 OOMs, retry_count=0,
-/// size_class_floor=NULL before this promotion was wired.
-///
-/// Also asserts I-097's invariant still holds (no failed_builders
-/// entry, status=Ready) — promotion is decoupled from poison-record.
-/// Converse (ephemeral disconnect → NO promote) at
-/// `test_ephemeral_disconnect_does_not_promote_floor`.
-#[tokio::test]
-async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
-    });
-
-    let mut rx = connect_fetcher_classed(&handle, "f-tiny", "x86_64-linux", "tiny").await?;
-
-    let mut node = make_node("oom-fod-173");
-    node.is_fixed_output = true;
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
-
-    // Dispatch → Assigned. Do NOT send Running ack.
-    let asgn = recv_assignment(&mut rx).await;
-    assert!(asgn.drv_path.contains("oom-fod-173"));
-    let pre = expect_drv(&handle, "oom-fod-173").await;
-    assert_eq!(
-        pre.status,
-        DerivationStatus::Assigned,
-        "precondition: status==Assigned at disconnect (the I-173 race)"
-    );
-
-    // Fetcher OOMs → disconnect. Status was Assigned, not Running.
-    disconnect(&handle, "f-tiny").await?;
-    drop(rx);
-
-    let info = expect_drv(&handle, "oom-fod-173").await;
-    assert_eq!(
-        info.sched.size_class_floor.as_deref(),
-        Some("small"),
-        "I-173: Assigned-disconnect-without-completion must promote FOD floor tiny→small"
-    );
-    // I-097 still holds: no failure recorded.
-    assert!(
-        info.retry.failed_builders.is_empty(),
-        "I-097: Assigned-disconnect must not record failure; got {:?}",
-        info.retry.failed_builders
-    );
-    assert_eq!(info.status, DerivationStatus::Ready);
-
-    Ok(())
-}
-
 // r[verify sched.builder.size-class-reactive]
-/// I-177: a non-FOD assigned to a tiny builder that disconnects while
-/// status==Assigned with NO CompletionReport sent MUST get its
-/// `size_class_floor` promoted, same as the FOD path (I-173). 103
-/// tiny builders OOMKilled on bootstrap-stage0-glibc / llvm-src;
-/// without promotion floor stayed NULL, retry routed back to tiny →
-/// poison.
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
+/// Assigned-disconnect-without-CompletionReport → `size_class_floor`
+/// promoted tiny→small. DerivationStatus stays Assigned for the build's
+/// whole lifetime (Running is set only at completion via
+/// `ensure_running()`), so the production disconnect path is always
+/// Assigned-status. Disconnect-without-completion = unexpected death
+/// (plausibly OOM) → promote. I-097 still holds (no `failed_builders`
+/// entry, status=Ready) — promotion is decoupled from poison-record.
 ///
-/// Mirrors `test_assigned_disconnect_promotes_fod_floor` with a
-/// builder-kind executor + builder size_classes config.
+/// - **fod** (I-173): FOD on a `fetcher_size_classes` tiny fetcher.
+///   Live: 14 OOMs, retry_count=0, size_class_floor=NULL.
+/// - **builder** (I-177): non-FOD on a builder `size_classes` tiny.
+///   Live: 103 tiny builders OOMKilled on bootstrap-stage0-glibc.
+/// - **ephemeral** (I-197, refines I-188 fix 1): same as builder; the
+///   I-188 blanket "one-shot disconnect → never promote" made openssl
+///   OOM-loop on tiny for hours. Converse (disconnect AFTER completion
+///   → NO promote) at `test_ephemeral_disconnect_after_completion_no_promote`.
+#[rstest::rstest]
+#[case::fod(rio_proto::types::ExecutorKind::Fetcher, true, "oom-fod-173")]
+#[case::builder(rio_proto::types::ExecutorKind::Builder, false, "oom-glibc-177")]
+#[case::ephemeral(rio_proto::types::ExecutorKind::Builder, false, "eph-glibc-188")]
 #[tokio::test]
-async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-
+async fn test_assigned_disconnect_promotes_floor(
+    #[case] kind: rio_proto::types::ExecutorKind,
+    #[case] is_fod: bool,
+    #[case] tag: &str,
+) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "tiny".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
+        if is_fod {
+            c.fetcher_size_classes = vec!["tiny".into(), "small".into()];
+        } else {
+            c.size_classes = size_classes(&[("tiny", 30.0), ("small", 3600.0)]);
+        }
     });
 
-    let mut rx = connect_builder_classed(&handle, "b-tiny", "x86_64-linux", "tiny").await?;
+    let mut rx = connect_executor_classed(&handle, "w-tiny", "x86_64-linux", "tiny", kind).await?;
 
-    // Non-FOD, no build_history → est_duration=DEFAULT (30s) →
-    // classify() picks "tiny" (30 ≤ 30). Routes to b-tiny.
-    let node = make_node("oom-glibc-177");
-    assert!(!node.is_fixed_output, "precondition: non-FOD");
+    let mut node = make_node(tag);
+    node.is_fixed_output = is_fod;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
     // Dispatch → Assigned. Do NOT send Running ack.
     let asgn = recv_assignment(&mut rx).await;
-    assert!(asgn.drv_path.contains("oom-glibc-177"));
-    let pre = expect_drv(&handle, "oom-glibc-177").await;
+    assert!(asgn.drv_path.contains(tag));
     assert_eq!(
-        pre.status,
+        expect_drv(&handle, tag).await.status,
         DerivationStatus::Assigned,
         "precondition: status==Assigned at disconnect"
     );
 
-    // Builder OOMs → disconnect. Status was Assigned, not Running.
-    disconnect(&handle, "b-tiny").await?;
+    // OOM → disconnect. Status was Assigned, not Running.
+    disconnect(&handle, "w-tiny").await?;
     drop(rx);
 
-    let info = expect_drv(&handle, "oom-glibc-177").await;
+    let info = expect_drv(&handle, tag).await;
     assert_eq!(
         info.sched.size_class_floor.as_deref(),
         Some("small"),
-        "I-177: Assigned-disconnect-without-completion must promote builder floor tiny→small"
+        "Assigned-disconnect-without-completion must promote floor tiny→small"
     );
-    // I-097 still holds: no failure recorded for Assigned-only disconnect.
     assert!(
         info.retry.failed_builders.is_empty(),
         "I-097: Assigned-disconnect must not record failure; got {:?}",
         info.retry.failed_builders
     );
     assert_eq!(info.status, DerivationStatus::Ready);
-
-    Ok(())
-}
-
-// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+2]
-/// I-197 (refines I-188 fix 1): a non-FOD assigned to a tiny builder
-/// that disconnects WITHOUT having sent a CompletionReport MUST get
-/// its `size_class_floor` promoted. The pod was OOMKilled mid-build —
-/// that IS a size-adequacy signal. I-188's blanket "one-shot
-/// disconnect → never promote" made openssl OOM-loop on `tiny` for
-/// hours with `size_class_floor` empty.
-///
-/// Converse (disconnect AFTER completion → does NOT promote, the
-/// original I-188 race) at
-/// `test_ephemeral_disconnect_after_completion_no_promote`.
-///
-/// Tests the reassign-side gate in isolation: disconnect is direct
-/// (ExecutorDisconnected), not via ProcessCompletion, so the
-/// draining-on-completion gate (Fix 2) doesn't apply.
-#[tokio::test]
-async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "tiny".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
-    });
-
-    let mut rx = connect_builder_classed(&handle, "b-eph", "x86_64-linux", "tiny").await?;
-
-    let node = make_node("eph-glibc-188");
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
-
-    let asgn = recv_assignment(&mut rx).await;
-    assert!(asgn.drv_path.contains("eph-glibc-188"));
-
-    // Ephemeral builder OOMKilled mid-build → disconnect with drv
-    // still Assigned, NO CompletionReport sent (last_completed=None).
-    // Status==Assigned is the production path (Running is only set at
-    // completion via ensure_running()).
-    disconnect(&handle, "b-eph").await?;
-    drop(rx);
-
-    let info = expect_drv(&handle, "eph-glibc-188").await;
-    assert_eq!(
-        info.sched.size_class_floor.as_deref(),
-        Some("small"),
-        "I-197: ephemeral OOMKilled disconnect (no CompletionReport) \
-         must promote floor tiny→small; got {:?}",
-        info.sched.size_class_floor
-    );
-    assert!(
-        info.retry.failed_builders.is_empty(),
-        "I-097: Assigned-only disconnect must not record failure"
-    );
-    assert_eq!(info.status, DerivationStatus::Ready);
-
     Ok(())
 }
 
@@ -1074,25 +903,7 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
 /// depth.
 #[tokio::test]
 async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "tiny".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
-    });
+    let (_db, handle, _task) = setup_with_classes(&[("tiny", 30.0), ("small", 3600.0)]).await;
 
     let mut rx = connect_builder_classed(&handle, "b-eph2", "x86_64-linux", "tiny").await?;
     send_heartbeat_with(&handle, "b-eph2", "x86_64-linux", |hb| {

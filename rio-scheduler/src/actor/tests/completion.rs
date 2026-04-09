@@ -4,7 +4,21 @@
 // r[verify sched.state.terminal-idempotent]
 
 use super::*;
+use rstest::rstest;
 use tracing_test::traced_test;
+
+/// What to seed in the realisations table before driving a
+/// [`CaFixture`] to completion. See [`ca_compare_edge_cases`].
+enum CaSeed {
+    /// No realisation rows — fresh first-ever build.
+    None,
+    /// Only this build's own `(f.modular_hash, out)` row — simulates
+    /// `insert_realisation` having fired before the compare (it does).
+    Own,
+    /// Own row + a PRIOR build's row at the same path (different
+    /// modular_hash) — the second-build positive case.
+    OwnAndPrior,
+}
 
 /// Self-check on [`setup_ca_fixture`]: the fixture returns with the
 /// actor waiting for a `ProcessCompletion`, NOT past the CA-compare
@@ -235,69 +249,102 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
 }
 
 // r[verify sched.ca.cutoff-compare]
-/// First-build self-exclusion (bughunt-mc196 regression).
+/// CA-compare edge-case matrix: for each `(seed, outputs)` pair, the
+/// compare must produce the expected `ca_output_unchanged` flag and
+/// `{miss,match}` counter deltas. All cases share the
+/// [`setup_ca_fixture`] preamble; only the realisation-table seed and
+/// the reported `built_outputs` vary.
 ///
-/// The ONLY realisation for `own_path` is keyed on THIS build's
-/// modular_hash (inserted by completion.rs's `insert_realisation`
-/// just before the compare fires). `query_prior_realisation(path,
-/// exclude=own_modular_hash)` filters it out → None → miss →
-/// `ca_output_unchanged=false`.
+/// Load-bearing cases:
 ///
-/// **BEFORE the realisation-based fix:** `ContentLookup(H,
-/// exclude=path)` was used, which for CA (same content → same path)
-/// always excluded the only row — so this test passed by accident
-/// but the SECOND-build case failed. The modular_hash exclusion
-/// handles both correctly.
-///
-/// Mutation check: remove the `drv_hash != $2` predicate in
-/// `query_prior_realisation` and this test FAILS with
-/// `ca_output_unchanged == true`.
+/// - **first_build** (bughunt-mc196): own row only → `query_prior_
+///   realisation(path, exclude=own_modular)` filters it → miss. Mutation
+///   check: drop `drv_hash != $2` predicate → unchanged flips true.
+/// - **second_build**: own + prior row at same path → exclusion hides
+///   self, finds sibling → match. Paired with first_build, proves the
+///   exclusion isn't "any match → None".
+/// - **zero_outputs**: `built_outputs=[]` → `!is_empty()` early-false →
+///   loop body never runs → no counter increment, unchanged stays false.
+/// - **empty_path**: `output_path=""` → guard short-circuits before PG
+///   query → counted as miss explicitly.
+/// - **no_prior**: nothing seeded, 2 outputs → first lookup → None →
+///   miss → short-circuit break.
+#[rstest]
+// bughunt-mc196: own row only → self-exclusion → miss
+#[case::first_build("ca-first", CaSeed::Own, vec![("out", "ca-first-out", 32)], false, Some(1), Some(0))]
+// own + prior → finds sibling → match → unchanged=true
+#[case::second_build("ca-second", CaSeed::OwnAndPrior, vec![("out", "ca-second-out", 32)], true, Some(0), Some(1))]
+// built_outputs=[] → !is_empty() guard → no loop iteration
+#[case::zero_outputs("ca-zero", CaSeed::None, vec![], false, Some(0), Some(0))]
+// output_path="" → is_empty() guard short-circuits before PG
+#[case::empty_path("ca-empty", CaSeed::None, vec![("out", "", 32)], false, None, None)]
+// nothing seeded → Ok(None) → miss → break
+#[case::no_prior("ca-noprior", CaSeed::None, vec![("out", "ca-noprior-out1", 32), ("dev", "ca-noprior-out2", 32)], false, Some(1), Some(0))]
 #[tokio::test]
-async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
+async fn ca_compare_edge_cases(
+    #[case] key: &str,
+    #[case] seed: CaSeed,
+    #[case] outputs: Vec<(&str, &str, usize)>,
+    #[case] expect_unchanged: bool,
+    #[case] expect_miss: Option<u64>,
+    #[case] expect_match: Option<u64>,
+) -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let f = setup_ca_fixture("ca-first").await?;
+    let f = setup_ca_fixture(key).await?;
 
-    // THE SELF-MATCH SETUP: seed a realisation for own_path keyed on
-    // OUR OWN modular_hash — simulating completion.rs's
-    // insert_realisation having fired (it runs BEFORE the compare).
-    // No OTHER modular_hash points to this path.
-    let own_path = test_store_path("ca-first-out");
-    let own_hash: [u8; 32] = [0x33; 32];
-    seed_realisation(&f.pool, &f.modular_hash, "out", &own_path, &own_hash).await?;
+    // Build output tuples: empty path-tag means literal "".
+    let outputs: Vec<_> = outputs
+        .into_iter()
+        .map(|(n, p, hlen)| {
+            let path = if p.is_empty() {
+                String::new()
+            } else {
+                test_store_path(p)
+            };
+            (n, path, vec![0x55u8; hlen])
+        })
+        .collect();
+
+    // Seed realisations for the FIRST output (the one the compare hits).
+    if let Some((name, path, hash)) = outputs.first() {
+        let hash: [u8; 32] = hash.as_slice().try_into().unwrap();
+        match seed {
+            CaSeed::None => {}
+            CaSeed::Own => {
+                seed_realisation(&f.pool, &f.modular_hash, name, path, &hash).await?;
+            }
+            CaSeed::OwnAndPrior => {
+                seed_realisation(&f.pool, &f.modular_hash, name, path, &hash).await?;
+                seed_realisation(&f.pool, &[0x66; 32], name, path, &hash).await?;
+            }
+        }
+    }
 
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
     let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
     let miss_before = recorder.get(miss_key);
     let match_before = recorder.get(match_key);
 
-    complete_ca(
-        &f.actor,
-        &f.executor_id,
-        &f.drv_path,
-        &[("out", &own_path, own_hash.to_vec())],
-    )
-    .await?;
+    let outputs_ref: Vec<_> = outputs
+        .iter()
+        .map(|(n, p, h)| (*n, p.as_str(), h.clone()))
+        .collect();
+    complete_ca(&f.actor, &f.executor_id, &f.drv_path, &outputs_ref).await?;
 
-    let info = expect_drv(&f.actor, "ca-first").await;
+    let info = expect_drv(&f.actor, key).await;
     assert_eq!(info.status, DerivationStatus::Completed);
-    assert!(
-        !info.ca.output_unchanged,
-        "FIRST build: query_prior_realisation(path, exclude=own_modular) → None → \
-         ca_output_unchanged=false. (Mutation: drop `drv_hash != $2` → true.)"
-    );
     assert_eq!(
-        recorder.get(miss_key) - miss_before,
-        1,
-        "self-excluded lookup → counter{{outcome=miss}} +1"
+        info.ca.output_unchanged, expect_unchanged,
+        "ca_output_unchanged mismatch for {key}"
     );
-    assert_eq!(
-        recorder.get(match_key),
-        match_before,
-        "self-excluded → NO match increment"
-    );
-
+    if let Some(m) = expect_miss {
+        assert_eq!(recorder.get(miss_key) - miss_before, m, "miss delta");
+    }
+    if let Some(m) = expect_match {
+        assert_eq!(recorder.get(match_key) - match_before, m, "match delta");
+    }
     Ok(())
 }
 
@@ -349,113 +396,6 @@ async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
     assert!(
         !info.ca.output_unchanged,
         "no prior → miss → ca_output_unchanged=false"
-    );
-    Ok(())
-}
-
-// r[verify sched.ca.cutoff-compare]
-/// Zero-outputs edge: `built_outputs=[]` → `all_matched` starts
-/// `false` (the `!result.built_outputs.is_empty()` early-false at
-/// the top of the CA-compare block in `handle_completed`) →
-/// `ca_output_unchanged` stays `false`. A worker bug that emits
-/// zero outputs on success shouldn't accidentally enable cutoff
-/// for downstream. Defensive — the worker SHOULD always emit ≥1.
-#[tokio::test]
-async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let f = setup_ca_fixture("ca-zero").await?;
-
-    let match_key = "rio_scheduler_ca_hash_compares_total{outcome=match}";
-    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
-    let match_before = recorder.get(match_key);
-    let miss_before = recorder.get(miss_key);
-
-    // Built success with NO outputs. Unusual (worker bug), but
-    // the CA hook must not read it as "all N outputs matched
-    // (where N=0)" → true.
-    complete_ca(&f.actor, &f.executor_id, &f.drv_path, &[]).await?;
-
-    let info = expect_drv(&f.actor, "ca-zero").await;
-    assert_eq!(info.status, DerivationStatus::Completed);
-    assert!(
-        !info.ca.output_unchanged,
-        "zero outputs → all_matched starts false (!is_empty() guard); \
-         NEVER flip true on no data"
-    );
-    // Loop body doesn't execute → no counter increment either way.
-    assert_eq!(recorder.get(match_key), match_before, "no match recorded");
-    assert_eq!(recorder.get(miss_key), miss_before, "no miss recorded");
-    Ok(())
-}
-
-// r[verify sched.ca.cutoff-compare]
-/// Empty-path edge: `output_path.is_empty()` → debug +
-/// `all_matched=false` + `continue` (no PG lookup). Proves the
-/// empty-path guard short-circuits before the query — a worker
-/// sending an empty output_path (bug) is counted as a miss
-/// explicitly rather than hitting PG with an empty WHERE.
-#[tokio::test]
-async fn ca_compare_empty_path_counts_as_miss() -> TestResult {
-    let f = setup_ca_fixture("ca-empty").await?;
-
-    // Empty output_path. Malformed — worker should always report
-    // the realized path.
-    complete_ca(
-        &f.actor,
-        &f.executor_id,
-        &f.drv_path,
-        &[("out", "", vec![0xCD; 32])],
-    )
-    .await?;
-
-    let info = expect_drv(&f.actor, "ca-empty").await;
-    assert_eq!(info.status, DerivationStatus::Completed);
-    assert!(
-        !info.ca.output_unchanged,
-        "empty path → all_matched=false (the is_empty() guard), no PG query fired"
-    );
-    Ok(())
-}
-
-// r[verify sched.ca.cutoff-compare]
-/// No-prior-realisation edge: output_path with no prior realisation
-/// in PG → `Ok(None)` → `matched=false`. Proves a fresh first-ever
-/// build (nothing seeded) degrades to "no cutoff" (safe — downstream
-/// rebuilds) rather than crashing.
-#[tokio::test]
-async fn ca_compare_no_prior_counts_as_miss() -> TestResult {
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let f = setup_ca_fixture("ca-noprior").await?;
-
-    let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
-    let miss_before = recorder.get(miss_key);
-
-    // Two outputs, neither seeded in PG realisations. First lookup →
-    // None → miss → short-circuit break.
-    complete_ca(
-        &f.actor,
-        &f.executor_id,
-        &f.drv_path,
-        &[
-            ("out", &test_store_path("ca-noprior-out1"), vec![0x01; 32]),
-            ("dev", &test_store_path("ca-noprior-out2"), vec![0x02; 32]),
-        ],
-    )
-    .await?;
-
-    let info = expect_drv(&f.actor, "ca-noprior").await;
-    assert_eq!(info.status, DerivationStatus::Completed);
-    assert!(
-        !info.ca.output_unchanged,
-        "no prior realisation → matched=false → ca_output_unchanged stays false"
-    );
-    assert!(
-        recorder.get(miss_key) > miss_before,
-        "no prior → at least one miss counter increment"
     );
     Ok(())
 }
@@ -599,49 +539,6 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
         ),
         "P0399: C goes Ready after B Skipped; got {:?}",
         info_c.status
-    );
-
-    Ok(())
-}
-
-/// Second-build positive case: a PRIOR build's realisation
-/// (`(M_prior, out) → P`) exists ALONGSIDE this build's own
-/// (`(M_current, out) → P` — same P, CA content-addressing).
-/// `query_prior_realisation(P, exclude=M_current)` finds the prior
-/// row → match → `ca_output_unchanged=true`.
-///
-/// Paired with `ca_compare_first_build_excludes_own_upload` this
-/// proves "hide self, find sibling" — the modular_hash exclusion
-/// isn't "any match → None" (over-correction).
-#[tokio::test]
-async fn ca_compare_second_build_matches_prior() -> TestResult {
-    let f = setup_ca_fixture("ca-second").await?;
-
-    // SAME output_path (CA: same content → same path). TWO
-    // realisations: prior build's modular_hash AND our own.
-    let out_path = test_store_path("ca-second-out");
-    let out_hash: [u8; 32] = [0x55; 32];
-    let prior_modular: [u8; 32] = [0x66; 32];
-    // Our own row (simulating completion.rs insert_realisation
-    // having fired before the compare).
-    seed_realisation(&f.pool, &f.modular_hash, "out", &out_path, &out_hash).await?;
-    // Prior build's row — different modular_hash, same path.
-    seed_realisation(&f.pool, &prior_modular, "out", &out_path, &out_hash).await?;
-
-    complete_ca(
-        &f.actor,
-        &f.executor_id,
-        &f.drv_path,
-        &[("out", &out_path, out_hash.to_vec())],
-    )
-    .await?;
-
-    let info = expect_drv(&f.actor, "ca-second").await;
-    assert_eq!(info.status, DerivationStatus::Completed);
-    assert!(
-        info.ca.output_unchanged,
-        "SECOND build: query_prior_realisation(P, exclude=M_current) → \
-         finds M_prior → ca_output_unchanged=true (downstream CAN skip)"
     );
 
     Ok(())
@@ -854,20 +751,16 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
 // r[verify sched.retry.promotion-exempt]
 #[tokio::test]
 async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResult {
-    use crate::assignment::SizeClassConfig;
     let db = TestDb::new(&MIGRATOR).await;
     let classes = ["tiny", "small", "medium", "large", "xlarge"];
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = classes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| SizeClassConfig {
-                name: (*n).into(),
-                cutoff_secs: 30.0 * (i + 1) as f64,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            })
-            .collect();
+        c.size_classes = size_classes(&[
+            ("tiny", 30.0),
+            ("small", 60.0),
+            ("medium", 90.0),
+            ("large", 120.0),
+            ("xlarge", 150.0),
+        ]);
         c.retry_policy = crate::RetryPolicy {
             backoff_base_secs: 0.0,
             ..Default::default()
@@ -1233,33 +1126,11 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
 /// tiny→small→medium then terminals.
 #[tokio::test]
 async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "tiny".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 120.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "medium".into(),
-                cutoff_secs: 600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
+        c.size_classes = size_classes(&[("tiny", 30.0), ("small", 120.0), ("medium", 600.0)]);
+        // 2 retries → walks tiny→small, small→medium, then terminal on 3rd TimedOut.
         c.retry_policy = crate::RetryPolicy {
-            // 2 retries → walks tiny→small, small→medium, then
-            // terminal on the 3rd TimedOut.
             max_timeout_retries: 2,
             ..Default::default()
         };
@@ -1529,50 +1400,51 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
     Ok(())
 }
 
-/// With `require_distinct_workers=false`, 3× TransientFailure on the
-/// SAME worker → poisoned. Contrast with default distinct mode where
-/// same-worker repeats don't count (HashSet insert is idempotent).
-/// Primary use case: single-worker dev deployments, where 3 distinct
-/// workers will never exist.
+/// `require_distinct_workers` mode: 3× TransientFailure on the SAME
+/// worker poisons iff `require_distinct_workers=false`. Same inputs,
+/// opposite config, opposite outcome.
+///
+/// - **non_distinct** (`false`): `failure_count` 1→2→3 ≥ threshold →
+///   poisoned. Primary use case: single-worker dev deployments.
+/// - **distinct** (default `true`): `failed_builders.len()=1 < 3` →
+///   NOT poisoned via threshold (would need 3 DISTINCT workers).
+///   `max_retries` raised so the `retry_count>=2` branch doesn't mask.
+///
+/// Both: 3 workers (one real + 2 aarch64 padding) so the
+/// all-workers-failed clamp (`min(threshold, worker_count)`) doesn't
+/// fire before `failure_count=3`.
+#[rstest]
+#[case::non_distinct(false, true)]
+#[case::distinct(true, false)]
 #[tokio::test]
-async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
+async fn test_same_worker_poison_threshold_distinct_mode(
+    #[case] require_distinct: bool,
+    #[case] expect_poisoned: bool,
+) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    // Configure: require_distinct_workers = false, threshold = 3.
-    // Also max_retries = 5 so we hit the poison-threshold branch,
-    // not the max_retries branch (default max_retries=2 would
-    // poison at retry_count>=2, masking what we're testing).
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
         c.poison = PoisonConfig {
             threshold: 3,
-            require_distinct_workers: false,
+            require_distinct_workers: require_distinct,
         };
+        // Raise max_retries so the retry_count>=2 branch doesn't mask
+        // what we're testing (the threshold branch).
+        c.retry_policy.max_retries = 10;
     });
     let _db = db;
 
-    // 3 workers so the all-workers-failed clamp (min(threshold,
-    // worker_count)) doesn't fire before we reach failure_count=3.
-    // Pad workers use a non-matching system so dispatch stays on
-    // solo-worker — they're just padding for worker_count >= threshold.
     let _rx = connect_executor(&handle, "solo-worker", "x86_64-linux").await?;
     let _rx2 = connect_executor(&handle, "pad-w2", "aarch64-linux").await?;
     let _rx3 = connect_executor(&handle, "pad-w3", "aarch64-linux").await?;
 
-    let build_id = Uuid::new_v4();
-    let drv_hash = "nondistinct-drv";
+    let drv_hash = "distinct-mode-drv";
     let drv_path = test_drv_path(drv_hash);
-    let _event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
-    // 3× TransientFailure on the SAME worker. In default distinct
-    // mode: failed_builders={solo-worker} stays at len()=1 < 3 → not
-    // poisoned (blocked by max_retries instead). In non-distinct mode:
-    // failure_count goes 1→2→3, and 3 >= threshold → poisoned.
     for i in 0..3 {
         if i > 0 {
-            // Backoff + failed_builders exclusion block real dispatch
-            // back to solo-worker. Force it.
-            let ok = handle.debug_force_assign(drv_hash, "solo-worker").await?;
-            assert!(ok, "force-assign should succeed");
+            assert!(handle.debug_force_assign(drv_hash, "solo-worker").await?);
         }
         complete_failure(
             &handle,
@@ -1582,94 +1454,19 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
             &format!("same-worker failure {i}"),
         )
         .await?;
-
-        let info = expect_drv(&handle, drv_hash).await;
-        // failed_builders (HashSet) stays at 1 — same worker every time.
-        assert_eq!(
-            info.retry.failed_builders.len(),
-            1,
-            "HashSet: same worker inserted once, stays len()=1"
-        );
-        // failure_count increments regardless.
-        assert_eq!(
-            info.retry.failure_count,
-            i + 1,
-            "non-distinct: failure_count increments unconditionally"
-        );
-    }
-
-    // Exit criterion: 3× same-worker TransientFailure under
-    // require_distinct_workers=false → POISONED.
-    let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "non-distinct mode: 3× same-worker failures → poisoned (failure_count={} >= threshold=3)",
-        info.retry.failure_count
-    );
-    Ok(())
-}
-
-/// Negative control for non-distinct mode: with DEFAULT config
-/// (require_distinct_workers=true), 3× same-worker TransientFailure
-/// does NOT poison via the threshold path — failed_builders.len()
-/// stays at 1. (max_retries=2 default still poisons, but via a
-/// different branch — this test isolates the distinct-workers logic
-/// by raising max_retries.)
-#[tokio::test]
-async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    // Default PoisonConfig (distinct=true, threshold=3) — but raise
-    // max_retries so we can observe 3 same-worker failures WITHOUT
-    // hitting max_retries. This is the control for the non-distinct
-    // test above: same inputs, opposite config, opposite outcome.
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.retry_policy.max_retries = 10;
-    });
-    let _db = db;
-
-    // 3 workers so the all-workers-failed clamp doesn't fire —
-    // we're isolating the distinct-vs-nondistinct counting, not
-    // the worker_count guard. Pad workers use a non-matching
-    // system so dispatch stays on ctrl-worker.
-    let _rx = connect_executor(&handle, "ctrl-worker", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "ctrl-pad2", "aarch64-linux").await?;
-    let _rx3 = connect_executor(&handle, "ctrl-pad3", "aarch64-linux").await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_hash = "ctrl-drv";
-    let drv_path = test_drv_path(drv_hash);
-    let _event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-
-    for i in 0..3 {
-        if i > 0 {
-            let ok = handle.debug_force_assign(drv_hash, "ctrl-worker").await?;
-            assert!(ok);
-        }
-        complete_failure(
-            &handle,
-            "ctrl-worker",
-            &drv_path,
-            rio_proto::types::BuildResultStatus::TransientFailure,
-            &format!("ctrl failure {i}"),
-        )
-        .await?;
     }
 
     let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.retry.failed_builders.len(),
         1,
-        "HashSet: same worker = 1"
+        "HashSet: same worker inserted once, stays len()=1"
     );
-    assert_eq!(info.retry.failure_count, 3, "flat count still increments");
-    // NOT poisoned: distinct mode uses failed_builders.len()=1 < 3.
-    assert_ne!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "distinct mode (default): 3× same-worker → NOT poisoned via threshold \
-         (failed_builders.len()=1 < 3); would need 3 DISTINCT workers"
+    assert_eq!(info.retry.failure_count, 3, "flat count always increments");
+    assert_eq!(
+        info.status == DerivationStatus::Poisoned,
+        expect_poisoned,
+        "require_distinct_workers={require_distinct}: 3× same-worker → poisoned={expect_poisoned}"
     );
     Ok(())
 }
@@ -1943,25 +1740,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
 #[tokio::test]
 #[traced_test]
 async fn test_misclass_detection_on_slow_completion() -> TestResult {
-    use crate::assignment::SizeClassConfig;
-
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
-    });
+    let (db, handle, _task) = setup_with_classes(&[("small", 30.0), ("large", 3600.0)]).await;
 
     // Small worker. No EMA pre-seed → classify() defaults to 30s →
     // routes to "small". Exactly the scenario: something LOOKED small,

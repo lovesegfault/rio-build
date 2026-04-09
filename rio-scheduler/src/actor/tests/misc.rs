@@ -29,24 +29,34 @@ fn spawn_actor_with_flags(
 }
 
 // r[verify sched.recovery.gate-dispatch]
-/// When is_leader=false, dispatch_ready early-returns. Worker
-/// connected, DAG merged, heartbeat sent → NO assignment received.
+/// `dispatch_ready` early-returns when `is_leader=false` OR
+/// `recovery_complete=false`. Worker connected, DAG merged, heartbeat
+/// sent → NO assignment received.
+#[rstest::rstest]
+#[case::not_leader(false, true)]
+#[case::recovery_incomplete(true, false)]
 #[tokio::test]
-async fn test_not_leader_does_not_dispatch() -> TestResult {
+async fn test_dispatch_gated_on_leader_and_recovery(
+    #[case] is_leader: bool,
+    #[case] recovery_complete: bool,
+) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), false, true);
+    let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), is_leader, recovery_complete);
 
-    let mut rx = connect_executor(&handle, "nl-worker", "x86_64-linux").await?;
-    merge_single_node(&handle, Uuid::new_v4(), "nl-drv", PriorityClass::Scheduled).await?;
-
-    // Extra heartbeat to trigger dispatch_ready.
-    send_heartbeat(&handle, "nl-worker", "x86_64-linux").await?;
+    let mut rx = connect_executor(&handle, "gate-w", "x86_64-linux").await?;
+    merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "gate-drv",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    send_heartbeat(&handle, "gate-w", "x86_64-linux").await?;
     barrier(&handle).await;
 
-    // No assignment — dispatch gated by !is_leader.
     assert!(
         rx.try_recv().is_err(),
-        "not-leader → no assignment dispatched"
+        "is_leader={is_leader} recovery_complete={recovery_complete} → no dispatch"
     );
     Ok(())
 }
@@ -105,25 +115,6 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
             recorder.gauge_names()
         );
     }
-    Ok(())
-}
-
-/// Same gate but for recovery_complete=false.
-#[tokio::test]
-async fn test_recovery_not_complete_does_not_dispatch() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), true, false);
-
-    let mut rx = connect_executor(&handle, "rc-worker", "x86_64-linux").await?;
-    merge_single_node(&handle, Uuid::new_v4(), "rc-drv", PriorityClass::Scheduled).await?;
-
-    send_heartbeat(&handle, "rc-worker", "x86_64-linux").await?;
-    barrier(&handle).await;
-
-    assert!(
-        rx.try_recv().is_err(),
-        "recovery not complete → no dispatch"
-    );
     Ok(())
 }
 
@@ -480,29 +471,7 @@ async fn test_shutdown_token_drains_workers() -> TestResult {
 #[tokio::test]
 async fn size_class_snapshot_preserves_configured_after_rebalance() {
     let db = TestDb::new(&MIGRATOR).await;
-
-    // Build actor directly (no spawn) so we can call
-    // compute_size_class_snapshot and mutate size_classes.
-    let actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            size_classes: vec![
-                crate::assignment::SizeClassConfig {
-                    name: "small".into(),
-                    cutoff_secs: 60.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-                crate::assignment::SizeClassConfig {
-                    name: "large".into(),
-                    cutoff_secs: 1800.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-            ],
-            ..Default::default()
-        },
-    );
+    let actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 1800.0)]);
 
     // Simulate a rebalancer pass: mutate effective cutoffs in-place.
     {
@@ -564,26 +533,7 @@ async fn size_class_snapshot_empty_when_unconfigured() {
 #[tokio::test]
 async fn size_class_snapshot_feature_filter() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            size_classes: vec![
-                crate::assignment::SizeClassConfig {
-                    name: "tiny".into(),
-                    cutoff_secs: 60.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-                crate::assignment::SizeClassConfig {
-                    name: "xlarge".into(),
-                    cutoff_secs: 3600.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-            ],
-            ..Default::default()
-        },
-    );
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("tiny", 60.0), ("xlarge", 3600.0)]);
 
     // 3 Ready derivations, all classify as `tiny` (no estimator
     // samples → est_duration=None → smallest class):
@@ -661,18 +611,7 @@ async fn size_class_snapshot_feature_filter() {
 #[tokio::test]
 async fn size_class_snapshot_kvm_pool_excludes_featureless_work() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            size_classes: vec![crate::assignment::SizeClassConfig {
-                name: "medium".into(),
-                cutoff_secs: 600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            }],
-            ..Default::default()
-        },
-    );
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("medium", 600.0)]);
 
     // Single Ready derivation, required_features = ∅ (e.g., hello).
     actor.test_inject_ready("hello", None, "x86_64-linux");
@@ -719,12 +658,7 @@ async fn size_class_snapshot_soft_features_strip() {
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            size_classes: vec![crate::assignment::SizeClassConfig {
-                name: "medium".into(),
-                cutoff_secs: 600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            }],
+            size_classes: size_classes(&[("medium", 600.0)]),
             soft_features: vec![crate::assignment::SoftFeature {
                 name: "big-parallel".into(),
                 floor_hint: None,
@@ -777,23 +711,12 @@ async fn size_class_snapshot_soft_features_strip() {
 // r[verify sched.sizing.soft-feature-floor]
 #[tokio::test]
 async fn soft_feature_floor_hint_seeds_size_class_floor() {
-    use crate::assignment::{SizeClassConfig, SoftFeature};
+    use crate::assignment::SoftFeature;
     let db = TestDb::new(&MIGRATOR).await;
-    let classes = |names: &[(&str, f64)]| {
-        names
-            .iter()
-            .map(|(n, c)| SizeClassConfig {
-                name: (*n).into(),
-                cutoff_secs: *c,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            })
-            .collect::<Vec<_>>()
-    };
     let mut actor = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            size_classes: classes(&[
+            size_classes: size_classes(&[
                 ("tiny", 30.0),
                 ("small", 120.0),
                 ("medium", 600.0),
@@ -845,7 +768,7 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
     let mut actor2 = bare_actor_cfg(
         db.pool.clone(),
         DagActorConfig {
-            size_classes: classes(&[("tiny", 30.0), ("xlarge", 36000.0)]),
+            size_classes: size_classes(&[("tiny", 30.0), ("xlarge", 36000.0)]),
             soft_features: vec![SoftFeature {
                 name: "big-parallel".into(),
                 floor_hint: Some("tiny".into()),
@@ -914,26 +837,7 @@ async fn soft_feature_floor_hint_seeds_size_class_floor() {
 #[tokio::test]
 async fn size_class_snapshot_honors_floor() {
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            size_classes: vec![
-                crate::assignment::SizeClassConfig {
-                    name: "tiny".into(),
-                    cutoff_secs: 60.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-                crate::assignment::SizeClassConfig {
-                    name: "small".into(),
-                    cutoff_secs: 600.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-            ],
-            ..Default::default()
-        },
-    );
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("tiny", 60.0), ("small", 600.0)]);
 
     // 1 Ready non-FOD: classify()=tiny (no estimator sample → smallest),
     // floor=small (set by I-177 promote_size_class_floor on a prior
@@ -1037,29 +941,8 @@ async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
 // r[verify sched.admin.estimator-stats]
 #[tokio::test]
 async fn estimator_stats_classifies_under_effective_cutoffs() {
-    use crate::assignment::SizeClassConfig;
-
     let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_cfg(
-        db.pool.clone(),
-        DagActorConfig {
-            size_classes: vec![
-                SizeClassConfig {
-                    name: "small".into(),
-                    cutoff_secs: 60.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-                SizeClassConfig {
-                    name: "large".into(),
-                    cutoff_secs: 3600.0,
-                    mem_limit_bytes: u64::MAX,
-                    cpu_limit_cores: None,
-                },
-            ],
-            ..Default::default()
-        },
-    );
+    let mut actor = bare_actor_classed(db.pool.clone(), &[("small", 60.0), ("large", 3600.0)]);
 
     actor.test_refresh_estimator(vec![
         ("hello".into(), "x86_64-linux".into(), 5.0, None, None, 12),
@@ -1193,26 +1076,9 @@ async fn fod_size_class_snapshot_buckets_by_floor() {
 /// shows up; dispatch → Assigned → running shows up, queued drops).
 #[tokio::test]
 async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            crate::assignment::SizeClassConfig {
-                name: "small".into(),
-                // est_duration defaults to 0.0 (no build_history
-                // entries for test nodes) → classify() routes to the
-                // smallest class whose cutoff ≥ 0.0 = small.
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            crate::assignment::SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
-    });
+    // est_duration defaults to 0.0 (no build_history entries for test
+    // nodes) → classify() routes to the smallest class = small.
+    let (_db, handle, _task) = setup_with_classes(&[("small", 30.0), ("large", 3600.0)]).await;
 
     // Merge 3 single-node DAGs. All three → Ready immediately (no
     // deps). No workers connected yet → they stay queued.
@@ -1296,25 +1162,9 @@ async fn size_class_snapshot_queued_and_running_counts() -> TestResult {
 /// (they dispatch to fetchers, not size-class builders — ADR-019).
 #[tokio::test]
 async fn size_class_snapshot_cold_start_counts_in_smallest_and_skips_fod() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        // Classes deliberately UNSORTED so the smallest-class fallback
-        // can't accidentally rely on index 0 being smallest.
-        c.size_classes = vec![
-            crate::assignment::SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            crate::assignment::SizeClassConfig {
-                name: "tiny".into(),
-                cutoff_secs: 30.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
-    });
+    // Classes deliberately UNSORTED so the smallest-class fallback
+    // can't accidentally rely on index 0 being smallest.
+    let (_db, handle, _task) = setup_with_classes(&[("large", 3600.0), ("tiny", 30.0)]).await;
 
     // Two non-FOD nodes with pnames the (empty) estimator has never
     // seen → est_duration falls back to DEFAULT_DURATION_SECS (30s)
