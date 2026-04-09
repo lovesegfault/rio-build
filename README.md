@@ -79,7 +79,6 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
 | `rio-controller` | Kubernetes operator (BuilderPool/FetcherPool CRDs, autoscaler) |
 | `rio-crds` | Kubernetes CRD types (kube-derive), shared between controller and CLI |
 | `rio-cli` | Admin CLI (trigger GC, tenant mgmt, backfill, dry-run introspection) |
-| `rio-bench` | Criterion benchmarks (wire parsers, chunker, scheduler hot paths) |
 | `rio-test-support` | Ephemeral PostgreSQL bootstrap, mock gRPC, wire helpers |
 
 ## Development

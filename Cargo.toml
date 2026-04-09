@@ -12,7 +12,6 @@ members = [
   "rio-test-support",
   "rio-builder",
   "rio-crds",
-  "rio-bench",
   "workspace-hack",
   "xtask",
 ]

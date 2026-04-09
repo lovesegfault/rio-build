@@ -3,7 +3,6 @@
   "root": null,
   "workspaceMembers": {
     "rio-auth": "rio-auth",
-    "rio-bench": "rio-bench",
     "rio-builder": "rio-builder",
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
@@ -323,28 +322,6 @@
         "Andrew Gallant <jamslam@gmail.com>"
       ]
     },
-    "alloca": {
-      "crateName": "alloca",
-      "version": "0.4.0",
-      "edition": "2021",
-      "sha256": "1x6p4387rz6j7h342kp3b7bgvqzyl9mibf959pkfk9xflrgd19z5",
-      "source": {
-        "type": "crates-io"
-      },
-      "buildDependencies": [
-        {
-          "name": "cc",
-          "packageId": "cc"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Adel Prokurov <adel.prokurov@gmail.com>",
-        "StackOverflowExcept1on"
-      ]
-    },
     "allocator-api2": {
       "crateName": "allocator-api2",
       "version": "0.2.21",
@@ -382,24 +359,6 @@
       ],
       "authors": [
         "Nicolas Silva <nical@fastmail.com>"
-      ]
-    },
-    "anes": {
-      "crateName": "anes",
-      "version": "0.1.6",
-      "edition": "2018",
-      "sha256": "16bj1ww1xkwzbckk32j2pnbn5vk6wgsl3q4p3j9551xbcarwnijb",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "default"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Robert Vojta <rvojta@me.com>"
       ]
     },
     "anstream": {
@@ -3943,21 +3902,6 @@
         "Michal 'vorner' Vaner <vorner@vorner.cz>"
       ]
     },
-    "cast": {
-      "crateName": "cast",
-      "version": "0.3.0",
-      "edition": "2018",
-      "sha256": "1dbyngbyz2qkk0jn2sxil8vrz3rnpcj142y184p9l4nbl9radcip",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Jorge Aparicio <jorge@japaric.io>"
-      ]
-    },
     "cbc 0.1.2": {
       "crateName": "cbc",
       "version": "0.1.2",
@@ -5057,132 +5001,6 @@
         "Alex Crichton <alex@alexcrichton.com>"
       ]
     },
-    "criterion": {
-      "crateName": "criterion",
-      "version": "0.8.2",
-      "edition": "2021",
-      "sha256": "1wwq9pfildrkqgb5pq3mwmv297kvvsizkx7m6sjzk4i4mar4c04m",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "alloca",
-          "packageId": "alloca",
-          "target": "cfg(any(windows, unix))"
-        },
-        {
-          "name": "anes",
-          "packageId": "anes"
-        },
-        {
-          "name": "cast",
-          "packageId": "cast"
-        },
-        {
-          "name": "ciborium",
-          "packageId": "ciborium"
-        },
-        {
-          "name": "clap",
-          "packageId": "clap"
-        },
-        {
-          "name": "criterion-plot",
-          "packageId": "criterion-plot"
-        },
-        {
-          "name": "itertools",
-          "packageId": "itertools 0.13.0"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "oorandom",
-          "packageId": "oorandom"
-        },
-        {
-          "name": "page_size",
-          "packageId": "page_size"
-        },
-        {
-          "name": "plotters",
-          "packageId": "plotters"
-        },
-        {
-          "name": "rayon",
-          "packageId": "rayon"
-        },
-        {
-          "name": "regex",
-          "packageId": "regex"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "tinytemplate",
-          "packageId": "tinytemplate"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "walkdir",
-          "packageId": "walkdir"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "async",
-        "async_tokio",
-        "cargo_bench_support",
-        "default",
-        "html_reports",
-        "plotters",
-        "rayon"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Jorge Aparicio <japaricious@gmail.com>",
-        "Brook Heisler <brookheisler@gmail.com>"
-      ]
-    },
-    "criterion-plot": {
-      "crateName": "criterion-plot",
-      "version": "0.8.2",
-      "edition": "2021",
-      "sha256": "1si9mrnzgs0123mr6d5pmhxq29rxph2q6pbvwjal6mav9wphmn6q",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "cast",
-          "packageId": "cast"
-        },
-        {
-          "name": "itertools",
-          "packageId": "itertools 0.13.0"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Jorge Aparicio <japaricious@gmail.com>",
-        "Brook Heisler <brookheisler@gmail.com>"
-      ]
-    },
     "crossbeam-channel": {
       "crateName": "crossbeam-channel",
       "version": "0.5.15",
@@ -5192,32 +5010,6 @@
         "type": "crates-io"
       },
       "dependencies": [
-        {
-          "name": "crossbeam-utils",
-          "packageId": "crossbeam-utils"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "crossbeam-deque": {
-      "crateName": "crossbeam-deque",
-      "version": "0.8.6",
-      "edition": "2021",
-      "sha256": "0l9f1saqp1gn5qy0rxvkmz4m6n7fc0b3dbm6q1r5pmgpnyvi3lcx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "crossbeam-epoch",
-          "packageId": "crossbeam-epoch"
-        },
         {
           "name": "crossbeam-utils",
           "packageId": "crossbeam-utils"
@@ -13519,33 +13311,7 @@
         "lib"
       ]
     },
-    "itertools 0.13.0": {
-      "crateName": "itertools",
-      "version": "0.13.0",
-      "edition": "2018",
-      "sha256": "11hiy3qzl643zcigknclh446qb9zlg4dpdzfkjaa9q9fqpgyfgj1",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "either",
-          "packageId": "either"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "use_alloc",
-        "use_std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "bluss"
-      ]
-    },
-    "itertools 0.14.0": {
+    "itertools": {
       "crateName": "itertools",
       "version": "0.14.0",
       "edition": "2018",
@@ -16303,21 +16069,6 @@
         "lib"
       ]
     },
-    "oorandom": {
-      "crateName": "oorandom",
-      "version": "11.1.5",
-      "edition": "2018",
-      "sha256": "07mlf13z453fq01qff38big1lh83j8l6aaglf63ksqzzqxc0yyfn",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Simon Heath <icefox@dreamquest.io>"
-      ]
-    },
     "opaque-debug": {
       "crateName": "opaque-debug",
       "version": "0.3.1",
@@ -17964,87 +17715,6 @@
         "jzr"
       ]
     },
-    "plotters": {
-      "crateName": "plotters",
-      "version": "0.3.7",
-      "edition": "2018",
-      "sha256": "0ixpy9svpmr2rkzkxvvdpysjjky4gw104d73n7pi2jbs7m06zsss",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "plotters-backend",
-          "packageId": "plotters-backend"
-        },
-        {
-          "name": "plotters-svg",
-          "packageId": "plotters-svg"
-        },
-        {
-          "name": "wasm-bindgen",
-          "packageId": "wasm-bindgen",
-          "target": "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
-        },
-        {
-          "name": "web-sys",
-          "packageId": "web-sys",
-          "target": "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "area_series",
-        "line_series",
-        "plotters-svg",
-        "svg_backend"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Hao Hou <haohou302@gmail.com>"
-      ]
-    },
-    "plotters-backend": {
-      "crateName": "plotters-backend",
-      "version": "0.3.7",
-      "edition": "2018",
-      "sha256": "0ahpliim4hrrf7d4ispc2hwr7rzkn6d6nf7lyyrid2lm28yf2hnz",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Hao Hou <haohou302@gmail.com>"
-      ]
-    },
-    "plotters-svg": {
-      "crateName": "plotters-svg",
-      "version": "0.3.7",
-      "edition": "2018",
-      "sha256": "0w56sxaa2crpasa1zj0bhxzihlapqfkncggavyngg0w86anf5fji",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "plotters-backend",
-          "packageId": "plotters-backend"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Hao Hou <haohou302@gmail.com>"
-      ]
-    },
     "poly1305": {
       "crateName": "poly1305",
       "version": "0.8.0",
@@ -18626,7 +18296,7 @@
         },
         {
           "name": "itertools",
-          "packageId": "itertools 0.14.0"
+          "packageId": "itertools"
         },
         {
           "name": "log",
@@ -18703,7 +18373,7 @@
         },
         {
           "name": "itertools",
-          "packageId": "itertools 0.14.0"
+          "packageId": "itertools"
         },
         {
           "name": "proc-macro2",
@@ -19434,51 +19104,6 @@
       "authors": [
         "Gerd Zellweger <mail@gerdzellweger.com>"
       ]
-    },
-    "rayon": {
-      "crateName": "rayon",
-      "version": "1.11.0",
-      "edition": "2021",
-      "sha256": "13x5fxb7rn4j2yw0cr26n7782jkc7rjzmdkg42qxk3xz0p8033rn",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "either",
-          "packageId": "either"
-        },
-        {
-          "name": "rayon-core",
-          "packageId": "rayon-core"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "rayon-core": {
-      "crateName": "rayon-core",
-      "version": "1.13.0",
-      "edition": "2021",
-      "sha256": "14dbr0sq83a6lf1rfjq5xdpk5r6zgzvmzs5j6110vlv2007qpq92",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "crossbeam-deque",
-          "packageId": "crossbeam-deque"
-        },
-        {
-          "name": "crossbeam-utils",
-          "packageId": "crossbeam-utils"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "links": "rayon-core"
     },
     "rcgen": {
       "crateName": "rcgen",
@@ -20330,61 +19955,6 @@
         {
           "name": "tempfile",
           "packageId": "tempfile"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ]
-    },
-    "rio-bench": {
-      "crateName": "rio-bench",
-      "version": "0.1.0",
-      "edition": "2024",
-      "source": {
-        "type": "local",
-        "path": "rio-bench"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "rio-proto",
-          "packageId": "rio-proto"
-        },
-        {
-          "name": "rio-scheduler",
-          "packageId": "rio-scheduler"
-        },
-        {
-          "name": "rio-test-support",
-          "packageId": "rio-test-support"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tonic",
-          "packageId": "tonic"
-        }
-      ],
-      "devDependencies": [
-        {
-          "name": "criterion",
-          "packageId": "criterion"
-        },
-        {
-          "name": "rio-nix",
-          "packageId": "rio-nix"
-        },
-        {
-          "name": "uuid",
-          "packageId": "uuid"
         }
       ],
       "libCrateTypes": [
@@ -26132,31 +25702,6 @@
         "The ICU4X Project Developers"
       ]
     },
-    "tinytemplate": {
-      "crateName": "tinytemplate",
-      "version": "1.2.1",
-      "edition": "2015",
-      "sha256": "1g5n77cqkdh9hy75zdb01adxn45mkh9y40wdr7l68xpz35gnnkdy",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Brook Heisler <brookheisler@gmail.com>"
-      ]
-    },
     "tinyvec": {
       "crateName": "tinyvec",
       "version": "1.11.0",
@@ -28722,18 +28267,10 @@
         "AbortSignal",
         "Blob",
         "BlobPropertyBag",
-        "CanvasRenderingContext2d",
-        "Document",
-        "DomRect",
-        "DomRectReadOnly",
-        "Element",
         "EventTarget",
         "File",
         "FormData",
         "Headers",
-        "HtmlCanvasElement",
-        "HtmlElement",
-        "Node",
         "Performance",
         "QueuingStrategy",
         "ReadableByteStreamController",

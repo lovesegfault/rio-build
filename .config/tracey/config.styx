@@ -73,8 +73,6 @@ specs (
           rio-auth/src/**/*.rs
           rio-cli/src/**/*.rs
           rio-test-support/src/**/*.rs
-          rio-bench/src/**/*.rs
-          rio-bench/benches/**/*.rs
           nix/nixos-node/**/*.nix
           nix/base-runtime-spec.nix
           nix/docker.nix

@@ -115,8 +115,6 @@ Scenarios ported from Lix [`functionaltests2`](https://git.lix.systems/lix-proje
 | CI | Every push | Unit tests, functional tests (real rio-store), clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
 | Weekly | Scheduled | + golden-matrix (4 daemons), mutation testing, EKS cluster tests, chaos tests, load tests | `.#golden-matrix`, `.#mutants` | Unbounded |
 
-> **Implemented:** criterion benchmarks live in the `rio-bench` crate.
-
 ## Mutation Testing
 
 `cargo-mutants` mutates source — swap `<` for `<=`, delete a statement, replace a return value with `Default::default()` — reruns the test suite, and flags mutations that **survive** (the tests still pass). A surviving mutant is code the tests don't actually constrain. tracey answers "is this spec rule covered"; mutants answers "does the test that covers it actually catch bugs." Complementary signals.
