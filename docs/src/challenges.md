@@ -33,7 +33,7 @@ Executors need a functional `/nix/store`. The FUSE + overlay approach introduces
 - Upper layer cleanup must be deterministic (unique per-build directory, discarded with the pod)
 - The namespace ordering (FUSE mount → overlayfs → nix sandbox) must be correct; see [builder.md](components/builder.md)
 
-**Decided approach:** Each executor runs a FUSE filesystem (`rio-fuse`) that lazily fetches store paths from rio-store. Each build gets a per-build overlayfs with **stacked lowers** (host `/nix/store` first so nix-daemon and its dependencies are reachable, FUSE mount second for lazily-fetched paths) and a per-build synthetic SQLite database in the upper layer. This avoids shared mutable state, eliminates shared PV infrastructure, and provides local-disk performance via SSD caching. See [builder.md](components/builder.md) for full details.
+**Decided approach:** Each executor runs the FUSE layer that lazily fetches store paths from rio-store. Each build gets a per-build overlayfs with **stacked lowers** (host `/nix/store` first so nix-daemon and its dependencies are reachable, FUSE mount second for lazily-fetched paths) and a per-build synthetic SQLite database in the upper layer. This avoids shared mutable state, eliminates shared PV infrastructure, and provides local-disk performance via SSD caching. See [builder.md](components/builder.md) for full details.
 
 ## 6. Failure Semantics
 
@@ -111,7 +111,7 @@ The scheduler maintains the entire global DAG in memory via a single-owner actor
 
 ## 13. FUSE Local I/O Performance
 
-The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. FUSE context switches between kernel and userspace could become a latency bottleneck --- even when the SSD cache is warm. This is a different risk from Challenge 11 (rio-store overload); this is about the local I/O path.
+rio-builder's FUSE daemon runs in userspace via the `fuser` crate. FUSE context switches between kernel and userspace could become a latency bottleneck --- even when the SSD cache is warm. This is a different risk from Challenge 11 (rio-store overload); this is about the local I/O path.
 
 **Concerns:**
 - Each file `read()` from the build sandbox crosses kernel → userspace → kernel. For builds that read thousands of small files (e.g., header-heavy C++ compilations), the overhead accumulates.

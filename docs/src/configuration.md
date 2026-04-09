@@ -71,7 +71,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `systems` | list\<string\> | (auto: `{arch}-{os}`) | Nix systems this builder can build for (any-match). Env `RIO_SYSTEMS` is comma-separated; TOML is an array. |
 | `features` | list\<string\> | `[]` | `requiredSystemFeatures` this builder supports (all-match). Same env/TOML format as `systems`. |
 | `fuse_mount_point` | path | `/var/rio/fuse-store` | FUSE mount point. **Never** `/nix/store` --- that would shadow the host store. |
-| `fuse_cache_dir` | path | `/var/rio/cache` | Local SSD cache directory for rio-fuse |
+| `fuse_cache_dir` | path | `/var/rio/cache` | Local SSD cache directory for the FUSE cache |
 | `fuse_threads` | u32 | 4 | Number of FUSE daemon threads |
 | `fuse_passthrough` | bool | true | Enable kernel passthrough (Linux 6.9+). Disable only for debugging. |
 | `overlay_base_dir` | path | `/var/rio/overlays` | Base directory for per-build overlay upper/work layers |
