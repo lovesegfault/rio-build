@@ -42,11 +42,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     })
     .await?;
 
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "drain-auth")
-        .expect("entry exists");
+    let w = expect_worker(&handle, "drain-auth").await;
     assert!(
         w.draining && w.store_degraded,
         "precondition: effective draining (admin OR hb) + degraded"
@@ -63,11 +59,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
         })
         .await?;
 
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "drain-auth")
-        .expect("entry exists post-reconnect");
+    let w = expect_worker(&handle, "drain-auth").await;
     assert!(
         w.draining,
         "I-063: effective draining still true — reconnect cleared \
@@ -86,11 +78,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
     // never draining). `draining_hb` clears; admin `draining` was
     // already cleared by reconnect → effective false.
     send_heartbeat(&handle, "drain-auth", "x86_64-linux").await?;
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "drain-auth")
-        .expect("entry exists post-heartbeat");
+    let w = expect_worker(&handle, "drain-auth").await;
     assert!(
         !w.draining,
         "both sources cleared → effective draining false"
@@ -110,11 +98,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
         .await?;
     assert!(reply_rx.await?.accepted);
     send_heartbeat(&handle, "drain-auth", "x86_64-linux").await?;
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "drain-auth")
-        .expect("entry exists");
+    let w = expect_worker(&handle, "drain-auth").await;
     assert!(
         w.draining,
         "admin drain survives heartbeat draining=false — heartbeat \
@@ -151,10 +135,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
     let drv_path = rio_test_support::fixtures::test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("merged");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Ready,
@@ -180,10 +161,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
 
     // Adoption: DAG node Assigned to A, A.running_build set, no
     // failed_builders (adoption is reconciliation, not failure).
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Assigned,
@@ -198,11 +176,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
         info.retry.failed_builders.is_empty(),
         "adoption must not penalize the worker"
     );
-    let workers = handle.debug_query_workers().await?;
-    let a = workers
-        .iter()
-        .find(|w| w.executor_id == "i066-a")
-        .expect("A registered");
+    let a = expect_worker(&handle, "i066-a").await;
     assert!(
         a.running_build == Some(drv_hash.to_string()),
         "worker.running_build set so A reads at-capacity"
@@ -212,19 +186,12 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
     // The drv is Assigned (adopted) → not in the Ready filter → B
     // gets nothing. Pre-I-066: drv was still Ready, B would receive it.
     let _stream_rx_b = connect_executor(&handle, "i066-b", "x86_64-linux").await?;
-    let workers = handle.debug_query_workers().await?;
-    let b = workers
-        .iter()
-        .find(|w| w.executor_id == "i066-b")
-        .expect("B registered");
+    let b = expect_worker(&handle, "i066-b").await;
     assert!(
         b.running_build.is_none(),
         "B must NOT receive the drv — adoption prevented re-dispatch"
     );
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.assigned_executor.as_deref(),
         Some("i066-a"),
@@ -268,11 +235,7 @@ async fn test_heartbeat_before_stream_does_not_create_zombie() -> TestResult {
     // (creates entry, sets stream_tx) followed by Heartbeat (updates).
     let _rx = connect_executor(&handle, "zombie-candidate", "x86_64-linux").await?;
 
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "zombie-candidate")
-        .expect("stream-first connect must create entry");
+    let w = expect_worker(&handle, "zombie-candidate").await;
     assert!(
         w.is_registered,
         "stream + heartbeat → fully registered (lifecycle invariant intact)"
@@ -293,11 +256,7 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
     // Stage 1: stream connected, no heartbeat. has_stream=true,
     // is_registered=false (systems empty), warm=false.
     let _rx = connect_executor_no_ack(&handle, "ext-builder", "x86_64-linux").await?;
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "ext-builder")
-        .expect("stream-open creates entry");
+    let w = expect_worker(&handle, "ext-builder").await;
     assert!(
         w.has_stream,
         "stream_tx set by ExecutorConnected → has_stream=true"
@@ -348,11 +307,7 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
             paths_fetched: 0,
         })
         .await?;
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "ext-fetcher")
-        .expect("fetcher registered");
+    let w = expect_worker(&handle, "ext-fetcher").await;
     assert!(w.has_stream);
     assert!(w.is_registered);
     assert!(
@@ -366,7 +321,7 @@ async fn test_debug_query_workers_extended_fields() -> TestResult {
     );
 
     // Both entries present.
-    assert_eq!(workers.len(), 2);
+    assert_eq!(handle.debug_query_workers().await?.len(), 2);
     Ok(())
 }
 
@@ -387,17 +342,10 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Verify: derivation is Assigned, worker.running_build contains it.
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.status, DerivationStatus::Assigned);
 
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "toctou-worker")
-        .expect("toctou-worker registered");
+    let w = expect_worker(&handle, "toctou-worker").await;
     assert!(
         w.running_build == Some(drv_hash.to_string()),
         "scheduler should have tracked the assignment in worker.running_build"
@@ -411,11 +359,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // Assignment must still be tracked. Before the fix, running_build
     // would be wholesale replaced with the empty set, orphaning the
     // assignment (completion would later warn "unknown derivation").
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "toctou-worker")
-        .expect("toctou-worker registered");
+    let w = expect_worker(&handle, "toctou-worker").await;
     assert!(
         w.running_build == Some(drv_hash.to_string()),
         "stale heartbeat must not clobber scheduler's fresh assignment"
@@ -443,16 +387,9 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
 
     // Precondition: dispatch assigned the drv (single candidate).
     // Worker's running_build has it; DAG is Assigned.
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.status, DerivationStatus::Assigned);
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "phantom-worker")
-        .expect("phantom-worker registered");
+    let w = expect_worker(&handle, "phantom-worker").await;
     assert!(
         w.running_build == Some(drv_hash.to_string()),
         "precondition: dispatch tracked the assignment"
@@ -460,19 +397,12 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
 
     // First miss: TOCTOU keep — same outcome as the test above.
     send_heartbeat(&handle, "phantom-worker", "x86_64-linux").await?;
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "phantom-worker")
-        .expect("phantom-worker registered");
+    let w = expect_worker(&handle, "phantom-worker").await;
     assert!(
         w.running_build == Some(drv_hash.to_string()),
         "first miss is the TOCTOU race — keep"
     );
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Assigned,
@@ -482,10 +412,7 @@ async fn test_heartbeat_phantom_drain_on_second_miss() -> TestResult {
     // Second miss: phantom confirmed. Drain → reset_to_ready →
     // dispatch_ready re-assigns to the (now-free) same worker.
     send_heartbeat(&handle, "phantom-worker", "x86_64-linux").await?;
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Assigned,
@@ -553,9 +480,8 @@ async fn test_completion_after_poison_frees_running_build() -> TestResult {
     handle.debug_force_assign(drv_hash, "i042-w2").await?;
 
     // Both workers track the drv. assigned_executor = w2.
-    let workers = handle.debug_query_workers().await?;
-    let w1 = workers.iter().find(|w| w.executor_id == "i042-w1").unwrap();
-    let w2 = workers.iter().find(|w| w.executor_id == "i042-w2").unwrap();
+    let w1 = expect_worker(&handle, "i042-w1").await;
+    let w2 = expect_worker(&handle, "i042-w2").await;
     assert!(w1.running_build == Some(drv_hash.to_string()));
     assert!(w2.running_build == Some(drv_hash.to_string()));
 
@@ -571,15 +497,14 @@ async fn test_completion_after_poison_frees_running_build() -> TestResult {
     )
     .await?;
 
-    let info = handle.debug_query_derivation(drv_hash).await?.unwrap();
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.status, DerivationStatus::Poisoned);
-    let workers = handle.debug_query_workers().await?;
-    let w2 = workers.iter().find(|w| w.executor_id == "i042-w2").unwrap();
+    let w2 = expect_worker(&handle, "i042-w2").await;
     assert!(
         w2.running_build != Some(drv_hash.to_string()),
         "w2's normal completion path frees its slot (line 515)"
     );
-    let w1 = workers.iter().find(|w| w.executor_id == "i042-w1").unwrap();
+    let w1 = expect_worker(&handle, "i042-w1").await;
     assert!(
         w1.running_build == Some(drv_hash.to_string()),
         "w1's stale entry is still there (no completion processed yet)"
@@ -599,8 +524,7 @@ async fn test_completion_after_poison_frees_running_build() -> TestResult {
     )
     .await?;
 
-    let workers = handle.debug_query_workers().await?;
-    let w1 = workers.iter().find(|w| w.executor_id == "i042-w1").unwrap();
+    let w1 = expect_worker(&handle, "i042-w1").await;
     assert!(
         w1.running_build != Some(drv_hash.to_string()),
         "I-042: completion for already-terminal derivation must free \
@@ -629,11 +553,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_build_entry() -> TestRe
     let _evt = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Precondition: dispatched, slot occupied.
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "i042-hb-w")
-        .unwrap();
+    let w = expect_worker(&handle, "i042-hb-w").await;
     assert!(w.running_build == Some(drv_hash.to_string()));
 
     // Poison via PermanentFailure. The completion-side fix frees the
@@ -648,7 +568,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_build_entry() -> TestRe
         "poison",
     )
     .await?;
-    let info = handle.debug_query_derivation(drv_hash).await?.unwrap();
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.status, DerivationStatus::Poisoned);
 
     // Re-seed the leak: force_assign on a Poisoned drv fails the
@@ -659,11 +579,7 @@ async fn test_heartbeat_reconcile_drops_terminal_running_build_entry() -> TestRe
     // logic by checking the slot stays clear after a heartbeat (it
     // was already clear from the completion-side fix).
     send_heartbeat(&handle, "i042-hb-w", "x86_64-linux").await?;
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "i042-hb-w")
-        .unwrap();
+    let w = expect_worker(&handle, "i042-hb-w").await;
     assert!(
         w.running_build != Some(drv_hash.to_string()),
         "Poisoned derivation must not survive heartbeat reconcile in \
@@ -736,10 +652,7 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
     .await?;
 
     // Verify poisoned.
-    let pre = handle
-        .debug_query_derivation("poison-ttl-hash")
-        .await?
-        .expect("derivation exists");
+    let pre = expect_drv(&handle, "poison-ttl-hash").await;
     assert_eq!(pre.status, DerivationStatus::Poisoned);
 
     // Wait past the cfg(test) POISON_TTL (100ms). 3× margin for loaded
@@ -786,19 +699,11 @@ async fn test_three_running_disconnects_poisons() -> TestResult {
         // Disconnect mid-build. reassign_derivations: was_running=
         // true → record_failure_and_check_poison. For i<2: reset to
         // Ready + next worker gets it. For i==2: poison.
-        handle
-            .send_unchecked(ActorCommand::ExecutorDisconnected {
-                executor_id: executor_id.clone().into(),
-            })
-            .await?;
-        barrier(&handle).await;
+        disconnect(&handle, &executor_id).await?;
         drop(rx);
     }
 
-    let info = handle
-        .debug_query_derivation("x6-drv")
-        .await?
-        .expect("derivation exists");
+    let info = expect_drv(&handle, "x6-drv").await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
@@ -863,10 +768,7 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
         tick(&handle).await?;
         drop(rx);
 
-        let s = handle
-            .debug_query_derivation("ladder-213")
-            .await?
-            .expect("exists");
+        let s = expect_drv(&handle, "ladder-213").await;
         assert_eq!(
             s.sched.size_class_floor.as_deref(),
             Some(classes[i + 1]),
@@ -900,10 +802,7 @@ async fn test_classed_running_disconnects_exempt_from_poison_until_top() -> Test
         tick(&handle).await?;
         drop(rx);
     }
-    let s = handle
-        .debug_query_derivation("ladder-213")
-        .await?
-        .expect("exists");
+    let s = expect_drv(&handle, "ladder-213").await;
     assert_eq!(
         s.status,
         DerivationStatus::Poisoned,
@@ -931,19 +830,11 @@ async fn test_assigned_only_disconnects_do_not_poison() -> TestResult {
         assert!(assignment.drv_path.contains("x7-drv"));
 
         // Disconnect WITHOUT transitioning to Running.
-        handle
-            .send_unchecked(ActorCommand::ExecutorDisconnected {
-                executor_id: executor_id.clone().into(),
-            })
-            .await?;
-        barrier(&handle).await;
+        disconnect(&handle, &executor_id).await?;
         drop(rx);
     }
 
-    let info = handle
-        .debug_query_derivation("x7-drv")
-        .await?
-        .expect("derivation exists");
+    let info = expect_drv(&handle, "x7-drv").await;
     assert_eq!(
         info.status,
         DerivationStatus::Ready,
@@ -997,10 +888,7 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
     // Dispatch → Assigned. Do NOT send Running ack.
     let asgn = recv_assignment(&mut rx).await;
     assert!(asgn.drv_path.contains("oom-fod-173"));
-    let pre = handle
-        .debug_query_derivation("oom-fod-173")
-        .await?
-        .expect("exists");
+    let pre = expect_drv(&handle, "oom-fod-173").await;
     assert_eq!(
         pre.status,
         DerivationStatus::Assigned,
@@ -1008,18 +896,10 @@ async fn test_assigned_disconnect_promotes_fod_floor() -> TestResult {
     );
 
     // Fetcher OOMs → disconnect. Status was Assigned, not Running.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "f-tiny".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "f-tiny").await?;
     drop(rx);
 
-    let info = handle
-        .debug_query_derivation("oom-fod-173")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "oom-fod-173").await;
     assert_eq!(
         info.sched.size_class_floor.as_deref(),
         Some("small"),
@@ -1079,10 +959,7 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
     // Dispatch → Assigned. Do NOT send Running ack.
     let asgn = recv_assignment(&mut rx).await;
     assert!(asgn.drv_path.contains("oom-glibc-177"));
-    let pre = handle
-        .debug_query_derivation("oom-glibc-177")
-        .await?
-        .expect("exists");
+    let pre = expect_drv(&handle, "oom-glibc-177").await;
     assert_eq!(
         pre.status,
         DerivationStatus::Assigned,
@@ -1090,18 +967,10 @@ async fn test_assigned_disconnect_promotes_builder_floor() -> TestResult {
     );
 
     // Builder OOMs → disconnect. Status was Assigned, not Running.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "b-tiny".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "b-tiny").await?;
     drop(rx);
 
-    let info = handle
-        .debug_query_derivation("oom-glibc-177")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "oom-glibc-177").await;
     assert_eq!(
         info.sched.size_class_floor.as_deref(),
         Some("small"),
@@ -1167,18 +1036,10 @@ async fn test_ephemeral_disconnect_without_completion_promotes_floor() -> TestRe
     // still Assigned, NO CompletionReport sent (last_completed=None).
     // Status==Assigned is the production path (Running is only set at
     // completion via ensure_running()).
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "b-eph".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "b-eph").await?;
     drop(rx);
 
-    let info = handle
-        .debug_query_derivation("eph-glibc-188")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "eph-glibc-188").await;
     assert_eq!(
         info.sched.size_class_floor.as_deref(),
         Some("small"),
@@ -1267,11 +1128,7 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
     // Precondition: running_build re-populated. Without this the
     // disconnect's reassign loop is empty and the assertion below
     // passes trivially.
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "b-eph2")
-        .expect("b-eph2 still registered");
+    let w = expect_worker(&handle, "b-eph2").await;
     assert!(
         w.running_build.is_some(),
         "precondition: heartbeat reconcile re-populated running_build; \
@@ -1280,18 +1137,10 @@ async fn test_ephemeral_disconnect_after_completion_no_promote() -> TestResult {
 
     // Ephemeral exits → disconnect. running_build=Some(X),
     // last_completed=Some(X) → expected one-shot exit → NO promote.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "b-eph2".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "b-eph2").await?;
     drop(rx);
 
-    let info = handle
-        .debug_query_derivation("eph-race-188")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "eph-race-188").await;
     assert_eq!(
         info.sched.size_class_floor, None,
         "I-188: ephemeral disconnect AFTER CompletionReport for the \
@@ -1345,11 +1194,7 @@ async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult 
     barrier(&handle).await;
 
     // Builder is draining; child NOT assigned to it.
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "eph-1")
-        .expect("eph-1 exists");
+    let w = expect_worker(&handle, "eph-1").await;
     assert!(
         w.draining,
         "I-188: ephemeral executor must be draining after completion"
@@ -1359,10 +1204,7 @@ async fn test_ephemeral_completion_marks_draining_no_redispatch() -> TestResult 
         "I-188: ephemeral executor must not be re-assigned post-completion"
     );
 
-    let child_info = handle
-        .debug_query_derivation("eph-child")
-        .await?
-        .expect("child exists");
+    let child_info = expect_drv(&handle, "eph-child").await;
     assert_eq!(
         child_info.status,
         DerivationStatus::Ready,
@@ -1465,11 +1307,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     );
 
     // running_build adoption (pre-I-066 already did this).
-    let workers = handle.debug_query_workers().await?;
-    let w = workers
-        .iter()
-        .find(|w| w.executor_id == "hb-worker")
-        .expect("worker registered");
+    let w = expect_worker(&handle, "hb-worker").await;
     assert!(
         w.running_build == Some("hb-drv".to_string()),
         "worker's claim adopted into running_build"
@@ -1478,10 +1316,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
     // DAG-side adoption (the I-066 fix). Without it, the post-
     // heartbeat dispatch_ready would re-pop the still-Ready node and
     // send it to the next idle worker.
-    let info = handle
-        .debug_query_derivation("hb-drv")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "hb-drv").await;
     assert_eq!(info.status, DerivationStatus::Assigned);
     assert_eq!(info.assigned_executor.as_deref(), Some("hb-worker"));
     assert!(info.retry.failed_builders.is_empty());
@@ -1592,10 +1427,7 @@ async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
     // reassign_derivations resets to Ready (or Queued — depends on
     // whether another worker exists; here there's only one, which is
     // now draining, so it stays Ready with busy-worker in failed_builders).
-    let post = handle
-        .debug_query_derivation("drain-drv")
-        .await?
-        .expect("drv exists");
+    let post = expect_drv(&handle, "drain-drv").await;
     assert!(
         matches!(
             post.status,
@@ -1737,10 +1569,7 @@ async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
     // failed_builders now. Either Ready (excluded) or a fresh
     // Assigned (dispatch fired again). What matters is: NOT stuck
     // in Running.
-    let post = handle
-        .debug_query_derivation("bs-drv")
-        .await?
-        .expect("drv exists");
+    let post = expect_drv(&handle, "bs-drv").await;
     assert!(
         matches!(
             post.status,
@@ -2033,10 +1862,7 @@ async fn test_store_degraded_worker_excluded_from_dispatch() -> TestResult {
     let _ev = merge_single_node(&handle, build_id, "sd-drv", PriorityClass::Scheduled).await?;
     barrier(&handle).await;
 
-    let info = handle
-        .debug_query_derivation("sd-drv")
-        .await?
-        .expect("sd-drv exists");
+    let info = expect_drv(&handle, "sd-drv").await;
     assert_eq!(
         info.status,
         DerivationStatus::Ready,
@@ -2127,18 +1953,10 @@ async fn on_worker_registered_sends_initial_hint_before_assignment() -> TestResu
     // The bootstrap worker is now holding A's assignment (one slot,
     // freed by completing B above). Disconnect boot-w to reset A to
     // Ready for the real worker.
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "boot-w".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "boot-w").await?;
     drop(boot_rx);
 
-    let info_a = handle
-        .debug_query_derivation("warm-a")
-        .await?
-        .expect("warm-a exists");
+    let info_a = expect_drv(&handle, "warm-a").await;
     assert_eq!(
         info_a.status,
         DerivationStatus::Ready,
@@ -2260,12 +2078,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
     let mut boot_rx = connect_executor(&handle, "boot-f", "x86_64-linux").await?;
     let _ = recv_assignment(&mut boot_rx).await;
     complete_success_empty(&handle, "boot-f", &test_drv_path("fail-b")).await?;
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "boot-f".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "boot-f").await?;
     drop(boot_rx);
 
     // Connect with a 1-slot channel, IMMEDIATELY fill it so the

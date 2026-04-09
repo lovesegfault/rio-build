@@ -59,20 +59,14 @@ async fn test_recover_from_pg_rebuilds_dag() -> TestResult {
     // Queued (depends on child). Both should have the build in
     // interested_builds (verified via debug_query — actually that
     // doesn't expose interested_builds, so check via status only).
-    let child = handle
-        .debug_query_derivation("recover-child")
-        .await?
-        .expect("child should be recovered");
+    let child = expect_drv(&handle, "recover-child").await;
     assert_eq!(
         child.status,
         DerivationStatus::Ready,
         "child (no deps) should be Ready after recovery"
     );
 
-    let parent = handle
-        .debug_query_derivation("recover-parent")
-        .await?
-        .expect("parent should be recovered");
+    let parent = expect_drv(&handle, "recover-parent").await;
     // Parent depends on child → not yet Ready. Could be Queued or
     // Created depending on compute_initial_states. Either is fine
     // — what matters is it's in the DAG and not terminal.
@@ -183,10 +177,7 @@ async fn test_recovery_skips_orphan_transitions() -> TestResult {
     // interested_builds. That's a separate concern — I-059 scopes
     // to the I-058 transition pass. This assertion documents the
     // boundary, not a guarantee.
-    let child = handle
-        .debug_query_derivation("orphan-child")
-        .await?
-        .expect("orphan child should be in DAG");
+    let child = expect_drv(&handle, "orphan-child").await;
     assert_eq!(
         child.status,
         DerivationStatus::Ready,
@@ -505,10 +496,7 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
     barrier(&handle).await;
 
     // Verify recovery found the Assigned drv.
-    let pre = handle
-        .debug_query_derivation("orphan-drv")
-        .await?
-        .expect("drv should be recovered");
+    let pre = expect_drv(&handle, "orphan-drv").await;
     assert_eq!(
         pre.status,
         DerivationStatus::Assigned,
@@ -524,10 +512,7 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
     barrier(&handle).await;
 
     // Drv should be Completed.
-    let post = handle
-        .debug_query_derivation("orphan-drv")
-        .await?
-        .expect("drv should still exist");
+    let post = expect_drv(&handle, "orphan-drv").await;
     assert_eq!(
         post.status,
         DerivationStatus::Completed,
@@ -632,10 +617,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
     barrier(&handle).await;
 
     // Drv should be Completed.
-    let post = handle
-        .debug_query_derivation("y2-drv")
-        .await?
-        .expect("drv exists");
+    let post = expect_drv(&handle, "y2-drv").await;
     assert_eq!(post.status, DerivationStatus::Completed);
 
     // Pin should be GONE. Without the unpin in the orphan-
@@ -713,10 +695,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
 
     // Verify: drv is Assigned, worker is in self.executors, but
     // running_build does NOT contain the drv (phantom!).
-    let pre = handle
-        .debug_query_derivation("phantom-drv")
-        .await?
-        .expect("drv recovered");
+    let pre = expect_drv(&handle, "phantom-drv").await;
     assert_eq!(
         pre.status,
         DerivationStatus::Assigned,
@@ -735,10 +714,7 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     // Without the running_build cross-check, it would stay Assigned
     // forever — worker present meant "leave it, completion will
     // arrive", but the worker never had it so no completion comes.
-    let post = handle
-        .debug_query_derivation("phantom-drv")
-        .await?
-        .expect("drv exists");
+    let post = expect_drv(&handle, "phantom-drv").await;
     assert!(
         matches!(
             post.status,
@@ -999,10 +975,7 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
     barrier(&handle).await;
 
     // Pre-reconcile: drv should be Assigned (recovered from PG).
-    let pre = handle
-        .debug_query_derivation("z4-drv")
-        .await?
-        .expect("drv recovered");
+    let pre = expect_drv(&handle, "z4-drv").await;
     assert_eq!(pre.status, DerivationStatus::Assigned);
 
     // ReconcileAssignments → worker not in self.executors → store
@@ -1021,10 +994,7 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
 
     // Drv should be Ready (NOT Completed — store couldn't verify
     // outputs) and retry_count bumped.
-    let post = handle
-        .debug_query_derivation("z4-drv")
-        .await?
-        .expect("drv exists");
+    let post = expect_drv(&handle, "z4-drv").await;
     assert_eq!(
         post.status,
         DerivationStatus::Ready,
@@ -1097,10 +1067,7 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
     barrier(&handle).await;
 
     // After recovery: derivation is back in the DAG with Poisoned status.
-    let post = handle
-        .debug_query_derivation("poison-rec")
-        .await?
-        .expect("poisoned drv should be recovered for TTL tracking");
+    let post = expect_drv(&handle, "poison-rec").await;
     assert_eq!(
         post.status,
         DerivationStatus::Poisoned,
@@ -1238,10 +1205,7 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
     barrier(&handle).await;
 
     // Precondition: recovery loaded the poisoned node.
-    let recovered = handle
-        .debug_query_derivation("zombie-drv")
-        .await?
-        .expect("poisoned drv recovered from PG");
+    let recovered = expect_drv(&handle, "zombie-drv").await;
     assert_eq!(recovered.status, DerivationStatus::Poisoned);
 
     // ClearPoison → node REMOVED (not reset-in-place).
@@ -1273,10 +1237,7 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
     assert_eq!(assignment.drv_path, test_drv_path("zombie-drv"));
 
     // And status progressed past Created.
-    let post_merge = handle
-        .debug_query_derivation("zombie-drv")
-        .await?
-        .expect("freshly inserted");
+    let post_merge = expect_drv(&handle, "zombie-drv").await;
     assert_ne!(
         post_merge.status,
         DerivationStatus::Created,

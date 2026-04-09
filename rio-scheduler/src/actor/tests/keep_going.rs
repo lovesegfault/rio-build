@@ -137,14 +137,8 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
     .await?;
 
     // Sanity: C is the only Ready/Assigned derivation; A and B are Queued.
-    let info_a = handle
-        .debug_query_derivation("cascadeA")
-        .await?
-        .expect("exists");
-    let info_b = handle
-        .debug_query_derivation("cascadeB")
-        .await?
-        .expect("exists");
+    let info_a = expect_drv(&handle, "cascadeA").await;
+    let info_b = expect_drv(&handle, "cascadeB").await;
     assert_eq!(info_a.status, DerivationStatus::Queued);
     assert_eq!(info_b.status, DerivationStatus::Queued);
 
@@ -159,19 +153,13 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
     .await?;
 
     // B and A should now be DependencyFailed (cascaded transitively).
-    let info_b = handle
-        .debug_query_derivation("cascadeB")
-        .await?
-        .expect("exists");
+    let info_b = expect_drv(&handle, "cascadeB").await;
     assert_eq!(
         info_b.status,
         DerivationStatus::DependencyFailed,
         "immediate parent B should be DependencyFailed after C poisoned"
     );
-    let info_a = handle
-        .debug_query_derivation("cascadeA")
-        .await?
-        .expect("exists");
+    let info_a = expect_drv(&handle, "cascadeA").await;
     assert_eq!(
         info_a.status,
         DerivationStatus::DependencyFailed,
@@ -216,10 +204,7 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
     .await?;
 
     // Verify preleaf is Poisoned.
-    let leaf = handle
-        .debug_query_derivation("preleaf")
-        .await?
-        .expect("exists");
+    let leaf = expect_drv(&handle, "preleaf").await;
     assert_eq!(leaf.status, DerivationStatus::Poisoned);
     // I-169: Poisoned now resets on resubmit when retry_count < limit.
     // This test exercises the dep-STILL-poisoned fail-fast path, so pin
@@ -243,10 +228,7 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
     .await?;
 
     // preparent must be DependencyFailed (not stuck Queued).
-    let parent = handle
-        .debug_query_derivation("preparent")
-        .await?
-        .expect("exists");
+    let parent = expect_drv(&handle, "preparent").await;
     assert_eq!(
         parent.status,
         DerivationStatus::DependencyFailed,
@@ -288,10 +270,7 @@ async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
     )
     .await?;
 
-    let pre = handle
-        .debug_query_derivation("resub-poison")
-        .await?
-        .expect("exists");
+    let pre = expect_drv(&handle, "resub-poison").await;
     assert_eq!(pre.status, DerivationStatus::Poisoned);
     // I-169: Poisoned now resets on resubmit when retry_count < limit.
     // This test exercises the at-limit fail-fast path; the under-limit

@@ -60,11 +60,7 @@ async fn setup_ca_fixture_does_not_race_past_ca_compare() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-race-guard")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-race-guard").await;
     assert_eq!(info.status, DerivationStatus::Completed);
 
     // The realisation seeded AFTER setup DID take effect: prior
@@ -121,11 +117,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let miss_key = "rio_scheduler_ca_hash_compares_total{outcome=miss}";
 
     // ─── Scenario 1: CA + prior realisation → unchanged=true ───────
-    let pre = f
-        .actor
-        .debug_query_derivation("ca-match")
-        .await?
-        .expect("exists");
+    let pre = expect_drv(&f.actor, "ca-match").await;
     assert!(pre.ca.is_ca, "precondition: merged with is_ca=true");
     assert!(!pre.ca.output_unchanged, "default false before completion");
 
@@ -138,11 +130,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-match")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-match").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         info.ca.output_unchanged,
@@ -187,11 +175,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-mixed")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-mixed").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca.output_unchanged,
@@ -230,11 +214,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ia-skip")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ia-skip").await;
     assert!(!info.ca.is_ca);
     assert!(
         !info.ca.output_unchanged,
@@ -300,11 +280,7 @@ async fn ca_compare_first_build_excludes_own_upload() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-first")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-first").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca.output_unchanged,
@@ -401,11 +377,7 @@ async fn ca_compare_zero_outputs_is_not_unchanged() -> TestResult {
     // (where N=0)" → true.
     complete_ca(&f.actor, &f.executor_id, &f.drv_path, &[]).await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-zero")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-zero").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca.output_unchanged,
@@ -438,11 +410,7 @@ async fn ca_compare_empty_path_counts_as_miss() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-empty")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-empty").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca.output_unchanged,
@@ -479,11 +447,7 @@ async fn ca_compare_no_prior_counts_as_miss() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-noprior")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-noprior").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca.output_unchanged,
@@ -566,19 +530,11 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
 
     // Preconditions: B and C Queued.
     assert_eq!(
-        handle
-            .debug_query_derivation("verify-b")
-            .await?
-            .unwrap()
-            .status,
+        expect_drv(&handle, "verify-b").await.status,
         DerivationStatus::Queued
     );
     assert_eq!(
-        handle
-            .debug_query_derivation("verify-c")
-            .await?
-            .unwrap()
-            .status,
+        expect_drv(&handle, "verify-c").await.status,
         DerivationStatus::Queued
     );
 
@@ -612,10 +568,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    let info_a = handle
-        .debug_query_derivation("verify-a")
-        .await?
-        .expect("verify-a exists");
+    let info_a = expect_drv(&handle, "verify-a").await;
     assert!(
         info_a.ca.output_unchanged,
         "precondition: A matched prior realisation → ca_output_unchanged=true"
@@ -623,10 +576,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
 
     // B: Skipped (realisation_deps walk found b_prior, output
     // present in store → verified). Also stamped with output_paths.
-    let info_b = handle
-        .debug_query_derivation("verify-b")
-        .await?
-        .expect("verify-b exists");
+    let info_b = expect_drv(&handle, "verify-b").await;
     assert_eq!(
         info_b.status,
         DerivationStatus::Skipped,
@@ -635,10 +585,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
 
     // C: NOT Skipped (no prior C in realisation_deps → walk didn't
     // find it → verify rejects). Mutation `|_| true` would Skip C.
-    let info_c = handle
-        .debug_query_derivation("verify-c")
-        .await?
-        .expect("verify-c exists");
+    let info_c = expect_drv(&handle, "verify-c").await;
     assert_ne!(
         info_c.status,
         DerivationStatus::Skipped,
@@ -689,11 +636,7 @@ async fn ca_compare_second_build_matches_prior() -> TestResult {
     )
     .await?;
 
-    let info = f
-        .actor
-        .debug_query_derivation("ca-second")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&f.actor, "ca-second").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         info.ca.output_unchanged,
@@ -752,10 +695,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
     )
     .await?;
 
-    let info = handle
-        .debug_query_derivation("ca-shortcircuit")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "ca-shortcircuit").await;
     assert_eq!(info.status, DerivationStatus::Completed);
     assert!(
         !info.ca.output_unchanged,
@@ -795,10 +735,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
         merge_single_node(&handle, build_id, "retry-hash", PriorityClass::Scheduled).await?;
 
     // Get initial worker assignment
-    let info1 = handle
-        .debug_query_derivation("retry-hash")
-        .await?
-        .expect("exists");
+    let info1 = expect_drv(&handle, "retry-hash").await;
     let first_worker = info1
         .assigned_executor
         .clone()
@@ -819,10 +756,7 @@ async fn test_transient_retry_different_worker() -> TestResult {
     // the derivation stays Ready (not immediately re-dispatched).
     // failed_builders contains first_worker so when backoff elapses,
     // retry goes to the OTHER worker.
-    let info2 = handle
-        .debug_query_derivation("retry-hash")
-        .await?
-        .expect("exists");
+    let info2 = expect_drv(&handle, "retry-hash").await;
     assert_eq!(
         info2.retry.count, 1,
         "transient failure should increment retry_count"
@@ -902,10 +836,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
         .await?;
     }
 
-    let info = handle
-        .debug_query_derivation("maxretry-hash")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "maxretry-hash").await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
@@ -975,10 +906,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
             "simulated OOM",
         )
         .await?;
-        let s = handle
-            .debug_query_derivation("ladder-drv")
-            .await?
-            .expect("exists");
+        let s = expect_drv(&handle, "ladder-drv").await;
         assert_eq!(
             s.sched.size_class_floor.as_deref(),
             Some(classes[i + 1]),
@@ -1005,10 +933,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
         )
         .await?;
     }
-    let s = handle
-        .debug_query_derivation("ladder-drv")
-        .await?
-        .expect("exists");
+    let s = expect_drv(&handle, "ladder-drv").await;
     assert_eq!(
         s.status,
         DerivationStatus::Poisoned,
@@ -1056,10 +981,7 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
         .await?;
     }
 
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
@@ -1122,10 +1044,7 @@ async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
         .await?;
     }
 
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
@@ -1188,10 +1107,7 @@ async fn test_fleet_exhaustion_is_kind_aware() -> TestResult {
         .await?;
     }
 
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
@@ -1246,10 +1162,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
         .await?;
     }
 
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     // Exit criterion: 3× InfrastructureFailure → failed_builders.is_empty()
     assert!(
         info.retry.failed_builders.is_empty(),
@@ -1288,10 +1201,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     )
     .await?;
 
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.retry.failed_builders.len(),
         1,
@@ -1379,10 +1289,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     )
     .await?;
 
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.sched.size_class_floor.as_deref(),
         Some("small"),
@@ -1425,10 +1332,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "build exceeded daemon_timeout_secs",
     )
     .await?;
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.sched.size_class_floor.as_deref(), Some("medium"));
     assert!(
         matches!(
@@ -1454,10 +1358,7 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
         "build exceeded daemon_timeout_secs",
     )
     .await?;
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Cancelled,
@@ -1517,10 +1418,7 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
     // After 10 failures: infra_retry_count=10 but the drv is still
     // alive (cap check is >=, checked BEFORE increment — 9 < 10 on
     // the 10th entry, increment to 10, return Ready).
-    let before = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let before = expect_drv(&handle, drv_hash).await;
     assert!(
         matches!(
             before.status,
@@ -1544,10 +1442,7 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
     )
     .await?;
 
-    let after = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let after = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         after.status,
         DerivationStatus::Poisoned,
@@ -1596,10 +1491,7 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
         .await?;
     }
 
-    let after = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let after = expect_drv(&handle, drv_hash).await;
     assert!(
         matches!(
             after.status,
@@ -1628,10 +1520,7 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
         "FUSE EIO",
     )
     .await?;
-    let after2 = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let after2 = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         after2.retry.infra_count, 1,
         "non-exempt infra failure after exempt ones → counter increments normally"
@@ -1694,10 +1583,7 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
         )
         .await?;
 
-        let info = handle
-            .debug_query_derivation(drv_hash)
-            .await?
-            .expect("exists");
+        let info = expect_drv(&handle, drv_hash).await;
         // failed_builders (HashSet) stays at 1 — same worker every time.
         assert_eq!(
             info.retry.failed_builders.len(),
@@ -1714,10 +1600,7 @@ async fn test_non_distinct_mode_counts_same_worker() -> TestResult {
 
     // Exit criterion: 3× same-worker TransientFailure under
     // require_distinct_workers=false → POISONED.
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
@@ -1774,10 +1657,7 @@ async fn test_distinct_mode_same_worker_does_not_poison_via_threshold() -> TestR
         .await?;
     }
 
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.retry.failed_builders.len(),
         1,
@@ -1814,10 +1694,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     .await?;
 
     // B is dispatched first (leaf). A is Queued waiting for B.
-    let info_a = handle
-        .debug_query_derivation("chainA")
-        .await?
-        .expect("exists");
+    let info_a = expect_drv(&handle, "chainA").await;
     assert_eq!(info_a.status, DerivationStatus::Queued);
 
     // Worker receives B's assignment.
@@ -1829,10 +1706,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     let mut stream_rx = connect_executor(&handle, "chain-worker-2", "x86_64-linux").await?;
 
     // A should now transition Queued -> Ready -> Assigned (dispatched).
-    let info_a = handle
-        .debug_query_derivation("chainA")
-        .await?
-        .expect("exists");
+    let info_a = expect_drv(&handle, "chainA").await;
     assert!(
         matches!(
             info_a.status,
@@ -1952,10 +1826,7 @@ async fn test_completion_for_non_running_state_ignored() -> TestResult {
     );
 
     // Drv still Ready (completion ignored).
-    let info = handle
-        .debug_query_derivation("ready-drv")
-        .await?
-        .expect("drv exists");
+    let info = expect_drv(&handle, "ready-drv").await;
     assert!(
         !matches!(info.status, DerivationStatus::Completed),
         "completion from wrong state should be ignored, status={:?}",
@@ -2043,10 +1914,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
     barrier(&handle).await;
 
     // Drv still Cancelled (no spurious state change).
-    let info = handle
-        .debug_query_derivation("cancel-drv")
-        .await?
-        .expect("drv exists");
+    let info = expect_drv(&handle, "cancel-drv").await;
     assert_eq!(info.status, DerivationStatus::Cancelled);
 
     // Cancelled has its own early-return (debug, not warn). The

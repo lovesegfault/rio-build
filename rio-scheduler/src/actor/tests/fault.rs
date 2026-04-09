@@ -54,10 +54,7 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
         .await?;
 
     // In-memory state should have transitioned despite all DB write failures.
-    let post = handle
-        .debug_query_derivation("fault-hash")
-        .await?
-        .expect("exists");
+    let post = expect_drv(&handle, "fault-hash").await;
     assert_eq!(post.status, DerivationStatus::Completed);
 
     // The three DB-error branches should all have logged.
@@ -138,10 +135,7 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
     .await?;
 
     // A should be Ready in-memory (transition succeeds); DB write logged.
-    let a = handle
-        .debug_query_derivation("nrA")
-        .await?
-        .expect("nrA exists");
+    let a = expect_drv(&handle, "nrA").await;
     // A may have been dispatched immediately (Ready → Assigned). Either is fine.
     assert!(
         matches!(

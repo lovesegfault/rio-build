@@ -99,10 +99,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
     // to Ready. The bug is that Running -> Ready is invalid.
 
     // Check current status: should be Assigned
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(info.status, DerivationStatus::Assigned);
     assert_eq!(info.retry.count, 0);
 
@@ -117,10 +114,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
     // NOT be incremented — the drv was only Assigned (never Running),
     // so the worker disconnected before starting it. No retry budget
     // consumed. Only was-Running disconnects count as attempts.
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should still exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         info.status,
         DerivationStatus::Ready,
@@ -173,10 +167,7 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
     // backoff for infra failures). Key wiring assertion: failed_builders
     // is EMPTY — proving the match arm routed to the infra handler,
     // not the transient handler (which would have inserted test-worker).
-    let info = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, drv_hash).await;
     assert!(
         info.retry.failed_builders.is_empty(),
         "InfrastructureFailure must route to handle_infrastructure_failure \

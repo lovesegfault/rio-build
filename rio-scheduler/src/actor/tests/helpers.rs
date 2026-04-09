@@ -741,6 +741,160 @@ pub(crate) async fn complete_failure(
     Ok(())
 }
 
+/// Query a derivation by hash and unwrap the `Some`. Replaces the 136×
+/// open-coded `handle.debug_query_derivation(k).await?.expect("exists")`.
+/// Panics with the hash on missing — better than a bare "exists".
+pub(crate) async fn expect_drv(handle: &ActorHandle, hash: &str) -> DebugDerivationInfo {
+    handle
+        .debug_query_derivation(hash)
+        .await
+        .expect("actor alive")
+        .unwrap_or_else(|| panic!("derivation {hash:?} should exist in DAG"))
+}
+
+/// Query workers and find one by id. Replaces the 29×
+/// `debug_query_workers().await?; ...iter().find(|w| w.executor_id == id).expect(...)`.
+pub(crate) async fn expect_worker(handle: &ActorHandle, id: &str) -> DebugExecutorInfo {
+    handle
+        .debug_query_workers()
+        .await
+        .expect("actor alive")
+        .into_iter()
+        .find(|w| w.executor_id == id)
+        .unwrap_or_else(|| panic!("executor {id:?} should be registered"))
+}
+
+/// Send `ExecutorDisconnected` and barrier. Replaces the ~40×
+/// open-coded `send_unchecked(ExecutorDisconnected{...}) + barrier()`.
+pub(crate) async fn disconnect(handle: &ActorHandle, id: &str) -> anyhow::Result<()> {
+    handle
+        .send_unchecked(ActorCommand::ExecutorDisconnected {
+            executor_id: id.into(),
+        })
+        .await?;
+    barrier(handle).await;
+    Ok(())
+}
+
+/// Build a `Vec<SizeClassConfig>` from `(name, cutoff_secs)` pairs with
+/// unbounded mem/cpu. Replaces the 25× inline 6-line struct literals
+/// scattered across `misc.rs`/`completion.rs`/`executor.rs`.
+pub(crate) fn size_classes(pairs: &[(&str, f64)]) -> Vec<crate::assignment::SizeClassConfig> {
+    pairs
+        .iter()
+        .map(|(n, c)| crate::assignment::SizeClassConfig {
+            name: (*n).into(),
+            cutoff_secs: *c,
+            mem_limit_bytes: u64::MAX,
+            cpu_limit_cores: None,
+        })
+        .collect()
+}
+
+/// Bootstrap PG + actor configured with builder size_classes from
+/// `(name, cutoff)` pairs. Absorbs the `TestDb::new` +
+/// `setup_actor_configured(|c,_| c.size_classes = vec![...])` preamble
+/// repeated across size-class routing / promote-on-fail tests.
+pub(crate) async fn setup_with_classes(
+    pairs: &[(&str, f64)],
+) -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>) {
+    let db = TestDb::new(&MIGRATOR).await;
+    let classes = size_classes(pairs);
+    let (handle, task) =
+        setup_actor_configured(db.pool.clone(), None, |c, _| c.size_classes = classes);
+    (db, handle, task)
+}
+
+/// Bare (unspawned) actor with builder size_classes. For snapshot tests
+/// that exercise `compute_size_class_snapshot` / `compute_capacity_manifest`
+/// directly via `&self`. Replaces 8× `bare_actor_cfg(pool,
+/// DagActorConfig{ size_classes: vec![...20 lines...], ..Default })`.
+pub(crate) fn bare_actor_classed(pool: sqlx::PgPool, pairs: &[(&str, f64)]) -> DagActor {
+    bare_actor_cfg(
+        pool,
+        DagActorConfig {
+            size_classes: size_classes(pairs),
+            ..Default::default()
+        },
+    )
+}
+
+/// Recovery test fixture. Absorbs the 19× phase-1/phase-2 boilerplate
+/// in `recovery.rs`: `TestDb::new` → spawn first actor → seed via
+/// closure → `drop(handle)` + join → spawn fresh actor →
+/// `LeaderAcquired` + barrier.
+///
+/// Phase-1 closure receives `(handle, pool)` and runs whatever
+/// merge/backdate the test needs. Phase-2 spawns a fresh actor on the
+/// same PG (with optional store client) and sends `LeaderAcquired`.
+pub(crate) struct RecoveryFixture {
+    pub db: TestDb,
+    pub handle: ActorHandle,
+    pub _task: tokio::task::JoinHandle<()>,
+}
+
+impl RecoveryFixture {
+    /// Full recovery cycle: run `seed` against a phase-1 actor, drop it,
+    /// spawn a fresh phase-2 actor, send `LeaderAcquired`, barrier.
+    pub(crate) async fn run<F, Fut>(seed: F) -> anyhow::Result<Self>
+    where
+        F: FnOnce(ActorHandle, sqlx::PgPool) -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        Self::run_with_store(None, seed).await
+    }
+
+    /// [`Self::run`] with an optional store client for the phase-2 actor
+    /// (orphan-completion / reconcile tests need a store for the
+    /// FindMissingPaths check).
+    pub(crate) async fn run_with_store<F, Fut>(
+        store: Option<StoreServiceClient<Channel>>,
+        seed: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce(ActorHandle, sqlx::PgPool) -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        let db = TestDb::new(&MIGRATOR).await;
+        // Phase 1: first "leader" writes state.
+        {
+            let (handle, task) = setup_actor(db.pool.clone());
+            seed(handle, db.pool.clone()).await?;
+            // handle dropped at end of seed's scope (moved in); join
+            // the task so PG writes are flushed.
+            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        }
+        // Phase 2: fresh actor recovers.
+        let (handle, task) = setup_actor_with_store(db.pool.clone(), store);
+        handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+        barrier(&handle).await;
+        Ok(Self {
+            db,
+            handle,
+            _task: task,
+        })
+    }
+}
+
+/// Phase-1 helper for [`RecoveryFixture`]: poison `drv_hash` via a
+/// PermanentFailure completion. Three recovery tests share this exact
+/// 10-line sequence.
+pub(crate) async fn seed_poisoned(handle: &ActorHandle, drv_hash: &str) -> anyhow::Result<()> {
+    let mut rx = connect_executor(handle, "seed-poison-w", "x86_64-linux").await?;
+    let _ev = merge_single_node(handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
+    let _ = rx.recv().await.expect("assignment");
+    complete_failure(
+        handle,
+        "seed-poison-w",
+        &test_drv_path(drv_hash),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "permanent",
+    )
+    .await?;
+    barrier(handle).await;
+    Ok(())
+}
+
 /// Awaits actor quiescence by round-tripping a no-op query.
 ///
 /// Unlike the old `settle()` (sleep-based), this is a **true barrier**:

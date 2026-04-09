@@ -87,6 +87,11 @@ tokio = { workspace = true, features = ["test-util"] }
 rio-store = { workspace = true, features = ["test-utils"] }
 rio-test-support = { workspace = true }
 tracing-test = { workspace = true }
+# parameterized test tables — collapses ~60 hand-rolled test clusters
+# (poison/ca-compare/size-class/cache-hit matrices) in actor/tests/.
+# default-features off: we don't need the `async-timeout` feature
+# (tokio::test handles that), saving the futures-timer dep.
+rstest = { workspace = true }
 aws-smithy-mocks = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 # grpc/tests.rs trace_id header test: needs the tracing→OTel bridge so

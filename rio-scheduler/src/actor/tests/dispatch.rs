@@ -94,10 +94,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
 
     // The derivation should record that it was assigned to "large"
     // (for misclassification detection at completion).
-    let state = handle
-        .debug_query_derivation("bigthing-hash")
-        .await?
-        .expect("exists");
+    let state = expect_drv(&handle, "bigthing-hash").await;
     assert_eq!(
         state.sched.assigned_size_class.as_deref(),
         Some("large"),
@@ -140,10 +137,7 @@ async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
     );
 
     // aarch64 derivation should still be Ready (not stuck, not dispatched).
-    let arm_info = handle
-        .debug_query_derivation("arm-hash")
-        .await?
-        .expect("exists");
+    let arm_info = expect_drv(&handle, "arm-hash").await;
     assert_eq!(
         arm_info.status,
         DerivationStatus::Ready,
@@ -1274,10 +1268,7 @@ async fn fod_size_class_floor_skips_smaller_fetchers() -> TestResult {
     .await?;
     tick(&handle).await?;
 
-    let state = handle
-        .debug_query_derivation("oom-fod")
-        .await?
-        .expect("exists");
+    let state = expect_drv(&handle, "oom-fod").await;
     assert_eq!(
         state.sched.size_class_floor.as_deref(),
         Some("small"),
@@ -1356,10 +1347,7 @@ async fn fod_dispatch_unclassed_when_feature_off() -> TestResult {
 
     let asgn = recv_assignment(&mut rx).await;
     assert!(asgn.drv_path.contains("plain-fod"));
-    let state = handle
-        .debug_query_derivation("plain-fod")
-        .await?
-        .expect("exists");
+    let state = expect_drv(&handle, "plain-fod").await;
     assert_eq!(
         state.sched.size_class_floor, None,
         "feature off: floor stays None"
@@ -1436,10 +1424,7 @@ async fn builder_size_class_floor_skips_smaller() -> TestResult {
     .await?;
     tick(&handle).await?;
 
-    let state = handle
-        .debug_query_derivation("glibc-177")
-        .await?
-        .expect("exists");
+    let state = expect_drv(&handle, "glibc-177").await;
     assert_eq!(
         state.sched.size_class_floor.as_deref(),
         Some("small"),

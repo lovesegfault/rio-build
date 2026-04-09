@@ -21488,6 +21488,10 @@
           "packageId": "rio-test-support"
         },
         {
+          "name": "rstest",
+          "packageId": "rstest"
+        },
+        {
           "name": "tokio",
           "packageId": "tokio"
         },

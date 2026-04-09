@@ -1249,10 +1249,7 @@ async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
     let build1 = Uuid::new_v4();
     merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
     barrier(&handle).await;
-    let info = handle
-        .debug_query_derivation("reprobe-ready")
-        .await?
-        .expect("node A in DAG");
+    let info = expect_drv(&handle, "reprobe-ready").await;
     assert_eq!(
         info.status,
         DerivationStatus::Ready,
@@ -1272,10 +1269,7 @@ async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
     merge_dag(&handle, build2, vec![node], vec![], false).await?;
     barrier(&handle).await;
 
-    let info = handle
-        .debug_query_derivation("reprobe-ready")
-        .await?
-        .expect("node A still in DAG");
+    let info = expect_drv(&handle, "reprobe-ready").await;
     assert_eq!(
         info.status,
         DerivationStatus::Completed,
@@ -1320,10 +1314,7 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    let info = handle
-        .debug_query_derivation("reprobe-poison")
-        .await?
-        .expect("node in DAG");
+    let info = expect_drv(&handle, "reprobe-poison").await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
@@ -1349,10 +1340,7 @@ async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
     merge_dag(&handle, build2, vec![node], vec![], false).await?;
     barrier(&handle).await;
 
-    let info = handle
-        .debug_query_derivation("reprobe-poison")
-        .await?
-        .expect("node still in DAG");
+    let info = expect_drv(&handle, "reprobe-poison").await;
     assert_eq!(
         info.status,
         DerivationStatus::Completed,
@@ -1392,10 +1380,7 @@ async fn test_resubmit_resets_poisoned_under_retry_limit() -> TestResult {
     merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
     assert!(handle.debug_force_poisoned("i169-under", 2).await?);
     barrier(&handle).await;
-    let info = handle
-        .debug_query_derivation("i169-under")
-        .await?
-        .expect("node in DAG");
+    let info = expect_drv(&handle, "i169-under").await;
     assert_eq!(info.status, DerivationStatus::Poisoned, "precondition");
     assert_eq!(info.retry.count, 2, "precondition");
 
@@ -1406,10 +1391,7 @@ async fn test_resubmit_resets_poisoned_under_retry_limit() -> TestResult {
     merge_dag(&handle, build2, vec![node], vec![], false).await?;
     barrier(&handle).await;
 
-    let info = handle
-        .debug_query_derivation("i169-under")
-        .await?
-        .expect("node still in DAG");
+    let info = expect_drv(&handle, "i169-under").await;
     assert_eq!(
         info.status,
         DerivationStatus::Ready,
@@ -1455,10 +1437,7 @@ async fn test_resubmit_fail_fasts_poisoned_at_retry_limit() -> TestResult {
     merge_dag(&handle, build2, vec![node], vec![], false).await?;
     barrier(&handle).await;
 
-    let info = handle
-        .debug_query_derivation("i169-at-limit")
-        .await?
-        .expect("node still in DAG");
+    let info = expect_drv(&handle, "i169-at-limit").await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,

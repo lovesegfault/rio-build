@@ -49,10 +49,7 @@ async fn test_scheduler_cache_check_skips_build() -> TestResult {
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
     // Derivation should have gone Created → Completed (scheduler cache hit).
-    let info = handle
-        .debug_query_derivation("cached-hash")
-        .await?
-        .expect("derivation should exist in DAG");
+    let info = expect_drv(&handle, "cached-hash").await;
     assert_eq!(
         info.status,
         DerivationStatus::Completed,
@@ -88,10 +85,7 @@ async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
     // Without store client, derivation should proceed normally to dispatch.
-    let info = handle
-        .debug_query_derivation("uncached-hash")
-        .await?
-        .expect("derivation should exist");
+    let info = expect_drv(&handle, "uncached-hash").await;
     assert!(
         matches!(
             info.status,
@@ -121,10 +115,7 @@ async fn test_db_failure_during_completion_logged() -> TestResult {
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Sanity check: derivation was dispatched.
-    let pre = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should exist");
+    let pre = expect_drv(&handle, drv_hash).await;
     assert_eq!(pre.status, DerivationStatus::Assigned);
 
     // Close the DB pool — subsequent DB writes will fail.
@@ -141,10 +132,7 @@ async fn test_db_failure_during_completion_logged() -> TestResult {
     .await?;
 
     // In-memory state should have transitioned despite DB failure.
-    let post = handle
-        .debug_query_derivation(drv_hash)
-        .await?
-        .expect("derivation should still exist");
+    let post = expect_drv(&handle, drv_hash).await;
     assert_eq!(
         post.status,
         DerivationStatus::Completed,
@@ -324,11 +312,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
 
     // Worker should have ZERO running builds — the failed send must
     // have cleaned up running_build, not leaked the phantom entry.
-    let workers = handle.debug_query_workers().await?;
-    let worker = workers
-        .iter()
-        .find(|w| w.executor_id == "tight-worker")
-        .expect("tight-worker registered");
+    let worker = expect_worker(&handle, "tight-worker").await;
     assert!(
         worker.running_build.is_none(),
         "failed try_send must clean up running_build; got {:?}",
@@ -336,10 +320,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
     );
 
     // The derivation should be back in Ready (not stuck Assigned).
-    let unsent = handle
-        .debug_query_derivation("drvA")
-        .await?
-        .expect("exists");
+    let unsent = expect_drv(&handle, "drvA").await;
     assert_eq!(
         unsent.status,
         DerivationStatus::Ready,

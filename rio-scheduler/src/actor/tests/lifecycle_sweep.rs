@@ -41,10 +41,7 @@ async fn test_stale_completion_dropped() -> TestResult {
     assert!(asgn_b.drv_path.contains("stale-drv"));
 
     // Precondition: assigned to B.
-    let pre = handle
-        .debug_query_derivation("stale-drv")
-        .await?
-        .expect("exists");
+    let pre = expect_drv(&handle, "stale-drv").await;
     assert_eq!(pre.assigned_executor.as_deref(), Some("stale-b"));
 
     // Send STALE completion from A (no longer owns the derivation).
@@ -52,10 +49,7 @@ async fn test_stale_completion_dropped() -> TestResult {
     // report while B is still running it). After: dropped.
     complete_success_empty(&handle, "stale-a", &test_drv_path("stale-drv")).await?;
 
-    let post = handle
-        .debug_query_derivation("stale-drv")
-        .await?
-        .expect("exists");
+    let post = expect_drv(&handle, "stale-drv").await;
     assert_eq!(
         post.assigned_executor.as_deref(),
         Some("stale-b"),
@@ -72,10 +66,7 @@ async fn test_stale_completion_dropped() -> TestResult {
 
     // B's completion still works normally.
     complete_success_empty(&handle, "stale-b", &test_drv_path("stale-drv")).await?;
-    let done = handle
-        .debug_query_derivation("stale-drv")
-        .await?
-        .expect("exists");
+    let done = expect_drv(&handle, "stale-drv").await;
     assert_eq!(done.status, DerivationStatus::Completed);
 
     Ok(())
@@ -99,26 +90,15 @@ async fn test_assigned_only_no_retry_bump() -> TestResult {
     let _asgn = recv_assignment(&mut rx).await;
 
     // Precondition: Assigned, never Running.
-    let pre = handle
-        .debug_query_derivation("nobump-drv")
-        .await?
-        .expect("exists");
+    let pre = expect_drv(&handle, "nobump-drv").await;
     assert_eq!(pre.status, DerivationStatus::Assigned);
     assert_eq!(pre.retry.count, 0);
 
     // Disconnect → reassign_derivations. Before the fix:
     // retry_count++. After: no bump (was never Running).
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "nobump-w".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "nobump-w").await?;
 
-    let post = handle
-        .debug_query_derivation("nobump-drv")
-        .await?
-        .expect("exists");
+    let post = expect_drv(&handle, "nobump-drv").await;
     assert_eq!(
         post.retry.count, 0,
         "Assigned-only disconnect must not bump retry_count"
@@ -196,12 +176,7 @@ async fn test_starvation_intersects_live() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "starv-a".into(),
-        })
-        .await?;
-    barrier(&handle).await;
+    disconnect(&handle, "starv-a").await?;
 
     let ok = handle.debug_force_assign("starv-drv", "starv-b").await?;
     assert!(ok);
@@ -214,10 +189,7 @@ async fn test_starvation_intersects_live() -> TestResult {
     )
     .await?;
 
-    let info = handle
-        .debug_query_derivation("starv-drv")
-        .await?
-        .expect("exists");
+    let info = expect_drv(&handle, "starv-drv").await;
     assert_ne!(
         info.status,
         DerivationStatus::Poisoned,
@@ -395,15 +367,9 @@ async fn test_cancel_transitions_queued() -> TestResult {
     )
     .await?;
 
-    let pre_a = handle
-        .debug_query_derivation("canc-a")
-        .await?
-        .expect("exists");
+    let pre_a = expect_drv(&handle, "canc-a").await;
     assert_eq!(pre_a.status, DerivationStatus::Queued);
-    let pre_b = handle
-        .debug_query_derivation("canc-b")
-        .await?
-        .expect("exists");
+    let pre_b = expect_drv(&handle, "canc-b").await;
     assert_eq!(pre_b.status, DerivationStatus::Ready);
 
     // Cancel. Before fix: A stays Queued, B stays Ready (only
@@ -418,19 +384,13 @@ async fn test_cancel_transitions_queued() -> TestResult {
         .await?;
     let _ = reply_rx.await?;
 
-    let post_a = handle
-        .debug_query_derivation("canc-a")
-        .await?
-        .expect("exists");
+    let post_a = expect_drv(&handle, "canc-a").await;
     assert_eq!(
         post_a.status,
         DerivationStatus::DependencyFailed,
         "sole-interest Queued must transition on cancel"
     );
-    let post_b = handle
-        .debug_query_derivation("canc-b")
-        .await?
-        .expect("exists");
+    let post_b = expect_drv(&handle, "canc-b").await;
     assert_eq!(
         post_b.status,
         DerivationStatus::DependencyFailed,
@@ -483,10 +443,7 @@ async fn test_keep_going_false_cancels_remaining() -> TestResult {
     let status = query_status(&handle, build_id).await?;
     assert_eq!(status.state, rio_proto::types::BuildState::Failed as i32);
 
-    let post_b = handle
-        .debug_query_derivation("kg-b")
-        .await?
-        .expect("exists");
+    let post_b = expect_drv(&handle, "kg-b").await;
     assert!(
         matches!(
             post_b.status,
