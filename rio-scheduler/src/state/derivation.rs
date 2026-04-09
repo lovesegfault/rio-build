@@ -399,19 +399,14 @@ pub struct SchedHint {
     /// Persisted as `derivations.size_class_floor` (P0556, `M_032`)
     /// so the OOM loop doesn't resume across scheduler failover.
     pub size_class_floor: Option<String>,
-    /// Bucketed memory estimate for the resource-fit placement filter
-    /// (ADR-020 §5). `hard_filter` checks `worker.memory_total_bytes
-    /// >= est`.
+    /// Bucketed memory estimate for the resource-fit placement filter.
+    /// `hard_filter` checks `worker.memory_total_bytes >= est`.
     ///
     /// Populated at DISPATCH time (`dispatch_ready`, same block as
     /// `classify()`), not merge time — the estimator refreshes on Tick,
     /// so a long-queued derivation picks up fresh history. `None` =
     /// cold start (no `build_history` row, no `pname`, or no memory
     /// sample); filter treats `None` as "any worker fits".
-    ///
-    /// Same `Estimator::bucketed_estimate()` + headroom as the
-    /// capacity manifest RPC → the controller's pod sizing and the
-    /// scheduler's placement filter agree on what "fits".
     pub est_memory_bytes: Option<u64>,
     /// Estimated build duration (from Estimator). Set at merge time;
     /// never updated after. The critical-path priority uses this;

@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::estimator::BucketedEstimate;
 use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 
 #[cfg(test)]
@@ -296,14 +295,6 @@ pub enum AdminQuery {
         /// reactive (`size_class_floor`), not duration-estimated.
         reply: oneshot::Sender<(Vec<SizeClassSnapshot>, Vec<SizeClassSnapshot>)>,
     },
-    /// Bucketed resource estimates for ready-queue derivations
-    /// (ADR-020 capacity manifest). Headroom applied from
-    /// `self.sizing.headroom_mult` (config-static, same value the dispatch
-    /// filter uses). Cold-start derivations (no `build_history`
-    /// sample) are omitted — controller uses its operator floor.
-    CapacityManifest {
-        reply: oneshot::Sender<Vec<BucketedEstimate>>,
-    },
     /// Dump the in-memory estimator snapshot — every `(pname, system)`
     /// `HistoryEntry` plus what `classify()` returns for it under the
     /// current effective cutoffs. I-124 / `rio-cli estimator`.
@@ -402,7 +393,6 @@ impl AdminQuery {
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::GetSizeClassSnapshot { .. } => "GetSizeClassSnapshot",
-            Self::CapacityManifest { .. } => "CapacityManifest",
             Self::EstimatorStats { .. } => "EstimatorStats",
             Self::GcRoots { .. } => "GcRoots",
             Self::ListExecutors { .. } => "ListExecutors",

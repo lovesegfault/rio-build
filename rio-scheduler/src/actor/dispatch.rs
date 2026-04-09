@@ -249,11 +249,9 @@ impl DagActor {
         // if size_classes unconfigured (optional feature off —
         // no filter, all workers candidates).
         //
-        // Also compute the ADR-020 bucketed memory estimate for
-        // the resource-fit filter. Same estimator lookup path
-        // as compute_capacity_manifest (lookup_entry +
-        // bucketed_estimate + self.sizing.headroom_mult) so the
-        // placement filter and the manifest RPC agree.
+        // Also compute the bucketed memory estimate for the
+        // resource-fit filter (lookup_entry + bucketed_estimate
+        // + self.sizing.headroom_mult).
         //
         // `is_fixed_output` is captured into a local so the
         // `state` borrow ends here — `node_mut` below needs

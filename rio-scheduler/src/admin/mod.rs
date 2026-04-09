@@ -29,11 +29,11 @@ use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
     DrainExecutorRequest, DrainExecutorResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetBuildLogsRequest, GetCapacityManifestRequest,
-    GetCapacityManifestResponse, GetEstimatorStatsRequest, GetEstimatorStatsResponse,
-    GetSizeClassStatusRequest, GetSizeClassStatusResponse, InspectBuildDagRequest,
-    InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse, ListExecutorsRequest,
-    ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse, PoisonedDerivation,
+    GetBuildGraphResponse, GetBuildLogsRequest, GetEstimatorStatsRequest,
+    GetEstimatorStatsResponse, GetSizeClassStatusRequest, GetSizeClassStatusResponse,
+    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListTenantsResponse,
+    PoisonedDerivation,
 };
 use uuid::Uuid;
 
@@ -61,7 +61,6 @@ mod executors;
 mod gc;
 mod graph;
 mod logs;
-mod manifest;
 mod sizeclass;
 mod tenants;
 
@@ -459,22 +458,6 @@ impl AdminService for AdminServiceImpl {
         let pool_features = req.filter_features.then_some(req.pool_features);
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = sizeclass::get_size_class_status(&self.actor, &db, pool_features).await?;
-        Ok(Response::new(resp))
-    }
-
-    /// Per-derivation resource estimates for the controller's manifest
-    /// reconciler (ADR-020 sizing=Manifest mode). Sibling to
-    /// `cluster_status` — that RPC returns the scalar count, this
-    /// returns the detailed shape.
-    #[instrument(skip(self, request), fields(rpc = "GetCapacityManifest"))]
-    async fn get_capacity_manifest(
-        &self,
-        request: Request<GetCapacityManifestRequest>,
-    ) -> Result<Response<GetCapacityManifestResponse>, Status> {
-        rio_proto::interceptor::link_parent(&request);
-        self.ensure_leader()?;
-        self.check_actor_alive()?;
-        let resp = manifest::get_capacity_manifest(&self.actor).await?;
         Ok(Response::new(resp))
     }
 

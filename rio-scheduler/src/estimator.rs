@@ -49,10 +49,11 @@ pub struct HistoryEntry {
     pub sample_count: i32,
 }
 
-/// Bucketed resource estimate for the capacity manifest (ADR-020).
-/// Output of [`Estimator::bucketed_estimate`]; admin.rs converts to
-/// the proto `DerivationResourceEstimate`. Local struct (not the
-/// proto type) keeps estimator free of the rio-proto dependency.
+/// Bucketed resource estimate. Output of
+/// [`Estimator::bucketed_estimate`]; consumed by the dispatch
+/// resource-fit filter (`r[sched.assign.resource-fit]`) so a
+/// derivation with EMA memory > worker `memory_total_bytes` is
+/// rejected before assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BucketedEstimate {
     /// EMA × headroom, rounded UP to [`MEMORY_BUCKET_BYTES`].
@@ -240,10 +241,9 @@ impl Estimator {
     /// should share a pod don't diverge from f64 noise applied in
     /// different places.
     ///
-    /// Not a `&self` method: takes a `HistoryEntry` directly so T3's
-    /// handler can look up once and bucket, rather than re-looking-up
+    /// Not a `&self` method: takes a `HistoryEntry` directly so the
+    /// caller can look up once and bucket, rather than re-looking-up
     /// by (pname, system) here.
-    // r[impl sched.admin.capacity-manifest.bucket]
     pub fn bucketed_estimate(entry: &HistoryEntry, headroom_mult: f64) -> Option<BucketedEstimate> {
         let mem_ema = entry.ema_peak_memory_bytes?;
 
@@ -584,7 +584,7 @@ mod tests {
         );
     }
 
-    // ─── bucketed_estimate (ADR-020 P0501 T2) ───────────────────────
+    // ─── bucketed_estimate (resource-fit filter input) ──────────────
 
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -597,7 +597,6 @@ mod tests {
         }
     }
 
-    // r[verify sched.admin.capacity-manifest.bucket]
     #[test]
     fn bucket_rounds_memory_up() {
         // 6.2 GiB × 1.25 = 7.75 GiB → ceils to 8 GiB (2 buckets).

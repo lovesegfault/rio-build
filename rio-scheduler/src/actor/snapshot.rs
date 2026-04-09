@@ -1,13 +1,12 @@
 //! Read-only snapshot/inspect handlers on [`DagActor`]. All methods
 //! here are `&self` over the in-memory DAG/executors and back the admin
-//! RPCs (ClusterStatus, GetSizeClassStatus, CapacityManifest,
-//! EstimatorStats, InspectBuildDag, DebugListExecutors).
+//! RPCs (ClusterStatus, GetSizeClassStatus, EstimatorStats,
+//! InspectBuildDag, DebugListExecutors).
 
 use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::estimator::{BucketedEstimate, Estimator};
 use crate::state::{BuildState, DerivationStatus};
 
 use super::{
@@ -27,9 +26,6 @@ impl DagActor {
                     self.compute_size_class_snapshot(pool_features.as_deref()),
                     self.compute_fod_size_class_snapshot(),
                 ));
-            }
-            AdminQuery::CapacityManifest { reply } => {
-                let _ = reply.send(self.compute_capacity_manifest());
             }
             AdminQuery::EstimatorStats { reply } => {
                 let _ = reply.send(self.compute_estimator_stats());
@@ -458,37 +454,6 @@ impl DagActor {
             }
         }
         snapshots
-    }
-
-    /// Bucketed resource estimates for `GetCapacityManifest` (ADR-020).
-    ///
-    /// Iterates DAG nodes filtered to `Ready` status — same set
-    /// `ready_queue.len()` counts for `queued_derivations`. For each:
-    /// look up `(pname, system)` in the estimator, apply headroom,
-    /// bucket to 4GiB/2000mcore.
-    ///
-    /// Omissions (controller uses its operator-configured floor for
-    /// each missing estimate):
-    /// - `pname` is `None`: no key for `build_history` lookup
-    /// - No history entry: cold start (never built before)
-    /// - No memory sample: `bucketed_estimate` returns `None`
-    pub(crate) fn compute_capacity_manifest(&self) -> Vec<BucketedEstimate> {
-        let mut out = Vec::new();
-        for (_, state) in self.dag.iter_nodes() {
-            if state.status() != DerivationStatus::Ready {
-                continue;
-            }
-            let Some(pname) = state.pname.as_deref() else {
-                continue;
-            };
-            let Some(entry) = self.estimator.lookup_entry(pname, &state.system) else {
-                continue;
-            };
-            if let Some(b) = Estimator::bucketed_estimate(&entry, self.sizing.headroom_mult) {
-                out.push(b);
-            }
-        }
-        out
     }
 
     // r[impl sched.admin.estimator-stats]

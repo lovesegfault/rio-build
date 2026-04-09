@@ -308,7 +308,6 @@ src/
 │   ├── gc.rs          # TriggerGC
 │   ├── graph.rs       # GetBuildGraph (induced-subgraph walk, node cap)
 │   ├── logs.rs        # GetBuildLogs (ring buffer + S3 replay)
-│   ├── manifest.rs    # GetCapacityManifest: per-ready-derivation bucketed resource manifest
 │   ├── sizeclass.rs   # GetCutoffs / SetCutoffs
 │   ├── tenants.rs     # ListTenants / tenant quota inspect
 │   ├── executors.rs   # ListExecutors / DrainExecutor / ClusterStatus

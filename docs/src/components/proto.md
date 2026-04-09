@@ -112,7 +112,6 @@ service AdminService {
   rpc ListPoisoned(Empty) returns (ListPoisonedResponse);
   rpc InspectBuildDag(InspectBuildDagRequest) returns (InspectBuildDagResponse);  // actor in-memory DAG snapshot (I-025 diag)
   rpc DebugListExecutors(Empty) returns (DebugListExecutorsResponse);             // actor in-memory executor map (I-048b/c diag)
-  rpc GetCapacityManifest(GetCapacityManifestRequest) returns (GetCapacityManifestResponse);  // queued-ready per-drv resource estimates (ADR-020 Manifest sizing)
   rpc GetEstimatorStats(GetEstimatorStatsRequest) returns (GetEstimatorStatsResponse);        // build_history EMA snapshot (I-124 diag)
 }
 ```

@@ -77,15 +77,6 @@ service AdminService {
   // routing is disabled.
   rpc GetSizeClassStatus(rio.types.GetSizeClassStatusRequest) returns (rio.types.GetSizeClassStatusResponse);
 
-  // Per-derivation resource estimates for queued-ready derivations.
-  // Polled by the controller's manifest reconciler (ADR-020
-  // sizing=Manifest mode) alongside ClusterStatus. This is the
-  // detailed shape behind ClusterStatus.queued_derivations —
-  // the count says HOW MANY, the manifest says HOW BIG each.
-  // Pull model (same as ClusterStatus); no new gRPC server, no
-  // push. P0501.
-  rpc GetCapacityManifest(rio.types.GetCapacityManifestRequest) returns (rio.types.GetCapacityManifestResponse);
-
   // Dump the in-memory build_history estimator snapshot (per-pname EMA
   // duration/memory + classify() result). I-124 diagnostic — `rio-cli
   // estimator`. Read-only; reflects the actor's last Tick refresh (~60s
