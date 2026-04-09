@@ -407,48 +407,46 @@ async fn test_ca_cache_hit_via_realisations() -> TestResult {
 }
 
 // r[verify sched.merge.stale-completed-verify]
-/// I-048: a CA node whose realisation row points to a GC'd output must
-/// NOT cache-hit. The realisations table is scheduler-local; store GC
-/// doesn't touch it. Without the store-existence verify, this node
-/// flips to Completed and ping-pongs against I-047's pre-existing-
-/// completed reset on subsequent merges.
+/// CA realisation cache-check: realisation row in PG ± path in store.
 ///
-/// Seed the realisation in PG but NOT the path in MockStore. With a
-/// store client present, FindMissingPaths reports missing → the
-/// realisation is filtered → the node proceeds to Ready.
+/// - **stale** (I-048): realisation row exists but path GC'd from store
+///   → FindMissingPaths reports missing → filtered → Active. Without
+///   verify, would flip Completed and ping-pong against I-047's reset.
+/// - **miss**: no realisation row at all → Active.
+#[rstest::rstest]
+#[case::stale_realisation(true)]
+#[case::no_realisation(false)]
 #[tokio::test]
-async fn test_ca_cache_miss_stale_realisation() -> TestResult {
-    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+async fn test_ca_cache_miss(#[case] seed_stale: bool) -> TestResult {
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     let modular_hash = [0x55u8; 32];
-    let stale_path = test_store_path("ca-gcd-out");
-
-    // Realisation exists (a prior build registered it), but the path is
-    // NOT in MockStore.paths (GC'd). The CA cache-check should find the
-    // realisation, then the store-existence verify should reject it.
-    crate::ca::insert_realisation(&_db.pool, &modular_hash, "out", &stale_path, &[0x22u8; 32])
+    if seed_stale {
+        // Realisation exists but path NOT in MockStore.paths (GC'd).
+        crate::ca::insert_realisation(
+            &db.pool,
+            &modular_hash,
+            "out",
+            &test_store_path("ca-gcd-out"),
+            &[0x22u8; 32],
+        )
         .await?;
+    }
 
-    let mut node = make_node("ca-stale-real");
+    let mut node = make_node("ca-miss");
     node.is_content_addressed = true;
     node.ca_modular_hash = modular_hash.to_vec();
     node.expected_output_paths = vec![String::new()];
     let build_id = Uuid::new_v4();
     merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
-    // The realisation was filtered → node is NOT cached → build is
-    // Active waiting for it to dispatch.
     let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Active as i32,
-        "stale realisation must NOT cache-hit; node should proceed to Ready"
+        "must NOT cache-hit (seed_stale={seed_stale})"
     );
-    assert_eq!(
-        status.cached_derivations, 0,
-        "stale realisation must not count as cached"
-    );
-
+    assert_eq!(status.cached_derivations, 0);
     Ok(())
 }
 
@@ -511,31 +509,6 @@ async fn test_fixed_ca_fod_path_based_lane(
             "missing → dispatches"
         );
     }
-    Ok(())
-}
-
-/// Negative case: CA node with a modular_hash that has NO realisation
-/// row → cache-miss → proceeds to Ready (not Completed).
-#[tokio::test]
-async fn test_ca_cache_miss_no_realisation() -> TestResult {
-    let test_db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(test_db.pool.clone());
-
-    let mut node = make_node("ca-cache-miss");
-    node.is_content_addressed = true;
-    node.ca_modular_hash = [0x99u8; 32].to_vec();
-    node.expected_output_paths = vec![String::new()];
-    let build_id = Uuid::new_v4();
-    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-    // Build should be Active (not Complete) — the node wasn't cached.
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(
-        status.state,
-        rio_proto::types::BuildState::Active as i32,
-        "CA node with no realisation should NOT cache-hit"
-    );
-
     Ok(())
 }
 

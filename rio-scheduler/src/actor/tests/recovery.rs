@@ -161,10 +161,7 @@ async fn test_recovery_skips_orphan_transitions() -> TestResult {
     // deps so child looks Ready → all_deps_completed for parent →
     // Ready). With the gate, parent's interested_builds is empty →
     // filtered out of to_recompute → stays at PG status.
-    let parent = handle
-        .debug_query_derivation("orphan-parent")
-        .await?
-        .expect("orphan parent should still be in DAG (loaded, just not transitioned)");
+    let parent = expect_drv(&handle, "orphan-parent").await;
     assert_eq!(
         parent.status,
         DerivationStatus::Queued,

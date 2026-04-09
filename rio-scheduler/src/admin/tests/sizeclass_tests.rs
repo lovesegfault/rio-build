@@ -80,25 +80,11 @@ async fn test_get_size_class_status_reports_fod_classes() -> anyhow::Result<()> 
 /// the proto response.
 #[tokio::test]
 async fn test_get_size_class_status_reports_configured_classes() -> anyhow::Result<()> {
-    use crate::actor::tests::setup_actor_configured;
-    use crate::assignment::SizeClassConfig;
+    use crate::actor::tests::{setup_actor_configured, size_classes};
 
     let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
     let (actor, task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.size_classes = vec![
-            SizeClassConfig {
-                name: "small".into(),
-                cutoff_secs: 60.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-            SizeClassConfig {
-                name: "large".into(),
-                cutoff_secs: 3600.0,
-                mem_limit_bytes: u64::MAX,
-                cpu_limit_cores: None,
-            },
-        ];
+        c.size_classes = size_classes(&[("small", 60.0), ("large", 3600.0)]);
     });
     let svc = AdminServiceImpl::new(
         Arc::new(LogBuffers::new()),

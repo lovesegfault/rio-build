@@ -742,7 +742,7 @@ pub(crate) async fn complete_failure(
 }
 
 /// Query a derivation by hash and unwrap the `Some`. Replaces the 136×
-/// open-coded `handle.debug_query_derivation(k).await?.expect("exists")`.
+/// open-coded `expect_drv(&handle, k).await`.
 /// Panics with the hash on missing — better than a bare "exists".
 pub(crate) async fn expect_drv(handle: &ActorHandle, hash: &str) -> DebugDerivationInfo {
     handle
@@ -892,6 +892,44 @@ pub(crate) async fn seed_poisoned(handle: &ActorHandle, drv_hash: &str) -> anyho
     )
     .await?;
     barrier(handle).await;
+    Ok(())
+}
+
+/// Connect N executors named `{prefix}{1..=n}` on `system`. Absorbs the
+/// `let _rxN = connect_executor(...)` × N pattern (15× across actor
+/// tests). The receivers are returned in a Vec — bind as `_rxs` to keep
+/// streams alive.
+pub(crate) async fn connect_n_executors(
+    handle: &ActorHandle,
+    prefix: &str,
+    system: &str,
+    n: usize,
+) -> anyhow::Result<Vec<mpsc::Receiver<rio_proto::types::SchedulerMessage>>> {
+    let mut rxs = Vec::with_capacity(n);
+    for i in 1..=n {
+        rxs.push(connect_executor(handle, &format!("{prefix}{i}"), system).await?);
+    }
+    Ok(rxs)
+}
+
+/// Force-assign + send `status` failure for `drv_hash` on each of
+/// `workers` in sequence. Absorbs the 12-line `for (i, w) in workers
+/// { force_assign; complete_failure }` loop repeated across the
+/// poison-threshold matrix in `completion.rs`.
+pub(crate) async fn fail_on_workers(
+    handle: &ActorHandle,
+    drv_hash: &str,
+    status: rio_proto::types::BuildResultStatus,
+    workers: &[&str],
+) -> anyhow::Result<()> {
+    let drv_path = test_drv_path(drv_hash);
+    for (i, w) in workers.iter().enumerate() {
+        assert!(
+            handle.debug_force_assign(drv_hash, w).await?,
+            "force-assign {drv_hash} → {w} (iter {i})"
+        );
+        complete_failure(handle, w, &drv_path, status, &format!("failure {i}")).await?;
+    }
     Ok(())
 }
 

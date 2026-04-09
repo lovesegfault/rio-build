@@ -835,178 +835,80 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     Ok(())
 }
 
-/// Derivation poisoned after POISON_THRESHOLD (3) distinct worker failures.
+/// Distinct-worker poison-threshold matrix. N TransientFailures on
+/// distinct workers → Poisoned, via three branches:
+///
+/// - **threshold**: 3 distinct of 4 workers → `failed_builders.len()
+///   ≥ POISON_THRESHOLD` → poison.
+/// - **clamp**: 2 distinct of 2 workers (below threshold=3) → poison
+///   via `worker_count` clamp `min(3,2)=2`. Without clamp, would
+///   starve Ready forever (best_executor excludes both).
+/// - **kind_aware** (I-065): 2 distinct builders + 1 fetcher present.
+///   Pre-fix `executors.keys().all(in failed_builders)` was false
+///   (fetcher not in set) → diffutils-3.12.drv stuck Ready forever.
+///   Fix: predicate is kind-aware.
+///
+/// `max_retries=10` for clamp/kind_aware so the `retry_count>=2`
+/// branch doesn't mask the threshold/clamp under test.
+#[rstest]
+#[case::threshold(false, 4, &["pt-w1", "pt-w2", "pt-w3"], false)]
+#[case::clamp(true, 2, &["pt-w1", "pt-w2"], false)]
+#[case::kind_aware(true, 2, &["pt-w1", "pt-w2"], true)]
 #[tokio::test]
-async fn test_poison_threshold_after_distinct_workers() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    // Register 4 workers so the derivation can be re-dispatched after each failure.
-    let _rx1 = connect_executor(&handle, "poison-w1", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "poison-w2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "poison-w3", "x86_64-linux").await?;
-    let _rx4 = connect_executor(&handle, "poison-w4", "x86_64-linux").await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_hash = "poison-drv";
-    let drv_path = test_drv_path(drv_hash);
-    let _event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-
-    // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
-    //
-    // debug_force_assign before each failure: backoff_until prevents
-    // immediate re-dispatch after each failure, AND the initial
-    // dispatch picks any of the 4 workers (not necessarily w1).
-    // Force-assign so the completion's executor_id matches
-    // assigned_executor — the stale-report guard would otherwise drop
-    // the completion. We're testing the poison-threshold logic
-    // (3 distinct failed_builders → poisoned), not dispatch timing.
-    for (i, worker) in ["poison-w1", "poison-w2", "poison-w3"].iter().enumerate() {
-        let ok = handle.debug_force_assign(drv_hash, worker).await?;
-        assert!(ok, "force-assign should succeed (iter {i})");
-        complete_failure(
-            &handle,
-            worker,
-            &drv_path,
-            rio_proto::types::BuildResultStatus::TransientFailure,
-            &format!("failure {i}"),
-        )
-        .await?;
-    }
-
-    let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "derivation should be Poisoned after {} distinct worker failures",
-        PoisonConfig::default().threshold
-    );
-
-    // Build should be Failed.
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(
-        status.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "build should fail after derivation is poisoned"
-    );
-    Ok(())
-}
-
-/// Starvation guard: 2-worker cluster (below configured threshold=3),
-/// both fail → derivation POISONS via the worker_count clamp in
-/// `handle_transient_failure`. Without the clamp, `failed_builders.len()
-/// =2 < threshold=3` → not poisoned, but `best_executor` excludes both
-/// → stuck in Ready forever. The clamp makes the effective threshold
-/// `min(3, 2) = 2`, so poison fires after the 2nd distinct failure.
-#[tokio::test]
-async fn test_all_workers_failed_below_threshold_poisons() -> TestResult {
+async fn test_distinct_transient_poison_matrix(
+    #[case] raise_max_retries: bool,
+    #[case] n_builders: usize,
+    #[case] fail_on: &[&str],
+    #[case] add_fetcher: bool,
+) -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    // Raise max_retries so we hit the worker_count clamp, not the
-    // max_retries branch (default max_retries=2 would poison on the
-    // 2nd failure via retry_count anyway — masking the clamp).
     let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.retry_policy.max_retries = 10;
+        if raise_max_retries {
+            c.retry_policy.max_retries = 10;
+        }
     });
     let _db = db;
 
-    // Exactly 2 workers — below PoisonConfig::default().threshold (3).
-    let _rx1 = connect_executor(&handle, "starve-w1", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "starve-w2", "x86_64-linux").await?;
-
-    let build_id = Uuid::new_v4();
-    let drv_hash = "starve-drv";
-    let drv_path = test_drv_path(drv_hash);
-    let _event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-
-    // Fail on both workers. After 2nd: all live workers in
-    // failed_builders → poison (clamp fires before threshold=3).
-    // Force-assign before each failure so the completion's
-    // executor_id matches assigned_executor (the stale-report guard
-    // would otherwise drop mismatched completions).
-    for (i, worker) in ["starve-w1", "starve-w2"].iter().enumerate() {
-        let ok = handle.debug_force_assign(drv_hash, worker).await?;
-        assert!(ok, "force-assign should succeed (iter {i})");
-        complete_failure(
-            &handle,
-            worker,
-            &drv_path,
-            rio_proto::types::BuildResultStatus::TransientFailure,
-            &format!("starve failure {i}"),
-        )
-        .await?;
+    let mut _rxs = Vec::new();
+    for i in 1..=n_builders {
+        _rxs.push(connect_executor(&handle, &format!("pt-w{i}"), "x86_64-linux").await?);
+    }
+    if add_fetcher {
+        // Fetcher's presence is what broke pre-I-065: not in failed_builders.
+        _rxs.push(
+            connect_executor_no_ack_kind(
+                &handle,
+                "pt-fetcher",
+                "builtin",
+                rio_proto::types::ExecutorKind::Fetcher,
+            )
+            .await?,
+        );
     }
 
-    let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "2-worker cluster, both failed: should poison via worker_count \
-         clamp (effective threshold = min(3, 2) = 2), not starve in Ready"
-    );
-    assert_eq!(
-        info.retry.failed_builders.len(),
-        2,
-        "both workers recorded in failed_builders"
-    );
-    Ok(())
-}
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "pt-drv", PriorityClass::Scheduled).await?;
 
-/// I-065 regression: the original starvation guard checked
-/// `self.executors.keys().all(...)` — ALL kinds. With 2 builders + 2
-/// fetchers, a non-FOD drv that failed on both builders never tripped
-/// it (fetchers aren't in failed_builders). Live: `diffutils-3.12.drv`
-/// stuck `[Ready]` forever, autoscaler at min, no log signal. The fix
-/// makes the predicate kind-aware AND adds a dispatch-time backstop.
-#[tokio::test]
-async fn test_fleet_exhaustion_is_kind_aware() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.retry_policy.max_retries = 10;
-    });
-    let _db = db;
-
-    // 2 builders + 1 fetcher. The fetcher's presence is what broke the
-    // pre-I-065 check: `executors.keys().all(in failed_builders)` was
-    // false because the fetcher isn't in failed_builders, even though
-    // the BUILDER fleet is exhausted.
-    let _b1 = connect_executor(&handle, "exhaust-b1", "x86_64-linux").await?;
-    let _b2 = connect_executor(&handle, "exhaust-b2", "x86_64-linux").await?;
-    let _f1 = connect_executor_no_ack_kind(
+    fail_on_workers(
         &handle,
-        "exhaust-f1",
-        "builtin",
-        rio_proto::types::ExecutorKind::Fetcher,
+        "pt-drv",
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        fail_on,
     )
     .await?;
 
-    let build_id = Uuid::new_v4();
-    let drv_hash = "exhaust-drv";
-    let drv_path = test_drv_path(drv_hash);
-    // merge_single_node makes a non-FOD drv (Builder kind).
-    let _event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-
-    for (i, worker) in ["exhaust-b1", "exhaust-b2"].iter().enumerate() {
-        let ok = handle.debug_force_assign(drv_hash, worker).await?;
-        assert!(ok, "force-assign should succeed (iter {i})");
-        complete_failure(
-            &handle,
-            worker,
-            &drv_path,
-            rio_proto::types::BuildResultStatus::TransientFailure,
-            &format!("exhaust failure {i}"),
-        )
-        .await?;
-    }
-
-    let info = expect_drv(&handle, drv_hash).await;
+    let info = expect_drv(&handle, "pt-drv").await;
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
-        "all kind-matching workers (2 builders) failed; the fetcher \
-         is irrelevant. Pre-I-065 this stuck in Ready forever because \
-         the fleet-exhaustion check counted the fetcher."
+        "{} distinct TransientFailures → Poisoned (failed_builders={:?})",
+        fail_on.len(),
+        info.retry.failed_builders
+    );
+    assert_eq!(info.retry.failed_builders.len(), fail_on.len());
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Failed as i32
     );
     Ok(())
 }
@@ -1022,38 +924,23 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
     let (_db, handle, _task) = setup().await;
 
     // 4 workers so re-dispatch always has a candidate.
-    let _rx1 = connect_executor(&handle, "infra-w1", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "infra-w2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "infra-w3", "x86_64-linux").await?;
-    let _rx4 = connect_executor(&handle, "infra-w4", "x86_64-linux").await?;
+    let _rxs = connect_n_executors(&handle, "infra-w", "x86_64-linux", 4).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // 3× InfrastructureFailure from distinct workers. In the
-    // TransientFailure case this would poison; here it must not.
-    // handle_infrastructure_failure does reset_to_ready WITHOUT
-    // failed_builders insert and WITHOUT backoff — so immediate
-    // re-dispatch to whatever worker wins. We drive via
-    // debug_force_assign to make the per-worker assertion
-    // deterministic AND so the completion's executor_id matches
-    // assigned_executor (the stale-report guard drops mismatched
-    // completions).
-    for (i, worker) in ["infra-w1", "infra-w2", "infra-w3"].iter().enumerate() {
-        let ok = handle.debug_force_assign(drv_hash, worker).await?;
-        assert!(ok, "force-assign should succeed (iter {i})");
-        complete_failure(
-            &handle,
-            worker,
-            &drv_path,
-            rio_proto::types::BuildResultStatus::InfrastructureFailure,
-            &format!("infra failure {i}"),
-        )
-        .await?;
-    }
+    // 3× InfrastructureFailure from distinct workers. TransientFailure
+    // would poison; here it must not (reset_to_ready WITHOUT
+    // failed_builders insert / backoff).
+    fail_on_workers(
+        &handle,
+        drv_hash,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        &["infra-w1", "infra-w2", "infra-w3"],
+    )
+    .await?;
 
     let info = expect_drv(&handle, drv_hash).await;
     // Exit criterion: 3× InfrastructureFailure → failed_builders.is_empty()
@@ -1083,14 +970,11 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
 
     // 4th attempt: now send TransientFailure. This DOES count — proving
     // the derivation is still live and the counting path still works.
-    let ok = handle.debug_force_assign(drv_hash, "infra-w4").await?;
-    assert!(ok);
-    complete_failure(
+    fail_on_workers(
         &handle,
-        "infra-w4",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::TransientFailure,
-        "now this one counts",
+        &["infra-w4"],
     )
     .await?;
 
