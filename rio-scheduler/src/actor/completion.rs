@@ -1479,16 +1479,93 @@ impl DagActor {
         self.persist_poisoned(drv_hash).await;
         self.unpin_best_effort(drv_hash).await;
 
-        // Cascade: parents of a poisoned derivation can never complete.
-        // Transition them to DependencyFailed so keepGoing builds terminate.
+        // No DerivationFailed event / log flush: transient/infra retry
+        // paths already emitted per-attempt events; the poison is a
+        // state-machine fact, not a fresh worker report.
+        self.terminal_failure_epilogue(drv_hash, None).await;
+    }
+
+    /// Shared tail of every terminal-failure path
+    /// ([`poison_and_cascade`], `handle_permanent_failure`,
+    /// `handle_timeout_failure` cap-exhausted): cascade
+    /// `DependencyFailed` to ancestors, optionally flush logs + emit a
+    /// `DerivationFailed` event to interested gateways, then run
+    /// `handle_derivation_failure` for the union of trigger + cascaded
+    /// builds.
+    ///
+    /// `event = None` skips flush+emit (the caller already emitted
+    /// per-attempt events, or has no `error_msg` to attach). `Some`
+    /// carries the wire status the gateway should render.
+    ///
+    /// This was the I-213 bug-class area — three near-identical ~30L
+    /// blocks that drifted on which side-effects ran. Keeping the
+    /// cascade/propagate sequencing in ONE place means a future
+    /// "permanent failures forgot to unpin" can't recur per-handler.
+    ///
+    /// [`poison_and_cascade`]: Self::poison_and_cascade
+    async fn terminal_failure_epilogue(
+        &mut self,
+        drv_hash: &DrvHash,
+        event: Option<(&str, rio_proto::types::BuildResultStatus)>,
+    ) {
+        // Cascade: parents of a terminally-failed derivation can never
+        // complete. Transition them to DependencyFailed so keepGoing
+        // builds terminate.
         let cascaded = self.cascade_dependency_failure(drv_hash).await;
 
-        // Propagate failure to interested builds — union of trigger's
-        // AND cascaded nodes'. A cascaded parent may belong to a
-        // merged build the trigger does not; that build must also get
-        // handle_derivation_failure or it hangs Active forever.
+        if let Some((error_msg, status)) = event {
+            // Flush + emit use the trigger's interested set (those
+            // builds saw THIS drv fail); handle_derivation_failure
+            // below uses the union (those builds saw SOME drv fail,
+            // possibly a cascaded one).
+            let trigger_builds = self.get_interested_builds(drv_hash);
+            // Flush BEFORE handle_derivation_failure (which may
+            // transition builds to terminal and schedule cleanup).
+            self.trigger_log_flush(drv_hash, trigger_builds.clone());
+            let drv_path = self.dag.path_or_hash_fallback(drv_hash);
+            for build_id in &trigger_builds {
+                self.events.emit(
+                    *build_id,
+                    rio_proto::types::build_event::Event::Derivation(
+                        rio_proto::types::DerivationEvent {
+                            derivation_path: drv_path.clone(),
+                            status: Some(rio_proto::types::derivation_event::Status::Failed(
+                                rio_proto::types::DerivationFailed {
+                                    error_message: error_msg.to_string(),
+                                    status: status.into(),
+                                },
+                            )),
+                        },
+                    ),
+                );
+            }
+        }
+
+        // Propagate to builds — union of trigger's AND cascaded nodes'.
+        // A cascaded parent may belong to a merged build the trigger
+        // does not; that build must also get handle_derivation_failure
+        // or it hangs Active forever.
         for build_id in self.union_interested_with_cascaded(drv_hash, &cascaded) {
             self.handle_derivation_failure(build_id, drv_hash).await;
+        }
+    }
+
+    /// Shared tail of the non-terminal retry paths
+    /// (`handle_infrastructure_failure`, `handle_timeout_failure`
+    /// under-cap): persist `Ready`, re-queue, emit progress so the
+    /// dashboard sees the requeue. The caller has already done the
+    /// `reset_to_ready` transition + counter bookkeeping.
+    ///
+    /// `handle_transient_failure` does NOT use this — it goes through
+    /// the `Failed→Ready` intermediate with backoff, which has
+    /// different ordering constraints (push_ready inside the
+    /// `node_mut` block).
+    async fn requeue_after_retry(&mut self, drv_hash: &DrvHash) {
+        self.persist_status(drv_hash, DerivationStatus::Ready, None)
+            .await;
+        self.push_ready(drv_hash.clone());
+        for build_id in self.get_interested_builds(drv_hash) {
+            self.emit_progress(build_id);
         }
     }
 
@@ -1809,15 +1886,7 @@ impl DagActor {
             exempt_from_cap,
             "infrastructure failure — retry without poison count"
         );
-        self.persist_status(drv_hash, DerivationStatus::Ready, None)
-            .await;
-        self.push_ready(drv_hash.clone());
-
-        // Dashboard: Running → Ready state change. emit_progress so
-        // the dashboard sees the retry requeue.
-        for build_id in self.get_interested_builds(drv_hash) {
-            self.emit_progress(build_id);
-        }
+        self.requeue_after_retry(drv_hash).await;
     }
 
     pub(super) async fn handle_permanent_failure(
@@ -1855,45 +1924,14 @@ impl DagActor {
         }
         self.unpin_best_effort(drv_hash).await;
 
-        // Cascade: parents of a poisoned derivation can never complete.
-        let cascaded = self.cascade_dependency_failure(drv_hash).await;
-
-        // Propagate failure to interested builds — union of trigger's
-        // AND cascaded nodes' (a cascaded parent may belong to a
-        // merged build the trigger does not). Log-flush + failure
-        // event use the trigger's set (those builds saw THIS drv
-        // fail); handle_derivation_failure uses the union (those
-        // builds saw SOME drv fail, possibly a cascaded one).
-        let trigger_builds = self.get_interested_builds(drv_hash);
-
-        // Flush logs for failed builds too — the failure's log is often the
-        // most useful log (compile errors, test output). Do this BEFORE
-        // handle_derivation_failure below, which may transition builds to
-        // terminal and schedule cleanup.
-        self.trigger_log_flush(drv_hash, trigger_builds.clone());
-
-        for build_id in &trigger_builds {
-            // Emit failure event
-            self.events.emit(
-                *build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent {
-                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
-                        status: Some(rio_proto::types::derivation_event::Status::Failed(
-                            rio_proto::types::DerivationFailed {
-                                error_message: error_msg.to_string(),
-                                status: rio_proto::types::BuildResultStatus::PermanentFailure
-                                    .into(),
-                            },
-                        )),
-                    },
-                ),
-            );
-        }
-
-        for build_id in self.union_interested_with_cascaded(drv_hash, &cascaded) {
-            self.handle_derivation_failure(build_id, drv_hash).await;
-        }
+        self.terminal_failure_epilogue(
+            drv_hash,
+            Some((
+                error_msg,
+                rio_proto::types::BuildResultStatus::PermanentFailure,
+            )),
+        )
+        .await;
     }
 
     /// Worker-side timeout (`BuildResultStatus::TimedOut`): promote
@@ -1967,12 +2005,7 @@ impl DagActor {
                 failed_class = ?failed_class,
                 "timeout — promoted size_class_floor, retrying on larger class"
             );
-            self.persist_status(drv_hash, DerivationStatus::Ready, None)
-                .await;
-            self.push_ready(drv_hash.clone());
-            for build_id in self.get_interested_builds(drv_hash) {
-                self.emit_progress(build_id);
-            }
+            self.requeue_after_retry(drv_hash).await;
             return;
         }
 
@@ -1995,33 +2028,11 @@ impl DagActor {
             .await;
         self.unpin_best_effort(drv_hash).await;
 
-        // Cascade: parents of a timed-out derivation can't complete THIS
-        // time (resubmit-reset handles the next attempt).
-        let cascaded = self.cascade_dependency_failure(drv_hash).await;
-
-        let trigger_builds = self.get_interested_builds(drv_hash);
-        self.trigger_log_flush(drv_hash, trigger_builds.clone());
-
-        for build_id in &trigger_builds {
-            self.events.emit(
-                *build_id,
-                rio_proto::types::build_event::Event::Derivation(
-                    rio_proto::types::DerivationEvent {
-                        derivation_path: self.dag.path_or_hash_fallback(drv_hash),
-                        status: Some(rio_proto::types::derivation_event::Status::Failed(
-                            rio_proto::types::DerivationFailed {
-                                error_message: error_msg.to_string(),
-                                status: rio_proto::types::BuildResultStatus::TimedOut.into(),
-                            },
-                        )),
-                    },
-                ),
-            );
-        }
-
-        for build_id in self.union_interested_with_cascaded(drv_hash, &cascaded) {
-            self.handle_derivation_failure(build_id, drv_hash).await;
-        }
+        self.terminal_failure_epilogue(
+            drv_hash,
+            Some((error_msg, rio_proto::types::BuildResultStatus::TimedOut)),
+        )
+        .await;
     }
 
     /// Transitively walk parents of a poisoned derivation and transition all
