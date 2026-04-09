@@ -232,20 +232,14 @@ store:
   # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
   # Upstream binary-cache egress allowlist. Each entry opens 443/TCP
-  # to the given CIDR from the rio-store pod. Empty list → the
-  # store-egress-upstream NetworkPolicy does NOT render, and the store
-  # cannot reach any public IP (the base store-egress policy allows
-  # only DNS + postgres + S3 VPC endpoint).
-  #
-  # NetworkPolicy has no FQDN support — resolve cache.nixos.org etc.
-  # to their current CIDRs at deploy time. For cache.nixos.org the
-  # backing CDN is Fastly; `dig cache.nixos.org +short` gives the
-  # anycast IPs. If CIDR churn is operational pain, a CNI with
-  # FQDN-aware policies (Cilium toFQDNs, Calico domain matchers) is
-  # the upgrade path.
+  # to the given FQDN from the rio-store pod via CiliumNetworkPolicy
+  # `toFQDNs` (DNS-aware — Cilium's L7 DNS proxy resolves and tracks
+  # the IP set, no manual CIDR maintenance). Empty list → the
+  # store-egress-upstream CNP does NOT render, and the store cannot
+  # reach any public IP (the base store-egress policy allows only
+  # DNS + postgres + S3 VPC endpoint).
   upstreamCaches: []
-  # - name: cache.nixos.org
-  #   cidr: 151.101.0.0/16  # Fastly
+  # - host: cache.nixos.org
   # Max concurrent S3 PutObject calls per put_chunked. With
   # scheduler.substituteMaxConcurrent=16 (below), 16*32=512 in-flight
   # S3 puts under full substitution burst — kept under the aws-sdk
@@ -682,12 +676,6 @@ dashboard:
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 128Mi}
-  # Service type for cilium-gateway-rio-dashboard (the Service Cilium
-  # creates per-Gateway in the Gateway's namespace). ClusterIP by
-  # default (nginx sits in-cluster and proxies to it). Set to
-  # LoadBalancer for direct external gRPC-Web access. Applied via
-  # Gateway.spec.infrastructure.annotations[io.cilium/lb-service-type].
-  gatewayServiceType: ClusterIP
   # ── Method-level authz (r[dash.auth.method-gate]) ─────────────────────
   # Expose ClearPoison/DrainExecutor/CreateTenant/TriggerGC via the
   # dashboard gateway. Default false — the GRPCRoute for mutating
