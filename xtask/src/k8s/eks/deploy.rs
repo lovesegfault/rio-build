@@ -187,12 +187,13 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         "service.beta.kubernetes.io/aws-load-balancer-type": "external",
         "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
         "service.beta.kubernetes.io/aws-load-balancer-scheme": "internal",
-        // ipv4: target-type=instance + dualstack creates an IPv6 target
-        // group that requires instances to have a PRIMARY IPv6 address.
-        // AL2023 system nodes (where rio-gateway runs) have secondary
-        // IPv6 only → InvalidTarget. NLB→node v4 NodePort→Cilium eBPF→
-        // pod works regardless of pod IP family.
-        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "ipv4",
+        // dualstack: cluster is IPv6-only (no IPv4 Service CIDR), so
+        // ip-address-type=ipv4 fails with "unsupported IPv6 config".
+        // dualstack with target-type=instance needs the instances to
+        // have a PRIMARY IPv6 — set via primary_ipv6=true on the
+        // nodegroup launch template (main.tf) and Karpenter
+        // EC2NodeClass.
+        "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });

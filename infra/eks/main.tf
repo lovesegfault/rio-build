@@ -278,6 +278,14 @@ module "eks" {
       # vpc-cni is in cluster_addons (which it no longer is).
       iam_role_attach_cni_policy = false
 
+      # NLB target-type=instance + dualstack requires instances to
+      # have a PRIMARY IPv6 address (not just secondary). Without
+      # this, target registration fails InvalidTarget. AL2023 default
+      # is secondary-only.
+      network_interfaces = [{
+        primary_ipv6 = true
+      }]
+
       # No taint: system components (plus kube-system addons like
       # CoreDNS, Karpenter controller) schedule here freely.
       #
