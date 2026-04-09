@@ -244,17 +244,22 @@ where
     )
 }
 
-/// Standard reconcile timing+metrics wrapper. Every reconciler's
+/// Standard reconcile span+timing+metrics wrapper. Every reconciler's
 /// public `reconcile()` is `timed("name", obj, ctx, reconcile_inner)`:
-/// records `rio_controller_reconcile_duration_seconds{reconciler=name}`
+/// opens a `reconcile{reconciler=name, name=…, ns=…}` span, records
+/// `rio_controller_reconcile_duration_seconds{reconciler=name}`
 /// (success AND error paths — slow apiserver timeouts show as long
-/// duration + error) and resets the per-object error-backoff counter
+/// duration + error), and resets the per-object error-backoff counter
 /// on success so the next failure starts the curve from 5s.
 ///
-/// The `#[tracing::instrument]` span stays on the caller — span
-/// fields are reconciler-specific (`pool=`, `wps=`, `cs=`).
+/// The span lives here (not as a per-reconciler `#[instrument]` attr)
+/// so the `reconciler` label is named once — previously each module
+/// passed it both in `#[instrument(fields(reconciler=…))]` AND in
+/// `timed("…", …)`, and the four attrs differed only in the field
+/// name for the object (`pool`/`wps`/`cs`). The uniform `name` field
+/// is what `error_key` already uses.
 pub async fn timed<K, F, Fut>(
-    name: &'static str,
+    reconciler: &'static str,
     obj: Arc<K>,
     ctx: Arc<Ctx>,
     f: F,
@@ -264,16 +269,75 @@ where
     F: FnOnce(Arc<K>, Arc<Ctx>) -> Fut,
     Fut: Future<Output = Result<Action>>,
 {
-    let start = Instant::now();
-    let key = error_key(obj.as_ref());
-    let result = f(obj, ctx.clone()).await;
-    if result.is_ok() {
-        ctx.reset_error_count(&key);
+    use tracing::Instrument;
+    let span = tracing::info_span!(
+        "reconcile",
+        reconciler,
+        name = %obj.name_any(),
+        ns = obj.namespace().as_deref().unwrap_or(""),
+    );
+    async move {
+        let start = Instant::now();
+        let key = error_key(obj.as_ref());
+        let result = f(obj, ctx.clone()).await;
+        if result.is_ok() {
+            ctx.reset_error_count(&key);
+        }
+        metrics::histogram!("rio_controller_reconcile_duration_seconds",
+            "reconciler" => reconciler)
+        .record(start.elapsed().as_secs_f64());
+        result
     }
-    metrics::histogram!("rio_controller_reconcile_duration_seconds",
-        "reconciler" => name)
-    .record(start.elapsed().as_secs_f64());
-    result
+    .instrument(span)
+    .await
+}
+
+/// Standard finalizer-wrapped reconcile body for namespaced CRs.
+/// Derives `Api<K>` from the object's namespace, runs
+/// `kube::runtime::finalizer` with the given apply/cleanup, and maps
+/// the recursive `finalizer::Error<Error>` into our boxed
+/// [`Error::Finalizer`]. The three pool reconcilers (builderpool /
+/// fetcherpool / builderpoolset) had byte-identical copies of this.
+///
+/// `apply`/`cleanup` take `Arc<Ctx>` (not `&Ctx`) so the closure
+/// passed to `finalizer()` can move them in by value without lifetime
+/// gymnastics; both arms can't run, so each `FnOnce` is consumed at
+/// most once.
+pub(crate) async fn finalized<K, A, AFut, C, CFut>(
+    obj: Arc<K>,
+    ctx: Arc<Ctx>,
+    finalizer_name: &'static str,
+    apply: A,
+    cleanup: C,
+) -> Result<Action>
+where
+    K: kube::Resource<DynamicType = (), Scope = kube::core::NamespaceResourceScope>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    A: FnOnce(Arc<K>, Arc<Ctx>) -> AFut + Send,
+    C: FnOnce(Arc<K>, Arc<Ctx>) -> CFut + Send,
+    AFut: Future<Output = Result<Action>> + Send,
+    CFut: Future<Output = Result<Action>> + Send,
+{
+    use kube::ResourceExt;
+    use kube::runtime::finalizer::{Event, finalizer};
+    let ns = obj
+        .namespace()
+        .ok_or_else(|| Error::InvalidSpec(format!("{} has no namespace", K::kind(&()))))?;
+    let api: kube::Api<K> = kube::Api::namespaced(ctx.client.clone(), &ns);
+    finalizer(&api, finalizer_name, obj, move |event| async move {
+        match event {
+            Event::Apply(o) => apply(o, ctx.clone()).await,
+            Event::Cleanup(o) => cleanup(o, ctx).await,
+        }
+    })
+    .await
+    .map_err(|e| Error::Finalizer(Box::new(e)))
 }
 
 /// Standard `error_policy`: emit `reconcile_errors_total`, then

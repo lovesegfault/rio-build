@@ -251,7 +251,7 @@ async fn warn_fires_for_ephemeral_with_host_network() {
     scenarios.extend(ephemeral_reconcile_scenarios());
     let guard = verifier.run(scenarios);
 
-    apply(Arc::new(wp), &ctx)
+    apply(Arc::new(wp), ctx.clone())
         .await
         .expect("apply completes (reconcile_static path)");
 

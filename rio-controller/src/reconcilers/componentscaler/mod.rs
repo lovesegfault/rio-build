@@ -23,7 +23,7 @@ use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{CustomResourceExt, ResourceExt};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::{Ctx, error_key, standard_error_policy, timed};
@@ -58,10 +58,6 @@ const MANAGER: &str = "rio-controller-componentscaler";
 /// the CR; the Deployment keeps its last-patched replica count
 /// until the next `helm upgrade` (or another scaler) sets it.
 // r[impl ctrl.scaler.component]
-#[instrument(
-    skip(cs, ctx),
-    fields(reconciler = "componentscaler", cs = %cs.name_any(), ns = cs.namespace().as_deref().unwrap_or(""))
-)]
 pub async fn reconcile(cs: Arc<ComponentScaler>, ctx: Arc<Ctx>) -> Result<Action> {
     timed("componentscaler", cs, ctx, reconcile_inner).await
 }

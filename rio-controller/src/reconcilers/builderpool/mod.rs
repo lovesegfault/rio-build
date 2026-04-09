@@ -23,13 +23,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kube::ResourceExt;
-use kube::api::Api;
 use kube::runtime::controller::Action;
-use kube::runtime::finalizer::{Event, finalizer};
 use tracing::info;
 
 use crate::error::{Error, Result};
-use crate::reconcilers::{Ctx, standard_error_policy, timed};
+use crate::reconcilers::{Ctx, finalized, standard_error_policy, timed};
 use rio_crds::builderpool::{BuilderPool, Sizing};
 
 mod builders;
@@ -52,51 +50,15 @@ const FINALIZER: &str = "builderpool.rio.build/drain";
 /// with the fetcherpool reconciler.
 pub(crate) use crate::reconcilers::common::pod::POOL_LABEL;
 
-/// Top-level reconcile. Wrapped in `finalizer()` which handles
-/// the metadata.finalizers dance: Apply on normal reconcile,
-/// Cleanup when deletionTimestamp is set.
-///
-/// `#[instrument]` creates a span carrying pool/ns for every
-/// log line inside. Histogram records duration — the
-/// observability spec (observability.md:132) calls for
-/// `rio_controller_reconcile_duration_seconds` labeled by
-/// reconciler; this provides it.
-#[tracing::instrument(
-    skip(wp, ctx),
-    fields(reconciler = "builderpool", pool = %wp.name_any(), ns = wp.namespace().as_deref().unwrap_or(""))
-)]
+/// Top-level reconcile. [`timed`] opens the `reconcile{reconciler,
+/// name, ns}` span and records the duration histogram; [`finalized`]
+/// handles the `metadata.finalizers` dance (Apply on normal
+/// reconcile, Cleanup when deletionTimestamp is set).
 pub async fn reconcile(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
-    timed("builderpool", wp, ctx, reconcile_inner).await
-}
-
-/// Actual reconcile body. Separate from the metric-wrapped
-/// `reconcile()` so `?` exits at the right scope (after the
-/// histogram record, not short-circuiting it).
-async fn reconcile_inner(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
-    let ns = wp.namespace().ok_or_else(|| {
-        // BuilderPool is #[kube(namespaced)] so this can't happen
-        // via normal apiserver paths (it'd reject a cluster-
-        // scoped BuilderPool). But the type is Option<String>
-        // (k8s-openapi models it that way). Belt-and-suspenders.
-        Error::InvalidSpec("BuilderPool has no namespace (should be impossible)".into())
-    })?;
-    let api: Api<BuilderPool> = Api::namespaced(ctx.client.clone(), &ns);
-
-    // finalizer() manages the metadata.finalizers entry. It calls
-    // our closure with Event::Apply or Event::Cleanup. After
-    // Cleanup returns Ok, it removes the finalizer → K8s GC
-    // proceeds. Cleanup Err → finalizer stays, reconcile retries.
-    //
-    // Box::new on the Err: finalizer::Error<Error> is recursive
-    // (see error.rs). The `?` converts via our From<Box<...>>.
-    finalizer(&api, FINALIZER, wp, |event| async {
-        match event {
-            Event::Apply(wp) => apply(wp, &ctx).await,
-            Event::Cleanup(wp) => cleanup(wp, &ctx).await,
-        }
+    timed("builderpool", wp, ctx, |wp, ctx| {
+        finalized(wp, ctx, FINALIZER, apply, cleanup)
     })
     .await
-    .map_err(|e| Error::Finalizer(Box::new(e)))
 }
 
 /// Emit Warning events for every spec field the builder will silently
@@ -150,19 +112,10 @@ async fn warn_on_spec_degrades(wp: &BuilderPool, ctx: &Ctx) {
 }
 
 /// Normal reconcile: make the world match spec.
-async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
-    // reconcile_inner() already checked namespace is Some, but
-    // re-derive via ok_or rather than .expect() — cross-function
-    // invariants are refactor-fragile, and a panic here is a pod
-    // crash-loop. InvalidSpec surfaces in error_policy instead.
-    let _ns = wp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPool has no namespace".into()))?;
-    let _name = wp.name_any();
-
+async fn apply(wp: Arc<BuilderPool>, ctx: Arc<Ctx>) -> Result<Action> {
     // Surface silent degrades — shared by Static and Manifest
     // reconcile paths (both use build_pod_spec).
-    warn_on_spec_degrades(&wp, ctx).await;
+    warn_on_spec_degrades(&wp, &ctx).await;
 
     // Both reconcile paths spawn one-shot Jobs. The only difference
     // is sizing: Manifest reads per-derivation resource estimates
@@ -170,9 +123,9 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
     // resources from spec.
     // r[impl ctrl.pool.manifest-reconcile]
     if wp.spec.sizing == Sizing::Manifest {
-        return manifest::reconcile_manifest(&wp, ctx).await;
+        return manifest::reconcile_manifest(&wp, &ctx).await;
     }
-    static_sizing::reconcile_static(&wp, ctx).await
+    static_sizing::reconcile_static(&wp, &ctx).await
 }
 
 /// Cleanup on delete. Jobs are one-shot and complete on their own;
@@ -180,7 +133,7 @@ async fn apply(wp: Arc<BuilderPool>, ctx: &Ctx) -> Result<Action> {
 /// is being deleted). Returning here removes the finalizer and
 /// ownerReference GC deletes the Jobs. To interrupt in-flight builds,
 /// `kubectl delete jobs -l rio.build/pool=X`.
-async fn cleanup(wp: Arc<BuilderPool>, _ctx: &Ctx) -> Result<Action> {
+async fn cleanup(wp: Arc<BuilderPool>, _ctx: Arc<Ctx>) -> Result<Action> {
     info!(builderpool = %wp.name_any(), sizing = ?wp.spec.sizing,
           "cleanup: ownerRef GC handles Jobs");
     Ok(Action::await_change())

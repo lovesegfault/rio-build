@@ -16,14 +16,12 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Toleration;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
-use kube::api::Api;
 use kube::runtime::controller::Action;
-use kube::runtime::finalizer::{Event, finalizer};
 use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::reconcilers::common::pod::{self, ExecutorKind, ExecutorPodParams};
-use crate::reconcilers::{Ctx, standard_error_policy, timed};
+use crate::reconcilers::{Ctx, finalized, standard_error_policy, timed};
 use rio_crds::builderpool::SeccompProfileKind;
 use rio_crds::fetcherpool::{FetcherPool, FetcherSizeClass};
 
@@ -39,39 +37,22 @@ const FETCHER_FUSE_CACHE: &str = "10Gi";
 
 /// Top-level reconcile. Same finalizer-wrap pattern as
 /// [`builderpool::reconcile`](super::builderpool::reconcile).
-#[tracing::instrument(
-    skip(fp, ctx),
-    fields(reconciler = "fetcherpool", pool = %fp.name_any(), ns = fp.namespace().as_deref().unwrap_or(""))
-)]
 pub async fn reconcile(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> {
-    timed("fetcherpool", fp, ctx, reconcile_inner).await
-}
-
-async fn reconcile_inner(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> {
-    let ns = fp
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("FetcherPool has no namespace".into()))?;
-    let api: Api<FetcherPool> = Api::namespaced(ctx.client.clone(), &ns);
-
-    finalizer(&api, FINALIZER, fp, |event| async {
-        match event {
-            Event::Apply(fp) => apply(fp, &ctx).await,
-            Event::Cleanup(fp) => cleanup(fp, &ctx).await,
-        }
+    timed("fetcherpool", fp, ctx, |fp, ctx| {
+        finalized(fp, ctx, FINALIZER, apply, cleanup)
     })
     .await
-    .map_err(|e| Error::Finalizer(Box::new(e)))
 }
 
 /// Normal reconcile: make the world match spec.
-async fn apply(fp: Arc<FetcherPool>, ctx: &Ctx) -> Result<Action> {
-    jobs::reconcile(&fp, ctx).await
+async fn apply(fp: Arc<FetcherPool>, ctx: Arc<Ctx>) -> Result<Action> {
+    jobs::reconcile(&fp, &ctx).await
 }
 
 /// Cleanup: ownerRef GC handles the Jobs. Fetches are short-lived
 /// so there's no long terminationGracePeriod to wait through —
 /// just let GC proceed.
-async fn cleanup(fp: Arc<FetcherPool>, _ctx: &Ctx) -> Result<Action> {
+async fn cleanup(fp: Arc<FetcherPool>, _ctx: Arc<Ctx>) -> Result<Action> {
     info!(pool = %fp.name_any(), "FetcherPool deleted; ownerRef GC will clean up");
     Ok(Action::await_change())
 }

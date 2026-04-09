@@ -42,14 +42,13 @@ use std::time::Duration;
 
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
-use kube::runtime::finalizer::{Event, finalizer};
 use kube::{CustomResourceExt, ResourceExt};
 use tracing::{debug, info, warn};
 
 use rio_proto::types::{GetSizeClassStatusRequest, GetSizeClassStatusResponse};
 
 use crate::error::{Error, Result};
-use crate::reconcilers::{Ctx, KubeErrorExt, standard_error_policy, timed};
+use crate::reconcilers::{Ctx, KubeErrorExt, finalized, standard_error_policy, timed};
 /// Is this BuilderPool owned by a SPECIFIC BuilderPoolSet? Checks
 /// `ownerReferences` for a controller entry whose UID matches
 /// `wps.metadata.uid`. Used by the prune path, where we must not
@@ -100,40 +99,18 @@ pub(crate) const STATUS_MANAGER: &str = "rio-controller-wps-status";
 /// backstop for dropped watch events.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Top-level reconcile. Wrapped in `finalizer()` — same pattern
-/// as the BuilderPool reconciler (see builderpool/mod.rs for the
-/// full metadata.finalizers dance explanation).
-#[tracing::instrument(
-    skip(wps, ctx),
-    fields(reconciler = "builderpoolset", wps = %wps.name_any(), ns = wps.namespace().as_deref().unwrap_or(""))
-)]
+/// Top-level reconcile. Same span+finalizer-wrap pattern as
+/// [`builderpool::reconcile`](super::builderpool::reconcile).
 pub async fn reconcile(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
-    timed("builderpoolset", wps, ctx, reconcile_inner).await
-}
-
-async fn reconcile_inner(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
-    let ns = wps
-        .namespace()
-        .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
-    let api: Api<BuilderPoolSet> = Api::namespaced(ctx.client.clone(), &ns);
-
-    finalizer(&api, FINALIZER, wps, |event| async {
-        match event {
-            Event::Apply(wps) => apply(wps, &ctx).await,
-            Event::Cleanup(wps) => cleanup(wps, &ctx).await,
-        }
+    timed("builderpoolset", wps, ctx, |wps, ctx| {
+        finalized(wps, ctx, FINALIZER, apply, cleanup)
     })
     .await
-    .map_err(|e| Error::Finalizer(Box::new(e)))
 }
 
 /// Normal reconcile: for each size class, SSA-apply its child
 /// BuilderPool. Idempotent — SSA with the same body is a no-op.
-async fn apply(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
-    // reconcile_inner() already checked namespace is Some, but
-    // re-derive via ok_or rather than .expect() — cross-function
-    // invariants are refactor-fragile, and a panic here is a pod
-    // crash-loop. InvalidSpec surfaces in error_policy instead.
+async fn apply(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
     let ns = wps
         .namespace()
         .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
@@ -392,7 +369,7 @@ pub(crate) fn wps_status_patch(classes: &[ClassStatus]) -> serde_json::Value {
 /// succeeded on this child before crashing on the next).
 /// Fine — skip and continue to the next child.
 // r[impl ctrl.wps.cleanup-sweep]
-async fn cleanup(wps: Arc<BuilderPoolSet>, ctx: &Ctx) -> Result<Action> {
+async fn cleanup(wps: Arc<BuilderPoolSet>, ctx: Arc<Ctx>) -> Result<Action> {
     let ns = wps
         .namespace()
         .ok_or_else(|| Error::InvalidSpec("BuilderPoolSet has no namespace".into()))?;
@@ -535,13 +512,15 @@ mod tests {
 
         // ---- First reconcile: 1Gi ----
         set_mem(&mut wps, "1Gi");
-        apply(Arc::new(wps.clone()), &ctx)
+        apply(Arc::new(wps.clone()), ctx.clone())
             .await
             .expect("first apply ok");
 
         // ---- Second reconcile: 2Gi (parent spec edited) ----
         set_mem(&mut wps, "2Gi");
-        apply(Arc::new(wps), &ctx).await.expect("second apply ok");
+        apply(Arc::new(wps), ctx.clone())
+            .await
+            .expect("second apply ok");
 
         guard.verified().await;
     }
@@ -566,7 +545,7 @@ mod tests {
         scenarios[0].path_contains = Box::leak(format!("fieldManager={MANAGER}").into_boxed_str());
         let guard = verifier.run(scenarios);
 
-        apply(Arc::new(wps), &ctx).await.expect("apply ok");
+        apply(Arc::new(wps), ctx.clone()).await.expect("apply ok");
         guard.verified().await;
     }
 
