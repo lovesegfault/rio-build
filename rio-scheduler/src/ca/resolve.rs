@@ -489,12 +489,15 @@ pub async fn insert_realisation_deps(
 /// the PG pool and migrations), not via the store gRPC. ADR-018 §3:
 /// "resolution logic belongs in the scheduler."
 ///
-/// TODO(b02): replace this raw-SQL copy with
+/// TODO: replace this raw-SQL copy with
 /// `rio_store::realisations::query` (now `pub`). The store-side fn
 /// returns the full `Realisation` struct with row validation; this
 /// shim only needs `output_path`. Swapping requires adding rio-store
-/// as a scheduler dep (with default-features=false to avoid pulling
-/// the gRPC server stack) — deferred to the b02-scheduler bundle.
+/// as a prod scheduler dep — currently dev-only — and rio-store has no
+/// lean feature gate (its only feature is `test-utils`), so this would
+/// pull aws-sdk-s3 + the gRPC server stack into the scheduler build.
+/// Deferred until rio-store grows a `schema`-only feature or the
+/// query moves to `rio_common::schema`.
 pub(crate) async fn query_realisation(
     pool: &PgPool,
     modular_hash: &[u8; 32],

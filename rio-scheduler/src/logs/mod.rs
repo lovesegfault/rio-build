@@ -80,9 +80,14 @@ impl LogBuffers {
     ///
     /// TODO: close by having the actor call a `seal(drv_path)` on
     /// dispatch-end (so push() becomes `get_mut`-only), or by sweeping
-    /// keys not in the actor's live drv set on Tick. Both require
-    /// touching `actor/{dispatch,completion}.rs`; deferred until that
-    /// surface is stable.
+    /// keys not in the actor's live drv set on Tick. The completion
+    /// surface is now stable (`terminal_failure_epilogue` /
+    /// `handle_success_completion` in `actor/completion.rs`), but the
+    /// actor has no direct `LogBuffers` handle — wiring needs either an
+    /// `Arc<LogBuffers>` threaded into `DagActor`, or a `seal` flag on
+    /// `FlushRequest` so the flusher tombstones post-drain. Retry must
+    /// un-seal on re-dispatch, so the open/seal pair spans
+    /// dispatch+completion.
     pub fn push(&self, batch: &BuildLogBatch) {
         // `entry()` locks the shard's write lock for the duration of the
         // closure. For the same-key case (one worker per drv_path), this is
