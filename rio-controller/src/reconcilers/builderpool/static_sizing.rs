@@ -404,10 +404,6 @@ pub(super) fn build_job(
 mod tests {
     use super::*;
     use crate::fixtures::{test_sched_addrs, test_store_addrs};
-    // `controller_owner_ref` comes from `kube::Resource`. Module-
-    // level import moved to common::job with the prologue helper;
-    // tests still build Jobs directly, so import here.
-    use kube::Resource;
 
     fn test_wp() -> BuilderPool {
         // Start from the shared fixture, then override the fields
@@ -438,7 +434,7 @@ mod tests {
     #[test]
     fn job_spec_load_bearing_fields() {
         let wp = test_wp();
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
 
         // ownerReference → GC on BuilderPool delete.
@@ -521,7 +517,7 @@ mod tests {
     #[test]
     fn job_name_format() {
         let wp = test_wp();
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         let name = job.metadata.name.unwrap();
 
@@ -563,7 +559,7 @@ mod tests {
         // Cutoff also set → would compute 30×5=150 if precedence
         // were wrong. 7200 must win.
         wp.spec.size_class_cutoff_secs = Some(30.0);
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
 
         let spec = job.spec.as_ref().unwrap();
@@ -589,7 +585,7 @@ mod tests {
     fn per_class_deadline_from_cutoff_secs() {
         let mut wp = test_wp();
         wp.spec.size_class_cutoff_secs = Some(30.0);
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
@@ -601,7 +597,7 @@ mod tests {
         // xlarge: cutoff=7200 → 36000. Proves the multiplier scales
         // (not a clamped-to-default refactor).
         wp.spec.size_class_cutoff_secs = Some(7200.0);
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
@@ -612,7 +608,7 @@ mod tests {
         // 600.5 → 601. Floor would give 600 and shave a second off
         // the bound — wrong direction.
         wp.spec.size_class_cutoff_secs = Some(120.1);
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.spec.as_ref().unwrap().active_deadline_seconds,
@@ -622,7 +618,7 @@ mod tests {
         // Degenerate cutoff=0 clamps to 1s (not 0, which K8s treats
         // as "kill immediately" → silent spawn loop).
         wp.spec.size_class_cutoff_secs = Some(0.0);
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(job.spec.as_ref().unwrap().active_deadline_seconds, Some(1));
     }
@@ -645,7 +641,7 @@ mod tests {
     fn job_tls_secret_mounted_when_set() {
         let mut wp = test_wp();
         wp.spec.tls_secret_name = Some("rio-builder-tls".into());
-        let oref = wp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&wp);
         let job = build_job(&wp, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         let pod = job.spec.unwrap().template.spec.unwrap();
 

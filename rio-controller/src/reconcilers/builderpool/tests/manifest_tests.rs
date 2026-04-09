@@ -483,7 +483,7 @@ fn inventory_groups_by_parsed_labels() {
 #[test]
 fn built_job_labels_roundtrip_through_inventory() {
     let wp = test_manifest_wp();
-    let oref = wp.controller_owner_ref(&()).unwrap();
+    let oref = crate::fixtures::oref(&wp);
     let bucket = (8 * GI, 2000);
 
     let job = build_manifest_job(
@@ -540,7 +540,7 @@ fn built_job_labels_roundtrip_through_inventory() {
 #[test]
 fn built_job_pod_has_bucket_resources() {
     let wp = test_manifest_wp();
-    let oref = wp.controller_owner_ref(&()).unwrap();
+    let oref = crate::fixtures::oref(&wp);
     let bucket = (32 * GI, 4000);
 
     let job = build_manifest_job(
@@ -585,7 +585,7 @@ fn cold_start_job_uses_spec_resources_floor() {
     // bucket is the point here.
     assert!(wp.spec.resources.is_none(), "precondition");
 
-    let oref = wp.controller_owner_ref(&()).unwrap();
+    let oref = crate::fixtures::oref(&wp);
     let job = build_manifest_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None)
         .expect("build_manifest_job");
 
@@ -619,7 +619,7 @@ fn cold_start_job_uses_spec_resources_floor() {
 #[test]
 fn job_spec_load_bearing_fields() {
     let wp = test_manifest_wp();
-    let oref = wp.controller_owner_ref(&()).unwrap();
+    let oref = crate::fixtures::oref(&wp);
     let job = build_manifest_job(
         &wp,
         oref,
@@ -688,7 +688,7 @@ fn job_spec_load_bearing_fields() {
 #[test]
 fn job_name_format() {
     let wp = test_manifest_wp();
-    let oref = wp.controller_owner_ref(&()).unwrap();
+    let oref = crate::fixtures::oref(&wp);
     let job = build_manifest_job(
         &wp,
         oref,
@@ -724,7 +724,7 @@ fn job_name_format() {
 #[test]
 fn job_name_format_cold_start() {
     let wp = test_manifest_wp();
-    let oref = wp.controller_owner_ref(&()).unwrap();
+    let oref = crate::fixtures::oref(&wp);
     let job =
         build_manifest_job(&wp, oref, &test_sched_addrs(), &test_store_addrs(), None).unwrap();
     let name = job.metadata.name.unwrap();

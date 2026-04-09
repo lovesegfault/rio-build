@@ -98,6 +98,16 @@ pub fn test_fetcherpool_spec() -> FetcherPoolSpec {
     }
 }
 
+/// `controller_owner_ref` for a test CR. The fixture constructors
+/// above all set `metadata.uid` so this never returns `None`; the
+/// `expect` message names the fix if a future fixture forgets.
+pub fn oref<K: kube::Resource<DynamicType = ()>>(
+    obj: &K,
+) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+    obj.controller_owner_ref(&())
+        .expect("test fixture missing metadata.uid — set it in the constructor")
+}
+
 /// Wrap a [`test_fetcherpool_spec`] in a `FetcherPool` with name +
 /// UID + namespace set.
 pub fn test_fetcherpool(name: &str) -> FetcherPool {

@@ -306,7 +306,6 @@ pub(super) fn build_job(
 mod tests {
     use super::*;
     use crate::fixtures::{test_fetcherpool, test_sched_addrs, test_store_addrs};
-    use kube::Resource;
 
     fn test_fp() -> FetcherPool {
         test_fetcherpool("eph-fp")
@@ -322,7 +321,7 @@ mod tests {
     #[test]
     fn build_job_uses_fetcher_params() {
         let fp = test_fp();
-        let oref = fp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&fp);
         let job = build_job(
             &fp,
             cls(&fp),
@@ -387,7 +386,7 @@ mod tests {
     fn build_job_honors_deadline_override() {
         let mut fp = test_fp();
         fp.spec.deadline_seconds = Some(900);
-        let oref = fp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&fp);
         let job = build_job(
             &fp,
             cls(&fp),
@@ -404,7 +403,7 @@ mod tests {
     #[test]
     fn build_job_labels_include_pool() {
         let fp = test_fp();
-        let oref = fp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&fp);
         let job = build_job(
             &fp,
             cls(&fp),
@@ -446,7 +445,7 @@ mod tests {
             max_concurrent: Some(4),
         }
         .into();
-        let oref = fp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&fp);
         let job = build_job(&fp, &class, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
 
         let labels = job.metadata.labels.as_ref().unwrap();
@@ -502,7 +501,7 @@ mod tests {
             max_concurrent: None,
         }
         .into();
-        let oref = fp.controller_owner_ref(&()).unwrap();
+        let oref = crate::fixtures::oref(&fp);
         let job = build_job(&fp, &class, oref, &test_sched_addrs(), &test_store_addrs()).unwrap();
         assert_eq!(
             job.metadata
