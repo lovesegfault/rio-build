@@ -41,11 +41,9 @@ pub(crate) fn test_pod_spec(wp: &BuilderPool) -> PodSpec {
 }
 
 /// Build a `Ctx` wired to the mock apiserver client. Scheduler/
-/// store/admin addresses point at `127.0.0.1:1` (fails fast —
-/// port 1 is never listened on). `connect_lazy` defers the TCP
-/// connect until the first RPC, so `apply()` (which never calls
-/// the scheduler) works; `cleanup()` treats RPC failure as
-/// best-effort skip.
+/// store/admin clients use [`rio_test_support::grpc::dead_channel`]
+/// so `apply()` (which never calls the scheduler) works while
+/// `cleanup()` treats RPC failure as best-effort skip.
 ///
 /// Shared between `apply_tests` (reconcile-loop wiring) and
 /// `disruption_tests` (warn_on_spec_degrades event emission).
@@ -57,10 +55,9 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
             instance: None,
         },
     );
-    let dead_ch = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
     Arc::new(Ctx {
         client,
-        admin: rio_proto::AdminServiceClient::new(dead_ch),
+        admin: rio_proto::AdminServiceClient::new(rio_test_support::grpc::dead_channel()),
         scheduler: rio_common::config::UpstreamAddrs {
             addr: "http://127.0.0.1:1".into(),
             ..rio_common::config::UpstreamAddrs::with_port(9001)

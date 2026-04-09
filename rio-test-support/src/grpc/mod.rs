@@ -21,7 +21,7 @@ mod store;
 pub use admin::{MockAdmin, spawn_mock_admin};
 pub use scheduler::{MockScheduler, SubmitOutcome, WatchOutcome, spawn_mock_scheduler};
 pub use spawn::{
-    spawn_grpc_server, spawn_grpc_server_layered, spawn_mock_store, spawn_mock_store_inproc,
-    spawn_mock_store_with_client,
+    dead_channel, spawn_grpc_server, spawn_grpc_server_layered, spawn_mock_store,
+    spawn_mock_store_inproc, spawn_mock_store_with_client,
 };
 pub use store::{MockStore, MockStoreCalls, MockStoreFaults, MockStoreState};

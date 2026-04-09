@@ -4,11 +4,25 @@ use std::net::SocketAddr;
 
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
+use tonic::transport::{Channel, Server};
 
 use rio_proto::{ChunkServiceServer, StoreServiceServer};
 
 use super::store::MockStore;
+
+/// A lazy [`Channel`] pointed at a port that is never listened on.
+///
+/// `connect_lazy` defers the TCP connect until the first RPC, so the
+/// channel can be wrapped in a generated client and passed into code
+/// under test without erroring at construction time; the first RPC
+/// then fails with `Unavailable`. Use this to assert "the code path
+/// never made an RPC" (test passes ⇔ no call) or to exercise
+/// RPC-failure branches without a mock server.
+///
+/// Port 1 (`tcpmux`) is reserved and never bound by the test harness.
+pub fn dead_channel() -> Channel {
+    Channel::from_static("http://127.0.0.1:1").connect_lazy()
+}
 
 /// Spawn an in-process tonic server on a random port. Returns `(addr, handle)`.
 ///

@@ -13,7 +13,6 @@ use rio_builder::log_stream::LogLimits;
 use rio_proto::StoreServiceClient;
 use rio_proto::types::ExecutorKind;
 use rio_proto::types::WorkAssignment;
-use tonic::transport::Channel;
 
 /// Minimal non-FOD ATerm: empty hashAlgo/hash in the output tuple →
 /// `Derivation::is_fixed_output()` returns `false`.
@@ -56,9 +55,8 @@ async fn run(kind: ExecutorKind, drv: &[u8], is_fod: bool) -> Result<(), Executo
     let dir = tempfile::tempdir().unwrap();
     let env = make_env(kind, dir.path());
     let assignment = make_assignment(drv, is_fod);
-    // connect_lazy: never dials — the gate fires before any gRPC call.
-    let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
-    let mut store = StoreServiceClient::new(channel);
+    // dead_channel: never dials — the gate fires before any gRPC call.
+    let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
     let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
     execute_build(&assignment, &env, &mut store, &log_tx)
         .await

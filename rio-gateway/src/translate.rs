@@ -994,12 +994,10 @@ mod tests {
     use rio_proto::StoreServiceClient;
     use rio_test_support::fixtures::test_drv_path;
 
-    /// Spin up a mock store that fails all RPCs (lazy connect to dead port).
+    /// A store client whose first RPC fails (lazy connect to dead port).
     /// Used to verify reconstruct_dag fails hard on unresolvable inputDrvs.
     fn unreachable_store() -> StoreServiceClient<tonic::transport::Channel> {
-        // Lazy channel to a dead port — any RPC will fail.
-        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
-        StoreServiceClient::new(channel)
+        StoreServiceClient::new(rio_test_support::grpc::dead_channel())
     }
 
     /// Parse a minimal ATerm derivation with the given inputDrvs.
