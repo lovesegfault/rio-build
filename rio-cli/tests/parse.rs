@@ -117,161 +117,98 @@ fn per_subcommand_help_renders() {
 // ---------------------------------------------------------------------------
 // Per-subcommand arg shapes
 // ---------------------------------------------------------------------------
-
-#[test]
-fn create_tenant_positional_and_flags() {
-    assert_parsed(&["create-tenant", "foo"]);
-    assert_parsed(&[
-        "create-tenant",
-        "foo",
-        "--gc-retention-hours",
-        "24",
-        "--gc-max-store-bytes",
-        "1000000",
-        "--cache-token",
-        "tok",
-    ]);
-    // Missing required positional.
-    assert_rejected(&["create-tenant"]);
-}
-
-#[test]
-fn workers_optional_status_filter() {
-    assert_parsed(&["workers"]);
-    assert_parsed(&["workers", "--status", "alive"]);
-}
-
-#[test]
-fn builds_status_and_limit() {
-    assert_parsed(&["builds"]);
-    assert_parsed(&["builds", "--status", "active", "--limit", "5"]);
-    // --limit must be numeric.
-    assert_rejected(&["builds", "--limit", "notanumber"]);
-}
-
-#[test]
-fn derivations_build_id_or_all_active() {
-    // Positional build_id.
-    assert_parsed(&["derivations", "abc-123"]);
-    assert_parsed(&["derivations", "abc-123", "--status", "Ready"]);
-    assert_parsed(&["derivations", "abc-123", "--stuck"]);
-    // --all-active instead of positional.
-    assert_parsed(&["derivations", "--all-active"]);
-    assert_parsed(&["derivations", "--all-active", "--stuck"]);
-    // conflicts_with: can't give both.
-    assert_rejected(&["derivations", "abc-123", "--all-active"]);
-    // Neither is a clap-level accept (Option<String>) — clap does not
-    // reject. The handler's runtime check fires AFTER connect, so this
-    // test only proves clap didn't exit-2 it; smoke.rs covers the
-    // handler-level "BUILD_ID required" message end-to-end.
-    assert_parsed(&["derivations"]);
-}
-
-#[test]
-fn logs_positional_drv_and_optional_build_id() {
-    assert_parsed(&["logs", "/nix/store/foo.drv"]);
-    assert_parsed(&["logs", "/nix/store/foo.drv", "--build-id", "uuid"]);
-    assert_rejected(&["logs"]);
-}
-
-#[test]
-fn gc_dry_run_flag() {
-    assert_parsed(&["gc"]);
-    assert_parsed(&["gc", "--dry-run"]);
-}
-
-#[test]
-fn poison_clear_requires_hash() {
-    assert_parsed(&["poison-clear", "abc123"]);
-    assert_rejected(&["poison-clear"]);
-}
-
-#[test]
-fn cancel_build_positional_and_reason() {
-    assert_parsed(&["cancel-build", "abc-123"]);
-    assert_parsed(&["cancel-build", "abc-123", "--reason", "stuck"]);
-    assert_rejected(&["cancel-build"]);
-}
-
-#[test]
-fn drain_worker_positional_and_force() {
-    assert_parsed(&["drain-executor", "builder-0"]);
-    assert_parsed(&["drain-executor", "builder-0", "--force"]);
-    assert_rejected(&["drain-executor"]);
-}
-
-#[test]
-fn bps_nested_subcommands() {
-    // bps get has a default namespace.
-    assert_parsed(&["bps", "get"]);
-    assert_parsed(&["bps", "get", "-n", "rio-system"]);
-    // bps describe needs a name.
-    assert_parsed(&["bps", "describe", "my-bps"]);
-    assert_rejected(&["bps", "describe"]);
-    // bare `bps` with no subcommand is a clap error.
-    assert_rejected(&["bps"]);
-}
-
+//
+// One row per (argv, should_parse) pair. `should_parse=true` → clap exit
+// code ≠ 2 (clap accepted the args; connect-refused exit 1 is fine).
+// `should_parse=false` → clap exit 2 (parse error). Case names group by
+// subcommand for readable failure reports.
+//
 // r[verify store.substitute.upstream]
-#[test]
-fn upstream_nested_subcommands() {
-    // list needs --tenant.
-    assert_parsed(&["upstream", "list", "--tenant", "t1"]);
-    assert_rejected(&["upstream", "list"]);
-    // add needs --tenant + --url; priority/sig-mode have defaults.
-    assert_parsed(&[
-        "upstream",
-        "add",
-        "--tenant",
-        "t1",
-        "--url",
-        "https://cache.nixos.org",
-    ]);
-    assert_parsed(&[
-        "upstream",
-        "add",
-        "--tenant",
-        "t1",
-        "--url",
-        "https://cache.nixos.org",
-        "--priority",
-        "10",
-        "--trusted-key",
-        "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
-        "--trusted-key",
-        "other:abc=",
-        "--sig-mode",
-        "add",
-    ]);
-    assert_rejected(&["upstream", "add", "--tenant", "t1"]);
-    // remove needs both.
-    assert_parsed(&[
-        "upstream",
-        "remove",
-        "--tenant",
-        "t1",
-        "--url",
-        "https://cache.nixos.org",
-    ]);
-    assert_rejected(&["upstream", "remove", "--tenant", "t1"]);
-    // bare `upstream` is a clap error.
-    assert_rejected(&["upstream"]);
-}
 
-#[test]
-fn global_json_flag_accepted_anywhere() {
-    // --json is #[arg(global = true)] — accepted before OR after the
-    // subcommand. clap handles this, but it's worth locking in: the
-    // docs show both forms.
-    assert_parsed(&["--json", "status"]);
-    assert_parsed(&["status", "--json"]);
-    assert_parsed(&["workers", "--json", "--status", "alive"]);
-}
-
-#[test]
-fn global_scheduler_addr_flag() {
-    assert_parsed(&["--scheduler-addr", "1.2.3.4:9001", "status"]);
-    assert_parsed(&["status", "--scheduler-addr", "1.2.3.4:9001"]);
+#[rstest::rstest]
+// create-tenant: positional name required; gc/cache flags optional.
+#[case::create_tenant_min(&["create-tenant", "foo"], true)]
+#[case::create_tenant_all_flags(
+    &["create-tenant", "foo", "--gc-retention-hours", "24",
+      "--gc-max-store-bytes", "1000000", "--cache-token", "tok"],
+    true
+)]
+#[case::create_tenant_missing_name(&["create-tenant"], false)]
+// workers: optional --status filter.
+#[case::workers_bare(&["workers"], true)]
+#[case::workers_status(&["workers", "--status", "alive"], true)]
+// builds: --status/--limit optional; --limit must be numeric.
+#[case::builds_bare(&["builds"], true)]
+#[case::builds_filtered(&["builds", "--status", "active", "--limit", "5"], true)]
+#[case::builds_bad_limit(&["builds", "--limit", "notanumber"], false)]
+// derivations: positional build_id XOR --all-active (conflicts_with).
+// Neither given is a clap-level accept (Option<String>); the handler's
+// runtime check fires AFTER connect — smoke.rs covers that path.
+#[case::drvs_by_id(&["derivations", "abc-123"], true)]
+#[case::drvs_by_id_status(&["derivations", "abc-123", "--status", "Ready"], true)]
+#[case::drvs_by_id_stuck(&["derivations", "abc-123", "--stuck"], true)]
+#[case::drvs_all_active(&["derivations", "--all-active"], true)]
+#[case::drvs_all_active_stuck(&["derivations", "--all-active", "--stuck"], true)]
+#[case::drvs_conflict(&["derivations", "abc-123", "--all-active"], false)]
+#[case::drvs_neither(&["derivations"], true)]
+// logs: positional drv required; --build-id optional.
+#[case::logs_min(&["logs", "/nix/store/foo.drv"], true)]
+#[case::logs_with_build_id(&["logs", "/nix/store/foo.drv", "--build-id", "uuid"], true)]
+#[case::logs_missing_drv(&["logs"], false)]
+// gc: --dry-run flag.
+#[case::gc_bare(&["gc"], true)]
+#[case::gc_dry_run(&["gc", "--dry-run"], true)]
+// poison-clear: positional hash required.
+#[case::poison_clear_ok(&["poison-clear", "abc123"], true)]
+#[case::poison_clear_missing(&["poison-clear"], false)]
+// cancel-build: positional id required; --reason optional.
+#[case::cancel_min(&["cancel-build", "abc-123"], true)]
+#[case::cancel_with_reason(&["cancel-build", "abc-123", "--reason", "stuck"], true)]
+#[case::cancel_missing_id(&["cancel-build"], false)]
+// drain-executor: positional id required; --force flag.
+#[case::drain_min(&["drain-executor", "builder-0"], true)]
+#[case::drain_force(&["drain-executor", "builder-0", "--force"], true)]
+#[case::drain_missing_id(&["drain-executor"], false)]
+// bps: nested. get has default namespace; describe needs a name; bare errors.
+#[case::bps_get_default_ns(&["bps", "get"], true)]
+#[case::bps_get_ns(&["bps", "get", "-n", "rio-system"], true)]
+#[case::bps_describe(&["bps", "describe", "my-bps"], true)]
+#[case::bps_describe_missing_name(&["bps", "describe"], false)]
+#[case::bps_bare(&["bps"], false)]
+// upstream: nested. list/add/remove all need --tenant; add/remove need --url.
+#[case::upstream_list(&["upstream", "list", "--tenant", "t1"], true)]
+#[case::upstream_list_no_tenant(&["upstream", "list"], false)]
+#[case::upstream_add_min(
+    &["upstream", "add", "--tenant", "t1", "--url", "https://cache.nixos.org"],
+    true
+)]
+#[case::upstream_add_full(
+    &["upstream", "add", "--tenant", "t1", "--url", "https://cache.nixos.org",
+      "--priority", "10",
+      "--trusted-key", "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+      "--trusted-key", "other:abc=", "--sig-mode", "add"],
+    true
+)]
+#[case::upstream_add_no_url(&["upstream", "add", "--tenant", "t1"], false)]
+#[case::upstream_remove(
+    &["upstream", "remove", "--tenant", "t1", "--url", "https://cache.nixos.org"],
+    true
+)]
+#[case::upstream_remove_no_url(&["upstream", "remove", "--tenant", "t1"], false)]
+#[case::upstream_bare(&["upstream"], false)]
+// --json is #[arg(global = true)] — accepted before OR after the subcommand.
+#[case::json_before(&["--json", "status"], true)]
+#[case::json_after(&["status", "--json"], true)]
+#[case::json_mid(&["workers", "--json", "--status", "alive"], true)]
+// --scheduler-addr is global.
+#[case::sched_addr_before(&["--scheduler-addr", "1.2.3.4:9001", "status"], true)]
+#[case::sched_addr_after(&["status", "--scheduler-addr", "1.2.3.4:9001"], true)]
+fn subcommand_arg_shapes(#[case] args: &[&str], #[case] should_parse: bool) {
+    if should_parse {
+        assert_parsed(args);
+    } else {
+        assert_rejected(args);
+    }
 }
 
 #[test]
