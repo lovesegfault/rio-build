@@ -23,6 +23,14 @@ resource "helm_release" "kube_prometheus_stack" {
   version = "75.6.0"
 
   set = [
+    # hostNetwork: EKS API server can't route to overlay pod IPs for
+    # admission webhooks (kube-prometheus-stack-admission). The
+    # operator pod serves the webhook; hostNetwork puts it on a node
+    # VPC IP. See same comment in secrets.tf external-secrets.
+    {
+      name  = "prometheusOperator.hostNetwork"
+      value = "true"
+    },
     # P0539b ships dashboards as ConfigMaps in rio-system labelled
     # `grafana_dashboard=1`. The sidecar watches for that label and
     # mounts the JSON into Grafana. searchNamespace=ALL because the

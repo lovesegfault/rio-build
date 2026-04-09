@@ -221,6 +221,13 @@ resource "helm_release" "aws_lbc" {
       name  = "serviceAccount.name"
       value = kubernetes_service_account_v1.aws_lbc.metadata[0].name
     },
+    # hostNetwork: EKS API server can't route to overlay pod IPs for
+    # admission webhooks (mservice.elbv2.k8s.aws) → "Address is not
+    # allowed". See same comment in secrets.tf external-secrets.
+    {
+      name  = "hostNetwork"
+      value = "true"
+    },
     # Region + VPC explicitly: the controller can auto-discover via
     # IMDS, but we set IMDSv2 hop limit 1 on worker nodes (defense-
     # in-depth, see main.tf). The controller runs on system nodes

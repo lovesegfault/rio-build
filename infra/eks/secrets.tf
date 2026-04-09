@@ -77,7 +77,19 @@ resource "helm_release" "external_secrets" {
     {
       name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
       value = module.eso_irsa.arn
-    }
+    },
+    # hostNetwork: EKS managed API server can't route to overlay pod IPs
+    # (Cilium cluster-pool fd42::/10.244.x) for admission webhook calls →
+    # "Address is not allowed". hostNetwork puts the webhook on a node
+    # VPC IP. Port 10260 avoids kubelet's 10250.
+    {
+      name  = "webhook.hostNetwork"
+      value = "true"
+    },
+    {
+      name  = "webhook.port"
+      value = "10260"
+    },
   ]
 
   # aws_lbc dep: webhook-ordering only — see addons.tf aws_lbc.
