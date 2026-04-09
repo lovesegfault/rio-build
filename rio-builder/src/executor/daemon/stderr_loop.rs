@@ -22,6 +22,17 @@ use crate::log_stream::{AddLineResult, BATCH_TIMEOUT, LogBatcher};
 
 use super::DAEMON_SETUP_TIMEOUT;
 
+/// Per-build option triple passed to the daemon. Bundled so
+/// [`run_daemon_build`] stays under the `too_many_arguments` threshold;
+/// per-field provenance (timeout from config, max_silent_time from
+/// assignment, build_cores from cgroup clamp) is documented at
+/// `executor::resolve_build_opts`.
+pub(in crate::executor) struct DaemonBuildOpts {
+    pub build_timeout: Duration,
+    pub max_silent_time: u64,
+    pub build_cores: u64,
+}
+
 /// All daemon I/O after spawn: handshake, setOptions, wopBuildDerivation, stderr loop.
 ///
 /// Caller MUST kill the daemon after this returns (whether Ok or Err).
@@ -31,26 +42,20 @@ use super::DAEMON_SETUP_TIMEOUT;
 /// Span duration ≈ actual sandbox build time — this is the hot zone in
 /// a trace (e.g., 95% of a slow build's wall time). `build_timeout` in
 /// span fields so Tempo can correlate slow builds with timeout config.
-// 8 args: daemon handle + drv identity + three timeout/limit knobs +
-// log plumbing. Bundling into a struct would obscure the per-knob
-// provenance (timeout from config, max_silent_time from assignment).
 // r[impl builder.daemon.stdio-client]
-#[allow(clippy::too_many_arguments)]
 #[instrument(
     skip_all,
     fields(
-        build_timeout_secs = build_timeout.as_secs(),
-        max_silent_secs = max_silent_time,
-        build_cores
+        build_timeout_secs = opts.build_timeout.as_secs(),
+        max_silent_secs = opts.max_silent_time,
+        build_cores = opts.build_cores,
     )
 )]
 pub(in crate::executor) async fn run_daemon_build(
     daemon: &mut tokio::process::Child,
     drv_path: &str,
     basic_drv: &rio_nix::derivation::BasicDerivation,
-    build_timeout: Duration,
-    max_silent_time: u64,
-    build_cores: u64,
+    opts: DaemonBuildOpts,
     batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<BuildResult, ExecutorError> {
@@ -80,7 +85,13 @@ pub(in crate::executor) async fn run_daemon_build(
             "daemon handshake complete"
         );
 
-        client_set_options(stdout_ref, &mut stdin, max_silent_time, build_cores).await?;
+        client_set_options(
+            stdout_ref,
+            &mut stdin,
+            opts.max_silent_time,
+            opts.build_cores,
+        )
+        .await?;
 
         client_send_build_derivation(&mut stdin, drv_path, basic_drv, BuildMode::Normal).await?;
 
@@ -115,22 +126,22 @@ pub(in crate::executor) async fn run_daemon_build(
     //
     // r[impl builder.timeout.no-reassign]
     let build_result = match tokio::time::timeout(
-        build_timeout,
-        read_build_stderr_loop(stdout, max_silent_time, batcher, log_tx),
+        opts.build_timeout,
+        read_build_stderr_loop(stdout, opts.max_silent_time, batcher, log_tx),
     )
     .await
     {
         Ok(inner) => inner?,
         Err(_elapsed) => {
             tracing::warn!(
-                timeout_secs = build_timeout.as_secs(),
+                timeout_secs = opts.build_timeout.as_secs(),
                 "build exceeded timeout; reporting TimedOut (no reassignment)"
             );
             BuildResult::failure(
                 BuildStatus::TimedOut,
                 format!(
                     "build exceeded configured timeout of {}s",
-                    build_timeout.as_secs()
+                    opts.build_timeout.as_secs()
                 ),
             )
         }
@@ -146,9 +157,199 @@ pub(in crate::executor) async fn run_daemon_build(
 /// many lines is itself pathological.
 const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
 
+/// Outcome of one STDERR-loop event. `Ok(None)` = saw `STDERR_LAST`,
+/// proceed to read `BuildResult`. `Ok(Some(fail))` = return that failure
+/// without reading `BuildResult`. `Err(e)` = wire error, propagate.
+type LoopOutcome = Result<Option<BuildResult>, wire::WireError>;
+
+/// Per-message dispatch state for [`read_build_stderr_loop`]'s `select!`.
+///
+/// Holds the batcher + log channel + book-keeping that every match arm
+/// touches. Methods correspond to the loop's phases: classify a message,
+/// forward a log line, forward a phase, time-driven flush. Splitting the
+/// 240-line `select!` body into methods keeps each arm at the call site
+/// (where the cancel-safety / `biased;` ordering comments belong) while
+/// the actual work lives next to the state it mutates.
+struct StderrLoop<'a> {
+    batcher: LogBatcher,
+    log_tx: &'a mpsc::Sender<ExecutorMessage>,
+    /// Count of STDERR messages seen so far; bounded by
+    /// [`MAX_BUILD_STDERR_MESSAGES`].
+    msg_count: u64,
+    /// Last instant an OUTPUT-producing message arrived (Next or
+    /// Result{101,107}). Progress chatter does NOT bump this — see
+    /// `r[builder.silence.timeout-kill]`.
+    last_output: Instant,
+    /// `max_silent_time` as a Duration, for the silence-deadline arm.
+    silence: Duration,
+}
+
+impl<'a> StderrLoop<'a> {
+    fn new(
+        batcher: LogBatcher,
+        log_tx: &'a mpsc::Sender<ExecutorMessage>,
+        silence: Duration,
+    ) -> Self {
+        Self {
+            batcher,
+            log_tx,
+            msg_count: 0,
+            last_output: Instant::now(),
+            silence,
+        }
+    }
+
+    /// Shared log-line handling for `STDERR_NEXT` and `STDERR_RESULT`
+    /// `BuildLogLine` — both need msg_count bound check + `batcher.add_line`
+    /// + `AddLineResult` dispatch. On `Continue`, bumps `last_output`.
+    async fn on_log_line(&mut self, line: Vec<u8>) -> std::ops::ControlFlow<LoopOutcome> {
+        use std::ops::ControlFlow::*;
+        self.msg_count += 1;
+        if self.msg_count >= MAX_BUILD_STDERR_MESSAGES {
+            return Break(Err(wire::WireError::Io(std::io::Error::other(
+                "exceeded maximum STDERR messages during build",
+            ))));
+        }
+        match self.batcher.add_line(line) {
+            AddLineResult::Buffered => {
+                self.last_output = Instant::now();
+                Continue(())
+            }
+            AddLineResult::BatchReady(batch) => {
+                if send_batch(self.log_tx, batch).await {
+                    self.last_output = Instant::now();
+                    Continue(())
+                } else {
+                    Break(Ok(Some(misc_fail(
+                        "log channel closed during build (scheduler stream gone)",
+                    ))))
+                }
+            }
+            // r[impl builder.log-limit]
+            AddLineResult::LimitExceeded { reason } => {
+                // Flush what's buffered so client sees output up to
+                // the limit. Best-effort: channel-closed is moot,
+                // we're breaking with LogLimitExceeded anyway.
+                if self.batcher.has_pending() {
+                    let _ = send_batch(self.log_tx, self.batcher.flush()).await;
+                }
+                tracing::warn!(reason = %reason, "build log limit exceeded, aborting");
+                Break(Ok(Some(BuildResult::failure(
+                    BuildStatus::LogLimitExceeded,
+                    reason,
+                ))))
+            }
+        }
+    }
+
+    // r[impl builder.stderr.forward-set-phase]
+    /// `STDERR_RESULT{104 SetPhase}`: forward as `BuildPhase` so the
+    /// gateway can emit `resSetPhase` against the per-drv activity → nom
+    /// shows "buildPhase"/"installPhase". NOT batched (state edge, not
+    /// spew); does NOT reset the silence deadline (a build that only
+    /// emits phase markers but no actual output is still "silent" by
+    /// the maxSilentTime contract — same rule as Progress chatter).
+    async fn forward_phase(&self, phase: &str) -> std::ops::ControlFlow<LoopOutcome> {
+        let msg = ExecutorMessage {
+            msg: Some(executor_message::Msg::Phase(rio_proto::types::BuildPhase {
+                derivation_path: self.batcher.drv_path().to_owned(),
+                phase: phase.to_owned(),
+            })),
+        };
+        if self.log_tx.send(msg).await.is_err() {
+            std::ops::ControlFlow::Break(Ok(Some(misc_fail(
+                "log channel closed during build (scheduler stream gone)",
+            ))))
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    /// Classify one parsed `StderrMessage` and dispatch to the
+    /// appropriate handler. Called from the `msg_rx.recv()` arm.
+    async fn dispatch(&mut self, msg: StderrMessage) -> std::ops::ControlFlow<LoopOutcome> {
+        use std::ops::ControlFlow::*;
+        match msg {
+            StderrMessage::Last => Break(Ok(None)),
+            StderrMessage::Error(e) => Break(Ok(Some(misc_fail(&e.message)))),
+            StderrMessage::Next(line) => self.on_log_line(line.into_bytes()).await,
+            StderrMessage::Read(_) => Break(Ok(Some(misc_fail(
+                "daemon sent STDERR_READ, not supported",
+            )))),
+            // STDERR_RESULT with result_type 101 (BuildLogLine) or
+            // 107 (PostBuildLogLine): this is how modern nix-daemon
+            // sends builder stderr output. It DOES NOT come as raw
+            // STDERR_NEXT — that's only for daemon chatter.
+            //
+            // This was a latent phase2a bug: we were silently dropping
+            // all build output. It never mattered because phase2a
+            // didn't assert on log content. vm-phase2b's log-pipeline
+            // assertion caught it — exactly what milestone VM tests
+            // are for.
+            //
+            // fields[0] is the log line (String). Same batching +
+            // limit logic as STDERR_NEXT.
+            StderrMessage::Result {
+                result_type,
+                fields,
+                ..
+            } if (result_type == 101 || result_type == 107)
+                && matches!(fields.first(), Some(ResultField::String(_))) =>
+            {
+                // Safe: matches! above verified it's Some(String(_)).
+                let ResultField::String(line) = &fields[0] else {
+                    unreachable!("match guard above proved String")
+                };
+                self.on_log_line(line.as_bytes().to_vec()).await
+            }
+            StderrMessage::Result {
+                result_type,
+                fields,
+                ..
+            } if result_type == 104 && matches!(fields.first(), Some(ResultField::String(_))) => {
+                let ResultField::String(phase) = &fields[0] else {
+                    unreachable!("match guard above proved String")
+                };
+                self.forward_phase(phase).await
+            }
+            // Other Result types (Progress, SetExpected, etc.) and
+            // activity lifecycle messages — discard.
+            StderrMessage::Write(_)
+            | StderrMessage::StartActivity { .. }
+            | StderrMessage::StopActivity { .. }
+            | StderrMessage::Result { .. } => Continue(()),
+        }
+    }
+
+    /// Tick-driven flush: if the batcher has pending lines, flush them.
+    /// The interval itself IS the 100ms gate; we don't use
+    /// `batcher.maybe_flush()` here — that checks against
+    /// `std::time::Instant`, which doesn't advance under tokio's
+    /// paused-time test mode. The tick already proved 100ms of
+    /// tokio-time elapsed.
+    async fn flush_tick(&mut self) -> std::ops::ControlFlow<LoopOutcome> {
+        if self.batcher.has_pending() && !send_batch(self.log_tx, self.batcher.flush()).await {
+            std::ops::ControlFlow::Break(Ok(Some(misc_fail(
+                "log channel closed during build (scheduler stream gone)",
+            ))))
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    /// Best-effort final flush after the loop exits. The build result is
+    /// already determined; if the log channel is closed, just drop.
+    async fn final_flush(&mut self) {
+        if self.batcher.has_pending() {
+            let _ = send_batch(self.log_tx, self.batcher.flush()).await;
+        }
+    }
+}
+
 /// Send a log batch on the executor stream. Returns `false` if the
-/// channel is closed (scheduler stream gone — caller breaks the loop
-/// with `MiscFailure`).
+/// channel is closed (scheduler stream gone). Free fn (not a method on
+/// `StderrLoop`) so callers can `batcher.flush()` (mutable self.batcher)
+/// in the same expression without a split-borrow dance.
 async fn send_batch(
     log_tx: &mpsc::Sender<ExecutorMessage>,
     batch: rio_proto::types::BuildLogBatch,
@@ -159,55 +360,8 @@ async fn send_batch(
     log_tx.send(msg).await.is_ok()
 }
 
-/// Outcome of handling one log line. `Continue` = keep reading.
-/// `Break(r)` = exit the stderr loop with this result.
-enum LineOutcome {
-    Continue,
-    Break(Result<Option<BuildResult>, wire::WireError>),
-}
-
-/// Shared log-line handling for `STDERR_NEXT` and `STDERR_RESULT`
-/// `BuildLogLine` — both need msg_count bound check + `batcher.add_line`
-/// + `AddLineResult` dispatch.
-async fn handle_log_line(
-    line: Vec<u8>,
-    msg_count: &mut u64,
-    batcher: &mut LogBatcher,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
-) -> LineOutcome {
-    *msg_count += 1;
-    if *msg_count >= MAX_BUILD_STDERR_MESSAGES {
-        return LineOutcome::Break(Err(wire::WireError::Io(std::io::Error::other(
-            "exceeded maximum STDERR messages during build",
-        ))));
-    }
-    match batcher.add_line(line) {
-        AddLineResult::Buffered => LineOutcome::Continue,
-        AddLineResult::BatchReady(batch) => {
-            if send_batch(log_tx, batch).await {
-                LineOutcome::Continue
-            } else {
-                LineOutcome::Break(Ok(Some(BuildResult::failure(
-                    BuildStatus::MiscFailure,
-                    "log channel closed during build (scheduler stream gone)".to_string(),
-                ))))
-            }
-        }
-        // r[impl builder.log-limit]
-        AddLineResult::LimitExceeded { reason } => {
-            // Flush what's buffered so client sees output up to
-            // the limit. Best-effort: channel-closed is moot,
-            // we're breaking with LogLimitExceeded anyway.
-            if batcher.has_pending() {
-                let _ = send_batch(log_tx, batcher.flush()).await;
-            }
-            tracing::warn!(reason = %reason, "build log limit exceeded, aborting");
-            LineOutcome::Break(Ok(Some(BuildResult::failure(
-                BuildStatus::LogLimitExceeded,
-                reason,
-            ))))
-        }
-    }
+fn misc_fail(m: &str) -> BuildResult {
+    BuildResult::failure(BuildStatus::MiscFailure, m.to_string())
 }
 
 /// Read the STDERR loop from the daemon, streaming logs via the batcher.
@@ -232,7 +386,7 @@ async fn handle_log_line(
 async fn read_build_stderr_loop<R>(
     reader: R,
     max_silent_time: u64,
-    mut batcher: LogBatcher,
+    batcher: LogBatcher,
     log_tx: &mpsc::Sender<ExecutorMessage>,
 ) -> Result<BuildResult, wire::WireError>
 where
@@ -248,10 +402,7 @@ where
     // Activity/Write/Progress chatter does NOT reset — a build that
     // spins sending progress updates but no actual log lines is still
     // "silent" by the maxSilentTime contract (builder stderr quiescence).
-    let mut last_output = Instant::now();
-    let silence_duration = Duration::from_secs(max_silent_time);
-
-    let misc_fail = |m: &str| BuildResult::failure(BuildStatus::MiscFailure, m.to_string());
+    let mut state = StderrLoop::new(batcher, log_tx, Duration::from_secs(max_silent_time));
 
     // Spawn the owned reader task. It reads one StderrMessage at a time and
     // pushes to `msg_tx`. Terminal messages (Last, Error, wire Err) break the
@@ -290,12 +441,7 @@ where
     // the full interval.
     flush_tick.tick().await;
 
-    let mut msg_count: u64 = 0;
-
-    // Outcome of the select! loop. Ok(None) = saw STDERR_LAST, proceed to
-    // read BuildResult. Ok(Some(fail)) = return that failure without reading
-    // BuildResult. Err(e) = wire error, propagate.
-    let outcome: Result<Option<BuildResult>, wire::WireError> = loop {
+    let outcome: LoopOutcome = loop {
         tokio::select! {
             // `biased` prioritizes the message arm over the tick arm when
             // both are ready. Under heavy log spew we want to drain messages
@@ -305,95 +451,11 @@ where
 
             maybe = msg_rx.recv() => {
                 match maybe {
-                    Some(Ok(StderrMessage::Last)) => break Ok(None),
-                    Some(Ok(StderrMessage::Error(e))) => break Ok(Some(misc_fail(&e.message))),
-                    Some(Ok(StderrMessage::Next(line))) => {
-                        match handle_log_line(
-                            line.into_bytes(),
-                            &mut msg_count,
-                            &mut batcher,
-                            log_tx,
-                        )
-                        .await
-                        {
-                            LineOutcome::Continue => last_output = Instant::now(),
-                            LineOutcome::Break(r) => break r,
+                    Some(Ok(msg)) => {
+                        if let std::ops::ControlFlow::Break(r) = state.dispatch(msg).await {
+                            break r;
                         }
                     }
-                    Some(Ok(StderrMessage::Read(_))) => {
-                        break Ok(Some(misc_fail("daemon sent STDERR_READ, not supported")));
-                    }
-                    // STDERR_RESULT with result_type 101 (BuildLogLine) or
-                    // 107 (PostBuildLogLine): this is how modern nix-daemon
-                    // sends builder stderr output. It DOES NOT come as raw
-                    // STDERR_NEXT — that's only for daemon chatter.
-                    //
-                    // This was a latent phase2a bug: we were silently dropping
-                    // all build output. It never mattered because phase2a
-                    // didn't assert on log content. vm-phase2b's log-pipeline
-                    // assertion caught it — exactly what milestone VM tests
-                    // are for.
-                    //
-                    // fields[0] is the log line (String). Same batching +
-                    // limit logic as STDERR_NEXT.
-                    Some(Ok(StderrMessage::Result { result_type, fields, .. }))
-                        if (result_type == 101 || result_type == 107)
-                            && matches!(fields.first(), Some(ResultField::String(_))) =>
-                    {
-                        // Safe: matches! above verified it's Some(String(_)).
-                        let ResultField::String(line) = &fields[0] else {
-                            unreachable!("match guard above proved String")
-                        };
-                        match handle_log_line(
-                            line.as_bytes().to_vec(),
-                            &mut msg_count,
-                            &mut batcher,
-                            log_tx,
-                        )
-                        .await
-                        {
-                            LineOutcome::Continue => last_output = Instant::now(),
-                            LineOutcome::Break(r) => break r,
-                        }
-                    }
-                    // r[impl builder.stderr.forward-set-phase]
-                    // STDERR_RESULT{104 SetPhase}: forward as BuildPhase so
-                    // the gateway can emit resSetPhase against the per-drv
-                    // activity → nom shows "buildPhase"/"installPhase". NOT
-                    // batched (state edge, not spew); does NOT reset the
-                    // silence deadline (a build that only emits phase
-                    // markers but no actual output is still "silent" by
-                    // the maxSilentTime contract — same rule as the
-                    // Progress chatter below).
-                    Some(Ok(StderrMessage::Result { result_type, fields, .. }))
-                        if result_type == 104
-                            && matches!(fields.first(), Some(ResultField::String(_))) =>
-                    {
-                        let ResultField::String(phase) = &fields[0] else {
-                            unreachable!("match guard above proved String")
-                        };
-                        let msg = ExecutorMessage {
-                            msg: Some(executor_message::Msg::Phase(
-                                rio_proto::types::BuildPhase {
-                                    derivation_path: batcher.drv_path().to_owned(),
-                                    phase: phase.clone(),
-                                },
-                            )),
-                        };
-                        if log_tx.send(msg).await.is_err() {
-                            break Ok(Some(misc_fail(
-                                "log channel closed during build (scheduler stream gone)",
-                            )));
-                        }
-                    }
-                    // Other Result types (Progress, SetExpected, etc.) and
-                    // activity lifecycle messages — discard.
-                    Some(Ok(
-                        StderrMessage::Write(_)
-                        | StderrMessage::StartActivity { .. }
-                        | StderrMessage::StopActivity { .. }
-                        | StderrMessage::Result { .. },
-                    )) => {}
                     Some(Err(e)) => break Err(e),
                     None => {
                         // Reader task exited without a terminal message (it
@@ -408,16 +470,8 @@ where
             }
 
             _ = flush_tick.tick() => {
-                // The interval itself IS the 100ms gate: if a tick fired and
-                // there's anything pending, flush unconditionally. (We don't
-                // use batcher.maybe_flush() here — that checks against
-                // std::time::Instant, which doesn't advance under tokio's
-                // paused-time test mode. The tick already proved 100ms of
-                // tokio-time elapsed.)
-                if batcher.has_pending() && !send_batch(log_tx, batcher.flush()).await {
-                    break Ok(Some(misc_fail(
-                        "log channel closed during build (scheduler stream gone)",
-                    )));
+                if let std::ops::ControlFlow::Break(r) = state.flush_tick().await {
+                    break r;
                 }
             }
 
@@ -429,7 +483,7 @@ where
             // iteration's deadline is pushed out. sleep_until with a past
             // deadline fires immediately, which is what we want after a
             // long msg_rx.recv() await where no output arrived.
-            _ = tokio::time::sleep_until(last_output + silence_duration),
+            _ = tokio::time::sleep_until(state.last_output + state.silence),
                 if max_silent_time > 0
             => {
                 tracing::warn!(
@@ -444,12 +498,9 @@ where
         }
     };
 
-    // Final flush: the loop owns the batcher (by-value), so
-    // any partial batch must be drained here. Best-effort — the build
-    // result is already determined; if the log channel is closed, just drop.
-    if batcher.has_pending() {
-        let _ = send_batch(log_tx, batcher.flush()).await;
-    }
+    // Final flush: the loop owns the batcher (by-value), so any partial
+    // batch must be drained here.
+    state.final_flush().await;
 
     // Terminal-message paths (Last/Error) fell through here: recover the reader
     // so we can read the BuildResult that follows STDERR_LAST. For the other

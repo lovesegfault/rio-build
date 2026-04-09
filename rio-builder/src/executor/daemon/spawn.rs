@@ -365,9 +365,12 @@ mod tests {
                 &mut fake_daemon,
                 "/nix/store/test.drv",
                 &basic_drv,
-                Duration::from_secs(5),
-                0, // max_silent_time: unbounded (handshake fails before it matters)
-                0, // build_cores: all
+                crate::executor::daemon::stderr_loop::DaemonBuildOpts {
+                    build_timeout: Duration::from_secs(5),
+                    // unbounded silence (handshake fails before it matters)
+                    max_silent_time: 0,
+                    build_cores: 0,
+                },
                 batcher,
                 &log_tx,
             ),

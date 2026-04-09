@@ -11,7 +11,7 @@ mod spawn;
 mod stderr_loop;
 
 pub(super) use spawn::spawn_daemon_in_namespace;
-pub(super) use stderr_loop::run_daemon_build;
+pub(super) use stderr_loop::{DaemonBuildOpts, run_daemon_build};
 
 /// Timeout for the daemon setup sequence (handshake + setOptions + send build).
 /// This bounds the blast radius of a stuck daemon before the build timeout kicks in.

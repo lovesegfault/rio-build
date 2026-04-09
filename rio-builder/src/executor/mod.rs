@@ -44,7 +44,7 @@ mod monitors;
 mod outputs;
 mod sandbox;
 
-use daemon::{run_daemon_build, spawn_daemon_in_namespace};
+use daemon::{DaemonBuildOpts, run_daemon_build, spawn_daemon_in_namespace};
 use inputs::{compute_input_closure, fetch_drv_from_store, prefetch_manifests};
 use monitors::{drain_build_cgroup, spawn_cgroup_monitors};
 use outputs::{BuildOutputs, collect_outputs};
@@ -684,9 +684,11 @@ async fn run_daemon_lifecycle(
         &mut daemon,
         drv_path,
         basic_drv,
-        opts.timeout,
-        opts.max_silent_time,
-        opts.build_cores,
+        DaemonBuildOpts {
+            build_timeout: opts.timeout,
+            max_silent_time: opts.max_silent_time,
+            build_cores: opts.build_cores,
+        },
         batcher,
         log_tx,
     )
