@@ -124,12 +124,12 @@ pub struct StuckNodeClaim {
 
 #[derive(Serialize)]
 pub struct SchedulerMetrics {
-    fod_queue_depth: f64,
-    fetcher_utilization: f64,
-    derivations_queued: f64,
+    pub fod_queue_depth: f64,
+    pub fetcher_utilization: f64,
+    pub derivations_queued: f64,
     /// fod_queue_depth > 0 && fetcher_utilization == 0.
     /// The I-025 check — FODs queued but no fetcher streams.
-    possible_freeze: bool,
+    pub possible_freeze: bool,
 }
 
 #[derive(Serialize)]
@@ -414,7 +414,7 @@ async fn gather_stuck_nodeclaims(client: &k::Client) -> Vec<StuckNodeClaim> {
 
 /// Port-forward to the scheduler leader's :9091, GET /metrics once,
 /// parse the three I-025 freeze-signal gauges.
-async fn gather_scheduler_metrics(client: &k::Client) -> Option<SchedulerMetrics> {
+pub(crate) async fn gather_scheduler_metrics(client: &k::Client) -> Option<SchedulerMetrics> {
     let leader = k::scheduler_leader(client, NS)
         .await
         .inspect_err(|e| debug!("scheduler leader: {e:#}"))

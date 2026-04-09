@@ -212,7 +212,7 @@ pub enum K8sCmd {
     /// Bring up the cluster: ami ∥ (bootstrap → provision → kubeconfig
     /// → push), then deploy → envoy. Phase flags select a subset.
     Up(UpOpts),
-    /// End-to-end build + worker-kill chaos test.
+    /// EKS-unique e2e: NLB health, SSM tunnel, S3-chunked build (IRSA).
     Smoke,
     /// helm rollback to REV (0 = previous).
     Rollback {
@@ -290,10 +290,8 @@ pub enum K8sCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
-    /// Detached stress-build harness. Fires N parallel builds through
-    /// SSM tunnels, returns immediately, tracks PIDs on disk for
-    /// SIGKILL-safe cleanup. Born from QA sessions where hand-rolled
-    /// `setsid nohup` left zombie session-manager-plugin tunnels.
+    /// Stress-build harness: N parallel builds through SSM tunnels.
+    /// Foreground — Ctrl-C tears down tunnels + builds.
     #[command(subcommand)]
     Stress(stress::StressCmd),
     /// NixOS node AMI management (ADR-021). EKS-only — `up --ami`

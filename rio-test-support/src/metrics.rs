@@ -353,9 +353,12 @@ pub fn grep_spec_names(obs_md_src: &str, prefix: &str) -> Vec<String> {
 /// `// r[verify obs.metric.X]` tracey marker goes ABOVE the macro
 /// invocation (tracey reads source text, not macro expansions).
 ///
-/// The grep runs at test time against `env!("CARGO_MANIFEST_DIR")` —
-/// no build.rs, no `OUT_DIR` artifacts, no per-crate build-script
-/// invocation on every `cargo build`.
+/// The grep runs at test time against the runtime
+/// `CARGO_MANIFEST_DIR` env (NOT compile-time `env!()` — under
+/// crate2nix the compile-time path is a per-crate build sandbox
+/// that's gone by the time nextest runs the binary). No build.rs,
+/// no `OUT_DIR` artifacts, no per-crate build-script invocation on
+/// every `cargo build`.
 ///
 /// Parameters:
 /// - `describe_fn`: path to the crate's `pub fn describe_metrics()`
@@ -376,13 +379,15 @@ macro_rules! metrics_suite {
         emit_floor: $emit_floor:literal,
         default_buckets_ok: [$($ok:literal),* $(,)?] $(,)?
     ) => {
+        fn manifest_dir() -> ::std::string::String {
+            ::std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo/nextest")
+        }
+
         #[test]
         fn all_spec_metrics_have_describe_call() {
-            let obs_md = ::std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../docs/src/observability.md"
-            ))
-            .expect("read docs/src/observability.md");
+            let path = format!("{}/../docs/src/observability.md", manifest_dir());
+            let obs_md = ::std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {path}: {e}"));
             let spec = $crate::metrics::grep_spec_names(&obs_md, $prefix);
             assert!(
                 spec.len() >= $spec_floor,
@@ -396,8 +401,7 @@ macro_rules! metrics_suite {
 
         #[test]
         fn all_emitted_metrics_are_described() {
-            let emitted =
-                $crate::metrics::grep_emitted_names(env!("CARGO_MANIFEST_DIR")).join("\n");
+            let emitted = $crate::metrics::grep_emitted_names(&manifest_dir()).join("\n");
             $crate::metrics::assert_emitted_metrics_described(
                 &emitted,
                 $emit_floor,

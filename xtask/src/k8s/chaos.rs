@@ -22,12 +22,13 @@
 //! fires → rules gone. xtask deletes the pod on its way out (Ctrl-C
 //! or normal completion).
 //!
-//! **SIGKILL-safe.** Same discipline as `stress run`: pod identity is
-//! flushed to `<session>/chaos.json` BEFORE the iptables rules go in.
-//! `stress cleanup` reads chaos.json, deletes any stale chaos pod,
-//! then spawns a one-shot remediation pod on each affected node that
-//! flushes/deletes the chain (idempotent — `iptables -F` on a missing
-//! chain is a no-op with `2>/dev/null`).
+//! **SIGKILL-safe.** Pod identity is flushed to
+//! `.stress-test/chaos/chaos.json` BEFORE the iptables rules go in.
+//! The next `stress chaos` invocation [`remediate`]s any stale entries
+//! first: deletes the chaos pod, then spawns a one-shot remediation
+//! pod on each affected node that flushes/deletes the chain
+//! (idempotent — `iptables -F` on a missing chain is a no-op with
+//! `2>/dev/null`).
 
 use std::fmt;
 use std::fs;
@@ -170,9 +171,9 @@ pub fn parse_duration_secs(s: &str) -> Result<Duration> {
 
 // ─── state file ─────────────────────────────────────────────────────
 
-/// One chaos pod's identity, written to `<session>/chaos.json` BEFORE
-/// the pod's iptables rules go in. `stress cleanup` reads this to
-/// remediate even if xtask was SIGKILLed mid-run.
+/// One chaos pod's identity, written to chaos.json BEFORE the pod's
+/// iptables rules go in. [`remediate`] reads this to clean up even if
+/// xtask was SIGKILLed mid-run.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChaosEntry {
     pub node: String,
@@ -336,7 +337,7 @@ async fn node_of(client: &k::Client, ns: &str, pod_name: &str) -> Result<String>
 ///   3. `-A` append the DROP rules (both directions)
 ///   4. trap: flush, unlink, delete chain. `2>/dev/null` makes each
 ///      step a no-op if a prior step already cleaned (e.g., concurrent
-///      remediation pod from `stress cleanup`).
+///      remediation pod from [`remediate`]).
 fn chaos_script(target_ip: &str, dur_secs: u64) -> String {
     // Single-quote-safe: target_ip is a podIP (digits + dots), CHAIN
     // is a const literal, dur_secs is a u64. No injection surface.
@@ -564,7 +565,7 @@ pub async fn run(
     // Delete the chaos pods. Their TERM trap fires → iptables cleaned.
     // We DON'T spawn a remediation pod here — the trap is reliable for
     // graceful delete. Remediation is for the SIGKILL-recovery path
-    // (`stress cleanup`).
+    // (next `stress chaos` invocation calls `remediate` first).
     let mut all_clean = true;
     for entry in &state.entries {
         match pods.delete(&entry.pod_name, &DeleteParams::default()).await {
@@ -610,7 +611,7 @@ pub async fn run(
     } else {
         eprintln!();
         eprintln!(
-            "{} cleanup incomplete — run `stress cleanup` to remediate via one-shot pod",
+            "{} cleanup incomplete — next `stress chaos` will remediate via one-shot pod",
             style("!").yellow()
         );
     }
@@ -620,8 +621,8 @@ pub async fn run(
 
 // ─── cleanup integration ────────────────────────────────────────────
 
-/// Remediate any chaos entries in `<session>/chaos.json`. Called from
-/// `stress cleanup`. For each entry: delete the chaos pod (404 is
+/// Remediate any chaos entries in `<session>/chaos.json`. Called at
+/// the start of `stress chaos`. For each entry: delete the chaos pod (404 is
 /// fine), then spawn a one-shot remediation pod on its node that
 /// flushes the chain. Idempotent — if the chain doesn't exist (the
 /// chaos pod's trap already cleaned), the remediation script is a

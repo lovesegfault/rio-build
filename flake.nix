@@ -246,11 +246,10 @@
           workspaceFileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
-            # build.rs include!() target shared by 5 crates. crate2nix
-            # wires this via a per-derivation symlink (nix/crate2nix.nix
-            # metricsGrepFileset), but the fuzz builds + misc-checks
-            # consume this fileset directly and need the file in-tree.
-            ./build-support
+            # tests/metrics_registered.rs greps the obs.md table at
+            # runtime via CARGO_MANIFEST_DIR/../docs/. nextest sets
+            # CARGO_MANIFEST_DIR to <this fileset>/<crate>/.
+            ./docs/src/observability.md
             ./rio-auth
             ./rio-bench
             ./rio-cli
@@ -266,7 +265,6 @@
             ./rio-store/src
             ./rio-store/tests
             ./rio-store/Cargo.toml
-            ./rio-store/build.rs
             ./rio-test-support
             ./rio-builder
             ./xtask
