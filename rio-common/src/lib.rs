@@ -16,6 +16,8 @@ pub mod migrate;
 pub mod observability;
 #[cfg(feature = "aws")]
 pub mod s3;
+#[cfg(feature = "postgres")]
+pub mod schema;
 pub mod server;
 pub mod signal;
 pub mod task;

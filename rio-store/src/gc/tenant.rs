@@ -3,6 +3,7 @@
 //! Phase 4b: accounting only. Phase 5: enforcement at the gateway
 //! (reject SubmitBuild above quota — `r[store.gc.tenant-quota-enforce]`).
 
+use rio_common::schema::TenantRow;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -52,16 +53,29 @@ pub async fn tenant_quota_by_name(
     pool: &PgPool,
     tenant_name: &str,
 ) -> Result<Option<(i64, Option<i64>)>, sqlx::Error> {
-    let row: Option<(Uuid, Option<i64>)> =
-        sqlx::query_as("SELECT tenant_id, gc_max_store_bytes FROM tenants WHERE tenant_name = $1")
-            .bind(tenant_name)
-            .fetch_optional(pool)
-            .await?;
-
-    let Some((tenant_id, limit)) = row else {
+    // `query_as!` into the cross-service [`TenantRow`]: compile-time
+    // proof that the columns rio-store reads (tenant_id,
+    // gc_max_store_bytes, tenant_name in WHERE) match what
+    // rio-scheduler's migrations define. Projecting the full row
+    // (vs. just the two columns we use) is the price of one shared
+    // contract struct — single-row lookup, 30s-cached, so the extra
+    // bytes are noise.
+    let Some(row) = sqlx::query_as!(
+        TenantRow,
+        r#"
+        SELECT tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
+               cache_token IS NOT NULL AS "has_cache_token!",
+               EXTRACT(EPOCH FROM created_at)::bigint AS "created_at!"
+        FROM tenants WHERE tenant_name = $1
+        "#,
+        tenant_name,
+    )
+    .fetch_optional(pool)
+    .await?
+    else {
         return Ok(None);
     };
 
-    let used = tenant_store_bytes(pool, tenant_id).await?;
-    Ok(Some((used, limit)))
+    let used = tenant_store_bytes(pool, row.tenant_id).await?;
+    Ok(Some((used, row.gc_max_store_bytes)))
 }

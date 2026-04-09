@@ -18,6 +18,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use rio_common::schema::TenantRow;
 use rio_common::tenant::NormalizedName;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -78,14 +79,29 @@ pub async fn auth_middleware(
             // PG's text comparison timing is not an exploitable side-
             // channel at network RTT resolution. If stricter timing-
             // safety is needed, Phase 5 hashes tokens before storage.
-            match sqlx::query_as::<_, (Uuid, String)>(
-                "SELECT tenant_id, tenant_name FROM tenants WHERE cache_token = $1",
+            //
+            // `query_as!` into the cross-service [`TenantRow`]: a
+            // scheduler-side migration that renames/retypes
+            // `cache_token`, `tenant_id`, or `tenant_name` is now a
+            // compile error here — not a 500 in production.
+            match sqlx::query_as!(
+                TenantRow,
+                r#"
+                SELECT tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
+                       cache_token IS NOT NULL AS "has_cache_token!",
+                       EXTRACT(EPOCH FROM created_at)::bigint AS "created_at!"
+                FROM tenants WHERE cache_token = $1
+                "#,
+                t,
             )
-            .bind(t)
             .fetch_optional(&auth.pool)
             .await
             {
-                Ok(Some((id, name))) => {
+                Ok(Some(TenantRow {
+                    tenant_id: id,
+                    tenant_name: name,
+                    ..
+                })) => {
                     // PG stores already-normalized names (CreateTenant
                     // validates via NormalizedName::new before INSERT,
                     // and migration 020 adds a CHECK constraint

@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,\n               cache_token IS NOT NULL AS \"has_cache_token!\",\n               EXTRACT(EPOCH FROM created_at)::bigint AS \"created_at!\"\n        FROM tenants WHERE tenant_name = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tenant_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "tenant_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "gc_retention_hours",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "gc_max_store_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "has_cache_token!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "23c28e32b8174cf7feb5d8a97fccdde23a4ad789217f92f69574dc902b2c9343"
+}

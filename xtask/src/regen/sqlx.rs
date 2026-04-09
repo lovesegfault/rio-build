@@ -56,10 +56,19 @@ pub async fn run() -> Result<()> {
     // `cargo sqlx prepare --workspace` internally does `cargo rustc -p
     // <crate>` per member — per-package feature resolution, unavoidable.
     // The --check fast-path avoids the rebuild in the common case.
+    //
+    // `-- --all-targets`: forwarded to the inner `cargo rustc` so
+    // `#[cfg(test)]` queries are cached too. The cross-service
+    // `LivePin` contract anchor (rio-store gc tests) lives under
+    // cfg(test) — without this, regen succeeds but `cargo test`
+    // fails on "no cached data for this query".
     let current = ui::step("cargo sqlx prepare --check", || async {
-        Ok(sh::run(cmd!(sh, "cargo sqlx prepare --workspace --check"))
-            .await
-            .is_ok())
+        Ok(sh::run(cmd!(
+            sh,
+            "cargo sqlx prepare --workspace --check -- --all-targets"
+        ))
+        .await
+        .is_ok())
     })
     .await?;
     if current {
@@ -68,7 +77,7 @@ pub async fn run() -> Result<()> {
     }
 
     ui::step("cargo sqlx prepare --workspace", || {
-        sh::run(cmd!(sh, "cargo sqlx prepare --workspace"))
+        sh::run(cmd!(sh, "cargo sqlx prepare --workspace -- --all-targets"))
     })
     .await?;
 

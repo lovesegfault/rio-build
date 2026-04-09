@@ -163,19 +163,11 @@ pub(crate) struct BuildListRow {
     pub submitted_at_micros: i64,
 }
 
-/// Row from `list_tenants` / `create_tenant`. `has_cache_token`
-/// is a projection (`cache_token IS NOT NULL`) — the token itself
-/// is never returned. `created_at` is epoch seconds via
-/// `EXTRACT(EPOCH FROM created_at)::bigint` — avoids a chrono dep.
-#[derive(Debug, sqlx::FromRow)]
-pub(crate) struct TenantRow {
-    pub tenant_id: Uuid,
-    pub tenant_name: String,
-    pub gc_retention_hours: i32,
-    pub gc_max_store_bytes: Option<i64>,
-    pub has_cache_token: bool,
-    pub created_at: i64,
-}
+/// Re-export of the cross-service `tenants` row. Defined in
+/// `rio-common` so rio-store's reads `query_as!` into the SAME
+/// struct — a column rename/retype is then a compile error in both
+/// crates, not a runtime tripwire.
+pub(crate) use rio_common::schema::TenantRow;
 
 /// Row from `load_nonterminal_builds`. FromRow for named-column
 /// mapping (tuples at this arity are error-prone).

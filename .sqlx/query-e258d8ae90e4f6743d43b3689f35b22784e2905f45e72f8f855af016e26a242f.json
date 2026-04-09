@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO scheduler_live_pins (store_path_hash, drv_hash)\n            SELECT * FROM UNNEST($1::bytea[], $2::text[])\n            ON CONFLICT DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "ByteaArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e258d8ae90e4f6743d43b3689f35b22784e2905f45e72f8f855af016e26a242f"
+}

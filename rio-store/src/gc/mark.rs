@@ -242,11 +242,20 @@ mod tests {
 
         // Insert scheduler_live_pins row. drv_hash is arbitrary text
         // (scheduler-assigned); store_path_hash must match narinfo.
-        sqlx::query(
-            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'test-drv')",
+        //
+        // `query_as!` into `rio_common::schema::LivePin` is the
+        // compile-time anchor for the cross-service contract on the
+        // store side: the production read (seed (e) of
+        // COMPUTE_UNREACHABLE_SQL above) is a const-string CTE that
+        // can't itself be macro-checked, but this RETURNING ties the
+        // shared struct's field names+types to the live schema.
+        let _pin = sqlx::query_as!(
+            rio_common::schema::LivePin,
+            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) \
+             VALUES ($1, 'test-drv') RETURNING store_path_hash, drv_hash",
+            &hash,
         )
-        .bind(&hash)
-        .execute(&db.pool)
+        .fetch_one(&db.pool)
         .await
         .unwrap();
 

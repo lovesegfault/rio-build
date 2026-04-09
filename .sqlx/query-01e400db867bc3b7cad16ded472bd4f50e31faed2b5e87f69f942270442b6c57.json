@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'test-drv') RETURNING store_path_hash, drv_hash",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "drv_hash",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "01e400db867bc3b7cad16ded472bd4f50e31faed2b5e87f69f942270442b6c57"
+}

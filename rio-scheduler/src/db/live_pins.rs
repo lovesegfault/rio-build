@@ -33,15 +33,20 @@ impl SchedulerDb {
         // by construction: same source vec). ON CONFLICT DO NOTHING
         // for idempotence — re-dispatching a drv (after reassign)
         // shouldn't error.
-        sqlx::query(
+        //
+        // `query!` (not runtime `query`): compile-checks the column
+        // list against `rio_common::schema::LivePin` — store reads
+        // these columns in gc/mark.rs + gc/sweep.rs.
+        let drv_hashes = vec![drv_hash.as_str(); hashes.len()];
+        sqlx::query!(
             r#"
             INSERT INTO scheduler_live_pins (store_path_hash, drv_hash)
             SELECT * FROM UNNEST($1::bytea[], $2::text[])
             ON CONFLICT DO NOTHING
             "#,
+            &hashes,
+            &drv_hashes as &[&str],
         )
-        .bind(&hashes)
-        .bind(vec![drv_hash.as_str(); hashes.len()])
         .execute(&self.pool)
         .await?;
         Ok(())

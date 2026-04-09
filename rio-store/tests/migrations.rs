@@ -192,13 +192,15 @@ fn migration_checksums_frozen() {
 ///
 /// rio-store's GC reads `scheduler_live_pins` directly (`gc/mark.rs`,
 /// `gc/sweep.rs`), and cache-server auth + GC quotas read `tenants`
-/// (`cache_server/auth.rs`, `gc/tenant.rs`). The contract between the
-/// two services is a Postgres table shape with no compile-time
-/// enforcement — a column rename or type change in a scheduler-side
-/// migration breaks store at RUNTIME only. This test asserts the exact
-/// (column, type) tuples rio-store's inline SQL relies on, so a
-/// scheduler-side migration that breaks store fails CI here instead of
-/// in production.
+/// (`cache_server/auth.rs`, `gc/tenant.rs`).
+///
+/// **Primary** enforcement is now compile-time: both crates
+/// `query_as!` into `rio_common::schema::{LivePin, TenantRow}`, so a
+/// column rename/retype breaks `cargo build`. THIS test is
+/// defense-in-depth — it catches a regression where someone swaps a
+/// `query_as!` site back to runtime `query_as` (silently dropping
+/// the compile check) or where the const-string CTEs in mark/sweep
+/// drift independently of the macro-checked anchors.
 ///
 /// If this test fails after you wrote a migration: either keep the old
 /// column shape (add a view, or rename back), or update BOTH the

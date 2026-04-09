@@ -1014,13 +1014,19 @@ mod tests {
     async fn sweep_recheck_sees_late_pins() {
         let db = TestDb::new(&crate::MIGRATOR).await;
 
-        // Q: pinned via scheduler_live_pins after mark.
+        // Q: pinned via scheduler_live_pins after mark. `query_as!`
+        // into the shared `LivePin` struct = compile-time anchor for
+        // the column shape `recheck_has_live_referrer` reads (its
+        // own SQL can't be macro-checked — it joins a session temp
+        // table sqlx-prepare can't see).
         let q_hash = StoreSeed::path("late-live-pin").seed(&db.pool).await;
-        sqlx::query(
-            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'drv')",
+        let _pin = sqlx::query_as!(
+            rio_common::schema::LivePin,
+            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) \
+             VALUES ($1, 'drv') RETURNING store_path_hash, drv_hash",
+            &q_hash,
         )
-        .bind(&q_hash)
-        .execute(&db.pool)
+        .fetch_one(&db.pool)
         .await
         .unwrap();
 

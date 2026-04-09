@@ -28,12 +28,19 @@ impl SchedulerDb {
     }
 
     /// List all tenants (for AdminService.ListTenants).
+    ///
+    /// `query_as!` (not runtime `query_as`): compile-checks the
+    /// projection against [`TenantRow`] — the cross-service contract
+    /// struct in `rio_common::schema`. The `!` overrides on
+    /// `has_cache_token`/`created_at` tell sqlx the expressions are
+    /// non-NULL (PG can't infer that for `IS NOT NULL` / `EXTRACT`).
     pub(crate) async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as!(
+            TenantRow,
             r#"
             SELECT tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
-                   cache_token IS NOT NULL AS has_cache_token,
-                   EXTRACT(EPOCH FROM created_at)::bigint AS created_at
+                   cache_token IS NOT NULL AS "has_cache_token!",
+                   EXTRACT(EPOCH FROM created_at)::bigint AS "created_at!"
             FROM tenants ORDER BY created_at
             "#,
         )
@@ -60,20 +67,21 @@ impl SchedulerDb {
         gc_max_store_bytes: Option<i64>,
         cache_token: Option<&str>,
     ) -> Result<Option<TenantRow>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as!(
+            TenantRow,
             r#"
             INSERT INTO tenants (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token)
             VALUES ($1, COALESCE($2, 168), $3, $4)
             ON CONFLICT DO NOTHING
             RETURNING tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
-                      cache_token IS NOT NULL AS has_cache_token,
-                      EXTRACT(EPOCH FROM created_at)::bigint AS created_at
+                      cache_token IS NOT NULL AS "has_cache_token!",
+                      EXTRACT(EPOCH FROM created_at)::bigint AS "created_at!"
             "#,
+            name,
+            gc_retention_hours,
+            gc_max_store_bytes,
+            cache_token,
         )
-        .bind(name)
-        .bind(gc_retention_hours)
-        .bind(gc_max_store_bytes)
-        .bind(cache_token)
         .fetch_optional(&self.pool)
         .await
     }
