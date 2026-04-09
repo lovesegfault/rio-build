@@ -258,6 +258,20 @@ module "eks" {
       type        = "ingress"
       self        = true
     }
+    # API server can't reach overlay pod IPs (cluster-pool IPAM), so
+    # admission webhooks run hostNetwork=true on shifted ports: aws-lbc
+    # on 9443, external-secrets + prom-operator on 10260 (kubelet has
+    # 10250). The module's default control-plane→node rule only covers
+    # 10250. Without this, fresh deploy fails: helm creates an
+    # ExternalSecret → webhook validation → 5s context-deadline.
+    webhooks_from_control_plane = {
+      description                   = "API server to hostNetwork admission webhooks"
+      protocol                      = "tcp"
+      from_port                     = 9443
+      to_port                       = 10260
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
   }
 
   # Managed node groups. System only — worker nodes are
