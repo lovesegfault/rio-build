@@ -1,9 +1,11 @@
 # ADR-020: Per-Derivation Capacity Manifest
 
 ## Status
-Accepted (sizing mechanism); amended 2026-04 (pod lifetime)
+Rejected (2026-04: Manifest path removed; never deployed, Static remains)
 
-## Status update (2026-04)
+The Manifest sizing path described below was implemented (`GetCapacityManifest` RPC, `BuilderPool.spec.sizing` enum, manifest reconciler) but never deployed — no production helm values ever set `sizing: Manifest`. Removed in favor of keeping ADR-015 Static size-class routing as the only mode. This document is retained for history.
+
+## Status update (2026-04, prior to removal)
 
 Manifest-spawned pods are now **one-shot** like every other worker pod — they run one build and exit. Design point 4 below ("Pods are long-lived, not one-shot") and the rejected-alternative analysis of "True one-pod-per-derivation" are superseded. The concerns there (cold-start dominating short builds, FUSE cache never warming, Karpenter churn cost) are addressed by composefs (<10ms mount, zero warm upcalls), node-level FSx Lustre cache surviving pod churn, and Karpenter consolidation keeping nodes alive across pods. The per-derivation sizing mechanism (points 1–3, 5) is unchanged. `r[ctrl.pool.manifest-long-lived]` is retired.
 

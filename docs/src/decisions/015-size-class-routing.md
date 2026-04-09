@@ -1,7 +1,7 @@
 # ADR-015: Size-Class Routing with Adaptive Cutoffs
 
 ## Status
-Superseded in part by [ADR-020](020-per-derivation-capacity-manifest.md) (sizing).
+Accepted
 
 ## Status update
 Builder pods are now one-shot (one build per pod), so the "8 builds/pod"
