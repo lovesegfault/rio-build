@@ -195,15 +195,18 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         // oneshot baked into the NixOS AMI (eks-node.nix); system
         // nodes are excluded from external LBs (main.tf).
         "service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
+        // dualstack listener + ipv6-only TG: IPv4 clients need the NLB
+        // to source-NAT to an IPv6 prefix it owns. Without this the NLB
+        // RSTs every IPv4 connection (no v6 source to forward with).
+        // aws-lbc reconciles this via SetSubnets; prefixes auto-assign.
+        "service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat": "on",
         "service.beta.kubernetes.io/aws-load-balancer-attributes": "load_balancing.cross_zone.enabled=true",
-        // preserve_client_ip OFF: the TG is ipAddressType=ipv6 (Service
-        // is single-stack v6). With preserve on (the instance-target
-        // default): IPv4 clients on the dualstack listener can't be
-        // forwarded to v6 targets without enablePrefixForIpv6SourceNat,
-        // and intra-VPC clients that are themselves registered targets
-        // hit NLB hairpin RST. NLB SNAT to its own v6 fixes both.
-        // Source IP is already lost at Cilium (loadBalancer.mode=snat,
-        // addons.tf) and rio-gateway doesn't consume it.
+        // preserve_client_ip OFF: with the instance-target default (on),
+        // intra-VPC clients that are themselves registered targets hit
+        // NLB hairpin RST, and the IPv6-source-NAT path above can't
+        // engage. Source IP is already lost at Cilium
+        // (loadBalancer.mode=snat, addons.tf) and rio-gateway doesn't
+        // consume it.
         "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes": "preserve_client_ip.enabled=false",
         "service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22": "tcp.idle_timeout.seconds=3600",
     });
