@@ -266,7 +266,6 @@ rstest = { version = "0.26", default-features = false }
 tempfile = "3"
 tracing-test = "0.2"
 aws-smithy-mocks = "0.2"
-rstest = { version = "0.26", default-features = false }
 
 # Utility
 regex = "1"
