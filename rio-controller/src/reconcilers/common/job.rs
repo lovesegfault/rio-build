@@ -11,11 +11,13 @@
 //! neither. Moved from `builderpool/` to `common/` once the fetcher
 //! reconciler started importing through the sibling reconciler.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
+use k8s_openapi::api::core::v1::{PodSpec, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, PostParams};
+use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
@@ -52,6 +54,99 @@ pub(crate) const JOB_REQUEUE: Duration = Duration::from_secs(10);
 /// before exiting) so there's no rio-side dependency on the Job
 /// sticking around.
 pub(crate) const JOB_TTL_SECS: i32 = 600;
+
+/// Pod-template annotation that opts a pod out of karpenter
+/// consolidation/drift eviction. I-126: I-090's bin-packing +
+/// `consolidateAfter:30s` on the NodePool means karpenter evicts
+/// mid-build to consolidate (observed: 3 builders evicted in ~2min
+/// warming inputs for the same drv → cascading reassigns). Set on
+/// EVERY ephemeral Job pod via [`ephemeral_job`] — the node
+/// consolidates AFTER Job completion. Goes on POD TEMPLATE metadata,
+/// not the Job's: karpenter reads pod annotations.
+pub(crate) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
+
+/// `terminationGracePeriodSeconds` for ephemeral Job pods. I-120: one
+/// build per pod; on SIGTERM exit fast. 30s covers FUSE unmount and
+/// completion report. (The role-level default in
+/// `ExecutorPodParams::termination_grace_period_seconds` is for the
+/// LONG-drain case; ephemeral pods don't drain, they finish and die.)
+const EPHEMERAL_TGPS: i64 = 30;
+
+/// The shared one-shot Job literal for executor pods. All three
+/// Job-mode reconcilers (`builderpool::{static_sizing,manifest}`,
+/// `fetcherpool::jobs`) route through this so the load-bearing
+/// invariants can't drift per call site:
+///
+///   - `restartPolicy: Never` + `backoffLimit: 0` — the SCHEDULER
+///     owns retry (reassign to a different worker / pool / size
+///     class). K8s retrying the same pod on the same node risks
+///     tight-loop on a node-local problem.
+///   - `parallelism/completions: 1` — one pod per Job. >1 would
+///     mean N pods sharing one Job → N workers heartbeat with the
+///     SAME pod-name prefix → scheduler's executors map collides.
+///   - [`JOB_TTL_SECS`] — completed Jobs auto-reap.
+///   - `activeDeadlineSeconds` — backstop for hung/wrong-pool pods.
+///     ALWAYS set (no `None`): a missing deadline means a stuck pod
+///     leaks for the life of the cluster. Callers compute the
+///     per-role/per-class value (cutoff×5 for builders, 300s for
+///     fetchers) and pass it in.
+///   - [`KARPENTER_DO_NOT_DISRUPT`] on the pod template — I-126
+///     mid-build eviction protection.
+///   - [`EPHEMERAL_TGPS`] — fast SIGTERM exit (one-build-per-pod
+///     means no drain to wait for).
+///
+/// Before this helper existed, the manifest path had drifted: it
+/// was missing the karpenter annotation, the fast tgps, AND used
+/// `deadline_seconds.map()` (no backstop when unset) — manifest
+/// builders were exposed to mid-build eviction and unbounded
+/// runtime. Consolidating here fixes that structurally.
+///
+/// `pod_spec` arrives with role-specific content (volumes, env,
+/// resources) already filled by `build_executor_pod_spec`; this
+/// fn only stamps the Job-lifecycle fields on top.
+pub(crate) fn ephemeral_job(
+    name: String,
+    namespace: Option<String>,
+    oref: OwnerReference,
+    labels: BTreeMap<String, String>,
+    deadline_seconds: i64,
+    mut pod_spec: PodSpec,
+) -> Job {
+    // restartPolicy: Never is REQUIRED by K8s for Jobs with
+    // backoffLimit=0 ("Always" — the PodSpec default — is rejected).
+    pod_spec.restart_policy = Some("Never".into());
+    pod_spec.termination_grace_period_seconds = Some(EPHEMERAL_TGPS);
+
+    Job {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace,
+            owner_references: Some(vec![oref]),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(JobSpec {
+            parallelism: Some(1),
+            completions: Some(1),
+            backoff_limit: Some(0),
+            ttl_seconds_after_finished: Some(JOB_TTL_SECS),
+            active_deadline_seconds: Some(deadline_seconds),
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels),
+                    annotations: Some(BTreeMap::from([(
+                        KARPENTER_DO_NOT_DISRUPT.into(),
+                        "true".into(),
+                    )])),
+                    ..Default::default()
+                }),
+                spec: Some(pod_spec),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
 
 /// Compute how many Jobs to spawn this tick.
 ///

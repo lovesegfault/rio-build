@@ -50,18 +50,19 @@
 //! untrusted tenant CANNOT leave poisoned cache entries for the
 //! next build — there is no "next build" on that pod.
 
-use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::PodTemplateSpec;
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
-use kube::api::{ListParams, ObjectMeta};
+use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
+#[cfg(test)]
+use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
-    JOB_REQUEUE, JOB_TTL_SECS, JobReconcilePrologue, SpawnOutcome, is_active_job,
+    JOB_REQUEUE, JobReconcilePrologue, SpawnOutcome, ephemeral_job, is_active_job,
     job_reconcile_prologue, patch_job_pool_status, random_suffix, reap_excess_pending,
     reap_orphan_running, spawn_count, try_spawn_job,
 };
@@ -107,7 +108,7 @@ pub(crate) const DEADLINE_MULTIPLIER: i64 = 5;
 /// kills the pod immediately; clamp to 1s so the misconfiguration is
 /// at least observable (pod starts, then dies) rather than a silent
 /// no-op spawn loop.
-fn ephemeral_deadline(spec: &rio_crds::builderpool::BuilderPoolSpec) -> i64 {
+pub(super) fn ephemeral_deadline(spec: &rio_crds::builderpool::BuilderPoolSpec) -> i64 {
     if let Some(explicit) = spec.deadline_seconds {
         return i64::from(explicit);
     }
@@ -374,6 +375,8 @@ async fn queued_for_pool(ctx: &Ctx, wp: &BuilderPool) -> std::result::Result<u32
 ///     the same way any other pod-death is: heartbeat timeout →
 ///     reassign.
 // r[impl ctrl.pool.ephemeral]
+// r[impl ctrl.pool.ephemeral-deadline]
+// r[impl ctrl.ephemeral.per-class-deadline]
 pub(super) fn build_job(
     wp: &BuilderPool,
     oref: OwnerReference,
@@ -381,77 +384,20 @@ pub(super) fn build_job(
     store: &UpstreamAddrs,
 ) -> Result<Job> {
     let pool = wp.name_any();
-    let labels = builders::labels(wp);
-
-    let mut pod_spec = builders::build_pod_spec(wp, scheduler, store, None);
-
-    // restartPolicy: Never is REQUIRED by K8s for Jobs with
-    // backoffLimit=0. "Always" (the PodSpec default) is rejected.
-    pod_spec.restart_policy = Some("Never".into());
-    // I-120: one build per pod; on SIGTERM exit fast. 30s covers
-    // FUSE unmount + completion report.
-    pod_spec.termination_grace_period_seconds = Some(30);
-
-    // Random suffix: 6 lowercase alphanumeric. Not crypto; just
-    // avoiding collisions. The executor_id downward-API pattern
-    // from common/pod.rs means each pod's RIO_EXECUTOR_ID is the
-    // Job's pod name (also random-suffixed by K8s on top of our
-    // suffix) — unique per pod, which is what the scheduler needs
-    // for its executors map.
     // K8s name limit: 63 chars. `rio-builder-{pool}-{6}` = pool+19.
     // Pool names are short (<20 chars); a 49+ char pool gets a
     // clear K8s rejection — no silent truncation.
     let job_name = pod::job_name(&pool, ExecutorKind::Builder, &random_suffix());
-
-    Ok(Job {
-        metadata: ObjectMeta {
-            name: Some(job_name),
-            namespace: wp.namespace(),
-            owner_references: Some(vec![oref]),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
-        spec: Some(JobSpec {
-            // One pod. parallelism/completions default to 1 if
-            // unset, but explicit for clarity (a Job with
-            // parallelism>1 would mean N pods sharing one Job →
-            // N workers heartbeat with the SAME pod-name prefix →
-            // scheduler's workers map merges on heartbeat — chaos).
-            parallelism: Some(1),
-            completions: Some(1),
-            backoff_limit: Some(0),
-            ttl_seconds_after_finished: Some(JOB_TTL_SECS),
-            // r[impl ctrl.pool.ephemeral-deadline]
-            // r[impl ctrl.ephemeral.per-class-deadline]
-            // Wrong-pool-spawn backstop + per-class hung-build
-            // detector (I-200): K8s kills the pod at deadline →
-            // Job Failed → TTL reaps; scheduler-side the disconnect
-            // promotes size_class_floor. Precedence: explicit
-            // override > cutoff×5 > flat 3600.
-            active_deadline_seconds: Some(ephemeral_deadline(&wp.spec)),
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels),
-                    // I-126: I-090's bin-packing + consolidateAfter:30s on
-                    // the NodePool means karpenter evicts mid-build to
-                    // consolidate (observed: 3 builders evicted in ~2min
-                    // warming inputs for the same drv → cascading
-                    // reassigns). do-not-disrupt pins the pod for its
-                    // lifetime; the node consolidates AFTER Job completion.
-                    // Annotation goes on the POD TEMPLATE metadata, not
-                    // the Job's — karpenter reads pod annotations.
-                    annotations: Some(std::collections::BTreeMap::from([(
-                        "karpenter.sh/do-not-disrupt".into(),
-                        "true".into(),
-                    )])),
-                    ..Default::default()
-                }),
-                spec: Some(pod_spec),
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
+    Ok(ephemeral_job(
+        job_name,
+        wp.namespace(),
+        oref,
+        builders::labels(wp),
+        // Wrong-pool-spawn backstop + per-class hung-build detector
+        // (I-200). Precedence: explicit override > cutoff×5 > flat 3600.
+        ephemeral_deadline(&wp.spec),
+        builders::build_pod_spec(wp, scheduler, store, None),
+    ))
 }
 
 #[cfg(test)]

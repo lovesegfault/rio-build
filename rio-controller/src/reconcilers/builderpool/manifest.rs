@@ -51,12 +51,12 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::{PodTemplateSpec, ResourceRequirements};
+use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
-use kube::api::{DeleteParams, ListParams, ObjectMeta};
+use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::Action;
 use rio_proto::types::{
     DerivationResourceEstimate, ExecutorInfo, GetCapacityManifestRequest, ListExecutorsRequest,
@@ -69,12 +69,13 @@ use rio_crds::builderpool::BuilderPool;
 
 use super::POOL_LABEL;
 use super::builders::{self, UpstreamAddrs};
+use super::static_sizing::ephemeral_deadline;
 /// Re-export: `Bucket` lives in `common::job` so `reconcilers::mod`
 /// can see the same alias `pub(crate)`. Re-exported here so
 /// `manifest_tests.rs`'s `use ...::manifest::Bucket` stays intact.
 pub(super) use crate::reconcilers::common::job::Bucket;
 use crate::reconcilers::common::job::{
-    JOB_TTL_SECS, JobReconcilePrologue, SpawnOutcome, is_active_job, is_failed_job,
+    JobReconcilePrologue, SpawnOutcome, ephemeral_job, is_active_job, is_failed_job,
     job_reconcile_prologue, patch_job_pool_status, random_suffix, try_spawn_job,
 };
 
@@ -1064,17 +1065,8 @@ pub(super) fn build_manifest_job(
     let pool = wp.name_any();
 
     // resources_override: Some → bucket; None → spec.resources floor.
-    // T1's signature change is what makes this possible.
     let resources_override = bucket.map(bucket_to_resources);
-    let mut pod_spec = builders::build_pod_spec(wp, scheduler, store, resources_override);
-
-    // restartPolicy: Never. Required by K8s for Jobs with
-    // backoffLimit=0. Same reasoning as ephemeral: if the pod
-    // crashes (OOM on a derivation that exceeded its estimate),
-    // the SCHEDULER owns retry (reassign to a larger-bucket pod
-    // next cycle, or update the estimate). K8s restarting the
-    // same pod on the same node is a tight-loop risk.
-    pod_spec.restart_policy = Some("Never".into());
+    let pod_spec = builders::build_pod_spec(wp, scheduler, store, resources_override);
 
     // Labels: pool labels + sizing mode + class. The class labels
     // are what inventory_by_bucket reads — THIS is the round-trip
@@ -1098,32 +1090,16 @@ pub(super) fn build_manifest_job(
     // Overlong pool name → K8s rejects with a clear error.
     let job_name = format!("{pool}-mf-{mem_tag}g-{cpu_tag}m-{suffix}");
 
-    Ok(Job {
-        metadata: ObjectMeta {
-            name: Some(job_name),
-            namespace: wp.namespace(),
-            owner_references: Some(vec![oref]),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
-        spec: Some(JobSpec {
-            parallelism: Some(1),
-            completions: Some(1),
-            backoff_limit: Some(0),
-            // Manifest pods are one-shot (same as static-sizing
-            // Jobs); ttlSecondsAfterFinished reaps the completed
-            // Job, activeDeadlineSeconds caps a hung build.
-            ttl_seconds_after_finished: Some(JOB_TTL_SECS),
-            active_deadline_seconds: wp.spec.deadline_seconds.map(i64::from),
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels),
-                    ..Default::default()
-                }),
-                spec: Some(pod_spec),
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
+    Ok(ephemeral_job(
+        job_name,
+        wp.namespace(),
+        oref,
+        labels,
+        // Same backstop as static-sizing — manifest pods are one-shot
+        // too. Previously this was `deadline_seconds.map()` (no
+        // backstop when unset), so a manifest builder with no explicit
+        // deadline could hang indefinitely on a stuck build.
+        ephemeral_deadline(&wp.spec),
+        pod_spec,
+    ))
 }

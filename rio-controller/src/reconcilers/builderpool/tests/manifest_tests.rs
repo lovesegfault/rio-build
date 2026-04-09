@@ -642,9 +642,40 @@ fn job_spec_load_bearing_fields() {
         Some(crate::reconcilers::common::job::JOB_TTL_SECS),
         "one-shot manifest pods → TTL reaps completed Jobs"
     );
+    // Deadline backstop. test_manifest_wp has neither deadline_seconds
+    // nor size_class_cutoff_secs set → flat 3600 fallback. Before the
+    // ephemeral_job() consolidation this was None — manifest pods
+    // could hang indefinitely on a stuck build.
+    assert_eq!(
+        spec.active_deadline_seconds,
+        Some(3600),
+        "manifest pods must carry the same deadline backstop as static-sizing"
+    );
+
+    // I-126: do-not-disrupt on the POD TEMPLATE. Before consolidation
+    // manifest pods lacked this and were exposed to mid-build karpenter
+    // eviction.
+    let pod_anns = spec
+        .template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.annotations.as_ref())
+        .expect("pod template must have annotations");
+    assert_eq!(
+        pod_anns
+            .get("karpenter.sh/do-not-disrupt")
+            .map(String::as_str),
+        Some("true"),
+        "I-126: manifest pods must opt out of karpenter disruption"
+    );
 
     let pod_spec = spec.template.spec.as_ref().unwrap();
     assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
+    assert_eq!(
+        pod_spec.termination_grace_period_seconds,
+        Some(30),
+        "I-120: one-build-per-pod → fast SIGTERM exit"
+    );
 
     // Sanity: build_pod_spec reuse — scheduler addr env present.
     let env = pod_spec.containers[0].env.as_ref().unwrap();

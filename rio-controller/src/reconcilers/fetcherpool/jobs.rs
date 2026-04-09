@@ -21,17 +21,18 @@
 //! `common::job`. Only `build_job` (the per-role pod spec) and the
 //! per-class spawn loop remain FetcherPool-specific.
 
-use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::PodTemplateSpec;
+use k8s_openapi::api::batch::v1::Job;
 use kube::ResourceExt;
-use kube::api::{ListParams, ObjectMeta};
+use kube::api::ListParams;
 use kube::runtime::controller::Action;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
+#[cfg(test)]
+use crate::reconcilers::common::job::JOB_TTL_SECS;
 use crate::reconcilers::common::job::{
-    JOB_REQUEUE, JOB_TTL_SECS, JobReconcilePrologue, SpawnOutcome, is_active_job,
+    JOB_REQUEUE, JobReconcilePrologue, SpawnOutcome, ephemeral_job, is_active_job,
     job_reconcile_prologue, patch_job_pool_status, random_suffix, reap_excess_pending,
     reap_orphan_running, spawn_count, try_spawn_job,
 };
@@ -284,50 +285,21 @@ pub(super) fn build_job(
     // name}` — set inside executor_params. Reused for the Job name
     // prefix so logs/metrics group per class.
     let pool = params.pool_name.clone();
-    let labels = pod::executor_labels(&params);
-
-    let mut pod_spec = pod::build_executor_pod_spec(&params, scheduler, store);
-    pod_spec.restart_policy = Some("Never".into());
-    pod_spec.termination_grace_period_seconds = Some(30);
-
     let job_name = pod::job_name(&pool, ExecutorKind::Fetcher, &random_suffix());
+    let labels = pod::executor_labels(&params);
+    let pod_spec = pod::build_executor_pod_spec(&params, scheduler, store);
 
-    Ok(Job {
-        metadata: ObjectMeta {
-            name: Some(job_name),
-            namespace: fp.namespace(),
-            owner_references: Some(vec![oref]),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
-        spec: Some(JobSpec {
-            parallelism: Some(1),
-            completions: Some(1),
-            backoff_limit: Some(0),
-            ttl_seconds_after_finished: Some(JOB_TTL_SECS),
-            active_deadline_seconds: Some(
-                fp.spec
-                    .deadline_seconds
-                    .map(i64::from)
-                    .unwrap_or(FOD_EPHEMERAL_DEADLINE_SECS),
-            ),
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels),
-                    // I-126: same as builderpool — pin against karpenter
-                    // consolidation evictions for the (short) Job lifetime.
-                    annotations: Some(std::collections::BTreeMap::from([(
-                        "karpenter.sh/do-not-disrupt".into(),
-                        "true".into(),
-                    )])),
-                    ..Default::default()
-                }),
-                spec: Some(pod_spec),
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
+    Ok(ephemeral_job(
+        job_name,
+        fp.namespace(),
+        oref,
+        labels,
+        fp.spec
+            .deadline_seconds
+            .map(i64::from)
+            .unwrap_or(FOD_EPHEMERAL_DEADLINE_SECS),
+        pod_spec,
+    ))
 }
 
 #[cfg(test)]
