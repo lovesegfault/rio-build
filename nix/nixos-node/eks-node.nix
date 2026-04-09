@@ -345,6 +345,60 @@ in
           };
         };
 
+        # ── primary-ipv6-init: oneshot, before kubelet ────────────────
+        # NLB target-type=instance + ip-address-type=dualstack registers
+        # instances in an IPv6 target group, which requires each ENI to
+        # have a PRIMARY IPv6 (not just the secondary the VPC assigns).
+        # Neither EC2NodeClass nor managed-nodegroup launch templates can
+        # set primary_ipv6 declaratively (EKS wraps user LTs and ignores
+        # NetworkInterfaces). This AMI has no cloud-init/amazon-init
+        # (default.nix disables both) so an EC2NodeClass userData shell
+        # part is never executed — nodeadm-init only consumes the
+        # NodeConfig MIME part. Set the flag here via IMDS +
+        # `curl --aws-sigv4` (no awscli in the AMI); node IAM has
+        # ec2:ModifyNetworkInterfaceAttribute (infra/eks/karpenter.tf).
+        primary-ipv6-init = {
+          description = "Set ENI primary IPv6 for NLB dualstack instance targets";
+          wantedBy = [ "multi-user.target" ];
+          # Ordered-before kubelet so the ENI is fixed before the node
+          # registers and aws-lbc adds it as an NLB target. kubelet does
+          # NOT Requires= this — failure here must not block node join.
+          before = [ "kubelet.service" ];
+          after = [ "network.target" ];
+          path = [
+            pkgs.curl
+            pkgs.jq
+          ];
+          script = ''
+            set -uo pipefail
+            imds() { curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+            TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+            MAC=$(imds mac)
+            ENI=$(imds "network/interfaces/macs/$MAC/interface-id")
+            REGION=$(imds placement/region)
+            ROLE=$(imds iam/security-credentials/ | head -n1)
+            CREDS=$(imds "iam/security-credentials/$ROLE")
+            AK=$(jq -r .AccessKeyId <<<"$CREDS")
+            SK=$(jq -r .SecretAccessKey <<<"$CREDS")
+            ST=$(jq -r .Token <<<"$CREDS")
+            curl -sSf --aws-sigv4 "aws:amz:$REGION:ec2" \
+              --user "$AK:$SK" \
+              -H "X-Amz-Security-Token: $ST" \
+              "https://ec2.$REGION.amazonaws.com/?Action=ModifyNetworkInterfaceAttribute&NetworkInterfaceId=$ENI&EnablePrimaryIpv6=true&Version=2016-11-15"
+          '';
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            # IMDS or the EC2 API can be briefly unreachable at very
+            # early boot; retry a few times, then give up — the node
+            # still joins, the NLB target is unhealthy until
+            # `systemctl restart primary-ipv6-init` or node replace.
+            Restart = "on-failure";
+            RestartSec = "10s";
+          };
+        };
+
         # ── kubelet: thin unit, all config from nodeadm output ──────────
         # AL2023 parity: ExecStart is `kubelet $NODEADM_KUBELET_ARGS` —
         # nodeadm writes EVERY flag (--config, --kubeconfig, --node-ip,

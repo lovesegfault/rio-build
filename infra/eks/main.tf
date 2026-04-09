@@ -277,11 +277,6 @@ module "eks" {
       # when ip_family=ipv6, but that policy is only created when
       # vpc-cni is in cluster_addons (which it no longer is).
       iam_role_attach_cni_policy = false
-      # network_interfaces.primary_ipv6 in the LT is a no-op: EKS
-      # managed nodegroups wrap with their own LT and ignore the
-      # user-LT NetworkInterfaces block. Primary-IPv6 is set on
-      # Karpenter nodes via EC2NodeClass userData (karpenter.yaml)
-      # since rio-gateway runs there, not on system nodes.
 
       # No taint: system components (plus kube-system addons like
       # CoreDNS, Karpenter controller) schedule here freely.
@@ -290,8 +285,19 @@ module "eks" {
       # The eks.amazonaws.com/nodegroup label is name-prefixed by
       # default (e.g. system-2026031219...) so we can't match it
       # statically. EKS applies label updates in-place — no node churn.
+      #
+      # exclude-from-external-load-balancers: NLB target-type=instance
+      # + dualstack requires every registered instance to have a
+      # PRIMARY IPv6 on its ENI. Karpenter nodes self-set it at boot
+      # (nix/nixos-node/eks-node.nix primary-ipv6-init); system nodes
+      # use stock AL2023, where neither the LT NetworkInterfaces block
+      # (EKS wraps with its own LT) nor that systemd unit applies.
+      # rio-gateway never schedules here, so system nodes would only
+      # ever be unhealthy targets — exclude them outright so aws-lbc's
+      # RegisterTargets call doesn't fail on a missing primary IPv6.
       labels = {
-        "rio.build/node-role" = "system"
+        "rio.build/node-role"                                     = "system"
+        "node.kubernetes.io/exclude-from-external-load-balancers" = "true"
       }
     }
   }

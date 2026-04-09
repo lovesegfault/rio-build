@@ -44,9 +44,10 @@ module "karpenter" {
 }
 
 # Allow nodes to set primary-IPv6 on their own ENI at boot
-# (EC2NodeClass userData in karpenter.yaml). NLB target-type=instance
-# + dualstack requires it; neither EC2NodeClass nor managed-nodegroup
-# LTs can set it declaratively.
+# (primary-ipv6-init systemd oneshot baked into the NixOS AMI,
+# nix/nixos-node/eks-node.nix). NLB target-type=instance + dualstack
+# requires it; neither EC2NodeClass nor managed-nodegroup LTs can set
+# it declaratively.
 resource "aws_iam_policy" "karpenter_node_primary_ipv6" {
   name = "${var.cluster_name}-karpenter-node-primary-ipv6"
   policy = jsonencode({
