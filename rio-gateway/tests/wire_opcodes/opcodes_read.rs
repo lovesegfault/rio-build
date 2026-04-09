@@ -1,3 +1,5 @@
+use rstest::rstest;
+
 use super::*;
 
 // ===========================================================================
@@ -5,37 +7,31 @@ use super::*;
 // ===========================================================================
 
 // r[verify gw.opcode.is-valid-path]
+/// wopIsValidPath: seeded → true; missing → false; unparseable path → false
+/// (graceful degradation, NOT STDERR_ERROR — Nix-compatible behavior).
+#[rstest]
+#[case::exists(true, TEST_PATH_A, true)]
+#[case::missing(false, TEST_PATH_MISSING, false)]
+#[case::garbage_returns_false(false, "garbage-not-a-store-path", false)]
 #[tokio::test]
-async fn test_is_valid_path_exists() -> anyhow::Result<()> {
+async fn test_is_valid_path(
+    #[case] seed: bool,
+    #[case] path: &str,
+    #[case] expect_valid: bool,
+) -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.store.seed_with_content(TEST_PATH_A, b"hello");
+    if seed {
+        h.store.seed_with_content(TEST_PATH_A, b"hello");
+    }
 
     wire_send!(&mut h.stream;
         u64: 1,                             // wopIsValidPath
-        string: TEST_PATH_A,
+        string: path,
     );
 
     drain_stderr_until_last(&mut h.stream).await?;
     let valid = wire::read_bool(&mut h.stream).await?;
-    assert!(valid, "seeded path should be valid");
-
-    h.finish().await;
-    Ok(())
-}
-
-// r[verify gw.opcode.is-valid-path]
-#[tokio::test]
-async fn test_is_valid_path_missing() -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
-
-    wire_send!(&mut h.stream;
-        u64: 1,                             // wopIsValidPath
-        string: TEST_PATH_MISSING,
-    );
-
-    drain_stderr_until_last(&mut h.stream).await?;
-    let valid = wire::read_bool(&mut h.stream).await?;
-    assert!(!valid, "missing path should be invalid");
+    assert_eq!(valid, expect_valid, "IsValidPath({path})");
 
     h.finish().await;
     Ok(())
@@ -586,27 +582,6 @@ async fn test_query_valid_paths_empty() -> anyhow::Result<()> {
     drain_stderr_until_last(&mut h.stream).await?;
     let valid = wire::read_strings(&mut h.stream).await?;
     assert!(valid.is_empty());
-
-    h.finish().await;
-    Ok(())
-}
-
-// r[verify gw.opcode.is-valid-path]
-/// IsValidPath with unparseable path returns false (not STDERR_ERROR).
-/// This documents the graceful-degradation behavior for Nix compatibility.
-#[tokio::test]
-async fn test_is_valid_path_garbage_returns_false() -> anyhow::Result<()> {
-    let mut h = GatewaySession::new_with_handshake().await?;
-
-    wire_send!(&mut h.stream;
-        u64: 1,
-        string: "garbage-not-a-store-path",
-    );
-
-    // Should NOT receive STDERR_ERROR — just STDERR_LAST + false.
-    drain_stderr_until_last(&mut h.stream).await?;
-    let valid = wire::read_bool(&mut h.stream).await?;
-    assert!(!valid, "garbage path should return false, not error");
 
     h.finish().await;
     Ok(())
